@@ -549,36 +549,56 @@ func resolveRepoRecord(ctx context.Context, store *db.Store, repo github.Reposit
 	return repoRecordFromStablePath(ctx, repo, fallbackDir)
 }
 
+// resolveRepoRecordWithDefaultSource reports whether DefaultBranch came from
+// origin/HEAD. Callers that persist an implicitly resolved record need this
+// provenance so a current-branch fallback cannot become repository-wide state.
+func resolveRepoRecordWithDefaultSource(ctx context.Context, store *db.Store, repo github.Repository, fallbackDir string, runner subprocess.Runner) (db.Repo, bool, error) {
+	existing, err := store.GetRepo(ctx, repo.FullName())
+	switch {
+	case err == nil && (strings.TrimSpace(existing.CheckoutPath) != "" || strings.TrimSpace(existing.PrimaryCheckoutPath) != ""):
+		resolved, _, fromRemote, err := resolveRegisteredRepoRecordWithRunnerAndDefaultSource(ctx, store, repo, existing, runner)
+		return resolved, fromRemote, err
+	case err != nil && !errors.Is(err, sql.ErrNoRows):
+		return db.Repo{}, false, err
+	}
+	return repoRecordFromStablePathWithDefaultSource(ctx, repo, fallbackDir, runner)
+}
+
 func resolveRegisteredRepoRecord(ctx context.Context, store *db.Store, repo github.Repository, existing db.Repo) (db.Repo, bool, error) {
 	return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, existing, subprocess.ExecRunner{})
 }
 
 func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store, repo github.Repository, existing db.Repo, runner subprocess.Runner) (db.Repo, bool, error) {
+	resolved, healed, _, err := resolveRegisteredRepoRecordWithRunnerAndDefaultSource(ctx, store, repo, existing, runner)
+	return resolved, healed, err
+}
+
+func resolveRegisteredRepoRecordWithRunnerAndDefaultSource(ctx context.Context, store *db.Store, repo github.Repository, existing db.Repo, runner subprocess.Runner) (db.Repo, bool, bool, error) {
 	checkout := strings.TrimSpace(existing.CheckoutPath)
 	var checkoutErr error
 	if checkout != "" {
-		resolved, err := repoRecordForCheckout(ctx, repo, jobGitClient(checkout, runner))
+		resolved, fromRemote, err := repoRecordForCheckout(ctx, repo, jobGitClient(checkout, runner))
 		if err == nil {
 			primary := strings.TrimSpace(existing.PrimaryCheckoutPath)
 			if primary == "" {
 				primary, err = jobGitClient(checkout, runner).PrimaryWorktree(ctx)
 				if err != nil {
-					return db.Repo{}, false, fmt.Errorf("resolve primary worktree for %s: %w", repo.FullName(), err)
+					return db.Repo{}, false, false, fmt.Errorf("resolve primary worktree for %s: %w", repo.FullName(), err)
 				}
 				updated, err := store.HealRepoCheckout(ctx, repo.FullName(), checkout, checkout, primary)
 				if err != nil {
-					return db.Repo{}, false, err
+					return db.Repo{}, false, false, err
 				}
 				if !updated {
 					current, err := store.GetRepo(ctx, repo.FullName())
 					if err != nil {
-						return db.Repo{}, false, err
+						return db.Repo{}, false, false, err
 					}
-					return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, current, runner)
+					return resolveRegisteredRepoRecordWithRunnerAndDefaultSource(ctx, store, repo, current, runner)
 				}
 			}
 			resolved.PrimaryCheckoutPath = primary
-			return preserveRegisteredRepoFields(resolved, existing), false, nil
+			return preserveRegisteredRepoFields(resolved, existing, fromRemote), false, fromRemote, nil
 		}
 		checkoutErr = err
 	} else {
@@ -587,41 +607,60 @@ func resolveRegisteredRepoRecordWithRunner(ctx context.Context, store *db.Store,
 
 	primary := strings.TrimSpace(existing.PrimaryCheckoutPath)
 	if primary == "" || sameCheckoutPath(primary, checkout) {
-		return db.Repo{}, false, fmt.Errorf("registered checkout %s for %s is unusable and no distinct primary checkout is available: %w", checkout, repo.FullName(), checkoutErr)
+		return db.Repo{}, false, false, fmt.Errorf("registered checkout %s for %s is unusable and no distinct primary checkout is available: %w", checkout, repo.FullName(), checkoutErr)
 	}
-	resolved, err := repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
+	resolved, fromRemote, err := repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
 	if err != nil {
-		return db.Repo{}, false, fmt.Errorf("registered checkout %s for %s is unusable (%v); verify primary checkout %s: %w", checkout, repo.FullName(), checkoutErr, primary, err)
+		return db.Repo{}, false, false, fmt.Errorf("registered checkout %s for %s is unusable (%v); verify primary checkout %s: %w", checkout, repo.FullName(), checkoutErr, primary, err)
 	}
 	primary, err = jobGitClient(resolved.CheckoutPath, runner).PrimaryWorktree(ctx)
 	if err != nil {
-		return db.Repo{}, false, fmt.Errorf("resolve primary worktree for %s from %s: %w", repo.FullName(), resolved.CheckoutPath, err)
+		return db.Repo{}, false, false, fmt.Errorf("resolve primary worktree for %s from %s: %w", repo.FullName(), resolved.CheckoutPath, err)
 	}
 	if !sameCheckoutPath(primary, resolved.CheckoutPath) {
-		resolved, err = repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
+		resolved, fromRemote, err = repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
 		if err != nil {
-			return db.Repo{}, false, fmt.Errorf("verify resolved primary checkout %s for %s: %w", primary, repo.FullName(), err)
+			return db.Repo{}, false, false, fmt.Errorf("verify resolved primary checkout %s for %s: %w", primary, repo.FullName(), err)
 		}
 	}
 	resolved.PrimaryCheckoutPath = primary
-	resolved = preserveRegisteredRepoFields(resolved, existing)
+	resolved = preserveRegisteredRepoFields(resolved, existing, fromRemote)
 	healed, err := store.HealRepoCheckout(ctx, repo.FullName(), checkout, resolved.CheckoutPath, primary)
 	if err != nil {
-		return db.Repo{}, false, err
+		return db.Repo{}, false, false, err
 	}
 	if !healed {
 		current, err := store.GetRepo(ctx, repo.FullName())
 		if err != nil {
-			return db.Repo{}, false, err
+			return db.Repo{}, false, false, err
 		}
-		return resolveRegisteredRepoRecordWithRunner(ctx, store, repo, current, runner)
+		return resolveRegisteredRepoRecordWithRunnerAndDefaultSource(ctx, store, repo, current, runner)
 	}
 	log.Printf("WARNING: %s", repoCheckoutHealMessage(repo.FullName(), checkout, resolved.CheckoutPath))
-	return resolved, true, nil
+	return resolved, true, fromRemote, nil
 }
 
-func preserveRegisteredRepoFields(resolved, existing db.Repo) db.Repo {
-	if strings.TrimSpace(existing.DefaultBranch) != "" {
+// preserveRegisteredRepoFields keeps operator-owned fields across a re-resolve.
+//
+// remoteDefault is the branch origin/HEAD names, or "" when it could not be
+// read. It is passed EXPLICITLY rather than inferred from resolved, because the
+// decision needs the PROVENANCE of the value and not just the value: a branch
+// derived from the remote is authoritative and must overwrite a stored one,
+// while a branch that fell back to the worktree's current HEAD must never
+// overwrite a stored value that may have come from the remote earlier.
+//
+// This kept the stored DefaultBranch whenever it was non-empty (#2145 review,
+// F1). That was protective while the resolved value came from CurrentBranch - it
+// stopped a worktree artifact overwriting the record - but it also meant a
+// CORRECT remote-derived value could never replace a wrong stored one, so
+// `jerryfane/herdr` kept `fix/lan-address-portability` however often it was
+// re-resolved. THE PRESERVE RULE WAS A WORKAROUND FOR THE DEFECT THIS CHANGE
+// FIXES, and keeping both leaves the record permanently wrong.
+func preserveRegisteredRepoFields(resolved, existing db.Repo, resolvedFromRemote bool) db.Repo {
+	switch {
+	case resolvedFromRemote && strings.TrimSpace(resolved.DefaultBranch) != "":
+		// keep the remote-derived value already on resolved
+	case strings.TrimSpace(existing.DefaultBranch) != "":
 		resolved.DefaultBranch = existing.DefaultBranch
 	}
 	resolved.PollInterval = existing.PollInterval
@@ -638,40 +677,46 @@ func repoRecordFromPath(ctx context.Context, repo github.Repository, path string
 	if err != nil {
 		return db.Repo{}, err
 	}
-	return repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(checkout))
+	record, _, err := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(checkout))
+	return record, err
 }
 
 // repoRecordFromStablePath resolves an operator/cwd-provided checkout but pins
 // linked worktrees to their primary. Explicit linked registration is reserved
 // for repo add --force.
 func repoRecordFromStablePath(ctx context.Context, repo github.Repository, path string) (db.Repo, error) {
+	record, _, err := repoRecordFromStablePathWithDefaultSource(ctx, repo, path, subprocess.ExecRunner{})
+	return record, err
+}
+
+func repoRecordFromStablePathWithDefaultSource(ctx context.Context, repo github.Repository, path string, runner subprocess.Runner) (db.Repo, bool, error) {
 	checkout, err := cleanCheckoutPath(path)
 	if err != nil {
-		return db.Repo{}, err
+		return db.Repo{}, false, err
 	}
-	client := gitutil.NewHostClient(checkout)
-	record, err := repoRecordForCheckout(ctx, repo, client)
+	client := jobGitClient(checkout, runner)
+	record, fromRemote, err := repoRecordForCheckout(ctx, repo, client)
 	if err != nil {
-		return db.Repo{}, err
+		return db.Repo{}, false, err
 	}
 	primary, err := client.PrimaryWorktree(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("resolve primary worktree: %w", err)
+		return db.Repo{}, false, fmt.Errorf("resolve primary worktree: %w", err)
 	}
 	record.PrimaryCheckoutPath = primary
 	linked, err := client.IsLinkedWorktree(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("detect linked worktree: %w", err)
+		return db.Repo{}, false, fmt.Errorf("detect linked worktree: %w", err)
 	}
 	if !linked || sameCheckoutPath(record.CheckoutPath, primary) {
-		return record, nil
+		return record, fromRemote, nil
 	}
-	primaryRecord, err := repoRecordForCheckout(ctx, repo, gitutil.NewHostClient(primary))
+	primaryRecord, primaryFromRemote, err := repoRecordForCheckout(ctx, repo, jobGitClient(primary, runner))
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("verify primary checkout: %w", err)
+		return db.Repo{}, false, fmt.Errorf("verify primary checkout: %w", err)
 	}
 	primaryRecord.PrimaryCheckoutPath = primary
-	return primaryRecord, nil
+	return primaryRecord, primaryFromRemote, nil
 }
 
 func cleanCheckoutPath(path string) (string, error) {

@@ -98,11 +98,18 @@ func effectiveDelegationDecision(result *AgentResult, childType string, action s
 	if result == nil {
 		return ""
 	}
-	if strings.EqualFold(strings.TrimSpace(action), "review") ||
-		strings.EqualFold(strings.TrimSpace(childType), "review") {
-		return effectiveReviewDecision(result, blockingSeverity)
+	isReview := strings.EqualFold(strings.TrimSpace(action), "review") ||
+		strings.EqualFold(strings.TrimSpace(childType), "review")
+	if !isReview {
+		return strings.TrimSpace(result.Decision)
 	}
-	return strings.TrimSpace(result.Decision)
+	// A review child that delegates is still a coordinator announcement. Callers
+	// capable of traversing the tree inspect its descendants; flat consumers must
+	// not promote the announcement to an approval of its parent's work.
+	if ResultIsFanOut(result) {
+		return ""
+	}
+	return effectiveReviewDecision(result, blockingSeverity)
 }
 
 func normalizedReviewBlockingSeverity(value string) string {

@@ -767,20 +767,22 @@ the daemon runs under. What that changes in practice:
   that override `widened`; Landlock remains the write boundary. Non-seat
   `read-only` keeps `always-ask`. The other three explicit policy mappings are
   declared `applied`, while `auto` is `widened`.
-- **OMP cross-family independence uses runtime-reported upstream-provider
+- **OMP runtime-family diversity uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
   OMP wrapper remains `effective_runtime=omp`. Providers shared with native
   adapters compare as the same family: `openai` and `openai-codex` map to
   Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
   without a native adapter stay namespaced, for example `omp:devin`. Different
-  models and agent names on one provider remain the same family, while different
-  proved providers qualify as cross-family. A requested model alone, a failed or
-  historical job without provider evidence, and an in-session implementation
-  row with no provider all fail closed. Native fan-out cannot prove an OMP
-  provider before execution, so it skips those reviewers; use an explicit
-  `agent review` dispatch to run one and record evidence. Native runtime behavior
-  is unchanged.
+  models and agent names on one provider remain the same family. The comparison
+  is advisory, not an independence gate: same-family comparisons emit
+  `merge_gate_family_advisory`, while unresolved comparisons retain the
+  `merge_gate_family_unresolved` event; neither disqualifies a substantive
+  approval from a reviewer whose identity is not an implementer. For a review
+  fan-out, every coordinating parent is an announcement rather than a verdict,
+  including nested fan-outs. The gate applies identity and family checks to each
+  approving leaf and records approval evidence on that leaf. Requested model
+  text alone and failed delivery are not provider evidence.
 - **Authentication is per profile.** Authenticate omp once interactively, export
   the provider key the daemon should use, or point it at an auth broker; then
   restart the Gitmoot daemon so it inherits the credential. The daemon must also
@@ -1110,6 +1112,13 @@ uses checkout HEAD, but refuses when the checkout is on a non-default branch
 that is behind `origin/<default>`. The error reports the branch and behind
 count and offers both explicit choices: `--base origin/<default>` or
 `--base HEAD`.
+
+The repository-wide default comes from the registered checkout's local
+`origin/HEAD` symbolic ref. Git does not refresh that ref when the upstream
+repository renames its default branch. Run `git remote set-head origin -a` in
+the registered checkout after such a rename; until then Gitmoot treats the
+cached ref as authoritative and may reconcile `repos.default_branch` back to
+the stale name.
 
 `gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,

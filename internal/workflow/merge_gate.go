@@ -14,7 +14,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 const (
@@ -25,8 +24,10 @@ const (
 
 	// GitmootMergeGateContext is the canonical commit-status context for the
 	// native merge gate and every observer of its current-head verdict.
-	GitmootMergeGateContext = "gitmoot/merge-gate"
-	gitmootNoCIContext      = "gitmoot/ci"
+	GitmootMergeGateContext            = "gitmoot/merge-gate"
+	gitmootNoCIContext                 = "gitmoot/ci"
+	mergeGateFamilyAdvisoryEventKind   = "merge_gate_family_advisory"
+	mergeGateFamilyUnresolvedEventKind = "merge_gate_family_unresolved"
 	// MergeLeaveOpenAutoMergeKillSwitchReason is persisted with a parked task so
 	// a later explicit auto_merge=false -> true config flip can re-arm only this
 	// operator decision.
@@ -1286,20 +1287,17 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			author, headlessObjection.job.ID)}
 	}
 	if len(activeAtHead) > 0 {
-		var selfApprovalReason string
-		var unknownImplementerReason string
-		var unattributedReviewerReason string
+		var authorship reviewAuthorshipAssessment
 		var undispatchedFanOuts []string
 		satisfied := false
-		var acceptedJob db.Job
-		var acceptedPayload JobPayload
+		var acceptedApprovals []delegatedReviewApproval
 		for _, review := range activeAtHead {
 			// THE THIRD SITE OF THE SAME IDENTITY RULE (#1950 F4, ruling 126350).
 			// Reading job.Agent alone classified a ROLE-AUTHORED approval as
 			// unattributed and refused it BEFORE the independence check ever ran, so a
 			// role could never approve anything - and the role's own self-approval was
 			// never even tested for. Agent still wins whenever present.
-			reviewer, reviewerFromRole := effectiveReviewerIdentity(review.job, review.payload)
+			reviewer := effectiveReviewerIdentityName(review.job, review.payload)
 			if JobState(review.job.State) != JobSucceeded {
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
@@ -1307,7 +1305,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
 			decision := effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity)
-			if reviewRowIsFanOut(review.payload.Result) {
+			fanOut := reviewRowIsFanOut(review.payload.Result)
+			if fanOut {
 				children := delegationChildrenByParent[review.job.ID]
 				if len(children) == 0 {
 					// Announced and never dispatched: there is nothing to judge, so this
@@ -1325,35 +1324,23 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			switch decision {
 			case "approved":
-				if err := ensureDelegatedReviewEvidence(
-					review.job, delegationChildrenByParent[review.job.ID], review.payload.Result.Delegations, request.ReviewBlockingSeverity,
-				); err != nil {
+				approvals, err := ensureDelegatedReviewEvidence(
+					review.job, delegationChildrenByParent, review.payload.Result.Delegations, request.ReviewBlockingSeverity,
+				)
+				if err != nil {
 					return err
 				}
+				if !fanOut {
+					approvals = []delegatedReviewApproval{{job: review.job, payload: review.payload}}
+				}
 				satisfied = true
-				acceptedJob, acceptedPayload = review.job, review.payload
-				switch {
-				case reviewer == "":
-					if unattributedReviewerReason == "" {
-						unattributedReviewerReason = "latest review round's approval has no recorded reviewer author; an independent reviewer cannot be verified"
+				acceptedApprovals = append(acceptedApprovals, approvals...)
+				for _, approval := range approvals {
+					assessment, err := g.assessReviewAuthor(ctx, approval.job, approval.payload, implementingAgents, missingImplementerReason)
+					if err != nil {
+						return err
 					}
-				case len(implementingAgents) == 0:
-					if unknownImplementerReason == "" {
-						unknownImplementerReason = missingImplementerReason
-					}
-				default:
-					if _, selfApproved := implementingAgents[reviewer]; selfApproved && selfApprovalReason == "" {
-						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
-					}
-					if selfApprovalReason == "" {
-						sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, review.job.ID, reviewer, reviewerFromRole, review.payload.EffectiveRuntime, implementingAgents)
-						if err != nil {
-							return err
-						}
-						if sameFamily {
-							selfApprovalReason = familyReason
-						}
-					}
+					authorship.absorb(assessment)
 				}
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
@@ -1361,7 +1348,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.payload.Result.Decision, review.job.ID)
 			}
 		}
-		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
+		if reason := authorship.failureReason(); reason != "" {
 			return errors.New(reason)
 		}
 		if !satisfied {
@@ -1374,7 +1361,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// AFTER every refusal, never inside the loop: an approval the gate then
 		// rejects (self-approval, unknown implementer, an undispatched fan-out)
 		// must not leave a record saying it authorised anything.
-		g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
+		for _, approval := range acceptedApprovals {
+			g.recordApprovalEvidence(ctx, approval.job, approval.payload)
+		}
 		return nil
 	}
 	var latest reviewRoundKey
@@ -1396,11 +1385,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("final agent review is not captured")
 	}
 	approved := false
-	var acceptedJob db.Job
-	var acceptedPayload JobPayload
-	var selfApprovalReason string
-	var unknownImplementerReason string
-	var unattributedReviewerReason string
+	var acceptedApprovals []delegatedReviewApproval
+	var authorship reviewAuthorshipAssessment
 	var undispatchedFanOuts []string
 	type eligibleReview struct {
 		job     db.Job
@@ -1420,38 +1406,15 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
-			// Same rule, same helper (#1950 F4): the latest-round arm resolved identity
-			// separately, which is the fourth copy that ruling 126350 removes.
-			reviewerAgent, reviewerFromRole := effectiveReviewerIdentity(job, payload)
-			switch {
-			case reviewerAgent == "":
-				if unattributedReviewerReason == "" {
-					unattributedReviewerReason = "latest review round's approval has no recorded reviewer author; an independent reviewer cannot be verified"
-				}
+		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" &&
+			!reviewRowIsFanOut(payload.Result) {
+			assessment, err := g.assessReviewAuthor(ctx, job, payload, implementingAgents, missingImplementerReason)
+			if err != nil {
+				return err
+			}
+			authorship.absorb(assessment)
+			if assessment.failureReason() != "" {
 				continue
-			case len(implementingAgents) == 0:
-				if unknownImplementerReason == "" {
-					unknownImplementerReason = missingImplementerReason
-				}
-				continue
-			default:
-				if _, selfApproved := implementingAgents[reviewerAgent]; selfApproved {
-					if selfApprovalReason == "" {
-						selfApprovalReason = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewerAgent)
-					}
-					continue
-				}
-				sameFamily, familyReason, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewerAgent, reviewerFromRole, payload.EffectiveRuntime, implementingAgents)
-				if err != nil {
-					return err
-				}
-				if sameFamily {
-					if selfApprovalReason == "" {
-						selfApprovalReason = familyReason
-					}
-					continue
-				}
 			}
 		}
 		eligible = append(eligible, eligibleReview{job: job, payload: payload})
@@ -1460,13 +1423,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		job := review.job
 		payload := review.payload
 		if err := g.ensureReviewMatchesHead(payload, headSHA, effectiveReviewerIdentityName(job, payload)); err != nil {
-			if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
+			if reason := authorship.failureReason(); reason != "" {
 				return errors.New(reason)
 			}
 			return err
 		}
 		decision := effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity)
-		if reviewRowIsFanOut(payload.Result) {
+		fanOut := reviewRowIsFanOut(payload.Result)
+		if fanOut {
 			// Same rule as the head-bound population above: an announcement is not a
 			// verdict, and its delegates are the only evidence it produces.
 			children := delegationChildrenByParent[job.ID]
@@ -1480,13 +1444,26 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		switch decision {
 		case "approved":
-			if err := ensureDelegatedReviewEvidence(
-				job, delegationChildrenByParent[job.ID], payload.Result.Delegations, request.ReviewBlockingSeverity,
-			); err != nil {
+			approvals, err := ensureDelegatedReviewEvidence(
+				job, delegationChildrenByParent, payload.Result.Delegations, request.ReviewBlockingSeverity,
+			)
+			if err != nil {
 				return err
 			}
+			if fanOut {
+				for _, approval := range approvals {
+					assessment, err := g.assessReviewAuthor(ctx, approval.job, approval.payload, implementingAgents, missingImplementerReason)
+					if err != nil {
+						return err
+					}
+					authorship.absorb(assessment)
+				}
+			} else {
+				// Direct approvals were assessed while eligibility was built above.
+				approvals = []delegatedReviewApproval{{job: job, payload: payload}}
+			}
 			approved = true
-			acceptedJob, acceptedPayload = job, payload
+			acceptedApprovals = append(acceptedApprovals, approvals...)
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
 			// (mergeBlocked), distinct from the transient/process review errors below
@@ -1495,10 +1472,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			return mergeBlocked{reason: fmt.Sprintf("latest review round has blocking result from %s", effectiveReviewerIdentityName(job, payload))}
 		}
 	}
+	if reason := authorship.failureReason(); reason != "" {
+		return errors.New(reason)
+	}
 	if !approved {
-		if reason := reviewAuthorshipFailureReason(selfApprovalReason, unknownImplementerReason, unattributedReviewerReason); reason != "" {
-			return errors.New(reason)
-		}
 		if len(undispatchedFanOuts) > 0 {
 			return fmt.Errorf(
 				"no review verdict in the latest round: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
@@ -1507,7 +1484,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("required reviewer approval is missing")
 	}
 	// AFTER every refusal: see the same call on the other acceptance path.
-	g.recordApprovalEvidence(ctx, acceptedJob, acceptedPayload)
+	for _, approval := range acceptedApprovals {
+		g.recordApprovalEvidence(ctx, approval.job, approval.payload)
+	}
 	return nil
 }
 
@@ -1541,16 +1520,26 @@ func ResultIsFanOut(result *AgentResult) bool {
 	return len(result.Delegations) > 0 || result.FanOut
 }
 
-// ensureDelegatedReviewEvidence decides a delegating review on its CHILDREN,
-// which are the only evidence a fan-out produces. declared is the parent's own
-// delegations[]: a delegation that was announced but has no child row has not
-// reported, and counting it as reported is how an announcement used to reach
-// merge eligibility.
-func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []Delegation, blockingSeverity string) error {
+type delegatedReviewApproval struct {
+	job     db.Job
+	payload JobPayload
+}
+
+// ensureDelegatedReviewEvidence decides a delegation tree on its LEAF verdicts,
+// which are the only evidence any fan-out produces. declared is the current
+// parent's own delegations[]: a delegation that was announced but has no child
+// row has not reported, and counting any nested announcement as reported would
+// reintroduce the same announcement-as-verdict defect one level down.
+//
+// A successful result returns every leaf whose verdict actually approved so
+// callers apply identity, family, and audit policy to verdict authors rather
+// than to any coordinator announcement.
+func ensureDelegatedReviewEvidence(parent db.Job, childrenByParent map[string][]db.Job, declared []Delegation, blockingSeverity string) ([]delegatedReviewApproval, error) {
+	children := childrenByParent[parent.ID]
 	if len(children) == 0 {
-		return nil
+		return nil, nil
 	}
-	hasApproval := false
+	approvals := make([]delegatedReviewApproval, 0, len(children))
 	var blocking []string
 	var active []string
 	var crashed []string
@@ -1561,62 +1550,94 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	var abstaining []string
 	var parked []string
 	var unrecognized []string
-	reported := make(map[string]struct{}, len(children))
-	for _, child := range children {
-		if id := strings.TrimSpace(child.DelegationID); id != "" {
-			reported[id] = struct{}{}
+	ancestors := make(map[string]struct{})
+	var collect func(db.Job, []Delegation)
+	collect = func(current db.Job, currentDeclared []Delegation) {
+		currentID := strings.TrimSpace(current.ID)
+		if _, cycle := ancestors[currentID]; cycle {
+			unrecognized = append(unrecognized, fmt.Sprintf("%s (delegation cycle)", currentID))
+			return
 		}
-	}
-	for _, delegation := range declared {
-		id := strings.TrimSpace(delegation.ID)
-		if id == "" {
-			continue
+		ancestors[currentID] = struct{}{}
+		defer delete(ancestors, currentID)
+
+		currentChildren := childrenByParent[current.ID]
+		if len(currentChildren) == 0 {
+			if len(currentDeclared) == 0 {
+				active = append(active, fmt.Sprintf("%s (fan-out, no child jobs)", currentID))
+				return
+			}
+			for _, delegation := range currentDeclared {
+				id := strings.TrimSpace(delegation.ID)
+				if id != "" {
+					active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
+				}
+			}
+			return
 		}
-		if _, ok := reported[id]; !ok {
-			// Dispatch happened (children exist) but this delegate produced no row, so
-			// its evidence is still outstanding rather than absent.
-			active = append(active, fmt.Sprintf("%s (declared, no job)", id))
+
+		reported := make(map[string]struct{}, len(currentChildren))
+		for _, child := range currentChildren {
+			if id := strings.TrimSpace(child.DelegationID); id != "" {
+				reported[id] = struct{}{}
+			}
 		}
-	}
-	for _, child := range children {
-		childID := strings.TrimSpace(child.ID)
-		switch JobState(child.State) {
-		case JobQueued, JobRunning:
-			active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobSucceeded:
-			payload, err := unmarshalPayload(child.Payload)
-			if err != nil {
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+		for _, delegation := range currentDeclared {
+			id := strings.TrimSpace(delegation.ID)
+			if id == "" {
 				continue
 			}
-			if payload.Result == nil {
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
-				continue
+			if _, ok := reported[id]; !ok {
+				// Dispatch happened (children exist) but this delegate produced no row,
+				// so its evidence is still outstanding rather than absent.
+				active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
 			}
-			decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
-			switch decision {
-			case "approved":
-				hasApproval = true
-			case "changes_requested", "blocked", "failed":
-				blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
-			case "skipped", "implemented":
-				abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
+		}
+		for _, child := range currentChildren {
+			childID := strings.TrimSpace(child.ID)
+			switch JobState(child.State) {
+			case JobQueued, JobRunning:
+				active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobSucceeded:
+				payload, err := unmarshalPayload(child.Payload)
+				if err != nil {
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
+					continue
+				}
+				if payload.Result == nil {
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
+					continue
+				}
+				if ResultIsFanOut(payload.Result) {
+					collect(child, payload.Result.Delegations)
+					continue
+				}
+				decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
+				switch decision {
+				case "approved":
+					approvals = append(approvals, delegatedReviewApproval{job: child, payload: payload})
+				case "changes_requested", "blocked", "failed":
+					blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
+				case "skipped", "implemented":
+					abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
+				default:
+					unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+				}
+			case JobCancelled:
+				// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
+				// as the slot classification above, in the fan-out summary a reader uses
+				// to decide what to do next.
+				cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobFailed:
+				crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
+			case JobBlocked:
+				parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
 			default:
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
+				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
 			}
-		case JobCancelled:
-			// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
-			// as the slot classification above, in the fan-out summary a reader uses
-			// to decide what to do next.
-			cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobFailed:
-			crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
-		case JobBlocked:
-			parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
-		default:
-			unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
 		}
 	}
+	collect(parent, declared)
 	sort.Strings(blocking)
 	sort.Strings(active)
 	sort.Strings(crashed)
@@ -1650,28 +1671,28 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	// The first matching class decides the outcome; reasonDetails retains every
 	// lower-priority obligation so a winning class cannot hide its siblings.
 	if len(blocking) > 0 {
-		return mergeBlocked{reason: fmt.Sprintf(
+		return nil, mergeBlocked{reason: fmt.Sprintf(
 			"delegated review parent %s has blocking delegation evidence (%s)",
 			parent.ID,
 			reasonDetails,
 		)}
 	}
 	if len(unrecognized) > 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"delegated review parent %s has unrecognized delegation evidence (%s); rerun or repair the delegated review",
 			parent.ID,
 			reasonDetails,
 		)
 	}
 	if len(active) > 0 {
-		return mergePending{reason: fmt.Sprintf(
+		return nil, mergePending{reason: fmt.Sprintf(
 			"waiting for delegated review parent %s to produce surviving evidence (%s)",
 			parent.ID,
 			reasonDetails,
 		)}
 	}
 	if len(crashed) > 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"delegated review parent %s has crashed delegation children (%s); rerun or repair the delegated review",
 			parent.ID,
 			reasonDetails,
@@ -1684,30 +1705,30 @@ func ensureDelegatedReviewEvidence(parent db.Job, children []db.Job, declared []
 	// gate weakening dressed as a message fix. It still refuses; only the
 	// diagnosis and the remedy differ.
 	if len(cancelled) > 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"delegated review parent %s has CANCELLED delegation children (%s); a cancellation is not a verdict and not a crash, so decide whether those slots should be re-dispatched rather than repaired",
 			parent.ID,
 			reasonDetails,
 		)
 	}
 	if len(abstaining) > 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"delegated review parent %s has no surviving delegation evidence: abstaining delegation children (%s); rerun or repair the delegated review",
 			parent.ID,
 			reasonDetails,
 		)
 	}
 	if len(parked) > 0 {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"delegated review parent %s has no surviving delegation evidence (%s); rerun or repair the delegated review",
 			parent.ID,
 			reasonDetails,
 		)
 	}
-	if hasApproval {
-		return nil
+	if len(approvals) > 0 {
+		return approvals, nil
 	}
-	return fmt.Errorf(
+	return nil, fmt.Errorf(
 		"delegated review parent %s has no surviving delegation evidence; rerun or repair the delegated review",
 		parent.ID,
 	)
@@ -1913,15 +1934,59 @@ func (e implementerAttributionEvidence) failureReason() string {
 	}
 }
 
-func reviewAuthorshipFailureReason(selfApproval string, unknownImplementer string, unattributedReviewer string) string {
+type reviewAuthorshipAssessment struct {
+	selfApproval         string
+	unknownImplementer   string
+	unattributedReviewer string
+}
+
+func (a *reviewAuthorshipAssessment) absorb(other reviewAuthorshipAssessment) {
+	if a.selfApproval == "" {
+		a.selfApproval = other.selfApproval
+	}
+	if a.unknownImplementer == "" {
+		a.unknownImplementer = other.unknownImplementer
+	}
+	if a.unattributedReviewer == "" {
+		a.unattributedReviewer = other.unattributedReviewer
+	}
+}
+
+func (a reviewAuthorshipAssessment) failureReason() string {
 	// Keep the operator-facing cause stable when a round contains multiple
 	// disqualified approvals.
-	for _, reason := range []string{selfApproval, unknownImplementer, unattributedReviewer} {
+	for _, reason := range []string{a.selfApproval, a.unknownImplementer, a.unattributedReviewer} {
 		if reason = strings.TrimSpace(reason); reason != "" {
 			return reason
 		}
 	}
 	return ""
+}
+
+func (g PolicyMergeGate) assessReviewAuthor(
+	ctx context.Context,
+	job db.Job,
+	payload JobPayload,
+	implementingAgents map[string]implementerIdentity,
+	missingImplementerReason string,
+) (reviewAuthorshipAssessment, error) {
+	var assessment reviewAuthorshipAssessment
+	reviewer, reviewerFromRole := effectiveReviewerIdentity(job, payload)
+	switch {
+	case reviewer == "":
+		assessment.unattributedReviewer = "latest review round's approval has no recorded reviewer author; an independent reviewer cannot be verified"
+	case len(implementingAgents) == 0:
+		assessment.unknownImplementer = missingImplementerReason
+	default:
+		if _, selfApproved := implementingAgents[reviewer]; selfApproved {
+			assessment.selfApproval = fmt.Sprintf("latest review round's approval was authored by %s, the implementing agent; an independent reviewer is required", reviewer)
+			return assessment, nil
+		}
+		if _, _, err := g.sameRuntimeFamilyAsImplementer(ctx, job.ID, reviewer, reviewerFromRole, payload.EffectiveRuntime, implementingAgents); err != nil {
+			return assessment, err
+		}
+	}
+	return assessment, nil
 }
 
 func reviewJobRecordedAfter(left db.Job, right db.Job) bool {
@@ -2797,60 +2862,21 @@ func parseRepoFullName(value string) (github.Repository, error) {
 	return github.Repository{Owner: owner, Name: name}, nil
 }
 
-// sameRuntimeFamilyAsImplementer reports whether an approving reviewer shares a
-// RUNTIME FAMILY with any recorded implementer of this pull request (#1531).
+// sameRuntimeFamilyAsImplementer reports whether runtime-family diversity is
+// absent or cannot be established for an otherwise independent reviewer.
 //
-// THE NAME CHECK ABOVE CANNOT ENFORCE THE PROPERTY THE GATE EXISTS FOR. The bar
-// is cross-family review; the comparison was `reviewer != implementer` as
-// strings. Measured on PR #1527 at head 2e0dd2ee: implementer `wave-impl` and
-// reviewer `g7-review` are both codex/gpt-5.6-sol, and `g7-review != wave-impl`,
-// so the self-approval check passed on a same-family, same-model approval. That
-// panel was caught only because the gate failed closed for an unrelated
-// bookkeeping reason and never reached this test.
-//
-// IT USES THE ONE SHARED RESOLVER, whose own doc names this as its second
-// consumer: `ResolveRuntimeFamily` prefers the runtime recorded on the job and
-// falls back to the agent registry default, so an override-run job attributes
-// correctly even after its agent's default later changes.
-//
-// UNRESOLVABLE NOW BLOCKS (#2004). #1531 shipped this falling through to the
-// name check, because refusing then would have blocked the native review
-// fanout: its lens legs are ephemeral by construction and ephemeral agents are
-// deliberately absent from the registry. #2004 removed that objection by
-// teaching the shared resolver to recover a synthetic agent's family from its
-// parent, so the residue no longer contains the thing the fall-through was
-// protecting.
-//
-// Measured on review and implement jobs since 2026-08-25, after parent
-// recovery: 17 of 1,903 rows resolve to no family. Eleven have an empty agent
-// column and CANNOT REACH THIS FUNCTION - collectImplementerAttributionMatching
-// routes them to sawEmptyAgent and its own attribution reason - so the exposure
-// is the six rows naming an agent that is simply not registered, all implement
-// rows, none of them on an open pull request.
-//
-// Blocking is the honest answer for those six: the gate's property is that the
-// approver did not share a runtime family with an implementer, and an agent
-// whose runtime nothing records cannot be shown not to. The observation row is
-// still written, so the reason survives past the decision.
+// Runtime and verified OMP provider families are an advisory signal. The hard
+// merge requirement is one substantive review whose effective identity is not
+// among the recorded implementers. Callers enforce that identity boundary before
+// reaching this function. A same or unresolved family is recorded on the review
+// job for operator visibility but never disqualifies that independent verdict.
 func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, reviewJobID string, reviewer string,
 	reviewerFromActingRole bool, reviewerRuntime string, implementers map[string]implementerIdentity) (bool, string, error) {
 	if g.Store == nil || strings.TrimSpace(reviewer) == "" || len(implementers) == 0 {
 		return false, "", nil
 	}
-	// A ROLE IS OUTSIDE THIS PREDICATE'S DOMAIN, NOT AN UNRESOLVED VALUE WITHIN IT
-	// (#2004). A role-authored review is a human session (#1916): there is no
-	// runtime family to share with anyone, so comparing families is a category
-	// error rather than a missing measurement.
-	//
-	// THE FLAG IS PLUMBED EXPLICITLY AND IS NEVER INFERRED FROM AN EMPTY FAMILY.
-	// An unregistered AGENT also resolves to no family, and that case must keep
-	// failing closed; deciding this on "the family came back empty" would collapse
-	// the two and reopen the hole this change closes.
-	//
-	// This is a domain exclusion rather than an exemption because every other
-	// independence check still binds a role: the caller tests
-	// implementingAgents[reviewer] BEFORE reaching here, so a role approving its
-	// own implementation is still refused on identity. That arm has its own test.
+	// A role-authored review has no runtime family. Identity independence still
+	// applies at the caller and remains the deciding requirement.
 	if reviewerFromActingRole {
 		return false, "", nil
 	}
@@ -2860,16 +2886,11 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	}
 	if !ok {
 		reason := fmt.Sprintf(
-			"runtime or verified upstream-provider family unresolved for reviewer %q, so cross-family independence cannot be shown; register the agent with a runtime, or re-run the review through a job that records successful execution evidence",
+			"runtime or verified upstream-provider family is unresolved for reviewer %q; runtime-family diversity is advisory, and independent reviewer identity remains eligible",
 			reviewer)
-		g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+		g.recordFamilyObservation(ctx, reviewJobID, mergeGateFamilyUnresolvedEventKind, reason)
 		return true, reason, nil
 	}
-	reviewerRuntimeName, reviewerRuntimeOK, err := resolveRuntimeNameDirect(ctx, g.Store, reviewJobID, reviewer, reviewerRuntime)
-	if err != nil {
-		return false, "", err
-	}
-	reviewerRanOnOmp := reviewerRuntimeOK && reviewerRuntimeName == runtime.OmpRuntime
 	names := make([]string, 0, len(implementers))
 	for name := range implementers {
 		names = append(names, name)
@@ -2877,21 +2898,12 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 	sort.Strings(names)
 	for _, name := range names {
 		identity := implementers[name]
-		// Native reviewer behavior stays unchanged for in-session attribution:
-		// roles are not runtime agents. An OMP-routed approval is different because
-		// its independence claim is specifically about the upstream provider. A
-		// role-only implementation row carries no successful runtime/provider
-		// evidence, so accepting it would let an unrecorded same-provider
-		// implementation self-ratify.
 		if identity.FromActingRole {
-			if reviewerRanOnOmp {
-				reason := fmt.Sprintf(
-					"verified upstream-provider family is unavailable for in-session implementer %q, so OMP reviewer %s cannot prove cross-family independence",
-					name, reviewer)
-				g.recordFamilyUnresolved(ctx, reviewJobID, reason)
-				return true, reason, nil
-			}
-			continue
+			reason := fmt.Sprintf(
+				"runtime or verified upstream-provider family is unavailable for in-session implementer %q; runtime-family diversity for reviewer %s is advisory, and independent reviewer identity remains eligible",
+				name, reviewer)
+			g.recordFamilyObservation(ctx, reviewJobID, mergeGateFamilyUnresolvedEventKind, reason)
+			return true, reason, nil
 		}
 		family, ok, err := ResolveRuntimeFamily(ctx, g.Store, identity.JobID, name, identity.RecordedRuntime)
 		if err != nil {
@@ -2899,32 +2911,31 @@ func (g PolicyMergeGate) sameRuntimeFamilyAsImplementer(ctx context.Context, rev
 		}
 		if !ok {
 			reason := fmt.Sprintf(
-				"runtime or verified upstream-provider family unresolved for implementer %q, so cross-family independence cannot be shown; register the agent with a runtime, or record successful execution evidence for the implement job",
-				name)
-			g.recordFamilyUnresolved(ctx, reviewJobID, reason)
+				"runtime or verified upstream-provider family is unresolved for implementer %q; runtime-family diversity for reviewer %s is advisory, and independent reviewer identity remains eligible",
+				name, reviewer)
+			g.recordFamilyObservation(ctx, reviewJobID, mergeGateFamilyUnresolvedEventKind, reason)
 			return true, reason, nil
 		}
 		if family == reviewerFamily {
-			return true, fmt.Sprintf(
-				"latest review round's approval was authored by %s on runtime family %q, the same family as implementer %s; the bar is cross-family review, and distinct agent names are not evidence of independence",
-				reviewer, reviewerFamily, name), nil
+			reason := fmt.Sprintf(
+				"reviewer %s and implementer %s used the same runtime family %q; cross-family diversity is preferred but advisory, and their distinct identities remain eligible",
+				reviewer, name, reviewerFamily)
+			g.recordFamilyObservation(ctx, reviewJobID, mergeGateFamilyAdvisoryEventKind, reason)
+			return true, reason, nil
 		}
 	}
 	return false, "", nil
 }
 
-// recordFamilyUnresolved makes an uncomparable family visible instead of letting
-// the gate report a check it did not perform. Best effort: the observation must
-// never change the merge decision it describes.
-func (g PolicyMergeGate) recordFamilyUnresolved(ctx context.Context, jobID string, message string) {
+// recordFamilyObservation persists the secondary family signal without changing
+// the merge decision. IfAbsent prevents one event per kind per daemon poll.
+func (g PolicyMergeGate) recordFamilyObservation(ctx context.Context, jobID string, kind string, message string) {
 	if g.Store == nil || strings.TrimSpace(jobID) == "" {
 		return
 	}
-	// IfAbsent, for the reason the CI observation beside it gives: a pending PR is
-	// re-evaluated on every poll, so a plain append would grow one row per tick.
 	_ = g.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 		JobID:   jobID,
-		Kind:    "merge_gate_family_unresolved",
+		Kind:    kind,
 		Message: message,
 	})
 }

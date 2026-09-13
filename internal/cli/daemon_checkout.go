@@ -806,24 +806,57 @@ func resolveDaemonStartRepo(ctx context.Context, store *db.Store, repo github.Re
 	return resolveRepoRecord(ctx, store, repo, workDir)
 }
 
-func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, error) {
+func repoRecordForCheckout(ctx context.Context, repo github.Repository, client gitutil.Client) (db.Repo, bool, error) {
 	root, err := client.Root(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("resolve repo checkout: %w", err)
+		return db.Repo{}, false, fmt.Errorf("resolve repo checkout: %w", err)
 	}
 	remote, err := client.OriginRemote(ctx)
 	if err != nil {
-		return db.Repo{}, fmt.Errorf("resolve repo checkout remote: %w", err)
+		return db.Repo{}, false, fmt.Errorf("resolve repo checkout remote: %w", err)
 	}
 	remoteRepo, err := gitutil.ParseGitHubRemote(remote)
 	if err != nil {
-		return db.Repo{}, err
+		return db.Repo{}, false, err
 	}
 	if remoteRepo.String() != repo.FullName() {
-		return db.Repo{}, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
+		return db.Repo{}, false, fmt.Errorf("current checkout origin is %s, not %s", remoteRepo.String(), repo.FullName())
 	}
+	// PREFER THE REMOTE'S DEFAULT OVER THE LOCAL HEAD (#2145).
+	//
+	// This read was CurrentBranch alone, so whichever branch the worktree
+	// happened to have checked out when the record was written became the
+	// repository's recorded default - and that field is consumed as the BASE
+	// BRANCH by daemon_workflow.go and as the dispatch branch default by
+	// agent_dispatch.go. On this host it had recorded
+	// `fix/lan-address-portability` for a repository whose default is `master`,
+	// while the worktree was on a third branch entirely.
+	//
+	// The defect was recording the local HEAD WHEN THE REMOTE DEFAULT WAS
+	// KNOWABLE, so the fix is precedence, not removal: origin/HEAD when it
+	// resolves, the checked-out branch only when it does not.
+	//
+	// The fallback is deliberate and its residual is real. A checkout with an
+	// origin but no origin/HEAD ref - `git init` plus `git remote add`, or a
+	// clone whose head ref was deleted - cannot reveal the remote default
+	// offline, and dropping the value there is worse than an imperfect one:
+	// `gitmoot repo add` would register a repo with no base branch at all, which
+	// `repo doctor` reports as a missing branch and dispatch reads as an empty
+	// default. Such a record keeps a possibly-wrong local branch exactly as
+	// before this change, and pollRepo upgrades it the moment origin/HEAD becomes
+	// resolvable, so the wrong value is now transient rather than permanent.
+	// fromRemote is RETURNED rather than re-derived by callers (#2146 review, F2).
+	// An earlier revision had the caller call RemoteDefaultBranch a SECOND time to
+	// learn the provenance, which meant a transient failure of that second
+	// subprocess - git lock contention on an unlocked path, for instance - made a
+	// value that had just been read correctly look unknowable, and discarded it
+	// for that resolve cycle. One read, one answer.
 	defaultBranch := ""
-	if branch, err := client.CurrentBranch(ctx); err == nil {
+	fromRemote := false
+	if branch, err := client.RemoteDefaultBranch(ctx); err == nil {
+		defaultBranch = branch
+		fromRemote = true
+	} else if branch, err := client.CurrentBranch(ctx); err == nil {
 		defaultBranch = branch
 	}
 	return db.Repo{
@@ -832,5 +865,5 @@ func repoRecordForCheckout(ctx context.Context, repo github.Repository, client g
 		DefaultBranch: defaultBranch,
 		RemoteURL:     remote,
 		CheckoutPath:  root,
-	}, nil
+	}, fromRemote, nil
 }

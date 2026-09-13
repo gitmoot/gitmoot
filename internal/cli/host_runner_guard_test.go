@@ -91,6 +91,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 1,
 		reason:      "operator repo registration inspects and repairs the selected host checkout",
 	},
+	"internal/cli/repo.go:repoRecordFromStablePath": {
+		execRunners: 1,
+		reason:      "operator and daemon-start repo resolution inspect a host checkout; backend dispatch calls repoRecordFromStablePathWithDefaultSource with its resolved runner",
+	},
 	"internal/cli/update.go:runDaemonRestartFromExecutable": {
 		rawCommands: 1,
 		reason:      "operator update lifecycle restarts the local daemon executable",
