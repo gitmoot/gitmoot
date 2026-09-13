@@ -702,3 +702,185 @@ func TestReviewStatusDoesNotRenderAFanOutAnnouncementAsAVerdict(t *testing.T) {
 		}
 	}
 }
+
+// ROUND-4 P2, and the reason my round-3 test did not catch it: that test passed
+// --reviewer, which BYPASSES selection entirely, so the fix was proven on a path
+// that avoids the broken one. This one goes through selectReviewRouterAgent with
+// ONE eligible review-only agent and no --reviewer, which is the exact shape the
+// docs promise and the shape the reviewer reproduced live.
+func TestReviewRequestSecondPurposeSurvivesSelectionWithOneReviewer(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "only-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	requireSingleEligibleReviewer(t, store, "only-reviewer")
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json"}
+
+	code, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, code.JobID)
+
+	security, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner", "--purpose", "security")...)
+	if failure != "" {
+		t.Fatalf("a security request was refused although only a CODE verdict exists at this head, and selection is the path that refused it: %s", failure)
+	}
+	if security.JobID == code.JobID {
+		t.Fatalf("security request reused the code job %s: a different question must get its own review", code.JobID)
+	}
+	if security.State == reviewRequestVerdictExists {
+		t.Fatalf("security request was answered by the code verdict: state=%s", security.State)
+	}
+}
+
+// The must-refuse control for the same path: a REPEAT of the same purpose by the
+// only eligible reviewer is still a loop, and selection must say so rather than
+// dispatching a duplicate.
+func TestReviewRequestRepeatedPurposeIsStillRefusedBySelection(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "only-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	requireSingleEligibleReviewer(t, store, "only-reviewer")
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json"}
+
+	first, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	repeat, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner")...)
+	if failure == "" && repeat.State != reviewRequestVerdictExists {
+		t.Fatalf("a repeated CODE request dispatched a duplicate instead of reusing or refusing: state=%s job=%s", repeat.State, repeat.JobID)
+	}
+}
+
+// ROUND-4 P3: the walk is acyclic by construction, but a corrupted
+// parent_job_id cycle exhausted the stack rather than failing closed.
+func TestStagedPreflightWalkSurvivesACorruptedParentCycle(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "review", string(workflow.JobSucceeded), "")
+	// The child must ALSO announce a fan-out, or the walk stops at it and never
+	// follows the corrupted edge back to the parent.
+	makeJobAFanOutAnnouncement(t, store, job.ID+"/delegation/leg")
+	forgeParentCycle(t, store, job.ID, job.ID+"/delegation/leg")
+	done := make(chan bool, 1)
+	go func() { done <- reviewJobStillAnswers(ctx, store, job) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the claim walk did not terminate on a corrupted parent cycle")
+	}
+}
+
+// saveReviewRouterVerdict marks a dispatched router job succeeded with a real
+// verdict, preserving the payload's recorded purpose.
+func saveReviewRouterVerdict(t *testing.T, store *db.Store, jobID string) {
+	t.Helper()
+	ctx := context.Background()
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, jobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "clean", TestsRun: []string{"go test ./..."}, Evidence: "executed"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionJobStatePayloadWithEvent(ctx, jobID, string(workflow.JobQueued), string(workflow.JobSucceeded), string(encoded), db.JobEvent{JobID: jobID, Kind: "succeeded", Message: "job succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// forgeParentCycle writes the corruption the walk must survive: parent_job_id
+// is insert-only in production, so this reaches past the store to make the
+// parent a child of its own child.
+func forgeParentCycle(t *testing.T, store *db.Store, parentID, childID string) {
+	t.Helper()
+	if err := store.ExecForTest(context.Background(), "UPDATE jobs SET parent_job_id = ? WHERE id = ?", childID, parentID); err != nil {
+		t.Fatalf("forge cycle: %v", err)
+	}
+}
+
+// requireSingleEligibleReviewer removes every OTHER review-only candidate, which
+// is the premise these tests depend on: with two eligible reviewers the router
+// substitutes one and a purpose-blind refusal never fires, so the test passes
+// while the defect is live. Round 4 caught exactly that shape.
+func requireSingleEligibleReviewer(t *testing.T, store *db.Store, keep string) {
+	t.Helper()
+	ctx := context.Background()
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eligible := 0
+	for _, agent := range agents {
+		if !agentHasCapability(agent.Capabilities, "review") || agentHasCapability(agent.Capabilities, "implement") {
+			continue
+		}
+		if agent.Name == keep {
+			eligible++
+			continue
+		}
+		if err := store.ExecForTest(ctx, "DELETE FROM agents WHERE name = ?", agent.Name); err != nil {
+			t.Fatalf("drop competing reviewer %s: %v", agent.Name, err)
+		}
+	}
+	if eligible != 1 {
+		t.Fatalf("kept reviewer %q is not eligible; the single-candidate premise does not hold", keep)
+	}
+}
+
+// makeJobAFanOutAnnouncement rewrites a job's result into a coordinator
+// announcement, the shape whose children the claim walk follows.
+func makeJobAFanOutAnnouncement(t *testing.T, store *db.Store, jobID string) {
+	t.Helper()
+	ctx := context.Background()
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, jobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Result = &workflow.AgentResult{Decision: "approved", FanOut: true}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET payload = ? WHERE id = ?", string(encoded), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// THE THIRD GUARD IN THIS CHANGE FOUND WITHOUT COVERAGE, caught by my own
+// inventory rather than by a reviewer. A succeeded review row that recorded NO
+// head cannot satisfy an exact-head wait, so the head-keyed resolver passes over
+// it. A requester never told about that skip waits its full TTL believing a
+// review is coming (#2130 makes headless rows common). Deleting the surfacing
+// loop passed all 53 review tests.
+func TestReviewRequestSurfacesAHeadlessReviewSkipAsAHold(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "only-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+
+	// A succeeded review for this PR that recorded no head at all.
+	payload, err := json.Marshal(map[string]any{
+		"repo": "owner/repo", "pull_request": 12, "head_sha": "",
+		"review_purpose": "code",
+		"result":         map[string]any{"decision": "approved", "evidence": "executed"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "headless-review", Agent: "only-reviewer", Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+
+	output, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--role", "joltra", "--home", home, "--json")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	for _, hold := range output.Holds {
+		if strings.Contains(hold, "headless-review") && strings.Contains(hold, "recorded no head") {
+			return
+		}
+	}
+	t.Fatalf("holds = %v, want the headless review named: the requester waits its whole TTL for a review that can never satisfy this exact-head wait", output.Holds)
+}

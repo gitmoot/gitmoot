@@ -270,7 +270,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.reviewer)
+	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -334,6 +334,20 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 // dispatched. The question is answered by the tree, so the tree is what must be
 // consulted.
 func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) bool {
+	return reviewJobStillAnswersWithin(ctx, store, job, map[string]bool{})
+}
+
+// reviewJobStillAnswersWithin carries the visited set. Round 3 established the
+// tree is acyclic BY CONSTRUCTION - parent_job_id is insert-only and depth is
+// capped - and round 4 refined that: construction holds, corruption is
+// undefended, and a hand-edited parent_job_id cycle exhausted the stack. A
+// visited job is treated as no answer, which is the same direction the walk
+// already takes for a child that cannot answer.
+func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Job, seen map[string]bool) bool {
+	if seen[job.ID] {
+		return false
+	}
+	seen[job.ID] = true
 	switch job.State {
 	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
 		return true
@@ -364,7 +378,7 @@ func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) boo
 		if !reviewTypedJob(child) {
 			continue
 		}
-		if reviewJobStillAnswers(ctx, store, child) {
+		if reviewJobStillAnswersWithin(ctx, store, child, seen) {
 			return true
 		}
 	}
@@ -554,7 +568,7 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 // review. The agent supplies identity and repo access; runtime and model come
 // from the router, so any review-capable agent scoped to the repository will
 // do, and an omp-native one is preferred so the override changes nothing.
-func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, explicit string) (db.Agent, error) {
+func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, purpose, explicit string) (db.Agent, error) {
 	if explicit = strings.TrimSpace(explicit); explicit != "" {
 		agent, err := store.GetAgent(ctx, explicit)
 		if err != nil {
@@ -586,19 +600,31 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		return db.Agent{}, fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
 	}
 	// A SECOND PURPOSE AT THE SAME HEAD MUST NOT BE REFUSED AS A LOOP (#2172
-	// review round 2). DetectReviewLoop keys on agent identity and head, and it
-	// is purpose-blind by design because it protects the engine's own re-review
-	// path. If the router hands it an agent that already holds a verdict here,
-	// a security request is refused because a code review happened — flatly
-	// contradicting the documented parallel-purposes contract. So prefer an
-	// agent that has not already answered at this head, and let the shared
-	// guard keep its meaning instead of weakening it for everyone.
+	// review rounds 2-4). "Answered" is scoped to the PURPOSE being requested,
+	// exactly as DetectReviewLoop now is: an agent holding a code verdict here
+	// has not answered a security request, so it is neither deprioritized nor
+	// grounds for refusal. Round 4 caught this map still purpose-blind while
+	// the guard behind it had been fixed - the refusal below fired for every
+	// candidate whenever a same-head verdict of ANY purpose existed, which is
+	// the documented contract failing on the selection path.
 	answered := map[string]bool{}
+	wantPurpose := strings.ToLower(strings.TrimSpace(purpose))
+	if wantPurpose == "" {
+		wantPurpose = db.DefaultReviewPurpose
+	}
 	if verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest); err == nil {
 		for _, verdict := range verdicts {
-			if strings.EqualFold(verdict.HeadSHA, headSHA) {
-				answered[strings.ToLower(strings.TrimSpace(verdict.Agent))] = true
+			if !strings.EqualFold(verdict.HeadSHA, headSHA) {
+				continue
 			}
+			got := strings.ToLower(strings.TrimSpace(verdict.ReviewPurpose))
+			if got == "" {
+				got = db.DefaultReviewPurpose
+			}
+			if got != wantPurpose {
+				continue
+			}
+			answered[strings.ToLower(strings.TrimSpace(verdict.Agent))] = true
 		}
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -613,7 +639,7 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		return candidates[i].Name < candidates[j].Name
 	})
 	if answered[strings.ToLower(candidates[0].Name)] {
-		return db.Agent{}, fmt.Errorf("every review-only agent for %s already holds a verdict at head %s, so a second purpose would be refused as a review loop; register another review-only agent or pass --reviewer", repo, headSHA)
+		return db.Agent{}, fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
 	}
 	return candidates[0], nil
 }

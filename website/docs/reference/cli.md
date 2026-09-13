@@ -1342,6 +1342,9 @@ What one request does, in order:
    `--reviewer` you name. The job runs as a background review-only job on `omp`
    with a fresh per-job session, `--no-fix-target` semantics, and the first
    model of the purpose's pool; merge-gate independence rules apply unchanged.
+   Selection is PURPOSE-SCOPED: an agent holding a verdict of a different
+   purpose at this head is still eligible, and the refusal fires only when every
+   candidate already answered THIS purpose.
 4. Subscribes the requester to the exact-head verdict FOR THAT PURPOSE. The
    subscription key is `owner/repo#N@sha|purpose`, so a `code` verdict cannot
    terminally satisfy a `security` request at the same head — enforced on BOTH
