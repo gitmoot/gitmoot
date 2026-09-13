@@ -721,10 +721,37 @@ func TestStageSeatToolchainRefusesUnsafeWorkspaceGoMod(t *testing.T) {
 			if !strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) {
 				t.Errorf("staged %q, want the published-unavailable command", staged)
 			}
-			if !strings.Contains(diagnostic, "go.mod is not a safe, valid regular module file") {
+			if !strings.Contains(diagnostic, "go.mod is not a safe, readable regular module file") {
 				t.Errorf("diagnostic = %q, want unsafe go.mod refusal", diagnostic)
 			}
 		})
+	}
+}
+
+// TestStageSeatToolchainAllowsDirectiveLessWorkspaceFiles is the valid-input
+// production boundary: valid go.mod and go.work files may omit a go directive.
+// They must reach the selected staged compiler, not the exit-126 refusal stub.
+func TestStageSeatToolchainAllowsDirectiveLessWorkspaceFiles(t *testing.T) {
+	installation := writeSeatToolchainFixture(t, filepath.Join(t.TempDir(), "go"), "go1.26.4")
+	t.Setenv("PATH", filepath.Join(installation, "bin"))
+	t.Setenv("GOWORK", "auto")
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "go.work"), []byte("use .\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	staged, _, diagnostic, err := stageSeatToolchain(config.PathsForHome(t.TempDir()), workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasSuffix(filepath.Base(staged), toolchain.UnavailableRuntimeSuffix) || diagnostic != "" {
+		t.Fatalf("valid directive-less workspace was refused: staged=%q diagnostic=%q", staged, diagnostic)
+	}
+	if output, runErr := exec.Command(filepath.Join(staged, "bin", "go"), "version").CombinedOutput(); runErr != nil {
+		t.Fatalf("selected staged compiler did not run: %v: %s", runErr, output)
 	}
 }
 

@@ -367,6 +367,26 @@ func TestWorkspaceGoRequirementHonorsGOWORK(t *testing.T) {
 	if version != "1.27" || effective != explicit {
 		t.Fatalf("explicit requirement = (%q, %q), want (1.27, %q)", version, effective, explicit)
 	}
+	if err := os.WriteFile(filepath.Join(child, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	version, effective, err = WorkspaceGoRequirement(child, "off")
+	if err != nil {
+		t.Fatalf("directive-less valid module was refused: %v", err)
+	}
+	if version != "" || effective != "off" {
+		t.Fatalf("directive-less module requirement = (%q, %q), want (empty, off)", version, effective)
+	}
+	if err := os.WriteFile(rootWork, []byte("use ./module\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	version, effective, err = WorkspaceGoRequirement(child, "auto")
+	if err != nil {
+		t.Fatalf("directive-less valid workspace was refused: %v", err)
+	}
+	if version != "" || effective != rootWork {
+		t.Fatalf("directive-less requirement = (%q, %q), want (empty, %q)", version, effective, rootWork)
+	}
 
 	linkedRoot := t.TempDir()
 	if err := os.Symlink(explicit, filepath.Join(linkedRoot, "go.work")); err != nil {

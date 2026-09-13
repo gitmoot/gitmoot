@@ -249,6 +249,14 @@ func InstallationsOnPath(pathEnv string) []GoInstallation {
 
 const maxGoModBytes int64 = 1 << 20
 
+type goDirectiveFileState uint8
+
+const (
+	goDirectiveAbsent goDirectiveFileState = iota
+	goDirectiveReadable
+	goDirectiveUnsafe
+)
+
 // ModuleGoDirective reports the `go` directive of the module rooted at dir, or
 // "" when there is no safe, valid go.mod to read.
 func ModuleGoDirective(dir string) string {
@@ -267,9 +275,9 @@ func ModuleGoDirective(dir string) string {
 // safely and parsed is refused instead of selecting from go.mod and then running
 // under a different requirement.
 func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string, err error) {
-	module, modulePresent := goDirectiveAt(dir, "go.mod")
-	if modulePresent && module == "" {
-		return "", "off", fmt.Errorf("checkout go.mod is not a safe, valid regular module file with a go directive")
+	module, moduleState := goDirectiveAt(dir, "go.mod")
+	if moduleState == goDirectiveUnsafe {
+		return "", "off", fmt.Errorf("checkout go.mod is not a safe, readable regular module file")
 	}
 	gowork = strings.TrimSpace(gowork)
 	if gowork == "off" {
@@ -279,9 +287,9 @@ func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string
 		if !filepath.IsAbs(gowork) {
 			return "", gowork, fmt.Errorf("GOWORK %q is not an absolute path", gowork)
 		}
-		workspace, present := goDirectiveAt(filepath.Dir(gowork), filepath.Base(gowork))
-		if !present || workspace == "" {
-			return "", gowork, fmt.Errorf("GOWORK %q is not a safe, valid regular workspace file with a go directive", gowork)
+		workspace, state := goDirectiveAt(filepath.Dir(gowork), filepath.Base(gowork))
+		if state != goDirectiveReadable {
+			return "", gowork, fmt.Errorf("GOWORK %q is not a safe, readable regular workspace file", gowork)
 		}
 		return laterGoDirective(module, workspace), gowork, nil
 	}
@@ -292,12 +300,12 @@ func WorkspaceGoRequirement(dir, gowork string) (version, effectiveGOWORK string
 	}
 	for {
 		workFile := filepath.Join(current, "go.work")
-		workspace, present := goDirectiveAt(current, "go.work")
-		if present {
-			if workspace == "" {
-				return "", workFile, fmt.Errorf("discovered GOWORK %q is not a safe, valid regular workspace file with a go directive", workFile)
-			}
+		workspace, state := goDirectiveAt(current, "go.work")
+		switch state {
+		case goDirectiveReadable:
 			return laterGoDirective(module, workspace), workFile, nil
+		case goDirectiveUnsafe:
+			return "", workFile, fmt.Errorf("discovered GOWORK %q is not a safe, readable regular workspace file", workFile)
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -334,34 +342,38 @@ func laterGoDirective(first, second string) string {
 // This is intentionally not a complete parser. Go rejects block comments, so
 // an invalid file that hides `go X` inside one may produce an unavailable-
 // toolchain diagnostic instead of a syntax diagnostic; no valid workspace can
-// be mis-selected by that divergence. present distinguishes an absent go.work
-// (continue searching parents) from a present but invalid one (Go would stop).
-func goDirectiveAt(dir, name string) (directive string, present bool) {
+// be mis-selected by that divergence. The state distinguishes absence (continue
+// searching parents), a safely read file with no directive (valid and no minimum
+// to add), and an unsafe or malformed file (fail closed before execution).
+func goDirectiveAt(dir, name string) (directive string, state goDirectiveFileState) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return "", false
+		return "", goDirectiveUnsafe
 	}
 	defer root.Close()
 
 	info, err := root.Lstat(name)
 	if err != nil {
-		return "", false
+		if os.IsNotExist(err) {
+			return "", goDirectiveAbsent
+		}
+		return "", goDirectiveUnsafe
 	}
 	if !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
-		return "", true
+		return "", goDirectiveUnsafe
 	}
 	file, err := root.Open(name)
 	if err != nil {
-		return "", true
+		return "", goDirectiveUnsafe
 	}
 	defer file.Close()
 	info, err = file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() > maxGoModBytes {
-		return "", true
+		return "", goDirectiveUnsafe
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxGoModBytes+1))
 	if err != nil || int64(len(contents)) > maxGoModBytes {
-		return "", true
+		return "", goDirectiveUnsafe
 	}
 
 	for _, line := range strings.Split(string(contents), "\n") {
@@ -371,12 +383,12 @@ func goDirectiveAt(dir, name string) (directive string, present bool) {
 			continue
 		}
 		if len(fields) != 2 {
-			return "", true
+			return "", goDirectiveUnsafe
 		}
 		if _, err := normalizedGoVersion(fields[1]); err != nil {
-			return "", true
+			return "", goDirectiveUnsafe
 		}
-		return fields[1], true
+		return fields[1], goDirectiveReadable
 	}
-	return "", true
+	return "", goDirectiveReadable
 }

@@ -809,10 +809,12 @@ If a seat gets exit 126 running `go`, no usable toolchain was staged. The comman
 is an engine-owned failure stub, not a fallthrough to an operator installation;
 it prints `gitmoot: runtime unavailable: no daemon-staged artifact exists`.
 Host-specific causes also print `gitmoot: read-only seat toolchain:` on the
-daemon's stderr rather than changing the job event stream.
+daemon's stderr. A declared real review also records
+`seat_toolchain_unavailable` with that diagnostic and blocks.
 
 - **No Go installation is on the daemon's `PATH`.** This normal case has no
-  daemon diagnostic, but invoking `go` still fails explicitly through the stub.
+  daemon diagnostic, so the `seat_toolchain_unavailable` event is the only
+  recorded reason and invoking `go` still fails explicitly through the stub.
 - **A candidate is not a recognizable Go installation.** It must have an
   executable `bin/go` and a `VERSION` file naming a Go release, both real files
   rather than symlinks.
