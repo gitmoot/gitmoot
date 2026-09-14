@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -250,5 +251,45 @@ func TestNamedReviewFindingsPromotesSummaryWhenChangesRequested(t *testing.T) {
 	}
 	if got := NamedReviewFindings(AgentResult{Decision: "approved", Summary: "clean"}); len(got) != 0 {
 		t.Fatalf("findings = %v, want none: an approved verdict's summary is not an obligation", got)
+	}
+}
+
+// #2179 through a real consumer. A verdict whose findings are bare strings was
+// dropped by db.SucceededReviewVerdicts, so the loop guard could not see it and
+// a duplicate review was dispatched at a head that had already been reviewed.
+// This is what makes the decode a correctness bug rather than a reporting one.
+func TestDetectReviewLoopSeesAStringFindingsVerdict(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedReviewLoopAgent(t, store, "g7-review", "codex", "gpt-5.6-sol")
+
+	encoded, err := marshalPayload(JobPayload{
+		Repo: "owner/repo", Branch: "main", PullRequest: 227, HeadSHA: "head-a",
+		TaskID: "review-pr-227", ReviewRound: "review-1", EffectiveRuntime: "codex",
+		Result: &AgentResult{
+			Decision: "changes_requested", Severity: "P2", Summary: "historical evidence",
+			Evidence: "executed",
+			Findings: []json.RawMessage{json.RawMessage(`"F1: stored as a bare string"`)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "review-string-findings", Agent: "g7-review", Type: "review",
+		State: string(JobSucceeded), Payload: encoded,
+	}, db.JobEvent{Kind: string(JobSucceeded), Message: "changes_requested"}); err != nil {
+		t.Fatal(err)
+	}
+
+	match, detected, err := DetectReviewLoop(ctx, store, "owner/repo", 227, "head-a", []string{"g7-review"}, "")
+	if err != nil {
+		t.Fatalf("DetectReviewLoop: %v", err)
+	}
+	if !detected {
+		t.Fatal("a verdict with bare-string findings is invisible to the loop guard, so a duplicate review dispatches at an already-reviewed head")
+	}
+	if match.JobID != "review-string-findings" {
+		t.Fatalf("match = %+v, want the string-findings verdict", match)
 	}
 }

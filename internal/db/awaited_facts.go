@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -316,6 +317,45 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 	}
 }
 
+// reviewVerdictFinding decodes one entry of a result's findings array.
+//
+// Producers write findings as OBJECTS ({severity,title,...}) or as bare
+// STRINGS: workflow.AgentResult.Findings is []json.RawMessage and
+// workflow.NamedReviewFindings accepts both. This decoder accepted only
+// objects, so a string-findings verdict failed to decode and the row was
+// dropped from verdict history entirely - 930 of 3,816 terminal verdicts with
+// a real pull request, store-wide, at the time of the fix (#2179). Nothing
+// upstream rejects the string form, so the rows were always stored correctly
+// and only the reader was wrong: no migration and no backfill.
+//
+// A string carries no severity. Any other shape - number, array, null, object
+// with a non-string severity - is still an error, so a genuinely malformed
+// payload stays undecodable rather than silently decoding to nothing, which is
+// the distinction the delta router's lossy-history guard depends on.
+type reviewVerdictFinding struct {
+	Severity string
+}
+
+func (f *reviewVerdictFinding) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil {
+			return err
+		}
+		f.Severity = ""
+		return nil
+	}
+	var object struct {
+		Severity string `json:"severity"`
+	}
+	if err := json.Unmarshal(trimmed, &object); err != nil {
+		return err
+	}
+	f.Severity = object.Severity
+	return nil
+}
+
 type reviewVerdictPayload struct {
 	Repo        string `json:"repo"`
 	PullRequest int    `json:"pull_request"`
@@ -344,11 +384,9 @@ type reviewVerdictPayload struct {
 		FanOut      bool              `json:"fan_out,omitempty"`
 		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
 		// woken seat learns what the verdict rests on without a second lookup.
-		Findings []struct {
-			Severity string `json:"severity"`
-		} `json:"findings"`
-		TestsRun []string `json:"tests_run"`
-		Evidence string   `json:"evidence"`
+		Findings []reviewVerdictFinding `json:"findings"`
+		TestsRun []string               `json:"tests_run"`
+		Evidence string                 `json:"evidence"`
 	} `json:"result"`
 	// ReviewPurpose scopes a #2171 router verdict to the question it answers, so
 	// a code review cannot satisfy a security waiter at the same head.
