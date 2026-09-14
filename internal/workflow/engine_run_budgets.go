@@ -1686,7 +1686,6 @@ func (e Engine) sumRootDelegationTokens(ctx context.Context, rootID string) (int
 	return e.Store.SumJobTokensByRoot(ctx, rootID)
 }
 
-
 // reviewScopedField carries a review-question field into a delegation child
 // only when that child is itself a review. #2171 established that purpose and
 // requester belong to the question rather than to the job answering it; #2172

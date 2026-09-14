@@ -178,7 +178,7 @@ type localAgentDispatchRequest struct {
 	// means a full review against the pull request base, which is what every
 	// router request did before delta review existed.
 	ReviewScope *workflow.ReviewScope
-	jobRunner       subprocess.Runner
+	jobRunner   subprocess.Runner
 }
 
 func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner {
