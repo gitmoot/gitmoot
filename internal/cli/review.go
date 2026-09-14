@@ -435,18 +435,19 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 	// decision "implemented" has REAL children that were never listed, and a
 	// live matching review grandchild under it was invisible. Whether a node
 	// has children is a question about the store, so ask the store.
+	// A node with no result never dispatched delegations, so it has no children
+	// to list. This is the one skip that is structural rather than a verdict
+	// judgement, and it keeps the walk off completed leaf subtrees.
+	if payload.Result == nil {
+		return false
+	}
 	children, err := store.ListJobsByParent(ctx, job.ID)
 	if err != nil {
 		// Unknown is not proof the tree is finished; failing closed costs a
 		// re-run, failing open costs a duplicate reviewer.
 		return true
 	}
-	if len(children) == 0 {
-		// No children YET is only meaningful for an announcement that promised
-		// them; anything else is simply a leaf.
-		if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
-			return false
-		}
+	if resultAwaitsUnbornChildren(payload.Result, len(children)) {
 		// Their subject is unknowable until they appear - EXCEPT when this node
 		// already declares a different one. #2176 round 3 measured the cost of
 		// ignoring that: a continuously active FOREIGN subtree renewed the hold
@@ -456,7 +457,9 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		if subjectIsForeign(subject, payload) {
 			return false
 		}
-		return fanOutChildrenMayStillArrive(job, now)
+		if fanOutChildrenMayStillArrive(job, now) {
+			return true
+		}
 	}
 	for _, child := range children {
 		if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
@@ -464,6 +467,27 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		}
 	}
 	return false
+}
+
+// resultAwaitsUnbornChildren reports whether a stored result promised children
+// that do not exist yet. It is a STRUCTURAL question and must never be asked of
+// a verdict classifier: #2176 round 4 caught ResultIsFanOut - which requires a
+// terminal review decision of approved or changes_requested - still gating this
+// branch after traversal had been freed from it. The conflation had moved one
+// level down rather than left. Two ways to await children:
+//
+//   - nothing has landed yet, and the result announced a fan-out at all;
+//   - some children landed but FEWER than the result declared, which is the
+//     deps-deferred shape: a deferred delegation creates no row until its deps
+//     succeed, so a sibling's existence must not cancel the grace.
+func resultAwaitsUnbornChildren(result *workflow.AgentResult, existing int) bool {
+	if result == nil {
+		return false
+	}
+	if declared := len(result.Delegations); declared > existing {
+		return true
+	}
+	return existing == 0 && (result.FanOut || len(result.Delegations) > 0)
 }
 
 // subjectIsForeign reports whether a node DECLARES a subject other than the

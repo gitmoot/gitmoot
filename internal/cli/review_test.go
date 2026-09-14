@@ -1183,3 +1183,91 @@ func TestChildlessFanOutOnAForeignSubjectGetsNoGrace(t *testing.T) {
 		t.Fatal("a freshly-active FOREIGN fan-out is holding this claim on children it has not created: an unrelated orchestra run renews the hold indefinitely")
 	}
 }
+
+// #2176 round 4 P2, first arm. The grace still asked a VERDICT classifier
+// whether children were coming: a leg that succeeded with decision
+// "implemented" and announced a review delegation was indistinguishable from a
+// leaf while that child was unborn, so the claim released and a duplicate
+// dispatched.
+func TestGraceCoversAnnouncedChildrenOnANonVerdictDecision(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "")
+	leg := job.ID + "/delegation/leg"
+	announced, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head,
+		Result: &workflow.AgentResult{Decision: "implemented", Delegations: []workflow.Delegation{{ID: "review", Agent: "opus-reviewer", Action: "review"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET payload = ? WHERE id = ?", string(announced), leg); err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("an announced-but-unborn review child on a non-verdict decision reads as a leaf: the claim releases and a duplicate dispatches")
+	}
+}
+
+// Second arm: a DEPS-DEFERRED delegation creates no row until its deps succeed,
+// so a sibling that already landed must not cancel the grace. The old
+// len(children)==0 precondition gave that shape no grace at all.
+func TestGraceSurvivesASiblingWhenADeferredChildIsStillUnborn(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "")
+	leg := job.ID + "/delegation/leg"
+	announced, err := json.Marshal(workflow.JobPayload{
+		Repo: "owner/repo", PullRequest: 12, HeadSHA: head,
+		Result: &workflow.AgentResult{Decision: "implemented", Delegations: []workflow.Delegation{
+			{ID: "build", Agent: "builder", Action: "implement"},
+			{ID: "review", Agent: "opus-reviewer", Action: "review", Deps: []string{"build"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET payload = ? WHERE id = ?", string(announced), leg); err != nil {
+		t.Fatal(err)
+	}
+	built, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, HeadSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: leg + "/delegation/build", Agent: "builder", Type: "implement",
+		State: string(workflow.JobSucceeded), Payload: string(built), Repo: "owner/repo", ParentJobID: leg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a landed sibling cancelled the grace while the deferred review child is still unborn: the claim releases before the review can start")
+	}
+}
+
+// #2176 round 4 P3. The reviewer proved both polarities in subjectIsForeign
+// were unpinned: flipping unset-is-not-foreign, and removing the unknown-subject
+// early return, each passed the whole suite. Unreachable in production per its
+// enumeration - but only deleting a guard tells you which way it points.
+func TestSubjectIsForeignTreatsSilenceAsNotForeign(t *testing.T) {
+	subject := testClaimSubject(t, "15ebf4cf5cc70f90a6521d3e9d4960721665c2b7")
+	if subjectIsForeign(subject, workflow.JobPayload{}) {
+		t.Fatal("a payload that declares no subject reads as foreign: coordinator legs that name nothing would lose their grace and prune the traversal")
+	}
+	if subjectIsForeign(subject, workflow.JobPayload{Repo: "owner/repo"}) {
+		t.Fatal("a partial payload naming only the matching repo reads as foreign")
+	}
+	if !subjectIsForeign(subject, workflow.JobPayload{Repo: "owner/repo", PullRequest: 99}) {
+		t.Fatal("a payload naming another pull request is not foreign: an unrelated subtree can renew this claim indefinitely")
+	}
+	// An UNKNOWN claim subject cannot judge anything foreign - the walk's
+	// unknown-subject direction is handled by answers(), not here, and having
+	// both return "foreign" would deny grace to every node under a corrupt key.
+	unknown, ok := reviewSubjectFromClaim(db.ReviewRequest{SubjectKey: "not-a-key", Purpose: "code"})
+	if ok {
+		t.Fatal("a malformed key parsed; this no longer exercises the unknown-subject early return")
+	}
+	if subjectIsForeign(unknown, workflow.JobPayload{Repo: "owner/repo", PullRequest: 99}) {
+		t.Fatal("an unknown subject is judging other nodes foreign")
+	}
+}
