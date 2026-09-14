@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,74 @@ func TestParseReviewVerdictSubjectKeyRejectsMalformedKeys(t *testing.T) {
 		if _, _, _, err := ParseReviewVerdictSubjectKey(malformed); err == nil {
 			t.Fatalf("ParseReviewVerdictSubjectKey(%q) succeeded, want an error: a partial subject makes the claim walk match loosely", malformed)
 		}
+	}
+}
+
+// seedVerdictWithFindings writes a succeeded review whose findings array is
+// exactly the given JSON, so a test can pin one decode shape at a time.
+func seedVerdictWithFindings(t *testing.T, store *Store, id, head, findingsJSON string) {
+	t.Helper()
+	payload := `{"repo":"owner/repo","pull_request":12,"head_sha":"` + head + `",` +
+		`"review_purpose":"code","result":{"decision":"approved","evidence":"executed","findings":` + findingsJSON + `}}`
+	if err := store.CreateJob(context.Background(), Job{ID: id, Agent: "reviewer", Type: "review",
+		State: "succeeded", Payload: payload, Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #2179. Findings are written as OBJECTS or as bare STRINGS - both are valid to
+// every producer - but this decoder accepted only objects, so a string-findings
+// verdict was dropped from verdict history entirely: 930 of 3,816 terminal
+// verdicts with a real pull request, store-wide. A genuinely malformed shape
+// must still fail, because the delta router distinguishes "no verdict here"
+// from "a verdict I could not read".
+func TestSucceededReviewVerdictsAcceptsStringFindings(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	head := "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"
+
+	seedVerdictWithFindings(t, store, "job-string", head, `["F1: bare string"]`)
+	seedVerdictWithFindings(t, store, "job-object", head, `[{"severity":"P2","title":"F2"}]`)
+	seedVerdictWithFindings(t, store, "job-malformed", head, `[42]`)
+
+	verdicts, err := store.SucceededReviewVerdicts(ctx, "owner/repo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, v := range verdicts {
+		seen[v.JobID] = true
+	}
+	if !seen["job-string"] {
+		t.Fatal("a verdict whose findings are bare strings is still invisible to verdict history")
+	}
+	if !seen["job-object"] {
+		t.Fatal("a verdict whose findings are objects became invisible")
+	}
+	if seen["job-malformed"] {
+		t.Fatal("a numeric finding decoded; a genuinely malformed payload must stay undecodable, or the delta router cannot tell absent from unreadable")
+	}
+
+	undecodable, err := store.UndecodableReviewVerdicts(ctx, "owner/repo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(undecodable) != 1 || undecodable[0].JobID != "job-malformed" {
+		t.Fatalf("undecodable = %+v, want only job-malformed", undecodable)
+	}
+}
+
+// The count that feeds the requester's wake must include string findings, or a
+// woken seat is told a changes_requested verdict rests on nothing.
+func TestReviewVerdictFactCountsStringFindings(t *testing.T) {
+	payload := `{"repo":"owner/repo","pull_request":12,"head_sha":"0bd967c5ba8e506607bd3a9999a94a4db5b881b4",` +
+		`"result":{"decision":"approved","evidence":"executed","tests_run":["go test ./..."],` +
+		`"findings":["F1","F2",{"severity":"P3","title":"F3"}]}}`
+	observation, ok := reviewVerdictFact("job-1", "reviewer", "succeeded", payload, func(string) string { return "P1" })
+	if !ok {
+		t.Fatal("a verdict with string findings produced no observation")
+	}
+	if !strings.Contains(observation.detail, "findings=3") {
+		t.Fatalf("detail = %q, want findings=3", observation.detail)
 	}
 }

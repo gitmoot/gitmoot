@@ -1849,8 +1849,9 @@ func TestDeltaStepsOverAWrongPurposeVerdictToAnOlderMatch(t *testing.T) {
 	}
 }
 
-// seedUndecodableVerdict writes a succeeded review whose findings are bare
-// strings: valid to every producer, undecodable to verdict history (#2179).
+// seedUndecodableVerdict writes a succeeded review whose findings are a shape
+// verdict history cannot decode. Bare STRINGS stopped qualifying when #2179
+// widened the decoder; a number still does.
 func seedUndecodableVerdict(t *testing.T, store *db.Store, id, head string) {
 	t.Helper()
 	seedUndecodableVerdictInState(t, store, id, head, string(workflow.JobSucceeded))
@@ -1864,8 +1865,10 @@ func seedUndecodableVerdictInState(t *testing.T, store *db.Store, id, head, stat
 	ctx := context.Background()
 	payload, err := json.Marshal(map[string]any{
 		"repo": "owner/repo", "pull_request": 12, "head_sha": head, "review_purpose": "code",
+		// A NUMBER finding is the shape that stays undecodable after #2179 widened
+		// the decoder to accept strings as well as objects.
 		"result": map[string]any{"decision": "changes_requested", "severity": "P2", "evidence": "executed",
-			"findings": []string{"F9: stored as a bare string"}},
+			"findings": []any{42}},
 	})
 	if err != nil {
 		t.Fatal(err)
