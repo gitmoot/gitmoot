@@ -3043,11 +3043,21 @@ func TestPollOnceMergeCommandRequiresReadyTask(t *testing.T) {
 	}
 }
 
+func testGateMissReason(t *testing.T, category, cause, headSHA string) workflow.MergeReason {
+	t.Helper()
+	reason, err := workflow.GateMissReason(category, cause, headSHA)
+	if err != nil {
+		t.Fatalf("GateMissReason: %v", err)
+	}
+	return reason
+}
+
 func TestMergeCommandShowsMergeRuleRefusalAndRemedy(t *testing.T) {
 	body, request := runMergeCommandForOutput(t, workflow.MergeDecision{
 		LeaveOpen: true,
-		Reason: workflow.PlainReason(
-			"org merge rule: acting role `gm-integrity` has `merge_rule = \"owner\"`; only owner role `owner` may merge. Remedy: ask that owner to perform the merge"),
+		Reason: testGateMissReason(t, "org merge rule",
+			"branch lock records acting role `gm-integrity`, whose `merge_rule = \"owner\"` reserves the merge for owner role `owner`; `/gitmoot merge` refuses this branch whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
+			"current123"),
 	}, true)
 	if request.ActingOrgRole != "gm-integrity" {
 		t.Fatalf("merge request acting role = %q, want gm-integrity", request.ActingOrgRole)
@@ -3055,8 +3065,9 @@ func TestMergeCommandShowsMergeRuleRefusalAndRemedy(t *testing.T) {
 
 	for _, want := range []string{
 		"Gitmoot did not merge PR #41.",
-		"acting role `gm-integrity` has `merge_rule = \"owner\"`",
-		"Remedy: ask that owner to perform the merge",
+		"branch lock records acting role `gm-integrity`",
+		"`/gitmoot merge` refuses this branch whoever asks",
+		"Remedy: have that owner merge outside Gitmoot",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
@@ -3067,8 +3078,9 @@ func TestMergeCommandShowsMergeRuleRefusalAndRemedy(t *testing.T) {
 func TestMergeCommandShowsMergeQueueRulesetRefusalAndRemedy(t *testing.T) {
 	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
 		LeaveOpen: true,
-		Reason: workflow.PlainReason(
-			"repository merge rule: repository ruleset 22536038 requires GitHub's merge queue and refuses Gitmoot's direct merge, including `--admin`. Remedy: enqueue PR #41 through GitHub's merge queue"),
+		Reason: testGateMissReason(t, "repository merge rule",
+			"repository ruleset 22536038 requires GitHub's merge queue and refuses Gitmoot's direct merge, including `--admin`. Remedy: enqueue PR #41 through GitHub's merge queue",
+			"current123"),
 	}, true)
 
 	for _, want := range []string{
@@ -3085,42 +3097,52 @@ func TestMergeCommandShowsMergeQueueRulesetRefusalAndRemedy(t *testing.T) {
 func TestMergeCommandShowsMissingCurrentHeadApprovalAndRemedy(t *testing.T) {
 	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
 		LeaveOpen: true,
-		Reason: workflow.PlainReason(
-			"review gate: no approval is bound to current head current123. Remedy: dispatch one independent review for this exact head"),
+		Reason: testGateMissReason(t, "review gate",
+			"no approval is bound to the current head. Remedy: dispatch one independent review",
+			"current123"),
 	}, true)
 
 	for _, want := range []string{
-		"no approval is bound to current head current123",
-		"Remedy: dispatch one independent review for this exact head",
+		"no approval is bound to the current head",
+		"Remedy: dispatch one independent review for head current123",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
 		}
+	}
+	if got := strings.Count(body, "current123"); got != 1 {
+		t.Fatalf("operator-visible reply repeats current head %d times: %q", got, body)
 	}
 }
 
 func TestMergeCommandShowsAncestorApprovalAndRemedy(t *testing.T) {
 	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
 		LeaveOpen: true,
-		Reason: workflow.PlainReason(
-			"review gate: approval from reviewer is bound to ancestor head ancestor123, not current head current123. Remedy: dispatch one independent review for the current head"),
+		Reason: testGateMissReason(t, "review gate",
+			"approval from reviewer is bound to ancestor head ancestor123, not the current head. Remedy: dispatch one independent review",
+			"current123"),
 	}, true)
 
 	for _, want := range []string{
 		"approval from reviewer is bound to ancestor head ancestor123",
-		"not current head current123",
-		"Remedy: dispatch one independent review for the current head",
+		"not the current head",
+		"Remedy: dispatch one independent review for head current123",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
 		}
+	}
+	if got := strings.Count(body, "current123"); got != 1 {
+		t.Fatalf("operator-visible reply repeats current head %d times: %q", got, body)
 	}
 }
 
 func TestMergeCommandExplainsAbsentMarkerWhenAutoMergeDisabled(t *testing.T) {
 	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
 		LeaveOpen: true,
-		Reason:    workflow.PlainReason("review gate: required reviewer approval is missing"),
+		Reason: testGateMissReason(t, "review gate",
+			"required reviewer approval is missing",
+			"current123"),
 	}, false)
 
 	for _, want := range []string{

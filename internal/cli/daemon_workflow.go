@@ -786,14 +786,14 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 		policy = config.DefaultMergeGatePolicy()
 	}
 	if request.HumanMergeRequested {
-		denied, reason, err := mergeRuleRefusal(g.Home, request.ActingOrgRole)
-		if err != nil {
-			return workflow.MergeDecision{}, err
-		}
+		denied, reason := mergeRuleRefusal(g.Home, request.ActingOrgRole)
 		if denied {
 			gateReason, reasonErr := workflow.GateMissReason("org merge rule", reason, request.HeadSHA)
 			if reasonErr != nil {
 				return workflow.MergeDecision{}, reasonErr
+			}
+			if err := g.escalateMergeGateMiss(ctx, request, gateReason); err != nil {
+				return workflow.MergeDecision{}, err
 			}
 			return workflow.MergeDecision{LeaveOpen: true, Reason: gateReason}, nil
 		}
@@ -850,29 +850,25 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	return decision, nil
 }
 
-func mergeRuleRefusal(home, actingRole string) (bool, string, error) {
+func mergeRuleRefusal(home, actingRole string) (bool, string) {
 	actingRole = strings.TrimSpace(actingRole)
 	if actingRole == "" {
-		return false, "", nil
+		return false, ""
 	}
-	configFile := resolveConfigFile(home)
-	if configFile == "" {
-		return false, "", nil
-	}
-	orgConfig, err := config.LoadOrg(config.Paths{ConfigFile: configFile})
-	if err != nil {
-		return false, "", fmt.Errorf("load org merge rule: %w", err)
+	orgConfig, loaded := loadMergeGateOrgConfig(home)
+	if !loaded || orgConfig.Enforce() == "warn" {
+		return false, ""
 	}
 	role, ok := orgConfig.Role(actingRole)
 	if !ok {
-		return false, "", nil
+		return false, ""
 	}
 	switch strings.ToLower(strings.TrimSpace(role.MergeRule)) {
 	case "self":
-		return false, "", nil
+		return false, ""
 	case "owner":
 		if role.Parent == "" {
-			return false, "", nil
+			return false, ""
 		}
 		roots := orgConfig.Roots()
 		owner := "the owner role"
@@ -880,14 +876,14 @@ func mergeRuleRefusal(home, actingRole string) (bool, string, error) {
 			owner = fmt.Sprintf("owner role `%s`", roots[0])
 		}
 		return true, fmt.Sprintf(
-			"acting role `%s` has `merge_rule = \"owner\"`; only %s may merge. Remedy: ask that owner to perform the merge, or change the role's merge rule before retrying `/gitmoot merge`",
-			role.Name, owner), nil
+			"branch lock records acting role `%s`, whose `merge_rule = \"owner\"` reserves the merge for %s; `/gitmoot merge` refuses this branch whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
+			role.Name, owner)
 	case "none":
 		return true, fmt.Sprintf(
-			"acting role `%s` has `merge_rule = \"none\"` and cannot merge. Remedy: use a role with merge authority, or change this role's merge rule before retrying `/gitmoot merge`",
-			role.Name), nil
+			"branch lock records acting role `%s`, whose `merge_rule = \"none\"` cannot merge. Remedy: use a branch owned by a role with merge authority, or change this role's merge rule before retrying `/gitmoot merge`",
+			role.Name)
 	default:
-		return false, "", nil
+		return false, ""
 	}
 }
 

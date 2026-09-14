@@ -342,6 +342,22 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		return g.gateMiss(reason), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
+		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
+		if err != nil {
+			return MergeDecision{}, err
+		}
+		if isPending {
+			// CI is still resolving (a check is genuinely in flight, or we're
+			// within the #596 Actions-creation-lag grace window) - this is not a
+			// policy miss, so retry silently on the next poll instead of parking
+			// and escalating.
+			return pendingDecision, nil
+		}
+		if !reason.IsZero() {
+			return g.gateMiss(reason), nil
+		}
+	}
+	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		if queueAware, ok := g.GitHub.(mergeQueueAwareGitHub); ok {
 			rule, required, known, err := queueAware.BaseMergeQueueRule(ctx, repo, pr.BaseRef)
 			if err != nil {
@@ -362,22 +378,6 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 				}
 				return g.gateMiss(reason), nil
 			}
-		}
-	}
-	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
-		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
-		if err != nil {
-			return MergeDecision{}, err
-		}
-		if isPending {
-			// CI is still resolving (a check is genuinely in flight, or we're
-			// within the #596 Actions-creation-lag grace window) - this is not a
-			// policy miss, so retry silently on the next poll instead of parking
-			// and escalating.
-			return pendingDecision, nil
-		}
-		if !reason.IsZero() {
-			return g.gateMiss(reason), nil
 		}
 	}
 	releaseCheckoutLock, err := g.acquireLocalCheckoutMutationLock(ctx, request)
@@ -1412,7 +1412,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 	}
 	if !haveLatest {
-		return fmt.Errorf("no approval is bound to current head %s. Remedy: dispatch one independent review for this exact head", headSHA)
+		return errors.New("no approval is bound to the current head. Remedy: dispatch one independent review")
 	}
 	approved := false
 	var acceptedApprovals []delegatedReviewApproval
@@ -2326,14 +2326,14 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(ctx context.Context, request Me
 			if repo, err := parseRepoFullName(request.Repo); err == nil {
 				if comparison, compareErr := g.GitHub.CompareCommits(ctx, repo, reviewHead, headSHA); compareErr == nil && strings.EqualFold(strings.TrimSpace(comparison.Status), "ahead") {
 					return fmt.Errorf(
-						"approval from %s is bound to ancestor head %s, not current head %s. Remedy: dispatch one independent review for the current head",
-						agent, reviewHead, headSHA)
+						"approval from %s is bound to ancestor head %s, not the current head. Remedy: dispatch one independent review",
+						agent, reviewHead)
 				}
 			}
 		}
 		return fmt.Errorf(
-			"latest review from %s is bound to head %s, not current head %s. Remedy: dispatch one independent review for the current head",
-			agent, reviewHead, headSHA)
+			"latest review from %s is bound to head %s, not the current head. Remedy: dispatch one independent review",
+			agent, reviewHead)
 	}
 	// A review that ran in an integration worktree (#332 decompose-and-verify)
 	// has its inherited HeadSHA deliberately cleared by the engine
@@ -2347,7 +2347,7 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(ctx context.Context, request Me
 	if isIntegrationWorktreeReview(payload) {
 		return nil
 	}
-	return fmt.Errorf("latest review from %s does not record a head SHA; remedy: rerun one independent review for current head %s", agent, headSHA)
+	return fmt.Errorf("latest review from %s does not record a head SHA; Remedy: rerun one independent review", agent)
 }
 
 // isIntegrationWorktreeReview reports whether the review job ran in a

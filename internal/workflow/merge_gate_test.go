@@ -1418,7 +1418,7 @@ func TestPolicyMergeGateFallbackKeepsPipelineReviewVerdictRaw(t *testing.T) {
 		want   string
 	}{
 		{name: "native", sender: "", want: "independent reviewer is required"},
-		{name: "pipeline", sender: PipelineJobSender, want: "not current head"},
+		{name: "pipeline", sender: PipelineJobSender, want: "not the current head"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -2275,7 +2275,7 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t 
 	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason.Render(), "not current head") {
+	if strings.Contains(decision.Reason.Render(), "not the current head") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -2326,7 +2326,7 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t 
 	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason.Render(), "not current head") {
+	if strings.Contains(decision.Reason.Render(), "not the current head") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -2471,7 +2471,7 @@ func TestPolicyMergeGateHumanRequestRequiresFinalReview(t *testing.T) {
 	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason.Render(), "no approval is bound to current head") {
+	if !strings.Contains(decision.Reason.Render(), "no approval is bound to the current head") {
 		t.Fatalf("decision reason = %q, want missing final review", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -3289,7 +3289,7 @@ func TestPolicyMergeGateReviewOptionalDoesNotBypassMandatoryReview(t *testing.T)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "no approval is bound to current head") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "no approval is bound to the current head") {
 		t.Fatalf("decision = %+v, want mandatory review gate miss", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -4958,7 +4958,7 @@ func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "not current head") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "not the current head") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if gh.prCheckCalls != 0 || len(gh.checkRefs) != 1 || gh.checkRefs[0] != "head123" {
@@ -5096,7 +5096,7 @@ func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason.Render(), "not current head") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "not the current head") {
 		t.Fatalf("delegation review with mismatched head was not rejected: decision = %+v", decision)
 	}
 }
@@ -5195,6 +5195,29 @@ func TestPolicyMergeGateLeavesQueueRequiredPRForMergeQueue(t *testing.T) {
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("direct merge calls = %+v, want none", gh.merges)
+	}
+}
+
+func TestPolicyMergeGateReportsMissingReviewBeforeMergeQueueRequirement(t *testing.T) {
+	ctx := context.Background()
+	_, gh, gate, request := newMergeGateQuorumScenario(t)
+	gh.mergeQueueKnown = true
+	gh.mergeQueueRequired = true
+	gh.mergeQueueRule = github.MergeQueueRule{RulesetID: 22536038}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	rendered := decision.Reason.Render()
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+		t.Fatalf("decision = %+v, want leave-open gate miss", decision)
+	}
+	if !strings.Contains(rendered, "no approval is bound to the current head") {
+		t.Fatalf("operator reason %q does not report the missing review", rendered)
+	}
+	if strings.Contains(rendered, "merge queue") {
+		t.Fatalf("merge-queue refusal masked the missing-review refusal: %q", rendered)
 	}
 }
 
