@@ -46,27 +46,27 @@ const (
 )
 
 type reviewRequestOutput struct {
-	State         string   `json:"state"`
-	Repo          string   `json:"repo"`
-	PullRequest   int      `json:"pull_request"`
-	HeadSHA       string   `json:"head_sha"`
-	Purpose       string   `json:"purpose"`
-	Requester     string   `json:"requester"`
-	JobID         string   `json:"job_id"`
-	JobState      string   `json:"job_state,omitempty"`
-	Reviewer      string   `json:"reviewer,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	ModelPool     []string `json:"model_pool,omitempty"`
-	Verdict       string   `json:"verdict,omitempty"`
+	State       string   `json:"state"`
+	Repo        string   `json:"repo"`
+	PullRequest int      `json:"pull_request"`
+	HeadSHA     string   `json:"head_sha"`
+	Purpose     string   `json:"purpose"`
+	Requester   string   `json:"requester"`
+	JobID       string   `json:"job_id"`
+	JobState    string   `json:"job_state,omitempty"`
+	Reviewer    string   `json:"reviewer,omitempty"`
+	Model       string   `json:"model,omitempty"`
+	ModelPool   []string `json:"model_pool,omitempty"`
+	Verdict     string   `json:"verdict,omitempty"`
 	// Baseline is the prior head a delta review was bounded to; BaselineSkipped
 	// names why a full review was dispatched instead (#2177). Exactly one is set
 	// on a dispatch, and neither on an attach or a reused verdict.
-	Baseline        string `json:"baseline,omitempty"`
-	BaselineSkipped string `json:"baseline_skipped,omitempty"`
-	AwaitedFactID int64    `json:"awaited_fact_id"`
-	NotifyBy      string   `json:"notify_by"`
-	Holds         []string `json:"holds,omitempty"`
-	WatchCommand  string   `json:"watch_command,omitempty"`
+	Baseline        string   `json:"baseline,omitempty"`
+	BaselineSkipped string   `json:"baseline_skipped,omitempty"`
+	AwaitedFactID   int64    `json:"awaited_fact_id"`
+	NotifyBy        string   `json:"notify_by"`
+	Holds           []string `json:"holds,omitempty"`
+	WatchCommand    string   `json:"watch_command,omitempty"`
 }
 
 func runReview(args []string, stdout, stderr io.Writer) int {
@@ -88,7 +88,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--full] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
@@ -100,17 +100,18 @@ func printReviewUsage(w io.Writer) {
 }
 
 type reviewRequestOptions struct {
-	home     string
-	repo     string
-	pr       int
-	head     string
-	branch   string
-	purpose  string
-	role     string
-	ttl      time.Duration
-	reviewer string
-	full     bool
-	json     bool
+	home                    string
+	repo                    string
+	pr                      int
+	head                    string
+	branch                  string
+	purpose                 string
+	role                    string
+	ttl                     time.Duration
+	reviewer                string
+	full                    bool
+	allowPromptHeadMismatch bool
+	json                    bool
 }
 
 func runReviewRequest(args []string, stdout, stderr io.Writer) int {
@@ -126,6 +127,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -317,6 +319,10 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		ReviewModelPool:      pool,
 		ReviewRequester:      opts.role,
 		ReviewScope:          scope,
+		// A carried finding may legitimately cite a commit outside this PR
+		// (#2178 round 1): the citation classifier scans the delta brief, and
+		// the refusal it prints names this flag, so the flag must exist here.
+		AllowPromptHeadMismatch: opts.allowPromptHeadMismatch,
 		DispatchWarning: func(warning string) {
 			fmt.Fprintf(stderr, "review request: warning: %s\n", warning)
 		},
@@ -846,6 +852,20 @@ func reviewRequestHolds(paths config.Paths, home string) []string {
 // here costs one full read and must never refuse the request. Refusing would
 // block the commonest shape of all - a branch rebased onto main.
 func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
+	// AN UNDECODABLE VERDICT IS NOT AN ABSENCE (#2179, #2178 round 1). A row
+	// SucceededReviewVerdicts cannot decode is dropped silently, so the loop
+	// below would walk straight past a real terminal verdict to an OLDER
+	// ancestor - bounding the review against a stale baseline and telling the
+	// reviewer "you last saw head X" when it did not. A false statement in the
+	// brief is worse than a full re-read, so lossy history disables the delta
+	// entirely rather than selecting from what survived.
+	undecodable, err := store.UndecodableReviewVerdicts(ctx, repo, pullRequest)
+	if err != nil {
+		return nil, "scope unavailable: " + err.Error()
+	}
+	if undecodable > 0 {
+		return nil, fmt.Sprintf("verdict history has %d undecodable row(s); baseline cannot be trusted", undecodable)
+	}
 	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
 	if err != nil {
 		return nil, "scope unavailable: " + err.Error()
@@ -986,20 +1006,20 @@ func reviewGateState(home, repo string) string {
 }
 
 type reviewStatusOutput struct {
-	Repo        string              `json:"repo"`
-	PullRequest int                 `json:"pull_request"`
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
 	// Gate states what the native merge gate can do for this repository, in
 	// words. A requester must never read an absent or kill-switched gate as an
 	// approval, and "not applied to this head" alone does not say which it is.
-	Gate        string              `json:"gate"`
-	Requests    []reviewStatusEntry `json:"requests"`
+	Gate     string              `json:"gate"`
+	Requests []reviewStatusEntry `json:"requests"`
 }
 
 type reviewStatusEntry struct {
-	JobID     string `json:"job_id"`
-	State     string `json:"state"`
-	HeadSHA   string `json:"head_sha"`
-	Purpose   string `json:"purpose,omitempty"`
+	JobID   string `json:"job_id"`
+	State   string `json:"state"`
+	HeadSHA string `json:"head_sha"`
+	Purpose string `json:"purpose,omitempty"`
 	// Baseline is the prior head this review was bounded to, empty for a full
 	// review (#2177). It tells a reader which kind of review produced a verdict
 	// without reading the reviewer's prompt.

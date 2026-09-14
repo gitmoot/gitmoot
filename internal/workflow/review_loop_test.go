@@ -237,3 +237,18 @@ func TestReviewScopeInstructionsMatchesFollowUpText(t *testing.T) {
 		t.Fatalf("shared paragraph lost its head sentence: %q", want)
 	}
 }
+
+// Mutant (d) from the #2178 round-1 battery: the summary-promotion arm of
+// NamedReviewFindings survived the ENTIRE workflow package. A
+// changes_requested verdict that names no structured findings still has to
+// carry something forward, or a delta brief inherits an empty obligation list
+// from a verdict that demanded changes.
+func TestNamedReviewFindingsPromotesSummaryWhenChangesRequested(t *testing.T) {
+	promoted := NamedReviewFindings(AgentResult{Decision: "changes_requested", Summary: "the guard has no test"})
+	if len(promoted) != 1 || promoted[0] != "the guard has no test" {
+		t.Fatalf("findings = %v, want the summary promoted: a changes_requested verdict with no structured findings would carry an empty obligation list", promoted)
+	}
+	if got := NamedReviewFindings(AgentResult{Decision: "approved", Summary: "clean"}); len(got) != 0 {
+		t.Fatalf("findings = %v, want none: an approved verdict's summary is not an obligation", got)
+	}
+}

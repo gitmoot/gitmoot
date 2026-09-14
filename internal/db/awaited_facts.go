@@ -407,6 +407,44 @@ type SucceededReviewVerdict struct {
 // has indexed columns for them. This is a pure read: unlike SubscribeAwaitedFact
 // it creates no durable interest or other state. Skipped reviews are abstentions,
 // not verdicts, and must remain retryable at the same head.
+// UndecodableReviewVerdicts counts succeeded review rows for this pull request
+// whose payload SucceededReviewVerdicts cannot decode, and therefore silently
+// drops (#2179). It exists so a consumer can tell ABSENT from UNDECODABLE: a
+// verdict that is merely missing means "nothing has answered here", while one
+// that failed to decode means "something answered and I cannot read it", and
+// the two justify opposite behaviour. It deliberately does NOT widen what
+// counts as verdict history - changing that affects the merge gate and the
+// review-loop guard simultaneously and belongs in its own change.
+func (s *Store) UndecodableReviewVerdicts(ctx context.Context, repo string, pullRequest int) (int, error) {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	if repo == "" {
+		return 0, errors.New("review verdict repo is required")
+	}
+	if pullRequest <= 0 {
+		return 0, errors.New("review verdict pull request must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT payload
+FROM jobs
+WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?`, repo, pullRequest)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	undecodable := 0
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return 0, err
+		}
+		var decoded reviewVerdictPayload
+		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+			undecodable++
+		}
+	}
+	return undecodable, rows.Err()
+}
+
 func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]SucceededReviewVerdict, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	if repo == "" {
