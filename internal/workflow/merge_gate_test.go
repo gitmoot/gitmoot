@@ -1418,7 +1418,7 @@ func TestPolicyMergeGateFallbackKeepsPipelineReviewVerdictRaw(t *testing.T) {
 		want   string
 	}{
 		{name: "native", sender: "", want: "independent reviewer is required"},
-		{name: "pipeline", sender: PipelineJobSender, want: "different head SHA"},
+		{name: "pipeline", sender: PipelineJobSender, want: "not current head"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1930,7 +1930,7 @@ func TestPolicyMergeGateEmptyReviewRoundUsesRecordedRecency(t *testing.T) {
 	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason.Render(), "latest review from alpha-reviewer is for a different head SHA") {
+	if !strings.Contains(decision.Reason.Render(), "approval from alpha-reviewer is bound to ancestor head") {
 		t.Fatalf("decision reason = %q, want newer root review selected by recorded time", decision.Reason)
 	}
 }
@@ -2275,7 +2275,7 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t 
 	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason.Render(), "different head SHA") {
+	if strings.Contains(decision.Reason.Render(), "not current head") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -2326,7 +2326,7 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t 
 	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
 		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
 	}
-	if strings.Contains(decision.Reason.Render(), "different head SHA") {
+	if strings.Contains(decision.Reason.Render(), "not current head") {
 		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
 	}
 }
@@ -2471,7 +2471,7 @@ func TestPolicyMergeGateHumanRequestRequiresFinalReview(t *testing.T) {
 	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
 		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
 	}
-	if !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
+	if !strings.Contains(decision.Reason.Render(), "no approval is bound to current head") {
 		t.Fatalf("decision reason = %q, want missing final review", decision.Reason)
 	}
 	if len(gh.merges) != 0 {
@@ -3179,7 +3179,7 @@ func TestPolicyMergeGateReviewOptionalDoesNotBypassMandatoryReview(t *testing.T)
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "no approval is bound to current head") {
 		t.Fatalf("decision = %+v, want mandatory review gate miss", decision)
 	}
 	if len(gh.merges) != 0 {
@@ -4848,7 +4848,7 @@ func TestPolicyMergeGateBlocksReviewForStaleHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "different head SHA") {
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || !strings.Contains(decision.Reason.Render(), "not current head") {
 		t.Fatalf("decision = %+v", decision)
 	}
 	if gh.prCheckCalls != 0 || len(gh.checkRefs) != 1 || gh.checkRefs[0] != "head123" {
@@ -4986,7 +4986,7 @@ func TestPolicyMergeGateBlocksDelegationReviewForMismatchedHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if decision.Ready || !strings.Contains(decision.Reason.Render(), "different head SHA") {
+	if decision.Ready || !strings.Contains(decision.Reason.Render(), "not current head") {
 		t.Fatalf("delegation review with mismatched head was not rejected: decision = %+v", decision)
 	}
 }
@@ -5053,6 +5053,39 @@ func (r *queuedMergeRunner) Run(_ context.Context, _ string, _ string, _ ...stri
 
 func (*queuedMergeRunner) LookPath(file string) (string, error) {
 	return file, nil
+}
+
+func TestPolicyMergeGateLeavesQueueRequiredPRForMergeQueue(t *testing.T) {
+	ctx := context.Background()
+	store, gh, gate, request := newMergeGateQuorumScenario(t)
+	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+		id: "review-approved", agent: "reviewer", headSHA: "head123", decision: "approved", hasResult: true,
+	})
+	gh.mergeQueueKnown = true
+	gh.mergeQueueRequired = true
+	gh.mergeQueueRule = github.MergeQueueRule{RulesetID: 22536038}
+
+	decision, err := gate.Evaluate(ctx, request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	rendered := decision.Reason.Render()
+	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() {
+		t.Fatalf("decision = %+v, want leave-open gate miss", decision)
+	}
+	for _, want := range []string{
+		"repository ruleset 22536038",
+		"requires GitHub's merge queue",
+		"including `--admin`",
+		"Remedy: enqueue PR #9",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("operator reason %q does not contain %q", rendered, want)
+		}
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("direct merge calls = %+v, want none", gh.merges)
+	}
 }
 
 type productionMergeGateGitHub struct {
@@ -5147,6 +5180,7 @@ func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ gith
 	}
 	return f.strictBase, f.strictKnown, nil
 }
+
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
 	if f.beforeMerge != nil {

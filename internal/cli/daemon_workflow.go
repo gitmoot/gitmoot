@@ -786,6 +786,19 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 		}
 		policy = config.DefaultMergeGatePolicy()
 	}
+	if request.HumanMergeRequested {
+		denied, reason, err := mergeRuleRefusal(g.Home, request.ActingOrgRole)
+		if err != nil {
+			return workflow.MergeDecision{}, err
+		}
+		if denied {
+			gateReason, reasonErr := workflow.GateMissReason("org merge rule", reason, request.HeadSHA)
+			if reasonErr != nil {
+				return workflow.MergeDecision{}, reasonErr
+			}
+			return workflow.MergeDecision{LeaveOpen: true, Reason: gateReason}, nil
+		}
+	}
 	if !policy.AutoMerge && !request.HumanMergeRequested && !recoveryOnly {
 		if g.Store != nil && strings.TrimSpace(request.TaskID) != "" {
 			claimed, claimErr := g.Store.HasTaskStateClaim(ctx, request.TaskID)
@@ -836,6 +849,47 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 		return workflow.MergeDecision{}, err
 	}
 	return decision, nil
+}
+
+func mergeRuleRefusal(home, actingRole string) (bool, string, error) {
+	actingRole = strings.TrimSpace(actingRole)
+	if actingRole == "" {
+		return false, "", nil
+	}
+	configFile := resolveConfigFile(home)
+	if configFile == "" {
+		return false, "", nil
+	}
+	orgConfig, err := config.LoadOrg(config.Paths{ConfigFile: configFile})
+	if err != nil {
+		return false, "", fmt.Errorf("load org merge rule: %w", err)
+	}
+	role, ok := orgConfig.Role(actingRole)
+	if !ok {
+		return false, "", nil
+	}
+	switch strings.ToLower(strings.TrimSpace(role.MergeRule)) {
+	case "self":
+		return false, "", nil
+	case "owner":
+		if role.Parent == "" {
+			return false, "", nil
+		}
+		roots := orgConfig.Roots()
+		owner := "the owner role"
+		if len(roots) == 1 {
+			owner = fmt.Sprintf("owner role `%s`", roots[0])
+		}
+		return true, fmt.Sprintf(
+			"acting role `%s` has `merge_rule = \"owner\"`; only %s may merge. Remedy: ask that owner to perform the merge, or change the role's merge rule before retrying `/gitmoot merge`",
+			role.Name, owner), nil
+	case "none":
+		return true, fmt.Sprintf(
+			"acting role `%s` has `merge_rule = \"none\"` and cannot merge. Remedy: use a role with merge authority, or change this role's merge rule before retrying `/gitmoot merge`",
+			role.Name), nil
+	default:
+		return false, "", nil
+	}
 }
 
 // escalateMergeGateMiss writes the durable, operator-read escalation note. It is a DELIVERY

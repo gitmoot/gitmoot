@@ -52,6 +52,13 @@ An authorized malformed command still produces a visible routing error. An
 unclosed fenced code block treats the remainder of the comment as code, so any
 later command is ignored without a reply.
 
+`/gitmoot merge` replies with the observed outcome. A refusal names the cause
+and remedy: acting-role `merge_rule`, a required GitHub merge queue, a missing
+current-head approval, or an approval bound to an ancestor head. With
+`merge_gate.auto_merge = false`, no earlier `gitmoot/merge-gate` marker is
+expected. Its absence does not mean the gate passed; the explicit command runs
+the gate and reports that fact.
+
 On a **pull request**, a line that is addressed by shape but names an action
 Gitmoot does not implement produces **no reply** — it is recorded in the daemon
 log instead. Source code reaches this path routinely, because a decorator or

@@ -255,6 +255,13 @@ type workflowAwareGitHub interface {
 	WorkflowsExistAtRef(ctx context.Context, repo github.Repository, ref string) (bool, error)
 }
 
+// mergeQueueAwareGitHub is an OPTIONAL capability. A readable active merge
+// queue rule lets the gate refuse its direct-merge path before making a write.
+// Clients without it retain the existing authoritative merge attempt.
+type mergeQueueAwareGitHub interface {
+	BaseMergeQueueRule(ctx context.Context, repo github.Repository, branch string) (github.MergeQueueRule, bool, bool, error)
+}
+
 // ledgerScope binds the gate's SHARED resolvers. It is the SAME value and the
 // SAME binding call the review brief uses (Engine.ledgerScopeFor), which is why
 // the two cannot demand different obligation sets. Round 2 and round 3 both
@@ -331,6 +338,29 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 			return MergeDecision{}, reasonErr
 		}
 		return g.gateMiss(reason), nil
+	}
+	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
+		if queueAware, ok := g.GitHub.(mergeQueueAwareGitHub); ok {
+			rule, required, known, err := queueAware.BaseMergeQueueRule(ctx, repo, pr.BaseRef)
+			if err != nil {
+				return MergeDecision{}, err
+			}
+			if known && required {
+				ruleset := "an active repository ruleset"
+				if rule.RulesetID > 0 {
+					ruleset = fmt.Sprintf("repository ruleset %d", rule.RulesetID)
+				}
+				reason, reasonErr := GateMissReason(
+					"repository merge rule",
+					fmt.Sprintf("%s requires GitHub's merge queue and refuses Gitmoot's direct merge, including `--admin`. Remedy: enqueue PR #%d through GitHub's merge queue", ruleset, request.PullRequest),
+					headSHA,
+				)
+				if reasonErr != nil {
+					return MergeDecision{}, reasonErr
+				}
+				return g.gateMiss(reason), nil
+			}
+		}
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
@@ -1380,7 +1410,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 	}
 	if !haveLatest {
-		return errors.New("final agent review is not captured")
+		return fmt.Errorf("no approval is bound to current head %s. Remedy: dispatch one independent review for this exact head", headSHA)
 	}
 	approved := false
 	var acceptedApprovals []delegatedReviewApproval
@@ -1420,7 +1450,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	for _, review := range eligible {
 		job := review.job
 		payload := review.payload
-		if err := g.ensureReviewMatchesHead(payload, headSHA, effectiveReviewerIdentityName(job, payload)); err != nil {
+		if err := g.ensureReviewMatchesHead(ctx, request, payload, headSHA, effectiveReviewerIdentityName(job, payload)); err != nil {
 			if reason := authorship.failureReason(); reason != "" {
 				return errors.New(reason)
 			}
@@ -2243,7 +2273,18 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 		return nil
 	}
 	if reviewHead != "" {
-		return fmt.Errorf("latest review from %s is for a different head SHA", agent)
+		if g.GitHub != nil && effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
+			if repo, err := parseRepoFullName(request.Repo); err == nil {
+				if comparison, compareErr := g.GitHub.CompareCommits(ctx, repo, reviewHead, headSHA); compareErr == nil && strings.EqualFold(strings.TrimSpace(comparison.Status), "ahead") {
+					return fmt.Errorf(
+						"approval from %s is bound to ancestor head %s, not current head %s. Remedy: dispatch one independent review for the current head",
+						agent, reviewHead, headSHA)
+				}
+			}
+		}
+		return fmt.Errorf(
+			"latest review from %s is bound to head %s, not current head %s. Remedy: dispatch one independent review for the current head",
+			agent, reviewHead, headSHA)
 	}
 	// A review that ran in an integration worktree (#332 decompose-and-verify)
 	// has its inherited HeadSHA deliberately cleared by the engine
@@ -2257,7 +2298,7 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA str
 	if isIntegrationWorktreeReview(payload) {
 		return nil
 	}
-	return fmt.Errorf("latest review from %s does not record a head SHA; rerun review", agent)
+	return fmt.Errorf("latest review from %s does not record a head SHA; remedy: rerun one independent review for current head %s", agent, headSHA)
 }
 
 // isIntegrationWorktreeReview reports whether the review job ran in a
