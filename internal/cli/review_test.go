@@ -1271,3 +1271,32 @@ func TestSubjectIsForeignTreatsSilenceAsNotForeign(t *testing.T) {
 		t.Fatal("an unknown subject is judging other nodes foreign")
 	}
 }
+
+// #2176 round 5, and I caught this one on my own fixture while measuring cost
+// rather than from a review. The tempting optimisation - a node with no stored
+// result never dispatched delegations, so skip listing its children - prunes
+// subtrees that DO have children: the staged fixture's own leg carries a nil
+// result and real child rows. Whether a node has children is a question about
+// the store, and every cheaper proxy for it has been wrong.
+func TestClaimWalkListsChildrenOfANodeWithNoStoredResult(t *testing.T) {
+	_, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	job := stagedPreflightClaim(t, store, head, "implement", string(workflow.JobSucceeded), "")
+	leg := job.ID + "/delegation/leg"
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET payload = ? WHERE id = ?", `{"repo":"owner/repo","pull_request":12,"head_sha":"`+head+`"}`, leg); err != nil {
+		t.Fatal(err)
+	}
+	matching, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, HeadSHA: head, ReviewPurpose: "code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: leg + "/delegation/review", Agent: "opus-reviewer", Type: "review",
+		State: string(workflow.JobRunning), Payload: string(matching), Repo: "owner/repo", ParentJobID: leg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !reviewJobStillAnswers(ctx, store, job, testClaimSubject(t, head), time.Now().UTC()) {
+		t.Fatal("a RUNNING review is invisible because its parent stored no result: the claim releases and a duplicate dispatches")
+	}
+}

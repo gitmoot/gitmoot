@@ -435,12 +435,14 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 	// decision "implemented" has REAL children that were never listed, and a
 	// live matching review grandchild under it was invisible. Whether a node
 	// has children is a question about the store, so ask the store.
-	// A node with no result never dispatched delegations, so it has no children
-	// to list. This is the one skip that is structural rather than a verdict
-	// judgement, and it keeps the walk off completed leaf subtrees.
-	if payload.Result == nil {
-		return false
-	}
+	// NO SKIP HERE, DELIBERATELY. The obvious optimisation - a node with no
+	// stored result never dispatched delegations, so do not list its children -
+	// is FALSE, and I proved it false on my own fixture before shipping it: a
+	// leg with a nil result and real child rows had its whole subtree pruned,
+	// which is the same defect class this walk has produced four times. Whether
+	// a node has children is a question about the store; every cheaper proxy
+	// for it has been wrong so far. The cost is bounded by the delegation cap
+	// and the seen-set, and a bounded query cost is worth less than a claim.
 	children, err := store.ListJobsByParent(ctx, job.ID)
 	if err != nil {
 		// Unknown is not proof the tree is finished; failing closed costs a
