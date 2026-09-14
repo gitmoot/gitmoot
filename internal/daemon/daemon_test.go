@@ -3160,6 +3160,21 @@ func TestMergeCommandExplainsAbsentMarkerWhenAutoMergeDisabled(t *testing.T) {
 	}
 }
 
+func TestMergeCommandShowsTerminalBlockedTaskState(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		Reason: workflow.PlainReason("review at evaluated head has a blocking result"),
+	}, true)
+
+	for _, want := range []string{
+		"Gitmoot did not merge PR #41; the task is now `blocked`.",
+		"Cause: review at evaluated head has a blocking result.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+}
+
 func runMergeCommandForOutput(t *testing.T, decision workflow.MergeDecision, autoMerge bool) (string, workflow.MergeRequest) {
 	t.Helper()
 	ctx := context.Background()
