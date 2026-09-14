@@ -522,6 +522,9 @@ func TestPolicyMergeGateRetainsClaimForAcceptedQueuedMerge(t *testing.T) {
 		t.Fatalf("conflicting queued-merge disposal = changed %v err %v, want durable claim rejection", changed, writeErr)
 	}
 
+	base.mergeQueueKnown = true
+	base.mergeQueueRequired = true
+	base.mergeQueueRule = github.MergeQueueRule{RulesetID: 22536038}
 	base.pr.State = "closed"
 	base.pr.Merged = true
 	base.pr.MergeSHA = "merge-completed-from-queue"
