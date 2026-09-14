@@ -1683,8 +1683,8 @@ remains policy-gated.
 ### Organization registry and scoped dispatch
 
 The optional `[org]` registry is enabled by any `[org.roles."name"]` section.
-Roles have `parent`, `scope`, advisory `merge_rule` (`owner`, `self`, or
-`none`), an optional `model` runtime pin, an optional per-role `recycle_after`
+Roles have `parent`, `scope`, `merge_rule` (`owner`, `self`, or `none`), an
+optional `model` runtime pin, an optional per-role `recycle_after`
 duration override, and an optional Herdr `pane` used by live presence and
 event-rule wakes; exactly one parent-less role is required.
 Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be

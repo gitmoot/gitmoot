@@ -3237,7 +3237,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if err != nil {
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
-			return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, blocked.Reason))
+			return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, blocked.Reason, true))
 		}
 		return err
 	}
@@ -3248,15 +3248,19 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if task.State == string(workflow.TaskMerged) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
 	}
-	return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, decision.Reason.Render()))
+	return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, decision.Reason.Render(), false))
 }
 
-func (d Daemon) mergeCommandRefusal(pullRequest int64, reason string) string {
+func (d Daemon) mergeCommandRefusal(pullRequest int64, reason string, taskBlocked bool) string {
 	reason = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(reason), "."))
 	if reason == "" {
 		reason = "the merge gate did not report a reason; inspect `/gitmoot status` and daemon logs"
 	}
-	message := fmt.Sprintf("Gitmoot did not merge PR #%d.\n\nCause: %s.", pullRequest, reason)
+	summary := fmt.Sprintf("Gitmoot did not merge PR #%d.", pullRequest)
+	if taskBlocked {
+		summary = fmt.Sprintf("Gitmoot did not merge PR #%d; the task is now `blocked`.", pullRequest)
+	}
+	message := fmt.Sprintf("%s\n\nCause: %s.", summary, reason)
 	if d.AutoMergeEnabled != nil && !d.AutoMergeEnabled(d.Repo.FullName()) {
 		message += "\n\nNote: `merge_gate.auto_merge = false`, so no prior `gitmoot/merge-gate` marker was expected. Its absence does not mean the gate passed; this explicit `/gitmoot merge` request ran the gate now."
 	}
