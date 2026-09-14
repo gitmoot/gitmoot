@@ -1774,8 +1774,8 @@ func TestUndecodableVerdictBetweenBaselineAndHeadBlocksTheDelta(t *testing.T) {
 	if third.Baseline != "" {
 		t.Fatalf("baseline = %q, want none: an invisible verdict sits between it and this head, so the brief would assert a head the reviewer never saw", third.Baseline)
 	}
-	if !strings.Contains(third.BaselineSkipped, "sits between") {
-		t.Fatalf("skip reason = %q, want it to name the interposed verdict", third.BaselineSkipped)
+	if !strings.Contains(third.BaselineSkipped, "would have been selected") {
+		t.Fatalf("skip reason = %q, want it to name the verdict selection would have chosen", third.BaselineSkipped)
 	}
 }
 
@@ -1879,7 +1879,7 @@ func seedUndecodableVerdictInState(t *testing.T, store *db.Store, id, head, stat
 	}
 }
 
-// M8: UndecodableReviewVerdictHeads must count only SUCCEEDED reviews. A failed
+// M8: UndecodableReviewVerdicts must report only SUCCEEDED reviews. A failed
 // job's payload is not verdict history, and treating one as an invisible
 // verdict would disable delta review on every PR that ever had a failed review.
 func TestUndecodableCountIgnoresNonSucceededReviews(t *testing.T) {
@@ -1894,7 +1894,7 @@ func TestUndecodableCountIgnoresNonSucceededReviews(t *testing.T) {
 
 	seedUndecodableVerdictInState(t, store, "failed-undecodable", secondHead, string(workflow.JobFailed))
 
-	heads, err := store.UndecodableReviewVerdictHeads(ctx, "owner/repo", 12)
+	heads, err := store.UndecodableReviewVerdicts(ctx, "owner/repo", 12)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1907,5 +1907,233 @@ func TestUndecodableCountIgnoresNonSucceededReviews(t *testing.T) {
 	}
 	if second.Baseline != firstHead {
 		t.Fatalf("baseline = %q, want %q: a failed review disabled the delta (%s)", second.Baseline, firstHead, second.BaselineSkipped)
+	}
+}
+
+// seedUndecodableVerdictFull writes an undecodable succeeded review with an
+// explicit purpose, head and updated_at, so a test can place it exactly where
+// selection would have looked.
+func seedUndecodableVerdictFull(t *testing.T, store *db.Store, id, head, purpose, updatedAt string) {
+	t.Helper()
+	ctx := context.Background()
+	body := map[string]any{
+		"repo": "owner/repo", "pull_request": 12, "review_purpose": purpose,
+		"result": map[string]any{"decision": "changes_requested", "severity": "P2", "evidence": "executed",
+			"findings": []any{42}},
+	}
+	if head != "" {
+		body["head_sha"] = head
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "only-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(payload), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12, updated_at = ? WHERE id = ?", updatedAt, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #2178 round 3 R3-F1. "The reviewer last saw head X" is a RECENCY claim.
+// Selection orders by updated_at, so a NEWER invisible verdict at a head that
+// is an ancestor OF the baseline would have sorted first - and a purely
+// positional check sees nothing "between" the baseline and the head.
+func TestDeltaRefusesWhenANewerInvisibleVerdictWouldHaveBeenSelected(t *testing.T) {
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, second.JobID)
+
+	// Invisible verdict at the OLDER commit but with the NEWEST timestamp.
+	seedUndecodableVerdictFull(t, store, "newer-invisible", firstHead, "code", "2099-01-01 00:00:00")
+
+	runGit(t, checkout, "switch", "feature/review")
+	writeFile(t, filepath.Join(checkout, "review.txt"), "round three\n")
+	runGit(t, checkout, "add", "review.txt")
+	runGit(t, checkout, "commit", "-m", "review round three")
+	thirdHead := readonlyWorktreeHead(t, checkout)
+
+	third, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", thirdHead,
+		"--branch", "feature/review", "--home", home, "--json", "--role", "owner")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if third.Baseline != "" {
+		t.Fatalf("baseline = %q, want none: a NEWER invisible verdict would have been selected first, so the brief would name the wrong head", third.Baseline)
+	}
+	if !strings.Contains(third.BaselineSkipped, "would have been selected") {
+		t.Fatalf("skip reason = %q, want it to name the newer invisible verdict", third.BaselineSkipped)
+	}
+}
+
+// R3-F2. Mailbox.OpenExternalJob writes review payloads with NO head_sha. Such
+// a row can never be a baseline - selection skips an empty head - so one
+// undecodable session verdict must not disable delta review for the whole PR.
+func TestHeadlessUndecodableVerdictDoesNotBlockTheDelta(t *testing.T) {
+	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+	seedUndecodableVerdictFull(t, store, "headless-session-verdict", "", "code", "2099-01-01 00:00:00")
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.Baseline != firstHead {
+		t.Fatalf("baseline = %q, want %q: a head-less session verdict is unselectable and must not disable delta review (%s)", second.Baseline, firstHead, second.BaselineSkipped)
+	}
+}
+
+// A payload that is not valid JSON at all is the one shape whose position
+// cannot be established, and it must still refuse unconditionally (mutant M4).
+func TestUnreadableVerdictPayloadBlocksTheDelta(t *testing.T) {
+	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
+	ctx := context.Background()
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	if err := store.CreateJob(ctx, db.Job{ID: "unreadable-verdict", Agent: "only-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(`{"repo":"owner/repo",`), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	// An unreadable payload projects no repo and no pull request, so the
+	// columns must be set explicitly; in production such a row is therefore
+	// never even associated with a pull request. This arm is defensive.
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12, repo = 'owner/repo' WHERE id = 'unreadable-verdict'"); err != nil {
+		t.Fatal(err)
+	}
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.Baseline != "" {
+		t.Fatalf("baseline = %q, want none: a payload that is not valid JSON cannot be placed", second.Baseline)
+	}
+	if !strings.Contains(second.BaselineSkipped, "unreadable") {
+		t.Fatalf("skip reason = %q, want it to name the unreadable row", second.BaselineSkipped)
+	}
+}
+
+// R3-F3, residual over-refusal: an invisible row for ANOTHER purpose could
+// never have bounded this request, and an OLDER one had already been passed
+// over by selection. Neither may refuse. Also kills mutant M3 (the
+// baseline/head skip) via the same-head row.
+func TestUnselectableInvisibleVerdictsDoNotBlockTheDelta(t *testing.T) {
+	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	seedUndecodableVerdictFull(t, store, "wrong-purpose-invisible", secondHead, "security", "2099-01-01 00:00:00")
+	seedUndecodableVerdictFull(t, store, "older-invisible", secondHead, "code", "2000-01-01 00:00:00")
+	seedUndecodableVerdictFull(t, store, "same-head-invisible", secondHead, "code", "2099-01-01 00:00:01")
+	seedUndecodableVerdictFull(t, store, "at-baseline-invisible", firstHead, "code", "2099-01-01 00:00:02")
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.Baseline != firstHead {
+		t.Fatalf("baseline = %q, want %q: wrong-purpose, older, at-baseline and at-head invisible rows are all unselectable and must not refuse (%s)", second.Baseline, firstHead, second.BaselineSkipped)
+	}
+}
+
+// threeCommitDeltaFixture gives h1 < h2 < h3 on feature/review with a decodable
+// baseline verdict at h2, so an invisible row can be placed at h1 - an ancestor
+// of the dispatch head that is NEITHER the baseline nor the head, which is the
+// only position where the recency and purpose arms decide anything.
+func threeCommitDeltaFixture(t *testing.T) (home string, store *db.Store, checkout, h1, h2, h3 string) {
+	t.Helper()
+	home, store, checkout, h1, h2 = deltaReviewFixture(t)
+	runGit(t, checkout, "switch", "feature/review")
+	writeFile(t, filepath.Join(checkout, "review.txt"), "round three\n")
+	runGit(t, checkout, "add", "review.txt")
+	runGit(t, checkout, "commit", "-m", "review round three")
+	h3 = readonlyWorktreeHead(t, checkout)
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, h2), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, second.JobID)
+	return home, store, checkout, h1, h2, h3
+}
+
+func requestAtHead(t *testing.T, home, head string) reviewRequestOutput {
+	t.Helper()
+	out, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--home", home, "--json", "--role", "owner")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	return out
+}
+
+// Recency arm in isolation: an invisible row at h1 is an ancestor of h3 and is
+// neither the baseline (h2) nor the head, but it is OLDER than the baseline, so
+// selection had already passed it. It must not refuse.
+func TestOlderInterposedInvisibleVerdictDoesNotBlockTheDelta(t *testing.T) {
+	home, store, _, h1, h2, h3 := threeCommitDeltaFixture(t)
+	seedUndecodableVerdictFull(t, store, "older-interposed", h1, "code", "2000-01-01 00:00:00")
+
+	third := requestAtHead(t, home, h3)
+	if third.Baseline != h2 {
+		t.Fatalf("baseline = %q, want %q: an invisible row OLDER than the baseline was already passed over by selection and must not refuse (%s)", third.Baseline, h2, third.BaselineSkipped)
+	}
+}
+
+// Purpose arm in isolation: same position, NEWER than the baseline, but for
+// another purpose - a different question that could never have bounded this one.
+func TestWrongPurposeInterposedInvisibleVerdictDoesNotBlockTheDelta(t *testing.T) {
+	home, store, _, h1, h2, h3 := threeCommitDeltaFixture(t)
+	seedUndecodableVerdictFull(t, store, "security-interposed", h1, "security", "2099-01-01 00:00:00")
+
+	third := requestAtHead(t, home, h3)
+	if third.Baseline != h2 {
+		t.Fatalf("baseline = %q, want %q: an invisible SECURITY verdict cannot bound a code review and must not refuse (%s)", third.Baseline, h2, third.BaselineSkipped)
+	}
+}
+
+// Off-history arm must CONTINUE, not end the scan: an unselectable row listed
+// BEFORE a genuinely selectable one must not hide it.
+func TestOffHistoryInvisibleVerdictDoesNotHideALaterBlockingOne(t *testing.T) {
+	home, store, checkout, h1, _, h3 := threeCommitDeltaFixture(t)
+
+	runGit(t, checkout, "switch", "main")
+	writeFile(t, filepath.Join(checkout, "orphan3.txt"), "off history\n")
+	runGit(t, checkout, "add", "orphan3.txt")
+	runGit(t, checkout, "commit", "-m", "off-history commit")
+	orphanHead := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "switch", "feature/review")
+
+	// Inserted FIRST so the scan meets the unselectable row before the one that
+	// must refuse; both are newer than the baseline.
+	seedUndecodableVerdictFull(t, store, "a-off-history", orphanHead, "code", "2099-01-01 00:00:00")
+	seedUndecodableVerdictFull(t, store, "b-interposed", h1, "code", "2099-01-01 00:00:01")
+
+	third := requestAtHead(t, home, h3)
+	if third.Baseline != "" {
+		t.Fatalf("baseline = %q, want none: an off-history row listed first hid a newer interposed verdict that would have been selected", third.Baseline)
+	}
+	if !strings.Contains(third.BaselineSkipped, "would have been selected") {
+		t.Fatalf("skip reason = %q, want the interposed verdict named", third.BaselineSkipped)
 	}
 }

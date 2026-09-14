@@ -851,33 +851,55 @@ func reviewRequestHolds(paths config.Paths, home string) []string {
 // full review; the reason is REPORTED, never acted on, because every failure
 // here costs one full read and must never refuse the request. Refusing would
 // block the commonest shape of all - a branch rebased onto main.
-// undecodableBetween reports why a delta must be refused because an invisible
-// verdict sits strictly between the chosen baseline and the dispatch head. An
-// unplaceable row - one whose head could not be recovered at all - disqualifies
-// unconditionally, because "I cannot tell where it sits" is not evidence that
-// it sits somewhere harmless.
-func undecodableBetween(ctx context.Context, git gitutil.Client, undecodableHeads []string, baseline, head string) string {
-	for _, invisible := range undecodableHeads {
-		invisible = strings.ToLower(strings.TrimSpace(invisible))
-		if invisible == "" {
-			return "verdict history has an undecodable row whose head cannot be read; baseline cannot be trusted"
+// undecodableBlocks reports why a delta must be refused because an invisible
+// verdict would have been SELECTED instead of the chosen baseline.
+//
+// Selection orders by updated_at and takes the newest ancestor matching the
+// purpose, so "the reviewer last saw head X" is a RECENCY claim, not merely a
+// positional one (#2178 round 3). Testing position alone missed a newer
+// invisible verdict at a head that happens to be an ancestor OF the baseline:
+// it would have sorted first, so the brief named the wrong head while the
+// positional check saw nothing between the two commits.
+//
+// Each arm below mirrors one reason selection itself would have passed the row
+// over, so a row that could never have been chosen never refuses:
+//   - not valid JSON at all: nothing about its position is knowable, and that
+//     is the ONLY shape that disqualifies unconditionally;
+//   - no head: selection skips an empty baseline, so it is unselectable
+//     (Mailbox.OpenExternalJob writes exactly this shape, and one such row used
+//     to disable delta review for its whole pull request permanently);
+//   - another purpose: a different question;
+//   - not newer than the baseline: selection had already passed it;
+//   - not an ancestor of the dispatch head: off this line of history.
+func undecodableBlocks(ctx context.Context, git gitutil.Client, undecodable []db.UndecodableReviewVerdict, baseline, baselineUpdatedAt, baselineJobID, head, wantPurpose string) string {
+	for _, invisible := range undecodable {
+		if !invisible.Readable {
+			return "verdict history has an unreadable row; its position cannot be established, so the baseline cannot be trusted"
 		}
-		if invisible == baseline || invisible == head {
+		if invisible.HeadSHA == "" {
 			continue
 		}
-		reachable, err := git.IsAncestor(ctx, invisible, head)
+		got := invisible.ReviewPurpose
+		if got == "" {
+			got = db.DefaultReviewPurpose
+		}
+		if got != wantPurpose {
+			continue
+		}
+		if invisible.HeadSHA == baseline || invisible.HeadSHA == head {
+			continue
+		}
+		// String comparison, because SucceededReviewVerdicts orders by the same
+		// column as a string: the two agree by construction.
+		if invisible.UpdatedAt < baselineUpdatedAt ||
+			(invisible.UpdatedAt == baselineUpdatedAt && invisible.JobID <= baselineJobID) {
+			continue
+		}
+		reachable, err := git.IsAncestor(ctx, invisible.HeadSHA, head)
 		if err != nil || !reachable {
-			// Not on this line of history (rebase orphan), or unreadable: it
-			// could never have been selected, so it cannot have been skipped.
 			continue
 		}
-		newerThanBaseline, err := git.IsAncestor(ctx, invisible, baseline)
-		if err != nil {
-			continue
-		}
-		if !newerThanBaseline {
-			return fmt.Sprintf("an undecodable verdict at %s sits between the baseline and this head; baseline cannot be trusted", invisible)
-		}
+		return fmt.Sprintf("an undecodable verdict at %s is newer than the baseline and reachable from this head, so it would have been selected; baseline cannot be trusted", invisible.HeadSHA)
 	}
 	return ""
 }
@@ -890,7 +912,7 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 	// reviewer "you last saw head X" when it did not. A false statement in the
 	// brief is worse than a full re-read, so lossy history disables the delta
 	// entirely rather than selecting from what survived.
-	undecodableHeads, err := store.UndecodableReviewVerdictHeads(ctx, repo, pullRequest)
+	undecodable, err := store.UndecodableReviewVerdicts(ctx, repo, pullRequest)
 	if err != nil {
 		return nil, "scope unavailable: " + err.Error()
 	}
@@ -953,7 +975,7 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 		// question is narrower - is an invisible verdict sitting BETWEEN the
 		// baseline and the dispatch head, where it would have been the real
 		// baseline? Only then is the "you last saw X" sentence false.
-		if reason := undecodableBetween(ctx, git, undecodableHeads, baseline, head); reason != "" {
+		if reason := undecodableBlocks(ctx, git, undecodable, baseline, job.UpdatedAt, job.ID, head, want); reason != "" {
 			return nil, reason
 		}
 		return &workflow.ReviewScope{
