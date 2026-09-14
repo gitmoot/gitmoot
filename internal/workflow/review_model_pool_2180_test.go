@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -173,21 +174,120 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 // through a LESS configured mailbox than the engine's own, because it does not
 // build one. No field list to forget the next field from.
 func TestEnqueueMailboxForwardsEveryEngineResolver(t *testing.T) {
-	sentinel := []string{"sentinel/model-a", "sentinel/model-b"}
-	engine := Engine{
-		Store:                   openEngineStore(t),
-		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		ReviewModelPool:         func(string) []string { return sentinel },
-		RuntimeDefaultModel:     func(string) string { return "sentinel/default" },
+	// REFLECTIVE ON PURPOSE (#2186 round 5). The first version of this test was
+	// named for exhaustiveness and asserted ONE field, which is the same
+	// enumeration defect it exists to prevent, one level up: it would pass
+	// forever while the tenth field went unforwarded. A test whose name claims
+	// more than its assertions is worse than no test, because it answers the
+	// question nobody re-asks.
+	//
+	// So: set EVERY func-typed exported field on Engine to a live stub, build the
+	// mailbox, and require every identically-named, identically-typed exported
+	// field on Mailbox to be non-nil. A new resolver added to both types is
+	// covered the day it is added, with no edit here.
+	engineValue := reflect.New(reflect.TypeOf(Engine{})).Elem()
+	engineType := engineValue.Type()
+	mailboxType := reflect.TypeOf(Mailbox{})
+
+	var expected []string
+	for i := range engineType.NumField() {
+		field := engineType.Field(i)
+		if !field.IsExported() || field.Type.Kind() != reflect.Func {
+			continue
+		}
+		mailboxField, ok := mailboxType.FieldByName(field.Name)
+		if !ok || !mailboxField.IsExported() || mailboxField.Type != field.Type {
+			continue
+		}
+		fieldType := field.Type
+		engineValue.Field(i).Set(reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
+			out := make([]reflect.Value, fieldType.NumOut())
+			for j := range out {
+				out[j] = reflect.Zero(fieldType.Out(j))
+			}
+			return out
+		}))
+		expected = append(expected, field.Name)
 	}
-	mailbox := engine.EnqueueMailbox()
-	if mailbox.ReviewModelPool == nil {
-		t.Fatal("EnqueueMailbox dropped ReviewModelPool: a producer taking this mailbox resolves against the wrong home")
+	if len(expected) < 2 {
+		t.Fatalf("reflection found %d forwardable resolvers (%v); the census itself is broken", len(expected), expected)
 	}
-	if got := mailbox.ReviewModelPool("code"); !slices.Equal(got, sentinel) {
-		t.Fatalf("forwarded resolver returned %v, want the engine's own %v", got, sentinel)
+
+	engine := engineValue.Addr().Interface().(*Engine)
+	engine.Store = openEngineStore(t)
+	engine.ResolveDeliveryWorktree = UnavailableDeliveryWorktreeResolver("test")
+
+	// Delivery MACHINERY is deliberately not inherited when a caller passes a
+	// capability sentinel - that is the round-5 fix, and the reflective census
+	// caught it on its first run rather than letting it read as an omission.
+	deliveryScoped := map[string]bool{"CollectChangeSet": true, "ApplyChangeSet": true}
+
+	inherited := reflect.ValueOf(engine.EnqueueMailbox(nil))
+	for _, name := range expected {
+		if inherited.FieldByName(name).IsNil() {
+			t.Fatalf("EnqueueMailbox(nil) did not forward %s: a producer taking this mailbox silently loses it", name)
+		}
 	}
-	if mailbox.RuntimeDefaultModel == nil {
-		t.Fatal("EnqueueMailbox dropped RuntimeDefaultModel")
+
+	sentineled := reflect.ValueOf(engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test")))
+	for _, name := range expected {
+		isNil := sentineled.FieldByName(name).IsNil()
+		if deliveryScoped[name] && !isNil {
+			t.Fatalf("%s survived a delivery sentinel: the producer refuses delivery but now carries the means to perform it", name)
+		}
+		if !deliveryScoped[name] && isNil {
+			t.Fatalf("EnqueueMailbox dropped config-bearing %s alongside the delivery machinery", name)
+		}
+	}
+	t.Logf("censused %d engine resolvers: %v", len(expected), expected)
+}
+
+// #2186 round 5, live survivor: the advisory's NEGATIVE direction was untested.
+// A mutant emitting review_pool_unresolved on EVERY review survived both full
+// packages - nothing failed when a review that HAD a pool was also told it had
+// none. An advisory that fires unconditionally is noise, and noise is how a
+// real "this review has no fallback" signal stops being read.
+func TestPoolUnresolvedAdvisoryIsSilentWhenThePoolResolves(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "reviewer", []string{"review", "implement"}, "owner/repo")
+	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	mailbox.ReviewModelPool = func(string) []string { return []string{"sentinel/pool-a"} }
+
+	for _, tc := range []struct {
+		name         string
+		action       string
+		wantPool     bool
+		wantAdvisory bool
+	}{
+		{"a review whose pool resolves is not warned", "review", true, false},
+		{"a non-review job is neither pooled nor warned", "implement", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := "job-" + strings.ReplaceAll(tc.name, " ", "-")
+			prepared, err := mailbox.PrepareEnqueue(ctx, JobRequest{
+				ID: id, Agent: "reviewer", Action: tc.action, Repo: "owner/repo",
+				Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40), ReviewPurpose: "code",
+			})
+			if err != nil {
+				t.Fatalf("PrepareEnqueue: %v", err)
+			}
+			payload, err := ParseJobPayload(prepared.Job.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(payload.ReviewModelPool) > 0; got != tc.wantPool {
+				t.Fatalf("pool present = %v, want %v", got, tc.wantPool)
+			}
+			advisory := false
+			for _, event := range prepared.Events {
+				if event.Kind == "review_pool_unresolved" {
+					advisory = true
+				}
+			}
+			if advisory != tc.wantAdvisory {
+				t.Fatalf("advisory emitted = %v, want %v: an advisory that fires regardless says nothing", advisory, tc.wantAdvisory)
+			}
+		})
 	}
 }
