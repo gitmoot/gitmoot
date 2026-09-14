@@ -79,6 +79,22 @@ func ReviewVerdictSubjectKey(repo string, pullRequest int, headSHA string) (stri
 // parseReviewVerdictSubjectKey is the exact inverse of the two constructors
 // above: it accepts the bare repo#pr@head key and the purpose-scoped
 // repo#pr@head|purpose key the review router subscribes with.
+// ParseReviewVerdictSubjectKey exposes the subject a claim is keyed to, so the
+// router can check that a verdict it finds while walking a delegation tree
+// actually answers THIS question (#2176). Purpose is read separately with
+// ReviewVerdictKeyPurpose because the bare key carries none.
+func ParseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
+	return parseReviewVerdictSubjectKey(key)
+}
+
+// ReviewVerdictKeyPurpose is the exported form of the purpose a subject key is
+// scoped to. A BARE key returns "" - scoped to no purpose means ANY purpose,
+// not a shorthand for DefaultReviewPurpose; conflating the two would let a bare
+// `org await review` wait be satisfied only by code verdicts.
+func ReviewVerdictKeyPurpose(key string) string {
+	return reviewVerdictKeyPurpose(key)
+}
+
 func parseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	key = strings.TrimSpace(key)
 	base, purpose, scoped := strings.Cut(key, "|")
@@ -188,11 +204,17 @@ func (s *Store) SubscribeAwaitedFact(ctx context.Context, request AwaitedFactSub
 	// answer is the attach the dedup would have produced. ON CONFLICT keeps this
 	// one statement, so the resolution is atomic rather than a read-after-error
 	// that a third writer could invalidate.
+	//
+	// #2176: the deadline only ever EXTENDS. Overwriting it with the joiner's
+	// shortened the winner's wait - a requester that asked for an hour could be
+	// expired early by a later requester asking for a minute.
 	row := tx.QueryRowContext(ctx, `
 INSERT INTO awaited_facts(waiter_role, subject_kind, subject_key, deadline)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(waiter_role, subject_kind, subject_key) WHERE state = 'waiting'
-DO UPDATE SET deadline = excluded.deadline
+DO UPDATE SET deadline = CASE
+	WHEN excluded.deadline > awaited_facts.deadline THEN excluded.deadline
+	ELSE awaited_facts.deadline END
 RETURNING id`, request.WaiterRole, request.SubjectKind, request.SubjectKey, request.Deadline.Format(time.RFC3339Nano))
 	// RETURNING, not LastInsertId: SQLite leaves last_insert_rowid() untouched on
 	// the DO UPDATE arm, so the loser of the race would otherwise attach to some

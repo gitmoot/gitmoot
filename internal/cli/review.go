@@ -333,8 +333,63 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 // eligible while the verdict child was still running and a second reviewer was
 // dispatched. The question is answered by the tree, so the tree is what must be
 // consulted.
-func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) bool {
-	return reviewJobStillAnswersWithin(ctx, store, job, map[string]bool{})
+// reviewClaimSubject is the QUESTION a claim was minted for. #2176: the walk
+// was subject-blind, so a review job under a non-review leg answering a
+// DIFFERENT pull request or head counted as answering this claim - and because
+// a stored verdict never stops answering, the claim pinned forever while the
+// awaited fact, keyed to this exact head and purpose, could never be satisfied
+// by it. Scoping fix 2 to the subject is what keeps widening the walk safe.
+type reviewClaimSubject struct {
+	repo        string
+	pullRequest int
+	headSHA     string
+	purpose     string
+}
+
+func reviewSubjectFromClaim(claim db.ReviewRequest) (reviewClaimSubject, bool) {
+	repo, pullRequest, headSHA, err := db.ParseReviewVerdictSubjectKey(claim.SubjectKey)
+	if err != nil {
+		return reviewClaimSubject{}, false
+	}
+	purpose := strings.ToLower(strings.TrimSpace(claim.Purpose))
+	if purpose == "" {
+		purpose = db.ReviewVerdictKeyPurpose(claim.SubjectKey)
+	}
+	return reviewClaimSubject{repo: repo, pullRequest: pullRequest, headSHA: headSHA, purpose: purpose}, true
+}
+
+// answers reports whether a job's payload addresses this exact question.
+//
+// An UNKNOWN subject answers NOTHING. A claim key is always written by
+// ReviewRequestSubjectKey, so an unparseable one is corruption - and the #2176
+// lesson is that construction holds while corruption is undefended. Disabling
+// the check there would let any verdict in the tree keep the claim, which is
+// the permanent wedge this fix exists to remove. Failing toward release costs
+// at most one duplicate reviewer; the claim holder itself is exempt and keeps
+// its own claim either way.
+func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
+	if s.repo == "" {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.Repo), s.repo) || payload.PullRequest != s.pullRequest {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), s.headSHA) {
+		return false
+	}
+	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
+	if got == "" {
+		got = db.DefaultReviewPurpose
+	}
+	want := s.purpose
+	if want == "" {
+		want = db.DefaultReviewPurpose
+	}
+	return got == want
+}
+
+func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time) bool {
+	return reviewJobStillAnswersWithin(ctx, store, job, subject, now, map[string]bool{}, true)
 }
 
 // reviewJobStillAnswersWithin carries the visited set. Round 3 established the
@@ -343,46 +398,149 @@ func reviewJobStillAnswers(ctx context.Context, store *db.Store, job db.Job) boo
 // undefended, and a hand-edited parent_job_id cycle exhausted the stack. A
 // visited job is treated as no answer, which is the same direction the walk
 // already takes for a child that cannot answer.
-func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Job, seen map[string]bool) bool {
+func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Job, subject reviewClaimSubject, now time.Time, seen map[string]bool, isClaimHolder bool) bool {
 	if seen[job.ID] {
 		return false
 	}
 	seen[job.ID] = true
-	switch job.State {
-	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
-		return true
+	payload, payloadErr := workflow.ParseJobPayload(job.Payload)
+
+	// ANSWERING AND TRAVERSING ARE DIFFERENT QUESTIONS, and #2176 round 2 caught
+	// me applying that principle to non-review legs while denying it to review
+	// legs. A job may answer only if it is a REVIEW of THIS subject; the claim
+	// holder is exempt because the claim was minted for it. Everything else is
+	// still walked, because any job can be the parent of one that answers - a
+	// foreign review leg (another PR, another head) can fan out a child that
+	// reviews exactly this head, and pruning its subtree released the claim and
+	// dispatched a duplicate while that child worked.
+	canAnswer := isClaimHolder || (reviewTypedJob(job) && payloadErr == nil && subject.answers(payload))
+
+	if canAnswer {
+		switch job.State {
+		case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
+			return true
+		}
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
-	if err != nil {
+	if payloadErr != nil {
 		return false
 	}
-	if reviewVerdictDecision(job, payload) != "" {
+	if canAnswer && reviewVerdictDecision(job, payload) != "" {
 		return true
 	}
-	if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
-		return false
-	}
+	// TRAVERSAL IS GATED ON CHILDREN, NOT ON A VERDICT CLASSIFIER (#2176 round
+	// 3). This asked ResultIsFanOut, which requires a terminal REVIEW decision
+	// (approved / changes_requested) - but dispatchDelegations runs for any
+	// decision that is not blocked or failed, and a non-pipeline result keeps
+	// its delegations. So an implement or ask leg that succeeded with, say,
+	// decision "implemented" has REAL children that were never listed, and a
+	// live matching review grandchild under it was invisible. Whether a node
+	// has children is a question about the store, so ask the store.
+	// NO SKIP HERE, DELIBERATELY. The obvious optimisation - a node with no
+	// stored result never dispatched delegations, so do not list its children -
+	// is FALSE, and I proved it false on my own fixture before shipping it: a
+	// leg with a nil result and real child rows had its whole subtree pruned,
+	// which is the same defect class this walk has produced four times. Whether
+	// a node has children is a question about the store; every cheaper proxy
+	// for it has been wrong so far. The cost is bounded by the delegation cap
+	// and the seen-set, and a bounded query cost is worth less than a claim.
 	children, err := store.ListJobsByParent(ctx, job.ID)
 	if err != nil {
 		// Unknown is not proof the tree is finished; failing closed costs a
 		// re-run, failing open costs a duplicate reviewer.
 		return true
 	}
-	for _, child := range children {
-		// #2172 round 3: only a REVIEW child can answer a review question. A
-		// staged preflight may also delegate a non-review leg (implement, ask)
-		// whose result legitimately carries decision="approved"; counting it
-		// pinned the claim forever while the awaited fact - which only a review
-		// verdict can satisfy - stayed unsatisfiable. A non-review child is not
-		// evidence in either direction, so it is skipped rather than trusted.
-		if !reviewTypedJob(child) {
-			continue
+	if resultAwaitsUnbornChildren(payload.Result, len(children)) {
+		// Their subject is unknowable until they appear - EXCEPT when this node
+		// already declares a different one. #2176 round 3 measured the cost of
+		// ignoring that: a continuously active FOREIGN subtree renewed the hold
+		// indefinitely, because the bound was foreign activity rather than this
+		// claim's clock. A node that names another subject does not get to hold
+		// this claim on the strength of children it has not created.
+		if subjectIsForeign(subject, payload) {
+			return false
 		}
-		if reviewJobStillAnswersWithin(ctx, store, child, seen) {
+		if fanOutChildrenMayStillArrive(job, now) {
+			return true
+		}
+	}
+	for _, child := range children {
+		if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
 			return true
 		}
 	}
 	return false
+}
+
+// resultAwaitsUnbornChildren reports whether a stored result promised children
+// that do not exist yet. It is a STRUCTURAL question and must never be asked of
+// a verdict classifier: #2176 round 4 caught ResultIsFanOut - which requires a
+// terminal review decision of approved or changes_requested - still gating this
+// branch after traversal had been freed from it. The conflation had moved one
+// level down rather than left. Two ways to await children:
+//
+//   - nothing has landed yet, and the result announced a fan-out at all;
+//   - some children landed but FEWER than the result declared, which is the
+//     deps-deferred shape: a deferred delegation creates no row until its deps
+//     succeed, so a sibling's existence must not cancel the grace.
+func resultAwaitsUnbornChildren(result *workflow.AgentResult, existing int) bool {
+	if result == nil {
+		return false
+	}
+	if declared := len(result.Delegations); declared > existing {
+		return true
+	}
+	return existing == 0 && (result.FanOut || len(result.Delegations) > 0)
+}
+
+// subjectIsForeign reports whether a node DECLARES a subject other than the
+// claim's. Unset fields are not foreign - a coordinator leg that names no repo
+// or pull request tells us nothing, and treating silence as foreign would prune
+// the traversal this round's P2 exists to keep open.
+func subjectIsForeign(subject reviewClaimSubject, payload workflow.JobPayload) bool {
+	if subject.repo == "" {
+		return false
+	}
+	if repo := strings.TrimSpace(payload.Repo); repo != "" && !strings.EqualFold(repo, subject.repo) {
+		return true
+	}
+	if payload.PullRequest > 0 && payload.PullRequest != subject.pullRequest {
+		return true
+	}
+	if head := strings.TrimSpace(payload.HeadSHA); head != "" && !strings.EqualFold(head, subject.headSHA) {
+		return true
+	}
+	return false
+}
+
+// fanOutChildrenMayStillArrive bounds the not-yet-enqueued grace (#2176 F1).
+// Dispatch writes the parent's announcement before the children rows exist, so
+// an empty list can mean "too early to tell" - but granting that unconditionally
+// pinned the claim FOREVER for shapes where children never arrive at all: a
+// refused staged preflight is rewritten to failed with its fan-out result kept
+// verbatim, and a succeeded marked preflight whose advance is permanently
+// refused sits in the same state. Two bounds, both required:
+//
+//   - a fan-out that is not SUCCEEDED will never enqueue children, so it gets no
+//     grace at all;
+//   - a succeeded one gets the dispatch window, after which the claim releases.
+//     Failing open costs one duplicate reviewer; pinning forever costs every
+//     future review of that head, which is strictly worse.
+func fanOutChildrenMayStillArrive(job db.Job, now time.Time) bool {
+	if strings.TrimSpace(job.State) != string(workflow.JobSucceeded) {
+		return false
+	}
+	stamp := strings.TrimSpace(job.UpdatedAt)
+	if stamp == "" {
+		return false
+	}
+	updated, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		updated, err = time.Parse("2006-01-02 15:04:05", stamp)
+		if err != nil {
+			return false
+		}
+	}
+	return now.Sub(updated) <= reviewRequestDispatchWindow
 }
 
 // reviewTypedJob reports whether a job answers a REVIEW question. The job type
@@ -464,7 +622,8 @@ func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.Revie
 	job, err := store.GetJob(ctx, claim.JobID)
 	switch {
 	case err == nil:
-		return job, !reviewJobStillAnswers(ctx, store, job), nil
+		subject, _ := reviewSubjectFromClaim(claim)
+		return job, !reviewJobStillAnswers(ctx, store, job, subject, now), nil
 	case !errors.Is(err, sql.ErrNoRows):
 		return db.Job{}, false, err
 	}
