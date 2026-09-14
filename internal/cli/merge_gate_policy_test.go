@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,5 +162,44 @@ auto_merge = false
 	}
 	if resolver("owner/repo") {
 		t.Fatal("resolver did not observe auto_merge kill-switch")
+	}
+}
+
+func TestMergeRuleRefusalNamesActingRoleAndRemedy(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[org]
+enforce = "block"
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+[org.roles."gm-integrity"]
+parent = "owner"
+scope = ["gitmoot/*"]
+merge_rule = "owner"
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	denied, reason, err := mergeRuleRefusal(paths.Home, "gm-integrity")
+	if err != nil {
+		t.Fatalf("mergeRuleRefusal: %v", err)
+	}
+	if !denied {
+		t.Fatal("mergeRuleRefusal denied = false, want true")
+	}
+	for _, want := range []string{
+		"acting role `gm-integrity`",
+		"`merge_rule = \"owner\"`",
+		"owner role `owner`",
+		"Remedy:",
+	} {
+		if !strings.Contains(reason, want) {
+			t.Fatalf("reason %q does not contain %q", reason, want)
+		}
 	}
 }

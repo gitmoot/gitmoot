@@ -237,7 +237,7 @@ func TestDaemonMergeGateEscalatesOncePerAccountableRecipient(t *testing.T) {
 			t.Fatalf("Evaluate: %v", err)
 		}
 		if !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-			!strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
+			!strings.Contains(decision.Reason.Render(), "no approval is bound to current head") {
 			t.Fatalf("decision = %+v", decision)
 		}
 		return decision.Reason.Render()

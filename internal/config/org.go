@@ -17,8 +17,8 @@ import (
 // configurable through [org].wake_coalesce_hold.
 const DefaultWakeCoalesceHold = 5 * time.Minute
 
-// OrgRole is one role in the local organization registry. MergeRule is
-// deliberately advisory in phase 1a; scope is enforced at dispatch.
+// OrgRole is one role in the local organization registry. MergeRule is enforced
+// for explicit /gitmoot merge commands and advisory on other paths.
 type OrgRole struct {
 	Name        string
 	DisplayName string

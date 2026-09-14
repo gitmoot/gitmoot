@@ -1106,6 +1106,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 		FindingsAdvisory:        e.findingsAdvisory(payload.Repo),
 		ExpectedTaskState:       expectedTaskState,
 		HumanMergeRequested:     humanMergeRequested,
+		ActingOrgRole:           payload.ActingOrgRole,
 	})
 	if err != nil {
 		return MergeDecision{}, err
