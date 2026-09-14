@@ -2,10 +2,12 @@ package workflow
 
 import (
 	"context"
+	"os"
 	"slices"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -149,5 +151,57 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 	}
 	if !slices.Equal(payload.ReviewModelPool, configured) {
 		t.Fatalf("engine review pool = %v, want %v: the resolver does not reach engine-produced reviews", payload.ReviewModelPool, configured)
+	}
+}
+
+// THE CLASS FIX, pinned (#2186 round 3). Resolution being available at the
+// chokepoint is not enough: the resolver still had to be ASSIGNED, eleven files
+// did it, and the daemon's PR-comment producer - `/gitmoot @agent review` at
+// internal/daemon/daemon.go - was the site nobody assigned, so its reviews
+// enqueued pool-less and silent. A missed producer was the symptom; the absent
+// default was the defect.
+//
+// This asserts the property that makes the miss impossible: a mailbox built by
+// NewMailbox and wired by NOBODY still resolves. A new producer inherits the
+// fallback by writing no code at all.
+func TestNewMailboxResolvesAPoolWithoutAnyProducerWiringIt(t *testing.T) {
+	configHome := t.TempDir()
+	paths := config.PathsForHome(configHome)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[review_router]\ncode = [\"devin/swe-2\", \"openai-codex/gpt-5.6-sol\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", configHome)
+
+	store := openEngineStore(t)
+	seedAgent(t, store, "unwired-reviewer", []string{"review"}, "owner/repo")
+	// Exactly the daemon comment path's construction: NewMailbox, no fields set.
+	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
+
+	prepared, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
+		ID: "job-unwired", Agent: "unwired-reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "main", PullRequest: 9, HeadSHA: strings.Repeat("f", 40), ReviewPurpose: "code",
+	})
+	if err != nil {
+		t.Fatalf("PrepareEnqueue: %v", err)
+	}
+	payload, err := ParseJobPayload(prepared.Job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	if !slices.Equal(payload.ReviewModelPool, want) {
+		t.Fatalf("unwired mailbox pool = %v, want %v: a producer that assigns nothing has no provider fallback",
+			payload.ReviewModelPool, want)
 	}
 }

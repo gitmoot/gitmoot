@@ -1300,9 +1300,18 @@ underneath and is still valid for a deliberate manual dispatch.
 
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
-    [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] [--json]
+    [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
+    [--runtime <name>] [--json]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 ```
+
+`--runtime` overrides the omp pin. The router pins omp because it SELECTS the
+reviewer, so the runtime is its choice rather than an agent's identity — but a
+pin with no escape is a dead end: a role carrying a runtime-scoped
+`org_role_unavailable` hold is refused dispatch when the hold names the runtime
+it selected, and the caller has nothing else to reach for. `gitmoot agent
+review` takes the same flag and pins nothing, because a REGISTERED reviewer's
+runtime carries its auth profile and session.
 
 What one request does, in order:
 

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/evidence"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -157,7 +158,35 @@ type DeliveryWorktreeResolver func(context.Context, db.Job, JobPayload) (Deliver
 // policy. Use UnavailableDeliveryWorktreeResolver at enqueue-only/ask-only sites;
 // it errors loudly if an implement delivery ever reaches that context.
 func NewMailbox(store *db.Store, resolver DeliveryWorktreeResolver) Mailbox {
-	return Mailbox{store: store, resolveDeliveryWorktree: resolver}
+	return Mailbox{store: store, resolveDeliveryWorktree: resolver, ReviewModelPool: DefaultReviewModelPool}
+}
+
+// DefaultReviewModelPool resolves a review purpose's pool from the default
+// config home. It is the DEFAULT rather than an opt-in because #2186 round 3
+// proved the opt-in cannot hold: after "resolution moved to the chokepoint",
+// eleven files still armed the field per site and the daemon's PR-comment
+// producer (internal/daemon/daemon.go, `/gitmoot @agent review`) was simply the
+// site nobody assigned - its reviews enqueued pool-less and silent.
+//
+// A missed producer was the symptom; an absent chokepoint was the defect. With
+// resolution defaulted at construction, a new producer inherits it by writing
+// no code at all, and a caller with an explicit --home still overrides the
+// field. Fails open to nil, never to an error: an unreadable config must not
+// refuse a review.
+func DefaultReviewModelPool(purpose string) []string {
+	paths, err := config.DefaultPaths()
+	if err != nil {
+		return nil
+	}
+	settings, err := config.LoadReviewRouterSettings(paths)
+	if err != nil {
+		return nil
+	}
+	models, err := settings.Models(purpose)
+	if err != nil {
+		return nil
+	}
+	return models
 }
 
 // UnavailableDeliveryWorktreeResolver is the explicit sentinel for construction
