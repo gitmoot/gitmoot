@@ -525,28 +525,28 @@ this head` and leaves any real gate verdict untouched. A `blocked` or
 cleared and Gitmoot can still resolve it when the task resumes. A draft pull
 request keeps the marker until it is undrafted.
 
-## No Branch Update For A PR That Is Behind Main
+## Reviewed PR Is Behind Main
 
-Symptom: a pull request is behind its base and Gitmoot merges it anyway, with no
-`pull request branch update from main requested` pending verdict.
+Symptom: a reviewed pull request is behind its base. Gitmoot either merges the
+reviewed head without a branch update or blocks the merge while preserving that
+head.
 
-Likely cause: this is the intended behaviour. Requesting the update creates a
-merge commit that supersedes the head the approving verdict is bound to, so the
-next poll would find an unreviewed head and dispatch a fresh review round.
-Gitmoot skips the update where GitHub does not require an up-to-date head and
-merges the reviewed head instead.
+Likely cause: both outcomes protect the exact-head review. Gitmoot merges the
+reviewed head as it stands only when GitHub reports it mergeable and the base
+explicitly permits behind heads. A branch update would create a new head and
+invalidate the approval.
 
 Check:
 
 ```sh
+gh pr view <number> --repo owner/repo --json headRefOid,mergeable
 gh api repos/owner/repo/branches/<base>/protection --jq '.required_status_checks.strict'
 ```
 
-Fix: nothing to do in the common case. `true` keeps the update-and-retry path.
-A 404 or a permission error is *undetermined* — indistinguishable from an
-unprotected branch — and also keeps it, so the guard fails closed. Only an
-explicit `false` skips the update, and a **diverged** branch always takes the
-update because merging it can conflict.
+Fix: if the base requires an up-to-date head, mergeability is conflicting or
+unknown, or protection cannot be determined, update the branch explicitly and
+obtain a new exact-head review. `/gitmoot merge` bypasses the automatic-merge
+kill switch, but it never updates a reviewed head.
 
 ## Live Docs Or LLM Context Stale
 

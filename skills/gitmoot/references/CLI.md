@@ -2664,6 +2664,11 @@ Use GitHub PR comments as the public audit trail:
 @<agent> ask|review|implement [instructions]
 ```
 
+`/gitmoot merge` runs the policy gate even when automatic merge is disabled. It
+does not weaken exact-head review: if a reviewed head needs a branch update, the
+gate blocks without changing it. Update the branch explicitly, then obtain a new
+review for the new head.
+
 A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
 `--watch-issues` flag, an issue comment) is treated as the same command as the
 `/gitmoot <agent> <action>` form (#389). `/gitmoot resume <jobID>

@@ -695,14 +695,13 @@ Fixes:
   visibly unjudged, so an unevaluated head stops reading as an approved one. A
   later gate evaluation replaces it with the specific pending, failure, or
   success verdict for that same head.
-- A PR that is merely **behind** its base is merged on its reviewed head, and no
-  branch update is requested, unless the base branch requires an up-to-date head.
-  If you expected a `pull request branch update from main requested` pending
-  verdict and do not see one, that is why. Confirm what the gate saw with
-  `gh api repos/<owner>/<repo>/branches/<base>/protection --jq
-  '.required_status_checks.strict'`: `true` keeps the update-and-retry path, and
-  a 404 or a permission error is *undetermined* and also keeps it. Only an
-  explicit `false` skips the update. Diverged branches always take the update.
+- A PR that is behind its base is merged on its reviewed head only when GitHub
+  reports it mergeable and the base explicitly allows behind heads. If the base
+  requires an up-to-date head, mergeability is conflicting or unknown, or branch
+  protection cannot be determined, Gitmoot blocks without updating the reviewed
+  head. Update the branch explicitly, then obtain a new exact-head review.
+  `/gitmoot merge` follows the same rule: it bypasses the automatic-merge kill
+  switch, not the exact-head review fence.
 - Gitmoot publishes it only while it owns the merge decision. With
   `[merge_gate] auto_merge = false`, with `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`,
   or once a task reaches `awaiting_human_merge`, `dismissed`, `superseded`,

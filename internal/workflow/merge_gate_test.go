@@ -3044,116 +3044,6 @@ func TestPolicyMergeGateAllowsSkippedExternalCI(t *testing.T) {
 	}
 }
 
-func TestPolicyMergeGateUpdatesStaleBranchAndStaysPending(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		PullRequest: 9,
-		HeadSHA:     "head123",
-		TaskID:      "task-9",
-		ReviewRound: "review-1",
-		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
-	})
-	mergeable := true
-	gh := &fakeMergeGateGitHub{
-		pr:      github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:  github.CombinedStatus{State: "success"},
-		compare: github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
-	}
-	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
-
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "branch update") {
-		t.Fatalf("decision = %+v", decision)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge inputs = %+v", gh.merges)
-	}
-	if len(gh.updates) != 1 || gh.updates[0].ExpectedHeadSHA != "head123" {
-		t.Fatalf("update inputs = %+v", gh.updates)
-	}
-	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
-		t.Fatalf("statuses = %+v", gh.statuses)
-	}
-}
-
-func TestPolicyMergeGateBlocksStaleBranchUpdateConflict(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		PullRequest: 9,
-		HeadSHA:     "head123",
-		TaskID:      "task-9",
-		ReviewRound: "review-1",
-		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
-	})
-	mergeable := true
-	gh := &fakeMergeGateGitHub{
-		pr:        github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:    github.CombinedStatus{State: "success"},
-		compare:   github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
-		updateErr: github.UpdatePullRequestBranchError{Kind: github.UpdatePullRequestBranchErrorConflict, Detail: "conflict"},
-	}
-	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
-
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if decision.Ready || !strings.Contains(decision.Reason.Render(), "conflicts with main") {
-		t.Fatalf("decision = %+v", decision)
-	}
-	if !hasStatus(gh.statuses, GitmootMergeGateContext, "failure") {
-		t.Fatalf("statuses = %+v", gh.statuses)
-	}
-	if len(gh.comments) != 1 || !strings.Contains(gh.comments[0], "not retryable") ||
-		!strings.Contains(gh.comments[0], "task: task-9") ||
-		!strings.Contains(gh.comments[0], "Gitmoot applies file changes in the task worktree") ||
-		!strings.Contains(gh.comments[0], "rerun review/merge") {
-		t.Fatalf("comments = %+v", gh.comments)
-	}
-}
-
-func TestPolicyMergeGateKeepsStaleHeadRacePending(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		PullRequest: 9,
-		HeadSHA:     "head123",
-		TaskID:      "task-9",
-		ReviewRound: "review-1",
-		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
-	})
-	mergeable := true
-	gh := &fakeMergeGateGitHub{
-		pr:        github.PullRequest{Number: 9, HeadRef: "task-9", BaseRef: "main", HeadSHA: "head123", Mergeable: &mergeable},
-		status:    github.CombinedStatus{State: "success"},
-		compare:   github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1},
-		updateErr: github.UpdatePullRequestBranchError{Kind: github.UpdatePullRequestBranchErrorStaleHead, Detail: "stale head"},
-	}
-	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
-
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "head changed") {
-		t.Fatalf("decision = %+v", decision)
-	}
-	if !hasStatus(gh.statuses, GitmootMergeGateContext, "pending") {
-		t.Fatalf("statuses = %+v", gh.statuses)
-	}
-}
-
 func TestPolicyMergeGateKeepsMergeQueueBusyPending(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -5187,11 +5077,9 @@ type fakeMergeGateGitHub struct {
 	mergeErr       error
 	statusErr      error
 	beforeMerge    func()
-	updateErr      error
 	statuses       []github.CommitStatusInput
 	merges         []github.MergePullRequestInput
 	updates        []github.UpdatePullRequestBranchInput
-	comments       []string
 	operations     []string
 	getCalls       int
 	statusCalls    int
@@ -5252,11 +5140,6 @@ func (f *fakeMergeGateGitHub) CreateCommitStatus(_ context.Context, input github
 	return github.CommitStatus{State: input.State, Context: input.Context}, f.statusErr
 }
 
-func (f *fakeMergeGateGitHub) PostIssueComment(_ context.Context, _ github.Repository, _ int64, body string) (github.IssueComment, error) {
-	f.comments = append(f.comments, body)
-	return github.IssueComment{Body: body}, nil
-}
-
 func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ github.Repository, branch string) (bool, bool, error) {
 	f.strictCalls++
 	f.strictBranches = append(f.strictBranches, branch)
@@ -5268,7 +5151,7 @@ func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ gith
 
 func (f *fakeMergeGateGitHub) UpdatePullRequestBranch(_ context.Context, input github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error) {
 	f.updates = append(f.updates, input)
-	return github.UpdatePullRequestBranchResult{Message: "Updating pull request branch."}, f.updateErr
+	return github.UpdatePullRequestBranchResult{Message: "Updating pull request branch."}, nil
 }
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
