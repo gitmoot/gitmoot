@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/evidence"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -158,35 +157,7 @@ type DeliveryWorktreeResolver func(context.Context, db.Job, JobPayload) (Deliver
 // policy. Use UnavailableDeliveryWorktreeResolver at enqueue-only/ask-only sites;
 // it errors loudly if an implement delivery ever reaches that context.
 func NewMailbox(store *db.Store, resolver DeliveryWorktreeResolver) Mailbox {
-	return Mailbox{store: store, resolveDeliveryWorktree: resolver, ReviewModelPool: DefaultReviewModelPool}
-}
-
-// DefaultReviewModelPool resolves a review purpose's pool from the default
-// config home. It is the DEFAULT rather than an opt-in because #2186 round 3
-// proved the opt-in cannot hold: after "resolution moved to the chokepoint",
-// eleven files still armed the field per site and the daemon's PR-comment
-// producer (internal/daemon/daemon.go, `/gitmoot @agent review`) was simply the
-// site nobody assigned - its reviews enqueued pool-less and silent.
-//
-// A missed producer was the symptom; an absent chokepoint was the defect. With
-// resolution defaulted at construction, a new producer inherits it by writing
-// no code at all, and a caller with an explicit --home still overrides the
-// field. Fails open to nil, never to an error: an unreadable config must not
-// refuse a review.
-func DefaultReviewModelPool(purpose string) []string {
-	paths, err := config.DefaultPaths()
-	if err != nil {
-		return nil
-	}
-	settings, err := config.LoadReviewRouterSettings(paths)
-	if err != nil {
-		return nil
-	}
-	models, err := settings.Models(purpose)
-	if err != nil {
-		return nil
-	}
-	return models
+	return Mailbox{store: store, resolveDeliveryWorktree: resolver}
 }
 
 // UnavailableDeliveryWorktreeResolver is the explicit sentinel for construction
@@ -759,7 +730,11 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		}
 		reviewPool = compactStrings(m.ReviewModelPool(reviewPurpose))
 	}
-	reviewIsPoolless := strings.EqualFold(strings.TrimSpace(request.Action), "review") && len(reviewPool) == 0 && m.ReviewModelPool != nil
+	// The advisory does NOT require a resolver to be present. Gating it on one
+	// made the only case that matters silent: a producer that wired no resolver
+	// at all enqueued a pool-less review and said nothing, which is the exact
+	// shape of the daemon comment path before #2186 round 4.
+	reviewIsPoolless := strings.EqualFold(strings.TrimSpace(request.Action), "review") && len(reviewPool) == 0
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
 		return db.Job{}, nil, err
@@ -943,8 +918,12 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// therefore no reachable provider fallback. Say so on the job rather than
 	// leaving the degradation indistinguishable from "no resolver configured".
 	if reviewIsPoolless {
+		statedPurpose := reviewPurpose
+		if statedPurpose == "" {
+			statedPurpose = "code"
+		}
 		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "review_pool_unresolved",
-			Message: fmt.Sprintf("no review model pool resolved for purpose %q: this review has no provider fallback (check [review_router] in config)", reviewPurpose)})
+			Message: fmt.Sprintf("no review model pool resolved for purpose %q: this review has no provider fallback (check [review_router] in config)", statedPurpose)})
 	}
 	return job, advisory, nil
 }

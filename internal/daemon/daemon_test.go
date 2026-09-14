@@ -98,7 +98,10 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	if len(events) != 3 || events[0].Kind != string(workflow.JobQueued) || events[1].Kind != "workflow_autolabeled" || events[2].Kind != "routed" {
+	// review_pool_unresolved is expected here: this daemon has no engine wired,
+	// so the comment-dispatched review genuinely has no provider fallback (#2186).
+	if len(events) != 4 || events[0].Kind != string(workflow.JobQueued) || events[1].Kind != "workflow_autolabeled" ||
+		events[2].Kind != "review_pool_unresolved" || events[3].Kind != "routed" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -3136,8 +3139,15 @@ func TestPollOnceRetriesUnseenCommentAfterAckFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events = %+v, want original queue+routed only", events)
+	// The property is NO DUPLICATION from the acknowledgement retry, not a raw
+	// count: an advisory added elsewhere (#2186's review_pool_unresolved) must
+	// not make this read as a re-enqueue.
+	counts := map[string]int{}
+	for _, event := range events {
+		counts[event.Kind]++
+	}
+	if counts[string(workflow.JobQueued)] != 1 || counts["routed"] != 1 {
+		t.Fatalf("events = %+v, want exactly one queued and one routed after the retry", events)
 	}
 }
 

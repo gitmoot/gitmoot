@@ -3322,20 +3322,19 @@ func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db
 	if !errors.Is(err, sql.ErrNoRows) {
 		return db.Job{}, false, err
 	}
-	var runtimeDefaultModel func(string) string
-	if d.Workflow != nil {
-		runtimeDefaultModel = d.Workflow.RuntimeDefaultModel
-	}
-	var requireWorkflowPolicy func(string) workflow.RequireWorkflowPolicy
-	var orgPolicy func(string) workflow.OrgEnforcement
-	if d.Workflow != nil {
-		requireWorkflowPolicy = d.Workflow.RequireWorkflowPolicy
-		orgPolicy = d.Workflow.OrgPolicy
-	}
+	// #2186 round 4: take the ENGINE'S OWN mailbox rather than rebuilding one and
+	// forwarding fields by name. The old three-field copy list silently dropped
+	// ReviewModelPool, so this producer enqueued reviews resolved against the
+	// wrong config home - and because the built-in router settings seed a default
+	// pool, the result was a plausible-but-wrong pool with no advisory, which is
+	// worse than the empty pool that announced itself.
+	//
+	// A nil Workflow keeps the previous unconfigured construction: this path must
+	// enqueue even on a daemon with no engine wired.
 	mailbox := workflow.NewMailbox(d.Store, workflow.UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
-	mailbox.RuntimeDefaultModel = runtimeDefaultModel
-	mailbox.RequireWorkflowPolicy = requireWorkflowPolicy
-	mailbox.OrgPolicy = orgPolicy
+	if d.Workflow != nil {
+		mailbox = d.Workflow.EnqueueMailbox()
+	}
 	job, err := mailbox.Enqueue(ctx, request)
 	return job, true, err
 }

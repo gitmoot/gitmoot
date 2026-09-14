@@ -109,7 +109,9 @@ func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
-	if len(events) != 1 || events[0].Kind != "queued" {
+	// A review with no resolvable pool also carries the #2186 advisory: it has no
+	// provider fallback, and that must be visible on the job rather than inferred.
+	if len(events) != 2 || events[0].Kind != "queued" || events[1].Kind != "review_pool_unresolved" {
 		t.Fatalf("events = %+v", events)
 	}
 }

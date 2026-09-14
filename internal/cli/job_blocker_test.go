@@ -447,6 +447,11 @@ func TestNextReviewPoolModelStartsAtFirstEntryWhenCurrentIsNotInPool(t *testing.
 		{"registered model absent from pool advances to the head", workflow.JobPayload{Model: "kimi-code/kimi-for-coding", ReviewModelPool: pool}, quota, "devin/swe-2", true},
 		{"first entry advances to the second", workflow.JobPayload{Model: "devin/swe-2", ReviewModelPool: pool}, quota, "openai-codex/gpt-5.6-sol", true},
 		{"exhausted pool holds instead of restarting", workflow.JobPayload{Model: "openai-codex/gpt-5.6-sol", ReviewModelPool: pool}, quota, "", false},
+		// M14 (#2186 round 4): a SINGLE-entry pool is the degraded case - the
+		// mutant bounding this arm at len > 1 survived every other row, because
+		// each used a two-entry pool. One alternative is still an alternative.
+		{"single-entry pool still offers its one alternative", workflow.JobPayload{Model: "", ReviewModelPool: []string{"devin/swe-2"}}, quota, "devin/swe-2", true},
+		{"single-entry pool already in use is exhausted", workflow.JobPayload{Model: "devin/swe-2", ReviewModelPool: []string{"devin/swe-2"}}, quota, "", false},
 		{"no pool never falls back", workflow.JobPayload{Model: "", ReviewModelPool: nil}, quota, "", false},
 		{"contention is not a provider fact", workflow.JobPayload{Model: "", ReviewModelPool: pool}, blockerClassification{Class: blockerClassCheckoutContention}, "", false},
 	} {

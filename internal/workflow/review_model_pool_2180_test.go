@@ -2,12 +2,10 @@ package workflow
 
 import (
 	"context"
-	"os"
 	"slices"
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -131,7 +129,13 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "engine-reviewer", []string{"review"}, "owner/repo")
-	configured := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	// FIXTURE RULE, not a fixture fix (#2186 round 4, M6): this pool must differ
+	// from the BUILT-IN default, or a test cannot tell COPY from INHERIT and the
+	// mutant deleting the copy survives. Round 2 hit the identical vacuity with a
+	// pool equal to the config pool; fixing that instance did not stop the next
+	// test from repeating it, so the rule is now stated where the fixture is
+	// written: review-pool fixtures use sentinel names no default can produce.
+	configured := []string{"sentinel/engine-a", "sentinel/engine-b"}
 	engine := Engine{
 		Store:                   store,
 		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
@@ -154,54 +158,36 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 	}
 }
 
-// THE CLASS FIX, pinned (#2186 round 3). Resolution being available at the
-// chokepoint is not enough: the resolver still had to be ASSIGNED, eleven files
-// did it, and the daemon's PR-comment producer - `/gitmoot @agent review` at
-// internal/daemon/daemon.go - was the site nobody assigned, so its reviews
-// enqueued pool-less and silent. A missed producer was the symptom; the absent
-// default was the defect.
+// THE CLASS FIX, third attempt, and the first two are why this one is written
+// this way (#2186 round 4).
 //
-// This asserts the property that makes the miss impossible: a mailbox built by
-// NewMailbox and wired by NOBODY still resolves. A new producer inherits the
-// fallback by writing no code at all.
-func TestNewMailboxResolvesAPoolWithoutAnyProducerWiringIt(t *testing.T) {
-	configHome := t.TempDir()
-	paths := config.PathsForHome(configHome)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatal(err)
+// Round 3 armed the resolver per site across eleven files and the daemon's
+// PR-comment producer was the site nobody armed. Round 3's remedy - defaulting
+// the resolver at construction - was WORSE for that producer: it read the
+// DEFAULT config home rather than the daemon's, and since the built-in router
+// settings seed a pool, the job carried a plausible-but-wrong pool with no
+// advisory. An empty pool that announces itself beats a wrong pool that does
+// not.
+//
+// The property that ends the class: a holder of an Engine cannot enqueue
+// through a LESS configured mailbox than the engine's own, because it does not
+// build one. No field list to forget the next field from.
+func TestEnqueueMailboxForwardsEveryEngineResolver(t *testing.T) {
+	sentinel := []string{"sentinel/model-a", "sentinel/model-b"}
+	engine := Engine{
+		Store:                   openEngineStore(t),
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		ReviewModelPool:         func(string) []string { return sentinel },
+		RuntimeDefaultModel:     func(string) string { return "sentinel/default" },
 	}
-	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
+	mailbox := engine.EnqueueMailbox()
+	if mailbox.ReviewModelPool == nil {
+		t.Fatal("EnqueueMailbox dropped ReviewModelPool: a producer taking this mailbox resolves against the wrong home")
 	}
-	if _, err := file.WriteString("\n[review_router]\ncode = [\"devin/swe-2\", \"openai-codex/gpt-5.6-sol\"]\n"); err != nil {
-		file.Close()
-		t.Fatal(err)
+	if got := mailbox.ReviewModelPool("code"); !slices.Equal(got, sentinel) {
+		t.Fatalf("forwarded resolver returned %v, want the engine's own %v", got, sentinel)
 	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", configHome)
-
-	store := openEngineStore(t)
-	seedAgent(t, store, "unwired-reviewer", []string{"review"}, "owner/repo")
-	// Exactly the daemon comment path's construction: NewMailbox, no fields set.
-	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
-
-	prepared, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
-		ID: "job-unwired", Agent: "unwired-reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "main", PullRequest: 9, HeadSHA: strings.Repeat("f", 40), ReviewPurpose: "code",
-	})
-	if err != nil {
-		t.Fatalf("PrepareEnqueue: %v", err)
-	}
-	payload, err := ParseJobPayload(prepared.Job.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
-	if !slices.Equal(payload.ReviewModelPool, want) {
-		t.Fatalf("unwired mailbox pool = %v, want %v: a producer that assigns nothing has no provider fallback",
-			payload.ReviewModelPool, want)
+	if mailbox.RuntimeDefaultModel == nil {
+		t.Fatal("EnqueueMailbox dropped RuntimeDefaultModel")
 	}
 }

@@ -102,6 +102,17 @@ func (e Engine) now() time.Time {
 // nil too, so finishWithPayload neither constructs nor emits an event and the
 // path is byte-identical. The hook maps the terminal JobState to the event_type,
 // resolves root_id from the payload, and ships a redacted event fire-and-forget.
+// EnqueueMailbox is e.mailbox() for callers outside this package (#2186 round
+// 4). It exists so a producer that holds an Engine can never enqueue through a
+// LESS configured mailbox than the engine's own.
+//
+// The daemon's PR-comment producer used to build a fresh Mailbox and forward
+// three fields by name; ReviewModelPool was the fourth and was not in the list,
+// so the daemon held a home-aware resolver and discarded it. Enumerated
+// forwarding is the defect: the next home-aware field is forgotten at the same
+// site the same way. One call site, no field list, exhaustive by construction.
+func (e Engine) EnqueueMailbox() Mailbox { return e.mailbox() }
+
 func (e Engine) mailbox() Mailbox {
 	mb := NewMailbox(e.Store, e.ResolveDeliveryWorktree)
 	mb.CollectChangeSet = e.CollectChangeSet
