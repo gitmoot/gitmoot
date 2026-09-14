@@ -279,7 +279,7 @@ func TestFailedWithoutFindingsIsNotAReviewVerdict(t *testing.T) {
 
 // #2061 review, P2, found by EXECUTING the predicate: a changes_requested that
 // carries only a Summary is a live objection, and requiring findings on every
-// arm silently lost it. review_loop.go's namedReviewFindings already promotes
+// arm silently lost it. review_loop.go's NamedReviewFindings already promotes
 // that summary to a finding; this mirrors the rule rather than inventing one.
 func TestChangesRequestedWithSummaryOnlyIsAReviewVerdict(t *testing.T) {
 	if !reviewShapedResult(&AgentResult{
