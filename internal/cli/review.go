@@ -111,7 +111,11 @@ type reviewRequestOptions struct {
 	reviewer                string
 	full                    bool
 	allowPromptHeadMismatch bool
-	json                    bool
+	// runtime is the operator escape from the omp pin below (#2180). A pinned
+	// runtime with no override is a dead end whenever an unavailability hold is
+	// written for that runtime: the caller has no second choice to reach for.
+	runtime string
+	json    bool
 }
 
 func runReviewRequest(args []string, stdout, stderr io.Writer) int {
@@ -127,6 +131,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
@@ -172,6 +177,15 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	printReviewRequestOutput(stdout, output)
 	return 0
+}
+
+// reviewRequestRuntime applies the router's omp pin unless the operator named a
+// runtime. One site for the pin, so a future caller cannot lose the override.
+func reviewRequestRuntime(override string) string {
+	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return trimmed
+	}
+	return runtime.OmpRuntime
 }
 
 func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptions, stderr io.Writer) (reviewRequestOutput, error) {
@@ -297,13 +311,17 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		}
 	}
 	request := localAgentDispatchRequest{
-		RepoFlag:             repo.FullName(),
-		Agent:                reviewer.Name,
-		Action:               "review",
-		Instructions:         reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
-		Background:           true,
-		Model:                pool[0],
-		Runtime:              runtime.OmpRuntime,
+		RepoFlag:     repo.FullName(),
+		Agent:        reviewer.Name,
+		Action:       "review",
+		Instructions: reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
+		Background:   true,
+		Model:        pool[0],
+		// The router SELECTS the reviewer, so it also chooses the runtime: omp
+		// unless the operator names another. The escape matters because a pinned
+		// runtime with no override is refused outright whenever an availability
+		// hold is written for that runtime (#2181), with nothing to fall back to.
+		Runtime:              reviewRequestRuntime(opts.runtime),
 		ActingOrgRole:        opts.role,
 		OperatorOrigin:       true,
 		Home:                 opts.home,

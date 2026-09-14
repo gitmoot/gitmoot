@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2138,5 +2139,169 @@ func TestOffHistoryInvisibleVerdictDoesNotHideALaterBlockingOne(t *testing.T) {
 	}
 	if !strings.Contains(third.BaselineSkipped, "would have been selected") {
 		t.Fatalf("skip reason = %q, want the interposed verdict named", third.BaselineSkipped)
+	}
+}
+
+// #2180. The defect this pins: `gitmoot review request` armed the review model
+// pool and the omp runtime at its own construction site, and `gitmoot agent
+// review` armed neither, so every agent-review job carried an EMPTY pool - a
+// state indistinguishable from a pool with no alternatives, which made the
+// provider fallback structurally unreachable for those dispatches.
+//
+// The assertions are on the PERSISTED PAYLOAD, because that is the artifact the
+// daemon worker and the blocker actually read. Asserting the request struct
+// would pass while the field was dropped between dispatch and insert.
+// #2180 observable: a BACKGROUND job deliberately leaves EffectiveRuntime empty
+// on the payload (the daemon records it when execution starts), so the runtime a
+// dispatch actually selected - the value the unavailability gate is tested
+// against at dispatch time - is read from the runtime event the dispatcher
+// writes with the override already applied.
+func dispatchedRuntime(t *testing.T, store *db.Store, jobID string, agentDefault string) string {
+	t.Helper()
+	if override := strings.TrimSpace(dispatchedReviewPayload(t, store, jobID).RuntimeOverride); override != "" {
+		return override
+	}
+	return agentDefault
+}
+
+func TestBothReviewVerbsResolveTheSamePoolAndKeepTheirRuntimes(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+
+	// Path A: the router. Path B: agent review, which arms nothing - and whose
+	// registered runtime is deliberately NOT omp, so an unresolved runtime is
+	// visible rather than coincidentally correct.
+	routed, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home, "--json")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	routedPayload := dispatchedReviewPayload(t, store, routed.JobID)
+
+	direct, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+	})
+	if err != nil {
+		t.Fatalf("agent review dispatch: %v", err)
+	}
+	directPayload := dispatchedReviewPayload(t, store, direct.JobID)
+
+	if len(directPayload.ReviewModelPool) == 0 {
+		t.Fatal("agent review dispatched with an EMPTY pool: the provider fallback is unreachable for this job (#2180)")
+	}
+	if !slices.Equal(directPayload.ReviewModelPool, routedPayload.ReviewModelPool) {
+		t.Fatalf("pools diverge for the same purpose: agent review=%v review request=%v",
+			directPayload.ReviewModelPool, routedPayload.ReviewModelPool)
+	}
+	if want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}; !slices.Equal(directPayload.ReviewModelPool, want) {
+		t.Fatalf("resolved pool = %v, want the configured code pool %v", directPayload.ReviewModelPool, want)
+	}
+	// The runtime is the half that decides whether a runtime-scoped
+	// unavailability hold refuses this dispatch (#2181): the two verbs must
+	// answer such a hold identically or the seat's remedy depends on the verb.
+	// RUNTIME IS THE DELIBERATE EXCEPTION, pinned here so a later reading of
+	// #2180's "both paths make the same decisions" cannot quietly extend to it.
+	// The router selects its own reviewer and pins omp; `agent review` is handed
+	// a registered reviewer whose runtime is part of its identity, alongside its
+	// auth profile and session. Forcing them to agree overrides the operator's
+	// chosen agent - the first version of this fix did exactly that and broke
+	// three existing tests. What must be equal is the POOL; what must exist for
+	// runtime is an escape, covered by TestExplicitRuntimeOverridesThePinOnBothVerbs.
+	if got := dispatchedRuntime(t, store, routed.JobID, runtime.ShellRuntime); got != runtime.OmpRuntime {
+		t.Fatalf("review request runtime = %q, want the router pin %q", got, runtime.OmpRuntime)
+	}
+	if got := dispatchedRuntime(t, store, direct.JobID, runtime.ShellRuntime); got != runtime.ShellRuntime {
+		t.Fatalf("agent review runtime = %q, want the reviewer's registered %q - the pin overrode a named agent", got, runtime.ShellRuntime)
+	}
+}
+
+// The invariant the pool defect's own fix must not break, and the reason the
+// resolver is gated on the action rather than applied to every request.
+func TestNonReviewDispatchAcquiresNoReviewPool(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "builder", runtime.ShellRuntime, "true", []string{"review", "implement", "ask"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "builder", Action: "ask",
+		Instructions: "what is the state of this repo", Background: true, Home: home,
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review", ActingOrgRole: "joltra",
+	})
+	if err != nil {
+		t.Fatalf("ask dispatch: %v", err)
+	}
+	payload := dispatchedReviewPayload(t, store, out.JobID)
+	if len(payload.ReviewModelPool) != 0 {
+		t.Fatalf("non-review job acquired a reviewer's pool %v (#2180)", payload.ReviewModelPool)
+	}
+	if got := dispatchedRuntime(t, store, out.JobID, runtime.ShellRuntime); got != runtime.ShellRuntime {
+		t.Fatalf("non-review job runtime = %q, want the agent's own %q", got, runtime.ShellRuntime)
+	}
+}
+
+// Acceptance criterion 3: no review path may be a dead end. A pinned runtime
+// with no operator escape is refused outright whenever an unavailability hold
+// is written for the pinned runtime - the shape #2181 hit from the other side.
+func TestExplicitRuntimeOverridesThePinOnBothVerbs(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+
+	routed, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.ClaudeRuntime, "--json")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if got := dispatchedRuntime(t, store, routed.JobID, runtime.ShellRuntime); got != runtime.ClaudeRuntime {
+		t.Fatalf("review request --runtime ignored: runtime = %q, want %q", got, runtime.ClaudeRuntime)
+	}
+
+	direct, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 13, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true, Runtime: runtime.ClaudeRuntime,
+	})
+	if err != nil {
+		t.Fatalf("agent review dispatch: %v", err)
+	}
+	if got := dispatchedRuntime(t, store, direct.JobID, runtime.ShellRuntime); got != runtime.ClaudeRuntime {
+		t.Fatalf("agent review --runtime ignored: runtime = %q, want %q", got, runtime.ClaudeRuntime)
+	}
+}
+
+// The property that makes this seam safe to add: it RESOLVES a missing pool, it
+// does not decide one. A producer that already chose a pool - a future router,
+// a pipeline stage, an operator - must reach the daemon with exactly that pool,
+// or the shared layer becomes a second authority competing with the first,
+// which is the failure mode #2180 exists to end rather than relocate.
+func TestSharedResolverPreservesACallerSuppliedPool(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+
+	// Deliberately NOT the configured code pool, so an overwrite is visible.
+	chosen := []string{"anthropic/claude-opus-5", "devin/swe-2"}
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+		ReviewPurpose: "code", ReviewModelPool: chosen, Model: chosen[0],
+	})
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	payload := dispatchedReviewPayload(t, store, out.JobID)
+	if !slices.Equal(payload.ReviewModelPool, chosen) {
+		t.Fatalf("caller pool overwritten: got %v, want %v", payload.ReviewModelPool, chosen)
+	}
+	if payload.Model != chosen[0] {
+		t.Fatalf("caller model overwritten: got %q, want %q", payload.Model, chosen[0])
 	}
 }

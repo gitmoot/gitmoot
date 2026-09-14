@@ -225,7 +225,85 @@ type localAgentJobOutput struct {
 	AdvanceError string `json:"advance_error,omitempty"`
 }
 
+// resolveReviewDispatchDefaults arms a review dispatch with the model pool and
+// runtime that `gitmoot review request` used to arm by hand, at the ONE function
+// both review paths call (#2180).
+//
+// THE DIVERGENCE THIS CLOSES. Two producers reach this dispatcher. `review
+// request` built its request at review.go with a configured pool and a pinned
+// omp runtime; `agent review` built one with neither, so its jobs carried an
+// EMPTY ReviewModelPool. An empty pool is indistinguishable from a pool with no
+// alternatives, which is why the router's provider fallback — correctly wired at
+// job_blocker.go:666, consulting the blocker in the right order — has been
+// structurally unreachable for every review this fleet dispatches since it
+// shipped. The field that arms it was populated in exactly one place, and that
+// place was not the shared one.
+//
+// ARMING PER PATH IS WHAT PRODUCED THE DEFECT, so this does not add a second
+// construction site: it resolves here, after both producers have handed their
+// request over, and is a no-op for a request that already carries a pool.
+//
+// RUNTIME IS DELIBERATELY NOT RESOLVED HERE, and the first version of this fix
+// got that wrong. #2180 asked for the two verbs to agree on runtime as well as
+// pool, and they must not: `agent review` names a REGISTERED reviewer, whose
+// runtime is part of its identity along with its model, auth profile and
+// session. Pinning omp over it is not symmetry, it is overriding the operator's
+// chosen agent - measured, it broke three existing tests, sending a claude
+// reviewer to a claude-profile-less omp seat
+// (TestDispatchReviewAllocatesDistinctExactHeadWorktrees) and refusing a
+// dispatch outright on an omp-only auth precondition
+// (TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy).
+//
+// The router pins omp because it SELECTS the reviewer itself; a caller who
+// names one is entitled to that agent's runtime. What #2181 actually requires
+// is not one runtime but no DEAD END, which is the --runtime escape both verbs
+// now expose.
+//
+// NON-REVIEW JOBS ARE UNTOUCHED, which is the invariant the pool defect's own
+// regression test pins: the action gate below is the whole reason a non-review
+// leg cannot acquire a reviewer's pool or runtime.
+//
+// FAIL-OPEN ON CONFIG. An unreadable or purpose-less router config leaves the
+// request exactly as the producer built it rather than refusing the dispatch:
+// this seam exists to close a gap between two paths, and it must not become a
+// new way for either to fail.
+func resolveReviewDispatchDefaults(request localAgentDispatchRequest) localAgentDispatchRequest {
+	if !strings.EqualFold(strings.TrimSpace(request.Action), "review") {
+		return request
+	}
+	for _, model := range request.ReviewModelPool {
+		if strings.TrimSpace(model) != "" {
+			return request
+		}
+	}
+	paths, err := pathsFromFlag(request.Home)
+	if err != nil {
+		return request
+	}
+	routerSettings, err := config.LoadReviewRouterSettings(paths)
+	if err != nil {
+		return request
+	}
+	purpose := strings.TrimSpace(request.ReviewPurpose)
+	if purpose == "" {
+		purpose = db.DefaultReviewPurpose
+	}
+	pool, err := routerSettings.Models(purpose)
+	if err != nil || len(pool) == 0 {
+		return request
+	}
+	request.ReviewPurpose = purpose
+	request.ReviewModelPool = pool
+	if strings.TrimSpace(request.Model) == "" {
+		request.Model = pool[0]
+	}
+	return request
+}
+
 func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (output localAgentJobOutput, err error) {
+	// #2180: both review producers hand their request over here, so the pool and
+	// runtime are resolved once, before any validation reads them.
+	request = resolveReviewDispatchDefaults(request)
 	// Validate a requested per-job runtime override FIRST — an unknown runtime
 	// (or a shell override without a session command) must fail with a clear
 	// error before any job is enqueued or any repo/agent state is touched.
