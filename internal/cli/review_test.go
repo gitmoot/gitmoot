@@ -2200,9 +2200,6 @@ func TestBothReviewVerbsResolveTheSamePoolAndKeepTheirRuntimes(t *testing.T) {
 	if want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}; !slices.Equal(directPayload.ReviewModelPool, want) {
 		t.Fatalf("resolved pool = %v, want the configured code pool %v", directPayload.ReviewModelPool, want)
 	}
-	// The runtime is the half that decides whether a runtime-scoped
-	// unavailability hold refuses this dispatch (#2181): the two verbs must
-	// answer such a hold identically or the seat's remedy depends on the verb.
 	// RUNTIME IS THE DELIBERATE EXCEPTION, pinned here so a later reading of
 	// #2180's "both paths make the same decisions" cannot quietly extend to it.
 	// The router selects its own reviewer and pins omp; `agent review` is handed
@@ -2303,5 +2300,69 @@ func TestSharedResolverPreservesACallerSuppliedPool(t *testing.T) {
 	}
 	if payload.Model != chosen[0] {
 		t.Fatalf("caller model overwritten: got %q, want %q", payload.Model, chosen[0])
+	}
+}
+
+// The scoping the owner's runtime switch needs, proved where a live provider
+// is not required: a shell agent's command is what executes, so a pool fallback
+// advances its model but must NOT move it to omp - that would silently replace
+// the operator's script with a model. Found by an existing test failing, then
+// pinned here.
+func TestReviewFallbackKeepsAScriptAgentOnItsRuntime(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	seedDaemonWorkerAgent(t, store, "script-reviewer", runtime.ShellRuntime,
+		`echo "HTTP 429 Too Many Requests: rate limit reached; try again in 3 seconds" 1>&2
+exit 1`, []string{"review"}, "owner/repo")
+	// No Model: the `agent review` shape, whose pool #2180 now resolves.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-script", Agent: "script-reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("b", 40), NoFixTarget: true,
+		ReviewModelPool: []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}, ReviewPurpose: "code",
+	})
+	worker := blockerE2EWorker(store, home, checkout)
+
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	_, payload := blockerE2EJobPayload(t, store, "job-script")
+	// A model that was never a pool entry now advances to the head of the pool:
+	// before #2180 armed these jobs, this branch could not be reached at all.
+	if payload.Model != "devin/swe-2" {
+		t.Fatalf("model = %q, want the first untried pool entry", payload.Model)
+	}
+	if payload.RuntimeOverride != "" {
+		t.Fatalf("runtime_override = %q, want none: switching a script agent to omp discards the script it runs", payload.RuntimeOverride)
+	}
+}
+
+// The owner's fallback decision itself (2026-09-14): a quota-blocked review on
+// a model-driven runtime retries on omp with the next pool model, rather than
+// on the runtime that just refused it. A pool entry is an OMP provider/model
+// name, so retrying a claude or codex job with it swaps one guaranteed failure
+// for another.
+//
+// Asserted on the predicate because the alternative needs a live claude/codex
+// delivery; the e2e above covers the excluded case on a real worker.
+func TestReviewFallbackRuntimeSwitchScope(t *testing.T) {
+	for _, tc := range []struct {
+		effectiveRuntime string
+		want             bool
+	}{
+		{runtime.ClaudeRuntime, true},
+		{"codex", true},
+		{"kimi", true},
+		{runtime.OmpRuntime, false},
+		{runtime.ShellRuntime, false},
+		{"", false},
+	} {
+		if got := reviewFallbackSwitchesToOmp(tc.effectiveRuntime); got != tc.want {
+			t.Fatalf("reviewFallbackSwitchesToOmp(%q) = %v, want %v", tc.effectiveRuntime, got, tc.want)
+		}
 	}
 }

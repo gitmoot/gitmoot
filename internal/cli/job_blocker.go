@@ -123,6 +123,27 @@ func isOmpProviderTransportFailure(text string) bool {
 	return strings.Contains(strings.ToLower(text), ompProviderTransportSignature)
 }
 
+// reviewFallbackSwitchesToOmp reports whether a pool fallback should move the
+// retry onto the omp runtime (owner decision 2026-09-14).
+//
+// True only for a MODEL-DRIVEN runtime that is not already omp. Two exclusions,
+// both load-bearing:
+//
+//   - shell: the agent's COMMAND executes and the model names nothing, so a
+//     switch would silently replace the operator's script with a model. Caught
+//     by TestReviewModelPoolFallsBackBeforeTimedHold, not by reasoning.
+//   - unknown/empty: an unreadable agent row is not evidence that a switch is
+//     safe. Leaving the runtime alone degrades to the previous behaviour; a
+//     wrong switch runs the job somewhere the operator never chose.
+func reviewFallbackSwitchesToOmp(effectiveRuntime string) bool {
+	switch strings.TrimSpace(effectiveRuntime) {
+	case "", runtime.OmpRuntime, runtime.ShellRuntime:
+		return false
+	default:
+		return true
+	}
+}
+
 // nextReviewPoolModel returns the pool entry after the one currently in use.
 // Quota, auth and a stalled provider stream qualify: each is a fact about ONE
 // provider that the next entry does not share. A GitHub/network outage or
@@ -140,9 +161,22 @@ func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClas
 	}
 	current := strings.TrimSpace(payload.Model)
 	for i, model := range payload.ReviewModelPool {
-		if model == current && i+1 < len(payload.ReviewModelPool) {
-			return payload.ReviewModelPool[i+1], true
+		if model == current {
+			if i+1 < len(payload.ReviewModelPool) {
+				return payload.ReviewModelPool[i+1], true
+			}
+			// The pool is exhausted: fall through to the timed hold rather than
+			// restarting at the head, which would retry an entry that already
+			// failed this attempt sequence.
+			return "", false
 		}
+	}
+	// Not in the pool at all: a review that ran on its agent's own model, which
+	// is every `gitmoot agent review` dispatch (#2180). Before the pool reached
+	// these jobs this branch could not be taken; now the first pool entry is the
+	// first UNTRIED alternative, so a blocked review has somewhere to go.
+	if len(payload.ReviewModelPool) > 0 {
+		return payload.ReviewModelPool[0], true
 	}
 	return "", false
 }
@@ -663,8 +697,39 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	// attempt budget above still bounds the whole sequence.
 	eventKind := blockerDeferredEventKind
 	previousModel := payload.Model
+	previousRuntime := strings.TrimSpace(payload.RuntimeOverride)
 	if next, ok := nextReviewPoolModel(payload, classification); ok {
 		payload.Model = next
+		// OWNER DECISION 2026-09-14: a quota/auth blocker falls back by moving to
+		// omp with the next pool model, not by retrying the dead runtime.
+		//
+		// This is required for correctness, not preference: a pool entry is an
+		// OMP provider/model name ("devin/swe-2"), and a review running on the
+		// claude or codex runtime would emit it as --model, which that runtime
+		// cannot resolve. Arming the pool for `agent review` (#2180) is what put
+		// non-omp runtimes on this path for the first time, so the switch ships
+		// with it rather than after it.
+		//
+		// SCOPED AWAY FROM SCRIPT AGENTS, found by an existing test rather than
+		// by reasoning: on the shell runtime the agent's COMMAND is what
+		// executes and the model names nothing, so switching to omp would
+		// silently replace the operator's script with a model. A pool entry
+		// cannot rescue a script, so those jobs advance the model (harmless)
+		// and keep their runtime.
+		effectiveRuntime := previousRuntime
+		if effectiveRuntime == "" {
+			if agent, agentErr := w.Store.GetAgent(ctx, latest.Agent); agentErr == nil {
+				effectiveRuntime = strings.TrimSpace(agent.Runtime)
+			}
+		}
+		if reviewFallbackSwitchesToOmp(effectiveRuntime) {
+			overrideRuntime, overrideRef, overrideErr := resolveJobRuntimeOverride(runtime.OmpRuntime, "")
+			if overrideErr != nil {
+				return false, overrideErr
+			}
+			payload.RuntimeOverride = overrideRuntime
+			payload.RuntimeOverrideRef = overrideRef
+		}
 		retryAt = time.Now().UTC().Format(time.RFC3339Nano)
 		eventKind = reviewModelFallbackEventKind
 	}
@@ -687,8 +752,8 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	message := fmt.Sprintf("%s: attempt %d/%d, retry at %s: %s",
 		classification.Class, attempt, maxOperationalBlockerRetries, retryAt, classification.Detail)
 	if eventKind == reviewModelFallbackEventKind {
-		message = fmt.Sprintf("%s on %s; falling back to review model %s (attempt %d/%d): %s",
-			classification.Class, previousModel, payload.Model, attempt, maxOperationalBlockerRetries, classification.Detail)
+		message = fmt.Sprintf("%s on %s; falling back to review model %s on runtime %s (attempt %d/%d): %s",
+			classification.Class, previousModel, payload.Model, payload.RuntimeOverride, attempt, maxOperationalBlockerRetries, classification.Detail)
 	}
 	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
 		JobID:   jobID,

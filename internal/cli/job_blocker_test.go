@@ -427,3 +427,34 @@ func TestRestorePreIsolationPayloadForDeferredJob(t *testing.T) {
 		}
 	})
 }
+
+// #2180. Arming the pool for `gitmoot agent review` puts jobs on the fallback
+// path whose model was never a pool entry - they ran on their agent's own
+// model. Before that, the loop could only advance from a known entry, so such a
+// job had nowhere to go and fell through to the timed hold.
+func TestNextReviewPoolModelStartsAtFirstEntryWhenCurrentIsNotInPool(t *testing.T) {
+	pool := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	quota := blockerClassification{Class: blockerClassRuntimeQuota}
+
+	for _, tc := range []struct {
+		name           string
+		payload        workflow.JobPayload
+		classification blockerClassification
+		wantModel      string
+		wantOK         bool
+	}{
+		{"agent model absent from pool advances to the head", workflow.JobPayload{Model: "", ReviewModelPool: pool}, quota, "devin/swe-2", true},
+		{"registered model absent from pool advances to the head", workflow.JobPayload{Model: "kimi-code/kimi-for-coding", ReviewModelPool: pool}, quota, "devin/swe-2", true},
+		{"first entry advances to the second", workflow.JobPayload{Model: "devin/swe-2", ReviewModelPool: pool}, quota, "openai-codex/gpt-5.6-sol", true},
+		{"exhausted pool holds instead of restarting", workflow.JobPayload{Model: "openai-codex/gpt-5.6-sol", ReviewModelPool: pool}, quota, "", false},
+		{"no pool never falls back", workflow.JobPayload{Model: "", ReviewModelPool: nil}, quota, "", false},
+		{"contention is not a provider fact", workflow.JobPayload{Model: "", ReviewModelPool: pool}, blockerClassification{Class: blockerClassCheckoutContention}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model, ok := nextReviewPoolModel(tc.payload, tc.classification)
+			if model != tc.wantModel || ok != tc.wantOK {
+				t.Fatalf("nextReviewPoolModel = (%q, %v), want (%q, %v)", model, ok, tc.wantModel, tc.wantOK)
+			}
+		})
+	}
+}
