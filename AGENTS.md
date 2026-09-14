@@ -458,8 +458,9 @@ silently dropped the non-empty `tests_run` evidence bar and the immediate
 pre-merge re-read - the two that caught a verdict which executed nothing and
 every head that moved under a review. One review is sufficient; another model
 family is preferred when available but never a gate. `/gitmoot merge` enforces
-the acting role's `merge_rule` from the durable branch lock: `"owner"` and
-`"none"` refuse a non-owner acting role and name the remedy. Other merge paths
+the acting role's `merge_rule` from the durable branch lock: `"owner"` refuses
+a non-root acting role, while `"none"` refuses every acting role; each refusal
+names the remedy. Other merge paths
 remain advisory: **an armed engine merge gate may merge on its own
 approval-plus-green conditions, with no `merge_rule` holder acting at all**, so
 a holder MUST NOT rely on parking a local commit to protect a merge window.

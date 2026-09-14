@@ -185,10 +185,7 @@ merge_rule = "owner"
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	denied, reason, err := mergeRuleRefusal(paths.Home, "gm-integrity")
-	if err != nil {
-		t.Fatalf("mergeRuleRefusal: %v", err)
-	}
+	denied, reason := mergeRuleRefusal(paths.Home, "gm-integrity")
 	if !denied {
 		t.Fatal("mergeRuleRefusal denied = false, want true")
 	}
@@ -201,5 +198,45 @@ merge_rule = "owner"
 		if !strings.Contains(reason, want) {
 			t.Fatalf("reason %q does not contain %q", reason, want)
 		}
+	}
+}
+
+func TestMergeRuleRefusalAllowsWarningOnlyEnforcement(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+[org.roles."gm-integrity"]
+parent = "owner"
+scope = ["gitmoot/*"]
+merge_rule = "none"
+`), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if denied, reason := mergeRuleRefusal(paths.Home, "gm-integrity"); denied || reason != "" {
+		t.Fatalf("mergeRuleRefusal = (%v, %q), want (false, empty) under warning-only enforcement", denied, reason)
+	}
+}
+
+func TestMergeRuleRefusalAllowsUnreadableOrganizationConfig(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if denied, reason := mergeRuleRefusal(paths.Home, "gm-integrity"); denied || reason != "" {
+		t.Fatalf("mergeRuleRefusal = (%v, %q), want (false, empty) for unreadable organization config", denied, reason)
 	}
 }
