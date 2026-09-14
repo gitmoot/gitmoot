@@ -48,7 +48,6 @@ type Client interface {
 	PostIssueComment(ctx context.Context, repo Repository, issueNumber int64, body string) (IssueComment, error)
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
-	UpdatePullRequestBranch(ctx context.Context, input UpdatePullRequestBranchInput) (UpdatePullRequestBranchResult, error)
 	BaseRequiresUpToDateHead(ctx context.Context, repo Repository, branch string) (required bool, known bool, err error)
 	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
 	ListCheckRunsForRef(ctx context.Context, repo Repository, ref string) ([]PullRequestCheck, error)
@@ -336,52 +335,6 @@ type MergeResult struct {
 	SHA     string `json:"sha"`
 	Merged  bool   `json:"merged"`
 	Message string `json:"message"`
-}
-
-type UpdatePullRequestBranchInput struct {
-	Repo            Repository
-	Number          int64
-	ExpectedHeadSHA string
-}
-
-type UpdatePullRequestBranchResult struct {
-	Message string `json:"message"`
-	URL     string `json:"url"`
-}
-
-type UpdatePullRequestBranchErrorKind string
-
-const (
-	UpdatePullRequestBranchErrorStaleHead   UpdatePullRequestBranchErrorKind = "stale_head"
-	UpdatePullRequestBranchErrorConflict    UpdatePullRequestBranchErrorKind = "conflict"
-	UpdatePullRequestBranchErrorUnsupported UpdatePullRequestBranchErrorKind = "unsupported"
-	UpdatePullRequestBranchErrorTransient   UpdatePullRequestBranchErrorKind = "transient"
-)
-
-type UpdatePullRequestBranchError struct {
-	Kind   UpdatePullRequestBranchErrorKind
-	Detail string
-	Err    error
-}
-
-func (e UpdatePullRequestBranchError) Error() string {
-	detail := strings.TrimSpace(e.Detail)
-	if detail == "" && e.Err != nil {
-		detail = e.Err.Error()
-	}
-	if detail == "" {
-		detail = string(e.Kind)
-	}
-	return "update pull request branch " + string(e.Kind) + ": " + detail
-}
-
-func (e UpdatePullRequestBranchError) Unwrap() error {
-	return e.Err
-}
-
-func IsUpdatePullRequestBranchError(err error, kind UpdatePullRequestBranchErrorKind) bool {
-	var updateErr UpdatePullRequestBranchError
-	return errors.As(err, &updateErr) && updateErr.Kind == kind
 }
 
 type CombinedStatus struct {
@@ -1095,32 +1048,6 @@ func (c *GhClient) BaseRequiresUpToDateHead(ctx context.Context, repo Repository
 	default:
 		return false, false, nil
 	}
-}
-
-func (c *GhClient) UpdatePullRequestBranch(ctx context.Context, input UpdatePullRequestBranchInput) (UpdatePullRequestBranchResult, error) {
-	if strings.TrimSpace(input.Repo.FullName()) == "" {
-		return UpdatePullRequestBranchResult{}, errors.New("repository is required")
-	}
-	if input.Number <= 0 {
-		return UpdatePullRequestBranchResult{}, errors.New("pull request number is required")
-	}
-	args := []string{
-		"api",
-		"-X", "PUT",
-		endpoint(input.Repo, "pulls", input.Number, "update-branch"),
-	}
-	if expected := strings.TrimSpace(input.ExpectedHeadSHA); expected != "" {
-		args = append(args, "-f", "expected_head_sha="+expected)
-	}
-	result, err := c.run(ctx, true, args...)
-	if err != nil {
-		return UpdatePullRequestBranchResult{}, classifyUpdatePullRequestBranchError(result, err)
-	}
-	var response UpdatePullRequestBranchResult
-	if err := json.Unmarshal([]byte(result.Stdout), &response); err != nil {
-		return UpdatePullRequestBranchResult{}, fmt.Errorf("decode gh update-branch response: %w", err)
-	}
-	return response, nil
 }
 
 // GetCombinedStatus reads the combined commit status for a ref. per_page=100
@@ -1863,33 +1790,6 @@ func isNoChecks(result subprocess.Result) bool {
 func isUnsupportedJSONFlag(result subprocess.Result) bool {
 	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
 	return strings.Contains(text, "unknown flag: --json") || strings.Contains(text, "unknown shorthand flag") && strings.Contains(text, "json")
-}
-
-func classifyUpdatePullRequestBranchError(result subprocess.Result, err error) error {
-	detail := strings.TrimSpace(result.Stderr)
-	if detail == "" {
-		detail = strings.TrimSpace(result.Stdout)
-	}
-	text := strings.ToLower(detail + "\n" + err.Error())
-	kind := UpdatePullRequestBranchErrorTransient
-	switch {
-	case strings.Contains(text, "expected_head_sha") ||
-		strings.Contains(text, "expected head sha") ||
-		strings.Contains(text, "head sha") && strings.Contains(text, "does not match"):
-		kind = UpdatePullRequestBranchErrorStaleHead
-	case strings.Contains(text, "merge conflict") ||
-		strings.Contains(text, "cannot be cleanly merged") ||
-		strings.Contains(text, "not mergeable") ||
-		strings.Contains(text, "conflict"):
-		kind = UpdatePullRequestBranchErrorConflict
-	case strings.Contains(text, "forbidden") ||
-		strings.Contains(text, "permission") ||
-		strings.Contains(text, "protected branch") ||
-		strings.Contains(text, "head repository") ||
-		strings.Contains(text, "fork"):
-		kind = UpdatePullRequestBranchErrorUnsupported
-	}
-	return UpdatePullRequestBranchError{Kind: kind, Detail: detail, Err: err}
 }
 
 func endpoint(repo Repository, parts ...any) string {

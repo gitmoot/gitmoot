@@ -19,8 +19,7 @@ import (
 // Error() is transparent (it forwards to the wrapped error) so every existing
 // string-based consumer of a gh failure — logs, comments, the #552 stuck-reason
 // matcher — stays byte-identical; the marker is observed only via errors.As /
-// AsTransient. It mirrors the existing UpdatePullRequestBranchError transient
-// discriminator, generalized to any gh call routed through commandError.
+// AsTransient for any gh call routed through commandError.
 type TransientError struct{ Err error }
 
 func (e TransientError) Error() string {

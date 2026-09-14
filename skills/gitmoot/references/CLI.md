@@ -3477,9 +3477,9 @@ kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
-such as a busy base-branch merge queue or a GitHub branch update in progress,
-are retried on the next daemon poll tick. The default poll interval is `30s`
-unless the daemon was started with a different `--poll`.
+such as a busy base-branch merge queue or an active job on the PR branch, are
+retried on the next daemon poll tick. The default poll interval is `30s` unless
+the daemon was started with a different `--poll`.
 
 ### Draining before a deploy
 

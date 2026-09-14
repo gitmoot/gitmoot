@@ -5079,7 +5079,6 @@ type fakeMergeGateGitHub struct {
 	beforeMerge    func()
 	statuses       []github.CommitStatusInput
 	merges         []github.MergePullRequestInput
-	updates        []github.UpdatePullRequestBranchInput
 	operations     []string
 	getCalls       int
 	statusCalls    int
@@ -5147,11 +5146,6 @@ func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ gith
 		return false, false, f.strictErr
 	}
 	return f.strictBase, f.strictKnown, nil
-}
-
-func (f *fakeMergeGateGitHub) UpdatePullRequestBranch(_ context.Context, input github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error) {
-	f.updates = append(f.updates, input)
-	return github.UpdatePullRequestBranchResult{Message: "Updating pull request branch."}, nil
 }
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {

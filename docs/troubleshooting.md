@@ -719,15 +719,11 @@ Fixes:
   deferral: the task stays `ready_to_merge` rather than becoming blocked, and the
   daemon re-evaluates on its next tick instead of squash-merging and deleting a
   branch beneath an `ask`, `review`, or `implement` job.
-- If the PR branch is merely behind or diverged from base, keep the daemon
-  running. Gitmoot serializes the base-branch merge gate, asks GitHub to update
-  the PR branch safely, then retries on a later daemon poll tick. The default
-  poll interval is `30s` unless `--poll` was configured differently.
-- If GitHub reports a branch update conflict, Gitmoot stops retrying, posts a
-  PR comment, marks `gitmoot/merge-gate` as failed, records `advance_blocked`
-  when the block came from job advancement, and shows the reason in
-  `gitmoot task list` / `gitmoot job events <job-id>`. Resolve the conflict
-  manually or run an explicit implement/fix job, then rerun review/merge.
+- If the reviewed PR branch is behind or diverged and cannot merge as-is,
+  Gitmoot blocks without updating it, marks `gitmoot/merge-gate` as failed, and
+  shows the reason in `gitmoot task list` / `gitmoot job events <job-id>`.
+  Update or fix the branch explicitly, then obtain a new exact-head review
+  before rerunning the merge.
 - Fix failing external CI or Gitmoot statuses.
 - If the task is `awaiting_human_merge`, inspect its reason. Either the mandatory
   exact-head review/CI gate missed (and the daemon journaled its chart-derived org
