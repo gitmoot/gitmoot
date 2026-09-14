@@ -702,6 +702,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("local agent enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+	mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
@@ -951,6 +952,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// Fail-open/empty by default; an agent/job pin wins.
 		mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
 		mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+		mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
 		_, runErr := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter)
 		recordKimiCredentialDegradation(ctx, store, io.Discard, job.ID, effectiveAgent, credentialBefore, credentialObserved)
@@ -1105,6 +1107,7 @@ func buildLocalAgentJobOutput(latest db.Job, request localAgentDispatchRequest) 
 func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, defaultBranch string, agentName string, overrideRuntime string, overrideRef string, orgPolicy func(string) workflow.OrgEnforcement) (localAgentJobOutput, error) {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("permission-blocked local agent enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
+	mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{

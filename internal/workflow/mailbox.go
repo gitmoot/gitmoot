@@ -103,6 +103,16 @@ type Mailbox struct {
 	// default, and any error/empty result) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// ReviewModelPool resolves the ordered provider/model fallback chain for a
+	// review purpose (#2180). Nil means no pool is attached, which is what every
+	// non-router review received before this field existed - and an empty pool is
+	// indistinguishable from a pool with no alternatives, which is exactly why
+	// the provider fallback was structurally unreachable for those dispatches.
+	//
+	// It lives here because enqueue is the ONE chokepoint BOTH producers pass:
+	// the CLI (dispatchLocalAgentJob) and the engine (e.enqueue). Arming it per
+	// dispatch path is how the fallback shipped unreachable in the first place.
+	ReviewModelPool func(purpose string) []string
 	// RuntimeDefaultEffort mirrors RuntimeDefaultModel for reasoning effort. It is
 	// consulted only as the final fallback after payload.Effort and agent.Effort;
 	// nil or empty forces no runtime argument.
@@ -706,6 +716,25 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		return db.Job{}, nil, err
 	}
 
+	// #2180: resolve the review model pool here, once, for every producer. The
+	// caller's pool always wins; a non-review job must reach the daemon with an
+	// EMPTY pool, because the claim walk and the blocker fallback both read it.
+	reviewPurpose := strings.TrimSpace(request.ReviewPurpose)
+	reviewPool := compactStrings(request.ReviewModelPool)
+	if strings.EqualFold(strings.TrimSpace(request.Action), "review") && len(reviewPool) == 0 && m.ReviewModelPool != nil {
+		if reviewPurpose == "" {
+			// config.ReviewRouterSettings refuses an unknown purpose and every
+			// pool falls back to code anyway, so an unstated purpose resolves
+			// the same chain the router would have chosen.
+			reviewPurpose = "code"
+		}
+		reviewPool = compactStrings(m.ReviewModelPool(reviewPurpose))
+	}
+	// The advisory does NOT require a resolver to be present. Gating it on one
+	// made the only case that matters silent: a producer that wired no resolver
+	// at all enqueued a pool-less review and said nothing, which is the exact
+	// shape of the daemon comment path before #2186 round 4.
+	reviewIsPoolless := strings.EqualFold(strings.TrimSpace(request.Action), "review") && len(reviewPool) == 0
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
 		return db.Job{}, nil, err
@@ -852,8 +881,8 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Network:                  request.Network,
 		Check:                    strings.TrimSpace(request.Check),
 		CheckRetries:             request.CheckRetries,
-		ReviewPurpose:            strings.TrimSpace(request.ReviewPurpose),
-		ReviewModelPool:          compactStrings(request.ReviewModelPool),
+		ReviewPurpose:            reviewPurpose,
+		ReviewModelPool:          reviewPool,
 		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
 	})
 	if err != nil {
@@ -882,6 +911,19 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	}
 	if orgWarning != "" {
 		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning})
+	}
+	// #2186 review, F3: the resolver fails OPEN on an unreadable or purpose-less
+	// [review_router] - a broken config must never refuse a review. Silently,
+	// though, that restores the exact pre-#2180 state: a review with no pool and
+	// therefore no reachable provider fallback. Say so on the job rather than
+	// leaving the degradation indistinguishable from "no resolver configured".
+	if reviewIsPoolless {
+		statedPurpose := reviewPurpose
+		if statedPurpose == "" {
+			statedPurpose = "code"
+		}
+		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "review_pool_unresolved",
+			Message: fmt.Sprintf("no review model pool resolved for purpose %q: this review has no provider fallback (check [review_router] in config)", statedPurpose)})
 	}
 	return job, advisory, nil
 }

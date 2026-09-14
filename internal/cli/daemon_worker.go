@@ -3704,6 +3704,7 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 	}
 	mailbox := workflow.NewMailbox(w.Store, workflow.UnavailableDeliveryWorktreeResolver("temporary worker merge-back enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(w.workflowHome())
+	mailbox.ReviewModelPool = reviewModelPoolResolver(w.workflowHome())
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(w.workflowHome())
 	mailbox.OrgPolicy = orgPolicyResolver(w.workflowHome())
 	if _, err := mailbox.Enqueue(ctx, request); err != nil {
