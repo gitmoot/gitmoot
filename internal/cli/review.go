@@ -427,9 +427,14 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 	if canAnswer && reviewVerdictDecision(job, payload) != "" {
 		return true
 	}
-	if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
-		return false
-	}
+	// TRAVERSAL IS GATED ON CHILDREN, NOT ON A VERDICT CLASSIFIER (#2176 round
+	// 3). This asked ResultIsFanOut, which requires a terminal REVIEW decision
+	// (approved / changes_requested) - but dispatchDelegations runs for any
+	// decision that is not blocked or failed, and a non-pipeline result keeps
+	// its delegations. So an implement or ask leg that succeeded with, say,
+	// decision "implemented" has REAL children that were never listed, and a
+	// live matching review grandchild under it was invisible. Whether a node
+	// has children is a question about the store, so ask the store.
 	children, err := store.ListJobsByParent(ctx, job.ID)
 	if err != nil {
 		// Unknown is not proof the tree is finished; failing closed costs a
@@ -437,16 +442,46 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 		return true
 	}
 	if len(children) == 0 {
-		// The announcement exists and the children do not YET. Their subject is
-		// unknowable until they appear, so this grace is deliberately not
-		// subject-scoped - and it is bounded, so an announcement whose children
-		// never arrive releases instead of wedging the claim.
+		// No children YET is only meaningful for an announcement that promised
+		// them; anything else is simply a leaf.
+		if payload.Result == nil || !workflow.ResultIsFanOut(payload.Result) {
+			return false
+		}
+		// Their subject is unknowable until they appear - EXCEPT when this node
+		// already declares a different one. #2176 round 3 measured the cost of
+		// ignoring that: a continuously active FOREIGN subtree renewed the hold
+		// indefinitely, because the bound was foreign activity rather than this
+		// claim's clock. A node that names another subject does not get to hold
+		// this claim on the strength of children it has not created.
+		if subjectIsForeign(subject, payload) {
+			return false
+		}
 		return fanOutChildrenMayStillArrive(job, now)
 	}
 	for _, child := range children {
 		if reviewJobStillAnswersWithin(ctx, store, child, subject, now, seen, false) {
 			return true
 		}
+	}
+	return false
+}
+
+// subjectIsForeign reports whether a node DECLARES a subject other than the
+// claim's. Unset fields are not foreign - a coordinator leg that names no repo
+// or pull request tells us nothing, and treating silence as foreign would prune
+// the traversal this round's P2 exists to keep open.
+func subjectIsForeign(subject reviewClaimSubject, payload workflow.JobPayload) bool {
+	if subject.repo == "" {
+		return false
+	}
+	if repo := strings.TrimSpace(payload.Repo); repo != "" && !strings.EqualFold(repo, subject.repo) {
+		return true
+	}
+	if payload.PullRequest > 0 && payload.PullRequest != subject.pullRequest {
+		return true
+	}
+	if head := strings.TrimSpace(payload.HeadSHA); head != "" && !strings.EqualFold(head, subject.headSHA) {
+		return true
 	}
 	return false
 }
