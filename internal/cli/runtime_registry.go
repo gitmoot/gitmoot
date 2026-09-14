@@ -104,6 +104,25 @@ func resolveRuntimeRegistryResilient(paths config.Paths) runtime.Registry {
 // default_model overrides still resolve (so one typo can no longer silently drop
 // every override at delivery). It re-reads config on each call, so a warm-reloaded
 // (SIGHUP) default_model edit takes effect without a full restart.
+// reviewModelPoolResolver reads [review_router] on each call (#2180), the same
+// way runtimeDefaultModelResolver re-reads config, so a pool edit takes effect
+// on the next enqueue without a restart. A config that fails to parse yields no
+// pool rather than an error: an unreadable pool must degrade to the previous
+// behaviour, never refuse a review.
+func reviewModelPoolResolver(home string) func(string) []string {
+	return func(purpose string) []string {
+		settings, err := config.LoadReviewRouterSettings(config.Paths{ConfigFile: resolveConfigFile(home)})
+		if err != nil {
+			return nil
+		}
+		models, err := settings.Models(purpose)
+		if err != nil {
+			return nil
+		}
+		return models
+	}
+}
+
 func runtimeDefaultModelResolver(home string) func(string) string {
 	return func(runtimeName string) string {
 		registry := resolveRuntimeRegistryResilient(config.Paths{ConfigFile: resolveConfigFile(home)})

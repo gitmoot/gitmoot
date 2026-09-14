@@ -84,6 +84,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// empty by default, so with no config no model or effort is forced; an
 		// agent/job override always wins.
 		RuntimeDefaultModel:  runtimeDefaultModelResolver(home),
+		ReviewModelPool:      reviewModelPoolResolver(home),
 		RuntimeDefaultEffort: runtimeDefaultEffortResolver(home),
 		// Off-restores-byte-identical result-check audit (#526): the deterministic
 		// binary-checklist audit of a job's parsed gitmoot_result. resultChecksMode

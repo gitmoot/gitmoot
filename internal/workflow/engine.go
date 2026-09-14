@@ -261,6 +261,10 @@ type Engine struct {
 	// agent/job pin always wins. Nil (the default) forces nothing, so delivery is
 	// byte-identical to before #652.
 	RuntimeDefaultModel func(runtimeName string) string
+	// ReviewModelPool is the engine-side half of #2180: engine-produced reviews
+	// pass through the same Mailbox chokepoint, so the resolver must reach it
+	// from here too or the fallback stays unreachable on that path.
+	ReviewModelPool func(purpose string) []string
 	// RuntimeDefaultEffort mirrors RuntimeDefaultModel for the runtime registry's
 	// default_effort fallback.
 	RuntimeDefaultEffort func(runtimeName string) string

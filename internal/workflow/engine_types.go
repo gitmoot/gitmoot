@@ -110,6 +110,7 @@ func (e Engine) mailbox() Mailbox {
 	mb.OrgPolicy = e.OrgPolicy
 	mb.deferBlocker = e.BlockerDeferrer
 	mb.RuntimeDefaultModel = e.RuntimeDefaultModel
+	mb.ReviewModelPool = e.ReviewModelPool
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.routerContextEnabled = e.RouterContextEnabled
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)

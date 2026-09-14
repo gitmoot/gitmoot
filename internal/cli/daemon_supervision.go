@@ -365,6 +365,7 @@ type heartbeatEnqueuer func(ctx context.Context, request workflow.JobRequest) (d
 func newHeartbeatEnqueuer(store *db.Store, home string) heartbeatEnqueuer {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("heartbeat enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
+	mailbox.ReviewModelPool = reviewModelPoolResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = orgPolicyResolver(home)
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {

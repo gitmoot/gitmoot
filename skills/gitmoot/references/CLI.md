@@ -1381,6 +1381,15 @@ left it unreachable. A citation whose relationship cannot be established at all,
 because the dispatching checkout resolves neither commit, also dispatches: that
 is a fact about the checkout rather than about the citation.
 
+`review request` dispatches on the **omp** runtime because it SELECTS the
+reviewer itself, so the runtime is its choice rather than an agent's identity.
+`--runtime NAME` overrides that pin. The escape is not cosmetic: a role
+carrying a runtime-scoped `org_role_unavailable` hold is refused dispatch when
+the hold names the runtime it selected, and a pin with no override leaves the
+caller nothing to reach for (gitmoot/gitmoot#2181). `gitmoot agent review`
+takes the same flag, but pins nothing: a REGISTERED reviewer keeps its own
+runtime, which carries its auth profile and session.
+
 `prompt_head_warning` IS still emitted for a review, for two relations rather
 than one. The normal-path relation is a RECORDED PRIOR HEAD THAT IS NOT AN
 ANCESTOR. The second is a citation whose ancestry the classifier could not

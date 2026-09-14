@@ -36,6 +36,7 @@ func pipelineStageCheckoutPath(ctx context.Context, store *db.Store, repo string
 func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueuer {
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("pipeline stage enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
+	mailbox.ReviewModelPool = reviewModelPoolResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = orgPolicyResolver(home)
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {

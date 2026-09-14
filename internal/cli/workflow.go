@@ -1373,6 +1373,7 @@ func enqueueTaskRunImplementJob(ctx context.Context, store *db.Store, task db.Ta
 	}
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("task run enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(home)
+	mailbox.ReviewModelPool = reviewModelPoolResolver(home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = fixedOrgPolicy(orgPolicy)
 	return mailbox.Enqueue(ctx, request)

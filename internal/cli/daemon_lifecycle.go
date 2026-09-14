@@ -367,6 +367,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Registry default model/effort fallbacks, home-aware and fail-open — see
 			// daemonWorkflowEngine. Empty by default => byte-identical.
 			RuntimeDefaultModel:  runtimeDefaultModelResolver(*home),
+			ReviewModelPool:      reviewModelPoolResolver(*home),
 			RuntimeDefaultEffort: runtimeDefaultEffortResolver(*home),
 			// Result-check audit (#526), home-aware and fail-safe to the default warn.
 			ResultCheckMode: resultChecksMode(*home),

@@ -2200,6 +2200,16 @@ func TestBothReviewVerbsResolveTheSamePoolAndKeepTheirRuntimes(t *testing.T) {
 	if want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}; !slices.Equal(directPayload.ReviewModelPool, want) {
 		t.Fatalf("resolved pool = %v, want the configured code pool %v", directPayload.ReviewModelPool, want)
 	}
+	// THE POOL IS ATTACHED, THE MODEL IS NOT CHOSEN (#2186 review, F1). An
+	// earlier version of this fix also set Model to the pool head on every
+	// review, which handed an OMP-qualified model to a registered claude
+	// reviewer - the model half of exactly the damage the runtime reversal
+	// above exists to prevent. The pool is what the fallback needs; the model
+	// belongs to the agent the operator named, until a blocker moves the job to
+	// omp and the fallback picks the first pool entry deliberately.
+	if directPayload.Model != "" {
+		t.Fatalf("agent review model = %q, want the agent's own: resolving a pool must not choose a model for a named reviewer", directPayload.Model)
+	}
 	// RUNTIME IS THE DELIBERATE EXCEPTION, pinned here so a later reading of
 	// #2180's "both paths make the same decisions" cannot quietly extend to it.
 	// The router selects its own reviewer and pins omp; `agent review` is handed
