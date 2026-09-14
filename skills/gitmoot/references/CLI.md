@@ -3547,6 +3547,11 @@ still block": an answered finding can still be mandatory at a later head if the
 files its relevance keys name changed again. Only the merge gate decides that, and
 the command says so in its own output.
 
+A failed review can still record a source finding when it supplies executed
+evidence or a static locator and rationale. Quoted-only output from a failed
+review stays a job-level protocol/runtime failure; it does not become a code
+finding or merge obligation.
+
 The row listing exists because the **obligation brief is byte-bounded**. Once its
 budget is exhausted the brief omits mandatory UIDs and tells the reviewer to
 consult the ledger, and until this command could print rows there was no supported
@@ -3569,11 +3574,13 @@ The rows above print `STATE`, the last recorded observation. `--at-head` prints
 the **obligations the merge gate would still demand at that head**, which is not
 derivable from any state column and differs in both directions:
 
-- an **open** finding recorded at an earlier head is still an obligation at a
-  later one, so filtering rows to "open at this head" reports a clean pull
-  request that the gate will refuse;
-- an **answered** finding becomes mandatory again when the diff since the answer
-  touches its relevance keys, so a state filter is blind to exactly that row.
+- an **open** finding recorded at an earlier head remains an obligation when
+  that head is the same as or an ancestor of the target head. A finding observed
+  only on a proven-divergent branch line is not an obligation for the rewritten
+  tree;
+- an **answered** finding on the same commit line becomes mandatory again when
+  the diff since the answer touches its relevance keys, so a state filter is
+  blind to exactly that row.
 
 It is not a reimplementation. It calls `LedgerObligationsAtHead` through
 `LedgerResolvers.ScopeFor`, which the type documents as the only production path
@@ -3586,9 +3593,10 @@ request at one head, and the refusal names that combination rather than only
 calling the input invalid.
 
 **Degradations are printed, including beside an empty list.** `LedgerScope`
-degrades rather than failing: without a changed-file resolver, answered findings
-stay advisory and simply do not appear, which under-reports. The engine records
-those as task events; this command has no task, so it prints them as
+degrades rather than failing. Without an ancestry resolver, observations cannot
+be limited to the target commit line. Without a changed-file resolver, answered
+findings stay advisory and simply do not appear, which under-reports. The engine
+records those as task events; this command has no task, so it prints them as
 `degraded: ...` lines. An empty obligation list and an instrument that could not
 look otherwise read identically, and the empty one reads as good news.
 

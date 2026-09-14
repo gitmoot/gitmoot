@@ -329,8 +329,8 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 		if err != nil {
 			return err
 		}
-		// A missing checkout is a DEGRADATION, not a failure: the predicate still
-		// answers for open findings, which are mandatory unconditionally.
+		// A missing checkout is a DEGRADATION, not a failure: the compare API may
+		// still resolve ancestry and changed files.
 		//
 		// #2099 f2: THE NOTE STATES THE FACT, NOT ITS ASSUMED CONSEQUENCE. The
 		// first version said "answered findings are advisory" here, which is a
@@ -373,6 +373,10 @@ func runFindingsObligations(repo string, pullRequest int, head string, home stri
 	if resolvers.ChangedSince == nil {
 		report.Degradations = append(report.Degradations,
 			"no changed-file resolver, so an ANSWERED finding cannot be re-armed by relevance and will not appear here")
+	}
+	if resolvers.IsAncestor == nil {
+		report.Degradations = append(report.Degradations,
+			"no ancestry resolver, so observations cannot be limited to the target commit line")
 	}
 	if resolvers.PathExistsAtHead == nil {
 		report.Degradations = append(report.Degradations,

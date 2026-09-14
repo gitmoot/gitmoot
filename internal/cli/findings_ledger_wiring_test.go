@@ -1,9 +1,14 @@
 package cli
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 // #1850 round 3 F1, P1, ADOPTED AS A PERMANENT REGRESSION. The reviewer built
@@ -35,8 +40,10 @@ func TestLedgerResolversAreWiredOnBothConsumers(t *testing.T) {
 	gate := newDaemonPolicyMergeGateForRunner(nil, gh, checkout, runner)
 
 	gateChanged := gate.LedgerResolvers.ChangedSince != nil
+	gateAncestor := gate.LedgerResolvers.IsAncestor != nil
 	gatePathExists := gate.LedgerResolvers.PathExistsAtHead != nil
 	engineChanged := engine.LedgerResolvers.ChangedSince != nil
+	engineAncestor := engine.LedgerResolvers.IsAncestor != nil
 	enginePathExists := engine.LedgerResolvers.PathExistsAtHead != nil
 
 	if gatePathExists != enginePathExists {
@@ -47,10 +54,97 @@ func TestLedgerResolversAreWiredOnBothConsumers(t *testing.T) {
 		t.Fatalf("changed-files resolver wired on gate=%v but engine=%v; the two consumers would compute different obligation sets",
 			gateChanged, engineChanged)
 	}
+	if gateAncestor != engineAncestor {
+		t.Fatalf("ancestry resolver wired on gate=%v but engine=%v; the gate and brief would disagree about findings from rewritten branch lines",
+			gateAncestor, engineAncestor)
+	}
 	// POSITIVE CONTROL: with a checkout present BOTH must be wired, so the
 	// equality above cannot be satisfied by both sides being nil.
-	if !gatePathExists || !gateChanged {
-		t.Fatalf("with a checkout present the gate must hold both ledger resolvers, got changed=%v pathExists=%v; the equality would otherwise be vacuous",
-			gateChanged, gatePathExists)
+	if !gatePathExists || !gateChanged || !gateAncestor {
+		t.Fatalf("with a checkout present the gate must hold every ledger resolver, got changed=%v ancestor=%v pathExists=%v; the equality would otherwise be vacuous",
+			gateChanged, gateAncestor, gatePathExists)
+	}
+}
+
+func TestDaemonLedgerAncestryResolverDistinguishesDivergedHeads(t *testing.T) {
+	repo, base := gitFixtureRepo(t, "base\n")
+	runGit(t, repo, "checkout", "-b", "observed")
+	if err := os.WriteFile(filepath.Join(repo, "observed.txt"), []byte("finding branch\n"), 0o600); err != nil {
+		t.Fatalf("write observed branch: %v", err)
+	}
+	runGit(t, repo, "add", "observed.txt")
+	runGit(t, repo, "commit", "-m", "observed branch")
+	observed := strings.TrimSpace(runGitOutput(t, repo, "rev-parse", "HEAD"))
+
+	runGit(t, repo, "checkout", "-b", "current", base)
+	if err := os.WriteFile(filepath.Join(repo, "current.txt"), []byte("rewritten branch\n"), 0o600); err != nil {
+		t.Fatalf("write current branch: %v", err)
+	}
+	runGit(t, repo, "add", "current.txt")
+	runGit(t, repo, "commit", "-m", "current branch")
+	current := strings.TrimSpace(runGitOutput(t, repo, "rev-parse", "HEAD"))
+
+	resolver := daemonLedgerIsAncestor(nil, repo, subprocess.ExecRunner{})
+	if resolver == nil {
+		t.Fatal("daemon ledger ancestry resolver is nil for a checkout")
+	}
+	got, err := resolver(context.Background(), "owner/repo", 2173, observed, current)
+	if err != nil {
+		t.Fatalf("resolve diverged ancestry: %v", err)
+	}
+	if got {
+		t.Fatalf("observed head %s reported as ancestor of diverged head %s", observed, current)
+	}
+	// Positive control: the same resolver must recognize the shared base.
+	got, err = resolver(context.Background(), "owner/repo", 2173, base, current)
+	if err != nil {
+		t.Fatalf("resolve ancestor: %v", err)
+	}
+	if !got {
+		t.Fatalf("base head %s was not recognized as ancestor of %s", base, current)
+	}
+}
+
+func TestDaemonLedgerAncestryResolverFallsBackToCompareStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{status: "ahead", want: true},
+		{status: "identical", want: true},
+		{status: "behind", want: false},
+		{status: "diverged", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			client := &reviewCompareClient{result: github.CompareResult{Status: tt.status}}
+			resolver := daemonLedgerIsAncestor(client, "", nil)
+			got, err := resolver(context.Background(), "owner/repo", 2173, strings.Repeat("a", 40), strings.Repeat("b", 40))
+			if err != nil {
+				t.Fatalf("resolve compare status %q: %v", tt.status, err)
+			}
+			if got != tt.want {
+				t.Fatalf("compare status %q resolved ancestor=%v, want %v", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDaemonLedgerAncestryResolverFallsBackWhenReviewedHeadIsMissingLocally(t *testing.T) {
+	repo, current := gitFixtureRepo(t, "current\n")
+	missingReviewedHead := strings.Repeat("a", 40)
+	client := &reviewCompareClient{result: github.CompareResult{Status: "diverged"}}
+	resolver := daemonLedgerIsAncestor(client, repo, subprocess.ExecRunner{})
+
+	got, err := resolver(context.Background(), "owner/repo", 2173, missingReviewedHead, current)
+	if err != nil {
+		t.Fatalf("resolve ancestry after local commit miss: %v", err)
+	}
+	if got {
+		t.Fatal("compare fallback reported a missing, diverged reviewed head as an ancestor")
+	}
+	if client.calls != 1 || client.base != missingReviewedHead || client.head != current {
+		t.Fatalf("compare calls=%d base=%q head=%q, want one exact-head fallback for %q...%q",
+			client.calls, client.base, client.head, missingReviewedHead, current)
 	}
 }

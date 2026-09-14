@@ -77,6 +77,10 @@ type LedgerResolvers struct {
 	// is the daemon's own checkout enumeration, which proves the range complete
 	// and fails CLOSED on a capped API page.
 	ChangedSince func(ctx context.Context, repo string, pullRequest int, previousHead string, currentHead string) ([]string, error)
+	// IsAncestor reports whether an observation's head is an ancestor of the
+	// head being evaluated. Findings belong to the branch line they were
+	// observed on; a proven-divergent observation cannot bind a rewritten PR.
+	IsAncestor func(ctx context.Context, repo string, pullRequest int, ancestorHead string, currentHead string) (bool, error)
 	// PathExistsAtHead reports whether a repo-relative path exists at a head, so a
 	// STATIC discharge citing a deleted file stops counting as an answer.
 	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
@@ -92,6 +96,11 @@ func (r LedgerResolvers) ScopeFor(repo string, pullRequest int, taskID string) L
 			return r.ChangedSince(ctx, repo, pullRequest, previousHead, currentHead)
 		}
 	}
+	if r.IsAncestor != nil {
+		scope.IsAncestor = func(ctx context.Context, ancestorHead string, currentHead string) (bool, error) {
+			return r.IsAncestor(ctx, repo, pullRequest, ancestorHead, currentHead)
+		}
+	}
 	return scope
 }
 
@@ -103,6 +112,9 @@ func (r LedgerResolvers) ScopeFor(repo string, pullRequest int, taskID string) L
 type LedgerScope struct {
 	// ChangedSince enumerates paths changed between two heads for THIS pr.
 	ChangedSince func(ctx context.Context, previousHead string, currentHead string) ([]string, error)
+	// IsAncestor reports whether the first head is an ancestor of the second.
+	// A false result proves that an observation belongs to another branch line.
+	IsAncestor func(ctx context.Context, ancestorHead string, currentHead string) (bool, error)
 	// PathExistsAtHead reports whether a repo-relative path exists at a head.
 	PathExistsAtHead func(ctx context.Context, head string, path string) (bool, error)
 	// FindingsAdvisory carries the repository's #1969 declaration. When true the
@@ -129,6 +141,40 @@ func (s LedgerScope) degrade(format string, args ...any) {
 	if s.Degraded != nil {
 		s.Degraded(fmt.Sprintf(format, args...))
 	}
+}
+
+// observationsOnCommitLine filters before folding. A later observation on a
+// side branch must not hide an earlier state that is still current on the target
+// branch. Ancestry answers are cached per observation head because one review
+// commonly contributes several findings.
+func (s LedgerScope) observationsOnCommitLine(ctx context.Context, observations []db.ReviewFindingObservation, currentHead string) []db.ReviewFindingObservation {
+	currentHead = strings.TrimSpace(currentHead)
+	if currentHead == "" || s.IsAncestor == nil {
+		return observations
+	}
+	appliesByHead := make(map[string]bool)
+	applicable := make([]db.ReviewFindingObservation, 0, len(observations))
+	for _, obs := range observations {
+		observationHead := strings.TrimSpace(obs.HeadSHA)
+		if observationHead == "" || observationHead == currentHead {
+			applicable = append(applicable, obs)
+			continue
+		}
+		applies, resolved := appliesByHead[observationHead]
+		if !resolved {
+			var err error
+			applies, err = s.IsAncestor(ctx, observationHead, currentHead)
+			if err != nil {
+				s.degrade("findings ancestry from %s to %s is unavailable: %v; retaining those observations", shortHead(observationHead), shortHead(currentHead), err)
+				applies = true
+			}
+			appliesByHead[observationHead] = applies
+		}
+		if applies {
+			applicable = append(applicable, obs)
+		}
+	}
+	return applicable
 }
 
 // latestObservation folds the append-only observation log into the most recent
@@ -247,19 +293,22 @@ func relevanceTouched(keys []string, changed []string) (string, bool) {
 
 // LedgerObligationsAtHead computes what a round at head must observe.
 //
-// MANDATORY: findings whose latest state is open, plus answered or superseded
-// findings any of whose relevance keys the diff SINCE THEIR OWN ANSWERED HEAD
-// touches, plus answered findings whose STATIC evidence cites a locator that no
-// longer exists at this head. A withdrawn finding is never mandatory, because a
-// reviewer has said it was never a defect and a later diff cannot re-break
-// something that was never broken - the store now requires a recorded reason for
-// that, which is the guard that stops withdrawal being the cheap exit.
+// MANDATORY: findings whose latest state is open on this head's commit line,
+// plus answered or superseded findings on that line any of whose relevance keys
+// the diff SINCE THEIR OWN ANSWERED HEAD touches, plus answered findings whose
+// STATIC evidence cites a locator that no longer exists at this head. A finding
+// observed only on a proven-divergent line is not about this tree. A withdrawn
+// finding is never mandatory, because a reviewer has said it was never a defect
+// and a later diff cannot re-break something that was never broken - the store
+// now requires a recorded reason for that, which is the guard that stops
+// withdrawal being the cheap exit.
 //
 // RELEVANCE IS EVALUATED PER FINDING, over the range from the head where the
 // finding was answered to this head, rather than against one whole-PR file list
 // (#1850 review F4). What matters is what changed SINCE the answer, and the
 // engine already has a seam that computes exactly that and proves it complete.
 func LedgerObligationsAtHead(ctx context.Context, observations []db.ReviewFindingObservation, head string, scope LedgerScope) []LedgerObligation {
+	observations = scope.observationsOnCommitLine(ctx, observations, head)
 	latest := latestObservation(observations)
 	already := dischargedAtHead(observations, head)
 	var out []LedgerObligation
