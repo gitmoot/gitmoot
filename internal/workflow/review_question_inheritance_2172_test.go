@@ -25,7 +25,7 @@ func TestReviewQuestionFieldsAreInheritedByReviewChildrenOnly(t *testing.T) {
 		Repo:            "gitmoot/gitmoot",
 		PullRequest:     2172,
 		ReviewPurpose:   "security",
-		ReviewModelPool: []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"},
+		ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"},
 		ReviewRequester: "joltra",
 	}
 

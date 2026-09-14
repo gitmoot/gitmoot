@@ -46,7 +46,7 @@ func poolReviewRequest(id, agent string) workflow.JobRequest {
 	return workflow.JobRequest{
 		ID: id, Agent: agent, Action: "review", Repo: "owner/repo", Branch: "main",
 		PullRequest: 1, HeadSHA: strings.Repeat("d", 40), NoFixTarget: true,
-		ReviewPurpose: "code", ReviewModelPool: []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"},
+		ReviewPurpose: "code", ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"},
 	}
 }
 
@@ -58,7 +58,7 @@ func TestQuotaBlockerMovesAClaudeReviewToOmpWithThePoolHead(t *testing.T) {
 	payload := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
 		poolReviewRequest("job-claude", "claude-reviewer"), errors.New(quotaFailure))
 
-	if payload.Model != "devin/swe-2" {
+	if payload.Model != "sentinel/router-a" {
 		t.Fatalf("model = %q, want the first untried pool entry", payload.Model)
 	}
 	if payload.RuntimeOverride != runtime.OmpRuntime {
@@ -107,7 +107,7 @@ func TestQuotaBlockerKeepsAScriptAgentOnItsRuntime(t *testing.T) {
 	payload := runBlockerOnRunningReview(t, runtime.ShellRuntime,
 		poolReviewRequest("job-script-agent", "script-reviewer"), errors.New(quotaFailure))
 
-	if payload.Model != "devin/swe-2" {
+	if payload.Model != "sentinel/router-a" {
 		t.Fatalf("model = %q, want the pool head", payload.Model)
 	}
 	if payload.RuntimeOverride != "" {
@@ -122,7 +122,7 @@ func TestNetworkOutageAdvancesThePoolOnlyForAProviderStall(t *testing.T) {
 	stall := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
 		poolReviewRequest("job-stall", "claude-reviewer"),
 		errors.New("omp turn failed (stopReason error): Provider stream stalled while waiting for the next event"))
-	if stall.Model != "devin/swe-2" || stall.RuntimeOverride != runtime.OmpRuntime {
+	if stall.Model != "sentinel/router-a" || stall.RuntimeOverride != runtime.OmpRuntime {
 		t.Fatalf("provider stall: model=%q runtime=%q, want the pool head on omp", stall.Model, stall.RuntimeOverride)
 	}
 

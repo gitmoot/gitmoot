@@ -28,7 +28,7 @@ func (h *testStoreHandle) payload(t *testing.T, prepared PreparedEnqueue) JobPay
 }
 
 func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *testing.T) {
-	configured := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	configured := []string{"sentinel/router-a", "sentinel/router-b"}
 	var askedFor []string
 
 	newMailbox := func(t *testing.T) (Mailbox, *testStoreHandle) {
@@ -173,64 +173,117 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 // The property that ends the class: a holder of an Engine cannot enqueue
 // through a LESS configured mailbox than the engine's own, because it does not
 // build one. No field list to forget the next field from.
-func TestEnqueueMailboxForwardsEveryEngineResolver(t *testing.T) {
-	// REFLECTIVE ON PURPOSE (#2186 round 5). The first version of this test was
-	// named for exhaustiveness and asserted ONE field, which is the same
-	// enumeration defect it exists to prevent, one level up: it would pass
-	// forever while the tenth field went unforwarded. A test whose name claims
-	// more than its assertions is worse than no test, because it answers the
-	// question nobody re-asks.
-	//
-	// So: set EVERY func-typed exported field on Engine to a live stub, build the
-	// mailbox, and require every identically-named, identically-typed exported
-	// field on Mailbox to be non-nil. A new resolver added to both types is
-	// covered the day it is added, with no edit here.
+// Renamed from ...ForwardsEveryEngineResolver, which OVERCLAIMED: it can only
+// see EXPORTED func fields whose names and types match on both types. The #2188
+// review demonstrated three blind spots, all now closed or declared:
+//
+//	a. PROVENANCE. Mutating `mb.RuntimeDefaultModel = e.RuntimeDefaultModel` to
+//	   `= e.RuntimeDefaultEffort` (same signature) passed the old census and the
+//	   whole package: asserting non-nil proves a field was SET, not that it was
+//	   set from its counterpart. Each field now gets a stub that returns its own
+//	   name, so a cross-wire is visible.
+//	b. INVISIBLE FORWARDS. Renamed or unexported forwards - BlockerDeferrer ->
+//	   deferBlocker above all - cannot be seen structurally. They are asserted
+//	   explicitly below; a reflective test that silently omits them is how the
+//	   deferBlocker drop survived to be caught only by a cli E2E.
+//	c. SILENT SKIPS. The skip rule could not distinguish "not meant to be
+//	   forwarded" from "somebody forgot the Mailbox field". Unmatched Engine func
+//	   fields are now compared against a declared list, so a NEW one fails here
+//	   until a human classifies it.
+func TestEnqueueMailboxForwardsExportedEngineFuncFields(t *testing.T) {
+	// Engine func fields with deliberately no same-named Mailbox counterpart.
+	// Adding to this list is a decision; forgetting to is now a test failure.
+	unforwardedByDesign := map[string]string{
+		// Forwarded, but not visibly: installed through a parameter or onto an
+		// unexported field, so reflection over matching names cannot see them.
+		"ResolveDeliveryWorktree": "installed via the EnqueueMailbox delivery parameter, not inherited",
+		"BlockerDeferrer":         "forwarded to the unexported deferBlocker; asserted explicitly below",
+		"RouterContextEnabled":    "forwarded to the unexported routerContextEnabled",
+		"ProduceCheckDir":         "forwarded to the unexported produceCheckDir",
+
+		// Engine-only. Verified mechanically rather than asserted: no
+		// `mb.X = e.X` assignment exists for any of these in EnqueueMailbox's
+		// copy list, and Mailbox declares no counterpart field. The census
+		// listed all thirteen as silent skips before this list existed.
+		"JobID":                         "engine-only",
+		"PayloadRefresher":              "engine-only",
+		"FixWorktreeAllocator":          "engine-only",
+		"BeforeReadOnlyWorktreeCleanup": "engine-only",
+		"OwnerPIDLive":                  "engine-only",
+		"WorktreeHasLiveProcess":        "engine-only",
+		"WorktreeLiveness":              "engine-only",
+		"Now":                           "engine-only",
+		"NativeReviewFanoutEnabled":     "engine-only",
+		"ReviewBlockingSeverity":        "engine-only; the mailbox gets the engine's METHOD, not this field",
+		"FindingsAdvisory":              "engine-only",
+		"PullRequestSignals":            "engine-only",
+		"ReviewChangedFiles":            "engine-only",
+	}
+
 	engineValue := reflect.New(reflect.TypeOf(Engine{})).Elem()
 	engineType := engineValue.Type()
 	mailboxType := reflect.TypeOf(Mailbox{})
 
-	var expected []string
+	provenance := map[string]string{}
+	var forwarded []string
 	for i := range engineType.NumField() {
 		field := engineType.Field(i)
 		if !field.IsExported() || field.Type.Kind() != reflect.Func {
 			continue
 		}
 		mailboxField, ok := mailboxType.FieldByName(field.Name)
-		if !ok || !mailboxField.IsExported() || mailboxField.Type != field.Type {
+		matched := ok && mailboxField.IsExported() && mailboxField.Type == field.Type
+		if !matched {
+			if _, declared := unforwardedByDesign[field.Name]; !declared {
+				t.Fatalf("Engine.%s is a func field with no forwarded Mailbox counterpart and is not declared unforwarded-by-design: "+
+					"either forward it in EnqueueMailbox or add it to the list with a reason", field.Name)
+			}
 			continue
 		}
+		name := field.Name
 		fieldType := field.Type
 		engineValue.Field(i).Set(reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
+			provenance["last"] = name
 			out := make([]reflect.Value, fieldType.NumOut())
 			for j := range out {
 				out[j] = reflect.Zero(fieldType.Out(j))
 			}
 			return out
 		}))
-		expected = append(expected, field.Name)
+		forwarded = append(forwarded, name)
 	}
-	if len(expected) < 2 {
-		t.Fatalf("reflection found %d forwardable resolvers (%v); the census itself is broken", len(expected), expected)
+	if len(forwarded) < 2 {
+		t.Fatalf("reflection found %d forwardable resolvers (%v); the census itself is broken", len(forwarded), forwarded)
 	}
 
 	engine := engineValue.Addr().Interface().(*Engine)
 	engine.Store = openEngineStore(t)
 	engine.ResolveDeliveryWorktree = UnavailableDeliveryWorktreeResolver("test")
+	engine.BlockerDeferrer = func(context.Context, string, error) (bool, error) { return false, nil }
 
-	// Delivery MACHINERY is deliberately not inherited when a caller passes a
-	// capability sentinel - that is the round-5 fix, and the reflective census
-	// caught it on its first run rather than letting it read as an omission.
 	deliveryScoped := map[string]bool{"CollectChangeSet": true, "ApplyChangeSet": true}
 
 	inherited := reflect.ValueOf(engine.EnqueueMailbox(nil))
-	for _, name := range expected {
-		if inherited.FieldByName(name).IsNil() {
-			t.Fatalf("EnqueueMailbox(nil) did not forward %s: a producer taking this mailbox silently loses it", name)
+	for _, name := range forwarded {
+		value := inherited.FieldByName(name)
+		if value.IsNil() {
+			t.Fatalf("EnqueueMailbox(nil) did not forward %s", name)
+		}
+		// PROVENANCE: call it and require ITS OWN stub to answer. A field wired
+		// from a same-signature sibling answers with the sibling's name.
+		callFuncWithZeroArgs(value)
+		if provenance["last"] != name {
+			t.Fatalf("Mailbox.%s is wired from Engine.%s, not from its counterpart", name, provenance["last"])
 		}
 	}
 
+	// (b) the unexported forward the census structurally cannot see.
+	if engine.EnqueueMailbox(nil).deferBlocker == nil {
+		t.Fatal("BlockerDeferrer was not forwarded to deferBlocker: invisible to reflection, so asserted by hand")
+	}
+
 	sentineled := reflect.ValueOf(engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test")))
-	for _, name := range expected {
+	for _, name := range forwarded {
 		isNil := sentineled.FieldByName(name).IsNil()
 		if deliveryScoped[name] && !isNil {
 			t.Fatalf("%s survived a delivery sentinel: the producer refuses delivery but now carries the means to perform it", name)
@@ -239,7 +292,18 @@ func TestEnqueueMailboxForwardsEveryEngineResolver(t *testing.T) {
 			t.Fatalf("EnqueueMailbox dropped config-bearing %s alongside the delivery machinery", name)
 		}
 	}
-	t.Logf("censused %d engine resolvers: %v", len(expected), expected)
+	t.Logf("censused %d exported func forwards: %v", len(forwarded), forwarded)
+}
+
+// callFuncWithZeroArgs invokes fn with zero values for every parameter, so a
+// provenance stub can report which field it belongs to.
+func callFuncWithZeroArgs(fn reflect.Value) {
+	fnType := fn.Type()
+	args := make([]reflect.Value, fnType.NumIn())
+	for i := range args {
+		args[i] = reflect.Zero(fnType.In(i))
+	}
+	fn.Call(args)
 }
 
 // #2186 round 5, live survivor: the advisory's NEGATIVE direction was untested.
@@ -289,5 +353,46 @@ func TestPoolUnresolvedAdvisoryIsSilentWhenThePoolResolves(t *testing.T) {
 				t.Fatalf("advisory emitted = %v, want %v: an advisory that fires regardless says nothing", advisory, tc.wantAdvisory)
 			}
 		})
+	}
+}
+
+// #2188 review, M9: the PR's headline fix was UNPINNED. Deleting the line that
+// installs the caller's sentinel passed every test, including the daemon ones -
+// their `delivered` flag is unreachable because the resolver never fires during
+// Enqueue, so they re-proved pool inheritance under a name that promised more.
+//
+// The assertion has to be in-package: resolveDeliveryWorktree is unexported, so
+// the daemon package structurally cannot see what it is being handed. Driving
+// the seam itself is the only honest check - invoke the delivery path and
+// require the SENTINEL's refusal, not the engine's real resolver.
+func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
+	realResolverRan := false
+	engine := Engine{
+		Store: openEngineStore(t),
+		ResolveDeliveryWorktree: func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
+			realResolverRan = true
+			return DeliveryWorktreeResolution{Path: "/tmp/engine-owned-checkout"}, nil
+		},
+	}
+
+	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
+	_, err := mailbox.deliveryWorktree(context.Background(), db.Job{ID: "job-1"}, JobPayload{})
+	if err == nil {
+		t.Fatal("delivery resolved: the caller's refusal sentinel was not installed")
+	}
+	if !strings.Contains(err.Error(), "daemon comment enqueue") {
+		t.Fatalf("error = %v, want the caller's sentinel naming its site", err)
+	}
+	if realResolverRan {
+		t.Fatal("the engine's real delivery resolver ran: the sentinel was replaced, not installed")
+	}
+
+	// The inverse direction, so the test cannot pass by refusing everything: a
+	// caller that passes no sentinel inherits the engine's real resolver.
+	if _, err := engine.EnqueueMailbox(nil).deliveryWorktree(context.Background(), db.Job{ID: "job-2"}, JobPayload{}); err != nil {
+		t.Fatalf("EnqueueMailbox(nil) refused delivery: %v", err)
+	}
+	if !realResolverRan {
+		t.Fatal("EnqueueMailbox(nil) did not inherit the engine's delivery resolver")
 	}
 }
