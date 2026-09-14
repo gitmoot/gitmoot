@@ -174,7 +174,11 @@ type localAgentDispatchRequest struct {
 	ReviewPurpose   string
 	ReviewModelPool []string
 	ReviewRequester string
-	jobRunner       subprocess.Runner
+	// ReviewScope bounds a router delta review to baseline..head (#2177). Nil
+	// means a full review against the pull request base, which is what every
+	// router request did before delta review existed.
+	ReviewScope *workflow.ReviewScope
+	jobRunner   subprocess.Runner
 }
 
 func localDispatchJobRunner(request localAgentDispatchRequest) subprocess.Runner {
@@ -741,6 +745,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReviewPurpose:            request.ReviewPurpose,
 		ReviewModelPool:          request.ReviewModelPool,
 		ReviewRequester:          request.ReviewRequester,
+		ReviewScope:              request.ReviewScope,
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue

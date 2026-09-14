@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -45,22 +46,27 @@ const (
 )
 
 type reviewRequestOutput struct {
-	State         string   `json:"state"`
-	Repo          string   `json:"repo"`
-	PullRequest   int      `json:"pull_request"`
-	HeadSHA       string   `json:"head_sha"`
-	Purpose       string   `json:"purpose"`
-	Requester     string   `json:"requester"`
-	JobID         string   `json:"job_id"`
-	JobState      string   `json:"job_state,omitempty"`
-	Reviewer      string   `json:"reviewer,omitempty"`
-	Model         string   `json:"model,omitempty"`
-	ModelPool     []string `json:"model_pool,omitempty"`
-	Verdict       string   `json:"verdict,omitempty"`
-	AwaitedFactID int64    `json:"awaited_fact_id"`
-	NotifyBy      string   `json:"notify_by"`
-	Holds         []string `json:"holds,omitempty"`
-	WatchCommand  string   `json:"watch_command,omitempty"`
+	State       string   `json:"state"`
+	Repo        string   `json:"repo"`
+	PullRequest int      `json:"pull_request"`
+	HeadSHA     string   `json:"head_sha"`
+	Purpose     string   `json:"purpose"`
+	Requester   string   `json:"requester"`
+	JobID       string   `json:"job_id"`
+	JobState    string   `json:"job_state,omitempty"`
+	Reviewer    string   `json:"reviewer,omitempty"`
+	Model       string   `json:"model,omitempty"`
+	ModelPool   []string `json:"model_pool,omitempty"`
+	Verdict     string   `json:"verdict,omitempty"`
+	// Baseline is the prior head a delta review was bounded to; BaselineSkipped
+	// names why a full review was dispatched instead (#2177). Exactly one is set
+	// on a dispatch, and neither on an attach or a reused verdict.
+	Baseline        string   `json:"baseline,omitempty"`
+	BaselineSkipped string   `json:"baseline_skipped,omitempty"`
+	AwaitedFactID   int64    `json:"awaited_fact_id"`
+	NotifyBy        string   `json:"notify_by"`
+	Holds           []string `json:"holds,omitempty"`
+	WatchCommand    string   `json:"watch_command,omitempty"`
 }
 
 func runReview(args []string, stdout, stderr io.Writer) int {
@@ -82,7 +88,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
@@ -94,16 +100,18 @@ func printReviewUsage(w io.Writer) {
 }
 
 type reviewRequestOptions struct {
-	home     string
-	repo     string
-	pr       int
-	head     string
-	branch   string
-	purpose  string
-	role     string
-	ttl      time.Duration
-	reviewer string
-	json     bool
+	home                    string
+	repo                    string
+	pr                      int
+	head                    string
+	branch                  string
+	purpose                 string
+	role                    string
+	ttl                     time.Duration
+	reviewer                string
+	full                    bool
+	allowPromptHeadMismatch bool
+	json                    bool
 }
 
 func runReviewRequest(args []string, stdout, stderr io.Writer) int {
@@ -119,6 +127,8 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
+	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -275,11 +285,22 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
 	}
+	// Resolved only once the claim is won and a reviewer exists, so a losing or
+	// attaching request never pays for git calls whose answer it will discard.
+	var scope *workflow.ReviewScope
+	if opts.full {
+		output.BaselineSkipped = "flag --full"
+	} else {
+		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, opts.purpose)
+		if scope != nil {
+			output.Baseline = scope.PreviousHeadSHA
+		}
+	}
 	request := localAgentDispatchRequest{
 		RepoFlag:             repo.FullName(),
 		Agent:                reviewer.Name,
 		Action:               "review",
-		Instructions:         reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head),
+		Instructions:         reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
 		Background:           true,
 		Model:                pool[0],
 		Runtime:              runtime.OmpRuntime,
@@ -297,6 +318,11 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		ReviewPurpose:        opts.purpose,
 		ReviewModelPool:      pool,
 		ReviewRequester:      opts.role,
+		ReviewScope:          scope,
+		// A carried finding may legitimately cite a commit outside this PR
+		// (#2178 round 1): the citation classifier scans the delta brief, and
+		// the refusal it prints names this flag, so the flag must exist here.
+		AllowPromptHeadMismatch: opts.allowPromptHeadMismatch,
 		DispatchWarning: func(warning string) {
 			fmt.Fprintf(stderr, "review request: warning: %s\n", warning)
 		},
@@ -819,7 +845,152 @@ func reviewRequestHolds(paths config.Paths, home string) []string {
 	return holds
 }
 
-func reviewRouterInstructions(purpose, repo string, pullRequest int, head string) string {
+// resolveDeltaReviewScope picks the most recent terminal verdict for this repo,
+// pull request and purpose whose head is an ancestor of head, and bounds the
+// review to that range (#2177). A nil scope with a non-empty reason means a
+// full review; the reason is REPORTED, never acted on, because every failure
+// here costs one full read and must never refuse the request. Refusing would
+// block the commonest shape of all - a branch rebased onto main.
+// undecodableBlocks reports why a delta must be refused because an invisible
+// verdict would have been SELECTED instead of the chosen baseline.
+//
+// Selection orders by updated_at and takes the newest ancestor matching the
+// purpose, so "the reviewer last saw head X" is a RECENCY claim, not merely a
+// positional one (#2178 round 3). Testing position alone missed a newer
+// invisible verdict at a head that happens to be an ancestor OF the baseline:
+// it would have sorted first, so the brief named the wrong head while the
+// positional check saw nothing between the two commits.
+//
+// Each arm below mirrors one reason selection itself would have passed the row
+// over, so a row that could never have been chosen never refuses:
+//   - not valid JSON at all: nothing about its position is knowable, and that
+//     is the ONLY shape that disqualifies unconditionally;
+//   - no head: selection skips an empty baseline, so it is unselectable
+//     (Mailbox.OpenExternalJob writes exactly this shape, and one such row used
+//     to disable delta review for its whole pull request permanently);
+//   - another purpose: a different question;
+//   - not newer than the baseline: selection had already passed it;
+//   - not an ancestor of the dispatch head: off this line of history.
+func undecodableBlocks(ctx context.Context, git gitutil.Client, undecodable []db.UndecodableReviewVerdict, baseline, baselineUpdatedAt, baselineJobID, head, wantPurpose string) string {
+	for _, invisible := range undecodable {
+		if !invisible.Readable {
+			return "verdict history has an unreadable row; its position cannot be established, so the baseline cannot be trusted"
+		}
+		if invisible.HeadSHA == "" {
+			continue
+		}
+		got := invisible.ReviewPurpose
+		if got == "" {
+			got = db.DefaultReviewPurpose
+		}
+		if got != wantPurpose {
+			continue
+		}
+		if invisible.HeadSHA == baseline || invisible.HeadSHA == head {
+			continue
+		}
+		// String comparison, because SucceededReviewVerdicts orders by the same
+		// column as a string: the two agree by construction.
+		if invisible.UpdatedAt < baselineUpdatedAt ||
+			(invisible.UpdatedAt == baselineUpdatedAt && invisible.JobID <= baselineJobID) {
+			continue
+		}
+		reachable, err := git.IsAncestor(ctx, invisible.HeadSHA, head)
+		if err != nil || !reachable {
+			continue
+		}
+		return fmt.Sprintf("an undecodable verdict at %s is newer than the baseline and reachable from this head, so it would have been selected; baseline cannot be trusted", invisible.HeadSHA)
+	}
+	return ""
+}
+
+func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
+	// AN UNDECODABLE VERDICT IS NOT AN ABSENCE (#2179, #2178 round 1). A row
+	// SucceededReviewVerdicts cannot decode is dropped silently, so the loop
+	// below would walk straight past a real terminal verdict to an OLDER
+	// ancestor - bounding the review against a stale baseline and telling the
+	// reviewer "you last saw head X" when it did not. A false statement in the
+	// brief is worse than a full re-read, so lossy history disables the delta
+	// entirely rather than selecting from what survived.
+	undecodable, err := store.UndecodableReviewVerdicts(ctx, repo, pullRequest)
+	if err != nil {
+		return nil, "scope unavailable: " + err.Error()
+	}
+	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
+	if err != nil {
+		return nil, "scope unavailable: " + err.Error()
+	}
+	want := strings.ToLower(strings.TrimSpace(purpose))
+	if want == "" {
+		want = db.DefaultReviewPurpose
+	}
+	head = strings.ToLower(strings.TrimSpace(head))
+	// SucceededReviewVerdicts is already ordered updated_at DESC, id DESC and
+	// already limited to succeeded jobs holding approved or changes_requested,
+	// which is exactly the terminal-verdict set a baseline may come from.
+	var lastUnavailable string
+	candidates := 0
+	for _, verdict := range verdicts {
+		got := strings.ToLower(strings.TrimSpace(verdict.ReviewPurpose))
+		if got == "" {
+			got = db.DefaultReviewPurpose
+		}
+		if got != want {
+			continue
+		}
+		baseline := strings.ToLower(strings.TrimSpace(verdict.HeadSHA))
+		if baseline == "" || baseline == head {
+			// The same head is the verdict-reuse path, already handled before
+			// any dispatch; it is not a baseline for a delta against itself.
+			continue
+		}
+		candidates++
+		files, err := localReviewChangedFiles(ctx, git, pullRequest, baseline, head)
+		if err != nil {
+			var unavailable workflow.ReviewScopeUnavailableError
+			if errors.As(err, &unavailable) {
+				// PROOF this head is not an ancestor. A rebase usually orphans
+				// every older head too, so keep looking rather than concluding.
+				lastUnavailable = unavailable.Reason
+				continue
+			}
+			// The instrument could not RUN. Do not keep hammering git.
+			return nil, "scope unavailable: " + err.Error()
+		}
+		job, err := store.GetJob(ctx, verdict.JobID)
+		if err != nil {
+			return nil, "scope unavailable: " + err.Error()
+		}
+		payload, err := workflow.ParseJobPayload(job.Payload)
+		if err != nil {
+			return nil, "scope unavailable: " + err.Error()
+		}
+		var findings []string
+		if payload.Result != nil {
+			findings = workflow.NamedReviewFindings(*payload.Result)
+		}
+		// ANCESTRY-SCOPED, NOT PR-SCOPED (#2178 round 2). Refusing on ANY
+		// undecodable row over-refuses: a row orphaned by a rebase, or one for
+		// another purpose, could never have been selected as this baseline. The
+		// question is narrower - is an invisible verdict sitting BETWEEN the
+		// baseline and the dispatch head, where it would have been the real
+		// baseline? Only then is the "you last saw X" sentence false.
+		if reason := undecodableBlocks(ctx, git, undecodable, baseline, job.UpdatedAt, job.ID, head, want); reason != "" {
+			return nil, reason
+		}
+		return &workflow.ReviewScope{
+			PreviousHeadSHA: baseline,
+			Findings:        findings,
+			ChangedFiles:    files,
+		}, ""
+	}
+	if candidates == 0 {
+		return nil, "no prior verdict for this purpose"
+	}
+	return nil, "not a direct follow-up: " + lastUnavailable
+}
+
+func reviewRouterInstructions(purpose, repo string, pullRequest int, head string, scope *workflow.ReviewScope) string {
 	var focus string
 	switch purpose {
 	case "security":
@@ -831,9 +1002,16 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	default:
 		focus = "Prioritize correctness of the changed production paths, their failure boundaries, and valid-input behavior."
 	}
+	// A bounded delta review replaces ONLY the diff-scope sentence; every
+	// obligation after it - execute checks, declare evidence, answer prior
+	// findings, do not edit - is identical on both paths (#2177).
+	diffScope := "Read the full diff against its base."
+	if scope != nil {
+		diffScope = workflow.ReviewScopeInstructions(head, scope)
+	}
 	return fmt.Sprintf(`Independent review-only assessment of %s pull request #%d at exact head %s.
 %s
-Read the full diff against its base. Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths); do not approve on static reading alone. Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding. Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.`, repo, pullRequest, head, focus)
+%s Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths); do not approve on static reading alone. Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding. Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.`, repo, pullRequest, head, focus, diffScope)
 }
 
 func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
@@ -849,6 +1027,12 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	}
 	if output.Verdict != "" {
 		fmt.Fprintf(w, "verdict: %s (already saved; no new review spent)\n", output.Verdict)
+	}
+	if output.Baseline != "" {
+		fmt.Fprintf(w, "baseline: %s (delta review; prior findings carried)\n", output.Baseline)
+	}
+	if output.BaselineSkipped != "" {
+		fmt.Fprintf(w, "baseline: none (%s)\n", output.BaselineSkipped)
 	}
 	if len(output.ModelPool) > 1 {
 		fmt.Fprintf(w, "fallback models: %s\n", strings.Join(output.ModelPool[1:], ", "))
@@ -881,20 +1065,24 @@ func reviewGateState(home, repo string) string {
 }
 
 type reviewStatusOutput struct {
-	Repo        string              `json:"repo"`
-	PullRequest int                 `json:"pull_request"`
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
 	// Gate states what the native merge gate can do for this repository, in
 	// words. A requester must never read an absent or kill-switched gate as an
 	// approval, and "not applied to this head" alone does not say which it is.
-	Gate        string              `json:"gate"`
-	Requests    []reviewStatusEntry `json:"requests"`
+	Gate     string              `json:"gate"`
+	Requests []reviewStatusEntry `json:"requests"`
 }
 
 type reviewStatusEntry struct {
-	JobID     string `json:"job_id"`
-	State     string `json:"state"`
-	HeadSHA   string `json:"head_sha"`
-	Purpose   string `json:"purpose,omitempty"`
+	JobID   string `json:"job_id"`
+	State   string `json:"state"`
+	HeadSHA string `json:"head_sha"`
+	Purpose string `json:"purpose,omitempty"`
+	// Baseline is the prior head this review was bounded to, empty for a full
+	// review (#2177). It tells a reader which kind of review produced a verdict
+	// without reading the reviewer's prompt.
+	Baseline  string `json:"baseline,omitempty"`
 	Requester string `json:"requester,omitempty"`
 	Reviewer  string `json:"reviewer"`
 	Model     string `json:"model,omitempty"`
@@ -948,6 +1136,9 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 				entry.HeadSHA = payload.HeadSHA
 				entry.Purpose = payload.ReviewPurpose
 				entry.Requester = payload.ReviewRequester
+				if payload.ReviewScope != nil {
+					entry.Baseline = payload.ReviewScope.PreviousHeadSHA
+				}
 				if payload.Model != "" {
 					entry.Model = payload.Model
 				}
@@ -986,6 +1177,9 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 		line := fmt.Sprintf("  %s %s head=%s reviewer=%s", entry.JobID, entry.State, shortReviewHead(entry.HeadSHA), entry.Reviewer)
 		if entry.Model != "" {
 			line += " model=" + entry.Model
+		}
+		if entry.Baseline != "" {
+			line += " baseline=" + shortReviewHead(entry.Baseline)
 		}
 		if entry.Verdict != "" {
 			line += fmt.Sprintf(" verdict=%s evidence=%s findings=%d", entry.Verdict, firstNonEmpty(entry.Evidence, "undeclared"), entry.Findings)

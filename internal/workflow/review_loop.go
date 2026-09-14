@@ -461,7 +461,7 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 			}
 			continue
 		}
-		findings := namedReviewFindings(*payload.Result)
+		findings := NamedReviewFindings(*payload.Result)
 		switch strings.TrimSpace(payload.Result.Decision) {
 		case "approved", "changes_requested":
 			if job.State != string(JobSucceeded) {
@@ -534,7 +534,10 @@ func laterReviewScopeCandidate(candidate, prior reviewScopeCandidate) bool {
 	return candidate.job.ID > prior.job.ID
 }
 
-func namedReviewFindings(result AgentResult) []string {
+// NamedReviewFindings renders a verdict's findings as plain strings for a
+// bounded follow-up brief. Exported for the review router's delta reviews
+// (#2177), which build the same brief from a prior router verdict.
+func NamedReviewFindings(result AgentResult) []string {
 	findings := make([]string, 0, len(result.Findings))
 	for _, raw := range result.Findings {
 		var text string
@@ -580,7 +583,17 @@ func sortedUniqueStrings(values []string) []string {
 func scopedReviewInstructions(event PullRequestEvent, scope *ReviewScope) string {
 	var instructions strings.Builder
 	fmt.Fprintf(&instructions, "Review pull request #%d as a scoped follow-up for task %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle))
-	fmt.Fprintf(&instructions, "The reviewer last saw exact head %s; the current head is %s. Diff from that prior head, never from the PR base.\n", scope.PreviousHeadSHA, event.HeadSHA)
+	instructions.WriteString(ReviewScopeInstructions(event.HeadSHA, scope))
+	return instructions.String()
+}
+
+// ReviewScopeInstructions renders the bounded-input paragraph shared by the
+// engine's follow-up reviews and the review router's delta reviews (#2177).
+// The text is identical on both paths deliberately: a reviewer must not be able
+// to tell which producer bounded it, or the two briefs drift apart.
+func ReviewScopeInstructions(currentHead string, scope *ReviewScope) string {
+	var instructions strings.Builder
+	fmt.Fprintf(&instructions, "The reviewer last saw exact head %s; the current head is %s. Diff from that prior head, never from the PR base.\n", scope.PreviousHeadSHA, currentHead)
 	instructions.WriteString("Named findings still in scope:\n")
 	if len(scope.Findings) == 0 {
 		instructions.WriteString("- none\n")
@@ -606,7 +619,7 @@ func scopedReviewInstructions(event PullRequestEvent, scope *ReviewScope) string
 
 func reviewFixInstructions(reviewer string, result AgentResult) string {
 	base := fmt.Sprintf("Address requested changes from %s: %s", reviewer, result.Summary)
-	findings := namedReviewFindings(result)
+	findings := NamedReviewFindings(result)
 	if len(findings) == 0 {
 		return base
 	}

@@ -1036,7 +1036,7 @@ func reviewShapedResult(result *AgentResult) bool {
 		//
 		// Requiring findings on every arm was right for "approved" and wrong here,
 		// and the asymmetry is not a special case: review_loop.go's
-		// namedReviewFindings already promotes a changes_requested SUMMARY to a
+		// NamedReviewFindings already promotes a changes_requested SUMMARY to a
 		// finding when the array is empty. This mirrors that rule rather than
 		// inventing a second one - the same reason the "blocked" arm matches
 		// followUpReviewScopes.

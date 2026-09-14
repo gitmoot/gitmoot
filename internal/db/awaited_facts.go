@@ -407,6 +407,82 @@ type SucceededReviewVerdict struct {
 // has indexed columns for them. This is a pure read: unlike SubscribeAwaitedFact
 // it creates no durable interest or other state. Skipped reviews are abstentions,
 // not verdicts, and must remain retryable at the same head.
+// UndecodableReviewVerdict places a succeeded review row that
+// SucceededReviewVerdicts cannot decode and therefore drops silently (#2179).
+// Heads alone were not enough: baseline selection orders by updated_at, so a
+// consumer must know WHEN a row would have sorted as well as WHERE it sits,
+// and must be able to tell a genuinely head-less row (unselectable, harmless)
+// from a payload it could not read at all (#2178 round 3).
+type UndecodableReviewVerdict struct {
+	// JobID breaks an updated_at tie exactly as the ORDER BY does
+	// (updated_at DESC, id DESC), so "would have sorted first" is decided the
+	// same way in both places.
+	JobID string
+	// HeadSHA is empty when the payload declares no head. Such a row can never
+	// be a baseline - selection skips an empty head - so it is unselectable
+	// rather than dangerous. Mailbox.OpenExternalJob writes exactly this shape.
+	HeadSHA string
+	// ReviewPurpose scopes the row the same way selection does; a row for
+	// another purpose could never have bounded this request.
+	ReviewPurpose string
+	// UpdatedAt is the jobs column selection orders by, compared as the string
+	// SQL compares so the two agree by construction.
+	UpdatedAt string
+	// Readable is false when the payload is not even valid JSON, so nothing
+	// about its position can be established. That is the only shape that
+	// disqualifies unconditionally.
+	Readable bool
+}
+
+// UndecodableReviewVerdicts returns the undecodable succeeded review rows for
+// this pull request, placed. It exists so a consumer can tell ABSENT from
+// UNDECODABLE (#2179) and, given the placement, tell an invisible verdict that
+// would have changed the outcome from one that could never have been chosen.
+func (s *Store) UndecodableReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]UndecodableReviewVerdict, error) {
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	if repo == "" {
+		return nil, errors.New("review verdict repo is required")
+	}
+	if pullRequest <= 0 {
+		return nil, errors.New("review verdict pull request must be positive")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, payload, updated_at
+FROM jobs
+WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?`, repo, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var undecodable []UndecodableReviewVerdict
+	for rows.Next() {
+		var jobID, payload, updatedAt string
+		if err := rows.Scan(&jobID, &payload, &updatedAt); err != nil {
+			return nil, err
+		}
+		var decoded reviewVerdictPayload
+		if err := json.Unmarshal([]byte(payload), &decoded); err == nil {
+			continue
+		}
+		// The decode failure is in the findings shape, so the identifying
+		// fields still parse. A payload that is not valid JSON at all fails
+		// here too, and that is the unplaceable case.
+		var lenient struct {
+			HeadSHA       string `json:"head_sha"`
+			ReviewPurpose string `json:"review_purpose"`
+		}
+		readable := json.Unmarshal([]byte(payload), &lenient) == nil
+		undecodable = append(undecodable, UndecodableReviewVerdict{
+			JobID:         jobID,
+			HeadSHA:       strings.ToLower(strings.TrimSpace(lenient.HeadSHA)),
+			ReviewPurpose: strings.ToLower(strings.TrimSpace(lenient.ReviewPurpose)),
+			UpdatedAt:     updatedAt,
+			Readable:      readable,
+		})
+	}
+	return undecodable, rows.Err()
+}
+
 func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]SucceededReviewVerdict, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	if repo == "" {

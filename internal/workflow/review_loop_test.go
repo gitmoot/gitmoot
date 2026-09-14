@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -214,5 +215,40 @@ func TestResolveRuntimeFamilyPrecedence(t *testing.T) {
 					tc.agent, tc.recorded, family, ok, tc.want, tc.wantOK)
 			}
 		})
+	}
+}
+
+// #2177. The router's delta reviews and the engine's follow-up reviews must
+// read identically: a reviewer must not be able to tell which producer bounded
+// it, or the two briefs drift apart. This pins the extraction as byte-identical.
+func TestReviewScopeInstructionsMatchesFollowUpText(t *testing.T) {
+	event := PullRequestEvent{Repo: "owner/repo", PullRequest: 12, HeadSHA: "b", TaskID: "task-7"}
+	scope := &ReviewScope{
+		PreviousHeadSHA: "a",
+		Findings:        []string{"F1: guard has no test"},
+		ChangedFiles:    []string{"internal/cli/review.go"},
+	}
+	want := fmt.Sprintf("Review pull request #%d as a scoped follow-up for task %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle)) +
+		ReviewScopeInstructions(event.HeadSHA, scope)
+	if got := scopedReviewInstructions(event, scope); got != want {
+		t.Fatalf("follow-up text drifted from the shared paragraph:\n got: %q\nwant: %q", got, want)
+	}
+	if !strings.Contains(want, "The reviewer last saw exact head a; the current head is b.") {
+		t.Fatalf("shared paragraph lost its head sentence: %q", want)
+	}
+}
+
+// Mutant (d) from the #2178 round-1 battery: the summary-promotion arm of
+// NamedReviewFindings survived the ENTIRE workflow package. A
+// changes_requested verdict that names no structured findings still has to
+// carry something forward, or a delta brief inherits an empty obligation list
+// from a verdict that demanded changes.
+func TestNamedReviewFindingsPromotesSummaryWhenChangesRequested(t *testing.T) {
+	promoted := NamedReviewFindings(AgentResult{Decision: "changes_requested", Summary: "the guard has no test"})
+	if len(promoted) != 1 || promoted[0] != "the guard has no test" {
+		t.Fatalf("findings = %v, want the summary promoted: a changes_requested verdict with no structured findings would carry an empty obligation list", promoted)
+	}
+	if got := NamedReviewFindings(AgentResult{Decision: "approved", Summary: "clean"}); len(got) != 0 {
+		t.Fatalf("findings = %v, want none: an approved verdict's summary is not an obligation", got)
 	}
 }
