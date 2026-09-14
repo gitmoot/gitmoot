@@ -851,6 +851,37 @@ func reviewRequestHolds(paths config.Paths, home string) []string {
 // full review; the reason is REPORTED, never acted on, because every failure
 // here costs one full read and must never refuse the request. Refusing would
 // block the commonest shape of all - a branch rebased onto main.
+// undecodableBetween reports why a delta must be refused because an invisible
+// verdict sits strictly between the chosen baseline and the dispatch head. An
+// unplaceable row - one whose head could not be recovered at all - disqualifies
+// unconditionally, because "I cannot tell where it sits" is not evidence that
+// it sits somewhere harmless.
+func undecodableBetween(ctx context.Context, git gitutil.Client, undecodableHeads []string, baseline, head string) string {
+	for _, invisible := range undecodableHeads {
+		invisible = strings.ToLower(strings.TrimSpace(invisible))
+		if invisible == "" {
+			return "verdict history has an undecodable row whose head cannot be read; baseline cannot be trusted"
+		}
+		if invisible == baseline || invisible == head {
+			continue
+		}
+		reachable, err := git.IsAncestor(ctx, invisible, head)
+		if err != nil || !reachable {
+			// Not on this line of history (rebase orphan), or unreadable: it
+			// could never have been selected, so it cannot have been skipped.
+			continue
+		}
+		newerThanBaseline, err := git.IsAncestor(ctx, invisible, baseline)
+		if err != nil {
+			continue
+		}
+		if !newerThanBaseline {
+			return fmt.Sprintf("an undecodable verdict at %s sits between the baseline and this head; baseline cannot be trusted", invisible)
+		}
+	}
+	return ""
+}
+
 func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
 	// AN UNDECODABLE VERDICT IS NOT AN ABSENCE (#2179, #2178 round 1). A row
 	// SucceededReviewVerdicts cannot decode is dropped silently, so the loop
@@ -859,12 +890,9 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 	// reviewer "you last saw head X" when it did not. A false statement in the
 	// brief is worse than a full re-read, so lossy history disables the delta
 	// entirely rather than selecting from what survived.
-	undecodable, err := store.UndecodableReviewVerdicts(ctx, repo, pullRequest)
+	undecodableHeads, err := store.UndecodableReviewVerdictHeads(ctx, repo, pullRequest)
 	if err != nil {
 		return nil, "scope unavailable: " + err.Error()
-	}
-	if undecodable > 0 {
-		return nil, fmt.Sprintf("verdict history has %d undecodable row(s); baseline cannot be trusted", undecodable)
 	}
 	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
 	if err != nil {
@@ -918,6 +946,15 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 		var findings []string
 		if payload.Result != nil {
 			findings = workflow.NamedReviewFindings(*payload.Result)
+		}
+		// ANCESTRY-SCOPED, NOT PR-SCOPED (#2178 round 2). Refusing on ANY
+		// undecodable row over-refuses: a row orphaned by a rebase, or one for
+		// another purpose, could never have been selected as this baseline. The
+		// question is narrower - is an invisible verdict sitting BETWEEN the
+		// baseline and the dispatch head, where it would have been the real
+		// baseline? Only then is the "you last saw X" sentence false.
+		if reason := undecodableBetween(ctx, git, undecodableHeads, baseline, head); reason != "" {
+			return nil, reason
 		}
 		return &workflow.ReviewScope{
 			PreviousHeadSHA: baseline,

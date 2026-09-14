@@ -407,42 +407,57 @@ type SucceededReviewVerdict struct {
 // has indexed columns for them. This is a pure read: unlike SubscribeAwaitedFact
 // it creates no durable interest or other state. Skipped reviews are abstentions,
 // not verdicts, and must remain retryable at the same head.
-// UndecodableReviewVerdicts counts succeeded review rows for this pull request
-// whose payload SucceededReviewVerdicts cannot decode, and therefore silently
-// drops (#2179). It exists so a consumer can tell ABSENT from UNDECODABLE: a
+// UndecodableReviewVerdictHeads returns the head SHAs of succeeded review rows
+// for this pull request whose payload SucceededReviewVerdicts cannot decode,
+// and therefore silently drops (#2179). Heads rather than a count, because a
+// consumer must be able to ask WHERE the invisible verdict sits: an undecodable
+// row orphaned by a rebase could never have been selected, and refusing on it
+// is pure over-refusal (#2178 round 2).
+//
+// The head is recovered with a lenient struct: the decode failure is in the
+// findings shape, so the identifying fields still parse. A row whose head
+// cannot be recovered either is returned as an empty string, which callers must
+// treat as unplaceable and therefore disqualifying.
+//
+// It exists so a consumer can tell ABSENT from UNDECODABLE: a
 // verdict that is merely missing means "nothing has answered here", while one
 // that failed to decode means "something answered and I cannot read it", and
 // the two justify opposite behaviour. It deliberately does NOT widen what
 // counts as verdict history - changing that affects the merge gate and the
 // review-loop guard simultaneously and belongs in its own change.
-func (s *Store) UndecodableReviewVerdicts(ctx context.Context, repo string, pullRequest int) (int, error) {
+func (s *Store) UndecodableReviewVerdictHeads(ctx context.Context, repo string, pullRequest int) ([]string, error) {
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	if repo == "" {
-		return 0, errors.New("review verdict repo is required")
+		return nil, errors.New("review verdict repo is required")
 	}
 	if pullRequest <= 0 {
-		return 0, errors.New("review verdict pull request must be positive")
+		return nil, errors.New("review verdict pull request must be positive")
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT payload
 FROM jobs
 WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_request = ?`, repo, pullRequest)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer rows.Close()
-	undecodable := 0
+	var heads []string
 	for rows.Next() {
 		var payload string
 		if err := rows.Scan(&payload); err != nil {
-			return 0, err
+			return nil, err
 		}
 		var decoded reviewVerdictPayload
-		if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
-			undecodable++
+		if err := json.Unmarshal([]byte(payload), &decoded); err == nil {
+			continue
 		}
+		var lenient struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		_ = json.Unmarshal([]byte(payload), &lenient)
+		heads = append(heads, strings.ToLower(strings.TrimSpace(lenient.HeadSHA)))
 	}
-	return undecodable, rows.Err()
+	return heads, rows.Err()
 }
 
 func (s *Store) SucceededReviewVerdicts(ctx context.Context, repo string, pullRequest int) ([]SucceededReviewVerdict, error) {

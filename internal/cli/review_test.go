@@ -1557,51 +1557,6 @@ func TestReviewStatusShowsBaseline(t *testing.T) {
 	}
 }
 
-// #2178 round 1 P2. An undecodable verdict is dropped silently by
-// SucceededReviewVerdicts, so the baseline loop used to walk past a REAL
-// terminal verdict to an older ancestor - bounding the review against a stale
-// baseline and asserting "the reviewer last saw exact head X" when it did not.
-// A false statement in the brief is worse than a full re-read.
-func TestDeltaRefusesWhenVerdictHistoryIsUndecodable(t *testing.T) {
-	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
-	ctx := context.Background()
-
-	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
-	if failure != "" {
-		t.Fatal(failure)
-	}
-	saveReviewRouterVerdict(t, store, first.JobID)
-
-	// A second succeeded review whose findings are bare STRINGS: valid to every
-	// producer, undecodable to verdict history.
-	payload, err := json.Marshal(map[string]any{
-		"repo": "owner/repo", "pull_request": 12, "head_sha": firstHead, "review_purpose": "code",
-		"result": map[string]any{"decision": "changes_requested", "severity": "P2", "evidence": "executed",
-			"findings": []string{"F9: a finding stored as a bare string"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CreateJob(ctx, db.Job{ID: "undecodable-verdict", Agent: "only-reviewer", Type: "review",
-		State: string(workflow.JobSucceeded), Payload: string(payload), Repo: "owner/repo"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12 WHERE id = 'undecodable-verdict'"); err != nil {
-		t.Fatal(err)
-	}
-
-	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
-	if failure != "" {
-		t.Fatal(failure)
-	}
-	if second.Baseline != "" {
-		t.Fatalf("baseline = %q, want none: verdict history is lossy, so any baseline chosen from it may be stale and the brief would assert a head the reviewer never saw", second.Baseline)
-	}
-	if !strings.Contains(second.BaselineSkipped, "undecodable") {
-		t.Fatalf("skip reason = %q, want it to name the undecodable rows", second.BaselineSkipped)
-	}
-}
-
 // Mutant (a) from the round-1 battery: `continue` -> `break` on the
 // not-a-follow-up arm. Needs TWO candidates where the NEWER is a non-ancestor
 // and the OLDER is an ancestor, which no earlier test exercised.
@@ -1684,7 +1639,7 @@ func TestDeltaTreatsALegacyVerdictWithNoPurposeAsCode(t *testing.T) {
 // test. Without it a request would be bounded against ITSELF: an empty range,
 // and an instruction telling the reviewer to approve without reading anything.
 func TestResolveDeltaScopeNeverBoundsAHeadAgainstItself(t *testing.T) {
-	home, store, checkout, _, head := deltaReviewFixture(t)
+	home, store, checkout, head, descendant := deltaReviewFixture(t)
 	ctx := context.Background()
 
 	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, head), "--role", "joltra")...)
@@ -1693,12 +1648,19 @@ func TestResolveDeltaScopeNeverBoundsAHeadAgainstItself(t *testing.T) {
 	}
 	saveReviewRouterVerdict(t, store, first.JobID)
 
-	// A REAL git client: with a nil runner the resolver fails before it reaches
-	// the guard, and the test would pass for the wrong reason. Proven by the
-	// positive control below, which must find the same-head verdict.
+	// THE CONTROL MUST DIFFER FROM THE ASSERTION, or it controls nothing. My
+	// first version called the resolver twice with identical arguments and
+	// passed even with a nil client, because the same-head guard short-circuits
+	// before any git call (#2178 round 2). The control therefore resolves at a
+	// DESCENDANT, where a scope must be built - proving the resolver, the store
+	// and the git client all work before the real assertion claims a nil.
 	git := gitutil.NewHostClient(checkout)
-	if reused, _ := resolveDeltaReviewScope(ctx, store, git, "owner/repo", 12, head, "code"); reused != nil {
-		t.Fatalf("control: a scope was built for the head against itself: %+v", reused)
+	control, controlReason := resolveDeltaReviewScope(ctx, store, git, "owner/repo", 12, descendant, "code")
+	if control == nil {
+		t.Fatalf("control: no scope built at a descendant head (%s), so a nil below would prove nothing", controlReason)
+	}
+	if control.PreviousHeadSHA != head {
+		t.Fatalf("control: baseline = %q, want the verdict head %q", control.PreviousHeadSHA, head)
 	}
 	scope, reason := resolveDeltaReviewScope(ctx, store, git, "owner/repo", 12, head, "code")
 	if scope != nil {
@@ -1731,6 +1693,15 @@ func TestCarriedFindingCitingAForeignCommitHasAWorkingEscape(t *testing.T) {
 	saveReviewRouterVerdictWith(t, store, first.JobID, "changes_requested",
 		[]string{"F1: regression introduced in " + foreignSHA})
 
+	// WITHOUT the flag the guard must still refuse: the escape is escapable,
+	// not off. This is the arm that fails if the flag is ever forced on.
+	var stdout, stderr bytes.Buffer
+	if exit := runReview(append([]string{"request"}, append(deltaReviewBase(home, secondHead), "--role", "owner")...), &stdout, &stderr); exit == 0 {
+		t.Fatalf("a foreign citation dispatched WITHOUT the escape flag: the head-binding guard is off, not escapable (stdout %q)", stdout.String())
+	} else if !strings.Contains(stderr.String(), "allow-prompt-head-mismatch") {
+		t.Fatalf("refusal does not name the escape: %q", stderr.String())
+	}
+
 	escaped, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner", "--allow-prompt-head-mismatch")...)
 	if failure != "" {
 		t.Fatalf("the escape flag named by the refusal does not work: %s", failure)
@@ -1741,5 +1712,200 @@ func TestCarriedFindingCitingAForeignCommitHasAWorkingEscape(t *testing.T) {
 	payload := dispatchedReviewPayload(t, store, escaped.JobID)
 	if !strings.Contains(payload.Instructions, foreignSHA) {
 		t.Fatalf("carried finding lost its citation: %q", payload.Instructions)
+	}
+}
+
+// #2178 round 2 r2-f1. Refusing on ANY undecodable row in the PR over-refuses:
+// a row orphaned by a rebase could never have been selected as this baseline,
+// so it cannot have been silently skipped. The delta must survive it.
+func TestUndecodableVerdictOffThisHistoryDoesNotBlockTheDelta(t *testing.T) {
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	runGit(t, checkout, "switch", "main")
+	writeFile(t, filepath.Join(checkout, "orphan2.txt"), "rebase orphan\n")
+	runGit(t, checkout, "add", "orphan2.txt")
+	runGit(t, checkout, "commit", "-m", "orphaned by rebase")
+	orphanHead := readonlyWorktreeHead(t, checkout)
+	runGit(t, checkout, "switch", "feature/review")
+
+	seedUndecodableVerdict(t, store, "orphan-undecodable", orphanHead)
+
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.Baseline != firstHead {
+		t.Fatalf("baseline = %q, want %q: an undecodable verdict off this line of history could never have been selected, so it must not disable the delta (skip reason %q)", second.Baseline, firstHead, second.BaselineSkipped)
+	}
+}
+
+// The other half: an undecodable verdict sitting BETWEEN the baseline and the
+// dispatch head is exactly the one that would have been selected, so the brief
+// would claim a head the reviewer never saw. That must still refuse.
+func TestUndecodableVerdictBetweenBaselineAndHeadBlocksTheDelta(t *testing.T) {
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	// A third commit ON THE REVIEW BRANCH - the fixture leaves the checkout on
+	// main, so committing without switching lands off this line of history.
+	runGit(t, checkout, "switch", "feature/review")
+	writeFile(t, filepath.Join(checkout, "review.txt"), "round three\n")
+	runGit(t, checkout, "add", "review.txt")
+	runGit(t, checkout, "commit", "-m", "review round three")
+	thirdHead := readonlyWorktreeHead(t, checkout)
+	seedUndecodableVerdict(t, store, "middle-undecodable", secondHead)
+
+	third, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", thirdHead,
+		"--branch", "feature/review", "--home", home, "--json", "--role", "owner")
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if third.Baseline != "" {
+		t.Fatalf("baseline = %q, want none: an invisible verdict sits between it and this head, so the brief would assert a head the reviewer never saw", third.Baseline)
+	}
+	if !strings.Contains(third.BaselineSkipped, "sits between") {
+		t.Fatalf("skip reason = %q, want it to name the interposed verdict", third.BaselineSkipped)
+	}
+}
+
+// r2-f2 mutant M4: `continue` -> `break` on the same-head arm. A same-head
+// verdict must be STEPPED OVER, not treated as the end of the search, or an
+// older ancestor that could have bounded the review is missed.
+func TestDeltaStepsOverASameHeadVerdictToAnOlderAncestor(t *testing.T) {
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
+	ctx := context.Background()
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	// A NEWER verdict at the dispatch head itself. Reached directly, the
+	// resolver must skip it and keep walking to firstHead.
+	payload, err := json.Marshal(map[string]any{
+		"repo": "owner/repo", "pull_request": 12, "head_sha": secondHead, "review_purpose": "code",
+		"result": map[string]any{"decision": "approved", "evidence": "executed", "findings": []any{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "same-head-verdict", Agent: "only-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(payload), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12, updated_at = '2099-01-01 00:00:00' WHERE id = 'same-head-verdict'"); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), "owner/repo", 12, secondHead, "code")
+	if scope == nil || scope.PreviousHeadSHA != firstHead {
+		t.Fatalf("scope = %+v (%s), want the older ancestor %s: a same-head verdict must be stepped over, not end the search", scope, reason, firstHead)
+	}
+}
+
+// r2-f2 mutant M5: `continue` -> `break` on the purpose arm. A NEWER
+// wrong-purpose verdict must not suppress a delta an older right-purpose
+// verdict would have bounded.
+func TestDeltaStepsOverAWrongPurposeVerdictToAnOlderMatch(t *testing.T) {
+	home, store, checkout, firstHead, secondHead := deltaReviewFixture(t)
+	ctx := context.Background()
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	payload, err := json.Marshal(map[string]any{
+		"repo": "owner/repo", "pull_request": 12, "head_sha": firstHead, "review_purpose": "security",
+		"result": map[string]any{"decision": "approved", "evidence": "executed", "findings": []any{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: "newer-security-verdict", Agent: "only-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(payload), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12, updated_at = '2099-01-01 00:00:00' WHERE id = 'newer-security-verdict'"); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, reason := resolveDeltaReviewScope(ctx, store, gitutil.NewHostClient(checkout), "owner/repo", 12, secondHead, "code")
+	if scope == nil || scope.PreviousHeadSHA != firstHead {
+		t.Fatalf("scope = %+v (%s), want %s: a newer wrong-purpose verdict must be stepped over, not end the search", scope, reason, firstHead)
+	}
+}
+
+// seedUndecodableVerdict writes a succeeded review whose findings are bare
+// strings: valid to every producer, undecodable to verdict history (#2179).
+func seedUndecodableVerdict(t *testing.T, store *db.Store, id, head string) {
+	t.Helper()
+	seedUndecodableVerdictInState(t, store, id, head, string(workflow.JobSucceeded))
+}
+
+// seedUndecodableVerdictInState creates the row already IN the state under
+// test. A raw UPDATE of jobs.state bypasses the lifecycle-generation seam
+// (#1407) and is refused by its guard test, correctly.
+func seedUndecodableVerdictInState(t *testing.T, store *db.Store, id, head, state string) {
+	t.Helper()
+	ctx := context.Background()
+	payload, err := json.Marshal(map[string]any{
+		"repo": "owner/repo", "pull_request": 12, "head_sha": head, "review_purpose": "code",
+		"result": map[string]any{"decision": "changes_requested", "severity": "P2", "evidence": "executed",
+			"findings": []string{"F9: stored as a bare string"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "only-reviewer", Type: "review",
+		State: state, Payload: string(payload), Repo: "owner/repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExecForTest(ctx, "UPDATE jobs SET pull_request = 12 WHERE id = ?", id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// M8: UndecodableReviewVerdictHeads must count only SUCCEEDED reviews. A failed
+// job's payload is not verdict history, and treating one as an invisible
+// verdict would disable delta review on every PR that ever had a failed review.
+func TestUndecodableCountIgnoresNonSucceededReviews(t *testing.T) {
+	home, store, _, firstHead, secondHead := deltaReviewFixture(t)
+	ctx := context.Background()
+
+	first, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, firstHead), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, first.JobID)
+
+	seedUndecodableVerdictInState(t, store, "failed-undecodable", secondHead, string(workflow.JobFailed))
+
+	heads, err := store.UndecodableReviewVerdictHeads(ctx, "owner/repo", 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(heads) != 0 {
+		t.Fatalf("undecodable heads = %v, want none: a FAILED review is not verdict history", heads)
+	}
+	second, failure := runReviewRequestJSON(t, append(deltaReviewBase(home, secondHead), "--role", "owner")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if second.Baseline != firstHead {
+		t.Fatalf("baseline = %q, want %q: a failed review disabled the delta (%s)", second.Baseline, firstHead, second.BaselineSkipped)
 	}
 }
