@@ -141,8 +141,10 @@ func pathFromLensEvidence(evidence string) string {
 	return path
 }
 
-// RecordReviewFindingsToLedger writes one observation per reported finding at the
-// review's exact head.
+// RecordReviewFindingsToLedger writes one observation per supported finding at
+// the review's exact head. A failed review may still supply locator-backed or
+// executed evidence about the code. Its quoted-only diagnostics stay on the job:
+// a protocol/runtime failure is not a code observation.
 //
 // IT NEVER FAILS THE REVIEW, and that is now true of every path rather than of
 // most of them: a review that produced a real verdict must not be discarded
@@ -182,6 +184,17 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		if !ok {
 			skipped++
 			e.recordLedgerSkip(ctx, job.ID, index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
+			continue
+		}
+		// A failed review whose only support is quoted output has not established
+		// a code observation. Keep the protocol/runtime failure on the job instead
+		// of turning it into a non-advisory merge obligation. Locator-backed or
+		// executed findings still survive a later reviewer failure.
+		if job.State == string(JobFailed) &&
+			strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") &&
+			obs.EvidenceKind == db.EvidenceQuoted {
+			skipped++
+			e.recordLedgerSkip(ctx, job.ID, index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
 			continue
 		}
 		if _, err := e.Store.RecordReviewFindingObservation(ctx, obs); err != nil {

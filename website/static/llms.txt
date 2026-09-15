@@ -13,6 +13,9 @@ full expanded context.
 
 Native review verdicts return `changes_requested` to the requester's org role
 by default. Unattended implement fix dispatch is a durable per-PR opt-in.
+Findings ledger obligations follow commit ancestry, not pull request number alone.
+Quoted-only diagnostics from a failed review remain job failures rather than code
+findings; locator-backed or executed findings still enter the ledger.
 
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:

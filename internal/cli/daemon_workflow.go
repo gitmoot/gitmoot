@@ -1032,6 +1032,7 @@ func newDaemonPolicyMergeGateForRunner(store *db.Store, gh github.Client, checko
 func daemonLedgerResolvers(gh github.Client, checkout string, runner subprocess.Runner) workflow.LedgerResolvers {
 	return workflow.LedgerResolvers{
 		ChangedSince:     daemonLedgerChangedFiles(gh, checkout, runner),
+		IsAncestor:       daemonLedgerIsAncestor(gh, checkout, runner),
 		PathExistsAtHead: daemonLedgerPathExists(checkout, runner),
 	}
 }
@@ -1093,6 +1094,62 @@ func daemonLedgerChangedFiles(gh github.Client, checkout string, runner subproce
 			paths = append(paths, file.Filename)
 		}
 		return sortedUniqueReviewPaths(paths), nil
+	}
+}
+
+// daemonLedgerIsAncestor binds findings to the branch line on which they were
+// observed. Unlike a changed-file comparison it does no diff work: open
+// findings need only the ancestry answer, and computing their full diff would
+// be avoidable work on every brief and merge-gate evaluation. The local object
+// database is authoritative when it has both commits; the compare API covers a
+// reviewed head that is no longer reachable from the force-pushed PR ref.
+func daemonLedgerIsAncestor(gh github.Client, checkout string, runner subprocess.Runner) func(context.Context, string, int, string, string) (bool, error) {
+	checkout = strings.TrimSpace(checkout)
+	if gh == nil && checkout == "" {
+		return nil
+	}
+	return func(ctx context.Context, repo string, number int, ancestorHead string, currentHead string) (bool, error) {
+		ancestorHead = strings.TrimSpace(ancestorHead)
+		currentHead = strings.TrimSpace(currentHead)
+		if ancestorHead == "" || currentHead == "" {
+			return false, fmt.Errorf("findings ledger ancestry needs both heads, got ancestor=%q current=%q", ancestorHead, currentHead)
+		}
+		if ancestorHead == currentHead {
+			return true, nil
+		}
+		var localErr error
+		if checkout != "" {
+			git := jobGitClient(checkout, runner)
+			if localErr = ensureReviewScopeCommits(ctx, git, number, ancestorHead, currentHead); localErr == nil {
+				if isAncestor, err := git.IsAncestor(ctx, ancestorHead, currentHead); err == nil {
+					return isAncestor, nil
+				} else {
+					localErr = err
+				}
+			}
+		}
+		if gh == nil {
+			if localErr != nil {
+				return false, localErr
+			}
+			return false, errors.New("findings ledger ancestry has no local checkout and no GitHub client")
+		}
+		owner, name, ok := strings.Cut(strings.TrimSpace(repo), "/")
+		if !ok || owner == "" || name == "" {
+			return false, fmt.Errorf("findings ledger ancestry: invalid repo %q", repo)
+		}
+		compare, err := gh.CompareCommits(ctx, github.Repository{Owner: owner, Name: name}, ancestorHead, currentHead)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(strings.TrimSpace(compare.Status)) {
+		case "ahead", "identical":
+			return true, nil
+		case "behind", "diverged":
+			return false, nil
+		default:
+			return false, fmt.Errorf("findings ledger ancestry: compare returned unknown status %q", compare.Status)
+		}
 	}
 }
 
