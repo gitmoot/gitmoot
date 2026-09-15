@@ -258,14 +258,48 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 }
 
 func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T) {
-	// Fields observed NOT to influence the mailbox. This list cannot CREATE
-	// coverage: an entry that does influence it fails below, so the list can
-	// only ever record an observation, never substitute for one.
+	// SET EQUALITY IN BOTH DIRECTIONS (#2188 round 4). The previous version's
+	// `mustForward` was obligation-only, which I argued made it safe. It did not:
+	// DELETING a name passed silently, which is the same edit direction the three
+	// deleted lists failed on - I had only closed the direction nobody uses.
+	//
+	// Worse, that rewrite REGRESSED two working properties. Round 3's source
+	// parser, blind in four ways, still FAILED on a newly added forward; the
+	// execution census did not, so "forgot to forward" was pinned only for the
+	// names already written down. Deleting the exemption SEMANTICS was right;
+	// deleting the mechanisms carrying them threw away detection and provenance.
+	//
+	// Every exported Engine field must therefore appear in EXACTLY ONE of these
+	// three sets, and each set must match what execution observes, exactly. A new
+	// field fails until classified, whichever way it behaves; a deleted name
+	// fails because observation still reports it.
+	mustForward := map[string]bool{
+		"ResolveDeliveryWorktree": true, "CollectChangeSet": true, "ApplyChangeSet": true,
+		"RequireWorkflowPolicy": true, "OrgPolicy": true, "ProduceCheckDir": true,
+		"BlockerDeferrer": true, "RouterContextEnabled": true, "RuntimeDefaultModel": true,
+		"ReviewModelPool": true, "RuntimeDefaultEffort": true, "ResultCheckMode": true,
+	}
+	// Observed inert: setting the field alone changes nothing on the mailbox.
+	// Every name here was OBSERVED, not assumed - an entry that turns out to be
+	// forwarded fails the set equality below, in that direction too.
 	expectedInert := map[string]bool{
-		// Observed, not assumed: this map is empty because the probe found every
-		// exported Engine field either forwarded or inert without exception.
-		// An entry here is a RECORD of an observation; naming a forwarded field
-		// fails below.
+		"ArtifactRoot": true, "BeforeReadOnlyWorktreeCleanup": true, "DelegationCheckout": true,
+		"FindingsAdvisory": true, "FixWorktreeAllocator": true, "Home": true,
+		"InjectUpstreamDepContext": true, "InlineArtifactBodies": true, "JobID": true,
+		"MaxDelegationNonProgressStreak": true, "MaxDelegationTokenBudget": true,
+		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true,
+		"NativeReviewFanoutEnabled": true, "Now": true, "OwnerPIDLive": true,
+		"PayloadRefresher": true, "PullRequestSignals": true, "ReviewBlockingSeverity": true,
+		"ReviewChangedFiles": true, "RiskLabelHigh": true, "RiskLabelRoutine": true,
+		"RiskTiersEnabled": true, "WorktreeHasLiveProcess": true, "WorktreeLiveness": true,
+	}
+	// Kinds this generator cannot synthesise a distinguishing value for. Listing
+	// one is a statement that it is UNPROBEABLE, not that it is uninteresting.
+	unprobeable := map[string]bool{
+		"DelegationTimeoutDefaults": true, "DelegationWorktrees": true, "EscalationNotifier": true,
+		"EventSink": true, "HighRiskPaths": true, "ImplementationFinalizer": true,
+		"LedgerResolvers": true, "MaxDelegationCostUSD": true, "Memory": true,
+		"MergeGate": true, "RequiredReviewers": true,
 	}
 
 	store := openEngineStore(t)
@@ -273,21 +307,23 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	baselineSnapshot := mailboxFieldSnapshot(t, baseline.EnqueueMailbox(nil))
 
 	engineType := reflect.TypeOf(Engine{})
-	var influencing, inert, unsettable []string
+	observedForward := map[string]bool{}
+	observedInert := map[string]bool{}
+	observedUnprobeable := map[string]bool{}
 	for i := range engineType.NumField() {
 		field := engineType.Field(i)
 		if !field.IsExported() || field.Name == "Store" {
 			continue
 		}
-		probe := reflect.New(engineType).Elem()
-		probe.FieldByName("Store").Set(reflect.ValueOf(store))
 		candidates := distinctiveValues(field.Type, i)
 		if len(candidates) == 0 {
-			unsettable = append(unsettable, field.Name)
+			observedUnprobeable[field.Name] = true
 			continue
 		}
 		changed := false
 		for _, candidate := range candidates {
+			probe := reflect.New(engineType).Elem()
+			probe.FieldByName("Store").Set(reflect.ValueOf(store))
 			probe.Field(i).Set(candidate)
 			engine := probe.Addr().Interface().(*Engine)
 			for name, got := range mailboxFieldSnapshot(t, engine.EnqueueMailbox(nil)) {
@@ -301,52 +337,19 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 			}
 		}
 		if changed {
-			influencing = append(influencing, field.Name)
-			if expectedInert[field.Name] {
-				t.Errorf("Engine.%s IS forwarded to the mailbox but is listed as inert: "+
-					"the list records observations and cannot be used to excuse one", field.Name)
-			}
-			continue
-		}
-		inert = append(inert, field.Name)
-	}
-
-	// THE ASYMMETRY THAT MAKES A LIST SAFE HERE. `expectedInert` was removed
-	// because it could EXCUSE a missing observation. This list can only DEMAND
-	// one: every name here must be observed reaching the mailbox, so adding a
-	// name adds an obligation and can never satisfy one. Deleting a name is a
-	// visible deletion in a diff, not a silent pass.
-	mustForward := []string{
-		"ResolveDeliveryWorktree", "CollectChangeSet", "ApplyChangeSet",
-		"RequireWorkflowPolicy", "OrgPolicy", "ProduceCheckDir", "BlockerDeferrer",
-		"RouterContextEnabled", "RuntimeDefaultModel", "ReviewModelPool",
-		"RuntimeDefaultEffort", "ResultCheckMode",
-	}
-	observed := map[string]bool{}
-	for _, name := range influencing {
-		observed[name] = true
-	}
-	for _, name := range mustForward {
-		if !observed[name] {
-			t.Errorf("Engine.%s reaches the mailbox in no observable way: a forward that was proved once is now gone", name)
+			observedForward[field.Name] = true
+		} else {
+			observedInert[field.Name] = true
 		}
 	}
 
-	// TWO FORWARD SHAPES A VARIANT-VS-BASELINE DIFF CANNOT SEE, both of which
-	// were live survivors when this census only diffed field values:
-	//
-	//  - a forward from a METHOD (`mb.reviewBlockingSeverity = e.reviewBlockingSeverity`)
-	//    is set unconditionally, so it is non-nil in the baseline too and no
-	//    engine field changes it. Deleting it made both sides nil and matched.
-	//  - a forward from a SUB-FIELD of a nil-guarded struct pointer
-	//    (`e.Memory.injectBlock`) never fires while Memory is nil, which the
-	//    zero-value probe guarantees.
-	//
-	// Both are asserted against the shapes that make them fire.
-	for _, name := range []string{"reviewBlockingSeverity"} {
-		if baselineSnapshot[name] == "nil" {
-			t.Errorf("Mailbox.%s is not wired at all: a method-derived forward is invisible to the value diff above", name)
-		}
+	requireSameSet(t, "forwarded", mustForward, observedForward)
+	requireSameSet(t, "inert", expectedInert, observedInert)
+	requireSameSet(t, "unprobeable", unprobeable, observedUnprobeable)
+
+	// Method-derived and sub-field forwards, invisible to the value diff above.
+	if baselineSnapshot["reviewBlockingSeverity"] == "nil" {
+		t.Error("Mailbox.reviewBlockingSeverity is not wired: a method-derived forward is invisible to the diff")
 	}
 	withMemory := Engine{Store: store, Memory: &MemoryController{}}
 	memorySnapshot := mailboxFieldSnapshot(t, withMemory.EnqueueMailbox(nil))
@@ -355,14 +358,71 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 			t.Errorf("Mailbox.%s is nil with a non-nil Memory: the sub-field forward is gone", name)
 		}
 	}
+}
 
-	if len(influencing) < 8 {
-		t.Fatalf("only %d engine fields observed reaching the mailbox (%v); the probe is broken, not the code", len(influencing), influencing)
+// requireSameSet reports BOTH directions, because each catches a different
+// edit: an unexpected member is a field nobody classified, and a missing member
+// is a property that was proved once and has since been deleted.
+func requireSameSet(t *testing.T, label string, declared, observed map[string]bool) {
+	t.Helper()
+	for name := range observed {
+		if !declared[name] {
+			t.Errorf("Engine.%s is observed %s but is classified nowhere: classify it as forwarded, inert or unprobeable", name, label)
+		}
 	}
-	t.Logf("observed forwarded: %d %v", len(influencing), influencing)
-	t.Logf("observed inert: %d", len(inert))
-	if len(unsettable) > 0 {
-		t.Logf("not probeable by this generator (struct/pointer/interface kinds): %v", unsettable)
+	for name := range declared {
+		if !observed[name] {
+			t.Errorf("Engine.%s is declared %s but is not observed %s: the behaviour it pinned is gone", name, label, label)
+		}
+	}
+}
+
+// PROVENANCE, restored (#2188 round 4). Its deletion was a regression: cross-
+// wiring `mb.RuntimeDefaultModel = e.RuntimeDefaultEffort` survived the whole
+// package, because non-nil proves a field was SET, not that it was set from its
+// counterpart. Two same-signature forwards can be swapped silently.
+func TestForwardedFuncFieldsComeFromTheirOwnCounterpart(t *testing.T) {
+	answered := ""
+	engineValue := reflect.New(reflect.TypeOf(Engine{})).Elem()
+	engineType := engineValue.Type()
+	mailboxType := reflect.TypeOf(Mailbox{})
+
+	var checked []string
+	for i := range engineType.NumField() {
+		field := engineType.Field(i)
+		if !field.IsExported() || field.Type.Kind() != reflect.Func {
+			continue
+		}
+		mailboxField, ok := mailboxType.FieldByName(field.Name)
+		if !ok || !mailboxField.IsExported() || mailboxField.Type != field.Type {
+			continue
+		}
+		name, fieldType := field.Name, field.Type
+		engineValue.Field(i).Set(reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
+			answered = name
+			out := make([]reflect.Value, fieldType.NumOut())
+			for j := range out {
+				out[j] = reflect.Zero(fieldType.Out(j))
+			}
+			return out
+		}))
+		checked = append(checked, name)
+	}
+	if len(checked) < 5 {
+		t.Fatalf("provenance covers only %d fields (%v); the probe is broken", len(checked), checked)
+	}
+
+	engine := engineValue.Addr().Interface().(*Engine)
+	engine.Store = openEngineStore(t)
+	engine.ResolveDeliveryWorktree = UnavailableDeliveryWorktreeResolver("test")
+	mailbox := reflect.ValueOf(engine.EnqueueMailbox(nil))
+
+	for _, name := range checked {
+		answered = ""
+		callFuncWithZeroArgs(mailbox.FieldByName(name))
+		if answered != name {
+			t.Errorf("Mailbox.%s is wired from Engine.%s, not from its counterpart", name, answered)
+		}
 	}
 }
 
@@ -434,4 +494,15 @@ func TestEnqueueMailboxForwardsFieldsReflectionCannotSee(t *testing.T) {
 	if mailbox.deferBlocker == nil {
 		t.Error("BlockerDeferrer -> deferBlocker not forwarded")
 	}
+}
+
+// callFuncWithZeroArgs invokes fn with zero values for every parameter, so a
+// provenance stub can report which field it belongs to.
+func callFuncWithZeroArgs(fn reflect.Value) {
+	fnType := fn.Type()
+	args := make([]reflect.Value, fnType.NumIn())
+	for i := range args {
+		args[i] = reflect.Zero(fnType.In(i))
+	}
+	fn.Call(args)
 }
