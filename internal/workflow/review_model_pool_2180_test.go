@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -303,9 +304,12 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		// INERT - the false-observation shape again, one indirection deeper than
 		// the depth bound that produced it last round.
 		//
-		// All-or-nothing propagates: an unsynthesisable pointee makes the
-		// pointer unsynthesisable, so the census fails loudly instead of
-		// concluding nothing-there from a value it never really built.
+		// NOTE: all-or-nothing does NOT propagate through this case, and an
+		// earlier version of this sentence claimed it did - false the moment
+		// the unconditional fallback below was added, IN THE SAME BLOCK. An
+		// unsynthesisable pointee yields the non-nil fallback alone, which is
+		// deliberate (see the candidate rationale below) and is the opposite of
+		// what the old sentence promised.
 		// TWO CANDIDATES, STRONGEST FIRST: a FILLED pointee when one can be
 		// built - which is what reaches a forward reading a pointee MEMBER -
 		// and a non-nil zero pointee otherwise.
@@ -857,4 +861,68 @@ func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
 	if !filled.flag {
 		t.Fatalf("unexported member flag stayed zero: a forward reading it would read INERT")
 	}
+}
+
+// #2188 round 13: METHOD-VALUE FORWARDS WERE PINNED BY NON-NIL ONLY. A
+// same-signature stub substituted for injectMemory, recordMemory or
+// reviewBlockingSeverity survived the entire package - the three are observed
+// to EXIST and not to be THEMSELVES, which is precisely the cross-wire defect
+// provenance was built for, in the one shape provenance does not reach:
+// provenance covers forwards landing on same-name same-type EXPORTED mailbox
+// fields, and these land on unexported ones.
+//
+// Identity is asserted two ways because the two shapes admit different proofs:
+// a method value carries its method's code pointer, and a config-derived
+// closure can be made to answer with a sentinel.
+func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
+	controller := &MemoryController{}
+	engine := Engine{
+		Store:                   openEngineStore(t),
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		Memory:                  controller,
+		// A VALID severity that is NOT the default, so the assertion cannot
+		// pass on the fallback reviewseverity.DefaultBlocking.
+		ReviewBlockingSeverity: func(string) string { return "P3" },
+	}
+	mailbox := engine.EnqueueMailbox(nil)
+
+	// IDENTITY BY RUNTIME FUNCTION NAME, not by pointer equality. A method VALUE
+	// is a compiler-generated wrapper, so its code pointer need not equal the
+	// method expression's - comparing them matched injectBlock and failed
+	// record, which is the shape of a check that passes by luck. The wrapper's
+	// NAME carries the method it closes over; a same-signature stub declared in
+	// a test carries the test's name instead.
+	for _, check := range []struct{ field, fn, want string }{
+		{"injectMemory", runtimeFuncName(mailbox.injectMemory), "MemoryController).injectBlock"},
+		{"recordMemory", runtimeFuncName(mailbox.recordMemory), "MemoryController).record"},
+	} {
+		if !strings.Contains(check.fn, check.want) {
+			t.Errorf("Mailbox.%s is wired from %s, not from %s: a same-signature stub passes a non-nil check",
+				check.field, check.fn, check.want)
+		}
+	}
+
+	// BEHAVIOURAL IDENTITY for the config-derived one: it must answer with the
+	// engine's own policy rather than merely being set.
+	if mailbox.reviewBlockingSeverity == nil {
+		t.Fatal("reviewBlockingSeverity not forwarded")
+	}
+	if got := mailbox.reviewBlockingSeverity("owner/repo"); got != "P3" {
+		t.Fatalf("reviewBlockingSeverity(owner/repo) = %q, want the engine's own P3: non-nil proves it is SET, not that it is ITSELF", got)
+	}
+}
+
+// runtimeFuncName reports the function a value actually closes over. It is the
+// only identity available for a forward landing on an UNEXPORTED field: the
+// census cannot compare it to a counterpart, and non-nil proves existence only.
+func runtimeFuncName(fn any) string {
+	value := reflect.ValueOf(fn)
+	if !value.IsValid() || value.IsNil() {
+		return "<nil>"
+	}
+	resolved := goruntime.FuncForPC(value.Pointer())
+	if resolved == nil {
+		return "<unresolvable>"
+	}
+	return resolved.Name()
 }
