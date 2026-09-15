@@ -618,7 +618,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// visible where the consequence lands (#2192 review).
 	if reason := strings.TrimSpace(managed.ReviewClassFallbackReason); reason != "" && isReviewJob(payload, job.Type) {
 		message := fmt.Sprintf("[review_router] unreadable (%s); using the built-in review class deadline %s", reason, managed.ReviewJobTimeout)
-		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_class_deadline_default", Message: message}); eventErr != nil {
+		// CLAIM, not if-absent: AddJobEventIfAbsent dedups on (job_id, kind), so a
+		// retry whose config failed differently would disclose NOTHING - the
+		// first reason spoken and every later distinct reason silent. Claiming on
+		// (job_id, kind, message) still collapses an identical repeat while
+		// keeping every DISTINCT value visible (#2192 review, P3). Same defect
+		// this advisory was added to fix, one level up at the disclosure layer.
+		if _, eventErr := w.Store.ClaimJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_class_deadline_default", Message: message}); eventErr != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
 				return finishErr
 			}
@@ -628,7 +634,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if invalid := strings.TrimSpace(timeoutResolution.InvalidPayload); invalid != "" {
 		message := fmt.Sprintf("job payload job_timeout %q is not a positive duration; using %s from %s instead",
 			invalid, timeoutResolution.Timeout, timeoutResolution.Source)
-		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "job_timeout_payload_invalid", Message: message}); eventErr != nil {
+		// Claimed on the MESSAGE, which carries the offending value, so a retry
+		// carrying a different invalid timeout is not swallowed (#2192 review).
+		if _, eventErr := w.Store.ClaimJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "job_timeout_payload_invalid", Message: message}); eventErr != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
 				return finishErr
 			}

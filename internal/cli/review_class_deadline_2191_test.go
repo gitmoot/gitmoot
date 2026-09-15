@@ -363,3 +363,65 @@ END;`); err != nil {
 		t.Fatalf("job state = %q, want failed", after.State)
 	}
 }
+
+// #2192 review (P3, seventh instance of the family): the advisory dedupped on
+// (job_id, kind), so a retry carrying a DIFFERENT invalid timeout emitted
+// nothing - first bad value disclosed, every later distinct bad value silent.
+// The fix for a silent-failure mode had acquired one of its own at the
+// disclosure layer.
+//
+// Driven through worker.run TWICE rather than by calling the store helper: a
+// store-level test would pass with the production call reverted to
+// AddJobEventIfAbsent, which is the defect under test.
+func TestEachDistinctInvalidPayloadTimeoutIsDisclosed(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-distinct-invalid", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main", JobTimeout: "banana"})
+
+	run := func(raw string) {
+		t.Helper()
+		if err := store.ExecForTest(ctx, `UPDATE jobs SET state='queued', payload=json_set(payload,'$.job_timeout',?) WHERE id=?`, raw, "job-distinct-invalid"); err != nil {
+			t.Fatal(err)
+		}
+		job, err := store.GetJob(ctx, "job-distinct-invalid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		worker := defaultJobWorker(store, io.Discard, home)
+		worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+			return t.TempDir(), nil
+		}
+		worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return &timeoutCaptureAdapter{}, nil }
+		if err := worker.run(ctx, job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run("banana")
+	run("-5m")
+	run("banana") // an identical repeat must still collapse
+
+	events, err := store.ListJobEvents(ctx, "job-distinct-invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disclosed := map[string]int{}
+	for _, event := range events {
+		if event.Kind == "job_timeout_payload_invalid" {
+			disclosed[event.Message]++
+		}
+	}
+	if len(disclosed) != 2 {
+		t.Fatalf("distinct invalid values disclosed = %d, want 2 (banana and -5m): %v", len(disclosed), disclosed)
+	}
+	for message, count := range disclosed {
+		if count != 1 {
+			t.Fatalf("message %q recorded %d times, want the identical repeat collapsed", message, count)
+		}
+	}
+}

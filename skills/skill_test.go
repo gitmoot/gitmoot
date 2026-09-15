@@ -296,3 +296,43 @@ func parseFrontmatter(t *testing.T, text string) string {
 	}
 	return parts[1]
 }
+
+// TestReviewDeadlineDocsAreIdenticalInBothTrees is the committed mechanism the
+// #2192 review asked for. The two CLI references are NOT copies of each other
+// (4973 vs 3814 lines; they address different readers), so whole-file parity
+// would be a false rule. What IS duplicated is the review-deadline block, which
+// was synced by hand in one shot - and a hand sync is prevented from drifting
+// by nobody. This pins the duplicated REGION byte-for-byte, so editing one copy
+// fails until the other is updated.
+func TestReviewDeadlineDocsAreIdenticalInBothTrees(t *testing.T) {
+	const (
+		blockStart = "The effective deadline resolves in this order:"
+		blockEnd   = "`quiet_kill_after` controls the transcript-silence leg"
+	)
+	extract := func(label, text string) string {
+		start := strings.Index(text, blockStart)
+		end := strings.Index(text, blockEnd)
+		if start < 0 || end < 0 || end <= start {
+			t.Fatalf("%s: review-deadline block not found (start=%d end=%d); if the docs were restructured, update this test's markers deliberately", label, start, end)
+		}
+		return strings.TrimSpace(text[start:end])
+	}
+	website := extract("website/docs/reference/cli.md", readRepoFile(t, "website", "docs", "reference", "cli.md"))
+	skill := extract("skills/gitmoot/references/CLI.md", readRepoFile(t, "skills", "gitmoot", "references", "CLI.md"))
+	if website != skill {
+		t.Fatalf("review-deadline docs have drifted between the two trees.\n--- website ---\n%s\n--- skills ---\n%s", website, skill)
+	}
+	// The facts a reader needs must actually be in the shared block, so a future
+	// edit cannot satisfy parity by deleting them from both copies.
+	for _, want := range []string{
+		"[review_router]",
+		"job_timeout_payload_invalid",
+		"review_class_deadline_default",
+		"must be positive",
+		"stored job type is `review`",
+	} {
+		if !strings.Contains(website, want) {
+			t.Errorf("shared review-deadline docs no longer mention %q", want)
+		}
+	}
+}
