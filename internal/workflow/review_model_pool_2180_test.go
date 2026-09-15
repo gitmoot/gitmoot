@@ -252,6 +252,40 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 		return values
 	case reflect.Int, reflect.Int64, reflect.Int32:
 		return []reflect.Value{reflect.ValueOf(int64(seed + 7)).Convert(fieldType)}
+	case reflect.Float64, reflect.Float32:
+		return []reflect.Value{reflect.ValueOf(float64(seed) + 0.5).Convert(fieldType)}
+
+	// #2188 round 5 (P2): `unprobeable` was decided by GENERATOR CAPABILITY, not
+	// by behaviour - so a forward FROM an unprobeable field was invisible by
+	// construction, and the check then passed HONESTLY rather than by anyone's
+	// oversight. Demonstrated live: `mb.produceCheckDir = e.HighRiskPaths[0]`
+	// left the whole package green.
+	//
+	// The exemption did not disappear when the declared lists went; it moved
+	// from human declaration to tool limitation. Widening the generator is the
+	// only remedy that removes it rather than relocating it again: composite
+	// kinds are now synthesised from their own element types, recursively.
+	case reflect.Slice:
+		element := distinctiveValues(fieldType.Elem(), seed+1)
+		if len(element) == 0 {
+			return nil
+		}
+		slice := reflect.MakeSlice(fieldType, 1, 1)
+		slice.Index(0).Set(element[0])
+		return []reflect.Value{slice}
+	case reflect.Map:
+		key := distinctiveValues(fieldType.Key(), seed+2)
+		value := distinctiveValues(fieldType.Elem(), seed+3)
+		if len(key) == 0 || len(value) == 0 {
+			return nil
+		}
+		mapping := reflect.MakeMap(fieldType)
+		mapping.SetMapIndex(key[0], value[0])
+		return []reflect.Value{mapping}
+	case reflect.Pointer:
+		return []reflect.Value{reflect.New(fieldType.Elem())}
+	case reflect.Struct:
+		return []reflect.Value{reflect.New(fieldType).Elem()}
 	default:
 		return nil
 	}
@@ -274,32 +308,44 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	// field fails until classified, whichever way it behaves; a deleted name
 	// fails because observation still reports it.
 	mustForward := map[string]bool{
-		"ResolveDeliveryWorktree": true, "CollectChangeSet": true, "ApplyChangeSet": true,
-		"RequireWorkflowPolicy": true, "OrgPolicy": true, "ProduceCheckDir": true,
-		"BlockerDeferrer": true, "RouterContextEnabled": true, "RuntimeDefaultModel": true,
-		"ReviewModelPool": true, "RuntimeDefaultEffort": true, "ResultCheckMode": true,
+		"ApplyChangeSet": true, "BlockerDeferrer": true, "CollectChangeSet": true,
+		"Memory": true, "OrgPolicy": true, "ProduceCheckDir": true,
+		"RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true, "ResultCheckMode": true,
+		"ReviewModelPool": true, "RouterContextEnabled": true, "RuntimeDefaultEffort": true,
+		"RuntimeDefaultModel": true,
 	}
 	// Observed inert: setting the field alone changes nothing on the mailbox.
 	// Every name here was OBSERVED, not assumed - an entry that turns out to be
 	// forwarded fails the set equality below, in that direction too.
 	expectedInert := map[string]bool{
 		"ArtifactRoot": true, "BeforeReadOnlyWorktreeCleanup": true, "DelegationCheckout": true,
-		"FindingsAdvisory": true, "FixWorktreeAllocator": true, "Home": true,
-		"InjectUpstreamDepContext": true, "InlineArtifactBodies": true, "JobID": true,
-		"MaxDelegationNonProgressStreak": true, "MaxDelegationTokenBudget": true,
-		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true,
-		"NativeReviewFanoutEnabled": true, "Now": true, "OwnerPIDLive": true,
-		"PayloadRefresher": true, "PullRequestSignals": true, "ReviewBlockingSeverity": true,
+		"DelegationTimeoutDefaults": true, "FindingsAdvisory": true, "FixWorktreeAllocator": true,
+		"HighRiskPaths": true, "Home": true, "InjectUpstreamDepContext": true,
+		"InlineArtifactBodies": true, "JobID": true, "LedgerResolvers": true,
+		"MaxDelegationCostUSD": true, "MaxDelegationNonProgressStreak": true, "MaxDelegationTokenBudget": true,
+		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true, "NativeReviewFanoutEnabled": true,
+		"Now": true, "OwnerPIDLive": true, "PayloadRefresher": true,
+		"PullRequestSignals": true, "RequiredReviewers": true, "ReviewBlockingSeverity": true,
 		"ReviewChangedFiles": true, "RiskLabelHigh": true, "RiskLabelRoutine": true,
 		"RiskTiersEnabled": true, "WorktreeHasLiveProcess": true, "WorktreeLiveness": true,
 	}
 	// Kinds this generator cannot synthesise a distinguishing value for. Listing
 	// one is a statement that it is UNPROBEABLE, not that it is uninteresting.
+	// The residual exemption, and it is now FIVE interface-typed fields rather
+	// than eleven fields of every composite kind. Widening the generator to
+	// slices, maps, pointers, structs and floats moved six of them into real
+	// observation - including HighRiskPaths, the field the reviewer used to
+	// prove a forward could hide behind generator capability.
+	//
+	// STATED AS A KNOWN GAP RATHER THAN GUARDED AGAIN: a forward whose SOURCE is
+	// one of these five is still invisible here. Synthesising a distinguishable
+	// interface value requires knowing each interface's implementations, which
+	// is the point where a tenth guard would cost more than it catches. Two of
+	// the five, EventSink and Memory-adjacent wiring, are pinned by their own
+	// tests (event_sink_test.go and the Memory residuals below).
 	unprobeable := map[string]bool{
-		"DelegationTimeoutDefaults": true, "DelegationWorktrees": true, "EscalationNotifier": true,
-		"EventSink": true, "HighRiskPaths": true, "ImplementationFinalizer": true,
-		"LedgerResolvers": true, "MaxDelegationCostUSD": true, "Memory": true,
-		"MergeGate": true, "RequiredReviewers": true,
+		"DelegationWorktrees": true, "EscalationNotifier": true, "EventSink": true,
+		"ImplementationFinalizer": true, "MergeGate": true,
 	}
 
 	store := openEngineStore(t)
