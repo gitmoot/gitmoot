@@ -402,6 +402,10 @@ type CompareResult struct {
 	Truncated bool `json:"-"`
 }
 
+type MergeQueueRule struct {
+	RulesetID int64
+}
+
 type CommitStatusInput struct {
 	Repo        Repository
 	SHA         string
@@ -1012,6 +1016,33 @@ func (c *GhClient) GetUserPermission(ctx context.Context, repo Repository, usern
 		return UserPermission{}, fmt.Errorf("decode gh api response: %w", err)
 	}
 	return permission, nil
+}
+
+// BaseMergeQueueRule reports the active merge-queue rule for a base branch.
+// known=false preserves the existing direct-merge path when the token cannot
+// read repository rules; the merge call remains authoritative in that case.
+func (c *GhClient) BaseMergeQueueRule(ctx context.Context, repo Repository, branch string) (rule MergeQueueRule, required bool, known bool, err error) {
+	branch = strings.TrimSpace(branch)
+	if strings.TrimSpace(repo.FullName()) == "" || branch == "" {
+		return MergeQueueRule{}, false, false, nil
+	}
+	result, runErr := c.run(ctx, false, "api", endpoint(repo, "rules", "branches", url.PathEscape(branch)))
+	if runErr != nil {
+		return MergeQueueRule{}, false, false, nil
+	}
+	var rules []struct {
+		Type      string `json:"type"`
+		RulesetID int64  `json:"ruleset_id"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &rules); err != nil {
+		return MergeQueueRule{}, false, false, fmt.Errorf("decode branch rules response: %w", err)
+	}
+	for _, candidate := range rules {
+		if candidate.Type == "merge_queue" {
+			return MergeQueueRule{RulesetID: candidate.RulesetID}, true, true, nil
+		}
+	}
+	return MergeQueueRule{}, false, true, nil
 }
 
 func (c *GhClient) MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error) {

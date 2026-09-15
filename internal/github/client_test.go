@@ -1007,6 +1007,26 @@ func TestListPullRequestChecksFallsBackToStatusCheckRollup(t *testing.T) {
 	)
 }
 
+func TestBaseMergeQueueRuleReportsRuleset(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{
+		Stdout: `[{"type":"merge_queue","ruleset_id":22536038},{"type":"required_status_checks","ruleset_id":22536038}]`,
+	}}}
+	client := GhClient{Runner: runner}
+
+	rule, required, known, err := client.BaseMergeQueueRule(
+		context.Background(),
+		Repository{Owner: "gitmoot", Name: "gitmoot"},
+		"main",
+	)
+	if err != nil {
+		t.Fatalf("BaseMergeQueueRule: %v", err)
+	}
+	if !known || !required || rule.RulesetID != 22536038 {
+		t.Fatalf("merge queue rule = %+v, required=%v, known=%v", rule, required, known)
+	}
+	runner.wantArgs(t, 0, "api", "repos/gitmoot/gitmoot/rules/branches/main")
+}
+
 func TestMergePullRequestUsesSafeHeadMatch(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{
 		{Stdout: "merged"},

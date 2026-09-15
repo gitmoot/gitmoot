@@ -3046,6 +3046,185 @@ func TestPollOnceMergeCommandRequiresReadyTask(t *testing.T) {
 	}
 }
 
+func testGateMissReason(t *testing.T, category, cause, headSHA string) workflow.MergeReason {
+	t.Helper()
+	reason, err := workflow.GateMissReason(category, cause, headSHA)
+	if err != nil {
+		t.Fatalf("GateMissReason: %v", err)
+	}
+	return reason
+}
+
+func TestMergeCommandShowsMergeRuleRefusalAndRemedy(t *testing.T) {
+	body, request := runMergeCommandForOutput(t, workflow.MergeDecision{
+		LeaveOpen: true,
+		Reason: testGateMissReason(t, "org merge rule",
+			"branch lock records acting role `gm-integrity`, whose `merge_rule = \"owner\"` reserves the merge for owner role `owner`; `/gitmoot merge` refuses this branch whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
+			"current123"),
+	}, true)
+	if request.ActingOrgRole != "gm-integrity" {
+		t.Fatalf("merge request acting role = %q, want gm-integrity", request.ActingOrgRole)
+	}
+
+	for _, want := range []string{
+		"Gitmoot did not merge PR #41.",
+		"branch lock records acting role `gm-integrity`",
+		"`/gitmoot merge` refuses this branch whoever asks",
+		"Remedy: have that owner merge outside Gitmoot",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+}
+
+func TestMergeCommandShowsMergeQueueRulesetRefusalAndRemedy(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		LeaveOpen: true,
+		Reason: testGateMissReason(t, "repository merge rule",
+			"repository ruleset 22536038 requires GitHub's merge queue and refuses Gitmoot's direct merge, including `--admin`. Remedy: enqueue PR #41 through GitHub's merge queue",
+			"current123"),
+	}, true)
+
+	for _, want := range []string{
+		"repository ruleset 22536038",
+		"refuses Gitmoot's direct merge, including `--admin`",
+		"Remedy: enqueue PR #41 through GitHub's merge queue",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+}
+
+func TestMergeCommandShowsMissingCurrentHeadApprovalAndRemedy(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		LeaveOpen: true,
+		Reason: testGateMissReason(t, "review gate",
+			"no approval is bound to the current head. Remedy: dispatch one independent review",
+			"current123"),
+	}, true)
+
+	for _, want := range []string{
+		"no approval is bound to the current head",
+		"Remedy: dispatch one independent review for head current123",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+	if got := strings.Count(body, "current123"); got != 1 {
+		t.Fatalf("operator-visible reply repeats current head %d times: %q", got, body)
+	}
+}
+
+func TestMergeCommandShowsAncestorApprovalAndRemedy(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		LeaveOpen: true,
+		Reason: testGateMissReason(t, "review gate",
+			"approval from reviewer is bound to ancestor head ancestor123, not the current head. Remedy: dispatch one independent review",
+			"current123"),
+	}, true)
+
+	for _, want := range []string{
+		"approval from reviewer is bound to ancestor head ancestor123",
+		"not the current head",
+		"Remedy: dispatch one independent review for head current123",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+	if got := strings.Count(body, "current123"); got != 1 {
+		t.Fatalf("operator-visible reply repeats current head %d times: %q", got, body)
+	}
+}
+
+func TestMergeCommandExplainsAbsentMarkerWhenAutoMergeDisabled(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		LeaveOpen: true,
+		Reason: testGateMissReason(t, "review gate",
+			"required reviewer approval is missing",
+			"current123"),
+	}, false)
+
+	for _, want := range []string{
+		"`merge_gate.auto_merge = false`",
+		"no prior `gitmoot/merge-gate` marker was expected",
+		"Its absence does not mean the gate passed",
+		"this explicit `/gitmoot merge` request ran the gate now",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+}
+
+func TestMergeCommandShowsTerminalBlockedTaskState(t *testing.T) {
+	body, _ := runMergeCommandForOutput(t, workflow.MergeDecision{
+		Reason: workflow.PlainReason("review at evaluated head has a blocking result"),
+	}, true)
+
+	for _, want := range []string{
+		"Gitmoot did not merge PR #41; the task is now `blocked`.",
+		"Cause: review at evaluated head has a blocking result.",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", body, want)
+		}
+	}
+}
+
+func runMergeCommandForOutput(t *testing.T, decision workflow.MergeDecision, autoMerge bool) (string, workflow.MergeRequest) {
+	t.Helper()
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	const branch = "fix/operator-output"
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "review-pr-41-output",
+		RepoFullName: repo.FullName(),
+		Title:        "Operator output",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "",
+	}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
+		RepoFullName:  repo.FullName(),
+		Branch:        branch,
+		Owner:         "builder",
+		ActingOrgRole: "gm-integrity",
+	}); err != nil || !acquired {
+		t.Fatalf("AcquireLock = %v, %v", acquired, err)
+	}
+	gate := &fakeWorkflowMergeGate{decision: decision}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	client := &fakeGitHub{}
+	daemon := Daemon{
+		Repo:             repo,
+		Store:            store,
+		GitHub:           client,
+		Workflow:         &engine,
+		AutoMergeEnabled: func(string) bool { return autoMerge },
+	}
+	if err := daemon.handleMergeCommand(ctx,
+		github.PullRequest{Number: 41, State: "open", HeadRef: branch, BaseRef: "main", HeadSHA: "current123"},
+		github.IssueComment{ID: 41, Body: "/gitmoot merge", Author: "operator"}); err != nil {
+		t.Fatalf("handleMergeCommand: %v", err)
+	}
+	if len(client.posted) != 1 {
+		t.Fatalf("posted acknowledgements = %+v, want one", client.posted)
+	}
+	if len(gate.requests) != 1 {
+		t.Fatalf("merge requests = %+v, want one", gate.requests)
+	}
+	if gate.requests[0].TaskID != "review-pr-41-output" {
+		t.Fatalf("merge request task = %q, want branchless review task", gate.requests[0].TaskID)
+	}
+	return client.posted[0].body, gate.requests[0]
+}
+
 func TestPollOnceQueuesImplementWithBranchLock(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

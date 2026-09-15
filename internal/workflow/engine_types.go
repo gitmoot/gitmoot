@@ -364,6 +364,9 @@ type MergeRequest struct {
 	// HumanMergeRequested is an explicit, authorized human instruction. It is
 	// evaluated inside PolicyMergeGate, never by a caller-side bypass.
 	HumanMergeRequested bool
+	// ActingOrgRole is the durable role attribution from the branch lock. The
+	// explicit /gitmoot merge path uses it to enforce that role's merge_rule.
+	ActingOrgRole string
 }
 
 type MergeDecision struct {

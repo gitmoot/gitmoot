@@ -545,11 +545,19 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 }
 
 func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullRequestEvent) error {
+	_, err := e.HandlePullRequestReadyToMergeDecision(ctx, event)
+	return err
+}
+
+// HandlePullRequestReadyToMergeDecision runs the normal stateful merge path and
+// also returns its decision to an operator-facing caller. Poll-driven callers
+// use HandlePullRequestReadyToMerge when they do not need an immediate reply.
+func (e Engine) HandlePullRequestReadyToMergeDecision(ctx context.Context, event PullRequestEvent) (MergeDecision, error) {
 	if err := e.validate(); err != nil {
-		return err
+		return MergeDecision{}, err
 	}
 	if err := validatePullRequestEvent(event); err != nil {
-		return err
+		return MergeDecision{}, err
 	}
 	// Best-effort observability: CI readiness must never block or roll back the
 	// primary merge-gate path. Repeated polls are deduped durably by the store.
@@ -562,7 +570,7 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	if stored, storedErr := e.Store.GetTask(ctx, event.TaskID); storedErr == nil && strings.TrimSpace(stored.Branch) == "" {
 		ref.Branch = ""
 	}
-	_, err := e.runMergeGateWithHumanMerge(ctx, "", JobPayload{
+	return e.runMergeGateWithHumanMerge(ctx, "", JobPayload{
 		Repo:                    event.Repo,
 		Branch:                  event.Branch,
 		PullRequest:             event.PullRequest,
@@ -574,9 +582,9 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 		TaskID:                  event.TaskID,
 		TaskTitle:               event.TaskTitle,
 		LeadAgent:               event.LeadAgent,
+		ActingOrgRole:           event.ActingOrgRole,
 		Reviewers:               compactStrings(append([]string{}, event.RequiredReviewers...)),
 	}, ref, event.HumanMergeRequested, string(TaskReadyToMerge))
-	return err
 }
 
 // HandleReviewPullRequestClosed reconciles a PR lifecycle task whose pull

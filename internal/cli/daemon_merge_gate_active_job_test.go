@@ -237,7 +237,7 @@ func TestDaemonMergeGateEscalatesOncePerAccountableRecipient(t *testing.T) {
 			t.Fatalf("Evaluate: %v", err)
 		}
 		if !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-			!strings.Contains(decision.Reason.Render(), "final agent review is not captured") {
+			!strings.Contains(decision.Reason.Render(), "no approval is bound to the current head") {
 			t.Fatalf("decision = %+v", decision)
 		}
 		return decision.Reason.Render()
@@ -346,6 +346,47 @@ scope = ["owner/repo"]
 	if gotTargets["coordinator"] != "reply:coordinator" ||
 		gotTargets["coordinator-b"] != "reply:coordinator-b" {
 		t.Fatalf("wake targets = %+v", gotTargets)
+	}
+}
+
+func TestDaemonMergeGateEscalatesOrganizationRuleRefusal(t *testing.T) {
+	store, checkout, gh, request := daemonMergeGateActiveJobFixture(t, false)
+	request.WorkflowID = "goal-org-refusal"
+	request.HumanMergeRequested = true
+	request.ActingOrgRole = "worker"
+
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[org]
+enforce = "block"
+[org.roles."owner"]
+scope = ["*"]
+merge_rule = "owner"
+[org.roles."worker"]
+parent = "owner"
+scope = ["owner/repo"]
+merge_rule = "owner"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	decision, err := newDaemonMergeGate(store, gh, checkout, paths.Home, subprocess.ExecRunner{}).Evaluate(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !decision.LeaveOpen || !strings.Contains(decision.Reason.Render(), "org merge rule") {
+		t.Fatalf("decision = %+v, want organization-rule refusal", decision)
+	}
+	notes, err := store.ListWorkflowNotes(context.Background(), request.WorkflowID, 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes = %+v, err=%v; want one escalation", notes, err)
+	}
+	_, to, workflowID, question, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
+	if !ok || to != "owner" || workflowID != request.WorkflowID || question != decision.Reason.Render() {
+		t.Fatalf("escalation = %+v; to=%q workflow=%q question=%q parsed=%v", notes[0], to, workflowID, question, ok)
 	}
 }
 
