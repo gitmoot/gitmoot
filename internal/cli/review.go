@@ -319,7 +319,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		Action:       "review",
 		Instructions: reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
 		Background:   true,
-		Model:        pool[0],
+		Model:        reviewModelForRuntime(reviewRequestRuntime(opts.runtime, selectedRuntime), pool),
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
@@ -789,17 +789,78 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 // instead of a model.
 func reviewRuntimeForCandidate(agent db.Agent, incident db.OrgRoleUnavailable, held bool) (string, bool) {
 	options := []string{runtime.OmpRuntime}
-	if registered := strings.TrimSpace(agent.Runtime); registered != "" &&
-		registered != runtime.OmpRuntime && registered != runtime.ShellRuntime {
+	if registered := strings.TrimSpace(agent.Runtime); registered != "" && registered != runtime.OmpRuntime {
 		options = append(options, registered)
 	}
 	for _, option := range options {
 		if held && orgRoleUnavailableRefusesRuntime(incident, option) {
 			continue
 		}
+		// EXCLUDED BY PROPERTY, NOT BY NAME (#2189 review). Shell used to be
+		// named here, and a name-skip is an exemption that does not look like
+		// one - the shape that let Engine.Store survive seven rounds of deleting
+		// exemption lists. The real constraint is that the router selects a
+		// runtime WITHOUT a session, and a runtime whose sessions are commands
+		// refuses exactly that. Ask the resolver instead of hardcoding which
+		// runtime that is today.
+		if _, _, err := resolveJobRuntimeOverride(option, ""); err != nil {
+			continue
+		}
 		return option, true
 	}
 	return "", false
+}
+
+// reviewRuntimeForOperatorNamedAgent is reviewRuntimeForCandidate with the
+// preference reversed: the named agent's OWN runtime first, the omp pin only as
+// the escape when that runtime is walled. Same usability property, same hold
+// check, opposite order - because here the operator chose the agent and its
+// runtime is part of that choice (#2187).
+func reviewRuntimeForOperatorNamedAgent(agent db.Agent, incident db.OrgRoleUnavailable, held bool) (string, bool) {
+	// The agent's OWN runtime is checked against the hold only. The usability
+	// property - "can this runtime be selected without a session?" - applies to
+	// a runtime we would SET AS AN OVERRIDE, not to the runtime the agent is
+	// already registered on: a shell agent runs its own command and needs no
+	// override, so testing it as one rerouted script agents onto omp and would
+	// have run a model instead of the operator's script.
+	registered := strings.TrimSpace(agent.Runtime)
+	if registered != "" && !(held && orgRoleUnavailableRefusesRuntime(incident, registered)) {
+		return registered, true
+	}
+	for _, option := range []string{runtime.OmpRuntime} {
+		if held && orgRoleUnavailableRefusesRuntime(incident, option) {
+			continue
+		}
+		if _, _, err := resolveJobRuntimeOverride(option, ""); err != nil {
+			continue
+		}
+		return option, true
+	}
+	return "", false
+}
+
+// reviewModelForRuntime enforces the invariant this work has now broken THREE
+// times from three directions (#2189 review P1):
+//
+//		MODEL AND RUNTIME MUST BE CHOSEN TOGETHER.
+//
+//	 1. #2186 round 4: runtime parity forced a claude reviewer onto omp, stripping
+//	    its auth profile.
+//	 2. Same round: the pool head was pinned as payload.Model regardless of the
+//	    effective runtime, handing an omp-qualified model to a claude reviewer.
+//	 3. Here: the RUNTIME was demoted away from omp for availability while the
+//	    omp-qualified pool model stayed - producing a job that runs and dies at
+//	    delivery instead of a review. Demoting turned a clear refusal into a
+//	    silent late failure, which is worse than what it replaced.
+//
+// The pool is an OMP provider/model chain, so it may only be used when the
+// review actually runs on omp. Off omp the agent's own configured model is the
+// only valid choice, and the router states nothing.
+func reviewModelForRuntime(selectedRuntime string, pool []string) string {
+	if strings.TrimSpace(selectedRuntime) != runtime.OmpRuntime || len(pool) == 0 {
+		return ""
+	}
+	return pool[0]
 }
 
 // selectReviewRouterAgent picks the registered agent that will carry the
