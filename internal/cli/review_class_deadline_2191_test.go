@@ -386,8 +386,26 @@ func TestEachDistinctInvalidPayloadTimeoutIsDisclosed(t *testing.T) {
 
 	run := func(raw string) {
 		t.Helper()
-		if err := store.ExecForTest(ctx, `UPDATE jobs SET state='queued', payload=json_set(payload,'$.job_timeout',?) WHERE id=?`, raw, "job-distinct-invalid"); err != nil {
+		// The payload write touches ONLY the payload: assigning jobs.state in raw
+		// SQL bypasses the lifecycle-generation seam, and the repo guard
+		// TestEveryJobStateWriteBumpsTheLifecycleGeneration caught this fixture
+		// doing exactly that. Every entry into queued must advance the
+		// generation, so the state change goes through the store method.
+		if err := store.ExecForTest(ctx, `UPDATE jobs SET payload=json_set(payload,'$.job_timeout',?) WHERE id=?`, raw, "job-distinct-invalid"); err != nil {
 			t.Fatal(err)
+		}
+		current, err := store.GetJob(ctx, "job-distinct-invalid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.State != string(workflow.JobQueued) {
+			moved, err := store.TransitionJobState(ctx, "job-distinct-invalid", current.State, string(workflow.JobQueued))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !moved {
+				t.Fatalf("could not requeue the job from state %q", current.State)
+			}
 		}
 		job, err := store.GetJob(ctx, "job-distinct-invalid")
 		if err != nil {
