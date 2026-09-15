@@ -296,7 +296,37 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		mapping.SetMapIndex(key[0], value[0])
 		return []reflect.Value{mapping}
 	case reflect.Pointer:
-		return []reflect.Value{reflect.New(fieldType.Elem())}
+		// REACH THROUGH THE INDIRECTION (#2188 round 10, P3). This used to return
+		// a pointer to a ZERO pointee: non-nil, so the field read as "set", while
+		// every member behind it stayed zero. A forward that reads a POINTEE
+		// MEMBER would then be probed with an effectively-zero value and report
+		// INERT - the false-observation shape again, one indirection deeper than
+		// the depth bound that produced it last round.
+		//
+		// All-or-nothing propagates: an unsynthesisable pointee makes the
+		// pointer unsynthesisable, so the census fails loudly instead of
+		// concluding nothing-there from a value it never really built.
+		// TWO CANDIDATES, STRONGEST FIRST, because refusing outright would have
+		// COST a real observation: Engine.Memory is a *MemoryController whose
+		// pointee cannot be fully synthesised, and its forward
+		// (`e.Memory.injectBlock`) only needs the pointer to be non-nil. An
+		// all-or-nothing refusal here reported Memory as unsynthesisable and
+		// lost a forward the census had been observing correctly.
+		//
+		// So: a FILLED pointee when one can be built - which is what reaches a
+		// forward reading a pointee MEMBER - and a non-nil zero pointee
+		// otherwise. The residual, stated: for a pointer whose pointee cannot
+		// be filled, the probe proves non-nil-ness only, so a forward reading
+		// one of ITS members would still read inert. Engine has two pointer
+		// fields today, Store (probed with a real second store) and Memory
+		// (members covered by the residual assertions below).
+		var candidates []reflect.Value
+		if pointee := distinctiveValuesAtDepth(fieldType.Elem(), seed+5, depth+1); len(pointee) > 0 {
+			filled := reflect.New(fieldType.Elem())
+			filled.Elem().Set(pointee[0])
+			candidates = append(candidates, filled)
+		}
+		return append(candidates, reflect.New(fieldType.Elem()))
 	case reflect.Struct:
 		// #2188 round 6 (the tenth instance): this case USED TO return the ZERO
 		// struct, which is indistinguishable from unset - so DelegationTimeoutDefaults
@@ -444,6 +474,12 @@ func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 			continue
 		}
 		candidates := distinctiveValues(field.Type, i)
+		if field.Name == "Store" {
+			// Probed with a REAL second store below, so the generator does not
+			// need to synthesise *db.Store - and must not fail the census for
+			// being unable to.
+			candidates = []reflect.Value{reflect.ValueOf(otherStore)}
+		}
 		if len(candidates) == 0 {
 			// No exemption remains, so this is a FAILURE rather than a category:
 			// a field the generator cannot synthesise is a field nothing checks.
@@ -735,5 +771,36 @@ func TestStructSynthesisIsAllOrNothing(t *testing.T) {
 	// confident "observed inert" for a field the probe never really set.
 	if partial := distinctiveValues(reflect.TypeOf(zzPartiallyFillable{}), 2); len(partial) != 0 {
 		t.Fatalf("a partially fillable struct produced %d candidates: the census would report it inert on an incomplete probe", len(partial))
+	}
+}
+
+// #2188 round 10 (P3): the constructed subject must reach through a POINTER.
+// Two hand-made structs proved all-or-nothing for direct fields and said
+// nothing about indirection.
+func TestStructSynthesisReachesThroughPointers(t *testing.T) {
+	// A pointer to a FILLABLE struct must arrive with its members populated -
+	// a non-nil pointer to a zero struct is the false "set" this closes.
+	// Two candidates: the FILLED pointee first - the one that reaches a forward
+	// reading a pointee member - then the non-nil fallback.
+	ok := distinctiveValues(reflect.TypeOf(&zzFillable{}), 3)
+	if len(ok) != 2 {
+		t.Fatalf("pointer to a fillable struct produced %d candidates, want the filled one and the fallback", len(ok))
+	}
+	pointee := ok[0].Interface().(*zzFillable)
+	if pointee == nil || pointee.Name == "" || pointee.Count == 0 || !pointee.Inner.Flag {
+		t.Fatalf("pointee came back zero: %+v", pointee)
+	}
+
+	// An unsynthesisable pointee makes the POINTER unsynthesisable, so refusal
+	// propagates through the indirection instead of stopping at it.
+	// A pointee that cannot be filled yields ONLY the non-nil fallback - one
+	// candidate, not two - so the census can still observe the pointer being
+	// forwarded while nothing claims its members were probed.
+	bad := distinctiveValues(reflect.TypeOf(&zzPartiallyFillable{}), 4)
+	if len(bad) != 1 {
+		t.Fatalf("pointer to an unfillable pointee produced %d candidates, want exactly the non-nil fallback", len(bad))
+	}
+	if got := bad[0].Interface().(*zzPartiallyFillable); got == nil || got.Name != "" {
+		t.Fatalf("fallback pointee should be zero and non-nil, got %+v", got)
 	}
 }
