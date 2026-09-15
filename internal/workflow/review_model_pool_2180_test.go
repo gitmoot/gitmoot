@@ -3,6 +3,8 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 	"reflect"
 	goruntime "runtime"
 	"slices"
@@ -811,8 +813,6 @@ func TestStructSynthesisReachesThroughPointers(t *testing.T) {
 		t.Fatalf("pointee came back zero: %+v", pointee)
 	}
 
-	// An unsynthesisable pointee makes the POINTER unsynthesisable, so refusal
-	// propagates through the indirection instead of stopping at it.
 	// A pointee that cannot be filled yields ONLY the non-nil fallback - one
 	// candidate, not two - so the census can still observe the pointer being
 	// forwarded while nothing claims its members were probed.
@@ -875,14 +875,20 @@ func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
 // a method value carries its method's code pointer, and a config-derived
 // closure can be made to answer with a sentinel.
 func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
-	controller := &MemoryController{}
+	store := openEngineStore(t)
+	// A Store is required: enabledFor short-circuits on a nil one, which would
+	// make the binding probe below pass vacuously for every receiver.
+	controller := &MemoryController{Store: store}
 	engine := Engine{
-		Store:                   openEngineStore(t),
+		Store:                   store,
 		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
 		Memory:                  controller,
-		// A VALID severity that is NOT the default, so the assertion cannot
-		// pass on the fallback reviewseverity.DefaultBlocking.
-		ReviewBlockingSeverity: func(string) string { return "P3" },
+		// A VALID severity that is NOT the default. P3 IS
+		// reviewseverity.DefaultBlocking, so the previous P3 sentinel could pass
+		// on the very fallback it was written to exclude - the sentinel rule
+		// held, the chosen instance collided with the default, which is exactly
+		// what this file's own fixture rule forbids for pool names.
+		ReviewBlockingSeverity: func(string) string { return reviewseverity.P1 },
 	}
 	mailbox := engine.EnqueueMailbox(nil)
 
@@ -892,13 +898,44 @@ func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
 	// record, which is the shape of a check that passes by luck. The wrapper's
 	// NAME carries the method it closes over; a same-signature stub declared in
 	// a test carries the test's name instead.
-	for _, check := range []struct{ field, fn, want string }{
-		{"injectMemory", runtimeFuncName(mailbox.injectMemory), "MemoryController).injectBlock"},
-		{"recordMemory", runtimeFuncName(mailbox.recordMemory), "MemoryController).record"},
+	// EXACT NAMES, NOT CONTAINMENT. strings.Contains admitted any PREFIX-EXTENDED
+	// method: mb.recordMemory = e.Memory.recordEnrolled has the same signature,
+	// skips the enrolment gate and both distill producers, and a containment
+	// check on "MemoryController).record" agrees with it. Substring containment
+	// expresses RESEMBLANCE; identity needs equality. The expected name is taken
+	// from the method expression itself rather than typed as a literal, so a
+	// rename cannot leave this test asserting a string that no longer exists.
+	for _, check := range []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"injectMemory", methodValueName(mailbox.injectMemory), runtimeFuncName((*MemoryController).injectBlock)},
+		{"recordMemory", methodValueName(mailbox.recordMemory), runtimeFuncName((*MemoryController).record)},
 	} {
-		if !strings.Contains(check.fn, check.want) {
-			t.Errorf("Mailbox.%s is wired from %s, not from %s: a same-signature stub passes a non-nil check",
-				check.field, check.fn, check.want)
+		if check.got != check.want {
+			t.Errorf("Mailbox.%s is wired from %s, want exactly %s: a same-signature method doing different work passes containment",
+				check.field, check.got, check.want)
+		}
+	}
+
+	// WHICH INSTANCE, not merely which method. A name check cannot see the
+	// receiver a method value closes over, so mb.injectMemory =
+	// (&MemoryController{}).injectBlock - the right method bound to a fresh
+	// empty controller - passed everything above. Both forwards consult
+	// c.Enabled first, so observing THIS controller's closure run proves the
+	// binding; a fresh controller has a nil Enabled and never calls it.
+	consulted := map[string]int{}
+	controller.Enabled = func(name string) bool {
+		consulted[name]++
+		return false
+	}
+	ctx := context.Background()
+	mailbox.injectMemory(ctx, runtime.Agent{Name: "inject-probe"}, JobPayload{})
+	mailbox.recordMemory(ctx, "job-1", runtime.Agent{Name: "record-probe"}, "review", JobPayload{}, AgentResult{})
+	for _, name := range []string{"inject-probe", "record-probe"} {
+		if consulted[name] == 0 {
+			t.Errorf("forward for %q never consulted the engine's own controller: it is bound to a different instance", name)
 		}
 	}
 
@@ -907,14 +944,24 @@ func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
 	if mailbox.reviewBlockingSeverity == nil {
 		t.Fatal("reviewBlockingSeverity not forwarded")
 	}
-	if got := mailbox.reviewBlockingSeverity("owner/repo"); got != "P3" {
-		t.Fatalf("reviewBlockingSeverity(owner/repo) = %q, want the engine's own P3: non-nil proves it is SET, not that it is ITSELF", got)
+	if got := mailbox.reviewBlockingSeverity("owner/repo"); got != reviewseverity.P1 {
+		t.Fatalf("reviewBlockingSeverity(owner/repo) = %q, want the engine's own %s: a sentinel equal to reviewseverity.DefaultBlocking would pass on the fallback it excludes",
+			got, reviewseverity.P1)
 	}
 }
 
 // runtimeFuncName reports the function a value actually closes over. It is the
 // only identity available for a forward landing on an UNEXPORTED field: the
 // census cannot compare it to a counterpart, and non-nil proves existence only.
+// methodValueName is runtimeFuncName for a METHOD VALUE. The compiler names the
+// wrapper "<method>-fm", so the suffix is stripped to compare against the method
+// EXPRESSION's own name. Stripping a known suffix keeps the comparison an
+// equality rather than a containment: "recordEnrolled-fm" becomes
+// "recordEnrolled" and still differs from "record".
+func methodValueName(fn any) string {
+	return strings.TrimSuffix(runtimeFuncName(fn), "-fm")
+}
+
 func runtimeFuncName(fn any) string {
 	value := reflect.ValueOf(fn)
 	if !value.IsValid() || value.IsNil() {
