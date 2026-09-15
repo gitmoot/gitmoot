@@ -695,3 +695,45 @@ func TestEmittedEventTimestampsComeFromTheEnginesClock(t *testing.T) {
 		t.Fatalf("event timestamp = %q, want the engine's clock %q: every emitted timestamp is wrong if this drifts", got, want)
 	}
 }
+
+// #2188 round 9 (P3): the all-or-nothing struct fill was CORRECT AND UNDEFENDED -
+// reverting it survived the whole package, because no current Engine field is
+// partially fillable. A guard whose subject does not exist in production cannot
+// be tested by production code, which is this lineage's thirteenth shape.
+//
+// So the subject is constructed here. These types exist only to be probed: one
+// fully fillable, one whose tail cannot be synthesised. The guard's contract is
+// that the first is OBSERVED and the second is refused rather than reported as
+// an incomplete-value probe.
+type zzFillable struct {
+	Name  string
+	Count int
+	Inner zzFillableInner
+}
+
+type zzFillableInner struct{ Flag bool }
+
+type zzPartiallyFillable struct {
+	Name string
+	Ch   chan int // unsynthesisable: no distinguishing value exists
+}
+
+func TestStructSynthesisIsAllOrNothing(t *testing.T) {
+	fillable := distinctiveValues(reflect.TypeOf(zzFillable{}), 1)
+	if len(fillable) != 1 {
+		t.Fatalf("a fully fillable struct produced %d candidates, want 1 - the guard rejects valid input", len(fillable))
+	}
+	// MUST-SUCCEED HALF: every field actually carries a distinguishing value,
+	// so the probe cannot report a zero struct as "filled".
+	got := fillable[0].Interface().(zzFillable)
+	if got.Name == "" || got.Count == 0 || !got.Inner.Flag {
+		t.Fatalf("fully fillable struct came back partly zero: %+v", got)
+	}
+
+	// REFUSAL HALF: one unsynthesisable field makes the whole struct
+	// unsynthesisable. Accepting a partial fill is what manufactured a
+	// confident "observed inert" for a field the probe never really set.
+	if partial := distinctiveValues(reflect.TypeOf(zzPartiallyFillable{}), 2); len(partial) != 0 {
+		t.Fatalf("a partially fillable struct produced %d candidates: the census would report it inert on an incomplete probe", len(partial))
+	}
+}

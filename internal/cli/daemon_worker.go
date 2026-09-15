@@ -4007,12 +4007,16 @@ type managedJobRuntimeConfig struct {
 	IdleTimeout       time.Duration
 	JobTimeoutDefault time.Duration
 	JobTimeoutMax     time.Duration
+	// ReviewJobTimeout is the floor a REVIEW gets whichever reviewer answers it
+	// (#2191). Zero leaves review deadlines exactly as they were.
+	ReviewJobTimeout time.Duration
 }
 
 func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (managedJobRuntimeConfig, error) {
 	runtimeConfig := managedJobRuntimeConfig{
 		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
 	var paths config.Paths
 	configFilePresent := false
@@ -4033,6 +4037,13 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 		if err == nil {
 			configFilePresent = true
 			runtimeConfig.JobTimeoutDefault, runtimeConfig.JobTimeoutMax = daemonConfig.JobTimeoutPolicy()
+		}
+		// The review-class floor is operator-settable as [review_router]
+		// job_timeout (#2191). Fails OPEN to the built-in default: an unreadable
+		// router section must not silently remove the floor that stops a
+		// rotated review from aborting mid-analysis.
+		if routerSettings, routerErr := config.LoadReviewRouterSettings(paths); routerErr == nil && routerSettings.JobTimeout > 0 {
+			runtimeConfig.ReviewJobTimeout = routerSettings.JobTimeout
 		}
 	}
 
@@ -4123,6 +4134,14 @@ func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeC
 	return resolveEffectiveJobTimeout(payload, managed).Timeout
 }
 
+// isReviewPayload reports whether this job is a review, for the class-deadline
+// floor. Both markers are checked because they are written by different
+// producers: the router sets a purpose, and every review dispatch sets
+// NoFixTarget or carries a pool.
+func isReviewPayload(payload workflow.JobPayload) bool {
+	return strings.TrimSpace(payload.ReviewPurpose) != "" || len(payload.ReviewModelPool) > 0
+}
+
 func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) jobTimeoutResolution {
 	jobTimeoutDefault := managed.JobTimeoutDefault
 	if jobTimeoutDefault <= 0 {
@@ -4141,6 +4160,19 @@ func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobR
 	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
 		requested = d
 		source = "payload"
+	}
+	// THE REVIEW CLASS FLOOR (#2191). A review's duration is a property of the
+	// PROMPT, not of whichever agent was selected to answer it. Before this, the
+	// deadline came from the agent - 10m, 30m, 45m or 2h on this box - so
+	// rotating reviewers rotated the deadline, and the first rotated review drew
+	// 10 minutes for a class whose observed maximum is 164 minutes.
+	//
+	// A FLOOR, not an assignment: an agent configured LONGER keeps its own
+	// value. The daemon's job_timeout_max still clamps the result, so this
+	// cannot raise a review above the operator's ceiling.
+	if managed.ReviewJobTimeout > 0 && isReviewPayload(payload) && requested < managed.ReviewJobTimeout {
+		requested = managed.ReviewJobTimeout
+		source = "review class"
 	}
 	resolution := jobTimeoutResolution{Timeout: requested, Requested: requested, Max: jobTimeoutMax, Source: source}
 	if requested > jobTimeoutMax {
