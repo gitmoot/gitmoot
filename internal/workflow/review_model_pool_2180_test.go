@@ -306,20 +306,23 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		// All-or-nothing propagates: an unsynthesisable pointee makes the
 		// pointer unsynthesisable, so the census fails loudly instead of
 		// concluding nothing-there from a value it never really built.
-		// TWO CANDIDATES, STRONGEST FIRST, because refusing outright would have
-		// COST a real observation: Engine.Memory is a *MemoryController whose
-		// pointee cannot be fully synthesised, and its forward
-		// (`e.Memory.injectBlock`) only needs the pointer to be non-nil. An
-		// all-or-nothing refusal here reported Memory as unsynthesisable and
-		// lost a forward the census had been observing correctly.
+		// TWO CANDIDATES, STRONGEST FIRST: a FILLED pointee when one can be
+		// built - which is what reaches a forward reading a pointee MEMBER -
+		// and a non-nil zero pointee otherwise.
 		//
-		// So: a FILLED pointee when one can be built - which is what reaches a
-		// forward reading a pointee MEMBER - and a non-nil zero pointee
-		// otherwise. The residual, stated: for a pointer whose pointee cannot
-		// be filled, the probe proves non-nil-ness only, so a forward reading
-		// one of ITS members would still read inert. Engine has two pointer
-		// fields today, Store (probed with a real second store) and Memory
-		// (members covered by the residual assertions below).
+		// The fallback exists because an all-or-nothing refusal COST a real
+		// observation when it was tried: a pointer whose pointee could not be
+		// synthesised was reported unsynthesisable, losing a forward the census
+		// had been observing correctly. Disagreement between candidates
+		// resolves to FORWARDED, which is the safe direction.
+		//
+		// NOTE ON A COMMENT THAT ROTTED IN ITS OWN COMMIT (#2188 round 11): the
+		// previous version of this paragraph named *MemoryController as a
+		// pointee that "cannot be fully synthesised". Under this code it CAN -
+		// the pointee filler now reaches unexported members - so the comment
+		// documented the FIRST ATTEMPT rather than the shipped behaviour. The
+		// example is removed rather than corrected: a rationale naming a
+		// specific type decays the moment that type changes.
 		var candidates []reflect.Value
 		if pointee := distinctiveValuesAtDepth(fieldType.Elem(), seed+5, depth+1); len(pointee) > 0 {
 			filled := reflect.New(fieldType.Elem())
@@ -348,20 +351,33 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		//
 		// An incompletely synthesisable struct is now unsynthesisable, which is
 		// a loud census failure rather than a quiet inert.
+		// UNEXPORTED MEMBERS ARE FILLED TOO (#2188 round 11, P3). Skipping them
+		// left a FILLABLE pointee whose unexported members stayed zero, so a
+		// forward reading one still read inert - the residual I disclosed was
+		// understated, and understating a residual is worse than having one
+		// because it tells the next reader the gap is elsewhere.
+		//
+		// The snapshot already reads unexported fields through reflect.NewAt;
+		// this is the same move in the write direction, on a value this test
+		// owns outright.
 		filled := reflect.New(fieldType).Elem()
-		exported := 0
+		settable := 0
 		for i := range fieldType.NumField() {
+			cell := filled.Field(i)
 			if !fieldType.Field(i).IsExported() {
-				continue
+				if !cell.CanAddr() {
+					return nil
+				}
+				cell = reflect.NewAt(cell.Type(), unsafe.Pointer(cell.UnsafeAddr())).Elem()
 			}
-			exported++
 			inner := distinctiveValuesAtDepth(fieldType.Field(i).Type, seed+i+11, depth+1)
 			if len(inner) == 0 {
 				return nil
 			}
-			filled.Field(i).Set(inner[0])
+			cell.Set(inner[0])
+			settable++
 		}
-		if exported == 0 {
+		if settable == 0 {
 			return nil
 		}
 		return []reflect.Value{filled}
@@ -802,5 +818,37 @@ func TestStructSynthesisReachesThroughPointers(t *testing.T) {
 	}
 	if got := bad[0].Interface().(*zzPartiallyFillable); got == nil || got.Name != "" {
 		t.Fatalf("fallback pointee should be zero and non-nil, got %+v", got)
+	}
+}
+
+// #2188 round 11 (P3): a FILLABLE pointee whose members are UNEXPORTED used to
+// come back with those members zero under both candidates, so a forward reading
+// one still read inert. My disclosed residual named only unfillable pointees,
+// which pointed the next reader at the wrong gap - understating a residual is
+// worse than having one.
+type zzUnexportedMembers struct {
+	Name   string
+	hidden string
+	flag   bool
+}
+
+func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
+	values := distinctiveValues(reflect.TypeOf(zzUnexportedMembers{}), 7)
+	if len(values) != 1 {
+		t.Fatalf("produced %d candidates, want 1", len(values))
+	}
+	filled := values[0].Interface().(zzUnexportedMembers)
+	if filled.Name == "" {
+		t.Fatalf("exported member unset: %+v", filled)
+	}
+	// Read back through the same unsafe path the snapshot uses, because the
+	// test cannot touch them directly either.
+	value := reflect.ValueOf(&filled).Elem()
+	for _, name := range []string{"hidden", "flag"} {
+		cell := value.FieldByName(name)
+		cell = reflect.NewAt(cell.Type(), unsafe.Pointer(cell.UnsafeAddr())).Elem()
+		if cell.IsZero() {
+			t.Fatalf("unexported member %s stayed zero: a forward reading it would read INERT", name)
+		}
 	}
 }
