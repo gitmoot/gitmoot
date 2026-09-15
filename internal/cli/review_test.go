@@ -50,7 +50,12 @@ scope = ["*"]
 parent = "owner"
 scope = ["owner/repo"]
 [review_router]
-code = ["devin/swe-2", "openai-codex/gpt-5.6-sol"]
+# SENTINEL NAMES, NOT THE DEFAULTS (#2188 review). This fixture used to write
+# config.DefaultReviewRouterSettings' own pool verbatim, so every test on this
+# home passed identically whether the pool came from THIS config or from a
+# default fallback - which is exactly the round-4 wrong-home defect class, and
+# it would have hidden a repeat of it.
+code = ["sentinel/router-a", "sentinel/router-b"]
 `); err != nil {
 		file.Close()
 		t.Fatal(err)
@@ -105,7 +110,7 @@ func TestReviewRequestDeduplicatesOnExactHead(t *testing.T) {
 	if failure != "" {
 		t.Fatal(failure)
 	}
-	if first.State != reviewRequestDispatched || first.Reviewer != "opus-reviewer" || first.Model != "devin/swe-2" {
+	if first.State != reviewRequestDispatched || first.Reviewer != "opus-reviewer" || first.Model != "sentinel/router-a" {
 		t.Fatalf("first request = %+v, want a dispatched review on the review-only agent with the pool head", first)
 	}
 	if first.AwaitedFactID == 0 {
@@ -119,8 +124,8 @@ func TestReviewRequestDeduplicatesOnExactHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if payload.RuntimeOverride != runtime.OmpRuntime || payload.Model != "devin/swe-2" ||
-		strings.Join(payload.ReviewModelPool, ",") != "devin/swe-2,openai-codex/gpt-5.6-sol" ||
+	if payload.RuntimeOverride != runtime.OmpRuntime || payload.Model != "sentinel/router-a" ||
+		strings.Join(payload.ReviewModelPool, ",") != "sentinel/router-a,sentinel/router-b" ||
 		payload.ReviewRequester != "joltra" || !payload.NoFixTarget || payload.HeadSHA != head {
 		t.Fatalf("routed payload = %+v, want omp override, pool, requester, no fix target and exact head", payload)
 	}
@@ -565,7 +570,7 @@ exit 1`, countFile, countFile)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-pool", Agent: "router-reviewer", Action: "review", Repo: "owner/repo",
 		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40), NoFixTarget: true,
-		Model: "devin/swe-2", ReviewModelPool: []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}, ReviewPurpose: "code",
+		Model: "sentinel/router-a", ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"}, ReviewPurpose: "code",
 	})
 	worker := blockerE2EWorker(store, home, checkout)
 
@@ -573,7 +578,7 @@ exit 1`, countFile, countFile)
 		t.Fatalf("first dispatch: %v", err)
 	}
 	job, payload := blockerE2EJobPayload(t, store, "job-pool")
-	if job.State != string(workflow.JobQueued) || payload.Model != "openai-codex/gpt-5.6-sol" {
+	if job.State != string(workflow.JobQueued) || payload.Model != "sentinel/router-b" {
 		events, _ := store.ListJobEvents(ctx, "job-pool")
 		t.Fatalf("after first quota failure state=%s model=%q pool=%v events=%+v, want queued on the second pool model", job.State, payload.Model, payload.ReviewModelPool, events)
 	}
@@ -599,7 +604,7 @@ exit 1`, countFile, countFile)
 		t.Fatalf("deliveries = %q (%v), want two", data, err)
 	}
 	job, payload = blockerE2EJobPayload(t, store, "job-pool")
-	if job.State != string(workflow.JobQueued) || payload.Model != "openai-codex/gpt-5.6-sol" || payload.BlockerAttempts != 2 {
+	if job.State != string(workflow.JobQueued) || payload.Model != "sentinel/router-b" || payload.BlockerAttempts != 2 {
 		t.Fatalf("after exhausted pool state=%s model=%q attempts=%d, want the last model held for retry", job.State, payload.Model, payload.BlockerAttempts)
 	}
 	retryAt, err = time.Parse(time.RFC3339Nano, payload.BlockerRetryAt)
@@ -2197,7 +2202,7 @@ func TestBothReviewVerbsResolveTheSamePoolAndKeepTheirRuntimes(t *testing.T) {
 		t.Fatalf("pools diverge for the same purpose: agent review=%v review request=%v",
 			directPayload.ReviewModelPool, routedPayload.ReviewModelPool)
 	}
-	if want := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}; !slices.Equal(directPayload.ReviewModelPool, want) {
+	if want := []string{"sentinel/router-a", "sentinel/router-b"}; !slices.Equal(directPayload.ReviewModelPool, want) {
 		t.Fatalf("resolved pool = %v, want the configured code pool %v", directPayload.ReviewModelPool, want)
 	}
 	// THE POOL IS ATTACHED, THE MODEL IS NOT CHOSEN (#2186 review, F1). An
@@ -2293,7 +2298,7 @@ func TestSharedResolverPreservesACallerSuppliedPool(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 
 	// Deliberately NOT the configured code pool, so an overwrite is visible.
-	chosen := []string{"anthropic/claude-opus-5", "devin/swe-2"}
+	chosen := []string{"anthropic/claude-opus-5", "sentinel/router-a"}
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
@@ -2333,7 +2338,7 @@ exit 1`, []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-script", Agent: "script-reviewer", Action: "review", Repo: "owner/repo",
 		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("b", 40), NoFixTarget: true,
-		ReviewModelPool: []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}, ReviewPurpose: "code",
+		ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"}, ReviewPurpose: "code",
 	})
 	worker := blockerE2EWorker(store, home, checkout)
 
@@ -2343,7 +2348,7 @@ exit 1`, []string{"review"}, "owner/repo")
 	_, payload := blockerE2EJobPayload(t, store, "job-script")
 	// A model that was never a pool entry now advances to the head of the pool:
 	// before #2180 armed these jobs, this branch could not be reached at all.
-	if payload.Model != "devin/swe-2" {
+	if payload.Model != "sentinel/router-a" {
 		t.Fatalf("model = %q, want the first untried pool entry", payload.Model)
 	}
 	if payload.RuntimeOverride != "" {

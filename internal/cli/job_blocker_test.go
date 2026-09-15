@@ -433,7 +433,7 @@ func TestRestorePreIsolationPayloadForDeferredJob(t *testing.T) {
 // model. Before that, the loop could only advance from a known entry, so such a
 // job had nowhere to go and fell through to the timed hold.
 func TestNextReviewPoolModelStartsAtFirstEntryWhenCurrentIsNotInPool(t *testing.T) {
-	pool := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	pool := []string{"sentinel/router-a", "sentinel/router-b"}
 	quota := blockerClassification{Class: blockerClassRuntimeQuota}
 
 	for _, tc := range []struct {
@@ -443,15 +443,15 @@ func TestNextReviewPoolModelStartsAtFirstEntryWhenCurrentIsNotInPool(t *testing.
 		wantModel      string
 		wantOK         bool
 	}{
-		{"agent model absent from pool advances to the head", workflow.JobPayload{Model: "", ReviewModelPool: pool}, quota, "devin/swe-2", true},
-		{"registered model absent from pool advances to the head", workflow.JobPayload{Model: "kimi-code/kimi-for-coding", ReviewModelPool: pool}, quota, "devin/swe-2", true},
-		{"first entry advances to the second", workflow.JobPayload{Model: "devin/swe-2", ReviewModelPool: pool}, quota, "openai-codex/gpt-5.6-sol", true},
-		{"exhausted pool holds instead of restarting", workflow.JobPayload{Model: "openai-codex/gpt-5.6-sol", ReviewModelPool: pool}, quota, "", false},
+		{"agent model absent from pool advances to the head", workflow.JobPayload{Model: "", ReviewModelPool: pool}, quota, "sentinel/router-a", true},
+		{"registered model absent from pool advances to the head", workflow.JobPayload{Model: "kimi-code/kimi-for-coding", ReviewModelPool: pool}, quota, "sentinel/router-a", true},
+		{"first entry advances to the second", workflow.JobPayload{Model: "sentinel/router-a", ReviewModelPool: pool}, quota, "sentinel/router-b", true},
+		{"exhausted pool holds instead of restarting", workflow.JobPayload{Model: "sentinel/router-b", ReviewModelPool: pool}, quota, "", false},
 		// M14 (#2186 round 4): a SINGLE-entry pool is the degraded case - the
 		// mutant bounding this arm at len > 1 survived every other row, because
 		// each used a two-entry pool. One alternative is still an alternative.
-		{"single-entry pool still offers its one alternative", workflow.JobPayload{Model: "", ReviewModelPool: []string{"devin/swe-2"}}, quota, "devin/swe-2", true},
-		{"single-entry pool already in use is exhausted", workflow.JobPayload{Model: "devin/swe-2", ReviewModelPool: []string{"devin/swe-2"}}, quota, "", false},
+		{"single-entry pool still offers its one alternative", workflow.JobPayload{Model: "", ReviewModelPool: []string{"sentinel/router-a"}}, quota, "sentinel/router-a", true},
+		{"single-entry pool already in use is exhausted", workflow.JobPayload{Model: "sentinel/router-a", ReviewModelPool: []string{"sentinel/router-a"}}, quota, "", false},
 		{"no pool never falls back", workflow.JobPayload{Model: "", ReviewModelPool: nil}, quota, "", false},
 		{"contention is not a provider fact", workflow.JobPayload{Model: "", ReviewModelPool: pool}, blockerClassification{Class: blockerClassCheckoutContention}, "", false},
 	} {

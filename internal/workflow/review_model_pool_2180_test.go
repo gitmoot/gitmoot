@@ -2,9 +2,16 @@ package workflow
 
 import (
 	"context"
+	"fmt"
+	"github.com/gitmoot/gitmoot/internal/reviewseverity"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"reflect"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+	"unsafe"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -27,7 +34,7 @@ func (h *testStoreHandle) payload(t *testing.T, prepared PreparedEnqueue) JobPay
 }
 
 func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *testing.T) {
-	configured := []string{"devin/swe-2", "openai-codex/gpt-5.6-sol"}
+	configured := []string{"sentinel/router-a", "sentinel/router-b"}
 	var askedFor []string
 
 	newMailbox := func(t *testing.T) (Mailbox, *testStoreHandle) {
@@ -172,22 +179,797 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 // The property that ends the class: a holder of an Engine cannot enqueue
 // through a LESS configured mailbox than the engine's own, because it does not
 // build one. No field list to forget the next field from.
-func TestEnqueueMailboxForwardsEveryEngineResolver(t *testing.T) {
-	sentinel := []string{"sentinel/model-a", "sentinel/model-b"}
+// THE CENSUS IS EXECUTED, NOT DECLARED (#2188 round 3).
+//
+// Three previous versions each replaced a declared list with a better declared
+// list, and the reviewer's finding each time was the declaration itself:
+//
+//  1. a hand-enumerated list of two fields, named "every";
+//  2. a reflective census plus `unforwardedByDesign`, which caught forgetting to
+//     classify and could not catch MISclassifying;
+//  3. a source-parsed copy list plus `handAsserted` - a SECOND trusted list, and
+//     adding a name to it silenced the coverage failure with zero assertions
+//     written. A guard satisfiable by DECLARING rather than by PROVING is not a
+//     guard, and the reviewer predicted that specific mechanism in advance.
+//
+// So no list decides anything here. For each exported Engine field, this sets
+// THAT FIELD ALONE to a distinctive non-zero value, builds a mailbox, and
+// compares every Mailbox field - exported and unexported alike - against a
+// mailbox built from an otherwise identical zero Engine. A field that reaches
+// the mailbox is OBSERVED reaching it; a field that does not is observed not
+// to. `expectedInert` below cannot create coverage: naming a field that DOES
+// influence the mailbox fails, exactly as omitting one that does not.
+//
+// This also drops the source parser, with its hardcoded filename, its
+// working-directory dependency, and its floor of eight against nineteen
+// assignments that let a degraded parse look clean while seven forwards went
+// unaudited.
+func mailboxFieldSnapshot(t *testing.T, mailbox Mailbox) map[string]string {
+	t.Helper()
+	value := reflect.ValueOf(&mailbox).Elem()
+	snapshot := map[string]string{}
+	for i := range value.NumField() {
+		field := value.Type().Field(i)
+		cell := value.Field(i)
+		if !cell.CanInterface() {
+			cell = reflect.NewAt(cell.Type(), unsafe.Pointer(cell.UnsafeAddr())).Elem()
+		}
+		switch cell.Kind() {
+		case reflect.Func, reflect.Map, reflect.Slice, reflect.Ptr, reflect.Interface, reflect.Chan:
+			if cell.IsNil() {
+				snapshot[field.Name] = "nil"
+			} else {
+				snapshot[field.Name] = fmt.Sprintf("set:%v", cell.Pointer())
+			}
+		default:
+			snapshot[field.Name] = fmt.Sprintf("%v", cell.Interface())
+		}
+	}
+	return snapshot
+}
+
+// distinctiveValues returns EVERY candidate worth trying for a field, not one.
+//
+// A single arbitrary string reports a false INERT wherever the forward
+// normalises its input: `mb.resultCheckMode = normalizeResultCheckMode(...)`
+// maps an unrecognised value to the zero mode, so "sentinel-12" arrives
+// indistinguishable from unset. The probe must not conclude "not forwarded"
+// from "my value was rejected", so it tries the domain's own vocabulary too and
+// treats influence by ANY candidate as forwarded.
+func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
+	return distinctiveValuesAtDepth(fieldType, seed, 0)
+}
+
+// distinctiveValuesAtDepth bounds recursion. A self-referential field type used
+// to CRASH the whole test binary rather than fail (#2188 round 7, P3): a future
+// Engine field of a cyclic type would have taken down every test in the package
+// while reporting nothing. Past the bound the type is unsynthesisable, which is
+// a loud failure in the census rather than a silent skip.
+func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect.Value {
+	if depth > 4 {
+		return nil
+	}
+	switch fieldType.Kind() {
+	case reflect.Func:
+		return []reflect.Value{reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
+			out := make([]reflect.Value, fieldType.NumOut())
+			for j := range out {
+				out[j] = reflect.Zero(fieldType.Out(j))
+			}
+			return out
+		})}
+	case reflect.Bool:
+		return []reflect.Value{reflect.ValueOf(true).Convert(fieldType)}
+	case reflect.String:
+		var values []reflect.Value
+		for _, candidate := range []string{fmt.Sprintf("sentinel-%d", seed), "block", "warn", "on", "true"} {
+			values = append(values, reflect.ValueOf(candidate).Convert(fieldType))
+		}
+		return values
+	case reflect.Int, reflect.Int64, reflect.Int32:
+		return []reflect.Value{reflect.ValueOf(int64(seed + 7)).Convert(fieldType)}
+	case reflect.Float64, reflect.Float32:
+		return []reflect.Value{reflect.ValueOf(float64(seed) + 0.5).Convert(fieldType)}
+
+	// #2188 round 5 (P2): `unprobeable` was decided by GENERATOR CAPABILITY, not
+	// by behaviour - so a forward FROM an unprobeable field was invisible by
+	// construction, and the check then passed HONESTLY rather than by anyone's
+	// oversight. Demonstrated live: `mb.produceCheckDir = e.HighRiskPaths[0]`
+	// left the whole package green.
+	//
+	// The exemption did not disappear when the declared lists went; it moved
+	// from human declaration to tool limitation. Widening the generator is the
+	// only remedy that removes it rather than relocating it again: composite
+	// kinds are now synthesised from their own element types, recursively.
+	case reflect.Slice:
+		element := distinctiveValuesAtDepth(fieldType.Elem(), seed+1, depth+1)
+		if len(element) == 0 {
+			return nil
+		}
+		slice := reflect.MakeSlice(fieldType, 1, 1)
+		slice.Index(0).Set(element[0])
+		return []reflect.Value{slice}
+	case reflect.Map:
+		key := distinctiveValuesAtDepth(fieldType.Key(), seed+2, depth+1)
+		value := distinctiveValuesAtDepth(fieldType.Elem(), seed+3, depth+1)
+		if len(key) == 0 || len(value) == 0 {
+			return nil
+		}
+		mapping := reflect.MakeMap(fieldType)
+		mapping.SetMapIndex(key[0], value[0])
+		return []reflect.Value{mapping}
+	case reflect.Pointer:
+		// REACH THROUGH THE INDIRECTION (#2188 round 10, P3). This used to return
+		// a pointer to a ZERO pointee: non-nil, so the field read as "set", while
+		// every member behind it stayed zero. A forward that reads a POINTEE
+		// MEMBER would then be probed with an effectively-zero value and report
+		// INERT - the false-observation shape again, one indirection deeper than
+		// the depth bound that produced it last round.
+		//
+		// NOTE: all-or-nothing does NOT propagate through this case, and an
+		// earlier version of this sentence claimed it did - false the moment
+		// the unconditional fallback below was added, IN THE SAME BLOCK. An
+		// unsynthesisable pointee yields the non-nil fallback alone, which is
+		// deliberate (see the candidate rationale below) and is the opposite of
+		// what the old sentence promised.
+		// TWO CANDIDATES, STRONGEST FIRST: a FILLED pointee when one can be
+		// built - which is what reaches a forward reading a pointee MEMBER -
+		// and a non-nil zero pointee otherwise.
+		//
+		// The fallback exists because an all-or-nothing refusal COST a real
+		// observation when it was tried: a pointer whose pointee could not be
+		// synthesised was reported unsynthesisable, losing a forward the census
+		// had been observing correctly. Disagreement between candidates
+		// resolves to FORWARDED, which is the safe direction.
+		//
+		// NOTE ON A COMMENT THAT ROTTED IN ITS OWN COMMIT (#2188 round 11): the
+		// previous version of this paragraph named *MemoryController as a
+		// pointee that "cannot be fully synthesised". Under this code it CAN -
+		// the pointee filler now reaches unexported members - so the comment
+		// documented the FIRST ATTEMPT rather than the shipped behaviour. The
+		// example is removed rather than corrected: a rationale naming a
+		// specific type decays the moment that type changes.
+		var candidates []reflect.Value
+		if pointee := distinctiveValuesAtDepth(fieldType.Elem(), seed+5, depth+1); len(pointee) > 0 {
+			filled := reflect.New(fieldType.Elem())
+			filled.Elem().Set(pointee[0])
+			candidates = append(candidates, filled)
+		}
+		return append(candidates, reflect.New(fieldType.Elem()))
+	case reflect.Struct:
+		// #2188 round 6 (the tenth instance): this case USED TO return the ZERO
+		// struct, which is indistinguishable from unset - so DelegationTimeoutDefaults
+		// and LedgerResolvers moved from honestly-admitted `unprobeable` to
+		// falsely-claimed "observed inert", and a forward from either was
+		// invisible while the census reported coverage.
+		//
+		// THE WIDENING TRADED AN ADMITTED GAP FOR A FALSE PROOF, which is
+		// strictly worse: an admitted gap is a known limit, a false proof
+		// removes the reason to look. Fields are now filled recursively, and a
+		// struct whose fields cannot be filled reports UNFILLABLE rather than
+		// inert.
+		// ALL-OR-NOTHING (#2188 round 8, P2). This used to accept a PARTIAL fill:
+		// one field set was enough, so a struct whose remaining fields hit the
+		// depth bound was probed with an incomplete value and reported "observed
+		// inert" with confidence. That is the zero-struct false proof from two
+		// rounds earlier, one level deeper - a bound added to stop a CRASH
+		// created a new channel for a wrong observation inside the stated reach.
+		//
+		// An incompletely synthesisable struct is now unsynthesisable, which is
+		// a loud census failure rather than a quiet inert.
+		// UNEXPORTED MEMBERS ARE FILLED TOO (#2188 round 11, P3). Skipping them
+		// left a FILLABLE pointee whose unexported members stayed zero, so a
+		// forward reading one still read inert - the residual I disclosed was
+		// understated, and understating a residual is worse than having one
+		// because it tells the next reader the gap is elsewhere.
+		//
+		// The snapshot already reads unexported fields through reflect.NewAt;
+		// this is the same move in the write direction, on a value this test
+		// owns outright.
+		filled := reflect.New(fieldType).Elem()
+		settable := 0
+		for i := range fieldType.NumField() {
+			cell := filled.Field(i)
+			if !fieldType.Field(i).IsExported() {
+				if !cell.CanAddr() {
+					return nil
+				}
+				cell = reflect.NewAt(cell.Type(), unsafe.Pointer(cell.UnsafeAddr())).Elem()
+			}
+			inner := distinctiveValuesAtDepth(fieldType.Field(i).Type, seed+i+11, depth+1)
+			if len(inner) == 0 {
+				return nil
+			}
+			cell.Set(inner[0])
+			settable++
+		}
+		if settable == 0 {
+			return nil
+		}
+		return []reflect.Value{filled}
+
+	// The five interface-typed fields were exempted as "unsynthesisable". That
+	// is a claim about the generator, and it is FALSE INSIDE THIS PACKAGE: the
+	// stubs already existed. Using them deletes the exemption set rather than
+	// relocating it - the first time in this lineage that closing a gap did not
+	// create a new place for the class to live.
+	case reflect.Interface:
+		for _, stub := range []any{
+			&recordingSink{}, &recordingNotifier{}, &fakeImplementationFinalizer{},
+			&fakeMergeGate{}, &fakeWorktreeManager{},
+		} {
+			candidate := reflect.ValueOf(stub)
+			if candidate.Type().Implements(fieldType) {
+				return []reflect.Value{candidate}
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// NAME STATES THE REACH (#2188 round 7). The previous name claimed "every
+// engine field", and that was FALSE in three ways at once: Engine.Now reaches
+// the mailbox only inside the emitTerminal closure, ReviewBlockingSeverity is
+// forwarded as a METHOD VALUE - always non-nil, fixed code pointer, so it reads
+// as inert - and Store was skipped by name.
+//
+// The premise is a single-field probe read from ONE post-construction snapshot.
+// Four shapes are outside it BY CONSTRUCTION: closures, method values,
+// conditionals and name-skips. Rather than widen the census a twelfth time,
+// each is covered by a direct behavioural test and named here:
+//
+//   - Engine.Now            -> TestEmittedEventTimestampsComeFromTheEnginesClock
+//   - ReviewBlockingSeverity -> the reviewBlockingSeverity wiring assertion below
+//   - Memory sub-fields      -> the Memory residual assertions below
+//   - Store                  -> now probed like everything else
+func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
+	// SET EQUALITY IN BOTH DIRECTIONS (#2188 round 4). The previous version's
+	// `mustForward` was obligation-only, which I argued made it safe. It did not:
+	// DELETING a name passed silently, which is the same edit direction the three
+	// deleted lists failed on - I had only closed the direction nobody uses.
+	//
+	// Worse, that rewrite REGRESSED two working properties. Round 3's source
+	// parser, blind in four ways, still FAILED on a newly added forward; the
+	// execution census did not, so "forgot to forward" was pinned only for the
+	// names already written down. Deleting the exemption SEMANTICS was right;
+	// deleting the mechanisms carrying them threw away detection and provenance.
+	//
+	// Every exported Engine field must therefore appear in EXACTLY ONE of these
+	// three sets, and each set must match what execution observes, exactly. A new
+	// field fails until classified, whichever way it behaves; a deleted name
+	// fails because observation still reports it.
+	mustForward := map[string]bool{
+		"Store":          true,
+		"ApplyChangeSet": true, "BlockerDeferrer": true, "CollectChangeSet": true,
+		"EventSink": true, "Memory": true, "OrgPolicy": true,
+		"ProduceCheckDir": true, "RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true,
+		"ResultCheckMode": true, "ReviewModelPool": true, "RouterContextEnabled": true,
+		"RuntimeDefaultEffort": true, "RuntimeDefaultModel": true,
+	}
+	// Observed inert: setting the field alone changes nothing on the mailbox.
+	// Every name here was OBSERVED, not assumed - an entry that turns out to be
+	// forwarded fails the set equality below, in that direction too.
+	expectedInert := map[string]bool{
+		"ArtifactRoot": true, "BeforeReadOnlyWorktreeCleanup": true, "DelegationCheckout": true,
+		"DelegationTimeoutDefaults": true, "DelegationWorktrees": true, "EscalationNotifier": true,
+		"FindingsAdvisory": true, "FixWorktreeAllocator": true, "HighRiskPaths": true,
+		"Home": true, "ImplementationFinalizer": true, "InjectUpstreamDepContext": true,
+		"InlineArtifactBodies": true, "JobID": true, "LedgerResolvers": true,
+		"MaxDelegationCostUSD": true, "MaxDelegationNonProgressStreak": true, "MaxDelegationTokenBudget": true,
+		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true, "MergeGate": true,
+		"NativeReviewFanoutEnabled": true, "Now": true, "OwnerPIDLive": true,
+		"PayloadRefresher": true, "PullRequestSignals": true, "RequiredReviewers": true,
+		// METHOD-VALUE forward: always non-nil with a fixed code pointer, so the
+		// snapshot reads it as inert. Pinned by the wiring assertion below.
+		"ReviewBlockingSeverity": true,
+		"ReviewChangedFiles":     true, "RiskLabelHigh": true,
+		"RiskLabelRoutine": true, "RiskTiersEnabled": true, "WorktreeHasLiveProcess": true,
+		"WorktreeLiveness": true,
+	}
+	// Kinds this generator cannot synthesise a distinguishing value for. Listing
+	// one is a statement that it is UNPROBEABLE, not that it is uninteresting.
+	// NO EXEMPTION SET. It was five interface-typed fields, justified as
+	// "unsynthesisable" - a claim about the generator that was FALSE inside this
+	// package, where recordingSink, recordingNotifier, fakeImplementationFinalizer,
+	// fakeMergeGate and fakeWorktreeManager already existed. Using them made all
+	// five real observations, and EventSink turned out to be FORWARDED, not
+	// merely unprobed - the same error the hand-audit made on Memory, found the
+	// same way. Every exported Engine field is now observed.
+
+	store := openEngineStore(t)
+	baseline := Engine{Store: store}
+	baselineSnapshot := mailboxFieldSnapshot(t, baseline.EnqueueMailbox(nil))
+	// Store was SKIPPED BY NAME for seven rounds - a one-field exemption in the
+	// most literal form available, sitting in plain sight while three exemption
+	// lists were deleted for being exemptions. It is probed like everything else
+	// now; the probe simply supplies a DIFFERENT store so the diff is real.
+	otherStore := openEngineStore(t)
+
+	engineType := reflect.TypeOf(Engine{})
+	observedForward := map[string]bool{}
+	observedInert := map[string]bool{}
+	for i := range engineType.NumField() {
+		field := engineType.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		candidates := distinctiveValues(field.Type, i)
+		if field.Name == "Store" {
+			// Probed with a REAL second store below, so the generator does not
+			// need to synthesise *db.Store - and must not fail the census for
+			// being unable to.
+			candidates = []reflect.Value{reflect.ValueOf(otherStore)}
+		}
+		if len(candidates) == 0 {
+			// No exemption remains, so this is a FAILURE rather than a category:
+			// a field the generator cannot synthesise is a field nothing checks.
+			t.Errorf("Engine.%s cannot be synthesised by the probe: extend distinctiveValues "+
+				"(a stub for its type), or this field is unchecked", field.Name)
+			continue
+		}
+		changed := false
+		for _, candidate := range candidates {
+			probe := reflect.New(engineType).Elem()
+			probe.FieldByName("Store").Set(reflect.ValueOf(store))
+			if field.Name == "Store" {
+				probe.Field(i).Set(reflect.ValueOf(otherStore))
+			} else {
+				probe.Field(i).Set(candidate)
+			}
+			engine := probe.Addr().Interface().(*Engine)
+			for name, got := range mailboxFieldSnapshot(t, engine.EnqueueMailbox(nil)) {
+				if got != baselineSnapshot[name] {
+					changed = true
+					break
+				}
+			}
+			if changed {
+				break
+			}
+		}
+		if changed {
+			observedForward[field.Name] = true
+		} else {
+			observedInert[field.Name] = true
+		}
+	}
+
+	requireSameSet(t, "forwarded", mustForward, observedForward)
+	requireSameSet(t, "inert", expectedInert, observedInert)
+
+	// Method-derived and sub-field forwards, invisible to the value diff above.
+	if baselineSnapshot["reviewBlockingSeverity"] == "nil" {
+		t.Error("Mailbox.reviewBlockingSeverity is not wired: a method-derived forward is invisible to the diff")
+	}
+	withMemory := Engine{Store: store, Memory: &MemoryController{}}
+	memorySnapshot := mailboxFieldSnapshot(t, withMemory.EnqueueMailbox(nil))
+	for _, name := range []string{"injectMemory", "recordMemory"} {
+		if memorySnapshot[name] == "nil" {
+			t.Errorf("Mailbox.%s is nil with a non-nil Memory: the sub-field forward is gone", name)
+		}
+	}
+}
+
+// requireSameSet reports BOTH directions, because each catches a different
+// edit: an unexpected member is a field nobody classified, and a missing member
+// is a property that was proved once and has since been deleted.
+func requireSameSet(t *testing.T, label string, declared, observed map[string]bool) {
+	t.Helper()
+	for name := range observed {
+		if !declared[name] {
+			// DO NOT RECOMMEND THE OBSERVATION AS THE ANSWER (#2188 round 8).
+			// The snapshot cannot see a forward through a closure, a method
+			// value, or a conditional on another field, so "observed inert" is
+			// exactly the wrong answer for those shapes - and telling the reader
+			// to paste it is the mechanism HANDING OVER a wrong classification
+			// rather than merely permitting one. It also offered "unprobeable",
+			// a classification that no longer exists.
+			hint := ""
+			if label == "inert" {
+				hint = " - before classifying it inert, check engine_types.go for a forward through a CLOSURE, a METHOD VALUE, " +
+					"or a CONDITIONAL on another field: this probe cannot see those, and each has already hidden a real " +
+					"forward on this file (Engine.Now, ReviewBlockingSeverity, Memory)"
+			}
+			t.Errorf("Engine.%s is observed %s but is classified nowhere%s", name, label, hint)
+		}
+	}
+	for name := range declared {
+		if !observed[name] {
+			t.Errorf("Engine.%s is declared %s but is not observed %s: the behaviour it pinned is gone", name, label, label)
+		}
+	}
+}
+
+// PROVENANCE, restored (#2188 round 4). Its deletion was a regression: cross-
+// wiring `mb.RuntimeDefaultModel = e.RuntimeDefaultEffort` survived the whole
+// package, because non-nil proves a field was SET, not that it was set from its
+// counterpart. Two same-signature forwards can be swapped silently.
+func TestForwardedFuncFieldsComeFromTheirOwnCounterpart(t *testing.T) {
+	answered := ""
+	engineValue := reflect.New(reflect.TypeOf(Engine{})).Elem()
+	engineType := engineValue.Type()
+	mailboxType := reflect.TypeOf(Mailbox{})
+
+	var checked []string
+	for i := range engineType.NumField() {
+		field := engineType.Field(i)
+		if !field.IsExported() || field.Type.Kind() != reflect.Func {
+			continue
+		}
+		mailboxField, ok := mailboxType.FieldByName(field.Name)
+		if !ok || !mailboxField.IsExported() || mailboxField.Type != field.Type {
+			continue
+		}
+		name, fieldType := field.Name, field.Type
+		engineValue.Field(i).Set(reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
+			answered = name
+			out := make([]reflect.Value, fieldType.NumOut())
+			for j := range out {
+				out[j] = reflect.Zero(fieldType.Out(j))
+			}
+			return out
+		}))
+		checked = append(checked, name)
+	}
+	if len(checked) < 5 {
+		t.Fatalf("provenance covers only %d fields (%v); the probe is broken", len(checked), checked)
+	}
+
+	engine := engineValue.Addr().Interface().(*Engine)
+	engine.Store = openEngineStore(t)
+	engine.ResolveDeliveryWorktree = UnavailableDeliveryWorktreeResolver("test")
+	mailbox := reflect.ValueOf(engine.EnqueueMailbox(nil))
+
+	for _, name := range checked {
+		answered = ""
+		callFuncWithZeroArgs(mailbox.FieldByName(name))
+		if answered != name {
+			t.Errorf("Mailbox.%s is wired from Engine.%s, not from its counterpart", name, answered)
+		}
+	}
+}
+
+// #2188 review, M9: the PR's headline fix was UNPINNED. Deleting the line that
+// installs the caller's sentinel passed every test, including the daemon ones -
+// their `delivered` flag is unreachable because the resolver never fires during
+// Enqueue, so they re-proved pool inheritance under a name that promised more.
+//
+// The assertion has to be in-package: resolveDeliveryWorktree is unexported, so
+// the daemon package structurally cannot see what it is being handed. Driving
+// the seam itself is the only honest check - invoke the delivery path and
+// require the SENTINEL's refusal, not the engine's real resolver.
+func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
+	realResolverRan := false
+	engine := Engine{
+		Store: openEngineStore(t),
+		ResolveDeliveryWorktree: func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
+			realResolverRan = true
+			return DeliveryWorktreeResolution{Path: "/tmp/engine-owned-checkout"}, nil
+		},
+	}
+
+	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
+	_, err := mailbox.deliveryWorktree(context.Background(), db.Job{ID: "job-1"}, JobPayload{})
+	if err == nil {
+		t.Fatal("delivery resolved: the caller's refusal sentinel was not installed")
+	}
+	if !strings.Contains(err.Error(), "daemon comment enqueue") {
+		t.Fatalf("error = %v, want the caller's sentinel naming its site", err)
+	}
+	if realResolverRan {
+		t.Fatal("the engine's real delivery resolver ran: the sentinel was replaced, not installed")
+	}
+
+	// The inverse direction, so the test cannot pass by refusing everything: a
+	// caller that passes no sentinel inherits the engine's real resolver.
+	if _, err := engine.EnqueueMailbox(nil).deliveryWorktree(context.Background(), db.Job{ID: "job-2"}, JobPayload{}); err != nil {
+		t.Fatalf("EnqueueMailbox(nil) refused delivery: %v", err)
+	}
+	if !realResolverRan {
+		t.Fatal("EnqueueMailbox(nil) did not inherit the engine's delivery resolver")
+	}
+}
+
+// The four forwards reflection structurally cannot see, each asserted on a
+// distinctive value. Three of these mutants (routerContextEnabled,
+// resultCheckMode, produceCheckDir) survived the entire package before this
+// test existed, and ResultCheckMode had no entry in the declared list at all.
+// Renamed (#2188 round 8, P3): "ReflectionCannotSee" was accurate when written
+// and became FALSE as the probe improved - the snapshot census sees all four
+// now. A name that decayed into a claim its assertions no longer carry is the
+// same defect this file has been bitten by three times.
+func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
 	engine := Engine{
 		Store:                   openEngineStore(t),
 		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		ReviewModelPool:         func(string) []string { return sentinel },
-		RuntimeDefaultModel:     func(string) string { return "sentinel/default" },
+		BlockerDeferrer:         func(context.Context, string, error) (bool, error) { return false, nil },
+		RouterContextEnabled:    true,
+		ResultCheckMode:         ResultChecksBlock,
+		ProduceCheckDir:         "/tmp/sentinel-produce-dir",
 	}
-	mailbox := engine.EnqueueMailbox()
-	if mailbox.ReviewModelPool == nil {
-		t.Fatal("EnqueueMailbox dropped ReviewModelPool: a producer taking this mailbox resolves against the wrong home")
+	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test"))
+
+	if !mailbox.routerContextEnabled {
+		t.Error("RouterContextEnabled -> routerContextEnabled not forwarded")
 	}
-	if got := mailbox.ReviewModelPool("code"); !slices.Equal(got, sentinel) {
-		t.Fatalf("forwarded resolver returned %v, want the engine's own %v", got, sentinel)
+	if mailbox.resultCheckMode != ResultChecksBlock {
+		t.Errorf("resultCheckMode = %q, want %q", mailbox.resultCheckMode, ResultChecksBlock)
 	}
-	if mailbox.RuntimeDefaultModel == nil {
-		t.Fatal("EnqueueMailbox dropped RuntimeDefaultModel")
+	if mailbox.produceCheckDir != "/tmp/sentinel-produce-dir" {
+		t.Errorf("produceCheckDir = %q, want the engine's", mailbox.produceCheckDir)
 	}
+	if mailbox.deferBlocker == nil {
+		t.Error("BlockerDeferrer -> deferBlocker not forwarded")
+	}
+}
+
+// callFuncWithZeroArgs invokes fn with zero values for every parameter, so a
+// provenance stub can report which field it belongs to.
+func callFuncWithZeroArgs(fn reflect.Value) {
+	fnType := fn.Type()
+	args := make([]reflect.Value, fnType.NumIn())
+	for i := range args {
+		args[i] = reflect.Zero(fnType.In(i))
+	}
+	fn.Call(args)
+}
+
+// #2188 round 7, and the ONLY finding in this lineage over PRODUCTION
+// behaviour rather than test machinery.
+//
+// Engine.Now reaches the mailbox solely inside the emitTerminal CLOSURE, guarded
+// by EventSink != nil, so the per-field census - one field, one post-construction
+// snapshot - cannot see it by construction. The mutant `e.now()` ->
+// `time.Now().Add(24h)` survived the entire package while making EVERY EMITTED
+// EVENT TIMESTAMP WRONG.
+//
+// A closure-captured receiver is one of four shapes outside that census's reach
+// (closures, method values, conditionals, name-skips). This asserts the
+// behaviour directly instead of widening the census a twelfth time.
+func TestEmittedEventTimestampsComeFromTheEnginesClock(t *testing.T) {
+	frozen := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	sink := &recordingSink{}
+	engine := Engine{
+		Store:                   openEngineStore(t),
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		EventSink:               sink,
+		Now:                     func() time.Time { return frozen },
+	}
+
+	mailbox := engine.EnqueueMailbox(nil)
+	if mailbox.emitTerminal == nil {
+		t.Fatal("emitTerminal is not wired with an EventSink set")
+	}
+	mailbox.emitTerminal(context.Background(), "job-clock", JobSucceeded, JobPayload{Repo: "owner/repo"})
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) != 1 {
+		t.Fatalf("emitted %d events, want 1", len(sink.events))
+	}
+	if got, want := sink.events[0].Timestamp, frozen.Format(time.RFC3339); got != want {
+		t.Fatalf("event timestamp = %q, want the engine's clock %q: every emitted timestamp is wrong if this drifts", got, want)
+	}
+}
+
+// #2188 round 9 (P3): the all-or-nothing struct fill was CORRECT AND UNDEFENDED -
+// reverting it survived the whole package, because no current Engine field is
+// partially fillable. A guard whose subject does not exist in production cannot
+// be tested by production code, which is this lineage's thirteenth shape.
+//
+// So the subject is constructed here. These types exist only to be probed: one
+// fully fillable, one whose tail cannot be synthesised. The guard's contract is
+// that the first is OBSERVED and the second is refused rather than reported as
+// an incomplete-value probe.
+type zzFillable struct {
+	Name  string
+	Count int
+	Inner zzFillableInner
+}
+
+type zzFillableInner struct{ Flag bool }
+
+type zzPartiallyFillable struct {
+	Name string
+	Ch   chan int // unsynthesisable: no distinguishing value exists
+}
+
+func TestStructSynthesisIsAllOrNothing(t *testing.T) {
+	fillable := distinctiveValues(reflect.TypeOf(zzFillable{}), 1)
+	if len(fillable) != 1 {
+		t.Fatalf("a fully fillable struct produced %d candidates, want 1 - the guard rejects valid input", len(fillable))
+	}
+	// MUST-SUCCEED HALF: every field actually carries a distinguishing value,
+	// so the probe cannot report a zero struct as "filled".
+	got := fillable[0].Interface().(zzFillable)
+	if got.Name == "" || got.Count == 0 || !got.Inner.Flag {
+		t.Fatalf("fully fillable struct came back partly zero: %+v", got)
+	}
+
+	// REFUSAL HALF: one unsynthesisable field makes the whole struct
+	// unsynthesisable. Accepting a partial fill is what manufactured a
+	// confident "observed inert" for a field the probe never really set.
+	if partial := distinctiveValues(reflect.TypeOf(zzPartiallyFillable{}), 2); len(partial) != 0 {
+		t.Fatalf("a partially fillable struct produced %d candidates: the census would report it inert on an incomplete probe", len(partial))
+	}
+}
+
+// #2188 round 10 (P3): the constructed subject must reach through a POINTER.
+// Two hand-made structs proved all-or-nothing for direct fields and said
+// nothing about indirection.
+func TestStructSynthesisReachesThroughPointers(t *testing.T) {
+	// A pointer to a FILLABLE struct must arrive with its members populated -
+	// a non-nil pointer to a zero struct is the false "set" this closes.
+	// Two candidates: the FILLED pointee first - the one that reaches a forward
+	// reading a pointee member - then the non-nil fallback.
+	ok := distinctiveValues(reflect.TypeOf(&zzFillable{}), 3)
+	if len(ok) != 2 {
+		t.Fatalf("pointer to a fillable struct produced %d candidates, want the filled one and the fallback", len(ok))
+	}
+	pointee := ok[0].Interface().(*zzFillable)
+	if pointee == nil || pointee.Name == "" || pointee.Count == 0 || !pointee.Inner.Flag {
+		t.Fatalf("pointee came back zero: %+v", pointee)
+	}
+
+	// A pointee that cannot be filled yields ONLY the non-nil fallback - one
+	// candidate, not two - so the census can still observe the pointer being
+	// forwarded while nothing claims its members were probed.
+	bad := distinctiveValues(reflect.TypeOf(&zzPartiallyFillable{}), 4)
+	if len(bad) != 1 {
+		t.Fatalf("pointer to an unfillable pointee produced %d candidates, want exactly the non-nil fallback", len(bad))
+	}
+	if got := bad[0].Interface().(*zzPartiallyFillable); got == nil || got.Name != "" {
+		t.Fatalf("fallback pointee should be zero and non-nil, got %+v", got)
+	}
+}
+
+// #2188 round 11 (P3): a FILLABLE pointee whose members are UNEXPORTED used to
+// come back with those members zero under both candidates, so a forward reading
+// one still read inert. My disclosed residual named only unfillable pointees,
+// which pointed the next reader at the wrong gap - understating a residual is
+// worse than having one.
+type zzUnexportedMembers struct {
+	Name   string
+	hidden string
+	flag   bool
+}
+
+func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
+	values := distinctiveValues(reflect.TypeOf(zzUnexportedMembers{}), 7)
+	if len(values) != 1 {
+		t.Fatalf("produced %d candidates, want 1", len(values))
+	}
+	filled := values[0].Interface().(zzUnexportedMembers)
+	if filled.Name == "" {
+		t.Fatalf("exported member unset: %+v", filled)
+	}
+	// READ DIRECTLY. The previous version read back through the same unsafe
+	// path the writer uses, with a comment claiming "the test cannot touch them
+	// directly either" - which is FALSE: this test is in the same package, so
+	// plain field access works. The comment asserted the unavailability of the
+	// very check that makes the assertion independent, and a reader trusting it
+	// would not have looked (#2188 round 12).
+	//
+	// Reading through the writer's own mechanism also risks a vacuous pass: if
+	// the unsafe addressing were wrong in a symmetric way, write and read-back
+	// would agree with each other and with nothing else.
+	if filled.hidden == "" {
+		t.Fatalf("unexported member hidden stayed zero: a forward reading it would read INERT")
+	}
+	if !filled.flag {
+		t.Fatalf("unexported member flag stayed zero: a forward reading it would read INERT")
+	}
+}
+
+// #2188 round 13: METHOD-VALUE FORWARDS WERE PINNED BY NON-NIL ONLY. A
+// same-signature stub substituted for injectMemory, recordMemory or
+// reviewBlockingSeverity survived the entire package - the three are observed
+// to EXIST and not to be THEMSELVES, which is precisely the cross-wire defect
+// provenance was built for, in the one shape provenance does not reach:
+// provenance covers forwards landing on same-name same-type EXPORTED mailbox
+// fields, and these land on unexported ones.
+//
+// Identity is asserted two ways because the two shapes admit different proofs:
+// a method value carries its method's code pointer, and a config-derived
+// closure can be made to answer with a sentinel.
+func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
+	store := openEngineStore(t)
+	// A Store is required: enabledFor short-circuits on a nil one, which would
+	// make the binding probe below pass vacuously for every receiver.
+	controller := &MemoryController{Store: store}
+	engine := Engine{
+		Store:                   store,
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		Memory:                  controller,
+		// A VALID severity that is NOT the default. P3 IS
+		// reviewseverity.DefaultBlocking, so the previous P3 sentinel could pass
+		// on the very fallback it was written to exclude - the sentinel rule
+		// held, the chosen instance collided with the default, which is exactly
+		// what this file's own fixture rule forbids for pool names.
+		ReviewBlockingSeverity: func(string) string { return reviewseverity.P1 },
+	}
+	mailbox := engine.EnqueueMailbox(nil)
+
+	// IDENTITY BY RUNTIME FUNCTION NAME, not by pointer equality. A method VALUE
+	// is a compiler-generated wrapper, so its code pointer need not equal the
+	// method expression's - comparing them matched injectBlock and failed
+	// record, which is the shape of a check that passes by luck. The wrapper's
+	// NAME carries the method it closes over; a same-signature stub declared in
+	// a test carries the test's name instead.
+	// EXACT NAMES, NOT CONTAINMENT. strings.Contains admitted any PREFIX-EXTENDED
+	// method: mb.recordMemory = e.Memory.recordEnrolled has the same signature,
+	// skips the enrolment gate and both distill producers, and a containment
+	// check on "MemoryController).record" agrees with it. Substring containment
+	// expresses RESEMBLANCE; identity needs equality. The expected name is taken
+	// from the method expression itself rather than typed as a literal, so a
+	// rename cannot leave this test asserting a string that no longer exists.
+	for _, check := range []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"injectMemory", methodValueName(mailbox.injectMemory), runtimeFuncName((*MemoryController).injectBlock)},
+		{"recordMemory", methodValueName(mailbox.recordMemory), runtimeFuncName((*MemoryController).record)},
+	} {
+		if check.got != check.want {
+			t.Errorf("Mailbox.%s is wired from %s, want exactly %s: a same-signature method doing different work passes containment",
+				check.field, check.got, check.want)
+		}
+	}
+
+	// WHICH INSTANCE, not merely which method. A name check cannot see the
+	// receiver a method value closes over, so mb.injectMemory =
+	// (&MemoryController{}).injectBlock - the right method bound to a fresh
+	// empty controller - passed everything above. Both forwards consult
+	// c.Enabled first, so observing THIS controller's closure run proves the
+	// binding; a fresh controller has a nil Enabled and never calls it.
+	consulted := map[string]int{}
+	controller.Enabled = func(name string) bool {
+		consulted[name]++
+		return false
+	}
+	ctx := context.Background()
+	mailbox.injectMemory(ctx, runtime.Agent{Name: "inject-probe"}, JobPayload{})
+	mailbox.recordMemory(ctx, "job-1", runtime.Agent{Name: "record-probe"}, "review", JobPayload{}, AgentResult{})
+	for _, name := range []string{"inject-probe", "record-probe"} {
+		if consulted[name] == 0 {
+			t.Errorf("forward for %q never consulted the engine's own controller: it is bound to a different instance", name)
+		}
+	}
+
+	// BEHAVIOURAL IDENTITY for the config-derived one: it must answer with the
+	// engine's own policy rather than merely being set.
+	if mailbox.reviewBlockingSeverity == nil {
+		t.Fatal("reviewBlockingSeverity not forwarded")
+	}
+	if got := mailbox.reviewBlockingSeverity("owner/repo"); got != reviewseverity.P1 {
+		t.Fatalf("reviewBlockingSeverity(owner/repo) = %q, want the engine's own %s: a sentinel equal to reviewseverity.DefaultBlocking would pass on the fallback it excludes",
+			got, reviewseverity.P1)
+	}
+}
+
+// runtimeFuncName reports the function a value actually closes over. It is the
+// only identity available for a forward landing on an UNEXPORTED field: the
+// census cannot compare it to a counterpart, and non-nil proves existence only.
+// methodValueName is runtimeFuncName for a METHOD VALUE. The compiler names the
+// wrapper "<method>-fm", so the suffix is stripped to compare against the method
+// EXPRESSION's own name. Stripping a known suffix keeps the comparison an
+// equality rather than a containment: "recordEnrolled-fm" becomes
+// "recordEnrolled" and still differs from "record".
+func methodValueName(fn any) string {
+	return strings.TrimSuffix(runtimeFuncName(fn), "-fm")
+}
+
+func runtimeFuncName(fn any) string {
+	value := reflect.ValueOf(fn)
+	if !value.IsValid() || value.IsNil() {
+		return "<nil>"
+	}
+	resolved := goruntime.FuncForPC(value.Pointer())
+	if resolved == nil {
+		return "<unresolvable>"
+	}
+	return resolved.Name()
 }
