@@ -3060,9 +3060,9 @@ configured org registry, and the gate still enforces independence against it.
 Never record an agent that did not implement, and never record the reviewer.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
-such as a busy base-branch merge queue or a GitHub branch update in progress,
-are retried on the next daemon poll tick. The default poll interval is `30s`
-unless the daemon was started with a different `--poll`. When an **external**
+such as a busy base-branch merge queue or an active job on the PR branch, are
+retried on the next daemon poll tick. The default poll interval is `30s` unless
+the daemon was started with a different `--poll`. When an **external**
 system owns the merge decision, set `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1`
 (also `true`/`yes`/`on`; #545): Gitmoot then **abstains** from its native merge
 gate — fail-closed, it never merges gatelessly; the external gate makes the

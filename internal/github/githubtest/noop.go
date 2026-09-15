@@ -100,13 +100,9 @@ func (NoopClient) MergePullRequest(context.Context, github.MergePullRequestInput
 }
 
 // BaseRequiresUpToDateHead reports UNDETERMINED, which makes the merge gate
-// fail closed and keep its pre-#1865 branch-update behaviour.
+// fail closed and preserve the reviewed head.
 func (NoopClient) BaseRequiresUpToDateHead(context.Context, github.Repository, string) (bool, bool, error) {
 	return false, false, nil
-}
-
-func (NoopClient) UpdatePullRequestBranch(context.Context, github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error) {
-	return github.UpdatePullRequestBranchResult{}, errors.ErrUnsupported
 }
 
 func (NoopClient) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {

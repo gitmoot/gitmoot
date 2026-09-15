@@ -2673,6 +2673,11 @@ Use GitHub PR comments as the public audit trail:
 @<agent> ask|review|implement [instructions]
 ```
 
+`/gitmoot merge` runs the policy gate even when automatic merge is disabled. It
+does not weaken exact-head review: if a reviewed head needs a branch update, the
+gate blocks without changing it. Update the branch explicitly, then obtain a new
+review for the new head.
+
 A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
 `--watch-issues` flag, an issue comment) is treated as the same command as the
 `/gitmoot <agent> <action>` form (#389). `/gitmoot resume <jobID>
@@ -3481,9 +3486,9 @@ kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
 is independent, and an authorized `@gitmoot merge` remains an explicit override.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
-such as a busy base-branch merge queue or a GitHub branch update in progress,
-are retried on the next daemon poll tick. The default poll interval is `30s`
-unless the daemon was started with a different `--poll`.
+such as a busy base-branch merge queue or an active job on the PR branch, are
+retried on the next daemon poll tick. The default poll interval is `30s` unless
+the daemon was started with a different `--poll`.
 
 ### Draining before a deploy
 

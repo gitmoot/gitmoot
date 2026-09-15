@@ -85,9 +85,6 @@ func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
 	if !decision.Merged {
 		t.Fatalf("behind head must merge on its own verdict: decision = %+v", decision)
 	}
-	if len(gh.updates) != 0 {
-		t.Fatalf("no branch update may be requested: updates = %+v", gh.updates)
-	}
 	if len(gh.merges) != 1 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
 	}
@@ -104,20 +101,50 @@ func TestMergeGateMergesBehindHeadWhenBaseAllowsIt(t *testing.T) {
 	}
 }
 
-// Acceptance 1, other arm: where GitHub does require an up-to-date head, the
-// update is still the only way to merge, so the pre-#1865 path must survive.
-func TestMergeGateStillUpdatesWhenBaseRequiresUpToDateHead(t *testing.T) {
+// Where GitHub requires an up-to-date head, the reviewed commit cannot merge as
+// is. The gate must preserve that commit and require an explicit update followed
+// by a fresh exact-head review.
+func TestMergeGateBlocksReviewedHeadWhenBaseRequiresUpToDateHead(t *testing.T) {
 	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.strictKnown = true
 	gh.strictBase = true
 
 	decision := evaluateBehindMergeGate(t, gh)
 
-	if decision.Merged || !strings.Contains(decision.Reason.Render(), "branch update") {
-		t.Fatalf("strict base must still take the update path: decision = %+v", decision)
+	if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+		t.Fatalf("strict base must block the reviewed head: decision = %+v", decision)
 	}
-	if len(gh.updates) != 1 || gh.updates[0].ExpectedHeadSHA != "head123" {
-		t.Fatalf("update inputs = %+v", gh.updates)
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge inputs = %+v", gh.merges)
+	}
+}
+
+// #2175: an explicit /gitmoot merge bypasses the automatic-merge kill switch,
+// but it must not bypass the exact-head review fence. If GitHub requires a
+// branch update, preserving the approved head is safer than silently creating
+// an unreviewed merge commit.
+func TestHumanMergeRequestPreservesReviewedHeadWhenBaseRequiresUpdate(t *testing.T) {
+	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
+	gh.strictKnown = true
+	gh.strictBase = true
+	gate := PolicyMergeGate{AutoMerge: false, Store: behindMergeGateStore(t), GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
+
+	decision, err := gate.Evaluate(context.Background(), MergeRequest{
+		Repo:                "gitmoot/gitmoot",
+		PullRequest:         9,
+		TaskID:              "task-9",
+		HumanMergeRequested: true,
+	})
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+		t.Fatalf("reviewed head requiring an update must block: %+v", decision)
+	}
+	for _, want := range []string{"head123", "update", "review"} {
+		if !strings.Contains(strings.ToLower(decision.Reason.Render()), want) {
+			t.Fatalf("block reason must name %q: %q", want, decision.Reason.Render())
+		}
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
@@ -125,9 +152,9 @@ func TestMergeGateStillUpdatesWhenBaseRequiresUpToDateHead(t *testing.T) {
 }
 
 // The guard fails CLOSED. An unprotected branch and a token that cannot read
-// protection are indistinguishable, so an undetermined answer keeps the old
-// behaviour instead of merging a head GitHub may refuse.
-func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
+// protection are indistinguishable, so an undetermined answer neither merges
+// nor updates a reviewed head.
+func TestMergeGatePreservesReviewedHeadWhenProtectionIsUndetermined(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		set  func(*fakeMergeGateGitHub)
@@ -145,21 +172,17 @@ func TestMergeGateFailsClosedWhenProtectionIsUndetermined(t *testing.T) {
 
 			decision := evaluateBehindMergeGate(t, gh)
 
-			if decision.Merged {
-				t.Fatalf("undetermined protection must not merge a behind head: %+v", decision)
-			}
-			if len(gh.updates) != 1 {
-				t.Fatalf("update inputs = %+v", gh.updates)
+			if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+				t.Fatalf("undetermined protection must block the reviewed head: %+v", decision)
 			}
 		})
 	}
 }
 
-// Conflict is the real reason to update, and it is reported by `mergeable`, not
-// by the compare status. A diverged head that GitHub says does not merge keeps
-// the mandatory update - the pre-#1865 behaviour - because merging the reviewed
-// head is not available.
-func TestMergeGateStillUpdatesDivergedConflictingBranch(t *testing.T) {
+// Conflict is reported by `mergeable`, not by the compare status. A diverged
+// reviewed head that GitHub says does not merge must remain unchanged so the
+// operator can resolve the conflict and obtain a review of the new head.
+func TestMergeGatePreservesReviewedDivergedConflictingBranch(t *testing.T) {
 	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	conflicting := false
 	gh.pr.Mergeable = &conflicting
@@ -168,19 +191,17 @@ func TestMergeGateStillUpdatesDivergedConflictingBranch(t *testing.T) {
 
 	decision := evaluateBehindMergeGate(t, gh)
 
-	if decision.Merged {
-		t.Fatalf("a conflicting head must not merge: %+v", decision)
-	}
-	if len(gh.updates) != 1 {
-		t.Fatalf("update inputs = %+v", gh.updates)
+	if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+		t.Fatalf("a conflicting reviewed head must block: %+v", decision)
 	}
 }
 
 // UNKNOWN MERGEABILITY FAILS CLOSED. GitHub computes mergeability
 // asynchronously, so a PR read moments after a base move returns null, and a
-// token that cannot see it returns null too. Treating null as "fine" would merge
-// on the strength of a value GitHub has not produced.
-func TestMergeGateStillUpdatesWhenMergeabilityIsUnknown(t *testing.T) {
+// token that cannot see it returns null too. The reviewed head must remain
+// unchanged until GitHub produces a usable answer or an explicit update creates
+// a new head for review.
+func TestMergeGatePreservesReviewedHeadWhenMergeabilityIsUnknown(t *testing.T) {
 	gh := behindMergeGateClient(github.CompareResult{Status: "diverged", BehindBy: 4, AheadBy: 1})
 	gh.pr.Mergeable = nil
 	gh.strictKnown = true
@@ -188,11 +209,8 @@ func TestMergeGateStillUpdatesWhenMergeabilityIsUnknown(t *testing.T) {
 
 	decision := evaluateBehindMergeGate(t, gh)
 
-	if decision.Merged {
-		t.Fatalf("unknown mergeability must not merge: %+v", decision)
-	}
-	if len(gh.updates) != 1 {
-		t.Fatalf("update inputs = %+v", gh.updates)
+	if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+		t.Fatalf("unknown mergeability must block the reviewed head: %+v", decision)
 	}
 }
 
@@ -223,9 +241,6 @@ func TestMergeGateMergesUpToDateBranchUnchanged(t *testing.T) {
 
 			if !decision.Merged {
 				t.Fatalf("up-to-date branch must merge: %+v", decision)
-			}
-			if len(gh.updates) != 0 {
-				t.Fatalf("updates = %+v", gh.updates)
 			}
 			if gh.strictCalls != 0 {
 				t.Fatalf("protection must not be read when the head is not behind: calls = %d", gh.strictCalls)
@@ -262,25 +277,22 @@ func TestMergeGateTreatsNumericBehindAsBehindWhateverTheStatusString(t *testing.
 				if gh.strictCalls == 0 {
 					t.Fatal("BehindBy > 0 must route through the behind branch and consult protection")
 				}
-				if !decision.Merged || len(gh.updates) != 0 {
-					t.Fatalf("decision = %+v updates = %+v", decision, gh.updates)
+				if !decision.Merged {
+					t.Fatalf("decision = %+v", decision)
 				}
 				if len(gh.merges) != 1 || gh.merges[0].MatchHeadCommit != "head123" {
 					t.Fatalf("merge must stay fenced to the reviewed head: %+v", gh.merges)
 				}
 			})
 
-			t.Run("protection undetermined still updates", func(t *testing.T) {
+			t.Run("protection undetermined preserves reviewed head", func(t *testing.T) {
 				gh := behindMergeGateClient(github.CompareResult{Status: status, BehindBy: 3})
 				gh.strictKnown = false
 
 				decision := evaluateBehindMergeGate(t, gh)
 
-				if decision.Merged {
-					t.Fatalf("numeric-behind head must not merge on an undetermined read: %+v", decision)
-				}
-				if len(gh.updates) != 1 || gh.updates[0].ExpectedHeadSHA != "head123" {
-					t.Fatalf("update inputs = %+v", gh.updates)
+				if decision.Ready || decision.Merged || decision.BlockClass != MergeBlockTransient {
+					t.Fatalf("numeric-behind reviewed head must block on an undetermined read: %+v", decision)
 				}
 			})
 		})
@@ -357,8 +369,8 @@ func TestMergeGateWaitsWhenMergeabilityIsUnknownOnAnUpToDateHead(t *testing.T) {
 //
 // Making the tuple coherent - diverged plus false - moves the case into
 // ensureBranchFresh, which handles it BEFORE the post-freshness mergeability
-// guard: that is TestMergeGateStillUpdatesDivergedConflictingBranch above, which
-// already covers the reachable conflict path.
+// guard: that is TestMergeGatePreservesReviewedDivergedConflictingBranch
+// above, which already covers the reachable conflict path.
 //
 // So the `!*pr.Mergeable` block after ensureBranchFresh is DEFENSIVE and is not
 // reachable through any compare status the API emits: conflicts arrive diverged
