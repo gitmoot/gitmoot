@@ -179,10 +179,34 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// effectiveReviewRuntime is the runtime the review will RUN on, which is not
+// always the value written to the request: the router emits no override when
+// its choice is the agent's own runtime. Model gating must follow the former.
+func effectiveReviewRuntime(override, selected string) string {
+	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(selected); trimmed != "" {
+		return trimmed
+	}
+	return runtime.OmpRuntime
+}
+
 // reviewRequestRuntime applies the router's omp pin unless the operator named a
 // runtime. One site for the pin, so a future caller cannot lose the override.
-func reviewRequestRuntime(override string) string {
+func reviewRequestRuntime(override, selected, registered string) string {
 	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return trimmed
+	}
+	// NO OVERRIDE WHEN THE CHOICE IS THE AGENT'S OWN RUNTIME (#2189 round 2).
+	// Setting one is not merely redundant: an override must be expressible as
+	// `--runtime X`, and a runtime whose sessions are commands cannot be, so a
+	// shell candidate the router legitimately selected was refused with
+	// "--runtime shell requires --session". The agent already runs on it.
+	if trimmed := strings.TrimSpace(selected); trimmed != "" {
+		if trimmed == strings.TrimSpace(registered) {
+			return ""
+		}
 		return trimmed
 	}
 	return runtime.OmpRuntime
@@ -294,7 +318,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer)
+	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer, opts.role)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -316,12 +340,15 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		Action:       "review",
 		Instructions: reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
 		Background:   true,
-		Model:        pool[0],
+		// Gated on the EFFECTIVE runtime, not on whether an override was
+		// emitted: a review running on the agent's own non-omp runtime must not
+		// carry an omp pool model either.
+		Model: reviewModelForRuntime(effectiveReviewRuntime(opts.runtime, selectedRuntime), pool),
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
 		// hold is written for that runtime (#2181), with nothing to fall back to.
-		Runtime:              reviewRequestRuntime(opts.runtime),
+		Runtime:              reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
 		ActingOrgRole:        opts.role,
 		OperatorOrigin:       true,
 		Home:                 opts.home,
@@ -767,24 +794,158 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 	return nil
 }
 
+// reviewRuntimeForCandidate picks the runtime this candidate will actually run
+// on, given any availability hold on the REQUESTER's role (#2187).
+//
+// THE DEFECT THIS CLOSES: selection pinned omp without consulting availability,
+// and refuseUnavailableOrgRole then tested that already-made choice at dispatch
+// - one layer too late, where the only remaining move is to refuse. On
+// 2026-09-14 two seats spent three dispatch attempts and two escalations
+// discovering that a review they were OBLIGED to obtain could not be
+// dispatched, and the remedy they were given was to type the runtime by hand.
+// A router that picks a runtime it could have known was walled has handed its
+// own job to the caller.
+//
+// Order is deliberate: the omp pin first, because the router owns the runtime
+// when it selects the reviewer; then the candidate's OWN registered runtime,
+// which it is provisioned for. Shell is never auto-selected - its "runtime ref"
+// is a command, so a review dispatched onto it would run the agent's script
+// instead of a model.
+func reviewRuntimeForCandidate(agent db.Agent, incident db.OrgRoleUnavailable, held bool) (string, bool) {
+	options := []string{runtime.OmpRuntime}
+	if registered := strings.TrimSpace(agent.Runtime); registered != "" && registered != runtime.OmpRuntime {
+		options = append(options, registered)
+	}
+	registered := strings.TrimSpace(agent.Runtime)
+	for _, option := range options {
+		if held && orgRoleUnavailableRefusesRuntime(incident, option) {
+			continue
+		}
+		// THE TWO VERBS MUST AGREE ON IDENTICAL FLEET STATE (#2189 round 2).
+		// A shell-only fleet under an omp hold used to have `review request`
+		// REFUSE while `agent review` dispatched the script - same repo, same
+		// PR, same holds, different answer depending on which verb was typed.
+		// The cause was applying the override-usability property to the
+		// candidate's OWN runtime, which needs no override at all.
+		if option == registered {
+			return option, true
+		}
+		// EXCLUDED BY PROPERTY, NOT BY NAME (#2189 review). Shell used to be
+		// named here, and a name-skip is an exemption that does not look like
+		// one - the shape that let Engine.Store survive seven rounds of deleting
+		// exemption lists. The real constraint is that the router selects a
+		// runtime WITHOUT a session, and a runtime whose sessions are commands
+		// refuses exactly that. Ask the resolver instead of hardcoding which
+		// runtime that is today.
+		if _, _, err := resolveJobRuntimeOverride(option, ""); err != nil {
+			continue
+		}
+		return option, true
+	}
+	return "", false
+}
+
+// reviewRuntimeForOperatorNamedAgent is reviewRuntimeForCandidate with the
+// preference reversed: the named agent's OWN runtime first, the omp pin only as
+// the escape when that runtime is walled. Same usability property, same hold
+// check, opposite order - because here the operator chose the agent and its
+// runtime is part of that choice (#2187).
+func reviewRuntimeForOperatorNamedAgent(agent db.Agent, incident db.OrgRoleUnavailable, held bool) (string, bool) {
+	// The agent's OWN runtime is checked against the hold only. The usability
+	// property - "can this runtime be selected without a session?" - applies to
+	// a runtime we would SET AS AN OVERRIDE, not to the runtime the agent is
+	// already registered on: a shell agent runs its own command and needs no
+	// override, so testing it as one rerouted script agents onto omp and would
+	// have run a model instead of the operator's script.
+	registered := strings.TrimSpace(agent.Runtime)
+	if registered != "" && !(held && orgRoleUnavailableRefusesRuntime(incident, registered)) {
+		return registered, true
+	}
+	// A HELD SCRIPT AGENT REFUSES; IT DOES NOT ESCAPE TO omp (#2189 round 2).
+	// A shell-scoped hold is reachable - any known runtime name can be walled,
+	// and a shell job failing with a quota signature writes one - and taking the
+	// omp escape would run a MODEL review under the script agent's identity,
+	// which is the exact harm this function exists to prevent. A script has no
+	// model fallback, so there is nothing to fall back to.
+	if registered == runtime.ShellRuntime {
+		return "", false
+	}
+	for _, option := range []string{runtime.OmpRuntime} {
+		if held && orgRoleUnavailableRefusesRuntime(incident, option) {
+			continue
+		}
+		if _, _, err := resolveJobRuntimeOverride(option, ""); err != nil {
+			continue
+		}
+		return option, true
+	}
+	return "", false
+}
+
+// reviewModelForRuntime enforces the invariant this work has now broken THREE
+// times from three directions (#2189 review P1):
+//
+//		MODEL AND RUNTIME MUST BE CHOSEN TOGETHER.
+//
+//	 1. #2186 round 4: runtime parity forced a claude reviewer onto omp, stripping
+//	    its auth profile.
+//	 2. Same round: the pool head was pinned as payload.Model regardless of the
+//	    effective runtime, handing an omp-qualified model to a claude reviewer.
+//	 3. Here: the RUNTIME was demoted away from omp for availability while the
+//	    omp-qualified pool model stayed - producing a job that runs and dies at
+//	    delivery instead of a review. Demoting turned a clear refusal into a
+//	    silent late failure, which is worse than what it replaced.
+//
+// THE GENERAL FORM, after a FOURTH arrival walked around the narrow one
+// (#2189 round 2): ANY model reaching a dispatch must be resolvable by the
+// runtime that dispatch will use, WHATEVER ITS SOURCE. This function binds the
+// POOL model; an operator-supplied --model is bound by routerChosenReviewRuntime,
+// which refuses to reroute underneath one. Stating the rule about pool models
+// only was a correct rule written narrowly enough that the next arrival - an
+// operator flag - walked straight past it.
+//
+// The pool is an OMP provider/model chain, so it may only be used when the
+// review actually runs on omp. Off omp the agent's own configured model is the
+// only valid choice, and the router states nothing.
+func reviewModelForRuntime(selectedRuntime string, pool []string) string {
+	if strings.TrimSpace(selectedRuntime) != runtime.OmpRuntime || len(pool) == 0 {
+		return ""
+	}
+	return pool[0]
+}
+
 // selectReviewRouterAgent picks the registered agent that will carry the
 // review. The agent supplies identity and repo access; runtime and model come
 // from the router, so any review-capable agent scoped to the repository will
 // do, and an omp-native one is preferred so the override changes nothing.
-func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, purpose, explicit string) (db.Agent, error) {
+func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, purpose, explicit, role string) (db.Agent, string, error) {
+	incident, held, err := store.GetActiveOrgRoleUnavailable(ctx, role, time.Now().UTC())
+	if err != nil {
+		return db.Agent{}, "", err
+	}
 	if explicit = strings.TrimSpace(explicit); explicit != "" {
 		agent, err := store.GetAgent(ctx, explicit)
 		if err != nil {
-			return db.Agent{}, fmt.Errorf("reviewer %q: %w", explicit, err)
+			return db.Agent{}, "", fmt.Errorf("reviewer %q: %w", explicit, err)
 		}
 		if !agentHasCapability(agent.Capabilities, "review") {
-			return db.Agent{}, fmt.Errorf("reviewer %q is not registered with the review capability", explicit)
+			return db.Agent{}, "", fmt.Errorf("reviewer %q is not registered with the review capability", explicit)
 		}
-		return agent, nil
+		// A NAMED reviewer is routed own-first on BOTH verbs (#2189 round 2).
+		// The auth-profile rationale - rerouting an unwalled agent strips the
+		// profile ApplyJobRuntimeOverride clears - does not depend on which verb
+		// the caller typed, and a router whose answer changes with the verb is a
+		// weaker guarantee than one answer. Only a reviewer the ROUTER picked is
+		// routed omp-first, because there the router chose the agent too.
+		selected, ok := reviewRuntimeForOperatorNamedAgent(agent, incident, held)
+		if !ok {
+			return db.Agent{}, "", unavailableReviewRuntimeError(role, incident)
+		}
+		return agent, selected, nil
 	}
 	agents, err := store.ListAgents(ctx)
 	if err != nil {
-		return db.Agent{}, err
+		return db.Agent{}, "", err
 	}
 	candidates := make([]db.Agent, 0, len(agents))
 	for _, agent := range agents {
@@ -793,14 +954,14 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		}
 		allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
 		if err != nil {
-			return db.Agent{}, err
+			return db.Agent{}, "", err
 		}
 		if allowed {
 			candidates = append(candidates, agent)
 		}
 	}
 	if len(candidates) == 0 {
-		return db.Agent{}, fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
+		return db.Agent{}, "", fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
 	}
 	// A SECOND PURPOSE AT THE SAME HEAD MUST NOT BE REFUSED AS A LOOP (#2172
 	// review rounds 2-4). "Answered" is scoped to the PURPOSE being requested,
@@ -842,9 +1003,30 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		return candidates[i].Name < candidates[j].Name
 	})
 	if answered[strings.ToLower(candidates[0].Name)] {
-		return db.Agent{}, fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
+		return db.Agent{}, "", fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
 	}
-	return candidates[0], nil
+	// ROUTE AROUND THE HOLD RATHER THAN REFUSE AT DISPATCH. Candidates are
+	// already ordered by the loop guard and the omp preference, so a hold
+	// DEMOTES a candidate instead of failing the request.
+	for _, candidate := range candidates {
+		if selected, ok := reviewRuntimeForCandidate(candidate, incident, held); ok {
+			return candidate, selected, nil
+		}
+	}
+	return db.Agent{}, "", unavailableReviewRuntimeError(role, incident)
+}
+
+// unavailableReviewRuntimeError names the runtime the hold is scoped to and
+// when it lifts. The refusal two seats hit on 2026-09-14 named neither, which
+// is why they escalated rather than routing elsewhere: a refusal that does not
+// say what it is scoped to is indistinguishable from a total outage (#2181).
+func unavailableReviewRuntimeError(role string, incident db.OrgRoleUnavailable) error {
+	scope := strings.TrimSpace(incident.Runtime)
+	if scope == "" {
+		scope = "every runtime"
+	}
+	return fmt.Errorf("no available runtime for role %q: its %s hold (%s) lasts until %s, and no review-capable agent offers another runtime; wait, pass --runtime, or clear the hold",
+		role, scope, strings.TrimSpace(incident.Reason), strings.TrimSpace(incident.Until))
 }
 
 // reviewRequestHolds names admission states that keep a dispatched review from

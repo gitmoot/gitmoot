@@ -225,10 +225,102 @@ type localAgentJobOutput struct {
 	AdvanceError string `json:"advance_error,omitempty"`
 }
 
+// routerChosenReviewRuntime resolves the runtime a review dispatch should run
+// on when the caller did not state one. Empty means "leave the request alone":
+// a non-review action, or an operator who named a runtime deliberately.
+//
+// The order is the router's, not the caller's: omp first, because the reviewer
+// is being asked to read a diff rather than to be itself, then the agent's own
+// registered runtime. A runtime walled for the acting role is skipped, so a
+// hold reroutes instead of refusing (#2187). If every option is walled the
+// dispatch refuses HERE, naming the scope and expiry, instead of failing later
+// with a message that says neither.
+func routerChosenReviewRuntime(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (string, error) {
+	if !strings.EqualFold(strings.TrimSpace(request.Action), "review") {
+		return "", nil
+	}
+	if strings.TrimSpace(request.Runtime) != "" {
+		return "", nil
+	}
+	agent, err := store.GetAgent(ctx, strings.TrimSpace(request.Agent))
+	if err != nil {
+		// Agent resolution has its own error path below; do not pre-empt it.
+		return "", nil
+	}
+	role := strings.TrimSpace(request.ActingOrgRole)
+	var incident db.OrgRoleUnavailable
+	held := false
+	if role != "" {
+		incident, held, err = store.GetActiveOrgRoleUnavailable(ctx, role, time.Now().UTC())
+		if err != nil {
+			return "", err
+		}
+	}
+	// ORDER: THE AGENT'S OWN RUNTIME FIRST, omp only as the escape.
+	//
+	// This is the opposite order from `review request`, and the difference is
+	// who chose the agent. The router picks its own reviewer, so it owns that
+	// reviewer's runtime too. Here the OPERATOR named the agent, and a
+	// registered agent's runtime carries its auth profile and session -
+	// ApplyJobRuntimeOverride clears its model and switches its config dir, so
+	// rerouting an unwalled agent breaks it.
+	//
+	// Measured, not reasoned: preferring omp here failed three existing tests -
+	// TestDispatchReviewAllocatesDistinctExactHeadWorktrees (claude reviewer
+	// sent to a seat with no claude profile), TestRunAgentReviewRequeuesQueued-
+	// JobWhenRuntimeSessionBusy, and TestForegroundReviewRuntimeStateSurvives-
+	// RepairAndCleansAtBoundary. The same three broke the last time this work
+	// forced omp over a named agent (#2186 round 1). They are correct.
+	//
+	// The seat still types nothing: the hand-typed `--runtime omp` existed
+	// because the reviewer's claude quota is dead, and a dead quota IS a
+	// runtime-scoped hold - so the reroute below is exactly the decision the
+	// coordinator was making by hand.
+	selected, ok := reviewRuntimeForOperatorNamedAgent(agent, incident, held)
+	if !ok {
+		return "", unavailableReviewRuntimeError(role, incident)
+	}
+	if selected == strings.TrimSpace(agent.Runtime) {
+		// Nothing to change; leave the request exactly as the caller built it.
+		return "", nil
+	}
+	// MODEL AND RUNTIME MOVE TOGETHER, OR NOTHING MOVES (#2189 round 2).
+	//
+	// An operator --model is scoped to the runtime they expected. Rerouting
+	// underneath it produces the round-1 P1 shape through a different door: a
+	// claude model name handed to omp, dispatched, dead at delivery. The router
+	// cannot vouch for a model it did not choose, so it refuses rather than
+	// silently rewriting or silently keeping it.
+	if model := strings.TrimSpace(request.Model); model != "" {
+		return "", fmt.Errorf("review dispatch names --model %q, but %s is held for role %q so the review must move to %s: "+
+			"a model is scoped to its runtime, so re-run without --model to let the router choose, or pass --runtime explicitly",
+			model, strings.TrimSpace(agent.Runtime), role, selected)
+	}
+	return selected, nil
+}
+
 func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest) (output localAgentJobOutput, err error) {
 	// Validate a requested per-job runtime override FIRST — an unknown runtime
 	// (or a shell override without a session command) must fail with a clear
 	// error before any job is enqueued or any repo/agent state is touched.
+	// THE ROUTER CHOOSES THE RUNTIME FOR EVERY REVIEW, ON EVERY VERB (#2187).
+	//
+	// Owner decision, 2026-09-15: a seat must not have to choose a runtime; the
+	// router does it in the background. Measured before building this: of the 16
+	// reviews dispatched on this box since the pool fix went live, ZERO used
+	// `gitmoot review request` and 16 used `gitmoot agent review` with
+	// `--runtime omp` TYPED BY HAND on every single dispatch - the coordinator
+	// making exactly the decision the router exists to make, because its
+	// registered reviewer sits on a quota-dead runtime.
+	//
+	// Fixing selection inside `review request` alone improved the path nobody
+	// uses. This is the shared dispatch seam both verbs pass, so the choice is
+	// made once, here, for all of them.
+	if resolved, err := routerChosenReviewRuntime(ctx, store, request); err != nil {
+		return localAgentJobOutput{}, err
+	} else if resolved != "" {
+		request.Runtime = resolved
+	}
 	overrideRuntime, overrideRef, err := resolveJobRuntimeOverride(request.Runtime, request.RuntimeSession)
 	if err != nil {
 		return localAgentJobOutput{}, err
