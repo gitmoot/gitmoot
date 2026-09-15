@@ -309,20 +309,29 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		// removes the reason to look. Fields are now filled recursively, and a
 		// struct whose fields cannot be filled reports UNFILLABLE rather than
 		// inert.
+		// ALL-OR-NOTHING (#2188 round 8, P2). This used to accept a PARTIAL fill:
+		// one field set was enough, so a struct whose remaining fields hit the
+		// depth bound was probed with an incomplete value and reported "observed
+		// inert" with confidence. That is the zero-struct false proof from two
+		// rounds earlier, one level deeper - a bound added to stop a CRASH
+		// created a new channel for a wrong observation inside the stated reach.
+		//
+		// An incompletely synthesisable struct is now unsynthesisable, which is
+		// a loud census failure rather than a quiet inert.
 		filled := reflect.New(fieldType).Elem()
-		populated := false
+		exported := 0
 		for i := range fieldType.NumField() {
 			if !fieldType.Field(i).IsExported() {
 				continue
 			}
+			exported++
 			inner := distinctiveValuesAtDepth(fieldType.Field(i).Type, seed+i+11, depth+1)
 			if len(inner) == 0 {
-				continue
+				return nil
 			}
 			filled.Field(i).Set(inner[0])
-			populated = true
 		}
-		if !populated {
+		if exported == 0 {
 			return nil
 		}
 		return []reflect.Value{filled}
@@ -492,7 +501,20 @@ func requireSameSet(t *testing.T, label string, declared, observed map[string]bo
 	t.Helper()
 	for name := range observed {
 		if !declared[name] {
-			t.Errorf("Engine.%s is observed %s but is classified nowhere: classify it as forwarded, inert or unprobeable", name, label)
+			// DO NOT RECOMMEND THE OBSERVATION AS THE ANSWER (#2188 round 8).
+			// The snapshot cannot see a forward through a closure, a method
+			// value, or a conditional on another field, so "observed inert" is
+			// exactly the wrong answer for those shapes - and telling the reader
+			// to paste it is the mechanism HANDING OVER a wrong classification
+			// rather than merely permitting one. It also offered "unprobeable",
+			// a classification that no longer exists.
+			hint := ""
+			if label == "inert" {
+				hint = " - before classifying it inert, check engine_types.go for a forward through a CLOSURE, a METHOD VALUE, " +
+					"or a CONDITIONAL on another field: this probe cannot see those, and each has already hidden a real " +
+					"forward on this file (Engine.Now, ReviewBlockingSeverity, Memory)"
+			}
+			t.Errorf("Engine.%s is observed %s but is classified nowhere%s", name, label, hint)
 		}
 	}
 	for name := range declared {
@@ -596,7 +618,11 @@ func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
 // distinctive value. Three of these mutants (routerContextEnabled,
 // resultCheckMode, produceCheckDir) survived the entire package before this
 // test existed, and ResultCheckMode had no entry in the declared list at all.
-func TestEnqueueMailboxForwardsFieldsReflectionCannotSee(t *testing.T) {
+// Renamed (#2188 round 8, P3): "ReflectionCannotSee" was accurate when written
+// and became FALSE as the probe improved - the snapshot census sees all four
+// now. A name that decayed into a claim its assertions no longer carry is the
+// same defect this file has been bitten by three times.
+func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
 	engine := Engine{
 		Store:                   openEngineStore(t),
 		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
