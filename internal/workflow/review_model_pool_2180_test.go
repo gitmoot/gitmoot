@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -233,6 +234,18 @@ func mailboxFieldSnapshot(t *testing.T, mailbox Mailbox) map[string]string {
 // from "my value was rejected", so it tries the domain's own vocabulary too and
 // treats influence by ANY candidate as forwarded.
 func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
+	return distinctiveValuesAtDepth(fieldType, seed, 0)
+}
+
+// distinctiveValuesAtDepth bounds recursion. A self-referential field type used
+// to CRASH the whole test binary rather than fail (#2188 round 7, P3): a future
+// Engine field of a cyclic type would have taken down every test in the package
+// while reporting nothing. Past the bound the type is unsynthesisable, which is
+// a loud failure in the census rather than a silent skip.
+func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect.Value {
+	if depth > 4 {
+		return nil
+	}
 	switch fieldType.Kind() {
 	case reflect.Func:
 		return []reflect.Value{reflect.MakeFunc(fieldType, func([]reflect.Value) []reflect.Value {
@@ -266,7 +279,7 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 	// only remedy that removes it rather than relocating it again: composite
 	// kinds are now synthesised from their own element types, recursively.
 	case reflect.Slice:
-		element := distinctiveValues(fieldType.Elem(), seed+1)
+		element := distinctiveValuesAtDepth(fieldType.Elem(), seed+1, depth+1)
 		if len(element) == 0 {
 			return nil
 		}
@@ -274,8 +287,8 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 		slice.Index(0).Set(element[0])
 		return []reflect.Value{slice}
 	case reflect.Map:
-		key := distinctiveValues(fieldType.Key(), seed+2)
-		value := distinctiveValues(fieldType.Elem(), seed+3)
+		key := distinctiveValuesAtDepth(fieldType.Key(), seed+2, depth+1)
+		value := distinctiveValuesAtDepth(fieldType.Elem(), seed+3, depth+1)
 		if len(key) == 0 || len(value) == 0 {
 			return nil
 		}
@@ -302,7 +315,7 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 			if !fieldType.Field(i).IsExported() {
 				continue
 			}
-			inner := distinctiveValues(fieldType.Field(i).Type, seed+i+11)
+			inner := distinctiveValuesAtDepth(fieldType.Field(i).Type, seed+i+11, depth+1)
 			if len(inner) == 0 {
 				continue
 			}
@@ -335,7 +348,22 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 	}
 }
 
-func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T) {
+// NAME STATES THE REACH (#2188 round 7). The previous name claimed "every
+// engine field", and that was FALSE in three ways at once: Engine.Now reaches
+// the mailbox only inside the emitTerminal closure, ReviewBlockingSeverity is
+// forwarded as a METHOD VALUE - always non-nil, fixed code pointer, so it reads
+// as inert - and Store was skipped by name.
+//
+// The premise is a single-field probe read from ONE post-construction snapshot.
+// Four shapes are outside it BY CONSTRUCTION: closures, method values,
+// conditionals and name-skips. Rather than widen the census a twelfth time,
+// each is covered by a direct behavioural test and named here:
+//
+//   - Engine.Now            -> TestEmittedEventTimestampsComeFromTheEnginesClock
+//   - ReviewBlockingSeverity -> the reviewBlockingSeverity wiring assertion below
+//   - Memory sub-fields      -> the Memory residual assertions below
+//   - Store                  -> now probed like everything else
+func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 	// SET EQUALITY IN BOTH DIRECTIONS (#2188 round 4). The previous version's
 	// `mustForward` was obligation-only, which I argued made it safe. It did not:
 	// DELETING a name passed silently, which is the same edit direction the three
@@ -352,6 +380,7 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	// field fails until classified, whichever way it behaves; a deleted name
 	// fails because observation still reports it.
 	mustForward := map[string]bool{
+		"Store":          true,
 		"ApplyChangeSet": true, "BlockerDeferrer": true, "CollectChangeSet": true,
 		"EventSink": true, "Memory": true, "OrgPolicy": true,
 		"ProduceCheckDir": true, "RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true,
@@ -371,7 +400,10 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true, "MergeGate": true,
 		"NativeReviewFanoutEnabled": true, "Now": true, "OwnerPIDLive": true,
 		"PayloadRefresher": true, "PullRequestSignals": true, "RequiredReviewers": true,
-		"ReviewBlockingSeverity": true, "ReviewChangedFiles": true, "RiskLabelHigh": true,
+		// METHOD-VALUE forward: always non-nil with a fixed code pointer, so the
+		// snapshot reads it as inert. Pinned by the wiring assertion below.
+		"ReviewBlockingSeverity": true,
+		"ReviewChangedFiles":     true, "RiskLabelHigh": true,
 		"RiskLabelRoutine": true, "RiskTiersEnabled": true, "WorktreeHasLiveProcess": true,
 		"WorktreeLiveness": true,
 	}
@@ -388,13 +420,18 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	store := openEngineStore(t)
 	baseline := Engine{Store: store}
 	baselineSnapshot := mailboxFieldSnapshot(t, baseline.EnqueueMailbox(nil))
+	// Store was SKIPPED BY NAME for seven rounds - a one-field exemption in the
+	// most literal form available, sitting in plain sight while three exemption
+	// lists were deleted for being exemptions. It is probed like everything else
+	// now; the probe simply supplies a DIFFERENT store so the diff is real.
+	otherStore := openEngineStore(t)
 
 	engineType := reflect.TypeOf(Engine{})
 	observedForward := map[string]bool{}
 	observedInert := map[string]bool{}
 	for i := range engineType.NumField() {
 		field := engineType.Field(i)
-		if !field.IsExported() || field.Name == "Store" {
+		if !field.IsExported() {
 			continue
 		}
 		candidates := distinctiveValues(field.Type, i)
@@ -409,7 +446,11 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 		for _, candidate := range candidates {
 			probe := reflect.New(engineType).Elem()
 			probe.FieldByName("Store").Set(reflect.ValueOf(store))
-			probe.Field(i).Set(candidate)
+			if field.Name == "Store" {
+				probe.Field(i).Set(reflect.ValueOf(otherStore))
+			} else {
+				probe.Field(i).Set(candidate)
+			}
 			engine := probe.Addr().Interface().(*Engine)
 			for name, got := range mailboxFieldSnapshot(t, engine.EnqueueMailbox(nil)) {
 				if got != baselineSnapshot[name] {
@@ -589,4 +630,42 @@ func callFuncWithZeroArgs(fn reflect.Value) {
 		args[i] = reflect.Zero(fnType.In(i))
 	}
 	fn.Call(args)
+}
+
+// #2188 round 7, and the ONLY finding in this lineage over PRODUCTION
+// behaviour rather than test machinery.
+//
+// Engine.Now reaches the mailbox solely inside the emitTerminal CLOSURE, guarded
+// by EventSink != nil, so the per-field census - one field, one post-construction
+// snapshot - cannot see it by construction. The mutant `e.now()` ->
+// `time.Now().Add(24h)` survived the entire package while making EVERY EMITTED
+// EVENT TIMESTAMP WRONG.
+//
+// A closure-captured receiver is one of four shapes outside that census's reach
+// (closures, method values, conditionals, name-skips). This asserts the
+// behaviour directly instead of widening the census a twelfth time.
+func TestEmittedEventTimestampsComeFromTheEnginesClock(t *testing.T) {
+	frozen := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	sink := &recordingSink{}
+	engine := Engine{
+		Store:                   openEngineStore(t),
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		EventSink:               sink,
+		Now:                     func() time.Time { return frozen },
+	}
+
+	mailbox := engine.EnqueueMailbox(nil)
+	if mailbox.emitTerminal == nil {
+		t.Fatal("emitTerminal is not wired with an EventSink set")
+	}
+	mailbox.emitTerminal(context.Background(), "job-clock", JobSucceeded, JobPayload{Repo: "owner/repo"})
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) != 1 {
+		t.Fatalf("emitted %d events, want 1", len(sink.events))
+	}
+	if got, want := sink.events[0].Timestamp, frozen.Format(time.RFC3339); got != want {
+		t.Fatalf("event timestamp = %q, want the engine's clock %q: every emitted timestamp is wrong if this drifts", got, want)
+	}
 }
