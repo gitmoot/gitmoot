@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -38,8 +39,10 @@ func TestReviewQuestionFieldsAreInheritedByReviewChildrenOnly(t *testing.T) {
 	if verdict.ReviewRequester != "joltra" {
 		t.Fatalf("verdict child requester = %q, want joltra: the requester waits its whole TTL for a verdict that was produced", verdict.ReviewRequester)
 	}
-	if len(verdict.ReviewModelPool) != 2 {
-		t.Fatalf("verdict child pool = %v, want the question's pool", verdict.ReviewModelPool)
+	// CONTENT, not length (#2188 round 2): a length check passes on a wrong pool
+	// of the right size - the same family as equality-by-coincidence.
+	if want := []string{"sentinel/router-a", "sentinel/router-b"}; !slices.Equal(verdict.ReviewModelPool, want) {
+		t.Fatalf("verdict child pool = %v, want the question's own %v", verdict.ReviewModelPool, want)
 	}
 
 	// The other direction, and the round-3 P2/P3 pair: a non-review leg of the

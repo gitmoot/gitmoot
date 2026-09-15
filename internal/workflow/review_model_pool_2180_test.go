@@ -2,7 +2,9 @@ package workflow
 
 import (
 	"context"
+	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -198,8 +200,9 @@ func TestEnqueueMailboxForwardsExportedEngineFuncFields(t *testing.T) {
 		// unexported field, so reflection over matching names cannot see them.
 		"ResolveDeliveryWorktree": "installed via the EnqueueMailbox delivery parameter, not inherited",
 		"BlockerDeferrer":         "forwarded to the unexported deferBlocker; asserted explicitly below",
-		"RouterContextEnabled":    "forwarded to the unexported routerContextEnabled",
-		"ProduceCheckDir":         "forwarded to the unexported produceCheckDir",
+		"RouterContextEnabled":    "forwarded to unexported routerContextEnabled; asserted in TestEnqueueMailboxForwardsFieldsReflectionCannotSee",
+		"ProduceCheckDir":         "forwarded to unexported produceCheckDir; asserted in TestEnqueueMailboxForwardsFieldsReflectionCannotSee",
+		"ResultCheckMode":         "forwarded to unexported resultCheckMode; asserted in TestEnqueueMailboxForwardsFieldsReflectionCannotSee",
 
 		// Engine-only. Verified mechanically rather than asserted: no
 		// `mb.X = e.X` assignment exists for any of these in EnqueueMailbox's
@@ -394,5 +397,109 @@ func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
 	}
 	if !realResolverRan {
 		t.Fatal("EnqueueMailbox(nil) did not inherit the engine's delivery resolver")
+	}
+}
+
+// forwardedEngineFields reads the ACTUAL copy list out of engine_types.go.
+//
+// #2188 round 2 (P2): `unforwardedByDesign` was TRUSTED, never verified - its
+// "verified mechanically" comment was prose, not a mechanism. So it caught
+// forgetting to classify a field and could not catch MIScflassifying one, which
+// is how two of its entries came to describe forwards the reflective census
+// cannot even see. A list whose correctness is asserted rather than checked,
+// guarding against a defect whose signature is asserting more than you check.
+//
+// Reading the source is the cheapest thing that cannot drift: the census now
+// compares its beliefs against the file that performs the forwarding.
+func forwardedEngineFields(t *testing.T) map[string]string {
+	t.Helper()
+	source, err := os.ReadFile("engine_types.go")
+	if err != nil {
+		t.Fatalf("read engine_types.go: %v", err)
+	}
+	body := string(source)
+	start := strings.Index(body, "func (e Engine) mailbox() Mailbox {")
+	if start < 0 {
+		t.Fatal("mailbox() not found: the census cannot read the copy list it audits")
+	}
+	end := strings.Index(body[start:], "\n}\n")
+	if end < 0 {
+		t.Fatal("mailbox() has no terminator")
+	}
+	// The trailing group distinguishes a DIRECT field forward (`e.X`) from a
+	// sub-field one (`e.Memory.injectBlock`). Collapsing them would have let the
+	// census demand a hand assertion for a struct field, which is how an
+	// exemption list grows entries that are really parser bugs.
+	assignment := regexp.MustCompile(`mb\.(\w+)\s*=\s*[^\n]*\be\.(\w+)(\.\w+)?`)
+	forwarded := map[string]string{}
+	for _, match := range assignment.FindAllStringSubmatch(body[start:start+end], -1) {
+		if match[3] != "" {
+			continue
+		}
+		forwarded[match[2]] = match[1]
+	}
+	if len(forwarded) < 8 {
+		t.Fatalf("parsed only %d forwards (%v); the parser is broken, not the code", len(forwarded), forwarded)
+	}
+	return forwarded
+}
+
+// The four forwards reflection structurally cannot see, each asserted on a
+// distinctive value. Three of these mutants (routerContextEnabled,
+// resultCheckMode, produceCheckDir) survived the entire package before this
+// test existed, and ResultCheckMode had no entry in the declared list at all.
+func TestEnqueueMailboxForwardsFieldsReflectionCannotSee(t *testing.T) {
+	engine := Engine{
+		Store:                   openEngineStore(t),
+		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		BlockerDeferrer:         func(context.Context, string, error) (bool, error) { return false, nil },
+		RouterContextEnabled:    true,
+		ResultCheckMode:         ResultChecksBlock,
+		ProduceCheckDir:         "/tmp/sentinel-produce-dir",
+	}
+	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test"))
+
+	if !mailbox.routerContextEnabled {
+		t.Error("RouterContextEnabled -> routerContextEnabled not forwarded")
+	}
+	if mailbox.resultCheckMode != ResultChecksBlock {
+		t.Errorf("resultCheckMode = %q, want %q", mailbox.resultCheckMode, ResultChecksBlock)
+	}
+	if mailbox.produceCheckDir != "/tmp/sentinel-produce-dir" {
+		t.Errorf("produceCheckDir = %q, want the engine's", mailbox.produceCheckDir)
+	}
+	if mailbox.deferBlocker == nil {
+		t.Error("BlockerDeferrer -> deferBlocker not forwarded")
+	}
+}
+
+// The P2 itself: a declared exemption must not describe a field the copy list
+// actually forwards, and every forward must be covered by SOMETHING.
+func TestUnforwardedByDesignMatchesTheRealCopyList(t *testing.T) {
+	forwarded := forwardedEngineFields(t)
+
+	// Covered by TestEnqueueMailboxForwardsFieldsReflectionCannotSee above.
+	handAsserted := map[string]bool{
+		"BlockerDeferrer": true, "RouterContextEnabled": true,
+		"ResultCheckMode": true, "ProduceCheckDir": true,
+	}
+	engineType := reflect.TypeOf(Engine{})
+	mailboxType := reflect.TypeOf(Mailbox{})
+
+	for source, destination := range forwarded {
+		field, ok := engineType.FieldByName(source)
+		if !ok || !field.IsExported() {
+			continue // e.Memory.injectBlock and friends: not a direct field forward
+		}
+		if handAsserted[source] {
+			continue
+		}
+		mailboxField, matched := mailboxType.FieldByName(source)
+		reflectivelyCovered := matched && mailboxField.IsExported() && mailboxField.Type == field.Type &&
+			field.Type.Kind() == reflect.Func
+		if !reflectivelyCovered {
+			t.Errorf("Engine.%s is forwarded to mb.%s but no census covers it: add a hand assertion, "+
+				"because reflection over matching exported func fields cannot see this shape", source, destination)
+		}
 	}
 }
