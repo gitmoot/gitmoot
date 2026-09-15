@@ -610,15 +610,25 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	timeoutResolution := resolveEffectiveJobTimeout(payload, managed)
+	timeoutResolution := resolveEffectiveJobTimeout(payload, managed, job.Type)
 	jobTimeout := timeoutResolution.Timeout
 	// The class floor fell back to its built-in because the operator's
 	// [review_router] could not be read. Reported on the REVIEW it affects, so
 	// a deliberately shorter class deadline silently becoming longer is
 	// visible where the consequence lands (#2192 review).
-	if reason := strings.TrimSpace(managed.ReviewClassFallbackReason); reason != "" && isReviewPayload(payload) {
+	if reason := strings.TrimSpace(managed.ReviewClassFallbackReason); reason != "" && isReviewJob(payload, job.Type) {
 		message := fmt.Sprintf("[review_router] unreadable (%s); using the built-in review class deadline %s", reason, managed.ReviewJobTimeout)
 		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_class_deadline_default", Message: message}); eventErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
+				return finishErr
+			}
+			return nil
+		}
+	}
+	if invalid := strings.TrimSpace(timeoutResolution.InvalidPayload); invalid != "" {
+		message := fmt.Sprintf("job payload job_timeout %q is not a positive duration; using %s from %s instead",
+			invalid, timeoutResolution.Timeout, timeoutResolution.Source)
+		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "job_timeout_payload_invalid", Message: message}); eventErr != nil {
 			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
 				return finishErr
 			}
@@ -3784,7 +3794,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 	}
 	// Resolve the same authority as the primary dispatch path so runtime-session
 	// contention cannot route a payload around the hard ceiling.
-	jobTimeout := effectiveJobTimeout(payload, managed)
+	jobTimeout := effectiveJobTimeout(payload, managed, job.Type)
 	tempAgent := original
 	tempAgent.Name = tempWorkerInstanceName(original.Name, job.ID)
 	tempAgent.RuntimeRef = ""
@@ -4152,24 +4162,37 @@ type jobTimeoutResolution struct {
 	Max       time.Duration
 	Source    string
 	Clamped   bool
+	// InvalidPayload carries a payload job_timeout that could not be parsed as
+	// a positive duration, so the caller can report it instead of silently
+	// falling through to a lower-priority source (#2192 review).
+	InvalidPayload string
 }
 
 // effectiveJobTimeout returns the kill deadline selected by the independent
 // timeout authority. The stale-running threshold is deliberately absent: it is
 // only a crash/staleness predicate and can never become a run-context deadline.
-func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) time.Duration {
-	return resolveEffectiveJobTimeout(payload, managed).Timeout
+func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig, jobType string) time.Duration {
+	return resolveEffectiveJobTimeout(payload, managed, jobType).Timeout
 }
 
 // isReviewPayload reports whether this job is a review, for the class-deadline
 // floor. Both markers are checked because they are written by different
 // producers: the router sets a purpose, and every review dispatch sets
 // NoFixTarget or carries a pool.
-func isReviewPayload(payload workflow.JobPayload) bool {
+// isReviewJob takes the JOB TYPE as well as the payload markers (#2192 review,
+// P3). Markers alone missed a review carrying NEITHER a purpose NOR a pool -
+// a markerless review escaped the class deadline entirely, which is the defect
+// the class deadline exists to prevent, reached by a different door. The type
+// is what the store says the job IS; the markers are what a producer happened
+// to fill in.
+func isReviewJob(payload workflow.JobPayload, jobType string) bool {
+	if strings.EqualFold(strings.TrimSpace(jobType), "review") {
+		return true
+	}
 	return strings.TrimSpace(payload.ReviewPurpose) != "" || len(payload.ReviewModelPool) > 0
 }
 
-func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) jobTimeoutResolution {
+func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig, jobType string) jobTimeoutResolution {
 	jobTimeoutDefault := managed.JobTimeoutDefault
 	if jobTimeoutDefault <= 0 {
 		jobTimeoutDefault = config.DefaultDaemonJobTimeoutDefault
@@ -4184,9 +4207,21 @@ func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobR
 		requested = managed.JobTimeout
 		source = "agent type"
 	}
-	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
-		requested = d
-		source = "payload"
+	invalidPayloadTimeout := ""
+	if raw := strings.TrimSpace(payload.JobTimeout); raw != "" {
+		d, err := time.ParseDuration(raw)
+		switch {
+		case err == nil && d > 0:
+			requested = d
+			source = "payload"
+		default:
+			// SILENTLY IGNORED BEFORE (#2192 review, P3). The level just
+			// promoted to highest priority had a silent-failure mode: a
+			// coordinator writing a malformed timeout got the class floor and
+			// no signal - the same absence-versus-claim defect as the malformed
+			// [review_router], one layer up.
+			invalidPayloadTimeout = raw
+		}
 	}
 	// THE REVIEW CLASS FLOOR (#2191). A review's duration is a property of the
 	// PROMPT, not of whichever agent was selected to answer it. Before this, the
@@ -4205,11 +4240,11 @@ func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobR
 	// applied to runtimes: the router routes, it does not OVERRULE a stated
 	// choice. The floor exists to stop an UNSTATED deadline being inherited
 	// from whichever agent was selected, not to overrule an operator.
-	if managed.ReviewJobTimeout > 0 && source != "payload" && isReviewPayload(payload) && requested < managed.ReviewJobTimeout {
+	if managed.ReviewJobTimeout > 0 && source != "payload" && isReviewJob(payload, jobType) && requested < managed.ReviewJobTimeout {
 		requested = managed.ReviewJobTimeout
 		source = "review class"
 	}
-	resolution := jobTimeoutResolution{Timeout: requested, Requested: requested, Max: jobTimeoutMax, Source: source}
+	resolution := jobTimeoutResolution{Timeout: requested, Requested: requested, Max: jobTimeoutMax, Source: source, InvalidPayload: invalidPayloadTimeout}
 	if requested > jobTimeoutMax {
 		resolution.Timeout = jobTimeoutMax
 		resolution.Clamped = true

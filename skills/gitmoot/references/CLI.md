@@ -615,12 +615,38 @@ quiet_kill_after = "45m"
 ```
 
 The effective deadline resolves in this order: a positive `job_timeout` in the
-job payload, the registered agent type's `[agents.<type>].job_timeout`, then
-`job_timeout_default`. `job_timeout_max` is a hard ceiling (default `8h`); a
-larger request is clamped and the job receives a `job_timeout_clamped` event
-recording the requested and applied durations. This prevents a delegation tree
-from granting itself an unbounded run. These keys are read when a job dispatches,
-so edits affect newly started jobs without changing an in-flight deadline.
+job payload, the review class floor below, the registered agent type's
+`[agents.<type>].job_timeout`, then `job_timeout_default`. `job_timeout_max` is
+a hard ceiling (default `8h`) applied last and clamping every source including
+an explicit payload value; a larger request is clamped and the job receives a
+`job_timeout_clamped` event recording the requested and applied durations. This
+prevents a delegation tree from granting itself an unbounded run. These keys are
+read when a job dispatches, so edits affect newly started jobs without changing
+an in-flight deadline.
+
+Reviews carry their own floor, because a review's duration is a property of the
+prompt class rather than of whichever agent happens to answer it:
+
+```toml
+[review_router]
+job_timeout = "3h"   # default 3h; must be positive
+```
+
+A review job gets at least this long even when the answering agent's own
+`job_timeout` is shorter, so rotating between reviewers cannot shorten a review.
+A longer agent setting still wins, and an explicit payload `job_timeout` still
+wins over both — a caller that deliberately caps one review keeps that cap. A
+job counts as a review when its stored job type is `review`, independent of
+whether the payload carries a review purpose or model pool.
+
+Two advisories report deadline inputs that would otherwise be ignored in
+silence: an unparseable or non-positive payload `job_timeout` lands a
+`job_timeout_payload_invalid` event on the job and falls through to the next
+source, and a `[review_router]` section that cannot be read lands a
+`review_class_deadline_default` event naming the parse error and the deadline
+used instead. A non-positive `job_timeout` in the config file is refused at load
+rather than accepted.
+
 `quiet_kill_after` controls the transcript-silence leg of the liveness
 conjunction (default `45m`, hard floor `5m`). The 30-minute stale-running
 threshold remains only an age predicate; neither value is a job kill deadline.

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"io"
 	"os"
 	"strings"
@@ -27,7 +28,7 @@ func TestReviewClassDeadlineFloorsAShortAgentTimeout(t *testing.T) {
 	}
 	review := workflow.JobPayload{ReviewPurpose: "code"}
 
-	got := resolveEffectiveJobTimeout(review, managed)
+	got := resolveEffectiveJobTimeout(review, managed, "review")
 	if got.Timeout != config.DefaultReviewJobTimeout {
 		t.Fatalf("review timeout = %s, want the class floor %s: a 10-minute agent still truncates a 164-minute class",
 			got.Timeout, config.DefaultReviewJobTimeout)
@@ -45,7 +46,7 @@ func TestReviewClassDeadlineDoesNotLowerALongerAgentTimeout(t *testing.T) {
 		JobTimeoutMax:     8 * time.Hour,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed)
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed, "review")
 	if got.Timeout != 4*time.Hour {
 		t.Fatalf("timeout = %s, want the agent's longer %s", got.Timeout, 4*time.Hour)
 	}
@@ -60,7 +61,7 @@ func TestReviewClassDeadlineLeavesNonReviewJobsAlone(t *testing.T) {
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	got := resolveEffectiveJobTimeout(workflow.JobPayload{}, managed)
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{}, managed, "ask")
 	if got.Timeout != 10*time.Minute {
 		t.Fatalf("non-review timeout = %s, want the agent's own %s", got.Timeout, 10*time.Minute)
 	}
@@ -75,7 +76,7 @@ func TestReviewClassDeadlineStillObeysTheDaemonMaximum(t *testing.T) {
 		JobTimeoutMax:     30 * time.Minute,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed)
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed, "review")
 	if got.Timeout != 30*time.Minute || !got.Clamped {
 		t.Fatalf("timeout = %s clamped=%v, want the daemon maximum enforced", got.Timeout, got.Clamped)
 	}
@@ -90,7 +91,7 @@ func TestReviewClassDeadlineRecognisesAPoolBearingReview(t *testing.T) {
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewModelPool: []string{"devin/swe-2"}}, managed)
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewModelPool: []string{"devin/swe-2"}}, managed, "review")
 	if got.Timeout != config.DefaultReviewJobTimeout {
 		t.Fatalf("pool-bearing review timeout = %s, want the class floor", got.Timeout)
 	}
@@ -152,7 +153,7 @@ func TestExplicitPayloadTimeoutBeatsTheClassFloor(t *testing.T) {
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code", JobTimeout: "15m"}, managed)
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code", JobTimeout: "15m"}, managed, "review")
 	if got.Timeout != 15*time.Minute {
 		t.Fatalf("timeout = %s, want the operator's explicit 15m: the floor overruled a stated choice", got.Timeout)
 	}
@@ -169,7 +170,7 @@ func TestUnstatedReviewTimeoutIsStillFloored(t *testing.T) {
 		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
 		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
 	}
-	if got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed); got.Timeout != config.DefaultReviewJobTimeout {
+	if got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed, "review"); got.Timeout != config.DefaultReviewJobTimeout {
 		t.Fatalf("timeout = %s, want the class floor", got.Timeout)
 	}
 }
@@ -241,5 +242,124 @@ func TestUnreadableRouterConfigAdvisoryLandsOnTheReviewJob(t *testing.T) {
 	}
 	if !blockerE2EHasEventKind(t, store, "job-class-advisory", "review_class_deadline_default") {
 		t.Fatal("no review_class_deadline_default event: the operator's unreadable config is invisible on the job it changed")
+	}
+}
+
+// #2192 review (P3): a MARKERLESS review - no purpose, no pool - used to escape
+// the class deadline entirely, which is the defect the floor exists to prevent
+// reached through a different door. The JOB TYPE is what the store says the job
+// IS; markers are what a producer happened to fill in.
+func TestMarkerlessReviewStillGetsTheClassDeadline(t *testing.T) {
+	managed := managedJobRuntimeConfig{
+		JobTimeout:        10 * time.Minute,
+		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
+		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
+	}
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{}, managed, "review")
+	if got.Timeout != config.DefaultReviewJobTimeout {
+		t.Fatalf("markerless review timeout = %s, want the class floor", got.Timeout)
+	}
+}
+
+// #2192 review (P3): an unparseable payload timeout was SILENTLY ignored at the
+// level just promoted to highest priority.
+func TestUnparseablePayloadTimeoutIsReported(t *testing.T) {
+	managed := managedJobRuntimeConfig{
+		JobTimeout:        10 * time.Minute,
+		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
+		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
+	}
+	for _, raw := range []string{"banana", "-5m", "0s"} {
+		got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code", JobTimeout: raw}, managed, "review")
+		if got.InvalidPayload != raw {
+			t.Fatalf("payload job_timeout %q was ignored silently: InvalidPayload=%q", raw, got.InvalidPayload)
+		}
+		if got.Source == "payload" {
+			t.Fatalf("payload job_timeout %q was USED despite being invalid", raw)
+		}
+		// It still falls through to the class floor rather than refusing.
+		if got.Timeout != config.DefaultReviewJobTimeout {
+			t.Fatalf("timeout = %s after an invalid payload value, want the class floor", got.Timeout)
+		}
+	}
+}
+
+// The positivity check on the operator knob was unguarded by any test: a zero
+// or negative [review_router] job_timeout must be REFUSED, not silently used.
+func TestNonPositiveClassDeadlineIsRefusedByTheLoader(t *testing.T) {
+	for _, raw := range []string{"0s", "-10m"} {
+		home := t.TempDir()
+		paths := config.PathsForHome(home)
+		if err := config.Initialize(paths); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteString("\n[review_router]\njob_timeout = \"" + raw + "\"\n"); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		file.Close()
+		_, err = config.LoadReviewRouterSettings(paths)
+		if err == nil {
+			t.Fatalf("[review_router] job_timeout %q was accepted; a non-positive deadline must be refused", raw)
+		}
+		if !strings.Contains(err.Error(), "must be positive") {
+			t.Fatalf("job_timeout %q refused for the wrong reason: %v", raw, err)
+		}
+	}
+}
+
+// #2192 review (P3): the event-error path was fail-closed by construction and
+// untested. A trigger fails EXACTLY the new advisory insert and nothing else,
+// so the assertion is about this branch rather than about a broken database:
+// when the daemon cannot record that it ignored an operator's timeout, it must
+// refuse the job instead of running it under a deadline nobody was told about.
+func TestInvalidPayloadTimeoutEventFailureStopsTheJob(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
+	if err := store.ExecForTest(ctx, `CREATE TRIGGER fail_invalid_timeout_event
+BEFORE INSERT ON job_events
+WHEN NEW.kind = 'job_timeout_payload_invalid'
+BEGIN
+	SELECT RAISE(ABORT, 'event write refused');
+END;`); err != nil {
+		t.Fatal(err)
+	}
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-invalid-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main", JobTimeout: "banana"})
+	job, err := store.GetJob(ctx, "job-invalid-timeout")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &timeoutCaptureAdapter{}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
+		return t.TempDir(), nil
+	}
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
+	if err := worker.run(ctx, job); err != nil {
+		t.Fatalf("run returned %v, want the job finished as failed", err)
+	}
+	// DELIVERY is dispatch. The adapter FACTORY runs earlier in the job
+	// lifecycle, so factory invocation would pass even with the guard removed.
+	if capture.hasDeadline {
+		t.Fatal("the agent ran after the advisory write failed: the substituted deadline went unrecorded")
+	}
+	after, err := store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != string(workflow.JobFailed) {
+		t.Fatalf("job state = %q, want failed", after.State)
 	}
 }
