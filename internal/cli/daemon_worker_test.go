@@ -277,33 +277,33 @@ func TestEffectiveJobTimeout(t *testing.T) {
 	managed := managedJobRuntimeConfig{OK: true, JobTimeout: 10 * time.Minute}
 
 	// A valid per-delegation timeout overrides the agent-type timeout.
-	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "30s"}, managed); got != 30*time.Second {
+	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "30s"}, managed, "ask"); got != 30*time.Second {
 		t.Fatalf("effectiveJobTimeout(payload override) = %v, want 30s", got)
 	}
 
 	// An empty payload timeout falls back to the managed timeout.
-	if got := effectiveJobTimeout(workflow.JobPayload{}, managed); got != 10*time.Minute {
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managed, "ask"); got != 10*time.Minute {
 		t.Fatalf("effectiveJobTimeout(empty payload) = %v, want 10m", got)
 	}
 
 	// An unparseable payload timeout falls back to the managed timeout.
-	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "banana"}, managed); got != 10*time.Minute {
+	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "banana"}, managed, "ask"); got != 10*time.Minute {
 		t.Fatalf("effectiveJobTimeout(invalid payload) = %v, want 10m", got)
 	}
 
 	// A non-positive payload timeout falls back to the managed timeout.
-	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "0s"}, managed); got != 10*time.Minute {
+	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "0s"}, managed, "ask"); got != 10*time.Minute {
 		t.Fatalf("effectiveJobTimeout(zero payload) = %v, want 10m", got)
 	}
 
 	// With no agent-type config, the independent daemon kill default applies;
 	// stale-running detection is never reused as the deadline.
-	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got != config.DefaultDaemonJobTimeoutDefault {
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}, "ask"); got != config.DefaultDaemonJobTimeoutDefault {
 		t.Fatalf("effectiveJobTimeout(unmanaged, empty) = %v, want %v", got, config.DefaultDaemonJobTimeoutDefault)
 	}
 
 	// With no managed config, a valid payload timeout still applies.
-	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "45s"}, managedJobRuntimeConfig{}); got != 45*time.Second {
+	if got := effectiveJobTimeout(workflow.JobPayload{JobTimeout: "45s"}, managedJobRuntimeConfig{}, "ask"); got != 45*time.Second {
 		t.Fatalf("effectiveJobTimeout(unmanaged, payload) = %v, want 45s", got)
 	}
 
@@ -311,10 +311,10 @@ func TestEffectiveJobTimeout(t *testing.T) {
 	// hard ceiling regardless of which higher-precedence source supplied the
 	// candidate duration.
 	authority := managedJobRuntimeConfig{JobTimeoutDefault: 3 * time.Hour, JobTimeoutMax: 6 * time.Hour}
-	if got := effectiveJobTimeout(workflow.JobPayload{}, authority); got != 3*time.Hour {
+	if got := effectiveJobTimeout(workflow.JobPayload{}, authority, "ask"); got != 3*time.Hour {
 		t.Fatalf("effectiveJobTimeout(configured default) = %v, want 3h", got)
 	}
-	resolution := resolveEffectiveJobTimeout(workflow.JobPayload{JobTimeout: "7h"}, authority)
+	resolution := resolveEffectiveJobTimeout(workflow.JobPayload{JobTimeout: "7h"}, authority, "ask")
 	if resolution.Timeout != 6*time.Hour || !resolution.Clamped || resolution.Source != "payload" {
 		t.Fatalf("resolveEffectiveJobTimeout(configured max) = %+v, want payload clamped to 6h", resolution)
 	}
@@ -486,7 +486,7 @@ func TestDaemonJobTimeoutIsSeparateFromStaleDetection(t *testing.T) {
 	if !(daemonRunningJobStaleAfter < config.DefaultDaemonJobTimeoutDefault) {
 		t.Fatalf("stale_after = %v, kill default = %v; want stale_after < kill default", daemonRunningJobStaleAfter, config.DefaultDaemonJobTimeoutDefault)
 	}
-	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}); got == daemonRunningJobStaleAfter {
+	if got := effectiveJobTimeout(workflow.JobPayload{}, managedJobRuntimeConfig{}, "ask"); got == daemonRunningJobStaleAfter {
 		t.Fatalf("effectiveJobTimeout returned stale detector constant %v", got)
 	}
 
