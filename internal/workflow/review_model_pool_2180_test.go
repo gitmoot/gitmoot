@@ -841,14 +841,20 @@ func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
 	if filled.Name == "" {
 		t.Fatalf("exported member unset: %+v", filled)
 	}
-	// Read back through the same unsafe path the snapshot uses, because the
-	// test cannot touch them directly either.
-	value := reflect.ValueOf(&filled).Elem()
-	for _, name := range []string{"hidden", "flag"} {
-		cell := value.FieldByName(name)
-		cell = reflect.NewAt(cell.Type(), unsafe.Pointer(cell.UnsafeAddr())).Elem()
-		if cell.IsZero() {
-			t.Fatalf("unexported member %s stayed zero: a forward reading it would read INERT", name)
-		}
+	// READ DIRECTLY. The previous version read back through the same unsafe
+	// path the writer uses, with a comment claiming "the test cannot touch them
+	// directly either" - which is FALSE: this test is in the same package, so
+	// plain field access works. The comment asserted the unavailability of the
+	// very check that makes the assertion independent, and a reader trusting it
+	// would not have looked (#2188 round 12).
+	//
+	// Reading through the writer's own mechanism also risks a vacuous pass: if
+	// the unsafe addressing were wrong in a symmetric way, write and read-back
+	// would agree with each other and with nothing else.
+	if filled.hidden == "" {
+		t.Fatalf("unexported member hidden stayed zero: a forward reading it would read INERT")
+	}
+	if !filled.flag {
+		t.Fatalf("unexported member flag stayed zero: a forward reading it would read INERT")
 	}
 }
