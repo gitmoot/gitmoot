@@ -181,8 +181,11 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 
 // reviewRequestRuntime applies the router's omp pin unless the operator named a
 // runtime. One site for the pin, so a future caller cannot lose the override.
-func reviewRequestRuntime(override string) string {
+func reviewRequestRuntime(override, selected string) string {
 	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(selected); trimmed != "" {
 		return trimmed
 	}
 	return runtime.OmpRuntime
@@ -294,7 +297,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer)
+	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer, opts.role)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -321,7 +324,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
 		// hold is written for that runtime (#2181), with nothing to fall back to.
-		Runtime:              reviewRequestRuntime(opts.runtime),
+		Runtime:              reviewRequestRuntime(opts.runtime, selectedRuntime),
 		ActingOrgRole:        opts.role,
 		OperatorOrigin:       true,
 		Home:                 opts.home,
@@ -767,24 +770,64 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 	return nil
 }
 
+// reviewRuntimeForCandidate picks the runtime this candidate will actually run
+// on, given any availability hold on the REQUESTER's role (#2187).
+//
+// THE DEFECT THIS CLOSES: selection pinned omp without consulting availability,
+// and refuseUnavailableOrgRole then tested that already-made choice at dispatch
+// - one layer too late, where the only remaining move is to refuse. On
+// 2026-09-14 two seats spent three dispatch attempts and two escalations
+// discovering that a review they were OBLIGED to obtain could not be
+// dispatched, and the remedy they were given was to type the runtime by hand.
+// A router that picks a runtime it could have known was walled has handed its
+// own job to the caller.
+//
+// Order is deliberate: the omp pin first, because the router owns the runtime
+// when it selects the reviewer; then the candidate's OWN registered runtime,
+// which it is provisioned for. Shell is never auto-selected - its "runtime ref"
+// is a command, so a review dispatched onto it would run the agent's script
+// instead of a model.
+func reviewRuntimeForCandidate(agent db.Agent, incident db.OrgRoleUnavailable, held bool) (string, bool) {
+	options := []string{runtime.OmpRuntime}
+	if registered := strings.TrimSpace(agent.Runtime); registered != "" &&
+		registered != runtime.OmpRuntime && registered != runtime.ShellRuntime {
+		options = append(options, registered)
+	}
+	for _, option := range options {
+		if held && orgRoleUnavailableRefusesRuntime(incident, option) {
+			continue
+		}
+		return option, true
+	}
+	return "", false
+}
+
 // selectReviewRouterAgent picks the registered agent that will carry the
 // review. The agent supplies identity and repo access; runtime and model come
 // from the router, so any review-capable agent scoped to the repository will
 // do, and an omp-native one is preferred so the override changes nothing.
-func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, purpose, explicit string) (db.Agent, error) {
+func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA, purpose, explicit, role string) (db.Agent, string, error) {
+	incident, held, err := store.GetActiveOrgRoleUnavailable(ctx, role, time.Now().UTC())
+	if err != nil {
+		return db.Agent{}, "", err
+	}
 	if explicit = strings.TrimSpace(explicit); explicit != "" {
 		agent, err := store.GetAgent(ctx, explicit)
 		if err != nil {
-			return db.Agent{}, fmt.Errorf("reviewer %q: %w", explicit, err)
+			return db.Agent{}, "", fmt.Errorf("reviewer %q: %w", explicit, err)
 		}
 		if !agentHasCapability(agent.Capabilities, "review") {
-			return db.Agent{}, fmt.Errorf("reviewer %q is not registered with the review capability", explicit)
+			return db.Agent{}, "", fmt.Errorf("reviewer %q is not registered with the review capability", explicit)
 		}
-		return agent, nil
+		selected, ok := reviewRuntimeForCandidate(agent, incident, held)
+		if !ok {
+			return db.Agent{}, "", unavailableReviewRuntimeError(role, incident)
+		}
+		return agent, selected, nil
 	}
 	agents, err := store.ListAgents(ctx)
 	if err != nil {
-		return db.Agent{}, err
+		return db.Agent{}, "", err
 	}
 	candidates := make([]db.Agent, 0, len(agents))
 	for _, agent := range agents {
@@ -793,14 +836,14 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		}
 		allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
 		if err != nil {
-			return db.Agent{}, err
+			return db.Agent{}, "", err
 		}
 		if allowed {
 			candidates = append(candidates, agent)
 		}
 	}
 	if len(candidates) == 0 {
-		return db.Agent{}, fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
+		return db.Agent{}, "", fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
 	}
 	// A SECOND PURPOSE AT THE SAME HEAD MUST NOT BE REFUSED AS A LOOP (#2172
 	// review rounds 2-4). "Answered" is scoped to the PURPOSE being requested,
@@ -842,9 +885,30 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		return candidates[i].Name < candidates[j].Name
 	})
 	if answered[strings.ToLower(candidates[0].Name)] {
-		return db.Agent{}, fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
+		return db.Agent{}, "", fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
 	}
-	return candidates[0], nil
+	// ROUTE AROUND THE HOLD RATHER THAN REFUSE AT DISPATCH. Candidates are
+	// already ordered by the loop guard and the omp preference, so a hold
+	// DEMOTES a candidate instead of failing the request.
+	for _, candidate := range candidates {
+		if selected, ok := reviewRuntimeForCandidate(candidate, incident, held); ok {
+			return candidate, selected, nil
+		}
+	}
+	return db.Agent{}, "", unavailableReviewRuntimeError(role, incident)
+}
+
+// unavailableReviewRuntimeError names the runtime the hold is scoped to and
+// when it lifts. The refusal two seats hit on 2026-09-14 named neither, which
+// is why they escalated rather than routing elsewhere: a refusal that does not
+// say what it is scoped to is indistinguishable from a total outage (#2181).
+func unavailableReviewRuntimeError(role string, incident db.OrgRoleUnavailable) error {
+	scope := strings.TrimSpace(incident.Runtime)
+	if scope == "" {
+		scope = "every runtime"
+	}
+	return fmt.Errorf("no available runtime for role %q: its %s hold (%s) lasts until %s, and no review-capable agent offers another runtime; wait, pass --runtime, or clear the hold",
+		role, scope, strings.TrimSpace(incident.Reason), strings.TrimSpace(incident.Until))
 }
 
 // reviewRequestHolds names admission states that keep a dispatched review from
