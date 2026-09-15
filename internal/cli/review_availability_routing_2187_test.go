@@ -327,8 +327,13 @@ func TestOmpReviewStillCarriesThePoolHeadAsItsModel(t *testing.T) {
 		t.Fatal(failure)
 	}
 	payload := dispatchedReviewPayload(t, store, output.JobID)
-	if payload.Model != "devin/swe-2" {
-		t.Fatalf("omp review model = %q, want the pool head", payload.Model)
+	// SENTINEL, not the built-in default (#2188's fixture rule, which landed on
+	// a different branch): reviewRouterHome's config pool is sentinel/router-*,
+	// so asserting the real provider name here passed only while the two
+	// branches were apart. A semantic conflict - both sides compile, both sides
+	// pass alone, and the merge fails.
+	if payload.Model != "sentinel/router-a" {
+		t.Fatalf("omp review model = %q, want the configured pool head", payload.Model)
 	}
 }
 
