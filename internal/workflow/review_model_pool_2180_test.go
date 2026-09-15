@@ -285,7 +285,51 @@ func distinctiveValues(fieldType reflect.Type, seed int) []reflect.Value {
 	case reflect.Pointer:
 		return []reflect.Value{reflect.New(fieldType.Elem())}
 	case reflect.Struct:
-		return []reflect.Value{reflect.New(fieldType).Elem()}
+		// #2188 round 6 (the tenth instance): this case USED TO return the ZERO
+		// struct, which is indistinguishable from unset - so DelegationTimeoutDefaults
+		// and LedgerResolvers moved from honestly-admitted `unprobeable` to
+		// falsely-claimed "observed inert", and a forward from either was
+		// invisible while the census reported coverage.
+		//
+		// THE WIDENING TRADED AN ADMITTED GAP FOR A FALSE PROOF, which is
+		// strictly worse: an admitted gap is a known limit, a false proof
+		// removes the reason to look. Fields are now filled recursively, and a
+		// struct whose fields cannot be filled reports UNFILLABLE rather than
+		// inert.
+		filled := reflect.New(fieldType).Elem()
+		populated := false
+		for i := range fieldType.NumField() {
+			if !fieldType.Field(i).IsExported() {
+				continue
+			}
+			inner := distinctiveValues(fieldType.Field(i).Type, seed+i+11)
+			if len(inner) == 0 {
+				continue
+			}
+			filled.Field(i).Set(inner[0])
+			populated = true
+		}
+		if !populated {
+			return nil
+		}
+		return []reflect.Value{filled}
+
+	// The five interface-typed fields were exempted as "unsynthesisable". That
+	// is a claim about the generator, and it is FALSE INSIDE THIS PACKAGE: the
+	// stubs already existed. Using them deletes the exemption set rather than
+	// relocating it - the first time in this lineage that closing a gap did not
+	// create a new place for the class to live.
+	case reflect.Interface:
+		for _, stub := range []any{
+			&recordingSink{}, &recordingNotifier{}, &fakeImplementationFinalizer{},
+			&fakeMergeGate{}, &fakeWorktreeManager{},
+		} {
+			candidate := reflect.ValueOf(stub)
+			if candidate.Type().Implements(fieldType) {
+				return []reflect.Value{candidate}
+			}
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -309,44 +353,37 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	// fails because observation still reports it.
 	mustForward := map[string]bool{
 		"ApplyChangeSet": true, "BlockerDeferrer": true, "CollectChangeSet": true,
-		"Memory": true, "OrgPolicy": true, "ProduceCheckDir": true,
-		"RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true, "ResultCheckMode": true,
-		"ReviewModelPool": true, "RouterContextEnabled": true, "RuntimeDefaultEffort": true,
-		"RuntimeDefaultModel": true,
+		"EventSink": true, "Memory": true, "OrgPolicy": true,
+		"ProduceCheckDir": true, "RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true,
+		"ResultCheckMode": true, "ReviewModelPool": true, "RouterContextEnabled": true,
+		"RuntimeDefaultEffort": true, "RuntimeDefaultModel": true,
 	}
 	// Observed inert: setting the field alone changes nothing on the mailbox.
 	// Every name here was OBSERVED, not assumed - an entry that turns out to be
 	// forwarded fails the set equality below, in that direction too.
 	expectedInert := map[string]bool{
 		"ArtifactRoot": true, "BeforeReadOnlyWorktreeCleanup": true, "DelegationCheckout": true,
-		"DelegationTimeoutDefaults": true, "FindingsAdvisory": true, "FixWorktreeAllocator": true,
-		"HighRiskPaths": true, "Home": true, "InjectUpstreamDepContext": true,
+		"DelegationTimeoutDefaults": true, "DelegationWorktrees": true, "EscalationNotifier": true,
+		"FindingsAdvisory": true, "FixWorktreeAllocator": true, "HighRiskPaths": true,
+		"Home": true, "ImplementationFinalizer": true, "InjectUpstreamDepContext": true,
 		"InlineArtifactBodies": true, "JobID": true, "LedgerResolvers": true,
 		"MaxDelegationCostUSD": true, "MaxDelegationNonProgressStreak": true, "MaxDelegationTokenBudget": true,
-		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true, "NativeReviewFanoutEnabled": true,
-		"Now": true, "OwnerPIDLive": true, "PayloadRefresher": true,
-		"PullRequestSignals": true, "RequiredReviewers": true, "ReviewBlockingSeverity": true,
-		"ReviewChangedFiles": true, "RiskLabelHigh": true, "RiskLabelRoutine": true,
-		"RiskTiersEnabled": true, "WorktreeHasLiveProcess": true, "WorktreeLiveness": true,
+		"MaxInlineArtifactBytes": true, "MaxVerifyReplanAttempts": true, "MergeGate": true,
+		"NativeReviewFanoutEnabled": true, "Now": true, "OwnerPIDLive": true,
+		"PayloadRefresher": true, "PullRequestSignals": true, "RequiredReviewers": true,
+		"ReviewBlockingSeverity": true, "ReviewChangedFiles": true, "RiskLabelHigh": true,
+		"RiskLabelRoutine": true, "RiskTiersEnabled": true, "WorktreeHasLiveProcess": true,
+		"WorktreeLiveness": true,
 	}
 	// Kinds this generator cannot synthesise a distinguishing value for. Listing
 	// one is a statement that it is UNPROBEABLE, not that it is uninteresting.
-	// The residual exemption, and it is now FIVE interface-typed fields rather
-	// than eleven fields of every composite kind. Widening the generator to
-	// slices, maps, pointers, structs and floats moved six of them into real
-	// observation - including HighRiskPaths, the field the reviewer used to
-	// prove a forward could hide behind generator capability.
-	//
-	// STATED AS A KNOWN GAP RATHER THAN GUARDED AGAIN: a forward whose SOURCE is
-	// one of these five is still invisible here. Synthesising a distinguishable
-	// interface value requires knowing each interface's implementations, which
-	// is the point where a tenth guard would cost more than it catches. Two of
-	// the five, EventSink and Memory-adjacent wiring, are pinned by their own
-	// tests (event_sink_test.go and the Memory residuals below).
-	unprobeable := map[string]bool{
-		"DelegationWorktrees": true, "EscalationNotifier": true, "EventSink": true,
-		"ImplementationFinalizer": true, "MergeGate": true,
-	}
+	// NO EXEMPTION SET. It was five interface-typed fields, justified as
+	// "unsynthesisable" - a claim about the generator that was FALSE inside this
+	// package, where recordingSink, recordingNotifier, fakeImplementationFinalizer,
+	// fakeMergeGate and fakeWorktreeManager already existed. Using them made all
+	// five real observations, and EventSink turned out to be FORWARDED, not
+	// merely unprobed - the same error the hand-audit made on Memory, found the
+	// same way. Every exported Engine field is now observed.
 
 	store := openEngineStore(t)
 	baseline := Engine{Store: store}
@@ -355,7 +392,6 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 	engineType := reflect.TypeOf(Engine{})
 	observedForward := map[string]bool{}
 	observedInert := map[string]bool{}
-	observedUnprobeable := map[string]bool{}
 	for i := range engineType.NumField() {
 		field := engineType.Field(i)
 		if !field.IsExported() || field.Name == "Store" {
@@ -363,7 +399,10 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 		}
 		candidates := distinctiveValues(field.Type, i)
 		if len(candidates) == 0 {
-			observedUnprobeable[field.Name] = true
+			// No exemption remains, so this is a FAILURE rather than a category:
+			// a field the generator cannot synthesise is a field nothing checks.
+			t.Errorf("Engine.%s cannot be synthesised by the probe: extend distinctiveValues "+
+				"(a stub for its type), or this field is unchecked", field.Name)
 			continue
 		}
 		changed := false
@@ -391,7 +430,6 @@ func TestEveryEngineFieldThatReachesTheMailboxIsObservedReachingIt(t *testing.T)
 
 	requireSameSet(t, "forwarded", mustForward, observedForward)
 	requireSameSet(t, "inert", expectedInert, observedInert)
-	requireSameSet(t, "unprobeable", unprobeable, observedUnprobeable)
 
 	// Method-derived and sub-field forwards, invisible to the value diff above.
 	if baselineSnapshot["reviewBlockingSeverity"] == "nil" {
