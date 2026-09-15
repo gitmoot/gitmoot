@@ -82,8 +82,14 @@ func TestReviewRequestRefusalNamesTheHeldRuntimeAndExpiry(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "omp-reviewer", runtime.OmpRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	holdRole(t, store, "joltra", runtime.OmpRuntime)
 
+	// NAMED reviewer, because the shared fixture also seeds a shell reviewer:
+	// with routing working, that agent is genuinely available, so an omp hold no
+	// longer walls the whole fleet. Naming the omp-only agent is what makes
+	// "every option walled" true rather than assumed - the earlier version of
+	// this test passed only because routing could not reach the alternative.
 	_, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
-		"--branch", "feature/review", "--role", "joltra", "--home", home, "--json")
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--reviewer", "omp-reviewer", "--json")
 	if failure == "" {
 		t.Fatal("a fully walled role obtained a review")
 	}
@@ -323,5 +329,169 @@ func TestOmpReviewStillCarriesThePoolHeadAsItsModel(t *testing.T) {
 	payload := dispatchedReviewPayload(t, store, output.JobID)
 	if payload.Model != "devin/swe-2" {
 		t.Fatalf("omp review model = %q, want the pool head", payload.Model)
+	}
+}
+
+// M4 (#2189 round 2): the action gate's LOAD-BEARING case. The previous
+// non-review test ran with no hold, so dropping the gate changed nothing and
+// the mutant lived. Under a hold, a non-review job must still keep its runtime.
+func TestNonReviewDispatchIsNotReroutedEvenUnderAHold(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "builder", runtime.ClaudeRuntime, "true", []string{"ask", "implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
+	holdRole(t, store, "joltra", runtime.ClaudeRuntime)
+
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "builder", Action: "ask",
+		Instructions: "what is here", Background: true, Home: home,
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review", ActingOrgRole: "joltra",
+	})
+	// THE REFUSAL IS THE ASSERTION. A non-review job on a held runtime is
+	// refused at dispatch, as it was before this work. If the action gate were
+	// dropped, the router would reroute it to omp and the job would DISPATCH -
+	// so "refused" is what distinguishes the gate from its absence. Rerouting a
+	// non-review job would also hand it a reviewer's runtime, which is the
+	// #2171 narrowing this work must not undo.
+	if err == nil {
+		t.Fatalf("ask dispatch on a held runtime succeeded (job %s): the router rerouted a NON-review job", out.JobID)
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("error = %v, want the existing unavailability refusal", err)
+	}
+	_ = out
+}
+
+// M6: the feature's core promise - DEMOTE rather than refuse - needs two
+// candidates where the first is unavailable. With one candidate the loop is
+// indistinguishable from always taking candidates[0].
+func TestRouterDemotesToTheNextCandidateRatherThanRefusing(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	// First by name and omp-registered, so ordering puts it first; walled by the
+	// omp hold. Second is claude-registered and reachable.
+	seedDaemonWorkerAgentWithPolicy(t, store, "aaa-omp-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "zzz-claude-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	holdRole(t, store, "joltra", runtime.OmpRuntime)
+
+	output, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home, "--json")
+	if failure != "" {
+		t.Fatalf("router refused instead of demoting to the reachable candidate: %s", failure)
+	}
+	// THE PROPERTY, not a specific name: the walled candidate must not be the
+	// one chosen. Naming the expected winner made this brittle against the
+	// fixture's other review-capable agents, and a test that fails when an
+	// unrelated candidate appears is pinning the fixture rather than the rule.
+	if output.Reviewer == "aaa-omp-reviewer" {
+		t.Fatalf("reviewer = %q: the router chose the candidate whose only runtime is walled", output.Reviewer)
+	}
+	if got := dispatchedRuntime(t, store, output.JobID, runtime.ClaudeRuntime); got == runtime.OmpRuntime {
+		t.Fatalf("runtime = %q: dispatched onto the held runtime", got)
+	}
+}
+
+// M11: "the router routes, it does not overrule" needs the HELD case. Unheld,
+// routing and the override agree, so dropping the early return changed nothing.
+func TestExplicitRuntimeIsNotReroutedUnderAHold(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	holdRole(t, store, "joltra", runtime.ClaudeRuntime)
+
+	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 16, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+		Runtime: runtime.ClaudeRuntime, // deliberate, onto the held runtime
+	})
+	// The operator named a runtime that is HELD. The router must not quietly
+	// move them off it: the dispatch refuses, exactly as it would have before
+	// this feature existed. Dropping the explicit-runtime early return makes
+	// the router reroute to omp and the job dispatch - so a successful dispatch
+	// here means a stated choice was overruled in silence.
+	if err == nil {
+		t.Fatalf("explicit --runtime on a held runtime dispatched anyway (job %s): the router overruled a stated choice", out.JobID)
+	}
+	if !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("error = %v, want the existing unavailability refusal", err)
+	}
+	_ = out
+}
+
+// P2 (#2189 round 2): a shell-scoped hold must REFUSE a script agent, not send
+// it to omp. Taking the escape would run a model review under the script
+// agent's identity - the harm the routing code exists to prevent.
+func TestHeldScriptAgentRefusesRatherThanRunningAModel(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "script-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	holdRole(t, store, "joltra", runtime.ShellRuntime)
+
+	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "script-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 17, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+	})
+	if err == nil {
+		t.Fatal("a shell-held script agent was dispatched anyway: it would run a model under the script's identity")
+	}
+	if !strings.Contains(err.Error(), "no available runtime") {
+		t.Fatalf("error = %v, want the named refusal", err)
+	}
+}
+
+// P2 (#2189 round 2): an operator --model is scoped to the runtime they
+// expected. Rerouting underneath it is the round-1 P1 through another door.
+func TestOperatorModelIsNotCarriedThroughAReroute(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	holdRole(t, store, "joltra", runtime.ClaudeRuntime)
+
+	_, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 18, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+		Model: "anthropic/claude-fable-5", // scoped to claude, which is held
+	})
+	if err == nil {
+		t.Fatal("a claude-scoped model was carried onto omp: the job would die at delivery")
+	}
+	if !strings.Contains(err.Error(), "--model") {
+		t.Fatalf("error = %v, want it to name the model conflict", err)
+	}
+}
+
+// P3 (#2189 round 2): the two verbs must answer identically on identical fleet
+// state. A shell-only fleet under an omp hold used to split - review request
+// refused, agent review dispatched the script.
+func TestBothVerbsAgreeOnAShellOnlyFleetUnderAnOmpHold(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "script-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	holdRole(t, store, "joltra", runtime.OmpRuntime)
+
+	routed, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home, "--json")
+	if failure != "" {
+		t.Fatalf("review request refused what agent review dispatches: %s", failure)
+	}
+	if got := dispatchedRuntime(t, store, routed.JobID, runtime.ShellRuntime); got != runtime.ShellRuntime {
+		t.Fatalf("review request runtime = %q, want the script agent's own %q", got, runtime.ShellRuntime)
+	}
+
+	direct, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		RepoFlag: "owner/repo", Agent: "script-reviewer", Action: "review",
+		Instructions: "review this", Background: true, Home: home,
+		PullRequest: 19, HeadSHA: head, Branch: "feature/review",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+	})
+	if err != nil {
+		t.Fatalf("agent review: %v", err)
+	}
+	if got := dispatchedRuntime(t, store, direct.JobID, runtime.ShellRuntime); got != runtime.ShellRuntime {
+		t.Fatalf("agent review runtime = %q, want %q - the verbs disagree", got, runtime.ShellRuntime)
 	}
 }

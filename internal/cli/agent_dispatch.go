@@ -284,6 +284,18 @@ func routerChosenReviewRuntime(ctx context.Context, store *db.Store, request loc
 		// Nothing to change; leave the request exactly as the caller built it.
 		return "", nil
 	}
+	// MODEL AND RUNTIME MOVE TOGETHER, OR NOTHING MOVES (#2189 round 2).
+	//
+	// An operator --model is scoped to the runtime they expected. Rerouting
+	// underneath it produces the round-1 P1 shape through a different door: a
+	// claude model name handed to omp, dispatched, dead at delivery. The router
+	// cannot vouch for a model it did not choose, so it refuses rather than
+	// silently rewriting or silently keeping it.
+	if model := strings.TrimSpace(request.Model); model != "" {
+		return "", fmt.Errorf("review dispatch names --model %q, but %s is held for role %q so the review must move to %s: "+
+			"a model is scoped to its runtime, so re-run without --model to let the router choose, or pass --runtime explicitly",
+			model, strings.TrimSpace(agent.Runtime), role, selected)
+	}
 	return selected, nil
 }
 
