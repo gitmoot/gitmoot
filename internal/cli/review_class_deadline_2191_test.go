@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,5 +138,108 @@ func TestReviewClassDeadlineDefaultsWhenUnconfigured(t *testing.T) {
 	}
 	if managed.ReviewJobTimeout != config.DefaultReviewJobTimeout {
 		t.Fatalf("review class timeout = %s, want the built-in %s", managed.ReviewJobTimeout, config.DefaultReviewJobTimeout)
+	}
+}
+
+// #2192 review (P3): an EXPLICIT per-job timeout must win over the class floor.
+// Without this a coordinator that deliberately caps a review at 15m silently
+// got 3h, so a delegation timeout could not bound a review at all - the router
+// overruling a stated choice, which this campaign already rejected for runtimes.
+func TestExplicitPayloadTimeoutBeatsTheClassFloor(t *testing.T) {
+	managed := managedJobRuntimeConfig{
+		JobTimeout:        10 * time.Minute,
+		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
+		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
+	}
+	got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code", JobTimeout: "15m"}, managed)
+	if got.Timeout != 15*time.Minute {
+		t.Fatalf("timeout = %s, want the operator's explicit 15m: the floor overruled a stated choice", got.Timeout)
+	}
+	if got.Source != "payload" {
+		t.Fatalf("source = %q, want payload", got.Source)
+	}
+}
+
+// And an UNSTATED deadline is still floored - the case the floor exists for.
+func TestUnstatedReviewTimeoutIsStillFloored(t *testing.T) {
+	managed := managedJobRuntimeConfig{
+		JobTimeout:        10 * time.Minute,
+		JobTimeoutDefault: config.DefaultDaemonJobTimeoutDefault,
+		JobTimeoutMax:     config.DefaultDaemonJobTimeoutMax,
+		ReviewJobTimeout:  config.DefaultReviewJobTimeout,
+	}
+	if got := resolveEffectiveJobTimeout(workflow.JobPayload{ReviewPurpose: "code"}, managed); got.Timeout != config.DefaultReviewJobTimeout {
+		t.Fatalf("timeout = %s, want the class floor", got.Timeout)
+	}
+}
+
+// #2192 review (P3): an unreadable [review_router] must not silently swap the
+// operator's class deadline for the built-in one.
+func TestUnreadableRouterConfigIsReportedNotSwallowed(t *testing.T) {
+	store, home := blockerE2EHome(t)
+	paths := config.PathsForHome(home)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[review_router]\njob_timeout = \"banana\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	managed, err := worker.managedJobConfig(context.Background(), "opus-reviewer")
+	if err != nil {
+		t.Fatalf("managedJobConfig: %v", err)
+	}
+	if managed.ReviewClassFallbackReason == "" {
+		t.Fatal("an unreadable [review_router] produced no fallback reason: the operator's shorter deadline silently becomes the built-in")
+	}
+	if managed.ReviewJobTimeout != config.DefaultReviewJobTimeout {
+		t.Fatalf("fallback timeout = %s, want the built-in %s", managed.ReviewJobTimeout, config.DefaultReviewJobTimeout)
+	}
+}
+
+// The advisory must reach the JOB, not just the config struct. Asserting the
+// reason field alone would be the "correct but undefended" shape this campaign
+// keeps finding: the operator learns nothing from a field no consumer reads.
+func TestUnreadableRouterConfigAdvisoryLandsOnTheReviewJob(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout := t.TempDir()
+	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	paths := config.PathsForHome(home)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[review_router]\njob_timeout = \"banana\"\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	seedDaemonWorkerAgent(t, store, "script-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo")
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
+		ID: "job-class-advisory", Agent: "script-reviewer", Action: "review", Repo: "owner/repo",
+		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40), NoFixTarget: true,
+		ReviewPurpose: "code",
+	})
+
+	worker := blockerE2EWorker(store, home, checkout)
+	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if !blockerE2EHasEventKind(t, store, "job-class-advisory", "review_class_deadline_default") {
+		t.Fatal("no review_class_deadline_default event: the operator's unreadable config is invisible on the job it changed")
 	}
 }

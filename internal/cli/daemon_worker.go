@@ -612,6 +612,19 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	timeoutResolution := resolveEffectiveJobTimeout(payload, managed)
 	jobTimeout := timeoutResolution.Timeout
+	// The class floor fell back to its built-in because the operator's
+	// [review_router] could not be read. Reported on the REVIEW it affects, so
+	// a deliberately shorter class deadline silently becoming longer is
+	// visible where the consequence lands (#2192 review).
+	if reason := strings.TrimSpace(managed.ReviewClassFallbackReason); reason != "" && isReviewPayload(payload) {
+		message := fmt.Sprintf("[review_router] unreadable (%s); using the built-in review class deadline %s", reason, managed.ReviewJobTimeout)
+		if eventErr := w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_class_deadline_default", Message: message}); eventErr != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, eventErr); finishErr != nil {
+				return finishErr
+			}
+			return nil
+		}
+	}
 	if timeoutResolution.Clamped {
 		message := fmt.Sprintf("%s job_timeout %s exceeds [daemon].job_timeout_max %s; clamped to %s",
 			timeoutResolution.Source, timeoutResolution.Requested, timeoutResolution.Max, timeoutResolution.Timeout)
@@ -4010,6 +4023,10 @@ type managedJobRuntimeConfig struct {
 	// ReviewJobTimeout is the floor a REVIEW gets whichever reviewer answers it
 	// (#2191). Zero leaves review deadlines exactly as they were.
 	ReviewJobTimeout time.Duration
+	// ReviewClassFallbackReason is set when [review_router] could not be read,
+	// so the built-in floor is in use instead of the operator's value. Reported
+	// on the job rather than swallowed (#2192 review).
+	ReviewClassFallbackReason string
 }
 
 func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (managedJobRuntimeConfig, error) {
@@ -4042,7 +4059,17 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 		// job_timeout (#2191). Fails OPEN to the built-in default: an unreadable
 		// router section must not silently remove the floor that stops a
 		// rotated review from aborting mid-analysis.
-		if routerSettings, routerErr := config.LoadReviewRouterSettings(paths); routerErr == nil && routerSettings.JobTimeout > 0 {
+		routerSettings, routerErr := config.LoadReviewRouterSettings(paths)
+		switch {
+		case routerErr != nil:
+			runtimeConfig.ReviewJobTimeout = config.DefaultReviewJobTimeout
+			// FAIL OPEN, BUT SAY SO (#2192 review, P3). A malformed
+			// [review_router] silently restored the built-in 3h, so an operator
+			// who deliberately set a SHORTER class deadline got one six times
+			// longer with nothing logged - the fallback was indistinguishable
+			// from an absent key.
+			runtimeConfig.ReviewClassFallbackReason = routerErr.Error()
+		case routerSettings.JobTimeout > 0:
 			runtimeConfig.ReviewJobTimeout = routerSettings.JobTimeout
 		}
 	}
@@ -4170,7 +4197,15 @@ func resolveEffectiveJobTimeout(payload workflow.JobPayload, managed managedJobR
 	// A FLOOR, not an assignment: an agent configured LONGER keeps its own
 	// value. The daemon's job_timeout_max still clamps the result, so this
 	// cannot raise a review above the operator's ceiling.
-	if managed.ReviewJobTimeout > 0 && isReviewPayload(payload) && requested < managed.ReviewJobTimeout {
+	// AN EXPLICIT PER-JOB TIMEOUT WINS OVER THE FLOOR (#2192 review, P3).
+	//
+	// Without this a coordinator that deliberately caps a review - JobTimeout
+	// "15m" on the payload - silently got 3h, so a delegation timeout could not
+	// bound a review at all. That is the same principle this campaign already
+	// applied to runtimes: the router routes, it does not OVERRULE a stated
+	// choice. The floor exists to stop an UNSTATED deadline being inherited
+	// from whichever agent was selected, not to overrule an operator.
+	if managed.ReviewJobTimeout > 0 && source != "payload" && isReviewPayload(payload) && requested < managed.ReviewJobTimeout {
 		requested = managed.ReviewJobTimeout
 		source = "review class"
 	}
