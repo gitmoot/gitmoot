@@ -519,6 +519,13 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	if exit != 0 {
 		return exit
 	}
+	// #2194: attach the requester's verdict wait, which only `review request`
+	// used to do. Measured 2026-09-16: 687 of 688 reviews on this box came
+	// through this command, so in practice NO review subscribed anyone and
+	// every verdict was relayed by hand - and twice in one day a published
+	// verdict left its requester still waiting. Dispatching is not the same as
+	// being told the answer.
+	attachReviewVerdictWait(&output, options, stderr)
 	if options.jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
 			fmt.Fprintf(stderr, "agent review: %v\n", err)
@@ -529,6 +536,44 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	printLocalAgentJobOutput(stdout, output)
 	printQueuedDaemonHint(stdout, output, options.background, options.home)
 	return 0
+}
+
+// attachReviewVerdictWait subscribes the acting org role to this review's
+// verdict at the dispatched head (#2194). It NEVER fails the dispatch: the
+// review is already queued and killing a queued review to report a bookkeeping
+// error would be worse than reporting the gap. Every reason for not attaching is
+// stated in SubscriptionHolds rather than left silent, because an absent
+// subscription is indistinguishable from a working one until the wait expires.
+func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOptions, stderr io.Writer) {
+	role := strings.TrimSpace(options.orgRole)
+	head := strings.TrimSpace(options.headSHA)
+	switch {
+	case role == "":
+		output.SubscriptionHolds = append(output.SubscriptionHolds,
+			"no --org-role, so nobody is subscribed to this verdict: it will have to be relayed by hand")
+		return
+	case head == "":
+		output.SubscriptionHolds = append(output.SubscriptionHolds,
+			"no --head-sha, so an exact-head wait cannot be attached: pass the full 40-character head to be woken on the verdict")
+		return
+	case options.prNumber <= 0:
+		return
+	}
+	if err := withStore(options.home, func(store *db.Store) error {
+		factID, holds, err := subscribeRoleToReviewVerdict(context.Background(), store, role,
+			options.repo, options.prNumber, head, db.DefaultReviewPurpose, defaultReviewRequestTTL)
+		if err != nil {
+			return err
+		}
+		output.AwaitedFactID = factID
+		output.SubscriptionHolds = append(output.SubscriptionHolds, holds...)
+		return nil
+	}); err != nil {
+		// Reported, not swallowed and not fatal: the review is dispatched.
+		fmt.Fprintf(stderr, "agent review: warning: could not subscribe %s to the verdict: %v\n", role, err)
+		output.SubscriptionHolds = append(output.SubscriptionHolds,
+			fmt.Sprintf("subscription failed (%v): this verdict will not wake %s", err, role))
+	}
 }
 
 func runAgentImplement(args []string, stdout, stderr io.Writer) int {

@@ -1147,3 +1147,135 @@ func assertReviewLeadHardRefusal(t *testing.T, store *db.Store, checkout string,
 		t.Fatalf("adapter calls = %d, want zero after hard refusal", adapter.calls)
 	}
 }
+
+// #2194: `agent review` must subscribe the acting role to the verdict, the way
+// `review request` always has. Measured 2026-09-16: 687 of 688 reviews on this
+// box were dispatched by this command, so in practice no review subscribed
+// anyone and every verdict was relayed by hand - and twice in one day a
+// published verdict left its requester still waiting for it.
+func TestAgentReviewSubscribesTheActingRoleToTheVerdict(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."joltra"]
+parent = "owner"
+scope = ["owner/repo"]
+`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	args := []string{
+		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	// The wait must exist in the STORE, keyed to this exact head and purpose -
+	// not merely be printed.
+	waiting, err := store.ListAwaitedFacts(context.Background(), "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, fact := range waiting {
+		if fact.SubjectKind == db.AwaitedFactSubjectReviewVerdict && fact.SubjectKey == wantKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("joltra holds no wait on %s: waiting=%+v", wantKey, waiting)
+	}
+	if !strings.Contains(stdout.String(), "awaiting verdict: fact ") {
+		t.Fatalf("stdout = %q, want the attached wait reported", stdout.String())
+	}
+
+	// Dispatching twice at the same head must not spend a second wait. NOTE THE
+	// DEFENDER: this is guaranteed by the STORE - a unique index on
+	// (waiter_role, subject_kind, subject_key) WHERE state='waiting' plus
+	// ON CONFLICT in SubscribeAwaitedFact - not by the pre-check loop in
+	// subscribeRoleToReviewVerdict, which is only a fast path. Removing that
+	// loop leaves this assertion passing, and that is correct rather than a
+	// coverage gap; the assertion pins the contract a caller observes, which is
+	// defended one layer down.
+	var stdout2, stderr2 bytes.Buffer
+	if code := runAgentReview(args, &stdout2, &stderr2); code != 0 {
+		t.Fatalf("second review exit=%d stderr=%q", code, stderr2.String())
+	}
+	after, err := store.ListAwaitedFacts(context.Background(), "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(waiting) {
+		t.Fatalf("waits grew from %d to %d on a repeat dispatch at the same head", len(waiting), len(after))
+	}
+}
+
+// A dispatch that cannot be woken must SAY so: an absent subscription is
+// indistinguishable from a working one until the wait expires (#2194).
+func TestAgentReviewReportsWhenNoVerdictWaitCanBeAttached(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	code := runAgentReview([]string{
+		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--foreground", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("review exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "not awaiting verdict: no --org-role") {
+		t.Fatalf("stdout = %q, want the missing-role hold stated", stdout.String())
+	}
+}

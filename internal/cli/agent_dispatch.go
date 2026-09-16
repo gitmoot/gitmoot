@@ -223,6 +223,14 @@ type localAgentJobOutput struct {
 	// race). The terminal-success result is still surfaced; this carries the
 	// advance warning so it is not silently lost.
 	AdvanceError string `json:"advance_error,omitempty"`
+	// AwaitedFactID is the requester's wait on this review's verdict at this
+	// exact head, attached by `agent review` as `review request` already did
+	// (#2194). Zero means no wait was attached; SubscriptionHolds says why.
+	AwaitedFactID int64 `json:"awaited_fact_id,omitempty"`
+	// SubscriptionHolds names reasons the verdict may never satisfy the wait -
+	// a head-blind review, or a dispatch with no head or no acting role. A
+	// requester that is not told waits its full TTL believing one is coming.
+	SubscriptionHolds []string `json:"subscription_holds,omitempty"`
 }
 
 // routerChosenReviewRuntime resolves the runtime a review dispatch should run
@@ -2405,6 +2413,12 @@ func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
 	writeLine(stdout, "action: %s", output.Action)
 	if output.AdvanceError != "" {
 		writeLine(stdout, "advance_error: %s", output.AdvanceError)
+	}
+	if output.AwaitedFactID != 0 {
+		writeLine(stdout, "awaiting verdict: fact %d (you will be woken when it is saved)", output.AwaitedFactID)
+	}
+	for _, hold := range output.SubscriptionHolds {
+		writeLine(stdout, "not awaiting verdict: %s", hold)
 	}
 	if output.WatchCommand != "" {
 		writeLine(stdout, "next: %s", output.WatchCommand)
