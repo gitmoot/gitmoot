@@ -3050,7 +3050,8 @@ func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
-	for _, id := range []string{"review-pr-41-first", "review-pr-41-second"} {
+	taskIDs := []string{"review-pr-41-first", "review-pr-41-second"}
+	for _, id := range taskIDs {
 		if err := store.UpsertTask(ctx, db.Task{
 			ID:           id,
 			RepoFullName: repo.FullName(),
@@ -3061,7 +3062,8 @@ func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
 		}
 	}
 	client := &fakeGitHub{}
-	engine := workflow.Engine{Store: store}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
 	err := daemon.handleMergeCommand(ctx,
@@ -3072,6 +3074,18 @@ func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
 	}
 	if len(client.posted) != 1 {
 		t.Fatalf("posted acknowledgements = %+v, want one", client.posted)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for ambiguous task identity", gate.requests)
+	}
+	for _, id := range taskIDs {
+		task, err := store.GetTask(ctx, id)
+		if err != nil {
+			t.Fatalf("GetTask(%s): %v", id, err)
+		}
+		if task.State != string(workflow.TaskReadyToMerge) {
+			t.Fatalf("task %s state = %q, want unchanged %q", id, task.State, workflow.TaskReadyToMerge)
+		}
 	}
 	for _, want := range []string{
 		"Gitmoot cannot merge PR #41 because multiple branchless tasks match it",
