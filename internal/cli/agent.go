@@ -530,9 +530,19 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	// keeping. The caller's message and --lead survive because they were added
 	// to that command first; delegating without them would have silently dropped
 	// every seat's review instructions and its fix target.
-	if !options.foreground {
+	//
+	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
+	// them, and both SAY SO rather than degrading quietly.
+	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
 		return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
 	}
+	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
+	// REQUIRES --role because the role is who the verdict is delivered to, and a
+	// review nobody receives is the defect #2194 exists to fix. Failing the
+	// dispatch instead would break every caller that reviews without a role
+	// (TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer is one), so
+	// the direct path stays and the #2194 hold below states the consequence.
+	//
 	// FOREGROUND IS NOT DELEGATED AND THAT IS A STATED LIMIT, not an oversight.
 	// `review request` always dispatches a daemon-owned job; a foreground review
 	// runs in this process and streams. Converting it would change what the
