@@ -3134,6 +3134,17 @@ func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest
 	return d.ack(ctx, pull.Number, strings.Join(lines, "\n"))
 }
 
+type ambiguousMergeCommandTasksError struct {
+	repo        string
+	pullRequest int64
+	taskIDs     []string
+}
+
+func (e *ambiguousMergeCommandTasksError) Error() string {
+	return fmt.Sprintf("ambiguous merge-command tasks for %s#%d: %s",
+		e.repo, e.pullRequest, strings.Join(e.taskIDs, ", "))
+}
+
 // lookupMergeCommandTask extends ordinary branch routing for branchless local
 // review tasks. Their stable id carries the PR number; the merge gate still
 // revalidates the current head and exact-head approval before any merge.
@@ -3178,8 +3189,9 @@ func (d Daemon) lookupMergeCommandTask(ctx context.Context, pull github.PullRequ
 		for _, candidate := range candidates {
 			ids = append(ids, candidate.ID)
 		}
-		return db.Task{}, fmt.Errorf("ambiguous merge-command tasks for %s#%d: %s",
-			d.Repo.FullName(), pull.Number, strings.Join(ids, ", "))
+		return db.Task{}, &ambiguousMergeCommandTasksError{
+			repo: repo, pullRequest: pull.Number, taskIDs: ids,
+		}
 	}
 }
 
@@ -3191,6 +3203,12 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
+		}
+		var ambiguous *ambiguousMergeCommandTasksError
+		if errors.As(err, &ambiguous) {
+			return d.ack(ctx, pull.Number, fmt.Sprintf(
+				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Remedy: resolve the duplicate task state, then retry `/gitmoot merge`.",
+				pull.Number, strings.Join(ambiguous.taskIDs, "`, `")))
 		}
 		return err
 	}

@@ -3046,6 +3046,44 @@ func TestPollOnceMergeCommandRequiresReadyTask(t *testing.T) {
 	}
 }
 
+func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	for _, id := range []string{"review-pr-41-first", "review-pr-41-second"} {
+		if err := store.UpsertTask(ctx, db.Task{
+			ID:           id,
+			RepoFullName: repo.FullName(),
+			Title:        "Ambiguous branchless review",
+			State:        string(workflow.TaskReadyToMerge),
+		}); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", id, err)
+		}
+	}
+	client := &fakeGitHub{}
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	err := daemon.handleMergeCommand(ctx,
+		github.PullRequest{Number: 41, State: "open", HeadRef: "fix/operator-output", BaseRef: "main", HeadSHA: "current123"},
+		github.IssueComment{ID: 42, Body: "/gitmoot merge", Author: "operator"})
+	if err != nil {
+		t.Fatalf("handleMergeCommand: %v", err)
+	}
+	if len(client.posted) != 1 {
+		t.Fatalf("posted acknowledgements = %+v, want one", client.posted)
+	}
+	for _, want := range []string{
+		"Gitmoot cannot merge PR #41 because multiple branchless tasks match it",
+		"`review-pr-41-first`, `review-pr-41-second`",
+		"Remedy: resolve the duplicate task state, then retry `/gitmoot merge`",
+	} {
+		if !strings.Contains(client.posted[0].body, want) {
+			t.Fatalf("operator-visible reply %q does not contain %q", client.posted[0].body, want)
+		}
+	}
+}
+
 func testGateMissReason(t *testing.T, category, cause, headSHA string) workflow.MergeReason {
 	t.Helper()
 	reason, err := workflow.GateMissReason(category, cause, headSHA)
