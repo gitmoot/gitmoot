@@ -443,7 +443,12 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	// misreports an explicit --model and made a working override look dropped
 	// (#2196 review). request.Model and request.Runtime are what the job carries.
 	output.Model = request.Model
-	output.Runtime = request.Runtime
+	// THE RESOLVED RUNTIME, NOT THE OVERRIDE FIELD. request.Runtime is
+	// deliberately EMPTY when the router's choice equals the reviewer's
+	// registered runtime, which is the normal case for a named reviewer - so
+	// reporting it left the printer fabricating "omp" for a review running on
+	// claude (#2196 review, P2).
+	output.Runtime = effectiveReviewRuntime(opts.runtime, selectedRuntime)
 	output.WatchCommand = jobWatchCommand(dispatched.JobID, opts.home)
 	if err := subscribeReviewRequester(ctx, store, &output, opts); err != nil {
 		return reviewRequestOutput{}, err
@@ -795,6 +800,9 @@ func attachDiscardedInputs(output reviewRequestOutput, opts reviewRequestOptions
 	if lead := strings.TrimSpace(opts.lead); lead != "" {
 		holds = append(holds, fmt.Sprintf("your --lead %s was NOT applied: a changes-requested verdict routes wherever the running review says", lead))
 	}
+	if wanted := strings.TrimSpace(opts.runtime); wanted != "" && !strings.EqualFold(wanted, output.Runtime) {
+		holds = append(holds, fmt.Sprintf("your --runtime %s was NOT used: the running review is on %s", wanted, firstNonEmpty(output.Runtime, "an unreported runtime")))
+	}
 	if model := strings.TrimSpace(opts.model); model != "" && !strings.EqualFold(model, output.Model) {
 		holds = append(holds, fmt.Sprintf("your --model %s was NOT used: the running review carries %s", model, output.Model))
 	}
@@ -807,6 +815,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	output.JobState = job.State
 	output.Reviewer = job.Agent
 	output.Model = job.Model
+	output.Runtime = job.Runtime
 	output.WatchCommand = jobWatchCommand(output.JobID, opts.home)
 	if job.ID == "" {
 		// The holder is inside its dispatch window: the job is real and coming,
@@ -823,6 +832,19 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 		}
 		if strings.TrimSpace(payload.Model) != "" {
 			output.Model = payload.Model
+		}
+		// The job's OVERRIDE wins over its registered runtime: that is what it
+		// is running on. Left unset, every attach printed the fabricated "omp".
+		if strings.TrimSpace(payload.RuntimeOverride) != "" {
+			output.Runtime = payload.RuntimeOverride
+		}
+	}
+	// NO OVERRIDE MEANS THE AGENT'S OWN RUNTIME, which is what the job will run
+	// on - resolved from the agent row rather than guessed, because the job row
+	// carries the override and not the registered runtime (#2196 review, P2).
+	if strings.TrimSpace(output.Runtime) == "" && strings.TrimSpace(output.Reviewer) != "" {
+		if agent, err := store.GetAgent(ctx, output.Reviewer); err == nil {
+			output.Runtime = agent.Runtime
 		}
 	}
 	output.Holds = append(output.Holds, attachDiscardedInputs(output, opts)...)
@@ -1342,7 +1364,11 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 		// dropped. That is worse than a silent drop: a silent drop produces no
 		// evidence, this produced POSITIVE FALSE EVIDENCE, and someone would
 		// have re-fixed a bug that was already fixed.
-		fmt.Fprintf(w, "reviewer: %s on %s model %s\n", output.Reviewer, firstNonEmpty(output.Runtime, "omp"), output.Model)
+		// NO FALLBACK. A default that is also a legal value cannot be told from
+		// a choice, and "omp" was BOTH the fallback and a real runtime - so the
+		// line read identically whether the runtime was known or invented. An
+		// unknown runtime now says so (#2196 review, P2).
+		fmt.Fprintf(w, "reviewer: %s on %s model %s\n", output.Reviewer, firstNonEmpty(output.Runtime, "an unreported runtime"), output.Model)
 	}
 	if output.Verdict != "" {
 		fmt.Fprintf(w, "verdict: %s (already saved; no new review spent)\n", output.Verdict)

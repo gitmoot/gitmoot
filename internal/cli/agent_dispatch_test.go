@@ -1598,6 +1598,17 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	}), "--session") {
 		t.Fatal("--session is not forwarded to review request")
 	}
+
+	// 13. THE RUNTIME REPORTED MUST BE THE ONE RESOLVED, NOT A FALLBACK. "omp"
+	// was both the fallback and a real runtime, so the line read identically
+	// whether the runtime was known or invented - a default indistinguishable
+	// from a choice, which is this week's unifying defect (#2196 review, P2).
+	if strings.Contains(stdout.String(), "on an unreported runtime") {
+		t.Fatalf("stdout = %q, want the resolved runtime reported", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "reviewer: dual-reviewer on shell model") {
+		t.Fatalf("stdout = %q, want the reviewer's own registered runtime (shell) reported rather than a fabricated omp", stdout.String())
+	}
 	// 12. THE OUTPUT MUST NOT MISREPORT WHAT IT DISPATCHED. This line hardcoded
 	// "on omp model" and printed pool[0], so an operator passing --model saw the
 	// pool head and concluded the override was dropped - positive false evidence,
@@ -1640,6 +1651,12 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 			t.Fatalf("attach output = %q, want %q: a caller told it is awaiting a verdict must be told its own inputs were discarded",
 				stdout3.String(), want)
 		}
+	}
+	// AND THE ATTACH PATH MUST REPORT THE RUNNING REVIEW'S RUNTIME. It set
+	// output.Runtime nowhere, so every attach printed the fabricated "omp"
+	// regardless of what the job runs on (#2196 review, P2).
+	if !strings.Contains(stdout3.String(), "on shell model") {
+		t.Fatalf("attach output = %q, want the running review's own runtime reported, not a fabricated omp", stdout3.String())
 	}
 }
 
@@ -1878,5 +1895,73 @@ func TestAttachingRequestIsToldWhatWasDiscarded(t *testing.T) {
 		reviewRequestOptions{reviewer: "Reviewer", model: "devin/swe-2"},
 	); len(holds) != 0 {
 		t.Fatalf("holds = %v, want none when the running review already matches the request", holds)
+	}
+}
+
+// #2196 review (P3): the round-5 rewrite replaced the only END-TO-END session
+// assertion with an argument-builder probe, which proves FORWARDING and not
+// HONORING - a mutant deleting the one-line `RuntimeSession` mapping this PR
+// added passed the whole suite. For a PR whose defect class is silently-dropped
+// inputs, the newest carried input had lost its only real guard.
+//
+// Uses --runtime shell --session <command>, which is valid and needs NO host
+// binary: that is what made the previous attempt CI-red.
+func TestReviewRequestHonorsTheForwardedSession(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "shell-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	if code := runReviewRequest([]string{
+		"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review",
+		"--role", "joltra", "--reviewer", "shell-reviewer",
+		"--runtime", runtime.ShellRuntime, "--session", "true", "--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review request exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	jobs, listErr := store.ListJobs(ctx)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want one", jobs)
+	}
+	payload, err := daemonJobPayload(jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.RuntimeOverrideRef != "true" {
+		t.Fatalf("runtime override ref = %q, want the forwarded session HONORED in the payload", payload.RuntimeOverrideRef)
+	}
+	if payload.RuntimeOverride != runtime.ShellRuntime {
+		t.Fatalf("runtime override = %q, want shell", payload.RuntimeOverride)
+	}
+	// AND THE OUTPUT REPORTS THAT RUNTIME rather than a fabricated omp.
+	if !strings.Contains(stdout.String(), "on shell model") {
+		t.Fatalf("stdout = %q, want the dispatched runtime reported", stdout.String())
 	}
 }
