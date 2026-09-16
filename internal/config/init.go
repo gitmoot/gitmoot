@@ -425,8 +425,8 @@ path = ""
 # [org.roles.*] entry turns enforcement on. One parent-less role is the org
 # owner; child scopes must be subsets of their parent's scope. scope accepts
 # "*" (all repos), "owner/*", or exact "owner/name". enforce is "block"
-# (default) or "warn". Scope is checked at dispatch; merge_rule is advisory in
-# this phase (owner | self | none).
+# (default) or "warn". Scope is checked at dispatch; merge_rule is enforced for
+# explicit /gitmoot merge commands and advisory elsewhere (owner | self | none).
 # [org]
 # enforce = "block"
 # directive_ack_ttl = "10m"

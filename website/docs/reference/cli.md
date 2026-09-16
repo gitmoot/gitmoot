@@ -1718,8 +1718,8 @@ remains policy-gated.
 ### Organization registry and scoped dispatch
 
 The optional `[org]` registry is enabled by any `[org.roles."name"]` section.
-Roles have `parent`, `scope`, advisory `merge_rule` (`owner`, `self`, or
-`none`), an optional `model` runtime pin, an optional per-role `recycle_after`
+Roles have `parent`, `scope`, `merge_rule` (`owner`, `self`, or `none`), an
+optional `model` runtime pin, an optional per-role `recycle_after`
 duration override, and an optional Herdr `pane` used by live presence and
 event-rule wakes; exactly one parent-less role is required.
 Scope entries are `*`, `owner/*`, or exact `owner/name`, and child scope must be
@@ -1734,7 +1734,8 @@ review`, `agent implement`, `orchestrate`, and `task run` dispatches require
 `--org-role <role>` (or `GITMOOT_ORG_ROLE`) and reject out-of-scope repositories
 at enqueue.
 `enforce = "block"` is the default; `"warn"` allows the job and records an
-`org_scope_violation` event. Merge rules are advisory in this phase.
+`org_scope_violation` event. Merge rules are enforced for explicit
+`/gitmoot merge` commands and advisory on other paths.
 
 `gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
 [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
@@ -2376,6 +2377,14 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot resume <job-id> retry|continue|abort|answer [instructions]
 @<agent> ask|review|implement [instructions]
 ```
+
+`/gitmoot merge` always posts the outcome it observed. A refusal names the
+cause and remedy, including an acting role whose `merge_rule` denies the
+operation, a repository ruleset that requires GitHub's merge queue, no approval
+for the current head, or an approval bound to an ancestor head. When
+`merge_gate.auto_merge = false`, the reply also states that no earlier
+`gitmoot/merge-gate` marker was expected: absence of that marker is not evidence
+that the gate passed. The explicit command still runs the gate.
 
 A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
 `--watch-issues` flag, an issue comment) is treated as the same command as the

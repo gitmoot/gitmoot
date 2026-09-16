@@ -3134,14 +3134,80 @@ func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest
 	return d.ack(ctx, pull.Number, strings.Join(lines, "\n"))
 }
 
+type ambiguousMergeCommandTasksError struct {
+	repo    string
+	taskIDs []string
+}
+
+func (e *ambiguousMergeCommandTasksError) Error() string {
+	return fmt.Sprintf("ambiguous merge-command tasks for %s: %s",
+		e.repo, strings.Join(e.taskIDs, ", "))
+}
+
+// lookupMergeCommandTask extends ordinary branch routing for branchless local
+// review tasks. Their stable id carries the PR number; the merge gate still
+// revalidates the current head and exact-head approval before any merge.
+func (d Daemon) lookupMergeCommandTask(ctx context.Context, pull github.PullRequest) (db.Task, error) {
+	repo := d.Repo.FullName()
+	if !d.pullRequestHeadIsLocal(pull) {
+		d.logf("task resolution refused for %s#%d: reason=fork_head repo=%q head_repo=%q head_ref=%q",
+			repo, pull.Number, repo, pull.HeadRepoFullName, pull.HeadRef)
+		return db.Task{}, sql.ErrNoRows
+	}
+	task, err := d.lookupPullRequestTask(ctx, repo, pull.HeadRef)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) || errors.Is(err, errTaskRepoMismatch) {
+		return task, err
+	}
+	tasks, listErr := d.Store.ListTasksByRepo(ctx, d.Repo.FullName())
+	if listErr != nil {
+		return db.Task{}, listErr
+	}
+	candidates := make([]db.Task, 0, 1)
+	for _, candidate := range tasks {
+		if strings.TrimSpace(candidate.Branch) != "" {
+			continue
+		}
+		if candidate.State != string(workflow.TaskReadyToMerge) &&
+			candidate.State != string(workflow.TaskAwaitingHumanMerge) {
+			continue
+		}
+		number, ok := reviewTaskPullRequestNumber(candidate.ID)
+		if ok && number == pull.Number {
+			candidates = append(candidates, candidate)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		d.logf("task resolution refused for %s#%d: reason=no_task_for_branch repo=%q head_repo=%q head_ref=%q",
+			repo, pull.Number, repo, pull.HeadRepoFullName, pull.HeadRef)
+		return db.Task{}, sql.ErrNoRows
+	case 1:
+		return candidates[0], nil
+	default:
+		ids := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			ids = append(ids, candidate.ID)
+		}
+		return db.Task{}, &ambiguousMergeCommandTasksError{
+			repo: repo, taskIDs: ids,
+		}
+	}
+}
+
 func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
 	if d.Workflow == nil {
 		return d.ack(ctx, pull.Number, "Gitmoot cannot merge this PR because the workflow engine is not configured.")
 	}
-	task, err := d.lookupPolledPullRequestTask(ctx, pull)
+	task, err := d.lookupMergeCommandTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
+		}
+		var ambiguous *ambiguousMergeCommandTasksError
+		if errors.As(err, &ambiguous) {
+			return d.ack(ctx, pull.Number, fmt.Sprintf(
+				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Remedy: dismiss every stale duplicate with `gitmoot task dismiss <task-id> --reason \"duplicate branchless PR task\"`, leave one listed task ready to merge, then retry `/gitmoot merge`.",
+				pull.Number, strings.Join(ambiguous.taskIDs, "`, `")))
 		}
 		return err
 	}
@@ -3152,6 +3218,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s` or `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge))
 	}
 	leadAgent := "github"
+	actingOrgRole := ""
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err == nil {
 		if lock.SkipNativeReviewFanout {
@@ -3160,6 +3227,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		if strings.TrimSpace(lock.Owner) != "" {
 			leadAgent = lock.Owner
 		}
+		actingOrgRole = strings.TrimSpace(lock.ActingOrgRole)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -3167,7 +3235,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if err != nil {
 		return err
 	}
-	err = d.Workflow.HandlePullRequestReadyToMerge(ctx, workflow.PullRequestEvent{
+	decision, err := d.Workflow.HandlePullRequestReadyToMergeDecision(ctx, workflow.PullRequestEvent{
 		Repo:                    d.Repo.FullName(),
 		Branch:                  firstNonEmpty(task.Branch, pull.HeadRef),
 		PullRequest:             int(pull.Number),
@@ -3180,12 +3248,13 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		LeadAgent:               leadAgent,
 		Sender:                  comment.Author,
 		RequiredReviewers:       reviewers,
+		ActingOrgRole:           actingOrgRole,
 		HumanMergeRequested:     true,
 	})
 	if err != nil {
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
-			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merge is blocked: %s.", blocked.Reason))
+			return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, blocked.Reason, true))
 		}
 		return err
 	}
@@ -3196,7 +3265,23 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if task.State == string(workflow.TaskMerged) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
 	}
-	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merge gate ran; task `%s` is `%s`.", task.ID, task.State))
+	return d.ack(ctx, pull.Number, d.mergeCommandRefusal(pull.Number, decision.Reason.Render(), false))
+}
+
+func (d Daemon) mergeCommandRefusal(pullRequest int64, reason string, taskBlocked bool) string {
+	reason = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(reason), "."))
+	if reason == "" {
+		reason = "the merge gate did not report a reason; inspect `/gitmoot status` and daemon logs"
+	}
+	summary := fmt.Sprintf("Gitmoot did not merge PR #%d.", pullRequest)
+	if taskBlocked {
+		summary = fmt.Sprintf("Gitmoot did not merge PR #%d; the task is now `blocked`.", pullRequest)
+	}
+	message := fmt.Sprintf("%s\n\nCause: %s.", summary, reason)
+	if d.AutoMergeEnabled != nil && !d.AutoMergeEnabled(d.Repo.FullName()) {
+		message += "\n\nNote: `merge_gate.auto_merge = false`, so no prior `gitmoot/merge-gate` marker was expected. Its absence does not mean the gate passed; this explicit `/gitmoot merge` request ran the gate now."
+	}
+	return message
 }
 
 func (d Daemon) jobStateCounts(ctx context.Context, pull github.PullRequest, taskID string) (map[string]int, error) {

@@ -2704,6 +2704,14 @@ does not weaken exact-head review: if a reviewed head needs a branch update, the
 gate blocks without changing it. Update the branch explicitly, then obtain a new
 review for the new head.
 
+`/gitmoot merge` always posts the outcome it observed. A refusal names the
+cause and remedy, including an acting role whose `merge_rule` denies the
+operation, a repository ruleset that requires GitHub's merge queue, no approval
+for the current head, or an approval bound to an ancestor head. When
+`merge_gate.auto_merge = false`, the reply also states that no earlier
+`gitmoot/merge-gate` marker was expected: absence of that marker is not evidence
+that the gate passed. The explicit command still runs the gate.
+
 A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
 `--watch-issues` flag, an issue comment) is treated as the same command as the
 `/gitmoot <agent> <action>` form (#389). `/gitmoot resume <jobID>

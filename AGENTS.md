@@ -457,14 +457,14 @@ earlier draft compressed it to "clean head plus one independent verdict", which
 silently dropped the non-empty `tests_run` evidence bar and the immediate
 pre-merge re-read - the two that caught a verdict which executed nothing and
 every head that moved under a review. One review is sufficient; another model
-family is preferred when available but never a gate. The `merge_rule`
-field is **advisory** — `merge_gate.go` never reads it (`internal/config/org.go`
-calls it "deliberately advisory in phase 1a"), so nothing mechanically stops a
-merge you are not entitled to make; the gate enforces exact-head review, CI and
-attribution, never role authority. Advisory cuts the other way too: **an armed
-engine merge gate may merge on its own approval-plus-green conditions, with no
-`merge_rule` holder acting at all**, so a holder MUST NOT rely on parking a local
-commit to protect a merge window. #1731 merged itself at 2026-09-02T11:23:26Z as
+family is preferred when available but never a gate. `/gitmoot merge` enforces
+the acting role's `merge_rule` from the durable branch lock: `"owner"` refuses
+a non-root acting role, while `"none"` refuses every acting role; each refusal
+names the remedy. Other merge paths
+remain advisory: **an armed engine merge gate may merge on its own
+approval-plus-green conditions, with no `merge_rule` holder acting at all**, so
+a holder MUST NOT rely on parking a local commit to protect a merge window.
+#1731 merged itself at 2026-09-02T11:23:26Z as
 squash `250b3fad` ("Gitmoot merge review-pr-1731-3f3a1026", committer GitHub);
 `merge_gates` row 963 flipped to `state=merged` four seconds later and six
 seconds *before* the approving verdict comment posted, and four fixes held back

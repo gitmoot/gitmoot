@@ -786,6 +786,19 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 		}
 		policy = config.DefaultMergeGatePolicy()
 	}
+	if request.HumanMergeRequested {
+		denied, reason := mergeRuleRefusal(g.Home, request.ActingOrgRole)
+		if denied {
+			gateReason, reasonErr := workflow.GateMissReason("org merge rule", reason, request.HeadSHA)
+			if reasonErr != nil {
+				return workflow.MergeDecision{}, reasonErr
+			}
+			if err := g.escalateMergeGateMiss(ctx, request, gateReason); err != nil {
+				return workflow.MergeDecision{}, err
+			}
+			return workflow.MergeDecision{LeaveOpen: true, Reason: gateReason}, nil
+		}
+	}
 	if !policy.AutoMerge && !request.HumanMergeRequested && !recoveryOnly {
 		if g.Store != nil && strings.TrimSpace(request.TaskID) != "" {
 			claimed, claimErr := g.Store.HasTaskStateClaim(ctx, request.TaskID)
@@ -836,6 +849,43 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 		return workflow.MergeDecision{}, err
 	}
 	return decision, nil
+}
+
+func mergeRuleRefusal(home, actingRole string) (bool, string) {
+	actingRole = strings.TrimSpace(actingRole)
+	if actingRole == "" {
+		return false, ""
+	}
+	orgConfig, loaded := loadMergeGateOrgConfig(home)
+	if !loaded || orgConfig.Enforce() == "warn" {
+		return false, ""
+	}
+	role, ok := orgConfig.Role(actingRole)
+	if !ok {
+		return false, ""
+	}
+	switch strings.ToLower(strings.TrimSpace(role.MergeRule)) {
+	case "self":
+		return false, ""
+	case "owner":
+		if role.Parent == "" {
+			return false, ""
+		}
+		roots := orgConfig.Roots()
+		owner := "the owner role"
+		if len(roots) == 1 {
+			owner = fmt.Sprintf("owner role `%s`", roots[0])
+		}
+		return true, fmt.Sprintf(
+			"branch lock records acting role `%s`, whose `merge_rule = \"owner\"` reserves the merge for %s; `/gitmoot merge` refuses this branch whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
+			role.Name, owner)
+	case "none":
+		return true, fmt.Sprintf(
+			"branch lock records acting role `%s`, whose `merge_rule = \"none\"` cannot merge. Remedy: use a branch owned by a role with merge authority, or change this role's merge rule before retrying `/gitmoot merge`",
+			role.Name)
+	default:
+		return false, ""
+	}
 }
 
 // escalateMergeGateMiss writes the durable, operator-read escalation note. It is a DELIVERY
