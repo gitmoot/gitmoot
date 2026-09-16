@@ -1224,14 +1224,25 @@ scope = ["owner/repo"]
 		t.Fatalf("stdout = %q, want the attached wait reported", stdout.String())
 	}
 
-	// Dispatching twice at the same head must not spend a second wait. NOTE THE
-	// DEFENDER: this is guaranteed by the STORE - a unique index on
-	// (waiter_role, subject_kind, subject_key) WHERE state='waiting' plus
-	// ON CONFLICT in SubscribeAwaitedFact - not by the pre-check loop in
-	// subscribeRoleToReviewVerdict, which is only a fast path. Removing that
-	// loop leaves this assertion passing, and that is correct rather than a
-	// coverage gap; the assertion pins the contract a caller observes, which is
-	// defended one layer down.
+	// Dispatching twice at the same head must not spend a second wait.
+	//
+	// THREE DEFENDERS, NAMED SEPARATELY, because two earlier versions of this
+	// comment each credited the wrong one and each would have told a reader that
+	// a load-bearing line was safe to delete:
+	//   1. DEDUP (no second row) - the store: a unique index on
+	//      (waiter_role, subject_kind, subject_key) WHERE state='waiting' plus
+	//      ON CONFLICT in SubscribeAwaitedFact. Breaking ON CONFLICT kills the
+	//      row-count assertion; deleting the pre-check loop does not.
+	//   2. DEADLINE PRESERVATION - the pre-check loop in
+	//      subscribeRoleToReviewVerdict. ON CONFLICT EXTENDS a deadline when the
+	//      joiner's is later and every re-dispatch computes now+ttl, so without
+	//      the loop a role re-dispatching its own review pushes its expiry out
+	//      each time, and a wait that never expires never escalates.
+	//   3. HOLD SUPPRESSION - also the loop: it returns before the insert, so a
+	//      repeat dispatch does not re-emit the same head-blind holds.
+	// A comment naming a guard's defender is a claim about CAUSATION, and
+	// causation is what reading cannot establish. Each line above was checked by
+	// running the mutant that breaks only that defender.
 	var stdout2, stderr2 bytes.Buffer
 	if code := runAgentReview(args, &stdout2, &stderr2); code != 0 {
 		t.Fatalf("second review exit=%d stderr=%q", code, stderr2.String())
@@ -1326,5 +1337,101 @@ func TestAgentReviewReportsWhenNoVerdictWaitCanBeAttached(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "not awaiting verdict: no --org-role") {
 		t.Fatalf("stdout = %q, want the missing-role hold stated", stdout.String())
+	}
+}
+
+// #2194 review: the attach site used to HARDCODE db.DefaultReviewPurpose. That
+// is correct only while `agent review` cannot express another purpose - and the
+// person who adds --purpose would inherit a wait keyed to "code" while the
+// review runs as something else, reading a comment that said the line was fine.
+// Correct-by-unreachability is the signature defect of this very subsystem
+// (#2180's fallback), so the purpose is now READ FROM THE DISPATCHED JOB.
+//
+// Driven through the real helper against a real job row, because the CLI has no
+// flag to express a non-default purpose yet: that is exactly why a test is
+// needed now rather than when the flag lands.
+func TestAgentReviewWaitUsesTheJobsOwnReviewPurpose(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	const head = "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"
+	payload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, ReviewPurpose: "security"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "job-purpose-derived", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobQueued), Repo: "owner/repo", PullRequest: 12, Payload: string(payload),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	output := localAgentJobOutput{JobID: "job-purpose-derived"}
+	var stderr bytes.Buffer
+	attachReviewVerdictWait(&output, agentRunOptions{
+		home: home, repo: "owner/repo", prNumber: 12, headSHA: head, orgRole: "joltra",
+	}, &stderr)
+	if output.AwaitedFactID == 0 {
+		t.Fatalf("no wait attached: holds=%v stderr=%q", output.SubscriptionHolds, stderr.String())
+	}
+	wantSecurity, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, "security")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCode, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := store.ListAwaitedFacts(ctx, "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, fact := range waiting {
+		keys = append(keys, fact.SubjectKey)
+	}
+	var foundSecurity, foundCode bool
+	for _, key := range keys {
+		if key == wantSecurity {
+			foundSecurity = true
+		}
+		if key == wantCode {
+			foundCode = true
+		}
+	}
+	if !foundSecurity {
+		t.Fatalf("wait not keyed to the job's own purpose: keys=%v want %s", keys, wantSecurity)
+	}
+	if foundCode {
+		t.Fatalf("wait keyed to the hardcoded default as well: keys=%v", keys)
+	}
+
+	// AND A JOB RECORDING NO PURPOSE MUST STILL ATTACH. ReviewRequestSubjectKey
+	// REJECTS an empty purpose ("review purpose is required"), so taking the
+	// recorded value unconditionally would turn a blank field into a failed
+	// subscription - the requester left waiting, which is this PR's own defect.
+	// No dispatch produces a blank purpose today; that is exactly why the guard
+	// is pinned here rather than trusted.
+	blank, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "job-purpose-blank", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobQueued), Repo: "owner/repo", PullRequest: 13, Payload: string(blank),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blankOutput := localAgentJobOutput{JobID: "job-purpose-blank"}
+	var blankStderr bytes.Buffer
+	attachReviewVerdictWait(&blankOutput, agentRunOptions{
+		home: home, repo: "owner/repo", prNumber: 13, headSHA: head, orgRole: "joltra",
+	}, &blankStderr)
+	if blankOutput.AwaitedFactID == 0 {
+		t.Fatalf("a job with no recorded purpose attached no wait: holds=%v stderr=%q",
+			blankOutput.SubscriptionHolds, blankStderr.String())
 	}
 }

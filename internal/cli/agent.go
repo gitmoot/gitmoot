@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -568,8 +569,25 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 		return
 	}
 	if err := withStore(options.home, func(store *db.Store) error {
+		// PURPOSE IS DERIVED FROM THE DISPATCHED JOB, not hardcoded (#2194
+		// review). A constant is correct only while this surface cannot express
+		// another value - `agent review` has no --purpose flag today - and the
+		// person who adds one would inherit a wait keyed to "code" while the
+		// review runs as something else, with a comment telling them the line
+		// was fine. Reading the job's own recorded purpose is correct before and
+		// after that flag exists. This is the subsystem whose signature defect
+		// was correct-by-unreachability; it does not need a third instance.
+		purpose := db.DefaultReviewPurpose
+		if job, err := store.GetJob(context.Background(), output.JobID); err == nil {
+			var payload workflow.JobPayload
+			if json.Unmarshal([]byte(job.Payload), &payload) == nil {
+				if recorded := strings.TrimSpace(payload.ReviewPurpose); recorded != "" {
+					purpose = recorded
+				}
+			}
+		}
 		factID, holds, err := subscribeRoleToReviewVerdict(context.Background(), store, role,
-			options.repo, options.prNumber, head, db.DefaultReviewPurpose, defaultReviewRequestTTL)
+			options.repo, options.prNumber, head, purpose, defaultReviewRequestTTL)
 		if err != nil {
 			return err
 		}
