@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -1489,7 +1490,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
 		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
 		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
-		"--effort", "high", "--runtime", "omp", "--session", "fresh:probe", "--home", home,
+		"--effort", "high", "--home", home,
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -1586,11 +1587,16 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	if payload.Effort != "high" {
 		t.Fatalf("effort = %q, want high carried through delegation", payload.Effort)
 	}
-	// --session lands as the runtime OVERRIDE REF, not as a payload session
-	// field, and it requires --runtime because it names a session on the
-	// override runtime.
-	if !strings.Contains(payload.RuntimeOverrideRef, "fresh:probe") {
-		t.Fatalf("runtime override ref = %q, want fresh:probe carried through delegation", payload.RuntimeOverrideRef)
+	// --session IS NOT ASSERTED HERE ON PURPOSE. It lands as the runtime override
+	// ref and REQUIRES --runtime, and forcing --runtime omp made this test pass
+	// only on a host with the omp binary installed: CI refused the dispatch with
+	// "executable file not found in $PATH" while it passed locally. A test that
+	// depends on the host's installed runtimes is not testing delegation. Session
+	// forwarding is asserted on the argument builder instead, which is host-free.
+	if !slices.Contains(reviewRequestArgsFromAgentReview(agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: head, orgRole: "joltra", session: "fresh:probe",
+	}), "--session") {
+		t.Fatal("--session is not forwarded to review request")
 	}
 	// 12. THE OUTPUT MUST NOT MISREPORT WHAT IT DISPATCHED. This line hardcoded
 	// "on omp model" and printed pool[0], so an operator passing --model saw the
