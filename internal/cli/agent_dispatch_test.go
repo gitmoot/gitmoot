@@ -1488,8 +1488,8 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	if code := runAgentReview([]string{
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
 		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
-		"--org-role", "joltra", "--model", "devin/swe-2", "--workflow", "release/queue",
-		"--home", home,
+		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
+		"--effort", "high", "--runtime", "omp", "--session", "fresh:probe", "--home", home,
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -1569,13 +1569,35 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	// it still runs and still returns a verdict - a STATIC one, because the
 	// model is what makes the seat able to execute. Nothing fails, so nothing
 	// reports it.
-	if payload.Model != "devin/swe-2" {
-		t.Fatalf("model = %q, want the operator's explicit devin/swe-2 carried through delegation", payload.Model)
+	// DELIBERATELY NOT THE POOL HEAD: the pool head here is devin/swe-2, so an
+	// assertion naming it would pass against a mutant that prints pool[0]. The
+	// explicit model must differ from the default for the check to discriminate.
+	if payload.Model != "openai-codex/gpt-5.6-sol" {
+		t.Fatalf("model = %q, want the operator's explicit openai-codex/gpt-5.6-sol carried through delegation", payload.Model)
 	}
 	// 9. --workflow SURVIVES: a review filed under the wrong workflow is
 	// invisible to every query keyed on it.
 	if payload.WorkflowID != "release/queue" {
 		t.Fatalf("workflow = %q, want release/queue", payload.WorkflowID)
+	}
+	// 10 and 11. --effort AND --session SURVIVE. Added because a mutant dropping
+	// BOTH passed the earlier version: the fix carried four values and guarded
+	// two, which is a guard that agrees on half its cases (#2196 review).
+	if payload.Effort != "high" {
+		t.Fatalf("effort = %q, want high carried through delegation", payload.Effort)
+	}
+	// --session lands as the runtime OVERRIDE REF, not as a payload session
+	// field, and it requires --runtime because it names a session on the
+	// override runtime.
+	if !strings.Contains(payload.RuntimeOverrideRef, "fresh:probe") {
+		t.Fatalf("runtime override ref = %q, want fresh:probe carried through delegation", payload.RuntimeOverrideRef)
+	}
+	// 12. THE OUTPUT MUST NOT MISREPORT WHAT IT DISPATCHED. This line hardcoded
+	// "on omp model" and printed pool[0], so an operator passing --model saw the
+	// pool head and concluded the override was dropped - positive false evidence,
+	// worse than the silent drop it replaced.
+	if !strings.Contains(stdout.String(), "model openai-codex/gpt-5.6-sol") {
+		t.Fatalf("stdout = %q, want the DISPATCHED model reported, not the pool head devin/swe-2", stdout.String())
 	}
 
 	// AND A SECOND DISPATCH AT THE SAME HEAD MUST NOT SPEND A SECOND REVIEWER -
@@ -1594,6 +1616,24 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	}
 	if len(after) != 1 {
 		t.Fatalf("second dispatch at the same head created %d jobs, want the claim to attach to the first", len(after))
+	}
+
+	// AND AN ATTACHING CALLER WITH DIFFERENT INPUTS MUST BE TOLD THEY WERE
+	// DISCARDED, through the real command output rather than through the helper:
+	// removing the call site has to fail something.
+	var stdout3, stderr3 bytes.Buffer
+	if code := runAgentReview([]string{
+		"reviewer", "a DIFFERENT instruction", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}, &stdout3, &stderr3); code != 0 {
+		t.Fatalf("third review exit stderr=%q", stderr3.String())
+	}
+	for _, want := range []string{"was NOT used", "instructions were NOT sent"} {
+		if !strings.Contains(stdout3.String(), want) {
+			t.Fatalf("attach output = %q, want %q: a caller told it is awaiting a verdict must be told its own inputs were discarded",
+				stdout3.String(), want)
+		}
 	}
 }
 
@@ -1793,5 +1833,44 @@ func TestAgentReviewWithoutLeadKeepsTheRefusalPath(t *testing.T) {
 	}, &stdout, &stderr)
 	if !strings.Contains(stderr.String(), "absent --lead with no --no-fix-target") {
 		t.Fatalf("stderr = %q, want the absent-lead reason named: delegation must not silently convert #2054's refusal into a review-only dispatch", stderr.String())
+	}
+}
+
+// #2196 review (P2): AN ATTACHING REQUEST MUST BE TOLD WHAT IT DID NOT GET.
+// A second dispatch at a claimed head attaches to the running review - correct,
+// and the dedup the router exists for - but the caller's own reviewer, message,
+// lead and model are discarded. Without saying so, the caller is told it is
+// awaiting a verdict and waits on a review it believes it commissioned. That is
+// this campaign's central defect at the dispatch surface.
+func TestAttachingRequestIsToldWhatWasDiscarded(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		opts reviewRequestOptions
+		want string
+	}{
+		{"a different reviewer", reviewRequestOptions{reviewer: "my-reviewer"}, "--reviewer my-reviewer was NOT used"},
+		{"instructions", reviewRequestOptions{message: "check the precedence table"}, "instructions were NOT sent"},
+		{"a lead", reviewRequestOptions{lead: "my-implementer"}, "--lead my-implementer was NOT applied"},
+		{"a model", reviewRequestOptions{model: "anthropic/claude-opus-5"}, "--model anthropic/claude-opus-5 was NOT used"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			holds := attachDiscardedInputs(reviewRequestOutput{Reviewer: "someone-else", Model: "devin/swe-2"}, testCase.opts)
+			var joined string
+			for _, hold := range holds {
+				joined += hold + "\n"
+			}
+			if !strings.Contains(joined, testCase.want) {
+				t.Fatalf("holds = %q, want %q stated", joined, testCase.want)
+			}
+		})
+	}
+	// AND NOTHING IS CLAIMED WHEN NOTHING WAS DISCARDED: a caller that named the
+	// same reviewer and model the running review carries lost nothing, and a
+	// false "your input was dropped" is its own misreport.
+	if holds := attachDiscardedInputs(
+		reviewRequestOutput{Reviewer: "reviewer", Model: "devin/swe-2"},
+		reviewRequestOptions{reviewer: "Reviewer", model: "devin/swe-2"},
+	); len(holds) != 0 {
+		t.Fatalf("holds = %v, want none when the running review already matches the request", holds)
 	}
 }

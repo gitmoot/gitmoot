@@ -61,6 +61,7 @@ type reviewRequestOutput struct {
 	// Baseline is the prior head a delta review was bounded to; BaselineSkipped
 	// names why a full review was dispatched instead (#2177). Exactly one is set
 	// on a dispatch, and neither on an attach or a reused verdict.
+	Runtime         string   `json:"runtime,omitempty"`
 	Baseline        string   `json:"baseline,omitempty"`
 	BaselineSkipped string   `json:"baseline_skipped,omitempty"`
 	AwaitedFactID   int64    `json:"awaited_fact_id"`
@@ -438,7 +439,11 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	output.JobID = dispatched.JobID
 	output.JobState = dispatched.State
 	output.Reviewer = reviewer.Name
-	output.Model = pool[0]
+	// THE DISPATCHED VALUES, NOT THE POOL HEAD. output.Model was pool[0], which
+	// misreports an explicit --model and made a working override look dropped
+	// (#2196 review). request.Model and request.Runtime are what the job carries.
+	output.Model = request.Model
+	output.Runtime = request.Runtime
 	output.WatchCommand = jobWatchCommand(dispatched.JobID, opts.home)
 	if err := subscribeReviewRequester(ctx, store, &output, opts); err != nil {
 		return reviewRequestOutput{}, err
@@ -772,6 +777,30 @@ func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.Revie
 	return db.Job{}, now.Sub(claimed) > reviewRequestDispatchWindow, nil
 }
 
+// attachDiscardedInputs names what an ATTACHING request supplied and did not
+// get (#2196 review, P2). A caller whose request attached to someone else's
+// running review is told it is awaiting a verdict; without this it is NOT told
+// that its own reviewer, message and lead were discarded, so it waits on a
+// review it believes it commissioned. That is this campaign's central defect at
+// the dispatch surface, and the remedy is the one #2194 already uses: say what
+// did not happen.
+func attachDiscardedInputs(output reviewRequestOutput, opts reviewRequestOptions) []string {
+	var holds []string
+	if reviewer := strings.TrimSpace(opts.reviewer); reviewer != "" && !strings.EqualFold(reviewer, output.Reviewer) {
+		holds = append(holds, fmt.Sprintf("your --reviewer %s was NOT used: this attached to %s's running review", reviewer, output.Reviewer))
+	}
+	if strings.TrimSpace(opts.message) != "" {
+		holds = append(holds, "your review instructions were NOT sent: the running review carries the instructions of whoever dispatched it")
+	}
+	if lead := strings.TrimSpace(opts.lead); lead != "" {
+		holds = append(holds, fmt.Sprintf("your --lead %s was NOT applied: a changes-requested verdict routes wherever the running review says", lead))
+	}
+	if model := strings.TrimSpace(opts.model); model != "" && !strings.EqualFold(model, output.Model) {
+		holds = append(holds, fmt.Sprintf("your --model %s was NOT used: the running review carries %s", model, output.Model))
+	}
+	return holds
+}
+
 func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, claim db.ReviewRequest, opts reviewRequestOptions) (reviewRequestOutput, error) {
 	output.State = reviewRequestAttached
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
@@ -796,6 +825,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 			output.Model = payload.Model
 		}
 	}
+	output.Holds = append(output.Holds, attachDiscardedInputs(output, opts)...)
 	if err := subscribeReviewRequester(ctx, store, &output, opts); err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -1306,7 +1336,13 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	}
 	fmt.Fprintln(w)
 	if output.Reviewer != "" {
-		fmt.Fprintf(w, "reviewer: %s on omp model %s\n", output.Reviewer, output.Model)
+		// THE RUNTIME IS REPORTED, NOT ASSUMED (#2196 review). This line
+		// hardcoded "on omp" and printed pool[0], so an operator passing
+		// --model or --runtime saw neither and concluded the override was
+		// dropped. That is worse than a silent drop: a silent drop produces no
+		// evidence, this produced POSITIVE FALSE EVIDENCE, and someone would
+		// have re-fixed a bug that was already fixed.
+		fmt.Fprintf(w, "reviewer: %s on %s model %s\n", output.Reviewer, firstNonEmpty(output.Runtime, "omp"), output.Model)
 	}
 	if output.Verdict != "" {
 		fmt.Fprintf(w, "verdict: %s (already saved; no new review spent)\n", output.Verdict)

@@ -533,6 +533,14 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	//
 	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
 	// them, and both SAY SO rather than degrading quietly.
+	// A FLAG THAT THE DIRECT PATH ITSELF REFUSES MUST REFUSE FIRST. --draft and
+	// --ready are implement-only; printing "dispatched WITHOUT the review router"
+	// and then refusing tells the caller what happened and then does something
+	// else (#2196 review).
+	if mode := strings.TrimSpace(options.pullRequestMode); mode != "" {
+		fmt.Fprintf(stderr, "agent review: --%s is only supported when routing to implement\n", mode)
+		return 2
+	}
 	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
 		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
 			// NOT SILENTLY DROPPED AND NOT FATAL. The router has no counterpart
