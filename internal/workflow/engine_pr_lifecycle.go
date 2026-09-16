@@ -327,9 +327,9 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	// lane converging on a fix and a lane chasing one defect around a file emit
 	// the same success signals.
 	//
-	// The threshold is 3 because that is where a written "stop at three
-	// relocations" rule was meant to fire and did not, having been left to a human
-	// counting across rounds (#1419's measured instance reached six).
+	// The threshold is 6 because that is where #1419's measured instance
+	// demonstrated that repeated patching had displaced the missing design round.
+	// Lower values also occur during legitimate review convergence.
 	//
 	// This warns and does not block. A high round count is evidence that the
 	// VESSEL may be wrong, not proof of it: some PRs legitimately take four
