@@ -5126,31 +5126,34 @@ func (g *productionMergeGateGitHub) MergePullRequest(ctx context.Context, input 
 }
 
 type fakeMergeGateGitHub struct {
-	pr             github.PullRequest
-	status         github.CombinedStatus
-	compare        github.CompareResult
-	checks         []github.PullRequestCheck
-	files          []github.PullRequestFile
-	mergeResult    github.MergeResult
-	getPullRequest func(int) (github.PullRequest, error)
-	mergeErr       error
-	statusErr      error
-	beforeMerge    func()
-	statuses       []github.CommitStatusInput
-	merges         []github.MergePullRequestInput
-	operations     []string
-	getCalls       int
-	statusCalls    int
-	compareCalls   int
-	checkCalls     int
-	prCheckCalls   int
-	checkRefs      []string
-	noChecks       bool
-	strictBase     bool
-	strictKnown    bool
-	strictErr      error
-	strictCalls    int
-	strictBranches []string
+	pr                 github.PullRequest
+	status             github.CombinedStatus
+	compare            github.CompareResult
+	checks             []github.PullRequestCheck
+	files              []github.PullRequestFile
+	mergeResult        github.MergeResult
+	getPullRequest     func(int) (github.PullRequest, error)
+	mergeErr           error
+	statusErr          error
+	beforeMerge        func()
+	statuses           []github.CommitStatusInput
+	merges             []github.MergePullRequestInput
+	operations         []string
+	getCalls           int
+	statusCalls        int
+	compareCalls       int
+	checkCalls         int
+	prCheckCalls       int
+	checkRefs          []string
+	noChecks           bool
+	strictBase         bool
+	strictKnown        bool
+	strictErr          error
+	strictCalls        int
+	strictBranches     []string
+	mergeQueueRule     github.MergeQueueRule
+	mergeQueueRequired bool
+	mergeQueueKnown    bool
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
@@ -5206,7 +5209,9 @@ func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ gith
 	}
 	return f.strictBase, f.strictKnown, nil
 }
-
+func (f *fakeMergeGateGitHub) BaseMergeQueueRule(context.Context, github.Repository, string) (github.MergeQueueRule, bool, bool, error) {
+	return f.mergeQueueRule, f.mergeQueueRequired, f.mergeQueueKnown, nil
+}
 
 func (f *fakeMergeGateGitHub) MergePullRequest(_ context.Context, input github.MergePullRequestInput) (github.MergeResult, error) {
 	if f.beforeMerge != nil {

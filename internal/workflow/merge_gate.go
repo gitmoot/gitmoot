@@ -2267,7 +2267,7 @@ func (g PolicyMergeGate) baseAllowsBehindMerge(ctx context.Context, repo github.
 	return !required
 }
 
-func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA string, agent string) error {
+func (g PolicyMergeGate) ensureReviewMatchesHead(ctx context.Context, request MergeRequest, payload JobPayload, headSHA string, agent string) error {
 	reviewHead := strings.TrimSpace(payload.HeadSHA)
 	if reviewHead == headSHA {
 		return nil

@@ -3135,14 +3135,13 @@ func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest
 }
 
 type ambiguousMergeCommandTasksError struct {
-	repo        string
-	pullRequest int64
-	taskIDs     []string
+	repo    string
+	taskIDs []string
 }
 
 func (e *ambiguousMergeCommandTasksError) Error() string {
-	return fmt.Sprintf("ambiguous merge-command tasks for %s#%d: %s",
-		e.repo, e.pullRequest, strings.Join(e.taskIDs, ", "))
+	return fmt.Sprintf("ambiguous merge-command tasks for %s: %s",
+		e.repo, strings.Join(e.taskIDs, ", "))
 }
 
 // lookupMergeCommandTask extends ordinary branch routing for branchless local
@@ -3190,7 +3189,7 @@ func (d Daemon) lookupMergeCommandTask(ctx context.Context, pull github.PullRequ
 			ids = append(ids, candidate.ID)
 		}
 		return db.Task{}, &ambiguousMergeCommandTasksError{
-			repo: repo, pullRequest: pull.Number, taskIDs: ids,
+			repo: repo, taskIDs: ids,
 		}
 	}
 }
@@ -3207,7 +3206,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		var ambiguous *ambiguousMergeCommandTasksError
 		if errors.As(err, &ambiguous) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf(
-				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Remedy: resolve the duplicate task state, then retry `/gitmoot merge`.",
+				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Remedy: dismiss every stale duplicate with `gitmoot task dismiss <task-id> --reason \"duplicate branchless PR task\"`, leave one listed task ready to merge, then retry `/gitmoot merge`.",
 				pull.Number, strings.Join(ambiguous.taskIDs, "`, `")))
 		}
 		return err

@@ -2707,7 +2707,7 @@ review for the new head.
 `/gitmoot merge` always posts the outcome it observed. A refusal names the
 cause and remedy, including an acting role whose `merge_rule` denies the
 operation, a repository ruleset that requires GitHub's merge queue, no approval
-for the current head, or an approval bound to another head. When
+for the current head, or an approval bound to an ancestor head. When
 `merge_gate.auto_merge = false`, the reply also states that no earlier
 `gitmoot/merge-gate` marker was expected: absence of that marker is not evidence
 that the gate passed. The explicit command still runs the gate.
