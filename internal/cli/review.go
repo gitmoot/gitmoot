@@ -751,47 +751,73 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 // later wakes it from the job's own state transition — never from gate
 // advancement and never from a process that has to still be alive.
 func subscribeReviewRequester(ctx context.Context, store *db.Store, output *reviewRequestOutput, opts reviewRequestOptions) error {
-	// The subscription is PURPOSE-SCOPED: a code verdict must not satisfy a
-	// security request at the same head, which is exactly what the bare verdict
-	// key does. `gitmoot org await review` keeps the bare key and its
-	// any-purpose semantics; the producer resolves both.
-	verdictKey, err := db.ReviewRequestSubjectKey(output.Repo, output.PullRequest, output.HeadSHA, output.Purpose)
+	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, output.Purpose, opts.ttl)
 	if err != nil {
 		return err
 	}
-	// One live wait per role and subject: a requester that asks twice keeps its
-	// original wait (and deadline) rather than failing on the live-subject index.
-	waiting, err := store.ListAwaitedFacts(ctx, opts.role, db.AwaitedFactStateWaiting)
+	output.Holds = append(output.Holds, holds...)
+	output.AwaitedFactID = factID
+	return nil
+}
+
+// subscribeRoleToReviewVerdict registers a role's wait on ONE review verdict at
+// ONE exact head. Extracted from `review request` so `agent review` can attach
+// the same wait (#2194): 687 of 688 reviews on this box were dispatched by
+// `agent review`, which subscribed nobody, so every verdict reached its
+// requester by a coordinator relaying it BY HAND. Twice on 2026-09-15 a verdict
+// was published and the requester went on waiting for it - invisible from both
+// ends, which is the failure the subscription exists to prevent.
+//
+// The subscription is PURPOSE-SCOPED: a code verdict must not satisfy a security
+// request at the same head, which is exactly what the bare verdict key does.
+// `gitmoot org await review` keeps the bare key and its any-purpose semantics;
+// the producer resolves both.
+func subscribeRoleToReviewVerdict(ctx context.Context, store *db.Store, role string, repo string, pullRequest int, headSHA string, purpose string, ttl time.Duration) (int64, []string, error) {
+	verdictKey, err := db.ReviewRequestSubjectKey(repo, pullRequest, headSHA, purpose)
 	if err != nil {
-		return err
+		return 0, nil, err
+	}
+	// One live wait per role and subject: a requester that asks twice keeps its
+	// original wait AND ITS ORIGINAL DEADLINE.
+	//
+	// THIS PRE-CHECK IS LOAD-BEARING AND NOT MERELY A FAST PATH (#2194 review).
+	// SubscribeAwaitedFact's ON CONFLICT arm EXTENDS the deadline whenever the
+	// joiner's is later (#2176, so a short later ask cannot expire a long
+	// earlier one). Every repeat dispatch computes now+ttl, which is always
+	// later - so without this short-circuit a role that re-dispatches the same
+	// review would silently push its own expiry out on each attempt, and a wait
+	// that never expires never escalates to its parent. Deleting this loop is a
+	// behaviour change, not a simplification.
+	waiting, err := store.ListAwaitedFacts(ctx, role, db.AwaitedFactStateWaiting)
+	if err != nil {
+		return 0, nil, err
 	}
 	for _, fact := range waiting {
 		if fact.SubjectKind == db.AwaitedFactSubjectReviewVerdict && fact.SubjectKey == verdictKey {
-			output.AwaitedFactID = fact.ID
-			return nil
+			return fact.ID, nil, nil
 		}
 	}
 	fact, skipped, err := store.SubscribeAwaitedFact(ctx, db.AwaitedFactSubscription{
-		WaiterRole:  opts.role,
+		WaiterRole:  role,
 		SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey:  verdictKey,
-		Deadline:    time.Now().UTC().Add(opts.ttl),
+		Deadline:    time.Now().UTC().Add(ttl),
 	})
 	if err != nil {
-		return fmt.Errorf("subscribe %s to the verdict: %w", opts.role, err)
+		return 0, nil, fmt.Errorf("subscribe %s to the verdict: %w", role, err)
 	}
 	// A head-blind review cannot satisfy an exact-head wait, so a requester that
 	// is never told about it waits the full TTL believing a review is coming.
 	// Say so at request time instead (#2130 makes this shape common).
+	var holds []string
 	for _, skip := range skipped {
 		hold := fmt.Sprintf("review job %s recorded no head, so it cannot satisfy this exact-head wait", skip.JobID)
 		if skip.ExternallyDriven {
 			hold += " (externally driven: its attribution row is not head-bound)"
 		}
-		output.Holds = append(output.Holds, hold)
+		holds = append(holds, hold)
 	}
-	output.AwaitedFactID = fact.ID
-	return nil
+	return fact.ID, holds, nil
 }
 
 // reviewRuntimeForCandidate picks the runtime this candidate will actually run

@@ -1147,3 +1147,291 @@ func assertReviewLeadHardRefusal(t *testing.T, store *db.Store, checkout string,
 		t.Fatalf("adapter calls = %d, want zero after hard refusal", adapter.calls)
 	}
 }
+
+// #2194: `agent review` must subscribe the acting role to the verdict, the way
+// `review request` always has. Measured 2026-09-16: 687 of 688 reviews on this
+// box were dispatched by this command, so in practice no review subscribed
+// anyone and every verdict was relayed by hand - and twice in one day a
+// published verdict left its requester still waiting for it.
+func TestAgentReviewSubscribesTheActingRoleToTheVerdict(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(`
+[org]
+enforce = "warn"
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."joltra"]
+parent = "owner"
+scope = ["owner/repo"]
+`); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	args := []string{
+		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+
+	// The wait must exist in the STORE, keyed to this exact head and purpose -
+	// not merely be printed.
+	waiting, err := store.ListAwaitedFacts(context.Background(), "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKey, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, fact := range waiting {
+		if fact.SubjectKind == db.AwaitedFactSubjectReviewVerdict && fact.SubjectKey == wantKey {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("joltra holds no wait on %s: waiting=%+v", wantKey, waiting)
+	}
+	if !strings.Contains(stdout.String(), "awaiting verdict: fact ") {
+		t.Fatalf("stdout = %q, want the attached wait reported", stdout.String())
+	}
+
+	// Dispatching twice at the same head must not spend a second wait.
+	//
+	// THREE DEFENDERS, NAMED SEPARATELY, because two earlier versions of this
+	// comment each credited the wrong one and each would have told a reader that
+	// a load-bearing line was safe to delete:
+	//   1. DEDUP (no second row) - the store: a unique index on
+	//      (waiter_role, subject_kind, subject_key) WHERE state='waiting' plus
+	//      ON CONFLICT in SubscribeAwaitedFact. Breaking ON CONFLICT kills the
+	//      row-count assertion; deleting the pre-check loop does not.
+	//   2. DEADLINE PRESERVATION - the pre-check loop in
+	//      subscribeRoleToReviewVerdict. ON CONFLICT EXTENDS a deadline when the
+	//      joiner's is later and every re-dispatch computes now+ttl, so without
+	//      the loop a role re-dispatching its own review pushes its expiry out
+	//      each time, and a wait that never expires never escalates.
+	//   3. HOLD SUPPRESSION - also the loop: it returns before the insert, so a
+	//      repeat dispatch does not re-emit the same head-blind holds.
+	// A comment naming a guard's defender is a claim about CAUSATION, and
+	// causation is what reading cannot establish. Each line above was checked by
+	// running the mutant that breaks only that defender.
+	var stdout2, stderr2 bytes.Buffer
+	if code := runAgentReview(args, &stdout2, &stderr2); code != 0 {
+		t.Fatalf("second review exit=%d stderr=%q", code, stderr2.String())
+	}
+	after, err := store.ListAwaitedFacts(context.Background(), "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(waiting) {
+		t.Fatalf("waits grew from %d to %d on a repeat dispatch at the same head", len(waiting), len(after))
+	}
+
+	// AND THE DEADLINE MUST NOT MOVE. This is what the pre-check loop actually
+	// defends (#2194 review asked whether it had a non-dedup purpose - it does):
+	// SubscribeAwaitedFact's ON CONFLICT arm EXTENDS the deadline whenever the
+	// joiner's is later, and every re-dispatch computes now+ttl, which always
+	// is. Without the short-circuit a role re-dispatching its own review pushes
+	// its expiry out each time, and a wait that never expires never escalates.
+	var deadlineBefore, deadlineAfter string
+	for _, fact := range waiting {
+		if fact.SubjectKey == wantKey {
+			deadlineBefore = fact.Deadline
+		}
+	}
+	for _, fact := range after {
+		if fact.SubjectKey == wantKey {
+			deadlineAfter = fact.Deadline
+		}
+	}
+	if deadlineBefore == "" || deadlineAfter != deadlineBefore {
+		t.Fatalf("deadline moved on a repeat dispatch: %q -> %q", deadlineBefore, deadlineAfter)
+	}
+}
+
+// The invariant the #2194 review named: no attached fact MUST mean a stated
+// hold. A path that attaches nothing and says nothing is this PR's own defect
+// re-created inside the fix.
+func TestAgentReviewNeverFailsToAttachSilently(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		options agentRunOptions
+	}{
+		{"no acting role", agentRunOptions{repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"}},
+		{"no head", agentRunOptions{repo: "owner/repo", prNumber: 12, orgRole: "joltra"}},
+		{"no pull request", agentRunOptions{repo: "owner/repo", orgRole: "joltra", headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			options := testCase.options
+			options.home = t.TempDir()
+			if err := config.Initialize(config.PathsForHome(options.home)); err != nil {
+				t.Fatal(err)
+			}
+			var output localAgentJobOutput
+			var stderr bytes.Buffer
+			attachReviewVerdictWait(&output, options, &stderr)
+			if output.AwaitedFactID == 0 && len(output.SubscriptionHolds) == 0 {
+				t.Fatal("no fact and no hold: the requester would wait its full TTL with nothing attached and nothing said")
+			}
+		})
+	}
+}
+
+// A dispatch that cannot be woken must SAY so: an absent subscription is
+// indistinguishable from a working one until the wait expires (#2194).
+func TestAgentReviewReportsWhenNoVerdictWaitCanBeAttached(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	code := runAgentReview([]string{
+		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--foreground", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("review exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "not awaiting verdict: no --org-role") {
+		t.Fatalf("stdout = %q, want the missing-role hold stated", stdout.String())
+	}
+}
+
+// #2194 review: the attach site used to HARDCODE db.DefaultReviewPurpose. That
+// is correct only while `agent review` cannot express another purpose - and the
+// person who adds --purpose would inherit a wait keyed to "code" while the
+// review runs as something else, reading a comment that said the line was fine.
+// Correct-by-unreachability is the signature defect of this very subsystem
+// (#2180's fallback), so the purpose is now READ FROM THE DISPATCHED JOB.
+//
+// Driven through the real helper against a real job row, because the CLI has no
+// flag to express a non-default purpose yet: that is exactly why a test is
+// needed now rather than when the flag lands.
+func TestAgentReviewWaitUsesTheJobsOwnReviewPurpose(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatal(err)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	const head = "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"
+	payload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 12, ReviewPurpose: "security"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "job-purpose-derived", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobQueued), Repo: "owner/repo", PullRequest: 12, Payload: string(payload),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	output := localAgentJobOutput{JobID: "job-purpose-derived"}
+	var stderr bytes.Buffer
+	attachReviewVerdictWait(&output, agentRunOptions{
+		home: home, repo: "owner/repo", prNumber: 12, headSHA: head, orgRole: "joltra",
+	}, &stderr)
+	if output.AwaitedFactID == 0 {
+		t.Fatalf("no wait attached: holds=%v stderr=%q", output.SubscriptionHolds, stderr.String())
+	}
+	wantSecurity, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, "security")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCode, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := store.ListAwaitedFacts(ctx, "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, fact := range waiting {
+		keys = append(keys, fact.SubjectKey)
+	}
+	var foundSecurity, foundCode bool
+	for _, key := range keys {
+		if key == wantSecurity {
+			foundSecurity = true
+		}
+		if key == wantCode {
+			foundCode = true
+		}
+	}
+	if !foundSecurity {
+		t.Fatalf("wait not keyed to the job's own purpose: keys=%v want %s", keys, wantSecurity)
+	}
+	if foundCode {
+		t.Fatalf("wait keyed to the hardcoded default as well: keys=%v", keys)
+	}
+
+	// AND A JOB RECORDING NO PURPOSE MUST STILL ATTACH. ReviewRequestSubjectKey
+	// REJECTS an empty purpose ("review purpose is required"), so taking the
+	// recorded value unconditionally would turn a blank field into a failed
+	// subscription - the requester left waiting, which is this PR's own defect.
+	// No dispatch produces a blank purpose today; that is exactly why the guard
+	// is pinned here rather than trusted.
+	blank, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", PullRequest: 13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "job-purpose-blank", Agent: "reviewer", Type: "review",
+		State: string(workflow.JobQueued), Repo: "owner/repo", PullRequest: 13, Payload: string(blank),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blankOutput := localAgentJobOutput{JobID: "job-purpose-blank"}
+	var blankStderr bytes.Buffer
+	attachReviewVerdictWait(&blankOutput, agentRunOptions{
+		home: home, repo: "owner/repo", prNumber: 13, headSHA: head, orgRole: "joltra",
+	}, &blankStderr)
+	if blankOutput.AwaitedFactID == 0 {
+		t.Fatalf("a job with no recorded purpose attached no wait: holds=%v stderr=%q",
+			blankOutput.SubscriptionHolds, blankStderr.String())
+	}
+}
