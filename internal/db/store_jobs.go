@@ -1541,6 +1541,49 @@ func (s *Store) ClaimJobEvent(ctx context.Context, event JobEvent) (bool, error)
 	return affected == 1, nil
 }
 
+// ClaimJobEventPair atomically acquires claim and records its companion owner.
+// A process exit or an owner-insert failure before commit leaves neither row.
+// Winning also replaces stale owner rows of the same kind, so a prior holder
+// cannot be mistaken for the new claim's owner.
+func (s *Store) ClaimJobEventPair(ctx context.Context, claim, owner JobEvent) (bool, error) {
+	if claim.JobID == "" || claim.JobID != owner.JobID {
+		return false, errors.New("job event claim and owner require the same non-empty job id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime)
+		SELECT ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM job_events WHERE job_id = ? AND kind = ? AND message = ?
+		)`, claim.JobID, claim.Kind, claim.Message, claim.Runtime, claim.JobID, claim.Kind, claim.Message)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != 1 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM job_events
+		WHERE job_id = ? AND kind = ?`, owner.JobID, owner.Kind); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime) VALUES (?, ?, ?, ?)`,
+		owner.JobID, owner.Kind, owner.Message, owner.Runtime); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ReleaseJobEventClaim deletes an exact job/kind/message claim so a later
 // caller can win it again. It is for a claim whose external write PROVABLY did
 // not happen: the pipeline auto-merge gate claims before calling Merge, and a
@@ -1560,6 +1603,50 @@ func (s *Store) ReleaseJobEventClaim(ctx context.Context, event JobEvent) (bool,
 		return false, err
 	}
 	return affected > 0, nil
+}
+
+// ReleaseJobEventPair atomically releases an exact claim and its exact
+// companion owner. If either row is absent or either delete fails, neither row
+// is removed. Matching the owner first makes it the recovery token: a stale
+// recoverer cannot release a successor's stable claim.
+func (s *Store) ReleaseJobEventPair(ctx context.Context, claim, owner JobEvent) (bool, error) {
+	if claim.JobID == "" || claim.JobID != owner.JobID {
+		return false, errors.New("job event claim and owner require the same non-empty job id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `DELETE FROM job_events
+		WHERE job_id = ? AND kind = ? AND message = ?`, owner.JobID, owner.Kind, owner.Message)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	result, err = tx.ExecContext(ctx, `DELETE FROM job_events
+		WHERE job_id = ? AND kind = ? AND message = ?`, claim.JobID, claim.Kind, claim.Message)
+	if err != nil {
+		return false, err
+	}
+	affected, err = result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // UpsertLatestJobEvent keeps one mutable latest-only row for a job/event kind.

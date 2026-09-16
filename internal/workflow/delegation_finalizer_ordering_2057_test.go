@@ -813,20 +813,22 @@ func corruptJobEventTimestamp(t *testing.T, store *db.Store, jobID, kind, value 
 func seedFinalizeClaim(t *testing.T, store *db.Store, jobID, ownerMessage string) {
 	t.Helper()
 	ctx := context.Background()
-	claimed, err := store.ClaimJobEvent(ctx, db.JobEvent{
+	claim := db.JobEvent{
 		JobID: jobID, Kind: implementationFinalizeClaimedEvent,
 		Message: implementationFinalizeClaimMessage(jobID),
-	})
-	if err != nil || !claimed {
-		t.Fatalf("seed claim %s: claimed=%v err=%v", jobID, claimed, err)
 	}
 	if strings.TrimSpace(ownerMessage) == "" {
+		claimed, err := store.ClaimJobEvent(ctx, claim)
+		if err != nil || !claimed {
+			t.Fatalf("seed ownerless claim %s: claimed=%v err=%v", jobID, claimed, err)
+		}
 		return
 	}
-	if err := store.AddJobEvent(ctx, db.JobEvent{
+	claimed, err := store.ClaimJobEventPair(ctx, claim, db.JobEvent{
 		JobID: jobID, Kind: implementationFinalizeClaimOwnerEvent, Message: ownerMessage,
-	}); err != nil {
-		t.Fatalf("seed owner %s: %v", jobID, err)
+	})
+	if err != nil || !claimed {
+		t.Fatalf("seed claim pair %s: claimed=%v err=%v", jobID, claimed, err)
 	}
 }
 
@@ -1058,15 +1060,14 @@ func finalizeClaimRowCounts(t *testing.T, store *db.Store, jobID string) (int, i
 	return claims, owners
 }
 
-// #2057 ROUND EIGHT, THE INVARIANT ITSELF: A CLAIM MUST NOT SURVIVE A FAILED
-// OWNER WRITE.
+// #2057 ROUND NINE, THE INVARIANT ITSELF: A CLAIM AND OWNER MUST COMMIT
+// TOGETHER.
 //
-// The mutant that made the owner write best-effort again survived every other
-// test in this file, because nothing exercised the failure. There is no
-// interface seam to inject one (#2093: Engine.Store is a concrete *db.Store), so
-// this uses the same technique the reviewer used - a SQLite TRIGGER that rejects
-// exactly the owner insert - which injects the fault into the PRODUCTION path
-// rather than around it.
+// The owner-insert trigger reaches Engine.AdvanceJob's production store path.
+// The claim-delete trigger makes the old cleanup approach fail too: separate
+// claim and owner writes leave the claim behind when both owner insertion and
+// compensating deletion fail. A transaction rolls the claim back without
+// attempting that delete.
 func TestAClaimIsReleasedWhenItsOwnerRowCannotBeWritten(t *testing.T) {
 	ctx := context.Background()
 	engine, store := newOrderingFixture(t)
@@ -1075,6 +1076,7 @@ func TestAClaimIsReleasedWhenItsOwnerRowCannotBeWritten(t *testing.T) {
 	insertCompletedJob(t, store, db.Job{ID: "impl-noowner", Agent: "lead", Type: "implement"}, orderingParentPayload())
 
 	rejectJobEventKind(t, store, implementationFinalizeClaimOwnerEvent)
+	rejectJobEventDeleteKind(t, store, implementationFinalizeClaimedEvent)
 
 	err := engine.AdvanceJob(ctx, "impl-noowner")
 	if err == nil {
@@ -1088,6 +1090,25 @@ func TestAClaimIsReleasedWhenItsOwnerRowCannotBeWritten(t *testing.T) {
 	claims, owners := finalizeClaimRowCounts(t, store, "impl-noowner")
 	if claims != 0 {
 		t.Fatalf("claims=%d owners=%d: the claim survived a failed owner write, which is the state that lets a later holder inherit a dead identity", claims, owners)
+	}
+}
+
+// Engine.AdvanceJob also reaches the pair release after a finalizer failure.
+// Rejecting the claim delete after the owner delete proves the store transaction
+// rolls both deletions back instead of publishing an ownerless claim.
+func TestFailedClaimReleaseKeepsOwnerAndClaimTogether(t *testing.T) {
+	ctx := context.Background()
+	engine, store := newOrderingFixture(t)
+	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("injected: finalizer failed")}
+	insertCompletedJob(t, store, db.Job{ID: "impl-release", Agent: "lead", Type: "implement"}, orderingParentPayload())
+	rejectJobEventDeleteKind(t, store, implementationFinalizeClaimedEvent)
+
+	if err := engine.AdvanceJob(ctx, "impl-release"); err == nil {
+		t.Fatal("advance succeeded despite the finalizer and claim release failures")
+	}
+	claims, owners := finalizeClaimRowCounts(t, store, "impl-release")
+	if claims != 1 || owners != 1 {
+		t.Fatalf("claims=%d owners=%d, want 1 and 1: a failed pair release must publish neither delete", claims, owners)
 	}
 }
 
@@ -1105,5 +1126,20 @@ func rejectJobEventKind(t *testing.T, store *db.Store, kind string) {
 	         BEGIN SELECT RAISE(ABORT, 'injected: owner row rejected'); END;`
 	if _, err := conn.Exec(stmt); err != nil {
 		t.Fatalf("create trigger: %v", err)
+	}
+}
+
+func rejectJobEventDeleteKind(t *testing.T, store *db.Store, kind string) {
+	t.Helper()
+	conn, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer conn.Close()
+	stmt := `CREATE TRIGGER reject_delete_kind BEFORE DELETE ON job_events
+	         WHEN OLD.kind = '` + kind + `'
+	         BEGIN SELECT RAISE(ABORT, 'injected: claim deletion rejected'); END;`
+	if _, err := conn.Exec(stmt); err != nil {
+		t.Fatalf("create delete trigger: %v", err)
 	}
 }
