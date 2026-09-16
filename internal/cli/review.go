@@ -104,8 +104,18 @@ type reviewRequestOptions struct {
 	// instead of beside it (#2196). Without them delegation would silently drop
 	// the caller's review instructions and its fix target, which is the whole
 	// reason the other surface was still being used.
-	lead                    string
-	message                 string
+	lead    string
+	message string
+	// model, effort, workflowID and session are carried so delegation from
+	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
+	// is load-bearing: every dispatch on this campaign passes
+	// --model devin/swe-2, and a review that loses it still runs and still
+	// returns a verdict - a STATIC one. That failure is invisible, which is the
+	// exact shape this work exists to remove.
+	model                   string
+	effort                  string
+	workflowID              string
+	session                 string
 	home                    string
 	repo                    string
 	pr                      int
@@ -138,6 +148,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
 	fs.StringVar(&opts.lead, "lead", "", "implementer a changes-requested verdict routes to; empty dispatches with no fix target")
+	fs.StringVar(&opts.model, "model", "", "provider/model the review runs on, overriding the pool head")
+	fs.StringVar(&opts.effort, "effort", "", "reasoning effort for runtimes that accept one")
+	fs.StringVar(&opts.workflowID, "workflow", "", "workflow the review job is filed under")
+	fs.StringVar(&opts.session, "session", "", "runtime session the review reuses")
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
@@ -209,6 +223,15 @@ func effectiveReviewRuntime(override, selected string) string {
 // scope, purpose and head framing cannot be displaced by a caller's prose, and
 // the caller's message is labelled so a reviewer can tell operator instructions
 // from generated framing.
+// reviewRequestModel resolves the model a review runs on: an explicit --model
+// wins, otherwise the pool head for the effective runtime (#2196 review).
+func reviewRequestModel(opts reviewRequestOptions, runtimeName string, pool []string) string {
+	if explicit := strings.TrimSpace(opts.model); explicit != "" {
+		return explicit
+	}
+	return reviewModelForRuntime(runtimeName, pool)
+}
+
 func reviewRequestInstructions(opts reviewRequestOptions, repo string, head string, scope *workflow.ReviewScope) string {
 	brief := reviewRouterInstructions(opts.purpose, repo, opts.pr, head, scope)
 	message := strings.TrimSpace(opts.message)
@@ -367,7 +390,13 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// Gated on the EFFECTIVE runtime, not on whether an override was
 		// emitted: a review running on the agent's own non-omp runtime must not
 		// carry an omp pool model either.
-		Model: reviewModelForRuntime(effectiveReviewRuntime(opts.runtime, selectedRuntime), pool),
+		// AN EXPLICIT --model WINS over the pool head, the same precedence an
+		// explicit payload timeout has over the review class floor (#2192): a
+		// stated operator choice is not a default to be improved on.
+		Model:          reviewRequestModel(opts, effectiveReviewRuntime(opts.runtime, selectedRuntime), pool),
+		Effort:         strings.TrimSpace(opts.effort),
+		WorkflowID:     strings.TrimSpace(opts.workflowID),
+		RuntimeSession: strings.TrimSpace(opts.session),
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability

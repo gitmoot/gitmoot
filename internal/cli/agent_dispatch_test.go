@@ -1486,7 +1486,8 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	if code := runAgentReview([]string{
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
 		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
-		"--org-role", "joltra", "--home", home,
+		"--org-role", "joltra", "--model", "devin/swe-2", "--workflow", "release/queue",
+		"--home", home,
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -1561,6 +1562,20 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 		t.Fatal("no verdict wait attached for joltra")
 	}
 
+	// 8. --model SURVIVES, and this is the one that would fail invisibly. Every
+	// dispatch on this campaign passes --model devin/swe-2; a review that loses
+	// it still runs and still returns a verdict - a STATIC one, because the
+	// model is what makes the seat able to execute. Nothing fails, so nothing
+	// reports it.
+	if payload.Model != "devin/swe-2" {
+		t.Fatalf("model = %q, want the operator's explicit devin/swe-2 carried through delegation", payload.Model)
+	}
+	// 9. --workflow SURVIVES: a review filed under the wrong workflow is
+	// invisible to every query keyed on it.
+	if payload.WorkflowID != "release/queue" {
+		t.Fatalf("workflow = %q, want release/queue", payload.WorkflowID)
+	}
+
 	// AND A SECOND DISPATCH AT THE SAME HEAD MUST NOT SPEND A SECOND REVIEWER -
 	// the dedup that was unreachable while this command bypassed the router.
 	var stdout2, stderr2 bytes.Buffer
@@ -1577,5 +1592,61 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	}
 	if len(after) != 1 {
 		t.Fatalf("second dispatch at the same head created %d jobs, want the claim to attach to the first", len(after))
+	}
+}
+
+// #2196 review: AN INPUT THE ROUTER CANNOT CARRY MUST NOT BE SILENTLY DROPPED.
+// Delegation would discard it, so the dispatch keeps the direct path and SAYS
+// which flag forced that. A caller who is not told cannot know its review
+// differs from the one it asked for - the invisible-degradation shape this work
+// exists to remove.
+func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview([]string{
+		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--skip-native-review-fanout", "--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--skip-native-review-fanout") {
+		t.Fatalf("stderr = %q, want the flag that forced the direct path named", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "WITHOUT the review router") {
+		t.Fatalf("stderr = %q, want the bypass stated", stderr.String())
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want the review still dispatched", jobs)
 	}
 }

@@ -534,7 +534,18 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
 	// them, and both SAY SO rather than degrading quietly.
 	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
-		return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
+		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
+			// NOT SILENTLY DROPPED AND NOT FATAL. The router has no counterpart
+			// for these, so delegating would discard a stated operator input -
+			// the invisible-degradation shape this work exists to remove. The
+			// direct path runs instead and names what forced it, because a
+			// caller who is not told cannot know its review is different from
+			// the one it asked for.
+			fmt.Fprintf(stderr, "agent review: dispatched WITHOUT the review router: %s cannot be expressed by `review request`\n",
+				strings.Join(unexpressible, ", "))
+		} else {
+			return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
+		}
 	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
 	// REQUIRES --role because the role is who the verdict is delivered to, and a
@@ -638,10 +649,45 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 // command's flags (#2196). Every value the caller supplied is carried; nothing
 // is invented. The reviewer is passed EXPLICITLY because the caller named it -
 // that is what distinguishes this surface from a bare router request.
+// agentReviewInputsTheRouterCannotCarry names every supplied input that
+// `review request` has no flag for (#2196 review). Enumerated MECHANICALLY
+// against the two flag sets rather than by hand: hand-enumeration found the
+// message and --lead and missed eight others, and the arithmetic said it
+// probably would.
+//
+// The four that ARE carryable - model, effort, workflow, session - were added to
+// the router command instead of listed here, because dropping --model turns an
+// executed review into a static one with nothing failing.
+func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
+	var named []string
+	for _, candidate := range []struct {
+		flag string
+		set  bool
+	}{
+		{"--action", strings.TrimSpace(options.action) != "" && !strings.EqualFold(strings.TrimSpace(options.action), "review")},
+		{"--type", strings.TrimSpace(options.typeName) != ""},
+		{"--task", strings.TrimSpace(options.taskID) != ""},
+		{"--base", strings.TrimSpace(options.base) != ""},
+		{"--recipe", strings.TrimSpace(options.recipe) != ""},
+		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
+		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
+		{"--" + strings.TrimSpace(options.pullRequestMode), strings.TrimSpace(options.pullRequestMode) != ""},
+	} {
+		if candidate.set {
+			named = append(named, candidate.flag)
+		}
+	}
+	return named
+}
+
 func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 	args := []string{"--pr", strconv.Itoa(options.prNumber)}
 	for _, pair := range [][2]string{
 		{"--repo", options.repo},
+		{"--model", options.model},
+		{"--effort", options.effort},
+		{"--workflow", options.workflowID},
+		{"--session", options.session},
 		{"--head", options.headSHA},
 		{"--branch", options.branch},
 		{"--role", options.orgRole},
