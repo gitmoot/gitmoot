@@ -557,6 +557,14 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 			"no --head-sha, so an exact-head wait cannot be attached: pass the full 40-character head to be woken on the verdict")
 		return
 	case options.prNumber <= 0:
+		// INVARIANT: AwaitedFactID == 0 IMPLIES at least one hold. A path that
+		// attaches nothing and says nothing re-creates this fix's own defect
+		// inside the fix - the requester waits its full TTL believing a wake is
+		// coming. runAgentReview rejects --pr <= 0 before dispatch, so this arm
+		// is unreachable today; it states the hold anyway rather than relying on
+		// a caller two functions away to stay that way.
+		output.SubscriptionHolds = append(output.SubscriptionHolds,
+			"no pull request number, so there is no verdict subject to wait on")
 		return
 	}
 	if err := withStore(options.home, func(store *db.Store) error {

@@ -778,7 +778,16 @@ func subscribeRoleToReviewVerdict(ctx context.Context, store *db.Store, role str
 		return 0, nil, err
 	}
 	// One live wait per role and subject: a requester that asks twice keeps its
-	// original wait (and deadline) rather than failing on the live-subject index.
+	// original wait AND ITS ORIGINAL DEADLINE.
+	//
+	// THIS PRE-CHECK IS LOAD-BEARING AND NOT MERELY A FAST PATH (#2194 review).
+	// SubscribeAwaitedFact's ON CONFLICT arm EXTENDS the deadline whenever the
+	// joiner's is later (#2176, so a short later ask cannot expire a long
+	// earlier one). Every repeat dispatch computes now+ttl, which is always
+	// later - so without this short-circuit a role that re-dispatches the same
+	// review would silently push its own expiry out on each attempt, and a wait
+	// that never expires never escalates to its parent. Deleting this loop is a
+	// behaviour change, not a simplification.
 	waiting, err := store.ListAwaitedFacts(ctx, role, db.AwaitedFactStateWaiting)
 	if err != nil {
 		return 0, nil, err

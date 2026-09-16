@@ -1243,6 +1243,55 @@ scope = ["owner/repo"]
 	if len(after) != len(waiting) {
 		t.Fatalf("waits grew from %d to %d on a repeat dispatch at the same head", len(waiting), len(after))
 	}
+
+	// AND THE DEADLINE MUST NOT MOVE. This is what the pre-check loop actually
+	// defends (#2194 review asked whether it had a non-dedup purpose - it does):
+	// SubscribeAwaitedFact's ON CONFLICT arm EXTENDS the deadline whenever the
+	// joiner's is later, and every re-dispatch computes now+ttl, which always
+	// is. Without the short-circuit a role re-dispatching its own review pushes
+	// its expiry out each time, and a wait that never expires never escalates.
+	var deadlineBefore, deadlineAfter string
+	for _, fact := range waiting {
+		if fact.SubjectKey == wantKey {
+			deadlineBefore = fact.Deadline
+		}
+	}
+	for _, fact := range after {
+		if fact.SubjectKey == wantKey {
+			deadlineAfter = fact.Deadline
+		}
+	}
+	if deadlineBefore == "" || deadlineAfter != deadlineBefore {
+		t.Fatalf("deadline moved on a repeat dispatch: %q -> %q", deadlineBefore, deadlineAfter)
+	}
+}
+
+// The invariant the #2194 review named: no attached fact MUST mean a stated
+// hold. A path that attaches nothing and says nothing is this PR's own defect
+// re-created inside the fix.
+func TestAgentReviewNeverFailsToAttachSilently(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		options agentRunOptions
+	}{
+		{"no acting role", agentRunOptions{repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"}},
+		{"no head", agentRunOptions{repo: "owner/repo", prNumber: 12, orgRole: "joltra"}},
+		{"no pull request", agentRunOptions{repo: "owner/repo", orgRole: "joltra", headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			options := testCase.options
+			options.home = t.TempDir()
+			if err := config.Initialize(config.PathsForHome(options.home)); err != nil {
+				t.Fatal(err)
+			}
+			var output localAgentJobOutput
+			var stderr bytes.Buffer
+			attachReviewVerdictWait(&output, options, &stderr)
+			if output.AwaitedFactID == 0 && len(output.SubscriptionHolds) == 0 {
+				t.Fatal("no fact and no hold: the requester would wait its full TTL with nothing attached and nothing said")
+			}
+		})
+	}
 }
 
 // A dispatch that cannot be woken must SAY so: an absent subscription is
