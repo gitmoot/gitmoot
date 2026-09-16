@@ -1266,13 +1266,16 @@ func TestExhaustedObligationDoesNotHoldLaterOnes(t *testing.T) {
 }
 
 // #2195: directiveCanStillEscalate decides which obligation may hold a queue,
-// and every "no" arm must hold independently. The EXHAUSTED arm is redundant
-// today - every path that stamps ExhaustedAt also burns the nudge budget - so a
-// sweep-level mutant survives removing it. That redundancy is exactly why it is
-// pinned HERE: a future path that stamps exhaustion without burning nudges would
-// otherwise let a dead obligation hold every later one forever, which is the
-// permanent-silence hazard this design exists to avoid, and the surviving
-// end-to-end mutant would never have shown it.
+// and every "no" arm must hold independently.
+//
+// THE EXHAUSTED ARM IS NOT REDUNDANT. An earlier version of this comment said it
+// was, on the strength of a surviving sweep-level mutant, and the review proved
+// the claim false: directiveNagEscalate into terminateDirectiveCompletionLadder
+// stamps ExhaustedAt WITHOUT burning DoneNudgeCount, so exhausted-unburned rows
+// exist in production and the nudge-count arm does not catch them. The mutant
+// survived because NO TEST COVERED THAT PATH - survival is a statement about the
+// suite, never about the code. The arm is pinned here because each "no" reason is
+// reachable at this level and only some of them are reachable through the sweep.
 func TestDirectiveCanStillEscalateArms(t *testing.T) {
 	home := t.TempDir()
 	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 3)
@@ -1399,5 +1402,55 @@ func TestDirectiveQueueHoldDoesNotCrossWorkflows(t *testing.T) {
 	}
 	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", firstInA.ID)) {
 		t.Fatalf("the oldest item in workflow A was held: output=%q", text)
+	}
+}
+
+// #2195 review (P3): THE QUEUE KEY MUST NOT BE CASE-SENSITIVE. to=Worker and
+// to=worker are the same seat; treating them as two queues means neither holds
+// the other and the hold is bypassed entirely by capitalisation. The safe
+// convention already existed three files away in db.ReviewRequestSubjectKey,
+// which lowercases and trims; this key had picked the other one.
+func TestDirectiveQueueKeyIgnoresTargetCase(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+
+	seed := func(target, body string) db.WorkflowNote {
+		t.Helper()
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/ttl",
+			Author:     "sender",
+			Body:       workflow.FormatOrgDirectiveNote("sender", target, "release/ttl", body),
+			Repo:       "gitmoot/gitmoot",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "release/ttl",
+			Author:     target,
+			Body:       workflow.FormatOrgDirectiveAckNote(note.ID, target),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+
+	first := seed("worker", "item one, lowercase target")
+	second := seed("Worker", "item two, capitalised target - SAME SEAT")
+
+	var output bytes.Buffer
+	if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, &output,
+		time.Now().UTC().Add(4*time.Hour), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", second.ID)) {
+		t.Fatalf("capitalised target got its own queue, so the hold was bypassed: output=%q", text)
+	}
+	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", first.ID)) {
+		t.Fatalf("the oldest item was held: output=%q", text)
 	}
 }

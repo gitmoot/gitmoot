@@ -783,7 +783,12 @@ func directiveOldestOpenPerTarget(items []db.OrgDirectiveObligation, orgConfig c
 // directiveQueueKey scopes a hold to one sender-visible ordering: a seat's queue
 // WITHIN a workflow (#2195 review). Two workflows are two independent queues.
 func directiveQueueKey(target, workflowID string) string {
-	return strings.TrimSpace(target) + "\x00" + strings.TrimSpace(workflowID)
+	// LOWERCASED, matching db.ReviewRequestSubjectKey three files away (#2195
+	// review, P3). Case-sensitive comparison made to=Worker and to=worker two
+	// independent queues that hold nothing, so a seat addressed with different
+	// capitalisation in two directives bypassed the hold entirely. The codebase
+	// already had the safe convention; this key had picked the other one.
+	return strings.ToLower(strings.TrimSpace(target)) + "\x00" + strings.ToLower(strings.TrimSpace(workflowID))
 }
 
 // directiveCanStillEscalate reports whether this obligation's COMPLETION ladder
