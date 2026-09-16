@@ -3673,13 +3673,8 @@ func (f *fakeGitHub) MergePullRequest(context.Context, github.MergePullRequestIn
 }
 
 func (f *fakeGitHub) BaseRequiresUpToDateHead(context.Context, github.Repository, string) (bool, bool, error) {
-	// Undetermined: the merge gate fails closed on this, which is the
-	// pre-#1865 update-then-retry behaviour these daemon tests assert.
+	// Undetermined: the merge gate fails closed and preserves the reviewed head.
 	return false, false, nil
-}
-
-func (f *fakeGitHub) UpdatePullRequestBranch(context.Context, github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error) {
-	return github.UpdatePullRequestBranchResult{}, errors.New("not implemented")
 }
 
 func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {

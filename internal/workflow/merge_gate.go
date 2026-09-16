@@ -65,8 +65,6 @@ type MergeGateGitHub interface {
 	CompareCommits(ctx context.Context, repo github.Repository, base string, head string) (github.CompareResult, error)
 	ListPullRequestChecks(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestCheck, error)
 	CreateCommitStatus(ctx context.Context, input github.CommitStatusInput) (github.CommitStatus, error)
-	PostIssueComment(ctx context.Context, repo github.Repository, issueNumber int64, body string) (github.IssueComment, error)
-	UpdatePullRequestBranch(ctx context.Context, input github.UpdatePullRequestBranchInput) (github.UpdatePullRequestBranchResult, error)
 	BaseRequiresUpToDateHead(ctx context.Context, repo github.Repository, branch string) (required bool, known bool, err error)
 	MergePullRequest(ctx context.Context, input github.MergePullRequestInput) (github.MergeResult, error)
 }
@@ -2184,36 +2182,20 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 			// time. GitHub answers conflict separately, in `mergeable`, which
 			// this gate already reads a few frames up.
 			//
-			// Unknown mergeability FAILS CLOSED to the update, matching
-			// baseAllowsBehindMerge: a merge GitHub has not finished computing
-			// and one it cannot compute are indistinguishable from here.
+			// Unknown mergeability must not reach the native merge. The
+			// reviewed head is preserved below.
 			return MergeDecision{}, false, nil
 		}
-		_, err := g.GitHub.UpdatePullRequestBranch(ctx, github.UpdatePullRequestBranchInput{
-			Repo:            repo,
-			Number:          int64(request.PullRequest),
-			ExpectedHeadSHA: headSHA,
-		})
-		if err == nil {
-			decision, pendingErr := g.pending(ctx, request, headSHA, fmt.Sprintf("pull request branch update from %s requested; daemon will retry after GitHub refreshes the head SHA and checks", base))
-			return decision, true, pendingErr
-		}
-		switch {
-		case github.IsUpdatePullRequestBranchError(err, github.UpdatePullRequestBranchErrorStaleHead):
-			decision, pendingErr := g.pending(ctx, request, headSHA, "pull request head changed while updating branch; daemon will retry with the latest head SHA")
-			return decision, true, pendingErr
-		case github.IsUpdatePullRequestBranchError(err, github.UpdatePullRequestBranchErrorConflict):
-			reason := fmt.Sprintf("branch update conflicts with %s; manual or agent fix required", base)
-			_ = g.postMergeConflictComment(ctx, repo, request, pr, reason)
-			decision, blockErr := g.block(ctx, request, headSHA, reason, MergeBlockTransient)
-			return decision, true, blockErr
-		case github.IsUpdatePullRequestBranchError(err, github.UpdatePullRequestBranchErrorUnsupported):
-			decision, blockErr := g.block(ctx, request, headSHA, fmt.Sprintf("GitHub cannot update this pull request branch automatically: %s", err), MergeBlockTransient)
-			return decision, true, blockErr
-		default:
-			decision, pendingErr := g.pending(ctx, request, headSHA, fmt.Sprintf("GitHub branch update failed transiently: %s; daemon will retry", err))
-			return decision, true, pendingErr
-		}
+		// Evaluate reaches branch freshness only after reviewAndCIGateMiss.
+		// headSHA is therefore the exact commit whose approval authorized this
+		// merge attempt. Never mutate that authorization target as part of the
+		// attempt itself.
+		reason := fmt.Sprintf(
+			"approved head %s requires a branch update from %s; update refused because it would invalidate the exact-head review. Update the branch explicitly, then obtain a new review for the new head",
+			headSHA, base,
+		)
+		decision, blockErr := g.block(ctx, request, headSHA, reason, MergeBlockTransient)
+		return decision, true, blockErr
 	}
 	if status != "" && status != "ahead" && status != "identical" {
 		decision, err := g.block(ctx, request, headSHA, fmt.Sprintf("pull request branch freshness is unknown: compare status %q", compare.Status), MergeBlockTransient)
@@ -2233,7 +2215,8 @@ func (g PolicyMergeGate) ensureBranchFresh(ctx context.Context, repo github.Repo
 // A nil Mergeable is UNKNOWN, never "fine": GitHub computes mergeability
 // asynchronously, so a PR read moments after a base move legitimately returns
 // nil, and a token that cannot see it returns nil too. Both must keep the
-// mandatory branch update, which is the pre-#1865 behaviour.
+// native merge closed, with the reviewed head preserved for an explicit update
+// followed by a new exact-head review.
 func mergeableWithoutConflict(pr github.PullRequest) bool {
 	return pr.Mergeable != nil && *pr.Mergeable
 }
@@ -2241,9 +2224,8 @@ func mergeableWithoutConflict(pr github.PullRequest) bool {
 // baseAllowsBehindMerge reports whether a head that is merely BEHIND base may be
 // merged without first requesting a branch update (#1865).
 //
-// It FAILS CLOSED: an undetermined protection read keeps the pre-#1865
-// behaviour of updating the branch and retrying, because an unprotected branch
-// and a token that cannot read protection are indistinguishable from here.
+// It FAILS CLOSED: an undetermined protection read never merges or changes the
+// reviewed head.
 func (g PolicyMergeGate) baseAllowsBehindMerge(ctx context.Context, repo github.Repository, base string) bool {
 	if g.GitHub == nil {
 		return false
@@ -2253,37 +2235,6 @@ func (g PolicyMergeGate) baseAllowsBehindMerge(ctx context.Context, repo github.
 		return false
 	}
 	return !required
-}
-
-func (g PolicyMergeGate) postMergeConflictComment(ctx context.Context, repo github.Repository, request MergeRequest, pr github.PullRequest, reason string) error {
-	if request.PullRequest <= 0 {
-		return nil
-	}
-	base := strings.TrimSpace(pr.BaseRef)
-	if base == "" {
-		base = strings.TrimSpace(pr.BaseSHA)
-	}
-	body := strings.Join([]string{
-		"Gitmoot merge gate is blocked.",
-		"",
-		"Gitmoot could not update this pull request branch before merge because it conflicts with `" + base + "`.",
-		"",
-		"- reason: " + reason,
-		"- retry: stopped; this is not retryable until the branch is fixed",
-		"- task: " + mergeConflictTaskLabel(request),
-		"- next action: resolve the conflict manually, or queue a Gitmoot implement/fix job so Gitmoot applies file changes in the task worktree and owns commit/push/PR refresh",
-		"- after fix: rerun review/merge on the updated pull request head",
-	}, "\n")
-	_, err := g.GitHub.PostIssueComment(ctx, repo, int64(request.PullRequest), body)
-	return err
-}
-
-func mergeConflictTaskLabel(request MergeRequest) string {
-	taskID := strings.TrimSpace(request.TaskID)
-	if taskID == "" {
-		return "unknown"
-	}
-	return taskID
 }
 
 func (g PolicyMergeGate) ensureReviewMatchesHead(payload JobPayload, headSHA string, agent string) error {
