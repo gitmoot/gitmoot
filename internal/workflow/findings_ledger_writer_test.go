@@ -87,6 +87,74 @@ func TestAdvanceJobRecordsReviewFindingsToTheLedger(t *testing.T) {
 	}
 }
 
+// #2173: a runtime that failed before emitting gitmoot_result reported its own
+// protocol failure as a P1 finding. AdvanceJob wrote that quoted text into the
+// code ledger before it handled the failed job, turning a job-level failure into
+// a merge obligation. A failed reviewer can still report a real source finding,
+// so the positive control keeps a locator-backed finding.
+func TestAdvanceJobDoesNotRecordFailedProtocolOutputAsACodeFinding(t *testing.T) {
+	tests := []struct {
+		name        string
+		finding     json.RawMessage
+		wantRows    int
+		wantSkipped int
+	}{
+		{
+			name:        "quoted protocol failure stays on the job",
+			finding:     json.RawMessage(`{"severity":"P1","file":"","line":0,"message":"gitmoot_result JSON object was missing from the previous response; protocol output must always contain exactly one valid gitmoot_result object."}`),
+			wantRows:    0,
+			wantSkipped: 1,
+		},
+		{
+			name:        "source finding survives a later review failure",
+			finding:     json.RawMessage(`{"severity":"P1","title":"nil dereference","file":"internal/run.go","rationale":"the error path dereferences result before checking it"}`),
+			wantRows:    1,
+			wantSkipped: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openEngineStore(t)
+			if err := store.UpsertTask(ctx, db.Task{
+				ID: "task-2173", RepoFullName: "gitmoot/gitmoot", Branch: "task-2173",
+				State: string(TaskReviewing),
+			}); err != nil {
+				t.Fatalf("UpsertTask: %v", err)
+			}
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot", Branch: "task-2173", PullRequest: 2173,
+				TaskID: "task-2173", HeadSHA: strings.Repeat("a", 40),
+				Result: &AgentResult{
+					Decision: "failed",
+					Summary:  "review runtime failed",
+					Evidence: "static_only",
+					Findings: []json.RawMessage{tt.finding},
+				},
+			}
+			const jobID = "review-2173"
+			insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "reviewer", Type: "review"}, payload)
+			if err := store.UpdateJobState(ctx, jobID, string(JobFailed)); err != nil {
+				t.Fatalf("UpdateJobState: %v", err)
+			}
+
+			if err := testEngine(store).AdvanceJob(ctx, jobID); err == nil {
+				t.Fatal("AdvanceJob accepted a failed review")
+			}
+			rows, err := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2173)
+			if err != nil {
+				t.Fatalf("ListReviewFindingObservations: %v", err)
+			}
+			if len(rows) != tt.wantRows {
+				t.Fatalf("ledger rows = %d, want %d: %+v", len(rows), tt.wantRows, rows)
+			}
+			if got := countJobEvents(t, store, jobID, "findings_ledger_skipped"); got != tt.wantSkipped {
+				t.Fatalf("findings_ledger_skipped events = %d, want %d", got, tt.wantSkipped)
+			}
+		})
+	}
+}
+
 // The loop's other half. A written ledger with no disclosure would turn the
 // inert feature into a guard that blocks legitimate merges: an obligation is
 // dischargeable ONLY by citing a uid, and a uid is obtainable ONLY by being
