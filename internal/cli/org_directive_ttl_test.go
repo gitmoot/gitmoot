@@ -1282,7 +1282,10 @@ func TestDirectiveCanStillEscalateArms(t *testing.T) {
 		item db.OrgDirectiveObligation
 		want bool
 	}{
-		{"unacked runs its own ack ladder", db.OrgDirectiveObligation{DoneTTLOverrideSeconds: -1}, true},
+		{"unacked with a live ack ladder", db.OrgDirectiveObligation{DoneTTLOverrideSeconds: -1}, true},
+		{"unacked with a SPENT ack ladder emits nothing, so it cannot hold a queue", db.OrgDirectiveObligation{
+			NudgeCount: 3, DoneTTLOverrideSeconds: -1,
+		}, false},
 		{"acked and live", db.OrgDirectiveObligation{AckedAt: acked, DoneTTLOverrideSeconds: -1}, true},
 		{"exhausted stamp with an UNBURNED budget", db.OrgDirectiveObligation{
 			AckedAt: acked, ExhaustedAt: "2026-09-16T11:00:00Z", DoneNudgeCount: 0, DoneTTLOverrideSeconds: -1,
@@ -1299,5 +1302,102 @@ func TestDirectiveCanStillEscalateArms(t *testing.T) {
 				t.Fatalf("directiveCanStillEscalate = %v, want %v: an obligation that cannot escalate must not hold later ones", got, testCase.want)
 			}
 		})
+	}
+}
+
+// #2195 review: THE PERMANENT-SILENCE CASE REACHED THROUGH THE ACK LADDER. An
+// unacked obligation whose ACK ladder is spent emits nothing - directiveTTLDue
+// stops nudging at the counter - yet it remains the target's oldest obligation.
+// Treating it as a valid queue holder silences everything behind it, and for a
+// seat that never acks that is its whole queue. End-to-end rather than at the
+// predicate, because the claim is about what the SWEEP does.
+func TestNeverAckedObligationDoesNotSilenceTheQueue(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 1)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+
+	silent := seedDirectiveTTLNote(t, store, "older item the seat never acked", 0, false)
+	later := seedDirectiveTTLNote(t, store, "later item, acked and owed", 0, false)
+	acknowledgeDirectiveTTLNote(t, store, later)
+
+	// Spend the older item's ACK ladder.
+	base := time.Now().UTC().Add(time.Hour)
+	for step := range 3 {
+		if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, io.Discard,
+			base.Add(time.Duration(step)*time.Hour), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := readDirectiveTTLObligation(t, store, silent.ID); got.NudgeCount < 1 {
+		t.Fatalf("older item's ack ladder was not spent, so this test proves nothing: %+v", got)
+	}
+
+	var output bytes.Buffer
+	if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, &output,
+		base.Add(12*time.Hour), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), fmt.Sprintf("org directive %d completion ladder held", later.ID)) {
+		t.Fatalf("acked obligation held behind a never-acked silent one: its queue is now invisible. output=%q", output.String())
+	}
+	if got := readDirectiveTTLObligation(t, store, later.ID); got.DoneNudgeCount == 0 && strings.TrimSpace(got.ExhaustedAt) == "" {
+		t.Fatalf("later obligation %d neither nudged nor escalated: %+v", later.ID, got)
+	}
+}
+
+// #2195 review (P3): TWO WORKFLOWS ARE TWO INDEPENDENT QUEUES. A seat-global
+// hold means one sender's stalled item silences an UNRELATED sender's work on
+// the same seat - the very failure this change exists to prevent, at a coarser
+// granularity. A sender can only sequence within its own workflow, so a
+// cross-workflow hold expresses an order nobody stated.
+func TestDirectiveQueueHoldDoesNotCrossWorkflows(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+
+	seed := func(workflowID, body string) db.WorkflowNote {
+		t.Helper()
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID:              workflowID,
+			Author:                  "sender",
+			Body:                    workflow.FormatOrgDirectiveNote("sender", "worker", workflowID, body),
+			Repo:                    "gitmoot/gitmoot",
+			DirectiveDoneTTLSeconds: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: workflowID,
+			Author:     "worker",
+			Body:       workflow.FormatOrgDirectiveAckNote(note.ID, "worker"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+
+	firstInA := seed("release/ttl", "workflow A, item one")
+	secondInA := seed("release/ttl", "workflow A, item two")
+	onlyInB := seed("other/workflow", "workflow B, unrelated work")
+
+	var output bytes.Buffer
+	if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, &output,
+		time.Now().UTC().Add(4*time.Hour), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", secondInA.ID)) {
+		t.Fatalf("item two of workflow A was not held behind item one: output=%q", text)
+	}
+	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", onlyInB.ID)) {
+		t.Fatalf("workflow B's only item was held behind workflow A: an unrelated sender's queue is now silent. output=%q", text)
+	}
+	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", firstInA.ID)) {
+		t.Fatalf("the oldest item in workflow A was held: output=%q", text)
 	}
 }
