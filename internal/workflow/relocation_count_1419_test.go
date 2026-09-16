@@ -1183,3 +1183,52 @@ func TestRelocationPathCheckerKeysItsMemoByHeadAndPath(t *testing.T) {
 		t.Fatalf("resolver calls = %v after a repeat of a known (head,path), want still 2", calls)
 	}
 }
+
+// This enters through the dispatcher-facing production entry point. A direct
+// ledgerRelocationBrief test cannot detect the resolver being left unwired in
+// ledgerObligationBrief, which would silently keep line-qualified observations
+// in separate buckets and erase the relocation warning.
+func TestReviewObligationBriefWiresRelocationResolver(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	const (
+		repo        = "gitmoot/gitmoot"
+		pullRequest = 2066
+		path        = "internal/workflow/runner.go"
+	)
+	heads := []string{
+		strings.Repeat("a", 40),
+		strings.Repeat("b", 40),
+		strings.Repeat("c", 40),
+	}
+	for i, head := range heads {
+		line := (i + 1) * 10
+		if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+			Repo: repo, PullRequest: pullRequest, HeadSHA: head,
+			ObserverJob:      fmt.Sprintf("review-%d", i+1),
+			State:            db.FindingOpen,
+			Severity:         "P1",
+			RoundLabel:       "F1",
+			Title:            "the defect moved again",
+			File:             fmt.Sprintf("%s:%d", path, line),
+			EvidenceKind:     db.EvidenceExecuted,
+			ExecutedCommands: []string{"go test ./internal/workflow"},
+			ExecutedCount:    1,
+		}); err != nil {
+			t.Fatalf("RecordReviewFindingObservation(round %d): %v", i+1, err)
+		}
+	}
+
+	engine := Engine{
+		Store: store,
+		LedgerResolvers: LedgerResolvers{
+			PathExistsAtHead: func(_ context.Context, _ string, candidate string) (bool, error) {
+				return candidate == path, nil
+			},
+		},
+	}
+	brief := engine.ReviewObligationBrief(ctx, repo, pullRequest, heads[len(heads)-1], "task-2066")
+	if !strings.Contains(brief, path+"  rounds=3") {
+		t.Fatalf("production obligation brief did not canonicalize and count relocated findings:\n%s", brief)
+	}
+}
