@@ -1232,3 +1232,42 @@ func TestReviewObligationBriefWiresRelocationResolver(t *testing.T) {
 		t.Fatalf("production obligation brief did not canonicalize and count relocated findings:\n%s", brief)
 	}
 }
+
+// The production entry point must also wire the logical-round resolver. Without
+// it, three fan-out children from one review round look like three independent
+// rounds and manufacture a relocation warning.
+func TestReviewObligationBriefWiresRoundResolver(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	const (
+		repo        = "gitmoot/gitmoot"
+		pullRequest = 2066
+		head        = "dddddddddddddddddddddddddddddddddddddddd"
+		path        = "internal/workflow/runner.go"
+	)
+	for i := 1; i <= 3; i++ {
+		jobID := fmt.Sprintf("lens-%d", i)
+		insertCompletedJob(t, store, db.Job{ID: jobID, Agent: "reviewer", Type: "review"}, JobPayload{
+			Repo: repo, PullRequest: pullRequest, ParentJobID: "panel", ReviewRound: "review-1", HeadSHA: head,
+		})
+		if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+			Repo: repo, PullRequest: pullRequest, HeadSHA: head,
+			ObserverJob:      jobID,
+			State:            db.FindingOpen,
+			Severity:         "P1",
+			RoundLabel:       fmt.Sprintf("F%d", i),
+			Title:            "one review round found related concerns",
+			File:             path,
+			EvidenceKind:     db.EvidenceExecuted,
+			ExecutedCommands: []string{"go test ./internal/workflow"},
+			ExecutedCount:    1,
+		}); err != nil {
+			t.Fatalf("RecordReviewFindingObservation(lens %d): %v", i, err)
+		}
+	}
+
+	brief := (Engine{Store: store}).ReviewObligationBrief(ctx, repo, pullRequest, head, "task-2066")
+	if strings.Contains(brief, "DEFECT RELOCATION COUNT") {
+		t.Fatalf("one review round's fan-out was reported as relocation:\n%s", brief)
+	}
+}
