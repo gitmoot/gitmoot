@@ -484,6 +484,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		return err
 	}
 	workingSeats := directiveWorkingSeats(ctx, store, deps, stdout, now)
+	oldestOpenPerTarget := directiveOldestOpenPerTarget(items, orgConfig)
 	for _, item := range items {
 		from, to, _, _, ok := workflow.ParseOrgDirectiveNote(item.Body)
 		if !ok {
@@ -512,6 +513,30 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		// asks for a receipt the seat has not yet given, so it is not a nag
 		// about unfinished work, and routing receipts off the pane entirely is
 		// its own slice (#1980).
+		// #2195: A LADDER CANNOT SEE A QUEUE. Each directive's completion clock
+		// runs from its OWN ack, so a coordinator that deliberately hands a seat
+		// three items in a stated order ages items two and three exactly like
+		// abandoned ones. Measured 2026-09-16: directive 167331 (the item its
+		// sender sequenced LAST) escalated as "incomplete after 4h0m1s" while the
+		// seat was demonstrably working the item sequenced FIRST - its head moved
+		// during the same window. An escalation that fires on work waiting its
+		// turn trains its reader to discount escalations.
+		//
+		// So a target's completion ladder runs for its OLDEST open obligation
+		// only. This stays BOUNDED because the oldest one still escalates on
+		// schedule: a seat that has genuinely stopped is reported by the item it
+		// stopped on, which is the useful row anyway. The acknowledgment phase is
+		// deliberately NOT held - a receipt is cheap, does not require the work to
+		// be finished, and an unacked directive is how a sender learns the seat
+		// never saw it.
+		if !unacked {
+			if olderID, held := oldestOpenPerTarget[to]; held && olderID != item.ID {
+				writeLine(stdout,
+					"org directive %d completion ladder held: %s has older open directive %d (queue order, not a stall)",
+					item.ID, to, olderID)
+				continue
+			}
+		}
 		if !unacked {
 			switch directiveCompletionNagDecision(workingSeats, to, anchor, ttl, orgConfig.DirectiveMaxNudges(), now) {
 			case directiveNagDefer:
@@ -691,6 +716,75 @@ func buildDirectiveWorkingEscalationEvent(
 		ev.WakeTargetRole = role.Parent
 	}
 	return ev
+}
+
+// directiveOldestOpenPerTarget maps each target seat to the id of its oldest
+// open obligation THAT CAN STILL ESCALATE, so a completion ladder can tell
+// "waiting its turn" from "stalled" (#2195).
+//
+// "CAN STILL ESCALATE" IS THE LOAD-BEARING QUALIFIER, and the first version of
+// this function omitted it. Holding behind the oldest OPEN obligation broke
+// TestDirectiveTTLAckSkipsAckNudgesAndDoneOverrideWins, where the older item has
+// a completion TTL of zero - a ladder that is switched off. Queueing behind an
+// item that can never come due is not a deferral, it is PERMANENT SILENCE: it
+// trades this fix's false alarm for a missed one, which is strictly worse. So a
+// candidate must have a positive effective completion TTL, an un-exhausted
+// counter, and no terminal stamp - exactly the conditions under which it will
+// eventually escalate on its own and expose the stall.
+//
+// Malformed rows are skipped rather than treated as the oldest: a row nobody can
+// parse must not silently suppress every later obligation to the same seat.
+func directiveOldestOpenPerTarget(items []db.OrgDirectiveObligation, orgConfig config.OrgConfig) map[string]int64 {
+	type candidate struct {
+		id      int64
+		created time.Time
+	}
+	oldest := map[string]candidate{}
+	for _, item := range items {
+		_, to, _, _, ok := workflow.ParseOrgDirectiveNote(item.Body)
+		if !ok || strings.TrimSpace(to) == "" {
+			continue
+		}
+		if !directiveCanStillEscalate(item, orgConfig) {
+			continue
+		}
+		created := parseTranscriptStoreTime(item.CreatedAt)
+		if created.IsZero() {
+			continue
+		}
+		current, seen := oldest[to]
+		if !seen || created.Before(current.created) || (created.Equal(current.created) && item.ID < current.id) {
+			oldest[to] = candidate{id: item.ID, created: created}
+		}
+	}
+	result := make(map[string]int64, len(oldest))
+	for to, pick := range oldest {
+		result[to] = pick.id
+	}
+	return result
+}
+
+// directiveCanStillEscalate reports whether this obligation's COMPLETION ladder
+// will eventually fire if nothing changes. Only such an obligation may hold
+// later ones behind it (#2195): the hold is bounded precisely because the item
+// holding the queue still reports the stall itself.
+func directiveCanStillEscalate(item db.OrgDirectiveObligation, orgConfig config.OrgConfig) bool {
+	if strings.TrimSpace(item.AckedAt) == "" {
+		// Unacked items run the acknowledgment ladder, which this hold never
+		// suppresses, and they escalate on their own clock.
+		return true
+	}
+	if strings.TrimSpace(item.ExhaustedAt) != "" {
+		return false
+	}
+	if item.DoneNudgeCount >= orgConfig.DirectiveMaxNudges() {
+		return false
+	}
+	ttl := orgConfig.DirectiveDoneTTL()
+	if item.DoneTTLOverrideSeconds >= 0 {
+		ttl = time.Duration(item.DoneTTLOverrideSeconds) * time.Second
+	}
+	return ttl > 0
 }
 
 func directiveTTLDue(item db.OrgDirectiveObligation, orgConfig config.OrgConfig, now time.Time) (anchor time.Time, ttl time.Duration, phase string, unacked, due bool) {

@@ -1143,3 +1143,161 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 			before.UpdatedAt, after[0].UpdatedAt, before.State, after[0].State, before.AttemptCount, after[0].AttemptCount)
 	}
 }
+
+// #2195: A LADDER CANNOT SEE A QUEUE. Reproduces the 2026-09-16 false alarm:
+// three directives to one seat in a stated order, the seat working the FIRST,
+// and the THIRD escalating as "incomplete after 4h0m1s". The completion ladder
+// must run for the seat's OLDEST open obligation only - the item it actually
+// stopped on - so an escalation names work that stalled rather than work
+// waiting its turn.
+func TestDirectiveCompletionLadderRunsOldestObligationOnly(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 3)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+
+	first := seedDirectiveTTLNote(t, store, "item one: fix the red CI", 0, false)
+	second := seedDirectiveTTLNote(t, store, "item two: add the production-entry test", 0, false)
+	third := seedDirectiveTTLNote(t, store, "item three: rebase and re-review", 0, false)
+	for _, directive := range []db.WorkflowNote{first, second, third} {
+		acknowledgeDirectiveTTLNote(t, store, directive)
+	}
+
+	now := time.Now().UTC().Add(4 * time.Hour)
+	var output bytes.Buffer
+	sink := &recordingSink{}
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, &output, now, directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+
+	text := output.String()
+	for _, held := range []db.WorkflowNote{second, third} {
+		want := fmt.Sprintf("org directive %d completion ladder held", held.ID)
+		if !strings.Contains(text, want) {
+			t.Fatalf("queued directive %d was not held: output=%q", held.ID, text)
+		}
+	}
+	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", first.ID)) {
+		t.Fatalf("the OLDEST obligation was held, so nothing would ever escalate: output=%q", text)
+	}
+
+	// The oldest one still runs its ladder: the bound that keeps this from
+	// silencing a genuinely stalled seat.
+	open, err := store.ListOpenOrgDirectiveObligations(context.Background(), 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstNudges, heldNudges int
+	for _, item := range open {
+		switch item.ID {
+		case first.ID:
+			firstNudges = item.DoneNudgeCount
+		case second.ID, third.ID:
+			heldNudges += item.DoneNudgeCount
+		}
+	}
+	if firstNudges == 0 {
+		t.Fatalf("oldest obligation %d recorded no completion nudge: open=%+v", first.ID, open)
+	}
+	if heldNudges != 0 {
+		t.Fatalf("held obligations recorded %d completion nudges, want 0", heldNudges)
+	}
+
+	// AND THE HOLD MUST LIFT. With the oldest resolved, the next one becomes the
+	// seat's oldest open obligation and runs its own ladder - otherwise this
+	// trades a false alarm for permanent silence.
+	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		WorkflowID: first.WorkflowID,
+		Author:     "worker",
+		Body:       workflow.FormatOrgDirectiveDoneNote(first.ID, "worker"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second_output bytes.Buffer
+	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, &second_output, now.Add(time.Hour), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(second_output.String(), fmt.Sprintf("org directive %d completion ladder held", second.ID)) {
+		t.Fatalf("hold did not lift after the oldest completed: output=%q", second_output.String())
+	}
+}
+
+// #2195: AN OBLIGATION THAT CAN NO LONGER ESCALATE MUST NOT HOLD THE QUEUE.
+// The hold is only bounded because the item holding it still reports the stall
+// itself; an older item whose ladder is EXHAUSTED never will, so queueing behind
+// it converts this fix's false alarm into permanent silence - strictly worse
+// than the defect. Found by a surviving mutant, not by design.
+func TestExhaustedObligationDoesNotHoldLaterOnes(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 1)
+	store := openDirectiveTTLStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+
+	stalled := seedDirectiveTTLNote(t, store, "older item the seat abandoned", 0, false)
+	later := seedDirectiveTTLNote(t, store, "later item that must still be reported", 0, false)
+	acknowledgeDirectiveTTLNote(t, store, stalled)
+	acknowledgeDirectiveTTLNote(t, store, later)
+
+	// Burn the older item's ladder to exhaustion.
+	now := time.Now().UTC().Add(time.Hour)
+	for step := range 3 {
+		if err := evaluateOrgDirectiveTTLs(ctx, store, &recordingSink{}, cfg, io.Discard,
+			now.Add(time.Duration(step)*time.Hour), directiveTTLDependencies{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := readDirectiveTTLObligation(t, store, stalled.ID); strings.TrimSpace(got.ExhaustedAt) == "" {
+		t.Fatalf("older obligation %d never exhausted, so this test proves nothing: %+v", stalled.ID, got)
+	}
+
+	var output bytes.Buffer
+	sink := &recordingSink{}
+	if err := evaluateOrgDirectiveTTLs(ctx, store, sink, cfg, &output,
+		now.Add(10*time.Hour), directiveTTLDependencies{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), fmt.Sprintf("org directive %d completion ladder held", later.ID)) {
+		t.Fatalf("later obligation held behind an EXHAUSTED one: it would never be reported. output=%q", output.String())
+	}
+	if got := readDirectiveTTLObligation(t, store, later.ID); got.DoneNudgeCount == 0 && strings.TrimSpace(got.ExhaustedAt) == "" {
+		t.Fatalf("later obligation %d neither nudged nor escalated after the older one exhausted: %+v", later.ID, got)
+	}
+}
+
+// #2195: directiveCanStillEscalate decides which obligation may hold a queue,
+// and every "no" arm must hold independently. The EXHAUSTED arm is redundant
+// today - every path that stamps ExhaustedAt also burns the nudge budget - so a
+// sweep-level mutant survives removing it. That redundancy is exactly why it is
+// pinned HERE: a future path that stamps exhaustion without burning nudges would
+// otherwise let a dead obligation hold every later one forever, which is the
+// permanent-silence hazard this design exists to avoid, and the surviving
+// end-to-end mutant would never have shown it.
+func TestDirectiveCanStillEscalateArms(t *testing.T) {
+	home := t.TempDir()
+	cfg := writeDirectiveTTLConfig(t, home, "supervisor", 10*time.Minute, 10*time.Minute, 3)
+	const acked = "2026-09-16T10:00:00Z"
+	for _, testCase := range []struct {
+		name string
+		item db.OrgDirectiveObligation
+		want bool
+	}{
+		{"unacked runs its own ack ladder", db.OrgDirectiveObligation{DoneTTLOverrideSeconds: -1}, true},
+		{"acked and live", db.OrgDirectiveObligation{AckedAt: acked, DoneTTLOverrideSeconds: -1}, true},
+		{"exhausted stamp with an UNBURNED budget", db.OrgDirectiveObligation{
+			AckedAt: acked, ExhaustedAt: "2026-09-16T11:00:00Z", DoneNudgeCount: 0, DoneTTLOverrideSeconds: -1,
+		}, false},
+		{"nudge budget spent", db.OrgDirectiveObligation{
+			AckedAt: acked, DoneNudgeCount: 3, DoneTTLOverrideSeconds: -1,
+		}, false},
+		{"completion ladder switched off by a zero override", db.OrgDirectiveObligation{
+			AckedAt: acked, DoneTTLOverrideSeconds: 0,
+		}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := directiveCanStillEscalate(testCase.item, cfg); got != testCase.want {
+				t.Fatalf("directiveCanStillEscalate = %v, want %v: an obligation that cannot escalate must not hold later ones", got, testCase.want)
+			}
+		})
+	}
+}
