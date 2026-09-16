@@ -516,6 +516,28 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent review: %v\n", err)
 		return 2
 	}
+	// #2196: ROUTE THROUGH `review request` INSTEAD OF BESIDE IT. Measured
+	// 2026-09-16: 687 of 688 reviews on this box came through this command, so
+	// the four features the router adds - exact-head claim and dedup, delta
+	// baseline against the last verdict, availability-aware runtime choice, and
+	// the verdict subscription - were reachable in principle and unused in
+	// practice. Announcing the other command was measured at 1 in 688, so the
+	// surface everyone uses now carries the machinery rather than asking seats
+	// to type a different verb.
+	//
+	// The named reviewer SURVIVES: `review request --reviewer` routes a named
+	// agent own-first, which is the property that made this command worth
+	// keeping. The caller's message and --lead survive because they were added
+	// to that command first; delegating without them would have silently dropped
+	// every seat's review instructions and its fix target.
+	if !options.foreground {
+		return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
+	}
+	// FOREGROUND IS NOT DELEGATED AND THAT IS A STATED LIMIT, not an oversight.
+	// `review request` always dispatches a daemon-owned job; a foreground review
+	// runs in this process and streams. Converting it would change what the
+	// caller observes, so it keeps the direct path and keeps the #2194
+	// subscription attached below.
 	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -600,6 +622,38 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 		output.SubscriptionHolds = append(output.SubscriptionHolds,
 			fmt.Sprintf("subscription failed (%v): this verdict will not wake %s", err, role))
 	}
+}
+
+// reviewRequestArgsFromAgentReview maps this command's options onto the router
+// command's flags (#2196). Every value the caller supplied is carried; nothing
+// is invented. The reviewer is passed EXPLICITLY because the caller named it -
+// that is what distinguishes this surface from a bare router request.
+func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
+	args := []string{"--pr", strconv.Itoa(options.prNumber)}
+	for _, pair := range [][2]string{
+		{"--repo", options.repo},
+		{"--head", options.headSHA},
+		{"--branch", options.branch},
+		{"--role", options.orgRole},
+		{"--reviewer", options.agent},
+		{"--runtime", options.runtime},
+		{"--lead", options.lead},
+		{"--home", options.home},
+	} {
+		if value := strings.TrimSpace(pair[1]); value != "" {
+			args = append(args, pair[0], value)
+		}
+	}
+	if options.allowPromptHeadMismatch {
+		args = append(args, "--allow-prompt-head-mismatch")
+	}
+	if options.jsonOutput {
+		args = append(args, "--json")
+	}
+	if message := strings.TrimSpace(options.message); message != "" {
+		args = append(args, message)
+	}
+	return args
 }
 
 func runAgentImplement(args []string, stdout, stderr io.Writer) int {

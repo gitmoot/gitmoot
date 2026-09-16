@@ -100,6 +100,12 @@ func printReviewUsage(w io.Writer) {
 }
 
 type reviewRequestOptions struct {
+	// lead and message exist so `agent review` can route THROUGH this command
+	// instead of beside it (#2196). Without them delegation would silently drop
+	// the caller's review instructions and its fix target, which is the whole
+	// reason the other surface was still being used.
+	lead                    string
+	message                 string
 	home                    string
 	repo                    string
 	pr                      int
@@ -131,6 +137,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.StringVar(&opts.lead, "lead", "", "implementer a changes-requested verdict routes to; empty dispatches with no fix target")
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
@@ -141,7 +148,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if fs.NArg() != 0 || opts.pr <= 0 {
+	if fs.NArg() == 1 {
+		opts.message = strings.TrimSpace(fs.Arg(0))
+	}
+	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
 		return 2
 	}
@@ -194,6 +204,20 @@ func effectiveReviewRuntime(override, selected string) string {
 
 // reviewRequestRuntime applies the router's omp pin unless the operator named a
 // runtime. One site for the pin, so a future caller cannot lose the override.
+// reviewRequestInstructions composes the router brief and appends the caller's
+// own message when one is given (#2196). The router text comes FIRST so the
+// scope, purpose and head framing cannot be displaced by a caller's prose, and
+// the caller's message is labelled so a reviewer can tell operator instructions
+// from generated framing.
+func reviewRequestInstructions(opts reviewRequestOptions, repo string, head string, scope *workflow.ReviewScope) string {
+	brief := reviewRouterInstructions(opts.purpose, repo, opts.pr, head, scope)
+	message := strings.TrimSpace(opts.message)
+	if message == "" {
+		return brief
+	}
+	return brief + "\n\nREQUESTER INSTRUCTIONS (verbatim from the dispatching operator):\n" + message
+}
+
 func reviewRequestRuntime(override, selected, registered string) string {
 	if trimmed := strings.TrimSpace(override); trimmed != "" {
 		return trimmed
@@ -338,7 +362,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		RepoFlag:     repo.FullName(),
 		Agent:        reviewer.Name,
 		Action:       "review",
-		Instructions: reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
+		Instructions: reviewRequestInstructions(opts, repo.FullName(), head, scope),
 		Background:   true,
 		// Gated on the EFFECTIVE runtime, not on whether an override was
 		// emitted: a review running on the agent's own non-omp runtime must not
@@ -348,14 +372,18 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
 		// hold is written for that runtime (#2181), with nothing to fall back to.
-		Runtime:              reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
-		ActingOrgRole:        opts.role,
-		OperatorOrigin:       true,
-		Home:                 opts.home,
-		PullRequest:          opts.pr,
-		HeadSHA:              head,
-		Branch:               branch,
-		NoFixTarget:          true,
+		Runtime:        reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
+		ActingOrgRole:  opts.role,
+		OperatorOrigin: true,
+		Home:           opts.home,
+		PullRequest:    opts.pr,
+		HeadSHA:        head,
+		Branch:         branch,
+		LeadAgent:      strings.TrimSpace(opts.lead),
+		// A NAMED LEAD IS A FIX TARGET. The router's own requests carry none, so
+		// a changes-requested verdict has nowhere to route and says so; a caller
+		// that names an implementer gets the routing it asked for (#2196).
+		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
 		SelectedAction:       "review",
 		SelectedActionReason: "review router " + opts.purpose,
 		ExecutionPath:        reviewRequestExecutionPath,
