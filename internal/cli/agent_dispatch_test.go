@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1648,5 +1650,148 @@ func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
 	}
 	if len(jobs) != 1 {
 		t.Fatalf("jobs = %+v, want the review still dispatched", jobs)
+	}
+}
+
+// #2196 review (P1): THE FIX FOR A MISSED FLAG IS NOT A LONGER HAND LIST.
+// Inspection found the message and --lead and missed at least eight others;
+// adding those by hand leaves the flag someone adds NEXT MONTH in exactly the
+// same position - silently dropped by a wrapper nobody re-audits.
+//
+// So this test enumerates `agent review`'s ACCEPTED FLAGS FROM ITS OWN PARSER
+// SOURCE and asserts every one is either FORWARDED to `review request` or
+// EXPLICITLY REJECTED into the direct path. A new flag that is neither fails
+// here, which turns a silent degradation into a build break. Same move as
+// deriving an expected method name from the method expression rather than
+// typing it (#2188): the list stops being a second copy of the truth.
+func TestEveryAgentReviewFlagIsForwardedOrRejected(t *testing.T) {
+	source, err := os.ReadFile("agent.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func parseAgentRunOptions(")
+	if start < 0 {
+		t.Fatal("parseAgentRunOptions not found: update this test's anchor deliberately")
+	}
+	end := strings.Index(text[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not bound parseAgentRunOptions")
+	}
+	body := text[start : start+end]
+
+	accepted := map[string]bool{}
+	for _, match := range regexp.MustCompile(`"(--[a-z][a-z-]*)"`).FindAllStringSubmatch(body, -1) {
+		accepted[match[1]] = true
+	}
+	for _, match := range regexp.MustCompile(`"(--[a-z][a-z-]*)="`).FindAllStringSubmatch(body, -1) {
+		accepted[match[1]] = true
+	}
+	if len(accepted) < 15 {
+		t.Fatalf("parsed only %d flags from the parser source, which cannot be right: the regex or the anchor is wrong, and a census that reads too few is worse than none", len(accepted))
+	}
+
+	// FORWARDED: present in the args the wrapper builds for `review request`.
+	forwarded := map[string]bool{}
+	probe := agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4",
+		branch: "feature/review", orgRole: "joltra", agent: "reviewer", runtime: "omp",
+		lead: "implementer", home: "/tmp", model: "devin/swe-2", effort: "high",
+		workflowID: "release/queue", session: "session-1", message: "probe",
+		allowPromptHeadMismatch: true,
+	}
+	for _, arg := range reviewRequestArgsFromAgentReview(probe) {
+		if strings.HasPrefix(arg, "--") {
+			forwarded[arg] = true
+		}
+	}
+
+	// REJECTED: named by the gate that keeps the dispatch on the direct path.
+	rejected := map[string]bool{}
+	for _, options := range []agentRunOptions{
+		{action: "implement"}, {typeName: "managed"}, {taskID: "task-1"}, {base: "main"},
+		{recipe: "r"}, {skipNativeReviewFanout: true}, {pullRequestMode: "ready"},
+		{pullRequestMode: "draft"}, {jsonOutput: true}, {lead: "x", noFixTarget: true}, {},
+	} {
+		for _, named := range agentReviewInputsTheRouterCannotCarry(options) {
+			rejected[named] = true
+		}
+	}
+
+	// Flags that describe HOW this process behaves rather than what the review
+	// is, so they have nothing to forward or reject. Each one is listed with its
+	// reason; an unexplained exemption is how a real gap hides.
+	exempt := map[string]string{
+		"--help":       "prints usage and exits",
+		"--foreground": "keeps the direct path by design: the router always dispatches a daemon-owned job",
+		"--background": "the router always dispatches in the background, so this is satisfied by construction",
+		"--org-role":   "forwarded as --role",
+		"--head-sha":   "forwarded as --head",
+		"--pr":         "always forwarded",
+		"--cockpit":    "pane plumbing, not a review input",
+		// #2196: named deliberately rather than swept, because each is a real
+		// decision and a future reader must be able to disagree with it.
+		"--cockpit-session": "pane plumbing, not a review input",
+		"--herdr":           "pane plumbing, not a review input",
+		"--force":           "direct-path dispatch guard, no router counterpart and no review semantics",
+		"--no-fix-target":   "expressed by an absent --lead on the router path",
+	}
+
+	var unaccounted []string
+	for flag := range accepted {
+		if forwarded[flag] || rejected[flag] || exempt[flag] != "" {
+			continue
+		}
+		unaccounted = append(unaccounted, flag)
+	}
+	sort.Strings(unaccounted)
+	if len(unaccounted) > 0 {
+		t.Fatalf("flags neither forwarded to `review request`, rejected into the direct path, nor exempt with a stated reason: %v\n"+
+			"A flag in this list is SILENTLY DROPPED by delegation. Forward it, add it to the rejection gate, or exempt it with the reason.",
+			unaccounted)
+	}
+}
+
+// #2196 review (P2): OMITTING --lead IS A REFUSAL PATH, NOT A REVIEW-ONLY
+// DISPATCH. On the direct path an absent --lead falls back to the reviewer as
+// lead and then VALIDATES it, refusing an unregistered or unsubscribed one
+// (#2054). The router expresses only "lead" or "no fix target", so delegating an
+// absent lead would convert a deliberate refusal into a quiet success - the
+// caller getting its outcome by accident rather than by permission.
+func TestAgentReviewWithoutLeadKeepsTheRefusalPath(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	runAgentReview([]string{
+		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review",
+		"--org-role", "joltra", "--home", home,
+	}, &stdout, &stderr)
+	if !strings.Contains(stderr.String(), "absent --lead with no --no-fix-target") {
+		t.Fatalf("stderr = %q, want the absent-lead reason named: delegation must not silently convert #2054's refusal into a review-only dispatch", stderr.String())
 	}
 }

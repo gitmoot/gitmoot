@@ -672,6 +672,21 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
 		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
 		{"--" + strings.TrimSpace(options.pullRequestMode), strings.TrimSpace(options.pullRequestMode) != ""},
+		// --json CHANGES SCHEMA on the delegated path: `review request` prints a
+		// different object. A programmatic caller parsing the old shape reads
+		// zeros or errors, silently. Keeping the direct path preserves the
+		// contract it was written against (#2196 review, P2).
+		{"--json", options.jsonOutput},
+		// NO --lead AND NO --no-fix-target IS A REFUSAL ON THE DIRECT PATH, NOT
+		// A REVIEW-ONLY DISPATCH (#2054): it falls back to the reviewer as lead
+		// and then VALIDATES that agent, refusing an unregistered or unsubscribed
+		// one. The router expresses only "lead" or "no fix target", so delegating
+		// an absent lead would convert a deliberate refusal into a quiet success
+		// - strictly worse than dropping a flag, because the caller gets the
+		// outcome by accident rather than by permission. Same shape as an
+		// auto-merge with no expectedHeadOid: a guard that stops existing and
+		// nothing announces it (#2196 review, P2).
+		{"absent --lead with no --no-fix-target", strings.TrimSpace(options.lead) == "" && !options.noFixTarget},
 	} {
 		if candidate.set {
 			named = append(named, candidate.flag)
