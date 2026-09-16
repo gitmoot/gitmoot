@@ -107,6 +107,15 @@ func TestOpenDispositionWithAUIDStillMints(t *testing.T) {
 
 // The state alias, isolated from identity so a failure names which half broke.
 func TestDispositionIsReadAsAnAlternateSpellingOfState(t *testing.T) {
+	payload := JobPayload{
+		PullRequest: 1930,
+		Result: &AgentResult{
+			Evidence: EvidenceExecuted,
+			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
+		},
+	}
+	job := db.Job{ID: "review-state-alias", Type: "review"}
+
 	for _, tc := range []struct {
 		name string
 		wire reviewFindingWire
@@ -117,13 +126,21 @@ func TestDispositionIsReadAsAnAlternateSpellingOfState(t *testing.T) {
 		{name: "neither means open", wire: reviewFindingWire{}, want: db.FindingOpen},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := db.FindingState(strings.ToLower(firstNonEmptyLedgerText(
-				strings.TrimSpace(tc.wire.State), strings.TrimSpace(tc.wire.Disposition))))
-			if got == "" {
-				got = db.FindingOpen
+			wire := tc.wire
+			wire.Title = "state alias"
+			wire.Detail = "bind the assertion to production precedence"
+			wire.File = "internal/workflow/x.go"
+			wire.WithdrawReason = "reviewer withdrew the finding after verification"
+
+			// Production entry point: ledgerObservationWithDeclaredState converts
+			// the review wire into the state persisted by the ledger writer.
+			obs, _, ok := (Engine{}).ledgerObservationWithDeclaredState(
+				job, payload, wire, strings.Repeat("e", 40), "gitmoot/gitmoot")
+			if !ok {
+				t.Fatal("ledgerObservationWithDeclaredState rejected a complete finding")
 			}
-			if got != tc.want {
-				t.Fatalf("declared state = %q, want %q", got, tc.want)
+			if obs.State != tc.want {
+				t.Fatalf("observation state = %q, want %q", obs.State, tc.want)
 			}
 		})
 	}
