@@ -60,17 +60,16 @@ gitmoot daemon start --workers 5 --scheduler barrier
 Parallelism under `pool` is bounded by **two** independent locks:
 
 1. **Checkout lock (per worktree).** Jobs run concurrently only when they have
-   distinct checkout keys. Delegation / orchestra `implement` children already get
-   their own worktree from the workflow engine, so they parallelize. Every local
+   distinct checkout keys. Every local
    `review` gets a detached per-job worktree at its requested head; background
-   taskless `ask` jobs can be auto-isolated at checkout `HEAD`. An engine review
-   reports requested changes back to the requester's org role by default. If
-   that PR has explicit auto-fix opt-in, Gitmoot dispatches the fix into an
-   independent writable per-job clone attached to the task branch at its
-   fetched remote head; allocation failure refuses the dispatch instead of
-   falling back to the registered checkout. A
-   plain, top-level same-repo `implement` job with no worktree still shares the
-   `repo:<repo>` key and serializes even under `pool`.
+   taskless `ask` jobs can be auto-isolated at checkout `HEAD`, and read-only
+   delegation legs get their own detached worktree from the workflow engine, so
+   they parallelize. An engine review reports requested changes back to the
+   requester's org role and to the `--lead` seat by default, and allocates no
+   implement job — there is no auto-fix opt-in and no writable fix clone
+   (#2203). The lead implements in its own checkout and records it with
+   `gitmoot job record --type implement`, which is outside the scheduler
+   entirely and so never contends for a checkout key.
 
    **Read-only refs depend on the action.** Review uses its exact requested head,
    preserves that head in the payload, and fails dispatch closed if allocation

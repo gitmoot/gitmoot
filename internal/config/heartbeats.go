@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -96,23 +97,22 @@ func LoadHeartbeats(paths Paths) ([]Heartbeat, error) {
 }
 
 // HeartbeatActions lists the actions a heartbeat may schedule: the read-only
-// "ask" (the conservative default) and "review", plus the WRITE action
-// "implement". "implement" is structurally valid here but POLICY-GATED (#611):
-// it only runs for a target agent whose autonomy policy grants headless writes
-// (workspace-write / danger-full-access) and that holds the "implement"
-// capability. That gate is agent-aware (it needs the agent registry), so it is
-// enforced at the CLI write path and the daemon scan, mirroring how the "review"
-// capability check lives outside this pure config loader.
-func HeartbeatActions() []string { return []string{"ask", "review", "implement"} }
+// "ask" (the conservative default) and "review".
+//
+// "implement" was removed in #2203. It was worse than dead: the CLI accepted
+// `agent heartbeat add --action implement` and this loader accepted the stored
+// entry, but the phase-2 reduction removed the heartbeat implement worktree
+// allocator, so the heartbeat would have enqueued a branchless implement job
+// that can never resolve a checkout. Zero heartbeats on the live store were ever
+// configured with it.
+func HeartbeatActions() []string { return []string{"ask", "review"} }
 
-// HeartbeatActionSupported reports whether action is one a heartbeat may use.
+// HeartbeatActionSupported reports whether action is one a heartbeat may use. It
+// is derived from HeartbeatActions() rather than repeating the set, so the CLI
+// write path (which prints HeartbeatActions()) and this loader-side check cannot
+// drift apart again — before #2203 they agreed only by coincidence.
 func HeartbeatActionSupported(action string) bool {
-	switch strings.TrimSpace(action) {
-	case "ask", "review", "implement":
-		return true
-	default:
-		return false
-	}
+	return slices.Contains(HeartbeatActions(), strings.TrimSpace(action))
 }
 
 // HeartbeatRuntimes lists the runtimes a per-heartbeat runtime override may name
@@ -259,12 +259,11 @@ func validateHeartbeat(entry Heartbeat) error {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: jitter %q: %w", entry.Agent, entry.Name, entry.Jitter, err)
 	}
 	// Supported actions are the read-only "ask" (analyze/answer) and "review"
-	// (read-only PR/code review), plus the WRITE action "implement" (#611). A
-	// "review" heartbeat additionally requires the target agent to HOLD the review
-	// capability, and an "implement" heartbeat requires the agent to hold the
-	// implement capability AND carry a write-granting autonomy policy; both checks
-	// need the agent registry, so they live in the daemon scan (runOneHeartbeat) and
-	// the CLI write path, not in this pure config loader.
+	// (read-only PR/code review) — a heartbeat never schedules a write action
+	// (#2203). A "review" heartbeat additionally requires the target agent to HOLD
+	// the review capability; that check needs the agent registry, so it lives in
+	// the daemon scan (runOneHeartbeat) and the CLI write path, not in this pure
+	// config loader.
 	if !HeartbeatActionSupported(entry.Action) {
 		return fmt.Errorf("heartbeat [agents.%s.heartbeats.%s]: unsupported action %q; supported actions are %s", entry.Agent, entry.Name, entry.Action, strings.Join(HeartbeatActions(), ", "))
 	}

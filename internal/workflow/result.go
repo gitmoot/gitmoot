@@ -47,8 +47,21 @@ var ReviewSeverities = reviewseverity.Values
 // cannot disagree about what a reviewer may say.
 var EvidenceKinds = []string{EvidenceExecuted, EvidenceStaticOnly}
 
-// DelegationActions is the canonical set of delegation/session job actions.
-var DelegationActions = []string{"ask", "review", "implement"}
+// DelegationActions is the canonical set of actions a coordinator may DISPATCH
+// through delegations[]. "implement" is deliberately absent (#2203): Gitmoot no
+// longer dispatches implementation, so an implement delegation is REFUSED by
+// validateAgentResult rather than downgraded — a silent downgrade to ask would
+// leave a coordinator believing work had been dispatched. Seats still RECORD
+// their own implement sessions; that set is SessionJobActions.
+var DelegationActions = []string{"ask", "review"}
+
+// SessionJobActions is the set of job types a session job may be opened,
+// recorded or closed as (`gitmoot job open|close|record`, `agent prompt
+// --record`). It keeps "implement" because a seat that implements in its own
+// session records that work as an implement job — the live traffic this surface
+// carries — even though nothing in Gitmoot dispatches one. Kept separate from
+// DelegationActions so recording can never be mistaken for dispatch (#2203).
+var SessionJobActions = []string{"ask", "review", "implement"}
 
 // DelegationFailurePolicies are the allowed values of Delegation.FailurePolicy
 // (the empty string falls back to the default and is accepted separately).
@@ -761,7 +774,11 @@ func validateAgentResult(result AgentResult) error {
 		} else if d.Action != action {
 			errs = append(errs, delegationFieldError(i, d, "action", "must not have leading or trailing whitespace"))
 		} else if !slices.Contains(DelegationActions, action) {
-			errs = append(errs, delegationFieldError(i, d, "action", "must be one of "+strings.Join(DelegationActions, ", ")))
+			// Name the offending value: an implement delegation is the action a
+			// coordinator is most likely to still emit from habit (#2203), and a
+			// message that only lists the allowed set leaves the author guessing
+			// which leg was refused.
+			errs = append(errs, delegationFieldError(i, d, "action", fmt.Sprintf("%q must be one of %s", action, strings.Join(DelegationActions, ", "))))
 		}
 		if strings.TrimSpace(d.Prompt) == "" {
 			errs = append(errs, delegationFieldError(i, d, "prompt", "is required"))

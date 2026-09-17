@@ -2939,15 +2939,6 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 	if !hasCapability(agent.Capabilities, command.Action) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` does not advertise `%s` capability.", agent.Name, command.Action))
 	}
-	if command.Action == "implement" {
-		allowed, err := d.agentOwnsBranchLock(ctx, agent.Name, pull.HeadRef)
-		if err != nil {
-			return err
-		}
-		if !allowed {
-			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` cannot implement on `%s` without holding the branch lock.", agent.Name, pull.HeadRef))
-		}
-	}
 
 	ref, err := d.commentTaskRef(ctx, pull, comment)
 	if err != nil {
@@ -3023,7 +3014,7 @@ func (d Daemon) handleHelpCommand(ctx context.Context, pull github.PullRequest) 
 	} else {
 		lines = append(lines, "- agents:")
 		lines = append(lines, allowed...)
-		lines = append(lines, "- agent command: `/gitmoot <agent> <review|implement|ask> <instructions>`")
+		lines = append(lines, "- agent command: `/gitmoot <agent> <review|ask> <instructions>`")
 	}
 	return d.ack(ctx, pull.Number, strings.Join(lines, "\n"))
 }
@@ -3366,17 +3357,6 @@ func (d Daemon) commentTaskRef(ctx context.Context, pull github.PullRequest, com
 		ref.branch = task.Branch
 	}
 	return ref, nil
-}
-
-func (d Daemon) agentOwnsBranchLock(ctx context.Context, agentName string, branch string) (bool, error) {
-	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return lock.Owner == agentName, nil
 }
 
 func (d Daemon) authorizeCommenter(ctx context.Context, author string) (bool, error) {

@@ -444,27 +444,6 @@ func (s *Store) ReleaseEscalationRecoveryLease(ctx context.Context, jobID string
 	return released == 1, nil
 }
 
-// RecordEscalationRoundPreEffects durably records the resources a replay allocated
-// outside the effect transaction, under the held fence. It is what lets a later
-// supersede or Class I release hand those resources back instead of orphaning them.
-func (s *Store) RecordEscalationRoundPreEffects(ctx context.Context, jobID string, roundID string, owner string, repo string, branch string, worktreePath string, lockOwner string, now time.Time) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE escalation_rounds
-		SET preeffect_repo = ?, preeffect_branch = ?, preeffect_worktree_path = ?, preeffect_lock_owner = ?
-		WHERE job_id = ? AND round_id = ? AND effects_completed_at IS NULL
-		  AND recovery_owner = ? AND recovery_lease_until > ?`,
-		strings.TrimSpace(repo), strings.TrimSpace(branch), strings.TrimSpace(worktreePath),
-		strings.TrimSpace(lockOwner), strings.TrimSpace(jobID), strings.TrimSpace(roundID),
-		strings.TrimSpace(owner), formatResourceLockTime(now))
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return affected == 1, nil
-}
-
 // ResolutionCommit is EVERY durable write one resolution performs. It exists so they
 // commit in ONE lease-guarded transaction: there is then no "after effect N, before
 // receipt" state for a crash to land in, which is what a per-effect boundary could not

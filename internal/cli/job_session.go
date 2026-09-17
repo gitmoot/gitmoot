@@ -17,8 +17,10 @@ import (
 )
 
 // sessionJobActions are the job types a session ("here"/prompt-import) job may be
-// opened as — the same action set an engine-run job uses.
-var sessionJobActions = workflow.DelegationActions
+// opened as. It is workflow.SessionJobActions, NOT DelegationActions: a seat
+// records the implement work it did in its own session, while nothing dispatches
+// an implement job any more (#2203).
+var sessionJobActions = workflow.SessionJobActions
 
 // jobSessionOutput is the shared JSON/text shape printed by `job open`, `job
 // close`, and `job record` (#657). Decision/summary/PR fields are omitted when
@@ -50,7 +52,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	agent := fs.String("agent", "", "agent that performs the session work (must exist)")
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
-	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
+	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.SessionJobActions, "|"))
 	title := fs.String("title", "", "optional human title for the job")
 	task := fs.String("task", "", "optional task id to associate")
 	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
@@ -233,7 +235,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	agent := fs.String("agent", "", "agent that performed the session work (must exist)")
 	actingRole := fs.String("acting-role", "", "org role that performed the session work in place of an agent (must exist)")
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
-	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.DelegationActions, "|"))
+	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.SessionJobActions, "|"))
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
 	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	title := fs.String("title", "", "optional human title for the job")

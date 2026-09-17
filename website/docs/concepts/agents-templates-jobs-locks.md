@@ -30,7 +30,10 @@ its `agent_templates` store row.
 ## Jobs
 
 Jobs are units of routed work. They can come from PR comments, local
-`agent ask`, `agent implement`, review dispatch, retries, or merge actions.
+`agent ask`/`agent review` dispatches, heartbeat schedules, pipeline stages,
+retries, or merge actions. A seat's own implementation is also a job — not a
+dispatched one: `gitmoot job record --type implement` writes the row after the
+fact, which is how 568 of the last 570 implement rows arrived.
 
 ## Delegations
 
@@ -109,9 +112,9 @@ runtime session lock. To run the *same* agent on several tasks at once, dispatch
 
 - **Temp-session forking** — the default. `[parallel_sessions]` ships with
   `same_session = "fork_temp_session"` and `max_temp_sessions_per_agent = 4`, so a
-  busy registered agent's extra eligible background jobs (`ask` / `review` /
-  `implement`) fork throwaway **temp workers** that run in parallel (same runtime
-  only; same-checkout work stays serialized; `implement` needs a task worktree).
+  busy registered agent's extra eligible background jobs (`ask` / `review`)
+  fork throwaway **temp workers** that run in parallel (same runtime
+  only; same-checkout work stays serialized).
   Zero configuration — this is the "temp worker" column in the table above.
 - **Managed agent types** — `gitmoot agent type set <type> --max-background N`
   defines a reusable, addressable pool. Dispatch with
@@ -119,10 +122,12 @@ runtime session lock. To run the *same* agent on several tasks at once, dispatch
   idle instance or spins a new one, up to `N`.
 
 `--type` selects this managed pool; it never selects the job action. On `agent
-run`, use the independent `--action ask|review|implement` override when routing
-must be explicit. For example, `--type fixer --action implement --pr 42`
-dispatches an implement fix pass through the `fixer` pool after Gitmoot validates
-that PR 42 is open, same-repository, and bound to the existing task branch.
+run`, use the independent `--action ask|review` override when routing must be
+explicit. For example, `--type reviewer --action review --pr 42` dispatches the
+review through the `reviewer` pool. `implement` is not an action Gitmoot
+dispatches (#2203), so there is no fixer-pool fix pass: a `changes_requested`
+verdict wakes the `--lead` seat, which implements in its own session and records
+it with `gitmoot job record --type implement`.
 
 Both need daemon **job slots** to run at the same time: `max_background` and temp
 sessions are session slots, but the daemon still executes at most `--workers`
@@ -132,8 +137,8 @@ jobs at once (default `1`; raise it, e.g. `--workers 6`).
 managed type, so a single agent named `researcher` shadows a `researcher` type —
 force the type with `--type researcher`. Since **v0.5.1** a foreground `gitmoot
 agent ask <type>` (the `ask` action) routes to the managed type synchronously
-(spins/reuses an instance up to `max_background`); `review`/`implement` to a type
-still use `--background`.
+(spins/reuses an instance up to `max_background`); `review` to a type
+still uses `--background`.
 
 ## Locks
 

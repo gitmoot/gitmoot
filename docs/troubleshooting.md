@@ -219,8 +219,8 @@ Fixes:
 - Template content is never read from a file at job runtime. A template that
   must change is edited or re-seeded in its `agent_templates` store row, and
   only jobs queued after that edit see the new content.
-- The thermo template is review-only. Remove `--capability implement` and route
-  local review fix passes to a separate implementation-capable agent with
+- The thermo template is review-only. Remove `--capability implement` and name
+  a separate implementation-capable agent as the fix owner with
   `gitmoot agent review thermo-review --repo owner/repo --pr <number> --lead <implementer> "Review this PR."`
 - If local review dispatch says the lead is missing, repo-ineligible, lacks
   `implement`, or has a non-write policy, correct the named implementer's agents
@@ -528,7 +528,7 @@ Fixes:
   moves the task to `blocked`. Confirm the event with `gitmoot task events
   <task-id> --json`; `gitmoot task list --repo owner/repo --state blocked
   --json` exposes its `worktree_path`. Manually salvage, commit, stash, or clean
-  the changes before retrying `agent implement`; an off-lineage
+  the changes before retrying; an off-lineage
   worktree is re-cut automatically only when it is clean. For a
   delegated/Orchestra implement worktree, the same event is stored as a
   JobEvent on the parent coordinator job; the delegation-worktree allocator
@@ -715,14 +715,11 @@ Fixes:
   exact-head review/CI gate missed (and the daemon journaled its chart-derived org
   escalation) or the repository has the explicit
   `[merge_gate] auto_merge = false` kill-switch. Merge it in
-  GitHub or use an authorized `@gitmoot merge` comment. Nothing you can type
-  moves the task out of `awaiting_human_merge`: removing the kill-switch lets
-  the daemon promote it back to `ready_to_merge` and record
-  `task_awaiting_human_merge_rearmed`, an observed merge moves it to `merged`,
-  and the stale-task disposal pass eventually strands it if neither happens.
-  Implement dispatch against the task itself is refused while it waits, so if
-  more implementation is required, land or close this PR and dispatch the
-  follow-up as fresh work on a new branch.
+  GitHub or use an authorized `@gitmoot merge` comment. If more implementation
+  is required instead, do it on the branch, push, and record it with `gitmoot
+  job record --type implement --pr <number> --head-sha <sha>`, then request the
+  next review: `gitmoot task resume-work` went with implementer dispatch
+  (#2203), so there is no command that moves the task back to `implementing`.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates
@@ -1160,11 +1157,14 @@ clone is different: removing it deletes its standalone object database.
 
 ### Fix clones are never deleted automatically
 
-Linux has no inode-conditional unlink that can guarantee a delete removes
-exactly the bytes a preceding proof examined. Gitmoot therefore never deletes a
-fix clone and never labels one proved disposable. Commit reachability and
-nested-repository checks can explain obvious retention cases, but they do not
-close over every loose blob, tree, annotated tag, pack, or concurrent write.
+No NEW fix clone is created — #2203 removed the fix-worktree lifecycle and the
+auto-fix leg that allocated one — but the clones already on disk stay, and this
+section is why. Linux has no inode-conditional unlink that can guarantee a
+delete removes exactly the bytes a preceding proof examined. Gitmoot therefore
+never deletes a fix clone and never labels one proved disposable. Commit
+reachability and nested-repository checks can explain obvious retention cases,
+but they do not close over every loose blob, tree, annotated tag, pack, or
+concurrent write.
 
 | path | behaviour |
 | --- | --- |

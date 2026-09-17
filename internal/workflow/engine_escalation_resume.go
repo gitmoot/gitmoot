@@ -958,32 +958,11 @@ func (e Engine) applyResolutionEffectsFenced(ctx context.Context, parentJob db.J
 		// injected crash land a job.
 		return verbErr
 	}
-	if sink.preEffectWorktree != "" || sink.preEffectBranch != "" {
-		recorded, err := e.Store.RecordEscalationRoundPreEffects(ctx, parentJob.ID, roundID, owner,
-			sink.preEffectRepo, sink.preEffectBranch, sink.preEffectWorktree, sink.preEffectLockOwner,
-			time.Now().UTC())
-		if err != nil {
-			return err
-		}
-		if !recorded {
-			// OWNERSHIP LOST while the external work ran: apply nothing.
-			//
-			// AND RELEASE NOTHING. An earlier version handed the branch lock back here,
-			// which was WORSE THAN LEAKING IT: the shared-checkout lock is owned by
-			// request.Agent (engine_delegation.go), an identity that is STABLE ACROSS
-			// PASSES rather than unique to the lease holder. So a replacement pass
-			// acquires the same repo/branch/agent lock legitimately, and a stale pass
-			// releasing "its" lock by that tuple deletes the lock the new pass believes
-			// it holds - turning a bounded leak into a silent mutual-exclusion failure.
-			//
-			// Nothing is stranded by declining: the same-agent identity means the next
-			// pass's AcquireLock succeeds, and the worktree key is idempotent so it is
-			// re-used rather than duplicated. Handback would only be safe with a
-			// pass-specific lock identity, which is a change to the lock's own contract
-			// and not this PR's scope (#1673).
-			return nil
-		}
-	}
+	// #2203 removed the only producer of pre-effect ALLOCATION RECORDS: the
+	// implement leg's writable worktree and its shared-checkout branch lock. The
+	// external work a resolution still performs is read-only detached worktree
+	// allocation, which is disposed through the delegation cleanup obligation
+	// rather than handed back off a round row, so there is nothing to record here.
 
 	commit := db.ResolutionCommit{
 		JobID:   parentJob.ID,

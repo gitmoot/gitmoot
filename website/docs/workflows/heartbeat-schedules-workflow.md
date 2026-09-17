@@ -22,11 +22,10 @@ gitmoot agent heartbeat add reviewer stale-prs \
   --repo gitmoot/gitmoot --interval 12h --action review \
   --prompt "Review stale open PRs and summarize blockers."
 
-# A policy-gated implement heartbeat (write action) on a specific runtime. The
-# agent must hold the implement capability AND a write-granting policy.
-gitmoot agent heartbeat add builder nightly-tidy \
-  --repo gitmoot/gitmoot --interval 24h --action implement --runtime codex \
-  --prompt "Fix the top lint/type error and open a small PR."
+# Add --runtime to pin a specific runtime for this schedule.
+gitmoot agent heartbeat add reviewer nightly-stale \
+  --repo gitmoot/gitmoot --interval 24h --action review --runtime codex \
+  --prompt "Review the oldest open PR and summarize what blocks it."
 ```
 
 The CLI edits the `[agents.<agent>.heartbeats.<name>]` config section through the
@@ -54,21 +53,24 @@ the block and its comments.
 | `repo`           | yes      | —       | `owner/name` the job runs against. Must be a registered, enabled daemon repo with a checkout. |
 | `interval`       | yes      | —       | Go duration (e.g. `24h`, `1h30m`). Validated at load.        |
 | `jitter`         | no       | `0s`    | Random `[0, jitter]` added to each `next_due` to de-thunder. |
-| `action`         | no       | `ask`   | `ask` (read-only analysis), `review` (read-only PR/code review; needs the `review` capability), or `implement` (write; **policy-gated** — see below). |
+| `action`         | no       | `ask`   | `ask` (read-only analysis) or `review` (read-only PR/code review; needs the `review` capability). `implement` is **refused** — see below. |
 | `runtime`        | no       | —       | Optional per-heartbeat runtime override (`codex`/`claude`/`kimi`/`omp` today — the set is derived from the adapter registry minus `shell`, so a newly registered runtime joins it); runs the scheduled job on that runtime (fresh session) instead of the agent default. Empty ⇒ agent default. |
 | `prompt`         | yes      | —       | Instructions passed to the agent.                            |
 | `max_concurrent` | no       | `1`     | Overlap cap; a new run is skipped while this many are active.|
 
-### Policy-gated `implement`
+### The `implement` action is refused
 
-An `implement` heartbeat enqueues a **write** job, so it is off by default and
-gated. It only runs when the target agent holds the `implement` capability **and**
-carries a write-granting autonomy policy (`--policy workspace-write` or
-`danger-full-access`) — mirroring `agent implement`, which fails closed under the
-default `auto`/`read-only` (a headless implement job would otherwise produce no
-files). `agent heartbeat add` refuses an implement heartbeat for an agent that
-does not qualify, and the daemon scan no-ops a due one (`last_status =
-policy_readonly`) until a write policy is granted.
+`implement` is refused at config validation (#2203). Gitmoot no longer
+dispatches implementation, and the heartbeat's writable-worktree allocator and
+its enqueue went with that removal — precisely what would have to come back for
+an `implement` schedule to mean anything. Without them a due `implement`
+heartbeat could only have produced a branchless job with no checkout to
+resolve, which is worse than refusing it.
+
+Schedule read-only work and let the seat record its own implementation with
+`gitmoot job record --type implement`. That is what the traffic already was:
+568 of the last 570 implement rows are seats recording their own sessions, and
+no heartbeat has ever been configured with the `implement` action.
 
 ## Observability
 
@@ -86,14 +88,13 @@ configured the section is omitted.
   does not re-fire an active heartbeat.
 - **Capacity-aware:** skipped this tick when the agent is at its `max_background`.
 - **Missed ticks coalesce:** after an outage the schedule replays only once.
-- **Read-only by default:** `ask` and `review` are read-only. `implement` is a
-  write action, off by default and policy-gated (see above) so recurring
-  code-change PRs only run for a deliberately write-enabled agent.
+- **Read-only only:** `ask` and `review` are the available actions, and both are
+  read-only. The write action `implement` is refused at config validation
+  (#2203), so a heartbeat cannot schedule a recurring unattended code change.
 - **Managed repos only:** a heartbeat pointing at an unmanaged/disabled repo is
   skipped (`last_status = repo_unmanaged`) and self-recovers once the repo becomes
   managed. A `review` heartbeat for an agent lacking the review capability is
-  skipped (`last_status = capability_missing`), and an `implement` heartbeat for an
-  agent without a write policy/capability is skipped (`last_status =
-  policy_readonly`), each self-recovering once the requirement is met.
+  skipped (`last_status = capability_missing`), self-recovering once the
+  capability is granted.
 
 See the in-repo reference at `docs/heartbeats.md` for the full field reference.

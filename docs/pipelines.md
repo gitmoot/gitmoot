@@ -322,7 +322,7 @@ are four agent-stage kinds, all sharing the mechanics in this section:
 | Kind | Declared by | What it does |
 | ---- | ----------- | ------------ |
 | **ask** / **review** (#757) | `agent` + `action: ask\|review` | Read-only leaf: looks + decides, never mutates. |
-| **implement** (#768) | `agent` + `action: implement` + `write: true` | Mutates the repo + opens a PR (fold-on-PR-opened). See [Implement stages](#implement-stages). |
+| **implement** (#768) | `agent` + `action: implement` + `write: true` | Declarable but NOT dispatchable: #2203 removed the pipeline-stage writable-worktree allocator and its enqueue, so the kind validates and no run can execute it (#2213 holds the refuse-at-`pipeline add` decision). Documented model: mutates the repo + opens a PR (fold-on-PR-opened). See [Implement stages](#implement-stages). |
 | **produce** (#814/#825) | `agent` + `action: produce` + `write: true` + `writes:` (+ optional `reads:`) | Sandboxed data writer: Codex everywhere it is supported, plus Claude/Kimi on Landlock-capable Linux; never creates a branch, task, commit, or PR. |
 | **orchestrate** (#758) | `agent` + `orchestrate: true` | Sub-tree coordinator: fans out owned children, waits for the tree, folds the synthesis. See [Orchestrate stages](#orchestrate-stages). |
 | **gate** (#768) | `gate:` (no `agent`) | Jobless waiter: folds when an external predicate holds (e.g. a PR merges). See [Gate stages](#gate-stages). |

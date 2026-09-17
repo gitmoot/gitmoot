@@ -3430,8 +3430,7 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		want string
 	}{
 		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
-		{name: "inline form", args: []string{"planner", "do the work", "--recipe=decompose-and-verify"}, want: "decompose-and-verify"},
-		{name: "third valid id", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
+		{name: "inline form", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
 		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
 	}
 	for _, tt := range tests {
@@ -3457,7 +3456,7 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		if !strings.Contains(errText, `unknown recipe "bogus"`) {
 			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
 		}
-		for _, id := range []string{"review-panel", "decompose-and-verify", "verifier"} {
+		for _, id := range []string{"review-panel", "verifier"} {
 			if !strings.Contains(errText, id) {
 				t.Fatalf("stderr missing valid id %q: %q", id, errText)
 			}
@@ -4241,5 +4240,41 @@ func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
+	}
+}
+
+// TestAgentImplementVerbIsRefused makes #2203's removal MUTATION-DETECTABLE.
+//
+// Without it, re-adding `case "implement":` to runAgent would compile, pass the
+// whole suite, and quietly restore a dispatch path the campaign removed on
+// measurement: 568 of 570 implement jobs in the fortnight before removal were
+// seats RECORDING their own sessions via `gitmoot job record`, exactly 2 were
+// ever dispatched, and all 30 per-PR auto-fix policy rows were disabled.
+//
+// The implementing agent's own sabotage run found this gap: re-adding the verb
+// failed only tests that were ALREADY failing on its tree, so the mutant proved
+// nothing about the verb. This asserts the refusal directly.
+//
+// It deliberately checks the exit code AND that the message names the verb, so a
+// future refactor that swallows the argument into a silent no-op also fails.
+func TestAgentImplementVerbIsRefused(t *testing.T) {
+	for _, args := range [][]string{
+		{"implement", "some-agent", "do the thing"},
+		{"implement"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := runAgent(args, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("runAgent(%q) exit=%d, want 2: gitmoot does not dispatch implementation (#2203)", args, code)
+		}
+		if got := stderr.String(); !strings.Contains(got, `unknown agent command "implement"`) {
+			t.Fatalf("runAgent(%q) stderr=%q, want it to name the unknown verb so the caller learns the surface is gone", args, got)
+		}
+	}
+	// Control: the surviving verbs must NOT be refused, so this test cannot pass
+	// by rejecting everything.
+	var stdout, stderr bytes.Buffer
+	if code := runAgent([]string{"review"}, &stdout, &stderr); code == 2 && strings.Contains(stderr.String(), "unknown agent command") {
+		t.Fatalf("runAgent(review) was refused as unknown; the refusal is too broad: %q", stderr.String())
 	}
 }

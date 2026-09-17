@@ -25,11 +25,6 @@ type resolutionEffectSink struct {
 	// and the state transition commit together rather than as two writes.
 	taskEvent      db.TaskEvent
 	taskEventValid bool
-	// preEffect records resources allocated OUTSIDE the transaction, under the fence.
-	preEffectRepo      string
-	preEffectBranch    string
-	preEffectWorktree  string
-	preEffectLockOwner string
 }
 
 // capturing reports whether this engine copy is collecting effects rather than writing.
@@ -43,16 +38,4 @@ func (e Engine) recordEffectEvent(ctx context.Context, event db.JobEvent) error 
 		return nil
 	}
 	return e.Store.AddJobEvent(ctx, event)
-}
-
-// recordEffectPreAllocation notes the resources a pre-effect took, so a supersede or a
-// Class I release can hand them back.
-func (e Engine) recordEffectPreAllocation(repo string, branch string, worktree string, lockOwner string) {
-	if !e.capturing() {
-		return
-	}
-	e.resolutionSink.preEffectRepo = repo
-	e.resolutionSink.preEffectBranch = branch
-	e.resolutionSink.preEffectWorktree = worktree
-	e.resolutionSink.preEffectLockOwner = lockOwner
 }

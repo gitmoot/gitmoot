@@ -145,9 +145,9 @@ organization event wakes; add validates the event kind, target org role, and
 `gitmoot agent prompt <agent-or-template>` to import an
 agent prompt into the current chat. Use
 `gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
-so Gitmoot can route to ask, review, or implement and own worktrees, branch
-locks, commits, pushes, PRs, and workflow advancement. Add `--action
-ask|review|implement` when that job action must be explicit; `--type` is
+so Gitmoot can route to ask or review and own read-only worktrees, branch
+locks, and workflow advancement. Add `--action ask|review` when that job action
+must be explicit; `--type` is
 independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. To get an independent review of a pull
@@ -157,12 +157,20 @@ when the verdict is saved (CLI.md § Review Router). Use `gitmoot agent review
 <reviewer> --repo owner/repo --pr <number> --lead <implementer> "..."` only for
 a deliberate manual dispatch; there the lead must be a registered, repo-allowed
 agent with `implement` capability and a write-granting policy so requested
-changes can route to it. Use `gitmoot agent
-implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
-For a fix pass on an existing open PR, use `agent implement --pr <number>` (or
-`agent run --action implement --pr <number>`); Gitmoot validates that the PR is
-open, belongs to the same repository, and matches the existing task branch
-before reusing its task worktree and PR.
+changes can route to it.
+
+**Gitmoot does not dispatch implementation (#2203).** `agent implement`,
+`--action implement`, `task run`, `repo auto-fix`, and the implement heartbeat
+are all gone; an `implement` delegation leg and a `/gitmoot <agent> implement`
+comment are refused. That is the product statement, not a gap: gitmoot reviews,
+seats implement. Do the file changes in THIS session, then record them so the
+merge gate can attribute them:
+`gitmoot job record --agent <seat> --repo owner/repo --type implement
+--decision implemented [--pr <number> --head-sha <sha>] [--task <task-id>]
+--summary "..."`. For a fix pass on an existing open PR, push the fix on its
+branch, record it that way, and ask for the next review with `gitmoot review
+request --pr <number>`.
+
 Before local review dispatch or native engine review fan-out, Gitmoot refuses a
 homogeneous succeeded decision repeated at the exact same repo/PR/head, emits
 `review_loop_detected` on the matched succeeded job, and hard-errors (CLI) or
@@ -187,7 +195,7 @@ pre-registration; mutually exclusive with `agent`). A `synthesis_rule`
 the combined result against the goal **independently**, add a read-only verify
 leg on a **different** runtime/model that `deps` on the producer(s) — produce vs.
 independent check, the same separation as ROMA's Verifier (cross-evaluation beats
-self-evaluation; see the `verifier` and `decompose-and-verify` recipes and the
+self-evaluation; see the `verifier` recipe and the
 "produce vs. independent check" note in
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
 individual job or delegation (via `--model` on run/ask/review/implement or the
@@ -255,7 +263,7 @@ escalation on its merits and then close it with
 answered-but-unresolved escalation stays on every owed-work surface and camouflages real
 blocks. Jobs join a group through
 `--workflow <label>` on agent
-ask/run/review/implement, orchestrate, or `job open`; orchestration descendants
+ask/run/review, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
 `[workflow] require_workflow = true` to enforce this discipline. `auto` mode
 files fresh unlabeled dispatches under `adhoc/<agent>-<yyyy-mm-dd>` and records
@@ -303,7 +311,7 @@ Claude, Kimi, and omp seats.
 
 1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
    ask` (or the `planner` template, or a session job opened with `--type ask`).
-   No file changes, no implement dispatches.
+   No file changes.
 2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
    keep the entry id the CLI prints — that id is the plan-id.
 3. **Stop.** Approval is an explicit act, never inferred from silence. In org
@@ -311,21 +319,23 @@ Claude, Kimi, and omp seats.
    <label> "approved: implement plan <plan-id> …"`; outside org mode an
    explicit human approval message referencing the plan-id serves the same
    role.
-4. **Implement quoting the plan-id.** The approved plan is the scope fence:
-   work outside it needs an amended plan and a fresh approval, not silent
-   expansion.
+4. **Implement in your own session, quoting the plan-id, then record it.** The
+   approved plan is the scope fence: work outside it needs an amended plan and
+   a fresh approval, not silent expansion. Gitmoot does not dispatch
+   implementation (#2203), so the seat is the implementer and `gitmoot job
+   record --type implement` is its receipt.
 5. **Close the loop.** The implementer marks the approval directive `done`
    when the work lands, and the workflow is `close`d when the PR merges.
 
 A coordinator may waive the gate for trivial mechanical fixes by writing
-"plan-waived" in the dispatch prompt. Claude Code seats may additionally use
+"plan-waived" in the recorded summary. Claude Code seats may additionally use
 the harness's own plan mode, but only when the approver is present at that
 session: an interactive plan-approval prompt blocks invisibly — the session
 appears idle, no job runs, and nothing escalates — so an unattended seat must
 use the durable convention above, which is the runtime-neutral form and always
-applies. Under this convention every implement dispatch prompt carries either
-a plan-id or the literal "plan-waived"; a dispatch with neither is out of
-contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
+applies. Under this convention every implementation records either
+a plan-id or the literal "plan-waived" in its summary; one with neither is out
+of contract. See WORKFLOWS.md § Plan-Gated Implement for the full command
 sequence.
 
 ## Agent Job Contract

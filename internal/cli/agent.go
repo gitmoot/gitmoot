@@ -487,7 +487,7 @@ func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Example:")
 	fmt.Fprintln(w, "  gitmoot orchestrate planner \"audit the auth flow and fan out fixes\" --repo owner/repo")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "--recipe <review-panel|decompose-and-verify|verifier> routes the coordinator")
+	fmt.Fprintf(w, "--recipe <%s> routes the coordinator\n", strings.Join(recipeTemplateIDs, "|"))
 	fmt.Fprintln(w, "to a named built-in recipe prompt (an opt-in deterministic decomposition")
 	fmt.Fprintln(w, "shape) instead of the agent's own prompt; the agent's identity is unchanged.")
 }
@@ -1102,7 +1102,6 @@ func printAgentRunUsage(w io.Writer, command string) {
 // the set stays coupled to the registry of installable templates.
 var recipeTemplateIDs = []string{
 	agenttemplate.ReviewPanelTemplateID,
-	agenttemplate.DecomposeAndVerifyTemplateID,
 	agenttemplate.VerifierTemplateID,
 }
 

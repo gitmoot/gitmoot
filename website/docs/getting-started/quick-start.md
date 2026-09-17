@@ -106,7 +106,7 @@ Pin the runtime model for a single job with `--model <name>` (a free-form,
 runtime-scoped Codex, Claude Code, or Kimi Code model name):
 
 ```sh
-gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --model gpt-5-codex "Review this PR."
 ```
 
 Or route work through PR comments:
@@ -126,13 +126,25 @@ gitmoot job list --repo owner/repo
 gitmoot events --repo owner/repo
 ```
 
-Use `gitmoot agent run` for coordinator delegation that may route to ask,
-review, or implement. Add `--action ask|review|implement` when the route must be
-explicit; `--type` independently selects a managed agent type. Use `gitmoot
-agent ask` for analysis and planning only. To fix an existing open PR without
-minting another task or PR, use `gitmoot agent implement <agent> --repo
-owner/repo --pr <number> "..."` (or `agent run --action implement --pr`): the PR
-must be open, same-repository, and bound to the existing task branch.
+Use `gitmoot agent run` for coordinator delegation that may route to ask or
+review. Add `--action ask|review` when the route must be explicit; `--type`
+independently selects a managed agent type. Use `gitmoot agent ask` for
+analysis and planning only.
+
+**Gitmoot does not dispatch implementation (#2203).** You implement in your own
+session — that is the product statement, not a gap: gitmoot reviews, seats
+implement. To fix an existing open PR, work on its branch in your own checkout,
+push, then record the work and ask for the re-review:
+
+```sh
+gitmoot job record --agent lead --repo owner/repo --type implement \
+  --decision implemented --pr 12 --head-sha <new-40-char-head> \
+  --title "Fix the findings on #12" --summary "What changed and why."
+gitmoot review request --pr 12 --repo owner/repo
+```
+
+The recorded row is not bookkeeping: the merge gate reads it to learn who
+implemented, which is how it proves the reviewer was somebody else.
 
 `gitmoot dashboard` prints a styled snapshot of local state — daemon health,
 repos, agents, jobs by state, worktrees, and branch locks. Use

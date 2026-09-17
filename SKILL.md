@@ -143,9 +143,8 @@ gitmoot agent list
 gitmoot agent doctor <agent>
 gitmoot agent heartbeat list [--agent <agent>]
 gitmoot agent prompt <agent-or-template>
-gitmoot agent run <agent> --repo owner/repo "question, review, or implementation request"
+gitmoot agent run <agent> --repo owner/repo "question or review request"
 gitmoot agent review <agent> --repo owner/repo --pr <number> "review request"
-gitmoot agent implement <agent> --repo owner/repo --task <task-id> "implementation request"
 gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
 gitmoot job show <job-id>
@@ -171,6 +170,19 @@ gitmoot job answer <job-id> "<question-id>: answer text" [--json]
 gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
 ```
 
+**Gitmoot does not dispatch implementation (#2203).** `agent implement`,
+`--action implement`, `task run`/`task recover`/`task resume-work`, `repo
+auto-fix`, and the implement heartbeat are gone; an `implement` delegation leg
+and a `/gitmoot <agent> implement` comment are refused. Seats implement in
+their own session and record it — 568 of the last 570 implement rows were
+already exactly that:
+
+```sh
+gitmoot job record --agent <seat> --repo owner/repo --type implement \
+  --decision implemented [--pr <number> --head-sha <sha>] [--task <task-id>] \
+  --summary "What changed and why."
+```
+
 Use `gitmoot daemon start` for the background daemon. Use `gitmoot daemon run`
 only when the user explicitly wants a foreground process. `--repo owner/repo`
 SCOPES the daemon to a single repo: it polls only that repo's PRs and claims
@@ -185,7 +197,7 @@ the file per delivery, so no daemon restart is needed.
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
 coordinator delegation through a registered Gitmoot agent; Gitmoot will route to
-ask, review, or implement and own worktrees, branch locks, commits, pushes, PRs,
+ask or review and own read-only worktrees, branch locks,
 and workflow advancement. To orchestrate an orchestra of agents,
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for `gitmoot agent run
 <agent> --background "..."`. Use `gitmoot agent ask` only for analysis, planning,
@@ -209,7 +221,7 @@ is advisory only and not a benchmark.
 
 Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
 for external-coordinator workflow groups.
-Attach `--workflow <label>` to agent ask/run/review/implement, orchestrate, or
+Attach `--workflow <label>` to agent ask/run/review, orchestrate, or
 `job open`; orchestration descendants inherit the label automatically.
 
 Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
@@ -226,13 +238,12 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot help
 /gitmoot status
 /gitmoot <agent> review [instructions]
-/gitmoot <agent> implement [instructions]
 /gitmoot ask <agent> [question]
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
 /gitmoot resume <job-id> retry|continue|abort|answer [instructions]
-@<agent> ask|review|implement [instructions]
+@<agent> ask|review [instructions]
 ```
 
 ## Template Agents
@@ -250,15 +261,13 @@ gitmoot agent start thermo-review \
 Coordinator recipes are built-in templates for the Orchestra pattern: a
 coordinator that fans work out to ephemeral workers (no pre-registration) and
 reconvenes them in one continuation. `review-panel` convenes a panel of
-diverse-lens reviewers over a PR and synthesizes their verdict;
-`decompose-and-verify` splits an implementation task into parallel file-disjoint
-legs and runs a verify step that depends on all of them; `verifier` is the
-minimal one-producer + independent-verify pair. Route any coordinator agent
+diverse-lens reviewers over a PR and synthesizes their verdict; `verifier` is
+the minimal one-producer + independent-verify pair. Route any coordinator agent
 through a recipe with the `--recipe` flag on `gitmoot orchestrate`:
 
 ```sh
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
+gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
 ```
 
 Start an agent against an installed custom prompt template:

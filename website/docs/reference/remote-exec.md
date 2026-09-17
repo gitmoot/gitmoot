@@ -84,8 +84,8 @@ traverse, set `backend = "local"`, and give every Claude leg a distinct
 
 ```sh
 gitmoot agent subscribe gate-a --runtime claude --session fresh:gate-a \
-  --role implementer --repo OWNER/REPO --policy danger-full-access \
-  --capability implement --home "$PROOF_HOME"
+  --role reviewer --repo OWNER/REPO --policy danger-full-access \
+  --capability ask --home "$PROOF_HOME"
 ```
 
 Keep the daemon running in its own shell:
@@ -95,12 +95,14 @@ gitmoot daemon run --repo OWNER/REPO --parallel 4 --poll 1s \
   --home "$PROOF_HOME"
 ```
 
-From the dispatch shell, submit every leg together:
+From the dispatch shell, submit every leg together. Gitmoot no longer
+dispatches implementation (#2203), so the legs are background `ask` jobs; a
+`danger-full-access` ask still writes, which is all this gate needs — it proves
+the execution backend's identity and isolation, not the implement finalizer:
 
 ```sh
-gitmoot agent implement gate-a "record uid, gid, pwd, start, end, and visible markers" \
-  --repo OWNER/REPO --base HEAD --background --skip-native-review-fanout \
-  --home "$PROOF_HOME"
+gitmoot agent ask gate-a "record uid, gid, pwd, start, end, and visible markers" \
+  --repo OWNER/REPO --background --home "$PROOF_HOME"
 ```
 
 Dispatch the other legs together, not after the first settles. Every leg's
@@ -116,6 +118,17 @@ The proof passes only when all of these are independently observed:
 - every workspace path is distinct, and each leg sees only its own marker;
 - the isolated ledger contains zero remote execution attempts, and no E2B
   credential or `remote` selector is present.
+
+One criterion is weaker than it was when this gate dispatched implement legs.
+A background taskless `ask` is auto-isolated into a detached committed-tip
+worktree only when same-repo readers are **contended**, and that isolation is
+deliberately fail-open — allocation failure records
+`readonly_worktree_skipped` and falls back to the registered checkout. Four
+simultaneous legs do contend, so in practice the paths are distinct, but read
+the reported workspace from each `gitmoot_result` and treat distinctness as
+OBSERVED, never assumed. When the gate needs guaranteed writable per-job
+isolation instead, run the legs as pipeline `action: produce` stages with
+declared `writes:` roots: produce is mutating, live, and sandboxed per job.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are

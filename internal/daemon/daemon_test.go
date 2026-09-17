@@ -513,12 +513,14 @@ func TestPollOnceRetriesPullRequestWorkflowAfterRoutingFailure(t *testing.T) {
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
 	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:           "lead",
-		Role:           "lead",
-		Runtime:        "codex",
-		RuntimeRef:     "last",
-		RepoScope:      repo.FullName(),
-		Capabilities:   []string{"implement"},
+		Name:       "lead",
+		Role:       "lead",
+		Runtime:    "codex",
+		RuntimeRef: "last",
+		RepoScope:  repo.FullName(),
+		// ask for the manual comment leg; implement because the PR-open lifecycle
+		// path still routes an implement job for the branch-lock owner.
+		Capabilities:   []string{"implement", "ask"},
 		AutonomyPolicy: "workspace-write",
 		HealthStatus:   "ok",
 	}); err != nil {
@@ -538,7 +540,7 @@ func TestPollOnceRetriesPullRequestWorkflowAfterRoutingFailure(t *testing.T) {
 			HeadSHA: "abc123",
 		}},
 		comments: map[int64][]github.IssueComment{
-			7: {{ID: 707, Body: "/gitmoot lead implement handle manual fallback", Author: "alice"}},
+			7: {{ID: 707, Body: "/gitmoot lead ask handle manual fallback", Author: "alice"}},
 		},
 	}
 	engine := workflow.Engine{
@@ -560,7 +562,7 @@ func TestPollOnceRetriesPullRequestWorkflowAfterRoutingFailure(t *testing.T) {
 	if _, err := store.GetPullRequest(ctx, repo.FullName(), 7); err == nil {
 		t.Fatal("pull request head was recorded before workflow routing succeeded")
 	}
-	if _, err := store.GetJob(ctx, jobID(repo, 7, 707, 0, "lead", "implement")); err != nil {
+	if _, err := store.GetJob(ctx, jobID(repo, 7, 707, 0, "lead", "ask")); err != nil {
 		t.Fatalf("manual comment job was not routed after workflow failure: %v", err)
 	}
 	if err := store.UpsertAgent(ctx, db.Agent{
@@ -2457,42 +2459,6 @@ func TestPollOnceAcknowledgesMissingCapabilityWithoutJob(t *testing.T) {
 	}
 }
 
-func TestPollOnceRejectsImplementWithoutBranchLock(t *testing.T) {
-	ctx := context.Background()
-	store := testStore(t)
-	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:           "builder",
-		Role:           "builder",
-		Runtime:        "codex",
-		RuntimeRef:     "last",
-		RepoScope:      repo.FullName(),
-		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "workspace-write",
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	client := &fakeGitHub{
-		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main"}},
-		comments: map[int64][]github.IssueComment{
-			10: {{ID: 808, Body: "/gitmoot builder implement", Author: "dana"}},
-		},
-	}
-
-	err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
-
-	if err != nil {
-		t.Fatalf("PollOnce returned error: %v", err)
-	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "without holding the branch lock") {
-		t.Fatalf("posted acknowledgements = %+v", client.posted)
-	}
-	if _, err := store.GetJob(ctx, jobID(repo, 10, 808, 0, "builder", "implement")); err == nil {
-		t.Fatal("implement job was created without a branch lock")
-	}
-}
-
 func TestPollOnceReportsStatusCommand(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -2585,7 +2551,7 @@ func TestPollOnceReportsHelpCommand(t *testing.T) {
 	if len(client.posted) != 1 {
 		t.Fatalf("posted = %+v, want one help comment", client.posted)
 	}
-	for _, want := range []string{"Gitmoot help for `gitmoot/gitmoot` PR #10", "`audit`: review,ask", "/gitmoot <agent> <review|implement|ask>"} {
+	for _, want := range []string{"Gitmoot help for `gitmoot/gitmoot` PR #10", "`audit`: review,ask", "/gitmoot <agent> <review|ask>"} {
 		if !strings.Contains(client.posted[0].body, want) {
 			t.Fatalf("help output missing %q:\n%s", want, client.posted[0].body)
 		}
@@ -3275,53 +3241,6 @@ func runMergeCommandForOutput(t *testing.T, decision workflow.MergeDecision, aut
 		t.Fatalf("merge request task = %q, want branchless review task", gate.requests[0].TaskID)
 	}
 	return client.posted[0].body, gate.requests[0]
-}
-
-func TestPollOnceQueuesImplementWithBranchLock(t *testing.T) {
-	ctx := context.Background()
-	store := testStore(t)
-	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:           "builder",
-		Role:           "builder",
-		Runtime:        "codex",
-		RuntimeRef:     "last",
-		RepoScope:      repo.FullName(),
-		Capabilities:   []string{"implement"},
-		AutonomyPolicy: "workspace-write",
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	if err := store.UpsertTask(ctx, db.Task{ID: "task-010", GoalID: "goal-1", Title: "Task 10", State: string(workflow.TaskImplementing), Branch: "task-10"}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	client := &fakeGitHub{
-		pulls: []github.PullRequest{{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main"}},
-		comments: map[int64][]github.IssueComment{
-			10: {{ID: 808, Body: "/gitmoot builder implement", Author: "dana"}},
-		},
-	}
-
-	err := (Daemon{Repo: repo, Store: store, GitHub: client}).PollOnce(ctx)
-
-	if err != nil {
-		t.Fatalf("PollOnce returned error: %v", err)
-	}
-	job, err := store.GetJob(ctx, jobID(repo, 10, 808, 0, "builder", "implement"))
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	var payload workflow.JobPayload
-	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-		t.Fatalf("Unmarshal payload returned error: %v", err)
-	}
-	if payload.TaskID != "task-010" || payload.GoalID != "goal-1" {
-		t.Fatalf("payload task context = task %q goal %q, want existing branch task context", payload.TaskID, payload.GoalID)
-	}
 }
 
 func TestPollOnceRetriesUnseenCommentAfterAckFailure(t *testing.T) {
