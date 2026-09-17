@@ -363,7 +363,7 @@ func TestP2GapJobSubprocessRoutesRefuseLocalFallback(t *testing.T) {
 	}
 }
 
-// TestP2GapEveryJobSubprocessRouteRefusesLocalFallback drives the stored-job
+// TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner drives the stored-job
 // selector through every subprocess route shape. A future backend may parse as
 // implemented, but it cannot reach checkout, git, or verifier execution until
 // Consume has a corresponding runner builder.

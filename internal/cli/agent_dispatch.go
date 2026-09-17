@@ -442,9 +442,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// foreground agent so those routes cannot silently default back to Local.
 		effectiveAgent.ExecBackend = string(execBackend)
 	}
-	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
-		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), dispatchBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
-	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
 		result, checked, err := runtimeContractPreflightForBackend(execBackend, func() runtime.RuntimeContractResult {
