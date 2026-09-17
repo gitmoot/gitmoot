@@ -108,7 +108,7 @@ func TestAgentTemplateListShowsInstalledCustomTemplate(t *testing.T) {
 		t.Fatalf("template list filter exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "planner") || strings.Contains(stdout.String(), "frontend-reviewer") || strings.Contains(stdout.String(), "thermo-nuclear-code-quality-review") {
-		t.Fatalf("goal_file filter output =\n%s", stdout.String())
+		t.Fatalf("plan filter output =\n%s", stdout.String())
 	}
 
 	stdout.Reset()

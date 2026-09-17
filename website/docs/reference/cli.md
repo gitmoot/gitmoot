@@ -1477,7 +1477,7 @@ the current version, content hash, source commit, promotion state, and content.
 Discover templates by metadata:
 
 ```sh
-gitmoot agent template list --runtime codex --output goal_file
+gitmoot agent template list --runtime codex --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
