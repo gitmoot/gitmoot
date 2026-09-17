@@ -480,10 +480,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// The previous round moved enforcement above dispatchDelegations' early
 	// return, which closed the zero-delegation bypass but left it downstream of
 	// everything else this function does with a review result. So a marked
-	// preflight could still have its findings written to the #1822 ledger, move
-	// the task to changes_requested, and potentially trigger auto-fix - the CHEAP
-	// stage acting as an ordinary reviewer, before anything checked whether it
-	// was allowed to be one.
+	// preflight could still have its findings written to the #1822 ledger and
+	// move the task to changes_requested - the CHEAP stage acting as an ordinary
+	// reviewer, before anything checked whether it was allowed to be one.
 	//
 	// Placed above the high-risk lens normalization for the same reason that
 	// block sits early: a refusal must precede the consumers, not race them.
@@ -536,17 +535,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			Message: "a critical refutation finding normalized the lens decision to blocked",
 		})
 	}
-
-	// A review fix owns an independent writable clone, not a linked delegation
-	// worktree. Record it for operator cleanup only after SUCCESSFUL advancement;
-	// a finalizer or store error can leave the clone holding the only committed fix,
-	// and the daemon may convert that result into a resumable blocked job. The real
-	// task branch is never deleted or unlocked by this cleanup.
-	defer func() {
-		if retErr == nil {
-			retErr = e.cleanupFixWorktree(ctx, jobID, job.Type, payload)
-		}
-	}()
 
 	// An implement delegation child runs in a per-delegation worktree on its own
 	// gitmoot-delegation-* branch; tear both down once the child is terminal so they
@@ -809,12 +797,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// now the two PR-open triggers disagreed: the daemon PR-watcher read
 		// lock.SkipNativeReviewFanout, while this in-process trigger read only the
 		// payload — so an engine hop that lost the flag re-armed the fanout here even
-		// though the branch had already been told. dispatchFix is exactly that hop:
-		// it builds a PARENTLESS implement request with no SkipNativeReviewFanout, so
-		// it escapes the enqueue-chokepoint inheritance (which requires a parent) and
-		// its fix round re-armed review on a branch whose lock already read true.
-		// Reading the lock here closes that class for every parentless engine
-		// re-dispatch, present and future, without reaching into the constructors.
+		// though the branch had already been told. Reading the lock here closes that
+		// class for every parentless engine re-dispatch, present and future,
+		// without reaching into the constructors.
 		// #1250 reader 1 of 2: the acting org role comes from the SAME branch lock,
 		// so this trigger and the daemon PR-watcher cannot disagree about who owns
 		// the work. Empty stays empty (unattributed), which is both the legacy value
@@ -859,11 +844,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
 		// A PR-less review (e.g. a review heartbeat enqueues Action="review" with
-		// PullRequest=0/Branch="") has no PR-only machinery to route into: a
-		// "changes_requested" decision would call dispatchFix -> leadAgent() ->
-		// GetBranchLock(repo, "") -> ErrNoRows ("lead agent is required"), and an
-		// "approved" decision would runMergeGate against PR #0. Both error every
-		// tick and drop the review outcome. Mirror the implement arm's guard:
+		// PullRequest=0/Branch="") has no PR-only machinery to route into: an
+		// "approved" decision would runMergeGate against PR #0, erroring every
+		// tick and dropping the review outcome. Mirror the implement arm's guard:
 		// treat the delivered review (the agent's comments) as terminal, like ask.
 		if payload.PullRequest <= 0 {
 			return e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_skipped_no_pr", Message: "no pull request is attached; skipping review advancement"})
@@ -874,10 +857,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// #1524: an objection transitions the task ONLY when it describes the
 			// pull request's CURRENT head. This arm was left unconditional, so an
 			// objection at a superseded head still pulled a PR out of
-			// ready_to_merge over a commit the branch had moved past - and,
-			// because dispatchFix is called INLINE below, also dispatched a fix
-			// leg against findings about that superseded commit. Returning early
-			// refuses both in one place.
+			// ready_to_merge over a commit the branch had moved past. Returning
+			// early refuses that.
 			//
 			// THE GUARD IS DELIBERATELY ASYMMETRIC WITH THE APPROVAL SIDE, and the
 			// asymmetry is a LIVENESS argument: refusing an objection withholds the
@@ -897,40 +878,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			if err := e.setTaskState(ctx, ref, TaskChangesRequested); err != nil {
 				return err
 			}
-			policy, configured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest)
-			if err != nil {
-				return err
-			}
-			// Report-only is the safe default: the requester already owns the
-			// context and worktree. A durable per-PR enable is the explicit
-			// unattended-chain opt-in for dispatching a fresh implement job (#1712).
-			if configured && !policy.Disabled {
-				// #1522: dispatch on the LAST review to settle at this head, not the
-				// first blocking verdict to arrive.
-				if err := e.dispatchFixWhenHeadHasSettled(ctx, job, payload, ref); err != nil {
-					return err
-				}
-			}
+			// #2203: a changes_requested verdict records the objection and stops
+			// here. No fix leg is dispatched: gitmoot does not dispatch
+			// implementation. The findings stay open in the #1822 ledger and the
+			// implementing lane picks them up.
 			return nil
 		case "approved":
-			// #1522: AN APPROVAL CAN BE THE LAST REVIEW TO SETTLE AT THIS HEAD, and
-			// when it is, it owes the head's deferred fix leg. Without this the pair
-			// objection-then-approval defers the leg on the objection's arm and then
-			// nobody dispatches it: the approval fixes nothing and the objection's
-			// arm has already returned. That is a deadlock rather than a delay.
-			//
-			// It runs BEFORE the approval's own logic so the ordering is the honest
-			// one: the objection at this head still stands, and the arm below is
-			// already built to hold rather than merge in that case
-			// (approvalSupersedesChangesRequested). Dispatching here therefore
-			// cannot advance a refuted change toward merge.
-			if autoFixPolicy, autoFixConfigured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest); err != nil {
-				return err
-			} else if autoFixConfigured && !autoFixPolicy.Disabled {
-				if err := e.dispatchFixWhenHeadHasSettled(ctx, job, payload, ref); err != nil {
-					return err
-				}
-			}
 			// High-risk review (#650): the native required-reviewer gate approves a PR
 			// as soon as every required reviewer has ONE approving review in the round.
 			// With the lens fan-out that is too weak — a single approving lens (or one

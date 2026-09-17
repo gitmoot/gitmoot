@@ -298,24 +298,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
 		return nil
 	}
-	// Review-to-fix jobs are the implementation jobs created by workflow
-	// advancement. They are explicitly marked FixWorktree; ordinary local
-	// implement dispatches and delegation legs may legitimately be PR-less
-	// and must not inherit this delivery gate. Check the same durable target the
-	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
-	if job.Type == "implement" && payload.FixWorktree {
-		if _, err := implementationFinalizationTargetForRunner(ctx, w.Store, job, payload, implementationFinalizationBeforeRun, jobRunner); err != nil {
-			err = fmt.Errorf("validate implementation target before model run: %w", err)
-			if !resultDeliveryFailed(err) {
-				return w.retryImplementationPreflight(ctx, job, payload, err)
-			}
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
-			return nil
-		}
-	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
 	// from the spec before the normal flow runs (which assumes the agent

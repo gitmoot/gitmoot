@@ -1812,21 +1812,6 @@ type implementerAttributionEvidence struct {
 	sawMalformedPayload bool
 }
 
-// collectImplementerAttribution is the STRICT-KEY collector, and it is the one
-// Engine.autoFixOwner uses (engine_routing_merge.go). Its result routes
-// WRITE-CAPABLE work: autoFixOwner resolves an owner from this evidence and
-// dispatchFix then enqueues an implementation job against it. #1519's positional
-// fallback is deliberately NOT applied here - widening ownership routing is a
-// different decision from widening a read-only independence check, and #1519
-// asked for the latter. #1929's review caught the collector being shared and the
-// widening leaking through it.
-func collectImplementerAttribution(jobs []db.Job, current JobPayload) implementerAttributionEvidence {
-	// Ownership routing deliberately passes NO run evidence: its question is who
-	// owns the task, which a queued leg answers. Only the gate's question - who
-	// implemented the tree in front of me - needs execution.
-	return collectImplementerAttributionMatching(jobs, current, sameTask, nil)
-}
-
 // collectGateImplementerAttribution is the merge gate's own collector. It
 // correlates positionally when task identity has migrated (#1519), because the
 // gate's question is "who implemented the PR in front of me" and its answer

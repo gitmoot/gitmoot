@@ -27,7 +27,7 @@ import (
 // blocked ask whose run already disposed it) is not turned into a permanent,
 // never-reconciled reclaim candidate.
 func recordReadOnlyWorktreeReclaimOnAbort(ctx context.Context, store *db.Store, job db.Job, payload JobPayload) {
-	if !isReadOnlyDelegationWorktree(job.Type, payload) && !isFixWorktree(job.Type, payload) {
+	if !isReadOnlyDelegationWorktree(job.Type, payload) {
 		return
 	}
 	path := strings.TrimSpace(payload.WorktreePath)
@@ -586,7 +586,7 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 // because it is derived from the job id, a retry uses the SAME path, so an
 // unguarded marker would hand a live checkout to the daemon's reclaim pass.
 func recordSupersededReadOnlyWorktreeReclaimAtGeneration(ctx context.Context, store *db.Store, job db.Job, payload JobPayload, atGeneration int64) error {
-	if !isReadOnlyDelegationWorktree(job.Type, payload) && !isFixWorktree(job.Type, payload) {
+	if !isReadOnlyDelegationWorktree(job.Type, payload) {
 		return nil
 	}
 	path := strings.TrimSpace(payload.WorktreePath)

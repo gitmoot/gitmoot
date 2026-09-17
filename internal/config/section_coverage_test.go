@@ -63,7 +63,6 @@ var (
 	unpinnedSectionHeaderSites = []string{
 		"edit_compat.go::configSectionAtParseError",
 		"github_remote.go::loadGitHubRemote",
-		"implement_base.go::LoadImplementBase",
 		"orchestrate.go::LoadEventsPolicy",
 		"orchestrate.go::LoadOrchestratePolicy",
 		"org.go::parseOrgContent",

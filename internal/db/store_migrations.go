@@ -2865,4 +2865,20 @@ ALTER TABLE workflow_notes DROP COLUMN memory_observation_id;
 	`
 DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal;
 	`,
+	// #2203 retires implementer dispatch. pull_request_auto_fix_policies was the
+	// per-PR opt-in the engine's changes_requested arm read before dispatching a
+	// fix leg. That arm is gone, so the table has no reader.
+	//
+	// Measured on the live store before dropping it: 30 rows, every one
+	// disabled=1, and not a single row was ever recorded with disabled=0 - so the
+	// opt-in this table existed to express was never once granted, and 584
+	// changes_requested verdicts produced zero fix legs.
+	//
+	// APPENDED, never edited in place: Migrate iterates positionally and skips
+	// any version already recorded in schema_migrations, so editing an applied
+	// migration means every database that ran a prior head never executes the
+	// change. #2202 round 2 P2 is the precedent.
+	`
+DROP TABLE IF EXISTS pull_request_auto_fix_policies;
+	`,
 }

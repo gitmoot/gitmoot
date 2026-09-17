@@ -18,7 +18,6 @@ import (
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -396,27 +395,6 @@ func heartbeatAgentHasCapability(ctx context.Context, store *db.Store, agent, ca
 	return agentHasCapability(record.Capabilities, capability), nil
 }
 
-// heartbeatImplementPermitted reports whether the named agent may run an implement
-// heartbeat: it must hold the "implement" capability AND carry a write-granting
-// autonomy policy (workspace-write / danger-full-access). A missing agent is NOT
-// an error — it returns false so an implement heartbeat for an unknown/unstarted
-// agent is skipped (and next_due advanced) rather than aborting the scan. It
-// reuses the exact runtime predicate the direct-implement dispatch gate uses, so
-// the two can never drift. A real store error propagates (#611).
-func heartbeatImplementPermitted(ctx context.Context, store *db.Store, agent string) (bool, error) {
-	record, err := store.GetAgent(ctx, strings.TrimSpace(agent))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	if !agentHasCapability(record.Capabilities, "implement") {
-		return false, nil
-	}
-	return runtime.PolicyGrantsImplementWrite(record.AutonomyPolicy), nil
-}
-
 func heartbeatJobID(agent, name string, now time.Time) string {
 	return fmt.Sprintf("heartbeat-%s-%s-%x", agent, name, now.UTC().UnixNano())
 }
@@ -524,29 +502,6 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 			return store.UpsertHeartbeatState(ctx, state)
 		}
 	}
-	// Policy gate: an implement heartbeat enqueues a WRITE job. The worker only
-	// produces files for an agent that holds the implement capability AND carries a
-	// write-granting autonomy policy (workspace-write / danger-full-access); under
-	// auto/read-only the job runs and produces nothing (and is separately blocked by
-	// readOnlyImplementationBlocked at dispatch). Validate here — the enqueue path
-	// bypasses ensureLocalAgentAccess — so an implement heartbeat for a read-only
-	// agent NO-OPs rather than churning doomed jobs. Skip but ADVANCE next_due with a
-	// clear status so it self-recovers once a write policy is granted. This is the
-	// agent-aware half of the config-level action gate (#611).
-	if heartbeat.Action == "implement" {
-		permitted, err := heartbeatImplementPermitted(ctx, store, heartbeat.Agent)
-		if err != nil {
-			return err
-		}
-		if !permitted {
-			state.Agent = heartbeat.Agent
-			state.Name = heartbeat.Name
-			state.LastRunAt = now
-			state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
-			state.LastStatus = "policy_readonly"
-			return store.UpsertHeartbeatState(ctx, state)
-		}
-	}
 	// Overlap protection: a still-active heartbeat job (>= max_concurrent) means the
 	// previous run has not finished. Skip WITHOUT advancing so it is retried next
 	// tick (this is also the restart-safe dedup: a restart sees the active job).
@@ -590,44 +545,12 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 		}
 		return overrideErr
 	}
-	// Implement heartbeats need the SAME isolated task/branch/worktree the direct
-	// `agent implement` path allocates (#611). Without it the enqueued job carries
-	// Branch="",TaskID="",WorktreePath="" and the daemon worker fails its checkout
-	// pre-flight ("checkout branch is main, not job branch ") on the shared checkout —
-	// a false-green that never runs the agent, creates a branch, or opens a PR. Do the
-	// allocation here (AFTER the overlap/capacity guards so a skipped tick allocates
-	// nothing) so taskWorktreeCheckout resolves the on-branch worktree and
-	// validateTargetCheckoutForRunner passes, exactly like a foreground implement. Read-only
-	// actions (ask/review) carry no branch identity and keep their bare-enqueue path.
-	var implementFields heartbeatImplementFields
-	if heartbeat.Action == "implement" {
-		implementFields, err = allocateHeartbeatImplement(ctx, store, home, heartbeat)
-		if err != nil {
-			// Allocation failure (e.g. a dirty checkout or a taken branch) is handled
-			// like an enqueue failure: skip but ADVANCE next_due with a clear status so a
-			// broken implement heartbeat does not hot-loop, and self-recovers next tick.
-			state.Agent = heartbeat.Agent
-			state.Name = heartbeat.Name
-			state.LastRunAt = now
-			state.NextDueAt = now.Add(interval + heartbeatJitter(jitter))
-			state.LastStatus = "implement_alloc_failed"
-			if upsertErr := store.UpsertHeartbeatState(ctx, state); upsertErr != nil {
-				return upsertErr
-			}
-			return err
-		}
-	}
 	job, enqueueErr := enqueue(ctx, workflow.JobRequest{
-		ID:        heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
-		Agent:     heartbeat.Agent,
-		Action:    heartbeat.Action,
-		Repo:      heartbeat.Repo,
-		Branch:    implementFields.Branch,
-		TaskID:    implementFields.TaskID,
-		TaskTitle: implementFields.TaskTitle,
-		GoalID:    implementFields.GoalID,
-		HeadSHA:   implementFields.HeadSHA,
-		Sender:    "heartbeat",
+		ID:     heartbeatJobID(heartbeat.Agent, heartbeat.Name, now),
+		Agent:  heartbeat.Agent,
+		Action: heartbeat.Action,
+		Repo:   heartbeat.Repo,
+		Sender: "heartbeat",
 		// #1967: a heartbeat has no seat behind it, so the honest dispatcher is the
 		// schedule that fired. Naming the schedule (not just "heartbeat") is what
 		// lets a finding be traced back to the configuration entry that ordered
@@ -656,56 +579,6 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 		return err
 	}
 	return enqueueErr
-}
-
-// heartbeatImplementFields is the task/branch/worktree identity an implement
-// heartbeat job must carry so the daemon worker's checkout pre-flight
-// (taskWorktreeCheckout + validateTargetCheckoutForRunner) resolves the freshly allocated
-// on-branch worktree and passes — the exact set the direct `agent implement` path
-// stamps onto its JobRequest (#611).
-type heartbeatImplementFields struct {
-	Branch    string
-	TaskID    string
-	TaskTitle string
-	GoalID    string
-	HeadSHA   string
-}
-
-// allocateHeartbeatImplement performs the SAME task/branch/worktree allocation the
-// direct `agent implement` dispatch does (prepareLocalImplementDispatchRequest →
-// workflow.Engine.AllocateTaskWorktree): it upserts a fresh adhoc task on a
-// gitmoot/<taskID> branch and adds an isolated git worktree checked out on that
-// branch, returning the identity fields the enqueued job needs. It reuses the
-// direct path verbatim so the scheduled and foreground implement flows can never
-// drift. It uses the STORED repo record (whose DefaultBranch is the allocation
-// base) rather than re-deriving the base from the possibly-off-branch shared
-// checkout (#611).
-func allocateHeartbeatImplement(ctx context.Context, store *db.Store, home string, heartbeat config.Heartbeat) (heartbeatImplementFields, error) {
-	repo, err := github.ParseRepository(heartbeat.Repo)
-	if err != nil {
-		return heartbeatImplementFields{}, err
-	}
-	record, err := store.GetRepo(ctx, heartbeat.Repo)
-	if err != nil {
-		return heartbeatImplementFields{}, err
-	}
-	_, prepared, err := prepareLocalImplementDispatchRequest(ctx, store, record, repo, localAgentDispatchRequest{
-		RepoFlag:     heartbeat.Repo,
-		Agent:        heartbeat.Agent,
-		Action:       "implement",
-		Instructions: heartbeat.Prompt,
-		Home:         home,
-	})
-	if err != nil {
-		return heartbeatImplementFields{}, err
-	}
-	return heartbeatImplementFields{
-		Branch:    prepared.Branch,
-		TaskID:    prepared.TaskID,
-		TaskTitle: prepared.TaskTitle,
-		GoalID:    prepared.GoalID,
-		HeadSHA:   prepared.HeadSHA,
-	}, nil
 }
 
 // startSingleRepoWorkerLoop wires the single-repo supervisor's per-tick worker

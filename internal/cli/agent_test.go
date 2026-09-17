@@ -449,11 +449,14 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	promptPath := filepath.Join(t.TempDir(), "frontend.md")
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
 	}
-	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	}
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440022"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -730,12 +733,14 @@ func TestSelectAgentRunAction(t *testing.T) {
 		options agentRunOptions
 		action  string
 	}{
-		{name: "task selects implement", options: agentRunOptions{taskID: "task-1", message: "anything"}, action: "implement"},
 		{name: "pr selects review", options: agentRunOptions{prNumber: 7, message: "anything"}, action: "review"},
 		{name: "head sha selects review", options: agentRunOptions{headSHA: strings.Repeat("a", 40), message: "anything"}, action: "review"},
 		{name: "review language selects review", options: agentRunOptions{message: "please review this PR"}, action: "review"},
-		{name: "implementation language selects implement", options: agentRunOptions{message: "update docs and add tests"}, action: "implement"},
-		{name: "write code selects implement", options: agentRunOptions{message: "write code for the new command"}, action: "implement"},
+		// #2203: implementation language no longer selects a dispatch action.
+		// Gitmoot does not dispatch implementation, so a prompt asking for code
+		// routes to the read-only ask path rather than minting a write job.
+		{name: "implementation language falls back to ask", options: agentRunOptions{message: "update docs and add tests"}, action: "ask"},
+		{name: "write code falls back to ask", options: agentRunOptions{message: "write code for the new command"}, action: "ask"},
 		{name: "code question selects ask", options: agentRunOptions{message: "what does this code do?"}, action: "ask"},
 		{name: "plain question selects ask", options: agentRunOptions{message: "what is the risk here?"}, action: "ask"},
 	}
@@ -983,7 +988,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "task recover"},
 		},
 		{
 			// #1530: the rebind-on-divergence must NOT precede the disposal
@@ -994,7 +999,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 				request.Branch = "feature/review"
 				request.HeadSHA = strings.Repeat("0", 40)
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "task recover"},
 		},
 		{
 			name: "requested task upsert",
@@ -1002,7 +1007,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "task recover"},
 		},
 		{
 			name: "superseded matching branch",
@@ -1139,201 +1144,6 @@ func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
 	}
 	if request.ReviewTaskHeadDivergence != "" {
 		t.Fatalf("mint path recorded a divergence note %q; no owning task means no rebind", request.ReviewTaskHeadDivergence)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestReusesExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	task, request, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err != nil {
-		t.Fatalf("prepareLocalImplementDispatchRequest returned error: %v", err)
-	}
-	if task.ID != "task-existing" || request.TaskID != "task-existing" {
-		t.Fatalf("task.ID=%q request.TaskID=%q, want task-existing", task.ID, request.TaskID)
-	}
-	if task.Branch != "feature/retry" || request.Branch != "feature/retry" {
-		t.Fatalf("task.Branch=%q request.Branch=%q, want feature/retry", task.Branch, request.Branch)
-	}
-	if task.WorktreePath == "" {
-		t.Fatal("task worktree path was not allocated")
-	}
-	if currentBranch := strings.TrimSpace(runGitOutput(t, task.WorktreePath, "branch", "--show-current")); currentBranch != "feature/retry" {
-		t.Fatalf("task worktree branch = %q, want feature/retry", currentBranch)
-	}
-	stored, err := store.GetTask(ctx, "task-existing")
-	if err != nil {
-		t.Fatalf("GetTask returned error: %v", err)
-	}
-	if stored.WorktreePath != task.WorktreePath || stored.State != string(workflow.TaskImplementing) {
-		t.Fatalf("stored task = %+v, returned task = %+v", stored, task)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsDirtyExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	worktree := filepath.Join(home, "dirty-task")
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runGit(t, repoDir, "worktree", "add", "-b", "feature/retry", worktree, "main")
-	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("partial work\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-		WorktreePath: worktree,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") || !strings.Contains(err.Error(), "inspect and commit/push them") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want dirty-worktree guidance", err)
-	}
-	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("dirty dispatch refusal created branch lock, err=%v", err)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsLiveExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	worktree := filepath.Join(home, "live-task")
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-		WorktreePath: worktree,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	prev := taskWorktreeHasLiveProcess
-	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
-	defer func() { taskWorktreeHasLiveProcess = prev }()
-
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "live process") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want live process", err)
-	}
-	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("live dispatch refusal created branch lock, err=%v", err)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsCompletedBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		State:        string(workflow.TaskMerged),
-		Branch:       "feature/retry",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Implement a new task on a reused branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "state merged") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want completed task rejection", err)
 	}
 }
 
@@ -1919,62 +1729,6 @@ func TestDispatchLocalAgentJobBlocksReadOnlyImplement(t *testing.T) {
 		t.Fatalf("job state = %q, want blocked", job.State)
 	}
 	events, err := store.ListJobEvents(context.Background(), job.ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !daemonWorkerHasEvent(events, "permission_blocked") {
-		t.Fatalf("events = %+v, want permission_blocked", events)
-	}
-}
-
-func TestDispatchLocalAgentJobBlocksReadOnlyManagedImplementBeforeStart(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "builder",
-		"--home", home,
-		"--runtime", "codex",
-		"--policy", "read-only",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "implement",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:         "owner/repo",
-		Agent:            "builder",
-		Action:           "implement",
-		Instructions:     "Implement task 1.",
-		Type:             "builder",
-		Home:             home,
-		AllowManagedSync: true,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-
-	if output.State != string(workflow.JobBlocked) || output.Action != "implement" || output.Agent != "builder" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started before read-only block: %+v", runner.calls)
-	}
-	events, err := store.ListJobEvents(context.Background(), output.JobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
 	}
@@ -2656,7 +2410,7 @@ func TestRunAgentStartRejectsMissingTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
+	want := "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2687,7 +2441,7 @@ func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
+	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2796,42 +2550,6 @@ func TestRunAgentStartRejectsConfigUnsafeNameBeforeRuntime(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "start", "shell-agent",
-		"--home", home,
-		"--runtime", "shell",
-		"--repo", "owner/repo",
-		"--path", repoDir,
-		// --capability ask keeps this test on its OWN gate. #2204 removed the
-		// --template flag this invocation used to carry, and without a template
-		// resolveAgentDefaults falls back to capabilities [ask review implement];
-		// the implement-write-policy refusal then fires at agent.go:1847 and
-		// returns 2 BEFORE the shell-runtime refusal this test exists to pin.
-		// Round-1 review of #2211 caught it: the test was passing judgement on a
-		// gate it does not name.
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
-	}
-}
-
 func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -2887,11 +2605,15 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 
 func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	promptPath := filepath.Join(t.TempDir(), "frontend.md")
+	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
 	}
-	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
+		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	}
+
 	stdout.Reset()
 	stderr.Reset()
 	code := Run([]string{
@@ -2952,7 +2674,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing custom template exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
+	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2970,7 +2692,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing template exit code = %d, want 1", code)
 	}
-	want = "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
+	want = "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -4483,5 +4205,41 @@ func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 	}
 	if help := stdout.String() + stderr.String(); !strings.Contains(help, "[--background|--foreground]") {
 		t.Fatalf("agent run help = %q, want both execution modes", help)
+	}
+}
+
+func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "shell-agent",
+		"--home", home,
+		"--runtime", "shell",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		// --capability ask keeps this test on its OWN gate. #2204 removed the
+		// --template flag this invocation used to carry, and without a template
+		// resolveAgentDefaults falls back to capabilities [ask review implement];
+		// the implement-write-policy refusal then fires at agent.go:1847 and
+		// returns 2 BEFORE the shell-runtime refusal this test exists to pin.
+		// Round-1 review of #2211 caught it: the test was passing judgement on a
+		// gate it does not name.
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
 	}
 }

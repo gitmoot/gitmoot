@@ -127,9 +127,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		engine.Home = home
 		engine.DelegationCheckout = checkout
 		engine.DelegationWorktrees = jobGitClient(checkout, runner)
-		engine.FixWorktreeAllocator = func(ctx context.Context, request workflow.FixWorktreeRequest) (workflow.FixWorktreeAllocation, error) {
-			return allocateFixWorktreeForRunner(ctx, store, home, checkout, request, runner)
-		}
 	}
 	return engine
 }
@@ -283,12 +280,11 @@ const (
 // both call this predicate so an early refusal cannot drift from the late
 // backstop.
 //
-// The delivery branch is resolved once, with the same FixWorktree override the
-// worktree path uses: for a fix job the PAYLOAD owns the branch — advance-created
-// fix jobs bind to the reviewing job's task, and review tasks (review-pr-<n>-<hash>)
-// legitimately carry no branch (#1523) — while for any other job the TASK owns it.
-// The returned task copy carries the resolved branch so the finalizer pushes and
-// opens the pull request for exactly the branch this predicate validated.
+// The delivery branch and worktree both come from the TASK: since #2203 removed
+// implementer dispatch there is no engine-created fix job carrying its own
+// branch, so the task row is the single source. The returned task copy carries
+// the resolved branch so the finalizer pushes and opens the pull request for
+// exactly the branch this predicate validated.
 func implementationFinalizationTargetForRunner(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, phase implementationFinalizationPhase, runner subprocess.Runner) (implementationFinalizationTarget, error) {
 	switch phase {
 	case implementationFinalizationBeforeRun, implementationFinalizationAfterRun:
@@ -301,7 +297,7 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 	taskID := strings.TrimSpace(payload.TaskID)
 	if taskID == "" {
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation job %s has no task id; cannot deliver a branch or pull request; rerun through `gitmoot agent implement %s \"Implement the task.\" --repo %s --task <task-id> --branch <branch>`",
+			"implementation job %s has no task id; cannot deliver a branch or pull request; record the implementation instead with `gitmoot job record --agent %s --repo %s --type implement --decision implemented --task <task-id>`",
 			job.ID, job.Agent, payload.Repo,
 		))
 	}
@@ -310,53 +306,17 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 		return implementationFinalizationTarget{}, fmt.Errorf("load task %s for implementation finalizer: %w", taskID, err)
 	}
 	worktreePath := strings.TrimSpace(task.WorktreePath)
-	if payload.FixWorktree {
-		worktreePath = strings.TrimSpace(payload.WorktreePath)
-	}
-	// One resolved branch, used at both branch sites below: a FixWorktree job
-	// takes the payload's branch, any other job takes the task's. The
-	// missing-branch refusal and the current-branch comparison must read the
-	// same value — the comparison is what makes a wrong payload branch fail
-	// closed against the checkout's actual branch instead of silently
-	// delivering to the wrong branch.
-	//
-	// The unconditional FixWorktree override depends on the producer side:
-	// allocateFixWorktreeForRunner (fix_worktree.go) hard-errors "fix worktree branch
-	// is required" on a blank branch before dispatchFix ever sets
-	// FixWorktree=true, so a fix job cannot reach this predicate with an empty
-	// payload.Branch that would clobber a valid task.Branch.
-	// TestAllocateFixWorktreeRejectsBlankBranch enforces that guard; if it
-	// fails, re-check this override before trusting it.
 	branchName := strings.TrimSpace(task.Branch)
-	if payload.FixWorktree {
-		branchName = strings.TrimSpace(payload.Branch)
-	}
 	if worktreePath == "" {
-		branch := firstNonEmpty(strings.TrimSpace(task.Branch), strings.TrimSpace(payload.Branch), "<branch>")
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation task %s has no worktree path; cannot deliver a branch or pull request; rerun with `gitmoot agent implement %s \"Implement the task.\" --repo %s --task %s --branch %s`",
-			task.ID, job.Agent, payload.Repo, task.ID, branch,
+			"implementation task %s has no worktree path; cannot deliver a branch or pull request",
+			task.ID,
 		))
 	}
 	if branchName == "" {
-		advice := firstNonEmpty(strings.TrimSpace(payload.Branch), strings.TrimSpace(task.Branch), "<branch>")
-		// Name the source the resolution actually consulted so the refusal is
-		// true for the case that produced it: a fix job resolves the branch
-		// from its payload, any other job from the task.
-		missing := fmt.Sprintf("implementation task %s has no branch", task.ID)
-		if payload.FixWorktree {
-			missing = fmt.Sprintf("implementation fix job for task %s carries no payload branch", task.ID)
-		}
-		if payload.PullRequest > 0 {
-			recoveryWorktree := firstNonEmpty(strings.TrimSpace(task.WorktreePath), worktreePath)
-			return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-				"%s; cannot push or open a pull request; inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD`; retry with `gitmoot agent implement %s \"Address the requested changes.\" --repo %s --task %s --pr %d --branch %s`",
-				missing, recoveryWorktree, payload.PullRequest, recoveryWorktree, job.Agent, payload.Repo, task.ID, payload.PullRequest, advice,
-			))
-		}
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"%s; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot agent implement %s \"Implement the task.\" --repo %s --task %s --branch %s`",
-			missing, job.Agent, payload.Repo, task.ID, advice,
+			"implementation task %s has no branch; cannot push or open a pull request",
+			task.ID,
 		))
 	}
 	git := jobGitClient(worktreePath, runner)
@@ -465,10 +425,6 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	task := target.Task
 	worktreePath := target.WorktreePath
 	git := jobGitClient(worktreePath, f.Runner)
-	validatedPR, hasValidatedPR, err := f.revalidateImplementationPullRequest(ctx, payload, task, worktreePath)
-	if err != nil {
-		return payload, err
-	}
 	// Write-ahead the skip-native-review-fanout flag onto the branch lock as soon
 	// as the branch is confirmed — before EVERY downstream path that proceeds with
 	// a PR: the no-changes-but-PR-exists early return below, the adopt path, and
@@ -494,9 +450,6 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 			return payload, fmt.Errorf("resolve clean implementation head: %w", err)
 		}
 		if strings.TrimSpace(payload.HeadSHA) == "" || head == payload.HeadSHA {
-			if hasValidatedPR {
-				return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
-			}
 			if payload.PullRequest > 0 && head == payload.HeadSHA {
 				payload.Branch = task.Branch
 				return payload, nil
@@ -515,9 +468,6 @@ func (f daemonImplementationFinalizer) FinalizeImplementation(ctx context.Contex
 	}
 	if err := git.PushBranch(ctx, "origin", task.Branch); err != nil {
 		return payload, blockedResultDelivery("push implementation branch failed: " + err.Error())
-	}
-	if hasValidatedPR {
-		return f.adoptValidatedImplementationPullRequest(ctx, payload, task, validatedPR, head)
 	}
 	repo, err := github.ParseRepository(payload.Repo)
 	if err != nil {
@@ -593,64 +543,8 @@ func (f daemonImplementationFinalizer) githubClient(checkout string) github.Clie
 	return jobGitHubClient(checkout, f.GitHub, f.Runner)
 }
 
-func (f daemonImplementationFinalizer) revalidateImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, worktreePath string) (github.PullRequest, bool, error) {
-	if !payload.ValidatedPullRequest {
-		return github.PullRequest{}, false, nil
-	}
-	if payload.PullRequest <= 0 {
-		return github.PullRequest{}, false, blockedResultDelivery("validated implementation payload has no pull request number")
-	}
-	repo, err := github.ParseRepository(payload.Repo)
-	if err != nil {
-		return github.PullRequest{}, false, err
-	}
-	pr, err := f.githubClient(worktreePath).GetPullRequest(ctx, repo, int64(payload.PullRequest))
-	if err != nil {
-		return github.PullRequest{}, false, fmt.Errorf("revalidate fix-pass pull request #%d: %w", payload.PullRequest, err)
-	}
-	if pr.Number != int64(payload.PullRequest) {
-		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request revalidation returned #%d, want #%d", pr.Number, payload.PullRequest))
-	}
-	if pr.Merged || strings.TrimSpace(pr.MergedAt) != "" || !strings.EqualFold(strings.TrimSpace(pr.State), "open") {
-		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d is no longer open", payload.PullRequest))
-	}
-	if strings.TrimSpace(pr.HeadRef) != task.Branch {
-		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d now targets head branch %s, not task branch %s", payload.PullRequest, firstNonEmpty(pr.HeadRef, "<missing>"), task.Branch))
-	}
-	if headRepo := strings.TrimSpace(pr.HeadRepoFullName); headRepo != "" && !strings.EqualFold(headRepo, payload.Repo) {
-		return github.PullRequest{}, false, blockedResultDelivery(fmt.Sprintf("fix-pass pull request #%d head belongs to %s, not %s", payload.PullRequest, headRepo, payload.Repo))
-	}
-	return pr, true, nil
-}
-
 func blockedResultDelivery(reason string) workflow.BlockedError {
 	return workflow.BlockedError{Reason: reason, ResultDeliveryFailed: true}
-}
-
-func (f daemonImplementationFinalizer) adoptValidatedImplementationPullRequest(ctx context.Context, payload workflow.JobPayload, task db.Task, pr github.PullRequest, head string) (workflow.JobPayload, error) {
-	base := strings.TrimSpace(pr.BaseRef)
-	if base == "" {
-		record, err := f.Store.GetRepo(ctx, payload.Repo)
-		if err != nil {
-			return payload, err
-		}
-		base = firstNonEmpty(strings.TrimSpace(record.DefaultBranch), "main")
-	}
-	payload.PullRequest = int(pr.Number)
-	payload.Branch = task.Branch
-	payload.HeadSHA = head
-	if err := f.Store.UpsertPullRequest(ctx, db.PullRequest{
-		RepoFullName: payload.Repo,
-		Number:       pr.Number,
-		URL:          pr.URL,
-		HeadBranch:   task.Branch,
-		BaseBranch:   base,
-		HeadSHA:      head,
-		State:        "open",
-	}); err != nil {
-		return payload, err
-	}
-	return payload, nil
 }
 
 func existingBranchPullRequest(ctx context.Context, store *db.Store, repo string, branch string) (db.PullRequest, bool, error) {
@@ -1230,9 +1124,6 @@ func refreshDaemonJobPayloadForRunner(ctx context.Context, store *db.Store, chec
 }
 
 func payloadHasTaskWorktree(ctx context.Context, store *db.Store, payload workflow.JobPayload) bool {
-	if payload.FixWorktree && strings.TrimSpace(payload.WorktreePath) != "" {
-		return true
-	}
 	if store == nil {
 		return false
 	}

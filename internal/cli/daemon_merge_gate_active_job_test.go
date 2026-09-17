@@ -676,24 +676,6 @@ func TestFindActiveJobForBranchCoversAllJobTypesAndActiveStates(t *testing.T) {
 	}
 }
 
-func TestFindActiveImplementJobForTaskStillIgnoresOtherActiveTypes(t *testing.T) {
-	store := daemonWorkerStore(t)
-	seedDaemonMergeGateJob(t, store, db.Job{
-		ID: "a-ask", Type: "ask", State: string(workflow.JobRunning),
-	}, workflow.JobPayload{Repo: "owner/repo", Branch: "fix-round", TaskID: "task-1017"})
-	seedDaemonMergeGateJob(t, store, db.Job{
-		ID: "z-implement", Type: "implement", State: string(workflow.JobQueued),
-	}, workflow.JobPayload{Repo: "owner/repo", Branch: "fix-round", TaskID: "task-1017"})
-
-	job, found, err := findActiveImplementJobForTask(context.Background(), store, "owner/repo", "fix-round", "task-1017")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found || job.ID != "z-implement" {
-		t.Fatalf("active implement job = %+v found=%v, want z-implement", job, found)
-	}
-}
-
 func daemonMergeGateLiveOrgHome(t *testing.T) string {
 	t.Helper()
 	paths := config.PathsForHome(t.TempDir())

@@ -24,7 +24,6 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 		"github.max_concurrent",
 		"github.min_interval",
 		"orchestrate.blocked_ttl",
-		"workflow.implement_base",
 	}
 
 	got := make([]string, 0, len(dashboardConfigProjection))

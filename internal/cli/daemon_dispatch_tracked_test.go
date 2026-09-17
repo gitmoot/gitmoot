@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -599,96 +597,6 @@ func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
 //     retried,
 //   - a pending advancement that would mutate the HELD shared checkout is
 //     skipped (the safety half) — and retried once the holder finishes.
-func TestTrackedTickMaintenanceNotStarvedByInFlightJobs(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
-
-	mustCreateTerminalJob := func(id string, state string, payload workflow.JobPayload, extraEvents ...db.JobEvent) {
-		t.Helper()
-		encoded, err := json.Marshal(payload)
-		if err != nil {
-			t.Fatalf("Marshal %s: %v", id, err)
-		}
-		if err := store.CreateJobWithEvent(ctx, db.Job{ID: id, Agent: "reviewer", Type: "review", State: state, Payload: string(encoded)}, db.JobEvent{JobID: id, Kind: state, Message: "seed"}); err != nil {
-			t.Fatalf("CreateJobWithEvent %s: %v", id, err)
-		}
-		for _, event := range extraEvents {
-			event.JobID = id
-			if err := store.AddJobEvent(ctx, event); err != nil {
-				t.Fatalf("AddJobEvent %s: %v", id, err)
-			}
-		}
-	}
-	approved := &workflow.AgentResult{Decision: "approved", Summary: "approved"}
-	// Failed result comment awaiting retry (posting is GitHub-API-only).
-	mustCreateTerminalJob("job-comment", string(workflow.JobFailed),
-		workflow.JobPayload{Repo: "owner/repo", Branch: "main", PullRequest: 7},
-		db.JobEvent{Kind: "comment_post_failed", Message: "temporary github error"})
-	// Pending fix-worktree review advancement keyed on its OWN writable worktree
-	// (free while job-live runs). Ordinary read-only review retries now use the
-	// shared checkout because their detached worktree can already be gone.
-	mustCreateTerminalJob("job-adv-wt", string(workflow.JobSucceeded),
-		workflow.JobPayload{Repo: "owner/repo", Branch: "task-wt", PullRequest: 1, TaskID: "task-wt", WorktreePath: filepath.Join(t.TempDir(), "wt-adv"), FixWorktree: true, Result: approved},
-		db.JobEvent{Kind: "advance_started", Message: "workflow advancement started"})
-	// Pending advancement keyed on the SHARED repo checkout (held by job-live).
-	mustCreateTerminalJob("job-adv-repo", string(workflow.JobSucceeded),
-		workflow.JobPayload{Repo: "owner/repo", Branch: "task-repo", PullRequest: 2, TaskID: "task-repo", Result: approved},
-		db.JobEvent{Kind: "advance_started", Message: "workflow advancement started"})
-
-	comments := &cliPollFakeGitHub{}
-	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return t.TempDir(), nil
-	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, MergeGate: gate}
-	}
-	worker.CommenterFactory = func(string) github.Client {
-		return comments
-	}
-
-	tracker := newInflightJobTracker(ctx)
-	// A long-running in-flight job occupying the shared checkout — on the old
-	// whole-repo busy gate this starved ALL maintenance below.
-	if !tracker.beginWithin(0, "job-live", "owner/repo", "repo:owner/repo", "") {
-		t.Fatalf("begin(job-live) refused on a fresh tracker")
-	}
-
-	hasEvent := func(jobID, kind string) bool {
-		events, err := store.ListJobEvents(ctx, jobID)
-		if err != nil {
-			t.Fatalf("ListJobEvents %s: %v", jobID, err)
-		}
-		return daemonWorkerHasEvent(events, kind)
-	}
-
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker, nil); err != nil {
-		t.Fatalf("tick (busy repo): %v", err)
-	}
-	if len(comments.posted) != 1 {
-		t.Fatalf("posted comments = %d, want 1 (comment retry starved by an in-flight job)", len(comments.posted))
-	}
-	if !hasEvent("job-adv-wt", "advance_retried") {
-		t.Fatalf("job-adv-wt not advanced while its own worktree key is free (advancement starved by an in-flight job)")
-	}
-	if hasEvent("job-adv-repo", "advance_retried") {
-		t.Fatalf("job-adv-repo advanced while an in-flight job holds the shared checkout it would mutate")
-	}
-
-	// Holder finishes -> the shared-checkout advancement is retried next tick.
-	tracker.end("job-live")
-	if err := runDaemonWorkerTickTracked(ctx, store, worker, 2, false, "owner/repo", "", io.Discard, time.Now().UTC(), tracker, nil); err != nil {
-		t.Fatalf("tick (idle repo): %v", err)
-	}
-	if !hasEvent("job-adv-repo", "advance_retried") {
-		t.Fatalf("job-adv-repo still not advanced after the shared checkout freed")
-	}
-}
-
-// countCLIJobEvents returns how many events of the given kind exist for jobID.
 func countCLIJobEvents(t *testing.T, store *db.Store, jobID, kind string) int {
 	t.Helper()
 	events, err := store.ListJobEvents(context.Background(), jobID)

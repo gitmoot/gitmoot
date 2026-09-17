@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -75,286 +74,6 @@ func validatePullRequestEvent(event PullRequestEvent) error {
 	return nil
 }
 
-func (e Engine) dispatchFix(ctx context.Context, verdictJob db.Job, reviewer string, payload JobPayload, result AgentResult, ref taskRef) error {
-	// ONE FIX LEG PER BRANCH AT A TIME (#1533). A two-family panel that both
-	// object dispatches one leg PER VERDICT with no mutual exclusion. Each leg
-	// starts from the head it was dispatched against, works for minutes, and
-	// pushes; whichever finishes second is GUARANTEED a non-fast-forward
-	// rejection, and that rejection is terminal - daemon_workflow.go maps a push
-	// failure to blockedResultDelivery with no rebase, no retry and no salvage,
-	// so a completed leg's work is discarded.
-	//
-	// Measured on the live store: 34 implement jobs carry "failed to push some
-	// refs", 2026-08-27 through 2026-09-07. Of the 20 whose own window is under
-	// 6h, 14 overlapped another short-window implement leg on the SAME branch.
-	//
-	// THE BRANCH LOCK CANNOT SERVE THIS PURPOSE and it is worth saying why, since
-	// the obvious question is why a lock is not enough: Store.AcquireLock returns
-	// true when the existing owner EQUALS the requester, so one lock admits N
-	// concurrent same-owner legs by design. Every leg in the measured races ran
-	// under the same lock.
-	//
-	// SKIP, NOT BLOCK, and not a queue. Blocking the task would strand it behind
-	// a condition that resolves itself in minutes. Skipping is
-	// safe because the sibling verdict's substance does not live in this dispatch:
-	// its findings are in the #1822 ledger, still open, and the merge gate refuses
-	// a verdict at a head that has not observed them, so the next round re-raises
-	// them against the head the in-flight leg is about to push. A dropped dispatch
-	// costs one round; a lost race costs a completed leg's work and leaves the
-	// finding open anyway.
-	// #2054: A REVIEW-ONLY VERDICT HAS NO FIX TARGET, BY DECLARATION.
-	//
-	// --no-fix-target dispatches a review whose reviewer cannot implement and
-	// which names no lead, because the operator owns the follow-up. Honouring
-	// that has to happen HERE, not only at dispatch: clearing the lead alone
-	// left this path to resolve one anyway, and the resolution it reaches is the
-	// reviewer - so the fix for a verdict would go to the agent that produced
-	// it, which is the independence violation the lead requirement exists to
-	// prevent.
-	//
-	// SKIP AND RECORD, in the shape the active-leg branch already uses: the
-	// findings stay open in the ledger, so nothing is lost by not dispatching,
-	// and the event says the omission was chosen rather than failed.
-	if payload.NoFixTarget {
-		return e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID: verdictJob.ID,
-			Kind:  "auto_fix_skipped_no_fix_target",
-			Message: fmt.Sprintf(
-				"auto-fix leg not dispatched for %s pull request #%d: this review was dispatched --no-fix-target, so it has no implementer and the dispatching operator owns the follow-up. The findings stay open in the ledger",
-				payload.Repo, payload.PullRequest),
-		})
-	}
-	if active, found, err := e.activeImplementLegOnBranch(ctx, payload); err != nil {
-		return err
-	} else if found {
-		return e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID: verdictJob.ID,
-			Kind:  "auto_fix_skipped_active_leg",
-			Message: fmt.Sprintf(
-				"auto-fix leg not dispatched for %s pull request #%d: implement job %s is already %s on branch %q; a second writer would lose the push race and its work would be discarded. The findings stay open in the ledger and are re-raised against the head that leg pushes",
-				payload.Repo, payload.PullRequest, active.ID, active.State, strings.TrimSpace(payload.Branch)),
-		})
-	}
-	policy, configured, err := e.Store.PullRequestAutoFixPolicyFor(ctx, payload.Repo, payload.PullRequest)
-	if err != nil {
-		return err
-	}
-	if configured && policy.Disabled {
-		return e.blockAutoFix(ctx, ref, fmt.Sprintf(
-			"auto-fix disabled for %s pull request #%d by %s: %s",
-			payload.Repo,
-			payload.PullRequest,
-			policy.Actor,
-			policy.Reason,
-		))
-	}
-	leadAgent, err := e.autoFixOwner(ctx, payload)
-	if err != nil {
-		return e.blockAutoFix(ctx, ref, err.Error())
-	}
-	branchOwner, err := e.fixBranchLockOwner(ctx, payload, leadAgent)
-	if err != nil {
-		return e.blockAutoFix(ctx, ref, fmt.Sprintf("auto-fix branch lock owner unresolved: %v", err))
-	}
-	request := JobRequest{
-		PolicyExempt:  "exempt",
-		Agent:         leadAgent,
-		Action:        "implement",
-		Repo:          payload.Repo,
-		Branch:        payload.Branch,
-		PullRequest:   payload.PullRequest,
-		HeadSHA:       payload.HeadSHA,
-		GoalID:        payload.GoalID,
-		TaskID:        payload.TaskID,
-		TaskTitle:     payload.TaskTitle,
-		LeadAgent:     leadAgent,
-		Reviewers:     e.requiredReviewers(payload),
-		ReviewRound:   payload.ReviewRound,
-		Sender:        reviewer,
-		ActingOrgRole: payload.ActingOrgRole,
-		Instructions:  reviewFixInstructions(reviewer, result),
-	}
-	if request.ID == "" {
-		request.ID = e.jobID(request)
-	}
-	if err := e.ensureAgentAllowedWithBranchOwner(ctx, request, branchOwner, ref, false); err != nil {
-		return err
-	}
-	// Fail closed at the dispatch site. Falling through here would enqueue the fix
-	// with no WorktreePath, which resolves to the registered checkout and permits a
-	// concurrent agent to overwrite the lane owner's uncommitted work (#1462).
-	if e.FixWorktreeAllocator == nil {
-		return errors.New("review fix dispatch requires a writable per-job worktree allocator")
-	}
-	allocation, err := e.FixWorktreeAllocator(ctx, FixWorktreeRequest{
-		JobID:  request.ID,
-		Repo:   request.Repo,
-		Branch: request.Branch,
-	})
-	if err != nil {
-		return fmt.Errorf("allocate review fix worktree: %w", err)
-	}
-	request.WorktreePath = strings.TrimSpace(allocation.Path)
-	if request.WorktreePath == "" {
-		return errors.New("review fix worktree allocator returned an empty path")
-	}
-	request.FixWorktree = true
-	if err := e.enqueue(ctx, request); err != nil {
-		if allocation.Created {
-			// Never delete a standalone fix clone: move it aside for the operator.
-			_, _ = SetAsideFixClone(request.WorktreePath)
-		}
-		return err
-	}
-	return nil
-}
-
-// activeImplementLegOnBranch reports a queued or running implement job that
-// already owns this fix leg's write target.
-//
-// THE KEY IS THE BRANCH, because the branch is the resource the legs collide on:
-// they race on `git push`, not on the task row. When the payload carries no
-// branch there is nothing to push to and no branch to key on, so it falls back
-// to the task, which is the same pairing the operator-side refusal uses
-// (findActiveImplementJobForTask takes both).
-//
-// The engine could not simply call that refusal: it lives in internal/cli, and
-// workflow must never import cli. The query is duplicated rather than the
-// dependency inverted, for the same reason db.SucceededReviewVerdicts duplicates
-// ResultIsFanOut, and it is a narrower query than the CLI's - implement jobs
-// only, since a review or ask job on the branch does not push a fix leg's work.
-func (e Engine) activeImplementLegOnBranch(ctx context.Context, payload JobPayload) (db.Job, bool, error) {
-	if e.Store == nil {
-		return db.Job{}, false, nil
-	}
-	repo := strings.TrimSpace(payload.Repo)
-	branch := strings.TrimSpace(payload.Branch)
-	taskID := strings.TrimSpace(payload.TaskID)
-	if repo == "" || (branch == "" && taskID == "") {
-		return db.Job{}, false, nil
-	}
-	active, err := e.Store.ListActiveJobs(ctx)
-	if err != nil {
-		return db.Job{}, false, fmt.Errorf("inspect active implement legs on %s branch %q: %w", repo, branch, err)
-	}
-	for _, job := range active {
-		if job.Type != "implement" {
-			continue
-		}
-		candidate, err := unmarshalPayload(job.Payload)
-		if err != nil {
-			// A payload this engine cannot read cannot be proven to target another
-			// branch, and admitting an unreadable row is how a second writer gets
-			// in. Treat it as an owner of the branch it claims to be on.
-			return job, true, nil
-		}
-		if !strings.EqualFold(strings.TrimSpace(candidate.Repo), repo) {
-			continue
-		}
-		if branch != "" {
-			if strings.TrimSpace(candidate.Branch) == branch {
-				return job, true, nil
-			}
-			continue
-		}
-		if strings.TrimSpace(candidate.TaskID) == taskID {
-			return job, true, nil
-		}
-	}
-	return db.Job{}, false, nil
-}
-
-// autoFixOwner names the agent that will RUN the auto-fix, so it must return
-// something dispatchable.
-//
-// AN EXPLICIT ACTING ROLE THAT CANNOT BE RESOLVED IS A HARD STOP, AND THAT IS
-// DELIBERATE, NOT A LIMITATION. My first attempt at #1718 made it fall through to
-// attribution-based resolution, and
-// TestEngineAdvanceReviewChangesRequestedDoesNotBypassUnresolvableActingRole
-// caught it: falling back reassigns ownership the coordinator EXPLICITLY set, to
-// the task implementer or a payload default it did not choose. The refusal is the
-// feature.
-//
-// WHAT WAS ACTUALLY WRONG (#1718) IS THE DIAGNOSTIC, NOT THE BLOCK. Returning the
-// role unchanged made it JobRequest.Agent, so the stop surfaced three layers later
-// from an agent-subscription check as `agent "gitmoot" is not subscribed` - a
-// sentence that is false in its own terms, since gitmoot is not an unsubscribed
-// agent but an org ROLE, a different namespace entirely. An operator reading it
-// looks for a subscription that was never the problem. The stop now happens here,
-// where the cause is known, and says so.
-func (e Engine) autoFixOwner(ctx context.Context, payload JobPayload) (string, error) {
-	if role := strings.TrimSpace(payload.ActingOrgRole); role != "" {
-		if _, err := e.Store.GetAgent(ctx, role); err == nil {
-			return role, nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return "", err
-		}
-		return "", fmt.Errorf(
-			"auto-fix ownership unresolved: acting org role %q is not a registered agent, so it cannot own a fix; org roles and agents are separate namespaces. Assign an implementing agent to this branch or dispatch the fix explicitly - the engine will not reassign an ownership you set",
-			role)
-	}
-	jobs, err := e.Store.ListJobs(ctx)
-	if err != nil {
-		return "", err
-	}
-	evidence := collectImplementerAttribution(jobs, payload)
-	switch {
-	case evidence.sawMalformedPayload:
-		return "", errors.New("auto-fix ownership unresolved: an implement job has a malformed payload")
-	case evidence.sawEmptyAgent:
-		return "", errors.New("auto-fix ownership unresolved: a matching implement job has no agent")
-	}
-	agents := make([]string, 0, len(evidence.agents))
-	roles := make([]string, 0, len(evidence.agents))
-	for name, identity := range evidence.agents {
-		// A ROLE IS ATTRIBUTABLE BUT NOT DISPATCHABLE. Keeping the two apart here is
-		// the whole point: an in-session role can own the credit for the work and
-		// still be an impossible executor for the fix.
-		if identity.FromActingRole {
-			roles = append(roles, name)
-			continue
-		}
-		agents = append(agents, name)
-	}
-	sort.Strings(agents)
-	sort.Strings(roles)
-	switch len(agents) {
-	case 0:
-		if len(roles) > 0 {
-			return "", fmt.Errorf(
-				"auto-fix ownership unresolved: task %s was implemented in session by org role %s, which is not a dispatchable agent; name an implementing agent for the fix instead",
-				payload.TaskID, strings.Join(roles, " "))
-		}
-		return "", fmt.Errorf("auto-fix ownership unresolved: %s", evidence.failureReason())
-	case 1:
-		return agents[0], nil
-	default:
-		return "", fmt.Errorf("auto-fix ownership ambiguous: task %s has implementing agents [%s]", payload.TaskID, strings.Join(agents, " "))
-	}
-}
-
-// fixBranchLockOwner preserves the task's existing serialization owner while an
-// acting org role executes the isolated fix. The lock is never an ownership
-// source: it cannot change the agent selected by autoFixOwner.
-func (e Engine) fixBranchLockOwner(ctx context.Context, payload JobPayload, executionAgent string) (string, error) {
-	lock, err := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return executionAgent, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	owner := strings.TrimSpace(lock.Owner)
-	if owner == "" {
-		return "", errors.New("existing branch lock has no owner")
-	}
-	return owner, nil
-}
-
-func (e Engine) blockAutoFix(ctx context.Context, ref taskRef, reason string) error {
-	return e.blockAttributed(ctx, ref, "review_auto_fix_blocked", reason, "auto-fix")
-}
-
 // blockMergeGate attributes a merge-gate block on the task itself (#1562).
 // All block writers converge on blockTask, so the event naming the owner is
 // written only after the durable blocked transition.
@@ -363,7 +82,7 @@ func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) 
 }
 
 // blockSynthesisGate attributes a coordinator synthesis-gate block (vote or
-// quorum unmet) on the task, mirroring blockMergeGate and blockAutoFix (#1562).
+// quorum unmet) on the task, mirroring blockMergeGate (#1562).
 // Generic workflow blocks use workflow_blocked at the same choke point, making
 // the latest blocking event a complete ownership record rather than a selective
 // list of callers.
@@ -608,144 +327,6 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 	return true, "", false, nil
 }
 
-// dispatchFixWhenHeadHasSettled dispatches AT MOST ONE fix leg per head, and
-// only once every review dispatched at that head has settled (#1522).
-//
-// THE OLD RULE WAS "THE FIRST BLOCKING VERDICT DISPATCHES", which makes a
-// cross-family pair unsatisfiable in one round whenever it splits: the first
-// objection's leg pushes a new head while the sibling is still reading the old
-// one, so the sibling's verdict is stale the moment it lands. Measured over the
-// live job store: 37 of 334 dispatched fix legs (11.1%) were created while at
-// least one sibling review at the SAME head was still running, and those
-// siblings then landed 51 verdicts against a head that no longer existed - 29
-// approvals, average 12.0 minutes late, worst 58 minutes, and 22 further
-// objections at 9.2 minutes late.
-//
-// The 29 stale APPROVALS are the merge-integrity half: an "approved" recorded
-// for a commit the fix leg superseded minutes later is a record asserting
-// something it cannot support, which is the whole subject of #1520.
-//
-// THE LAST REVIEW TO SETTLE IS THE ONE THAT DISPATCHES, which is why this is
-// reachable from the approving arm too. If only the objecting arm called it, a
-// pair that splits objection-then-approval would defer the leg and then never
-// dispatch it: the approval does not fix anything, and the objection's arm has
-// already returned. That is a deadlock, not a delay, and it is the shape #1524
-// was opened for.
-//
-// ONE LEG PER HEAD is also what makes the concurrency this cannot see impossible
-// in the panel case: two blocking verdicts at one head now produce one leg
-// rather than two racing writers (#1533). It does not replace #1533's guard,
-// which still bounds legs arriving from separate rounds and other routes.
-func (e Engine) dispatchFixWhenHeadHasSettled(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
-	head := strings.TrimSpace(payload.HeadSHA)
-	if head == "" {
-		// No evaluated head means no head to reason about, so behave exactly as
-		// before rather than inventing a reason never to dispatch. Withholding a
-		// fix is a liveness cost and it must never be the accidental default.
-		if payload.Result == nil {
-			return nil
-		}
-		return e.dispatchFix(ctx, job, reviewDecisionAgent(job, payload), payload, *payload.Result, ref)
-	}
-	jobs, err := e.Store.ListJobs(ctx)
-	if err != nil {
-		return err
-	}
-	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
-	var pending []string
-	var existingLeg string
-	var verdictJob db.Job
-	var verdictPayload JobPayload
-	// The current job is included in the scan on equal terms with its siblings:
-	// the objecting arm arrives here carrying its own blocking result, and the
-	// approving arm arrives carrying none, so a single rule covers both.
-	candidates := append([]db.Job{job}, jobs...)
-	seen := map[string]struct{}{}
-	for _, candidate := range candidates {
-		if _, dup := seen[candidate.ID]; dup {
-			continue
-		}
-		seen[candidate.ID] = struct{}{}
-		candidatePayload, err := unmarshalPayload(candidate.Payload)
-		if err != nil {
-			return err
-		}
-		if !sameTask(payload, candidatePayload) {
-			continue
-		}
-		if candidateHead := strings.TrimSpace(candidatePayload.HeadSHA); candidateHead != head {
-			// Same rule as everywhere in #2008: a headless row is not a settled or
-			// pending leg at this head, and saying so is the only change.
-			if candidate.Type == "review" {
-				if reason, excluded := HeadBoundExclusion(candidate.ExternallyDriven, candidateHead); excluded {
-					if err := RecordHeadBoundExclusion(ctx, e.Store, candidate.ID,
-						"engine_routing_merge.dispatchFixWhenHeadHasSettled", reason); err != nil {
-						return err
-					}
-				}
-			}
-			continue
-		}
-		switch candidate.Type {
-		case "review":
-			if candidate.ID != job.ID &&
-				(JobState(candidate.State) == JobQueued || JobState(candidate.State) == JobRunning) {
-				pending = append(pending, candidate.ID+" ("+candidate.State+")")
-				continue
-			}
-			if candidatePayload.Result == nil || ResultIsFanOut(candidatePayload.Result) {
-				continue
-			}
-			if effectiveReviewDecisionForPayload(candidatePayload, blockingSeverity) != "changes_requested" {
-				continue
-			}
-			// NEWEST OBJECTION WINS, ordered by the row's own updated_at with the id
-			// as a deterministic tie-break. NOT by ListJobs order: engine job ids are
-			// deterministic strings like "review-audit-task-9-review-2", so id order
-			// is lexical and not chronological. I wrote that claim first and it was
-			// wrong; the leg must carry the most recent statement of the objection at
-			// this head, and two rows in the same second must still pick the same one
-			// on every replay.
-			if verdictPayload.Result != nil {
-				if candidate.UpdatedAt < verdictJob.UpdatedAt {
-					continue
-				}
-				if candidate.UpdatedAt == verdictJob.UpdatedAt && candidate.ID <= verdictJob.ID {
-					continue
-				}
-			}
-			verdictJob, verdictPayload = candidate, candidatePayload
-		case "implement":
-			if candidatePayload.FixWorktree {
-				existingLeg = candidate.ID
-			}
-		}
-	}
-	if len(pending) > 0 {
-		sort.Strings(pending)
-		return e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID: job.ID,
-			Kind:  "auto_fix_deferred_live_sibling",
-			Message: fmt.Sprintf(
-				"auto-fix leg deferred at head %s: sibling review(s) %s have not settled. Dispatching now would push a new head while they are still reading this one, so their verdicts would be stale on arrival; the last review to settle at this head dispatches instead",
-				head, strings.Join(pending, ", ")),
-		})
-	}
-	if existingLeg != "" {
-		return e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID: job.ID,
-			Kind:  "auto_fix_skipped_head_already_dispatched",
-			Message: fmt.Sprintf(
-				"auto-fix leg not dispatched at head %s: implement job %s already carries this head's fix pass",
-				head, existingLeg),
-		})
-	}
-	if verdictPayload.Result == nil {
-		return nil
-	}
-	return e.dispatchFix(ctx, verdictJob, reviewDecisionAgent(verdictJob, verdictPayload), verdictPayload, *verdictPayload.Result, ref)
-}
-
 func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (string, error) {
 	jobs, err := e.Store.ListJobs(ctx)
 	if err != nil {
@@ -915,7 +496,6 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.Instructions == request.Instructions &&
 		payload.WorkflowID == request.WorkflowID &&
 		payload.WorktreePath == request.WorktreePath &&
-		payload.FixWorktree == request.FixWorktree &&
 		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
 		equalStrings(payload.Constraints, compactStrings(request.Constraints))
@@ -955,13 +535,6 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 	authorizationAgent := job.Agent
 	if job.Type == "implement" && payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
 		branchOwner = payload.OriginalAgent
-	}
-	if job.Type == "implement" && payload.FixWorktree {
-		fixOwner, err := e.fixBranchLockOwner(ctx, payload, branchOwner)
-		if err != nil {
-			return e.block(ctx, ref, fmt.Sprintf("auto-fix branch lock owner unresolved: %v", err))
-		}
-		branchOwner = fixOwner
 	}
 	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
 		authorizationAgent = payload.OriginalAgent
@@ -1299,26 +872,21 @@ func (e Engine) parkTaskAwaitingHumanMerge(ctx context.Context, ref taskRef, rea
 //
 // THE DEFECT: a verdict is evidence about a COMMIT, not about the branch. This
 // arm transitioned the task unconditionally, so an objection bound to a
-// superseded head pulled a PR out of ready_to_merge - and, because dispatchFix
-// is called inline from it, dispatched a fix leg against findings about that
-// superseded commit.
+// superseded head pulled a PR out of ready_to_merge over a commit the branch
+// had moved past.
 //
 // ONLY A CONTRADICTED HEAD REFUSES; both unknowns admit. What refusing would
-// cost is the CONSERVATIVE transition and, inline from here, the FIX PASS - for
-// an objection nobody can show is stale. That liveness cost is the whole reason
-// the unknowns admit.
+// cost is the CONSERVATIVE transition for an objection nobody can show is
+// stale. That liveness cost is the whole reason the unknowns admit.
 //
 // A CLI review dispatched without --head-sha produces the headless payload
 // today, which is why that case is real traffic. The arms are pinned in
 // stale_verdict_head_test.go.
 //
-// ACCEPTED LIMITATION: when the ONLY objection on a PR is bound
-// to a superseded head, this arm strands it. The task does not transition, no fix
-// leg is dispatched, and nothing here re-drives anything - the PR waits for a
-// review at the current head. That is deliberate: a fix pass carrying findings
-// about a commit the branch has moved past is wrong work, not late work. It is
-// also the reason the refusal is terminal rather than retried, and it is not
-// mitigated in this change.
+// ACCEPTED LIMITATION: when the ONLY objection on a PR is bound to a superseded
+// head, this arm strands it. The task does not transition and nothing here
+// re-drives anything - the PR waits for a review at the current head. That is
+// deliberate, and it is the reason the refusal is terminal rather than retried.
 func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayload) (bool, string, error) {
 	objectionHead := strings.TrimSpace(payload.HeadSHA)
 	if objectionHead == "" || payload.PullRequest <= 0 {

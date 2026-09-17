@@ -157,7 +157,7 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// It is updated by every branch that appends a migration, which is the point:
 	// the test fails until the new migration is both last and named here, so two
 	// branches cannot each believe theirs is the tail.
-	const branchMigrationMarker = "DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal"
+	const branchMigrationMarker = "DROP TABLE IF EXISTS pull_request_auto_fix_policies"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {
