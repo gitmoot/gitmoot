@@ -288,10 +288,12 @@ Goal: PR comment -> queued review job -> Codex resume with cached thermo templat
 instructions -> attributed PR result comment. Run this with a Gitmoot build that
 includes `gitmoot agent template` commands.
 
-1. Cache the template and start a Gitmoot-managed Codex review agent.
+1. Confirm the template row is installed (seed the `agent_templates` row
+   directly if `agent template list` reports it as not installed), then start a
+   Gitmoot-managed Codex review agent.
 
    ```sh
-   gitmoot agent template update thermo-nuclear-code-quality-review
+   gitmoot agent template show thermo-nuclear-code-quality-review
    gitmoot agent start thermo-review \
      --runtime codex \
      --repo owner/project \
@@ -347,13 +349,6 @@ Expected signals:
   > Job: `...`
   ```
 
-5. Check or refresh the cached template only through explicit commands.
-
-   ```sh
-   gitmoot agent template diff thermo-nuclear-code-quality-review
-   gitmoot agent template update thermo-nuclear-code-quality-review
-   ```
-
 ## Planner Template Smoke Test
 
 Goal: cached planner template -> Gitmoot-managed Codex planner agent -> the
@@ -373,7 +368,6 @@ workflow is discoverable before using it on a real PR.
 
    ```sh
    /tmp/gitmoot-current agent template list --home "$GITMOOT_SMOKE_HOME" | grep planner
-   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" planner
    /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" planner
    ```
 
@@ -479,11 +473,12 @@ session.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. From the test repo checkout, cache the template and start the agent.
+2. From the test repo checkout, confirm the installed template and start the
+   agent.
 
    ```sh
    cd /path/to/project
-   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" thermo-nuclear-code-quality-review
+   /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" thermo-nuclear-code-quality-review
    /tmp/gitmoot-current agent start thermo-start-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --runtime codex \
@@ -524,171 +519,6 @@ Expected signals:
    /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
    /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
    ```
-
-## Custom Prompt Template Smoke Test
-
-Goal: local v1 template file -> cached custom template -> template-backed Codex
-agent -> queued PR comment job with custom template metadata.
-
-Prerequisites: a safe test repository, authenticated `gh`, installed Codex, and
-a Gitmoot build that includes `agent template draft` and `agent template add`.
-
-1. Build a local test binary and use an isolated Gitmoot home.
-
-   ```sh
-   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
-   export GITMOOT_SMOKE_HOME=/tmp/gitmoot-custom-template-smoke
-   rm -rf "$GITMOOT_SMOKE_HOME"
-   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
-   ```
-
-2. From the test repo checkout, create and install a local v1 template.
-
-   ```sh
-   cd /path/to/project
-   mkdir -p agents
-   /tmp/gitmoot-current agent template draft local-reviewer \
-     --output agents/local-reviewer.md \
-     --force
-   $EDITOR agents/local-reviewer.md
-   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
-   /tmp/gitmoot-current agent template add local-reviewer \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --file agents/local-reviewer.md
-   /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" local-reviewer
-   ```
-
-3. Start or subscribe a Codex test agent with the custom template.
-
-   ```sh
-   /tmp/gitmoot-current agent start local-reviewer \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --runtime codex \
-     --repo owner/project \
-     --path . \
-     --template local-reviewer \
-     --role reviewer \
-     --capability ask \
-     --capability review \
-     --start-daemon
-   /tmp/gitmoot-current agent doctor local-reviewer --home "$GITMOOT_SMOKE_HOME"
-   ```
-
-   To register an existing session instead, use:
-
-   ```sh
-   /tmp/gitmoot-current agent subscribe local-reviewer \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --runtime codex \
-     --session <session-id-or-last> \
-     --repo owner/project \
-     --template local-reviewer \
-     --role reviewer \
-     --capability ask \
-     --capability review
-   /tmp/gitmoot-current daemon start \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --repo owner/project \
-     --poll 10s
-   ```
-
-4. Open a disposable PR, then comment:
-
-   ```text
-   /gitmoot local-reviewer review
-   ```
-
-5. Verify the job and metadata.
-
-   ```sh
-   /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
-   /tmp/gitmoot-current job show <job-id> --home "$GITMOOT_SMOKE_HOME"
-   gh pr view <number> --repo owner/project --comments
-   ```
-
-Expected signals:
-
-- `agent template show` displays `source: local@file:` and `resolved commit: sha256:...`.
-- The PR receives a queued-job acknowledgement for `local-reviewer`.
-- The result comment includes `Agent`, `Runtime`, `Template`, and `Job` metadata.
-- `job show <job-id>` includes the custom template id and `sha256:` content hash.
-
-6. Edit and refresh the template only through explicit template commands.
-
-   ```sh
-   $EDITOR agents/local-reviewer.md
-   /tmp/gitmoot-current agent template validate agents/local-reviewer.md
-   /tmp/gitmoot-current agent template diff --home "$GITMOOT_SMOKE_HOME" local-reviewer
-   /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" local-reviewer
-   ```
-
-7. Stop the isolated daemon.
-
-   ```sh
-   /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"
-   /tmp/gitmoot-current daemon status --home "$GITMOOT_SMOKE_HOME"
-   ```
-
-## Template Capture Smoke Test
-
-Goal: current-chat template capture semantics -> draft scaffold -> structural
-validation -> local template install -> prompt reuse, without requiring a live
-background agent or PR comment.
-
-Prerequisites: a Gitmoot build that includes `agent template draft` and
-`agent template validate`.
-
-1. Build a local test binary and use an isolated Gitmoot home.
-
-   ```sh
-   GOTOOLCHAIN=go1.26.0 go build -o /tmp/gitmoot-current ./cmd/gitmoot
-   export GITMOOT_SMOKE_HOME="$(mktemp -d)"
-   export GITMOOT_DRAFT_FILE="$GITMOOT_SMOKE_HOME/release-planner.md"
-   /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
-   ```
-
-2. Scaffold a draft file.
-
-   ```sh
-   /tmp/gitmoot-current agent template draft release-planner \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --output "$GITMOOT_DRAFT_FILE"
-   ```
-
-3. In a Codex, Claude Code, or Kimi Code chat with the Gitmoot plugin/skill
-   installed, fill that draft from visible current-chat context:
-
-   ```text
-   Use Gitmoot to capture this session as agent template release-planner. Draft only.
-   ```
-
-4. After reviewing the filled draft, validate, install, and inspect the captured
-   template.
-
-   ```sh
-   /tmp/gitmoot-current agent template validate "$GITMOOT_DRAFT_FILE"
-   /tmp/gitmoot-current agent template add release-planner \
-     --home "$GITMOOT_SMOKE_HOME" \
-     --file "$GITMOOT_DRAFT_FILE"
-   /tmp/gitmoot-current agent template show \
-     --home "$GITMOOT_SMOKE_HOME" \
-     release-planner
-   /tmp/gitmoot-current agent prompt release-planner \
-     --home "$GITMOOT_SMOKE_HOME"
-   ```
-
-Expected signals:
-
-- `agent template draft` writes `$GITMOOT_DRAFT_FILE` with the standard
-  title and required sections.
-- The current-chat capture step fills the draft from visible context without
-  starting a daemon, queueing a job, or installing the template.
-- `agent template validate` succeeds for the draft and reports clear missing
-  sections or placeholders if the file is edited into an invalid state.
-- `agent template show` displays `source: local@file:` and
-  `resolved commit: sha256:...`.
-- `agent prompt release-planner` prints the installed template content for
-  current-chat reuse.
 
 ## Two-Repo Smoke Test
 

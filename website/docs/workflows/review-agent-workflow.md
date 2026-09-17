@@ -1,10 +1,10 @@
 # Review Agent Workflow
 
 Gitmoot includes a strict review template named
-`thermo-nuclear-code-quality-review`.
+`thermo-nuclear-code-quality-review`. Its `agent_templates` row must already be
+installed; confirm with `gitmoot agent template list`.
 
 ```sh
-gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \

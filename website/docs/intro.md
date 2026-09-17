@@ -25,8 +25,6 @@ context in one file.
 - Orchestrate work across multiple agents with structured delegations and
   automatic synthesis.
 - Use agent templates for reusable planner, review, or custom prompt agents.
-- Capture a successful current chat as a reviewed, reusable agent template
-  draft.
 - Import a cached agent prompt into the current chat with
   `gitmoot agent prompt <agent-or-template>`.
 - Track jobs, branch locks, review cycles, reviews, and merges locally.

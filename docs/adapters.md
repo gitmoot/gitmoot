@@ -56,7 +56,7 @@ form `session_<uuid>` or empty. omp accepts a session UUID or `fresh:<suffix>` â
 because it never resumes â€” and its adapter also accepts an empty reference,
 since delivery ignores the value entirely. Shell uses the configured command.
 `TemplateID` is Gitmoot-owned metadata. Adapters do not fetch or interpret template
-content; Gitmoot snapshots cached template instructions into the rendered prompt
+content; Gitmoot snapshots installed template instructions into the rendered prompt
 before delivery.
 
 ## Session Startup
@@ -219,7 +219,7 @@ type Job struct {
 ```
 
 The prompt already includes repo, branch, PR number, task label, sender,
-requested action, cached template instructions when present, constraints, and the
+requested action, installed template instructions when present, constraints, and the
 required `gitmoot_result` JSON shape. Adapters should pass the prompt through
 without rewriting workflow semantics.
 
@@ -250,16 +250,10 @@ assumptions into workflow, daemon, GitHub, database, or merge-gate code.
 
 Agent Templates are prompt/profile bundles layered above runtimes. They are not runtime
 adapters and should not create adapter-specific behavior. Gitmoot snapshots
-cached template content into startup and job prompts before invoking an adapter.
+installed template content into startup and job prompts before invoking an adapter.
 
-The built-in `thermo-nuclear-code-quality-review` template is fetched explicitly
-with:
-
-```sh
-gitmoot agent template update thermo-nuclear-code-quality-review
-```
-
-After it is cached, bind it to a normal runtime-backed agent:
+Bind the built-in `thermo-nuclear-code-quality-review` template to a normal
+runtime-backed agent:
 
 ```sh
 gitmoot agent start thermo-review \
@@ -271,18 +265,11 @@ gitmoot agent start thermo-review \
 The thermo template is non-mutating. It supplies reviewer defaults and allows
 `ask,review`, but it cannot grant `implement`.
 
-Local custom agent templates are installed from files:
-
-```sh
-gitmoot agent template validate agents/frontend-reviewer.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
-```
-
-They store `local@file:<absolute-path>` metadata and a `sha256:<hash>` resolved
-identifier. Adapters should not read those files or decide how agent templates behave;
-workflow code passes only the rendered prompt. After a template file changes, the
-user must run `gitmoot agent template update <custom-id>` before new jobs use the new
-content.
+Custom agent templates are read-only installed rows in the `agent_templates`
+store carrying a `sha256:<hash>` resolved identifier. Adapters should not read
+that store or decide how agent templates behave; workflow code passes only the
+rendered prompt. A template that must change is edited or re-seeded directly in
+its store row, and only jobs queued after that edit see the new content.
 
 ## Shell Adapter
 

@@ -183,11 +183,10 @@ Symptoms:
 
 - `gitmoot agent subscribe ... --template thermo-nuclear-code-quality-review`
   fails with an install hint.
-- `gitmoot agent start ... --template <custom-id>` fails with an `agent template add`
-  hint.
+- `gitmoot agent start ... --template <custom-id>` fails with `agent template
+  <custom-id> is not installed; seed the agent_templates row for it first`.
 - A custom prompt edit is not reflected in new jobs.
 - A template-backed job does not include the expected review instructions.
-- You want to know whether the cached template differs from upstream.
 
 Checks:
 
@@ -195,26 +194,13 @@ Checks:
 gitmoot agent template list
 gitmoot agent template show thermo-nuclear-code-quality-review
 gitmoot agent template show <custom-id>
-gitmoot agent template diff thermo-nuclear-code-quality-review
-gitmoot agent template diff <custom-id>
 gitmoot agent list
 ```
 
 Fixes:
 
-- Install or refresh the template explicitly:
-
-  ```sh
-  gitmoot agent template update thermo-nuclear-code-quality-review
-  ```
-
-  For a custom local template file:
-
-  ```sh
-  gitmoot agent template validate agents/<custom-id>.md
-  gitmoot agent template add <custom-id> --file agents/<custom-id>.md
-  gitmoot agent template update <custom-id>
-  ```
+- Seed the `agent_templates` store row for the template, then re-run the checks
+  above to confirm Gitmoot resolves it.
 
 - Re-subscribe the agent after the template is installed:
 
@@ -228,11 +214,11 @@ Fixes:
   ```
 
 - Template content is snapshotted when a job is queued. Retry an existing job to
-  reuse its original snapshot; comment again after `agent template update` to queue a
-  job with refreshed content.
-- Custom template files are not read at job runtime. Run
-  `gitmoot agent template diff <custom-id>` and `gitmoot agent template update <custom-id>`
-  after editing the file.
+  reuse its original snapshot; comment again after the store row changes to
+  queue a job with refreshed content.
+- Template content is never read from a file at job runtime. A template that
+  must change is edited or re-seeded in its `agent_templates` store row, and
+  only jobs queued after that edit see the new content.
 - The thermo template is review-only. Remove `--capability implement` and route
   local review fix passes to a separate implementation-capable agent with
   `gitmoot agent review thermo-review --repo owner/repo --pr <number> --lead <implementer> "Review this PR."`

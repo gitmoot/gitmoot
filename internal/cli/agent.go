@@ -1774,7 +1774,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	model := fs.String("model", "", "default runtime model for this agent")
 	effort := fs.String("effort", "", "default reasoning effort for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
-	updateTemplate := fs.Bool("update-template", false, "install or refresh the agent template before starting")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
@@ -1807,10 +1806,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*repoFlag) == "" {
 		fmt.Fprintln(stderr, "agent start requires --repo")
-		return 2
-	}
-	if *updateTemplate && strings.TrimSpace(*templateID) == "" {
-		fmt.Fprintln(stderr, "agent start --update-template requires --template")
 		return 2
 	}
 	paths, err := initializedPaths(*home)
@@ -1865,14 +1860,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if agent.TemplateID == "" {
-			return nil
-		}
-		if *updateTemplate {
-			updated, err := updateTemplateByID(context.Background(), store, agent.TemplateID)
-			if err != nil {
-				return err
-			}
-			cachedTemplate = updated
 			return nil
 		}
 		installed, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID)
@@ -2116,10 +2103,10 @@ func loadInstalledTemplate(ctx context.Context, store *db.Store, templateID stri
 	}
 	cached, err := store.GetAgentTemplateReference(ctx, templateID)
 	if errors.Is(err, sql.ErrNoRows) {
-		if _, ok := agenttemplate.Lookup(logicalTemplateID); !ok {
-			return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template add %s --file <path>", logicalTemplateID, logicalTemplateID)
-		}
-		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; run gitmoot agent template update %s", logicalTemplateID, logicalTemplateID)
+		// #2204 removed every authoring verb, so there is no command to point at:
+		// templates are read-only installed data and a missing row is installed by
+		// seeding it directly.
+		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; seed the agent_templates row for it first", logicalTemplateID)
 	}
 	return cached, err
 }

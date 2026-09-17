@@ -18,16 +18,14 @@ Agent Templates are reusable prompt/profile bundles. Gitmoot snapshots template 
 into each job so the job has reproducible instructions.
 
 ```sh
-gitmoot agent template update planner
-gitmoot agent template update thermo-nuclear-code-quality-review
-gitmoot agent template draft release-planner
-gitmoot agent template validate .gitmoot/templates/release-planner.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template list
+gitmoot agent template show planner
 ```
 
-Template capture is the current-chat path for creating new custom templates
-from a successful visible workflow. The current Codex or Claude chat fills a
-draft from visible context; `agent template add` installs the reviewed snapshot.
+Templates are read-only installed data (#2204). Gitmoot inspects an installed
+row and reads its content into a job, but it cannot author, update, or
+distribute one; a template that must change is edited or re-seeded directly in
+its `agent_templates` store row.
 
 ## Jobs
 

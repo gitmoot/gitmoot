@@ -1710,8 +1710,8 @@ gitmoot orchestrate project-planner "Implement the rate limiter and prove it wor
 The bare `gitmoot orchestrate <recipe-id> "..."` form also works, but the
 positional argument must resolve to a **registered agent** (or configured
 managed type) — so it requires an agent registered under the recipe name
-(e.g. after `agent template update review-panel` + `agent start review-panel
---template review-panel …`). On a fresh install without that registration it
+(e.g. `agent start review-panel --template review-panel …` against an installed
+`review-panel` row). On a fresh install without that registration it
 fails with "agent not found"; prefer `--recipe`.
 
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
@@ -1788,10 +1788,37 @@ forking use the **background** path. See WORKFLOWS.md → "Running one agent's j
 
 ## Agent Templates
 
-Install or refresh the built-in thermo review template:
+Agent templates are **read-only installed data** (#2204). Gitmoot inspects them
+and reads an installed row's content into a job payload so it reaches the
+agent's prompt. It cannot author, update, or distribute one: there is no
+`draft`, `validate`, `add`, `export`, `publish`, `pull`, `remote`, `diff`,
+`revert`, or `update` verb, and no template-remote config section. A
+template that must change is edited or re-seeded directly in its
+`agent_templates` store row. That is the accepted trade, not an oversight.
+
+The two surviving verbs are read-only inspection:
 
 ```sh
-gitmoot agent template update thermo-nuclear-code-quality-review
+gitmoot agent template list [--capability <cap>] [--runtime <runtime>] [--tag <tag>] [--output <output>]
+gitmoot agent template show <template-id>
+```
+
+`list` prints every built-in definition and every installed row: `available`
+means a built-in is registered but has no store row, `installed@<commit>` means
+a row exists. `show` prints the definition and its metadata and, when installed,
+the current version, content hash, source commit, promotion state, and content.
+
+Discover templates by metadata:
+
+```sh
+gitmoot agent template list --runtime codex --output goal_file
+gitmoot agent template list --tag review --capability ask
+gitmoot agent template show frontend-reviewer
+```
+
+Start an agent against an installed template:
+
+```sh
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
@@ -1799,26 +1826,17 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-Install or refresh the built-in full planner template:
+Templates are versioned in the store. An agent uses the current version by
+default, or a pinned version when configured with a reference such as
+`--template frontend-reviewer@v1`. Queued jobs keep the exact template content
+snapshot they were created with. The dashboard's Agents page shows a template's
+version history.
+
+The built-in coordinator recipes (`review-panel`, `decompose-and-verify`,
+`verifier`) are coordinator prompts for the Orchestra pattern, selected per
+invocation with `--recipe <id>` rather than started as long-lived agents:
 
 ```sh
-gitmoot agent template update planner
-gitmoot agent start project-planner \
-  --runtime codex \
-  --repo owner/repo \
-  --path . \
-  --template planner \
-  --start-daemon
-```
-
-Install or refresh the built-in coordinator recipe templates. These are
-coordinator prompts for the Orchestra pattern, run with `gitmoot orchestrate
-<agent> "..." --recipe <id>` (no re-registration needed) rather than started as
-long-lived agents:
-
-```sh
-gitmoot agent template update review-panel
-gitmoot agent template update decompose-and-verify
 gitmoot agent template show review-panel
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
 gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
@@ -1831,7 +1849,7 @@ For fast current-chat planning, use the Gitmoot skill with the same packaged
 Use the Gitmoot planner here. Write the implementation plan.
 ```
 
-The current chat can also import any cached custom agent or template prompt:
+The current chat can also import any installed agent or template prompt:
 
 ```sh
 gitmoot agent prompt frontend-reviewer
@@ -1866,85 +1884,6 @@ gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|
 `--type` defaults to `implement`. When the imported work is done, close the job
 with `gitmoot job close <id> --decision …`. `--json` includes the opened
 `job_id`. Without `--record`, behavior is unchanged (no job).
-
-Draft and validate a captured template before installing it:
-
-```sh
-gitmoot agent template draft release-planner
-gitmoot agent template validate .gitmoot/templates/release-planner.md
-gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
-```
-
-`agent template draft` only creates the standard markdown structure. For
-current-chat capture, the active Codex or Claude chat reads
-`references/TEMPLATE_CAPTURE.md` and fills that structure from visible
-conversation context. Gitmoot does not extract hidden runtime memory.
-
-Create a local custom prompt template:
-
-```sh
-mkdir -p agents
-gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
-$EDITOR agents/frontend-reviewer.md
-gitmoot agent template validate agents/frontend-reviewer.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
-gitmoot agent start frontend-reviewer \
-  --runtime codex \
-  --repo owner/repo \
-  --template frontend-reviewer \
-  --role reviewer \
-  --capability ask \
-  --capability review
-```
-
-After editing a local template file, refresh Gitmoot's cached snapshot:
-
-```sh
-gitmoot agent template diff frontend-reviewer
-gitmoot agent template update frontend-reviewer
-```
-
-Template updates are versioned locally. `gitmoot agent template show <id>`
-prints the current version, content hash, source commit, and promotion state.
-Agents use the current promoted version by default, or a pinned version when
-configured with a reference such as `--template frontend-reviewer@v1`.
-
-A bad promotion can be undone: `gitmoot agent template revert <template-id>
---version <version-id>` makes a superseded version current again (the dashboard's
-Agents page does the same with `v` in the agent detail).
-Queued jobs keep the exact template content snapshot they were created with.
-
-Discover templates by metadata:
-
-```sh
-gitmoot agent template list --runtime codex --output plan
-gitmoot agent template list --tag review --capability ask
-gitmoot agent template show frontend-reviewer
-```
-
-### Back Up And Share Templates Via GitHub
-
-Templates can be backed up to and pulled from a GitHub repo (#476):
-
-```sh
-gitmoot agent template export [<id>...] [--all] [--to <dir>] [--dry-run]
-gitmoot agent template publish [<id>...] [--all] [--repo <owner/repo>] [--path <subdir>] [--ref <branch>] [--message <msg>] [--create] [--dry-run]
-gitmoot agent template pull [<id>...] [--all] [--repo <owner/repo>] [--ref <ref>] [--path <subdir>] [--dry-run]
-gitmoot agent template add <id> --from-repo <owner/repo> [--ref <ref>] [--path <file>]
-gitmoot agent template remote set <owner/repo> [--ref <ref>] [--path <subdir>]
-gitmoot agent template remote show
-```
-
-`export` writes template `.md` files to a local directory; `publish` commits
-them to a GitHub repo (`--create` creates a missing **private** repo); `pull`
-installs or refreshes templates from that repo; `add --from-repo` installs a
-single template file directly from a repo. `--all` on `export`/`publish` covers
-only your custom templates — built-ins are skipped. `remote set` stores a default remote in the
-`[template_remote]` config section (`repo`; `ref` defaults to `main`; `path`
-defaults to `templates`) so publish/pull/add can omit `--repo`; with no remote
-configured, those commands require an explicit `--repo`. **Caution: templates
-are stored and published VERBATIM (prompt body + metadata) — point the remote
-at a PRIVATE repo unless the prompts are meant to be public.**
 
 ## Organization registry and scoped dispatch
 
@@ -3869,15 +3808,16 @@ single YAML blob:
 ```text
 nightly-sync.bundle/
 ├── bundle.yaml          # version, requirements, warnings, agents, spec hash
-├── spec.yaml            # stored bytes with only repo replaced by __GITMOOT_REPO__
-└── templates/
-    └── reply-triager.md # canonical agenttemplate.Export snapshot
+└── spec.yaml            # stored bytes with only repo replaced by __GITMOOT_REPO__
 ```
 
-The exporter carries YAML comments and ordering through unchanged, reports
+A bundle carries each agent's template id as a REFERENCE only. #2204 removed
+template distribution, so no prompt body travels in a bundle and there is no
+`templates/` directory.
+
+The exporter carries YAML comments and ordering through unchanged and reports
 host-specific `/root`, `/home`, `/Users`, and `/tmp` paths found in command
-stages, and warns that template prompts travel verbatim. It never exports
-environment values or local runtime state.
+stages. It never exports environment values or local runtime state.
 
 Import on another machine with its real repository and any local agent mapping:
 
@@ -3891,10 +3831,10 @@ gitmoot pipeline import ./nightly-sync.bundle \
 Every import prints a requirements report first: available/missing runtimes,
 present/missing upstream pipelines, write-authority flags that need consent, and
 absolute-path warnings.
-Without `--agent-map`, embedded templates are installed and their declared agents
-are registered. Existing templates, agents, or pipeline names with different
-content are refused unless `--force`; identical content is a no-op. A missing
-runtime for an unmapped agent is a hard failure.
+Without `--agent-map`, the declared agents are registered against template ids
+that must already exist in the importing home. Existing agents or pipeline names
+with different content are refused unless `--force`; identical content is a
+no-op. A missing runtime for an unmapped agent is a hard failure.
 
 Imported pipelines land **disabled**, even when replacing an enabled row. Review
 the report and stored spec, then run `pipeline enable <name>` or pass `--enable`
@@ -3924,24 +3864,22 @@ gitmoot pipeline pull nightly-sync \
 ```
 
 The optional `[pipeline_remote]` config section has the same `repo`, `ref`, and
-`path` shape as `[template_remote]`; `ref` defaults to `main` and `path` to
+`path` shape as the other GitHub-backed remotes; `ref` defaults to `main` and `path` to
 `pipelines`. An explicit `--remote owner/repo` wins over the configured repo.
 `remote set` also accepts `--ref` and `--path`.
 
 Each published entry is a reviewable directory at
-`pipelines/<name>/bundle.yaml`, `spec.yaml`, and `templates/<id>.md`. Publishing
+`pipelines/<name>/bundle.yaml` and `spec.yaml`. Publishing
 compares the exported bytes with HEAD: unchanged files cause no commit, changed
 files alone are upserted, and files removed from the current bundle are deleted
-from that managed pipeline directory. Template prompts and metadata are stored
-verbatim. `--create` therefore creates a **private** repository; without it the
-remote must already exist, and prompts should only go to a public repo when they
-are intentionally public.
+from that managed pipeline directory. `--create` creates a **private**
+repository; without it the remote must already exist.
 
 `pipeline pull --list` prints each available name, description, and a one-line
 requirements summary. Pull downloads the selected directory at HEAD and hands
 it to the same `pipeline import` path: the requirements report, `--agent-map`,
 `--name`, collision/`--force` gates, and `--enable` behavior are unchanged.
-Nothing beyond the spec and embedded agent templates is installed, and the
+Nothing beyond the spec is installed, and the
 pipeline lands disabled unless `--enable` explicitly re-consents its authority.
 
 ### Reading pipeline status

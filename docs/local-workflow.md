@@ -28,8 +28,7 @@ gitmoot plugin install codex
 gitmoot plugin install claude
 gitmoot plugin doctor
 gitmoot agent template list
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
-gitmoot agent template update thermo-nuclear-code-quality-review
+gitmoot agent template show thermo-nuclear-code-quality-review
 gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
 gitmoot agent subscribe <name> --runtime codex|claude|kimi|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--task task-id] [--pr number] [--background]
@@ -328,12 +327,11 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot agent doctor lead
    ```
 
-   To add the built-in strict review template, fetch and cache it explicitly.
+   To bind the built-in strict review template, pass its id to `agent start`.
    `--template` supplies the default reviewer role and `ask,review` capabilities
    when those flags are omitted.
 
    ```sh
-   gitmoot agent template update thermo-nuclear-code-quality-review
    gitmoot agent start thermo-review \
      --runtime codex \
      --repo owner/project \
@@ -341,21 +339,16 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot agent doctor thermo-review
    ```
 
-   If the template is not cached yet, `agent start --template ...` fails with the
-   same explicit `gitmoot agent template update <template>` guidance as `agent subscribe`.
-   Add `--update-template` when you want startup to refresh the cached template
-   before creating the runtime session.
+   If the template is not installed, `agent start --template ...` fails with the
+   same explicit `agent template <id> is not installed; seed the agent_templates
+   row for it first` guidance as `agent subscribe`.
 
-   Custom prompt agent templates are local files snapshotted into Gitmoot state. Use
-   them when you want a repo- or team-specific agent profile without changing
-   Codex, Claude, or repository agent files.
+   Custom prompt agent templates are installed rows in the `agent_templates`
+   store, snapshotted into every job. Use them when you want a repo- or
+   team-specific agent profile without changing Codex, Claude, or repository
+   agent files.
 
    ```sh
-   mkdir -p agents
-   gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
-   $EDITOR agents/frontend-reviewer.md
-   gitmoot agent template validate agents/frontend-reviewer.md
-   gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
    gitmoot agent start frontend-reviewer \
      --runtime codex \
      --repo owner/project \
@@ -371,38 +364,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    still keeps the normal fallback defaults if omitted, while
    `agent subscribe --template <custom-id>` requires explicit values.
 
-   After editing a custom template file, refresh the cached snapshot explicitly:
+   A custom template that must change is edited or re-seeded directly in its
+   `agent_templates` store row. Gitmoot can read and inspect installed
+   templates, but it has no verb that authors, refreshes, or distributes one.
 
-   ```sh
-   gitmoot agent template diff frontend-reviewer
-   gitmoot agent template update frontend-reviewer
-   ```
-
-   To create a new custom template from a successful current chat, use template
-   capture. The current Codex or Claude chat distills visible conversation,
-   inspected files, commands, corrections, and durable workflow rules into a
-   draft. Gitmoot cannot read hidden model memory, so capture is always
-   draft-first and user-reviewed.
-
-   ```text
-   Use Gitmoot to capture this session as agent template release-planner. Draft only.
-   ```
-
-   A blank scaffold is also available when you want to write the template by
-   hand:
-
-   ```sh
-   gitmoot agent template draft release-planner
-   gitmoot agent template validate .gitmoot/templates/release-planner.md
-   gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
-   gitmoot agent prompt release-planner
-   ```
-
-   `agent template draft` creates the structure, current-chat capture fills it
-   from visible context, `agent template validate` performs a structural check,
-   `agent template add` installs a snapshot, `agent prompt` reuses it in the
-   current chat, and `agent start --template` creates a runnable background
-   agent instance.
+   `agent prompt <id>` reuses an installed template in the current chat, and
+   `agent start --template` creates a runnable background agent instance.
 
    After startup, open a created Codex session later with the session id printed
    by Gitmoot:
@@ -421,15 +388,6 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    gitmoot agent subscribe audit --runtime claude --session <claude-session-id> --role reviewer --repo owner/project --capability review --capability ask
    gitmoot agent subscribe shell-smoke --runtime shell --session "printf '%s\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"ok\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"shell\"],\"needs\":[],\"delegations\":[]}}'" --role reviewer --repo owner/project --capability ask
    gitmoot agent list
-   ```
-
-   Template updates are explicit and auditable. Diff upstream content before
-   refreshing the local cached copy. For custom agent templates, `diff` compares the
-   cached content with the stored local file path.
-
-   ```sh
-   gitmoot agent template diff thermo-nuclear-code-quality-review
-   gitmoot agent template update thermo-nuclear-code-quality-review
    ```
 
    To inspect the installed Gitmoot build or check for a beta release:
@@ -691,8 +649,9 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
   in V1.
 - GitHub comments are authored by the authenticated user. Agent attribution is
   written in the comment body.
-- Template content is not fetched at job runtime. Run `gitmoot agent template update`
-  intentionally when you want to refresh a cached template.
+- A queued job keeps the template snapshot it was created with; template content
+  is never fetched at job runtime. Changing a template means editing its
+  `agent_templates` store row, which only affects jobs queued afterwards.
 - For Claude implementation worker validation, including the explicit live
   doctor check and mixed Codex + Claude parallel smoke, see
   [Claude Runtime Validation](claude-runtime-validation.md).

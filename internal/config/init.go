@@ -183,25 +183,11 @@ default_review_timeout = ""
 default_gate_timeout = ""
 default_repair_timeout = ""
 
-# [template_remote] is the OPTIONAL default GitHub repo the agent-template
-# publish / pull / add commands fall back to when --repo is omitted (#476).
-# Empty repo (the default) means no default remote: those commands then require
-# an explicit --repo, so behavior is byte-identical to having no section. repo is
-# owner/repo; ref defaults to "main" when empty; path is the subdir holding the
-# template .md files and defaults to "templates" when empty. Set it with
-# gitmoot agent template remote set <owner/repo> [--ref] [--path].
-# CAUTION: templates are stored and published verbatim (prompt body + metadata);
-# point this at a PRIVATE repo unless you intend the prompts to be public.
-[template_remote]
-repo = ""
-ref = ""
-path = ""
-
 # [pipeline_remote] is the OPTIONAL default GitHub repo used by pipeline
 # publish / pull when --remote is omitted (#941). repo is owner/repo; ref
-# defaults to "main"; path defaults to "pipelines". Pipeline bundles include
-# agent-template prompts verbatim, so keep the remote private unless those
-# prompts are intentionally public.
+# defaults to "main"; path defaults to "pipelines". Pipeline bundles carry
+# agent names, runtimes, and template references — never template prompt
+# bodies (#2204 removed template distribution).
 [pipeline_remote]
 repo = ""
 ref = ""

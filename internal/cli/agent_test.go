@@ -449,14 +449,11 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
+	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440022"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -2659,7 +2656,7 @@ func TestRunAgentStartRejectsMissingTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
+	want := "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2690,7 +2687,7 @@ func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2723,36 +2720,6 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("runtime was started before existing-agent validation: %+v", runner.calls)
-	}
-}
-
-func TestRunAgentStartUpdateTemplateInstallsBeforeStart(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{content: "Updated review instructions."})
-	defer restoreFetcher()
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440013"}` + "\n"}}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "start", "thermo-review",
-		"--home", home,
-		"--runtime", "codex",
-		"--repo", "owner/repo",
-		"--path", repoDir,
-		"--template", "thermo-nuclear-code-quality-review",
-		"--update-template",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
-	}
-	prompt := runner.calls[0].args[len(runner.calls[0].args)-1]
-	if !strings.Contains(prompt, "Updated review instructions.") {
-		t.Fatalf("startup prompt missing updated template:\n%s", prompt)
 	}
 }
 
@@ -2829,13 +2796,11 @@ func TestRunAgentStartRejectsConfigUnsafeNameBeforeRuntime(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartRejectsShellRuntimeBeforeTemplateUpdate(t *testing.T) {
+func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	restoreFetcher := replaceAgentTemplateFetcher(fakeAgentTemplateFetcher{content: "should not fetch"})
-	defer restoreFetcher()
 	runner := &agentStartRunner{}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -2847,8 +2812,6 @@ func TestRunAgentStartRejectsShellRuntimeBeforeTemplateUpdate(t *testing.T) {
 		"--runtime", "shell",
 		"--repo", "owner/repo",
 		"--path", repoDir,
-		"--template", "thermo-nuclear-code-quality-review",
-		"--update-template",
 	}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
@@ -2858,11 +2821,6 @@ func TestRunAgentStartRejectsShellRuntimeBeforeTemplateUpdate(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if _, err := store.GetAgentTemplate(context.Background(), "thermo-nuclear-code-quality-review"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("template lookup error = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -2921,15 +2879,11 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 
 func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
-	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-
+	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
 	stdout.Reset()
 	stderr.Reset()
 	code := Run([]string{
@@ -2990,7 +2944,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing custom template exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -3008,7 +2962,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing template exit code = %d, want 1", code)
 	}
-	want = "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
+	want = "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}

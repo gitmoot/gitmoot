@@ -235,34 +235,35 @@ The remote layout is intentionally inspectable:
 ```text
 pipelines/nightly-sync/
 ├── bundle.yaml           # version, requirements, warnings, agents, spec hash
-├── spec.yaml             # original bytes with repo parameterized
-└── templates/
-    └── scorer.md         # canonical template snapshot, including full prompt
+└── spec.yaml             # original bytes with repo parameterized
 ```
 
+A bundle carries each agent's template id as a **reference** only. #2204 removed
+template distribution, so no prompt body travels in a bundle and there is no
+`templates/` directory.
+
 An unchanged republish performs no writes. When bytes change, only the changed
-files are committed, and template files that vanished from the exported bundle
-are deleted from that managed directory. Template prompts and metadata travel
-verbatim, so `--create` creates a private repository and you should only target a
-public repository when those prompts are intentionally public. Set a one-off
-repo with `--remote owner/repo`; `[pipeline_remote]` stores the default `repo`,
-`ref` (default `main`), and `path` (default `pipelines`).
+files are committed, and files that vanished from the exported bundle are
+deleted from that managed directory. Set a one-off repo with
+`--remote owner/repo`; `[pipeline_remote]` stores the default `repo`,
+`ref` (default `main`), and `path` (default `pipelines`). `--create` creates a
+private repository; without it the remote must already exist.
 
 `pipeline pull --list` prints each manifest's name, description, and requirements
 on one line. Pull downloads the selected directory at HEAD and then uses the
 same import path and gates described below.
 
 `spec.yaml` preserves comments, ordering, and block formatting; only its `repo`
-scalar becomes `__GITMOOT_REPO__`. Template prompts travel verbatim, so review
-them before publishing a bundle. Environment values and local runtime state are
-never exported.
+scalar becomes `__GITMOOT_REPO__`. Environment values and local runtime state
+are never exported.
 
 Import prints a requirements report on every attempt: runtimes, upstream
 pipelines, write-authority flags, and host-specific absolute paths found in
 command stages. An unmapped agent whose runtime is missing is a hard failure.
 `--agent-map exported=local` selects an existing local agent; without a mapping
-Gitmoot installs the embedded template and registers the agent.
-Different-content template/agent and pipeline-name collisions require
+Gitmoot registers the declared agent against its template id, which must
+already exist in the importing home.
+Different-content agent and pipeline-name collisions require
 `--force`; use `--name` when both copies should coexist.
 
 Imports land **disabled by default**. Review the report, especially

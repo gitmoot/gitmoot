@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, pipelines, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
@@ -29,8 +29,8 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
-structured implementation plans, agent template workflows,
-template capture, custom prompt agents, job status, branch lock inspection,
+structured implementation plans, agent template inspection,
+custom prompt agents, job status, branch lock inspection,
 declarative pipelines, agent memory,
 routing telemetry, or runtime metadata.
 
@@ -48,20 +48,16 @@ explicitly asks for background execution, PR-comment routing, or job tracking.
 
 For fast planning, "use the Gitmoot planner here" is the natural-language
 shortcut for `gitmoot agent prompt planner`. If the planner template is not
-cached, read and apply the packaged `skills/gitmoot/agent-templates/planner.md`
+installed, read and apply the packaged `skills/gitmoot/agent-templates/planner.md`
 instructions directly.
 
-For template capture, phrases like "capture this session as a Gitmoot agent
-template", "turn this workflow into a Gitmoot template", or "draft a reusable
-agent template from this chat" mean read
-`skills/gitmoot/references/TEMPLATE_CAPTURE.md` and distill the visible
-current-chat context into a draft template. Gitmoot cannot read hidden model
-memory or runtime internals. Do not install, overwrite, or update a permanent
-template unless the user explicitly approves that step.
-Use `gitmoot agent template draft <id>` for a blank scaffold,
-`gitmoot agent template validate <file>` for a structural check,
-`gitmoot agent template add <id> --file <file>` to install a snapshot, and
-`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
+Agent templates are READ-ONLY installed data (#2204). Gitmoot can inspect and
+read them — `gitmoot agent template list`, `gitmoot agent template show <id>`,
+and `gitmoot agent prompt <agent-or-template>` to reuse an installed template in
+the current chat — but it cannot author, update, or distribute one. There is no
+draft, validate, add, export, publish, pull, remote, diff, revert, or update
+verb. A template that must change is edited or re-seeded in its
+`agent_templates` store row by hand.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -241,10 +237,9 @@ Use GitHub PR comments as the public audit trail:
 
 ## Template Agents
 
-Install or refresh the built-in thermo review template:
+Start an agent against the built-in thermo review template:
 
 ```sh
-gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review \
   --runtime codex \
   --repo owner/repo \
@@ -266,14 +261,9 @@ gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/
 gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
-Create a local custom prompt template:
+Start an agent against an installed custom prompt template:
 
 ```sh
-mkdir -p agents
-gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
-$EDITOR agents/frontend-reviewer.md
-gitmoot agent template validate agents/frontend-reviewer.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
 gitmoot agent start frontend-reviewer \
   --runtime codex \
   --repo owner/repo \
@@ -283,14 +273,7 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-After editing a local template file, refresh Gitmoot's cached snapshot explicitly:
-
-```sh
-gitmoot agent template diff frontend-reviewer
-gitmoot agent template update frontend-reviewer
-```
-
-Template updates are versioned locally. `gitmoot agent template show <id>`
+Installed templates are versioned locally. `gitmoot agent template show <id>`
 prints the current version, content hash, source commit, and promotion state.
 Agents use the current promoted version by default, or a pinned version when
 configured with a reference such as `--template frontend-reviewer@v1`.
@@ -302,15 +285,6 @@ Discover templates by metadata:
 gitmoot agent template list --runtime codex --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
-```
-
-Draft and validate a captured template before installing it:
-
-```sh
-gitmoot agent template draft release-planner
-gitmoot agent template validate .gitmoot/templates/release-planner.md
-gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
-gitmoot agent prompt release-planner
 ```
 
 ## Agent Job Contract

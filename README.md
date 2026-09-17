@@ -56,11 +56,11 @@ gitmoot orchestrate lead "Review PR #123 from three independent angles." --repo 
 
 ### Create custom agents in minutes
 
-An agent is a named identity with a role, capabilities, a runtime, and a versioned prompt template. Draft a template, edit it, bind it to an agent; or capture the workflow of your current Codex or Claude chat into a reusable template without retyping anything. Templates are versioned, snapshotted into every job, diffable, pinnable (`--template reviewer@v1`), and shareable through a GitHub repo with `template publish` and `template pull`.
+An agent is a named identity with a role, capabilities, a runtime, and a versioned prompt template. Templates are read-only installed data: list what is installed, inspect one, and bind it to an agent. Templates are versioned, snapshotted into every job, and pinnable (`--template reviewer@v1`).
 
 ```sh
-gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template list --tag review
+gitmoot agent template show frontend-reviewer
 gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer --effort high
 ```
 
@@ -152,7 +152,7 @@ Built-in coordinator recipes turn the Orchestra pattern into one command:
 - **Producer vs. checker**: one implementation leg, one independent read-only verification on a different runtime.
   `gitmoot orchestrate lead "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier`
 
-More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [template capture](https://gitmoot.io/docs/workflows/template-capture-workflow) · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
+More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
 
 ## What's Next
 

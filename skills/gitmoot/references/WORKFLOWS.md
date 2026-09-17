@@ -151,7 +151,6 @@ Use the thermo template for strict review-only work. It should not implement cod
 or request implementation capability.
 
 ```sh
-gitmoot agent template update thermo-nuclear-code-quality-review
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
 
@@ -176,13 +175,12 @@ PR comment:
 ## Custom Prompt Agent
 
 Use custom prompt agent templates for project-specific reviewers or helpers.
+Templates are read-only installed data (#2204): Gitmoot cannot author one, so the
+`agent_templates` row is seeded or edited directly, and `agent template list`
+confirms it is installed before an agent references it.
 
 ```sh
-mkdir -p agents
-gitmoot agent template draft frontend-reviewer --output agents/frontend-reviewer.md
-$EDITOR agents/frontend-reviewer.md
-gitmoot agent template validate agents/frontend-reviewer.md
-gitmoot agent template add frontend-reviewer --file agents/frontend-reviewer.md
+gitmoot agent template list --tag review
 gitmoot agent start frontend-reviewer \
   --runtime codex \
   --repo owner/repo \
@@ -192,9 +190,8 @@ gitmoot agent start frontend-reviewer \
   --capability review
 ```
 
-Custom template content is snapshotted into local Gitmoot state. After editing the
-source template file, run `gitmoot agent template diff <id>` and `gitmoot agent template update
-<id>` before expecting new jobs to use the changed prompt.
+Template content is snapshotted into each queued job. A job created before a row
+was edited keeps the prompt it was created with; only later jobs see the change.
 
 ## Current-Chat Planner
 
@@ -281,51 +278,12 @@ start a daemon, resume a runtime session, or post a PR comment. If the user
 wants tracked background execution, use `gitmoot agent ask <agent> --background`
 instead.
 
-## Current-Chat Template Capture
-
-Use template capture when the user wants to turn a successful visible Codex or
-Claude Code conversation into a reusable agent template.
-
-```text
-Use Gitmoot to capture this session as agent template release-planner. Draft only.
-```
-
-The current chat reads `references/TEMPLATE_CAPTURE.md`, extracts durable
-workflow rules from visible conversation context and inspected files, and writes
-or returns a draft. It must not route the request through `gitmoot agent ask`,
-start a daemon, queue a job, or install/replace a template without explicit user
-approval.
-
-For a blank starting point, scaffold the required sections:
-
-```sh
-gitmoot agent template draft release-planner
-```
-
-After the user reviews the draft:
-
-```sh
-gitmoot agent template validate .gitmoot/templates/release-planner.md
-gitmoot agent template add release-planner --file .gitmoot/templates/release-planner.md
-gitmoot agent prompt release-planner
-```
-
-The capture pieces are distinct:
-
-- `agent template draft`: scaffold a blank structure.
-- "capture here": current chat fills that structure from visible context.
-- `agent template validate`: structural check.
-- `agent template add`: install a snapshot.
-- `agent prompt`: reuse the installed prompt in the current chat.
-- `agent start --template`: create a runnable background agent instance.
-
 ## Background Planner Agent
 
 Use the planner template when the user wants a structured implementation plan to
 run as a tracked Gitmoot background agent job.
 
 ```sh
-gitmoot agent template update planner
 gitmoot agent start project-planner \
   --runtime codex \
   --repo owner/repo \
@@ -844,16 +802,15 @@ summary before installation. Pull fetches the directory at HEAD and invokes the
 existing import flow unchanged. `spec.yaml` is the stored pipeline text with only
 `repo` replaced by the declared
 `__GITMOOT_REPO__` parameter; comments, ordering, block scalars, and other bytes
-survive. Referenced custom templates are canonical snapshots produced by the same
-export path as `agent template export`. Template prompts are verbatim, so inspect
-them before publishing. Local environment values and runtime state are never
-copied.
+survive. A bundle carries template ids as references only — #2204 removed
+template distribution, so no prompt body is published or installed. Local
+environment values and runtime state are never copied.
 
 Import always prints its requirements report. Use `--agent-map exported=local`
-for a machine-local agent/session, or omit it to install the embedded template and
-register the declared runtime. A missing runtime for an unmapped agent fails
-before anything is imported. Name/content collisions fail unless `--force`, and
-`--name` gives the pipeline a new local name.
+for a machine-local agent/session, or omit it to register the declared agent
+against a template id that must already exist locally. A missing runtime for an
+unmapped agent fails before anything is imported. Name/content collisions fail
+unless `--force`, and `--name` gives the pipeline a new local name.
 
 The imported pipeline is disabled by default. This is also the re-consent
 boundary for any bundled write authority (`allow_scheduled_writes`,
