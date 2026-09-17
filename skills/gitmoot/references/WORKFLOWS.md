@@ -418,7 +418,7 @@ destroy human planning context that nothing else reconstructs.
 When enabled, it reuses the same live-job, same-repo open-PR, remote-branch,
 and remote-uncertainty skips and records `task_dismissed_planned_ttl`. Task
 worktree allocation claims `planned -> implementing` with a write-time CAS, so
-a concurrent TTL dismissal cannot be overwritten.
+a concurrent TTL dismissal cannot be overwritten; a job retry restores it.
 
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state

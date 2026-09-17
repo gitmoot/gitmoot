@@ -2555,8 +2555,8 @@ queryable until the separate evidence-disposal pass transitions it.
 
 `task events <id>` prints the append-only task lifecycle trail. Automatic stale
 dismissals use `task_dismissed_auto`; opt-in never-started-plan retirement uses
-`task_dismissed_planned_ttl`; an explicit job retry that restores a dismissed
-task records `task_recovered_job_retry`. A clean closed-unmerged PR records
+`task_dismissed_planned_ttl`; restoring a dismissed task by retrying one of its
+jobs uses `task_recovered_job_retry`. A clean closed-unmerged PR records
 `pr_closed_unmerged` while moving `pr_open`, `reviewing`, or
 `changes_requested` to `blocked`. Once advancement/delegation handling has no
 live successor, an implemented top-level job with no attached PR first checks
