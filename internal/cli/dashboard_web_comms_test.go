@@ -660,3 +660,48 @@ setImmediate(()=>{
   }catch(error){console.error(error.stack||error);process.exitCode=1;}
 });
 `
+
+// TestDashboardCommsMobileNavHasNoDeadItems is the guard the round-1 reviewer
+// showed was missing, by finding the exact bug it now prevents.
+//
+// renderDashboardCommsMobileNav walks a HARD-CODED href list and looks each one
+// up in dashboardNavManifest. #2206 removed /brain from the manifest but left it
+// in that list, so the loop emitted an item with an empty href and an empty
+// label: an unlabeled button that reloaded the current page. The sidebar walks
+// the manifest directly and could never drift this way; only the mobile list
+// can, because it repeats the hrefs instead of deriving them.
+//
+// Asserting "every rendered item has a non-empty href AND label" catches the
+// whole class, not just /brain: any future manifest removal that forgets this
+// list fails here.
+func TestDashboardCommsMobileNavHasNoDeadItems(t *testing.T) {
+	nav := renderDashboardCommsMobileNav()
+	items := regexp.MustCompile(`<a class="gm-mobile-item"[^>]*>.*?</a>`).FindAllString(nav, -1)
+	if len(items) == 0 {
+		t.Fatalf("no mobile nav items rendered at all: %q", nav)
+	}
+	hrefPattern := regexp.MustCompile(`href="([^"]*)"`)
+	labelPattern := regexp.MustCompile(`<span[^>]*>([^<]*)</span>`)
+	for _, item := range items {
+		href := hrefPattern.FindStringSubmatch(item)
+		if href == nil || strings.TrimSpace(href[1]) == "" {
+			t.Fatalf("mobile nav item has no href, so tapping it reloads the page: %q", item)
+		}
+		label := labelPattern.FindStringSubmatch(item)
+		if label == nil || strings.TrimSpace(label[1]) == "" {
+			t.Fatalf("mobile nav item %q has an empty label; it is a dead slot left by a manifest removal", href[1])
+		}
+		// Every href the mobile list names must still exist in the manifest it
+		// claims to mirror.
+		found := false
+		for _, entry := range dashboardNavManifest {
+			if entry.Href == href[1] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("mobile nav names %q, which is not in dashboardNavManifest; the two lists have drifted", href[1])
+		}
+	}
+}

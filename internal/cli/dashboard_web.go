@@ -166,7 +166,7 @@ func dashboardCommsSPAItem() string {
 // withDashboardCommsNav adds the gitmoot-owned Comms route to the embedded
 // dashboard module's sidebar. Comms is a standalone read-only page, so the
 // sidebar entry is an ordinary link; the destination page owns its active-state
-// treatment. The replacement is intentionally anchored to Chat's unique nav
+// treatment. The replacement is intentionally anchored to the Org entry's nav
 // tail so module markup drift fails the rendered-page regression instead of
 // placing the link in an arbitrary section.
 func withDashboardCommsNav(next http.Handler) http.Handler {
