@@ -163,11 +163,6 @@ gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
-gitmoot memory list [--pending|--confirmed] [--agent NAME] [--repo owner/repo] [--json]
-gitmoot memory ingest <path|dir> --agent NAME [--repo owner/repo] [--tier repo|general] [--dry-run] [--json]
-gitmoot memory observations [--agent NAME] [--provenance-prefix P] [--json]
-gitmoot memory confirm <obs-id>... | --provenance-prefix P [--agent NAME] [--yes] [--json]
-gitmoot memory groom --propose [--out PLAN.json] [--json]
 gitmoot pipeline add <spec.yaml> [--enable]
 gitmoot pipeline list [--json]
 gitmoot pipeline run <name>
@@ -211,11 +206,6 @@ run, and `pipeline resume` reruns the halted stage plus dependents.
 Use `gitmoot job answer <job-id> "<question-id>: text"` to resume a job paused at
 `awaiting_human`; it routes through the same escalation-resume path the daemon's
 PR-comment `answer` verb uses.
-
-Use `gitmoot memory` to inspect or curate persistent agent memory. `memory
-ingest` stages Markdown as pending observations, `memory confirm` is the human
-promotion gate, and `memory groom` proposes or applies deterministic retirement
-plans. Do not treat ingested Markdown as trusted until it has been confirmed.
 
 Use `gitmoot runtime list` to inspect runtime metadata and
 `gitmoot router summary` for local observed routing telemetry. Router telemetry
