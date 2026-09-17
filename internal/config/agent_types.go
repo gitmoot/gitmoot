@@ -20,11 +20,6 @@ type AgentType struct {
 	MaxBackground  int
 	IdleTimeout    string
 	JobTimeout     string
-	// Memory enrolls this agent in persistent memory (#626). Default false
-	// (off) — an agent that never sets it behaves byte-identically. Enrollment is
-	// the per-agent switch for both the READ path (inject prior learnings) and the
-	// Phase-1 SHADOW writes (log returned learnings to memory_observations).
-	Memory bool
 }
 
 func LoadAgentTypes(paths Paths) (map[string]AgentType, error) {
@@ -206,13 +201,6 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		parsed, err := parseConfigString(value)
 		entry.JobTimeout = parsed
 		return err
-	case "memory":
-		parsed, err := parseConfigBool(value)
-		if err != nil {
-			return err
-		}
-		entry.Memory = parsed
-		return nil
 	default:
 		return nil
 	}
@@ -351,11 +339,6 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	builder.WriteString("\njob_timeout = ")
 	builder.WriteString(strconv.Quote(entry.JobTimeout))
 	builder.WriteString("\n")
-	// Only emit memory when enrolled, so a config written for an agent that never
-	// touched memory stays byte-identical to before this field existed.
-	if entry.Memory {
-		builder.WriteString("memory = true\n")
-	}
 }
 
 func compactConfigStrings(values []string) []string {

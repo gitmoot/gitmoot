@@ -237,13 +237,6 @@ INSERT INTO wake_outbox(
 func TestAddressedWorkflowNoteWritesOutboxThroughEveryInsertEntryPoint(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
-	observation := func(content string) MemoryObservation {
-		return MemoryObservation{
-			Owner: MemoryOwner{Kind: "shared", Ref: "shared"}, AuthorRef: "operator",
-			Repo: "owner/repo", Scope: "repo", Content: content, TrustMark: "low",
-		}
-	}
-
 	var noteIDs []int64
 	first, err := store.InsertWorkflowNote(ctx, WorkflowNote{
 		WorkflowID: "wake/simple", Author: "operator", Body: "simple",
@@ -263,30 +256,12 @@ func TestAddressedWorkflowNoteWritesOutboxThroughEveryInsertEntryPoint(t *testin
 	}
 	noteIDs = append(noteIDs, second.ID)
 
-	third, _, err := store.InsertWorkflowNoteWithObservation(ctx, WorkflowNote{
-		WorkflowID: "wake/observation", Author: "operator", Body: "observation",
-		Repo: "owner/repo", AddressedTarget: "owner",
-	}, observation("observation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	noteIDs = append(noteIDs, third.ID)
-
-	fourth, _, err := store.InsertWorkflowNoteWithObservationAndMeta(ctx, WorkflowNote{
-		WorkflowID: "wake/both", Author: "operator", Body: "both",
-		Repo: "owner/repo", AddressedTarget: "owner",
-	}, observation("both"), WorkflowMeta{Description: "description", DescriptionSet: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	noteIDs = append(noteIDs, fourth.ID)
-
 	outbox, err := store.ListWakeOutbox(ctx, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(outbox) != 4 {
-		t.Fatalf("outbox rows = %+v, want four", outbox)
+	if len(outbox) != 2 {
+		t.Fatalf("outbox rows = %+v, want two", outbox)
 	}
 	for index, entry := range outbox {
 		if entry.SourceKind != WakeOutboxSourceWorkflowNote ||

@@ -112,7 +112,6 @@ func TestBridgeEndpointsWithSeededHome(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "planner", runtime.ShellRuntime, heartbeatShellResultScript, []string{"ask"}, "owner/repo")
-	seedBridgeMemory(t, store)
 	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
 
 	specYAML := "name: bridge-flow\nrepo: owner/repo\nstages:\n" +
@@ -150,17 +149,6 @@ func TestBridgeEndpointsWithSeededHome(t *testing.T) {
 	decodeBridgeBody(t, stateResp, &runState)
 	if runState.ID != runOut.RunID || runState.State == "" || len(runState.Stages) != 1 {
 		t.Fatalf("run state = %+v, want matching run with one stage", runState)
-	}
-
-	recallReq := `{"query":"arm64 runner flake","repo":"owner/repo","agent":"lead","limit":3}`
-	recallResp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/memory/recall", strings.NewReader(recallReq)))
-	if recallResp.Code != http.StatusOK {
-		t.Fatalf("memory recall status=%d body=%s", recallResp.Code, recallResp.Body.String())
-	}
-	var recall bridgeMemoryRecallResponse
-	decodeBridgeBody(t, recallResp, &recall)
-	if len(recall.Entries) == 0 || recall.Entries[0].Key != "bridge-memory" {
-		t.Fatalf("recall entries = %+v, want seeded bridge memory", recall.Entries)
 	}
 
 	askReq := `{"message":"plan the work","repo":"owner/repo"}`
@@ -256,8 +244,8 @@ func TestBridgeRateLimitTrip(t *testing.T) {
 func TestBridgeBodySizeCap(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-	body := `{"query":"` + strings.Repeat("x", bridgeBodyLimit) + `"}`
-	resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/memory/recall", strings.NewReader(body)))
+	body := `{"message":"` + strings.Repeat("x", bridgeBodyLimit) + `"}`
+	resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/agents/planner/ask", strings.NewReader(body)))
 	if resp.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize body status=%d, want 413 body=%s", resp.Code, resp.Body.String())
 	}
@@ -370,20 +358,6 @@ func seedBridgeJob(t *testing.T, store *db.Store, id string) {
 		Payload: mustJSON(t, payload),
 	}); err != nil {
 		t.Fatalf("CreateJob(%s): %v", id, err)
-	}
-}
-
-func seedBridgeMemory(t *testing.T, store *db.Store) {
-	t.Helper()
-	if _, err := store.UpsertConfirmedMemory(context.Background(), db.ConfirmedMemory{
-		Owner:      db.MemoryOwner{Kind: "agent", Ref: "lead"},
-		Repo:       "owner/repo",
-		Scope:      "repo",
-		Key:        "bridge-memory",
-		Content:    "arm64 runner flake is visible through bridge recall",
-		Provenance: "seed",
-	}); err != nil {
-		t.Fatalf("UpsertConfirmedMemory: %v", err)
 	}
 }
 

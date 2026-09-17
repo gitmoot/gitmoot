@@ -65,11 +65,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestJobRepoBackfillMigrationUpdatesOnlyStaleRows":                       true,
 		"TestJobTokenMigrationOnPreExistingDB":                                   true,
 		"TestKeychainMigrationAppliesToExistingDatabase":                         true,
-		"TestMemoryEventBackfillLiveShapeIsIdempotent":                           true,
-		"TestMemoryEventBackfillMixedLiveHistory":                                true,
-		"TestMemoryEventsMigrationFreshAndUpgradeConverge":                       true,
-		"TestMemoryHarvestMigrationFreshAndUpgrade":                              true,
-		"TestMemoryMigrationCreatesTables":                                       true,
 		"TestMigrateAddsExecBackendAttempts":                                     true,
 		"TestMigrateAddsPipelinesToUpgradedDB":                                   true,
 		"TestMigrateDropsTriggerBindingFromExistingPipeline":                     true,
@@ -596,11 +591,13 @@ func copyCachedTestTemplateSnapshotIfMissing(snapshot []byte, path string) error
 
 // TestCachedOpenDoesNotMigrate binds the in-package cached frontend to
 // OpenAlreadyMigrated. Swapping it for Open leaves every assertion in the suite
-// green -- a cached copy already carries all 116 migrations and applyMigration is
-// idempotent, so Migrate is a no-op that changes nothing observable (measured:
-// PRAGMA data_version unmoved). What it costs is 115 wasted transactions per store
-// open, which is the entire point of #1550, so the contract needs a non-timing
-// guard. Requested by g7-review; MigrateObserver is the seam.
+// green -- a cached copy already carries every migration in the schema and
+// applyMigration is idempotent, so Migrate is a no-op that changes nothing
+// observable (measured: PRAGMA data_version unmoved). What it costs is one
+// wasted transaction per migration per store open (SchemaMigrationCount() is
+// 143 at the time of writing), which is the entire point of #1550, so the
+// contract needs a non-timing guard. Requested by g7-review; MigrateObserver
+// is the seam.
 func TestCachedOpenDoesNotMigrate(t *testing.T) {
 	cacheRoot := t.TempDir()
 	t.Setenv("TMPDIR", cacheRoot)

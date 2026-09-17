@@ -74,17 +74,17 @@ type DashboardTerminalBucket struct {
 const dashboardChangeCursorSQL = `SELECT
 	COALESCE((SELECT MAX(id) FROM job_events), 0),
 	COALESCE((SELECT MAX(id) FROM workflow_notes), 0),
-	COALESCE((SELECT MAX(id) FROM task_events), 0),
-	COALESCE((SELECT MAX(id) FROM memory_events), 0)`
+	COALESCE((SELECT MAX(id) FROM task_events), 0)`
 
 // DashboardChangeCursor returns the monotonic row ids that invalidate
 // dashboard views. All maxima are read in one statement so a poll is one cheap
 // SQLite round trip and an empty store has the stable all-zero cursor
-// (job events, workflow notes, task events, memory events — the 4th
-// component arrived with #988's brain changelog).
-func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflowNoteID, taskEventID, memoryEventID int64, err error) {
-	err = s.db.QueryRowContext(ctx, dashboardChangeCursorSQL).Scan(&jobEventID, &workflowNoteID, &taskEventID, &memoryEventID)
-	return jobEventID, workflowNoteID, taskEventID, memoryEventID, err
+// (job events, workflow notes, task events). A 4th component read
+// memory_events until #2202 retired the brain and dropped that table — the term
+// had to go with it, because a dropped table makes the whole statement fail.
+func (s *Store) DashboardChangeCursor(ctx context.Context) (jobEventID, workflowNoteID, taskEventID int64, err error) {
+	err = s.db.QueryRowContext(ctx, dashboardChangeCursorSQL).Scan(&jobEventID, &workflowNoteID, &taskEventID)
+	return jobEventID, workflowNoteID, taskEventID, err
 }
 
 // ListDashboardJobSummaries avoids materializing the full jobs.payload corpus

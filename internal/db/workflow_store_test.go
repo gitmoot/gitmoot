@@ -544,32 +544,7 @@ func TestWorkflowIDDerivedAtEveryJobInsertPath(t *testing.T) {
 	}
 }
 
-func TestWorkflowNoteAndObservationAreAtomic(t *testing.T) {
-	store := openWorkflowTestStore(t)
-	ctx := context.Background()
-	_, _, err := store.InsertWorkflowNoteWithObservation(ctx,
-		WorkflowNote{WorkflowID: "release-42", Body: "fact"},
-		MemoryObservation{Content: "fact"})
-	if err == nil {
-		t.Fatal("expected missing observation owner to fail")
-	}
-	var notes int
-	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workflow_notes`).Scan(&notes); err != nil || notes != 0 {
-		t.Fatalf("notes after rollback = %d, err=%v", notes, err)
-	}
-	note, obs, err := store.InsertWorkflowNoteWithObservation(ctx,
-		WorkflowNote{WorkflowID: "release-42", Author: "human", Body: "arm64 CI is flaky", Repo: "acme/widget"},
-		MemoryObservation{Owner: MemoryOwner{Kind: "shared", Ref: "shared"}, AuthorRef: "human", Repo: "acme/widget", Scope: "repo", Content: "arm64 CI is flaky", TrustMark: "low"})
-	if err != nil {
-		t.Fatalf("InsertWorkflowNoteWithObservation: %v", err)
-	}
-	id := strconv.FormatInt(note.ID, 10)
-	if note.MemoryObservationID != obs.ID || obs.Key != "workflow-release-42-"+id || obs.Provenance != "workflow:release-42#"+id {
-		t.Fatalf("note=%+v obs=%+v", note, obs)
-	}
-}
-
-func TestWorkflowMetaLastWriteWinsAndObservationFailureRollsBack(t *testing.T) {
+func TestWorkflowMetaLastWriteWins(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
 	first, err := store.InsertWorkflowNoteWithMeta(ctx,
@@ -597,22 +572,6 @@ func TestWorkflowMetaLastWriteWinsAndObservationFailureRollsBack(t *testing.T) {
 	meta, err = store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
 	if err != nil || meta.Author != "reviewer" || meta.Pane != "pane-2" || meta.SessionID != "session-2" || meta.WorkDir != "/work/two" {
 		t.Fatalf("metadata after omitted optional flags = %+v, err=%v", meta, err)
-	}
-
-	_, _, err = store.InsertWorkflowNoteWithObservationAndMeta(ctx,
-		WorkflowNote{WorkflowID: "fable/dashboard-redesign", Author: "bad", Body: "must roll back"},
-		MemoryObservation{Content: "missing owner"},
-		WorkflowMeta{Author: "bad", Pane: "bad", SessionID: "bad", WorkDir: "/bad"})
-	if err == nil {
-		t.Fatal("expected invalid observation to roll back note and metadata")
-	}
-	meta, err = store.GetWorkflowMeta(ctx, "fable/dashboard-redesign")
-	if err != nil || meta.Author != "reviewer" || meta.Pane != "pane-2" || meta.SessionID != "session-2" || meta.WorkDir != "/work/two" {
-		t.Fatalf("metadata changed after rollback: %+v, err=%v", meta, err)
-	}
-	notes, err := store.ListWorkflowNotes(ctx, "fable/dashboard-redesign", 0)
-	if err != nil || len(notes) != 3 {
-		t.Fatalf("notes after rollback = %+v, err=%v", notes, err)
 	}
 }
 

@@ -184,30 +184,6 @@ the current spec) as a preview instead of a run. This detail feed is strictly
 read-only and deterministic; the list rows additionally summarize each pipeline's
 recent success rate and average duration.
 
-## Learning
-
-Route: `/learning` (opens `/learning/skills`; second tab `/learning/knowledge`)
-
-Learning is one nav item with two tabs telling one story: what the agents are
-learning. **Skills** is the agent-template overview — one row per agent
-template with its version history and the version it currently resolves to.
-Clicking a row
-jumps to that agent's detail panel. The memory fact galaxy that used to live
-here as a second tab is now the top-level **Brain** view (below) —
-one lane per repo scope, each lane holding its facts as a wiki-link
-constellation, cluster and sub-cluster hub columns, and enrolled agents as
-wells on the right; clicking a fact, cluster, or agent opens its detail panel.
-Deep cluster trees stay scannable through progressive disclosure: a `+n` badge
-on a hub reveals hidden intermediate levels, and Escape (or clicking empty sky)
-collapses back. Three header toggles control density: **fact links** (wiki
-links between facts), **cross-repo links** (links whose endpoints live in
-different repo lanes render as dashed stubs at the lane border; hovering or
-selecting a fact draws its full dashed curve to the partner), and **history**
-(off by default — superseded ghost facts and their red supersede edges are
-hidden; toggle on to see how facts were replaced over time, e.g. by the
-automatic brick splitter). Unclustered facts sit in their own repo's lane.
-Both tabs are read-only and poll every 12 seconds.
-
 ## Workflows
 
 Route: `/workflows` (index) and `/workflows/{label}` (mission log)
@@ -262,24 +238,6 @@ Inside Herdr, omitted pane/session/workdir flags are detected from the current
 pane. The resume command is shown only when the stored session id is a full
 UUID; legacy shortened values remain visible in the workflow index but cannot
 produce a broken command.
-
-## Brain
-
-Route: `/brain` (the old `/learning/knowledge` route redirects)
-
-The memory fact galaxy, promoted from Learning's second tab to a first-class
-view: one lane per repo scope, facts as wiki-link constellations, cluster and
-sub-cluster hub columns, enrolled agents as wells, progressive disclosure for
-deep cluster trees, and the fact-links / cross-repo / history header toggles.
-See the Learning section above for how facts are produced; Brain is where you
-read them.
-
-The changelog feed comes from `/api/brain/events`, whose `total` reports the
-exact append-only event count. Selecting an event loads `/api/brain/fact?id=ID`,
-which can return active, retired, or superseded facts for historical inspection.
-Fact-detail and Knowledge payloads also include injection and direct-recall
-counts plus their last-use timestamps; these distinguish unused facts without
-turning absence of usage into an automatic retirement decision.
 
 ## Agents
 

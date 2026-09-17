@@ -22,7 +22,7 @@ func TestLoadResultChecksModeDefaultsToWarn(t *testing.T) {
 
 func TestLoadResultChecksModeMissingFileDefaultsToWarn(t *testing.T) {
 	// A home whose config file was never written must still resolve to warn, not
-	// error, mirroring LoadMemorySettings' missing-file handling.
+	// error, mirroring every other loader's missing-file handling.
 	paths := PathsForHome(t.TempDir())
 	mode, err := LoadResultChecksMode(paths)
 	if err != nil {
@@ -86,7 +86,7 @@ func TestLoadResultChecksModeIgnoresOtherSections(t *testing.T) {
 	if err := Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+"\n[memory]\nresult_checks = off\n"), 0o600); err != nil {
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+"\n[router]\nresult_checks = off\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	mode, err := LoadResultChecksMode(paths)
@@ -94,6 +94,6 @@ func TestLoadResultChecksModeIgnoresOtherSections(t *testing.T) {
 		t.Fatalf("LoadResultChecksMode: %v", err)
 	}
 	if mode != ResultChecksWarn {
-		t.Fatalf("mode = %q, want warn (result_checks under [memory] must be ignored)", mode)
+		t.Fatalf("mode = %q, want warn (result_checks under [router] must be ignored)", mode)
 	}
 }

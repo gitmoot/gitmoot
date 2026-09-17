@@ -29,7 +29,6 @@ and enqueue agent asks.
 | --- | --- | --- |
 | POST | `/v1/pipelines/{name}/run` | start a pipeline run (409 when one is active) |
 | GET | `/v1/runs/{id}` | pipeline run state and stages |
-| POST | `/v1/memory/recall` | ranked confirmed-memory lookup (`{query, repo?, agent?, shared?, limit?}`) |
 | GET | `/v1/jobs/{id}` | job state and result payload |
 | POST | `/v1/agents/{name}/ask` | enqueue a background ask (`{message, repo, model?, runtime?}`) |
 

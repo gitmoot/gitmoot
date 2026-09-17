@@ -19,7 +19,7 @@ differently: **who decides the next step?**
 | Execution machinery | **gitmoot's engine**: dependency ordering, retries, timeouts, failure policies, quorum/vote synthesis, tree token budgets, wall-clock limits, kill scope, human-question pauses | **none by design** — grouping and journaling only; the external coordinator owns retries, ordering, and judgment |
 | Job relationships | real parent → child edges (delegation tree) | a shared label on otherwise independent jobs |
 | Where you see it | the run graph (`/?run=<id>`) as a delegation tree | `gitmoot workflow list/show`, Galaxy workflow hubs, and `/workflows/<label>` in the web dashboard |
-| Reasoning trail | the coordinator job's own result | the **journal** (`gitmoot workflow note`), optionally distilled into shared memory with `--remember` |
+| Reasoning trail | the coordinator job's own result | the **journal** (`gitmoot workflow note`) |
 | Coordinator cost | the coordinator is itself an LLM job (billed and visible) | free to gitmoot — the brain lives elsewhere |
 
 ## When to use `orchestrate`
@@ -40,8 +40,7 @@ steps is the point**. The canonical case is a coordinated build: run the tests
 own git and PRs, choose merge timing. No declarative tree can express "run the
 suite, read the failure, decide whether it is a real bug or a timeout, bisect
 against main." The label makes that externally-managed project visible; the
-notes keep the *why*; `--remember` turns cross-job insight into durable shared
-memory that future agents recall.
+notes keep the *why*.
 
 `--workflow` is deliberately **visibility-only**: it never adds scheduling,
 locking, budgets, or lifecycle behavior to the labeled jobs.

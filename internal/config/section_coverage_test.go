@@ -33,7 +33,7 @@ import (
 var (
 	// pinnedSectionHeaderSites are MUTATION-PROVEN: reverting the site to the
 	// pre-#1759 two-bracket form fails a named subtest. 4 guard loaders by
-	// refusal, 8 by routing, 4 in TestMalformedHeaderRoutingRemainingLoaders,
+	// refusal, 8 by routing, 3 in TestMalformedHeaderRoutingRemainingLoaders,
 	// staged_review.go pinned by TestStagedReviewMalformedHeaderClearsSection,
 	// and review_router.go by TestReviewRouterMalformedHeaderEndsSection.
 	pinnedSectionHeaderSites = []string{
@@ -42,7 +42,6 @@ var (
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",
 		"github_limiter.go::LoadGitHubLimiterPolicy",
 		"heartbeats.go::LoadHeartbeats",
-		"memory.go::LoadMemorySettings",
 		"merge_gate.go::LoadMergeGatePolicy",
 		"orchestrate.go::LoadReviewConfig",
 		"parallel_sessions.go::LoadParallelSessionPolicy",
@@ -162,8 +161,8 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	if distinctFiles != 24 {
-		t.Errorf("sectionHeader call sites span %d files, want 24: update this expectation together with the lists above", distinctFiles)
+	if distinctFiles != 23 {
+		t.Errorf("sectionHeader call sites span %d files, want 23: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

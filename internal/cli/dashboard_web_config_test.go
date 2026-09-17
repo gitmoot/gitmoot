@@ -23,38 +23,6 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 	want := []string{
 		"github.max_concurrent",
 		"github.min_interval",
-		"memory.cluster_depth_cap",
-		"memory.cluster_fanout",
-		"memory.cluster_fanout_keep",
-		"memory.default_enroll",
-		"memory.disabled",
-		"memory.distill_all_jobs",
-		"memory.distill_at_terminal",
-		"memory.distill_max_per_job",
-		"memory.distill_successes",
-		"memory.groom_llm_total_max_per_run",
-		"memory.groom_quality",
-		"memory.groom_quality_max_per_run",
-		"memory.groom_quality_min_age",
-		"memory.groom_split_llm",
-		"memory.groom_split_llm_max_per_run",
-		"memory.groom_split_llm_model",
-		"memory.groom_split_llm_runtime",
-		"memory.groom_stale",
-		"memory.groom_stale_age",
-		"memory.harvest_effort",
-		"memory.harvest_enabled",
-		"memory.harvest_max_jobs_per_sweep",
-		"memory.harvest_max_per_job",
-		"memory.harvest_model",
-		"memory.harvest_runtime",
-		"memory.ingest_auto_confirm",
-		"memory.max_entries",
-		"memory.token_budget",
-		"memory.pipelines.groom_propose",
-		"memory.pipelines.groom_propose_jitter",
-		"memory.pipelines.ingest_sweep",
-		"memory.pipelines.ingest_sweep_jitter",
 		"orchestrate.blocked_ttl",
 		"workflow.implement_base",
 	}
@@ -81,7 +49,6 @@ func TestDashboardConfigProjectionAllowlist(t *testing.T) {
 	}
 
 	defaults := dashboardConfigSettings{
-		memory:      config.DefaultMemorySettings(),
 		orchestrate: config.DefaultOrchestratePolicy(), github: config.DefaultGitHubLimiterPolicy(),
 	}
 	if first, second := projectDashboardConfig(defaults, defaults), projectDashboardConfig(defaults, defaults); !reflect.DeepEqual(first, second) {
@@ -99,13 +66,12 @@ func TestWebDataSourceConfigOverridesAgentsMetadataAndSecretSafety(t *testing.T)
 	const secret = "ghp_this_must_never_leave_the_config_file"
 	contents := string(base) + `
 
-[memory]
-groom_split_llm = true
+[orchestrate]
+blocked_ttl = "9h"
 
 [agents.worker]
 runtime = "codex"
 model = "gpt-test"
-memory = true
 capabilities = ["ask", "implement"]
 autonomy_policy = "workspace-write"
 max_background = 9
@@ -146,19 +112,19 @@ private_token = "` + secret + `"
 		t.Fatalf("modified_at = %d, want %d", snapshot.ModifiedAt, wantMod.UnixMilli())
 	}
 
-	knob := dashboardConfigKnob(t, snapshot, "memory", "groom_split_llm")
-	if value, ok := knob.Value.(bool); !ok || !value || knob.IsDefault {
-		t.Fatalf("groom_split_llm = value %#v default %#v is_default %v", knob.Value, knob.Default, knob.IsDefault)
+	knob := dashboardConfigKnob(t, snapshot, "orchestrate", "blocked_ttl")
+	if value, ok := knob.Value.(string); !ok || value != "9h" || knob.IsDefault {
+		t.Fatalf("blocked_ttl = value %#v default %#v is_default %v", knob.Value, knob.Default, knob.IsDefault)
 	}
-	if defaultValue, ok := knob.Default.(bool); !ok || defaultValue {
-		t.Fatalf("groom_split_llm default = %#v, want false", knob.Default)
+	if defaultValue, ok := knob.Default.(string); !ok || defaultValue != "" {
+		t.Fatalf("blocked_ttl default = %#v, want empty", knob.Default)
 	}
 
 	if len(snapshot.Agents) != 1 {
 		t.Fatalf("agents = %+v, want one worker", snapshot.Agents)
 	}
 	agent := snapshot.Agents[0]
-	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || !agent.Memory || agent.MaxBackground != 9 {
+	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || agent.MaxBackground != 9 {
 		t.Fatalf("worker config = %+v", agent)
 	}
 	if !reflect.DeepEqual(agent.Capabilities, []string{"ask", "implement"}) || agent.AutonomyPolicy != "workspace-write" {

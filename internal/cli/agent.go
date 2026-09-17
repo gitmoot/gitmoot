@@ -1776,7 +1776,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	policy := fs.String("policy", "auto", "autonomy policy")
 	updateTemplate := fs.Bool("update-template", false, "install or refresh the agent template before starting")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
-	memoryFlag := fs.Bool("memory", false, "enroll this agent in persistent memory (use --memory=false to override memory.default_enroll)")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -1798,12 +1797,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent start requires exactly one name")
 		return 2
 	}
-	memoryExplicit := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "memory" {
-			memoryExplicit = true
-		}
-	})
 	if !validAgentTypeName(name) {
 		fmt.Fprintf(stderr, "invalid agent name %q for config enrollment\n", name)
 		return 2
@@ -1824,15 +1817,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
-	}
-	memorySettings, err := config.LoadMemorySettings(paths)
-	if err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
-		return 1
-	}
-	memoryEnrolled := memorySettings.DefaultEnroll
-	if memoryExplicit {
-		memoryEnrolled = *memoryFlag
 	}
 	repo, err := github.ParseRepository(*repoFlag)
 	if err != nil {
@@ -1940,20 +1924,13 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	entry, exists := types[agent.Name]
-	persistType := !exists || memoryExplicit
-	if exists {
-		memoryEnrolled = entry.Memory
-		if memoryExplicit {
-			memoryEnrolled = *memoryFlag
-			entry.Memory = memoryEnrolled
-		}
-	} else {
+	persistType := !exists
+	if !exists {
 		entry = config.AgentType{
 			Name: agent.Name, Runtime: agent.Runtime, Template: agent.TemplateID,
 			Model: agent.Model, Effort: agent.Effort, Role: agent.Role,
 			Capabilities:   append([]string(nil), agent.Capabilities...),
 			AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
-			Memory:         memoryEnrolled,
 		}
 	}
 	if persistType {
@@ -1965,14 +1942,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "started %s (%s) for %s", agent.Name, agent.Runtime, repo.FullName())
 	writeLine(stdout, "session: %s", agent.RuntimeRef)
 	writeLine(stdout, "invoke: /gitmoot %s review", agent.Name)
-	switch {
-	case memoryEnrolled && memorySettings.Disabled:
-		writeLine(stdout, "memory: enrolled but globally disabled by [memory].disabled")
-	case memoryEnrolled:
-		writeLine(stdout, "memory: on")
-	default:
-		writeLine(stdout, "memory: off (enable with --memory)")
-	}
 	if *startDaemon {
 		writeLine(stdout, "step: start background daemon")
 		return runDaemonStartWithWorkDir([]string{"--home", *home, "--repo", repo.FullName()}, record.CheckoutPath, stdout, stderr)

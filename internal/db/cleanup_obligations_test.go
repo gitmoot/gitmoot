@@ -140,8 +140,9 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, #1770's
 	// Activepieces trigger removal, #1731's escalation_rounds table, #1754's
 	// chat/moot teardown, #1756's preset-delivery removal, #1753's
-	// cockpit/interactive table drop, and #1822's findings ledger plus its #1850
-	// rebuild. This branch's job_events.provider evidence column is now last.
+	// cockpit/interactive table drop, #1822's findings ledger plus its #1850
+	// rebuild, and #2171's review_requests claim table. This branch's #2202
+	// brain retirement (the memory-family table drop) is now last.
 	//
 	// Two branches cannot both be "last", and the ordering that matters is the
 	// one a deployed database sees, which is why this marker MUST be repointed on
@@ -149,12 +150,12 @@ func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
 	// appended last" rather than as a merge conflict.
 	//
 	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
-	// index name is unique to #2171's review_requests claim table.
+	// dropped harvest-state table is unique to #2202's brain retirement.
 	//
 	// It is updated by every branch that appends a migration, which is the point:
 	// the test fails until the new migration is both last and named here, so two
 	// branches cannot each believe theirs is the tail.
-	const branchMigrationMarker = "idx_review_requests_job"
+	const branchMigrationMarker = "DROP TABLE IF EXISTS memory_harvest_state"
 	branchIndex := -1
 	for index, migration := range migrations {
 		if strings.Contains(migration, branchMigrationMarker) {

@@ -596,43 +596,10 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "%s", daemonDiskGuardLine(paths))
 	writeLine(stdout, "%s", daemonGitHubLimiterLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
-	if line := daemonMemoryHarvestLine(paths, *home); line != "" {
-		writeLine(stdout, "%s", line)
-	}
 	for _, line := range daemonHeartbeatLines(paths, *home) {
 		writeLine(stdout, "%s", line)
 	}
 	return 0
-}
-
-// daemonMemoryHarvestLine surfaces the fail-closed uncertain-receipt count. It
-// stays absent for installations that never enable harvest and have no uncertain
-// history, preserving the default status surface.
-func daemonMemoryHarvestLine(paths config.Paths, home string) string {
-	settings, err := config.LoadMemorySettings(paths)
-	if err != nil {
-		return "memory harvest: unavailable"
-	}
-	uncertain := 0
-	active := settings.HarvestEnabled && !settings.Disabled
-	if err := withStore(home, func(store *db.Store) error {
-		var err error
-		uncertain, err = store.CountMemoryHarvestRunsByState(context.Background(), db.MemoryHarvestUncertain)
-		return err
-	}); err != nil {
-		if active {
-			return "memory harvest: unavailable"
-		}
-		return ""
-	}
-	if !active && uncertain == 0 {
-		return ""
-	}
-	state := "off"
-	if active {
-		state = "enabled"
-	}
-	return fmt.Sprintf("memory harvest: %s, uncertain receipts: %d", state, uncertain)
 }
 
 // daemonHeartbeatLines surfaces the configured heartbeat schedules and their

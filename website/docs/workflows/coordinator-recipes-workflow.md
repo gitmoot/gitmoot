@@ -9,7 +9,7 @@ several jobs. It works on agent ask/run/review/implement, `orchestrate`, and
 ```sh
 gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow fable/release-42
 gitmoot workflow describe fable/release-42 "Validate and ship release 42."
-gitmoot workflow note fable/release-42 "Canary passed." --author operator --remember
+gitmoot workflow note fable/release-42 "Canary passed." --author operator
 gitmoot workflow show fable/release-42
 ```
 
@@ -31,10 +31,7 @@ deduped `[auto:pr:...]` notes as author `daemon`.
 
 Journal text and authors are stored verbatim. JSON keeps them verbatim, while
 terminal text output sanitizes escapes/control bytes and caps each field to one
-line. `--remember` uses low-trust prefiltering,
-defaults to shared memory, and accepts `--agent NAME` for a private pool. A
-single repo is inferred; otherwise pass `--repo`. Rejection writes no note, and
-note plus observation commit atomically.
+line.
 
 Coordinator recipes are built-in agent templates that turn the
 [Orchestra pattern](../reference/result-contract.md#delegations-orchestration)

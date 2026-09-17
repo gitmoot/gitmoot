@@ -222,27 +222,28 @@ func TestWorkflowExplicitStatusAndMachineReceiptDoNotImplicitlyReopen(t *testing
 	})
 }
 
-func TestWorkflowObservationNoteReopensAtomically(t *testing.T) {
+// TestWorkflowMetaNoteReopensAtomically covers the meta-writing insert arm: a
+// note that carries metadata but does NOT set a status must still reopen a
+// terminal workflow in the same transaction as the metadata upsert. The
+// no-metadata arm is covered by TestWorkflowPlainNoteReopensTerminalStatus and
+// the status-setting arm by TestWorkflowExplicitStatusAndMachineReceiptDoNotImplicitlyReopen.
+func TestWorkflowMetaNoteReopensAtomically(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
-	const label = "release/observation"
+	const label = "release/meta-reopen"
 	if _, err := store.InsertWorkflowNoteWithMeta(ctx,
 		WorkflowNote{WorkflowID: label, Body: "done seed"},
 		WorkflowMeta{Status: string(WorkflowStatusDone), StatusSet: true}); err != nil {
 		t.Fatalf("seed done: %v", err)
 	}
-	note, obs, err := store.InsertWorkflowNoteWithObservationAndMeta(ctx,
+	note, err := store.InsertWorkflowNoteWithMeta(ctx,
 		WorkflowNote{WorkflowID: label, Author: "human", Body: "durable fact", Repo: "acme/widget"},
-		MemoryObservation{
-			Owner: MemoryOwner{Kind: "shared", Ref: "shared"}, AuthorRef: "human",
-			Repo: "acme/widget", Scope: "repo", Content: "durable fact", TrustMark: "low",
-		},
 		WorkflowMeta{Author: "human"})
-	if err != nil || note.MemoryObservationID == 0 || obs.ID != note.MemoryObservationID {
-		t.Fatalf("observation note = %+v, observation=%+v, err=%v", note, obs, err)
+	if err != nil || note.ID == 0 {
+		t.Fatalf("meta note = %+v, err=%v", note, err)
 	}
 	meta, err := store.GetWorkflowMeta(ctx, label)
-	if err != nil || meta.Status != string(WorkflowStatusActive) {
+	if err != nil || meta.Status != string(WorkflowStatusActive) || meta.Author != "human" {
 		t.Fatalf("meta = %+v, err=%v", meta, err)
 	}
 	notes, err := store.ListWorkflowNotes(ctx, label, 0)

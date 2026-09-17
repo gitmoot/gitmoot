@@ -159,7 +159,7 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 //	  daemon_runtime.go:99, github_limiter.go:80, remote_exec.go:72,
 //	  credentials.go:52, heartbeats.go:61
 //	in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
-//	  memory.go:185, runtime_registry.go:61, repo_concurrency.go:56
+//	  runtime_registry.go:61, repo_concurrency.go:56
 //
 // admission appears ONCE, under the guard loaders. Its routing regression is
 // the same call site proven a second way, not an additional site.
@@ -306,19 +306,6 @@ func TestMalformedHeaderRoutingRemainingLoaders(t *testing.T) {
 		}
 		if string(mode) != "warn" {
 			t.Fatalf("result_checks = %q, want warn: the override after a malformed header was misattributed", mode)
-		}
-	})
-
-	t.Run("memory", func(t *testing.T) {
-		settings, err := LoadMemorySettings(writeGateConfig(t, "[memory]\ntoken_budget = 111\n[memory\ntoken_budget = 999\n"))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if settings.TokenBudget == 999 {
-			t.Fatal("token_budget = 999 after a malformed header was misattributed to [memory]")
-		}
-		if settings.TokenBudget != 111 {
-			t.Fatalf("token_budget = %d, want 111 (keys BEFORE the malformed header must still apply)", settings.TokenBudget)
 		}
 	})
 

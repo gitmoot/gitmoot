@@ -9,9 +9,6 @@ stable `description`, auto-seeded from a referenced local issue title, the first
 note sentence, or the label campaign, plus a live `status`. The daemon appends
 deduped `daemon` notes and advances status when a linked PR opens, becomes ready
 to merge, or closes. Orchestration descendants inherit the label.
-`workflow note --remember` stages low-trust memory in the shared pool by
-default, infers one repo (or requires `--repo`), and atomically writes the note
-and observation after prefiltering.
 
 Gitmoot V1 runs on one machine. The GitHub repository is the visible audit
 trail, while local SQLite state is the workflow source of truth. The local

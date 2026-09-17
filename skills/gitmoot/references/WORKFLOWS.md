@@ -10,7 +10,7 @@ synthesis, tree token budgets, kill scope). `--workflow <label>` makes an
 EXTERNAL coordinator the manager — a Claude/Codex session, a script, or a human
 drives independent jobs, judging results between steps; the label plus the
 `workflow note` journal make that project visible (workflow list/show, Galaxy
-hubs, `/workflows/<label>`) and `--remember` distills its insight into shared
+hubs, `/workflows/<label>`) and the journal keeps its body verbatim
 memory. Use `orchestrate` when the plan fits a declarable tree run unattended
 (parallel fan-out, bounded autonomous work, pipeline orchestrate stages); use
 an external coordinator with `--workflow` when judgment between steps is the
@@ -30,7 +30,7 @@ and continuations inherit it.
 gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
 gitmoot workflow describe release-42 "Validate and ship release 42."
 gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
-gitmoot workflow note release-42 "Canary passed." --author operator --remember
+gitmoot workflow note release-42 "Canary passed." --author operator
 gitmoot workflow show release-42
 gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
 ```
@@ -66,11 +66,7 @@ pipeline grants. Credential values and value-derived data are never projected.
 
 The append-only journal stores text and authors verbatim. JSON show output keeps
 them verbatim; terminal text output sanitizes escapes/control bytes and caps each
-field to one line. `--remember` uses the
-normal low-trust prefilter/dedup path, defaults to the shared pool, and accepts
-`--agent NAME` for a registered agent's private pool. A single repo is inferred;
-otherwise `--repo` is required. Rejection writes no note, and note plus
-observation are atomic. V1 has no group lifecycle controls and allows reuse.
+field to one line. V1 has no group lifecycle controls and allows reuse.
 
 ## First Repo Setup
 
@@ -907,7 +903,7 @@ trigger:
   pipeline: memory-groom-propose
 stages:
   - id: sweep
-    cmd: gitmoot memory ingest sweep --json
+    cmd: gitmoot job list --json
 ```
 
 This replaces the old `24h` / `24h30m` imitation of ordering: failed or cancelled
@@ -1081,14 +1077,11 @@ gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
 unknown label to guard against a typo - so file the row under the lane the PR is
 already being coordinated in rather than inventing a label.
 
-The note's repo COLUMN is a separate, optional thing. A note whose column is
-empty still counts when its body names this repository, which is the ordinary
-case: `gitmoot workflow note` writes an empty column unless you pass
-`--remember --repo <owner/repo>`, and `--repo` is REJECTED without `--remember`
-(`--agent, --repo, and --remember-status require --remember`), because that flag
-set also opts the note into durable memory. Setting the column is therefore
-optional and costs a memory write; getting `repo=` right in the BODY is not
-optional.
+The note's repo COLUMN is a separate thing, and `gitmoot workflow note` now
+always writes it empty: the flags that used to set it went with the memory
+surface (#2202). A note whose column is empty still counts when its body names
+this repository, which is the ordinary case. Getting `repo=` right in the BODY
+is not optional.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own

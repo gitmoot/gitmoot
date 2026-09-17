@@ -77,24 +77,6 @@ Use `gitmoot agent template draft <id>` for a blank scaffold,
 `gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
 § Agent Templates.
 
-For agent persistent memory, phrases like "give this agent persistent memory",
-"why does my agent keep forgetting things about this repo", or "what has this
-agent learned" map to Gitmoot's off-by-default agent memory feature (#626): an
-enrolled agent gets a repo-filtered pool of durable facts injected into its job
-prompt as a read-only "Prior learnings" reference block (never instructions).
-The block can include `[linked]` facts reached from persisted memory links, and
-non-empty blocks end with a footer pointing the agent to
-`gitmoot memory recall "<query>" --agent <agent-name>` for on-demand recall.
-Live prompt injection and direct recall hits maintain best-effort per-fact usage
-counters; preview/eval reads and linked-only recall expansion do not count.
-Enrollment is per agent via `[agents.<name>].memory = true` plus an optional
-`[memory]` section; inspect the store read-only with `gitmoot memory list`. For
-owner-curated memory, `gitmoot memory ingest` stages Markdown as pending
-observations, `gitmoot memory observations` lists them, `gitmoot memory confirm`
-promotes selected observations, and `gitmoot memory groom` proposes or applies
-deterministic retirements. See CLI.md § Agent Memory and the "Agent Persistent
-Memory" concepts page for depth.
-
 For routing telemetry, phrases like "which runtime/model works best here",
 "show observed routing performance", or "should I route Go tasks to Codex" map to
 Gitmoot's execution-grounded routing telemetry (#530): every job records an

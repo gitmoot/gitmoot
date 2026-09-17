@@ -27,9 +27,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/memory"
+
 	"github.com/gitmoot/gitmoot/internal/pipeline"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
@@ -309,8 +308,6 @@ func (s *bridgeServer) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleRunGet(w, r, id)
-	case r.Method == http.MethodPost && path == "/v1/memory/recall":
-		s.handleMemoryRecall(w, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/jobs/"):
 		id, ok := bridgePathTail(path, "/v1/jobs/")
 		if !ok {
@@ -507,73 +504,6 @@ func (s *bridgeServer) handleRunGet(w http.ResponseWriter, r *http.Request, id s
 		return
 	}
 	writeBridgeJSON(w, http.StatusOK, pipelineRunToJSON(view))
-}
-
-type bridgeMemoryRecallRequest struct {
-	Query  string `json:"query"`
-	Repo   string `json:"repo,omitempty"`
-	Agent  string `json:"agent,omitempty"`
-	Shared bool   `json:"shared,omitempty"`
-	Limit  int    `json:"limit,omitempty"`
-}
-
-type bridgeMemoryRecallResponse struct {
-	Entries []memoryRecallEntry `json:"entries"`
-}
-
-func (s *bridgeServer) handleMemoryRecall(w http.ResponseWriter, r *http.Request) {
-	var req bridgeMemoryRecallRequest
-	if err := decodeRequiredBridgeJSON(r, &req); err != nil {
-		writeBridgeDecodeError(w, err)
-		return
-	}
-	if strings.TrimSpace(req.Query) == "" {
-		writeBridgeError(w, http.StatusBadRequest, "query is required")
-		return
-	}
-	if req.Shared && strings.TrimSpace(req.Agent) != "" {
-		writeBridgeError(w, http.StatusBadRequest, "shared cannot be combined with agent")
-		return
-	}
-	entries, err := bridgeRecallMemories(r.Context(), s.store, req)
-	if err != nil {
-		writeBridgeMappedError(w, err)
-		return
-	}
-	writeBridgeJSON(w, http.StatusOK, bridgeMemoryRecallResponse{Entries: entries})
-}
-
-func bridgeRecallMemories(ctx context.Context, store *db.Store, req bridgeMemoryRecallRequest) ([]memoryRecallEntry, error) {
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 15
-	}
-	query := workflow.BuildMemoryMatchQuery(req.Query)
-	var rows []db.ConfirmedMemory
-	var err error
-	repo := strings.TrimSpace(req.Repo)
-	agent := strings.TrimSpace(req.Agent)
-	switch {
-	case req.Shared:
-		rows, err = store.QueryConfirmedMemoriesForShared(ctx, repo, query, limit)
-	case agent != "":
-		owner := db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: agent}
-		if repo != "" {
-			rows, err = store.QueryConfirmedMemories(ctx, owner, repo, query, limit)
-		} else {
-			rows, err = store.QueryConfirmedMemoriesForOwnerAllRepos(ctx, owner, query, limit)
-		}
-	default:
-		rows, err = store.QueryConfirmedMemoriesForAllAgents(ctx, repo, query, limit)
-	}
-	if err != nil {
-		return nil, err
-	}
-	entries := make([]memoryRecallEntry, 0, len(rows))
-	for _, row := range rows {
-		entries = append(entries, memoryRecallJSONEntry(row, 0))
-	}
-	return entries, nil
 }
 
 func (s *bridgeServer) handleJobGet(w http.ResponseWriter, r *http.Request, id string) {

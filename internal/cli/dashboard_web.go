@@ -26,7 +26,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/memory"
 	"github.com/gitmoot/gitmoot/internal/update"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -88,9 +87,6 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	// and the "workflows" cache key already includes the workflow-note-id so a
 	// status change busts the cache.
 	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
-	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
-	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
-	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
 	registerDashboardCommsRoutes(mux, ds)
 	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
 	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)
@@ -195,6 +191,20 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 // (#1754), so there is no thread store left to read: the list is empty and every
 // id is unknown. These are the truthful answers, not placeholders — the module's
 // Chat view renders as empty rather than reporting a server error.
+// Knowledge and Skills satisfy the pinned dashboard DataSource after #2202
+// retired the brain. They return empty rather than being deleted because the
+// interface is defined in the external gitmoot-dashboard module: dropping the
+// methods breaks compilation. Same shape as the ChatThreads stubs below, which
+// #1754 left behind for the same reason. The pages render empty until a
+// dashboard release removes their nav entries (#2206).
+func (d *webDataSource) Knowledge(context.Context) (dashboard.Knowledge, error) {
+	return dashboard.Knowledge{}, nil
+}
+
+func (d *webDataSource) Skills(context.Context) (dashboard.Skills, error) {
+	return dashboard.Skills{}, nil
+}
+
 func (d *webDataSource) ChatThreads(context.Context) ([]dashboard.ChatThreadSummary, error) {
 	return []dashboard.ChatThreadSummary{}, nil
 }
@@ -883,11 +893,6 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 			return err
 		}
 
-		// The [agents.<name>] config sections drive the per-agent memory chip. Load
-		// them ONCE per call, fail-open: a config-load error yields a nil map (no
-		// chips) rather than failing the endpoint (mirrors Health()'s fail-open path).
-		agentTypes := loadAgentTypesFailOpen(paths)
-
 		// Aggregate per-agent job stats from the single ListJobs pass (shared with
 		// Agent()). Ephemeral workers fold into one rollup.
 		byAgent, ephemeral, hasEphemeral := aggregateAgentJobStats(jobs)
@@ -895,9 +900,6 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
 		for _, a := range agents {
 			summary := newAgentSummary(a)
-			if at, ok := agentTypes[a.Name]; ok {
-				summary.MemoryEnabled = at.Memory
-			}
 			if s := byAgent[a.Name]; s != nil {
 				s.applyTo(&summary)
 			}
@@ -952,23 +954,12 @@ func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.Agent
 		}
 
 		// Config-section visibility. Load the [agents.<name>] sections ONCE, fail-open
-		// (a config-load error => no section, Config nil, no chip — never an endpoint
-		// error). Config is nil unless this agent has its own section; the memory chip
-		// mirrors that section's memory flag so the summary matches Agents().
+		// (a config-load error => no section, Config nil — never an endpoint error).
+		// Config is nil unless this agent has its own section.
 		if at, ok := loadAgentTypesFailOpen(paths)[agent.Name]; ok {
-			summary.MemoryEnabled = at.Memory
 			detail.Config = agentConfigInfo(at)
 		}
 		detail.AgentSummary = summary
-
-		// Owned memory pool sizes (all owner versions). Fail-open: a query error
-		// leaves the count at 0 rather than failing the endpoint.
-		if n, cerr := store.CountConfirmedMemoriesForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
-			detail.MemoryFacts = n
-		}
-		if n, cerr := store.CountMemoryObservationsForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
-			detail.MemoryObservations = n
-		}
 
 		// Template + version history. Fail-open: a missing/broken template leaves the
 		// detail's Template nil and Versions the initialized empty slice rather than
@@ -1005,7 +996,7 @@ func newAgentSummary(a db.Agent) dashboard.AgentSummary {
 	}
 }
 
-// loadAgentTypesFailOpen loads the [agents.<name>] config sections for the memory
+// loadAgentTypesFailOpen loads the [agents.<name>] config sections for the config
 // chip / config panel, returning nil on ANY error (missing/unreadable/malformed
 // config) so both Agents() and Agent() degrade to "no config visibility" rather
 // than failing the endpoint. Indexing the nil result is safe (a missing key
@@ -1026,7 +1017,6 @@ func loadAgentTypesFailOpen(paths config.Paths) map[string]config.AgentType {
 // return is meaningful presence).
 func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 	return &dashboard.AgentConfigInfo{
-		Memory:        at.Memory,
 		MaxBackground: at.MaxBackground,
 		IdleTimeout:   strings.TrimSpace(at.IdleTimeout),
 		JobTimeout:    strings.TrimSpace(at.JobTimeout),

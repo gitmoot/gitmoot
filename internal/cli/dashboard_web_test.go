@@ -1575,26 +1575,26 @@ func TestWebDataSourceUpdateNoRelease(t *testing.T) {
 	}
 }
 
-// TestWebDataSourceAgentConfigAndMemory asserts the config-visibility enrichment:
-// Agents() sets MemoryEnabled from each agent's [agents.<name>] section, and
-// Agent() builds AgentDetail.Config (nil when the agent has no section) plus the
-// two owned-memory counts (across all owner versions, scoped to the agent).
-func TestWebDataSourceAgentConfigAndMemory(t *testing.T) {
+// TestWebDataSourceAgentConfig asserts the config-visibility enrichment: Agent()
+// builds AgentDetail.Config from the agent's [agents.<name>] section — the seeded
+// values as LoadAgentTypes resolves them, parse-time defaults folded in — and
+// leaves Config nil when the agent has no section at all.
+func TestWebDataSourceAgentConfig(t *testing.T) {
 	home := dashboardTestHome(t)
 	paths := config.PathsForHome(home)
 	ctx := context.Background()
 
-	// Config sections: mem-agent enrolled (memory on, custom pool knobs); plain-agent
-	// has a section with memory OFF (parse-time defaults fill the rest); nosection-agent
-	// gets NO [agents.<name>] section at all.
+	// Config sections: full-agent sets every pool knob explicitly; plain-agent has
+	// a section carrying nothing but the runtime (parse-time defaults fill the
+	// rest); nosection-agent gets NO [agents.<name>] section at all.
 	if err := config.SaveAgentType(paths, config.AgentType{
-		Name: "mem-agent", Runtime: "codex", Memory: true,
+		Name: "full-agent", Runtime: "codex",
 		MaxBackground: 3, IdleTimeout: "15m", JobTimeout: "30m",
 		Model: "gpt-5.5", Template: "coordinator", Capabilities: []string{"orchestrate", "review"},
 	}); err != nil {
-		t.Fatalf("SaveAgentType mem-agent: %v", err)
+		t.Fatalf("SaveAgentType full-agent: %v", err)
 	}
-	if err := config.SaveAgentType(paths, config.AgentType{Name: "plain-agent", Runtime: "claude", Memory: false}); err != nil {
+	if err := config.SaveAgentType(paths, config.AgentType{Name: "plain-agent", Runtime: "claude"}); err != nil {
 		t.Fatalf("SaveAgentType plain-agent: %v", err)
 	}
 
@@ -1603,9 +1603,9 @@ func TestWebDataSourceAgentConfigAndMemory(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	// Store registration is independent of the config section: all three agents are
-	// registered, but only two carry a section and only one has memory rows.
+	// registered, but only two carry a section.
 	for _, a := range []db.Agent{
-		{Name: "mem-agent", Runtime: "codex"},
+		{Name: "full-agent", Runtime: "codex"},
 		{Name: "plain-agent", Runtime: "claude"},
 		{Name: "nosection-agent", Runtime: "codex"},
 	} {
@@ -1613,113 +1613,44 @@ func TestWebDataSourceAgentConfigAndMemory(t *testing.T) {
 			t.Fatalf("UpsertAgent %s: %v", a.Name, err)
 		}
 	}
-
-	// Seed memory rows OWNED by mem-agent: two confirmed facts (distinct keys, one
-	// under a non-empty owner version so the "all owner versions" count is exercised)
-	// and three observations (append-only; a repeated key still counts). Rows owned
-	// by a DIFFERENT agent must be excluded from mem-agent's counts.
-	seedConfirmed := func(ref, version, key string) {
-		if _, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
-			Owner: db.MemoryOwner{Kind: "agent", Ref: ref, Version: version},
-			Repo:  "jerryfane/noted", Scope: "repo", Key: key, Content: "fact " + key,
-		}); err != nil {
-			t.Fatalf("UpsertConfirmedMemory: %v", err)
-		}
-	}
-	seedObs := func(ref, key string) {
-		if _, err := store.InsertMemoryObservation(ctx, db.MemoryObservation{
-			Owner: db.MemoryOwner{Kind: "agent", Ref: ref},
-			Repo:  "jerryfane/noted", Scope: "repo", Key: key, Content: "obs " + key,
-		}); err != nil {
-			t.Fatalf("InsertMemoryObservation: %v", err)
-		}
-	}
-	seedConfirmed("mem-agent", "", "fix-rounds")
-	seedConfirmed("mem-agent", "v2", "outcome") // different owner version, still counted
-	seedObs("mem-agent", "a")
-	seedObs("mem-agent", "a") // append-only: the repeated key is a distinct row
-	seedObs("mem-agent", "b")
-	seedConfirmed("other-agent", "", "x") // foreign owner, must be excluded
-	seedObs("other-agent", "y")
 	store.Close()
 
 	ds := &webDataSource{home: home}
 
-	// Agents(): MemoryEnabled tracks the config section — enrolled vs off vs none.
-	agents, err := ds.Agents(ctx)
+	// Agent(full-agent): the full config section, surfaced as seeded.
+	full, err := ds.Agent(ctx, "full-agent")
 	if err != nil {
-		t.Fatalf("Agents: %v", err)
+		t.Fatalf("Agent(full-agent): %v", err)
 	}
-	byName := map[string]dashboard.AgentSummary{}
-	for _, a := range agents {
-		byName[a.Name] = a
+	if full.Config == nil {
+		t.Fatalf("full-agent Config = nil, want a section")
 	}
-	if !byName["mem-agent"].MemoryEnabled {
-		t.Fatalf("mem-agent MemoryEnabled = false, want true")
+	if full.Config.MaxBackground != 3 || full.Config.IdleTimeout != "15m" ||
+		full.Config.JobTimeout != "30m" || full.Config.Model != "gpt-5.5" || full.Config.Template != "coordinator" {
+		t.Fatalf("full-agent Config = %+v, want the seeded section values", full.Config)
 	}
-	if byName["plain-agent"].MemoryEnabled {
-		t.Fatalf("plain-agent MemoryEnabled = true, want false (config memory off)")
-	}
-	if byName["nosection-agent"].MemoryEnabled {
-		t.Fatalf("nosection-agent MemoryEnabled = true, want false (no config section)")
+	if len(full.Config.Capabilities) != 2 {
+		t.Fatalf("full-agent Config.Capabilities = %v, want 2", full.Config.Capabilities)
 	}
 
-	// Agent(mem-agent): full config section + owned memory counts.
-	mem, err := ds.Agent(ctx, "mem-agent")
-	if err != nil {
-		t.Fatalf("Agent(mem-agent): %v", err)
-	}
-	if !mem.MemoryEnabled {
-		t.Fatalf("mem-agent detail MemoryEnabled = false, want true")
-	}
-	if mem.Config == nil {
-		t.Fatalf("mem-agent Config = nil, want a section")
-	}
-	if !mem.Config.Memory || mem.Config.MaxBackground != 3 || mem.Config.IdleTimeout != "15m" ||
-		mem.Config.JobTimeout != "30m" || mem.Config.Model != "gpt-5.5" || mem.Config.Template != "coordinator" {
-		t.Fatalf("mem-agent Config = %+v, want the seeded section values", mem.Config)
-	}
-	if len(mem.Config.Capabilities) != 2 {
-		t.Fatalf("mem-agent Config.Capabilities = %v, want 2", mem.Config.Capabilities)
-	}
-	if mem.MemoryFacts != 2 {
-		t.Fatalf("mem-agent MemoryFacts = %d, want 2 (both owner versions)", mem.MemoryFacts)
-	}
-	if mem.MemoryObservations != 3 {
-		t.Fatalf("mem-agent MemoryObservations = %d, want 3", mem.MemoryObservations)
-	}
-
-	// Agent(plain-agent): a section exists (memory off; parse-time defaults folded in),
-	// no memory rows.
+	// Agent(plain-agent): a section exists, with parse-time defaults folded in.
 	plain, err := ds.Agent(ctx, "plain-agent")
 	if err != nil {
 		t.Fatalf("Agent(plain-agent): %v", err)
 	}
-	if plain.MemoryEnabled {
-		t.Fatalf("plain-agent detail MemoryEnabled = true, want false")
-	}
-	if plain.Config == nil || plain.Config.Memory {
-		t.Fatalf("plain-agent Config = %+v, want a non-nil section with memory off", plain.Config)
+	if plain.Config == nil {
+		t.Fatalf("plain-agent Config = nil, want a non-nil section")
 	}
 	if plain.Config.MaxBackground != 1 || plain.Config.IdleTimeout != "20m" || plain.Config.JobTimeout != "10m" {
 		t.Fatalf("plain-agent Config defaults = %+v, want max_background 1 / idle 20m / job 10m", plain.Config)
 	}
-	if plain.MemoryFacts != 0 || plain.MemoryObservations != 0 {
-		t.Fatalf("plain-agent memory counts = %d/%d, want 0/0", plain.MemoryFacts, plain.MemoryObservations)
-	}
 
-	// Agent(nosection-agent): no config section => nil Config, no chip, zero counts.
+	// Agent(nosection-agent): no config section => nil Config.
 	none, err := ds.Agent(ctx, "nosection-agent")
 	if err != nil {
 		t.Fatalf("Agent(nosection-agent): %v", err)
 	}
 	if none.Config != nil {
 		t.Fatalf("nosection-agent Config = %+v, want nil (no section)", none.Config)
-	}
-	if none.MemoryEnabled {
-		t.Fatalf("nosection-agent MemoryEnabled = true, want false")
-	}
-	if none.MemoryFacts != 0 || none.MemoryObservations != 0 {
-		t.Fatalf("nosection-agent memory counts = %d/%d, want 0/0", none.MemoryFacts, none.MemoryObservations)
 	}
 }

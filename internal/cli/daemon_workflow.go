@@ -68,16 +68,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// byte-identical. The sink is a process-global shared singleton (one drain
 		// goroutine), so re-building the engine per tick never leaks goroutines.
 		EventSink: daemonEventSink(store, home),
-		// Off-by-default agent persistent memory (#626, Phase 1 observation mode):
-		// when at least one agent is enrolled ([agents.<name>].memory = true) and the
-		// global kill switch is off, the engine's Mailbox injects a "Prior learnings"
-		// block into enrolled agents' prompts (READ) and shadow-logs their returned
-		// learnings + writes mechanical facts at job terminal (WRITE). daemonMemory-
-		// Controller returns nil when nothing is enrolled (or on any config-load
-		// error), so with no config NO memory hook is wired and prompt assembly +
-		// the terminal path are byte-identical. Non-enrolled agents are never touched
-		// even when the controller is present.
-		Memory: cfg.memoryController(store, home),
 		// Registry default model/effort fallbacks: when a delivered job pins no
 		// agent/job override, fall back to the HOME-AWARE resolved runtime registry
 		// (built-in defaults overlaid with [runtimes.<name>] config). Fail-open and

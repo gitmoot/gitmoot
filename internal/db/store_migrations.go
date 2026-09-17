@@ -2813,4 +2813,31 @@ CREATE TABLE IF NOT EXISTS review_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_review_requests_job ON review_requests(job_id);
 	`,
+	// #2202 retires the brain. Every reader of these tables is deleted in the same
+	// change: the memory CLI verbs, the harvest/groom/distill machinery, the
+	// dashboard Learning and Brain pages, the bridge recall endpoint and the
+	// "Prior learnings" prompt injection. Nothing surviving reads a memory row, so
+	// the drop is a retirement rather than a data migration - the rows are
+	// abandoned on purpose, with the owner's decision recorded on the campaign
+	// issue.
+	//
+	// workflow_notes.memory_observation_id goes with them. It pointed at
+	// memory_observations, and `workflow note --remember` - the only writer that
+	// ever set it - is removed too. Journal notes keep every other column, so the
+	// org ledger is untouched by this.
+	`
+DROP INDEX IF EXISTS idx_memory_obs_owner;
+DROP INDEX IF EXISTS idx_confirmed_repo_key;
+DROP INDEX IF EXISTS idx_confirmed_general_key;
+DROP TABLE IF EXISTS confirmed_memories_fts;
+DROP TABLE IF EXISTS confirmed_memories;
+DROP TABLE IF EXISTS memory_cluster_members;
+DROP TABLE IF EXISTS memory_clusters;
+DROP TABLE IF EXISTS memory_links;
+DROP TABLE IF EXISTS memory_events;
+DROP TABLE IF EXISTS memory_harvest_state;
+DROP TABLE IF EXISTS memory_harvest_runs;
+DROP TABLE IF EXISTS memory_observations;
+ALTER TABLE workflow_notes DROP COLUMN memory_observation_id;
+	`,
 }

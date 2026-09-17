@@ -161,14 +161,6 @@ func (e Engine) mailbox() Mailbox {
 	// its claim on the durable event, renders "0 approved".
 	mb.reviewBlockingSeverity = e.reviewBlockingSeverity
 	mb.produceCheckDir = e.ProduceCheckDir
-	// Wire the off-by-default memory hooks (#626). When e.Memory is nil (every
-	// non-enrolled path) both hooks stay nil, so Run's prompt assembly and terminal
-	// path are byte-identical. The hooks themselves also no-op when the executor
-	// agent is not enrolled, so a controller shared across mixed agents is safe.
-	if e.Memory != nil {
-		mb.injectMemory = e.Memory.injectBlock
-		mb.recordMemory = e.Memory.record
-	}
 	if e.EventSink == nil {
 		return mb
 	}
