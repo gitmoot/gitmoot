@@ -2,10 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
@@ -94,7 +90,8 @@ func seedSkillTemplates(t *testing.T, home string) (newestID string) {
 // and a nil slice would marshal as JSON null and break a client that iterates it.
 //
 // #2202 round 2: this is the test that catches Skills being reduced to an empty
-// stub along with Knowledge. Its tables survive the brain removal, so an empty
+// stub along with Knowledge in #2202, and #2206 removed the Knowledge stub
+// entirely once the module stopped requiring it. Its tables survive, so an empty
 // answer here is a regression, not a truthful "nothing left to read" — the live
 // store has 17 template rows.
 func TestWebDataSourceSkills(t *testing.T) {
@@ -241,64 +238,5 @@ func TestSkillTemplateFromVersionsSortsAscending(t *testing.T) {
 	st = skillTemplateFromVersions(tmpl, nil, nil)
 	if st.Versions == nil || len(st.Versions) != 0 || st.Pending == nil {
 		t.Fatalf("nil versions must yield empty non-nil slices: %+v", st)
-	}
-}
-
-// TestRetiredBrainRoutesServeEmptyJSON pins the reason these two routes are still
-// registered after #2202 removed the memory tables behind them: the pinned
-// dashboard module's Brain page fetches them, and an unregistered path falls
-// through to the module's static handler, which answers with index.html. The
-// frontend then parses HTML as JSON and the Changelog tab reports an HTTP error.
-// So the contract is: 200, application/json, and a body that parses into the
-// shape the frontend destructures.
-func TestRetiredBrainRoutesServeEmptyJSON(t *testing.T) {
-	handler := newDashboardWebHandler(&webDataSource{home: dashboardTestHome(t)})
-
-	// index.html:6336 fetches this with ?limit=60 (and ?cursor= when paging older).
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/brain/events?limit=60", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("/api/brain/events status = %d, want 200", recorder.Code)
-	}
-	if ct := recorder.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		t.Fatalf("/api/brain/events Content-Type = %q, want application/json (an HTML shell is what a fall-through serves)", ct)
-	}
-	var events struct {
-		Events     *[]json.RawMessage `json:"events"`
-		NextCursor *int64             `json:"nextCursor"`
-		Total      *int64             `json:"total"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &events); err != nil {
-		t.Fatalf("/api/brain/events body is not JSON: %v", err)
-	}
-	// index.html:6347 requires events to be an array, not null/absent.
-	if events.Events == nil || len(*events.Events) != 0 {
-		t.Fatalf("events = %v, want an empty array", events.Events)
-	}
-	// index.html:6356/:6363 treat a falsy nextCursor as "history exhausted"; a
-	// non-zero one would make the client page forever.
-	if events.NextCursor == nil || *events.NextCursor != 0 {
-		t.Fatalf("nextCursor = %v, want 0 so the older-page walk terminates", events.NextCursor)
-	}
-	// index.html:6379 reads total as a number.
-	if events.Total == nil || *events.Total != 0 {
-		t.Fatalf("total = %v, want 0", events.Total)
-	}
-
-	// index.html:6421 fetches a single fact by id; :6423 requires a JSON object.
-	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/brain/fact?id=7", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("/api/brain/fact status = %d, want 200", recorder.Code)
-	}
-	if ct := recorder.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		t.Fatalf("/api/brain/fact Content-Type = %q, want application/json", ct)
-	}
-	fact := map[string]any{}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &fact); err != nil {
-		t.Fatalf("/api/brain/fact body is not a JSON object: %v", err)
-	}
-	if len(fact) != 0 {
-		t.Fatalf("fact = %v, want an empty object: the tables it read are gone and no field value may be invented", fact)
 	}
 }

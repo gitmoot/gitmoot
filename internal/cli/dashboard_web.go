@@ -72,12 +72,13 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 
 // newDashboardWebHandler shadows the bounded endpoints covered by the frozen
 // #948/#956 cache policies and serves #958's widened workflow JSON
-// (description/status) through the cached workflows route. It also registers the
-// two retired /api/brain/* routes, which exist only so the pinned module's
-// frontend parses JSON rather than the HTML shell until #2206 removes the nav.
-// The local knowledge handler this comment used to name went with the brain
-// (#2202): Knowledge() is now a DataSource stub served by the pinned module.
-// Every other route remains owned by that module.
+// (description/status) through the cached workflows route. Every other route
+// remains owned by the pinned dashboard module.
+//
+// #2206 removed the last two transitional routes this comment used to name: the
+// module no longer has a Brain page to feed, and no longer requires Knowledge or
+// ChatThreads on its DataSource, so gitmoot stopped answering for pages that do
+// not exist. Skills stayed REAL - #2204 keeps its tables.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
@@ -98,15 +99,6 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.js", handleFleetActivityJS)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
-	// Transitional: the pinned dashboard module's Brain page still fetches these
-	// two paths, but #2202 removed the memory tables behind them. They are
-	// registered so the requests get an empty, well-formed JSON feed instead of
-	// falling through to the module's static handler, which answers every unknown
-	// path with index.html and makes the Changelog tab report an HTTP error. Same
-	// reasoning as the Knowledge stub: an empty feed is a correct answer, an HTML
-	// page is not. Both routes go away with the Brain nav entry in #2206.
-	mux.HandleFunc("GET /api/brain/events", handleRetiredBrainEvents)
-	mux.HandleFunc("GET /api/brain/fact", handleRetiredBrainFact)
 	// Public pipeline receipts are deliberately narrow, read-only projections of
 	// already-finalized verified archives. Register them before the dashboard
 	// module fallback so no /api or module behavior changes.
@@ -116,7 +108,16 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	return mux
 }
 
-const dashboardChatNavTail = `      <span style="{{ chatNavDotStyle }}"></span>
+// dashboardCommsNavAnchor is the markup the Comms nav entry is injected AFTER.
+// It is the tail of the module's Org entry, the last surviving FLEET item.
+//
+// It used to be the tail of the CHAT entry, and #2206 removing Chat from the
+// dashboard module would have made this injection silently find nothing and drop
+// the Comms entry from the rail with no error anywhere - caught by measuring the
+// anchor against the new module before re-pinning, not by the page going missing.
+// The Org tail is unique in BOTH the old and new module builds, so the anchor is
+// not a fresh single-version bet.
+const dashboardCommsNavAnchor = `      <span style="{{ orgNavDotStyle }}"></span>
     </div>`
 
 type dashboardNavItem struct {
@@ -133,9 +134,7 @@ var dashboardNavManifest = []dashboardNavItem{
 	{Href: "/pipelines", Title: "Pipelines", Group: "WORK"},
 	{Href: "/agents", Title: "Agents", Group: "FLEET"},
 	{Href: "/org", Title: "Org", Group: "FLEET"},
-	{Href: "/chat", Title: "Chat", Group: "FLEET"},
 	{Href: "/comms", Title: "Comms", Group: "FLEET"},
-	{Href: "/brain", Title: "Brain", Group: "INSIGHT"},
 	{Href: "/galaxy", Title: "Galaxy", Group: "INSIGHT"},
 	{Href: "/charts", Title: "Charts", Group: "INSIGHT"},
 	{Href: "/learning", Title: "Learning", Group: "INSIGHT"},
@@ -187,9 +186,9 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 		}
 		body := buffered.body.Bytes()
 		if status == http.StatusOK && strings.Contains(w.Header().Get("Content-Type"), "text/html") {
-			anchor := []byte(dashboardChatNavTail)
+			anchor := []byte(dashboardCommsNavAnchor)
 			if bytes.Contains(body, anchor) {
-				replacement := []byte(dashboardChatNavTail + "\n" + dashboardCommsSPAItem())
+				replacement := []byte(dashboardCommsNavAnchor + "\n" + dashboardCommsSPAItem())
 				body = bytes.Replace(body, anchor, replacement, 1)
 				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			}
@@ -197,76 +196,6 @@ func withDashboardCommsNav(next http.Handler) http.Handler {
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 	})
-}
-
-// ChatThreads and ChatThread satisfy dashboard.DataSource, whose interface lives
-// in the external dashboard module. Native chat was removed from Gitmoot
-// (#1754), so there is no thread store left to read: the list is empty and every
-// id is unknown. These are the truthful answers, not placeholders — the module's
-// Chat view renders as empty rather than reporting a server error.
-func (d *webDataSource) ChatThreads(context.Context) ([]dashboard.ChatThreadSummary, error) {
-	return []dashboard.ChatThreadSummary{}, nil
-}
-
-func (d *webDataSource) ChatThread(context.Context, string) (*dashboard.ChatThreadDetail, error) {
-	return nil, dashboard.ErrChatThreadNotFound
-}
-
-// Knowledge satisfies the same external interface after #2202 retired the brain.
-// It returns empty rather than being deleted because dropping a DataSource method
-// breaks compilation — the precedent the ChatThreads stubs above set. Its tables
-// (confirmed_memories, memory_observations, memory_clusters, memory_links) are
-// really gone, so empty is the truthful answer, and the page renders empty until a
-// dashboard release removes its nav entry (#2206).
-//
-// Skills is deliberately NOT a stub: it reads agent_templates and
-// agent_template_versions, which survive this campaign (#2204), so it stayed a
-// real implementation in dashboard_web_skills.go.
-func (d *webDataSource) Knowledge(context.Context) (dashboard.Knowledge, error) {
-	return dashboard.Knowledge{}, nil
-}
-
-// The two transitional brain payloads. #2202 removed memory_events and
-// confirmed_memories, so there is nothing to read and the bodies are compile-time
-// constants rather than store projections — which is also why they bypass the
-// dashboard response cache: there is no computation to memoize.
-//
-// The shapes are the ones the pinned module's frontend actually parses, read off
-// gitmoot-dashboard@v0.0.0-20260726182004-510fdc8bd010/web/dist/index.html:
-//
-//   - the events feed (fetched at :6336) is destructured at :6347
-//     (`Array.isArray(data.events)`), :6356 and :6363 (`data.nextCursor`, whose
-//     falsiness is what marks the history exhausted and stops the "load older"
-//     walk) and :6379 (`Number(data.total)`). An empty array with a zero cursor
-//     and zero total is therefore a complete, terminating answer.
-//   - a fact (fetched at :6421) is consumed as a plain object at :6423
-//     (`fact && typeof fact === 'object'`), and every field read off it is
-//     nullish-guarded — `fact.status` falls back to "active" at :6696 and
-//     `fact.content` to "" at :6702 — so the empty object needs no invented
-//     field values.
-//
-// Both go away with the Brain nav entry in #2206.
-const (
-	dashboardRetiredBrainEventsBody = `{"events":[],"nextCursor":0,"total":0}`
-	dashboardRetiredBrainFactBody   = `{}`
-)
-
-func handleRetiredBrainEvents(w http.ResponseWriter, _ *http.Request) {
-	writeRetiredBrainJSON(w, dashboardRetiredBrainEventsBody)
-}
-
-func handleRetiredBrainFact(w http.ResponseWriter, _ *http.Request) {
-	writeRetiredBrainJSON(w, dashboardRetiredBrainFactBody)
-}
-
-func writeRetiredBrainJSON(w http.ResponseWriter, body string) {
-	// no-store matches what the retired handlers served: the Brain feed was a live
-	// audit view that must never be served stale, and an intermediary caching the
-	// empty body would outlive #2206's removal of these routes.
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.WriteString(w, body)
 }
 
 type dashboardWorkflowAPIView struct {

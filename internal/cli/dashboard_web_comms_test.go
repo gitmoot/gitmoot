@@ -474,7 +474,20 @@ func dashboardEmbeddedModuleNav(t *testing.T, body string) []dashboardNavItem {
 	return items
 }
 
-func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
+// TestDashboardSidebarLinksCommsAfterOrg is the guard for a SILENT loss. The
+// Comms rail entry is not in the dashboard module at all - gitmoot injects it
+// into the module's served HTML by finding a known nav entry's tail and writing
+// itself in after it. If a module re-pin changes that markup, the injection
+// finds nothing, and withDashboardCommsNav is deliberately fail-open: it returns
+// the upstream body untouched. The page still renders, CI still passes, and the
+// Comms entry is simply GONE.
+//
+// That very nearly shipped in #2206: the anchor was the CHAT entry's tail, and
+// the module release removed Chat. It was caught by measuring the anchor against
+// the new module asset before re-pinning. This test makes the next one loud by
+// asserting against the REAL embedded module asset rather than a fixture, so a
+// future re-pin that moves the nav fails here instead of quietly dropping a page.
+func TestDashboardSidebarLinksCommsAfterOrg(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
 		recorder, httptest.NewRequest(http.MethodGet, "/", nil),
@@ -483,14 +496,22 @@ func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
 		t.Fatalf("GET / status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	chat := strings.Index(body, `<span style="flex:1">Chat</span>`)
-	comms := strings.Index(body, `href="/comms"`)
-	brain := strings.Index(body, `<span style="flex:1">Brain</span>`)
-	if chat < 0 || comms < 0 || brain < 0 || !(chat < comms && comms < brain) {
-		t.Fatalf("sidebar ordering chat=%d comms=%d brain=%d, want Chat < Comms < Brain", chat, comms, brain)
+	if !strings.Contains(body, dashboardCommsNavAnchor) {
+		t.Fatalf("the module asset no longer contains the Comms nav anchor %q; the injection would silently drop the Comms entry - repoint dashboardCommsNavAnchor at a surviving nav entry's tail", dashboardCommsNavAnchor)
 	}
-	if !strings.Contains(body[comms:brain], `<span style="flex:1">Comms</span>`) {
+	org := strings.Index(body, `<span style="flex:1">Org</span>`)
+	comms := strings.Index(body, `href="/comms"`)
+	if org < 0 || comms < 0 || org > comms {
+		t.Fatalf("sidebar ordering org=%d comms=%d, want Org < Comms", org, comms)
+	}
+	if !strings.Contains(body[comms:], `<span style="flex:1">Comms</span>`) {
 		t.Fatal("Comms sidebar link is missing its visible label")
+	}
+	// The pages this campaign removed must not be advertised any more.
+	for _, gone := range []string{`<span style="flex:1">Chat</span>`, `<span style="flex:1">Brain</span>`} {
+		if strings.Contains(body, gone) {
+			t.Fatalf("sidebar still advertises a removed page: %s", gone)
+		}
 	}
 }
 
