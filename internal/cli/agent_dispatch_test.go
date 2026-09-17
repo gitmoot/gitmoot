@@ -2003,3 +2003,81 @@ func TestDelegatedMessageMayStartWithADash(t *testing.T) {
 		t.Fatalf("positionals = %v, want exactly the message", fs.Args())
 	}
 }
+
+// #2197: A BYPASS NOBODY CAN QUERY IS INDISTINGUISHABLE FROM A ROUTER THAT
+// SILENTLY DID NOT RUN. Measured 2026-09-17: three dispatches by one seat
+// skipped the router on the new build and NOTHING IN THE STORE COULD SAY WHY -
+// the reason was printed to stderr and nowhere else, so causes could be
+// eliminated but none named. The reason is now a job event.
+func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		extra []string
+		want  string
+	}{
+		{"no acting role", nil, "no --org-role"},
+		{"an inexpressible flag", []string{"--org-role", "joltra", "--skip-native-review-fanout"}, "--skip-native-review-fanout"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := config.Initialize(paths); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+				file.Close()
+				t.Fatal(err)
+			}
+			file.Close()
+			store := openCLIJobStore(t, home)
+			defer store.Close()
+			checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+			seedReviewDispatchFixture(t, store, checkout)
+			seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+				return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+			})
+			installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+			previousGitHubFactory := newAgentDispatchGitHubClient
+			newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+			t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+			args := append([]string{
+				"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+				"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+				"--home", home,
+			}, testCase.extra...)
+			var stdout, stderr bytes.Buffer
+			if code := runAgentReview(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+			jobs, err := store.ListJobs(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs) != 1 {
+				t.Fatalf("jobs = %+v, want one", jobs)
+			}
+			events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var recorded string
+			for _, event := range events {
+				if event.Kind == "router_bypassed" {
+					recorded = event.Message
+				}
+			}
+			if recorded == "" {
+				t.Fatalf("no router_bypassed event on the job: the reason exists only on stderr, which is what this fixes")
+			}
+			if !strings.Contains(recorded, testCase.want) {
+				t.Fatalf("router_bypassed = %q, want it to name %q", recorded, testCase.want)
+			}
+		})
+	}
+}
