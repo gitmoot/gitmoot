@@ -3405,8 +3405,10 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		want string
 	}{
 		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
-		{name: "inline form", args: []string{"planner", "do the work", "--recipe=decompose-and-verify"}, want: "decompose-and-verify"},
-		{name: "third valid id", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
+		// #2203 retired decompose-and-verify, so the inline form is exercised with a
+		// SURVIVING id. Keeping it on the retired one asserted that a removed recipe
+		// is still selectable.
+		{name: "inline form", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
 		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
 	}
 	for _, tt := range tests {
@@ -3432,10 +3434,15 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		if !strings.Contains(errText, `unknown recipe "bogus"`) {
 			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
 		}
-		for _, id := range []string{"review-panel", "decompose-and-verify", "verifier"} {
+		for _, id := range []string{"review-panel", "verifier"} {
 			if !strings.Contains(errText, id) {
 				t.Fatalf("stderr missing valid id %q: %q", id, errText)
 			}
+		}
+		// The retired id must NOT be offered as a choice. Without this the list
+		// could regrow it and the loop above would still pass.
+		if strings.Contains(errText, "decompose-and-verify") {
+			t.Fatalf("stderr offers the retired decompose-and-verify recipe: %q", errText)
 		}
 	})
 }
