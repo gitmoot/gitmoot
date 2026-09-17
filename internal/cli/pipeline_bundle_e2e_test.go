@@ -286,17 +286,9 @@ func writePipelineBundleVariant(t *testing.T, source string, mutate func(*pipeli
 	if err := os.WriteFile(filepath.Join(target, "spec.yaml"), readPipelineBundleTestFile(t, filepath.Join(source, "spec.yaml")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(target, "templates"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, agent := range manifest.Agents {
-		if agent.TemplateRef == "" {
-			continue
-		}
-		raw := readPipelineBundleTestFile(t, filepath.Join(source, "templates", agent.TemplateRef+".md"))
-		if err := os.WriteFile(filepath.Join(target, "templates", agent.TemplateRef+".md"), raw, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// #2204: a bundle carries each agent's template id as a REFERENCE only, so a
+	// variant needs bundle.yaml + spec.yaml and nothing else. Copying a
+	// templates/ directory here killed three subtests in this helper before they
+	// reached the import they exist to exercise.
 	return target
 }

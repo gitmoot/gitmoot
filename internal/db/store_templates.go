@@ -174,6 +174,18 @@ func (s *Store) ListAgentTemplateVersions(ctx context.Context, templateID string
 }
 
 // RevertAgentTemplateVersion makes a previously superseded version current
+//
+// It has NO production caller after #2204 removed `agent template revert`, and
+// round-1 review of #2211 correctly flagged that. It is kept deliberately, and
+// removing it was tried and reversed: the rollback invariant it enforces -
+// `superseded` is the one state it accepts, so a current or retired version
+// cannot be silently resurrected - is what makes the documented hand-seed and
+// hand-edit flow safe on tables this campaign KEEPS. Deleting the method also
+// deletes the three tests that pin that invariant, which is a net loss of
+// coverage for a capability the campaign preserves on purpose.
+//
+// If a later phase decides installed templates are immutable, this goes with
+// UpsertAgentTemplate in the same change, not before it.
 // again (a rollback): it supersedes the live current version, promotes the target
 // back to `current`, and recomputes the template's current/latest pointers. Only a
 // `superseded` target is accepted, so a revert can never resurrect a retired row.

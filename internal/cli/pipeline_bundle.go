@@ -479,14 +479,24 @@ func stringSlicesEqual(left, right []string) bool {
 }
 
 type pipelineBundleRequirementReport struct {
-	Runtimes    map[string]string
+	Runtimes map[string]string
+	// Templates reports, per template id an imported agent references, whether
+	// the row exists in THIS home. #2204 made a bundle carry the id as a
+	// reference only - the content no longer travels - so the row has to be here
+	// already. Nothing checked it at import, and the round-1 review of #2211
+	// found the consequence: the report printed all-green, the agent registered,
+	// and every stage job then died at dispatch with `references missing
+	// template`. The prerequisite is reported the same soft way a missing
+	// upstream pipeline is, because both leave the pipeline installed but unable
+	// to run rather than corrupt.
+	Templates   map[string]string
 	Upstreams   map[string]string
 	AgentErrors []error
 	MapErrors   []error
 }
 
 func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, manifest pipelineBundleManifest, agentMap map[string]string) pipelineBundleRequirementReport {
-	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Upstreams: map[string]string{}}
+	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Templates: map[string]string{}, Upstreams: map[string]string{}}
 	for _, name := range manifest.Requirements.Runtimes {
 		if pipelineBundleRuntimeAvailable(name) {
 			report.Runtimes[name] = "present"
@@ -503,6 +513,24 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, man
 		} else {
 			report.Upstreams[requirement] = "missing (pipeline will remain dormant)"
 		}
+	}
+	for _, agent := range manifest.Agents {
+		ref := strings.TrimSpace(agent.TemplateRef)
+		if ref == "" {
+			continue
+		}
+		if _, seen := report.Templates[ref]; seen {
+			continue
+		}
+		if _, err := store.GetAgentTemplateReference(ctx, ref); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				report.Templates[ref] = "missing (stage jobs will fail at dispatch until the row is seeded)"
+			} else {
+				report.Templates[ref] = "unchecked (" + err.Error() + ")"
+			}
+			continue
+		}
+		report.Templates[ref] = "present"
 	}
 	agentByName := make(map[string]pipelineBundleAgent, len(manifest.Agents))
 	for _, agent := range manifest.Agents {
@@ -528,6 +556,7 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, man
 func printPipelineBundleRequirements(w io.Writer, report pipelineBundleRequirementReport, manifest pipelineBundleManifest) {
 	fmt.Fprintln(w, "Requirements report:")
 	printRequirementMap(w, "runtime", report.Runtimes)
+	printRequirementMap(w, "template", report.Templates)
 	printRequirementMap(w, "upstream pipeline", report.Upstreams)
 	if len(manifest.WriteAuthority) == 0 {
 		fmt.Fprintln(w, "  write authority: none")

@@ -2812,9 +2812,17 @@ func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 		"--runtime", "shell",
 		"--repo", "owner/repo",
 		"--path", repoDir,
+		// --capability ask keeps this test on its OWN gate. #2204 removed the
+		// --template flag this invocation used to carry, and without a template
+		// resolveAgentDefaults falls back to capabilities [ask review implement];
+		// the implement-write-policy refusal then fires at agent.go:1847 and
+		// returns 2 BEFORE the shell-runtime refusal this test exists to pin.
+		// Round-1 review of #2211 caught it: the test was passing judgement on a
+		// gate it does not name.
+		"--capability", "ask",
 	}, &stdout, &stderr)
 	if code != 1 {
-		t.Fatalf("start exit code = %d, want 1", code)
+		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
 		t.Fatalf("stderr = %q", stderr.String())
