@@ -2825,17 +2825,10 @@ CREATE INDEX IF NOT EXISTS idx_review_requests_job ON review_requests(job_id);
 	// memory_observations, and `workflow note --remember` - the only writer that
 	// ever set it - is removed too. Journal notes keep every other column, so the
 	// org ledger is untouched by this.
-	//
-	// The #884 partial index idx_jobs_memory_harvest_terminal on jobs is dropped
-	// here too: its only consumer was the harvest sweep's receipt anti-join, which
-	// is deleted, so it was left writing on every job state transition for nobody.
-	// The jobs.result_hash column added alongside it stays - proof grading reads
-	// it to verify reported result integrity.
 	`
 DROP INDEX IF EXISTS idx_memory_obs_owner;
 DROP INDEX IF EXISTS idx_confirmed_repo_key;
 DROP INDEX IF EXISTS idx_confirmed_general_key;
-DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal;
 DROP TABLE IF EXISTS confirmed_memories_fts;
 DROP TABLE IF EXISTS confirmed_memories;
 DROP TABLE IF EXISTS memory_cluster_members;
@@ -2846,5 +2839,30 @@ DROP TABLE IF EXISTS memory_harvest_state;
 DROP TABLE IF EXISTS memory_harvest_runs;
 DROP TABLE IF EXISTS memory_observations;
 ALTER TABLE workflow_notes DROP COLUMN memory_observation_id;
+	`,
+	// #2202 round 2, P2. The #884 partial index idx_jobs_memory_harvest_terminal
+	// on jobs is dead - its only consumer was the harvest sweep's receipt
+	// anti-join - so it was left writing on every job state transition for
+	// nobody. It gets its OWN migration rather than being added to the one above,
+	// which is where I put it first and was wrong.
+	//
+	// Migrate iterates POSITIONALLY and skips any version already recorded in
+	// schema_migrations, so editing a migration that some database has already
+	// applied means that database never runs the addition. "Not shipped to main
+	// yet" is not the test: every store that ran the PRIOR head of this branch -
+	// reviewer probe databases, dev daemons, any checkout - recorded this
+	// version and would keep the dead index forever while the comment claimed it
+	// was dropped. Measured on this box before fixing it: a store at version 143
+	// from the prior head still had the index present.
+	//
+	// This file already documents the same mistake at #1850 round 2 F3, where an
+	// in-place edit to the #1822 migration reached nothing on every developer and
+	// reviewer daemon here. Appending is the only safe shape once a migration can
+	// have been applied anywhere.
+	//
+	// jobs.result_hash, added alongside the index, STAYS: proof grading reads it
+	// to verify reported result integrity.
+	`
+DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal;
 	`,
 }

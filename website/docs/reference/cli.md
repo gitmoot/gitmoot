@@ -2186,6 +2186,13 @@ disables detection. Missing Herdr state, command failures, timeouts, and invalid
 output are ignored so the note still succeeds, and author is not inferred.
 Only a full UUID is eligible for the dashboard resume command. If coordinator
 author metadata is empty, the newest note author is used.
+`workflow note --repo <owner/repo>` records the note's repo COLUMN and nothing
+else - it opts the note into no other behaviour. Malformed input is refused with
+exit 2 rather than stored as a column nothing matches. Prefer setting it on an
+operating-mode or reconciliation note: the workload-mode gate reads those
+through two bounded windows, one repo-scoped and one for the repo-less rows, so
+a scoped note cannot be crowded out of the window by other repositories' notes.
+
 Each workflow has a stable `description` and live `status`. Description is
 auto-seeded from a referenced local issue title, else the first note sentence,
 else the label campaign; override it with `workflow describe`. Legacy

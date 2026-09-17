@@ -88,6 +88,21 @@ func TestDefaultConfigNamesNoRemovedCommand(t *testing.T) {
 		"# the daemon harvests post-terminal insight",
 		"# grooming proposes dedupe/merge/expiry actions",
 		"# see the Agent Persistent Memory concepts page",
+		// #2202 round 2 F8's probe set, verbatim: every one of these escaped the
+		// round-1 vocabulary. They are controls now, not examples.
+		"# harvest_enabled = false",
+		"# harvest_runtime = \"codex\"",
+		"# groom_split_llm = true",
+		"# groom_stale_age = \"720h\"",
+		"# distill_at_terminal = true",
+		"# distill_max_per_job = 3",
+		"# cluster_fanout = 6",
+		"# cluster_depth_cap = 4",
+		"# memory=true",
+		"# memory = false",
+		"# memory =  true",
+		"# [memory.ingest]",
+		"# [memory.observations]",
 	} {
 		if named := removedSurfaceNamed(mutant); len(named) == 0 {
 			t.Fatalf("matcher did not fire on %q; a silent matcher passes on any config", mutant)
@@ -147,6 +162,13 @@ var removedSurfaceWords = regexp.MustCompile(`(?i)\b(?:` + strings.Join([]string
 	`memory_[a-z_]+`, `ingest_auto_confirm`, `default_enroll`, `token_budget`,
 	`groom(?:ed|ing|s)?`, `harvests?`, `distill(?:ed|ing|s)?`,
 	`agent-memory`, `install-defaults`,
+	// #2202 round 2, F8. The knob FAMILIES, matched with their underscore tails:
+	// \b cannot fire before '_', so `harvest_enabled`, `groom_split_llm`,
+	// `distill_at_terminal` and `cluster_fanout` all escaped the bare stems
+	// above. That is the shape a reintroduction under a renamed section (say
+	// [insights]) would take, which is exactly what the guard is for.
+	`harvest_[a-z_]+`, `groom_[a-z_]+`, `distill_[a-z_]+`, `cluster_[a-z_]+`,
+	`observations?_[a-z_]+`, `recall_[a-z_]+`,
 }, "|") + `)\b`)
 
 // removedSurfaceLiterals cover terms whose edges are not word characters, where a
@@ -162,8 +184,16 @@ var removedSurfaceLiterals = []string{
 	"memory pool", "memory block",
 }
 
+// removedSurfaceShapes cover forms whose spelling varies, where an exact literal
+// pins one writing and lets the rest through. #2202 round 2 F8 measured the gap:
+// `memory = true` as a literal missed `memory=true`, `memory = false` and
+// `memory =  true`, and `[[memory.ingest]]` missed the single-table
+// `[memory.ingest]`. A shape matches the family instead of one keystroke pattern.
+var removedSurfaceShapes = regexp.MustCompile(`(?i)(?:memory\s*=\s*(?:true|false)|\[{1,2}memory(?:\.[a-z_]+)?\]{1,2})`)
+
 func removedSurfaceNamed(text string) []string {
 	named := removedSurfaceWords.FindAllString(text, -1)
+	named = append(named, removedSurfaceShapes.FindAllString(text, -1)...)
 	lowered := strings.ToLower(text)
 	for _, literal := range removedSurfaceLiterals {
 		if strings.Contains(lowered, literal) {

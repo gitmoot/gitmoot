@@ -71,9 +71,13 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 }
 
 // newDashboardWebHandler shadows the bounded endpoints covered by the frozen
-// #948/#956 cache policies plus the already-local knowledge handler, and serves
-// #958's widened workflow JSON (description/status) through the cached workflows
-// route. Every other route remains owned by the pinned dashboard module.
+// #948/#956 cache policies and serves #958's widened workflow JSON
+// (description/status) through the cached workflows route. It also registers the
+// two retired /api/brain/* routes, which exist only so the pinned module's
+// frontend parses JSON rather than the HTML shell until #2206 removes the nav.
+// The local knowledge handler this comment used to name went with the brain
+// (#2202): Knowledge() is now a DataSource stub served by the pinned module.
+// Every other route remains owned by that module.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)

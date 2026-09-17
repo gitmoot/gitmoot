@@ -2528,6 +2528,13 @@ is fail-open and never prevents a note, and it does not infer `--author`.
 Dashboard resume commands require a full UUID; legacy short session values stay
 visible in the workflow index as context but are not rendered into a broken
 command. Author defaults to the newest note author.
+`workflow note --repo <owner/repo>` records the note's repo COLUMN and nothing
+else - it opts the note into no other behaviour. Malformed input is refused with
+exit 2 rather than stored as a column nothing matches. Prefer setting it on an
+operating-mode or reconciliation note: the workload-mode gate reads those
+through two bounded windows, one repo-scoped and one for the repo-less rows, so
+a scoped note cannot be crowded out of the window by other repositories' notes.
+
 Each workflow has a stable `description` and live `status`, both shown by
 `workflow show`. Description is seeded automatically from a referenced local
 issue title, else the first kickoff-note sentence, else the label campaign.
