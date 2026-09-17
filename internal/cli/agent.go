@@ -516,6 +516,57 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent review: %v\n", err)
 		return 2
 	}
+	// #2196: ROUTE THROUGH `review request` INSTEAD OF BESIDE IT. Measured
+	// 2026-09-16: 687 of 688 reviews on this box came through this command, so
+	// the four features the router adds - exact-head claim and dedup, delta
+	// baseline against the last verdict, availability-aware runtime choice, and
+	// the verdict subscription - were reachable in principle and unused in
+	// practice. Announcing the other command was measured at 1 in 688, so the
+	// surface everyone uses now carries the machinery rather than asking seats
+	// to type a different verb.
+	//
+	// The named reviewer SURVIVES: `review request --reviewer` routes a named
+	// agent own-first, which is the property that made this command worth
+	// keeping. The caller's message and --lead survive because they were added
+	// to that command first; delegating without them would have silently dropped
+	// every seat's review instructions and its fix target.
+	//
+	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
+	// them, and both SAY SO rather than degrading quietly.
+	// A FLAG THAT THE DIRECT PATH ITSELF REFUSES MUST REFUSE FIRST. --draft and
+	// --ready are implement-only; printing "dispatched WITHOUT the review router"
+	// and then refusing tells the caller what happened and then does something
+	// else (#2196 review).
+	if mode := strings.TrimSpace(options.pullRequestMode); mode != "" {
+		fmt.Fprintf(stderr, "agent review: --%s is only supported when routing to implement\n", mode)
+		return 2
+	}
+	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
+		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
+			// NOT SILENTLY DROPPED AND NOT FATAL. The router has no counterpart
+			// for these, so delegating would discard a stated operator input -
+			// the invisible-degradation shape this work exists to remove. The
+			// direct path runs instead and names what forced it, because a
+			// caller who is not told cannot know its review is different from
+			// the one it asked for.
+			fmt.Fprintf(stderr, "agent review: dispatched WITHOUT the review router: %s cannot be expressed by `review request`\n",
+				strings.Join(unexpressible, ", "))
+		} else {
+			return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
+		}
+	}
+	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
+	// REQUIRES --role because the role is who the verdict is delivered to, and a
+	// review nobody receives is the defect #2194 exists to fix. Failing the
+	// dispatch instead would break every caller that reviews without a role
+	// (TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer is one), so
+	// the direct path stays and the #2194 hold below states the consequence.
+	//
+	// FOREGROUND IS NOT DELEGATED AND THAT IS A STATED LIMIT, not an oversight.
+	// `review request` always dispatches a daemon-owned job; a foreground review
+	// runs in this process and streams. Converting it would change what the
+	// caller observes, so it keeps the direct path and keeps the #2194
+	// subscription attached below.
 	output, exit := dispatchAgentCommand(options, "review", "explicit agent review", "agent_review", stdout, stderr)
 	if exit != 0 {
 		return exit
@@ -600,6 +651,92 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 		output.SubscriptionHolds = append(output.SubscriptionHolds,
 			fmt.Sprintf("subscription failed (%v): this verdict will not wake %s", err, role))
 	}
+}
+
+// reviewRequestArgsFromAgentReview maps this command's options onto the router
+// command's flags (#2196). Every value the caller supplied is carried; nothing
+// is invented. The reviewer is passed EXPLICITLY because the caller named it -
+// that is what distinguishes this surface from a bare router request.
+// agentReviewInputsTheRouterCannotCarry names every supplied input that
+// `review request` has no flag for (#2196 review). Enumerated MECHANICALLY
+// against the two flag sets rather than by hand: hand-enumeration found the
+// message and --lead and missed eight others, and the arithmetic said it
+// probably would.
+//
+// The four that ARE carryable - model, effort, workflow, session - were added to
+// the router command instead of listed here, because dropping --model turns an
+// executed review into a static one with nothing failing.
+func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
+	var named []string
+	for _, candidate := range []struct {
+		flag string
+		set  bool
+	}{
+		{"--action", strings.TrimSpace(options.action) != "" && !strings.EqualFold(strings.TrimSpace(options.action), "review")},
+		{"--type", strings.TrimSpace(options.typeName) != ""},
+		{"--task", strings.TrimSpace(options.taskID) != ""},
+		{"--base", strings.TrimSpace(options.base) != ""},
+		{"--recipe", strings.TrimSpace(options.recipe) != ""},
+		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
+		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
+		{"--" + strings.TrimSpace(options.pullRequestMode), strings.TrimSpace(options.pullRequestMode) != ""},
+		// --json CHANGES SCHEMA on the delegated path: `review request` prints a
+		// different object. A programmatic caller parsing the old shape reads
+		// zeros or errors, silently. Keeping the direct path preserves the
+		// contract it was written against (#2196 review, P2).
+		{"--json", options.jsonOutput},
+		// NO --lead AND NO --no-fix-target IS A REFUSAL ON THE DIRECT PATH, NOT
+		// A REVIEW-ONLY DISPATCH (#2054): it falls back to the reviewer as lead
+		// and then VALIDATES that agent, refusing an unregistered or unsubscribed
+		// one. The router expresses only "lead" or "no fix target", so delegating
+		// an absent lead would convert a deliberate refusal into a quiet success
+		// - strictly worse than dropping a flag, because the caller gets the
+		// outcome by accident rather than by permission. Same shape as an
+		// auto-merge with no expectedHeadOid: a guard that stops existing and
+		// nothing announces it (#2196 review, P2).
+		{"absent --lead with no --no-fix-target", strings.TrimSpace(options.lead) == "" && !options.noFixTarget},
+	} {
+		if candidate.set {
+			named = append(named, candidate.flag)
+		}
+	}
+	return named
+}
+
+func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
+	args := []string{"--pr", strconv.Itoa(options.prNumber)}
+	for _, pair := range [][2]string{
+		{"--repo", options.repo},
+		{"--model", options.model},
+		{"--effort", options.effort},
+		{"--workflow", options.workflowID},
+		{"--session", options.session},
+		{"--head", options.headSHA},
+		{"--branch", options.branch},
+		{"--role", options.orgRole},
+		{"--reviewer", options.agent},
+		{"--runtime", options.runtime},
+		{"--lead", options.lead},
+		{"--home", options.home},
+	} {
+		if value := strings.TrimSpace(pair[1]); value != "" {
+			args = append(args, pair[0], value)
+		}
+	}
+	if options.allowPromptHeadMismatch {
+		args = append(args, "--allow-prompt-head-mismatch")
+	}
+	if options.jsonOutput {
+		args = append(args, "--json")
+	}
+	if message := strings.TrimSpace(options.message); message != "" {
+		// "--" FIRST. The message re-enters a flag parser on the delegated path,
+		// which it never did before, so `agent review r "-check the diff"` exited
+		// 2 with "flag provided but not defined" (#2196 review). A caller whose
+		// review instructions happen to start with a dash is not making an error.
+		args = append(args, "--", message)
+	}
+	return args
 }
 
 func runAgentImplement(args []string, stdout, stderr io.Writer) int {

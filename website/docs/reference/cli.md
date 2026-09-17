@@ -1320,16 +1320,42 @@ concurrently](../concepts/agents-templates-jobs-locks.md#running-one-agents-jobs
 `gitmoot review request` is the front door for asking for an independent review.
 The requester names the pull request; Gitmoot picks the reviewer, runtime and
 model, deduplicates on the exact head, and wakes the requester when the verdict
-is saved. It replaces hand-assembling `agent review ... --runtime omp --model
-... --no-fix-target` per seat; that lower-level form remains the engine
-underneath and is still valid for a deliberate manual dispatch.
+is saved.
+
+**`gitmoot agent review` now routes THROUGH this command.** It used to dispatch
+beside it, which is why the router's machinery went unused: measured 2026-09-16,
+687 of 688 reviews on one box came through `agent review`, so exact-head dedup,
+the delta baseline, availability-aware runtime choice and the verdict wake were
+reachable in principle and unused in practice. The lower-level form keeps its
+own surface — it NAMES a reviewer, carries a review message, and takes
+`--lead` — and those inputs are forwarded rather than discarded.
 
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
-    [--runtime <name>] [--json]
+    [--runtime <name>] [--model <provider/model>] [--effort <level>] [--workflow <id>] \
+    [--session <ref>] [--lead <implementer>] [--full] [--allow-prompt-head-mismatch] [--json] \
+    [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 ```
+
+`--lead` names the implementer a changes-requested verdict routes to; with no
+`--lead` the request dispatches with no fix target and says so. The positional
+message is appended to the router's own brief under a labelled header, so a
+reviewer can tell operator instructions from generated framing — pass it after
+`--` if it starts with a dash.
+
+Two things `agent review` reports that are easy to miss:
+
+- **A dispatch that cannot be delegated says why.** No `--org-role` (the router
+  requires a verdict recipient), `--foreground`, or any flag the router cannot
+  express keeps the direct path and names the flag on stderr: a silently
+  different review is worse than a refused one.
+- **An ATTACHING request is told what it lost.** A second request at a head that
+  already holds a claim attaches to the running review rather than spending a
+  second reviewer — and prints which of your `--reviewer`, instructions,
+  `--lead`, `--model` or `--runtime` were discarded, because a caller told only
+  that it is "awaiting a verdict" would wait on a review it never commissioned.
 
 `--runtime` overrides the omp pin. The router pins omp because it SELECTS the
 reviewer, so the runtime is its choice rather than an agent's identity — but a

@@ -61,6 +61,7 @@ type reviewRequestOutput struct {
 	// Baseline is the prior head a delta review was bounded to; BaselineSkipped
 	// names why a full review was dispatched instead (#2177). Exactly one is set
 	// on a dispatch, and neither on an attach or a reused verdict.
+	Runtime         string   `json:"runtime,omitempty"`
 	Baseline        string   `json:"baseline,omitempty"`
 	BaselineSkipped string   `json:"baseline_skipped,omitempty"`
 	AwaitedFactID   int64    `json:"awaited_fact_id"`
@@ -88,7 +89,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
@@ -100,6 +101,22 @@ func printReviewUsage(w io.Writer) {
 }
 
 type reviewRequestOptions struct {
+	// lead and message exist so `agent review` can route THROUGH this command
+	// instead of beside it (#2196). Without them delegation would silently drop
+	// the caller's review instructions and its fix target, which is the whole
+	// reason the other surface was still being used.
+	lead    string
+	message string
+	// model, effort, workflowID and session are carried so delegation from
+	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
+	// is load-bearing: every dispatch on this campaign passes
+	// --model devin/swe-2, and a review that loses it still runs and still
+	// returns a verdict - a STATIC one. That failure is invisible, which is the
+	// exact shape this work exists to remove.
+	model                   string
+	effort                  string
+	workflowID              string
+	session                 string
 	home                    string
 	repo                    string
 	pr                      int
@@ -131,6 +148,11 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.StringVar(&opts.lead, "lead", "", "implementer a changes-requested verdict routes to; empty dispatches with no fix target")
+	fs.StringVar(&opts.model, "model", "", "provider/model the review runs on, overriding the pool head")
+	fs.StringVar(&opts.effort, "effort", "", "reasoning effort for runtimes that accept one")
+	fs.StringVar(&opts.workflowID, "workflow", "", "workflow the review job is filed under")
+	fs.StringVar(&opts.session, "session", "", "runtime session the review reuses")
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
@@ -141,7 +163,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if fs.NArg() != 0 || opts.pr <= 0 {
+	if fs.NArg() == 1 {
+		opts.message = strings.TrimSpace(fs.Arg(0))
+	}
+	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
 		return 2
 	}
@@ -194,6 +219,29 @@ func effectiveReviewRuntime(override, selected string) string {
 
 // reviewRequestRuntime applies the router's omp pin unless the operator named a
 // runtime. One site for the pin, so a future caller cannot lose the override.
+// reviewRequestInstructions composes the router brief and appends the caller's
+// own message when one is given (#2196). The router text comes FIRST so the
+// scope, purpose and head framing cannot be displaced by a caller's prose, and
+// the caller's message is labelled so a reviewer can tell operator instructions
+// from generated framing.
+// reviewRequestModel resolves the model a review runs on: an explicit --model
+// wins, otherwise the pool head for the effective runtime (#2196 review).
+func reviewRequestModel(opts reviewRequestOptions, runtimeName string, pool []string) string {
+	if explicit := strings.TrimSpace(opts.model); explicit != "" {
+		return explicit
+	}
+	return reviewModelForRuntime(runtimeName, pool)
+}
+
+func reviewRequestInstructions(opts reviewRequestOptions, repo string, head string, scope *workflow.ReviewScope) string {
+	brief := reviewRouterInstructions(opts.purpose, repo, opts.pr, head, scope)
+	message := strings.TrimSpace(opts.message)
+	if message == "" {
+		return brief
+	}
+	return brief + "\n\nREQUESTER INSTRUCTIONS (verbatim from the dispatching operator):\n" + message
+}
+
 func reviewRequestRuntime(override, selected, registered string) string {
 	if trimmed := strings.TrimSpace(override); trimmed != "" {
 		return trimmed
@@ -338,24 +386,34 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		RepoFlag:     repo.FullName(),
 		Agent:        reviewer.Name,
 		Action:       "review",
-		Instructions: reviewRouterInstructions(opts.purpose, repo.FullName(), opts.pr, head, scope),
+		Instructions: reviewRequestInstructions(opts, repo.FullName(), head, scope),
 		Background:   true,
 		// Gated on the EFFECTIVE runtime, not on whether an override was
 		// emitted: a review running on the agent's own non-omp runtime must not
 		// carry an omp pool model either.
-		Model: reviewModelForRuntime(effectiveReviewRuntime(opts.runtime, selectedRuntime), pool),
+		// AN EXPLICIT --model WINS over the pool head, the same precedence an
+		// explicit payload timeout has over the review class floor (#2192): a
+		// stated operator choice is not a default to be improved on.
+		Model:          reviewRequestModel(opts, effectiveReviewRuntime(opts.runtime, selectedRuntime), pool),
+		Effort:         strings.TrimSpace(opts.effort),
+		WorkflowID:     strings.TrimSpace(opts.workflowID),
+		RuntimeSession: strings.TrimSpace(opts.session),
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
 		// hold is written for that runtime (#2181), with nothing to fall back to.
-		Runtime:              reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
-		ActingOrgRole:        opts.role,
-		OperatorOrigin:       true,
-		Home:                 opts.home,
-		PullRequest:          opts.pr,
-		HeadSHA:              head,
-		Branch:               branch,
-		NoFixTarget:          true,
+		Runtime:        reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
+		ActingOrgRole:  opts.role,
+		OperatorOrigin: true,
+		Home:           opts.home,
+		PullRequest:    opts.pr,
+		HeadSHA:        head,
+		Branch:         branch,
+		LeadAgent:      strings.TrimSpace(opts.lead),
+		// A NAMED LEAD IS A FIX TARGET. The router's own requests carry none, so
+		// a changes-requested verdict has nowhere to route and says so; a caller
+		// that names an implementer gets the routing it asked for (#2196).
+		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
 		SelectedAction:       "review",
 		SelectedActionReason: "review router " + opts.purpose,
 		ExecutionPath:        reviewRequestExecutionPath,
@@ -381,7 +439,16 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	output.JobID = dispatched.JobID
 	output.JobState = dispatched.State
 	output.Reviewer = reviewer.Name
-	output.Model = pool[0]
+	// THE DISPATCHED VALUES, NOT THE POOL HEAD. output.Model was pool[0], which
+	// misreports an explicit --model and made a working override look dropped
+	// (#2196 review). request.Model and request.Runtime are what the job carries.
+	output.Model = request.Model
+	// THE RESOLVED RUNTIME, NOT THE OVERRIDE FIELD. request.Runtime is
+	// deliberately EMPTY when the router's choice equals the reviewer's
+	// registered runtime, which is the normal case for a named reviewer - so
+	// reporting it left the printer fabricating "omp" for a review running on
+	// claude (#2196 review, P2).
+	output.Runtime = effectiveReviewRuntime(opts.runtime, selectedRuntime)
 	output.WatchCommand = jobWatchCommand(dispatched.JobID, opts.home)
 	if err := subscribeReviewRequester(ctx, store, &output, opts); err != nil {
 		return reviewRequestOutput{}, err
@@ -715,12 +782,40 @@ func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.Revie
 	return db.Job{}, now.Sub(claimed) > reviewRequestDispatchWindow, nil
 }
 
+// attachDiscardedInputs names what an ATTACHING request supplied and did not
+// get (#2196 review, P2). A caller whose request attached to someone else's
+// running review is told it is awaiting a verdict; without this it is NOT told
+// that its own reviewer, message and lead were discarded, so it waits on a
+// review it believes it commissioned. That is this campaign's central defect at
+// the dispatch surface, and the remedy is the one #2194 already uses: say what
+// did not happen.
+func attachDiscardedInputs(output reviewRequestOutput, opts reviewRequestOptions) []string {
+	var holds []string
+	if reviewer := strings.TrimSpace(opts.reviewer); reviewer != "" && !strings.EqualFold(reviewer, output.Reviewer) {
+		holds = append(holds, fmt.Sprintf("your --reviewer %s was NOT used: this attached to %s's running review", reviewer, output.Reviewer))
+	}
+	if strings.TrimSpace(opts.message) != "" {
+		holds = append(holds, "your review instructions were NOT sent: the running review carries the instructions of whoever dispatched it")
+	}
+	if lead := strings.TrimSpace(opts.lead); lead != "" {
+		holds = append(holds, fmt.Sprintf("your --lead %s was NOT applied: a changes-requested verdict routes wherever the running review says", lead))
+	}
+	if wanted := strings.TrimSpace(opts.runtime); wanted != "" && !strings.EqualFold(wanted, output.Runtime) {
+		holds = append(holds, fmt.Sprintf("your --runtime %s was NOT used: the running review is on %s", wanted, firstNonEmpty(output.Runtime, "an unreported runtime")))
+	}
+	if model := strings.TrimSpace(opts.model); model != "" && !strings.EqualFold(model, output.Model) {
+		holds = append(holds, fmt.Sprintf("your --model %s was NOT used: the running review carries %s", model, output.Model))
+	}
+	return holds
+}
+
 func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, claim db.ReviewRequest, opts reviewRequestOptions) (reviewRequestOutput, error) {
 	output.State = reviewRequestAttached
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
 	output.Reviewer = job.Agent
 	output.Model = job.Model
+	output.Runtime = job.Runtime
 	output.WatchCommand = jobWatchCommand(output.JobID, opts.home)
 	if job.ID == "" {
 		// The holder is inside its dispatch window: the job is real and coming,
@@ -738,7 +833,21 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 		if strings.TrimSpace(payload.Model) != "" {
 			output.Model = payload.Model
 		}
+		// The job's OVERRIDE wins over its registered runtime: that is what it
+		// is running on. Left unset, every attach printed the fabricated "omp".
+		if strings.TrimSpace(payload.RuntimeOverride) != "" {
+			output.Runtime = payload.RuntimeOverride
+		}
 	}
+	// NO OVERRIDE MEANS THE AGENT'S OWN RUNTIME, which is what the job will run
+	// on - resolved from the agent row rather than guessed, because the job row
+	// carries the override and not the registered runtime (#2196 review, P2).
+	if strings.TrimSpace(output.Runtime) == "" && strings.TrimSpace(output.Reviewer) != "" {
+		if agent, err := store.GetAgent(ctx, output.Reviewer); err == nil {
+			output.Runtime = agent.Runtime
+		}
+	}
+	output.Holds = append(output.Holds, attachDiscardedInputs(output, opts)...)
 	if err := subscribeReviewRequester(ctx, store, &output, opts); err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -1249,7 +1358,17 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	}
 	fmt.Fprintln(w)
 	if output.Reviewer != "" {
-		fmt.Fprintf(w, "reviewer: %s on omp model %s\n", output.Reviewer, output.Model)
+		// THE RUNTIME IS REPORTED, NOT ASSUMED (#2196 review). This line
+		// hardcoded "on omp" and printed pool[0], so an operator passing
+		// --model or --runtime saw neither and concluded the override was
+		// dropped. That is worse than a silent drop: a silent drop produces no
+		// evidence, this produced POSITIVE FALSE EVIDENCE, and someone would
+		// have re-fixed a bug that was already fixed.
+		// NO FALLBACK. A default that is also a legal value cannot be told from
+		// a choice, and "omp" was BOTH the fallback and a real runtime - so the
+		// line read identically whether the runtime was known or invented. An
+		// unknown runtime now says so (#2196 review, P2).
+		fmt.Fprintf(w, "reviewer: %s on %s model %s\n", output.Reviewer, firstNonEmpty(output.Runtime, "an unreported runtime"), output.Model)
 	}
 	if output.Verdict != "" {
 		fmt.Fprintf(w, "verdict: %s (already saved; no new review spent)\n", output.Verdict)

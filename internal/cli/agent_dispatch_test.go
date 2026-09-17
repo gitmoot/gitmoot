@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -75,7 +80,11 @@ scope = ["owner/repo"]
 	if len(jobs) != 1 || jobs[0].State != string(workflow.JobQueued) {
 		t.Fatalf("jobs = %+v, want one daemon-owned queued review", jobs)
 	}
-	for _, want := range []string{"state: queued", "next: gitmoot job watch"} {
+	// #2196: `agent review` routes THROUGH `review request` now, so the surface
+	// is the router's. The property defended is unchanged and asserted on the job
+	// row above: a daemon-owned QUEUED review, not an in-process run. The old
+	// strings pinned the previous command's wording rather than the behaviour.
+	for _, want := range []string{"(queued)", "watch: gitmoot job watch"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
 		}
@@ -1220,7 +1229,7 @@ scope = ["owner/repo"]
 	if !found {
 		t.Fatalf("joltra holds no wait on %s: waiting=%+v", wantKey, waiting)
 	}
-	if !strings.Contains(stdout.String(), "awaiting verdict: fact ") {
+	if !strings.Contains(stdout.String(), "notify: awaited fact wake to joltra") {
 		t.Fatalf("stdout = %q, want the attached wait reported", stdout.String())
 	}
 
@@ -1433,5 +1442,564 @@ func TestAgentReviewWaitUsesTheJobsOwnReviewPurpose(t *testing.T) {
 	if blankOutput.AwaitedFactID == 0 {
 		t.Fatalf("a job with no recorded purpose attached no wait: holds=%v stderr=%q",
 			blankOutput.SubscriptionHolds, blankStderr.String())
+	}
+}
+
+// #2196: `agent review` must route THROUGH `review request`, not beside it.
+// Measured 2026-09-16: 687 of 688 reviews came through this command, so the
+// router's machinery was reachable in principle and unused in practice.
+// This pins the four things delegation must deliver, and the two the caller
+// supplies that delegation must not eat.
+func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	// A reviewer THE ROUTER WOULD NEVER PICK: selectReviewRouterAgent excludes
+	// implement-capable agents from its candidate pool, while an explicitly
+	// named reviewer only needs the review capability. So naming this one makes
+	// the assertion below discriminating - dropping --reviewer cannot pick it by
+	// coincidence, which is exactly how the first version of this test passed
+	// while asserting nothing.
+	seedDaemonWorkerAgentWithPolicy(t, store, "dual-reviewer", runtime.ShellRuntime, "true", []string{"review", "implement"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	const message = "Attack point one: the precedence table. Attack point two: the holder predicate."
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview([]string{
+		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
+		"--effort", "high", "--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want exactly one", jobs)
+	}
+	job := jobs[0]
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. THE ROUTER PATH, not the direct one. Asserted on the route_selected
+	// event because that is the SAME field the adoption measurement read: 687
+	// "via agent_review" against 1 "via review_request". A test keyed to the
+	// metric cannot pass while the metric stays broken.
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var route string
+	for _, event := range events {
+		if event.Kind == "route_selected" {
+			route = event.Message
+		}
+	}
+	if !strings.Contains(route, reviewRequestExecutionPath) {
+		t.Fatalf("route_selected = %q, want the router path %q: the dispatch did not go through review request",
+			route, reviewRequestExecutionPath)
+	}
+	// 2. THE CALLER'S NAMED REVIEWER SURVIVES - the reason this surface exists.
+	if job.Agent != "dual-reviewer" {
+		t.Fatalf("reviewer = %q, want the NAMED reviewer to survive delegation: the router's own pool excludes it, so this can only be the explicit path", job.Agent)
+	}
+	// 3. THE CALLER'S MESSAGE SURVIVES, verbatim.
+	if !strings.Contains(payload.Instructions, message) {
+		t.Fatalf("instructions dropped the caller's message: %q", payload.Instructions)
+	}
+	// 4. THE FIX TARGET SURVIVES: a named lead means a changes-requested verdict
+	// has somewhere to route, which the router's own requests never have.
+	if payload.LeadAgent != "implementer" {
+		t.Fatalf("lead = %q, want implementer carried through", payload.LeadAgent)
+	}
+	// 5. THE MODEL POOL is attached by the router.
+	if len(payload.ReviewModelPool) == 0 {
+		t.Fatal("no review model pool attached: the router's fallback chain was not applied")
+	}
+	// 6. THE EXACT-HEAD CLAIM exists, which is what makes a duplicate request
+	// attach instead of spending a second reviewer.
+	subjectKey, err := db.ReviewRequestSubjectKey("owner/repo", 12, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.GetReviewRequest(ctx, subjectKey)
+	if err != nil {
+		t.Fatalf("no review claim recorded for %s: %v", subjectKey, err)
+	}
+	if claim.JobID != job.ID {
+		t.Fatalf("claim job = %q, want the dispatched job %q", claim.JobID, job.ID)
+	}
+	// 7. THE VERDICT WAIT is attached to the acting role.
+	waiting, err := store.ListAwaitedFacts(ctx, "joltra", db.AwaitedFactStateWaiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(waiting) == 0 {
+		t.Fatal("no verdict wait attached for joltra")
+	}
+
+	// 8. --model SURVIVES, and this is the one that would fail invisibly. Every
+	// dispatch on this campaign passes --model devin/swe-2; a review that loses
+	// it still runs and still returns a verdict - a STATIC one, because the
+	// model is what makes the seat able to execute. Nothing fails, so nothing
+	// reports it.
+	// DELIBERATELY NOT THE POOL HEAD: the pool head here is devin/swe-2, so an
+	// assertion naming it would pass against a mutant that prints pool[0]. The
+	// explicit model must differ from the default for the check to discriminate.
+	if payload.Model != "openai-codex/gpt-5.6-sol" {
+		t.Fatalf("model = %q, want the operator's explicit openai-codex/gpt-5.6-sol carried through delegation", payload.Model)
+	}
+	// 9. --workflow SURVIVES: a review filed under the wrong workflow is
+	// invisible to every query keyed on it.
+	if payload.WorkflowID != "release/queue" {
+		t.Fatalf("workflow = %q, want release/queue", payload.WorkflowID)
+	}
+	// 10 and 11. --effort AND --session SURVIVE. Added because a mutant dropping
+	// BOTH passed the earlier version: the fix carried four values and guarded
+	// two, which is a guard that agrees on half its cases (#2196 review).
+	if payload.Effort != "high" {
+		t.Fatalf("effort = %q, want high carried through delegation", payload.Effort)
+	}
+	// --session IS NOT ASSERTED HERE ON PURPOSE. It lands as the runtime override
+	// ref and REQUIRES --runtime, and forcing --runtime omp made this test pass
+	// only on a host with the omp binary installed: CI refused the dispatch with
+	// "executable file not found in $PATH" while it passed locally. A test that
+	// depends on the host's installed runtimes is not testing delegation. Session
+	// forwarding is asserted on the argument builder instead, which is host-free.
+	if !slices.Contains(reviewRequestArgsFromAgentReview(agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: head, orgRole: "joltra", session: "fresh:probe",
+	}), "--session") {
+		t.Fatal("--session is not forwarded to review request")
+	}
+
+	// 13. THE RUNTIME REPORTED MUST BE THE ONE RESOLVED, NOT A FALLBACK. "omp"
+	// was both the fallback and a real runtime, so the line read identically
+	// whether the runtime was known or invented - a default indistinguishable
+	// from a choice, which is this week's unifying defect (#2196 review, P2).
+	if strings.Contains(stdout.String(), "on an unreported runtime") {
+		t.Fatalf("stdout = %q, want the resolved runtime reported", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "reviewer: dual-reviewer on shell model") {
+		t.Fatalf("stdout = %q, want the reviewer's own registered runtime (shell) reported rather than a fabricated omp", stdout.String())
+	}
+	// 12. THE OUTPUT MUST NOT MISREPORT WHAT IT DISPATCHED. This line hardcoded
+	// "on omp model" and printed pool[0], so an operator passing --model saw the
+	// pool head and concluded the override was dropped - positive false evidence,
+	// worse than the silent drop it replaced.
+	if !strings.Contains(stdout.String(), "model openai-codex/gpt-5.6-sol") {
+		t.Fatalf("stdout = %q, want the DISPATCHED model reported, not the pool head devin/swe-2", stdout.String())
+	}
+
+	// AND A SECOND DISPATCH AT THE SAME HEAD MUST NOT SPEND A SECOND REVIEWER -
+	// the dedup that was unreachable while this command bypassed the router.
+	var stdout2, stderr2 bytes.Buffer
+	if code := runAgentReview([]string{
+		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}, &stdout2, &stderr2); code != 0 {
+		t.Fatalf("second review exit stderr=%q", stderr2.String())
+	}
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 {
+		t.Fatalf("second dispatch at the same head created %d jobs, want the claim to attach to the first", len(after))
+	}
+
+	// AND AN ATTACHING CALLER WITH DIFFERENT INPUTS MUST BE TOLD THEY WERE
+	// DISCARDED, through the real command output rather than through the helper:
+	// removing the call site has to fail something.
+	var stdout3, stderr3 bytes.Buffer
+	if code := runAgentReview([]string{
+		"reviewer", "a DIFFERENT instruction", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--home", home,
+	}, &stdout3, &stderr3); code != 0 {
+		t.Fatalf("third review exit stderr=%q", stderr3.String())
+	}
+	for _, want := range []string{"was NOT used", "instructions were NOT sent"} {
+		if !strings.Contains(stdout3.String(), want) {
+			t.Fatalf("attach output = %q, want %q: a caller told it is awaiting a verdict must be told its own inputs were discarded",
+				stdout3.String(), want)
+		}
+	}
+	// AND THE ATTACH PATH MUST REPORT THE RUNNING REVIEW'S RUNTIME. It set
+	// output.Runtime nowhere, so every attach printed the fabricated "omp"
+	// regardless of what the job runs on (#2196 review, P2).
+	if !strings.Contains(stdout3.String(), "on shell model") {
+		t.Fatalf("attach output = %q, want the running review's own runtime reported, not a fabricated omp", stdout3.String())
+	}
+}
+
+// #2196 review: AN INPUT THE ROUTER CANNOT CARRY MUST NOT BE SILENTLY DROPPED.
+// Delegation would discard it, so the dispatch keeps the direct path and SAYS
+// which flag forced that. A caller who is not told cannot know its review
+// differs from the one it asked for - the invisible-degradation shape this work
+// exists to remove.
+func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview([]string{
+		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--skip-native-review-fanout", "--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--skip-native-review-fanout") {
+		t.Fatalf("stderr = %q, want the flag that forced the direct path named", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "WITHOUT the review router") {
+		t.Fatalf("stderr = %q, want the bypass stated", stderr.String())
+	}
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want the review still dispatched", jobs)
+	}
+}
+
+// #2196 review (P1): THE FIX FOR A MISSED FLAG IS NOT A LONGER HAND LIST.
+// Inspection found the message and --lead and missed at least eight others;
+// adding those by hand leaves the flag someone adds NEXT MONTH in exactly the
+// same position - silently dropped by a wrapper nobody re-audits.
+//
+// So this test enumerates `agent review`'s ACCEPTED FLAGS FROM ITS OWN PARSER
+// SOURCE and asserts every one is either FORWARDED to `review request` or
+// EXPLICITLY REJECTED into the direct path. A new flag that is neither fails
+// here, which turns a silent degradation into a build break. Same move as
+// deriving an expected method name from the method expression rather than
+// typing it (#2188): the list stops being a second copy of the truth.
+func TestEveryAgentReviewFlagIsForwardedOrRejected(t *testing.T) {
+	source, err := os.ReadFile("agent.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	start := strings.Index(text, "func parseAgentRunOptions(")
+	if start < 0 {
+		t.Fatal("parseAgentRunOptions not found: update this test's anchor deliberately")
+	}
+	end := strings.Index(text[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatal("could not bound parseAgentRunOptions")
+	}
+	body := text[start : start+end]
+
+	accepted := map[string]bool{}
+	for _, match := range regexp.MustCompile(`"(--[a-z][a-z-]*)"`).FindAllStringSubmatch(body, -1) {
+		accepted[match[1]] = true
+	}
+	for _, match := range regexp.MustCompile(`"(--[a-z][a-z-]*)="`).FindAllStringSubmatch(body, -1) {
+		accepted[match[1]] = true
+	}
+	if len(accepted) < 15 {
+		t.Fatalf("parsed only %d flags from the parser source, which cannot be right: the regex or the anchor is wrong, and a census that reads too few is worse than none", len(accepted))
+	}
+
+	// FORWARDED: present in the args the wrapper builds for `review request`.
+	forwarded := map[string]bool{}
+	probe := agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4",
+		branch: "feature/review", orgRole: "joltra", agent: "reviewer", runtime: "omp",
+		lead: "implementer", home: "/tmp", model: "devin/swe-2", effort: "high",
+		workflowID: "release/queue", session: "session-1", message: "probe",
+		allowPromptHeadMismatch: true,
+	}
+	for _, arg := range reviewRequestArgsFromAgentReview(probe) {
+		if strings.HasPrefix(arg, "--") {
+			forwarded[arg] = true
+		}
+	}
+
+	// REJECTED: named by the gate that keeps the dispatch on the direct path.
+	rejected := map[string]bool{}
+	for _, options := range []agentRunOptions{
+		{action: "implement"}, {typeName: "managed"}, {taskID: "task-1"}, {base: "main"},
+		{recipe: "r"}, {skipNativeReviewFanout: true}, {pullRequestMode: "ready"},
+		{pullRequestMode: "draft"}, {jsonOutput: true}, {lead: "x", noFixTarget: true}, {},
+	} {
+		for _, named := range agentReviewInputsTheRouterCannotCarry(options) {
+			rejected[named] = true
+		}
+	}
+
+	// Flags that describe HOW this process behaves rather than what the review
+	// is, so they have nothing to forward or reject. Each one is listed with its
+	// reason; an unexplained exemption is how a real gap hides.
+	exempt := map[string]string{
+		"--help":       "prints usage and exits",
+		"--foreground": "keeps the direct path by design: the router always dispatches a daemon-owned job",
+		"--background": "the router always dispatches in the background, so this is satisfied by construction",
+		"--org-role":   "forwarded as --role",
+		"--head-sha":   "forwarded as --head",
+		"--pr":         "always forwarded",
+		"--cockpit":    "pane plumbing, not a review input",
+		// #2196: named deliberately rather than swept, because each is a real
+		// decision and a future reader must be able to disagree with it.
+		"--cockpit-session": "pane plumbing, not a review input",
+		"--herdr":           "pane plumbing, not a review input",
+		"--force":           "direct-path dispatch guard, no router counterpart and no review semantics",
+		"--no-fix-target":   "expressed by an absent --lead on the router path",
+	}
+
+	var unaccounted []string
+	for flag := range accepted {
+		if forwarded[flag] || rejected[flag] || exempt[flag] != "" {
+			continue
+		}
+		unaccounted = append(unaccounted, flag)
+	}
+	sort.Strings(unaccounted)
+	if len(unaccounted) > 0 {
+		t.Fatalf("flags neither forwarded to `review request`, rejected into the direct path, nor exempt with a stated reason: %v\n"+
+			"A flag in this list is SILENTLY DROPPED by delegation. Forward it, add it to the rejection gate, or exempt it with the reason.",
+			unaccounted)
+	}
+}
+
+// #2196 review (P2): OMITTING --lead IS A REFUSAL PATH, NOT A REVIEW-ONLY
+// DISPATCH. On the direct path an absent --lead falls back to the reviewer as
+// lead and then VALIDATES it, refusing an unregistered or unsubscribed one
+// (#2054). The router expresses only "lead" or "no fix target", so delegating an
+// absent lead would convert a deliberate refusal into a quiet success - the
+// caller getting its outcome by accident rather than by permission.
+func TestAgentReviewWithoutLeadKeepsTheRefusalPath(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	runAgentReview([]string{
+		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review",
+		"--org-role", "joltra", "--home", home,
+	}, &stdout, &stderr)
+	if !strings.Contains(stderr.String(), "absent --lead with no --no-fix-target") {
+		t.Fatalf("stderr = %q, want the absent-lead reason named: delegation must not silently convert #2054's refusal into a review-only dispatch", stderr.String())
+	}
+}
+
+// #2196 review (P2): AN ATTACHING REQUEST MUST BE TOLD WHAT IT DID NOT GET.
+// A second dispatch at a claimed head attaches to the running review - correct,
+// and the dedup the router exists for - but the caller's own reviewer, message,
+// lead and model are discarded. Without saying so, the caller is told it is
+// awaiting a verdict and waits on a review it believes it commissioned. That is
+// this campaign's central defect at the dispatch surface.
+func TestAttachingRequestIsToldWhatWasDiscarded(t *testing.T) {
+	for _, testCase := range []struct {
+		name string
+		opts reviewRequestOptions
+		want string
+	}{
+		{"a different reviewer", reviewRequestOptions{reviewer: "my-reviewer"}, "--reviewer my-reviewer was NOT used"},
+		{"instructions", reviewRequestOptions{message: "check the precedence table"}, "instructions were NOT sent"},
+		{"a lead", reviewRequestOptions{lead: "my-implementer"}, "--lead my-implementer was NOT applied"},
+		{"a model", reviewRequestOptions{model: "anthropic/claude-opus-5"}, "--model anthropic/claude-opus-5 was NOT used"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			holds := attachDiscardedInputs(reviewRequestOutput{Reviewer: "someone-else", Model: "devin/swe-2"}, testCase.opts)
+			var joined string
+			for _, hold := range holds {
+				joined += hold + "\n"
+			}
+			if !strings.Contains(joined, testCase.want) {
+				t.Fatalf("holds = %q, want %q stated", joined, testCase.want)
+			}
+		})
+	}
+	// AND NOTHING IS CLAIMED WHEN NOTHING WAS DISCARDED: a caller that named the
+	// same reviewer and model the running review carries lost nothing, and a
+	// false "your input was dropped" is its own misreport.
+	if holds := attachDiscardedInputs(
+		reviewRequestOutput{Reviewer: "reviewer", Model: "devin/swe-2"},
+		reviewRequestOptions{reviewer: "Reviewer", model: "devin/swe-2"},
+	); len(holds) != 0 {
+		t.Fatalf("holds = %v, want none when the running review already matches the request", holds)
+	}
+}
+
+// #2196 review (P3): the round-5 rewrite replaced the only END-TO-END session
+// assertion with an argument-builder probe, which proves FORWARDING and not
+// HONORING - a mutant deleting the one-line `RuntimeSession` mapping this PR
+// added passed the whole suite. For a PR whose defect class is silently-dropped
+// inputs, the newest carried input had lost its only real guard.
+//
+// Uses --runtime shell --session <command>, which is valid and needs NO host
+// binary: that is what made the previous attempt CI-red.
+func TestReviewRequestHonorsTheForwardedSession(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	ctx := context.Background()
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "shell-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+
+	var stdout, stderr bytes.Buffer
+	if code := runReviewRequest([]string{
+		"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review",
+		"--role", "joltra", "--reviewer", "shell-reviewer",
+		"--runtime", runtime.ShellRuntime, "--session", "true", "--home", home,
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review request exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	jobs, listErr := store.ListJobs(ctx)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want one", jobs)
+	}
+	payload, err := daemonJobPayload(jobs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.RuntimeOverrideRef != "true" {
+		t.Fatalf("runtime override ref = %q, want the forwarded session HONORED in the payload", payload.RuntimeOverrideRef)
+	}
+	if payload.RuntimeOverride != runtime.ShellRuntime {
+		t.Fatalf("runtime override = %q, want shell", payload.RuntimeOverride)
+	}
+	// AND THE OUTPUT REPORTS THAT RUNTIME rather than a fabricated omp.
+	if !strings.Contains(stdout.String(), "on shell model") {
+		t.Fatalf("stdout = %q, want the dispatched runtime reported", stdout.String())
+	}
+}
+
+// #2196 review: A MESSAGE STARTING WITH '-' MUST STILL DISPATCH. The delegated
+// path re-enters a flag parser, which the message never did before, so
+// `agent review reviewer "-check the diff"` began exiting 2 with "flag provided
+// but not defined". Rare input, loud failure, and a regression introduced by the
+// delegation rather than a pre-existing limit.
+func TestDelegatedMessageMayStartWithADash(t *testing.T) {
+	args := reviewRequestArgsFromAgentReview(agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4",
+		orgRole: "joltra", agent: "reviewer", lead: "implementer",
+		message: "-check the diff",
+	})
+	// The terminator must precede the message, and nothing may follow it.
+	terminator := slices.Index(args, "--")
+	if terminator < 0 {
+		t.Fatalf("args = %v, want a -- terminator before the message", args)
+	}
+	if terminator != len(args)-2 || args[len(args)-1] != "-check the diff" {
+		t.Fatalf("args = %v, want the message last, immediately after --", args)
+	}
+	// And the real parser must accept that shape, yielding the message as the
+	// single positional rather than refusing it as an unknown flag.
+	fs := flag.NewFlagSet("review request", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var pr int
+	fs.IntVar(&pr, "pr", 0, "")
+	for _, name := range []string{"repo", "head", "branch", "role", "reviewer", "lead", "home", "model", "effort", "workflow", "session", "runtime", "purpose"} {
+		fs.String(name, "", "")
+	}
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("flag.Parse(%v) = %v, want the dash-leading message accepted", args, err)
+	}
+	if fs.NArg() != 1 || fs.Arg(0) != "-check the diff" {
+		t.Fatalf("positionals = %v, want exactly the message", fs.Args())
 	}
 }
