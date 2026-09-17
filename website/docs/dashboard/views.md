@@ -30,9 +30,8 @@ each refresh:
 - **Fleet** lists registered agents with runtime, running state, and jobs started
   in the rolling 24-hour window.
 
-The page is read-only and polls every 12 seconds. Groom proposals appear only
-when Gitmoot has a cheap persisted proposal source; the server does not walk
-artifact directories during a dashboard request.
+The page is read-only and polls every 12 seconds; no dashboard request walks
+artifact directories.
 
 ## Org
 
@@ -365,12 +364,11 @@ Route: `/config`
 The read-only effective-configuration viewer. Every known knob is listed by
 config section with its current value, its default, and a `default` /
 `overridden` badge (overridden values stand out); boolean feature flags render
-as ON/OFF chips, and the off-by-default feature flags (memory distillation,
-`groom_split_llm`, …) are gathered
+as ON/OFF chips, and any that are off by default are gathered
 into a highlighted section at the top so you can see at a glance what is
 enabled on this install. Below the knobs, a per-agent table shows each
 registered or configured agent's runtime, model, capabilities, autonomy
-policy, memory enrollment, and background-job cap. A
+policy, and background-job cap. A
 filter box narrows by key, section, or value, and every knob carries a
 click-to-copy `key = value` snippet for pasting into `config.toml`, whose path
 and last-modified time are shown in the footer.

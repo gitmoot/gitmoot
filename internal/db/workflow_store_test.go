@@ -81,10 +81,6 @@ func TestWorkflowStoreAggregatesAndFiltersByIndexedColumn(t *testing.T) {
 	if err != nil || len(limitedNotes) != 1 || limitedNotes[0].Body != "checkpoint two" {
 		t.Fatalf("limited notes=%+v err=%v", limitedNotes, err)
 	}
-	repos, err := store.WorkflowRepos(ctx, "release-42")
-	if err != nil || len(repos) != 1 || repos[0] != "acme/widget" {
-		t.Fatalf("repos=%v err=%v", repos, err)
-	}
 	if strings.Contains(strings.ToLower(ListJobsByWorkflowSQL), "payload") || strings.Contains(strings.ToLower(WorkflowReposSQL), "payload") {
 		t.Fatal("workflow scalar queries must not read or parse payload")
 	}
@@ -317,7 +313,7 @@ func TestWorkflowProductionQueriesUseIndexes(t *testing.T) {
 		{"dashboard-graph-jobs", ListWorkflowGraphJobsSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 		{"show-notes", ListWorkflowNotesSQL, []any{"release-42", 100}, "idx_workflow_notes_wid"},
 		{"filter", CountJobsByWorkflowSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
-		{"repo-inference", WorkflowReposSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
+		{"lifecycle-repo-set", WorkflowReposSQL, []any{"release-42"}, "idx_jobs_workflow_id"},
 	}
 	for _, tc := range queries {
 		t.Run(tc.name, func(t *testing.T) {

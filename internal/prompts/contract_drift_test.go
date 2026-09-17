@@ -103,10 +103,9 @@ func TestNormalizationOwnedFieldsStayOutOfThePrompt(t *testing.T) {
 }
 
 // TestContractFieldsCoveredInJobPrompt is the load-bearing drift guard: every
-// JSON field of AgentResult, Delegation, EphemeralSpec, HumanQuestion, and
-// Learning must be named in the rendered job prompt. Adding a field to any of
-// those structs without teaching the generator (and thus the prompt) about it
-// fails here.
+// JSON field of AgentResult, Delegation, EphemeralSpec and HumanQuestion must be
+// named in the rendered job prompt. Adding a field to any of those structs
+// without teaching the generator (and thus the prompt) about it fails here.
 func TestContractFieldsCoveredInJobPrompt(t *testing.T) {
 	prompt := renderedJob()
 

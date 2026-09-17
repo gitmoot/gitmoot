@@ -626,11 +626,15 @@ gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
 unknown label to guard against a typo - so file the row under the lane the PR is
 already being coordinated in rather than inventing a label.
 
-The note's repo COLUMN is a separate thing, and `gitmoot workflow note` now
-always writes it empty: the flags that used to set it went with the memory
-surface (#2202). A note whose column is empty still counts when its body names
-this repository, which is the ordinary case. Getting `repo=` right in the BODY
-is not optional.
+The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
+--repo <owner/repo>` sets it and nothing else - it no longer opts the note into
+anything, because the memory surface it used to accompany is gone (#2202). A
+note whose column is empty still counts when its body names this repository,
+which is the ordinary case, so setting the column is optional; getting `repo=`
+right in the BODY is not. Prefer setting it anyway for an operating-mode or
+reconciliation note: the gate reads those through two bounded windows, one
+repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
+out of the window by other repositories' notes.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own

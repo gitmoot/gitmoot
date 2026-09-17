@@ -4003,7 +4003,7 @@ their kind plus bounded command/prompt previews:
 
 ```text
 enabled: true
-mode: after: memory-groom-propose
+mode: after: nightly-sync
 interval: -
 ...
 stages:
@@ -4030,15 +4030,15 @@ that run settles. Missing upstreams warn at add time and remain dormant; removin
 an upstream is allowed. Add-time validation rejects self-reference and trigger
 cycles such as `B -> A -> B`. Pipeline triggers use local database state.
 
-For example, replace a clock-staggered `memory-ingest-sweep` schedule (such as
-24h30m after a 24h groom) with an ordered success chain:
+For example, replace a clock-staggered downstream schedule (such as 24h30m
+after a 24h upstream) with an ordered success chain:
 
 ```yaml
-name: memory-ingest-sweep
+name: nightly-report
 repo: owner/repo
 trigger:
   kind: pipeline
-  pipeline: memory-groom-propose
+  pipeline: nightly-sync
 stages: [...]
 ```
 
@@ -4227,11 +4227,15 @@ gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
 unknown label to guard against a typo - so file the row under the lane the PR is
 already being coordinated in rather than inventing a label.
 
-The note's repo COLUMN is a separate, optional thing, and `gitmoot workflow
-note` always writes it empty: the flags that once set it went with the memory
-surface (#2202). A note whose column is empty still counts when its body names
-this repository, which is the ordinary case. Getting `repo=` right in the BODY
-is not optional.
+The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
+--repo <owner/repo>` sets it and nothing else - it no longer opts the note into
+anything, because the memory surface it used to accompany is gone (#2202). A
+note whose column is empty still counts when its body names this repository,
+which is the ordinary case, so setting the column is optional; getting `repo=`
+right in the BODY is not. Prefer setting it anyway for an operating-mode or
+reconciliation note: the gate reads those through two bounded windows, one
+repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
+out of the window by other repositories' notes.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own

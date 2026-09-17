@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"sync"
 )
@@ -51,18 +50,6 @@ func emptyText(value string) string {
 		return "-"
 	}
 	return value
-}
-
-// writeJSONFile marshals v as indented JSON to path (with a trailing newline). It
-// moved here from the SkillOpt rubric command deleted in #1752; the memory cluster
-// and groom exports still use it.
-func writeJSONFile(path string, v any) error {
-	encoded, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	encoded = append(encoded, '\n')
-	return os.WriteFile(path, encoded, 0o644)
 }
 
 // repeatedStringFlag collects a flag that may be passed more than once, in order.

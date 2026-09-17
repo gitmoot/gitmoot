@@ -79,7 +79,7 @@ func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 	if len(overview.NeedsYou) != 1 || overview.NeedsYou[0].Kind != "unlabeled_jobs" || overview.NeedsYou[0].Title != "10 unlabeled agent jobs in 24h (acme/drift)" {
 		t.Fatalf("needs=%+v", overview.NeedsYou)
 	}
-	if !(dashboardNeedRank("stalled_workflow") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("pr_awaiting_merge") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("blocked_job") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("unlabeled_jobs") < dashboardNeedRank("groom_proposal")) {
+	if !(dashboardNeedRank("stalled_workflow") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("pr_awaiting_merge") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("blocked_job") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("unlabeled_jobs") < dashboardNeedRank("anything_unknown")) {
 		t.Fatal("unlabeled_jobs rank is not advisory")
 	}
 }

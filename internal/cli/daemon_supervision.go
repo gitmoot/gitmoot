@@ -1067,19 +1067,18 @@ func resolveDelegationWorktreeTTL(home string) (time.Duration, error) {
 
 // tickConfigCache memoizes the daemon's hot config.toml reads for the span of
 // ONE tick (a worker sweep or a poll pass). resolveBlockedTTL,
-// resolveBlockedRoleWakeAfter, resolveDelegationWorktreeTTL and
-// daemonMemoryController are each a pure function of <home>/config.toml, and each
-// was re-read AND re-parsed once per ENABLED REPO per tick: at 45 repos that is
-// 135 opens/tick for the three durations plus ~90 more for a memory controller
-// that returns nil every time (#1758).
+// resolveBlockedRoleWakeAfter and resolveDelegationWorktreeTTL are each a pure
+// function of <home>/config.toml, and each was re-read AND re-parsed once per
+// ENABLED REPO per tick: at 45 repos that is 135 opens/tick for the three
+// durations (#1758).
 //
 // It is created FRESH each tick and never retained, so config.toml keeps exactly
 // the live tunability it had — one re-read per tick — and only the per-REPO
-// repetition disappears. Entries are keyed by their home (and store, for the
-// memory controller) so a caller passing a different one always re-resolves
-// rather than silently reading another home's policy. Only SUCCESSES are
-// memoized, matching candidateMemo: a transient read failure is retried by the
-// next repo in the sweep instead of being replayed to all of them.
+// repetition disappears. Entries are keyed by their home so a caller passing a
+// different one always re-resolves rather than silently reading another home's
+// policy. Only SUCCESSES are memoized, matching candidateMemo: a transient read
+// failure is retried by the next repo in the sweep instead of being replayed to
+// all of them.
 //
 // Like candidateMemo it carries no mutex because it is consumed only on the
 // synchronous tick goroutine — the worker sweep's per-repo loop and the poll

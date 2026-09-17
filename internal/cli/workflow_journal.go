@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	workflowpkg "github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -56,7 +57,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workflow show-note <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]")
 	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
 }
 
@@ -553,6 +554,16 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	noAuto := fs.Bool("no-auto", false, "disable Herdr coordinator identity detection")
 	summary := fs.String("summary", "", "legacy alias for the stable workflow description")
 	status := fs.String("status", "", "live workflow status escape hatch")
+	// --repo sets the note row's repo COLUMN and nothing else. It existed before
+	// #2202 only in the company of --remember, which is why removing the memory
+	// surface took it too; review found that regressed something unrelated.
+	// ListRepoWorkflowNotesByBodyPrefix reads operating-mode and reconciliation
+	// notes through TWO bounded windows, one repo-scoped and one for the repoless
+	// rows, precisely because #1783 measured a single repoless window letting one
+	// repo's notes crowd out another's decision note. With no way to set the
+	// column, every handwritten note lands in the shared window and that crowding
+	// becomes structural rather than opt-in. The flag comes back on its own terms.
+	repo := fs.String("repo", "", "repo binding recorded on the note row, as owner/repo")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
 	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
 		if len(args) < 2 {
@@ -625,6 +636,18 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
+	noteRepo := strings.TrimSpace(*repo)
+	if noteRepo != "" {
+		parsed, err := github.ParseRepository(noteRepo)
+		if err != nil {
+			fmt.Fprintf(stderr, "workflow note: --repo %v\n", err)
+			return 2
+		}
+		// Store the canonical owner/repo: the scoped read window matches this
+		// column against repo.FullName(), so a case or whitespace variant would
+		// file the note where nothing looks for it.
+		noteRepo = parsed.FullName()
+	}
 	var out workflowNoteOutput
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		ctx := context.Background()
@@ -635,7 +658,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		if count == 0 {
 			return fmt.Errorf("workflow %q has no jobs; refusing note to guard against a typo", label)
 		}
-		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body}
+		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body, Repo: noteRepo}
 		meta := db.WorkflowMeta{
 			WorkflowID:     label,
 			Author:         *author,

@@ -75,6 +75,19 @@ func TestDefaultConfigNamesNoRemovedCommand(t *testing.T) {
 		"# moots are bounded brainstorms",
 		"# threads live in chat_threads",
 		"# promote a Chat message into a job",
+		// #2202's vocabulary. The first two are the exact prose the [memory]
+		// template carried; the rest are the shapes a reintroduction would take.
+		"# memory ingest confirms into the private pool",
+		"# lets the agent recall prior learnings",
+		"# [memory]",
+		"# default_enroll = false",
+		"# token_budget = 1500",
+		"# [[memory.ingest]]",
+		"# gitmoot pipeline install-defaults registers memory-groom-propose",
+		"# add memory = true to an [agents.<name>] block to enroll it",
+		"# the daemon harvests post-terminal insight",
+		"# grooming proposes dedupe/merge/expiry actions",
+		"# see the Agent Persistent Memory concepts page",
 	} {
 		if named := removedSurfaceNamed(mutant); len(named) == 0 {
 			t.Fatalf("matcher did not fire on %q; a silent matcher passes on any config", mutant)
@@ -85,10 +98,15 @@ func TestDefaultConfigNamesNoRemovedCommand(t *testing.T) {
 	// "chatter"/"chattel" contain "chat" without one.
 	for _, benign := range []string{
 		"# gitmoot writes this file on init",
-		"# memory ingest confirms into the private pool",
 		"# job answer <job-id> \"<question-id>: text\"",
 		"# reduce log chatter with a higher poll interval",
 		"# see https://gitmoot.io for the reference",
+		// Surviving vocabulary that merely LOOKS related: [admission] documents
+		// RAM estimates and [github] an in-memory ETag cache, so `memory` must
+		// not be matched bare (#2202).
+		"# set max_memory_gb to cap in-flight sessions",
+		"# codex_memory_gb = 0.2 is the per-runtime RAM estimate",
+		"# conditional_requests uses in-memory ETags",
 	} {
 		if named := removedSurfaceNamed(benign); len(named) != 0 {
 			t.Fatalf("matcher fired on benign text %q: %v", benign, named)
@@ -102,21 +120,47 @@ func TestDefaultConfigNamesNoRemovedCommand(t *testing.T) {
 }
 
 // removedSurfaceWords is matched on WORD BOUNDARIES so the BARE nouns are caught
-// in ordinary prose — "chat", "moot" — while "gitmoot" and "chatter" are not.
-// Matching the bare nouns is deliberate: the natural way to describe the removed
-// feature does not use its command syntax, so a vocabulary of command-shaped
-// phrases alone let the most likely prose through.
+// in ordinary prose — "chat", "moot", "learnings" — while "gitmoot" and
+// "chatter" are not. Matching the bare nouns is deliberate: the natural way to
+// describe the removed feature does not use its command syntax, so a vocabulary
+// of command-shaped phrases alone let the most likely prose through.
+//
+// #2202 added the brain's vocabulary after review found `gitmoot init` still
+// writing the entire ~85-line [memory] template — every knob, [[memory.ingest]],
+// [memory.pipelines], `memory = true`, and a reference to the deleted
+// `pipeline install-defaults` verb — for a feature whose keys are now silently
+// ignored. This guard existed and did not catch it, because it only knew the
+// chat vocabulary: a removal-surface guard is only as wide as its last removal,
+// so widening it is part of removing a feature, not a follow-up.
+//
+// `memory` is NOT matched bare: the surviving [admission] section legitimately
+// documents max_memory_gb and per-runtime *_memory_gb RAM estimates, and
+// [github] documents an in-memory ETag cache. The brain's own vocabulary is
+// specific enough without it.
 var removedSurfaceWords = regexp.MustCompile(`(?i)\b(?:` + strings.Join([]string{
 	`chats?`, `moots?`,
 	`chat_[a-z_]+`, `moot_[a-z_]+`,
 	`auto_respond(?:_cap|_cooldown)?`, `autorespond`, `auto-respond`,
 	`chat-[a-z]+`,
 	`gitmoot_chat_relay`,
+	`learnings?`, `memories`, `enroll(?:ed|ment|s)?`,
+	`memory_[a-z_]+`, `ingest_auto_confirm`, `default_enroll`, `token_budget`,
+	`groom(?:ed|ing|s)?`, `harvests?`, `distill(?:ed|ing|s)?`,
+	`agent-memory`, `install-defaults`,
 }, "|") + `)\b`)
 
 // removedSurfaceLiterals cover terms whose edges are not word characters, where a
 // \b anchor would not apply.
-var removedSurfaceLiterals = []string{"[chat]", "kind=chat"}
+var removedSurfaceLiterals = []string{
+	"[chat]", "kind=chat",
+	"[memory]", "[memory.pipelines]", "[[memory.ingest]]",
+	"gitmoot memory", "memory = true", "memory.default_enroll", "memory.disabled",
+	// Phrases rather than words, because `memory` alone is legitimate vocabulary
+	// in the surviving [admission] and [github] sections (#2202).
+	"memory ingest", "memory recall", "memory list", "memory observations",
+	"memory confirm", "memory groom", "persistent memory", "agent memory",
+	"memory pool", "memory block",
+}
 
 func removedSurfaceNamed(text string) []string {
 	named := removedSurfaceWords.FindAllString(text, -1)

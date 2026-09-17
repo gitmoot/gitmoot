@@ -1207,3 +1207,60 @@ func TestWorkflowShowNotePrintsTheWholeBody(t *testing.T) {
 		t.Fatalf("JSON body length=%d, want %d verbatim bytes", len(decoded.Body), len(body))
 	}
 }
+
+// TestWorkflowNoteRepoColumnScopesTheGateWindow pins the reason --repo exists at
+// all. The workload-mode gate reads operating-mode and reconciliation notes
+// through TWO bounded windows - one scoped to the repo column, one for the
+// repoless rows - because #1783 measured a single repoless window letting one
+// repo's chatter crowd out another repo's decision note. #2202 removed --repo as
+// collateral of the memory removal, which silently pushed every handwritten note
+// into the shared window; review caught it. This asserts the column is settable,
+// canonicalised, and actually reachable through the SCOPED read - not merely
+// stored.
+func TestWorkflowNoteRepoColumnScopesTheGateWindow(t *testing.T) {
+	home, store := workflowJournalTestHome(t)
+	ctx := context.Background()
+	if err := store.CreateJob(ctx, db.Job{ID: "job-repo-1", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"acme/mode"}`}); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	// Mixed case on purpose, and the recorded spelling is PRESERVED rather than
+	// lowercased: ListRepoWorkflowNotesByBodyPrefix compares COLLATE NOCASE
+	// precisely because GitHub treats owner/repo case-insensitively and #1783's
+	// F3 found a byte-equal filter hiding a "Gitmoot/gitmoot" note. So the
+	// property to pin is REACHABILITY under a differently-cased query, not a
+	// canonical form. An earlier draft of this test asserted lowercasing, which
+	// would have contradicted the store's own design.
+	code := runWorkflowJournal([]string{
+		"note", "acme/mode", "[operating-mode focus] repo=acme/widget",
+		"--author", "coord", "--repo", "ACME/Widget", "--home", home,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("workflow note --repo exit=%d stderr=%q", code, stderr.String())
+	}
+
+	// The literal is workflow.operatingModeNotePrefix (workload_mode_gate.go:14),
+	// unexported and in another package, so the real production prefix is spelled
+	// out rather than approximated.
+	scoped, err := store.ListRepoWorkflowNotesByBodyPrefix(ctx, "[operating-mode ", "acme/widget", 200)
+	if err != nil {
+		t.Fatalf("ListRepoWorkflowNotesByBodyPrefix: %v", err)
+	}
+	if len(scoped) != 1 {
+		t.Fatalf("scoped window returned %d notes, want 1 (the repo column did not reach the scoped read)", len(scoped))
+	}
+	if scoped[0].Repo != "ACME/Widget" {
+		t.Fatalf("note repo column = %q, want the recorded spelling %q", scoped[0].Repo, "ACME/Widget")
+	}
+
+	// A malformed repo must be refused rather than stored as a column nothing
+	// matches: a wrong column is worse than an empty one, because the note then
+	// sits in neither window.
+	stdout.Reset()
+	stderr.Reset()
+	if code := runWorkflowJournal([]string{
+		"note", "acme/mode", "second note", "--author", "coord", "--repo", "not-a-repo", "--home", home,
+	}, &stdout, &stderr); code != 2 {
+		t.Fatalf("malformed --repo exit=%d, want 2; stderr=%q", code, stderr.String())
+	}
+}

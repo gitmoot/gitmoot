@@ -37,9 +37,6 @@ func TestDashboardCachePolicyTable(t *testing.T) {
 		{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
 		{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 		{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
-		{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
-		{endpoint: "brain-events", keyKind: "singleflight-only", retain: false},
-		{endpoint: "brain-fact", keyKind: "singleflight-only", retain: false},
 		{endpoint: "org", keyKind: "full-cursor", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 		{endpoint: "org-role", keyKind: "full-cursor+role", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 	}
@@ -790,7 +787,7 @@ func TestDashboardCacheMetricsReportUsesPolicyTable(t *testing.T) {
 	cache.mu.Lock()
 	report := cache.recordLocked("overview", "hit", 42, base.Add(dashboardCacheReportInterval))
 	cache.mu.Unlock()
-	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; knowledge hits=0 misses=0 shared=0 bytes=0; brain-events hits=0 misses=0 shared=0 bytes=0; brain-fact hits=0 misses=0 shared=0 bytes=0; org hits=0 misses=0 shared=0 bytes=0; org-role hits=0 misses=0 shared=0 bytes=0\n"
+	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; org hits=0 misses=0 shared=0 bytes=0; org-role hits=0 misses=0 shared=0 bytes=0\n"
 	if report != want {
 		t.Fatalf("metrics report:\n%s\nwant:\n%s", report, want)
 	}

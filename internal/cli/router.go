@@ -22,10 +22,10 @@ import (
 // pathsFromFlag/config.PathsForHome here re-appended ".gitmoot" a SECOND time and
 // read a phantom <home>/.gitmoot/.gitmoot/config.toml with no [router] section,
 // so a user who set [router] context_enabled = true would get the feature
-// silently disabled forever on the daemon path (the same #446/#459 double
-// resolution memoryPathsForHome was created to fix for [memory]). Only
-// LoadRouterSettings reads the returned Paths, and it uses only ConfigFile, so
-// resolving that one field is sufficient.
+// silently disabled forever on the daemon path — the #446/#459 double-resolution
+// class that daemonDrainSentinelPath and requireWorkflowPolicyResolverRoot guard
+// against the same way. Only LoadRouterSettings reads the returned Paths, and it
+// uses only ConfigFile, so resolving that one field is sufficient.
 func routerPathsForHome(home string) (config.Paths, error) {
 	if strings.TrimSpace(home) == "" {
 		return config.DefaultPaths()

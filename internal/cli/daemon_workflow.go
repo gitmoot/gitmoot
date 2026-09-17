@@ -39,9 +39,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 }
 
 // daemonWorkflowEngineCached is daemonWorkflowEngine for a caller that already
-// holds a per-tick config memo (#1758) — today only the sequential registered-repo
-// poll pass, whose 45 per-repo engine rebuilds otherwise re-read and re-parsed
-// config.toml twice each just to resolve a memory controller that is nil.
+// holds a per-tick config memo (#1758) — today only the sequential
+// registered-repo poll pass, which rebuilds one engine per enabled repo. The
+// memo is threaded through the builder for the engine seams that read
+// home-scoped config per tick rather than per repo; the brain retirement
+// (#2202) removed the memory controller that was the builder's own consumer of
+// it, so the poll pass's remaining savings come from the TTL lookups it makes
+// through the same memo outside this constructor.
 func daemonWorkflowEngineCached(store *db.Store, gh github.Client, checkout string, home string, cfg *tickConfigCache) workflow.Engine {
 	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{}, cfg)
 }

@@ -266,6 +266,9 @@ ORDER BY created_at, id`
 const CountJobsByWorkflowSQL = `SELECT COUNT(*) FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ?`
 
+// WorkflowReposSQL is the distinct non-empty repo set for one workflow. Its
+// Store method went with `--remember` repo inference (#2202); the live consumer
+// is workflow_lifecycle_store.go, which runs it inside a lifecycle transaction.
 const WorkflowReposSQL = `SELECT DISTINCT repo
 FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ? AND repo != ''
@@ -1504,25 +1507,4 @@ func (s *Store) ListWorkflowRepos(ctx context.Context) (map[string][]string, err
 		out[workflowID] = append(out[workflowID], repo)
 	}
 	return out, rows.Err()
-}
-
-// WorkflowRepos returns distinct non-empty denormalized repo values for a
-// workflow. It is used only for --remember repo inference.
-func (s *Store) WorkflowRepos(ctx context.Context, workflowID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, WorkflowReposSQL, workflowID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var repos []string
-	for rows.Next() {
-		var repo string
-		if err := rows.Scan(&repo); err != nil {
-			return nil, err
-		}
-		if repo = strings.TrimSpace(repo); repo != "" {
-			repos = append(repos, repo)
-		}
-	}
-	return repos, rows.Err()
 }

@@ -234,7 +234,7 @@ func dashboardUnknownConfigKeys(path string) ([]string, error) {
 		known[row.section+"."+row.key] = struct{}{}
 	}
 	agentKeys := map[string]struct{}{
-		"runtime": {}, "model": {}, "memory": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
+		"runtime": {}, "model": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
 	}
 	unknown := map[string]struct{}{}
 	doc.Scan(func(key parser.Key, entry *tomledit.Entry) bool {

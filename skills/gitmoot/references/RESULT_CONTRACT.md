@@ -659,6 +659,19 @@ The same capture also feeds the `$`-denominated
   sparingly**: ask only when you genuinely cannot proceed without a human decision,
   not on every result.
 
+## Removed fields fail; they are not ignored
+
+The accepted-field roster is derived from the contract struct, so a
+`gitmoot_result` carrying a field that no longer exists fails validation with
+`unsupported gitmoot_result field "<name>"` and the job fails with it. This is
+deliberate: the roster is what catches a typo or an invented field before it
+becomes a silent no-op.
+
+`learnings` was removed in #2202 with the persistent-memory feature. If you are
+an agent reading a cached prompt, do not send it - the prompt no longer asks for
+it, and sending it fails the job rather than being dropped. `next_agents` was
+removed earlier on the same terms.
+
 ## Decisions
 
 - `approved`: review found no blocking issues.

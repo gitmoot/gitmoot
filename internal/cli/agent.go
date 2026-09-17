@@ -1914,10 +1914,10 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
 	}
-	// The config block is the daemon's enrollment authority. A pre-existing type
-	// is operator-owned configuration: preserve every field and even its current
-	// enrollment unless --memory was explicit. A genuinely new type records the
-	// complete started-agent shape with the tri-state/default enrollment result.
+	// The [agents.<name>] config block is the daemon's agent-type registry. A
+	// pre-existing type is operator-owned configuration: preserve every field
+	// verbatim, including fields `agent start` has no flag for. Only a genuinely
+	// new type is written, recording the complete started-agent shape.
 	types, err := config.LoadAgentTypes(paths)
 	if err != nil {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
@@ -1935,7 +1935,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if persistType {
 		if err := config.SaveAgentType(paths, entry); err != nil {
-			fmt.Fprintf(stderr, "agent start: persist memory enrollment: %v\n", err)
+			fmt.Fprintf(stderr, "agent start: persist agent type: %v\n", err)
 			return 1
 		}
 	}

@@ -2825,10 +2825,17 @@ CREATE INDEX IF NOT EXISTS idx_review_requests_job ON review_requests(job_id);
 	// memory_observations, and `workflow note --remember` - the only writer that
 	// ever set it - is removed too. Journal notes keep every other column, so the
 	// org ledger is untouched by this.
+	//
+	// The #884 partial index idx_jobs_memory_harvest_terminal on jobs is dropped
+	// here too: its only consumer was the harvest sweep's receipt anti-join, which
+	// is deleted, so it was left writing on every job state transition for nobody.
+	// The jobs.result_hash column added alongside it stays - proof grading reads
+	// it to verify reported result integrity.
 	`
 DROP INDEX IF EXISTS idx_memory_obs_owner;
 DROP INDEX IF EXISTS idx_confirmed_repo_key;
 DROP INDEX IF EXISTS idx_confirmed_general_key;
+DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal;
 DROP TABLE IF EXISTS confirmed_memories_fts;
 DROP TABLE IF EXISTS confirmed_memories;
 DROP TABLE IF EXISTS memory_cluster_members;

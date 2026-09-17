@@ -587,3 +587,37 @@ func TestEphemeralAgentNameContainsInfix(t *testing.T) {
 		t.Fatalf("ephemeralAgentName collided across parents: %q", name)
 	}
 }
+
+// TestRemovedResultFieldsAreRejectedNotIgnored pins a DELIBERATE consequence of
+// #2202 rather than an accident of it. `learnings` was removed from AgentResult,
+// and because agentResultAllowedFields is derived from the struct's JSON tags,
+// an agent that still emits it now fails the whole job with
+// `unsupported gitmoot_result field "learnings"` instead of having the field
+// dropped. 133 review jobs emitted it in the fortnight before removal, so this
+// is a real behaviour change for real callers and the round-1 reviewer was right
+// to say the PR should name it.
+//
+// It stays strict on purpose. The roster is the mechanism that catches a typo or
+// a hallucinated field before it becomes a silent no-op, and carving a
+// tolerated-but-ignored exception for a removed field is a permanent shim of
+// exactly the kind this campaign exists to delete. The exposure is also bounded
+// by construction: the prompt no longer asks for the field, and the prompt is
+// rendered per job, so no job dispatched after this ships is told to send it.
+// Same shape as the next_agents removal in b25986cc.
+func TestRemovedResultFieldsAreRejectedNotIgnored(t *testing.T) {
+	for _, field := range []string{"learnings", "next_agents"} {
+		raw := `{"gitmoot_result":{"decision":"approved","summary":"s","evidence":"executed","` + field + `":[{"key":"k","content":"c"}]}}`
+		_, err := ExtractAgentResult(raw)
+		if err == nil {
+			t.Fatalf("result carrying removed field %q was accepted; a removed field must fail loudly, not be silently dropped", field)
+		}
+		if got := err.Error(); !strings.Contains(got, field) {
+			t.Fatalf("error for removed field %q = %q; it must name the offending field so the emitter can be fixed", field, got)
+		}
+	}
+	// Control: the same envelope without the removed field must pass, so the test
+	// is not merely asserting that everything fails.
+	if _, err := ExtractAgentResult(`{"gitmoot_result":{"decision":"approved","summary":"s","evidence":"executed"}}`); err != nil {
+		t.Fatalf("clean result rejected: %v", err)
+	}
+}

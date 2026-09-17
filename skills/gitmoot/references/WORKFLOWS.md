@@ -10,8 +10,8 @@ synthesis, tree token budgets, kill scope). `--workflow <label>` makes an
 EXTERNAL coordinator the manager — a Claude/Codex session, a script, or a human
 drives independent jobs, judging results between steps; the label plus the
 `workflow note` journal make that project visible (workflow list/show, Galaxy
-hubs, `/workflows/<label>`) and the journal keeps its body verbatim
-memory. Use `orchestrate` when the plan fits a declarable tree run unattended
+hubs, `/workflows/<label>`) and the journal keeps its body verbatim.
+Use `orchestrate` when the plan fits a declarable tree run unattended
 (parallel fan-out, bounded autonomous work, pipeline orchestrate stages); use
 an external coordinator with `--workflow` when judgment between steps is the
 point (build-review-fix loops, test-and-decide sequences, git/PR ownership).
@@ -752,8 +752,9 @@ Write the DAG as YAML, register it, and run it:
 # nightly-sync.yaml
 name: nightly-sync
 repo: owner/repo            # required to run (stages need a managed repo)
-group: Release Automation   # optional display section (falls back to repo when unset;
-                            #   built-in memory pipelines ship under "Gitmoot System")
+group: Release Automation   # optional display section on /pipelines and `pipeline list`;
+                            #   free-form, decoupled from repo (one group may span repos,
+                            #   one repo may split across groups); unset falls back to repo.
 description: Syncs nightly data for deployment. # optional detail-page purpose (multiline, max 500 chars)
 env_file: /root/.config/nightly-sync/env # optional 0600 secret file
 env:                         # optional inline NON-secret defaults
@@ -893,24 +894,24 @@ gitmoot pipeline import ./nightly-sync.bundle --repo acme/nightly-target
 ### Chain a pipeline after another succeeds
 
 Use `kind: pipeline` when ordering matters more than a clock stagger. This
-example runs ingest exactly once after each newly-succeeded groom run:
+example runs the report exactly once after each newly-succeeded sync run:
 
 ```yaml
-name: memory-ingest-sweep
+name: nightly-report
 repo: owner/repo
 trigger:
   kind: pipeline
-  pipeline: memory-groom-propose
+  pipeline: nightly-sync
 stages:
-  - id: sweep
+  - id: report
     cmd: gitmoot job list --json
 ```
 
-This replaces the old `24h` / `24h30m` imitation of ordering: failed or cancelled
-groom runs do not start ingest, while each successful run fires it once. The
-cursor is durable across daemon restarts. Adding or enabling ingest arms at the
-latest groom run, so no historical or disabled-period runs backfill. If ingest
-is already active, its cursor does not move and it fires after settlement.
+This replaces a `24h` / `24h30m` imitation of ordering: failed or cancelled sync
+runs do not start the report, while each successful run fires it once. The
+cursor is durable across daemon restarts. Adding or enabling the report arms at
+the latest sync run, so no historical or disabled-period runs backfill. If the
+report is already active, its cursor does not move and it fires after settlement.
 Pipeline-trigger cycles are rejected at add time. A missing or later-removed
 upstream is allowed but leaves the downstream dormant and visibly marked
 `(upstream missing)`. Pipeline triggers use local database state.
@@ -1077,11 +1078,15 @@ gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
 unknown label to guard against a typo - so file the row under the lane the PR is
 already being coordinated in rather than inventing a label.
 
-The note's repo COLUMN is a separate thing, and `gitmoot workflow note` now
-always writes it empty: the flags that used to set it went with the memory
-surface (#2202). A note whose column is empty still counts when its body names
-this repository, which is the ordinary case. Getting `repo=` right in the BODY
-is not optional.
+The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
+--repo <owner/repo>` sets it and nothing else - it no longer opts the note into
+anything, because the memory surface it used to accompany is gone (#2202). A
+note whose column is empty still counts when its body names this repository,
+which is the ordinary case, so setting the column is optional; getting `repo=`
+right in the BODY is not. Prefer setting it anyway for an operating-mode or
+reconciliation note: the gate reads those through two bounded windows, one
+repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
+out of the window by other repositories' notes.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own
