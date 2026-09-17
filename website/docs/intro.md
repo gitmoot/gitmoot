@@ -29,7 +29,7 @@ context in one file.
   draft.
 - Import a cached agent prompt into the current chat with
   `gitmoot agent prompt <agent-or-template>`.
-- Track jobs, branch locks, goals, tasks, reviews, and merges locally.
+- Track jobs, branch locks, review cycles, reviews, and merges locally.
 - Run `gitmoot dashboard` for a styled snapshot of daemon health, repos, agents,
   jobs by state, worktrees, and branch locks — or `gitmoot dashboard --web` for
   a read-only browser view of a running orchestration.

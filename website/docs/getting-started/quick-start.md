@@ -98,7 +98,7 @@ use the same pattern, for example `Use frontend-reviewer here`.
 Ask the registered background planner when you want a queued Gitmoot job:
 
 ```sh
-gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 gitmoot job watch <job-id>
 ```
 
