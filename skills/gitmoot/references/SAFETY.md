@@ -484,14 +484,13 @@ cannot recurse or fan out forever:
   `human_questions[]` is byte-identical to today's behavior.
 
 - Dismissed task terminality (#913): `dismissed` may be entered only from
-  `implementing` or `blocked`. Manual `task dismiss` proves there is no live
-  matching job and no process in the task worktree. Automatic stale-task
-  reconciliation proves there is no live matching job and requires its separate
-  open-PR/remote-branch evidence, but does not inspect worktree processes.
-  Ordinary task run/allocation and late review or continuation advancement fail
-  closed instead of overwriting it. Only `task recover` or retrying a job performs
-  an explicit audited recovery. Dismissal never deletes the task branch or
-  worktree.
+  `implementing` or `blocked`, and only by automatic reconciliation — no command
+  dismisses a task. Automatic stale-task reconciliation proves there is no live
+  matching job and requires its separate open-PR/remote-branch evidence, but
+  does not inspect worktree processes. Ordinary task allocation and late review
+  or continuation advancement fail closed instead of overwriting it. Only
+  retrying a job performs an explicit audited recovery. Dismissal never deletes
+  the task branch or worktree.
 
 - Dead implement worktree retries (#994): a queued top-level implement job may
   bypass only the dirty-checkout pre-flight when the dirty path resolves to that

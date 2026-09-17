@@ -94,13 +94,6 @@ type AgentInstance struct {
 	ExpiresAt      string
 }
 
-type Goal struct {
-	ID     string
-	Title  string
-	Source string
-	Status string
-}
-
 type Task struct {
 	ID                     string
 	RepoFullName           string

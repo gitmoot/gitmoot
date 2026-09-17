@@ -94,8 +94,8 @@ func (e Engine) dispatchFix(ctx context.Context, verdictJob db.Job, reviewer str
 	// concurrent same-owner legs by design. Every leg in the measured races ran
 	// under the same lock.
 	//
-	// SKIP, NOT BLOCK, and not a queue. Blocking the task would need an operator
-	// resume-work for a condition that resolves itself in minutes. Skipping is
+	// SKIP, NOT BLOCK, and not a queue. Blocking the task would strand it behind
+	// a condition that resolves itself in minutes. Skipping is
 	// safe because the sibling verdict's substance does not live in this dispatch:
 	// its findings are in the #1822 ledger, still open, and the merge gate refuses
 	// a verdict at a head that has not observed them, so the next round re-raises

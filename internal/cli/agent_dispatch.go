@@ -1548,14 +1548,11 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	return request, nil
 }
 
-func dismissedReviewTaskError(taskID string) error {
-	return fmt.Errorf("task %s is dismissed; run task recover first", taskID)
-}
-
+// disposedReviewTaskError refuses a review dispatch onto a terminally disposed
+// task. Before #2205 a `dismissed` task got its own message pointing at
+// `gitmoot task recover`; that verb is gone, so every disposed state now gets
+// the one remedy that still exists - a successor task.
 func disposedReviewTaskError(task db.Task) error {
-	if task.State == string(workflow.TaskDismissed) {
-		return dismissedReviewTaskError(task.ID)
-	}
 	return fmt.Errorf("task %s is %s; create a successor task before dispatching another review", task.ID, task.State)
 }
 
@@ -1608,7 +1605,7 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 			}
 			prOpenFixPass := validatedPRBinding && workflow.TaskState(existing.State) == workflow.TaskPullRequestOpen
 			if !taskBranchReusableForImplement(existing.State) && !prOpenFixPass {
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s in state %s; choose a fresh branch or recover/review the existing task", branchHint, existing.ID, existing.State)
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s in state %s; choose a fresh branch or review the existing task", branchHint, existing.ID, existing.State)
 			}
 			if active, ok, err := findActiveImplementJobForTask(ctx, store, repo.FullName(), branchHint, existing.ID); err != nil {
 				return db.Task{}, localAgentDispatchRequest{}, err
@@ -1636,8 +1633,10 @@ func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, 
 				if prOpenFixPass {
 					return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying the PR fix-pass", branchHint, existing.WorktreePath)
 				}
-				skipFanout := taskRecoverSkipFanout(ctx, store, repo.FullName(), branchHint)
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect it, then run %s to commit/push/open a PR, or clean/stash it before retrying implement", branchHint, existing.WorktreePath, taskRecoverCommand(existing.ID, request.Home, repo.FullName(), request.Agent, skipFanout))
+				// #2205: the implement leg used to name `gitmoot task recover` as the way
+				// to commit the worktree and open the PR. That verb is gone, so the only
+				// remaining remedy is the one the fix-pass leg always gave.
+				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying implement", branchHint, existing.WorktreePath)
 			}
 			taskID = existing.ID
 			taskTitle = firstNonEmpty(taskTitle, existing.Title)

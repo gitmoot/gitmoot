@@ -125,7 +125,7 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
 		// instead of the read-only committed-tip worktree — it must commit + push.
 		// This allocation is also fail-closed, preventing retries from duplicating
-		// or clobbering a branch/PR (`gitmoot task recover` is the escape hatch).
+		// or clobbering a branch/PR.
 		var writableErr error
 		request, writableErr = allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, runner)
 		if writableErr != nil {

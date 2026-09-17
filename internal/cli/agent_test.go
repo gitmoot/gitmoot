@@ -986,7 +986,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			// #1530: the rebind-on-divergence must NOT precede the disposal
@@ -997,7 +997,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 				request.Branch = "feature/review"
 				request.HeadSHA = strings.Repeat("0", 40)
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			name: "requested task upsert",
@@ -1005,7 +1005,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			name: "superseded matching branch",
@@ -1245,8 +1245,8 @@ func TestPrepareLocalImplementDispatchRequestRejectsDirtyExistingBranchTask(t *t
 		Instructions: "Continue the existing implementation branch.",
 		Branch:       "feature/retry",
 	})
-	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") || !strings.Contains(err.Error(), "gitmoot task recover task-existing") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want recover guidance", err)
+	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") || !strings.Contains(err.Error(), "inspect and commit/push them") {
+		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want dirty-worktree guidance", err)
 	}
 	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("dirty dispatch refusal created branch lock, err=%v", err)

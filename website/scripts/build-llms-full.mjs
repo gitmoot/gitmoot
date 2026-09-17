@@ -44,7 +44,6 @@ const sources = [
   'skills/gitmoot/references/TEMPLATE_CAPTURE.md',
   'skills/gitmoot/references/SAFETY.md',
   'skills/gitmoot/references/RESULT_CONTRACT.md',
-  'skills/gitmoot/references/GOAL_TEMPLATE.md',
 ];
 
 const header = `# Gitmoot Full LLM Context

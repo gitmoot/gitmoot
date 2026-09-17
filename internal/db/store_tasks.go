@@ -195,43 +195,6 @@ func (r Repo) FullName() string {
 	return r.Owner + "/" + r.Name
 }
 
-func (s *Store) InsertGoal(ctx context.Context, goal Goal) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO goals(id, title, source, status) VALUES (?, ?, ?, ?)`, goal.ID, goal.Title, goal.Source, goal.Status)
-	return err
-}
-
-func (s *Store) UpsertGoal(ctx context.Context, goal Goal) error {
-	return upsertGoal(ctx, s.db, goal)
-}
-
-func upsertGoal(ctx context.Context, execer sqlExecer, goal Goal) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO goals(id, title, source, status, updated_at)
-		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET
-			title = excluded.title,
-			source = excluded.source,
-			status = excluded.status,
-			updated_at = CURRENT_TIMESTAMP`,
-		goal.ID, goal.Title, goal.Source, goal.Status)
-	return err
-}
-
-func (s *Store) ListGoals(ctx context.Context) ([]Goal, error) {
-	out, err := queryList(ctx, s.db, `SELECT id, title, source, status FROM goals ORDER BY id`, nil,
-		func(row rowScanner) (Goal, error) {
-			var goal Goal
-			err := row.Scan(&goal.ID, &goal.Title, &goal.Source, &goal.Status)
-			return goal, err
-		})
-	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
-	// divergence this justification used to omit: on an early failure these
-	// methods return a non-nil len-0 slice with the error, where the pre-#1759
-	// bodies returned nil. Stated once there rather than restated here, because
-	// six copies of a justification drift and the previous six were already
-	// silent about half of it (#1795 review N4).
-	return emptyIfNil(out), err
-}
-
 func (s *Store) UpsertTask(ctx context.Context, task Task) error {
 	return upsertTask(ctx, s.db, task)
 }
@@ -632,42 +595,6 @@ func upsertTask(ctx context.Context, execer sqlExecer, task Task) error {
 				WHEN excluded.worktree_path <> '' THEN excluded.worktree_path
 				ELSE tasks.worktree_path
 			END,
-			updated_at = CURRENT_TIMESTAMP`,
-		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
-	return err
-}
-
-func (s *Store) UpsertGoalWithTasks(ctx context.Context, goal Goal, tasks []Task) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if err := upsertGoal(ctx, tx, goal); err != nil {
-		return err
-	}
-	for _, task := range tasks {
-		if err := upsertImportedTask(ctx, tx, task); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
-
-func upsertImportedTask(ctx context.Context, execer sqlExecer, task Task) error {
-	_, err := execer.ExecContext(ctx, `INSERT INTO tasks(id, repo_full_name, goal_id, title, state, branch, worktree_path, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-			ON CONFLICT(id) DO UPDATE SET
-				repo_full_name = CASE
-					WHEN excluded.repo_full_name <> '' THEN excluded.repo_full_name
-					ELSE tasks.repo_full_name
-				END,
-				goal_id = excluded.goal_id,
-				title = excluded.title,
-				state = tasks.state,
-			branch = tasks.branch,
-			worktree_path = tasks.worktree_path,
 			updated_at = CURRENT_TIMESTAMP`,
 		task.ID, task.RepoFullName, task.GoalID, task.Title, task.State, task.Branch, task.WorktreePath)
 	return err

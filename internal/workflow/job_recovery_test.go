@@ -348,8 +348,8 @@ func TestCancelJobReleasesRuntimeSessionLock(t *testing.T) {
 
 // TestCancelJobReleasesInactiveTaskLaneLock kills both a missing self-exclusion,
 // which retains the lane, and task dismissal inside CancelJob, which usurps the
-// stale-task reconciler. Cancellation must free the lane while leaving task state
-// and dismissal audit ownership unchanged.
+// stale-task reconciler that owns dismissal. Cancellation must free the lane while
+// leaving task state and dismissal audit ownership unchanged.
 func TestCancelJobReleasesInactiveTaskLaneLock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

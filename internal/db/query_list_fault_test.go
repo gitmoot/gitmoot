@@ -109,18 +109,19 @@ func openFaultingStore(t *testing.T, columns int) *Store {
 // AND the error is surfaced, together.
 func TestQueryListPreservesRowsOnIterationError(t *testing.T) {
 	ctx := context.Background()
-	// ListGoals selects four columns and is one of the six preserving callers.
+	// ListRecycleOverdueEpisodes selects four columns and is one of the
+	// preserving callers.
 	store := openFaultingStore(t, 4)
 
-	goals, err := store.ListGoals(ctx)
+	episodes, err := store.ListRecycleOverdueEpisodes(ctx)
 	if err == nil {
 		t.Fatal("want the iteration error surfaced, got nil - a faulting driver must not read as success")
 	}
-	if goals == nil {
+	if episodes == nil {
 		t.Fatalf("iteration error returned a NIL slice, silently converting a failure into an empty result; want the accumulated rows alongside err=%v", err)
 	}
-	if len(goals) != 1 {
-		t.Fatalf("len(goals) = %d, want 1 row accumulated before the fault (err=%v)", len(goals), err)
+	if len(episodes) != 1 {
+		t.Fatalf("len(episodes) = %d, want 1 row accumulated before the fault (err=%v)", len(episodes), err)
 	}
 }
 

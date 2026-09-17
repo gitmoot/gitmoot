@@ -542,7 +542,7 @@ Fixes:
   moves the task to `blocked`. Confirm the event with `gitmoot task events
   <task-id> --json`; `gitmoot task list --repo owner/repo --state blocked
   --json` exposes its `worktree_path`. Manually salvage, commit, stash, or clean
-  the changes before retrying `task run`/`agent implement`; an off-lineage
+  the changes before retrying `agent implement`; an off-lineage
   worktree is re-cut automatically only when it is clean. For a
   delegated/Orchestra implement worktree, the same event is stored as a
   JobEvent on the parent coordinator job; the delegation-worktree allocator
@@ -729,11 +729,14 @@ Fixes:
   exact-head review/CI gate missed (and the daemon journaled its chart-derived org
   escalation) or the repository has the explicit
   `[merge_gate] auto_merge = false` kill-switch. Merge it in
-  GitHub or use an authorized `@gitmoot merge` comment. If more implementation
-  is required instead, a coordinator can explicitly run `gitmoot task
-  resume-work <id> --reason "..." --override-pending-human-decision`; this
-  preserves the branch lock and records the override before returning the task
-  to `implementing`.
+  GitHub or use an authorized `@gitmoot merge` comment. Nothing you can type
+  moves the task out of `awaiting_human_merge`: removing the kill-switch lets
+  the daemon promote it back to `ready_to_merge` and record
+  `task_awaiting_human_merge_rearmed`, an observed merge moves it to `merged`,
+  and the stale-task disposal pass eventually strands it if neither happens.
+  Implement dispatch against the task itself is refused while it waits, so if
+  more implementation is required, land or close this PR and dispatch the
+  follow-up as fresh work on a new branch.
 - If the reason reads `waiting to confirm no external CI` (or `waiting … for CI
   to be created`), the gate saw **zero** external commit-statuses and check-runs
   at the head and is deferring rather than merging before GitHub Actions creates

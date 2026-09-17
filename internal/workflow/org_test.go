@@ -38,7 +38,7 @@ func TestMailboxOrgScopeGate(t *testing.T) {
 		{ID: "missing", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local", OperatorOrigin: true},
 		{ID: "unknown", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local", OperatorOrigin: true, ActingOrgRole: "nope"},
 		{ID: "scope", Agent: "a", Action: "ask", Repo: "other/repo", Sender: "local", OperatorOrigin: true, ActingOrgRole: "owner"},
-		{ID: "task-run", Agent: "a", Action: "implement", Repo: "owner/repo", Sender: "task run", OperatorOrigin: true},
+		{ID: "implement-no-role", Agent: "a", Action: "implement", Repo: "owner/repo", Sender: "local", OperatorOrigin: true},
 	} {
 		if _, err := mb.Enqueue(ctx, request); err == nil {
 			t.Fatalf("%s unexpectedly accepted", request.ID)

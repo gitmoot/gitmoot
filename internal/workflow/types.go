@@ -74,10 +74,8 @@ const TaskEventMergedRegressionRefused = "task_merged_regression_refused"
 //	                     step later. Nothing legitimately moves landed work back
 //	                     to a pre-work state.
 //	implementing         PERMITTED. It is not a terminal failure-policy result.
-//	                     The CLI resume-work command separately rejects `merged`;
-//	                     this state-machine guard does not claim that CLI path.
 //	pr_open              PERMITTED. A real pull request exists on the branch —
-//	                     the fresh cycle resume-work started.
+//	                     the one the fresh cycle opened.
 //	reviewing            PERMITTED. A real review is running on that real PR.
 //	changes_requested    PERMITTED. A reviewer's verdict on a real PR is evidence,
 //	                     not a leg that never ran; refusing it would silently drop

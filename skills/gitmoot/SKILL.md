@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, pipeline chaining through the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, pipeline chaining through the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
@@ -11,10 +11,10 @@ metadata:
 # Gitmoot Agent Skill
 
 Gitmoot is a local-first coordinator for AI agents working across repositories,
-goals, reviews, PR comments, and runtime workflows. Use this skill when the
+reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup, structured
-implementation plans, standard goal files, agent template workflows, custom
+implementation plans, agent template workflows, custom
 prompt agents, template capture, job status, or branch lock inspection. When a job
 pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
 "<question-id>: text"` (see CLI.md § Jobs).
@@ -138,7 +138,7 @@ Use the SessionStart "Current snapshot" for quick repo-local daemon/task/job/loc
 answers when available. Use `gitmoot status --repo owner/repo` for concise repo
 status, `gitmoot daemon status` for daemon state, `gitmoot agent list` and
 `gitmoot agent show <agent>` for registered agents. Use `gitmoot task list --repo owner/repo`
-or `gitmoot task list --repo owner/repo --json` for imported task state. Use
+or `gitmoot task list --repo owner/repo --json` for task state. Use
 `gitmoot job list --repo owner/repo` for jobs, and use
 `gitmoot dashboard --json` only when a structured full dashboard snapshot is
 needed. The read-only web dashboard's Overview and Org pages distinguish live
@@ -232,8 +232,7 @@ retargets delivery and `default_effort` selects Codex effort and omp's
 can discover Gitmoot through an installed runtime plugin. Use
 `gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
 adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
-Use `gitmoot goal template` when
-writing a standard task-by-task goal file. Use `gitmoot workflow list`, `gitmoot
+Use `gitmoot workflow list`, `gitmoot
 workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
 `gitmoot workflow note`, and `gitmoot workflow close` to
 inspect external-coordinator workflow groups, set their stable description, add
@@ -302,9 +301,6 @@ For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
 For current-chat template capture, read
 [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md).
-For the canonical goal prompt template, read
-[GOAL_TEMPLATE.md](references/GOAL_TEMPLATE.md) only when the user asks for a
-goal file.
 
 ## Plan-Gated Implementation
 

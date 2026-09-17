@@ -705,7 +705,8 @@ func (s *Store) ReleaseLockWithEvent(ctx context.Context, lock BranchLock, event
 // ReleaseBranchLockIfInactiveWithEvent releases lock only when no non-terminal
 // task or job still references its repo+branch. ignoredImplementingTaskID lets
 // event-driven cancellation exclude only its exact implementing task while the
-// stale-task reconciler retains ownership of task dismissal and cleanup. Empty
+// stale-task reconciler retains ownership of automatic task dismissal and
+// cleanup. Empty
 // disables the exclusion, as the daemon sweeper requires. A zero updatedBefore
 // disables the age predicate; the sweeper supplies a cutoff so a newly acquired
 // lane can never be reclaimed.

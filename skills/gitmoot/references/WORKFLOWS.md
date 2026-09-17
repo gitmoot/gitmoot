@@ -210,9 +210,6 @@ in chat.
 Use the Gitmoot planner here. Write a task-by-task implementation plan for this feature.
 ```
 
-If the user asks for a standard goal file, read the canonical goal template and
-write the goal file. Do not create a goal file unless explicitly requested.
-
 ## Plan-Gated Implement
 
 Gate implementation on an approved plan when the change is non-trivial. The
@@ -324,8 +321,8 @@ The capture pieces are distinct:
 
 ## Background Planner Agent
 
-Use the planner template when the user wants a structured implementation plan or a
-standard Gitmoot goal file to run as a tracked Gitmoot background agent job.
+Use the planner template when the user wants a structured implementation plan to
+run as a tracked Gitmoot background agent job.
 
 ```sh
 gitmoot agent template update planner
@@ -340,7 +337,7 @@ gitmoot agent start project-planner \
 Ask from a PR comment:
 
 ```text
-/gitmoot project-planner ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+/gitmoot project-planner ask Write a task-by-task implementation plan for this feature.
 ```
 
 Ask directly from a local Codex or Claude Code chat by having the runtime call
@@ -348,7 +345,7 @@ the Gitmoot CLI when the user explicitly wants a registered background-capable
 agent path:
 
 ```sh
-gitmoot agent ask project-planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+gitmoot agent ask project-planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature."
 gitmoot job watch <job-id>
 ```
 
@@ -357,13 +354,6 @@ form is `$gitmoot:gitmoot agent ask project-planner --repo owner/repo --backgrou
 important part is that background planner work goes through `gitmoot agent ask`;
 fast "here" planning stays in the current chat and uses `gitmoot agent prompt`
 only to read prompt content.
-
-If the planner writes a goal file and the user wants Gitmoot to track it, import
-it explicitly:
-
-```sh
-gitmoot goal import --file GOAL-feature.md --repo owner/repo
-```
 
 ## Answering A Paused Job
 
@@ -405,24 +395,22 @@ a success is working as designed, not flaky:
   envelope records a `malformed_output` event and is re-asked with a repair
   prompt a bounded number of times before failing terminally.
 
-**Dead implement recovery (manual):** if an implementer's process dies after
+**Dead implement, finished by hand:** if an implementer's process dies after
 editing the task worktree but before it commits/pushes/opens a PR, the edits sit
-uncommitted. `gitmoot task run` and `gitmoot agent implement` refuse to restart
-over a dirty worktree with no active job (so nothing is discarded) and point at
-`gitmoot task recover <task-id> --owner <agent>`, which commits the full
-worktree state (`git add -A`, incl. untracked non-ignored files), pushes the
-branch, and opens or adopts the PR. `--repo` is optional (falls back to the
-task's repo). `--owner` is required for this artifact-finalization path, but not
-when a dismissed branchless task is simply restored to `planned`. Recovery
-refuses while a live process is still inside the worktree.
+uncommitted. `gitmoot agent implement` refuses to restart over a dirty worktree
+with no active job (so nothing is discarded) and names the worktree: `branch <b>
+has uncommitted changes in task worktree <path>; inspect and commit/push them,
+or clean/stash them before retrying implement`. No command finishes that work
+for you: inspect the worktree, then either commit and push the branch by hand —
+opening or updating the PR yourself — or clean/stash the changes, and retry
+`gitmoot agent implement`. Dispatch refuses separately while a live process is
+still inside the worktree.
 
 **Task dismissal and stale reconciliation:** `dismissed` is a terminal task
-state for implicit workflow transitions. An operator can run `gitmoot task
-dismiss <id> [--reason ...]` only from `implementing` or `blocked`; Gitmoot
-refuses while any matching job is live or a process remains in the task
-worktree. The branch and worktree are preserved, while the branch lock is
-released best-effort. Manual and daemon transitions are audited as
-`task_dismissed_manual` and `task_dismissed_auto` in `gitmoot task events <id>`.
+state reached only through implicit workflow transitions; no command dismisses a
+task. The daemon preserves the branch and worktree, releases the branch lock
+best-effort, and audits each transition as `task_dismissed_auto` (or
+`task_dismissed_planned_ttl`) in `gitmoot task events <id>`.
 
 Each repo poll reads a bounded oldest-first stale window and processes up to 20
 qualifying `implementing` tasks whose `updated_at` predates
@@ -430,10 +418,9 @@ qualifying `implementing` tasks whose `updated_at` predates
 `updated_at` is deliberately a conservative activity proxy, not proof of
 abandonment. A candidate is skipped for a live job, a same-repo open-PR branch,
 or an exact branch still present on `origin`; remote lookup uncertainty skips
-mutation. A branchless candidate needs no remote lookup. Explicit `task
-recover` restores preserved artifacts through `implementing` to `pr_open`, or
-restores a branchless task to `planned`; job retry records its own recovery
-event. The server-side task board omits dismissed rows immediately.
+mutation. A branchless candidate needs no remote lookup. Retrying one of a
+dismissed task's jobs restores it and records its own recovery event. The
+server-side task board omits dismissed rows immediately.
 
 `blocked` and `awaiting_human_merge` use a separate evidence-based disposal
 ladder at that TTL: own PR merged -> `merged`; a later merged task/PR on the same
@@ -468,11 +455,11 @@ remain fatal.
 Never-started `planned` tasks use a separate opt-in policy:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
 zero, and invalid values all resolve to off because automatic dismissal can
-destroy human planning context that goal-file re-import cannot reconstruct.
+destroy human planning context that nothing else reconstructs.
 When enabled, it reuses the same live-job, same-repo open-PR, remote-branch,
 and remote-uncertainty skips and records `task_dismissed_planned_ttl`. Task
 worktree allocation claims `planned -> implementing` with a write-time CAS, so
-a concurrent TTL dismissal cannot be overwritten; explicit recovery is needed.
+a concurrent TTL dismissal cannot be overwritten; a job retry restores it.
 
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
@@ -490,9 +477,9 @@ implementation task. `--action` chooses ask/review/implement; `--type` instead
 chooses a managed agent type, so the two flags are independent. Before reuse,
 Gitmoot proves the PR is open, same-repository, and bound to the existing task's
 head branch. That validated door permits `pr_open` to re-enter implementation
-without widening the predicate shared by `task recover`; review/merge states,
-branch mismatches, dirty/live worktrees, active implement jobs, and foreign
-branch locks still fail closed. The job keeps the PR number so finalization
+without widening the dispatch predicate; review/merge states, branch
+mismatches, dirty/live worktrees, active implement jobs, and foreign branch
+locks still fail closed. The job keeps the PR number so finalization
 adopts the existing PR.
 
 Fresh implementation PRs opened by the engine are drafts by default. Dispatch

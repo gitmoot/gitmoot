@@ -622,9 +622,9 @@ func (e Engine) claimPlannedTaskForImplementation(ctx context.Context, taskID st
 		return nil
 	}
 	if current == string(TaskDismissed) {
-		return fmt.Errorf("task %s was dismissed while task run was starting; recover it explicitly before retrying", taskID)
+		return fmt.Errorf("task %s was dismissed while its worktree was being allocated; dispatch a successor task instead of retrying this one", taskID)
 	}
-	return fmt.Errorf("task %s left planned state while task run was starting (now %s); retry from its current lifecycle state", taskID, current)
+	return fmt.Errorf("task %s left planned state while its worktree was being allocated (now %s); retry from its current lifecycle state", taskID, current)
 }
 
 // DelegationWorktreeRequest carries the inputs needed to allocate a git
