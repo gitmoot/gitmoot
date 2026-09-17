@@ -1493,7 +1493,7 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-Or the built-in full planner/goal template:
+Or the built-in full planner template:
 
 ```sh
 gitmoot agent start project-planner \
