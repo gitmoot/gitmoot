@@ -170,7 +170,7 @@ func TestFindingWithContentIsNotRefused(t *testing.T) {
 // identity, classification, and locators. Named explicitly so the classification
 // test below is a decision rather than a filter.
 var ledgerNonContentKeys = []string{
-	"id", "severity", "file", "continues_uid", "state", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens",
+	"id", "uid", "severity", "file", "continues_uid", "state", "disposition", "evidence_kind", "evidence_locator", "locator", "location", "withdraw_reason", "line", "relevance_keys", "lens",
 }
 
 // THE REVERSE DRIFT, which the advertised-keys test alone does not catch.
@@ -275,8 +275,9 @@ func refusalPresent(events []db.JobEvent) bool {
 // FIVE false misclassifications beside the one real one. The map is exhaustive
 // by assertion so a new key cannot silently reintroduce that.
 var nonContentProbeValues = map[string]string{
-	"id": `"F1"`, "file": `"internal/x.go"`, "continues_uid": `"gitmoot/gitmoot#1-f1"`,
-	"state": `"open"`, "evidence_kind": `"EXECUTED"`, "evidence_locator": `"internal/x.go:1"`,
+	"id": `"F1"`, "uid": `"gitmoot/gitmoot#1-f1"`, "file": `"internal/x.go"`,
+	"continues_uid": `"gitmoot/gitmoot#1-f1"`, "state": `"open"`, "disposition": `"answered"`,
+	"evidence_kind": `"EXECUTED"`, "evidence_locator": `"internal/x.go:1"`,
 	"locator": `"internal/x.go:1"`, "location": `"internal/x.go:1"`,
 	"withdraw_reason": `"no longer applies"`, "line": `42`,
 	"relevance_keys": `["k"]`, "lens": `"security"`, "severity": `"P3"`,

@@ -2167,6 +2167,11 @@ func (d *webDataSource) runSSEPoller(ctx context.Context, runID string, poller *
 			// closed its channel under poller.mu, so nothing remains to close.
 			return
 		case <-ticker.C:
+			// A tick and cancellation can become ready together. Do not begin
+			// another snapshot after the last subscriber has stopped the poller.
+			if ctx.Err() != nil {
+				return
+			}
 			publish()
 		}
 	}
