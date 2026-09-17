@@ -151,6 +151,10 @@ type localAgentDispatchRequest struct {
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
+	// RouterBypassReason names why a review dispatch skipped `review request`.
+	// Recorded as a job event so the reason is queryable rather than living in
+	// one terminal's scrollback (#2199).
+	RouterBypassReason string
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)
@@ -880,6 +884,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_no_fix_target",
 			Message: "dispatched --no-fix-target: this review has no implementer for a changes_requested verdict; the dispatching operator owns the follow-up"})
 	}
+	if reason := strings.TrimSpace(request.RouterBypassReason); reason != "" {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "router_bypassed", Message: "dispatched WITHOUT the review router: " + reason + " cannot be expressed by `review request`"}); err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -1241,6 +1250,11 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err
+	}
+	if reason := strings.TrimSpace(request.RouterBypassReason); reason != "" {
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "router_bypassed", Message: "dispatched WITHOUT the review router: " + reason + " cannot be expressed by `review request`"}); err != nil {
+			return localAgentJobOutput{}, err
+		}
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err

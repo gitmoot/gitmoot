@@ -372,28 +372,31 @@ func printAgentRuntimeOverrideHelp(w io.Writer) {
 }
 
 type agentRunOptions struct {
-	home                    string
-	repo                    string
-	jsonOutput              bool
-	background              bool
-	foreground              bool
-	typeName                string
-	action                  string
-	model                   string
-	effort                  string
-	workflowID              string
-	workflowSet             bool
-	orgRole                 string
-	runtime                 string
-	session                 string
-	taskID                  string
-	prNumber                int
-	pullRequestReady        bool
-	pullRequestMode         string
-	headSHA                 string
-	base                    string
-	branch                  string
-	lead                    string
+	home             string
+	repo             string
+	jsonOutput       bool
+	background       bool
+	foreground       bool
+	typeName         string
+	action           string
+	model            string
+	effort           string
+	workflowID       string
+	workflowSet      bool
+	orgRole          string
+	runtime          string
+	session          string
+	taskID           string
+	prNumber         int
+	pullRequestReady bool
+	pullRequestMode  string
+	headSHA          string
+	base             string
+	branch           string
+	lead             string
+	// routerBypassReason names why this dispatch skipped `review request`, so
+	// the job carries it instead of only the operator's terminal (#2199).
+	routerBypassReason      string
 	agent                   string
 	message                 string
 	skipNativeReviewFanout  bool
@@ -541,8 +544,25 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent review: --%s is only supported when routing to implement\n", mode)
 		return 2
 	}
+	// EVERY reason is recorded, not just the flag one: a bypass nobody can query
+	// is indistinguishable from a router that silently did not run (#2199).
+	switch {
+	case options.foreground:
+		options.routerBypassReason = "--foreground (the router always dispatches a daemon-owned job)"
+	case strings.TrimSpace(options.orgRole) == "":
+		options.routerBypassReason = "no --org-role (the router requires a role to deliver the verdict to)"
+	}
 	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
 		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
+			// RECORDED, NOT ONLY PRINTED (#2199). The notice below goes to
+			// stderr and nowhere else, so the reason a dispatch skipped the
+			// router survives only in whoever's terminal ran it. Measured
+			// 2026-09-17: three dispatches by one seat bypassed the router on
+			// the new build and NOTHING IN THE STORE COULD SAY WHY - I could
+			// eliminate causes but not name one. A reason nobody can query is
+			// the same defect this campaign has been closing all week, one
+			// layer up: the system knew and told no durable record.
+			options.routerBypassReason = strings.Join(unexpressible, ", ")
 			// NOT SILENTLY DROPPED AND NOT FATAL. The router has no counterpart
 			// for these, so delegating would discard a stated operator input -
 			// the invisible-degradation shape this work exists to remove. The
@@ -872,6 +892,7 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		LeadAgent:               options.lead,
 		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
 		AllowPromptHeadMismatch: options.allowPromptHeadMismatch,
+		RouterBypassReason:      options.routerBypassReason,
 		NoFixTarget:             options.noFixTarget,
 		Recipe:                  options.recipe,
 		SelectedAction:          action,

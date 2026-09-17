@@ -365,7 +365,18 @@ func TestReviewRouterDocsAreIdenticalInBothTrees(t *testing.T) {
 		"routes THROUGH this command",
 		"--lead <implementer>",
 		"ATTACHING request is told what it lost",
-		"names the flag on stderr",
+		// Was "names the flag on stderr" until #2199: the stderr claim was
+		// inaccurate for --foreground and a missing --org-role, which print
+		// nothing. The DURABLE record is the job event, so that is what the docs
+		// must keep naming.
+		"router_bypassed",
+		"UNDERCOUNTS",
+		// #2199 round 2 named 'gitmoot job show' - which never lists events -
+		// and claimed the other arms 'do not print', which is false whenever an
+		// advance warning fires. Both are pinned so a confident wrong command
+		// cannot come back.
+		"gitmoot job events <id>",
+		"not the discriminator",
 	} {
 		if !strings.Contains(website, want) {
 			t.Errorf("shared review-router docs no longer mention %q", want)
