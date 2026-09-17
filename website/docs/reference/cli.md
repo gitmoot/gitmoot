@@ -1347,10 +1347,17 @@ reviewer can tell operator instructions from generated framing — pass it after
 
 Two things `agent review` reports that are easy to miss:
 
-- **A dispatch that cannot be delegated says why.** No `--org-role` (the router
-  requires a verdict recipient), `--foreground`, or any flag the router cannot
-  express keeps the direct path and names the flag on stderr: a silently
-  different review is worse than a refused one.
+- **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
+  router requires a verdict recipient), `--foreground`, or any flag the router
+  cannot express keeps the direct path and writes a `router_bypassed` job event
+  naming the reason — queryable months later with
+  `gitmoot job show <id>`, not just printed. The unexpressible-flag case also
+  prints to stderr; the other two do not, which is exactly why the durable event
+  exists. A silently different review is worse than a refused one.
+  **Counting unrouted reviews:** `router_bypassed` alone UNDERCOUNTS, because
+  `agent run --action review` and `orchestrate --pr` never reach that gate and
+  record their reason in `route_selected` instead. The complete query is
+  `route_selected NOT LIKE '%review_request%'`.
 - **An ATTACHING request is told what it lost.** A second request at a head that
   already holds a claim attaches to the running review rather than spending a
   second reviewer — and prints which of your `--reviewer`, instructions,

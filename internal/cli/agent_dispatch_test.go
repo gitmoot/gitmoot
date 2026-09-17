@@ -2081,3 +2081,95 @@ func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
 		})
 	}
 }
+
+// #2199 review: the false-positive direction I asked for and then did not
+// assert. A dispatch that DID route must record no bypass reason - recording one
+// would be the same false-evidence shape #2196 round 5 shipped and had to fix.
+// Also covers --foreground, the third reason, which the first test table omitted.
+func TestRoutedDispatchRecordsNoBypassAndForegroundRecordsOne(t *testing.T) {
+	setup := func(t *testing.T) (string, *db.Store, string) {
+		t.Helper()
+		home := t.TempDir()
+		paths := config.PathsForHome(home)
+		if err := config.Initialize(paths); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		file.Close()
+		store := openCLIJobStore(t, home)
+		checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+		seedReviewDispatchFixture(t, store, checkout)
+		seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+		replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+			return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+		})
+		installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+		previousGitHubFactory := newAgentDispatchGitHubClient
+		newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+		t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+		return home, store, head
+	}
+	bypassEvents := func(t *testing.T, store *db.Store) []string {
+		t.Helper()
+		jobs, err := store.ListJobs(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found []string
+		for _, job := range jobs {
+			events, err := store.ListJobEvents(context.Background(), job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range events {
+				if event.Kind == "router_bypassed" {
+					found = append(found, event.Message)
+				}
+			}
+		}
+		return found
+	}
+
+	t.Run("a routed dispatch records none", func(t *testing.T) {
+		home, store, head := setup(t)
+		defer store.Close()
+		var stdout, stderr bytes.Buffer
+		if code := runAgentReview([]string{
+			"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+			"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+			"--org-role", "joltra", "--home", home,
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+		}
+		if got := bypassEvents(t, store); len(got) != 0 {
+			t.Fatalf("routed dispatch recorded a bypass reason %v: that is false evidence, the shape this instrument exists to avoid producing", got)
+		}
+	})
+
+	t.Run("--foreground records its reason", func(t *testing.T) {
+		home, store, head := setup(t)
+		defer store.Close()
+		var stdout, stderr bytes.Buffer
+		if code := runAgentReview([]string{
+			"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+			"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+			"--org-role", "joltra", "--foreground", "--home", home,
+		}, &stdout, &stderr); code != 0 {
+			t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+		}
+		got := bypassEvents(t, store)
+		if len(got) == 0 {
+			t.Fatal("a --foreground dispatch recorded no reason: it prints nothing to stderr either, so the bypass would be invisible")
+		}
+		if !strings.Contains(got[0], "--foreground") {
+			t.Fatalf("recorded %q, want the --foreground reason named", got[0])
+		}
+	})
+}

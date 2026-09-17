@@ -365,7 +365,12 @@ func TestReviewRouterDocsAreIdenticalInBothTrees(t *testing.T) {
 		"routes THROUGH this command",
 		"--lead <implementer>",
 		"ATTACHING request is told what it lost",
-		"names the flag on stderr",
+		// Was "names the flag on stderr" until #2199: the stderr claim was
+		// inaccurate for --foreground and a missing --org-role, which print
+		// nothing. The DURABLE record is the job event, so that is what the docs
+		// must keep naming.
+		"router_bypassed",
+		"UNDERCOUNTS",
 	} {
 		if !strings.Contains(website, want) {
 			t.Errorf("shared review-router docs no longer mention %q", want)
