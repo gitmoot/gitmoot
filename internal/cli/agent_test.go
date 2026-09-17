@@ -1680,60 +1680,6 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	}
 }
 
-func TestDispatchLocalAgentJobBlocksReadOnlyImplement(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
-		t.Fatalf("UpsertRepo returned error: %v", err)
-	}
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name:           "lead",
-		Role:           "implementer",
-		Runtime:        runtime.ShellRuntime,
-		RuntimeRef:     "unused",
-		RepoScope:      "owner/repo",
-		Capabilities:   []string{"implement"},
-		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:     "owner/repo",
-		Agent:        "lead",
-		Action:       "implement",
-		Instructions: "Implement task 1.",
-		Home:         home,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-
-	if output.State != string(workflow.JobBlocked) || output.Action != "implement" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	job, err := store.GetJob(context.Background(), output.JobID)
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	if job.State != string(workflow.JobBlocked) {
-		t.Fatalf("job state = %q, want blocked", job.State)
-	}
-	events, err := store.ListJobEvents(context.Background(), job.ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !daemonWorkerHasEvent(events, "permission_blocked") {
-		t.Fatalf("events = %+v, want permission_blocked", events)
-	}
-}
-
 func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -4265,3 +4211,19 @@ func TestAgentImplementVerbIsRefused(t *testing.T) {
 		t.Fatalf("runAgent(review) was refused as unknown; the refusal is too broad: %q", stderr.String())
 	}
 }
+
+// #2203 retired TestDispatchLocalAgentJobBlocksReadOnlyImplement along with the
+// dispatch-side readOnlyImplementationBlocked check it pinned. It called
+// dispatchLocalAgentJob directly with Action:"implement" and asserted that a
+// read-only policy produced JobBlocked plus a permission_blocked event.
+//
+// No surface can produce that input any more: --action is validated against
+// workflow.DelegationActions = [ask review] at parse time, so the only way to
+// reach the removed check was to call the internal function with an Action the
+// CLI refuses. Round 2 of #2215 caught that removing the check turned this test
+// red, which is the correct signal - the test was the last thing keeping the
+// dead branch alive.
+//
+// The behaviour is NOT uncovered. A legacy queued implement row still fails
+// closed through the worker-side guards (daemon_worker.go:434 and :3270), and
+// TestPreflightAutoImplementIsPermissionBlocked still covers that path.
