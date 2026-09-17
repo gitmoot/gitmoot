@@ -395,7 +395,7 @@ type agentRunOptions struct {
 	branch           string
 	lead             string
 	// routerBypassReason names why this dispatch skipped `review request`, so
-	// the job carries it instead of only the operator's terminal (#2197).
+	// the job carries it instead of only the operator's terminal (#2199).
 	routerBypassReason      string
 	agent                   string
 	message                 string
@@ -545,7 +545,7 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	// EVERY reason is recorded, not just the flag one: a bypass nobody can query
-	// is indistinguishable from a router that silently did not run (#2197).
+	// is indistinguishable from a router that silently did not run (#2199).
 	switch {
 	case options.foreground:
 		options.routerBypassReason = "--foreground (the router always dispatches a daemon-owned job)"
@@ -554,7 +554,7 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	}
 	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
 		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
-			// RECORDED, NOT ONLY PRINTED (#2197). The notice below goes to
+			// RECORDED, NOT ONLY PRINTED (#2199). The notice below goes to
 			// stderr and nowhere else, so the reason a dispatch skipped the
 			// router survives only in whoever's terminal ran it. Measured
 			// 2026-09-17: three dispatches by one seat bypassed the router on

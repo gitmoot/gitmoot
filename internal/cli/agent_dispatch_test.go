@@ -2004,7 +2004,7 @@ func TestDelegatedMessageMayStartWithADash(t *testing.T) {
 	}
 }
 
-// #2197: A BYPASS NOBODY CAN QUERY IS INDISTINGUISHABLE FROM A ROUTER THAT
+// #2199: A BYPASS NOBODY CAN QUERY IS INDISTINGUISHABLE FROM A ROUTER THAT
 // SILENTLY DID NOT RUN. Measured 2026-09-17: three dispatches by one seat
 // skipped the router on the new build and NOTHING IN THE STORE COULD SAY WHY -
 // the reason was printed to stderr and nowhere else, so causes could be

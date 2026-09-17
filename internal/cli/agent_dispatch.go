@@ -153,7 +153,7 @@ type localAgentDispatchRequest struct {
 	ExecutionPath          string
 	// RouterBypassReason names why a review dispatch skipped `review request`.
 	// Recorded as a job event so the reason is queryable rather than living in
-	// one terminal's scrollback (#2197).
+	// one terminal's scrollback (#2199).
 	RouterBypassReason string
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
