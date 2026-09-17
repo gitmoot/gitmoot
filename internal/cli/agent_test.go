@@ -2756,79 +2756,14 @@ func TestRunAgentStartUpdateTemplateInstallsBeforeStart(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartMemoryEnrollmentTriStateAndNotice(t *testing.T) {
-	tests := []struct {
-		name       string
-		memoryBody string
-		flag       string
-		wantMemory bool
-		wantNotice string
-	}{
-		{name: "default off", wantNotice: "memory: off (enable with --memory)"},
-		{name: "explicit on", flag: "--memory", wantMemory: true, wantNotice: "memory: on"},
-		{name: "default enroll", memoryBody: "default_enroll = true\n", wantMemory: true, wantNotice: "memory: on"},
-		{name: "explicit false overrides default", memoryBody: "default_enroll = true\n", flag: "--memory=false", wantNotice: "memory: off (enable with --memory)"},
-		{name: "enrolled globally disabled", memoryBody: "default_enroll = true\ndisabled = true\n", wantMemory: true, wantNotice: "memory: enrolled but globally disabled by [memory].disabled"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
-			paths := config.PathsForHome(home)
-			if err := config.Initialize(paths); err != nil {
-				t.Fatalf("Initialize: %v", err)
-			}
-			if tc.memoryBody != "" {
-				if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+"\n[memory]\n"+tc.memoryBody), 0o600); err != nil {
-					t.Fatalf("write config: %v", err)
-				}
-			}
-			repoDir := t.TempDir()
-			runGit(t, repoDir, "init")
-			runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-			fake := &agentRestartFakeAdapter{newRef: "550e8400-e29b-41d4-a716-446655440099"}
-			previous := agentStartAdapterFor
-			agentStartAdapterFor = func(_ string, runtimeName string, checkout string) (runtime.Adapter, error) {
-				fake.name = runtimeName
-				fake.lastCheckout = checkout
-				return fake, nil
-			}
-			t.Cleanup(func() { agentStartAdapterFor = previous })
-
-			args := []string{"agent", "start", "memory-agent", "--home", home, "--runtime", "codex", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}
-			if tc.flag != "" {
-				args = append(args, tc.flag)
-			}
-			var stdout, stderr bytes.Buffer
-			if code := Run(args, &stdout, &stderr); code != 0 {
-				t.Fatalf("agent start exit=%d stderr=%s", code, stderr.String())
-			}
-			entries, err := config.LoadAgentTypes(paths)
-			if err != nil {
-				t.Fatalf("LoadAgentTypes: %v", err)
-			}
-			entry, ok := entries["memory-agent"]
-			if !ok || entry.Memory != tc.wantMemory || entry.Runtime != "codex" || entry.Role == "" || len(entry.Capabilities) == 0 {
-				t.Fatalf("persisted full agent type = %+v ok=%v", entry, ok)
-			}
-			if !strings.Contains(stdout.String(), tc.wantNotice) {
-				t.Fatalf("stdout missing %q:\n%s", tc.wantNotice, stdout.String())
-			}
-		})
-	}
-}
-
-func TestRunAgentStartPreservesExistingAgentTypeWithoutMemoryFlag(t *testing.T) {
+func TestRunAgentStartPreservesExistingAgentType(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
 	configured := config.DefaultConfig(paths) + `
-[memory]
-default_enroll = false
-
-[agents.memory-agent]
+[agents.preserved-agent]
 runtime = "claude"
 template = "preserved-template"
 model = "preserved-model"
@@ -2839,7 +2774,6 @@ autonomy_policy = "read-only"
 max_background = 4
 idle_timeout = "41m"
 job_timeout = "17m"
-memory = true
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(configured), 0o600); err != nil {
 		t.Fatal(err)
@@ -2858,7 +2792,7 @@ memory = true
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "memory-agent", "--home", home, "--runtime", "codex",
+		"agent", "start", "preserved-agent", "--home", home, "--runtime", "codex",
 		"--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -2875,14 +2809,11 @@ memory = true
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry := entries["memory-agent"]
-	if !entry.Memory || entry.Runtime != "claude" || entry.Template != "preserved-template" || entry.Model != "preserved-model" ||
+	entry := entries["preserved-agent"]
+	if entry.Runtime != "claude" || entry.Template != "preserved-template" || entry.Model != "preserved-model" ||
 		entry.Effort != "high" || entry.Role != "preserved-role" || !reflect.DeepEqual(entry.Capabilities, []string{"review"}) ||
 		entry.AutonomyPolicy != "read-only" || entry.MaxBackground != 4 || entry.IdleTimeout != "41m" || entry.JobTimeout != "17m" {
 		t.Fatalf("pre-existing type was clobbered: %+v", entry)
-	}
-	if !strings.Contains(stdout.String(), "memory: on") {
-		t.Fatalf("stdout missing preserved enrollment notice:\n%s", stdout.String())
 	}
 }
 

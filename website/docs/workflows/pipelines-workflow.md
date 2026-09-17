@@ -28,7 +28,6 @@ repo: owner/repo            # optional to register; REQUIRED to run
 group: Release Automation   # optional display section on /pipelines and `pipeline list`;
                             #   free-form, decoupled from repo (one group may span repos,
                             #   one repo may split across groups); unset falls back to repo.
-                            #   Built-in memory pipelines ship under "Gitmoot System".
 description: Syncs nightly data for deployment. # optional detail-page purpose (multiline, max 500 chars)
 env_file: /root/.config/nightly-sync/env # optional operator-owned 0600 secret file
 env:                         # optional inline NON-secret defaults
@@ -189,14 +188,14 @@ Use a pipeline trigger when an upstream must finish successfully before the next
 flow starts:
 
 ```yaml
-name: memory-ingest-sweep
+name: nightly-report
 repo: owner/repo
 trigger:
   kind: pipeline
-  pipeline: memory-groom-propose
+  pipeline: nightly-sync
 stages:
-  - id: sweep
-    cmd: gitmoot memory ingest sweep --json
+  - id: report
+    cmd: gitmoot job list --json
 ```
 
 This replaces a `24h` groom plus `24h30m` ingest clock stagger with real ordering.
@@ -286,7 +285,6 @@ gitmoot pipeline import ./nightly-sync.bundle --repo acme/nightly-target
 gitmoot pipeline list [--json]
 gitmoot pipeline show <name> [--json]        # registry view for a pipeline name
 gitmoot pipeline show <run-id> [--json]      # run funnel for a "prun-…" run id
-gitmoot pipeline install-defaults            # install built-in memory pipelines
 gitmoot pipeline export <name> --output <dir>
 gitmoot pipeline import <dir> --repo owner/repo [--agent-map exported=local]
 gitmoot pipeline remote set <owner/repo> [--ref <ref>] [--path <subdir>]
@@ -416,42 +414,6 @@ A triggered pipeline containing an `implement` or `produce` stage must set
 `allow_triggered_writes: true`, in addition to each stage's `write: true`. This is
 independent of `allow_scheduled_writes` when an email pipeline has both trigger and schedule.
 
-`pipeline install-defaults` installs Gitmoot's built-in memory pipelines:
-`memory-ingest-sweep` and `memory-groom-propose`. The daemon also runs that
-installer at startup. The installer is idempotent; if either name already exists,
-Gitmoot skips it and preserves the user's stored YAML, hash, enabled flag, and
-schedule. With empty config, the definitions are installed manual-only. Add
-`[[memory.ingest]]` sources and optional `[memory.pipelines]` intervals to make
-them useful:
-
-```toml
-[[memory.ingest]]
-path = "/path/to/markdown-notes"
-agent = "lead"
-repo = "owner/repo"
-tier = "repo"
-
-[memory.pipelines]
-repo = "owner/repo"
-ingest_sweep = "nightly"
-groom_propose = "nightly"
-```
-
-`nightly` is accepted as `24h`; any positive Go duration such as `"12h"` also
-works. If schedules are unset, run them on demand:
-
-```sh
-gitmoot pipeline run memory-ingest-sweep
-gitmoot pipeline run memory-groom-propose
-```
-
-The installed `memory-ingest-sweep` spec has a fixed two-stage shape: `sweep`
-calls `gitmoot memory ingest sweep --json`, then `summarize` reports the totals.
-The source list is loaded from `[[memory.ingest]]` at run time, so config edits
-apply on the next scheduled or manual run without reinstalling defaults. A bad
-source is reported in the sweep JSON and does not stop other sources. The stage
-fails visibly only when the config is invalid or every configured source fails.
-With no sources, the run succeeds with a skipped summary.
 
 ## The stage contract
 
@@ -664,14 +626,15 @@ gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
 unknown label to guard against a typo - so file the row under the lane the PR is
 already being coordinated in rather than inventing a label.
 
-The note's repo COLUMN is a separate, optional thing. A note whose column is
-empty still counts when its body names this repository, which is the ordinary
-case: `gitmoot workflow note` writes an empty column unless you pass
-`--remember --repo <owner/repo>`, and `--repo` is REJECTED without `--remember`
-(`--agent, --repo, and --remember-status require --remember`), because that flag
-set also opts the note into durable memory. Setting the column is therefore
-optional and costs a memory write; getting `repo=` right in the BODY is not
-optional.
+The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
+--repo <owner/repo>` sets it and nothing else - it no longer opts the note into
+anything, because the memory surface it used to accompany is gone (#2202). A
+note whose column is empty still counts when its body names this repository,
+which is the ordinary case, so setting the column is optional; getting `repo=`
+right in the BODY is not. Prefer setting it anyway for an operating-mode or
+reconciliation note: the gate reads those through two bounded windows, one
+repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
+out of the window by other repositories' notes.
 
 PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
 it. `decision_note=none` means the PR itself is the decision, and the row's own

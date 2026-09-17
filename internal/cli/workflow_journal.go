@@ -14,7 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/memory"
+	"github.com/gitmoot/gitmoot/internal/github"
 	workflowpkg "github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -57,7 +57,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workflow show-note <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--remember [--remember-status] [--agent NAME] [--repo R]]")
+	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]")
 	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
 }
 
@@ -484,12 +484,7 @@ func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTim
 }
 
 type workflowNoteOutput struct {
-	Note           db.WorkflowNote `json:"note"`
-	Remembered     bool            `json:"remembered"`
-	Deduped        bool            `json:"deduped,omitempty"`
-	MemoryKey      string          `json:"memory_key,omitempty"`
-	AutoConfirmed  bool            `json:"auto_confirmed,omitempty"`
-	SkippedRetired bool            `json:"skipped_retired,omitempty"`
+	Note db.WorkflowNote `json:"note"`
 }
 
 func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
@@ -559,10 +554,16 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	noAuto := fs.Bool("no-auto", false, "disable Herdr coordinator identity detection")
 	summary := fs.String("summary", "", "legacy alias for the stable workflow description")
 	status := fs.String("status", "", "live workflow status escape hatch")
-	remember := fs.Bool("remember", false, "also stage the note as persistent memory")
-	rememberStatus := fs.Bool("remember-status", false, "explicitly allow a shipping-status-shaped note into memory")
-	agent := fs.String("agent", "", "registered agent whose private pool receives memory")
-	repo := fs.String("repo", "", "repo binding for memory when it cannot be inferred")
+	// --repo sets the note row's repo COLUMN and nothing else. It existed before
+	// #2202 only in the company of --remember, which is why removing the memory
+	// surface took it too; review found that regressed something unrelated.
+	// ListRepoWorkflowNotesByBodyPrefix reads operating-mode and reconciliation
+	// notes through TWO bounded windows, one repo-scoped and one for the repoless
+	// rows, precisely because #1783 measured a single repoless window letting one
+	// repo's notes crowd out another's decision note. With no way to set the
+	// column, every handwritten note lands in the shared window and that crowding
+	// becomes structural rather than opt-in. The flag comes back on its own terms.
+	repo := fs.String("repo", "", "repo binding recorded on the note row, as owner/repo")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
 	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
 		if len(args) < 2 {
@@ -635,14 +636,17 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if !*remember && (strings.TrimSpace(*agent) != "" || strings.TrimSpace(*repo) != "" || *rememberStatus) {
-		fmt.Fprintln(stderr, "workflow note: --agent, --repo, and --remember-status require --remember")
-		return 2
-	}
-	if *remember && memory.IsShippingStatus(body) && !*rememberStatus {
-		fmt.Fprintln(stderr, "warning: shipping statuses belong in the workflow journal, not durable memory")
-		fmt.Fprintln(stderr, "workflow note: pass --remember-status to explicitly override the shipping-status memory gate")
-		return 2
+	noteRepo := strings.TrimSpace(*repo)
+	if noteRepo != "" {
+		parsed, err := github.ParseRepository(noteRepo)
+		if err != nil {
+			fmt.Fprintf(stderr, "workflow note: --repo %v\n", err)
+			return 2
+		}
+		// Store the canonical owner/repo: the scoped read window matches this
+		// column against repo.FullName(), so a case or whitespace variant would
+		// file the note where nothing looks for it.
+		noteRepo = parsed.FullName()
 	}
 	var out workflowNoteOutput
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
@@ -654,7 +658,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		if count == 0 {
 			return fmt.Errorf("workflow %q has no jobs; refusing note to guard against a typo", label)
 		}
-		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body}
+		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body, Repo: noteRepo}
 		meta := db.WorkflowMeta{
 			WorkflowID:     label,
 			Author:         *author,
@@ -668,57 +672,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			Status:         *status,
 			StatusSet:      statusSet,
 		}
-		if !*remember {
-			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
-			return err
-		}
-		settings, err := config.LoadMemorySettings(paths)
-		if err != nil {
-			return err
-		}
-		memoryRepo := strings.TrimSpace(*repo)
-		if memoryRepo == "" {
-			repos, err := store.WorkflowRepos(ctx, label)
-			if err != nil {
-				return err
-			}
-			if len(repos) != 1 {
-				return fmt.Errorf("workflow %q spans %d repos; --remember requires --repo", label, len(repos))
-			}
-			memoryRepo = repos[0]
-		}
-		note.Repo = memoryRepo
-		if ok, reason := memory.PreFilter(body, memory.ScopeRepo); !ok {
-			return fmt.Errorf("memory prefilter rejected note: %s", reason)
-		}
-		owner := db.MemoryOwner{Kind: memory.OwnerKindShared, Ref: memory.SharedOwnerRef}
-		if privateAgent := strings.TrimSpace(*agent); privateAgent != "" {
-			if _, err := store.GetAgent(ctx, privateAgent); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return fmt.Errorf("agent %q is not registered", privateAgent)
-				}
-				return err
-			}
-			owner = db.MemoryOwner{Kind: memory.OwnerKindAgent, Ref: privateAgent}
-		}
-		seen, err := store.ObservationDedupKeys(ctx, owner.Ref)
-		if err != nil {
-			return err
-		}
-		if _, duplicate := seen[db.MemoryDedupKey(memory.ScopeRepo, memoryRepo, memory.ContentHash(body))]; duplicate {
-			out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
-			out.Deduped = err == nil
-			return err
-		}
-		obs := db.MemoryObservation{Owner: owner, AuthorRef: *author, Repo: memoryRepo,
-			Scope: memory.ScopeRepo, Content: body, TrustMark: memory.TrustLow}
-		out.Note, obs, err = store.InsertWorkflowNoteWithObservationAndMeta(ctx, note, obs, meta)
-		if err != nil {
-			return err
-		}
-		out.Remembered = true
-		out.MemoryKey = obs.Key
-		out.AutoConfirmed, out.SkippedRetired, err = autoConfirmWorkflowObservationIfEnabled(ctx, store, obs, settings.IngestAutoConfirm)
+		out.Note, err = store.InsertWorkflowNoteWithMeta(ctx, note, meta)
 		return err
 	})
 	if err != nil {
@@ -733,36 +687,5 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	fmt.Fprintf(stdout, "noted workflow %s as entry %d\n", label, out.Note.ID)
-	if out.Remembered {
-		fmt.Fprintf(stdout, "memory observation: %d (%s)\n", out.Note.MemoryObservationID, out.MemoryKey)
-	} else if out.Deduped {
-		fmt.Fprintln(stdout, "memory: exact duplicate already known; note stored without another observation")
-	}
 	return 0
-}
-
-func autoConfirmWorkflowObservationIfEnabled(ctx context.Context, store *db.Store, obs db.MemoryObservation, enabled bool) (bool, bool, error) {
-	if !enabled || !autoConfirmEligibleProvenance(obs.Provenance) {
-		return false, false, nil
-	}
-	actor := strings.TrimSpace(obs.SourceJob)
-	if actor == "" {
-		actor = "cli:workflow-note"
-	}
-	id, err := store.UpsertConfirmedMemory(ctx, db.ConfirmedMemory{
-		Owner: obs.Owner, AuthorRef: obs.AuthorRef, Repo: obs.Repo, Scope: obs.Scope,
-		Key: obs.Key, Content: obs.Content, Provenance: obs.Provenance,
-	}, db.PreserveSupersededEdition(), db.WithConfirmedMemoryEvent(db.MemoryEventIngested, actor),
-		db.WithConfirmedMemoryEventDetail(ingestedMemoryEventDetail(obs.Provenance)))
-	if err != nil {
-		if errors.Is(err, db.ErrConfirmedMemoryRetired) {
-			return false, true, nil
-		}
-		return false, false, err
-	}
-	attachConfirmedFactToCluster(ctx, store, db.ConfirmedMemory{
-		ID: id, Owner: obs.Owner, AuthorRef: obs.AuthorRef, Repo: obs.Repo,
-		Scope: obs.Scope, Key: obs.Key, Content: obs.Content,
-	})
-	return true, false, nil
 }

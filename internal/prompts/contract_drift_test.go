@@ -14,7 +14,6 @@ package prompts_test
 
 import (
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -87,7 +86,6 @@ func contractFieldNames() []string {
 	fields = append(fields, jsonFieldNames(workflow.Delegation{})...)
 	fields = append(fields, jsonFieldNames(workflow.EphemeralSpec{})...)
 	fields = append(fields, jsonFieldNames(workflow.HumanQuestion{})...)
-	fields = append(fields, jsonFieldNames(workflow.Learning{})...)
 	return fields
 }
 
@@ -105,10 +103,9 @@ func TestNormalizationOwnedFieldsStayOutOfThePrompt(t *testing.T) {
 }
 
 // TestContractFieldsCoveredInJobPrompt is the load-bearing drift guard: every
-// JSON field of AgentResult, Delegation, EphemeralSpec, HumanQuestion, and
-// Learning must be named in the rendered job prompt. Adding a field to any of
-// those structs without teaching the generator (and thus the prompt) about it
-// fails here.
+// JSON field of AgentResult, Delegation, EphemeralSpec and HumanQuestion must be
+// named in the rendered job prompt. Adding a field to any of those structs
+// without teaching the generator (and thus the prompt) about it fails here.
 func TestContractFieldsCoveredInJobPrompt(t *testing.T) {
 	prompt := renderedJob()
 
@@ -152,28 +149,6 @@ func TestEnumValuesCoveredInJobPrompt(t *testing.T) {
 			t.Fatalf("rendered job prompt omits allowed enum value %q\n--- prompt ---\n%s", v, prompt)
 		}
 	}
-
-	scopeLine := promptLineContaining(t, prompt, "scope (string")
-	for _, scope := range workflow.LearningScopes {
-		if !containsDelimitedToken(scopeLine, scope) {
-			t.Fatalf("rendered job prompt scope enum omits allowed value %q\n--- scope line ---\n%s", scope, scopeLine)
-		}
-	}
-}
-
-func promptLineContaining(t *testing.T, prompt, marker string) string {
-	t.Helper()
-	for _, line := range strings.Split(prompt, "\n") {
-		if strings.Contains(line, marker) {
-			return line
-		}
-	}
-	t.Fatalf("rendered job prompt has no line containing %q", marker)
-	return ""
-}
-
-func containsDelimitedToken(text, token string) bool {
-	return regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(token) + `\b`).MatchString(text)
 }
 
 // TestExampleShapeIsByteIdentical pins the {"gitmoot_result":{…}} example

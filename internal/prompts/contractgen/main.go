@@ -17,7 +17,7 @@
 //
 // Drift guard: every struct field MUST have an annotation. An un-annotated NEW
 // field is a hard error here — that is the mechanism by which adding a field to
-// AgentResult/Delegation/EphemeralSpec/HumanQuestion/Learning forces the prompt
+// AgentResult/Delegation/EphemeralSpec/HumanQuestion forces the prompt
 // to be regenerated. CI
 // re-runs `go generate ./... && git diff --exit-code` so a stale checked-in
 // artifact fails the build.
@@ -62,7 +62,6 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"evidence":        {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
-	"learnings":       {help: `top-level learnings (object[], optional): use RARELY to record a durable, keyed FACT worth remembering next time (e.g. "this repo's arm64 CI is flaky"), NOT a directive and NOT for this job only. Each entry is {` + learningFieldsHelp() + `}. Most jobs return none; leave it absent unless you learned something that will help a future job.`},
 	// fan_out is NORMALIZATION-OWNED and deliberately carries neither an example
 	// nor help: agents are never asked for it, so advertising it in the prompt
 	// would invite a value the product sets itself. It records that a result WAS
@@ -136,12 +135,6 @@ var humanQuestionFieldAnnotations = map[string]fieldAnnotation{
 	"choices": {help: `choices (string[], optional)`},
 }
 
-var learningFieldAnnotations = map[string]fieldAnnotation{
-	"key":     {help: `key (string, required, short stable handle)`},
-	"scope":   {help: `scope (string, optional, one of ` + enumList(workflow.LearningScopes) + `): "repo" for a fact about this repository — the default — or "general" for a fact true everywhere`},
-	"content": {help: `content (string, required, the fact itself)`},
-}
-
 const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- Outside pipelines, skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
 
 func main() {
@@ -164,9 +157,6 @@ func run() error {
 		return err
 	}
 	if err := requireAnnotations(reflect.TypeOf(workflow.HumanQuestion{}), humanQuestionFieldAnnotations, "HumanQuestion"); err != nil {
-		return err
-	}
-	if err := requireAnnotations(reflect.TypeOf(workflow.Learning{}), learningFieldAnnotations, "Learning"); err != nil {
 		return err
 	}
 
@@ -292,12 +282,6 @@ func renderDelegationHelp() string {
 	if h := resultFieldAnnotations["human_questions"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
-	// learnings is a top-level persistent-memory field (#626), not a delegation
-	// field, but like human_questions it is documented in the same prompt block the
-	// runtime agent actually receives so it can choose to record a durable fact.
-	if h := resultFieldAnnotations["learnings"].help; h != "" {
-		b.WriteString("- " + h + "\n")
-	}
 	return b.String()
 }
 
@@ -320,10 +304,6 @@ func ephemeralFieldsHelp() string {
 
 func humanQuestionFieldsHelp() string {
 	return structFieldsHelp(reflect.TypeOf(workflow.HumanQuestion{}), humanQuestionFieldAnnotations)
-}
-
-func learningFieldsHelp() string {
-	return structFieldsHelp(reflect.TypeOf(workflow.Learning{}), learningFieldAnnotations)
 }
 
 func structFieldsHelp(t reflect.Type, annotations map[string]fieldAnnotation) string {

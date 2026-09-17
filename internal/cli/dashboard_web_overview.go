@@ -490,9 +490,7 @@ func dashboardNeedRank(kind string) int {
 		return 2
 	case "unlabeled_jobs":
 		return 3
-	case "groom_proposal":
-		return 4
 	default:
-		return 5
+		return 4
 	}
 }

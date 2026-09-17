@@ -659,20 +659,18 @@ The same capture also feeds the `$`-denominated
   sparingly**: ask only when you genuinely cannot proceed without a human decision,
   not on every result.
 
-- `learnings` (optional): durable, keyed **facts** worth remembering for future
-  jobs (agent persistent memory, #626). Each entry is
-  `{ "key": "...", "scope": "repo"|"general", "content": "..." }` where `key` is a
-  short stable handle (required), `content` is the fact itself (required), and
-  `scope` is optional — `"repo"` (about this repository, the default) or
-  `"general"` (true everywhere). It is **fully additive**: a result that omits it
-  behaves byte-identically, and **most jobs should omit it**. Record a fact only
-  when you learned something a future job would benefit from (e.g. "this repo's
-  arm64 CI is flaky"), state it as a **fact, not a directive** ("always…"/"you
-  must…" is rejected), and never put commands or secrets in it. Memory is **off by
-  default** (opt in per agent with `[agents.<name>].memory = true`); when off,
-  returning `learnings` is harmless and simply ignored. In the current observation
-  phase, returned learnings are logged for measurement but are **not** injected
-  into any prompt. See the *Agent Persistent Memory* concept doc.
+## Removed fields fail; they are not ignored
+
+The accepted-field roster is derived from the contract struct, so a
+`gitmoot_result` carrying a field that no longer exists fails validation with
+`unsupported gitmoot_result field "<name>"` and the job fails with it. This is
+deliberate: the roster is what catches a typo or an invented field before it
+becomes a silent no-op.
+
+`learnings` was removed in #2202 with the persistent-memory feature. If you are
+an agent reading a cached prompt, do not send it - the prompt no longer asks for
+it, and sending it fails the job rather than being dropped. `next_agents` was
+removed earlier on the same terms.
 
 ## Decisions
 

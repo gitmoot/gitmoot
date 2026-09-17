@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"reflect"
-	goruntime "runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -323,12 +321,12 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 		// resolves to FORWARDED, which is the safe direction.
 		//
 		// NOTE ON A COMMENT THAT ROTTED IN ITS OWN COMMIT (#2188 round 11): the
-		// previous version of this paragraph named *MemoryController as a
-		// pointee that "cannot be fully synthesised". Under this code it CAN -
-		// the pointee filler now reaches unexported members - so the comment
-		// documented the FIRST ATTEMPT rather than the shipped behaviour. The
-		// example is removed rather than corrected: a rationale naming a
-		// specific type decays the moment that type changes.
+		// previous version of this paragraph named a specific engine field's
+		// pointee type as one that "cannot be fully synthesised". Under this
+		// code it CAN - the pointee filler now reaches unexported members - so
+		// the comment documented the FIRST ATTEMPT rather than the shipped
+		// behaviour. The example is removed rather than corrected: a rationale
+		// naming a specific type decays the moment that type changes.
 		var candidates []reflect.Value
 		if pointee := distinctiveValuesAtDepth(fieldType.Elem(), seed+5, depth+1); len(pointee) > 0 {
 			filled := reflect.New(fieldType.Elem())
@@ -422,7 +420,6 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 //
 //   - Engine.Now            -> TestEmittedEventTimestampsComeFromTheEnginesClock
 //   - ReviewBlockingSeverity -> the reviewBlockingSeverity wiring assertion below
-//   - Memory sub-fields      -> the Memory residual assertions below
 //   - Store                  -> now probed like everything else
 func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 	// SET EQUALITY IN BOTH DIRECTIONS (#2188 round 4). The previous version's
@@ -443,7 +440,7 @@ func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 	mustForward := map[string]bool{
 		"Store":          true,
 		"ApplyChangeSet": true, "BlockerDeferrer": true, "CollectChangeSet": true,
-		"EventSink": true, "Memory": true, "OrgPolicy": true,
+		"EventSink": true, "OrgPolicy": true,
 		"ProduceCheckDir": true, "RequireWorkflowPolicy": true, "ResolveDeliveryWorktree": true,
 		"ResultCheckMode": true, "ReviewModelPool": true, "RouterContextEnabled": true,
 		"RuntimeDefaultEffort": true, "RuntimeDefaultModel": true,
@@ -475,8 +472,8 @@ func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 	// package, where recordingSink, recordingNotifier, fakeImplementationFinalizer,
 	// fakeMergeGate and fakeWorktreeManager already existed. Using them made all
 	// five real observations, and EventSink turned out to be FORWARDED, not
-	// merely unprobed - the same error the hand-audit made on Memory, found the
-	// same way. Every exported Engine field is now observed.
+	// merely unprobed - the same error the hand-audit made on a sub-field
+	// forward, found the same way. Every exported Engine field is now observed.
 
 	store := openEngineStore(t)
 	baseline := Engine{Store: store}
@@ -539,16 +536,12 @@ func TestSnapshotVisibleEngineFieldsAreClassifiedByObservation(t *testing.T) {
 	requireSameSet(t, "forwarded", mustForward, observedForward)
 	requireSameSet(t, "inert", expectedInert, observedInert)
 
-	// Method-derived and sub-field forwards, invisible to the value diff above.
+	// The method-derived forward, invisible to the value diff above: a method
+	// value is always non-nil with a fixed code pointer, so the snapshot reads
+	// it as inert. Its identity is pinned behaviourally by
+	// TestUnexportedClosureForwardsAnswerWithTheEnginesOwnPolicy.
 	if baselineSnapshot["reviewBlockingSeverity"] == "nil" {
 		t.Error("Mailbox.reviewBlockingSeverity is not wired: a method-derived forward is invisible to the diff")
-	}
-	withMemory := Engine{Store: store, Memory: &MemoryController{}}
-	memorySnapshot := mailboxFieldSnapshot(t, withMemory.EnqueueMailbox(nil))
-	for _, name := range []string{"injectMemory", "recordMemory"} {
-		if memorySnapshot[name] == "nil" {
-			t.Errorf("Mailbox.%s is nil with a non-nil Memory: the sub-field forward is gone", name)
-		}
 	}
 }
 
@@ -570,7 +563,7 @@ func requireSameSet(t *testing.T, label string, declared, observed map[string]bo
 			if label == "inert" {
 				hint = " - before classifying it inert, check engine_types.go for a forward through a CLOSURE, a METHOD VALUE, " +
 					"or a CONDITIONAL on another field: this probe cannot see those, and each has already hidden a real " +
-					"forward on this file (Engine.Now, ReviewBlockingSeverity, Memory)"
+					"forward on this file (Engine.Now, ReviewBlockingSeverity)"
 			}
 			t.Errorf("Engine.%s is observed %s but is classified nowhere%s", name, label, hint)
 		}
@@ -863,26 +856,20 @@ func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
 	}
 }
 
-// #2188 round 13: METHOD-VALUE FORWARDS WERE PINNED BY NON-NIL ONLY. A
-// same-signature stub substituted for injectMemory, recordMemory or
-// reviewBlockingSeverity survived the entire package - the three are observed
-// to EXIST and not to be THEMSELVES, which is precisely the cross-wire defect
-// provenance was built for, in the one shape provenance does not reach:
-// provenance covers forwards landing on same-name same-type EXPORTED mailbox
-// fields, and these land on unexported ones.
+// #2188 round 13: AN UNEXPORTED FORWARD WAS PINNED BY NON-NIL ONLY. A
+// same-signature stub substituted for reviewBlockingSeverity survived the
+// entire package - the field is observed to EXIST and not to be ITSELF, which
+// is precisely the cross-wire defect provenance was built for, in the one shape
+// provenance does not reach: provenance covers forwards landing on same-name
+// same-type EXPORTED mailbox fields, and this one lands on an unexported one.
 //
-// Identity is asserted two ways because the two shapes admit different proofs:
-// a method value carries its method's code pointer, and a config-derived
-// closure can be made to answer with a sentinel.
-func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
-	store := openEngineStore(t)
-	// A Store is required: enabledFor short-circuits on a nil one, which would
-	// make the binding probe below pass vacuously for every receiver.
-	controller := &MemoryController{Store: store}
+// A config-derived closure admits the stronger proof of the two available for
+// unexported forwards: it can be made to answer with a sentinel, so identity is
+// asserted behaviourally rather than by code pointer.
+func TestUnexportedClosureForwardsAnswerWithTheEnginesOwnPolicy(t *testing.T) {
 	engine := Engine{
-		Store:                   store,
+		Store:                   openEngineStore(t),
 		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		Memory:                  controller,
 		// A VALID severity that is NOT the default. P3 IS
 		// reviewseverity.DefaultBlocking, so the previous P3 sentinel could pass
 		// on the very fallback it was written to exclude - the sentinel rule
@@ -892,55 +879,10 @@ func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
 	}
 	mailbox := engine.EnqueueMailbox(nil)
 
-	// IDENTITY BY RUNTIME FUNCTION NAME, not by pointer equality. A method VALUE
-	// is a compiler-generated wrapper, so its code pointer need not equal the
-	// method expression's - comparing them matched injectBlock and failed
-	// record, which is the shape of a check that passes by luck. The wrapper's
-	// NAME carries the method it closes over; a same-signature stub declared in
-	// a test carries the test's name instead.
-	// EXACT NAMES, NOT CONTAINMENT. strings.Contains admitted any PREFIX-EXTENDED
-	// method: mb.recordMemory = e.Memory.recordEnrolled has the same signature,
-	// skips the enrolment gate and both distill producers, and a containment
-	// check on "MemoryController).record" agrees with it. Substring containment
-	// expresses RESEMBLANCE; identity needs equality. The expected name is taken
-	// from the method expression itself rather than typed as a literal, so a
-	// rename cannot leave this test asserting a string that no longer exists.
-	for _, check := range []struct {
-		field string
-		got   string
-		want  string
-	}{
-		{"injectMemory", methodValueName(mailbox.injectMemory), runtimeFuncName((*MemoryController).injectBlock)},
-		{"recordMemory", methodValueName(mailbox.recordMemory), runtimeFuncName((*MemoryController).record)},
-	} {
-		if check.got != check.want {
-			t.Errorf("Mailbox.%s is wired from %s, want exactly %s: a same-signature method doing different work passes containment",
-				check.field, check.got, check.want)
-		}
-	}
-
-	// WHICH INSTANCE, not merely which method. A name check cannot see the
-	// receiver a method value closes over, so mb.injectMemory =
-	// (&MemoryController{}).injectBlock - the right method bound to a fresh
-	// empty controller - passed everything above. Both forwards consult
-	// c.Enabled first, so observing THIS controller's closure run proves the
-	// binding; a fresh controller has a nil Enabled and never calls it.
-	consulted := map[string]int{}
-	controller.Enabled = func(name string) bool {
-		consulted[name]++
-		return false
-	}
-	ctx := context.Background()
-	mailbox.injectMemory(ctx, runtime.Agent{Name: "inject-probe"}, JobPayload{})
-	mailbox.recordMemory(ctx, "job-1", runtime.Agent{Name: "record-probe"}, "review", JobPayload{}, AgentResult{})
-	for _, name := range []string{"inject-probe", "record-probe"} {
-		if consulted[name] == 0 {
-			t.Errorf("forward for %q never consulted the engine's own controller: it is bound to a different instance", name)
-		}
-	}
-
-	// BEHAVIOURAL IDENTITY for the config-derived one: it must answer with the
-	// engine's own policy rather than merely being set.
+	// BEHAVIOURAL IDENTITY, not non-nil: the forward must ANSWER with the
+	// engine's own policy. Non-nil proves the field was set, and a
+	// same-signature stub returning the package default satisfies it while
+	// discarding every per-repo severity the operator configured.
 	if mailbox.reviewBlockingSeverity == nil {
 		t.Fatal("reviewBlockingSeverity not forwarded")
 	}
@@ -948,28 +890,4 @@ func TestMethodValueForwardsAreTheirOwnMethods(t *testing.T) {
 		t.Fatalf("reviewBlockingSeverity(owner/repo) = %q, want the engine's own %s: a sentinel equal to reviewseverity.DefaultBlocking would pass on the fallback it excludes",
 			got, reviewseverity.P1)
 	}
-}
-
-// runtimeFuncName reports the function a value actually closes over. It is the
-// only identity available for a forward landing on an UNEXPORTED field: the
-// census cannot compare it to a counterpart, and non-nil proves existence only.
-// methodValueName is runtimeFuncName for a METHOD VALUE. The compiler names the
-// wrapper "<method>-fm", so the suffix is stripped to compare against the method
-// EXPRESSION's own name. Stripping a known suffix keeps the comparison an
-// equality rather than a containment: "recordEnrolled-fm" becomes
-// "recordEnrolled" and still differs from "record".
-func methodValueName(fn any) string {
-	return strings.TrimSuffix(runtimeFuncName(fn), "-fm")
-}
-
-func runtimeFuncName(fn any) string {
-	value := reflect.ValueOf(fn)
-	if !value.IsValid() || value.IsNil() {
-		return "<nil>"
-	}
-	resolved := goruntime.FuncForPC(value.Pointer())
-	if resolved == nil {
-		return "<unresolvable>"
-	}
-	return resolved.Name()
 }

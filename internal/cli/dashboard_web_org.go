@@ -87,11 +87,11 @@ func (d *webDataSource) OrgRole(ctx context.Context, name string) (dashboard.Org
 }
 
 func dashboardOrgCursor(ctx context.Context, store *db.Store) (string, error) {
-	jobEventID, workflowNoteID, taskEventID, memoryEventID, err := store.DashboardChangeCursor(ctx)
+	jobEventID, workflowNoteID, taskEventID, err := store.DashboardChangeCursor(ctx)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%d.%d.%d.%d", jobEventID, workflowNoteID, taskEventID, memoryEventID), nil
+	return fmt.Sprintf("%d.%d.%d", jobEventID, workflowNoteID, taskEventID), nil
 }
 
 type dashboardOrgInputs struct {

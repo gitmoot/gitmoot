@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -81,7 +80,6 @@ type WorkflowNote struct {
 	// completion nudges off for this directive.
 	DirectiveDoneTTLSeconds int64  `json:"-"`
 	DirectiveDoneTTLSet     bool   `json:"-"`
-	MemoryObservationID     int64  `json:"memory_observation_id,omitempty"`
 	CreatedAt               string `json:"created_at"`
 }
 
@@ -162,7 +160,7 @@ type WorkflowSummary struct {
 
 // Exported query constants keep production SQL and EXPLAIN regression tests on
 // exactly the same statements.
-const ListWorkflowNotesSQL = `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
+const ListWorkflowNotesSQL = `SELECT id, workflow_id, author, body, repo, created_at
 FROM workflow_notes INDEXED BY idx_workflow_notes_wid
 WHERE workflow_id = ? ORDER BY created_at DESC, id DESC LIMIT ?`
 
@@ -268,6 +266,9 @@ ORDER BY created_at, id`
 const CountJobsByWorkflowSQL = `SELECT COUNT(*) FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ?`
 
+// WorkflowReposSQL is the distinct non-empty repo set for one workflow. Its
+// Store method went with `--remember` repo inference (#2202); the live consumer
+// is workflow_lifecycle_store.go, which runs it inside a lifecycle transaction.
 const WorkflowReposSQL = `SELECT DISTINCT repo
 FROM jobs INDEXED BY idx_jobs_workflow_id
 WHERE workflow_id != '' AND workflow_id = ? AND repo != ''
@@ -287,7 +288,7 @@ func workflowQueryLimit(limit int) int {
 }
 
 func (s *Store) InsertWorkflowNote(ctx context.Context, note WorkflowNote) (WorkflowNote, error) {
-	stored, _, err := s.insertWorkflowNoteWithObservationAndMeta(ctx, note, MemoryObservation{}, WorkflowMeta{}, false, false)
+	stored, err := s.insertWorkflowNoteWithMeta(ctx, note, WorkflowMeta{}, false)
 	return stored, err
 }
 
@@ -468,7 +469,7 @@ SELECT EXISTS(
 // InsertWorkflowNoteWithMeta atomically appends a note and updates the
 // workflow's coordinator handoff metadata with the values from this note.
 func (s *Store) InsertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNote, meta WorkflowMeta) (WorkflowNote, error) {
-	stored, _, err := s.insertWorkflowNoteWithObservationAndMeta(ctx, note, MemoryObservation{}, meta, true, false)
+	stored, err := s.insertWorkflowNoteWithMeta(ctx, note, meta, true)
 	return stored, err
 }
 
@@ -488,8 +489,8 @@ func (s *Store) InsertWorkflowAutoNoteWithMeta(ctx context.Context, note Workflo
 		return WorkflowNote{}, false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_notes(workflow_id, author, body, repo, memory_observation_id)
-VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, note.MemoryObservationID)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO workflow_notes(workflow_id, author, body, repo)
+VALUES (?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo)
 	if err != nil {
 		return WorkflowNote{}, false, fmt.Errorf("insert workflow auto note: %w", err)
 	}
@@ -532,30 +533,16 @@ func (s *Store) WorkflowAutoNoteExists(ctx context.Context, workflowID, key stri
 	return exists, err
 }
 
-// InsertWorkflowNoteWithObservation atomically appends a journal note and its
-// pending memory observation. The note id is part of the stable ingest key and
-// provenance, so both rows are derived and committed in this one transaction.
-func (s *Store) InsertWorkflowNoteWithObservation(ctx context.Context, note WorkflowNote, obs MemoryObservation) (WorkflowNote, MemoryObservation, error) {
-	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, WorkflowMeta{}, false, true)
-}
-
-// InsertWorkflowNoteWithObservationAndMeta is the coordinator-metadata variant
-// of InsertWorkflowNoteWithObservation. Note, metadata, and memory observation
-// either all commit or all roll back.
-func (s *Store) InsertWorkflowNoteWithObservationAndMeta(ctx context.Context, note WorkflowNote, obs MemoryObservation, meta WorkflowMeta) (WorkflowNote, MemoryObservation, error) {
-	return s.insertWorkflowNoteWithObservationAndMeta(ctx, note, obs, meta, true, true)
-}
-
-func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, note WorkflowNote, obs MemoryObservation, meta WorkflowMeta, writeMeta, writeObservation bool) (WorkflowNote, MemoryObservation, error) {
+func (s *Store) insertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNote, meta WorkflowMeta, writeMeta bool) (WorkflowNote, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
+		return WorkflowNote{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if !writeMeta || !meta.StatusSet {
 		status, err := workflowMetaStatusTx(ctx, tx, note.WorkflowID)
 		if err != nil {
-			return WorkflowNote{}, MemoryObservation{}, err
+			return WorkflowNote{}, err
 		}
 		if IsTerminalWorkflowStatus(status) {
 			if _, err := insertWorkflowNoteTx(ctx, tx, WorkflowNote{
@@ -564,58 +551,36 @@ func (s *Store) insertWorkflowNoteWithObservationAndMeta(ctx context.Context, no
 				Body:       fmt.Sprintf("[auto:workflow:reopened] reopened from %s", status),
 				Repo:       note.Repo,
 			}); err != nil {
-				return WorkflowNote{}, MemoryObservation{}, err
+				return WorkflowNote{}, err
 			}
 			if err := upsertWorkflowMetaTx(ctx, tx, WorkflowMeta{
 				WorkflowID: note.WorkflowID,
 				Status:     string(WorkflowStatusActive),
 				StatusSet:  true,
 			}); err != nil {
-				return WorkflowNote{}, MemoryObservation{}, err
+				return WorkflowNote{}, err
 			}
 		}
 	}
 	noteID, err := insertWorkflowNoteTx(ctx, tx, note)
 	if err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
+		return WorkflowNote{}, err
 	}
 	if writeMeta {
 		meta.WorkflowID = note.WorkflowID
 		if err := upsertWorkflowMetaTx(ctx, tx, meta); err != nil {
-			return WorkflowNote{}, MemoryObservation{}, err
+			return WorkflowNote{}, err
 		}
 	}
 	if !writeMeta || !meta.DescriptionSet {
 		if err := ensureWorkflowDescriptionTx(ctx, tx, note.WorkflowID); err != nil {
-			return WorkflowNote{}, MemoryObservation{}, err
+			return WorkflowNote{}, err
 		}
-	}
-	if !writeObservation {
-		if err := tx.Commit(); err != nil {
-			return WorkflowNote{}, MemoryObservation{}, err
-		}
-		stored, err := s.getWorkflowNote(ctx, noteID)
-		return stored, MemoryObservation{}, err
-	}
-	obs.Key = "workflow-" + note.WorkflowID + "-" + strconv.FormatInt(noteID, 10)
-	obs.Provenance = fmt.Sprintf("workflow:%s#%d", note.WorkflowID, noteID)
-	obsID, err := insertMemoryObservationTx(ctx, tx, obs)
-	if err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE workflow_notes SET memory_observation_id = ? WHERE id = ?`, obsID, noteID); err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
+		return WorkflowNote{}, err
 	}
-	note.ID, note.MemoryObservationID = noteID, obsID
-	obs.ID = obsID
-	stored, err := s.getWorkflowNote(ctx, noteID)
-	if err != nil {
-		return WorkflowNote{}, MemoryObservation{}, err
-	}
-	return stored, obs, nil
+	return s.getWorkflowNote(ctx, noteID)
 }
 
 func workflowMetaStatusTx(ctx context.Context, tx *sql.Tx, workflowID string) (string, error) {
@@ -636,8 +601,8 @@ func insertWorkflowNoteTx(ctx context.Context, tx *sql.Tx, note WorkflowNote) (i
 		doneTTLSeconds = note.DirectiveDoneTTLSeconds
 	}
 	res, err := tx.ExecContext(ctx, `
-INSERT INTO workflow_notes(workflow_id, author, body, repo, memory_observation_id, directive_done_ttl_seconds)
-VALUES (?, ?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, note.MemoryObservationID, doneTTLSeconds)
+INSERT INTO workflow_notes(workflow_id, author, body, repo, directive_done_ttl_seconds)
+VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, doneTTLSeconds)
 	if err != nil {
 		return 0, fmt.Errorf("insert workflow note: %w", err)
 	}
@@ -933,10 +898,10 @@ func (s *Store) ListWorkflowMeta(ctx context.Context) (map[string]WorkflowMeta, 
 func (s *Store) getWorkflowNote(ctx context.Context, id int64) (WorkflowNote, error) {
 	var note WorkflowNote
 	err := s.db.QueryRowContext(ctx, `
-SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
+SELECT id, workflow_id, author, body, repo, created_at
 FROM workflow_notes WHERE id = ?`, id).Scan(
 		&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo,
-		&note.MemoryObservationID, &note.CreatedAt)
+		&note.CreatedAt)
 	return note, err
 }
 
@@ -954,7 +919,7 @@ func (s *Store) ListWorkflowNotes(ctx context.Context, workflowID string, limit 
 	var notes []WorkflowNote
 	for rows.Next() {
 		var note WorkflowNote
-		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.CreatedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, note)
@@ -975,7 +940,7 @@ func (s *Store) ListWorkflowNotesByBodyPrefix(ctx context.Context, prefix string
 	if limit <= 0 || limit > 200 {
 		limit = 200
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, created_at
 FROM workflow_notes
 WHERE substr(body, 1, length(?)) = ?
 ORDER BY created_at DESC, id DESC
@@ -987,7 +952,7 @@ LIMIT ?`, prefix, prefix, limit)
 	notes := []WorkflowNote{}
 	for rows.Next() {
 		var note WorkflowNote
-		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.CreatedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, note)
@@ -1050,7 +1015,7 @@ func (s *Store) ListRepoWorkflowNotesByBodyPrefix(ctx context.Context, prefix st
 }
 
 func (s *Store) workflowNotesByBodyPrefixWhere(ctx context.Context, scope string, args []any, prefix string) ([]WorkflowNote, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, memory_observation_id, created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, workflow_id, author, body, repo, created_at
 FROM workflow_notes
 WHERE substr(body, 1, length(?)) = ?
   AND `+scope+`
@@ -1063,7 +1028,7 @@ LIMIT ?`, args...)
 	notes := []WorkflowNote{}
 	for rows.Next() {
 		var note WorkflowNote
-		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.CreatedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, note)
@@ -1082,7 +1047,7 @@ LIMIT ?`, args...)
 // practice, because only a hand-written marker note could produce the state.
 func (s *Store) ListUnacknowledgedOrgDirectives(ctx context.Context, targetRole string) ([]WorkflowNote, error) {
 	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
-	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at
+	rows, err := s.db.QueryContext(ctx, `SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.created_at
 FROM workflow_notes d
 WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 	AND (? = '' OR substr(d.body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' ')
@@ -1103,7 +1068,7 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 	notes := []WorkflowNote{}
 	for rows.Next() {
 		var note WorkflowNote
-		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.MemoryObservationID, &note.CreatedAt); err != nil {
+		if err := rows.Scan(&note.ID, &note.WorkflowID, &note.Author, &note.Body, &note.Repo, &note.CreatedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, note)
@@ -1212,7 +1177,7 @@ WHERE substr(d.body, 1, length('[org:directive ')) = '[org:directive '
 const listOpenOrgDirectiveObligationsSQL = `
 WITH ` + directiveTerminalMarkersCTE + `,
 ` + directiveAckMarkersCTE + `
-SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
+SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.created_at,
 	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
 	d.directive_done_nudge_count, d.directive_exhausted_at,
 	COALESCE(a.acked_at, '')
@@ -1264,7 +1229,7 @@ func (s *Store) ListOpenOrgDirectiveObligations(ctx context.Context, limit int) 
 		var item OrgDirectiveObligation
 		if err := rows.Scan(
 			&item.ID, &item.WorkflowID, &item.Author, &item.Body, &item.Repo,
-			&item.MemoryObservationID, &item.CreatedAt, &item.NudgeCount,
+			&item.CreatedAt, &item.NudgeCount,
 			&item.LastNudgedAt, &item.DoneTTLOverrideSeconds,
 			&item.DoneNudgeCount, &item.ExhaustedAt, &item.AckedAt,
 		); err != nil {
@@ -1542,25 +1507,4 @@ func (s *Store) ListWorkflowRepos(ctx context.Context) (map[string][]string, err
 		out[workflowID] = append(out[workflowID], repo)
 	}
 	return out, rows.Err()
-}
-
-// WorkflowRepos returns distinct non-empty denormalized repo values for a
-// workflow. It is used only for --remember repo inference.
-func (s *Store) WorkflowRepos(ctx context.Context, workflowID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, WorkflowReposSQL, workflowID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var repos []string
-	for rows.Next() {
-		var repo string
-		if err := rows.Scan(&repo); err != nil {
-			return nil, err
-		}
-		if repo = strings.TrimSpace(repo); repo != "" {
-			repos = append(repos, repo)
-		}
-	}
-	return repos, rows.Err()
 }

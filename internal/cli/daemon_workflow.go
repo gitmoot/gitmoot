@@ -39,9 +39,13 @@ func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, ho
 }
 
 // daemonWorkflowEngineCached is daemonWorkflowEngine for a caller that already
-// holds a per-tick config memo (#1758) — today only the sequential registered-repo
-// poll pass, whose 45 per-repo engine rebuilds otherwise re-read and re-parsed
-// config.toml twice each just to resolve a memory controller that is nil.
+// holds a per-tick config memo (#1758) — today only the sequential
+// registered-repo poll pass, which rebuilds one engine per enabled repo. The
+// memo is threaded through the builder for the engine seams that read
+// home-scoped config per tick rather than per repo; the brain retirement
+// (#2202) removed the memory controller that was the builder's own consumer of
+// it, so the poll pass's remaining savings come from the TTL lookups it makes
+// through the same memo outside this constructor.
 func daemonWorkflowEngineCached(store *db.Store, gh github.Client, checkout string, home string, cfg *tickConfigCache) workflow.Engine {
 	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{}, cfg)
 }
@@ -68,16 +72,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// byte-identical. The sink is a process-global shared singleton (one drain
 		// goroutine), so re-building the engine per tick never leaks goroutines.
 		EventSink: daemonEventSink(store, home),
-		// Off-by-default agent persistent memory (#626, Phase 1 observation mode):
-		// when at least one agent is enrolled ([agents.<name>].memory = true) and the
-		// global kill switch is off, the engine's Mailbox injects a "Prior learnings"
-		// block into enrolled agents' prompts (READ) and shadow-logs their returned
-		// learnings + writes mechanical facts at job terminal (WRITE). daemonMemory-
-		// Controller returns nil when nothing is enrolled (or on any config-load
-		// error), so with no config NO memory hook is wired and prompt assembly +
-		// the terminal path are byte-identical. Non-enrolled agents are never touched
-		// even when the controller is present.
-		Memory: cfg.memoryController(store, home),
 		// Registry default model/effort fallbacks: when a delivered job pins no
 		// agent/job override, fall back to the HOME-AWARE resolved runtime registry
 		// (built-in defaults overlaid with [runtimes.<name>] config). Fail-open and

@@ -246,14 +246,6 @@ type Engine struct {
 	// existing set is byte-identical. It is sourced from the host
 	// [orchestrate].max_verify_replan_attempts config at daemon startup.
 	MaxVerifyReplanAttempts int
-	// Memory is the injected, off-by-default agent persistent-memory controller
-	// (#626). When set (only when at least one agent is enrolled and the global
-	// kill switch is off), the engine's Mailbox injects a "Prior learnings" block
-	// into the job prompt (READ path) and shadow-logs returned learnings + writes
-	// mechanical facts at job terminal (WRITE path). When nil (the default, every
-	// path with no enrolled agent), the Mailbox is built with nil memory hooks and
-	// both prompt assembly and the terminal path are byte-identical.
-	Memory *MemoryController
 	// RuntimeDefaultModel, when set, resolves a runtime's configured registry
 	// default_model (HOME-AWARE) for the runtime named by the argument (#652). It is
 	// copied onto the Mailbox in mailbox() and consulted at delivery ONLY as the

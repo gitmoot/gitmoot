@@ -41,21 +41,6 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
 	{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 	{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
-	// knowledge (#962): the memory-cluster hierarchy costs ~1s CPU per compute.
-	// Freshness stays TTL-only even though #988 added a memory-event cursor
-	// component: the hierarchy is a minutes-scale browsing surface, 60s
-	// staleness is honest for it, and TTL keeps the needs-you radar's
-	// per-client polling at one compute per minute. (Switching it to the
-	// memory-event component is a valid future refinement.)
-	{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
-	// brain-events (#988): a live audit feed must never serve stale pages, so
-	// nothing is retained — but concurrent identical polls (public dashboard on
-	// the ~1s SSE tick) still coalesce into one store read per page variant.
-	{endpoint: "brain-events", keyKind: "singleflight-only", retain: false},
-	// brain-fact (#988): facts may retire or be superseded at any time, so the
-	// selected row is re-read on every request while identical id lookups share
-	// one in-flight read.
-	{endpoint: "brain-fact", keyKind: "singleflight-only", retain: false},
 	// Org projections aggregate store-backed role state and signal journals.
 	// The short full-cursor TTL bounds public polling while episode/presence
 	// tables that are not cursor components still become visible within 15s.
@@ -64,19 +49,16 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 }
 
 var (
-	dashboardJobsCachePolicy        = dashboardCachePolicies[0]
-	dashboardChartsCachePolicy      = dashboardCachePolicies[1]
-	dashboardHealthCachePolicy      = dashboardCachePolicies[2]
-	dashboardOverviewCachePolicy    = dashboardCachePolicies[3]
-	dashboardAttentionCachePolicy   = dashboardCachePolicies[4]
-	dashboardAgentsCachePolicy      = dashboardCachePolicies[5]
-	dashboardTasksCachePolicy       = dashboardCachePolicies[6]
-	dashboardWorkflowsCachePolicy   = dashboardCachePolicies[7]
-	dashboardKnowledgeCachePolicy   = dashboardCachePolicies[8]
-	dashboardBrainEventsCachePolicy = dashboardCachePolicies[9]
-	dashboardBrainFactCachePolicy   = dashboardCachePolicies[10]
-	dashboardOrgCachePolicy         = dashboardCachePolicies[11]
-	dashboardOrgRoleCachePolicy     = dashboardCachePolicies[12]
+	dashboardJobsCachePolicy      = dashboardCachePolicies[0]
+	dashboardChartsCachePolicy    = dashboardCachePolicies[1]
+	dashboardHealthCachePolicy    = dashboardCachePolicies[2]
+	dashboardOverviewCachePolicy  = dashboardCachePolicies[3]
+	dashboardAttentionCachePolicy = dashboardCachePolicies[4]
+	dashboardAgentsCachePolicy    = dashboardCachePolicies[5]
+	dashboardTasksCachePolicy     = dashboardCachePolicies[6]
+	dashboardWorkflowsCachePolicy = dashboardCachePolicies[7]
+	dashboardOrgCachePolicy       = dashboardCachePolicies[8]
+	dashboardOrgRoleCachePolicy   = dashboardCachePolicies[9]
 )
 
 type dashboardCacheEntry struct {

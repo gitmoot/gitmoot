@@ -81,18 +81,6 @@ type Mailbox struct {
 	// byte-identical. The cause it receives is always a DeliveryError so the
 	// classifier's #602 contract gate still refuses agent-authored text.
 	deferBlocker func(ctx context.Context, jobID string, cause error) (bool, error)
-	// injectMemory, when set, returns the "Prior learnings" block (#626) to append
-	// to the rendered job prompt. Nil (default, every path with no enrolled agent)
-	// => byte-identical: no query runs and nothing is appended. It is wired from
-	// Engine.Memory via mailbox(). Best-effort: it never errors up.
-	injectMemory func(ctx context.Context, agent runtime.Agent, payload JobPayload) string
-	// recordMemory, when set, shadow-logs the agent's returned learnings to
-	// memory_observations and writes any gitmoot-authored mechanical facts to
-	// confirmed_memories at job terminal (#626/#645). It is passed the job action
-	// (job.Type) so the mechanical producers can key facts by (action, outcome).
-	// Nil (default) => no-op, so the terminal path is byte-identical. Best-effort:
-	// it never fails the job.
-	recordMemory func(ctx context.Context, jobID string, agent runtime.Agent, action string, payload JobPayload, result AgentResult)
 	// RuntimeDefaultModel, when set, resolves a runtime's configured default model
 	// (the registry default_model, HOME-AWARE: built-in defaults overlaid with any
 	// [runtimes.<name>] config) for the runtime named by the argument (#652). It is
@@ -1287,15 +1275,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
 	jobPrompt := payload.prompt(job.Type)
 	prompt := prompts.RenderJob(jobPrompt)
-	// Append the off-by-default "Prior learnings" memory block (#626 READ path).
-	// When the memory hook is unset (every non-enrolled path) or returns "" (no
-	// enrolled agent, empty sanitized query, or no confirmed match), the prompt is
-	// byte-identical.
-	if m.injectMemory != nil {
-		if block := m.injectMemory(ctx, agent, payload); block != "" {
-			prompt = prompt + "\n\n" + block
-		}
-	}
 	// Append the off-by-default #530 coordinator routing-context block. Gated on the
 	// [router] context_enabled knob (routerContextEnabled) AND on the job being a
 	// top-level coordinator (no parent) — a delegation child inherits its
@@ -1680,12 +1659,6 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				return AgentResult{}, &ResultChecksError{Failed: failed}
 			}
 		}
-	}
-	// Shadow-log returned learnings + write any mechanical fact at job terminal
-	// (#626 WRITE path). No-op when the hook is unset or the agent is not enrolled,
-	// so the terminal path is byte-identical. Best-effort — it never fails the job.
-	if m.recordMemory != nil {
-		m.recordMemory(ctx, job.ID, agent, job.Type, payload, result)
 	}
 	state := stateForDecision(result.Decision)
 	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {

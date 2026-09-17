@@ -936,3 +936,15 @@ WHERE id = ? AND state = 'waiting'`, stamp, stamp, id)
 	}
 	return true, tx.Commit()
 }
+
+// firstNonEmptyString returns the first value that is not blank after trimming,
+// or "" when every value is blank. It outlived the memory store that defined it
+// (#2202) and now lives beside its remaining caller.
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

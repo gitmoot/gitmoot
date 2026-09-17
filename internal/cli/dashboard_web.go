@@ -26,7 +26,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/memory"
 	"github.com/gitmoot/gitmoot/internal/update"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -72,9 +71,13 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 }
 
 // newDashboardWebHandler shadows the bounded endpoints covered by the frozen
-// #948/#956 cache policies plus the already-local knowledge handler, and serves
-// #958's widened workflow JSON (description/status) through the cached workflows
-// route. Every other route remains owned by the pinned dashboard module.
+// #948/#956 cache policies and serves #958's widened workflow JSON
+// (description/status) through the cached workflows route. It also registers the
+// two retired /api/brain/* routes, which exist only so the pinned module's
+// frontend parses JSON rather than the HTML shell until #2206 removes the nav.
+// The local knowledge handler this comment used to name went with the brain
+// (#2202): Knowledge() is now a DataSource stub served by the pinned module.
+// Every other route remains owned by that module.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
@@ -88,9 +91,6 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	// and the "workflows" cache key already includes the workflow-note-id so a
 	// status change busts the cache.
 	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
-	mux.HandleFunc("GET /api/learning/knowledge", ds.handleLearningKnowledge)
-	mux.HandleFunc("GET /api/brain/events", ds.handleBrainEvents)
-	mux.HandleFunc("GET /api/brain/fact", ds.handleBrainFact)
 	registerDashboardCommsRoutes(mux, ds)
 	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
 	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)
@@ -98,6 +98,15 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.js", handleFleetActivityJS)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
+	// Transitional: the pinned dashboard module's Brain page still fetches these
+	// two paths, but #2202 removed the memory tables behind them. They are
+	// registered so the requests get an empty, well-formed JSON feed instead of
+	// falling through to the module's static handler, which answers every unknown
+	// path with index.html and makes the Changelog tab report an HTTP error. Same
+	// reasoning as the Knowledge stub: an empty feed is a correct answer, an HTML
+	// page is not. Both routes go away with the Brain nav entry in #2206.
+	mux.HandleFunc("GET /api/brain/events", handleRetiredBrainEvents)
+	mux.HandleFunc("GET /api/brain/fact", handleRetiredBrainFact)
 	// Public pipeline receipts are deliberately narrow, read-only projections of
 	// already-finalized verified archives. Register them before the dashboard
 	// module fallback so no /api or module behavior changes.
@@ -201,6 +210,63 @@ func (d *webDataSource) ChatThreads(context.Context) ([]dashboard.ChatThreadSumm
 
 func (d *webDataSource) ChatThread(context.Context, string) (*dashboard.ChatThreadDetail, error) {
 	return nil, dashboard.ErrChatThreadNotFound
+}
+
+// Knowledge satisfies the same external interface after #2202 retired the brain.
+// It returns empty rather than being deleted because dropping a DataSource method
+// breaks compilation — the precedent the ChatThreads stubs above set. Its tables
+// (confirmed_memories, memory_observations, memory_clusters, memory_links) are
+// really gone, so empty is the truthful answer, and the page renders empty until a
+// dashboard release removes its nav entry (#2206).
+//
+// Skills is deliberately NOT a stub: it reads agent_templates and
+// agent_template_versions, which survive this campaign (#2204), so it stayed a
+// real implementation in dashboard_web_skills.go.
+func (d *webDataSource) Knowledge(context.Context) (dashboard.Knowledge, error) {
+	return dashboard.Knowledge{}, nil
+}
+
+// The two transitional brain payloads. #2202 removed memory_events and
+// confirmed_memories, so there is nothing to read and the bodies are compile-time
+// constants rather than store projections — which is also why they bypass the
+// dashboard response cache: there is no computation to memoize.
+//
+// The shapes are the ones the pinned module's frontend actually parses, read off
+// gitmoot-dashboard@v0.0.0-20260726182004-510fdc8bd010/web/dist/index.html:
+//
+//   - the events feed (fetched at :6336) is destructured at :6347
+//     (`Array.isArray(data.events)`), :6356 and :6363 (`data.nextCursor`, whose
+//     falsiness is what marks the history exhausted and stops the "load older"
+//     walk) and :6379 (`Number(data.total)`). An empty array with a zero cursor
+//     and zero total is therefore a complete, terminating answer.
+//   - a fact (fetched at :6421) is consumed as a plain object at :6423
+//     (`fact && typeof fact === 'object'`), and every field read off it is
+//     nullish-guarded — `fact.status` falls back to "active" at :6696 and
+//     `fact.content` to "" at :6702 — so the empty object needs no invented
+//     field values.
+//
+// Both go away with the Brain nav entry in #2206.
+const (
+	dashboardRetiredBrainEventsBody = `{"events":[],"nextCursor":0,"total":0}`
+	dashboardRetiredBrainFactBody   = `{}`
+)
+
+func handleRetiredBrainEvents(w http.ResponseWriter, _ *http.Request) {
+	writeRetiredBrainJSON(w, dashboardRetiredBrainEventsBody)
+}
+
+func handleRetiredBrainFact(w http.ResponseWriter, _ *http.Request) {
+	writeRetiredBrainJSON(w, dashboardRetiredBrainFactBody)
+}
+
+func writeRetiredBrainJSON(w http.ResponseWriter, body string) {
+	// no-store matches what the retired handlers served: the Brain feed was a live
+	// audit view that must never be served stale, and an intermediary caching the
+	// empty body would outlive #2206's removal of these routes.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, body)
 }
 
 type dashboardWorkflowAPIView struct {
@@ -883,11 +949,6 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 			return err
 		}
 
-		// The [agents.<name>] config sections drive the per-agent memory chip. Load
-		// them ONCE per call, fail-open: a config-load error yields a nil map (no
-		// chips) rather than failing the endpoint (mirrors Health()'s fail-open path).
-		agentTypes := loadAgentTypesFailOpen(paths)
-
 		// Aggregate per-agent job stats from the single ListJobs pass (shared with
 		// Agent()). Ephemeral workers fold into one rollup.
 		byAgent, ephemeral, hasEphemeral := aggregateAgentJobStats(jobs)
@@ -895,9 +956,6 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
 		for _, a := range agents {
 			summary := newAgentSummary(a)
-			if at, ok := agentTypes[a.Name]; ok {
-				summary.MemoryEnabled = at.Memory
-			}
 			if s := byAgent[a.Name]; s != nil {
 				s.applyTo(&summary)
 			}
@@ -952,23 +1010,12 @@ func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.Agent
 		}
 
 		// Config-section visibility. Load the [agents.<name>] sections ONCE, fail-open
-		// (a config-load error => no section, Config nil, no chip — never an endpoint
-		// error). Config is nil unless this agent has its own section; the memory chip
-		// mirrors that section's memory flag so the summary matches Agents().
+		// (a config-load error => no section, Config nil — never an endpoint error).
+		// Config is nil unless this agent has its own section.
 		if at, ok := loadAgentTypesFailOpen(paths)[agent.Name]; ok {
-			summary.MemoryEnabled = at.Memory
 			detail.Config = agentConfigInfo(at)
 		}
 		detail.AgentSummary = summary
-
-		// Owned memory pool sizes (all owner versions). Fail-open: a query error
-		// leaves the count at 0 rather than failing the endpoint.
-		if n, cerr := store.CountConfirmedMemoriesForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
-			detail.MemoryFacts = n
-		}
-		if n, cerr := store.CountMemoryObservationsForOwner(ctx, memory.OwnerKindAgent, agent.Name); cerr == nil {
-			detail.MemoryObservations = n
-		}
 
 		// Template + version history. Fail-open: a missing/broken template leaves the
 		// detail's Template nil and Versions the initialized empty slice rather than
@@ -1005,7 +1052,7 @@ func newAgentSummary(a db.Agent) dashboard.AgentSummary {
 	}
 }
 
-// loadAgentTypesFailOpen loads the [agents.<name>] config sections for the memory
+// loadAgentTypesFailOpen loads the [agents.<name>] config sections for the config
 // chip / config panel, returning nil on ANY error (missing/unreadable/malformed
 // config) so both Agents() and Agent() degrade to "no config visibility" rather
 // than failing the endpoint. Indexing the nil result is safe (a missing key
@@ -1026,7 +1073,6 @@ func loadAgentTypesFailOpen(paths config.Paths) map[string]config.AgentType {
 // return is meaningful presence).
 func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 	return &dashboard.AgentConfigInfo{
-		Memory:        at.Memory,
 		MaxBackground: at.MaxBackground,
 		IdleTimeout:   strings.TrimSpace(at.IdleTimeout),
 		JobTimeout:    strings.TrimSpace(at.JobTimeout),

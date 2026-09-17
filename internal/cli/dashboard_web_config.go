@@ -17,11 +17,9 @@ import (
 )
 
 type dashboardConfigSettings struct {
-	memory         config.MemorySettings
-	orchestrate    config.OrchestratePolicy
-	github         config.GitHubLimiterPolicy
-	memoryPipeline config.MemoryPipelineSettings
-	implementBase  string
+	orchestrate   config.OrchestratePolicy
+	github        config.GitHubLimiterPolicy
+	implementBase string
 }
 
 type dashboardConfigProjectionRow struct {
@@ -39,38 +37,6 @@ type dashboardConfigProjectionRow struct {
 var dashboardConfigProjection = []dashboardConfigProjectionRow{
 	{section: "github", key: "max_concurrent", kind: "int", doc: "Maximum number of concurrent GitHub calls; zero is unlimited.", value: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }},
 	{section: "github", key: "min_interval", kind: "duration", doc: "Minimum spacing between GitHub call starts.", value: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }},
-	{section: "memory", key: "cluster_depth_cap", kind: "int", doc: "Maximum recursive memory-cluster depth.", value: func(s dashboardConfigSettings) any { return s.memory.ClusterDepthCap }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.ClusterDepthCap }},
-	{section: "memory", key: "cluster_fanout", kind: "int", doc: "Sibling-count threshold that triggers memory clustering.", value: func(s dashboardConfigSettings) any { return s.memory.ClusterFanout }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.ClusterFanout }},
-	{section: "memory", key: "cluster_fanout_keep", kind: "int", doc: "Hysteresis threshold for retaining an existing memory grouping.", value: func(s dashboardConfigSettings) any { return s.memory.ClusterFanoutKeep }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.ClusterFanoutKeep }},
-	{section: "memory", key: "default_enroll", kind: "flag", doc: "Enroll newly started manual agents in persistent memory by default.", value: func(s dashboardConfigSettings) any { return s.memory.DefaultEnroll }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DefaultEnroll }},
-	{section: "memory", key: "disabled", kind: "flag", doc: "Disable persistent memory globally, overriding per-agent enrollment.", value: func(s dashboardConfigSettings) any { return s.memory.Disabled }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.Disabled }},
-	{section: "memory", key: "distill_all_jobs", kind: "flag", doc: "Distill outcomes from agents that are not enrolled in memory.", value: func(s dashboardConfigSettings) any { return s.memory.DistillAllJobs }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillAllJobs }},
-	{section: "memory", key: "distill_at_terminal", kind: "flag", doc: "Stage deterministic memory observations when jobs terminate.", value: func(s dashboardConfigSettings) any { return s.memory.DistillAtTerminal }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillAtTerminal }},
-	{section: "memory", key: "distill_max_per_job", kind: "int", doc: "Maximum observations staged by distillation for one job.", value: func(s dashboardConfigSettings) any { return s.memory.DistillMaxPerJob }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillMaxPerJob }},
-	{section: "memory", key: "distill_successes", kind: "flag", doc: "Stage observations from recovered failures.", value: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.DistillSuccesses }},
-	{section: "memory", key: "groom_llm_total_max_per_run", kind: "int", doc: "Shared maximum LLM calls across quality, stale, and split grooming passes.", value: func(s dashboardConfigSettings) any { return s.memory.GroomLLMTotalMaxPerRun }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomLLMTotalMaxPerRun }},
-	{section: "memory", key: "groom_quality", kind: "flag", doc: "Permit corroborated useless quality verdicts to retire facts; false is shadow mode.", value: func(s dashboardConfigSettings) any { return s.memory.GroomQuality }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomQuality }},
-	{section: "memory", key: "groom_quality_max_per_run", kind: "int", doc: "Maximum uncached quality verdicts requested in one grooming run.", value: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMaxPerRun }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMaxPerRun }},
-	{section: "memory", key: "groom_quality_min_age", kind: "duration", doc: "Minimum fact age before the general quality audit considers it.", value: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMinAge.String() }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomQualityMinAge.String() }},
-	{section: "memory", key: "groom_split_llm", kind: "flag", doc: "Enable LLM-guided lossless splitting during memory grooming.", value: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLM }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLM }},
-	{section: "memory", key: "groom_split_llm_max_per_run", kind: "int", doc: "Maximum LLM split verdicts requested in one grooming run.", value: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMMaxPerRun }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMMaxPerRun }},
-	{section: "memory", key: "groom_split_llm_model", kind: "string", doc: "Optional model override for LLM-guided memory splitting.", value: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMModel }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMModel }},
-	{section: "memory", key: "groom_split_llm_runtime", kind: "string", doc: "Runtime used for LLM-guided memory splitting.", value: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMRuntime }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomSplitLLMRuntime }},
-	{section: "memory", key: "groom_stale", kind: "flag", doc: "Detect stale operational-status memories during grooming.", value: func(s dashboardConfigSettings) any { return s.memory.GroomStale }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomStale }},
-	{section: "memory", key: "groom_stale_age", kind: "duration", doc: "Minimum age before an operational-status memory is stale.", value: func(s dashboardConfigSettings) any { return s.memory.GroomStaleAge.String() }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.GroomStaleAge.String() }},
-	{section: "memory", key: "harvest_effort", kind: "string", doc: "Reasoning effort used by the insight-harvest classifier.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestEffort }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestEffort }},
-	{section: "memory", key: "harvest_enabled", kind: "flag", doc: "Stage durable insights from new terminal job results for human review.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestEnabled }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestEnabled }},
-	{section: "memory", key: "harvest_max_jobs_per_sweep", kind: "int", doc: "Maximum eligible result-bearing jobs handled in one harvest sweep.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxJobsPerSweep }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxJobsPerSweep }},
-	{section: "memory", key: "harvest_max_per_job", kind: "int", doc: "Maximum pending observations staged from one job result.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxPerJob }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestMaxPerJob }},
-	{section: "memory", key: "harvest_model", kind: "string", doc: "Optional model override for the insight-harvest classifier.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestModel }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestModel }},
-	{section: "memory", key: "harvest_runtime", kind: "string", doc: "Runtime used for the isolated insight-harvest classifier.", value: func(s dashboardConfigSettings) any { return s.memory.HarvestRuntime }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.HarvestRuntime }},
-	{section: "memory", key: "ingest_auto_confirm", kind: "flag", doc: "Confirm allowlisted ingest and workflow observations into the private author pool.", value: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.IngestAutoConfirm }},
-	{section: "memory", key: "max_entries", kind: "int", doc: "Maximum confirmed memories considered for context injection.", value: func(s dashboardConfigSettings) any { return s.memory.MaxEntries }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.MaxEntries }},
-	{section: "memory", key: "token_budget", kind: "int", doc: "Token budget for injected memory context.", value: func(s dashboardConfigSettings) any { return s.memory.TokenBudget }, defaultValue: func(s dashboardConfigSettings) any { return s.memory.TokenBudget }},
-	{section: "memory.pipelines", key: "groom_propose", kind: "duration", doc: "Schedule for automatic memory groom proposal runs.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeInterval }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeInterval }},
-	{section: "memory.pipelines", key: "groom_propose_jitter", kind: "duration", doc: "Scheduling jitter applied to memory groom proposals.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeJitter }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.GroomProposeJitter }},
-	{section: "memory.pipelines", key: "ingest_sweep", kind: "duration", doc: "Schedule for automatic memory ingest sweeps.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepInterval }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepInterval }},
-	{section: "memory.pipelines", key: "ingest_sweep_jitter", kind: "duration", doc: "Scheduling jitter applied to memory ingest sweeps.", value: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepJitter }, defaultValue: func(s dashboardConfigSettings) any { return s.memoryPipeline.IngestSweepJitter }},
 	{section: "orchestrate", key: "blocked_ttl", kind: "duration", doc: "Maximum time a blocked job remains awaiting a human; empty disables expiry.", value: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }, defaultValue: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }},
 	{section: "workflow", key: "implement_base", kind: "string", doc: "Base ref used when dispatching implementation jobs.", value: func(s dashboardConfigSettings) any { return s.implementBase }, defaultValue: func(s dashboardConfigSettings) any { return s.implementBase }},
 }
@@ -181,22 +147,15 @@ func projectDashboardConfigKeychain(ctx context.Context, store *db.Store, home s
 func loadDashboardConfigSettings(paths config.Paths) (dashboardConfigSettings, dashboardConfigSettings, error) {
 	values := dashboardConfigSettings{}
 	defaults := dashboardConfigSettings{
-		memory:      config.DefaultMemorySettings(),
 		orchestrate: config.DefaultOrchestratePolicy(),
 		github:      config.DefaultGitHubLimiterPolicy(),
 	}
 	var err error
-	if values.memory, err = config.LoadMemorySettings(paths); err != nil {
-		return values, defaults, fmt.Errorf("load memory config: %w", err)
-	}
 	if values.orchestrate, err = config.LoadOrchestratePolicy(paths); err != nil {
 		return values, defaults, fmt.Errorf("load orchestrate config: %w", err)
 	}
 	if values.github, err = config.LoadGitHubLimiterPolicy(paths); err != nil {
 		return values, defaults, fmt.Errorf("load github config: %w", err)
-	}
-	if values.memoryPipeline, err = config.LoadMemoryPipelineSettings(paths); err != nil {
-		return values, defaults, fmt.Errorf("load memory pipeline config: %w", err)
 	}
 	if values.implementBase, err = config.LoadImplementBase(paths); err != nil {
 		return values, defaults, fmt.Errorf("load workflow config: %w", err)
@@ -235,7 +194,6 @@ func projectDashboardConfigAgents(registered []db.Agent, configured map[string]c
 		if model := strings.TrimSpace(agentType.Model); model != "" {
 			row.Model = model
 		}
-		row.Memory = agentType.Memory
 		row.Capabilities = append([]string(nil), agentType.Capabilities...)
 		row.AutonomyPolicy = strings.TrimSpace(agentType.AutonomyPolicy)
 		row.MaxBackground = agentType.MaxBackground
@@ -276,7 +234,7 @@ func dashboardUnknownConfigKeys(path string) ([]string, error) {
 		known[row.section+"."+row.key] = struct{}{}
 	}
 	agentKeys := map[string]struct{}{
-		"runtime": {}, "model": {}, "memory": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
+		"runtime": {}, "model": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
 	}
 	unknown := map[string]struct{}{}
 	doc.Scan(func(key parser.Key, entry *tomledit.Entry) bool {

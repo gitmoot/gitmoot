@@ -291,8 +291,8 @@ portable code behavior.
 - `--home /x` resolves to `/x/.gitmoot`. The live daemon home is `/root/.gitmoot`.
   **Never touch `/root/.gitmoot` in tests** — use throwaway `/tmp` homes only.
 - The daemon rebuilds its per-repo workflow engine each tick and warm-reloads
-  runtime config on `SIGHUP` (#577), so many config edits (e.g. `[memory]`,
-  worker count, poll interval) take effect without a full restart. Warm reload
+  runtime config on `SIGHUP` (#577), so many config edits (e.g. worker count,
+  poll interval, `[admission]`) take effect without a full restart. Warm reload
   never re-execs (it preserves inherited runtime auth — the #559 lesson).
 - Public read-only dashboard: <https://gitmoot.themartian.app> (a separate
   `gitmoot-dashboard-web` systemd service behind traefik). Docs site: gitmoot.io.
@@ -420,7 +420,7 @@ detection.
 
    Both empty (`[]`), then:
    `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
-5. Config-only changes (e.g. `[memory]`) usually need no restart
+5. Config-only changes (e.g. `[admission]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
 6. **Public releases need explicit OWNER sign-off** —
    `gh release create vX.Y.Z --latest` triggers `release.yml`. "Deploy locally"

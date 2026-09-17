@@ -37,9 +37,6 @@ func TestDashboardCachePolicyTable(t *testing.T) {
 		{endpoint: "agents", keyKind: "job-event-id", retain: true, minRecompute: 5 * time.Second, maxAge: 30 * time.Second},
 		{endpoint: "tasks", keyKind: "task-event-id", retain: true, minRecompute: 2 * time.Second, maxAge: 15 * time.Second},
 		{endpoint: "workflows", keyKind: "job-event-id+workflow-note-id", retain: true, minRecompute: 5 * time.Second, maxAge: 15 * time.Second},
-		{endpoint: "knowledge", keyKind: "ttl-only", retain: true, minRecompute: 15 * time.Second, maxAge: 60 * time.Second},
-		{endpoint: "brain-events", keyKind: "singleflight-only", retain: false},
-		{endpoint: "brain-fact", keyKind: "singleflight-only", retain: false},
 		{endpoint: "org", keyKind: "full-cursor", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 		{endpoint: "org-role", keyKind: "full-cursor+role", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 	}
@@ -71,7 +68,7 @@ func TestDashboardCacheCursorSelection(t *testing.T) {
 			}
 		}
 	}
-	assertCursors("0", "0", "0.0", "0.0.0.0")
+	assertCursors("0", "0", "0.0", "0.0.0")
 
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
@@ -92,7 +89,7 @@ func TestDashboardCacheCursorSelection(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	assertCursors("1", "1", "1.1", "1.1.1.0")
+	assertCursors("1", "1", "1.1", "1.1.1")
 }
 
 func TestDashboardCacheCursorFloorAndHardMax(t *testing.T) {
@@ -295,33 +292,37 @@ func TestDashboardHealthSingleflightWithoutRetention(t *testing.T) {
 	}
 }
 
-func TestDashboardBrainEventsCacheSeparatesPageFlights(t *testing.T) {
+// Coalescing is keyed: two different keys must run two flights. Without this,
+// a flight map that ignored the key would serve one body for every variant of
+// a paged endpoint, and TestDashboardCacheConcurrentMissesSingleflight (one
+// key, many waiters) would still pass.
+func TestDashboardCacheDistinctKeysDoNotCoalesceFlights(t *testing.T) {
 	cache := newDashboardJSONCache(nil)
 	started := make(chan string, 2)
 	release := make(chan struct{})
 	results := make(chan string, 2)
 	var wg sync.WaitGroup
-	run := func(cursor, limit int64, body string) {
+	run := func(key, body string) {
 		defer wg.Done()
-		got, outcome, err := cache.get(context.Background(), dashboardBrainEventsCacheKey(cursor, limit), "", dashboardBrainEventsCachePolicy, func(context.Context) ([]byte, error) {
+		got, outcome, err := cache.get(context.Background(), key, "", dashboardHealthCachePolicy, func(context.Context) ([]byte, error) {
 			started <- body
 			<-release
 			return []byte(body), nil
 		})
 		if err != nil || outcome != "miss" {
-			t.Errorf("page %d.%d outcome=%q err=%v", cursor, limit, outcome, err)
+			t.Errorf("key %q outcome=%q err=%v", key, outcome, err)
 			return
 		}
 		results <- string(got)
 	}
 
 	wg.Add(1)
-	go run(0, 2, "newest-page")
+	go run("health:0:2", "newest-page")
 	if got := <-started; got != "newest-page" {
 		t.Fatalf("first flight = %q", got)
 	}
 	wg.Add(1)
-	go run(42, 2, "older-page")
+	go run("health:42:2", "older-page")
 	select {
 	case got := <-started:
 		if got != "older-page" {
@@ -330,19 +331,13 @@ func TestDashboardBrainEventsCacheSeparatesPageFlights(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		close(release)
 		wg.Wait()
-		t.Fatal("different brain-event pages coalesced into one flight")
+		t.Fatal("different keys coalesced into one flight")
 	}
 	close(release)
 	wg.Wait()
 	seen := map[string]bool{<-results: true, <-results: true}
 	if !seen["newest-page"] || !seen["older-page"] {
 		t.Fatalf("page results = %#v", seen)
-	}
-}
-
-func TestDashboardBrainFactCacheKeyIncludesID(t *testing.T) {
-	if first, second := dashboardBrainFactCacheKey(1), dashboardBrainFactCacheKey(2); first == second {
-		t.Fatalf("fact cache keys must differ by id: %q", first)
 	}
 }
 
@@ -792,7 +787,7 @@ func TestDashboardCacheMetricsReportUsesPolicyTable(t *testing.T) {
 	cache.mu.Lock()
 	report := cache.recordLocked("overview", "hit", 42, base.Add(dashboardCacheReportInterval))
 	cache.mu.Unlock()
-	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; knowledge hits=0 misses=0 shared=0 bytes=0; brain-events hits=0 misses=0 shared=0 bytes=0; brain-fact hits=0 misses=0 shared=0 bytes=0; org hits=0 misses=0 shared=0 bytes=0; org-role hits=0 misses=0 shared=0 bytes=0\n"
+	want := "dashboard cache: jobs hits=0 misses=0 shared=0 bytes=0; charts hits=0 misses=0 shared=0 bytes=0; health hits=0 misses=0 shared=0 bytes=0; overview hits=1 misses=0 shared=0 bytes=42; attention hits=0 misses=0 shared=0 bytes=0; agents hits=0 misses=0 shared=0 bytes=0; tasks hits=0 misses=0 shared=0 bytes=0; workflows hits=0 misses=0 shared=0 bytes=0; org hits=0 misses=0 shared=0 bytes=0; org-role hits=0 misses=0 shared=0 bytes=0\n"
 	if report != want {
 		t.Fatalf("metrics report:\n%s\nwant:\n%s", report, want)
 	}
@@ -915,43 +910,5 @@ func TestDashboardCacheLeaderDisconnectDoesNotAbortCompute(t *testing.T) {
 	})
 	if err != nil || string(body) != "survived" {
 		t.Fatalf("leader cancellation aborted the shared compute: %q, %v", body, err)
-	}
-}
-
-func TestDashboardKnowledgeCacheTTLAndParity(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedWebDashboardTree(t, home)
-	now := time.Now()
-	ds := &webDataSource{home: home, responseCache: newDashboardJSONCache(nil)}
-	ds.responseCache.now = func() time.Time { return now }
-	h := newDashboardWebHandler(ds)
-	get := func() (string, string) {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/api/learning/knowledge", nil))
-		if rec.Code != 200 {
-			t.Fatalf("knowledge status %d: %s", rec.Code, rec.Body.String())
-		}
-		return rec.Body.String(), rec.Header().Get(dashboardCacheHeader)
-	}
-	first, o1 := get()
-	if o1 != "miss" {
-		t.Fatalf("first outcome %q, want miss", o1)
-	}
-	// Parity: the cached bytes must equal a direct compute.
-	direct, err := ds.knowledgeJSON(context.Background())
-	if err != nil || first != string(direct) {
-		t.Fatalf("cached body diverges from direct compute (err=%v, lens %d vs %d)", err, len(first), len(direct))
-	}
-	// Within maxAge: served from cache regardless of data (ttl-only policy).
-	now = now.Add(30 * time.Second)
-	second, o2 := get()
-	if o2 != "hit" || second != first {
-		t.Fatalf("30s outcome %q (want hit), bytes equal=%v", o2, second == first)
-	}
-	// Past maxAge: recompute.
-	now = now.Add(31 * time.Second)
-	_, o3 := get()
-	if o3 != "miss" {
-		t.Fatalf("61s outcome %q, want miss", o3)
 	}
 }

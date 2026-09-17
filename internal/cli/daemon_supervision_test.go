@@ -828,45 +828,6 @@ func TestTickConfigCacheReadsConfigOncePerTick(t *testing.T) {
 	}
 }
 
-// The memory controller is the loader that cost the most for the least: two full
-// config loads per repo per tick to return nil. Memoize the RESULT, nil included,
-// and still re-resolve on the next tick.
-func TestTickConfigCacheMemoizesMemoryController(t *testing.T) {
-	paths := config.PathsForHome(t.TempDir())
-	if err := config.Initialize(paths); err != nil {
-		t.Fatal(err)
-	}
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	write := func(body string) {
-		if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	write("[agents.solo]\nmemory = true\n")
-	cache := &tickConfigCache{}
-	if cache.memoryController(store, paths.Home) == nil {
-		t.Fatal("an enrolled agent must produce a controller")
-	}
-	write("[memory]\ndisabled = true\n")
-	if cache.memoryController(store, paths.Home) == nil {
-		t.Fatal("the controller was re-resolved mid-tick; the memo did not hold")
-	}
-	cache.reset()
-	if cache.memoryController(store, paths.Home) != nil {
-		t.Fatal("after reset the kill switch must take effect")
-	}
-	// The nil result is memoized too — reaching it costs the same two loads.
-	write("[agents.solo]\nmemory = true\n")
-	if cache.memoryController(store, paths.Home) != nil {
-		t.Fatal("the nil result was not memoized")
-	}
-}
-
 // Every poll pass must start from a cold config memo, otherwise the poller would
 // read config.toml once per PROCESS rather than once per tick and stop being
 // live-tunable.
@@ -884,14 +845,13 @@ func TestPollPassResetsConfigCache(t *testing.T) {
 	if poller.ConfigCache == nil {
 		t.Fatal("the default poller must carry a config cache")
 	}
-	poller.ConfigCache.memoryDone = true
-	poller.ConfigCache.memoryHome = "stale"
+	poller.ConfigCache.blocked = durationMemo{home: "stale", value: 7 * time.Hour, done: true}
 	// No enabled repos: the pass does nothing except its own setup, so a cleared
 	// cache can only have come from the reset.
 	if _, err := pollRegisteredReposWithPoller(context.Background(), poller, registeredRepoSchedule{}, time.Now().UTC(), time.Second); err != nil {
 		t.Fatalf("poll pass: %v", err)
 	}
-	if poller.ConfigCache.memoryDone || poller.ConfigCache.memoryHome != "" {
+	if poller.ConfigCache.blocked.done || poller.ConfigCache.blocked.home != "" {
 		t.Fatalf("config cache survived a poll pass: %+v", poller.ConfigCache)
 	}
 }

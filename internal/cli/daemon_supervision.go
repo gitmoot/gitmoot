@@ -101,10 +101,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				w.UsePool = usePool
 				return runEnabledRepoWorkerTicksTracked(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks, tracker)
 			})
-			// #884 home-scoped post-terminal insight harvest. This owns one
-			// sequential classifier lane for the daemon process and is deliberately
-			// outside daemonWorkflowEngine, which is rebuilt per repo/tick.
-			startMemoryHarvestLoop(ctx, paths, home, store, stdout)
 			startBlockedRoleWakeLoop(ctx, store, paths.Home, stdout)
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
@@ -117,9 +113,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// (no pipelines => an empty list before any state touch) and skipped under
 		// --dry-run for the same reason.
 		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
-		if !dryRun {
-			pipeline.InstallDefaultMemoryPipelinesForDaemon(ctx, store, paths, home, stdout)
-		}
 		sqliteMaintenance := &sqliteMaintenanceState{}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
@@ -246,9 +239,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	}
 	heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
 	if heartbeatPathsErr == nil {
-		// The single-repo daemon gets the same one-per-home sweep owner as the
-		// registered-repo supervisor; it is not attached to the per-tick engine.
-		startMemoryHarvestLoop(ctx, heartbeatPaths, home, store, stdout)
 		startTranscriptRetentionLoop(ctx, heartbeatPaths, store, stdout)
 	}
 	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
@@ -257,11 +247,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// heartbeat scan it needs no config paths (it reads the DB), so a paths failure
 	// does not disable it.
 	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
-	if heartbeatPathsErr == nil {
-		pipeline.InstallDefaultMemoryPipelinesForDaemon(ctx, store, heartbeatPaths, home, stdout)
-	} else {
-		writeLine(stdout, "default memory pipeline install disabled: %s", heartbeatPathsErr)
-	}
 	sqliteMaintenance := &sqliteMaintenanceState{}
 	// Bounds the poll-error diagnostics below. The poll interval has no minimum, so a
 	// persistently failing poll would otherwise write an unbounded, perfectly repetitive
@@ -1082,19 +1067,18 @@ func resolveDelegationWorktreeTTL(home string) (time.Duration, error) {
 
 // tickConfigCache memoizes the daemon's hot config.toml reads for the span of
 // ONE tick (a worker sweep or a poll pass). resolveBlockedTTL,
-// resolveBlockedRoleWakeAfter, resolveDelegationWorktreeTTL and
-// daemonMemoryController are each a pure function of <home>/config.toml, and each
-// was re-read AND re-parsed once per ENABLED REPO per tick: at 45 repos that is
-// 135 opens/tick for the three durations plus ~90 more for a memory controller
-// that returns nil every time (#1758).
+// resolveBlockedRoleWakeAfter and resolveDelegationWorktreeTTL are each a pure
+// function of <home>/config.toml, and each was re-read AND re-parsed once per
+// ENABLED REPO per tick: at 45 repos that is 135 opens/tick for the three
+// durations (#1758).
 //
 // It is created FRESH each tick and never retained, so config.toml keeps exactly
 // the live tunability it had — one re-read per tick — and only the per-REPO
-// repetition disappears. Entries are keyed by their home (and store, for the
-// memory controller) so a caller passing a different one always re-resolves
-// rather than silently reading another home's policy. Only SUCCESSES are
-// memoized, matching candidateMemo: a transient read failure is retried by the
-// next repo in the sweep instead of being replayed to all of them.
+// repetition disappears. Entries are keyed by their home so a caller passing a
+// different one always re-resolves rather than silently reading another home's
+// policy. Only SUCCESSES are memoized, matching candidateMemo: a transient read
+// failure is retried by the next repo in the sweep instead of being replayed to
+// all of them.
 //
 // Like candidateMemo it carries no mutex because it is consumed only on the
 // synchronous tick goroutine — the worker sweep's per-repo loop and the poll
@@ -1102,13 +1086,9 @@ func resolveDelegationWorktreeTTL(home string) (time.Duration, error) {
 // per-job engine factory touch it. A nil receiver resolves directly, so every
 // non-daemon caller and every existing test path stays byte-identical.
 type tickConfigCache struct {
-	blocked     durationMemo
-	delegation  durationMemo
-	wake        durationMemo
-	memoryHome  string
-	memoryStore *db.Store
-	memoryDone  bool
-	memory      *workflow.MemoryController
+	blocked    durationMemo
+	delegation durationMemo
+	wake       durationMemo
 }
 
 type durationMemo struct {
@@ -1160,21 +1140,6 @@ func (c *tickConfigCache) delegationWorktreeTTL(home string) (time.Duration, err
 		return resolveDelegationWorktreeTTL(home)
 	}
 	return c.delegation.get(home, resolveDelegationWorktreeTTL)
-}
-
-// memoryController memoizes the nil-or-controller resolution, including the nil
-// result — returning nil is the default outcome and it costs two full config
-// loads (LoadMemorySettings + LoadAgentTypes) to reach.
-func (c *tickConfigCache) memoryController(store *db.Store, home string) *workflow.MemoryController {
-	if c == nil {
-		return daemonMemoryController(store, home)
-	}
-	if c.memoryDone && c.memoryHome == home && c.memoryStore == store {
-		return c.memory
-	}
-	controller := daemonMemoryController(store, home)
-	c.memoryHome, c.memoryStore, c.memory, c.memoryDone = home, store, controller, true
-	return controller
 }
 
 func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPoller, schedule registeredRepoSchedule, now time.Time, fallbackPoll time.Duration) (time.Duration, error) {

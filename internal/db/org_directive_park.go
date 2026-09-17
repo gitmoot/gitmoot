@@ -180,7 +180,7 @@ WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directiv
 func (s *Store) ListParkedOrgDirectives(ctx context.Context, targetRole string) ([]OrgDirectiveObligation, error) {
 	targetRole = strings.ToLower(strings.TrimSpace(targetRole))
 	rows, err := s.db.QueryContext(ctx, `
-SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.memory_observation_id, d.created_at,
+SELECT d.id, d.workflow_id, d.author, d.body, d.repo, d.created_at,
 	d.directive_nudge_count, d.directive_last_nudged_at, d.directive_done_ttl_seconds,
 	d.directive_done_nudge_count, d.directive_exhausted_at,
 	d.directive_parked_at, d.directive_parked_reason,
@@ -206,7 +206,7 @@ ORDER BY d.created_at ASC, d.id ASC`, targetRole, targetRole, targetRole)
 		var item OrgDirectiveObligation
 		if err := rows.Scan(
 			&item.ID, &item.WorkflowID, &item.Author, &item.Body, &item.Repo,
-			&item.MemoryObservationID, &item.CreatedAt, &item.NudgeCount,
+			&item.CreatedAt, &item.NudgeCount,
 			&item.LastNudgedAt, &item.DoneTTLOverrideSeconds,
 			&item.DoneNudgeCount, &item.ExhaustedAt,
 			&item.ParkedAt, &item.ParkedReason, &item.AckedAt,

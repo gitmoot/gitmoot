@@ -10,12 +10,12 @@ func TestDashboardChangeCursor(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
 
-	events, notes, taskEvents, memoryEvents, err := store.DashboardChangeCursor(ctx)
+	events, notes, taskEvents, err := store.DashboardChangeCursor(ctx)
 	if err != nil {
 		t.Fatalf("DashboardChangeCursor(empty): %v", err)
 	}
-	if events != 0 || notes != 0 || taskEvents != 0 || memoryEvents != 0 {
-		t.Fatalf("empty cursor = %d.%d.%d.%d, want 0.0.0.0", events, notes, taskEvents, memoryEvents)
+	if events != 0 || notes != 0 || taskEvents != 0 {
+		t.Fatalf("empty cursor = %d.%d.%d, want 0.0.0", events, notes, taskEvents)
 	}
 
 	if err := store.CreateJobWithEvent(ctx,
@@ -23,7 +23,7 @@ func TestDashboardChangeCursor(t *testing.T) {
 		JobEvent{Kind: "queued", Message: "created"}); err != nil {
 		t.Fatalf("CreateJobWithEvent: %v", err)
 	}
-	events, notes, taskEvents, memoryEvents, err = store.DashboardChangeCursor(ctx)
+	events, notes, taskEvents, err = store.DashboardChangeCursor(ctx)
 	if err != nil || events != 1 || notes != 0 || taskEvents != 0 {
 		t.Fatalf("event cursor = %d.%d.%d, err=%v, want 1.0.0", events, notes, taskEvents, err)
 	}
@@ -31,7 +31,7 @@ func TestDashboardChangeCursor(t *testing.T) {
 	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "release/one", Body: "checkpoint"}); err != nil {
 		t.Fatalf("InsertWorkflowNote: %v", err)
 	}
-	events, notes, taskEvents, memoryEvents, err = store.DashboardChangeCursor(ctx)
+	events, notes, taskEvents, err = store.DashboardChangeCursor(ctx)
 	if err != nil || events != 1 || notes != 1 || taskEvents != 0 {
 		t.Fatalf("note cursor = %d.%d.%d, err=%v, want 1.1.0", events, notes, taskEvents, err)
 	}
@@ -41,21 +41,13 @@ func TestDashboardChangeCursor(t *testing.T) {
 	if err := store.AddTaskEvent(ctx, TaskEvent{TaskID: "task-1", Kind: "task_dismissed_manual", FromState: "implementing", ToState: "dismissed"}); err != nil {
 		t.Fatalf("AddTaskEvent: %v", err)
 	}
-	events, notes, taskEvents, memoryEvents, err = store.DashboardChangeCursor(ctx)
+	events, notes, taskEvents, err = store.DashboardChangeCursor(ctx)
 	if err != nil || events != 1 || notes != 1 || taskEvents != 1 {
 		t.Fatalf("task event cursor = %d.%d.%d, err=%v, want 1.1.1", events, notes, taskEvents, err)
 	}
 
-	if _, err := store.UpsertConfirmedMemory(ctx, ConfirmedMemory{Owner: MemoryOwner{Kind: "agent", Ref: "worker"}, Key: "cursor", Content: "memory cursor"}); err != nil {
-		t.Fatalf("UpsertConfirmedMemory: %v", err)
-	}
-	events, notes, taskEvents, memoryEvents, err = store.DashboardChangeCursor(ctx)
-	if err != nil || memoryEvents != 1 {
-		t.Fatalf("memory event cursor = %d.%d.%d.%d, err=%v, want 1.1.1.1", events, notes, taskEvents, memoryEvents, err)
-	}
-
-	events2, notes2, taskEvents2, memoryEvents2, err := store.DashboardChangeCursor(ctx)
-	if err != nil || events2 != events || notes2 != notes || taskEvents2 != taskEvents || memoryEvents2 != memoryEvents {
+	events2, notes2, taskEvents2, err := store.DashboardChangeCursor(ctx)
+	if err != nil || events2 != events || notes2 != notes || taskEvents2 != taskEvents {
 		t.Fatalf("repeat cursor = %d.%d.%d, err=%v, want %d.%d.%d", events2, notes2, taskEvents2, err, events, notes, taskEvents)
 	}
 }
