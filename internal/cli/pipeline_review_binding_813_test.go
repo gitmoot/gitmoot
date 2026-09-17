@@ -269,9 +269,15 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	}
 
 	rec, spec := newTestPipeline(t, store, "source-review", pipelineSourceReviewSpec)
+	// #2203: the implement stage exists only so it can be SETTLED with a PR binding -
+	// its job is never run here. The real enqueuer now refuses an implement stage, so
+	// the run STARTS on the stub enqueuer and then ADVANCES on the real one, which is
+	// the half that matters: what this test proves (#813) is that the REVIEW stage's
+	// worktree is a detached read-only checkout pinned to the bound PR head, and that
+	// allocation is real on the advance below.
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	run := startTestRun(t, store, rec, spec, enqueue, now)
+	run := startTestRun(t, store, rec, spec, testStageEnqueuer(store), now)
 	impl := stageRow(t, store, run.ID, "impl")
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: "feat-813", TaskID: "task-813", LeadAgent: "coder"})
 	run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
