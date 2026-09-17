@@ -346,16 +346,8 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	}
 }
 
-func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) {
+func TestAgentImplementRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
-	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
-	if err := os.WriteFile(goalPath, []byte("# Build Gitmoot\n\n### Task 1: Bootstrap\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("goal import code=%d stderr=%q", code, stderr.String())
-	}
 	subscribeShellImplementAgent(t, home, "lead", "gitmoot/gitmoot")
 	checkout := t.TempDir()
 	runGit(t, checkout, "init")
@@ -372,6 +364,15 @@ func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpsertTask(context.Background(), db.Task{
+		ID:           "task-001",
+		RepoFullName: "gitmoot/gitmoot",
+		Title:        "Bootstrap",
+		State:        string(workflow.TaskPlanned),
+	}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	if err := store.UpsertOrgRoleUnavailable(context.Background(), "review", "quota", now.Add(time.Hour), now); err != nil {
 		store.Close()
@@ -381,15 +382,15 @@ func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	stdout.Reset()
-	stderr.Reset()
+	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"task", "run", "task-001", "--home", home, "--repo", "gitmoot/gitmoot",
-		"--owner", "lead", "--org-role", "review",
+		"agent", "implement", "lead", "bootstrap the repo",
+		"--home", home, "--repo", "gitmoot/gitmoot",
+		"--task", "task-001", "--org-role", "review",
 	}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
 		!strings.Contains(stderr.String(), "dispatch refused") {
-		t.Fatalf("task run unavailable: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+		t.Fatalf("agent implement unavailable: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	store, err = dbtest.Open(t, paths.Database)
 	if err != nil {
@@ -404,10 +405,10 @@ func TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation(t *testing.T) 
 		t.Fatalf("task mutated before refusal: %+v", task)
 	}
 	if jobs, err := store.ListJobs(context.Background()); err != nil || len(jobs) != 0 {
-		t.Fatalf("jobs after refused task run = %+v err=%v", jobs, err)
+		t.Fatalf("jobs after refused dispatch = %+v err=%v", jobs, err)
 	}
 	if _, err := os.Stat(filepath.Join(paths.Home, "worktrees", "gitmoot--gitmoot", "task-001")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("worktree exists after refused task run: %v", err)
+		t.Fatalf("worktree exists after refused dispatch: %v", err)
 	}
 }
 

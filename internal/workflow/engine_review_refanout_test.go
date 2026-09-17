@@ -20,8 +20,8 @@ func TestReviewingTaskResumeWorkRearmsNextHeadFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	// gitmoot task resume-work moves a settled review task back to implementing.
-	// A new head without a completed prior verdict still receives a full review.
+	// A fix pass moves a settled review task back to implementing. A new head
+	// without a completed prior verdict still receives a full review.
 	task.State = string(TaskImplementing)
 	if err := store.UpsertTask(ctx, task); err != nil {
 		t.Fatalf("UpsertTask implementing: %v", err)

@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, goals, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, memory curation, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
@@ -26,10 +26,10 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 `skills/gitmoot/`, with deeper reference files under `skills/gitmoot/references/`.
 
 Gitmoot is a local-first coordinator for AI agents working across repositories,
-goals, reviews, PR comments, and runtime workflows. Use this skill when the
+reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
-structured implementation plans, standard goal files, agent template workflows,
+structured implementation plans, agent template workflows,
 template capture, custom prompt agents, job status, branch lock inspection,
 declarative pipelines, agent memory,
 routing telemetry, or runtime metadata.
@@ -299,7 +299,7 @@ Queued jobs keep the exact template content snapshot they were created with.
 Discover templates by metadata:
 
 ```sh
-gitmoot agent template list --runtime codex --output goal_file
+gitmoot agent template list --runtime codex --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```

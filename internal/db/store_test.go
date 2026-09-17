@@ -1299,14 +1299,8 @@ func TestRepositoryMethods(t *testing.T) {
 	if len(agents) != 1 || agents[0].Name != "audit" {
 		t.Fatalf("agents = %+v", agents)
 	}
-	if err := store.InsertGoal(ctx, Goal{ID: "goal-1", Title: "Build Gitmoot", Source: "GOAL.md", Status: "planned"}); err != nil {
-		t.Fatalf("InsertGoal returned error: %v", err)
-	}
 	if err := store.UpsertTask(ctx, Task{ID: "task-1", GoalID: "goal-1", Title: "Bootstrap", State: "planned"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	if err := store.InsertGoal(ctx, Goal{ID: "goal-2", Title: "Corrected Goal", Source: "GOAL.md", Status: "planned"}); err != nil {
-		t.Fatalf("second InsertGoal returned error: %v", err)
 	}
 	if err := store.UpsertTask(ctx, Task{ID: "task-1", GoalID: "goal-2", Title: "Bootstrap", State: "planned"}); err != nil {
 		t.Fatalf("second UpsertTask returned error: %v", err)

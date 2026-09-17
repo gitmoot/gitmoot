@@ -299,8 +299,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	// Review-to-fix jobs are the implementation jobs created by workflow
-	// advancement. They are explicitly marked FixWorktree; ordinary task runs,
-	// local implement dispatches, and delegation legs may legitimately be PR-less
+	// advancement. They are explicitly marked FixWorktree; ordinary local
+	// implement dispatches and delegation legs may legitimately be PR-less
 	// and must not inherit this delivery gate. Check the same durable target the
 	// finalizer will use before agent lookup, checkout setup, or adapter delivery.
 	if job.Type == "implement" && payload.FixWorktree {

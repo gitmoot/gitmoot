@@ -200,13 +200,13 @@ When you want the current Codex chat to invoke a registered background-capable
 Gitmoot agent, route that request through the CLI:
 
 ```text
-$gitmoot:gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+$gitmoot:gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 ```
 
 Without the chat command bridge, ask Codex to run the same shell command:
 
 ```sh
-gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 gitmoot job watch <job-id>
 ```
 
@@ -230,7 +230,7 @@ For a registered background-agent ask from Claude Code, use the same CLI
 command:
 
 ```sh
-gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 gitmoot job watch <job-id>
 ```
 

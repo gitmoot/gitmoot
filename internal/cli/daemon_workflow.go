@@ -301,8 +301,8 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 	taskID := strings.TrimSpace(payload.TaskID)
 	if taskID == "" {
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation job %s has no task id; cannot deliver a branch or pull request; rerun through `gitmoot task run <task-id> --repo %s --owner %s --branch <branch>` or `gitmoot agent implement %s \"Implement the task.\" --repo %s --task <task-id> --branch <branch>`",
-			job.ID, payload.Repo, job.Agent, job.Agent, payload.Repo,
+			"implementation job %s has no task id; cannot deliver a branch or pull request; rerun through `gitmoot agent implement %s \"Implement the task.\" --repo %s --task <task-id> --branch <branch>`",
+			job.ID, job.Agent, payload.Repo,
 		))
 	}
 	task, err := store.GetTask(ctx, taskID)
@@ -334,8 +334,8 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 	if worktreePath == "" {
 		branch := firstNonEmpty(strings.TrimSpace(task.Branch), strings.TrimSpace(payload.Branch), "<branch>")
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"implementation task %s has no worktree path; cannot deliver a branch or pull request; rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
-			task.ID, task.ID, payload.Repo, job.Agent, branch,
+			"implementation task %s has no worktree path; cannot deliver a branch or pull request; rerun with `gitmoot agent implement %s \"Implement the task.\" --repo %s --task %s --branch %s`",
+			task.ID, job.Agent, payload.Repo, task.ID, branch,
 		))
 	}
 	if branchName == "" {
@@ -355,8 +355,8 @@ func implementationFinalizationTargetForRunner(ctx context.Context, store *db.St
 			))
 		}
 		return implementationFinalizationTarget{}, blockedResultDelivery(fmt.Sprintf(
-			"%s; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot task run %s --repo %s --owner %s --branch %s`",
-			missing, task.ID, payload.Repo, job.Agent, advice,
+			"%s; cannot push or open a pull request; inspect or stash local changes, then rerun with `gitmoot agent implement %s \"Implement the task.\" --repo %s --task %s --branch %s`",
+			missing, job.Agent, payload.Repo, task.ID, advice,
 		))
 	}
 	git := jobGitClient(worktreePath, runner)

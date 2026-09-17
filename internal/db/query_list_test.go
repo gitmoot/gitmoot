@@ -76,9 +76,6 @@ func TestListMethodsPreserveTheirEmptyResultShape(t *testing.T) {
 		if got, err := store.ListAgentTemplates(ctx); err != nil || got == nil {
 			t.Fatalf("ListAgentTemplates = %#v, err %v; want non-nil empty slice", got, err)
 		}
-		if got, err := store.ListGoals(ctx); err != nil || got == nil {
-			t.Fatalf("ListGoals = %#v, err %v; want non-nil empty slice", got, err)
-		}
 		// Served straight to the dashboard HTTP client, so null-vs-[] is visible
 		// to a browser, not just to Go callers.
 		if got, err := store.ListDashboardBlockedJobs(ctx); err != nil || got == nil {

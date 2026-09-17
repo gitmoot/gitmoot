@@ -32,7 +32,7 @@ draft from visible context; `agent template add` installs the reviewed snapshot.
 ## Jobs
 
 Jobs are units of routed work. They can come from PR comments, local
-`agent ask`, task runs, retries, or merge actions.
+`agent ask`, `agent implement`, review dispatch, retries, or merge actions.
 
 ## Delegations
 

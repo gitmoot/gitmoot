@@ -1048,8 +1048,8 @@ func IsUnlabeledAgentDispatch(workflowID, sender, delegationReason string) bool 
 // dispatches. Engine children inherit their parent's WorkflowID, heartbeat and
 // temporary-worker merge-back are internal producers, and pipeline jobs have
 // their own grouping semantics, so none are auto-filed or strict-rejected. Job
-// open (Sender "session") and task recover intentionally bypass this chokepoint:
-// diagnostics count their unlabeled rows, but enforcement does not touch them.
+// open (Sender "session") intentionally bypasses this chokepoint: diagnostics
+// count its unlabeled rows, but enforcement does not touch them.
 func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
 	// Engine reactions belong to their PR tree; the initiating dispatch owns labeling.
 	if request.PolicyExempt == "exempt" {

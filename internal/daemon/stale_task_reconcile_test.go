@@ -287,7 +287,7 @@ func TestPlannedTaskReconcilerDefaultOffAndOptIn(t *testing.T) {
 		{name: "default off"},
 		{name: "invalid remains off", config: "later"},
 		{name: "opted in", config: "1h", wantDismiss: true},
-		{name: "in-flight task run stays planned", config: "1h", liveJob: true},
+		{name: "in-flight implement job stays planned", config: "1h", liveJob: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()

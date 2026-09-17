@@ -56,7 +56,6 @@ Create or reuse a disposable repository registered with Gitmoot:
 
 ```sh
 gitmoot repo add owner/repo --path /path/to/repo
-gitmoot goal import --file GOAL.md --repo owner/repo
 gitmoot task list --repo owner/repo
 ```
 
@@ -80,12 +79,12 @@ gitmoot agent subscribe claude-worker \
   --policy workspace-write
 ```
 
-Start one task per worker. `task run` should allocate a dedicated worktree and
-print its path:
+Queue one implement job per worker. Each dispatch mints its own task and should
+allocate a dedicated worktree:
 
 ```sh
-gitmoot task run task-001 --repo owner/repo --owner codex-worker
-gitmoot task run task-002 --repo owner/repo --owner claude-worker
+gitmoot agent implement codex-worker "Write the codex marker file" --repo owner/repo --background
+gitmoot agent implement claude-worker "Write the claude marker file" --repo owner/repo --background
 ```
 
 Run the daemon with enough workers for both jobs:
@@ -118,6 +117,6 @@ The following focused tests cover the non-live invariants:
 
 ```sh
 GOTOOLCHAIN=go1.26.0 go test ./internal/cli ./internal/runtime ./internal/workflow \
-  -run 'Permission|RunTaskRun|SelectRunnableQueuedJobs|AdvanceImplement' \
+  -run 'Permission|AllocateTaskWorktree|SelectRunnableQueuedJobs|AdvanceImplement' \
   -v -timeout 180s
 ```

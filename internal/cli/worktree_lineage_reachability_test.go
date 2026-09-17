@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -160,12 +159,10 @@ func TestPrepareLocalImplementDispatchRequestReconcilesDirtyWorktreeLineage(t *t
 						t.Fatalf("blocked error %q missing %q", err, want)
 					}
 				}
-				if strings.Contains(err.Error(), "gitmoot task recover") {
-					t.Fatalf("off-lineage error points at stale-branch recovery: %v", err)
-				}
 			} else {
-				if !strings.Contains(err.Error(), "gitmoot task recover task-lineage") {
-					t.Fatalf("on-lineage error changed existing recovery guidance: %v", err)
+				want := "branch " + fixture.task.Branch + " has uncommitted changes in task worktree " + fixture.worktree + "; inspect and commit/push them, or clean/stash them before retrying implement"
+				if err == nil || err.Error() != want {
+					t.Fatalf("on-lineage error = %v, want plain dirty refusal %q", err, want)
 				}
 				if stored.State != fixture.task.State {
 					t.Fatalf("on-lineage task state = %q, want %q", stored.State, fixture.task.State)
@@ -264,80 +261,6 @@ func TestPrepareLocalImplementDispatchRequestImplicitPRBaseSkipsGenericLineage(t
 			}
 			if len(events) != 0 {
 				t.Fatalf("clean implicit PR task events = %+v, want none", events)
-			}
-		})
-	}
-}
-
-func TestRunTaskRunReconcilesDirtyWorktreeLineage(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		offLineage  bool
-		wantBlocked bool
-	}{
-		{name: "on-lineage keeps existing recovery guidance"},
-		{name: "off-lineage blocks and journals", offLineage: true, wantBlocked: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			fixture := newDirtyTaskLineageFixture(t, tc.offLineage)
-			if err := fixture.store.Close(); err != nil {
-				t.Fatalf("close seed store: %v", err)
-			}
-			withWorkingDirectory(t, fixture.checkout)
-
-			var stdout, stderr bytes.Buffer
-			code := Run([]string{
-				"task", "run", fixture.task.ID,
-				"--home", fixture.home,
-				"--repo", "owner/repo",
-				"--owner", "lead",
-				"--base", "HEAD",
-			}, &stdout, &stderr)
-			if code != 1 {
-				t.Fatalf("task run code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-			}
-
-			store := openCLIJobStore(t, fixture.home)
-			defer store.Close()
-			stored, err := store.GetTask(context.Background(), fixture.task.ID)
-			if err != nil {
-				t.Fatalf("GetTask: %v", err)
-			}
-			events, err := store.ListTaskEvents(context.Background(), fixture.task.ID)
-			if err != nil {
-				t.Fatalf("ListTaskEvents: %v", err)
-			}
-			if tc.wantBlocked {
-				if stored.State != string(workflow.TaskBlocked) {
-					t.Fatalf("task state = %q, want blocked", stored.State)
-				}
-				if len(events) != 1 || events[0].Kind != "stale_worktree_dirty_blocked" {
-					t.Fatalf("task events = %+v", events)
-				}
-				for _, want := range []string{"is stale", "uncommitted changes", "manually salvage"} {
-					if !strings.Contains(stderr.String(), want) {
-						t.Fatalf("blocked stderr %q missing %q", stderr.String(), want)
-					}
-				}
-				if strings.Contains(stderr.String(), "gitmoot task recover") {
-					t.Fatalf("off-lineage stderr points at stale-branch recovery: %s", stderr.String())
-				}
-			} else {
-				if !strings.Contains(stderr.String(), "gitmoot task recover task-lineage") {
-					t.Fatalf("on-lineage stderr changed existing recovery guidance: %s", stderr.String())
-				}
-				if stored.State != fixture.task.State {
-					t.Fatalf("on-lineage task state = %q, want %q", stored.State, fixture.task.State)
-				}
-				if len(events) != 0 {
-					t.Fatalf("on-lineage task events = %+v, want none", events)
-				}
-			}
-			if content, readErr := os.ReadFile(filepath.Join(fixture.worktree, "salvage.txt")); readErr != nil || string(content) != "uncommitted salvage\n" {
-				t.Fatalf("salvage file = %q, %v", content, readErr)
-			}
-			if _, lockErr := store.GetBranchLock(context.Background(), "owner/repo", fixture.task.Branch); !errors.Is(lockErr, sql.ErrNoRows) {
-				t.Fatalf("dirty preflight created branch lock: %v", lockErr)
 			}
 		})
 	}

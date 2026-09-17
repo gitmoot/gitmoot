@@ -323,8 +323,8 @@ func TestPollOnceLeavesTaskBlockedByUnknownMechanismBlocked(t *testing.T) {
 // #1562. A task blocked on "local worktree is not clean" — a condition the gate
 // itself classified MergeBlockTransient — must regain an exit from the ordinary
 // poll, WITHOUT a human merging the pull request. ready_to_merge is that exit: it
-// is the documented retry authority and it is also the state `task resume-work`
-// accepts, so the row becomes reachable both automatically and by an operator.
+// is the documented retry authority, so the row becomes reachable again
+// automatically.
 //
 // Mutant M1 ("releases nothing"): delete the
 // reconcileTransientlyBlockedMergeGates call from PollOnce, or invert its class
@@ -363,8 +363,7 @@ func TestPollOnceReleasesTransientlyBlockedReviewTask(t *testing.T) {
 // worthless if nothing consumes that state: a branchless review task is invisible
 // to a pull.HeadRef lookup, so before lookupReadyPullRequestTask existed the
 // released task sat in ready_to_merge and the gate was never re-run — the
-// automatic self-clearing retry #1562 asks for did not happen, only manual
-// `task resume-work` recovery.
+// automatic self-clearing retry #1562 asks for did not happen at all.
 //
 // Poll 1 releases; poll 2 MUST reach the merge gate.
 //

@@ -71,7 +71,7 @@ it names one of omp's accepted levels; Claude and Kimi ignore it.
 
 ### Built for unattended runs
 
-Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `task recover` for salvaging a dead implementer's half-finished work; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
+Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
 
 ### Driven from GitHub, visible everywhere
 

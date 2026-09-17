@@ -1526,7 +1526,7 @@ UPDATE repos SET poll_interval = '' WHERE poll_interval = '30s';
 	`,
 	// #913 task dismissal lifecycle audit. Task state is already unconstrained
 	// TEXT, so the state itself needs no column migration; this append-only table
-	// records every explicit manual, automatic, and recovery transition.
+	// records every task lifecycle transition, whichever path wrote it.
 	`
 CREATE TABLE IF NOT EXISTS task_events (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,

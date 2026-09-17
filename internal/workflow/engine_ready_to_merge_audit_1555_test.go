@@ -22,9 +22,8 @@ import (
 // would have shipped the escape.
 //
 // Two of the issue's four original asks were WITHDRAWN by its author after
-// checking: the fix-pass refusal was correct and protective, and the escape
-// hatch (`task dismiss`/`recover`/`resume-work`/`events`) exists. Neither is
-// touched here.
+// checking: the fix-pass refusal was correct and protective, and an escape from
+// the state exists. Neither is touched here.
 func TestDeferredMergeDoesNotCallATaskMergeableWhileAWriterHoldsTheBranch(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

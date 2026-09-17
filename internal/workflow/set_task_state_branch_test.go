@@ -195,8 +195,7 @@ func TestSetTaskStateRefusesMergedRegressionAndLeavesADurableTrace(t *testing.T)
 // TestSetTaskStateAllowsMergedToNonRegressionStates is the other half of the rule,
 // and the one a widened refusal would break. The guard is deliberately limited to
 // the three states a dead leg's failure policy can write; it does not freeze every
-// other state transition out of merged. The CLI resume-work contract is tested at
-// its own entry point and separately rejects merged.
+// other state transition out of merged.
 func TestSetTaskStateAllowsMergedToNonRegressionStates(t *testing.T) {
 	for _, allowed := range []TaskState{
 		TaskImplementing, TaskPullRequestOpen, TaskReviewing, TaskChangesRequested,

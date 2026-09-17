@@ -710,7 +710,7 @@ func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullReq
 		e.reconcileMergedCleanup(ctx, event.Repo, task)
 	}
 	if !merged && taskState == TaskAwaitingHumanMerge {
-		// Preserve the worktree for task recovery, but do not leave a closed,
+		// Preserve the worktree so its work can still be salvaged by hand, but do not leave a closed,
 		// human-parked PR holding the branch lock indefinitely.
 		if branch := strings.TrimSpace(task.Branch); branch != "" {
 			if lock, err := e.Store.GetBranchLock(ctx, event.Repo, branch); err == nil {

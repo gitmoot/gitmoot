@@ -356,9 +356,9 @@ Expected signals:
 
 ## Planner Template Smoke Test
 
-Goal: canonical goal template -> cached planner template -> Gitmoot-managed Codex
-planner agent. This verifies the planning workflow is discoverable before using
-it on a real PR.
+Goal: cached planner template -> Gitmoot-managed Codex planner agent -> the
+first plan item dispatched as implementation work. This verifies the planning
+workflow is discoverable before using it on a real PR.
 
 1. Build a local test binary and use an isolated Gitmoot home.
 
@@ -369,10 +369,9 @@ it on a real PR.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. Confirm the canonical template and planner template are available.
+2. Confirm the planner template is available.
 
    ```sh
-   /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
    /tmp/gitmoot-current agent template list --home "$GITMOOT_SMOKE_HOME" | grep planner
    /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" planner
    /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" planner
@@ -399,18 +398,42 @@ it on a real PR.
    /tmp/gitmoot-current agent ask project-planner-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --repo owner/project \
-     "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+     "Write a task-by-task implementation plan for this feature."
    /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
    /tmp/gitmoot-current job show <local-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
    ```
 
-5. Open a disposable PR, then comment:
+5. Hand the first plan item to an implement-capable agent and inspect the task
+   Gitmoot records for it.
 
-   ```text
-   /gitmoot project-planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+   ```sh
+   /tmp/gitmoot-current agent start project-implementer-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --runtime codex \
+     --repo owner/project \
+     --path . \
+     --role implementer \
+     --capability implement \
+     --policy danger-full-access
+   /tmp/gitmoot-current agent implement project-implementer-smoke \
+     --home "$GITMOOT_SMOKE_HOME" \
+     --repo owner/project \
+     "Implement the first task from the planner's plan."
+   /tmp/gitmoot-current task list --home "$GITMOOT_SMOKE_HOME" --repo owner/project --json
+   /tmp/gitmoot-current task events <task-id> --home "$GITMOOT_SMOKE_HOME" --json
    ```
 
-6. Verify the queued PR job and PR result.
+   `agent implement` mints the task itself unless `--task <task-id>` names an
+   existing one, so read the recorded id out of `task list --json` before
+   calling `task events`.
+
+6. Open a disposable PR, then comment:
+
+   ```text
+   /gitmoot project-planner-smoke ask Write a task-by-task implementation plan for this feature.
+   ```
+
+7. Verify the queued PR job and PR result.
 
    ```sh
    /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
@@ -421,7 +444,6 @@ it on a real PR.
 
 Expected signals:
 
-- `goal template` prints the canonical PR-per-task prompt.
 - `agent template show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
 - `agent doctor project-planner-smoke` succeeds.
@@ -429,11 +451,13 @@ Expected signals:
   `action: ask`, and a planner summary.
 - `job show <local-ask-job-id>` includes `"sender": "local"`, the cached
   `planner` template metadata, and the planner result.
+- `agent implement project-implementer-smoke` reports its implement job, and
+  `task list` shows the recorded task with its branch and state.
+- `task events <task-id>` prints that task's append-only event trail.
 - The PR result comment includes `Template: planner`.
-- The planner returns a structured plan and, when requested, a
-  `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
+- The planner returns a structured task-by-task plan.
 
-7. Stop the isolated daemon.
+8. Stop the isolated daemon.
 
    ```sh
    /tmp/gitmoot-current daemon stop --home "$GITMOOT_SMOKE_HOME"

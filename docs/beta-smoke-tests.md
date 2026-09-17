@@ -320,9 +320,8 @@ Expected signals:
 
 ## Planner Template Smoke Test
 
-Goal: canonical goal template -> cached planner template -> Gitmoot-managed Codex
-planner agent. This verifies the planning workflow is discoverable before using
-it on a real PR.
+Goal: cached planner template -> Gitmoot-managed Codex planner agent. This
+verifies the planning workflow is discoverable before using it on a real PR.
 
 1. Build a local test binary and use an isolated Gitmoot home.
 
@@ -333,10 +332,9 @@ it on a real PR.
    /tmp/gitmoot-current init --home "$GITMOOT_SMOKE_HOME"
    ```
 
-2. Confirm the canonical template and planner template are available.
+2. Confirm the planner template is available.
 
    ```sh
-   /tmp/gitmoot-current goal template | grep "codex exec review is clean; ready for manual /review."
    /tmp/gitmoot-current agent template list --home "$GITMOOT_SMOKE_HOME" | grep planner
    /tmp/gitmoot-current agent template update --home "$GITMOOT_SMOKE_HOME" planner
    /tmp/gitmoot-current agent template show --home "$GITMOOT_SMOKE_HOME" planner
@@ -363,7 +361,7 @@ it on a real PR.
    /tmp/gitmoot-current agent ask project-planner-smoke \
      --home "$GITMOOT_SMOKE_HOME" \
      --repo owner/project \
-     "Write a task-by-task implementation plan for this feature, then create the goal file prompt."
+     "Write a task-by-task implementation plan for this feature."
    /tmp/gitmoot-current job list --home "$GITMOOT_SMOKE_HOME" --repo owner/project
    /tmp/gitmoot-current job show <local-ask-job-id> --home "$GITMOOT_SMOKE_HOME"
    ```
@@ -371,7 +369,7 @@ it on a real PR.
 5. Open a disposable PR, then comment:
 
    ```text
-   /gitmoot project-planner-smoke ask Write a task-by-task implementation plan for this feature, then create the goal file prompt.
+   /gitmoot project-planner-smoke ask Write a task-by-task implementation plan for this feature.
    ```
 
 6. Verify the queued PR job and PR result.
@@ -385,7 +383,6 @@ it on a real PR.
 
 Expected signals:
 
-- `goal template` prints the canonical PR-per-task prompt.
 - `agent template show` displays `default role: planner`, `default capabilities: ask`,
   and `mutation: true`.
 - `agent doctor project-planner-smoke` succeeds.
@@ -394,8 +391,8 @@ Expected signals:
 - `job show <local-ask-job-id>` includes `"sender": "local"`, the cached
   `planner` template metadata, and the planner result.
 - The PR result comment includes `Template: planner`.
-- The planner returns a structured plan and, when requested, a
-  `GOAL-<short-slug>.md` path plus `/goal GOAL-<short-slug>.md`.
+- The planner returns a decision-complete plan split into tasks, each with its
+  scope, PR boundary, acceptance criteria, and suggested commit message.
 
 7. Stop the isolated daemon.
 

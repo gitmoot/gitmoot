@@ -3090,7 +3090,7 @@ func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
 	for _, want := range []string{
 		"Gitmoot cannot merge PR #41 because multiple branchless tasks match it",
 		"`review-pr-41-first`, `review-pr-41-second`",
-		"Remedy: dismiss every stale duplicate with `gitmoot task dismiss <task-id> --reason \"duplicate branchless PR task\"`, leave one listed task ready to merge, then retry `/gitmoot merge`",
+		"Gitmoot cannot pick which task owns the pull request, so merge PR #41 from GitHub",
 	} {
 		if !strings.Contains(client.posted[0].body, want) {
 			t.Fatalf("operator-visible reply %q does not contain %q", client.posted[0].body, want)

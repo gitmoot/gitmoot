@@ -104,7 +104,7 @@ var builtins = []Definition{
 	{
 		ID:                  PlannerTemplateID,
 		Name:                "Gitmoot Planner",
-		Description:         "Structured planning and standard goal-file agent template for Gitmoot workflows, usable in current chat or as a managed agent.",
+		Description:         "Structured planning agent template for Gitmoot workflows, usable in current chat or as a managed agent.",
 		DefaultRole:         "planner",
 		DefaultCapabilities: []string{"ask"},
 		Mutation:            true,
@@ -769,9 +769,15 @@ func MetadataForDefinition(definition Definition) Metadata {
 	}
 	switch definition.ID {
 	case PlannerTemplateID:
-		metadata.Tags = []string{"planning", "goals", "pull-requests"}
+		// #2205 removed the goal-file surface, so the built-in's metadata must
+		// match the frontmatter it SHADOWS for an uninstalled template. Round-1
+		// review of #2212 caught the split: `agent template show planner`
+		// advertised goal_file for the built-in and then flipped to plan,tasks
+		// once installed, which is the same value reported two different ways
+		// depending on install state.
+		metadata.Tags = []string{"planning", "plans", "pull-requests"}
 		metadata.Inputs = []string{"repo", "task", "visible_context"}
-		metadata.Outputs = []string{"plan", "goal_file"}
+		metadata.Outputs = []string{"plan", "tasks"}
 		metadata.Evaluation = map[string]string{
 			"driver":         "gitmoot-planner",
 			"preferred_gate": "pairwise",

@@ -509,8 +509,8 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 // condition from an authoritative quality rejection, but that classification used
 // to live only on the returned decision, so nothing outside the blocking call
 // stack could act on it: daemon.lookupReadyPullRequestTask admits ready_to_merge
-// only, engine_pr_lifecycle's non-merged close branch omits blocked, and
-// `task resume-work` refuses blocked. Measured on review-pr-1699-3f3a1026, whose
+// only and engine_pr_lifecycle's non-merged close branch omits blocked, so a
+// transiently blocked task had no exit at all. Measured on review-pr-1699-3f3a1026, whose
 // dirty-worktree block outlived the dirt by 95 minutes and cleared only when a
 // human merged the PR by hand.
 //
@@ -3206,8 +3206,8 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		var ambiguous *ambiguousMergeCommandTasksError
 		if errors.As(err, &ambiguous) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf(
-				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Remedy: dismiss every stale duplicate with `gitmoot task dismiss <task-id> --reason \"duplicate branchless PR task\"`, leave one listed task ready to merge, then retry `/gitmoot merge`.",
-				pull.Number, strings.Join(ambiguous.taskIDs, "`, `")))
+				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Gitmoot cannot pick which task owns the pull request, so merge PR #%d from GitHub.",
+				pull.Number, strings.Join(ambiguous.taskIDs, "`, `"), pull.Number))
 		}
 		return err
 	}

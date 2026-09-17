@@ -132,7 +132,12 @@ func TestAgentTemplateListShowsAvailableBuiltin(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("template show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"installed: no", "metadata:", "outputs: plan,goal_file", "evaluation:"} {
+	// #2205 removed the goal-file surface, so the planner's outputs are
+	// plan,tasks in BOTH install states. The subject of this assertion - that
+	// `show` reports the built-in's metadata for an uninstalled template -
+	// survives; only the value moved, which is why it is re-pinned rather than
+	// deleted.
+	for _, want := range []string{"installed: no", "metadata:", "outputs: plan,tasks", "evaluation:"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("show output missing %q:\n%s", want, stdout.String())
 		}
@@ -633,7 +638,8 @@ func TestAgentTemplateListShowsInstalledCustomTemplate(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "template", "list", "--home", home, "--output", "goal_file", "--runtime", "codex"}, &stdout, &stderr)
+	// --output plan still selects the planner alone: no other built-in emits it.
+	code = Run([]string{"agent", "template", "list", "--home", home, "--output", "plan", "--runtime", "codex"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("template list filter exit code = %d, stderr=%s", code, stderr.String())
 	}

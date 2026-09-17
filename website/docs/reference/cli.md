@@ -927,7 +927,7 @@ gitmoot agent implement lead --repo owner/repo --task task-001 --ready "Implemen
 gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
 gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
-gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan and goal file."
+gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
 gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
 gitmoot job watch <job-id>
@@ -1465,7 +1465,7 @@ gitmoot agent start thermo-review \
   --start-daemon
 ```
 
-Install or refresh the built-in full planner/goal template:
+Install or refresh the built-in full planner template:
 
 ```sh
 gitmoot agent template update planner
@@ -1570,7 +1570,7 @@ Queued jobs keep the exact template content snapshot they were created with.
 Discover templates by metadata:
 
 ```sh
-gitmoot agent template list --runtime codex --output goal_file
+gitmoot agent template list --runtime codex --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
@@ -1758,7 +1758,7 @@ snapshot and event-rule store. It fails when a role has no live pane, has no
 enabled wake route, or a labeled live pane is not claimed by any role; each
 failure includes category counts and a reason. Use `gitmoot org show` to view
 the configured roles. When enabled, fresh local `agent ask`, `agent run`, `agent
-review`, `agent implement`, `orchestrate`, and `task run` dispatches require
+review`, `agent implement`, and `orchestrate` dispatches require
 `--org-role <role>` (or `GITMOOT_ORG_ROLE`) and reject out-of-scope repositories
 at enqueue.
 `enforce = "block"` is the default; `"warn"` allows the job and records an
@@ -2225,47 +2225,28 @@ Linked PR transitions add structured `[auto:pr:...]` notes as author `daemon`
 and advance status at open, checks-green/ready-to-merge, and merged or
 closed-without-merging. The workflow/PR/transition key deduplicates poll replays,
 and automatic updates never overwrite description.
-## Goals
+## Tasks
 
-Print the standard Gitmoot goal prompt template:
-
-```sh
-gitmoot goal template
-```
-
-Import a goal file into local Gitmoot state:
+Inspect task state and the append-only task event trail:
 
 ```sh
-gitmoot goal import --file GOAL-feature.md --repo owner/repo
-```
-
-Start a task in its dedicated branch worktree and inspect task state:
-
-```sh
-gitmoot task run task-001 --repo owner/repo --owner lead --base main
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task list --repo owner/repo --state stranded --json
-gitmoot task dismiss task-001 --reason "abandoned experiment"
-gitmoot task resume-work task-001 --reason "review requires another fix pass"
-gitmoot task resume-work task-001 --reason "withdraw pending merge" --override-pending-human-decision
 gitmoot task events task-001 --json
 ```
 
-`task run` stores the deterministic task worktree path under
-`$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/` and leaves the registered
-checkout on its current branch.
+Tasks are minted by the dispatch paths that need them: `agent implement`
+creates or reuses the task for the branch it works on, and review dispatch
+mints the `review-pr-<n>-<hash>` task identity. Each task's deterministic
+worktree path is `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/`, and the
+registered checkout stays on its current branch.
 
-`task dismiss` is an explicit terminal action for stale `implementing` or
-`blocked` tasks. It refuses states owned by planning, PR/review/merge, or human
-resume machinery, and refuses while a matching job or worktree process remains
-live. It preserves branch and worktree, releases the branch lock best-effort,
-and records `task_dismissed_manual`; an already-dismissed task is an exit-0
-no-op (`changed:false` in JSON). `task events <id>` lists the append-only trail,
-including daemon `task_dismissed_auto`, opt-in
+`task events <id>` lists the append-only trail, including daemon
+`task_dismissed_auto`, opt-in
 `task_dismissed_planned_ttl`, closed-unmerged `pr_closed_unmerged`, terminal
 top-level implement triage (`task_blocked_terminal_no_pr` or
-`task_blocked_job_failed`), and explicit recovery events.
+`task_blocked_job_failed`), and job-retry recovery.
 
 Past `[workflow].stale_task_ttl`, blocked tasks follow an evidence ladder: own
 merged PR (`merged`), later merged work on the same referenced issue
@@ -2278,16 +2259,11 @@ The blocked-task alert has a separate finite ladder: three interval-spaced
 nudges, one terminal escalation, then no further alerts while the task remains
 queryable. Only the evidence-disposal pass transitions task state.
 
-`task resume-work` is an explicit coordinator-only return to development from
-`reviewing`, `ready_to_merge`, or `awaiting_human_merge`. It requires `--reason`,
-refuses while a matching job or worktree process is live, preserves the branch
-lock, moves the task to `implementing`, and records `task_resume_work_manual`.
-The `awaiting_human_merge` state also requires
-`--override-pending-human-decision`, acknowledging that Gitmoot cannot observe a
-human who may be about to merge. Daemon advancement and autonomous retries do
-not invoke this command. Repeated manual use can still recreate the uncapped
-review/fix pattern tracked by #1142; the distinct event makes that activity
-measurable rather than invisible.
+`awaiting_human_merge` is left automatically rather than by hand. The daemon
+promotes the task back to `ready_to_merge` once the merge is safe again, a
+merged PR moves it to `merged`, and the stale-task disposal bound above
+eventually strands it. Nothing forces the task back into development while it
+waits, because Gitmoot cannot observe a human who may be about to merge.
 
 ### Recover a dead implement
 
@@ -2301,40 +2277,25 @@ normal finalizer still owns commit, push, and PR creation. A live worktree, a
 dirty registered/other checkout, wrong-head state, or an exhausted retry budget
 keeps the existing block/failure path.
 
-A new `task run` (or `agent implement`) still refuses a dirty worktree with no
-active job rather than silently discarding the work, and points you at
-`task recover`:
+A new `agent implement` still refuses a dirty worktree with no active job
+rather than silently discarding the work:
 
-```sh
-gitmoot task recover task-001 --owner lead
-gitmoot task recover task-001 --owner lead --repo owner/repo --skip-native-review-fanout --json
+```text
+branch <b> has uncommitted changes in task worktree <path>; inspect and commit/push them, or clean/stash them before retrying implement
 ```
 
-`--owner <agent>` is required for preserved branch/worktree recovery and names a
-registered implement-capable agent attributed as the recovery lead. A dismissed
-task with no branch returns directly to `planned`, so that path does not require
-`--owner`. `--repo owner/repo` is optional and falls back to the task's stored
-repo, so it is only needed when the task carries none.
-`--skip-native-review-fanout` persists that flag before the PR is opened, and
-`--json` prints the machine-readable recovery result.
+No command finalizes that worktree for you. Inspect it, commit and push the
+work by hand (or clean/stash it), then retry `agent implement`.
 
-`task recover` commits the full worktree state (`git add -A`, including
-untracked non-ignored files), pushes the task branch, and opens or adopts the
-task's PR — the finalize steps the dead implementer never reached. When the
-worktree is already clean it recovers the commit already ahead of the base, and
-refuses when there is nothing ahead to recover.
-
-`task recover` is also the only task-level recovery from `dismissed`. Preserved
-branch/worktree artifacts move through `implementing` to `pr_open`; a branchless
-task returns to `planned` with guidance to use `task run`. Ordinary allocation
-and workflow advancement cannot resurrect the task. Retrying one of its jobs
-restores it explicitly and records `task_recovered_job_retry`.
+A `dismissed` task is not resurrected by ordinary allocation or workflow
+advancement. Retrying one of its jobs restores it explicitly and records
+`task_recovered_job_retry`.
 
 If an existing task worktree has fallen off the resolved base lineage, Gitmoot
-re-cuts it only when it is clean. When it also has uncommitted changes, `task
-run`/`agent implement` preserve the worktree, move the task to `blocked`, and
-record `stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean
-the changes before retrying.
+re-cuts it only when it is clean. When it also has uncommitted changes, `agent
+implement` preserves the worktree, moves the task to `blocked`, and records
+`stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean the
+changes before retrying.
 
 The daemon reads a bounded oldest-first stale window and processes up to 20
 qualifying `implementing` tasks per repo poll.
@@ -2360,11 +2321,12 @@ remain fatal.
 `[workflow].planned_ttl = "720h"` is a separate repository opt-in for old
 never-started plans. It is disabled by default; unset, empty, `"0"`, and invalid
 values all mean off because automatic dismissal can destroy human planning
-context that goal-file re-import cannot reconstruct. When enabled it uses the
+context that Gitmoot cannot reconstruct. When enabled it uses the
 same live-job, same-repo open-PR, remote-branch, and remote-uncertainty skips and
 records `task_dismissed_planned_ttl`. Task allocation claims
 `planned -> implementing` atomically at the write boundary, so a concurrent TTL
-dismissal cannot be resurrected by `task run`; explicit recovery is required.
+dismissal cannot be resurrected by a later allocation; retrying one of the
+task's jobs is the explicit path back.
 
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
@@ -2378,16 +2340,15 @@ recorded head SHA when available. Other terminal outcomes remain
 `task_blocked_job_failed`. Delegation children and queued fixes, retries,
 continuations, or pending advancement are not reclassified.
 
-Two refusals guard recovery (and the `task run` / `agent implement` restart that
-points to it):
+Two refusals guard the `agent implement` restart into an existing task
+worktree:
 
-- **Dirty worktree without an active job** — a restart refuses when the task
-  worktree has uncommitted changes and no in-flight job. Inspect it, then run
-  `task recover` to commit/push/open the PR, or clean/stash the worktree before
-  retrying.
-- **Live process still in the worktree** — `task recover` refuses while a live
+- **Dirty worktree without an active job** — the restart refuses when the task
+  worktree has uncommitted changes and no in-flight job. Inspect it, commit and
+  push the work yourself, or clean/stash the worktree before retrying.
+- **Live process still in the worktree** — the restart refuses while a live
   process is still inside the task worktree. Wait for it to exit, or stop the
-  orphaned implementer, before recovering.
+  orphaned implementer, before retrying.
 
 ## PR Comments
 
