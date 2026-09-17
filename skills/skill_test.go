@@ -336,3 +336,39 @@ func TestReviewDeadlineDocsAreIdenticalInBothTrees(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewRouterDocsAreIdenticalInBothTrees is the #2192 parity rule applied
+// to the second duplicated region (#2196). The review-router section was synced
+// by hand when `agent review` began routing through `review request`, and a hand
+// sync is prevented from drifting by nobody. Pins the region byte-for-byte and
+// asserts the load-bearing facts survive, so parity cannot be satisfied by
+// deleting them from both copies.
+func TestReviewRouterDocsAreIdenticalInBothTrees(t *testing.T) {
+	const (
+		blockStart = "`gitmoot review request` is the front door"
+		blockEnd   = "What one request does, in order:"
+	)
+	extract := func(label, text string) string {
+		start := strings.Index(text, blockStart)
+		end := strings.Index(text, blockEnd)
+		if start < 0 || end < 0 || end <= start {
+			t.Fatalf("%s: review-router block not found (start=%d end=%d); if the docs were restructured, update these markers deliberately", label, start, end)
+		}
+		return strings.TrimSpace(text[start:end])
+	}
+	website := extract("website/docs/reference/cli.md", readRepoFile(t, "website", "docs", "reference", "cli.md"))
+	skill := extract("skills/gitmoot/references/CLI.md", readRepoFile(t, "skills", "gitmoot", "references", "CLI.md"))
+	if website != skill {
+		t.Fatalf("review-router docs have drifted between the two trees.\n--- website ---\n%s\n--- skills ---\n%s", website, skill)
+	}
+	for _, want := range []string{
+		"routes THROUGH this command",
+		"--lead <implementer>",
+		"ATTACHING request is told what it lost",
+		"names the flag on stderr",
+	} {
+		if !strings.Contains(website, want) {
+			t.Errorf("shared review-router docs no longer mention %q", want)
+		}
+	}
+}

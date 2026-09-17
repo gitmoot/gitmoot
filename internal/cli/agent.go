@@ -730,7 +730,11 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 		args = append(args, "--json")
 	}
 	if message := strings.TrimSpace(options.message); message != "" {
-		args = append(args, message)
+		// "--" FIRST. The message re-enters a flag parser on the delegated path,
+		// which it never did before, so `agent review r "-check the diff"` exited
+		// 2 with "flag provided but not defined" (#2196 review). A caller whose
+		// review instructions happen to start with a dash is not making an error.
+		args = append(args, "--", message)
 	}
 	return args
 }

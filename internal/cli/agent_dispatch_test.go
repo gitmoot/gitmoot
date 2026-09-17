@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1963,5 +1965,41 @@ func TestReviewRequestHonorsTheForwardedSession(t *testing.T) {
 	// AND THE OUTPUT REPORTS THAT RUNTIME rather than a fabricated omp.
 	if !strings.Contains(stdout.String(), "on shell model") {
 		t.Fatalf("stdout = %q, want the dispatched runtime reported", stdout.String())
+	}
+}
+
+// #2196 review: A MESSAGE STARTING WITH '-' MUST STILL DISPATCH. The delegated
+// path re-enters a flag parser, which the message never did before, so
+// `agent review reviewer "-check the diff"` began exiting 2 with "flag provided
+// but not defined". Rare input, loud failure, and a regression introduced by the
+// delegation rather than a pre-existing limit.
+func TestDelegatedMessageMayStartWithADash(t *testing.T) {
+	args := reviewRequestArgsFromAgentReview(agentRunOptions{
+		repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4",
+		orgRole: "joltra", agent: "reviewer", lead: "implementer",
+		message: "-check the diff",
+	})
+	// The terminator must precede the message, and nothing may follow it.
+	terminator := slices.Index(args, "--")
+	if terminator < 0 {
+		t.Fatalf("args = %v, want a -- terminator before the message", args)
+	}
+	if terminator != len(args)-2 || args[len(args)-1] != "-check the diff" {
+		t.Fatalf("args = %v, want the message last, immediately after --", args)
+	}
+	// And the real parser must accept that shape, yielding the message as the
+	// single positional rather than refusing it as an unknown flag.
+	fs := flag.NewFlagSet("review request", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var pr int
+	fs.IntVar(&pr, "pr", 0, "")
+	for _, name := range []string{"repo", "head", "branch", "role", "reviewer", "lead", "home", "model", "effort", "workflow", "session", "runtime", "purpose"} {
+		fs.String(name, "", "")
+	}
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("flag.Parse(%v) = %v, want the dash-leading message accepted", args, err)
+	}
+	if fs.NArg() != 1 || fs.Arg(0) != "-check the diff" {
+		t.Fatalf("positionals = %v, want exactly the message", fs.Args())
 	}
 }
