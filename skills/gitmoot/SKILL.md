@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, template capture and publish/pull, custom prompt agents, orchestration, heartbeats, pipelines, pipeline chaining through the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, pipelines, pipeline chaining through the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
@@ -15,7 +15,7 @@ reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup, structured
 implementation plans, agent template workflows, custom
-prompt agents, template capture, job status, or branch lock inspection. When a job
+prompt agents, job status, or branch lock inspection. When a job
 pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
 "<question-id>: text"` (see CLI.md § Jobs).
 
@@ -63,19 +63,13 @@ owning that worktree is `in_progress`, while its conclusive sampled absence is
 `stalled`. That system observation is graded `observed` but remains explicitly
 `non_authoritative`; it triggers no cancellation or recovery policy.
 
-For template capture, phrases like "capture this session as a Gitmoot agent
-template", "turn this workflow into a Gitmoot template", or "draft a reusable
-agent template from this chat" mean read [TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md)
-and distill the visible current-chat context into a draft template. Gitmoot
-cannot read hidden model memory or runtime internals. Do not install, overwrite,
-or update a permanent template unless the user explicitly approves that step.
-Use `gitmoot agent template draft <id>` for a blank scaffold,
-`gitmoot agent template validate <file>` for a structural check,
-`gitmoot agent template add <id> --file <file>` to install a snapshot, and
-`gitmoot agent prompt <id>` to reuse the installed template in the current chat.
-"Publish", "back up", or "pull" agent templates means the GitHub-backed
-`gitmoot agent template export/publish/pull/remote set` commands — see CLI.md
-§ Agent Templates.
+Agent templates are READ-ONLY installed data (#2204). Gitmoot can inspect and
+read them — `gitmoot agent template list`, `gitmoot agent template show <id>`,
+and `gitmoot agent prompt <agent-or-template>` to reuse an installed template in
+the current chat — but it cannot author, update, or distribute one. There is no
+draft, validate, add, export, publish, pull, remote, diff, revert, or update
+verb. A template that must change is edited or re-seeded in the
+`agent_templates` store row by hand. See CLI.md § Agent Templates.
 
 For routing telemetry, phrases like "which runtime/model works best here",
 "show observed routing performance", or "should I route Go tasks to Codex" map to
@@ -299,8 +293,6 @@ issue, report that URL as existing instead of new.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
-For current-chat template capture, read
-[TEMPLATE_CAPTURE.md](references/TEMPLATE_CAPTURE.md).
 
 ## Plan-Gated Implementation
 

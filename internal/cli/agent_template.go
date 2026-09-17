@@ -7,52 +7,31 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-var newAgentTemplateFetcher = func() agenttemplate.Fetcher {
-	return agenttemplate.GHFetcher{}
-}
-
+// runAgentTemplate is the READ-ONLY agent-template surface. Authoring and
+// distribution (add, export, publish, pull, remote, draft, diff, revert,
+// update, validate) were removed in #2204: templates are installed data, and
+// the only thing gitmoot does with them is read a row's content into a job
+// payload so it reaches the agent's prompt. A template that needs changing is
+// edited or re-seeded in the store by hand.
 func runAgentTemplate(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		printAgentTemplateUsage(stdout)
 		return 0
 	}
 	switch args[0] {
-	case "add":
-		return runAgentTemplateAdd(args[1:], stdout, stderr)
-	case "export":
-		return runAgentTemplateExport(args[1:], stdout, stderr)
-	case "publish":
-		return runAgentTemplatePublish(args[1:], stdout, stderr)
-	case "pull":
-		return runAgentTemplatePull(args[1:], stdout, stderr)
-	case "remote":
-		return runAgentTemplateRemote(args[1:], stdout, stderr)
-	case "draft":
-		return runAgentTemplateDraft(args[1:], stdout, stderr)
 	case "list":
 		return runAgentTemplateList(args[1:], stdout, stderr)
-	case "validate":
-		return runAgentTemplateValidate(args[1:], stdout, stderr)
 	case "show":
 		return runAgentTemplateShow(args[1:], stdout, stderr)
-	case "update":
-		return runAgentTemplateUpdate(args[1:], stdout, stderr)
-	case "diff":
-		return runAgentTemplateDiff(args[1:], stdout, stderr)
-	case "revert":
-		return runAgentTemplateRevert(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown agent template command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown agent template command %q\n", args[0])
 		printAgentTemplateUsage(stderr)
 		return 2
 	}
@@ -60,249 +39,12 @@ func runAgentTemplate(args []string, stdout, stderr io.Writer) int {
 
 func printAgentTemplateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent template add <template-id> --file ./agents/<template-id>.md [--name <name>] [--description <text>]")
-	fmt.Fprintln(w, "  gitmoot agent template add <template-id> --from-repo <owner/repo> [--ref <ref>] [--path <file>]")
-	fmt.Fprintln(w, "  gitmoot agent template export [<template-id>...] [--all] [--to <dir>] [--dry-run]")
-	fmt.Fprintln(w, "  gitmoot agent template publish [<template-id>...] [--all] [--repo <owner/repo>] [--path <subdir>] [--ref <branch>] [--message <msg>] [--create] [--dry-run]")
-	fmt.Fprintln(w, "  gitmoot agent template pull [<template-id>...] [--all] [--repo <owner/repo>] [--ref <ref>] [--path <subdir>] [--dry-run]")
-	fmt.Fprintln(w, "  gitmoot agent template remote set <owner/repo> [--ref <ref>] [--path <subdir>]")
-	fmt.Fprintln(w, "  gitmoot agent template remote show")
-	fmt.Fprintln(w, "  gitmoot agent template draft <template-id> [--output .gitmoot/templates/<template-id>.md] [--force]")
-	fmt.Fprintln(w, "  gitmoot agent template validate <file>")
-	fmt.Fprintln(w, "  gitmoot agent template list")
+	fmt.Fprintln(w, "  gitmoot agent template list [--capability <cap>] [--runtime <runtime>] [--tag <tag>] [--output <output>]")
 	fmt.Fprintln(w, "  gitmoot agent template show thermo-nuclear-code-quality-review")
-	fmt.Fprintln(w, "  gitmoot agent template update thermo-nuclear-code-quality-review")
-	fmt.Fprintln(w, "  gitmoot agent template diff thermo-nuclear-code-quality-review")
-	fmt.Fprintln(w, "  gitmoot agent template revert <template-id> --version <version-id>")
-}
-
-// runAgentTemplateRevert rolls a template back to a previously current
-// (superseded) version.
-func runAgentTemplateRevert(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template revert", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	versionRef := fs.String("version", "", "superseded version id to make current again")
-	id, flagArgs := leadingID(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if strings.TrimSpace(id) == "" || strings.TrimSpace(*versionRef) == "" {
-		fmt.Fprintln(stderr, "agent template revert requires <template-id> and --version")
-		return 2
-	}
-	var reverted db.AgentTemplateVersion
-	if err := withStore(*home, func(store *db.Store) error {
-		version, err := store.GetAgentTemplateVersion(context.Background(), strings.TrimSpace(id), strings.TrimSpace(*versionRef))
-		if err != nil {
-			return err
-		}
-		reverted, err = store.RevertAgentTemplateVersion(context.Background(), strings.TrimSpace(id), version.ID)
-		return err
-	}); err != nil {
-		fmt.Fprintf(stderr, "agent template revert: %v\n", err)
-		return 1
-	}
-	writeLine(stdout, "reverted %s to %s", strings.TrimSpace(id), reverted.ID)
-	return 0
-}
-
-func runAgentTemplateAdd(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template add", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	file := fs.String("file", "", "local template file to install")
-	fromRepo := fs.String("from-repo", "", "GitHub owner/repo to fetch the template from")
-	ref := fs.String("ref", "", "git ref to fetch from --from-repo (default main)")
-	path := fs.String("path", "", "template file path within --from-repo (default templates/<id>.md)")
-	name := fs.String("name", "", "agent template display name")
-	description := fs.String("description", "", "agent template description")
-	id, flagArgs := leadingID(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if id == "" {
-		if fs.NArg() == 1 {
-			id = fs.Arg(0)
-		} else {
-			fmt.Fprintln(stderr, "agent template add requires exactly one template id")
-			return 2
-		}
-	} else if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent template add requires exactly one template id")
-		return 2
-	}
-	hasFile := strings.TrimSpace(*file) != ""
-	hasRepo := strings.TrimSpace(*fromRepo) != ""
-	if hasFile && hasRepo {
-		fmt.Fprintln(stderr, "agent template add accepts either --file or --from-repo, not both")
-		return 2
-	}
-	// With neither source given, fall back to the configured [template_remote]
-	// default (#476). This is additive/off-by-default: it only fires when a remote
-	// is configured; with no remote, hasRepo stays false and the existing
-	// "requires --file or --from-repo" error path below is byte-identical.
-	if !hasFile && !hasRepo {
-		if remote, ok := configuredTemplateRemote(*home); ok {
-			*fromRepo = remote.Repo
-			if strings.TrimSpace(*ref) == "" {
-				*ref = remote.Ref
-			}
-			if strings.TrimSpace(*path) == "" && strings.TrimSpace(remote.Path) != "" {
-				*path = strings.Trim(remote.Path, "/") + "/" + id + ".md"
-			}
-			hasRepo = true
-		}
-	}
-	if hasRepo {
-		fmt.Fprintln(stderr, "note: pulled templates are stored verbatim; only pull from repos you trust, and keep private prompts in a private repo")
-		return withStoreExit(*home, stderr, "add agent template", func(store *db.Store) error {
-			added, err := agenttemplate.AddRemote(context.Background(), store, newAgentTemplateFetcher(), id, *fromRepo, *ref, *path)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "added %s at %s\n", added.ID, added.ResolvedCommit)
-			return nil
-		})
-	}
-	if !hasFile {
-		fmt.Fprintln(stderr, "agent template add requires --file or --from-repo")
-		return 2
-	}
-	return withStoreExit(*home, stderr, "add agent template", func(store *db.Store) error {
-		added, err := agenttemplate.AddLocal(context.Background(), store, id, *file, *name, *description)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "added %s at %s\n", added.ID, added.ResolvedCommit)
-		return nil
-	})
-}
-
-// runAgentTemplateExport reconstructs stored templates back into .md files on
-// disk. It is network-free (DB only). By default it scopes to custom templates
-// and skips built-ins, which already live upstream.
-func runAgentTemplateExport(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template export", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	all := fs.Bool("all", false, "export all custom templates (skips built-ins)")
-	to := fs.String("to", ".", "directory to write exported .md files into")
-	dryRun := fs.Bool("dry-run", false, "list what would be exported without writing files")
-	ids, flagArgs := leadingIDs(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	ids = append(ids, fs.Args()...)
-	ids = compactValues(ids)
-	if len(ids) == 0 && !*all {
-		fmt.Fprintln(stderr, "agent template export requires one or more template ids or --all")
-		return 2
-	}
-	if len(ids) > 0 && *all {
-		fmt.Fprintln(stderr, "agent template export accepts either template ids or --all, not both")
-		return 2
-	}
-	dir := strings.TrimSpace(*to)
-	if dir == "" {
-		dir = "."
-	}
-	return withStoreExit(*home, stderr, "export agent template", func(store *db.Store) error {
-		targets, err := exportTargets(context.Background(), store, ids, *all, stderr)
-		if err != nil {
-			return err
-		}
-		if len(targets) == 0 {
-			fmt.Fprintln(stderr, "no custom templates to export")
-			return nil
-		}
-		if !*dryRun {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				return fmt.Errorf("create export directory: %w", err)
-			}
-		}
-		for _, target := range targets {
-			content, err := agenttemplate.Export(target)
-			if err != nil {
-				return err
-			}
-			path := filepath.Join(dir, target.ID+".md")
-			if *dryRun {
-				writeLine(stdout, "would export %s -> %s", target.ID, path)
-				continue
-			}
-			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-				return fmt.Errorf("write exported template %s: %w", path, err)
-			}
-			writeLine(stdout, "exported %s -> %s", target.ID, path)
-		}
-		fmt.Fprintln(stderr, "note: exported .md files contain the full prompt; review for secrets before committing to a shared or public repo")
-		return nil
-	})
-}
-
-// exportTargets resolves the rows to export: explicit ids look up each custom
-// row (built-in ids are skipped with a note), while --all collects every custom
-// row and skips built-ins and retired ids.
-func exportTargets(ctx context.Context, store *db.Store, ids []string, all bool, stderr io.Writer) ([]db.AgentTemplate, error) {
-	if len(ids) > 0 {
-		targets := make([]db.AgentTemplate, 0, len(ids))
-		for _, id := range ids {
-			if _, ok := agenttemplate.Lookup(id); ok {
-				fmt.Fprintf(stderr, "skipping built-in template %s; built-ins already live upstream\n", id)
-				continue
-			}
-			if agenttemplate.IsRetired(id) {
-				return nil, retiredAgentTemplateError(id)
-			}
-			cached, err := store.GetAgentTemplate(ctx, id)
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, fmt.Errorf("unknown agent template %q", id)
-			}
-			if err != nil {
-				return nil, err
-			}
-			targets = append(targets, cached)
-		}
-		return targets, nil
-	}
-	cachedTemplates, err := store.ListAgentTemplates(ctx)
-	if err != nil {
-		return nil, err
-	}
-	targets := make([]db.AgentTemplate, 0, len(cachedTemplates))
-	for _, cached := range cachedTemplates {
-		if _, ok := agenttemplate.Lookup(cached.ID); ok {
-			continue
-		}
-		if agenttemplate.IsRetired(cached.ID) {
-			continue
-		}
-		targets = append(targets, cached)
-	}
-	return targets, nil
-}
-
-func leadingIDs(args []string) ([]string, []string) {
-	ids := make([]string, 0, len(args))
-	index := 0
-	for index < len(args) {
-		if strings.HasPrefix(args[index], "-") {
-			break
-		}
-		ids = append(ids, args[index])
-		index++
-	}
-	return ids, args[index:]
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Agent templates are read-only installed data: gitmoot inspects and reads")
+	fmt.Fprintln(w, "them, and cannot author, update, or distribute them. Seed or edit a row")
+	fmt.Fprintln(w, "directly in the store to change a template.")
 }
 
 func leadingID(args []string) (string, []string) {
@@ -310,89 +52,6 @@ func leadingID(args []string) (string, []string) {
 		return "", args
 	}
 	return args[0], args[1:]
-}
-
-func runAgentTemplateDraft(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template draft", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	_ = fs.String("home", "", "accepted for command consistency; not used")
-	output := fs.String("output", "", "path to write the draft template")
-	force := fs.Bool("force", false, "overwrite an existing draft file")
-	id, flagArgs := leadingID(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if id == "" {
-		if fs.NArg() == 1 {
-			id = fs.Arg(0)
-		} else {
-			fmt.Fprintln(stderr, "agent template draft requires exactly one template id")
-			return 2
-		}
-	} else if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent template draft requires exactly one template id")
-		return 2
-	}
-	content, err := agenttemplate.DraftCaptureTemplate(id)
-	if err != nil {
-		fmt.Fprintf(stderr, "draft agent template: %v\n", err)
-		return 1
-	}
-	path := strings.TrimSpace(*output)
-	if path == "" {
-		path = filepath.Join(".gitmoot", "templates", id+".md")
-	}
-	if err := writeAgentTemplateDraft(path, content, *force); err != nil {
-		fmt.Fprintf(stderr, "draft agent template: %v\n", err)
-		return 1
-	}
-	writeLine(stdout, "drafted %s at %s", id, path)
-	return 0
-}
-
-func writeAgentTemplateDraft(path string, content string, force bool) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return errors.New("output path is required")
-	}
-	if _, err := os.Stat(path); err == nil && !force {
-		return fmt.Errorf("template draft %s already exists; pass --force to overwrite", path)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect template draft %s: %w", path, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create template draft directory: %w", err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write template draft %s: %w", path, err)
-	}
-	return nil
-}
-
-func runAgentTemplateValidate(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template validate", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	_ = fs.String("home", "", "accepted for command consistency; not used")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "agent template validate requires exactly one file path")
-		return 2
-	}
-	path := fs.Arg(0)
-	if err := agenttemplate.ValidateCaptureTemplateFile(path); err != nil {
-		fmt.Fprintf(stderr, "validate agent template: %v\n", err)
-		return 1
-	}
-	writeLine(stdout, "valid agent template: %s", path)
-	return 0
 }
 
 func runAgentTemplateList(args []string, stdout, stderr io.Writer) int {
@@ -504,139 +163,6 @@ func runAgentTemplateShow(args []string, stdout, stderr io.Writer) int {
 		writeCustomTemplate(stdout, cached)
 		return nil
 	})
-}
-
-func runAgentTemplateUpdate(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template update", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "agent template update requires exactly one template id")
-		return 2
-	}
-	id := fs.Arg(0)
-	return withStoreExit(*home, stderr, "update agent template", func(store *db.Store) error {
-		updated, err := updateTemplateByID(context.Background(), store, id)
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "updated %s at %s\n", updated.ID, updated.ResolvedCommit)
-		return nil
-	})
-}
-
-func runAgentTemplateDiff(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent template diff", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "agent template diff requires exactly one template id")
-		return 2
-	}
-	id := fs.Arg(0)
-	return withStoreExit(*home, stderr, "diff agent template", func(store *db.Store) error {
-		if agenttemplate.IsRetired(id) {
-			return retiredAgentTemplateError(id)
-		}
-		cached, err := store.GetAgentTemplate(context.Background(), id)
-		if errors.Is(err, sql.ErrNoRows) {
-			if _, ok := agenttemplate.Lookup(id); ok {
-				return fmt.Errorf("agent template %s is not installed; run gitmoot agent template update %s", id, id)
-			}
-			return fmt.Errorf("unknown agent template %q", id)
-		}
-		if err != nil {
-			return err
-		}
-		if agenttemplate.IsLocal(cached) {
-			file, hash, err := agenttemplate.ReadLocalForDiff(cached.SourcePath)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
-			fmt.Fprintf(stdout, "upstream: %s\n", hash)
-			fmt.Fprint(stdout, agenttemplate.DiffExact(cached.Content, file.Content))
-			return nil
-		}
-		if definition, ok := agenttemplate.Lookup(id); ok {
-			fetcher := newAgentTemplateFetcher()
-			resolvedCommit, err := fetcher.ResolveRef(context.Background(), definition.SourceRepo, definition.SourceRef)
-			if err != nil {
-				return err
-			}
-			upstream, err := fetcher.FetchFile(context.Background(), definition.SourceRepo, resolvedCommit, definition.SourcePath)
-			if err != nil {
-				return err
-			}
-			upstreamContent, err := agenttemplate.ContentForDefinition(definition, upstream.Content)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
-			fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
-			fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstreamContent))
-			return nil
-		}
-		// A pulled (remote-sourced) row carries a real owner/repo and is
-		// re-fetchable: mirror the built-in branch against its stored
-		// SourceRepo/SourceRef/SourcePath so `diff` works for pulled templates
-		// (#476). Gated on IsRemote so local rows never reach here.
-		if agenttemplate.IsRemote(cached) {
-			fetcher := newAgentTemplateFetcher()
-			resolvedCommit, err := fetcher.ResolveRef(context.Background(), cached.SourceRepo, cached.SourceRef)
-			if err != nil {
-				return err
-			}
-			upstream, err := fetcher.FetchFile(context.Background(), cached.SourceRepo, resolvedCommit, cached.SourcePath)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "cached:   %s\n", cached.ResolvedCommit)
-			fmt.Fprintf(stdout, "upstream: %s\n", resolvedCommit)
-			fmt.Fprint(stdout, agenttemplate.Diff(cached.Content, upstream.Content))
-			return nil
-		}
-		return fmt.Errorf("agent template %s is not a local custom template and has no built-in source", id)
-	})
-}
-
-func updateTemplateByID(ctx context.Context, store *db.Store, id string) (db.AgentTemplate, error) {
-	if agenttemplate.IsRetired(id) {
-		return db.AgentTemplate{}, retiredAgentTemplateError(id)
-	}
-	if _, ok := agenttemplate.Lookup(id); ok {
-		return agenttemplate.Update(ctx, store, newAgentTemplateFetcher(), id)
-	}
-	cached, err := store.GetAgentTemplate(ctx, id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return db.AgentTemplate{}, fmt.Errorf("unknown agent template %q; run gitmoot agent template add %s --file <path>", id, id)
-	}
-	if err != nil {
-		return db.AgentTemplate{}, err
-	}
-	if agenttemplate.IsLocal(cached) {
-		return agenttemplate.UpdateLocal(ctx, store, cached)
-	}
-	// Pulled templates carry a real owner/repo SourceRepo and are re-fetchable
-	// via the GHFetcher. This branch is strictly gated on IsRemote so local rows
-	// (SourceRepo "local") keep using UpdateLocal and the path stays byte-for-byte
-	// unchanged for them.
-	if agenttemplate.IsRemote(cached) {
-		return agenttemplate.UpdateRemote(ctx, store, newAgentTemplateFetcher(), cached)
-	}
-	return db.AgentTemplate{}, fmt.Errorf("agent template %s is not a local custom template and has no built-in source", id)
 }
 
 func retiredAgentTemplateError(id string) error {
@@ -778,14 +304,6 @@ func shortCommit(commit string) string {
 
 func withStoreExit(home string, stderr io.Writer, label string, fn func(*db.Store) error) int {
 	if err := withStore(home, fn); err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", label, err)
-		return 1
-	}
-	return 0
-}
-
-func withStoreAndPathsExit(home string, stderr io.Writer, label string, fn func(config.Paths, *db.Store) error) int {
-	if err := withStoreAndPaths(home, fn); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return 1
 	}

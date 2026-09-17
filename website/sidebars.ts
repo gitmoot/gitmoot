@@ -24,7 +24,6 @@ const sidebars: SidebarsConfig = {
       label: 'Workflows',
       items: [
         'workflows/pr-comment-workflow',
-        'workflows/template-capture-workflow',
         'workflows/review-agent-workflow',
         'workflows/coordinator-recipes-workflow',
         'workflows/parallel-jobs-workflow',

@@ -311,10 +311,10 @@ portable code behavior.
   or panes leak to the prod Telegram group.
 - Global flags like `--home` use Go flag parsing, so they must precede positional
   args (e.g. `agent template --home /tmp/h show <id>`, not after the id).
-- `agent template add` needs a file with YAML frontmatter — use
-  `agent template draft` to scaffold one. `template publish --create` makes a
-  **private** repo; prompt bodies + metadata are stored/published **verbatim**,
-  so point the remote at a private repo unless the prompts are meant to be public.
+- Agent templates are read-only installed data after #2204: gitmoot cannot
+  author, update, or distribute one, so seed or edit the `agent_templates` store
+  row directly. `agent template list` / `agent template show <id>` inspect what
+  is installed.
 - An invalid `CLAUDE_CODE_OAUTH_TOKEN` 401s fresh claude sessions but `--resume`
   masks it; `gitmoot doctor` "auth ok" is set-not-valid (a false green).
 - Killing a foreground `agent ask` strands a runtime-session resource lock;

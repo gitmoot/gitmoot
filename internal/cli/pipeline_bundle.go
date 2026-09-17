@@ -125,7 +125,7 @@ func exportPipelineBundle(ctx context.Context, store *db.Store, name, output str
 		return fmt.Errorf("parameterize repo: %w", err)
 	}
 
-	agents, templates, err := collectPipelineBundleAgents(ctx, store, spec)
+	agents, err := collectPipelineBundleAgents(ctx, store, spec)
 	if err != nil {
 		return err
 	}
@@ -154,23 +154,12 @@ func exportPipelineBundle(ctx context.Context, store *db.Store, name, output str
 	if err := os.WriteFile(filepath.Join(output, "spec.yaml"), parameterized, 0o644); err != nil {
 		return fmt.Errorf("write spec.yaml: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(output, "templates"), 0o755); err != nil {
-		return fmt.Errorf("create templates directory: %w", err)
-	}
-	for id, content := range templates {
-		if err := os.WriteFile(filepath.Join(output, "templates", id+".md"), content, 0o644); err != nil {
-			return fmt.Errorf("write template %s: %w", id, err)
-		}
-	}
 	if err := os.WriteFile(filepath.Join(output, "bundle.yaml"), encoded, 0o644); err != nil {
 		return fmt.Errorf("write bundle.yaml: %w", err)
 	}
 	writeLine(stdout, "exported pipeline %s -> %s", spec.Name, output)
 	for _, warning := range warnings {
 		fmt.Fprintf(stderr, "WARNING: %s\n", warning)
-	}
-	if len(templates) > 0 {
-		fmt.Fprintf(stderr, "note: publishing %d template(s) to %s; prompts are pushed verbatim — only publish private prompts to a private repo\n", len(templates), output)
 	}
 	return nil
 }
@@ -196,7 +185,13 @@ func preparePipelineBundleOutput(output string) error {
 	return nil
 }
 
-func collectPipelineBundleAgents(ctx context.Context, store *db.Store, spec pipeline.Spec) ([]pipelineBundleAgent, map[string][]byte, error) {
+// collectPipelineBundleAgents resolves the agents a spec references into
+// manifest entries. Each entry carries the agent's template id as a REFERENCE
+// only: #2204 removed template authoring and distribution, so a bundle no
+// longer embeds a templates/<id>.md snapshot and importing one no longer
+// installs a template. An imported agent resolves its template against rows
+// that already exist in the importing home.
+func collectPipelineBundleAgents(ctx context.Context, store *db.Store, spec pipeline.Spec) ([]pipelineBundleAgent, error) {
 	names := make(map[string]struct{})
 	for _, stage := range spec.Stages {
 		if stage.Agent != "" {
@@ -209,34 +204,18 @@ func collectPipelineBundleAgents(ctx context.Context, store *db.Store, spec pipe
 	}
 	sort.Strings(ordered)
 	agents := make([]pipelineBundleAgent, 0, len(ordered))
-	templates := make(map[string][]byte)
 	for _, name := range ordered {
 		agent, err := store.GetAgent(ctx, name)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return nil, nil, fmt.Errorf("pipeline agent %q is not registered", name)
+				return nil, fmt.Errorf("pipeline agent %q is not registered", name)
 			}
-			return nil, nil, err
+			return nil, err
 		}
 		templateID, _ := db.SplitAgentTemplateReference(agent.TemplateID)
 		agents = append(agents, pipelineBundleAgent{Name: name, Runtime: agent.Runtime, TemplateRef: templateID})
-		if templateID == "" {
-			continue
-		}
-		cached, err := store.GetAgentTemplateReference(ctx, agent.TemplateID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("export template %q for agent %q: %w", agent.TemplateID, name, err)
-		}
-		content, err := agenttemplate.Export(cached)
-		if err != nil {
-			return nil, nil, err
-		}
-		if prior, ok := templates[templateID]; ok && !bytes.Equal(prior, []byte(content)) {
-			return nil, nil, fmt.Errorf("agents reference different snapshots for template %q", templateID)
-		}
-		templates[templateID] = []byte(content)
 	}
-	return agents, templates, nil
+	return agents, nil
 }
 
 func derivePipelineBundleRequirements(spec pipeline.Spec, agents []pipelineBundleAgent) pipelineBundleRequirements {
@@ -349,7 +328,7 @@ func runPipelineImport(args []string, stdout, stderr io.Writer) int {
 		if err := validatePipelineBundle(manifest, raw, buildinfo.Current().Version); err != nil {
 			return err
 		}
-		return importPipelineBundle(ctx, store, *home, bundleDir, repo.FullName(), strings.TrimSpace(*nameFlag), agentMap, *force, *enable, manifest, raw, stdout, stderr, report)
+		return importPipelineBundle(ctx, store, *home, repo.FullName(), strings.TrimSpace(*nameFlag), agentMap, *force, *enable, manifest, raw, stdout, stderr, report)
 	}); err != nil {
 		fmt.Fprintf(stderr, "pipeline import: %v\n", err)
 		return 1
@@ -500,14 +479,24 @@ func stringSlicesEqual(left, right []string) bool {
 }
 
 type pipelineBundleRequirementReport struct {
-	Runtimes    map[string]string
+	Runtimes map[string]string
+	// Templates reports, per template id an imported agent references, whether
+	// the row exists in THIS home. #2204 made a bundle carry the id as a
+	// reference only - the content no longer travels - so the row has to be here
+	// already. Nothing checked it at import, and the round-1 review of #2211
+	// found the consequence: the report printed all-green, the agent registered,
+	// and every stage job then died at dispatch with `references missing
+	// template`. The prerequisite is reported the same soft way a missing
+	// upstream pipeline is, because both leave the pipeline installed but unable
+	// to run rather than corrupt.
+	Templates   map[string]string
 	Upstreams   map[string]string
 	AgentErrors []error
 	MapErrors   []error
 }
 
 func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, manifest pipelineBundleManifest, agentMap map[string]string) pipelineBundleRequirementReport {
-	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Upstreams: map[string]string{}}
+	report := pipelineBundleRequirementReport{Runtimes: map[string]string{}, Templates: map[string]string{}, Upstreams: map[string]string{}}
 	for _, name := range manifest.Requirements.Runtimes {
 		if pipelineBundleRuntimeAvailable(name) {
 			report.Runtimes[name] = "present"
@@ -524,6 +513,24 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, man
 		} else {
 			report.Upstreams[requirement] = "missing (pipeline will remain dormant)"
 		}
+	}
+	for _, agent := range manifest.Agents {
+		ref := strings.TrimSpace(agent.TemplateRef)
+		if ref == "" {
+			continue
+		}
+		if _, seen := report.Templates[ref]; seen {
+			continue
+		}
+		if _, err := store.GetAgentTemplateReference(ctx, ref); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				report.Templates[ref] = "missing (stage jobs will fail at dispatch until the row is seeded)"
+			} else {
+				report.Templates[ref] = "unchecked (" + err.Error() + ")"
+			}
+			continue
+		}
+		report.Templates[ref] = "present"
 	}
 	agentByName := make(map[string]pipelineBundleAgent, len(manifest.Agents))
 	for _, agent := range manifest.Agents {
@@ -549,6 +556,7 @@ func inspectPipelineBundleRequirements(ctx context.Context, store *db.Store, man
 func printPipelineBundleRequirements(w io.Writer, report pipelineBundleRequirementReport, manifest pipelineBundleManifest) {
 	fmt.Fprintln(w, "Requirements report:")
 	printRequirementMap(w, "runtime", report.Runtimes)
+	printRequirementMap(w, "template", report.Templates)
 	printRequirementMap(w, "upstream pipeline", report.Upstreams)
 	if len(manifest.WriteAuthority) == 0 {
 		fmt.Fprintln(w, "  write authority: none")
@@ -581,7 +589,7 @@ func printRequirementMap(w io.Writer, label string, values map[string]string) {
 	}
 }
 
-func importPipelineBundle(ctx context.Context, store *db.Store, home, bundleDir, repo, overrideName string, agentMap map[string]string, force, enable bool, manifest pipelineBundleManifest, raw []byte, stdout, stderr io.Writer, report pipelineBundleRequirementReport) error {
+func importPipelineBundle(ctx context.Context, store *db.Store, home, repo, overrideName string, agentMap map[string]string, force, enable bool, manifest pipelineBundleManifest, raw []byte, stdout, stderr io.Writer, report pipelineBundleRequirementReport) error {
 	if len(report.MapErrors) > 0 {
 		return report.MapErrors[0]
 	}
@@ -604,9 +612,6 @@ func importPipelineBundle(ctx context.Context, store *db.Store, home, bundleDir,
 	for _, bundled := range manifest.Agents {
 		if _, mapped := agentMap[bundled.Name]; mapped {
 			continue
-		}
-		if err := installPipelineBundleTemplate(ctx, store, bundleDir, bundled, force); err != nil {
-			return err
 		}
 		if err := installPipelineBundleAgent(ctx, store, bundled, repo, force); err != nil {
 			return err
@@ -631,39 +636,6 @@ func importPipelineBundle(ctx context.Context, store *db.Store, home, bundleDir,
 		return err
 	}
 	writeLine(stdout, "imported pipeline %s (%s, %d stages)", spec.Name, enabledLabel(finalEnabled), len(spec.Stages))
-	return nil
-}
-
-func installPipelineBundleTemplate(ctx context.Context, store *db.Store, bundleDir string, bundled pipelineBundleAgent, force bool) error {
-	if bundled.TemplateRef == "" {
-		return nil
-	}
-	path := filepath.Join(bundleDir, "templates", bundled.TemplateRef+".md")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read embedded template %q: %w", bundled.TemplateRef, err)
-	}
-	if _, err := agenttemplate.ParseTemplateContent(string(raw)); err != nil {
-		return fmt.Errorf("invalid embedded template %q: %w", bundled.TemplateRef, err)
-	}
-	existing, err := store.GetAgentTemplate(ctx, bundled.TemplateRef)
-	if err == nil {
-		exported, exportErr := agenttemplate.Export(existing)
-		if exportErr != nil {
-			return exportErr
-		}
-		if exported == string(raw) {
-			return nil
-		}
-		if !force {
-			return fmt.Errorf("agent template %q already exists with different content; use --force", bundled.TemplateRef)
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if _, err := agenttemplate.AddLocal(ctx, store, bundled.TemplateRef, path, "", ""); err != nil {
-		return fmt.Errorf("install embedded template %q: %w", bundled.TemplateRef, err)
-	}
 	return nil
 }
 

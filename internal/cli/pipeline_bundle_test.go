@@ -12,6 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
+	dbpkg "github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -221,7 +222,7 @@ func TestDetectPipelineAbsolutePathWarnings(t *testing.T) {
 	}
 }
 
-func TestPipelineBundleTemplateAndAgentCollisionMatrix(t *testing.T) {
+func TestPipelineBundleAgentCollisionMatrix(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
@@ -233,35 +234,7 @@ func TestPipelineBundleTemplateAndAgentCollisionMatrix(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 	ctx := context.Background()
-	bundle := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(bundle, "templates"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	templatePath := filepath.Join(bundle, "templates", "bundle-reviewer.md")
-	first := bundleTemplateContent("bundle-reviewer", "Review carefully.")
-	if err := os.WriteFile(templatePath, []byte(first), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	bundled := pipelineBundleAgent{Name: "reviewer", Runtime: runtime.CodexRuntime, TemplateRef: "bundle-reviewer"}
-	if err := installPipelineBundleTemplate(ctx, store, bundle, bundled, false); err != nil {
-		t.Fatalf("new template: %v", err)
-	}
-	if err := installPipelineBundleTemplate(ctx, store, bundle, bundled, false); err != nil {
-		t.Fatalf("same template no-op: %v", err)
-	}
-	if err := installPipelineBundleTemplate(ctx, store, bundle, bundled, true); err != nil {
-		t.Fatalf("same template with force no-op: %v", err)
-	}
-	second := bundleTemplateContent("bundle-reviewer", "Review differently.")
-	if err := os.WriteFile(templatePath, []byte(second), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := installPipelineBundleTemplate(ctx, store, bundle, bundled, false); err == nil || !strings.Contains(err.Error(), "different content") {
-		t.Fatalf("different template without force = %v", err)
-	}
-	if err := installPipelineBundleTemplate(ctx, store, bundle, bundled, true); err != nil {
-		t.Fatalf("different template with force: %v", err)
-	}
 	if err := installPipelineBundleAgent(ctx, store, bundled, "owner/repo", false); err != nil {
 		t.Fatalf("new agent: %v", err)
 	}
@@ -343,4 +316,53 @@ func bundleTemplateContent(id, body string) string {
 		Inputs:               []string{"task"},
 		Outputs:              []string{"review"},
 	}, body)
+}
+
+// TestPipelineBundleRequirementsReportMissingTemplate pins the prerequisite that
+// #2204 created. A bundle now carries a template id as a REFERENCE only, so the
+// row must already exist in the importing home. Round-1 review of #2211 found
+// that nothing checked it: the report printed all-green, the agent registered,
+// and every stage job then failed at dispatch with "references missing
+// template". The requirements report is the designed surface for exactly this
+// kind of prerequisite - it already soft-warns a missing upstream pipeline - so
+// the template belongs in it.
+func TestPipelineBundleRequirementsReportMissingTemplate(t *testing.T) {
+	ctx := context.Background()
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	manifest := pipelineBundleManifest{Agents: []pipelineBundleAgent{
+		{Name: "bundle-reviewer", Runtime: "codex", TemplateRef: "not-installed-here"},
+	}}
+
+	report := inspectPipelineBundleRequirements(ctx, store, manifest, nil)
+	got, ok := report.Templates["not-installed-here"]
+	if !ok {
+		t.Fatal("the requirements report omits the template prerequisite entirely; an operator sees all-green and the stage jobs die at dispatch")
+	}
+	if !strings.Contains(got, "missing") {
+		t.Fatalf("template status = %q, want it reported missing", got)
+	}
+	if !strings.Contains(got, "dispatch") {
+		t.Fatalf("template status = %q, want it to name the CONSEQUENCE so the operator knows what breaks and when", got)
+	}
+
+	// Control: a template that IS installed must report present, so the check is
+	// not merely always-missing.
+	if err := store.UpsertAgentTemplate(ctx, dbpkg.AgentTemplate{
+		ID: "seeded-here", Name: "Seeded", Content: "# seeded\n",
+	}); err != nil {
+		t.Fatalf("UpsertAgentTemplate: %v", err)
+	}
+	manifest.Agents = append(manifest.Agents, pipelineBundleAgent{Name: "other", Runtime: "codex", TemplateRef: "seeded-here"})
+	report = inspectPipelineBundleRequirements(ctx, store, manifest, nil)
+	if got := report.Templates["seeded-here"]; got != "present" {
+		t.Fatalf("installed template status = %q, want %q", got, "present")
+	}
 }

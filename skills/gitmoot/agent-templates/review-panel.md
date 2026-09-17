@@ -54,8 +54,8 @@ gitmoot orchestrate review-panel "Review PR #123 in this repo." --repo owner/rep
    Ephemeral workers are leaf-only: they return findings, never their own
    delegations. The lens prompt is self-contained — do not set an ephemeral
    template unless that template is already installed in this Gitmoot home (for
-   example, set "template": "thermo-nuclear-code-quality-review" only when you
-   have run gitmoot agent template update for it).
+   example, set "template": "thermo-nuclear-code-quality-review" only when
+   gitmoot agent template list reports it installed).
 4. Set synthesis_rule summary on each delegation.
 5. Every panelist is ephemeral. On each delegation set the `ephemeral` object
    (`{"runtime": ..., "role": ..., "capabilities": [...]}`) and the `action`.

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -53,10 +52,15 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	if code := Run([]string{"pipeline", "export", "share-flow", "--home", homeA, "--output", bundleDir}, &stdout, &stderr); code != 0 {
 		t.Fatalf("pipeline export exit=%d stderr=%s", code, stderr.String())
 	}
-	for _, path := range []string{"bundle.yaml", "spec.yaml", filepath.Join("templates", templateID+".md")} {
+	for _, path := range []string{"bundle.yaml", "spec.yaml"} {
 		if _, err := os.Stat(filepath.Join(bundleDir, path)); err != nil {
 			t.Fatalf("bundle missing %s: %v", path, err)
 		}
+	}
+	// #2204 removed template distribution: the bundle carries the template REF
+	// and no prompt body, so there is no templates/ directory at all.
+	if _, err := os.Stat(filepath.Join(bundleDir, "templates")); !os.IsNotExist(err) {
+		t.Fatalf("bundle still embeds a templates directory, stat err=%v", err)
 	}
 	bundledSpec := readPipelineBundleTestFile(t, filepath.Join(bundleDir, "spec.yaml"))
 	for _, want := range []string{
@@ -84,23 +88,19 @@ func TestPipelineBundleRoundTripE2E(t *testing.T) {
 	if len(manifest.Warnings) != 1 || !strings.Contains(manifest.Warnings[0], "/tmp") {
 		t.Fatalf("absolute path warnings = %v", manifest.Warnings)
 	}
-	if !strings.Contains(stderr.String(), "WARNING:") || !strings.Contains(stderr.String(), "/tmp") || !strings.Contains(stderr.String(), "prompts are pushed verbatim") {
+	if !strings.Contains(stderr.String(), "WARNING:") || !strings.Contains(stderr.String(), "/tmp") {
 		t.Fatalf("export warnings missing:\n%s", stderr.String())
 	}
-	originalTemplate, err := storeA.GetAgentTemplate(ctx, templateID)
-	if err != nil {
-		t.Fatal(err)
+	if len(manifest.Agents) != 1 || manifest.Agents[0].TemplateRef != templateID {
+		t.Fatalf("manifest agents = %+v, want the template reference %q", manifest.Agents, templateID)
 	}
-	wantTemplate, err := agenttemplate.Export(originalTemplate)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := string(readPipelineBundleTestFile(t, filepath.Join(bundleDir, "templates", templateID+".md"))); got != wantTemplate {
-		t.Fatalf("template snapshot differs from agenttemplate.Export\nwant:\n%q\ngot:\n%q", wantTemplate, got)
-	}
-	for _, path := range []string{filepath.Join(bundleDir, "bundle.yaml"), filepath.Join(bundleDir, "spec.yaml"), filepath.Join(bundleDir, "templates", templateID+".md")} {
-		if raw := readPipelineBundleTestFile(t, path); bytes.Contains(raw, []byte("trigger_binding")) {
+	for _, path := range []string{filepath.Join(bundleDir, "bundle.yaml"), filepath.Join(bundleDir, "spec.yaml")} {
+		raw := readPipelineBundleTestFile(t, path)
+		if bytes.Contains(raw, []byte("trigger_binding")) {
 			t.Fatalf("bundle file %s contains removed trigger binding state", path)
+		}
+		if bytes.Contains(raw, []byte("Review the pipeline result carefully.")) {
+			t.Fatalf("bundle file %s carries the template prompt body:\n%s", path, raw)
 		}
 	}
 
@@ -286,17 +286,9 @@ func writePipelineBundleVariant(t *testing.T, source string, mutate func(*pipeli
 	if err := os.WriteFile(filepath.Join(target, "spec.yaml"), readPipelineBundleTestFile(t, filepath.Join(source, "spec.yaml")), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(target, "templates"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, agent := range manifest.Agents {
-		if agent.TemplateRef == "" {
-			continue
-		}
-		raw := readPipelineBundleTestFile(t, filepath.Join(source, "templates", agent.TemplateRef+".md"))
-		if err := os.WriteFile(filepath.Join(target, "templates", agent.TemplateRef+".md"), raw, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// #2204: a bundle carries each agent's template id as a REFERENCE only, so a
+	// variant needs bundle.yaml + spec.yaml and nothing else. Copying a
+	// templates/ directory here killed three subtests in this helper before they
+	// reached the import they exist to exercise.
 	return target
 }

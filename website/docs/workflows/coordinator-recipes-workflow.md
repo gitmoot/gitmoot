@@ -55,18 +55,16 @@ gitmoot orchestrate project-planner "Implement the rate limiter described in the
 The second style passes the recipe id as the agent positional —
 `gitmoot orchestrate review-panel "..." --repo owner/repo` — but the positional
 must resolve to a **registered agent** (or configured managed type), so it only
-works after registering an agent under the recipe name (install the template
-with `agent template update review-panel`, then `agent start review-panel
---template review-panel …`). On a fresh install without that registration it
-fails with "agent not found"; prefer `--recipe`.
+works after registering an agent under the recipe name (`agent start
+review-panel --template review-panel …`). On a fresh install without that
+registration it fails with "agent not found"; prefer `--recipe`.
 
-Three recipes ship built in. Install or refresh any template the same way as any
-built-in template:
+Three recipes ship built in. A recipe is selected per invocation with
+`--recipe`; its `agent_templates` row must already be installed. Confirm that
+with the read-only inspection verbs:
 
 ```sh
-gitmoot agent template update review-panel
-gitmoot agent template update decompose-and-verify
-gitmoot agent template update verifier
+gitmoot agent template list
 gitmoot agent template show review-panel
 ```
 
