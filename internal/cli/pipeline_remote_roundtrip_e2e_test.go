@@ -149,10 +149,16 @@ func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
 		t.Fatalf("publish --create did not create a private repo; calls=%v", backend.calls)
 	}
 
+	// #2204: a published bundle carries each agent's template id as a REFERENCE
+	// only, so no templates/ entry travels with it. The subject of this
+	// assertion - that publish then pull round-trips the exact remote layout
+	// through the shared backend - survives; only the layout shrank, which is
+	// why it is re-pinned rather than deleted. CI caught it on two lanes because
+	// my own runs were targeted; the whole-package run is the check that matters
+	// for a layout assertion.
 	wantRemotePaths := []string{
 		"pipelines/share-flow/bundle.yaml",
 		"pipelines/share-flow/spec.yaml",
-		"pipelines/share-flow/templates/" + templateID + ".md",
 	}
 	backend.mu.Lock()
 	gotRemotePaths := make([]string, 0, len(backend.files[catalogRepo]))
