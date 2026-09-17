@@ -193,12 +193,21 @@ func TestPipelineSkippedAdvancesE2E(t *testing.T) {
 	}
 }
 
-// TestPipelineImplementApprovedNoPRTerminatesE2E is the #817 wedge repro through
-// the real shell worker and pipeline scan. The implement agent returns approved (a
-// default success decision) without a PR; the implement stage succeeds immediately,
-// the downstream merge gate blocks honestly, and the run reaches a terminal state.
-func TestPipelineImplementApprovedNoPRTerminatesE2E(t *testing.T) {
-	ctx := context.Background()
+// #2203 replaced the #817 wedge repro with its CLI-surface refusal. The original
+// drove a real shell implement agent that returned `approved` with no PR, then
+// asserted the implement stage succeeded with a no-PR note, the downstream
+// pr_merged gate blocked honestly, and the run reached a terminal state. None of
+// that is reachable: implementer dispatch is gone, so the stage cannot run at all.
+//
+// What IS worth pinning is that the refusal reaches the OPERATOR - `pipeline run`
+// must exit non-zero and say why, rather than storing a run that quietly wedges.
+// TestPipelineImplementStageIsRefusedAtEnqueueE2E covers the same refusal at the
+// enqueue seam; this one covers the command surface an operator actually types.
+//
+// The honest-gate behaviour from #817 is NOT covered anywhere now, because no
+// surviving stage kind can open a PR. Tracked in #2216 with the rest of the
+// unreachable pr_merged surface.
+func TestPipelineImplementRunIsRefusedAtTheCommandSurface(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
@@ -222,64 +231,19 @@ stages:
 `
 	specFile := writeSpec(t, specYAML)
 	var out, errBuf bytes.Buffer
+	// `pipeline add` still ACCEPTS the spec - validation is unchanged, which is the
+	// gap filed as #2216. The refusal lands at run time.
 	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
 		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
 	}
 	out.Reset()
 	errBuf.Reset()
-	if code := Run([]string{"pipeline", "run", "approved-no-pr", "--home", home}, &out, &errBuf); code != 0 {
-		t.Fatalf("pipeline run exit=%d stderr=%s", code, errBuf.String())
+	code := Run([]string{"pipeline", "run", "approved-no-pr", "--home", home}, &out, &errBuf)
+	if code == 0 {
+		t.Fatalf("pipeline run should be refused, got exit 0 stdout=%s", out.String())
 	}
-	runID := strings.TrimSpace(out.String())
-
-	enqueue := newPipelineStageEnqueuer(store, home)
-	worker := defaultJobWorker(store, io.Discard, home)
-	now := time.Date(2026, 7, 11, 11, 0, 0, 0, time.UTC)
-	for i := 0; i < 8; i++ {
-		if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now, nil, nil); err != nil {
-			t.Fatalf("worker tick %d: %v", i, err)
-		}
-		if err := runPipelineScanOnce(ctx, store, enqueue, now); err != nil {
-			t.Fatalf("pipeline scan %d: %v", i, err)
-		}
-		run, _, err := store.GetPipelineRun(ctx, runID)
-		if err != nil {
-			t.Fatalf("GetPipelineRun: %v", err)
-		}
-		if run.State != pipeline.RunRunning {
-			break
-		}
-	}
-
-	run, ok, err := store.GetPipelineRun(ctx, runID)
-	if err != nil || !ok {
-		t.Fatalf("GetPipelineRun(%s): ok=%v err=%v", runID, ok, err)
-	}
-	if run.State != pipeline.RunBlocked || run.HaltStage != "wait" {
-		t.Fatalf("run = %+v, want terminal blocked at wait", run)
-	}
-	impl := stageRow(t, store, runID, "impl")
-	if impl.State != pipeline.StageSucceeded || !strings.Contains(impl.Summary, "no PR opened; decision approved") {
-		t.Fatalf("impl stage = %+v, want succeeded with no-PR note", impl)
-	}
-	gate := stageRow(t, store, runID, "wait")
-	if gate.State != pipeline.StageBlocked {
-		t.Fatalf("gate stage = %+v, want blocked", gate)
-	}
-	if got := pipeline.DecodePipelineNeeds(gate.NeedsJSON); len(got) != 1 || got[0] != "source stage succeeded without opening a PR; nothing to wait for" {
-		t.Fatalf("gate needs = %v", got)
-	}
-	events, err := store.ListJobEvents(ctx, impl.JobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	count := 0
-	for _, event := range events {
-		if event.Kind == "advance_skipped_no_pr" {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("advance_skipped_no_pr count = %d, want 1; events=%+v", count, events)
+	stderr := errBuf.String()
+	if !strings.Contains(stderr, "not dispatchable") || !strings.Contains(stderr, "#2203") {
+		t.Fatalf("pipeline run stderr = %q, want a refusal naming #2203", stderr)
 	}
 }
