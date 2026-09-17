@@ -259,12 +259,12 @@ func pipelineStageJobRequest(rec db.Pipeline, stage Stage, run db.PipelineRun, a
 	// #768 MUTATING implement stage: bind to the named agent running its OWN runtime,
 	// but — unlike a read-only agent stage — carry a DETERMINISTIC, attempt-INDEPENDENT
 	// Branch/TaskID so a retry lands in the SAME branch/worktree (never a duplicate PR).
-	// The writable task-worktree itself is allocated at the enqueue seam
-	// (allocatePipelineStageWritableWorktreeForRunner), which reuses the existing implement
-	// dispatch's GetTaskByRepoBranch reuse + fail-closed guards. Still a LEAF
-	// (Sender=pipeline strips delegations/human_questions), and this implement job never
-	// merges its PR; only a separately authorized gate may. This is an APPEND above the
-	// read-only agent branch, which stays byte-identical.
+	// #2203 removed the writable task-worktree allocator this request depended on
+	// (allocatePipelineStageWritableWorktreeForRunner, deleted with its call site), so
+	// this request is now REFUSED at the enqueue seam rather than dispatched - see the
+	// implement check in enqueuePipelineStageJobForRunner. The shape is kept so an
+	// existing spec still parses and so the refusal names a real stage; it is not a
+	// live dispatch path. Owner-authorized, workflow note 173859.
 	if stage.Kind() == StageKindAgentImplement {
 		return workflow.JobRequest{
 			ID:           pipelineStageJobID(run.ID, stage.ID, attempt),

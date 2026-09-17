@@ -5,8 +5,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -380,24 +378,29 @@ stages:
 	}
 }
 
-// TestPipelineImplementStageWritableWorktreeReuseE2E proves the WRITABLE-worktree
-// dispatch (#768): a mutating implement stage takes the real task-worktree path (not
-// the read-only committed-tip worktree), is born on its DETERMINISTIC run-scoped branch,
-// keys worktree:<path> (so mutating same-repo stages parallelize), and a RETRY reuses
-// the SAME branch/worktree and FAILS CLOSED when that worktree has uncommitted changes.
+// #2203: a mutating implement stage is REFUSED at the enqueue seam. This test used to
+// assert the opposite - that the stage took a real writable task-worktree on a
+// deterministic run-scoped branch, and that a retry reused it and failed closed on
+// uncommitted changes. That whole capability went with implementer dispatch: the
+// allocator (allocatePipelineStageWritableWorktreeForRunner), its eligibility helper
+// and its call site are deleted, so an implement stage had nowhere to write and the
+// run failed late with "stage job produced no gitmoot_result". Owner-authorized to
+// refuse instead (workflow note 173859).
 //
-// It drives the production enqueuer (newPipelineStageEnqueuer) against a real local git
-// checkout so the writable allocation genuinely runs, but never runs the worker (the
-// implement finalizer needs GitHub) — the retry is driven by settling the job failed.
-func TestPipelineImplementStageWritableWorktreeReuseE2E(t *testing.T) {
+// It keeps driving the PRODUCTION enqueuer against a real local git checkout, so what
+// is pinned is the real refusal on the real path - not a stub's idea of one. A spec
+// that declares an implement stage still PARSES (validate accepts the kind); it simply
+// cannot run, and this test is what makes that failure loud rather than silent.
+func TestPipelineImplementStageIsRefusedAtEnqueueE2E(t *testing.T) {
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
 
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// A named implement-capable agent on the shell runtime with a WRITE policy (a
-	// read-only policy would fail-closed the implement preflight). The shell body is
-	// irrelevant here — the worker never runs; the allocation + retry are what matter.
+	// A named implement-capable agent on the shell runtime with a WRITE policy - the
+	// most permissive setup that could possibly have been allowed to write. The point
+	// is that even THIS is refused: the refusal is unconditional on #2203's removal,
+	// not a policy or capability outcome.
 	seedDaemonWorkerAgentWithPolicy(t, store, "coder", runtime.ShellRuntime,
 		pipelineStageResultCmd("implemented", "fixed", nil),
 		[]string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
@@ -416,62 +419,25 @@ stages:
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Date(2026, 7, 9, 9, 0, 0, 0, time.UTC)
 
-	run := startTestRun(t, store, rec, parsed, enqueue, now)
-
-	impl := stageRow(t, store, run.ID, "impl")
-	if impl.State != pipeline.StageQueued || impl.JobID == "" {
-		t.Fatalf("impl stage = %+v, want queued with a job", impl)
-	}
-	job, err := store.GetJob(ctx, impl.JobID)
+	run, err := pipeline.CreatePipelineRun(ctx, store, rec, parsed, "manual", "{}", now)
 	if err != nil {
-		t.Fatalf("GetJob(impl): %v", err)
+		t.Fatalf("CreatePipelineRun: %v", err)
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload(impl): %v", err)
+	// The refusal happens on the ADVANCE that enqueues the stage, not at run creation:
+	// a run row exists, and the stage never acquires a job.
+	if _, err = pipeline.AdvancePipelineRun(ctx, store, enqueue, rec, parsed, run, now); err == nil {
+		t.Fatalf("advancing into an implement stage should be refused, got nil error")
 	}
-	// It took the WRITABLE task-worktree, not the read-only committed-tip worktree.
-	if strings.TrimSpace(payload.WorktreePath) == "" {
-		t.Fatalf("impl stage has no writable task worktree")
+	// The refusal must name the removal, not just fail: an operator reading this needs
+	// to know the stage kind is retired rather than that their agent or policy is wrong.
+	if !strings.Contains(err.Error(), "not dispatchable") {
+		t.Fatalf("refusal error = %q, want it to say the stage is not dispatchable", err.Error())
 	}
-	if payload.ReadOnlyWorktree {
-		t.Fatalf("impl stage ReadOnlyWorktree = true, want false (a mutating worktree is durable)")
+	if !strings.Contains(err.Error(), "#2203") {
+		t.Fatalf("refusal error = %q, want it to cite #2203 so the cause is findable", err.Error())
 	}
-	wantBranch := "gitmoot/pipe-" + run.ID + "-impl"
-	if payload.Branch != wantBranch {
-		t.Fatalf("impl branch = %q, want %q", payload.Branch, wantBranch)
-	}
-	if _, statErr := os.Stat(payload.WorktreePath); statErr != nil {
-		t.Fatalf("impl worktree %s not created on disk: %v", payload.WorktreePath, statErr)
-	}
-	// A worktree-keyed job parallelizes with same-repo siblings (never repo:<repo>).
-	if key := queuedJobCheckoutKey(ctx, store, job); !strings.HasPrefix(key, "worktree:") {
-		t.Fatalf("impl stage checkout key = %q, want worktree:<path> (parallelizes)", key)
-	}
-
-	worktreePath := payload.WorktreePath
-
-	// RETRY REUSE + FAIL-CLOSED: dirty the worktree, then fail the job so the stage
-	// retries (retry:1). The retry re-derives the SAME deterministic branch/task and
-	// reuses the worktree — but the uncommitted change trips the fail-closed guard, so
-	// the advance errors rather than duplicating or clobbering the branch/PR.
-	if err := os.WriteFile(filepath.Join(worktreePath, "dirty.txt"), []byte("uncommitted\n"), 0o644); err != nil {
-		t.Fatalf("dirty the worktree: %v", err)
-	}
-	settleStageJob(t, store, impl.JobID, "failed", "boom", nil)
-	_, err = pipeline.AdvancePipelineRun(ctx, store, enqueue, rec, parsed, run, now)
-	if err == nil {
-		t.Fatalf("retry into a dirty worktree should FAIL CLOSED, got nil error")
-	}
-	if !strings.Contains(err.Error(), "uncommitted changes") {
-		t.Fatalf("fail-closed error = %q, want it to mention uncommitted changes", err.Error())
-	}
-	// The retry stayed on the SAME branch (never minted a fresh one).
-	if !strings.Contains(err.Error(), wantBranch) {
-		t.Fatalf("fail-closed error = %q, want it to reference the reused branch %q", err.Error(), wantBranch)
-	}
-	retried := stageRow(t, store, run.ID, "impl")
-	if retried.Attempt != 1 {
-		t.Fatalf("impl attempt = %d, want 1 (retry budget consumed)", retried.Attempt)
+	// No job may be left behind by a refused stage.
+	if impl := stageRow(t, store, run.ID, "impl"); impl.JobID != "" {
+		t.Fatalf("refused impl stage left job %q behind, want none", impl.JobID)
 	}
 }

@@ -99,6 +99,17 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktreeForRunner(ctx, store, home, request, runner)
 			}
 		}
+		// #2203: a pipeline implement stage is no longer dispatchable. The writable
+		// task-worktree allocator this stage required was removed with implementer
+		// dispatch, so enqueueing one produced a job with nowhere to write and the
+		// run failed late with "stage job produced no gitmoot_result". Refuse here
+		// instead: a spec that declares an implement stage is a spec that cannot
+		// run, and saying so at enqueue is the only honest answer. Owner-authorized
+		// (workflow note 173859); the validate path still ACCEPTS the stage kind so
+		// existing specs parse rather than erroring at load.
+		if strings.TrimSpace(request.Action) == "implement" {
+			return db.Job{}, fmt.Errorf("pipeline implement stages are not dispatchable: implementer dispatch was removed in #2203, so no writable task worktree can be allocated for stage %q", strings.TrimSpace(request.Fingerprint))
+		}
 		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
 			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
 			if worktreeErr != nil {

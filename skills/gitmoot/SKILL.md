@@ -198,7 +198,7 @@ independent check, the same separation as ROMA's Verifier (cross-evaluation beat
 self-evaluation; see the `verifier` recipe and the
 "produce vs. independent check" note in
 [RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
-individual job or delegation (via `--model` on run/ask/review/implement or the
+individual job or delegation (via `--model` on run/ask/review or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
 value overriding the agent default. When neither pins one, a job falls back to the
 runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's own
