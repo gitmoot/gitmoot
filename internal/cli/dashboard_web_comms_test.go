@@ -474,7 +474,20 @@ func dashboardEmbeddedModuleNav(t *testing.T, body string) []dashboardNavItem {
 	return items
 }
 
-func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
+// TestDashboardSidebarLinksCommsAfterOrg is the guard for a SILENT loss. The
+// Comms rail entry is not in the dashboard module at all - gitmoot injects it
+// into the module's served HTML by finding a known nav entry's tail and writing
+// itself in after it. If a module re-pin changes that markup, the injection
+// finds nothing, and withDashboardCommsNav is deliberately fail-open: it returns
+// the upstream body untouched. The page still renders, CI still passes, and the
+// Comms entry is simply GONE.
+//
+// That very nearly shipped in #2206: the anchor was the CHAT entry's tail, and
+// the module release removed Chat. It was caught by measuring the anchor against
+// the new module asset before re-pinning. This test makes the next one loud by
+// asserting against the REAL embedded module asset rather than a fixture, so a
+// future re-pin that moves the nav fails here instead of quietly dropping a page.
+func TestDashboardSidebarLinksCommsAfterOrg(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	newDashboardWebHandler(&webDataSource{}).ServeHTTP(
 		recorder, httptest.NewRequest(http.MethodGet, "/", nil),
@@ -483,14 +496,22 @@ func TestDashboardSidebarLinksCommsDirectlyAfterChat(t *testing.T) {
 		t.Fatalf("GET / status=%d body=%q", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
-	chat := strings.Index(body, `<span style="flex:1">Chat</span>`)
-	comms := strings.Index(body, `href="/comms"`)
-	brain := strings.Index(body, `<span style="flex:1">Brain</span>`)
-	if chat < 0 || comms < 0 || brain < 0 || !(chat < comms && comms < brain) {
-		t.Fatalf("sidebar ordering chat=%d comms=%d brain=%d, want Chat < Comms < Brain", chat, comms, brain)
+	if !strings.Contains(body, dashboardCommsNavAnchor) {
+		t.Fatalf("the module asset no longer contains the Comms nav anchor %q; the injection would silently drop the Comms entry - repoint dashboardCommsNavAnchor at a surviving nav entry's tail", dashboardCommsNavAnchor)
 	}
-	if !strings.Contains(body[comms:brain], `<span style="flex:1">Comms</span>`) {
+	org := strings.Index(body, `<span style="flex:1">Org</span>`)
+	comms := strings.Index(body, `href="/comms"`)
+	if org < 0 || comms < 0 || org > comms {
+		t.Fatalf("sidebar ordering org=%d comms=%d, want Org < Comms", org, comms)
+	}
+	if !strings.Contains(body[comms:], `<span style="flex:1">Comms</span>`) {
 		t.Fatal("Comms sidebar link is missing its visible label")
+	}
+	// The pages this campaign removed must not be advertised any more.
+	for _, gone := range []string{`<span style="flex:1">Chat</span>`, `<span style="flex:1">Brain</span>`} {
+		if strings.Contains(body, gone) {
+			t.Fatalf("sidebar still advertises a removed page: %s", gone)
+		}
 	}
 }
 
@@ -639,3 +660,48 @@ setImmediate(()=>{
   }catch(error){console.error(error.stack||error);process.exitCode=1;}
 });
 `
+
+// TestDashboardCommsMobileNavHasNoDeadItems is the guard the round-1 reviewer
+// showed was missing, by finding the exact bug it now prevents.
+//
+// renderDashboardCommsMobileNav walks a HARD-CODED href list and looks each one
+// up in dashboardNavManifest. #2206 removed /brain from the manifest but left it
+// in that list, so the loop emitted an item with an empty href and an empty
+// label: an unlabeled button that reloaded the current page. The sidebar walks
+// the manifest directly and could never drift this way; only the mobile list
+// can, because it repeats the hrefs instead of deriving them.
+//
+// Asserting "every rendered item has a non-empty href AND label" catches the
+// whole class, not just /brain: any future manifest removal that forgets this
+// list fails here.
+func TestDashboardCommsMobileNavHasNoDeadItems(t *testing.T) {
+	nav := renderDashboardCommsMobileNav()
+	items := regexp.MustCompile(`<a class="gm-mobile-item"[^>]*>.*?</a>`).FindAllString(nav, -1)
+	if len(items) == 0 {
+		t.Fatalf("no mobile nav items rendered at all: %q", nav)
+	}
+	hrefPattern := regexp.MustCompile(`href="([^"]*)"`)
+	labelPattern := regexp.MustCompile(`<span[^>]*>([^<]*)</span>`)
+	for _, item := range items {
+		href := hrefPattern.FindStringSubmatch(item)
+		if href == nil || strings.TrimSpace(href[1]) == "" {
+			t.Fatalf("mobile nav item has no href, so tapping it reloads the page: %q", item)
+		}
+		label := labelPattern.FindStringSubmatch(item)
+		if label == nil || strings.TrimSpace(label[1]) == "" {
+			t.Fatalf("mobile nav item %q has an empty label; it is a dead slot left by a manifest removal", href[1])
+		}
+		// Every href the mobile list names must still exist in the manifest it
+		// claims to mirror.
+		found := false
+		for _, entry := range dashboardNavManifest {
+			if entry.Href == href[1] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("mobile nav names %q, which is not in dashboardNavManifest; the two lists have drifted", href[1])
+		}
+	}
+}

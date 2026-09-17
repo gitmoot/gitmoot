@@ -16,7 +16,7 @@ import (
 // that feeds reviewer prompts, so the template overview is still a real feature.
 // It was carried over from the retired dashboard_web_learning.go, which also
 // held Knowledge() (the memory brain graph); that half is gone with the memory
-// tables and Knowledge() is an empty stub in dashboard_web.go.
+// tables and Knowledge() was an empty stub until #2206 removed it with the module requirement.
 //
 // Skills reads through the same read-only store paths as the rest of
 // dashboard_web.go (withStore, parseJobTimeMillis) and is deterministic: the
