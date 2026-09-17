@@ -12,9 +12,12 @@ import (
 )
 
 // This file covers what is left of the Learning page after #2202 retired the
-// brain: Skills, which reads the agent_templates / agent_template_versions store
-// that survives the #2201 narrowing (#2204 keeps it), plus the two transitional
-// /api/brain/* routes the pinned dashboard module's frontend still fetches.
+// brain: Skills, and only Skills. It reads the agent_templates /
+// agent_template_versions store that survives the #2201 narrowing (#2204 keeps
+// it), which is why Skills stayed a REAL implementation while Knowledge did not.
+//
+// It briefly also covered two transitional /api/brain/* routes. #2206 removed
+// those with the module's Brain page, so nothing here touches them.
 //
 // The Knowledge tests that used to live beside these were deleted with their
 // subject; the Skills tests are the pre-#2202 ones, unchanged, because their
