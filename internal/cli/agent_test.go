@@ -449,14 +449,11 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
+	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
 	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440022"}` + "\n"}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -988,7 +985,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			// #1530: the rebind-on-divergence must NOT precede the disposal
@@ -999,7 +996,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 				request.Branch = "feature/review"
 				request.HeadSHA = strings.Repeat("0", 40)
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			name: "requested task upsert",
@@ -1007,7 +1004,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
-			wantError: []string{"is dismissed", "task recover"},
+			wantError: []string{"is dismissed", "create a successor task"},
 		},
 		{
 			name: "superseded matching branch",
@@ -2410,7 +2407,7 @@ func TestRunAgentStartRejectsMissingTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
+	want := "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2441,7 +2438,7 @@ func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2550,6 +2547,42 @@ func TestRunAgentStartRejectsConfigUnsafeNameBeforeRuntime(t *testing.T) {
 	}
 }
 
+func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "shell-agent",
+		"--home", home,
+		"--runtime", "shell",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		// --capability ask keeps this test on its OWN gate. #2204 removed the
+		// --template flag this invocation used to carry, and without a template
+		// resolveAgentDefaults falls back to capabilities [ask review implement];
+		// the implement-write-policy refusal then fires at agent.go:1847 and
+		// returns 2 BEFORE the shell-runtime refusal this test exists to pin.
+		// Round-1 review of #2211 caught it: the test was passing judgement on a
+		// gate it does not name.
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
+	}
+}
+
 func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -2605,15 +2638,11 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 
 func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	home := t.TempDir()
-	promptPath := filepath.Join(t.TempDir(), "frontend.md")
-	if err := os.WriteFile(promptPath, []byte(testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n")), 0o600); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "template", "add", "frontend-reviewer", "--home", home, "--file", promptPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("template add exit code = %d, stderr=%s", code, stderr.String())
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-
+	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
 	stdout.Reset()
 	stderr.Reset()
 	code := Run([]string{
@@ -2674,7 +2703,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing custom template exit code = %d, want 1", code)
 	}
-	want := "agent template frontend-reviewer is not installed; run gitmoot agent template add frontend-reviewer --file <path>"
+	want := "agent template frontend-reviewer is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -2692,7 +2721,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	if code != 1 {
 		t.Fatalf("missing template exit code = %d, want 1", code)
 	}
-	want = "agent template thermo-nuclear-code-quality-review is not installed; run gitmoot agent template update thermo-nuclear-code-quality-review"
+	want = "agent template thermo-nuclear-code-quality-review is not installed; seed the agent_templates row for it first"
 	if strings.TrimSpace(stderr.String()) != want {
 		t.Fatalf("stderr = %q, want %q", stderr.String(), want)
 	}
@@ -3430,7 +3459,8 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		want string
 	}{
 		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
-		{name: "inline form", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
+		{name: "inline form", args: []string{"planner", "do the work", "--recipe=decompose-and-verify"}, want: "decompose-and-verify"},
+		{name: "third valid id", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
 		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
 	}
 	for _, tt := range tests {
@@ -3456,7 +3486,7 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		if !strings.Contains(errText, `unknown recipe "bogus"`) {
 			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
 		}
-		for _, id := range []string{"review-panel", "verifier"} {
+		for _, id := range []string{"review-panel", "decompose-and-verify", "verifier"} {
 			if !strings.Contains(errText, id) {
 				t.Fatalf("stderr missing valid id %q: %q", id, errText)
 			}
@@ -4207,56 +4237,13 @@ func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "start", "shell-agent",
-		"--home", home,
-		"--runtime", "shell",
-		"--repo", "owner/repo",
-		"--path", repoDir,
-		// --capability ask keeps this test on its OWN gate. #2204 removed the
-		// --template flag this invocation used to carry, and without a template
-		// resolveAgentDefaults falls back to capabilities [ask review implement];
-		// the implement-write-policy refusal then fires at agent.go:1847 and
-		// returns 2 BEFORE the shell-runtime refusal this test exists to pin.
-		// Round-1 review of #2211 caught it: the test was passing judgement on a
-		// gate it does not name.
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started for shell agent: %+v", runner.calls)
-	}
-}
-
-// TestAgentImplementVerbIsRefused makes #2203's removal MUTATION-DETECTABLE.
-//
-// Without it, re-adding `case "implement":` to runAgent would compile, pass the
-// whole suite, and quietly restore a dispatch path the campaign removed on
-// measurement: 568 of 570 implement jobs in the fortnight before removal were
-// seats RECORDING their own sessions via `gitmoot job record`, exactly 2 were
-// ever dispatched, and all 30 per-PR auto-fix policy rows were disabled.
-//
-// The implementing agent's own sabotage run found this gap: re-adding the verb
-// failed only tests that were ALREADY failing on its tree, so the mutant proved
-// nothing about the verb. This asserts the refusal directly.
-//
-// It deliberately checks the exit code AND that the message names the verb, so a
-// future refactor that swallows the argument into a silent no-op also fails.
+// TestAgentImplementVerbIsRefused makes #2203's removal MUTATION-DETECTABLE. The
+// verb is gone from the router, and re-adding it must fail a test rather than
+// silently work: the implementing agent's own sabotage run found that re-adding
+// the verb failed only tests that were ALREADY failing on its tree, so the
+// mutant proved nothing. This asserts the refusal directly, checking the exit
+// code AND that the message names the verb, so a refactor that swallows the
+// argument into a silent no-op also fails.
 func TestAgentImplementVerbIsRefused(t *testing.T) {
 	for _, args := range [][]string{
 		{"implement", "some-agent", "do the thing"},
@@ -4265,13 +4252,13 @@ func TestAgentImplementVerbIsRefused(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		code := runAgent(args, &stdout, &stderr)
 		if code != 2 {
-			t.Fatalf("runAgent(%q) exit=%d, want 2: gitmoot does not dispatch implementation (#2203)", args, code)
+			t.Fatalf("runAgent(%v) exit = %d, want 2", args, code)
 		}
-		if got := stderr.String(); !strings.Contains(got, `unknown agent command "implement"`) {
-			t.Fatalf("runAgent(%q) stderr=%q, want it to name the unknown verb so the caller learns the surface is gone", args, got)
+		if !strings.Contains(stderr.String(), `unknown agent command "implement"`) {
+			t.Fatalf("runAgent(%v) stderr = %q, want it to name the removed verb", args, stderr.String())
 		}
 	}
-	// Control: the surviving verbs must NOT be refused, so this test cannot pass
+	// Control: a SURVIVING verb must not be refused, or this test would pass
 	// by rejecting everything.
 	var stdout, stderr bytes.Buffer
 	if code := runAgent([]string{"review"}, &stdout, &stderr); code == 2 && strings.Contains(stderr.String(), "unknown agent command") {
