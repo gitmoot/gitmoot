@@ -896,8 +896,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// THE HOST READ-ONLY SEAT IS A HOST-BOUNDARY CONTROL, so it does not apply
 	// when the runtime executes off-box. Its Landlock grants restrict what a
 	// review may touch in the HOST filesystem; a remote job never runs on the
-	// host, its isolation boundary is the execution instance, and the adapter
-	// runs on the host at all.
+	// host, and its isolation boundary is the execution instance rather than
+	// anything Landlock can express here.
 	//
 	// THE OBSERVED FAILURE CAME VIA THE NIL-FACTORY PATH, which is worth stating
 	// precisely because the provisioned path would have been WORSE. When no

@@ -504,6 +504,23 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized response", method, path, resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		// A PER-ID 404 IS AMBIGUOUS AND A COLLECTION 404 IS NOT. For GET or DELETE
+		// on /sandboxes/<id>, "never existed" and "already gone" are
+		// indistinguishable, and this epic treats that as unresolvable without a
+		// successful list in the same pass - so it stays inconclusive.
+		//
+		// POST /sandboxes is different: the 404 is about the COLLECTION, not about
+		// any instance. An unknown template, or a misrouted e2b_domain reaching a
+		// different service, means nothing was allocated. Round 2 review of #2226
+		// made this argument and it is better than the blanket rule I had: leaving
+		// a create-404 inconclusive stranded its reservation until TTL, the exact
+		// leak this work exists to close.
+		if operationForRequest(method, path) == OperationCreate {
+			return Unknown, resp.Header, &RequestRefusedError{
+				StatusCode: resp.StatusCode, Operation: OperationCreate,
+				Err: c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody),
+			}
+		}
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
@@ -622,16 +639,12 @@ func operationForRequest(method, path string) string {
 
 func requestRefused(status int) bool {
 	switch status {
-	// 404 AND 410 ARE DELIBERATELY ABSENT. doJSONState classifies them as
-	// INCONCLUSIVE before this check is reached, so listing them here was dead
-	// code that also made a false claim: a create-time 404 (an unknown template,
-	// say) still strands its reservation exactly like the 400 this fix cures.
-	// Round 1 review of #2226 caught it by execution.
-	//
-	// Dropping them is the right half of the fix rather than forcing them
-	// through, because a per-id 404 genuinely means two things on this provider -
-	// "never existed" and "already gone" - and the epic already treats that
-	// ambiguity as unresolvable without a successful list in the same pass.
+	// 404 AND 410 ARE DELIBERATELY ABSENT HERE, and handled earlier instead.
+	// doJSONState reaches its own 404/410 branch before this check, where a
+	// CREATE 404 becomes a refusal (the collection cannot be missing and an
+	// instance still be allocated) while a per-id 404 stays inconclusive, because
+	// "never existed" and "already gone" are indistinguishable on this provider.
+	// Listing them here as well would be dead code.
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired,
 		http.StatusForbidden, http.StatusMethodNotAllowed,
 		http.StatusConflict, http.StatusUnprocessableEntity:
