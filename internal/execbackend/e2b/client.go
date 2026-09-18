@@ -23,9 +23,23 @@ import (
 )
 
 const (
-	DefaultBaseURL               = "https://api.e2b.app"
-	DefaultSandboxDomain         = "e2b.app"
-	DefaultRequestTimeout        = 15 * time.Second
+	DefaultBaseURL        = "https://api.e2b.app"
+	DefaultSandboxDomain  = "e2b.app"
+	DefaultRequestTimeout = 15 * time.Second
+	// DefaultUploadTimeout bounds a BULK WORKSPACE TRANSFER, which is a different
+	// kind of operation from the control-plane calls DefaultRequestTimeout was
+	// sized for.
+	//
+	// THEY SHARED ONE VALUE AND IT MADE REAL REPOSITORIES UNUSABLE. Syncing this
+	// repository's own 73 MiB worktree into a sandbox died with "envd upload
+	// request failed: context deadline exceeded" - 15 seconds is generous for a
+	// status poll and impossible for a tarball, so remote execution worked only
+	// for toy checkouts. Measured while bringing up the first sandbox reviewer:
+	// the small stand-in repo synced fine and the real one never did.
+	//
+	// This is the recurring shape in this epic once more: one value standing for
+	// two different facts.
+	DefaultUploadTimeout         = 10 * time.Minute
 	maxProviderResponseBodyBytes = 1 << 20
 	minAPIKeyLength              = 8
 	listSandboxesPageSize        = 100
