@@ -46,7 +46,11 @@ func provisionRefusalAttemptState(t *testing.T, jobID string, provisionErr error
 func TestProviderRefusalReleasesTheReservation(t *testing.T) {
 	refusal := &e2b.RequestRefusedError{
 		StatusCode: 400,
-		Err:        errors.New(`POST /sandboxes: E2B returned HTTP 400: {"code":400,"message":"Timeout cannot be greater than 1 hours"}`),
+		// Operation is REQUIRED for the release: round 1 of #2226 showed that a
+		// refusal from a cleanup Delete must not free a reservation for a sandbox
+		// that may still bill, so only a refused CREATE counts.
+		Operation: e2b.OperationCreate,
+		Err:       errors.New(`POST /sandboxes: E2B returned HTTP 400: {"code":400,"message":"Timeout cannot be greater than 1 hours"}`),
 	}
 	if state := provisionRefusalAttemptState(t, "job-refused", refusal); state != string(db.ExecBackendAttemptStateFailed) {
 		t.Fatalf("attempt state = %q, want %q: a refused provision must not strand its cost and concurrency slot",
@@ -76,5 +80,21 @@ func TestServerErrorKeepsTheReservation(t *testing.T) {
 	err := errors.New("POST /sandboxes: E2B returned HTTP 503: upstream unavailable")
 	if state := provisionRefusalAttemptState(t, "job-5xx", err); state != "provisioning" {
 		t.Fatalf("attempt state = %q, want %q: a 5xx may follow a completed allocation", state, "provisioning")
+	}
+}
+
+// TestNonCreateRefusalKeepsTheReservation pins the narrow hazard round 1
+// identified: Provision deletes the sandbox it just made when envd construction
+// fails, so a refusal-class error from THAT delete must not release the
+// reservation - the sandbox may exist and bill, and freeing the slot invites a
+// duplicate run.
+func TestNonCreateRefusalKeepsTheReservation(t *testing.T) {
+	refusal := &e2b.RequestRefusedError{
+		StatusCode: 403,
+		Operation:  e2b.OperationDelete,
+		Err:        errors.New("DELETE /sandboxes/abc: E2B returned HTTP 403: forbidden"),
+	}
+	if state := provisionRefusalAttemptState(t, "job-delete-refused", refusal); state != "provisioning" {
+		t.Fatalf("attempt state = %q, want %q: only a refused CREATE proves nothing was allocated", state, "provisioning")
 	}
 }
