@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
@@ -91,6 +92,11 @@ type sandboxState struct {
 	hostWorktree string
 	hostBase     string
 	remoteBase   string
+
+	// stopKeepalive ends the TTL refresh loop. Nil when no refresh is running,
+	// which is the case whenever the requested TTL fits inside the provider's
+	// ceiling in one go.
+	stopKeepalive context.CancelFunc
 }
 
 var _ execbackend.ExecutionBackend = (*Backend)(nil)
@@ -123,6 +129,29 @@ func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
 
 func (b *Backend) Name() execbackend.Backend { return execbackend.Remote }
 
+// ProviderMaxTTL is the largest sandbox timeout E2B accepts on create. Asking
+// for more is refused outright: `POST /sandboxes` returns HTTP 400 with
+// {"code":400,"message":"Timeout cannot be greater than 1 hours"}.
+//
+// THIS MADE REMOTE REVIEWS IMPOSSIBLE, not merely awkward. The review class
+// floor (#2191) is three hours, the lifecycle adds a teardown grace, and the sum
+// went to the provider verbatim - so every review was rejected before a sandbox
+// existed. Measured on 658ab6ef with the job-type allowlist lifted.
+const ProviderMaxTTL = time.Hour
+
+// ttlRefreshLead is how long before expiry the keepalive renews. E2B's
+// SetTimeout replaces the TTL measured from the time of the request, so renewing
+// early simply moves the deadline forward; renewing late loses the sandbox.
+const ttlRefreshLead = 10 * time.Minute
+
+// ttlRetryInitialBackoff and ttlRetryMaxBackoff bound the renewal retries inside
+// that lead. Ten minutes of exponential backoff from 5s gives roughly a dozen
+// attempts, which covers a transient provider blip without hammering it.
+const (
+	ttlRetryInitialBackoff = 5 * time.Second
+	ttlRetryMaxBackoff     = 2 * time.Minute
+)
+
 func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*execbackend.Instance, error) {
 	if b == nil {
 		return nil, errors.New("remote execution backend is nil")
@@ -153,7 +182,17 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	if token := strings.TrimSpace(scope.DaemonFencingToken); token != "" {
 		metadata[metadataDaemonFencingToken] = token
 	}
-	sandbox, credential, err := b.client.Create(ctx, b.templateID, scope.TTL, e2b.CreateOptions{Metadata: metadata})
+	// Clamp to what the provider will accept, and remember whether the job asked
+	// for longer. A clamp ALONE would be a silent downgrade: a three-hour review
+	// would die at one hour with no explanation, which is worse than the refusal
+	// it replaces. The keepalive below is what makes the clamp honest.
+	createTTL := scope.TTL
+	needsRefresh := false
+	if createTTL > ProviderMaxTTL {
+		createTTL = ProviderMaxTTL
+		needsRefresh = true
+	}
+	sandbox, credential, err := b.client.Create(ctx, b.templateID, createTTL, e2b.CreateOptions{Metadata: metadata})
 	if err != nil {
 		return nil, fmt.Errorf("provision remote execution sandbox: %w", err)
 	}
@@ -171,7 +210,124 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	b.mu.Lock()
 	b.sandboxes[sandbox.ID] = state
 	b.mu.Unlock()
+	if needsRefresh {
+		b.startTTLKeepalive(state, scope.TTL)
+	}
 	return state.instance(), nil
+}
+
+// startTTLKeepalive renews a sandbox's provider TTL for as long as the job's
+// requested lifetime exceeds the provider's per-request ceiling.
+//
+// It is DELIBERATELY BOUNDED by the requested TTL rather than running until the
+// sandbox is destroyed. An unbounded keepalive turns any lost owner into an
+// immortal billed sandbox - the failure mode #1539's reaper exists to prevent -
+// so the loop stops on its own at the deadline the caller asked for, and the
+// provider's own timeout then collects the sandbox even if this process dies.
+//
+// It runs on context.Background rather than the provision context: the caller's
+// context ends when Provision returns, and a refresher tied to it would stop
+// immediately. stopTTLKeepalive is the only thing that ends it early.
+func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration) {
+	if state == nil || requested <= ProviderMaxTTL {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	state.mu.Lock()
+	state.stopKeepalive = cancel
+	sandboxID := state.sandbox.ID
+	state.mu.Unlock()
+
+	deadline := time.Now().Add(requested)
+	interval := ProviderMaxTTL - ttlRefreshLead
+	if interval <= 0 {
+		interval = ProviderMaxTTL / 2
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if time.Until(deadline) <= 0 {
+					return
+				}
+				b.renewWithinLead(ctx, sandboxID, deadline)
+			}
+		}
+	}()
+}
+
+// renewWithinLead renews the provider TTL, RETRYING UNTIL THE LEAD IS SPENT.
+//
+// THE RETRY IS THE WHOLE VALUE OF THE LEAD. The first version renewed once per
+// tick and ignored the error, with a comment claiming the next tick would try
+// again "while time remains" - which was false. Ticks are 50 minutes apart and
+// the sandbox expires 60 minutes after the last successful renewal, so a single
+// transient failure left the next attempt 40 minutes too late: the job died at
+// ~1h regardless of its requested TTL. That is precisely the silent downgrade
+// the keepalive exists to prevent, reintroduced by the keepalive itself. Round 1
+// review of #2226 found it.
+//
+// Renewal stays BEST-EFFORT: exhausting the lead never kills the job early or
+// panics the goroutine, it just leaves the sandbox on the TTL it already has.
+func (b *Backend) renewWithinLead(ctx context.Context, sandboxID string, deadline time.Time) {
+	b.renewWithinLeadUsing(ctx, sandboxID, deadline, func(ctx context.Context, id string, ttl time.Duration) error {
+		_, err := b.client.SetTimeout(ctx, id, ttl)
+		return err
+	})
+}
+
+// renewWithinLeadUsing is renewWithinLead with the provider call injected. The
+// seam is a PARAMETER rather than a field on Backend so production has exactly
+// one path and no test-only state can be left set by accident.
+func (b *Backend) renewWithinLeadUsing(ctx context.Context, sandboxID string, deadline time.Time, setTimeout func(context.Context, string, time.Duration) error) {
+	leadExpiry := time.Now().Add(ttlRefreshLead)
+	backoff := ttlRetryInitialBackoff
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		extend := remaining
+		if extend > ProviderMaxTTL {
+			extend = ProviderMaxTTL
+		}
+		if err := setTimeout(ctx, sandboxID, extend); err == nil {
+			return
+		}
+		// Stop once a further attempt could not land before the CURRENT provider
+		// TTL lapses. Retrying past that point cannot save the sandbox and only
+		// burns provider calls.
+		if time.Now().Add(backoff).After(leadExpiry) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > ttlRetryMaxBackoff {
+			backoff = ttlRetryMaxBackoff
+		}
+	}
+}
+
+// stopTTLKeepalive ends any refresh loop for this sandbox. Safe to call for a
+// sandbox that never had one.
+func (b *Backend) stopTTLKeepalive(state *sandboxState) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	stop := state.stopKeepalive
+	state.stopKeepalive = nil
+	state.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 // Attach reuses only credentials retained by this process. Durable reattach is
@@ -395,11 +551,14 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 		return nil
 	}
 	b.mu.Lock()
-	_, tracked := b.sandboxes[instance.ID]
+	tracked_state, tracked := b.sandboxes[instance.ID]
 	b.mu.Unlock()
 	if !tracked {
 		return nil
 	}
+	// Stop renewing BEFORE deleting, so a tick cannot race the delete and hand a
+	// fresh hour to a sandbox that is being torn down.
+	b.stopTTLKeepalive(tracked_state)
 	state, err := b.client.Delete(ctx, instance.ID)
 	if err != nil {
 		return fmt.Errorf("destroy remote execution sandbox %q: %w", instance.ID, err)

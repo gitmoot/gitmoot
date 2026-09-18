@@ -504,10 +504,31 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d with an oversized response", method, path, resp.StatusCode)
 	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		// A PER-ID 404 IS AMBIGUOUS AND A COLLECTION 404 IS NOT. For GET or DELETE
+		// on /sandboxes/<id>, "never existed" and "already gone" are
+		// indistinguishable, and this epic treats that as unresolvable without a
+		// successful list in the same pass - so it stays inconclusive.
+		//
+		// POST /sandboxes is different: the 404 is about the COLLECTION, not about
+		// any instance. An unknown template, or a misrouted e2b_domain reaching a
+		// different service, means nothing was allocated. Round 2 review of #2226
+		// made this argument and it is better than the blanket rule I had: leaving
+		// a create-404 inconclusive stranded its reservation until TTL, the exact
+		// leak this work exists to close.
+		if operationForRequest(method, path) == OperationCreate {
+			return Unknown, resp.Header, &RequestRefusedError{
+				StatusCode: resp.StatusCode, Operation: OperationCreate,
+				Err: c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody),
+			}
+		}
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		refusal := c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		if requestRefused(resp.StatusCode) {
+			refusal = &RequestRefusedError{StatusCode: resp.StatusCode, Operation: operationForRequest(method, path), Err: refusal}
+		}
+		return Unknown, resp.Header, refusal
 	}
 	if output == nil {
 		return Present, resp.Header, nil
@@ -548,6 +569,88 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 	return &clientError{
 		message: workflow.RedactedStderrTail(message, c.apiKey),
 		match:   contextErrorIdentity(cause),
+	}
+}
+
+// RequestRefusedError marks a provider response that is AUTHORITATIVE PROOF
+// NOTHING WAS ALLOCATED: the request was rejected on its own terms, before any
+// sandbox could exist.
+//
+// The distinction is load-bearing for the cost ledger. A transport failure is
+// genuinely ambiguous - the provider may have allocated a sandbox whose response
+// never arrived - so its reservation must stay held until inventory resolves it.
+// A 4xx validation refusal is not ambiguous, and treating it as though it were
+// STRANDS THE RESERVATION: measured on this box, an HTTP 400 ("Timeout cannot be
+// greater than 1 hours") left $1.00 reserved in state "provisioning" holding the
+// only concurrency slot, and with cost_max_concurrent = 1 every subsequent
+// remote job was refused for the four hours until the row's TTL expired.
+//
+// This is the recurring defect in this epic once more: one value standing for
+// two different facts. "Provision returned an error" meant both "maybe
+// allocated" and "definitely did not allocate".
+//
+// 5xx and 429 are deliberately NOT included. A server error may follow a
+// completed allocation, and a rate-limit response can race one; both stay
+// ambiguous and keep the fail-safe hold.
+type RequestRefusedError struct {
+	StatusCode int
+	// Operation names the provider call that was refused. The ledger releases a
+	// reservation only for OperationCreate: a refusal from a cleanup Delete or a
+	// status Get says nothing about whether the CREATE allocated anything.
+	Operation string
+	Err       error
+}
+
+// Provider operations that can carry a refusal. Only OperationCreate is proof of
+// non-allocation for the cost ledger.
+const (
+	OperationCreate     = "create"
+	OperationGet        = "get"
+	OperationDelete     = "delete"
+	OperationSetTimeout = "set_timeout"
+	OperationMetrics    = "metrics"
+	OperationOther      = "other"
+)
+
+func (e *RequestRefusedError) Error() string { return e.Err.Error() }
+func (e *RequestRefusedError) Unwrap() error { return e.Err }
+
+// requestRefused reports whether a status code proves the provider rejected the
+// request without allocating anything.
+// operationForRequest classifies a provider call so the ledger can tell a
+// refused CREATE from a refused cleanup.
+func operationForRequest(method, path string) string {
+	trimmed := strings.TrimSuffix(path, "/")
+	switch {
+	case method == http.MethodPost && trimmed == "/sandboxes":
+		return OperationCreate
+	case method == http.MethodDelete:
+		return OperationDelete
+	case method == http.MethodGet && strings.Contains(trimmed, "/metrics"):
+		return OperationMetrics
+	case method == http.MethodGet:
+		return OperationGet
+	case method == http.MethodPost && strings.Contains(trimmed, "/timeout"):
+		return OperationSetTimeout
+	default:
+		return OperationOther
+	}
+}
+
+func requestRefused(status int) bool {
+	switch status {
+	// 404 AND 410 ARE DELIBERATELY ABSENT HERE, and handled earlier instead.
+	// doJSONState reaches its own 404/410 branch before this check, where a
+	// CREATE 404 becomes a refusal (the collection cannot be missing and an
+	// instance still be allocated) while a per-id 404 stays inconclusive, because
+	// "never existed" and "already gone" are indistinguishable on this provider.
+	// Listing them here as well would be dead code.
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired,
+		http.StatusForbidden, http.StatusMethodNotAllowed,
+		http.StatusConflict, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
 	}
 }
 

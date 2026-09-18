@@ -146,6 +146,20 @@ func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {
 
 func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, cfg config.RemoteExecConfig, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, *credgw.Lease, []string, error) {
 	if w.ExecutionBackendFactory == nil {
+		// A worker WITHOUT the lifecycle factory is the foreground/unit-test seam,
+		// and for a local job "no instance" is the correct answer. For a non-local
+		// job it is not: nothing will ever attach an instance, so the job proceeds
+		// to unprovisionedRemoteDeliveryAdapter and dies with "remote execution
+		// backend is not provisioned" - a message that describes the symptom and
+		// hides the cause, which is that this worker cannot provision at all.
+		//
+		// Refuse here instead, naming the actual constraint. Measured while making
+		// remote reviews dispatchable: `gitmoot job run` builds defaultJobWorker,
+		// so every remote job run in the foreground failed this way regardless of
+		// configuration.
+		if backend != execbackend.Local {
+			return nil, nil, nil, nil, fmt.Errorf("this worker cannot provision the %s execution backend: it was built without a lifecycle factory, which is the foreground/unit-test seam; run the job under the daemon", backend)
+		}
 		return nil, nil, nil, nil, nil
 	}
 	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime {

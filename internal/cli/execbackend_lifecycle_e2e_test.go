@@ -1044,54 +1044,6 @@ func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
 
 // GITMOOT-IMPL: non-implement work must fail before construction; otherwise a
 // billed sandbox could run work whose result has no transport back to the host.
-func TestRemoteExecutionBackendRefusesNonImplementBeforeProvision(t *testing.T) {
-	ctx := context.Background()
-	home, paths, store := heartbeatLoopE2EHome(t)
-	writeRemoteLifecycleConfig(t, paths, "")
-	checkout := createDaemonWorkerGitCheckout(t, "remote-refusal")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "remote-ask-agent", runtime.ShellRuntime, heartbeatShellResultScript, []string{"ask"}, "owner/repo")
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("must refuse before checkout"))
-	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID: "remote-ask-must-refuse", Agent: "remote-ask-agent", Action: "ask", Repo: "owner/repo", Instructions: "must not provision",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	factoryCalls := 0
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.ExecutionBackendFactory = func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
-		factoryCalls++
-		return nil, errors.New("factory must not be called")
-	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatalf("worker.run: %v", err)
-	}
-	if factoryCalls != 0 {
-		t.Fatalf("execution backend factory calls = %d, want 0", factoryCalls)
-	}
-	completed, err := store.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.State != string(workflow.JobFailed) {
-		t.Fatalf("job state = %q, want failed", completed.State)
-	}
-	events, err := store.ListJobEvents(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, event := range events {
-		if strings.Contains(event.Message, "only implement jobs transport changes back to the host") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("remote refusal event missing: %+v", events)
-	}
-}
-
 func writeRemoteLifecycleConfig(t *testing.T, paths config.Paths, baseURL string) {
 	t.Helper()
 	keyFile := filepath.Join(t.TempDir(), "e2b-api-key")

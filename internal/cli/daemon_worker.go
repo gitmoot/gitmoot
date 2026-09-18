@@ -264,6 +264,45 @@ func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) j
 
 var recoverKillPendingAtWorkerStartup sync.Once
 
+// remoteExecutionJobTypes is the allowlist of job types a non-local execution
+// backend will dispatch.
+//
+// IT WAS "implement" ALONE, AND THAT MADE THE BACKEND UNREACHABLE. The original
+// gate (#1633 slice D) justified itself with "only implement jobs transport
+// changes back to the host", which described the CHANGE-SET path. Then #2203
+// removed implementer dispatch: `agent implement` is gone, DelegationActions is
+// ["ask","review"], and pipeline implement stages are refused at enqueue. No
+// surviving path creates a dispatchable implement job, so the allowlist named
+// exactly one type that can no longer occur and the remote backend accepted
+// nothing at all. Measured on 658ab6ef: a review dispatch failed with that
+// refusal before any sandbox was provisioned.
+//
+// REVIEW IS SAFE TO ADD BECAUSE THE TRANSPORT CONCERN IS ENFORCED ELSEWHERE, and
+// three times over rather than here:
+//   - workflow/mailbox.go skips collection entirely unless the job type is
+//     implement, so a review never even reads a change set;
+//   - refreshDaemonJobPayloadForRunner and refreshImplementedPayloadForRetry both
+//     require type implement AND decision "implemented" before touching a host
+//     worktree.
+//
+// So this gate was never the thing preventing a stray host write; it only
+// decided what may DISPATCH. A review transports FINDINGS in its result
+// envelope, which is the ordinary adapter return path and needs no change set.
+//
+// "ask" stays out deliberately. It has no worktree contract and no acceptance
+// defined in #1529, so admitting it would be scope rather than capability.
+var remoteExecutionJobTypes = []string{"implement", "review"}
+
+func remoteExecutionSupportsJobType(jobType string) bool {
+	jobType = strings.TrimSpace(jobType)
+	for _, supported := range remoteExecutionJobTypes {
+		if strings.EqualFold(jobType, supported) {
+			return true
+		}
+	}
+	return false
+}
+
 func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -282,8 +321,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
 		return nil
 	}
-	if execBackend != execbackend.Local && job.Type != "implement" {
-		err := fmt.Errorf("%s jobs are not supported on the %s execution backend; only implement jobs transport changes back to the host", job.Type, execBackend)
+	if execBackend != execbackend.Local && !remoteExecutionSupportsJobType(job.Type) {
+		err := fmt.Errorf("%s jobs are not supported on the %s execution backend; supported types are %s", job.Type, execBackend, strings.Join(remoteExecutionJobTypes, ", "))
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -854,7 +893,30 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			}
 		}
 	}
-	adapter, seatSetup, err := wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
+	// THE HOST READ-ONLY SEAT IS A HOST-BOUNDARY CONTROL, so it does not apply
+	// when the runtime executes off-box. Its Landlock grants restrict what a
+	// review may touch in the HOST filesystem; a remote job never runs on the
+	// host, and its isolation boundary is the execution instance rather than
+	// anything Landlock can express here.
+	//
+	// THE OBSERVED FAILURE CAME VIA THE NIL-FACTORY PATH, which is worth stating
+	// precisely because the provisioned path would have been WORSE. When no
+	// lifecycle factory is configured the adapter here is still
+	// unprovisionedRemoteDeliveryAdapter, which wrapReadOnlyAdapterRunner cannot
+	// type-switch, so the job died with "read-only Landlock sandbox cannot wrap
+	// ... unprovisionedRemoteDeliveryAdapter". On the PROVISIONED path the
+	// lifecycle has already rebuilt the adapter above, so the wrap would have
+	// SUCCEEDED and rewritten every remote command into a host sandbox-exec
+	// invocation - silently breaking delivery instead of refusing. Round 1 review
+	// of #2226 corrected this description.
+	//
+	// The zero readOnlySeatSetup is already the supported "nothing to clean up"
+	// value: wrapReadOnlySandboxAdapter returns exactly that for any agent
+	// without ReadOnlySeat.
+	var seatSetup readOnlySeatSetup
+	if execBackend == execbackend.Local {
+		adapter, seatSetup, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
+	}
 	if len(seatSetup.dropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,

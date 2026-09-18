@@ -21,11 +21,15 @@ local_root = "/var/tmp/gitmoot-local"
 ```
 
 `local` is the default. `remote` provisions E2B for engine-driven shell
-implement jobs; unsupported job types and model runtimes refuse before
+review jobs -- implement remains on the allowlist but #2203 removed every way to
+dispatch one, so `review` is the type that actually reaches the backend;
+unsupported job types and model runtimes refuse before
 provider allocation. For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
-survives Mailbox repair deliveries. An implement job's changes return through
+survives Mailbox repair deliveries. Only an implement job imports changes, and none can be dispatched; a review
+returns its FINDINGS in the result envelope and needs no change set. An
+implement job's changes would return through
 the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
 result observation; host Git commands and the finalizer still run against the
 host worktree, and backend-created commits are refused.
