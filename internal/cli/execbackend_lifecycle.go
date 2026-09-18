@@ -236,6 +236,13 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		if baseBranch == "" {
 			return "", fmt.Errorf("PR #%d has no base branch", payload.PullRequest)
 		}
+		// A queued review resolves its scope from origin/<base>. A stale
+		// remote-tracking ref silently widens that scope to commits already
+		// merged into the base, so refresh it first and fail loudly rather
+		// than hand the sandbox a wrong review subject.
+		if err := git.FetchRemote(ctx, "origin"); err != nil {
+			return "", fmt.Errorf("refresh origin before resolving PR #%d base: %w", payload.PullRequest, err)
+		}
 		base, err = git.MergeBase(ctx, "origin/"+baseBranch, head)
 		if err != nil {
 			return "", fmt.Errorf("resolve merge base of origin/%s and %s: %w", baseBranch, head, err)
