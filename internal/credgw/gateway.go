@@ -411,6 +411,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	response, err := g.client.Do(outbound)
 	if err != nil {
 		http.Error(w, "upstream request failed", http.StatusBadGateway)
+		// The LOCAL placeholder path had the identical silent failure. Round 1
+		// review of #2227 caught it surviving here after the proxy path was fixed:
+		// this is the mechanism every ordinary local sandbox run uses, so leaving
+		// it mute would have kept the common case undiagnosable while curing the
+		// rarer one.
+		g.logUpstreamFailure(r.Method, registered.upstream.Hostname(), registered.jobID, err, registered.credential.Value)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadGateway, registered.jobID)
 		return
 	}
@@ -519,7 +525,7 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		// this the error was discarded entirely, so a 502 was indistinguishable
 		// between DNS, dial, TLS and timeout - the same "refusal with no record"
 		// defect as the silent 401 one layer out.
-		g.logUpstreamFailure(r.Method, registered.upstream.Hostname(), registered.jobID, err)
+		g.logUpstreamFailure(r.Method, registered.upstream.Hostname(), registered.jobID, err, resolved.Value)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadGateway, registered.jobID)
 		return
 	}
@@ -527,7 +533,7 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 	if !responseSafeToStream(response) {
 		http.Error(w, "upstream response failed", http.StatusBadGateway)
 		g.logUpstreamFailure(r.Method, registered.upstream.Hostname(), registered.jobID,
-			errors.New("upstream response was not safe to stream"))
+			errors.New("upstream response was not safe to stream"), resolved.Value)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadGateway, registered.jobID)
 		return
 	}
@@ -1128,12 +1134,22 @@ func streamResponse(w http.ResponseWriter, body io.Reader) {
 // logUpstreamFailure records WHY a forwarded request never produced a response.
 // The credential value is redacted defensively: a transport error can quote the
 // request URL, and a policy may one day carry the secret in a query parameter.
-func (g *Gateway) logUpstreamFailure(method, host, jobID string, cause error) {
+func (g *Gateway) logUpstreamFailure(method, host, jobID string, cause error, secrets ...string) {
 	if g == nil || g.logf == nil || cause == nil {
 		return
 	}
+	// REDACT THROUGH THE SHARED HELPER rather than trusting that a transport
+	// error never quotes the credential. Round 1 review of #2227 rated the
+	// unredacted version as no live leak - credentials go in headers, and
+	// redirects are disabled - but "cannot leak today" is a property of the
+	// current call sites, not of this function. Passing the resolved value makes
+	// it hold regardless of who calls it next.
+	message := cause.Error()
+	for _, secret := range secrets {
+		message = redactCredentialText(message, credentialRedactionPatterns(secret))
+	}
 	g.logf("model gateway upstream failed method=%s upstream_host=%s job_id=%s error=%s",
-		method, host, jobID, cause.Error())
+		method, host, jobID, message)
 }
 
 func (g *Gateway) logRemoteRefusal(method, reason string) {
