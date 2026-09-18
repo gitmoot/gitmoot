@@ -53,6 +53,13 @@ type Mailbox struct {
 	// selects execbackend.ImportChangeSet; the field exists so ordering/failure
 	// tests can put a firing barrier exactly at this mailbox seam.
 	ApplyChangeSet func(ctx context.Context, worktree string, changes execbackend.ChangeSet) error
+	// RecordReviewFindings persists a review job's findings to the #1822 ledger.
+	// Injected because the Mailbox owns the DELIVERY-FAILURE path, where a
+	// partial review is salvaged (#2224), while the writer lives on the Engine
+	// and its normal call site sits AFTER the failed/blocked early return that a
+	// dead delivery never reaches. Nil disables salvage, which is the behaviour
+	// every caller had before this field existed.
+	RecordReviewFindings func(ctx context.Context, jobID string) error
 	// RequireWorkflowPolicy resolves the current policy for a repository at the
 	// enqueue chokepoint. Nil deliberately means feature disabled so existing
 	// direct Mailbox users remain byte-identical.
@@ -1299,7 +1306,23 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// and `report bug` can explain a session that died without an envelope.
 		// Best-effort: diagnostics must never change the failure path.
 		m.storeFailureDiagnostics(ctx, job.ID, &payload, firstDiag)
-		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
+		// #2224: preserve the findings this review had already produced. Same
+		// best-effort contract as the diagnostics above - it must never change the
+		// failure path - and it deliberately leaves the decision "failed", so a
+		// partial can satisfy no merge gate and suppress no re-review.
+		salvaged := m.salvagePartialReviewFindings(ctx, job, &payload)
+		failErr := m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
+		if salvaged && failErr == nil {
+			// STRICTLY AFTER A SUCCESSFUL terminal transition. The ledger writer's
+			// guard that stops a failed review's quoted-only findings becoming merge
+			// obligations is conditioned on the job reading JobFailed, and the writer
+			// re-fetches the job. Calling before fail() left it reading "running",
+			// silently disabling the guard (round 1). Gating on fail's ERROR closes
+			// the remaining race (round 2): fail is a CAS from JobRunning, and
+			// CancelJob or the session reaper can win it, in which case the job never
+			// reaches Failed and the write must not happen.
+			m.recordSalvagedFindingsToLedger(ctx, job.ID)
+		}
 		// #1726: classify a SIGNALLED death beside the failure so the abandoned
 		// population is findable. Recording only; nothing requeues.
 		m.recordDeliverySignalKill(ctx, job.ID, firstErr)

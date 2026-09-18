@@ -138,6 +138,16 @@ func (e Engine) mailbox() Mailbox {
 	mb.OrgPolicy = e.OrgPolicy
 	mb.deferBlocker = e.BlockerDeferrer
 	mb.RuntimeDefaultModel = e.RuntimeDefaultModel
+	// #2224: the Mailbox owns the delivery-failure path, where a dead review's
+	// findings are salvaged. The ledger writer lives here, so hand it over as a
+	// closure rather than duplicating the writer.
+	mb.RecordReviewFindings = func(ctx context.Context, jobID string) error {
+		job, payload, err := e.jobPayload(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		return e.RecordReviewFindingsToLedger(ctx, job, payload)
+	}
 	mb.ReviewModelPool = e.ReviewModelPool
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.routerContextEnabled = e.RouterContextEnabled
