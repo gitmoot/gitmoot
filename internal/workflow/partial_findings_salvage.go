@@ -27,6 +27,34 @@ const FindingsLogEnv = "GITMOOT_FINDINGS_LOG"
 // that already moves a patch out of a sandbox.
 const findingsLogName = ".gitmoot-findings.jsonl"
 
+// FindingsLogName is the log's name RELATIVE to the reviewer's working
+// directory, which is the job worktree. It is exported because the reviewer has
+// to be told where to append, and a relative name is the only form the dispatch
+// layer can state: the worktree is allocated by the worker, long after the brief
+// is composed.
+func FindingsLogName() string { return findingsLogName }
+
+// ReviewFindingsLogBrief is the reviewer-side half of #2224. Without it the
+// salvage has nothing to salvage: no template writes the log, so every partial
+// is still lost.
+//
+// IT ASKS FOR APPENDS AS THE REVIEW PROCEEDS, which is the whole point. A
+// reviewer that writes the log only at the end has written nothing a crash can
+// recover - it would just be a second copy of the envelope it already returns.
+//
+// The wording is deliberately narrow about what the log is FOR. A salvaged
+// partial is not a verdict, satisfies no merge gate, and the reviewer must still
+// return its normal envelope; the log is insurance against dying before it can.
+func ReviewFindingsLogBrief() string {
+	return "\n\nFINDINGS LOG (#2224). As you work, APPEND each finding you are confident about to " +
+		findingsLogName + " in your working directory - one JSON object per line, with at least " +
+		"severity and title, plus file and line when you have them. Append as you go, NOT at the end: " +
+		"the log exists so that findings survive if your run dies before it can return an envelope " +
+		"(a deadline, a cancelled job, a lost sandbox). It does NOT replace your result - still return " +
+		"your normal verdict envelope, which remains the only thing that can satisfy a merge gate. " +
+		"A log recovered from a dead run is recorded as a PARTIAL and approves nothing."
+}
+
 // FindingsLogPath is the absolute path handed to the reviewer and read back on
 // the failure path. An empty worktree yields an empty path, which the salvage
 // treats as "no log" rather than as an error.
