@@ -169,21 +169,65 @@ func (g *Gateway) RemoteURL() string {
 	return g.remoteURL
 }
 
+// remoteRequestRefusalReason names the precondition a remote gateway request
+// failed, or "" when it passed. Kept separate so the reasons are enumerable and
+// testable rather than implied by a compound boolean.
+func remoteRequestRefusalReason(routed bool, r *http.Request) string {
+	switch {
+	case !routed:
+		return "request path is not a proxy route"
+	case r.TLS == nil:
+		return "connection is not TLS"
+	case len(r.TLS.PeerCertificates) == 0:
+		return "client presented no certificate"
+	// A CHAIN IS ACCEPTED, and it has to be. The check here previously demanded
+	// EXACTLY ONE peer certificate, which no real client could satisfy through
+	// the material this gateway itself installs: curl in an E2B sandbox, given
+	// both `cert` and `cacert`, presents the leaf AND the CA, so every remote
+	// request was refused with a bare 401 and no record of why.
+	//
+	// Requiring a bare leaf was never the security property. RequireAndVerify
+	// ClientCert already verifies the chain against the process CA, and the
+	// identity check below pins the sha256 of PeerCertificates[0] - the LEAF,
+	// which TLS guarantees is first - against the exact certificate issued for
+	// this sandbox. Extra chain members change neither of those.
+	default:
+		return ""
+	}
+}
+
 type remoteGatewayHandler struct {
 	gateway   *Gateway
 	authority string
 }
 
 func (h remoteGatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// EVERY REFUSAL MUST SAY WHICH CHECK REFUSED. This branch previously
+	// returned 401 and logged NOTHING, so a sandbox that reached the listener
+	// and was rejected left no record anywhere: the operator saw only the body
+	// "unauthorized" inside the sandbox, with no way to tell a routing mistake
+	// from a missing client certificate from a presented chain.
+	//
+	// Found while bringing up the first real remote review. The reason is coarse
+	// on purpose - it names the failed precondition and never echoes certificate
+	// contents, subject names, or the capability.
 	route, routed := proxyRoute(r.URL.EscapedPath())
-	if !routed || r.TLS == nil || len(r.TLS.PeerCertificates) != 1 {
+	if reason := remoteRequestRefusalReason(routed, r); reason != "" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		h.gateway.logRemoteRefusal(r.Method, reason)
 		return
 	}
 	capability := strings.TrimSpace(r.Header.Get(CapabilityHeader))
 	if !validCapabilitySyntax(capability) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		h.gateway.writeLog(r.Method, "", http.StatusUnauthorized, "")
+		// Distinguish absent from malformed. Both were logged identically as a
+		// bare status=401, which cannot tell a client that never set the header
+		// from one whose value is the wrong shape.
+		if capability == "" {
+			h.gateway.logRemoteRefusal(r.Method, "capability header absent")
+		} else {
+			h.gateway.logRemoteRefusal(r.Method, "capability header malformed")
+		}
 		return
 	}
 	h.gateway.serveProxyRequest(w, r, proxyRequestAccess{
