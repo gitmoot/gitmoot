@@ -507,7 +507,11 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 	}
 	if resp.StatusCode != expectedStatus {
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		refusal := c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		if requestRefused(resp.StatusCode) {
+			refusal = &RequestRefusedError{StatusCode: resp.StatusCode, Err: refusal}
+		}
+		return Unknown, resp.Header, refusal
 	}
 	if output == nil {
 		return Present, resp.Header, nil
@@ -548,6 +552,47 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 	return &clientError{
 		message: workflow.RedactedStderrTail(message, c.apiKey),
 		match:   contextErrorIdentity(cause),
+	}
+}
+
+// RequestRefusedError marks a provider response that is AUTHORITATIVE PROOF
+// NOTHING WAS ALLOCATED: the request was rejected on its own terms, before any
+// sandbox could exist.
+//
+// The distinction is load-bearing for the cost ledger. A transport failure is
+// genuinely ambiguous - the provider may have allocated a sandbox whose response
+// never arrived - so its reservation must stay held until inventory resolves it.
+// A 4xx validation refusal is not ambiguous, and treating it as though it were
+// STRANDS THE RESERVATION: measured on this box, an HTTP 400 ("Timeout cannot be
+// greater than 1 hours") left $1.00 reserved in state "provisioning" holding the
+// only concurrency slot, and with cost_max_concurrent = 1 every subsequent
+// remote job was refused for the four hours until the row's TTL expired.
+//
+// This is the recurring defect in this epic once more: one value standing for
+// two different facts. "Provision returned an error" meant both "maybe
+// allocated" and "definitely did not allocate".
+//
+// 5xx and 429 are deliberately NOT included. A server error may follow a
+// completed allocation, and a rate-limit response can race one; both stay
+// ambiguous and keep the fail-safe hold.
+type RequestRefusedError struct {
+	StatusCode int
+	Err        error
+}
+
+func (e *RequestRefusedError) Error() string { return e.Err.Error() }
+func (e *RequestRefusedError) Unwrap() error { return e.Err }
+
+// requestRefused reports whether a status code proves the provider rejected the
+// request without allocating anything.
+func requestRefused(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired,
+		http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed,
+		http.StatusConflict, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
@@ -91,6 +92,11 @@ type sandboxState struct {
 	hostWorktree string
 	hostBase     string
 	remoteBase   string
+
+	// stopKeepalive ends the TTL refresh loop. Nil when no refresh is running,
+	// which is the case whenever the requested TTL fits inside the provider's
+	// ceiling in one go.
+	stopKeepalive context.CancelFunc
 }
 
 var _ execbackend.ExecutionBackend = (*Backend)(nil)
@@ -123,6 +129,21 @@ func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
 
 func (b *Backend) Name() execbackend.Backend { return execbackend.Remote }
 
+// ProviderMaxTTL is the largest sandbox timeout E2B accepts on create. Asking
+// for more is refused outright: `POST /sandboxes` returns HTTP 400 with
+// {"code":400,"message":"Timeout cannot be greater than 1 hours"}.
+//
+// THIS MADE REMOTE REVIEWS IMPOSSIBLE, not merely awkward. The review class
+// floor (#2191) is three hours, the lifecycle adds a teardown grace, and the sum
+// went to the provider verbatim - so every review was rejected before a sandbox
+// existed. Measured on 658ab6ef with the job-type allowlist lifted.
+const ProviderMaxTTL = time.Hour
+
+// ttlRefreshLead is how long before expiry the keepalive renews. E2B's
+// SetTimeout replaces the TTL measured from the time of the request, so renewing
+// early simply moves the deadline forward; renewing late loses the sandbox.
+const ttlRefreshLead = 10 * time.Minute
+
 func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*execbackend.Instance, error) {
 	if b == nil {
 		return nil, errors.New("remote execution backend is nil")
@@ -153,7 +174,17 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	if token := strings.TrimSpace(scope.DaemonFencingToken); token != "" {
 		metadata[metadataDaemonFencingToken] = token
 	}
-	sandbox, credential, err := b.client.Create(ctx, b.templateID, scope.TTL, e2b.CreateOptions{Metadata: metadata})
+	// Clamp to what the provider will accept, and remember whether the job asked
+	// for longer. A clamp ALONE would be a silent downgrade: a three-hour review
+	// would die at one hour with no explanation, which is worse than the refusal
+	// it replaces. The keepalive below is what makes the clamp honest.
+	createTTL := scope.TTL
+	needsRefresh := false
+	if createTTL > ProviderMaxTTL {
+		createTTL = ProviderMaxTTL
+		needsRefresh = true
+	}
+	sandbox, credential, err := b.client.Create(ctx, b.templateID, createTTL, e2b.CreateOptions{Metadata: metadata})
 	if err != nil {
 		return nil, fmt.Errorf("provision remote execution sandbox: %w", err)
 	}
@@ -171,7 +202,77 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	b.mu.Lock()
 	b.sandboxes[sandbox.ID] = state
 	b.mu.Unlock()
+	if needsRefresh {
+		b.startTTLKeepalive(state, scope.TTL)
+	}
 	return state.instance(), nil
+}
+
+// startTTLKeepalive renews a sandbox's provider TTL for as long as the job's
+// requested lifetime exceeds the provider's per-request ceiling.
+//
+// It is DELIBERATELY BOUNDED by the requested TTL rather than running until the
+// sandbox is destroyed. An unbounded keepalive turns any lost owner into an
+// immortal billed sandbox - the failure mode #1539's reaper exists to prevent -
+// so the loop stops on its own at the deadline the caller asked for, and the
+// provider's own timeout then collects the sandbox even if this process dies.
+//
+// It uses context.WithoutCancel of the background lifetime rather than the
+// provision context: the caller's context ends when Provision returns, and a
+// refresher tied to it would stop immediately.
+func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration) {
+	if state == nil || requested <= ProviderMaxTTL {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	state.mu.Lock()
+	state.stopKeepalive = cancel
+	sandboxID := state.sandbox.ID
+	state.mu.Unlock()
+
+	deadline := time.Now().Add(requested)
+	interval := ProviderMaxTTL - ttlRefreshLead
+	if interval <= 0 {
+		interval = ProviderMaxTTL / 2
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return
+				}
+				extend := remaining
+				if extend > ProviderMaxTTL {
+					extend = ProviderMaxTTL
+				}
+				// Best-effort by design: a failed renewal must not kill the job
+				// early or panic a background goroutine. The sandbox keeps the TTL
+				// it already has, and the next tick tries again while time remains.
+				_, _ = b.client.SetTimeout(ctx, sandboxID, extend)
+			}
+		}
+	}()
+}
+
+// stopTTLKeepalive ends any refresh loop for this sandbox. Safe to call for a
+// sandbox that never had one.
+func (b *Backend) stopTTLKeepalive(state *sandboxState) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	stop := state.stopKeepalive
+	state.stopKeepalive = nil
+	state.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 // Attach reuses only credentials retained by this process. Durable reattach is
@@ -395,11 +496,14 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 		return nil
 	}
 	b.mu.Lock()
-	_, tracked := b.sandboxes[instance.ID]
+	tracked_state, tracked := b.sandboxes[instance.ID]
 	b.mu.Unlock()
 	if !tracked {
 		return nil
 	}
+	// Stop renewing BEFORE deleting, so a tick cannot race the delete and hand a
+	// fresh hour to a sandbox that is being torn down.
+	b.stopTTLKeepalive(tracked_state)
 	state, err := b.client.Delete(ctx, instance.ID)
 	if err != nil {
 		return fmt.Errorf("destroy remote execution sandbox %q: %w", instance.ID, err)

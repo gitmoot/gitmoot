@@ -11,6 +11,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 )
 
 const e2bAttemptProvider = "e2b"
@@ -104,9 +105,26 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 
 	instance, err := b.inner.Provision(ctx, scope)
 	if err != nil {
-		// A transport failure is not proof that the provider did not allocate.
-		// Keep the metadata-keyed row recoverable until a complete inventory can
-		// either attach its sandbox ID or mark it orphaned.
+		// A PROVIDER REFUSAL IS PROOF OF NON-ALLOCATION, so release the
+		// reservation immediately. Holding it strands the money and the
+		// concurrency slot: measured here, an HTTP 400 left $1.00 reserved in
+		// "provisioning" and, with cost_max_concurrent = 1, refused every later
+		// remote job for the four hours until the row's TTL expired. One bad
+		// request should not take the backend offline for an afternoon.
+		//
+		// Only for errors that PROVE nothing was created - see
+		// e2b.RequestRefusedError, which deliberately excludes 5xx and 429.
+		var refused *e2b.RequestRefusedError
+		if errors.As(err, &refused) {
+			if _, failErr := b.store.MarkExecBackendAttemptFailed(context.WithoutCancel(ctx), key); failErr != nil {
+				return instance, errors.Join(err, fmt.Errorf("release refused execution backend reservation: %w", failErr))
+			}
+			return instance, err
+		}
+		// Anything else is genuinely ambiguous: a transport failure is not proof
+		// that the provider did not allocate. Keep the metadata-keyed row
+		// recoverable until a complete inventory can either attach its sandbox ID
+		// or mark it orphaned.
 		return instance, err
 	}
 	if instance == nil || strings.TrimSpace(instance.ID) == "" {
