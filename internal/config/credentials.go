@@ -23,6 +23,21 @@ type CredentialsConfig struct {
 	GitHub                 string
 	ModelGateway           bool
 	ModelGatewayAllowHosts []string
+	// ModelGatewayKey optionally names a KEYCHAIN key, in proxied mode, that
+	// supplies the upstream and credential for remote model calls. Empty keeps
+	// the Anthropic default sourced from runtime-auth.env.
+	//
+	// IT NAMES A KEY RATHER THAN RESTATING ITS SETTINGS. `gitmoot key configure`
+	// already validates and stores the upstream, auth kind and header, and
+	// `gitmoot key list` already shows them, so duplicating those three values in
+	// config would create a second source of truth that can disagree with the one
+	// the operator actually edits.
+	//
+	// It exists because the credential decides the provider. A Claude Code
+	// subscription token authenticates against api.anthropic.com and still cannot
+	// address any /v1/messages model, so a box whose only working model credential
+	// belongs to another provider could not use the model gateway at all.
+	ModelGatewayKey string
 	// KeychainPath optionally overrides the base-home-derived
 	// ~/.config/gitmoot/keychain.env path. Empty selects that default.
 	KeychainPath string
@@ -93,6 +108,12 @@ func LoadCredentialsConfig(paths Paths) (CredentialsConfig, error) {
 				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway_allow_hosts: %w", err)
 			}
 			cfg.ModelGatewayAllowHosts = parsed
+		case "model_gateway_key":
+			parsed, err := parseConfigString(value)
+			if err != nil {
+				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway_key: %w", err)
+			}
+			cfg.ModelGatewayKey = strings.TrimSpace(parsed)
 		case "keychain_path":
 			parsed, err := parseConfigString(value)
 			if err != nil {
