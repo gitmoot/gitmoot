@@ -1311,14 +1311,16 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// failure path - and it deliberately leaves the decision "failed", so a
 		// partial can satisfy no merge gate and suppress no re-review.
 		salvaged := m.salvagePartialReviewFindings(ctx, job, &payload)
-		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
-		if salvaged {
-			// STRICTLY AFTER the terminal transition. The ledger writer's guard that
-			// stops a failed review's quoted-only findings becoming merge obligations
-			// is conditioned on the job reading JobFailed, and the writer re-fetches
-			// the job. Calling before fail() left it reading "running", silently
-			// disabling the guard. Round 1 review of #2225 found that; see
-			// recordSalvagedFindingsToLedger.
+		failErr := m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
+		if salvaged && failErr == nil {
+			// STRICTLY AFTER A SUCCESSFUL terminal transition. The ledger writer's
+			// guard that stops a failed review's quoted-only findings becoming merge
+			// obligations is conditioned on the job reading JobFailed, and the writer
+			// re-fetches the job. Calling before fail() left it reading "running",
+			// silently disabling the guard (round 1). Gating on fail's ERROR closes
+			// the remaining race (round 2): fail is a CAS from JobRunning, and
+			// CancelJob or the session reaper can win it, in which case the job never
+			// reaches Failed and the write must not happen.
 			m.recordSalvagedFindingsToLedger(ctx, job.ID)
 		}
 		// #1726: classify a SIGNALLED death beside the failure so the abandoned

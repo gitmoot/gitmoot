@@ -190,6 +190,27 @@ func (m Mailbox) recordSalvagedFindingsToLedger(ctx context.Context, jobID strin
 	}
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
+	// RE-CHECK THE STATE HERE RATHER THAN TRUSTING THE CALLER. The caller gates on
+	// fail() returning nil, but that is a caller obligation and this function is
+	// the thing that must not write. Round 2 review of #2225 showed the race: fail
+	// is a CAS from JobRunning with no lease, and CancelJob or the session reaper
+	// can transition a running job away with zero coordination, so a lost race
+	// would let the write fire while the writer observes a non-failed state - the
+	// quoted-only bypass again, probabilistic instead of deterministic.
+	//
+	// One extra read on an already-failing path is a cheap price for making the
+	// invariant local.
+	job, err := m.store.GetJob(writeCtx, jobID)
+	if err != nil {
+		_ = m.addEvent(ctx, jobID, "review_findings_salvage_failed",
+			fmt.Sprintf("findings were salvaged onto the payload but the job could not be re-read before the ledger write: %v", err))
+		return
+	}
+	if job.State != string(JobFailed) {
+		_ = m.addEvent(ctx, jobID, "review_findings_salvage_failed",
+			fmt.Sprintf("findings were salvaged onto the payload but the ledger write was skipped: job is %q, not %q, so the failed-review guard would not apply", job.State, string(JobFailed)))
+		return
+	}
 	if err := m.RecordReviewFindings(writeCtx, jobID); err != nil {
 		_ = m.addEvent(ctx, jobID, "review_findings_salvage_failed",
 			fmt.Sprintf("findings were salvaged onto the payload but the ledger write failed: %v", err))

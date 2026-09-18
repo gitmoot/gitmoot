@@ -230,3 +230,52 @@ func TestSalvageSkipsTheLedgerWhenNothingWasSalvaged(t *testing.T) {
 		t.Fatalf("ledger writer invocations = %d, want 0: nothing was salvaged", calls)
 	}
 }
+
+// TestSalvageSkipsTheLedgerWhenTheJobIsNotFailed is the round-2 regression for
+// the race the second review found.
+//
+// m.fail is a CAS from JobRunning with no lease, and CancelJob or the session
+// reaper can win it. If the ledger write proceeded anyway, the writer would
+// observe a non-failed job and its quoted-only guard would not apply — the same
+// bypass round 1 closed, reappearing probabilistically.
+//
+// The guarantee is made LOCAL: recordSalvagedFindingsToLedger re-reads the job
+// itself and refuses to write unless it is terminally failed.
+//
+// MUTATION: remove the state re-check in recordSalvagedFindingsToLedger and this
+// goes red with a ledger call for a cancelled job.
+func TestSalvageSkipsTheLedgerWhenTheJobIsNotFailed(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	calls := 0
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox.RecordReviewFindings = func(context.Context, string) error { calls++; return nil }
+
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "job-raced", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot",
+		PullRequest: 11, HeadSHA: strings.Repeat("f", 40), WorktreePath: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	// The job is queued, never running and never failed: exactly what the writer
+	// must refuse to act on.
+	mailbox.recordSalvagedFindingsToLedger(ctx, "job-raced")
+
+	if calls != 0 {
+		t.Fatalf("ledger writer invocations = %d, want 0: the job is not terminally failed, so the quoted-only guard would not apply", calls)
+	}
+	events, err := store.ListJobEvents(ctx, "job-raced")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	var skipped bool
+	for _, event := range events {
+		if event.Kind == "review_findings_salvage_failed" && strings.Contains(event.Message, "ledger write was skipped") {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Fatal("no event recorded the skipped ledger write: a silent skip is the defect this feature keeps reproducing")
+	}
+}
