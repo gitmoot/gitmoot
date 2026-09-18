@@ -144,6 +144,14 @@ const ProviderMaxTTL = time.Hour
 // early simply moves the deadline forward; renewing late loses the sandbox.
 const ttlRefreshLead = 10 * time.Minute
 
+// ttlRetryInitialBackoff and ttlRetryMaxBackoff bound the renewal retries inside
+// that lead. Ten minutes of exponential backoff from 5s gives roughly a dozen
+// attempts, which covers a transient provider blip without hammering it.
+const (
+	ttlRetryInitialBackoff = 5 * time.Second
+	ttlRetryMaxBackoff     = 2 * time.Minute
+)
+
 func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*execbackend.Instance, error) {
 	if b == nil {
 		return nil, errors.New("remote execution backend is nil")
@@ -217,9 +225,9 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 // so the loop stops on its own at the deadline the caller asked for, and the
 // provider's own timeout then collects the sandbox even if this process dies.
 //
-// It uses context.WithoutCancel of the background lifetime rather than the
-// provision context: the caller's context ends when Provision returns, and a
-// refresher tied to it would stop immediately.
+// It runs on context.Background rather than the provision context: the caller's
+// context ends when Provision returns, and a refresher tied to it would stop
+// immediately. stopTTLKeepalive is the only thing that ends it early.
 func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration) {
 	if state == nil || requested <= ProviderMaxTTL {
 		return
@@ -243,21 +251,68 @@ func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				remaining := time.Until(deadline)
-				if remaining <= 0 {
+				if time.Until(deadline) <= 0 {
 					return
 				}
-				extend := remaining
-				if extend > ProviderMaxTTL {
-					extend = ProviderMaxTTL
-				}
-				// Best-effort by design: a failed renewal must not kill the job
-				// early or panic a background goroutine. The sandbox keeps the TTL
-				// it already has, and the next tick tries again while time remains.
-				_, _ = b.client.SetTimeout(ctx, sandboxID, extend)
+				b.renewWithinLead(ctx, sandboxID, deadline)
 			}
 		}
 	}()
+}
+
+// renewWithinLead renews the provider TTL, RETRYING UNTIL THE LEAD IS SPENT.
+//
+// THE RETRY IS THE WHOLE VALUE OF THE LEAD. The first version renewed once per
+// tick and ignored the error, with a comment claiming the next tick would try
+// again "while time remains" - which was false. Ticks are 50 minutes apart and
+// the sandbox expires 60 minutes after the last successful renewal, so a single
+// transient failure left the next attempt 40 minutes too late: the job died at
+// ~1h regardless of its requested TTL. That is precisely the silent downgrade
+// the keepalive exists to prevent, reintroduced by the keepalive itself. Round 1
+// review of #2226 found it.
+//
+// Renewal stays BEST-EFFORT: exhausting the lead never kills the job early or
+// panics the goroutine, it just leaves the sandbox on the TTL it already has.
+func (b *Backend) renewWithinLead(ctx context.Context, sandboxID string, deadline time.Time) {
+	b.renewWithinLeadUsing(ctx, sandboxID, deadline, func(ctx context.Context, id string, ttl time.Duration) error {
+		_, err := b.client.SetTimeout(ctx, id, ttl)
+		return err
+	})
+}
+
+// renewWithinLeadUsing is renewWithinLead with the provider call injected. The
+// seam is a PARAMETER rather than a field on Backend so production has exactly
+// one path and no test-only state can be left set by accident.
+func (b *Backend) renewWithinLeadUsing(ctx context.Context, sandboxID string, deadline time.Time, setTimeout func(context.Context, string, time.Duration) error) {
+	leadExpiry := time.Now().Add(ttlRefreshLead)
+	backoff := ttlRetryInitialBackoff
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		extend := remaining
+		if extend > ProviderMaxTTL {
+			extend = ProviderMaxTTL
+		}
+		if err := setTimeout(ctx, sandboxID, extend); err == nil {
+			return
+		}
+		// Stop once a further attempt could not land before the CURRENT provider
+		// TTL lapses. Retrying past that point cannot save the sandbox and only
+		// burns provider calls.
+		if time.Now().Add(backoff).After(leadExpiry) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > ttlRetryMaxBackoff {
+			backoff = ttlRetryMaxBackoff
+		}
+	}
 }
 
 // stopTTLKeepalive ends any refresh loop for this sandbox. Safe to call for a

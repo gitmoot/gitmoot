@@ -897,12 +897,18 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// when the runtime executes off-box. Its Landlock grants restrict what a
 	// review may touch in the HOST filesystem; a remote job never runs on the
 	// host, its isolation boundary is the execution instance, and the adapter
-	// held here is still the unprovisioned placeholder that the lifecycle
-	// replaces after Provision. Wrapping that placeholder is meaningless, and
-	// wrapReadOnlyAdapterRunner cannot type-switch it, so every remote review
-	// died with "read-only Landlock sandbox cannot wrap ...
-	// unprovisionedRemoteDeliveryAdapter" - the second gate behind the job-type
-	// allowlist, and the reason lifting that allowlist alone changed nothing.
+	// runs on the host at all.
+	//
+	// THE OBSERVED FAILURE CAME VIA THE NIL-FACTORY PATH, which is worth stating
+	// precisely because the provisioned path would have been WORSE. When no
+	// lifecycle factory is configured the adapter here is still
+	// unprovisionedRemoteDeliveryAdapter, which wrapReadOnlyAdapterRunner cannot
+	// type-switch, so the job died with "read-only Landlock sandbox cannot wrap
+	// ... unprovisionedRemoteDeliveryAdapter". On the PROVISIONED path the
+	// lifecycle has already rebuilt the adapter above, so the wrap would have
+	// SUCCEEDED and rewritten every remote command into a host sandbox-exec
+	// invocation - silently breaking delivery instead of refusing. Round 1 review
+	// of #2226 corrected this description.
 	//
 	// The zero readOnlySeatSetup is already the supported "nothing to clean up"
 	// value: wrapReadOnlySandboxAdapter returns exactly that for any agent

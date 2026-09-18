@@ -509,7 +509,7 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 	if resp.StatusCode != expectedStatus {
 		refusal := c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
 		if requestRefused(resp.StatusCode) {
-			refusal = &RequestRefusedError{StatusCode: resp.StatusCode, Err: refusal}
+			refusal = &RequestRefusedError{StatusCode: resp.StatusCode, Operation: operationForRequest(method, path), Err: refusal}
 		}
 		return Unknown, resp.Header, refusal
 	}
@@ -577,18 +577,63 @@ func (c *Client) errorf(cause error, format string, args ...any) error {
 // ambiguous and keep the fail-safe hold.
 type RequestRefusedError struct {
 	StatusCode int
-	Err        error
+	// Operation names the provider call that was refused. The ledger releases a
+	// reservation only for OperationCreate: a refusal from a cleanup Delete or a
+	// status Get says nothing about whether the CREATE allocated anything.
+	Operation string
+	Err       error
 }
+
+// Provider operations that can carry a refusal. Only OperationCreate is proof of
+// non-allocation for the cost ledger.
+const (
+	OperationCreate     = "create"
+	OperationGet        = "get"
+	OperationDelete     = "delete"
+	OperationSetTimeout = "set_timeout"
+	OperationMetrics    = "metrics"
+	OperationOther      = "other"
+)
 
 func (e *RequestRefusedError) Error() string { return e.Err.Error() }
 func (e *RequestRefusedError) Unwrap() error { return e.Err }
 
 // requestRefused reports whether a status code proves the provider rejected the
 // request without allocating anything.
+// operationForRequest classifies a provider call so the ledger can tell a
+// refused CREATE from a refused cleanup.
+func operationForRequest(method, path string) string {
+	trimmed := strings.TrimSuffix(path, "/")
+	switch {
+	case method == http.MethodPost && trimmed == "/sandboxes":
+		return OperationCreate
+	case method == http.MethodDelete:
+		return OperationDelete
+	case method == http.MethodGet && strings.Contains(trimmed, "/metrics"):
+		return OperationMetrics
+	case method == http.MethodGet:
+		return OperationGet
+	case method == http.MethodPost && strings.Contains(trimmed, "/timeout"):
+		return OperationSetTimeout
+	default:
+		return OperationOther
+	}
+}
+
 func requestRefused(status int) bool {
 	switch status {
+	// 404 AND 410 ARE DELIBERATELY ABSENT. doJSONState classifies them as
+	// INCONCLUSIVE before this check is reached, so listing them here was dead
+	// code that also made a false claim: a create-time 404 (an unknown template,
+	// say) still strands its reservation exactly like the 400 this fix cures.
+	// Round 1 review of #2226 caught it by execution.
+	//
+	// Dropping them is the right half of the fix rather than forcing them
+	// through, because a per-id 404 genuinely means two things on this provider -
+	// "never existed" and "already gone" - and the epic already treats that
+	// ambiguity as unresolvable without a successful list in the same pass.
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired,
-		http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed,
+		http.StatusForbidden, http.StatusMethodNotAllowed,
 		http.StatusConflict, http.StatusUnprocessableEntity:
 		return true
 	default:

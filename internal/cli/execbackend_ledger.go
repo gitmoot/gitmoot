@@ -114,8 +114,14 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 		//
 		// Only for errors that PROVE nothing was created - see
 		// e2b.RequestRefusedError, which deliberately excludes 5xx and 429.
+		// ONLY A CREATE REFUSAL PROVES THE CREATE ALLOCATED NOTHING. Provision's
+		// envd-failure path deletes the sandbox it just made, so a refusal-class
+		// error from that CLEANUP Delete would otherwise release the reservation
+		// while the sandbox may still exist and bill - the double-run hazard, let
+		// in through the very mechanism added to stop a leak. Round 1 review of
+		// #2226 found this shape.
 		var refused *e2b.RequestRefusedError
-		if errors.As(err, &refused) {
+		if errors.As(err, &refused) && refused.Operation == e2b.OperationCreate {
 			if _, failErr := b.store.MarkExecBackendAttemptFailed(context.WithoutCancel(ctx), key); failErr != nil {
 				return instance, errors.Join(err, fmt.Errorf("release refused execution backend reservation: %w", failErr))
 			}
