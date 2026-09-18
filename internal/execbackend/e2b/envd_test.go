@@ -454,8 +454,14 @@ func TestEnvdCallsAreTimeoutBounded(t *testing.T) {
 	}))
 	defer server.Close()
 	envd, err := NewEnvd(Sandbox{ID: "sbx-timeout"}, EnvdCredential{token: testEnvdToken}, EnvdOptions{
-		HTTPClient:       server.Client(),
-		RequestTimeout:   20 * time.Millisecond,
+		HTTPClient:     server.Client(),
+		RequestTimeout: 20 * time.Millisecond,
+		// The upload has its own knob now (see DefaultUploadTimeout): a bulk
+		// transfer cannot share a control-plane deadline without making real
+		// repositories unsyncable. This test asserts every call is BOUNDED, not
+		// which knob bounds it, so it sets both rather than relying on the old
+		// coupling.
+		UploadTimeout:    20 * time.Millisecond,
 		EndpointResolver: func(string, int) string { return server.URL },
 	})
 	if err != nil {

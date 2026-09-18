@@ -32,8 +32,12 @@ const (
 // EnvdOptions configures sandbox envd calls. Zero RequestTimeout selects the
 // bounded control-plane default. EndpointResolver is an offline-test seam.
 type EnvdOptions struct {
-	HTTPClient       *http.Client
-	RequestTimeout   time.Duration
+	HTTPClient     *http.Client
+	RequestTimeout time.Duration
+	// UploadTimeout bounds bulk file uploads only. Zero selects
+	// DefaultUploadTimeout; it is deliberately separate from RequestTimeout so a
+	// tight control-plane deadline cannot truncate a workspace transfer.
+	UploadTimeout    time.Duration
 	EndpointResolver func(sandboxID string, port int) string
 
 	// OnUnknownEndEventFields, when set, is called once when a decoded process
@@ -52,6 +56,7 @@ type Envd struct {
 	credential              EnvdCredential
 	httpClient              *http.Client
 	requestTimeout          time.Duration
+	uploadTimeout           time.Duration
 	onUnknownEndEventFields func(fields []string)
 	resolveEndpoint         func(string, int) string
 }
@@ -65,6 +70,10 @@ func NewEnvd(sandbox Sandbox, credential EnvdCredential, options EnvdOptions) (*
 	}
 	if strings.TrimSpace(credential.token) == "" {
 		return nil, errors.New("E2B envd credential is required")
+	}
+	uploadTimeout := options.UploadTimeout
+	if uploadTimeout <= 0 {
+		uploadTimeout = DefaultUploadTimeout
 	}
 	timeout := options.RequestTimeout
 	if timeout == 0 {
@@ -99,6 +108,7 @@ func NewEnvd(sandbox Sandbox, credential EnvdCredential, options EnvdOptions) (*
 		credential:      credential,
 		httpClient:      &httpClientCopy,
 		requestTimeout:  timeout,
+		uploadTimeout:   uploadTimeout,
 		resolveEndpoint: resolver,
 
 		onUnknownEndEventFields: options.OnUnknownEndEventFields,
@@ -275,7 +285,8 @@ func (e *Envd) Upload(ctx context.Context, path string, reader io.Reader) error 
 	if err != nil {
 		return err
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, e.requestTimeout)
+	// The UPLOAD deadline, not the control-plane one. See DefaultUploadTimeout.
+	requestCtx, cancel := context.WithTimeout(ctx, e.uploadTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, reader)
 	if err != nil {
