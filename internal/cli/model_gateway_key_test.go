@@ -2,11 +2,26 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
+
+// writeModelGatewayKeychainFile writes the keychain env file the resolver reads,
+// at the mode the loader requires.
+func writeModelGatewayKeychainFile(t *testing.T, home, content string) {
+	t.Helper()
+	path := filepath.Join(home, ".config", "gitmoot", "keychain.env")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(keychain) returned error: %v", err)
+	}
+}
 
 // seedModelGatewayKey registers a keychain key in the given mode and, when an
 // upstream is supplied, configures its proxy settings the way
@@ -117,5 +132,53 @@ func TestModelGatewayResolverFailsClosedOnARevokedKey(t *testing.T) {
 	}
 	if _, err := resolver(ctx); err == nil {
 		t.Fatal("resolver returned a credential for a key that has been removed from the keychain")
+	}
+}
+
+// TestModelGatewayResolverReturnsTheKeychainCredential is the round-2 gap: every
+// earlier test failed inside the DB lookup, one step BEFORE the resolver reads
+// the keychain file — so the code that actually produces the credential
+// (pipeline.LoadValidatedKeychainFile and the ResolvedCredential it builds) was
+// exercised in neither direction.
+//
+// This drives the real file read and asserts the whole shape the gateway
+// forwards with: the secret from the file, and the upstream and auth taken FROM
+// THE KEY rather than from config.
+func TestModelGatewayResolverReturnsTheKeychainCredential(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	seedModelGatewayKey(t, store, "GATEWAY_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
+	writeModelGatewayKeychainFile(t, home, "GATEWAY_KEY=super-secret-value\n")
+
+	worker := jobWorker{Store: store, ConfigHome: home}
+	resolved, err := worker.keychainModelGatewayResolver("GATEWAY_KEY")(ctx)
+	if err != nil {
+		t.Fatalf("resolver returned error: %v", err)
+	}
+	if resolved.Value != "super-secret-value" {
+		t.Fatalf("Value = %q, want the secret from the keychain file", resolved.Value)
+	}
+	if resolved.Upstream != "https://api.example.com/v1" {
+		t.Fatalf("Upstream = %q, want the key's configured upstream", resolved.Upstream)
+	}
+	if string(resolved.AuthKind) != db.KeychainProxyAuthBearer {
+		t.Fatalf("AuthKind = %q, want %q", resolved.AuthKind, db.KeychainProxyAuthBearer)
+	}
+}
+
+// TestModelGatewayResolverFailsClosedWhenTheFileLacksTheKey pins the other side
+// of that same file read. A key registered in the database but absent from the
+// keychain file must refuse rather than forward an empty credential, which the
+// upstream would reject as an anonymous request.
+func TestModelGatewayResolverFailsClosedWhenTheFileLacksTheKey(t *testing.T) {
+	ctx := context.Background()
+	home, _, store := heartbeatLoopE2EHome(t)
+	seedModelGatewayKey(t, store, "ABSENT_VALUE_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
+	seedModelGatewayKey(t, store, "OTHER_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
+	writeModelGatewayKeychainFile(t, home, "OTHER_KEY=some-other-value\n")
+
+	worker := jobWorker{Store: store, ConfigHome: home}
+	if _, err := worker.keychainModelGatewayResolver("ABSENT_VALUE_KEY")(ctx); err == nil {
+		t.Fatal("resolver succeeded for a key with no value in the keychain file")
 	}
 }
