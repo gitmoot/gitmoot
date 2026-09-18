@@ -267,6 +267,38 @@ func TestRemoteSyncInAppliesHostChanges(t *testing.T) {
 	}
 }
 
+func TestRemoteSyncInProjectsCommittedReviewDiff(t *testing.T) {
+	source := testSourceRepo(t)
+	testGit(t, source, "add", "-A")
+	testGit(t, source, "commit", "-q", "-m", "review base")
+	diffBase := strings.TrimSpace(testGit(t, source, "rev-parse", "HEAD"))
+	testWriteFile(t, source, "input.txt", []byte("reviewed change\n"), 0o644)
+	testWriteFile(t, source, "review-new.txt", []byte("new review file\n"), 0o644)
+	testGit(t, source, "add", "-A")
+	testGit(t, source, "commit", "-q", "-m", "review head")
+
+	harness := newProviderHarness(t)
+	backend := harness.backend(t)
+	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "review-job", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.SyncIn(context.Background(), instance, execbackend.Materials{
+		SourceWorktree: source,
+		DiffBaseHEAD:   diffBase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	changed := strings.Fields(testGit(t, harness.workspace, "diff", "--name-only", "HEAD", "--"))
+	if want := []string{"input.txt", "review-new.txt"}; !reflect.DeepEqual(changed, want) {
+		t.Fatalf("sandbox review diff files = %v, want %v", changed, want)
+	}
+	if _, err := backend.Collect(context.Background(), instance); err == nil || !strings.Contains(err.Error(), "projected review diff") {
+		t.Fatalf("Collect projected review workspace error = %v, want refusal", err)
+	}
+}
+
 // GITMOOT-IMPL: kills MG, removal of the sandbox-created commit guard.
 func TestRemoteCollectRefusesSandboxCreatedCommit(t *testing.T) {
 	harness := newProviderHarness(t)

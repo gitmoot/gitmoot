@@ -96,6 +96,63 @@ func (entry *ChangeManifestEntry) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// BuildChangeSetFromBase captures source's current tree as changes against an
+// exact ancestor rather than only against sourceHead. The source HEAD remains
+// fixed and any existing uncommitted changes are included.
+func BuildChangeSetFromBase(ctx context.Context, source, sourceHead, baseHEAD string) (ChangeSet, error) {
+	sourceHead = strings.TrimSpace(sourceHead)
+	baseHEAD = strings.TrimSpace(baseHEAD)
+	if sourceHead == "" {
+		return ChangeSet{}, errors.New("changeset source HEAD is required")
+	}
+	if baseHEAD == "" {
+		return ChangeSet{}, errors.New("changeset diff base HEAD is required")
+	}
+	current, err := BuildChangeSet(ctx, source, sourceHead)
+	if err != nil {
+		return ChangeSet{}, err
+	}
+	if baseHEAD == sourceHead {
+		return current, nil
+	}
+
+	var projectionPatch []byte
+	if err := StageAt(ctx, source, sourceHead, func(stage string) error {
+		if len(current.Patch) > 0 || len(current.Manifest) > 0 {
+			if err := ImportChangeSet(ctx, stage, current); err != nil {
+				return fmt.Errorf("materialize source changes: %w", err)
+			}
+		}
+		if _, err := gitOutput(ctx, stage, "add", "-A"); err != nil {
+			return fmt.Errorf("index projected source tree: %w", err)
+		}
+		projectionPatch, err = gitBytes(ctx, stage, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-renames", "--cached", baseHEAD, "--")
+		if err != nil {
+			return fmt.Errorf("capture projected source tree: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return ChangeSet{}, err
+	}
+
+	var projected ChangeSet
+	if err := StageAt(ctx, source, baseHEAD, func(stage string) error {
+		if len(projectionPatch) > 0 {
+			cmd := exec.CommandContext(ctx, "git", "-C", stage, "apply", "--binary", "--whitespace=nowarn", "-")
+			cmd.Stdin = bytes.NewReader(projectionPatch)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("apply projected source tree: %w: %s", err, strings.TrimSpace(string(output)))
+			}
+		}
+		var err error
+		projected, err = BuildChangeSet(ctx, stage, baseHEAD)
+		return err
+	}); err != nil {
+		return ChangeSet{}, err
+	}
+	return projected, nil
+}
+
 // BuildChangeSet captures uncommitted sandbox changes. expectedBase is supplied
 // by the host-side provision record; requiring sandbox HEAD to remain there is
 // the v1 prohibition on sandbox-created commits.
