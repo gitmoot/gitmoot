@@ -213,3 +213,51 @@ egress boundary. These two limits are deliberate:
 Codex/Kimi custody, MITM CA support, corporate proxy/`NO_PROXY` interoperability,
 Landlock read restrictions, and hard egress enforcement remain P3. SSH keys,
 SSH agents, Git credential helpers, and direct network access are untouched.
+
+### Choosing the model-gateway provider
+
+`[credentials].model_gateway` defaults to Anthropic, reading the credential from
+`runtime-auth.env`. That file is deliberately Claude-only, so a box whose working
+model credential belongs to another provider cannot use the gateway at all — and
+a Claude Code **subscription** token is a real instance of this: it authenticates
+against `api.anthropic.com` and still cannot address any `/v1/messages` model.
+
+`model_gateway_key` names a **proxied keychain key** that supplies the upstream
+and the credential instead:
+
+```toml
+[credentials]
+model_gateway = true
+model_gateway_allow_hosts = ["127.0.0.1"]
+model_gateway_key = "OMP_AUTH_GATEWAY"
+model_gateway_allow_loopback_upstream = true
+```
+
+```
+gitmoot key add OMP_AUTH_GATEWAY --mode proxied
+gitmoot key configure OMP_AUTH_GATEWAY --upstream https://api.example.com --auth bearer
+```
+
+Config names the key; the KEY owns its upstream, auth kind and header. There is
+no second copy of those settings to drift, and `gitmoot key list` shows them.
+
+The key is resolved twice on purpose: at preflight, so a wrong mode or an
+unconfigured key refuses **before** a billable sandbox exists, and again on every
+request, so a revoked or reconfigured key stops working immediately rather than
+at the next daemon restart.
+
+**Scope, stated plainly:** the gateway credential is resolved by NAME, not
+through the keychain's per-consumer grants. It is daemon-wide configuration, so
+any remote job on this daemon can reach the upstream through the gateway. That
+matches the pre-existing `runtime-auth.env` path, which was also daemon-global,
+but it means a grant to one agent is not a restriction here. The value itself
+never enters a sandbox: the sandbox receives only an mTLS client identity and a
+placeholder bearer.
+
+`model_gateway_allow_loopback_upstream` permits a plaintext `http://` upstream
+when, and only when, its host is genuinely loopback — gitmoot still refuses any
+other host. It exists for a local credential broker such as `omp auth-gateway`,
+where the chain is sandbox → gitmoot over public mTLS → broker over `127.0.0.1`.
+The plaintext hop never leaves the host. Pair it with
+`gitmoot key configure --allow-loopback`, which applies the same rule when the
+key is registered. Both default off.

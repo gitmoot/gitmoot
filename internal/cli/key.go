@@ -287,6 +287,17 @@ func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
 	jsonOut := fs.Bool("json", false, "print JSON")
 	upstream := fs.String("upstream", "", "fixed HTTPS upstream origin and base path")
 	auth := fs.String("auth", "", "credential placement: bearer or header:<HeaderName>")
+	// A LOOPBACK UPSTREAM IS A DIFFERENT RISK FROM A REMOTE PLAINTEXT ONE, which
+	// the blanket HTTPS rule could not express. The real case is a local
+	// credential broker such as `omp auth-gateway`: it holds the subscription
+	// accounts and speaks each provider's login protocol, and it listens on
+	// 127.0.0.1. The plaintext hop never leaves this host's loopback interface,
+	// so demanding a certificate for 127.0.0.1 would protect against no attacker
+	// that reaching loopback does not already imply.
+	//
+	// Opt-in per key and never inferred, and credgw still refuses any host that
+	// is not genuinely loopback.
+	allowLoopback := fs.Bool("allow-loopback", false, "permit a plaintext http:// upstream when its host is loopback (for a local credential broker)")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -304,7 +315,7 @@ func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
 	}
 	policy, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
 		Upstream: strings.TrimSpace(*upstream), AuthKind: authKind, Header: header,
-		AllowLoopbackHTTP: keyConfigureAllowLoopbackHTTP,
+		AllowLoopbackHTTP: keyConfigureAllowLoopbackHTTP || *allowLoopback,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "key configure: %v\n", err)

@@ -114,6 +114,10 @@ artifact_blobs = %q
 # env_passthrough = [] # e.g. ["GOCACHE", "NPM_*"]
 # github = "deny"
 # model_gateway = false
+# model_gateway_key = "" # name a PROXIED keychain key supplying the upstream and credential
+#                       # (see: gitmoot key configure); empty uses Anthropic via runtime-auth.env
+# model_gateway_allow_loopback_upstream = false # allow a plaintext http:// upstream ONLY when its
+#                       # host is loopback, for a local broker such as omp auth-gateway
 # model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "" # default: <base-home>/.config/gitmoot/keychain.env
 

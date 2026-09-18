@@ -10,7 +10,9 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -25,9 +27,17 @@ var (
 )
 
 type remoteCredentialGatewayPlan struct {
-	gateway      *credgw.Gateway
-	home         string
-	allowedHosts []string
+	gateway *credgw.Gateway
+	home    string
+	// keyName names the proxied keychain key supplying the upstream and
+	// credential. Empty keeps the Anthropic default read from runtime-auth.env,
+	// so an existing configuration behaves exactly as before.
+	keyName       string
+	allowLoopback bool
+	upstream      string
+	authKind      credgw.ProxyAuthKind
+	authHeader    string
+	allowedHosts  []string
 }
 
 // prepareRemoteCredentialGateway performs every check that can fail before a
@@ -51,9 +61,26 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 	if strings.TrimSpace(remoteCfg.CredentialGatewayListen) == "" || strings.TrimSpace(remoteCfg.CredentialGatewayURL) == "" {
 		return remoteCredentialGatewayPlan{}, errors.New("remote model gateway requires [remote_exec].credential_gateway_listen and credential_gateway_url")
 	}
+	// A named keychain key supplies its OWN upstream and auth, validated when the
+	// operator ran `gitmoot key configure`. Resolving it here, before a billed
+	// sandbox exists, keeps a misconfigured key a preflight failure rather than a
+	// 401 discovered inside a running review.
+	upstream := modelGatewayUpstreamURL
+	authKind := credgw.ProxyAuthResolved
+	authHeader := ""
+	keyName := strings.TrimSpace(credentialsCfg.ModelGatewayKey)
+	if keyName != "" {
+		key, err := w.modelGatewayKeychainKey(keyName)
+		if err != nil {
+			return remoteCredentialGatewayPlan{}, err
+		}
+		upstream = key.ProxyUpstream
+		authKind = credgw.ProxyAuthKind(key.ProxyAuthKind)
+		authHeader = key.ProxyHeader
+	}
 	if _, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
-		Upstream: modelGatewayUpstreamURL, AuthKind: credgw.ProxyAuthResolved,
-		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP,
+		Upstream: upstream, AuthKind: authKind, Header: authHeader,
+		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP || credentialsCfg.ModelGatewayAllowLoopbackUpstream,
 		SandboxID:         "preflight", Runtime: runtime.ShellRuntime, ExpiresAt: time.Now().Add(ttl),
 		AllowedHosts: append([]string(nil), credentialsCfg.ModelGatewayAllowHosts...),
 	}); err != nil {
@@ -67,7 +94,9 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 		return remoteCredentialGatewayPlan{}, fmt.Errorf("start remote credential gateway: %w", err)
 	}
 	return remoteCredentialGatewayPlan{
-		gateway: gateway, home: paths.Home,
+		gateway: gateway, home: paths.Home, keyName: keyName,
+		allowLoopback: credentialsCfg.ModelGatewayAllowLoopbackUpstream,
+		upstream:      upstream, authKind: authKind, authHeader: authHeader,
 		allowedHosts: append([]string(nil), credentialsCfg.ModelGatewayAllowHosts...),
 	}, nil
 }
@@ -86,12 +115,16 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 		return nil, nil, nil
 	}
 	policy := credgw.ProxyPolicy{
-		Upstream: modelGatewayUpstreamURL, AuthKind: credgw.ProxyAuthResolved,
-		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP,
+		Upstream: plan.upstream, AuthKind: plan.authKind, Header: plan.authHeader,
+		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP || plan.allowLoopback,
 		SandboxID:         instance.ID, Runtime: runtimeName, ExpiresAt: time.Now().Add(ttl),
 		AllowedHosts: append([]string(nil), plan.allowedHosts...),
 	}
-	lease, err := plan.gateway.RegisterProxy(jobID, policy, lazyModelGatewayResolver(plan.home))
+	resolver := lazyModelGatewayResolver(plan.home)
+	if plan.keyName != "" {
+		resolver = w.keychainModelGatewayResolver(plan.keyName)
+	}
+	lease, err := plan.gateway.RegisterProxy(jobID, policy, resolver)
 	if err != nil {
 		return nil, nil, fmt.Errorf("register remote credential gateway lease: %w", err)
 	}
@@ -199,5 +232,61 @@ func (b *credentialRevokingExecutionBackend) ReapInventory(ctx context.Context) 
 func (b *credentialRevokingExecutionBackend) revoke(instance *execbackend.Instance) {
 	if instance != nil {
 		credgw.DefaultRegistry.RevokeSandbox(b.home, instance.ID)
+	}
+}
+
+// modelGatewayKeychainKey loads the proxied keychain key named by
+// [credentials].model_gateway_key and refuses anything that cannot serve as an
+// upstream credential.
+//
+// The checks are deliberately strict AT PREFLIGHT, before a billed sandbox
+// exists: a key in the wrong mode, or proxied but never configured, is an
+// operator mistake that should surface as a refusal to start rather than as a
+// 401 discovered inside a running review.
+func (w jobWorker) modelGatewayKeychainKey(name string) (db.KeychainKey, error) {
+	if w.Store == nil {
+		return db.KeychainKey{}, fmt.Errorf("model gateway key %q requires a store", name)
+	}
+	key, found, err := w.Store.GetKeychainKey(context.Background(), name)
+	if err != nil {
+		return db.KeychainKey{}, fmt.Errorf("load model gateway key %q: %w", name, err)
+	}
+	if !found {
+		return db.KeychainKey{}, fmt.Errorf("model gateway key %q is not in the keychain; add it with `gitmoot key add %s`", name, name)
+	}
+	if key.Mode != db.KeychainModeProxied {
+		return db.KeychainKey{}, fmt.Errorf("model gateway key %q has mode %q; it must be %q so the value never enters a sandbox", name, key.Mode, db.KeychainModeProxied)
+	}
+	if !key.ProxyConfigured() {
+		return db.KeychainKey{}, fmt.Errorf("model gateway key %q is proxied but unconfigured; run `gitmoot key configure %s`", name, name)
+	}
+	return key, nil
+}
+
+// keychainModelGatewayResolver returns the upstream credential from the
+// keychain, re-reading it on EVERY request.
+//
+// Re-reading is the point: a key revoked, reconfigured or removed mid-job must
+// stop working immediately rather than at the next daemon restart. This mirrors
+// the pipeline proxied-key resolver, which is the existing proven path for
+// serving a keychain credential through the gateway.
+func (w jobWorker) keychainModelGatewayResolver(name string) credgw.CredentialResolver {
+	return func(ctx context.Context) (credgw.ResolvedCredential, error) {
+		key, err := w.modelGatewayKeychainKey(name)
+		if err != nil {
+			return credgw.ResolvedCredential{}, err
+		}
+		_, values, err := pipeline.LoadValidatedKeychainFile(ctx, w.Store, w.ConfigHome)
+		if err != nil {
+			return credgw.ResolvedCredential{}, fmt.Errorf("load keychain for model gateway key %q: %w", name, err)
+		}
+		value := strings.TrimSpace(values[name])
+		if value == "" {
+			return credgw.ResolvedCredential{}, fmt.Errorf("model gateway key %q has no value in the keychain file", name)
+		}
+		return credgw.ResolvedCredential{
+			Value: value, Upstream: key.ProxyUpstream,
+			AuthKind: credgw.ProxyAuthKind(key.ProxyAuthKind), Header: key.ProxyHeader,
+		}, nil
 	}
 }
