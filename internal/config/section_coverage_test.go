@@ -63,7 +63,6 @@ var (
 	unpinnedSectionHeaderSites = []string{
 		"edit_compat.go::configSectionAtParseError",
 		"github_remote.go::loadGitHubRemote",
-		"implement_base.go::LoadImplementBase",
 		"orchestrate.go::LoadEventsPolicy",
 		"orchestrate.go::LoadOrchestratePolicy",
 		"org.go::parseOrgContent",
@@ -161,8 +160,11 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	if distinctFiles != 23 {
-		t.Errorf("sectionHeader call sites span %d files, want 23: update this expectation together with the lists above", distinctFiles)
+	// 22 since #2203 deleted internal/config/implement_base.go and its
+	// implement_base.go::LoadImplementBase site; that commit dropped the site from
+	// the lists above but left this count at 23, which is why the test was red.
+	if distinctFiles != 22 {
+		t.Errorf("sectionHeader call sites span %d files, want 22: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

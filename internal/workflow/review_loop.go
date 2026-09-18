@@ -616,18 +616,3 @@ func ReviewScopeInstructions(currentHead string, scope *ReviewScope) string {
 	}
 	return instructions.String()
 }
-
-func reviewFixInstructions(reviewer string, result AgentResult) string {
-	base := fmt.Sprintf("Address requested changes from %s: %s", reviewer, result.Summary)
-	findings := NamedReviewFindings(result)
-	if len(findings) == 0 {
-		return base
-	}
-	var instructions strings.Builder
-	instructions.WriteString(base)
-	instructions.WriteString("\nNamed findings to close:\n")
-	for _, finding := range findings {
-		fmt.Fprintf(&instructions, "- %s\n", finding)
-	}
-	return strings.TrimSpace(instructions.String())
-}

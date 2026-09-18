@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -61,12 +60,4 @@ func requireWorkflowPolicyResolverPaths(paths config.Paths) func(string) workflo
 		p := cfg.For(repo)
 		return workflow.RequireWorkflowPolicy{Enabled: p.Enabled, Mode: p.Mode}
 	}
-}
-
-func preflightStrictWorkflowPolicy(home, repo, workflowID, policyExempt string) error {
-	policy := requireWorkflowPolicyResolver(home)(repo)
-	if policy.Enabled && policy.Mode == "strict" && strings.TrimSpace(workflowID) == "" && policyExempt != "exempt" && policyExempt != "auto-only" {
-		return fmt.Errorf("repo %s has require_workflow=strict: pass --workflow <namespace>/<campaign>", strings.TrimSpace(repo))
-	}
-	return nil
 }

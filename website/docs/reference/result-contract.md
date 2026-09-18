@@ -263,7 +263,11 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   `delegation_preflight_failed` event listing the agents valid for the repo and
   routes the coordinator through a corrective continuation (see
   [Termination bounds](#termination-bounds)).
-- `action` (required): the job action — one of `ask`, `review`, or `implement`.
+- `action` (required): the job action — `ask` or `review`. An `implement` leg is
+  refused with the action named: Gitmoot does not dispatch implementation
+  (#2203), and the writable per-delegation worktree allocation plus its enqueue
+  are what was removed. Delegation-origin implement legs totalled 47 over the
+  store's lifetime and zero in the last 30 days.
 - `prompt` (required): the instructions handed to the delegated job.
 - `deps` (optional): an array of sibling delegation `id`s. The delegation runs
   only after every listed sibling job succeeds. Each entry must reference a
@@ -349,8 +353,8 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
     human-in-the-loop pause); the **coordinator** hand-rolls the verify→replan loop
     in its continuation. The merge gate independently blocks merge on the non-ready
     decision. The built-in
-    [`verifier` and `decompose-and-verify` recipes](../workflows/coordinator-recipes-workflow.md)
-    are templates for this — no new engine primitive is involved (`ephemeral`,
+    [`verifier` recipe](../workflows/coordinator-recipes-workflow.md)
+    is a template for this — no new engine primitive is involved (`ephemeral`,
     `failure_policy`, and the merge gate already ship).
   - **Engine-enforced rule (#439).** Tag the verify leg with
     `synthesis_rule: verify` (see above). The **engine** derives the verdict from
@@ -453,15 +457,16 @@ the same `delegations` field, `coordinator`, and `continuation` mechanics.
   - `capabilities` (optional): an array of capability strings the worker
     advertises.
   - `autonomy_policy` (optional): the worker's sandbox autonomy. Defaults to
-    `read-only`. An **implement** ephemeral worker (`action: "implement"` or an
-    explicit `"implement"` capability) **must** carry a write policy
+    `read-only`, which is what an `ask`/`review` leg needs. A worker that
+    advertises the `implement` capability **must** still carry a write policy
     (`workspace-write` or `danger-full-access`); an empty/`auto`/`read-only`
     policy is rejected at validation with the same fail-closed guidance the CLI
     emits, because an unset policy normalizes to `auto`, which grants no
-    deterministic headless write. Note `workspace-write` (`acceptEdits`) auto-
-    accepts file edits but does NOT unblock Bash (`go`/`git`/`gh`), so full
-    headless implementation needs `danger-full-access`. See the autonomy policy
-    mapping in the CLI reference for the full table.
+    deterministic headless write. That check survives on the capability even
+    though `action: "implement"` is refused (#2203). Note `workspace-write`
+    (`acceptEdits`) auto-accepts file edits but does NOT unblock Bash
+    (`go`/`git`/`gh`). See the autonomy policy mapping in the CLI reference for
+    the full table.
 
   Ephemeral delegations are bounded by the same delegation limits as every other
   delegation (see [Termination bounds](#termination-bounds)): they do not relax
@@ -494,12 +499,11 @@ them all in a single round.
 
 :::tip Built-in coordinator recipes
 You do not have to author the `ephemeral` fan-out by hand. The built-in
-**coordinator recipes** `review-panel`, `decompose-and-verify`, and `verifier`
+**coordinator recipes** `review-panel` and `verifier`
 are templates that emit a ready-made ephemeral `delegations[]` for you — a
-diverse-lens review panel, parallel implementation legs plus a verify gate, or one
+diverse-lens review panel, or one
 producer plus an independent verify leg. Run them with
 `gitmoot orchestrate review-panel "..."` /
-`gitmoot orchestrate decompose-and-verify "..."` /
 `gitmoot orchestrate verifier "..."`. See the
 [Coordinator Recipes Workflow](../workflows/coordinator-recipes-workflow.md).
 :::
@@ -512,15 +516,13 @@ sibling it depends on has succeeded before it dispatches. Because the dependency
 graph is a DAG, Gitmoot can resolve a clear order without ever looping.
 
 Sibling children that share the repo run in isolated git worktrees so they do
-not serialize on the shared checkout: `implement` children each get their own
-branch worktree, and when a coordinator fans out two or more read-only
-(`ask`/`review`) children, each gets a throwaway detached worktree (no branch),
-disposed automatically when the child finishes. A read-only child that `deps` on
-`implement` legs (e.g. a decompose-and-verify verify gate) runs in a detached
-worktree with those legs' branches merged in, so it sees their combined work
-rather than the base checkout; if the legs are not file-disjoint the merge
-conflicts and the parent is blocked. This is internal scheduling — coordinators
-do not request it.
+not serialize on the shared checkout: when a coordinator fans out two or more
+children, each gets a throwaway detached worktree (no branch), disposed
+automatically when the child finishes. Every delegation leg is read-only now —
+`ask` and `review` are the only accepted actions — so no leg gets a writable
+branch worktree, and the merged-in detached worktree that once let a verify gate
+`deps` on implement legs has nothing to merge. This is internal scheduling —
+coordinators do not request it.
 
 Once every top-level delegation reaches a terminal state, Gitmoot enqueues
 exactly one coordinator "continuation" job, sent back to the delegating agent, to

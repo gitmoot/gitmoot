@@ -14,7 +14,6 @@ import (
 	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -282,32 +281,6 @@ func runTaskEvents(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "%d\t%s\t%s\t%s\t%s\t%s\n", event.ID, event.CreatedAt, event.Kind, event.FromState, event.ToState, event.Reason)
 	}
 	return 0
-}
-
-func taskWorktreeDirtyWithRunner(ctx context.Context, task db.Task, runner subprocess.Runner) (bool, error) {
-	if strings.TrimSpace(task.WorktreePath) == "" {
-		return false, nil
-	}
-	status, err := jobGitClient(task.WorktreePath, runner).StatusPorcelain(ctx)
-	if err != nil {
-		return false, fmt.Errorf("inspect task worktree %s: %w", task.WorktreePath, err)
-	}
-	return strings.TrimSpace(status) != "", nil
-}
-
-func taskBranchReusableForImplement(state string) bool {
-	switch workflow.TaskState(strings.TrimSpace(state)) {
-	case "", workflow.TaskPlanned, workflow.TaskImplementing, workflow.TaskChangesRequested, workflow.TaskBlocked, workflow.TaskAwaitingHuman:
-		return true
-	default:
-		return false
-	}
-}
-
-func findActiveImplementJobForTask(ctx context.Context, store *db.Store, repo string, branch string, taskID string) (db.Job, bool, error) {
-	return findActiveJobMatching(ctx, store, repo, branch, func(job db.Job, payload workflow.JobPayload) bool {
-		return job.Type == "implement" && payload.TaskID == taskID
-	})
 }
 
 // findActiveJobForBranch returns the first queued/running job whose structured

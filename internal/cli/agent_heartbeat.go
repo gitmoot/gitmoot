@@ -11,7 +11,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 // runAgentHeartbeat is the write-side (and read-side) CLI for heartbeat schedules
@@ -67,7 +66,7 @@ func runAgentHeartbeatAdd(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "managed repo as owner/repo (required)")
 	interval := fs.String("interval", "", "schedule interval, e.g. 24h (required)")
 	prompt := fs.String("prompt", "", "instructions the heartbeat sends the agent (required)")
-	action := fs.String("action", "ask", "heartbeat action: ask, review, or implement (implement is policy-gated)")
+	action := fs.String("action", "ask", fmt.Sprintf("heartbeat action: %s", strings.Join(config.HeartbeatActions(), ", ")))
 	runtimeOverride := fs.String("runtime", "", fmt.Sprintf("run this heartbeat on a specific runtime (%s) instead of the agent default", strings.Join(config.HeartbeatRuntimes(), "|")))
 	jitter := fs.String("jitter", "", "random delay added to each interval, e.g. 15m (default 0s)")
 	maxConcurrent := fs.Int("max-concurrent", 1, "maximum concurrent jobs for this heartbeat")
@@ -133,17 +132,6 @@ func runAgentHeartbeatAdd(args []string, stdout, stderr io.Writer) int {
 			return exit
 		}
 	}
-	// An implement heartbeat enqueues a WRITE job. Refuse to write one unless the
-	// target agent both holds the implement capability AND carries a write-granting
-	// autonomy policy (workspace-write / danger-full-access). This mirrors the
-	// agent-start gate exactly: under auto/read-only an implement job runs and
-	// produces no files, so it is fail-closed at config-write time rather than
-	// silently no-op'd by the daemon scan (#611).
-	if entry.Action == "implement" {
-		if exit := requireHeartbeatImplementPermission(*home, agent, stderr); exit != 0 {
-			return exit
-		}
-	}
 	if err := config.SaveHeartbeat(paths, entry); err != nil {
 		fmt.Fprintf(stderr, "agent heartbeat add: %v\n", err)
 		return 1
@@ -169,38 +157,6 @@ func requireHeartbeatReviewCapability(home, agent string, stderr io.Writer) int 
 	}
 	if !agentHasCapability(record.Capabilities, "review") {
 		fmt.Fprintf(stderr, "agent heartbeat add: agent %q lacks the review capability required for a review heartbeat\n", agent)
-		return 2
-	}
-	return 0
-}
-
-// requireHeartbeatImplementPermission returns a non-zero exit code (and prints to
-// stderr) when the named agent cannot safely run an implement heartbeat: it must
-// exist, hold the "implement" capability, AND carry a write-granting autonomy
-// policy (workspace-write / danger-full-access). Under auto/read-only an
-// implement job would run and produce nothing, so this is the fail-closed gate
-// that refuses the misconfiguration at write time (#611). It reuses the exact
-// runtime predicate (PolicyGrantsImplementWrite) that agent start / implement
-// dispatch use, so the heartbeat gate can never drift from the direct-job gate.
-func requireHeartbeatImplementPermission(home, agent string, stderr io.Writer) int {
-	var record db.Agent
-	if err := withStore(home, func(store *db.Store) error {
-		got, err := store.GetAgent(context.Background(), agent)
-		if err != nil {
-			return err
-		}
-		record = got
-		return nil
-	}); err != nil {
-		fmt.Fprintf(stderr, "agent heartbeat add: agent %q must exist, hold the implement capability, and carry a write-granting policy for an implement heartbeat: %v\n", agent, err)
-		return 1
-	}
-	if !agentHasCapability(record.Capabilities, "implement") {
-		fmt.Fprintf(stderr, "agent heartbeat add: agent %q lacks the implement capability required for an implement heartbeat\n", agent)
-		return 2
-	}
-	if !runtime.PolicyGrantsImplementWrite(record.AutonomyPolicy) {
-		fmt.Fprintf(stderr, "agent heartbeat add: agent %q autonomy policy %q grants no headless write permission; an implement heartbeat needs --policy workspace-write or danger-full-access on the agent\n", agent, runtime.NormalizeStoredAutonomyPolicy(record.AutonomyPolicy))
 		return 2
 	}
 	return 0

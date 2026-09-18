@@ -730,12 +730,14 @@ func TestSelectAgentRunAction(t *testing.T) {
 		options agentRunOptions
 		action  string
 	}{
-		{name: "task selects implement", options: agentRunOptions{taskID: "task-1", message: "anything"}, action: "implement"},
 		{name: "pr selects review", options: agentRunOptions{prNumber: 7, message: "anything"}, action: "review"},
 		{name: "head sha selects review", options: agentRunOptions{headSHA: strings.Repeat("a", 40), message: "anything"}, action: "review"},
 		{name: "review language selects review", options: agentRunOptions{message: "please review this PR"}, action: "review"},
-		{name: "implementation language selects implement", options: agentRunOptions{message: "update docs and add tests"}, action: "implement"},
-		{name: "write code selects implement", options: agentRunOptions{message: "write code for the new command"}, action: "implement"},
+		// #2203: implementation language no longer selects a dispatch action.
+		// Gitmoot does not dispatch implementation, so a prompt asking for code
+		// routes to the read-only ask path rather than minting a write job.
+		{name: "implementation language falls back to ask", options: agentRunOptions{message: "update docs and add tests"}, action: "ask"},
+		{name: "write code falls back to ask", options: agentRunOptions{message: "write code for the new command"}, action: "ask"},
 		{name: "code question selects ask", options: agentRunOptions{message: "what does this code do?"}, action: "ask"},
 		{name: "plain question selects ask", options: agentRunOptions{message: "what is the risk here?"}, action: "ask"},
 	}
@@ -1139,201 +1141,6 @@ func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
 	}
 	if request.ReviewTaskHeadDivergence != "" {
 		t.Fatalf("mint path recorded a divergence note %q; no owning task means no rebind", request.ReviewTaskHeadDivergence)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestReusesExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	task, request, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err != nil {
-		t.Fatalf("prepareLocalImplementDispatchRequest returned error: %v", err)
-	}
-	if task.ID != "task-existing" || request.TaskID != "task-existing" {
-		t.Fatalf("task.ID=%q request.TaskID=%q, want task-existing", task.ID, request.TaskID)
-	}
-	if task.Branch != "feature/retry" || request.Branch != "feature/retry" {
-		t.Fatalf("task.Branch=%q request.Branch=%q, want feature/retry", task.Branch, request.Branch)
-	}
-	if task.WorktreePath == "" {
-		t.Fatal("task worktree path was not allocated")
-	}
-	if currentBranch := strings.TrimSpace(runGitOutput(t, task.WorktreePath, "branch", "--show-current")); currentBranch != "feature/retry" {
-		t.Fatalf("task worktree branch = %q, want feature/retry", currentBranch)
-	}
-	stored, err := store.GetTask(ctx, "task-existing")
-	if err != nil {
-		t.Fatalf("GetTask returned error: %v", err)
-	}
-	if stored.WorktreePath != task.WorktreePath || stored.State != string(workflow.TaskImplementing) {
-		t.Fatalf("stored task = %+v, returned task = %+v", stored, task)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsDirtyExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	worktree := filepath.Join(home, "dirty-task")
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runGit(t, repoDir, "worktree", "add", "-b", "feature/retry", worktree, "main")
-	if err := os.WriteFile(filepath.Join(worktree, "feature.txt"), []byte("partial work\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-		WorktreePath: worktree,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") || !strings.Contains(err.Error(), "inspect and commit/push them") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want dirty-worktree guidance", err)
-	}
-	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("dirty dispatch refusal created branch lock, err=%v", err)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsLiveExistingBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	worktree := filepath.Join(home, "live-task")
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		GoalID:       "goal-existing",
-		Title:        "Existing branch task",
-		State:        string(workflow.TaskImplementing),
-		Branch:       "feature/retry",
-		WorktreePath: worktree,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	prev := taskWorktreeHasLiveProcess
-	taskWorktreeHasLiveProcess = func(path string) bool { return path == worktree }
-	defer func() { taskWorktreeHasLiveProcess = prev }()
-
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Continue the existing implementation branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "live process") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want live process", err)
-	}
-	if _, err := store.GetBranchLock(ctx, "owner/repo", "feature/retry"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("live dispatch refusal created branch lock, err=%v", err)
-	}
-}
-
-func TestPrepareLocalImplementDispatchRequestRejectsCompletedBranchTask(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("main\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-existing",
-		RepoFullName: "owner/repo",
-		State:        string(workflow.TaskMerged),
-		Branch:       "feature/retry",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	record := db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: repoDir}
-	_, _, err := prepareLocalImplementDispatchRequest(ctx, store, record, github.Repository{Owner: "owner", Name: "repo"}, localAgentDispatchRequest{
-		Home:         home,
-		Agent:        "builder",
-		Action:       "implement",
-		Instructions: "Implement a new task on a reused branch.",
-		Branch:       "feature/retry",
-	})
-	if err == nil || !strings.Contains(err.Error(), "state merged") {
-		t.Fatalf("prepareLocalImplementDispatchRequest err = %v, want completed task rejection", err)
 	}
 }
 
@@ -1870,116 +1677,6 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	}
 	if policies[runtime.AutonomyPolicyReadOnly] != 1 || policies[runtime.AutonomyPolicyWorkspaceWrite] != 1 {
 		t.Fatalf("instances = %+v, want one read-only and one workspace-write", instances)
-	}
-}
-
-func TestDispatchLocalAgentJobBlocksReadOnlyImplement(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
-		t.Fatalf("UpsertRepo returned error: %v", err)
-	}
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name:           "lead",
-		Role:           "implementer",
-		Runtime:        runtime.ShellRuntime,
-		RuntimeRef:     "unused",
-		RepoScope:      "owner/repo",
-		Capabilities:   []string{"implement"},
-		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:     "owner/repo",
-		Agent:        "lead",
-		Action:       "implement",
-		Instructions: "Implement task 1.",
-		Home:         home,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-
-	if output.State != string(workflow.JobBlocked) || output.Action != "implement" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	job, err := store.GetJob(context.Background(), output.JobID)
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	if job.State != string(workflow.JobBlocked) {
-		t.Fatalf("job state = %q, want blocked", job.State)
-	}
-	events, err := store.ListJobEvents(context.Background(), job.ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !daemonWorkerHasEvent(events, "permission_blocked") {
-		t.Fatalf("events = %+v, want permission_blocked", events)
-	}
-}
-
-func TestDispatchLocalAgentJobBlocksReadOnlyManagedImplementBeforeStart(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "builder",
-		"--home", home,
-		"--runtime", "codex",
-		"--policy", "read-only",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "implement",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:         "owner/repo",
-		Agent:            "builder",
-		Action:           "implement",
-		Instructions:     "Implement task 1.",
-		Type:             "builder",
-		Home:             home,
-		AllowManagedSync: true,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-
-	if output.State != string(workflow.JobBlocked) || output.Action != "implement" || output.Agent != "builder" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime was started before read-only block: %+v", runner.calls)
-	}
-	events, err := store.ListJobEvents(context.Background(), output.JobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !daemonWorkerHasEvent(events, "permission_blocked") {
-		t.Fatalf("events = %+v, want permission_blocked", events)
 	}
 }
 
@@ -3708,8 +3405,10 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		want string
 	}{
 		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
-		{name: "inline form", args: []string{"planner", "do the work", "--recipe=decompose-and-verify"}, want: "decompose-and-verify"},
-		{name: "third valid id", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
+		// #2203 retired decompose-and-verify, so the inline form is exercised with a
+		// SURVIVING id. Keeping it on the retired one asserted that a removed recipe
+		// is still selectable.
+		{name: "inline form", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
 		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
 	}
 	for _, tt := range tests {
@@ -3735,10 +3434,15 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 		if !strings.Contains(errText, `unknown recipe "bogus"`) {
 			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
 		}
-		for _, id := range []string{"review-panel", "decompose-and-verify", "verifier"} {
+		for _, id := range []string{"review-panel", "verifier"} {
 			if !strings.Contains(errText, id) {
 				t.Fatalf("stderr missing valid id %q: %q", id, errText)
 			}
+		}
+		// The retired id must NOT be offered as a choice. Without this the list
+		// could regrow it and the loop above would still pass.
+		if strings.Contains(errText, "decompose-and-verify") {
+			t.Fatalf("stderr offers the retired decompose-and-verify recipe: %q", errText)
 		}
 	})
 }
@@ -4485,3 +4189,48 @@ func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 		t.Fatalf("agent run help = %q, want both execution modes", help)
 	}
 }
+
+// TestAgentImplementVerbIsRefused makes #2203's removal MUTATION-DETECTABLE. The
+// verb is gone from the router, and re-adding it must fail a test rather than
+// silently work: the implementing agent's own sabotage run found that re-adding
+// the verb failed only tests that were ALREADY failing on its tree, so the
+// mutant proved nothing. This asserts the refusal directly, checking the exit
+// code AND that the message names the verb, so a refactor that swallows the
+// argument into a silent no-op also fails.
+func TestAgentImplementVerbIsRefused(t *testing.T) {
+	for _, args := range [][]string{
+		{"implement", "some-agent", "do the thing"},
+		{"implement"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := runAgent(args, &stdout, &stderr)
+		if code != 2 {
+			t.Fatalf("runAgent(%v) exit = %d, want 2", args, code)
+		}
+		if !strings.Contains(stderr.String(), `unknown agent command "implement"`) {
+			t.Fatalf("runAgent(%v) stderr = %q, want it to name the removed verb", args, stderr.String())
+		}
+	}
+	// Control: a SURVIVING verb must not be refused, or this test would pass
+	// by rejecting everything.
+	var stdout, stderr bytes.Buffer
+	if code := runAgent([]string{"review"}, &stdout, &stderr); code == 2 && strings.Contains(stderr.String(), "unknown agent command") {
+		t.Fatalf("runAgent(review) was refused as unknown; the refusal is too broad: %q", stderr.String())
+	}
+}
+
+// #2203 retired TestDispatchLocalAgentJobBlocksReadOnlyImplement along with the
+// dispatch-side readOnlyImplementationBlocked check it pinned. It called
+// dispatchLocalAgentJob directly with Action:"implement" and asserted that a
+// read-only policy produced JobBlocked plus a permission_blocked event.
+//
+// No surface can produce that input any more: --action is validated against
+// workflow.DelegationActions = [ask review] at parse time, so the only way to
+// reach the removed check was to call the internal function with an Action the
+// CLI refuses. Round 2 of #2215 caught that removing the check turned this test
+// red, which is the correct signal - the test was the last thing keeping the
+// dead branch alive.
+//
+// The behaviour is NOT uncovered. A legacy queued implement row still fails
+// closed through the worker-side guards (daemon_worker.go:434 and :3270), and
+// TestPreflightAutoImplementIsPermissionBlocked still covers that path.

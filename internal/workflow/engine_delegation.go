@@ -228,9 +228,9 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	}
 
 	// Only delegations with no unmet deps are enqueued now; deferred ones are
-	// enqueued by advanceDelegations once every dep has succeeded. Allocate
-	// worktrees/branch locks only for the ready implement delegations so a
-	// deferred delegation does not hold a lock before it can run.
+	// enqueued by advanceDelegations once every dep has succeeded. Resolve a
+	// leg's checkout only when it is ready so a deferred delegation does not
+	// hold a worktree before it can run.
 	for _, d := range delegations {
 		if len(compactStrings(d.Deps)) > 0 {
 			continue
@@ -515,9 +515,8 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 	return nil
 }
 
-// enqueueDelegation allocates the per-delegation worktree (or branch lock) for
-// implement delegations, then enqueues the child job and records a
-// delegation_enqueued event on the parent. It is idempotent: a duplicate
+// enqueueDelegation resolves the delegation's checkout, then enqueues the child
+// job and records a delegation_enqueued event on the parent. It is idempotent: a duplicate
 // deterministic-ID insert is swallowed by e.enqueue when the existing job
 // matches the request, so it is safe to call from both dispatchDelegations and
 // advanceDelegations.
@@ -661,15 +660,15 @@ type PullRequestFetcher interface {
 	FetchPullRequest(ctx context.Context, remote string, number int) error
 }
 
-// allocateAndEnqueueDelegation allocates the per-delegation worktree (or branch
-// lock) for implement delegations and enqueues the prepared request, recording a
+// allocateAndEnqueueDelegation resolves the delegation's checkout (integration
+// or detached read-only worktree) and enqueues the prepared request, recording a
 // delegation_enqueued event. It is shared by enqueueDelegation (initial/deferred
-// dispatch) and requeueDelegation (retry) so both go through identical worktree
+// dispatch) and requeueDelegation (retry) so both go through identical
 // allocation and idempotent enqueue.
 // allocateAndEnqueueDelegation is the ONE CHOKE POINT every delegation precondition
-// flows through: worktree allocation, the shared-checkout branch lock, dependency
-// resolution and the enqueue itself. Under a capturing resolution its refusal is
-// therefore classifiable STRUCTURALLY rather than per-site (#1673).
+// flows through: worktree allocation, dependency resolution and the enqueue
+// itself. Under a capturing resolution its refusal is therefore classifiable
+// STRUCTURALLY rather than per-site (#1673).
 //
 // WHY THE CLASSIFICATION LIVES HERE AND NOT AT THE ERROR TYPE. A refused allocation and
 // a recorded synthesis decision are the SAME Go type - both surface as BlockedError -
@@ -695,58 +694,12 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 }
 
 func (e Engine) allocateAndEnqueueDelegationInner(ctx context.Context, job db.Job, payload JobPayload, d Delegation, request JobRequest, ref taskRef) error {
-	if request.Action == "implement" {
-		if e.DelegationWorktrees == nil || strings.TrimSpace(e.Home) == "" {
-			// No per-delegation worktree isolation is available (the engine lacks a
-			// Home/DelegationWorktrees manager), so the child falls back to a
-			// shared-checkout branch lock. Emit a parent event so the loss of
-			// isolation is observable rather than silent.
-			_ = e.recordEffectEvent(ctx, db.JobEvent{
-				JobID:   job.ID,
-				Kind:    "delegation_worktree_skipped",
-				Message: fmt.Sprintf("delegation %q implement runs in the shared checkout on branch %s: per-delegation worktree isolation unavailable", request.DelegationID, request.Branch),
-			})
-			if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, request.Agent, request.ActingOrgRole, ref); err != nil {
-				return err
-			}
-			// THE FALLBACK LOCK IS A PRE-EFFECT TOO. Recording only the isolated-worktree
-			// branch left a crash or supersede after fallback lock acquisition with no
-			// round metadata able to release it (#1673).
-			e.recordEffectPreAllocation(request.Repo, request.Branch, "", request.Agent)
-		} else {
-			result, err := e.AllocateDelegationWorktree(ctx, DelegationWorktreeRequest{
-				Home:         e.Home,
-				Repo:         request.Repo,
-				ParentJobID:  job.ID,
-				DelegationID: request.DelegationID,
-				Delegation:   d,
-				BaseBranch:   payload.Branch,
-				Owner:        request.Agent,
-				Checkout:     e.DelegationCheckout,
-				RetryAttempt: request.RetryCount,
-			}, e.DelegationWorktrees)
-			if err != nil {
-				var blocked BlockedError
-				if errors.As(err, &blocked) {
-					return e.block(ctx, ref, blocked.Reason)
-				}
-				return err
-			}
-			request.Branch = result.Branch
-			request.WorktreePath = result.Path
-			// Recorded so a later supersede or Class I release can hand this worktree
-			// back instead of orphaning it (#1673).
-			e.recordEffectPreAllocation(request.Repo, result.Branch, result.Path, request.Agent)
-			// The freshly-allocated worktree is created off the parent's base
-			// branch, whose tip may have advanced past the HeadSHA the child
-			// inherited from the parent payload. validateTargetCheckoutForRunner (daemon)
-			// compares the worktree HEAD against payload.HeadSHA and would
-			// spuriously reject the child on a moving parent branch. Clear the
-			// inherited HeadSHA so the child validates against its own fresh
-			// worktree HEAD instead of a stale parent SHA.
-			request.HeadSHA = ""
-		}
-	} else if integration, err := e.resolveIntegrationDeps(ctx, job, payload, d); err != nil {
+	// Gitmoot dispatches no implement delegation any more (#2203), so there is no
+	// writable-worktree/branch-lock arm here: every action that reaches this
+	// function is read-only. validateAgentResult refuses an implement action
+	// before dispatch, which is why this chain can start at dependency
+	// resolution.
+	if integration, err := e.resolveIntegrationDeps(ctx, job, payload, d); err != nil {
 		return err
 	} else if len(integration.unresolvedDeps) > 0 {
 		// Fail closed (#19): this read-only delegation depends on implement legs that

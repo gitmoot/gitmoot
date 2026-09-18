@@ -74,8 +74,7 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		if err != nil || strings.TrimSpace(payload.WorktreePath) == "" {
 			continue
 		}
-		fixClone := payload.FixWorktree
-		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree && !fixClone {
+		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
 			continue // ordinary task/shared-checkout payload
 		}
 		path, ok := worktreePathUnderRoot(root, payload.WorktreePath)

@@ -3,12 +3,9 @@ package workflow
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 // blockingWorktreeManager refuses allocation with a BlockedError, which is the
@@ -17,7 +14,7 @@ type blockingWorktreeManager struct {
 	fakeWorktreeManager
 }
 
-func (b *blockingWorktreeManager) AddWorktree(_ context.Context, _ string, _ string, _ string) error {
+func (b *blockingWorktreeManager) AddDetachedWorktree(_ context.Context, _ string, _ string) error {
 	return BlockedError{Reason: "worktree allocation refused for the test"}
 }
 
@@ -31,7 +28,7 @@ func TestRefusedAllocationBlocksUnderTheFenceAndNeverRepeats(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	pausedImplementEscalation(t, store, &engine)
+	pausedEscalation(t, store, &engine)
 	// Swap in a manager that refuses, so the refusal comes from the production path
 	// rather than from a test hook.
 	engine.DelegationWorktrees = &blockingWorktreeManager{}
@@ -108,7 +105,7 @@ func TestTerminalTaskWinnerRefusesTheWholeResolution(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	pausedImplementEscalation(t, store, &engine)
+	pausedEscalation(t, store, &engine)
 
 	// The concurrent winner lands in the capture/commit seam, through the same hook
 	// the crash tests use, so the race is deterministic.
@@ -152,89 +149,6 @@ func TestTerminalTaskWinnerRefusesTheWholeResolution(t *testing.T) {
 	}
 }
 
-// TestPreEffectOwnershipLossLeavesTheReplacementsLockAlone covers P1-3 in its
-// PRODUCTION SHAPE. The earlier version of this test used "other-recoverer" as the
-// replacement branch-lock owner and asserted the stale pass HANDED THE LOCK BACK. Both
-// halves were wrong.
-//
-// The shared-checkout lock is owned by request.Agent (engine_delegation.go), an identity
-// that is STABLE ACROSS RECOVERY PASSES rather than unique to the lease holder. So a
-// replacement pass acquires the very same repo/branch/agent lock legitimately - and a
-// stale pass "releasing its own lock" by that tuple DELETES THE LIVE LOCK the new pass
-// believes it holds, turning a bounded leak into a silent mutual-exclusion failure.
-//
-// SEMANTIC REVERSION THIS KILLS: re-introduce the handback and the replacement's lock
-// disappears.
-func TestPreEffectOwnershipLossLeavesTheReplacementsLockAlone(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	engine.EscalationNotifier = &recordingNotifier{}
-	pausedImplementEscalation(t, store, &engine)
-	// FORCE THE SHARED-CHECKOUT FALLBACK: with no worktree manager the leg takes a real
-	// BRANCH LOCK, which is the resource this finding is about.
-	engine.DelegationWorktrees = nil
-	round, ok := unsettledRound(t, store, "parent-job")
-	if !ok {
-		t.Fatal("no unsettled round")
-	}
-
-	resolutionEffectsHook = func(hookCtx context.Context, jobID string) error {
-		now := time.Now().UTC()
-		taken, err := store.AcquireEscalationRecoveryLease(hookCtx, "parent-job", round.RoundID, "other-recoverer",
-			now.Add(time.Minute), now.Add(2*escalationRecoveryLeaseTTL))
-		if err != nil {
-			t.Fatalf("hook acquire: %v", err)
-		}
-		if !taken {
-			t.Fatal("the hook could not take ownership: the test cannot observe loss")
-		}
-		return nil
-	}
-	t.Cleanup(func() { resolutionEffectsHook = nil })
-
-	if err := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, ""); err != nil {
-		t.Fatalf("ResolveEscalation: %v", err)
-	}
-
-	// NO EFFECTS from a pass that lost ownership.
-	if got := countJobs(t, store, "/resume"); got != 0 {
-		t.Fatalf("resume jobs = %d, want 0 after ownership loss", got)
-	}
-	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
-		t.Fatalf("receipts = %d, want 0 after ownership loss", got)
-	}
-	// NOTHING RECORDED on the round either: the pre-effect record is owner-scoped.
-	stored, ok := unsettledRound(t, store, "parent-job")
-	if !ok {
-		t.Fatal("the round vanished: the claim must survive an ownership loss")
-	}
-	if strings.TrimSpace(stored.PreEffectBranch) != "" {
-		t.Fatalf("a pass that lost ownership recorded pre-effects: %+v", stored)
-	}
-
-	// THE REPLACEMENT'S LOCK SURVIVES. The replacement holds it under the REAL
-	// production identity - the same agent - which is exactly why a handback keyed on
-	// that tuple would delete it.
-	lock := db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-005", Owner: "builder"}
-	if _, err := store.AcquireLock(ctx, lock); err != nil {
-		t.Fatalf("replacement AcquireLock: %v", err)
-	}
-	held, err := store.ListBranchLocks(ctx, "gitmoot/gitmoot")
-	if err != nil {
-		t.Fatalf("ListLocks: %v", err)
-	}
-	found := false
-	for _, existing := range held {
-		if existing.Branch == "task-005" && existing.Owner == "builder" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("the replacement pass's branch lock was deleted by the stale pass; locks = %+v", held)
-	}
-}
-
 // TestReleasingAFenceYouDoNotOwnReportsFalse covers the tenth guarded write,
 // ReleaseEscalationRecoveryLease, whose affected-row count was previously discarded
 // inside the store. Zero rows is legitimate - but it must be REPORTED, so a caller can
@@ -244,7 +158,7 @@ func TestReleasingAFenceYouDoNotOwnReportsFalse(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	pausedImplementEscalation(t, store, &engine)
+	pausedEscalation(t, store, &engine)
 	round, ok := unsettledRound(t, store, "parent-job")
 	if !ok {
 		t.Fatal("no unsettled round")
@@ -300,7 +214,7 @@ func TestOwnershipLostBeforeRenewalAppliesNothing(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 	round, ok := unsettledRound(t, store, "parent-job")
 	if !ok {
 		t.Fatal("no unsettled round")
@@ -381,7 +295,7 @@ func TestHeartbeatKeepsOwnershipAcrossASlowPreEffect(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
@@ -432,7 +346,7 @@ func TestHeartbeatCancelsThePassOnAuthoritativeLoss(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
@@ -487,62 +401,6 @@ func TestHeartbeatCancelsThePassOnAuthoritativeLoss(t *testing.T) {
 	}
 }
 
-// TestBranchLockCollisionDoesNotSettleTheRetry is the P1 of the fea59486 review, and it
-// is the case a type check cannot separate: a shared-checkout branch lock held by
-// another agent refuses the retry with a BlockedError - the SAME Go type a recorded
-// synthesis decision uses.
-//
-// Classified as a decision it commits a receipt and SETTLES the round, so a retry that
-// dispatched nothing looks applied and the human's decision is lost for good. Classified
-// structurally - the block came out of the allocation choke point, so the decision could
-// not be ATTEMPTED - the receipt is withheld and the claim survives to be re-driven once
-// the lock frees.
-//
-// SEMANTIC REVERSION THIS KILLS: stop marking the choke point's refusal (or key the
-// guard on the error type again) and this round settles with no child dispatched.
-func TestBranchLockCollisionDoesNotSettleTheRetry(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	engine.EscalationNotifier = &recordingNotifier{}
-	pausedImplementEscalation(t, store, &engine)
-	// Force the shared-checkout fallback, which is the arm that takes a branch lock.
-	engine.DelegationWorktrees = nil
-
-	// ANOTHER AGENT ALREADY HOLDS THE BRANCH. This is the production trigger.
-	taken, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: "gitmoot/gitmoot", Branch: "task-005", Owner: "someone-else",
-	})
-	if err != nil {
-		t.Fatalf("AcquireLock: %v", err)
-	}
-	if !taken {
-		t.Fatal("the competing agent could not take the branch lock: the test cannot observe the collision")
-	}
-
-	resolveErr := engine.ResolveEscalation(ctx, "parent-job", ResumeRetry, "")
-	var blocked BlockedError
-	if !errors.As(resolveErr, &blocked) {
-		t.Fatalf("ResolveEscalation error = %v, want a BlockedError from the lock collision", resolveErr)
-	}
-
-	// NOTHING WAS DISPATCHED, so nothing may be recorded as applied.
-	if got := countJobs(t, store, "/resume"); got != 0 {
-		t.Fatalf("resume jobs = %d, want 0: the lock collision prevented any dispatch", got)
-	}
-	if got := countWorkflowJobEvents(t, store, "parent-job", escalationEffectsCompletedEvent); got != 0 {
-		t.Fatalf("receipts = %d, want 0: a refused allocation must not look applied", got)
-	}
-	// AND THE HUMAN'S DECISION SURVIVES for a later pass.
-	round, ok := unsettledRound(t, store, "parent-job")
-	if !ok {
-		t.Fatal("the round settled: the human retry decision is unrecoverable")
-	}
-	if !round.Claimed() {
-		t.Fatal("the claim was discarded by a refused allocation")
-	}
-}
-
 // TestRenewalErrorsCancelAtTheConfirmedExpiry is the P1 of the 2754115c review, and it
 // is what round 2's heartbeat made possible: moving from a one-shot renewal to a retry
 // loop turned the RETRY policy into an AUTHORITY policy, and a loop that retries past
@@ -561,7 +419,7 @@ func TestRenewalErrorsCancelAtTheConfirmedExpiry(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
@@ -640,7 +498,7 @@ func TestRenewalErrorsAfterSuccessesStillCompleteTheRun(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
@@ -692,7 +550,7 @@ func TestLateRenewalDoesNotExtendAuthorityPastThePersistedExpiry(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
@@ -766,7 +624,7 @@ func TestStalledRenewalStopsPreEffectsAtThePersistedExpiry(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 300 * time.Millisecond
@@ -839,7 +697,7 @@ func TestExpiryIsReArmedAfterEachConfirmedRenewal(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = shortRecoveryLeaseTTL
@@ -911,7 +769,7 @@ func TestStalledRenewalDoesNotStallTheResolution(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	originalTTL := escalationRecoveryLeaseTTL
 	escalationRecoveryLeaseTTL = 200 * time.Millisecond

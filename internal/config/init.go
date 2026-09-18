@@ -37,11 +37,7 @@ workspaces = %q
 evals = %q
 artifact_blobs = %q
 
-# [workflow] controls job-level workflow defaults. implement_base is optional:
-# when set, agent implement and agent run jobs that route to implement create a
-# new-branch worktree from that ref. Use "origin/main" for a remote-tracking
-# default, or "HEAD" to follow the registered checkout. With no value, implement
-# follows checkout HEAD and guards stale non-default checkouts. result_checks is
+# [workflow] controls job-level workflow defaults. result_checks is
 # off | warn | block and defaults to warn when omitted. stale_task_ttl is the
 # conservative updated_at age after which abandoned implementing tasks are
 # branch-cleaned and blocked/awaiting_human_merge tasks are evidence-disposed
@@ -59,7 +55,6 @@ artifact_blobs = %q
 # "strict"; a mode-only override remains inert for pre-#1053 compatibility.
 # Both can be overridden in a flat [repos."owner/repo"] section.
 # [workflow]
-# implement_base = "origin/main"
 # result_checks = "warn"
 # stale_task_ttl = "168h"
 # auto_settle_after = "24h" # default 24h; 0 disables workflow auto-settle

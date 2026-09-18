@@ -17,9 +17,8 @@ import (
 )
 
 type dashboardConfigSettings struct {
-	orchestrate   config.OrchestratePolicy
-	github        config.GitHubLimiterPolicy
-	implementBase string
+	orchestrate config.OrchestratePolicy
+	github      config.GitHubLimiterPolicy
 }
 
 type dashboardConfigProjectionRow struct {
@@ -38,7 +37,6 @@ var dashboardConfigProjection = []dashboardConfigProjectionRow{
 	{section: "github", key: "max_concurrent", kind: "int", doc: "Maximum number of concurrent GitHub calls; zero is unlimited.", value: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MaxConcurrent }},
 	{section: "github", key: "min_interval", kind: "duration", doc: "Minimum spacing between GitHub call starts.", value: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }, defaultValue: func(s dashboardConfigSettings) any { return s.github.MinInterval.String() }},
 	{section: "orchestrate", key: "blocked_ttl", kind: "duration", doc: "Maximum time a blocked job remains awaiting a human; empty disables expiry.", value: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }, defaultValue: func(s dashboardConfigSettings) any { return s.orchestrate.BlockedTTL }},
-	{section: "workflow", key: "implement_base", kind: "string", doc: "Base ref used when dispatching implementation jobs.", value: func(s dashboardConfigSettings) any { return s.implementBase }, defaultValue: func(s dashboardConfigSettings) any { return s.implementBase }},
 }
 
 // Config returns the effective, sanitized dashboard configuration. Every value
@@ -156,9 +154,6 @@ func loadDashboardConfigSettings(paths config.Paths) (dashboardConfigSettings, d
 	}
 	if values.github, err = config.LoadGitHubLimiterPolicy(paths); err != nil {
 		return values, defaults, fmt.Errorf("load github config: %w", err)
-	}
-	if values.implementBase, err = config.LoadImplementBase(paths); err != nil {
-		return values, defaults, fmt.Errorf("load workflow config: %w", err)
 	}
 	return values, defaults, nil
 }

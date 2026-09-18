@@ -335,8 +335,6 @@ what an update replaces.
 gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
 gitmoot repo set-interval owner/repo (<duration>|default)
-gitmoot repo auto-fix owner/repo --pr <number> --disable --by <role-or-agent> --reason "<text>"
-gitmoot repo auto-fix owner/repo --pr <number> --enable --by <role-or-agent> --reason "<text>"
 gitmoot repo set-interval --all (<duration>|default)
 gitmoot repo remove owner/repo
 gitmoot repo doctor owner/repo
@@ -350,11 +348,10 @@ per Gitmoot home supervises every **enabled** registered repo. Omitting
 `repo list` prints `inherit`. Use `repo set-interval` with a duration to change
 an override, with `default` to restore inheritance, or with `--all` to update all
 registered repos.
-`repo auto-fix` records a durable, per-PR opt-in for unattended fix dispatch.
-By default, a changes-requested review reports its verdict to the requester and
-does not create an implement job. `--enable` opts that PR into auto-fix;
-`--disable` revokes the opt-in. Both forms require the audit fields `--by` and
-`--reason`, and the latest decision remains stored per PR.
+A changes-requested review reports its verdict to the requester and never
+creates an implement job: Gitmoot does not dispatch implementation (#2203).
+The seat named by `--lead` (or the requester's own session) does the fix work
+and records it with `gitmoot job record --type implement`.
 `repo doctor owner/repo` checks checkout/config health. If the registered
 checkout is missing or is no longer a Git worktree, Gitmoot verifies the
 recorded primary checkout, repairs the registration, and reports the self-heal.
@@ -687,7 +684,7 @@ and an omitted model preserves the runtime's own default. The same default can
 be set in config under `[agents.<type>].model`.
 
 The same commands accept `--effort <value>` as the agent's default reasoning
-effort, and `agent run`, `ask`, `implement`, `review`, and `orchestrate` accept it
+effort, and `agent run`, `ask`, `review`, and `orchestrate` accept it
 as a per-job override. A delegation's `effort` field is the child-job override,
 while an ephemeral worker spec's `effort` is that worker's default. The
 resolution order mirrors model selection: job/delegation effort, agent/worker
@@ -728,8 +725,9 @@ state or delivery.
 
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability
-implement` with `auto`/empty or `read-only` is refused at `agent start`, `agent
-subscribe`, and at implement-job dispatch with an actionable message. Set
+implement` with `auto`/empty or `read-only` is refused at `agent start`, at
+`agent subscribe`, and when `--lead` names that agent on a review dispatch,
+each with an actionable message. Set
 `--policy danger-full-access` for full headless implementation (file writes plus
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). `read-only`/`ask`/`review` agents are unaffected.
@@ -918,20 +916,43 @@ Delegate to a registered agent from the current local chat:
 
 ```sh
 gitmoot agent run project-planner --repo owner/repo "Return the plan status."
-gitmoot agent run lead --repo owner/repo --task task-001 --background "Implement this task."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --lead lead --background "Review this PR."
-gitmoot agent run lead --repo owner/repo --action implement --pr 12 "Fix findings on the existing PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 --lead lead "Review this PR."
-gitmoot agent implement lead --repo owner/repo --task task-001 "Implement this task."
-gitmoot agent implement lead --repo owner/repo --task task-001 --ready "Implement and open the PR ready for review."
-gitmoot agent implement lead --repo owner/repo --pr 12 "Fix findings on the existing PR."
-gitmoot agent implement lead --repo owner/repo --task task-002 --base origin/main "Implement from current origin/main."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
-gitmoot agent run lead --repo owner/repo --model gpt-5-codex "Implement this task."
-gitmoot agent run lead --repo owner/repo --effort xhigh "Implement this task."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --model gpt-5-codex "Review this PR."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --effort xhigh "Review this PR."
 gitmoot job watch <job-id>
 ```
+
+**Gitmoot does not dispatch implementation by any route a user can reach
+(#2203).** There is no `agent implement` verb, no `--action implement`, and no
+`--task`/`--base`/`--draft`/`--ready` implement flags; an `implement` leg in a
+result's `delegations[]` is refused with the action named, `/gitmoot <agent>
+implement` is not a recognized PR-comment command, and an `implement` heartbeat
+is refused at config validation. The one remaining exception is the pipeline
+`action: implement` stage kind, which still VALIDATES but has no allocator to
+run in; whether `pipeline add` should refuse it is tracked in
+[#2213](https://github.com/gitmoot/gitmoot/issues/2213).
+
+What was removed in each case is the writable-worktree ALLOCATION plus the
+enqueue — precisely what would have to come back for dispatch to return. The
+removal followed the traffic rather than leading it: 568 of 570 implement rows
+in a 14-day window were seats recording their own sessions, delegation-origin
+implement legs total 47 lifetime with zero in the last 30 days, no PR comment
+has ever carried an implement command, no heartbeat is configured with that
+action, and no pipeline has ever created an implement stage (lifetime stage
+jobs: ask 5,229, produce 92, implement zero). Seats implement in their own
+session and record the work themselves:
+
+```sh
+gitmoot job record --agent lead --repo owner/repo --type implement \
+  --decision implemented --pr 12 --head-sha <sha> \
+  --title "Fix the findings on #12" --summary "What changed and why."
+```
+
+A `changes_requested` verdict therefore reports to the requester and to the
+`--lead` seat; it never mints a fix job.
 
 `agent review` and review-resolved `agent run` with `--org-role` queue the job
 for daemon ownership by default. This keeps a review running if the calling
@@ -939,13 +960,12 @@ seat or its command runner exits. Use `--foreground` only when synchronous
 ownership is intentional. Unattributed reviews retain their synchronous
 default; `--background` remains accepted.
 
-`agent run --action ask|review|implement` explicitly selects the job action and
-wins before the usual inference order (`--task` -> implement, then
-`--pr`/review `--head-sha` -> review, then message heuristics). `--type <name>`
-has a separate meaning: it selects a managed agent type. The flags can be used
-together. Invalid actions and contradictions are rejected before enqueue;
-notably, `--action review` requires `--pr`, while `--action implement --pr` is
-the explicit existing-PR fix-pass route.
+`agent run --action ask|review` explicitly selects the job action and wins
+before the usual inference order (`--pr`/review `--head-sha` -> review, then
+message heuristics, else ask). `--type <name>` has a separate meaning: it
+selects a managed agent type. The flags can be used together. Invalid actions
+and contradictions are rejected before enqueue; notably, `--action review`
+requires `--pr`, and `implement` is no longer an accepted action.
 
 Review admission is evidence-gated before Gitmoot creates a new review job.
 For local `agent review` / `agent run` requests that resolve to review, and for
@@ -1042,23 +1062,24 @@ is unchanged here and remains advance-time guarded until #1433; cached-verdict
 serving remains out of scope for #1415/#1423.
 Local review dispatches accept `--lead <implementer>` on `agent review` and on
 `agent run` when it resolves to review. A `changes_requested` verdict routes its
-fix job to that lead, not to the reviewer. Before creating a review job or
+fix WORK to that lead, not to the reviewer: Gitmoot wakes the lead's org role
+and never mints a fix job (#2203). Before creating a review job or
 starting its runtime session, Gitmoot loads the lead from the agents database
 and requires that it exist, can access the repository, has `implement`
 capability, and uses a write-granting policy (`workspace-write` or
 `danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
 must pass the same checks. Managed-type review dispatches also require an
-explicit DB-backed lead. `--lead` is rejected when `agent run` resolves to ask or
-implement, and is not accepted by `agent implement` or `orchestrate`.
+explicit DB-backed lead. `--lead` is rejected whenever `agent run` resolves to
+anything but review, and is not accepted by `orchestrate`.
 
 A strict review-only agent therefore needs either an explicit implementer or
 `--no-fix-target`, which declares that this review has NO fix target and the
 dispatching operator owns the follow-up. That declaration is carried on the job
-payload, not only as an event, because advancement is what decides whether a
-`changes_requested` verdict dispatches a fix at all: such a verdict records
-`auto_fix_skipped_no_fix_target` and leaves its findings open in the ledger
-rather than routing a fix to the reviewer that produced it. `--no-fix-target`
-is rejected outside review and is mutually exclusive with `--lead`.
+payload, not only as an event, so the ledger records who owns an open
+`changes_requested` finding: Gitmoot dispatches no fix either way (#2203), and a
+review with no lead has no org role to wake, which is exactly what the operator
+is taking on. `--no-fix-target` is rejected outside review and is mutually
+exclusive with `--lead`.
 
 This dispatch-time lead validation applies only to local CLI reviews started by
 `gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed
@@ -1067,18 +1088,15 @@ advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
 adds the corresponding ingress preflight.
 
 When an engine review returns `changes_requested`, Gitmoot persists the verdict
-and wakes the requester's org role without creating an implement job. If that
-PR has an explicit `repo auto-fix --enable` policy, the resulting implement fix
-job gets an independent writable per-job clone checked out on the task branch
-at the fetched remote head. It does not execute in the review Task's empty
-worktree path or the registered checkout, so it cannot interleave with an
-operator's uncommitted files. Allocation fails closed before enqueue; there is
-no registered-checkout fallback. The clone stays attached to the real branch so
-the fix can commit and push, then terminal cleanup (with the
-delegation-worktree TTL as a backstop) removes only the clone.
+and wakes the requester's org role without creating an implement job. That is
+the terminal behaviour, not a default: there is no per-PR opt-in that converts a
+verdict into a fix dispatch, and no writable fix clone is allocated (#2203).
+The lead implements in its own session and records the work with `gitmoot job
+record --type implement` — the rows the merge gate's implementer attribution
+and reviewer-independence check read.
 
 Before delivery, these dispatch commands scan commit-shaped tokens against the
-target repository. Ask and implement preserve their existing scanner input;
+target repository. Ask preserves its existing scanner input;
 review scans its newly allocated exact-head worktree with the requested head
 still bound. If a token resolves to a commit other than the dispatch head,
 Gitmoot prints an advisory warning such as
@@ -1093,53 +1111,22 @@ agent's own template is not scanned, so a stale commit cited inside a template
 body dispatches with no warning. If you drive dispatches through templates,
 treat this warning as covering your instructions only.
 
-New implementation PRs opened by the engine are drafts by default. Use
-`--ready` on `agent run`, `agent implement`, or `orchestrate` to opt into an
-immediately merge-gate-eligible PR once review evidence is satisfied; `--draft`
-states the safe default explicitly. A draft PR does not move its task to
-`awaiting_human_merge`, because
-no human merge decision has been requested. Marking the PR ready lets normal
-merge-gate advancement resume.
+A PR the forge reports as a DRAFT is an author-controlled hold: it does not move
+its task to `awaiting_human_merge`, because no human merge decision has been
+requested. Marking the PR ready for review lets normal merge-gate advancement
+resume, and an unknown draft state fails toward NOT parking. Gitmoot no longer
+opens implementation PRs itself and the `--draft`/`--ready` dispatch flags went
+with `agent implement` (#2203), so this hold now describes whatever PR the gate
+observes — including one a seat opened by hand.
 
-For `agent implement --pr <number>` (or the equivalent `agent run --action
-implement --pr <number>`), Gitmoot resolves the PR and reuses its existing task
-and worktree only when the PR is open, its head is in the same repository, and
-its head branch matches that task. This is the only route that lets a `pr_open`
-task re-enter implementation; `changes_requested` remains reusable as before.
-`reviewing` and `ready_to_merge`, closed/merged PRs, fork or unrelated heads,
-branch mismatches, active implement jobs, live processes, dirty worktrees, and
-foreign branch locks are refused. The existing PR number stays on the job
-payload so finalization adopts that PR instead of creating a second task or PR.
-
-For `agent implement`, `--base <ref>` selects the commit used to create a new
-branch worktree. `agent run` accepts the same flag when it routes to implement.
-An `origin/*` ref is fetched before it is resolved, and an unknown ref fails
-before a job is enqueued. `--base HEAD` explicitly follows the registered
-checkout's current commit. On implement, `--head-sha <sha>` is a compatibility
-alias for `--base <sha>`; passing both with different values is an error.
-
-Set a default for implement dispatches in `config.toml`:
-
-```toml
-[workflow]
-implement_base = "origin/main"
-```
-
-The flag wins over the config value. The config value `"HEAD"` keeps
-checkout-following behavior. With no flag and no config value, Gitmoot still
-uses checkout HEAD, but refuses when the checkout is on a non-default branch
-that is behind `origin/<default>`. The error reports the branch and behind
-count and offers both explicit choices: `--base origin/<default>` or
-`--base HEAD`.
-
-The repository-wide default comes from the registered checkout's local
+A repository's default branch comes from the registered checkout's local
 `origin/HEAD` symbolic ref. Git does not refresh that ref when the upstream
 repository renames its default branch. Run `git remote set-head origin -a` in
 the registered checkout after such a rename; until then Gitmoot treats the
 cached ref as authoritative and may reconcile `repos.default_branch` back to
 the stale name.
 
-`gitmoot agent run`, `ask`, `implement`, and `review` (and `orchestrate`) accept
+`gitmoot agent run`, `ask`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
 overriding the agent's configured default. It is a free-form, runtime-scoped
 string (a Codex, Claude Code, Kimi Code, or omp model name) with no allow-list;
@@ -1182,19 +1169,18 @@ gitmoot agent ask reviewer "Compare the approaches." --repo owner/repo --runtime
 gitmoot agent ask reviewer "Summarize the risk in this diff." --repo owner/repo --runtime omp --effort high
 ```
 
-`gitmoot orchestrate`, `agent run`, and `agent implement` also accept an optional
-`--skip-native-review-fanout` flag. By default an `implement` job that opens a
-pull request fans the PR out to Gitmoot's native reviewers (the configured
-required reviewers, or the ones passed for the task). With
-`--skip-native-review-fanout` set, the coordinator owns review orchestration
-instead: the implement→PR step still records the PR baseline, runs the merge
-gate, and records the `implemented` decision, but it enqueues **no** native
-review jobs. The skip is honored on both PR-open paths — the engine's
-implement-advance and the daemon's GitHub PR-watcher — so a PR opened either way
-stays free of native review fan-out. The flag defaults off; leave it off for the
-full native review fan-out, which is byte-identical to prior behavior.
+`gitmoot orchestrate` and `agent run` also accept an optional
+`--skip-native-review-fanout` flag. It states that the coordinator owns review
+orchestration, so a PR on this branch must not be fanned out to Gitmoot's
+native reviewers (the configured required reviewers, or the ones passed for the
+task). The flag is persisted on the job payload and on the branch lock, and the
+daemon's GitHub PR-watcher reads the lock, so a PR it observes on that branch
+stays free of native review fan-out. The engine's implement-advance arm reads
+the same flag, but no implement job can be dispatched while #2203 stands, so
+the PR-watcher is the path that still exercises it. The flag defaults off;
+leave it off for the full native review fan-out.
 
-When a synchronous `agent implement`/`run`/`ask`/`review`/`orchestrate` job
+When a synchronous `agent run`/`ask`/`review`/`orchestrate` job
 delivers and **succeeds terminally** but a benign *post-success* advancement step
 errors — for example a merge-gate block on the freshly-opened PR, or a 422
 "a pull request already exists" race — the command no longer discards the result.
@@ -1212,13 +1198,13 @@ the older re-sync behavior only for legacy/fallback review jobs that lack an
 owned read-only worktree: when their shared checkout advances and the PR remains
 open on the same branch, it re-targets the payload and records
 `review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
-A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`) and keeps the original wrong-head error, which a **non-delegation** review job defers and auto-retries within the shared blocker budget before failing terminally, while a **delegation-child** leg (a high-risk lens child, say) is routed terminally by its own DAG on the first tick and a leg carrying a **fix worktree** likewise gets no deferral — either way the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
+A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`) and keeps the original wrong-head error, which a **non-delegation** review job defers and auto-retries within the shared blocker budget before failing terminally, while a **delegation-child** leg (a high-risk lens child, say) is routed terminally by its own DAG on the first tick — either way the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
 Any dispatched head that git resolves to the checkout's own commit — an abbreviation of any length, a case-differing 40-character SHA, a rev expression, a ref name — is recorded as `review_head_normalized` and is never a re-sync, while a dispatched head this checkout cannot resolve at all leaves the re-sync refused and keeps the original wrong-head failure, deferrable on the same non-delegation terms.
 Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
 frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled and
-dropped; `agent ask`/`implement` stay synchronous and keep their existing
+dropped; `agent ask` stays synchronous and keeps its existing
 busy-session cancel behavior.
 
 Start an orchestra of agents with `gitmoot orchestrate`:
@@ -1235,15 +1221,15 @@ gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/
 (coordinator) that returns a `delegations[]` score; the players (child agents)
 then run in parallel or in dependency order, and a finale (continuation)
 reconvenes and synthesizes the results.
-`--recipe review-panel|decompose-and-verify|verifier` (#477, also accepted on
+`--recipe review-panel|verifier` (#477, also accepted on
 `agent run`) routes the coordinator through a named built-in recipe prompt
 without changing the agent's identity — see
 [Coordinator Recipes](../workflows/coordinator-recipes-workflow.md).
 
 This uses the same agent registry, repo access grants, cached template snapshot,
 runtime adapter, and local job history as PR-comment jobs. `agent run` is the
-default coordinator-safe entrypoint because it routes to `ask`, `review`, or
-`implement` and keeps branch, worktree, commit, push, PR, and workflow lifecycle
+default coordinator-safe entrypoint because it routes to `ask` or `review` and
+keeps branch, worktree, commit, push, PR, and workflow lifecycle
 inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it is
 read-only, so when the message reads like branch/commit/push/PR orchestration it
 prints a non-fatal note and still runs (pass `--force` to suppress the note).
@@ -1274,22 +1260,23 @@ Schedule recurring agent work (heartbeats, off by default):
 ```sh
 gitmoot agent heartbeat add repo-maintainer daily-status \
   --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
-# implement is policy-gated; --runtime pins a runtime for this schedule.
-gitmoot agent heartbeat add builder nightly-tidy \
-  --repo owner/repo --interval 24h --action implement --runtime codex \
-  --prompt "Fix the top lint error and open a small PR."
+# --runtime pins a runtime for this schedule.
+gitmoot agent heartbeat add reviewer stale-prs \
+  --repo owner/repo --interval 12h --action review --runtime codex \
+  --prompt "Review stale open PRs and summarize blockers."
 gitmoot agent heartbeat list [--agent <agent>]
 gitmoot agent heartbeat show repo-maintainer daily-status
 gitmoot agent heartbeat enable|disable repo-maintainer daily-status
 gitmoot agent heartbeat remove repo-maintainer daily-status
 ```
 
-A heartbeat enqueues a normal background job on its `interval`. Actions: read-only
-`ask` (default) or `review` (`review` needs the agent's `review` capability), plus
-the **policy-gated** write action `implement` — it only runs for an agent that
-holds the `implement` capability AND a write-granting policy (`--policy
-workspace-write` or `danger-full-access`); otherwise it is refused at `add` and
-no-op'd (`last_status = policy_readonly`) by the daemon scan. An optional
+A heartbeat enqueues a normal background job on its `interval`. The actions are
+read-only: `ask` (default) and `review` (`review` needs the agent's `review`
+capability). `implement` is refused at config validation (#2203) — the
+heartbeat's writable-worktree allocator and its enqueue are gone, so an
+`implement` schedule could only have produced a branchless job with no checkout
+to resolve. Schedule read-only work and let the seat record its own
+implementation with `gitmoot job record --type implement`. An optional
 `--runtime codex|claude|kimi|omp` runs the scheduled job on that runtime (fresh
 session) instead of the agent default — the accepted set is derived from the
 adapter registry, so `omp` joined it the moment the runtime was registered, and
@@ -1304,7 +1291,7 @@ dispatch resolves `gitmoot agent <name>` to a registered single instance before 
 type, so force the type with `--type <name>` (or do not register a single
 instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
 (the `ask` action) dispatches to the managed type synchronously; background
-`run`/`review`/`implement` to a type and `[parallel_sessions]` temp-session
+`run`/`review` to a type and `[parallel_sessions]` temp-session
 forking use the **background** path. See [Running one agent's jobs
 concurrently](../concepts/agents-templates-jobs-locks.md#running-one-agents-jobs-concurrently).
 
@@ -1510,14 +1497,12 @@ default, or a pinned version when configured with a reference such as
 snapshot they were created with. The dashboard's Agents page shows a template's
 version history.
 
-The built-in coordinator recipes (`review-panel`, `decompose-and-verify`,
-`verifier`) are coordinator prompts for the Orchestra pattern, selected per
+The built-in coordinator recipes (`review-panel`, `verifier`) are coordinator prompts for the Orchestra pattern, selected per
 invocation with `--recipe <id>` rather than started as long-lived agents:
 
 ```sh
 gitmoot agent template show review-panel
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
 ```
 
 For fast current-chat planning, use the Gitmoot skill with the same packaged
@@ -1670,15 +1655,15 @@ Notification delivery is best-effort — reliable from a foreground `agent ask`,
 but a short-lived `--background`/`orchestrate` dispatch may exit before the wake
 fires.
 
-Agent `ask`, `run`, `review`, `implement`, and `orchestrate` accept
+Agent `ask`, `run`, `review`, and `orchestrate` accept
 `--org-role <name>`. The role is validated and touched before dispatch, then
 stored as `acting_org_role` in the job payload for provenance, and its scope is
 enforced at enqueue. Capability booleans are not part of this phase.
 
 ## External-coordinator workflow groups
 
-Pass `--workflow <label>` to `agent ask`, `agent run`, `agent review`, `agent
-implement`, `orchestrate`, or `job open`. Labels are global lowercase slugs up
+Pass `--workflow <label>` to `agent ask`, `agent run`, `agent review`,
+`orchestrate`, or `job open`. Labels are global lowercase slugs up
 to 64 characters. One `/` may separate a namespace and campaign; both sides use
 lowercase letters, digits, and single hyphens without leading/trailing hyphens.
 Orchestration children and continuations inherit the label.
@@ -1720,7 +1705,7 @@ snapshot and event-rule store. It fails when a role has no live pane, has no
 enabled wake route, or a labeled live pane is not claimed by any role; each
 failure includes category counts and a reason. Use `gitmoot org show` to view
 the configured roles. When enabled, fresh local `agent ask`, `agent run`, `agent
-review`, `agent implement`, and `orchestrate` dispatches require
+review`, and `orchestrate` dispatches require
 `--org-role <role>` (or `GITMOOT_ORG_ROLE`) and reject out-of-scope repositories
 at enqueue.
 `enforce = "block"` is the default; `"warn"` allows the job and records an
@@ -2189,20 +2174,25 @@ closed-without-merging. The workflow/PR/transition key deduplicates poll replays
 and automatic updates never overwrite description.
 ## Tasks
 
-Inspect task state and the append-only task event trail:
+Inspect and retire task state. Gitmoot no longer STARTS a task: `task run` went
+with implementer dispatch (#2203), and `task recover` / `task resume-work` went
+with it because both existed only to restart or re-enter a dispatched implement
+job. Review dispatch still mints the `review-pr-<n>-<hash>` task identity, and a
+`planned` task is the plan a SEAT picks up in its own checkout, recording the
+work against the task id, which is how 568 of the last 570 implement rows were
+already produced:
 
 ```sh
 gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task events task-001 --json
+gitmoot job record --agent lead --repo owner/repo --type implement --task task-001 \
+  --decision implemented --summary "What changed and why."
 ```
 
-Tasks are minted by the dispatch paths that need them: `agent implement`
-creates or reuses the task for the branch it works on, and review dispatch
-mints the `review-pr-<n>-<hash>` task identity. Each task's deterministic
-worktree path is `$GITMOOT_HOME/worktrees/<owner>--<repo>/<task-id>/`, and the
-registered checkout stays on its current branch.
+`task list` and `task events` are the whole surviving verb set;
+`gitmoot task --help` prints exactly those two.
 
 `task events <id>` lists the append-only trail, including daemon
 `task_dismissed_auto`, opt-in
@@ -2221,43 +2211,24 @@ The blocked-task alert has a separate finite ladder: three interval-spaced
 nudges, one terminal escalation, then no further alerts while the task remains
 queryable. Only the evidence-disposal pass transitions task state.
 
-`awaiting_human_merge` is left automatically rather than by hand. The daemon
-promotes the task back to `ready_to_merge` once the merge is safe again, a
-merged PR moves it to `merged`, and the stale-task disposal bound above
-eventually strands it. Nothing forces the task back into development while it
-waits, because Gitmoot cannot observe a human who may be about to merge.
+### A seat that dies mid-work
 
-### Recover a dead implement
+Gitmoot no longer dispatches the implement job that this section used to
+recover, so the dead-implementer case it finalized cannot occur through Gitmoot
+any more (#2203). A seat that abandons its own work owns its own worktree:
+finish or discard it with ordinary git, then record the outcome with `gitmoot
+job record --type implement`. There is no `task recover`.
 
-If an implementer dies mid-work — its process exits after editing the task
-worktree but before it commits, pushes, and opens a PR — the changes are left
-uncommitted in the worktree. A retry of that same implement job re-delivers into
-its recorded task worktree when both the worktree process probe and runtime-owner
-lease prove the prior attempt is dead and the bounded retry budget remains. The
-retry prompt tells the agent to review and preserve the uncommitted work; the
-normal finalizer still owns commit, push, and PR creation. A live worktree, a
-dirty registered/other checkout, wrong-head state, or an exhausted retry budget
-keeps the existing block/failure path.
-
-A new `agent implement` still refuses a dirty worktree with no active job
-rather than silently discarding the work:
-
-```text
-branch <b> has uncommitted changes in task worktree <path>; inspect and commit/push them, or clean/stash them before retrying implement
-```
-
-No command finalizes that worktree for you. Inspect it, commit and push the
-work by hand (or clean/stash it), then retry `agent implement`.
-
-A `dismissed` task is not resurrected by ordinary allocation or workflow
-advancement. Retrying one of its jobs restores it explicitly and records
-`task_recovered_job_retry`.
+A dismissed task is still not resurrected implicitly — ordinary allocation and
+workflow advancement cannot bring it back. Retrying one of its jobs restores it
+explicitly and records `task_recovered_job_retry`.
 
 If an existing task worktree has fallen off the resolved base lineage, Gitmoot
-re-cuts it only when it is clean. When it also has uncommitted changes, `agent
-implement` preserves the worktree, moves the task to `blocked`, and records
-`stale_worktree_dirty_blocked`; manually salvage, commit, stash, or clean the
-changes before retrying.
+re-cuts it only when it is clean. When it also has uncommitted changes, the
+delegation leg that would have used it preserves the worktree, moves the task to
+`blocked`, and records `stale_worktree_dirty_blocked`; manually salvage, commit,
+stash, or clean the changes before retrying. This is a read-only delegation
+concern now: an implement leg cannot be allocated at all.
 
 The daemon reads a bounded oldest-first stale window and processes up to 20
 qualifying `implementing` tasks per repo poll.
@@ -2287,8 +2258,7 @@ context that Gitmoot cannot reconstruct. When enabled it uses the
 same live-job, same-repo open-PR, remote-branch, and remote-uncertainty skips and
 records `task_dismissed_planned_ttl`. Task allocation claims
 `planned -> implementing` atomically at the write boundary, so a concurrent TTL
-dismissal cannot be resurrected by a later allocation; retrying one of the
-task's jobs is the explicit path back.
+dismissal cannot be raced by another allocation.
 
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
@@ -2299,18 +2269,8 @@ returns the task to `pr_open` and records
 `task_terminal_pushed_to_open_pr`; without an open branch PR it blocks with
 `task_blocked_terminal_no_pr`, whose reason names the recoverable branch and
 recorded head SHA when available. Other terminal outcomes remain
-`task_blocked_job_failed`. Delegation children and queued fixes, retries,
+`task_blocked_job_failed`. Delegation children, retries,
 continuations, or pending advancement are not reclassified.
-
-Two refusals guard the `agent implement` restart into an existing task
-worktree:
-
-- **Dirty worktree without an active job** — the restart refuses when the task
-  worktree has uncommitted changes and no in-flight job. Inspect it, commit and
-  push the work yourself, or clean/stash the worktree before retrying.
-- **Live process still in the worktree** — the restart refuses while a live
-  process is still inside the task worktree. Wait for it to exit, or stop the
-  orphaned implementer, before retrying.
 
 ## PR Comments
 
@@ -2320,14 +2280,18 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot help
 /gitmoot status
 /gitmoot <agent> review [instructions]
-/gitmoot <agent> implement [instructions]
 /gitmoot ask <agent> [question]
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
 /gitmoot resume <job-id> retry|continue|abort|answer [instructions]
-@<agent> ask|review|implement [instructions]
+@<agent> ask|review [instructions]
 ```
+
+`implement` is NOT a PR-comment command. It parses as an unknown action and is
+refused (#2203); on a pull request an unrecognized action is logged without a
+reply, so nothing will answer it. Record implementation work with `gitmoot job
+record --type implement` instead.
 
 `/gitmoot merge` always posts the outcome it observed. A refusal names the
 cause and remedy, including an acting role whose `merge_rule` denies the
@@ -3412,6 +3376,19 @@ coordinator that fans out owned children and folds the synthesis); and **gate** 
 implement stage's PR merges). A read-only stage's `needs` result summaries are prepended
 to its prompt, and a repo-bound read-only agent stage runs in its own detached
 read-only worktree so same-repo stages parallelize without touching the live checkout.
+
+The **implement** stage kind is the one `implement` surface #2203 left
+declarable, and it cannot currently run. Its kind still validates, because
+`write: true` and `allow_scheduled_writes` are #768's mutating-safety contract
+and `action: produce` is mutating too — that half is live and was not touched.
+What went is the pipeline-stage writable-worktree ALLOCATION plus the enqueue,
+so a declared implement stage has nothing to run in, and neither a
+`source:`-bound review nor a `gate: pr_merged` waiter will ever see the PR stamp
+it was written to consume. Lifetime pipeline stage jobs: ask 5,229, produce 92,
+implement zero — no pipeline ever created one. Whether `pipeline add` should
+refuse the kind outright is the open decision in
+[#2213](https://github.com/gitmoot/gitmoot/issues/2213).
+
 A non-service shell stage can opt in with `isolate: true`; it then runs in a
 disposable detached read-only committed-tip worktree. Default `false` preserves the
 shared checkout. Allocation failure records `readonly_worktree_skipped` and falls

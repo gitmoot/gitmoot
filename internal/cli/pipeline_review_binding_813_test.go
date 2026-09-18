@@ -2,10 +2,7 @@ package cli
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -272,9 +269,15 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	}
 
 	rec, spec := newTestPipeline(t, store, "source-review", pipelineSourceReviewSpec)
+	// #2203: the implement stage exists only so it can be SETTLED with a PR binding -
+	// its job is never run here. The real enqueuer now refuses an implement stage, so
+	// the run STARTS on the stub enqueuer and then ADVANCES on the real one, which is
+	// the half that matters: what this test proves (#813) is that the REVIEW stage's
+	// worktree is a detached read-only checkout pinned to the bound PR head, and that
+	// allocation is real on the advance below.
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
-	run := startTestRun(t, store, rec, spec, enqueue, now)
+	run := startTestRun(t, store, rec, spec, testStageEnqueuer(store), now)
 	impl := stageRow(t, store, run.ID, "impl")
 	settleBoundImplementStageJob(t, store, impl.JobID, "implemented", pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: "feat-813", TaskID: "task-813", LeadAgent: "coder"})
 	run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
@@ -303,254 +306,6 @@ func TestPipelineSourceReviewWorktreePinnedToBoundHead(t *testing.T) {
 	}
 	if gotCheckout != payload.WorktreePath {
 		t.Fatalf("defaultCheckoutForRunner = %q, want %q", gotCheckout, payload.WorktreePath)
-	}
-}
-
-func TestPipelineSourceReviewEnqueueReplayAdoptsExistingJob(t *testing.T) {
-	ctx := context.Background()
-	home, _, store := heartbeatLoopE2EHome(t)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "coder", runtime.ShellRuntime,
-		pipelineStageResultCmd("implemented", "fixed", nil),
-		[]string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime,
-		pipelineStageResultCmd("approved", "good", nil), []string{"review"}, "owner/repo")
-
-	rec, spec := newTestPipeline(t, store, "source-review", pipelineSourceReviewSpec)
-	productionEnqueue := newPipelineStageEnqueuer(store, home)
-	now := time.Date(2026, 7, 10, 12, 30, 0, 0, time.UTC)
-	run := startTestRun(t, store, rec, spec, productionEnqueue, now)
-	implRow := stageRow(t, store, run.ID, "impl")
-	implJob, err := store.GetJob(ctx, implRow.JobID)
-	if err != nil {
-		t.Fatalf("GetJob(impl): %v", err)
-	}
-	implPayload, err := workflow.ParseJobPayload(implJob.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload(impl): %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(implPayload.WorktreePath, "replay.txt"), []byte("replay\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile replay: %v", err)
-	}
-	runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "replay.txt")
-	runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "replay head")
-	head, err := (gitutil.NewHostClient(implPayload.WorktreePath)).HeadSHA(ctx)
-	if err != nil {
-		t.Fatalf("HeadSHA(impl): %v", err)
-	}
-	settleBoundImplementStageJob(t, store, implJob.ID, "implemented", pipeline.PipelineStagePRBinding{
-		PullRequest: 813,
-		HeadSHA:     head,
-		Branch:      implPayload.Branch,
-		TaskID:      implPayload.TaskID,
-		LeadAgent:   "coder",
-	})
-
-	// Fault injection: cancel the scan immediately after the real enqueuer has
-	// created the pinned worktree and job. The following stage-row UPDATE observes
-	// context cancellation, reproducing enqueue-success/persist-failure exactly.
-	faultCtx, cancel := context.WithCancel(ctx)
-	enqueueCalls := 0
-	faultEnqueue := func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
-		enqueueCalls++
-		job, err := productionEnqueue(ctx, request)
-		if err == nil {
-			cancel()
-		}
-		return job, err
-	}
-	if _, err := pipeline.AdvancePipelineRun(faultCtx, store, faultEnqueue, rec, spec, run, now.Add(time.Second)); err == nil {
-		t.Fatal("fault-injected advance returned nil; want cancelled stage-row persist")
-	}
-	if enqueueCalls != 1 {
-		t.Fatalf("fault enqueue calls = %d, want 1", enqueueCalls)
-	}
-	reviewRow := stageRow(t, store, run.ID, "review")
-	if reviewRow.State != pipeline.StagePending || reviewRow.JobID != "" {
-		t.Fatalf("review row after interrupted enqueue = %+v, want pending without JobID", reviewRow)
-	}
-
-	reviewJobID := pipeline.PipelineStageJobID(run.ID, "review", 0)
-	created, err := store.GetJob(ctx, reviewJobID)
-	if err != nil {
-		t.Fatalf("GetJob(interrupted review): %v", err)
-	}
-	createdPayload, err := workflow.ParseJobPayload(created.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload(interrupted review): %v", err)
-	}
-	if strings.TrimSpace(createdPayload.WorktreePath) == "" {
-		t.Fatal("interrupted review job has no pinned worktree")
-	}
-	createdHead, err := (gitutil.NewHostClient(createdPayload.WorktreePath)).HeadSHA(ctx)
-	if err != nil {
-		t.Fatalf("HeadSHA(interrupted review worktree): %v", err)
-	}
-	if createdHead != head {
-		t.Fatalf("interrupted review worktree HEAD = %s, want %s", createdHead, head)
-	}
-
-	// Replay must adopt before allocation. Make any call to the allocating enqueuer
-	// fail the test: a call would collide with the deterministic existing worktree.
-	replayEnqueueCalls := 0
-	replayEnqueue := func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
-		replayEnqueueCalls++
-		return productionEnqueue(ctx, request)
-	}
-	run, err = pipeline.AdvancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(2*time.Second))
-	if err != nil {
-		t.Fatalf("replay advance: %v", err)
-	}
-	if replayEnqueueCalls != 0 {
-		t.Fatalf("replay called allocating enqueuer %d time(s), want 0", replayEnqueueCalls)
-	}
-	reviewRow = stageRow(t, store, run.ID, "review")
-	if reviewRow.State != pipeline.StageQueued || reviewRow.JobID != reviewJobID {
-		t.Fatalf("adopted review row = %+v, want queued job %s", reviewRow, reviewJobID)
-	}
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatalf("ListJobs: %v", err)
-	}
-	count := 0
-	for _, job := range jobs {
-		if job.ID == reviewJobID {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("review attempt job count = %d, want exactly 1", count)
-	}
-
-	// Once row and job agree, another scan is a strict no-op for enqueue.
-	before := reviewRow
-	run, err = pipeline.AdvancePipelineRun(ctx, store, replayEnqueue, rec, spec, run, now.Add(3*time.Second))
-	if err != nil {
-		t.Fatalf("consistent rescan: %v", err)
-	}
-	after := stageRow(t, store, run.ID, "review")
-	if replayEnqueueCalls != 0 || !pipelineStageEqual(before, after) {
-		t.Fatalf("consistent rescan changed stage or enqueued: before=%+v after=%+v calls=%d", before, after, replayEnqueueCalls)
-	}
-}
-
-func TestPipelineSourceReviewShellRuntimeE2E(t *testing.T) {
-	for _, decision := range []string{"changes_requested", "approved"} {
-		t.Run(decision, func(t *testing.T) {
-			ctx := context.Background()
-			severity := ""
-			if decision == "changes_requested" {
-				severity = "P1"
-			}
-			home, _, store := heartbeatLoopE2EHome(t)
-			checkout := createDaemonWorkerGitCheckout(t, "main")
-			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-			seedDaemonWorkerAgentWithPolicy(t, store, "coder", runtime.ShellRuntime,
-				pipelineStageResultCmd("implemented", "fixed", nil),
-				[]string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-			seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime,
-				pipelineStageResultCmdWithSeverity(decision, "review verdict", nil, severity),
-				[]string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-
-			const specYAML = `name: source-review-e2e
-repo: owner/repo
-stages:
-  - id: impl
-    agent: coder
-    prompt: Fix the bug.
-    action: implement
-    write: true
-  - id: review
-    agent: reviewer
-    prompt: Review the implementation PR.
-    action: review
-    source: impl
-    needs: [impl]
-    success_decisions: [approved]
-  - id: wait
-    gate: pr_merged
-    source: impl
-    needs: [impl, review]
-`
-			rec, spec := newTestPipeline(t, store, "source-review-e2e", specYAML)
-			enqueue := newPipelineStageEnqueuer(store, home)
-			now := time.Date(2026, 7, 10, 13, 0, 0, 0, time.UTC)
-			run := startTestRun(t, store, rec, spec, enqueue, now)
-			implRow := stageRow(t, store, run.ID, "impl")
-			implJob, err := store.GetJob(ctx, implRow.JobID)
-			if err != nil {
-				t.Fatalf("GetJob(impl): %v", err)
-			}
-			implPayload, err := workflow.ParseJobPayload(implJob.Payload)
-			if err != nil {
-				t.Fatalf("ParseJobPayload(impl): %v", err)
-			}
-			if err := os.WriteFile(filepath.Join(implPayload.WorktreePath, "change.txt"), []byte("review me\n"), 0o644); err != nil {
-				t.Fatalf("WriteFile change: %v", err)
-			}
-			runDaemonWorkerGit(t, implPayload.WorktreePath, "add", "change.txt")
-			runDaemonWorkerGit(t, implPayload.WorktreePath, "commit", "-m", "pipeline implementation")
-			head, err := (gitutil.NewHostClient(implPayload.WorktreePath)).HeadSHA(ctx)
-			if err != nil {
-				t.Fatalf("HeadSHA(impl): %v", err)
-			}
-			binding := pipeline.PipelineStagePRBinding{PullRequest: 813, HeadSHA: head, Branch: implPayload.Branch, TaskID: implPayload.TaskID, LeadAgent: "coder"}
-			settleBoundImplementStageJob(t, store, implJob.ID, "implemented", binding)
-			run = advance(t, store, rec, spec, enqueue, run, now.Add(time.Second))
-
-			reviewRow := stageRow(t, store, run.ID, "review")
-			reviewJob, err := store.GetJob(ctx, reviewRow.JobID)
-			if err != nil {
-				t.Fatalf("GetJob(review): %v", err)
-			}
-			reviewPayload, err := workflow.ParseJobPayload(reviewJob.Payload)
-			if err != nil {
-				t.Fatalf("ParseJobPayload(review): %v", err)
-			}
-			if reviewPayload.PullRequest != 813 || reviewPayload.HeadSHA != head {
-				t.Fatalf("review payload = %+v, want PR 813 head %s", reviewPayload, head)
-			}
-
-			worker := defaultJobWorker(store, io.Discard, home)
-			if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 1, "", io.Discard, now.Add(2*time.Second), nil, nil); err != nil {
-				t.Fatalf("review worker tick: %v", err)
-			}
-			events, err := store.ListJobEvents(ctx, reviewJob.ID)
-			if err != nil {
-				t.Fatalf("ListJobEvents(review): %v", err)
-			}
-			if !jobEventKindPresent(events, "pipeline_review_report_only") {
-				t.Fatalf("review events = %+v, want pipeline_review_report_only", events)
-			}
-			if _, err := store.GetJob(ctx, "implement-coder-"+implPayload.TaskID); err == nil {
-				t.Fatal("pipeline changes_requested review dispatched a native fix job")
-			}
-			if _, err := store.GetMergeGate(ctx, "owner/repo", 813); !errors.Is(err, sql.ErrNoRows) {
-				t.Fatalf("GetMergeGate = %v, want no native merge-gate evaluation", err)
-			}
-
-			run = advance(t, store, rec, spec, enqueue, run, now.Add(3*time.Second))
-			if decision == "changes_requested" {
-				if run.State != pipeline.RunFailed || run.HaltStage != "review" {
-					t.Fatalf("changes-requested run = %+v, want parked failed at review", run)
-				}
-				if gate := stageRow(t, store, run.ID, "wait"); gate.JobID != "" || gate.State != pipeline.StageSkipped {
-					t.Fatalf("gate = %+v, want never enqueued", gate)
-				}
-				return
-			}
-
-			gate := stageRow(t, store, run.ID, "wait")
-			if gate.JobID != "" || (gate.State != pipeline.StageQueued && gate.State != pipeline.StageRunning) {
-				t.Fatalf("approved review gate = %+v, want jobless in-flight gate", gate)
-			}
-			markPipelinePRMerged(t, store, "owner/repo", 813, "merged")
-			run = advance(t, store, rec, spec, enqueue, run, now.Add(4*time.Second))
-			if run.State != pipeline.RunSucceeded {
-				t.Fatalf("approved+merged run = %+v, want succeeded", run)
-			}
-		})
 	}
 }
 

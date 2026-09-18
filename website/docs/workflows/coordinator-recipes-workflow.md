@@ -3,7 +3,7 @@
 ## Grouping work driven by an external coordinator
 
 Add `--workflow <label>` when a coordinator outside Gitmoot needs to group
-several jobs. It works on agent ask/run/review/implement, `orchestrate`, and
+several jobs. It works on agent ask/run/review, `orchestrate`, and
 `job open`; every delegation child and continuation inherits it.
 
 ```sh
@@ -48,8 +48,7 @@ without changing the agent's identity or registration (#477):
 
 ```sh
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
-gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
+gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
 ```
 
 The second style passes the recipe id as the agent positional —
@@ -59,12 +58,10 @@ works after registering an agent under the recipe name (`agent start
 review-panel --template review-panel …`). On a fresh install without that
 registration it fails with "agent not found"; prefer `--recipe`.
 
-Three recipes ship built in. A recipe is selected per invocation with
-`--recipe`; its `agent_templates` row must already be installed. Confirm that
-with the read-only inspection verbs:
+Two recipes ship built in. Install or refresh any template the same way as any
+built-in template:
 
 ```sh
-gitmoot agent template list
 gitmoot agent template show review-panel
 ```
 
@@ -88,21 +85,26 @@ de-duplicates the findings, decides the verdict (`changes_requested` if any
 reviewer raised a blocking issue, else `approved`), and reports which lenses drove
 it.
 
-## Decompose and Verify
+## Decompose and Verify (retired)
 
-`decompose-and-verify` takes one implementation task, splits it into independent
-file-disjoint subtasks, and fans them out to ephemeral implementation workers that
-build in parallel in their own branch worktrees. It then adds one `review`-action
-verify step whose `deps` list every implementation leg, forming a small DAG, so
-the gate runs only after all the legs finish.
+`decompose-and-verify` was RETIRED because Gitmoot no longer dispatches
+implementation (#2203). The recipe existed to split one implementation task into
+file-disjoint subtasks and fan them out to ephemeral implementation workers
+building in parallel in their own branch worktrees. `ask` and `review` are now
+the only accepted delegation actions, so there is no action those legs could run
+under and no branch worktree for them to build in.
 
-```sh
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
-```
+What it taught still applies to any fan-out you write by hand: split into
+**file-disjoint** subtasks so parallel legs cannot conflict with each other, and
+end the DAG with a separate verify worker that `deps` on every leg instead of
+trusting a producer's self-report. The `verifier` recipe below is the surviving
+one-producer form of that idea.
 
-After verify finishes, Gitmoot enqueues one continuation. The coordinator reads
-the verify result first — it is the gate — and either reports the merged changes
-when verify passed, or summarizes what failed and which leg owns the fix.
+The id stays reserved rather than unknown: `gitmoot agent template list` hides
+it, `gitmoot agent template show <id>` and `gitmoot agent prompt <id>` refuse it
+by name and point at a successor recipe, and an agent or managed type still
+configured with it fails dispatch with that same named refusal — so a stale
+script or a saved command gets a successor instead of "unknown template".
 
 ## Verifier
 
@@ -124,11 +126,11 @@ gap), and LLM-as-judge graders show a self-preference bias toward their own
 outputs that a different-model judge does not share. It is the same separation as
 [ROMA](https://github.com/sentient-agi/ROMA)'s Verifier
 (`(goal, candidate_output) -> verdict + feedback`), where a failed verdict drives
-a re-plan rather than trusting the producer. `decompose-and-verify` is the
-parallel-producers form of the same idea; `verifier` is its one-producer form.
+a re-plan rather than trusting the producer. `verifier` is the one-producer form
+of that idea.
 
 ```sh
-gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
+gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
 ```
 
 A failed verdict routes through the verify leg's `failure_policy: escalate` back
@@ -141,36 +143,35 @@ and merge gate.
 
 ## Coordinator-owned review
 
-By default an `implement` job that opens a pull request fans the PR out to
-Gitmoot's native reviewers — the configured required reviewers, or the ones
-passed for the task — so each reviewer runs as its own review job before the
-merge gate. When a coordinator already plans review itself (for example a
-`review-panel` leg, or a custom continuation that reconvenes its own reviewers),
-that native fan-out duplicates work. Pass `--skip-native-review-fanout` on
-`gitmoot orchestrate`, `gitmoot agent run`, or `gitmoot agent implement` to hand
-review orchestration to the coordinator:
+When a PR appears on a branch Gitmoot holds a lock for, the daemon's PR-watcher
+fans it out to Gitmoot's native reviewers — the configured required reviewers,
+or the ones passed for the task — so each reviewer runs as its own review job
+before the merge gate. When a coordinator already plans review itself (for
+example a `review-panel` leg, or a custom continuation that reconvenes its own
+reviewers), that native fan-out duplicates work. Pass
+`--skip-native-review-fanout` on `gitmoot orchestrate` or `gitmoot agent run`
+to hand review orchestration to the coordinator:
 
 ```sh
-gitmoot agent implement lead --repo owner/repo --task task-001 --skip-native-review-fanout "Implement this task."
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify --skip-native-review-fanout
+gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier --skip-native-review-fanout
+gitmoot agent run lead --repo owner/repo --pr 12 --skip-native-review-fanout "Review this PR."
 ```
 
-With the flag set, the implement→PR step still records the PR baseline, runs the
-merge gate, and records the `implemented` decision — it simply enqueues **no**
-native review jobs. The skip is honored on both PR-open paths: the engine's
-implement-advance and the daemon's GitHub PR-watcher, so a PR opened either way
-stays free of native review fan-out. The flag defaults off; leaving it off keeps
-the full native review fan-out, byte-identical to prior behavior.
+The flag is persisted on the job payload and on the branch lock, and the
+PR-watcher reads the lock, so a PR it observes on that branch stays free of
+native review fan-out. The engine's implement-advance arm reads the same flag,
+but Gitmoot no longer dispatches implementation (#2203), so the PR-watcher is
+the path that still exercises it. The flag defaults off; leaving it off keeps
+the full native review fan-out.
 
-Fresh implementation PRs opened by these engine paths are drafts by default.
-Pass `--ready` only when the PR should enter review and merge-gate processing
-immediately; `--draft` states the default explicitly. A forge-reported draft
-does not park its task at `awaiting_human_merge`, because no human merge decision
-has been requested yet.
+A forge-reported draft does not park its task at `awaiting_human_merge`, because
+no human merge decision has been requested yet. The `--draft`/`--ready` dispatch
+flags went with `agent implement`, so mark the PR ready on the forge when it
+should enter review and merge-gate processing.
 
 ## Ephemeral, leaf-only, bounded
 
-In all three recipes the delegations never set `agent`: `agent` and `ephemeral`
+In both recipes the delegations never set `agent`: `agent` and `ephemeral`
 are mutually exclusive, and every panelist or leg here is ephemeral. Ephemeral workers
 are **leaf-only** — they return findings, never their own delegations — so a
 recipe's fan-out is exactly one level deep. The recipes run inside the same

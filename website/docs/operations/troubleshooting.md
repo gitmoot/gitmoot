@@ -604,7 +604,9 @@ period the daemon force-removes dirty terminal-owned read-only and delegation
 worktrees. Set the TTL to `"0"` to disable this pass. Blocked, queued, and
 running owners remain pinned.
 
-No gitmoot path deletes an independent fix clone. It is a standalone object
+No NEW fix clone is created — #2203 removed the fix-worktree lifecycle and the
+auto-fix leg that allocated one — and no gitmoot path deletes one that already
+exists. It is a standalone object
 database, and Linux has no inode-conditional unlink that can make deletion match
 a preceding proof. Commit and nested-repository checks can diagnose obvious
 retention reasons, but they do not close over every blob, tree, annotated tag,

@@ -450,19 +450,6 @@ type ImplementationFinalizer interface {
 	FinalizeImplementation(ctx context.Context, job db.Job, payload JobPayload) (JobPayload, error)
 }
 
-type FixWorktreeRequest struct {
-	JobID  string
-	Repo   string
-	Branch string
-}
-
-type FixWorktreeAllocation struct {
-	Path    string
-	Created bool
-}
-
-type FixWorktreeAllocator func(context.Context, FixWorktreeRequest) (FixWorktreeAllocation, error)
-
 // EscalationRequest carries the context the EscalationNotifier needs to notify a
 // human that a delegation tree has paused awaiting their decision (#340).
 type EscalationRequest struct {

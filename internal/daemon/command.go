@@ -289,7 +289,11 @@ var ErrUnsupportedAction = errors.New("unsupported command action")
 
 func (c Command) Validate() error {
 	switch c.Action {
-	case "review", "implement", "ask", "status", "merge", "retry", "cancel", "help", "resume":
+	// "implement" is absent (#2203): Gitmoot dispatches no implementation, so an
+	// `/gitmoot <agent> implement ...` comment takes the SAME path as any other
+	// unrecognized action — ErrUnsupportedAction, which handleCommand logs and
+	// stays silent about rather than replying on the thread (#1355).
+	case "review", "ask", "status", "merge", "retry", "cancel", "help", "resume":
 	default:
 		return fmt.Errorf("%w %q", ErrUnsupportedAction, c.Action)
 	}

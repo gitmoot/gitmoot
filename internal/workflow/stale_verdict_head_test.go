@@ -110,33 +110,6 @@ func TestObjectionAtCurrentHeadStillRequestsChanges(t *testing.T) {
 //
 // An ABSENT head is governed by the integration markers instead of by this arm -
 // see TestObjectionWithNoHeadStillRequestsChanges below.
-func TestObjectionWithNoObservedPullRequestRowStillRequestsChanges(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
-		State: string(TaskReadyToMerge),
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	seedImplementAttribution(t, store)
-	engine, _ := wedgeEngine(t, store)
-
-	seedReviewJob(t, store, "review-unobserved", "auditor", "head-old", "changes_requested", JobSucceeded)
-
-	if err := engine.AdvanceJob(ctx, "review-unobserved"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-	assertTaskState(t, store, "task-9", TaskChangesRequested)
-	if reason := staleHeadSkipReason(t, store, "review-unobserved"); reason != "" {
-		t.Fatalf("an unconfirmable head must admit, not skip: %q", reason)
-	}
-}
-
-// PIN 2 - A STALE OBJECTION DISPATCHES NO FIX LEG. dispatchFix is called INLINE
-// from this arm, so refusing the transition without refusing the dispatch would
-// leave the worse half running: a fix job carrying findings about a commit the
-// branch has already moved past is wrong work, not late work.
 func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -148,7 +121,6 @@ func TestStaleObjectionDispatchesNoFixLeg(t *testing.T) {
 	}
 	seedObservedPullRequest(t, store, "head-new")
 	seedImplementAttribution(t, store)
-	enableAutoFix(t, store, 9)
 	engine, _ := wedgeEngine(t, store)
 
 	before, err := store.ListJobs(ctx)

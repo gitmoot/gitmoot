@@ -73,7 +73,7 @@ func TestSaveHeartbeatRuntimeOverride(t *testing.T) {
 	// With a runtime override: the key is written and round-trips.
 	if err := SaveHeartbeat(paths, Heartbeat{
 		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
-		Interval: "24h", Action: "implement", Runtime: "codex", Prompt: "tidy",
+		Interval: "24h", Action: "review", Runtime: "codex", Prompt: "tidy",
 	}); err != nil {
 		t.Fatalf("SaveHeartbeat with runtime: %v", err)
 	}
@@ -127,14 +127,14 @@ func TestSaveHeartbeatClearsRuntimeOnResaveWithoutOverride(t *testing.T) {
 	// First save WITH an override.
 	if err := SaveHeartbeat(paths, Heartbeat{
 		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
-		Interval: "24h", Action: "implement", Runtime: "codex", Prompt: "tidy",
+		Interval: "24h", Action: "review", Runtime: "codex", Prompt: "tidy",
 	}); err != nil {
 		t.Fatalf("SaveHeartbeat with runtime: %v", err)
 	}
 	// Re-save the SAME heartbeat WITHOUT a runtime: the override must be cleared.
 	if err := SaveHeartbeat(paths, Heartbeat{
 		Agent: "builder", Name: "nightly", Enabled: true, Repo: "o/r",
-		Interval: "24h", Action: "implement", Prompt: "tidy",
+		Interval: "24h", Action: "review", Prompt: "tidy",
 	}); err != nil {
 		t.Fatalf("SaveHeartbeat without runtime: %v", err)
 	}

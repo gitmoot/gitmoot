@@ -11,16 +11,24 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 )
 
-// pausedImplementEscalation seeds a paused escalation whose failing leg is an
-// IMPLEMENT delegation. That distinction is the whole point: only an implement leg
-// runs PRE-EFFECTS (worktree allocation, branch lock), so a fixture built on a review
-// leg cannot observe them and any pre-effect assertion against it is vacuous (#1673).
-func pausedImplementEscalation(t *testing.T, store *db.Store, engine *Engine) *fakeWorktreeManager {
+// pausedEscalation seeds a paused escalation whose failing leg is a READ-ONLY
+// review delegation in a two-sibling fan-out. The fan-out is the whole point:
+// >=2 read-only siblings are what make the engine allocate a DETACHED WORKTREE
+// for each leg, and that git work is the external pre-effect these tests
+// instrument. A single-leg fixture allocates nothing, so any pre-effect
+// assertion against it would be vacuous (#1673).
+//
+// It was an IMPLEMENT leg until #2203 removed the implement delegation action
+// along with its writable worktree and shared-checkout branch lock. The
+// external-allocation window it exercises survives on the read-only path; the
+// branch lock does not, which is why the lock-specific tests went with it.
+func pausedEscalation(t *testing.T, store *db.Store, engine *Engine) *fakeWorktreeManager {
 	// engine is taken by pointer because the fixture WIRES it: Home, DelegationCheckout
-	// and the worktree manager are what make an implement leg run pre-effects at all.
+	// and the worktree manager are what make a read-only leg allocate at all.
 	t.Helper()
 	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "builder", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "builder", []string{"review"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "sibling", []string{"review"}, "gitmoot/gitmoot")
 	manager := &fakeWorktreeManager{}
 	engine.Home = t.TempDir()
 	engine.DelegationCheckout = t.TempDir()
@@ -36,7 +44,8 @@ func pausedImplementEscalation(t *testing.T, store *db.Store, engine *Engine) *f
 			Decision: "approved",
 			Summary:  "done",
 			Delegations: []Delegation{
-				{ID: "impl", Agent: "builder", Action: "implement", Prompt: "build it", FailurePolicy: "escalate_human"},
+				{ID: "impl", Agent: "builder", Action: "review", Prompt: "check it", FailurePolicy: "escalate_human"},
+				{ID: "other", Agent: "sibling", Action: "review", Prompt: "check it too"},
 			},
 		},
 	})
@@ -46,19 +55,23 @@ func pausedImplementEscalation(t *testing.T, store *db.Store, engine *Engine) *f
 	completeDelegationChild(t, store, "parent-job/delegation/impl", JobFailed,
 		AgentResult{Decision: "failed", Summary: "build broke"})
 	if err := engine.AdvanceJob(context.Background(), "parent-job/delegation/impl"); err == nil {
-		t.Fatal("expected the failing implement leg to pause on a human")
+		t.Fatal("expected the failing review leg to pause on a human")
 	}
+	// MEASURE FROM ZERO. The initial dispatch allocated one worktree per sibling;
+	// every count below is a statement about the RESOLUTION's allocations, not the
+	// fixture's.
+	manager.detachedCalls = nil
 	return manager
 }
 
-// distinctWorktrees counts the DISTINCT worktree paths a fixture allocated. The count
+// distinctWorktrees counts the DISTINCT detached worktree paths a fixture allocated. The count
 // that matters is one of RESOURCES, not one of invocations: re-running an allocation
 // keyed by home/repo/parent/delegation re-uses the same worktree, and that re-use is
 // exactly the property that makes a pre-effect safe to replay under the fence (#1673).
 func distinctWorktrees(manager *fakeWorktreeManager) []string {
 	seen := map[string]bool{}
 	paths := []string{}
-	for _, call := range manager.calls {
+	for _, call := range manager.detachedCalls {
 		if seen[call.path] {
 			continue
 		}
@@ -98,7 +111,7 @@ func TestFencedResolutionCrashKeepsOneOfEverythingAndReusesTheAllocation(t *test
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	boom := errors.New("crash inside the effect window")
 	crashes := 0
@@ -185,7 +198,7 @@ func TestFencedResolutionFenceLoserAppliesNoEffects(t *testing.T) {
 	engine.EscalationNotifier = notifier
 	sink := &recordingSink{}
 	engine.EventSink = sink
-	pausedImplementEscalation(t, store, &engine)
+	pausedEscalation(t, store, &engine)
 	// BASELINE: the fixture's own pause already announced once. Measuring from zero
 	// here is what makes a later count a statement about the RESOLUTION rather than
 	// about the fixture - the first version of this test measured the fixture.
@@ -243,7 +256,7 @@ func TestFencedResolutionOnlyTheHolderRunsPreEffects(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	engine.EscalationNotifier = &recordingNotifier{}
-	manager := pausedImplementEscalation(t, store, &engine)
+	manager := pausedEscalation(t, store, &engine)
 
 	boom := errors.New("crash inside the effect window")
 	resolutionEffectsHook = func(hookCtx context.Context, jobID string) error { return boom }

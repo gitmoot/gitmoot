@@ -122,15 +122,15 @@ func (w jobWorker) checkoutForPostDeliveryAdvance(ctx context.Context, job db.Jo
 	if w.CheckoutValidator != nil {
 		return w.CheckoutValidator(ctx, job, payload, agent)
 	}
-	if reviewAdvanceUsesRegisteredCheckout(job, payload) {
+	if reviewAdvanceUsesRegisteredCheckout(job) {
 		checkout, _, err := w.resolveRegisteredRepoCheckoutForRunner(ctx, job, payload.Repo, runner)
 		return checkout, err
 	}
 	return w.defaultCheckoutForRunner(ctx, job, payload, agent, runner)
 }
 
-func reviewAdvanceUsesRegisteredCheckout(job db.Job, payload workflow.JobPayload) bool {
-	return job.Type == "review" && !payload.FixWorktree
+func reviewAdvanceUsesRegisteredCheckout(job db.Job) bool {
+	return job.Type == "review"
 }
 
 // prepareNativeReviewWorktreeForRunner gives a native PR review leg that reached
@@ -231,23 +231,6 @@ func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job
 }
 
 func (w jobWorker) resolveJobCheckoutForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (string, error) {
-	if payload.FixWorktree {
-		checkout, err := normalizeTaskWorktreePath(payload.WorktreePath)
-		if err != nil {
-			return "", err
-		}
-		if checkout == "" {
-			return "", errors.New("review fix job has no allocated worktree path")
-		}
-		repo, err := github.ParseRepository(payload.Repo)
-		if err != nil {
-			return "", err
-		}
-		if err := preflightDaemonRepoCheckoutWithRunner(ctx, repo, checkout, runner); err != nil {
-			return "", err
-		}
-		return checkout, nil
-	}
 	checkout, repo, err := w.resolveRegisteredRepoCheckoutForRunner(ctx, job, payload.Repo, runner)
 	if err != nil {
 		return "", err
@@ -361,27 +344,6 @@ func normalizeTaskWorktreePath(path string) (string, error) {
 
 func (w jobWorker) validateTargetCheckoutForRunner(ctx context.Context, payload workflow.JobPayload, checkout string, runner subprocess.Runner) error {
 	git := jobGitClient(checkout, runner)
-	// A fix-round checkout is an independent writable clone attached to the real
-	// task branch. Its allocator bound HEAD to the fetched branch tip at dispatch;
-	// validate branch identity and cleanliness here without comparing the inherited
-	// review HeadSHA, which may legitimately predate that fetched tip.
-	if payload.FixWorktree {
-		branch, err := git.CurrentBranch(ctx)
-		if err != nil {
-			return err
-		}
-		if branch != payload.Branch {
-			return fmt.Errorf("checkout branch is %s, not job branch %s", branch, payload.Branch)
-		}
-		clean, err := git.WorktreeClean(ctx)
-		if err != nil {
-			return err
-		}
-		if !clean {
-			return fmt.Errorf("checkout %s has uncommitted changes", checkout)
-		}
-		return nil
-	}
 	// A delegation worktree child runs in a gitmoot-managed worktree. An implement
 	// child is on its delegation branch (created off the parent base, whose tip may
 	// have advanced past the inherited HeadSHA — so its HeadSHA check is skipped),

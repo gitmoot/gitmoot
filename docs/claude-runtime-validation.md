@@ -1,9 +1,16 @@
 # Claude Runtime Validation
 
-Use this checklist when validating Claude Code as a Gitmoot implementation
-worker. It is intentionally operational: it proves the daemon can route Claude
-jobs through task worktrees without storing Claude credentials or raw runtime
+Use this checklist when validating Claude Code as a Gitmoot runtime. It is
+intentionally operational: it proves the daemon can route Claude jobs through
+their own worktrees without storing Claude credentials or raw runtime
 transcripts in the repository.
+
+Gitmoot no longer dispatches implementation (#2203), so the scenarios below use
+the dispatchable actions — `ask` and `review`. The invariants this checklist
+exists for are unchanged by that: credential custody, per-job worktree
+isolation, runtime-session locks, and fail-closed permission policy are all
+exercised by read-only dispatch. What it can no longer prove end-to-end is the
+implement finalizer (commit/push/PR), because nothing enqueues an implement job.
 
 ## Preconditions
 
@@ -45,10 +52,10 @@ operational values such as `PATH` only.
 
 | Scenario | Required signal |
 | --- | --- |
-| Claude read-only (or `auto`/default) implement worker | Job is blocked before runtime delivery with a `permission_blocked` event and the standard write-permission message — `auto` grants no deterministic headless write, so it fails closed like `read-only` (#452). |
-| Claude workspace-write implement worker | Job runs in `task.worktree_path` and produces the expected marker change there, not in the registered checkout. |
-| Mixed Codex + Claude parallel implement | Two tasks have two distinct worktrees, daemon runs with `--workers 2`, Codex owns one runtime session, Claude owns another, and both jobs finish without checkout or runtime-session contention. |
-| Local/no-PR implement advancement | Implementation job records `advance_skipped_no_pr`, then `advance_completed`; it should not keep retrying PR advancement when no PR is attached. |
+| Claude read-only (or `auto`/default) worker carrying `--capability implement` | `agent start`/`agent subscribe` refuses the registration outright — `auto` grants no deterministic headless write, so it fails closed like `read-only` (#452). |
+| Claude review worker | Job runs in its own detached read-only worktree at the requested exact head, not in the registered checkout. |
+| Mixed Codex + Claude parallel review | Two reviews have two distinct worktrees, daemon runs with `--workers 2`, Codex owns one runtime session, Claude owns another, and both jobs finish without checkout or runtime-session contention. |
+| Recorded implementation | `gitmoot job record --type implement` writes a succeeded row the merge gate can attribute; no dispatch, no worktree, no finalizer is involved. |
 
 ## Smoke Flow
 
@@ -62,29 +69,29 @@ gitmoot task list --repo owner/repo
 Register or start workers with separate runtime sessions:
 
 ```sh
-gitmoot agent subscribe codex-worker \
+gitmoot agent subscribe codex-reviewer \
   --repo owner/repo \
   --runtime codex \
   --session <codex-session> \
-  --role implementer \
-  --capability implement \
-  --policy workspace-write
+  --role reviewer \
+  --capability review \
+  --policy read-only
 
-gitmoot agent subscribe claude-worker \
+gitmoot agent subscribe claude-reviewer \
   --repo owner/repo \
   --runtime claude \
   --session <claude-session-uuid> \
-  --role implementer \
-  --capability implement \
-  --policy workspace-write
+  --role reviewer \
+  --capability review \
+  --policy read-only
 ```
 
-Queue one implement job per worker. Each dispatch mints its own task and should
-allocate a dedicated worktree:
+Dispatch one review per worker. Each should allocate its own detached
+read-only worktree at the requested exact head and print its path:
 
 ```sh
-gitmoot agent implement codex-worker "Write the codex marker file" --repo owner/repo --background
-gitmoot agent implement claude-worker "Write the claude marker file" --repo owner/repo --background
+gitmoot agent review codex-reviewer --repo owner/repo --pr <n> --head-sha <40-char-head> --background "Review this PR."
+gitmoot agent review claude-reviewer --repo owner/repo --pr <n> --head-sha <40-char-head> --background "Review this PR."
 ```
 
 Run the daemon with enough workers for both jobs:
@@ -104,12 +111,10 @@ gitmoot job events <job-id>
 
 Expected evidence:
 
-- Each implementation job uses its task worktree path.
+- Each review job uses its own detached worktree path at the requested head.
 - No job reuses the same `runtime:<runtime>:<runtime_ref>` lock concurrently.
-- Local jobs without a PR number include `advance_skipped_no_pr` followed by
-  `advance_completed`.
-- Read-only implement attempts never start Claude or Codex; they stop with the
-  standard `permission_blocked` event.
+- A registration that pairs `--capability implement` with `read-only`/`auto` is
+  refused at `agent start`/`agent subscribe`, before any job exists.
 
 ## Related Unit Coverage
 
@@ -117,6 +122,6 @@ The following focused tests cover the non-live invariants:
 
 ```sh
 GOTOOLCHAIN=go1.26.0 go test ./internal/cli ./internal/runtime ./internal/workflow \
-  -run 'Permission|AllocateTaskWorktree|SelectRunnableQueuedJobs|AdvanceImplement' \
+  -run 'Permission|SelectRunnableQueuedJobs|ReviewWorktree' \
   -v -timeout 180s
 ```

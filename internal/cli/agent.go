@@ -51,8 +51,6 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentRun(args[1:], stdout, stderr)
 	case "review":
 		return runAgentReview(args[1:], stdout, stderr)
-	case "implement":
-		return runAgentImplement(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
 	case "heartbeat":
@@ -94,9 +92,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
@@ -145,7 +142,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 	}
 	if !options.force && looksLikeWorkflowOrchestration(options.message) {
 		fmt.Fprintln(stderr, "note: this reads like implementation workflow orchestration, but `agent ask` is read-only and will only answer/analyze.")
-		fmt.Fprintln(stderr, "If you want Gitmoot to manage worktrees, branches, commits, and PRs, use `gitmoot agent run` or `gitmoot agent implement`.")
+		fmt.Fprintln(stderr, "Gitmoot does not dispatch implementation (#2203): implement in your own session and record it with `gitmoot job record --type implement`.")
 	}
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
@@ -328,7 +325,7 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 		return agentAskOptions{}, false
 	}
 	if options.action != "" && options.action != "ask" {
-		fmt.Fprintf(stderr, "agent ask: --action must be ask; use agent run to choose ask, review, or implement\n")
+		fmt.Fprintf(stderr, "agent ask: --action must be ask; use agent run to choose ask or review\n")
 		return agentAskOptions{}, false
 	}
 	if options.workflowSet && options.workflowID == "" {
@@ -358,7 +355,7 @@ func printAgentAskUsage(w io.Writer) {
 }
 
 // printAgentRuntimeOverrideHelp documents the per-job --runtime override
-// (#531) shared by agent ask/run/review/implement and orchestrate. The valid
+// (#531) shared by agent ask/run/review and orchestrate. The valid
 // runtime values are enumerated from the adapter registry, never hard-coded.
 func printAgentRuntimeOverrideHelp(w io.Writer) {
 	fmt.Fprintf(w, "  --runtime %s runs THIS job on the named runtime; the agent's registered default runtime is unchanged.\n", strings.Join(runtime.SupportedRuntimes(), "|"))
@@ -372,28 +369,24 @@ func printAgentRuntimeOverrideHelp(w io.Writer) {
 }
 
 type agentRunOptions struct {
-	home             string
-	repo             string
-	jsonOutput       bool
-	background       bool
-	foreground       bool
-	typeName         string
-	action           string
-	model            string
-	effort           string
-	workflowID       string
-	workflowSet      bool
-	orgRole          string
-	runtime          string
-	session          string
-	taskID           string
-	prNumber         int
-	pullRequestReady bool
-	pullRequestMode  string
-	headSHA          string
-	base             string
-	branch           string
-	lead             string
+	home        string
+	repo        string
+	jsonOutput  bool
+	background  bool
+	foreground  bool
+	typeName    string
+	action      string
+	model       string
+	effort      string
+	workflowID  string
+	workflowSet bool
+	orgRole     string
+	runtime     string
+	session     string
+	prNumber    int
+	headSHA     string
+	branch      string
+	lead        string
 	// routerBypassReason names why this dispatch skipped `review request`, so
 	// the job carries it instead of only the operator's terminal (#2199).
 	routerBypassReason      string
@@ -483,7 +476,7 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 
 func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--recipe id] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--recipe id] [--home path] [--json]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
 	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
@@ -494,7 +487,7 @@ func printOrchestrateUsage(w io.Writer) {
 	fmt.Fprintln(w, "Example:")
 	fmt.Fprintln(w, "  gitmoot orchestrate planner \"audit the auth flow and fan out fixes\" --repo owner/repo")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "--recipe <review-panel|decompose-and-verify|verifier> routes the coordinator")
+	fmt.Fprintf(w, "--recipe <%s> routes the coordinator\n", strings.Join(recipeTemplateIDs, "|"))
 	fmt.Fprintln(w, "to a named built-in recipe prompt (an opt-in deterministic decomposition")
 	fmt.Fprintln(w, "shape) instead of the agent's own prompt; the agent's identity is unchanged.")
 }
@@ -536,14 +529,6 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	//
 	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
 	// them, and both SAY SO rather than degrading quietly.
-	// A FLAG THAT THE DIRECT PATH ITSELF REFUSES MUST REFUSE FIRST. --draft and
-	// --ready are implement-only; printing "dispatched WITHOUT the review router"
-	// and then refusing tells the caller what happened and then does something
-	// else (#2196 review).
-	if mode := strings.TrimSpace(options.pullRequestMode); mode != "" {
-		fmt.Fprintf(stderr, "agent review: --%s is only supported when routing to implement\n", mode)
-		return 2
-	}
 	// EVERY reason is recorded, not just the flag one: a bypass nobody can query
 	// is indistinguishable from a router that silently did not run (#2199).
 	switch {
@@ -694,12 +679,9 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 	}{
 		{"--action", strings.TrimSpace(options.action) != "" && !strings.EqualFold(strings.TrimSpace(options.action), "review")},
 		{"--type", strings.TrimSpace(options.typeName) != ""},
-		{"--task", strings.TrimSpace(options.taskID) != ""},
-		{"--base", strings.TrimSpace(options.base) != ""},
 		{"--recipe", strings.TrimSpace(options.recipe) != ""},
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
 		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
-		{"--" + strings.TrimSpace(options.pullRequestMode), strings.TrimSpace(options.pullRequestMode) != ""},
 		// --json CHANGES SCHEMA on the delegated path: `review request` prints a
 		// different object. A programmatic caller parsing the old shape reads
 		// zeros or errors, silently. Keeping the direct path preserves the
@@ -759,34 +741,6 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 	return args
 }
 
-func runAgentImplement(args []string, stdout, stderr io.Writer) int {
-	options, ok := parseAgentRunOptions("implement", args, stderr)
-	if !ok {
-		if containsHelpFlag(args) {
-			return 0
-		}
-		return 2
-	}
-	if err := normalizeReviewExecutionMode(&options, "implement"); err != nil {
-		fmt.Fprintf(stderr, "agent implement: %v\n", err)
-		return 2
-	}
-	output, exit := dispatchAgentCommand(options, "implement", "explicit agent implement", "agent_implement", stdout, stderr)
-	if exit != 0 {
-		return exit
-	}
-	if options.jsonOutput {
-		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "agent implement: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	printLocalAgentJobOutput(stdout, output)
-	printQueuedDaemonHint(stdout, output, options.background, options.home)
-	return 0
-}
-
 func normalizeReviewExecutionMode(options *agentRunOptions, action string) error {
 	if options.foreground && action != "review" {
 		return errors.New("--foreground is only supported when routing to review")
@@ -810,14 +764,6 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	}
 	if strings.TrimSpace(options.lead) != "" && action != "review" {
 		fmt.Fprintf(stderr, "%s: --lead is only supported when routing to review\n", errLabel)
-		return localAgentJobOutput{}, 2
-	}
-	if err := normalizeAgentImplementBase(&options, action); err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", errLabel, err)
-		return localAgentJobOutput{}, 2
-	}
-	if options.pullRequestMode != "" && action != "implement" {
-		fmt.Fprintf(stderr, "%s: --%s is only supported when routing to implement\n", errLabel, options.pullRequestMode)
 		return localAgentJobOutput{}, 2
 	}
 	dispatchCtx := context.Background()
@@ -883,11 +829,8 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		Runtime:                 options.runtime,
 		RuntimeSession:          options.session,
 		Home:                    options.home,
-		TaskID:                  options.taskID,
 		PullRequest:             options.prNumber,
-		PullRequestReady:        options.pullRequestReady,
 		HeadSHA:                 options.headSHA,
-		ImplementBase:           options.base,
 		Branch:                  options.branch,
 		LeadAgent:               options.lead,
 		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
@@ -947,15 +890,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.noFixTarget = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--draft" || arg == "--ready":
-			mode := strings.TrimPrefix(arg, "--")
-			if options.pullRequestMode != "" && options.pullRequestMode != mode {
-				fmt.Fprintf(stderr, "%s: --draft and --ready are mutually exclusive\n", label)
-				return agentRunOptions{}, false
-			}
-			options.pullRequestMode = mode
-			options.pullRequestReady = mode == "ready"
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--task" || arg == "--pr" || arg == "--head-sha" || arg == "--base" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -989,16 +924,12 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--home="):
 			options.home = strings.TrimPrefix(arg, "--home=")
-		case strings.HasPrefix(arg, "--task="):
-			options.taskID = strings.TrimPrefix(arg, "--task=")
 		case strings.HasPrefix(arg, "--pr="):
 			if !setAgentRunOption(&options, "--pr", strings.TrimPrefix(arg, "--pr="), stderr) {
 				return agentRunOptions{}, false
 			}
 		case strings.HasPrefix(arg, "--head-sha="):
 			options.headSHA = strings.TrimPrefix(arg, "--head-sha=")
-		case strings.HasPrefix(arg, "--base="):
-			options.base = strings.TrimSpace(strings.TrimPrefix(arg, "--base="))
 		case strings.HasPrefix(arg, "--branch="):
 			options.branch = strings.TrimPrefix(arg, "--branch=")
 		case strings.HasPrefix(arg, "--lead="):
@@ -1098,12 +1029,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.repo = value
 	case "--home":
 		options.home = value
-	case "--task":
-		options.taskID = value
 	case "--head-sha":
 		options.headSHA = value
-	case "--base":
-		options.base = value
 	case "--branch":
 		options.branch = value
 	case "--lead":
@@ -1143,20 +1070,14 @@ func validateAgentRunActionOptions(command string, options agentRunOptions) erro
 	if command == "review" && action != "review" {
 		return fmt.Errorf("agent review only supports --action review; use agent run to choose %s", action)
 	}
-	if command == "implement" && action != "implement" {
-		return fmt.Errorf("agent implement only supports --action implement; use agent run to choose %s", action)
-	}
 	switch action {
 	case "ask":
-		if strings.TrimSpace(options.taskID) != "" || options.prNumber > 0 || strings.TrimSpace(options.headSHA) != "" || strings.TrimSpace(options.base) != "" || strings.TrimSpace(options.branch) != "" {
-			return errors.New("--action ask cannot be combined with --task, --pr, --head-sha, --base, or --branch")
+		if options.prNumber > 0 || strings.TrimSpace(options.headSHA) != "" || strings.TrimSpace(options.branch) != "" {
+			return errors.New("--action ask cannot be combined with --pr, --head-sha, or --branch")
 		}
 	case "review":
 		if options.prNumber <= 0 {
 			return errors.New("--action review requires --pr number")
-		}
-		if strings.TrimSpace(options.taskID) != "" || strings.TrimSpace(options.base) != "" {
-			return errors.New("--action review cannot be combined with --task or --base")
 		}
 	}
 	return nil
@@ -1166,49 +1087,14 @@ func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
 	switch command {
 	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--head-sha sha] [--branch branch] [--draft|--ready] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
 		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 		fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
-	case "implement":
-		fmt.Fprintln(w, "  gitmoot agent implement <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--base ref] [--head-sha sha] [--branch branch] [--draft|--ready] [--background] [--type type] [--action implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--skip-native-review-fanout] [--home path] [--json]")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--task task-id] [--pr number] [--lead implementer] [--head-sha sha] [--base ref] [--branch branch] [--draft|--ready] [--background|--foreground] [--type type] [--action ask|review|implement] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
-	}
-	if command == "implement" || command == "run" {
-		fmt.Fprintln(w, "  --base <ref> selects the starting commit for implement worktrees; origin/* refs are fetched before resolution.")
-		fmt.Fprintln(w, "  On implement, --head-sha is a compatibility alias for --base. Different values are rejected.")
-	}
-	if command == "implement" || command == "run" || command == "orchestrate" {
-		fmt.Fprintln(w, "  Implementation PRs open as drafts by default. Use --ready to opt into immediate merge-gate eligibility.")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
 	printAgentRuntimeOverrideHelp(w)
-}
-
-// normalizeAgentImplementBase applies the implement-only compatibility rule for
-// --head-sha. Review routing keeps its existing head-SHA semantics; once a
-// command has selected implement, --head-sha becomes an alias for --base.
-func normalizeAgentImplementBase(options *agentRunOptions, action string) error {
-	base := strings.TrimSpace(options.base)
-	headSHA := strings.TrimSpace(options.headSHA)
-	if action != "implement" {
-		if base != "" {
-			return errors.New("--base is only supported when agent implement or agent run routes to implement")
-		}
-		return nil
-	}
-	if base != "" && headSHA != "" && base != headSHA {
-		return fmt.Errorf("--base %q conflicts with --head-sha %q; pass only one value", base, headSHA)
-	}
-	if base == "" {
-		base = headSHA
-	}
-	options.base = base
-	// An implement job's HeadSHA is always replaced with the allocated worktree
-	// head. Clear the compatibility input so permission-blocked jobs do not store
-	// an unvalidated target SHA as if it were the task worktree head.
-	options.headSHA = ""
-	return nil
 }
 
 // recipeTemplateIDs is the allowlist of built-in coordinator recipes the
@@ -1216,7 +1102,6 @@ func normalizeAgentImplementBase(options *agentRunOptions, action string) error 
 // the set stays coupled to the registry of installable templates.
 var recipeTemplateIDs = []string{
 	agenttemplate.ReviewPanelTemplateID,
-	agenttemplate.DecomposeAndVerifyTemplateID,
 	agenttemplate.VerifierTemplateID,
 }
 
@@ -1246,9 +1131,6 @@ func selectOrchestrateAction(options agentRunOptions) (string, string) {
 	if action := strings.TrimSpace(options.action); action != "" {
 		return action, "--action explicitly selects " + action + " workflow"
 	}
-	if strings.TrimSpace(options.taskID) != "" {
-		return "implement", "--task selects implementation workflow"
-	}
 	if options.prNumber > 0 {
 		return "review", "--pr selects review workflow"
 	}
@@ -1262,9 +1144,6 @@ func selectAgentRunAction(options agentRunOptions) (string, string) {
 	if action := strings.TrimSpace(options.action); action != "" {
 		return action, "--action explicitly selects " + action + " workflow"
 	}
-	if strings.TrimSpace(options.taskID) != "" {
-		return "implement", "--task selects implementation workflow"
-	}
 	if options.prNumber > 0 {
 		return "review", "--pr selects review workflow"
 	}
@@ -1273,9 +1152,6 @@ func selectAgentRunAction(options agentRunOptions) (string, string) {
 	}
 	if looksLikeReviewRequest(options.message) {
 		return "review", "message asks for PR review or approval"
-	}
-	if looksLikeImplementationRequest(options.message) {
-		return "implement", "message asks for code, docs, tests, or file changes"
 	}
 	return "ask", "message is analysis, planning, or a question"
 }
@@ -1313,17 +1189,6 @@ func looksLikeWorkflowOrchestration(message string) bool {
 func looksLikeReviewRequest(message string) bool {
 	lower := strings.ToLower(message)
 	phrases := []string{"review pr", "review this pr", "review pull request", "code review", "approve pr", "approve pull request", "request changes", "audit pr", "audit pull request"}
-	for _, phrase := range phrases {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-func looksLikeImplementationRequest(message string) bool {
-	lower := strings.ToLower(message)
-	phrases := []string{"implement", "edit", "change file", "update file", "write tests", "add test", "fix bug", "patch", "modify", "refactor", "update docs", "documentation", "write code", "change code", "code change"}
 	for _, phrase := range phrases {
 		if strings.Contains(lower, phrase) {
 			return true

@@ -155,7 +155,7 @@ gitmoot agent start thermo-review --runtime codex --repo owner/repo --template t
 ```
 
 For a local dispatch, pair that reviewer with the registered implementer that
-should receive a `changes_requested` fix pass:
+should own a `changes_requested` fix:
 
 ```sh
 gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
@@ -232,10 +232,14 @@ GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
   --to implementer-role --workflow feature-42 \
   "approved: implement plan 1234 as written; the plan is the scope fence"
 
-# 4. Implement, quoting the approved plan-id.
-gitmoot agent implement builder --repo owner/repo --workflow feature-42 \
-  "Implement plan 1234 (workflow note in feature-42). Stay inside it; work
-   outside the plan needs an amended plan and a fresh approval."
+# 4. Implement in the implementer seat's OWN session, quoting the approved
+#    plan-id, then record the work. Gitmoot does not dispatch implementation
+#    (#2203), so the seat is the implementer and the job row is its receipt.
+gitmoot job record --agent builder --repo owner/repo --workflow feature-42 \
+  --type implement --decision implemented \
+  --title "Plan 1234" \
+  --summary "Implemented plan 1234 (workflow note in feature-42), inside its
+   fence; work outside the plan needs an amended plan and a fresh approval."
 
 # 5. Completion ends the obligation; merge closes the workflow — in this
 #    order: a `done` posted after `close` reopens the workflow, because
@@ -246,10 +250,10 @@ gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
 
 Outside org mode, step 3 is an explicit human approval message referencing the
 plan-id; the rest is unchanged. A coordinator may waive the gate for trivial
-mechanical fixes by writing "plan-waived" in the dispatch prompt — the waiver
+mechanical fixes by writing "plan-waived" in the recorded summary — the waiver
 is deliberate and visible, never implied. Under this convention every
-implement dispatch prompt carries either a plan-id or the literal
-"plan-waived"; a dispatch with neither is out of contract. Prefer this
+implementation carries either a plan-id or the literal "plan-waived" in its
+recorded summary; one with neither is out of contract. Prefer this
 durable handshake over an
 interactive plan-approval prompt for any unattended seat: a session blocked on
 an in-pane approval modal reports idle, runs no job, and escalates nothing, so
@@ -353,16 +357,13 @@ a success is working as designed, not flaky:
   envelope records a `malformed_output` event and is re-asked with a repair
   prompt a bounded number of times before failing terminally.
 
-**Dead implement, finished by hand:** if an implementer's process dies after
-editing the task worktree but before it commits/pushes/opens a PR, the edits sit
-uncommitted. `gitmoot agent implement` refuses to restart over a dirty worktree
-with no active job (so nothing is discarded) and names the worktree: `branch <b>
-has uncommitted changes in task worktree <path>; inspect and commit/push them,
-or clean/stash them before retrying implement`. No command finishes that work
-for you: inspect the worktree, then either commit and push the branch by hand —
-opening or updating the PR yourself — or clean/stash the changes, and retry
-`gitmoot agent implement`. Dispatch refuses separately while a live process is
-still inside the worktree.
+**Dead implement recovery is gone, with its cause:** Gitmoot no longer
+dispatches implementation (#2203), so there is no Gitmoot-owned implement job
+that can die between editing a task worktree and opening the PR, and therefore
+no `task run`/`task recover` pair to restart or finalize one. A seat that dies
+mid-work left its own worktree dirty: finish or discard it with ordinary git in
+that worktree, then record the outcome with `gitmoot job record --type
+implement`.
 
 **Task dismissal and stale reconciliation:** `dismissed` is a terminal task
 state reached only through implicit workflow transitions; no command dismisses a
@@ -428,24 +429,20 @@ otherwise-stuck `implementing` task. Implemented success without a PR records
 `task_blocked_job_failed`. Delegation children and tasks with queued retries,
 fixes, continuations, or pending advancement remain under their existing owner.
 
-**PR-bound fix pass:** use `gitmoot agent implement <agent> --repo owner/repo
---pr <number> "..."` or `gitmoot agent run <agent> --repo owner/repo --action
-implement --pr <number> "..."` to send an existing open PR back through its
-implementation task. `--action` chooses ask/review/implement; `--type` instead
-chooses a managed agent type, so the two flags are independent. Before reuse,
-Gitmoot proves the PR is open, same-repository, and bound to the existing task's
-head branch. That validated door permits `pr_open` to re-enter implementation
-without widening the dispatch predicate; review/merge states, branch
-mismatches, dirty/live worktrees, active implement jobs, and foreign branch
-locks still fail closed. The job keeps the PR number so finalization
-adopts the existing PR.
+**PR-bound fix pass:** there is no dispatch for one. A `changes_requested`
+verdict reports to the requester and to the `--lead` seat and stops there; the
+lead reopens its own checkout on the PR branch, pushes the fix, and records it
+with `gitmoot job record --type implement --pr <number> --head-sha <sha>`.
+Those rows are what the merge gate's implementer attribution and
+reviewer-independence check read, so recording is not bookkeeping — it is how
+the gate learns who implemented and that the reviewer was someone else. Request
+the re-review at the new head with `gitmoot review request --pr <number>`.
 
-Fresh implementation PRs opened by the engine are drafts by default. Dispatch
-with `--ready` only when the PR should enter review and merge-gate processing
-immediately; `--draft` records the default intent explicitly. While the forge
-reports the PR as draft, Gitmoot leaves the task in its current lifecycle state
-instead of parking it at `awaiting_human_merge`: a draft is an author hold, not
-a pending human merge decision.
+While the forge reports a PR as draft, Gitmoot leaves the task in its current
+lifecycle state instead of parking it at `awaiting_human_merge`: a draft is an
+author hold, not a pending human merge decision. The `--draft`/`--ready`
+dispatch flags went with `agent implement`, so mark the PR ready on the forge
+when it should enter review and merge-gate processing.
 
 The daemon default is `--workers 1`. Users can raise it when jobs target
 different runtime sessions, managed agent types with `max_background` greater
@@ -593,26 +590,26 @@ or task-bearing ask, or pass an **absolute** path to the file/dir under analysis
 
 ## Coordinator-Owned Review
 
-By default an `implement` job that opens a pull request fans the PR out to
-Gitmoot's native reviewers — the configured required reviewers, or the ones
-passed for the task — so each reviewer runs as its own review job before the
-merge gate. When a coordinator already plans review itself (for example a
-`review-panel` leg, or a custom continuation that reconvenes its own reviewers),
-that native fan-out duplicates work. Pass `--skip-native-review-fanout` on
-`gitmoot orchestrate`, `gitmoot agent run`, or `gitmoot agent implement` to hand
-review orchestration to the coordinator:
+When a PR appears on a branch Gitmoot holds a lock for, the daemon's PR-watcher
+fans it out to Gitmoot's native reviewers — the configured required reviewers,
+or the ones passed for the task — so each reviewer runs as its own review job
+before the merge gate. When a coordinator already plans review itself (for
+example a `review-panel` leg, or a custom continuation that reconvenes its own
+reviewers), that native fan-out duplicates work. Pass
+`--skip-native-review-fanout` on `gitmoot orchestrate` or `gitmoot agent run`
+to hand review orchestration to the coordinator:
 
 ```sh
-gitmoot agent implement lead --repo owner/repo --task task-001 --skip-native-review-fanout "Implement this task."
-gitmoot orchestrate decompose-and-verify "Implement the export feature described in the task." --repo owner/repo --skip-native-review-fanout
+gitmoot orchestrate verifier "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --skip-native-review-fanout
+gitmoot agent run lead --repo owner/repo --pr 12 --skip-native-review-fanout "Review this PR."
 ```
 
-With the flag set, the implement→PR step still records the PR baseline, runs the
-merge gate, and records the `implemented` decision — it simply enqueues **no**
-native review jobs. The skip is honored on both PR-open paths: the engine's
-implement-advance and the daemon's GitHub PR-watcher, so a PR opened either way
-stays free of native review fan-out. The flag defaults off; leaving it off keeps
-the full native review fan-out, byte-identical to prior behavior.
+The flag is persisted on the job payload and on the branch lock, and the
+PR-watcher reads the lock, so a PR it observes on that branch stays free of
+native review fan-out. The engine's implement-advance arm reads the same flag,
+but no implement job can be dispatched since #2203, so the PR-watcher is the
+path that still exercises it. The flag defaults off; leaving it off keeps the
+full native review fan-out.
 
 ## Coordinator Recipes
 
@@ -636,15 +633,20 @@ Three recipes ship built in:
   a self-contained lens prompt across mixed runtimes so the panel does not share
   one model's blind spots (point a panelist at an installed review template such
   as `thermo-nuclear-code-quality-review` only if you want).
-- **`decompose-and-verify`** — decomposes one implementation task into
-  file-disjoint subtasks, fans them out to ephemeral implementation workers that
-  build in parallel in their own branch worktrees, then runs a single `review`
-  verify step that `deps` on every implementation leg before reporting back.
+- **`decompose-and-verify`** was RETIRED because Gitmoot no longer dispatches
+  implementation (#2203). It existed to fan one implementation task out to
+  parallel implementation legs, and `ask`/`review` are now the only accepted
+  delegation actions, so those legs have no action to run under. The teaching it
+  carried is still the rule for any fan-out you write yourself: decompose into
+  **file-disjoint** subtasks so parallel legs cannot conflict, and end with a
+  separate verify worker rather than trusting a producer's self-report.
+  Installing it refuses with `agent template is retired; use verifier`, so a
+  stale script gets a named successor rather than "unknown template".
 - **`verifier`** — the minimal **produce vs. independent check** recipe: one
   producer leg plus one independent verify leg. The verify leg is a read-only
   ephemeral `review` worker that `deps` on the producer, runs on a **different
-  runtime/model**, and checks the producer's combined result against the original
-  goal — re-running the build and tests itself rather than trusting the producer's
+  runtime/model**, and checks the producer's result against the original
+  goal — reading the real code and running its own checks rather than trusting the producer's
   self-report. It returns `changes_requested` with structured findings on any
   objective failure (else `approved`), with `failure_policy: escalate` routing a
   failed verdict back to the coordinator continuation for autonomous correction
@@ -652,8 +654,8 @@ Three recipes ship built in:
 
 **Produce vs. independent check.** A `synthesis_rule` (`summary`/`vote`/`quorum`)
 reconciles what the producers **self-report** — self-evaluation, which inherits
-the producer's blind spots. A `verifier`/`decompose-and-verify` verify leg is a
-*separate* worker on a different runtime/model that checks the combined result
+the producer's blind spots. A `verifier` verify leg is a
+*separate* worker on a different runtime/model that checks the producer's result
 against the goal — cross-evaluation, which the literature finds beats
 self-evaluation (the generator-verifier gap; LLM-as-judge self-preference bias).
 This generalizes ROMA's Verifier (`(goal, candidate_output) -> verdict +
@@ -663,19 +665,18 @@ feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
 
 ```sh
 gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Implement the export feature described in the task." --repo owner/repo --recipe decompose-and-verify
-gitmoot orchestrate project-planner "Implement the rate limiter described in the task and prove it works." --repo owner/repo --recipe verifier
+gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
 ```
 
-The panelists in `review-panel` and every producer and verify leg in
-`decompose-and-verify` and `verifier` are **ephemeral** workers: Gitmoot creates
+The panelists in `review-panel` and both legs of `verifier` are **ephemeral**
+workers: Gitmoot creates
 each from the delegation's `ephemeral` spec, runs it, and disposes of it once the
 child job finishes. Ephemeral workers are leaf-only — they return findings, never their own
-delegations — so a recipe's fan-out is exactly one level deep. In all three recipes the
+delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
 delegations never set `agent`, because `agent` and `ephemeral` are mutually
 exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
 the coordinator to merge the results (the panel verdict, or the verify gate plus
-the merged changes). Inspect the run under `gitmoot job list --repo owner/repo`
+the producer's artifact). Inspect the run under `gitmoot job list --repo owner/repo`
 and the `delegation_enqueued` events in `gitmoot events --repo owner/repo`. See
 `RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
 bounds these recipes run inside.
@@ -887,7 +888,14 @@ runtime (claude / codex). Four kinds:
 - **ask / review** (#757) — read-only **leaf** (`action: ask|review`); `delegations[]`
   and `human_questions[]` stripped. A review may add `source: <implement stage>`
   (#813) to bind to that stage's PR and exact head SHA.
-- **implement** (#768): `action: implement` + `write: true`. MUTATES the repo on a
+- **implement** (#768): `action: implement` + `write: true`. The stage kind still
+  VALIDATES, but no implement stage can be dispatched after #2203 removed the
+  pipeline-stage writable-worktree allocator and its enqueue — that allocation
+  is precisely what would have to come back. Whether `pipeline add` should
+  refuse the kind outright is the open decision in #2213. The model below is
+  still documented because `write: true` and `allow_scheduled_writes` are
+  #768's mutating-safety contract and `action: produce` is mutating too. It
+  MUTATES the repo on a
   deterministic `gitmoot/pipe-<run>-<stage>` branch (retry reuses it, never duplicates).
   The `implemented` decision folds **on PR-opened**; other configured success decisions
   settle immediately without promising a PR. The implement job never merges. Scheduled

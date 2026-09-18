@@ -488,8 +488,9 @@ cannot recurse or fan out forever:
   dismisses a task. Automatic stale-task reconciliation proves there is no live
   matching job and requires its separate open-PR/remote-branch evidence, but
   does not inspect worktree processes. Ordinary task allocation and late review
-  or continuation advancement fail closed instead of overwriting it. Only
-  retrying a job performs an explicit audited recovery. Dismissal never deletes
+  or continuation advancement fail closed instead of overwriting it; retrying
+  one of its jobs performs the only explicit audited recovery, and `task
+  recover` is gone with implementer dispatch (#2203). Dismissal never deletes
   the task branch or worktree.
 
 - Dead implement worktree retries (#994): a queued top-level implement job may
@@ -568,13 +569,16 @@ owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
 successful linked-worktree force-remove and metadata prune records
 `delegation_worktree_reclaimed_ttl`.
 
-An aged fix clone is retained. Deleting a standalone clone deletes its object
+No NEW fix clone is ever created: #2203 removed the fix-worktree lifecycle
+along with the auto-fix leg that allocated one. The clones already on disk are
+still discovered, sized, and reported, and an aged one is retained rather than
+deleted. Deleting a standalone clone deletes its object
 database, and Linux has no inode-conditional unlink that can make a deletion
 match a preceding proof. Commit reachability and nested-repository checks can
 diagnose obvious unpublished content, but they do not prove the absence of
-every loose blob, tree, annotated tag, pack, or concurrent write. Passing those
-checks therefore records `delegation_worktree_retained_unproved`, never a
-proved-disposable handoff.
+every loose blob, tree, annotated tag, pack, or concurrent write. Dropping the
+payload field that used to mark these clones only reclassified them from
+pinned/reclaimable to unproven; it never made them invisible.
 
 Cleanup obligations for fix clones stay OPEN. Managed-path absence is not
 removal evidence, even when no sibling is found; a clone may have been set

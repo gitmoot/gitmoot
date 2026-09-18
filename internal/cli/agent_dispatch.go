@@ -132,16 +132,10 @@ type localAgentDispatchRequest struct {
 	PullRequest      int
 	PullRequestReady bool
 	HeadSHA          string
-	// ImplementBase is the CLI/config worktree base for implement dispatches.
-	// Before the request can enqueue, it is resolved to a commit SHA and
-	// ImplementBaseResolved is set so allocation uses that exact commit.
-	ImplementBase         string
-	ImplementBaseResolved bool
-	ImplementPRValidated  bool
-	Branch                string
-	GoalID                string
-	TaskTitle             string
-	LeadAgent             string
+	Branch           string
+	GoalID           string
+	TaskTitle        string
+	LeadAgent        string
 	// NoFixTarget states that this review has NO implementer to route a
 	// changes_requested verdict to (#2054). It is the review-only dispatch.
 	NoFixTarget            bool
@@ -376,16 +370,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		orgPolicy = fixedOrgPolicy(resolvedOrgPolicy)
 		request.ActingOrgRole = workflow.NormalizeActingOrgRole(request.ActingOrgRole)
 	}
-	// Strict workflow rejection must happen before repo/task/worktree/branch-lock
-	// mutation. Otherwise a retry without --workflow strands a fresh adhoc task.
-	if request.Action == "implement" {
-		if err := preflightStrictWorkflowPolicy(request.Home, repo.FullName(), request.WorkflowID, ""); err != nil {
-			return localAgentJobOutput{}, err
-		}
-	}
-	// Implement and review both allocate durable state before enqueue. Check the
-	// shared decision first so a block never strands a task or worktree.
-	if request.Action == "implement" || request.Action == "review" {
+	// Review allocates durable state before enqueue. Check the org decision
+	// first so a block never strands a task or worktree.
+	if request.Action == "review" {
 		if err := preflightOrgScope(resolvedOrgPolicy, repo.FullName(), request.ActingOrgRole, request.OperatorOrigin); err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -401,47 +388,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
-	if request.Action == "implement" {
-		paths, err := pathsFromFlag(request.Home)
-		if err != nil {
-			return localAgentJobOutput{}, err
-		}
-		// Resolve only an explicit CLI/config base at this early seam. Permission-
-		// blocked implement jobs never allocate a worktree, and historically they
-		// can be recorded even for an unborn checkout with no HEAD. Runnable jobs
-		// resolve the implicit HEAD and run the stale-checkout guard in prepare.
-		base := strings.TrimSpace(request.ImplementBase)
-		if base == "" {
-			base, err = config.LoadImplementBase(paths)
-			if err != nil {
-				return localAgentJobOutput{}, fmt.Errorf("load workflow implement_base: %w", err)
-			}
-		}
-		if base != "" {
-			request.ImplementBase, err = resolveLocalImplementBaseForRunner(ctx, paths, record, base, localDispatchJobRunner(request))
-			if err != nil {
-				return localAgentJobOutput{}, err
-			}
-			request.ImplementBaseResolved = true
-		}
-		if request.PullRequest > 0 {
-			request, err = bindLocalImplementRequestToPullRequest(ctx, store, record, repo, request)
-			if err != nil {
-				return localAgentJobOutput{}, err
-			}
-			request.ImplementPRValidated = true
-		}
-	}
 	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	var checkoutPath string
 	checkoutPath = record.CheckoutPath
-	if agent, blocked, err := readOnlyManagedImplementationBlock(ctx, store, request, repo.FullName()); err != nil {
-		return localAgentJobOutput{}, err
-	} else if blocked {
-		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), dispatchBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
-	}
 	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -490,9 +441,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// result observation). Stamp the same resolved decision on the effective
 		// foreground agent so those routes cannot silently default back to Local.
 		effectiveAgent.ExecBackend = string(execBackend)
-	}
-	if readOnlyImplementationBlocked(request.Action, effectiveAgent) {
-		return enqueuePermissionBlockedLocalAgentJob(ctx, store, request, repo.FullName(), dispatchBranch, agent.Name, overrideRuntime, overrideRef, orgPolicy)
 	}
 	var foregroundContract *runtime.RuntimeContractResult
 	if !request.Background {
@@ -560,16 +508,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		request, err = prepareLocalReviewDispatchRequest(ctx, store, record, repo, request)
 		if err != nil {
 			return localAgentJobOutput{}, err
-		}
-	case "implement":
-		var task db.Task
-		var err error
-		task, request, err = prepareLocalImplementDispatchRequest(ctx, store, record, repo, request)
-		if err != nil {
-			return localAgentJobOutput{}, err
-		}
-		if strings.TrimSpace(task.WorktreePath) != "" {
-			checkoutPath = task.WorktreePath
 		}
 	}
 	// #2054: REFUSE AN ABBREVIATED --head-sha before any durable state.
@@ -842,7 +780,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		RequiredEvents:           requiredEvents,
 		SkipNativeReviewFanout:   request.SkipNativeReviewFanout,
 		NoFixTarget:              request.NoFixTarget,
-		ValidatedPullRequest:     request.ImplementPRValidated,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
@@ -1241,12 +1178,11 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 		// payload as-is, so dropping them here would silently retry the job on the
 		// agent's default runtime — resuming the default-runtime session the user's
 		// --runtime explicitly asked it to stay off.
-		Model:                request.Model,
-		Effort:               request.Effort,
-		WorkflowID:           request.WorkflowID,
-		ValidatedPullRequest: request.ImplementPRValidated,
-		RuntimeOverride:      overrideRuntime,
-		RuntimeOverrideRef:   overrideRef,
+		Model:              request.Model,
+		Effort:             request.Effort,
+		WorkflowID:         request.WorkflowID,
+		RuntimeOverride:    overrideRuntime,
+		RuntimeOverrideRef: overrideRef,
 	})
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -1482,9 +1418,8 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 					// attribute to any implement job. This rebind affects review
 					// attribution ONLY: every implement path that consumes
 					// task.WorktreePath re-validates the checkout independently
-					// (validateFixPassTaskWorktreeHead at dispatch, and the daemon
-					// pre-flight "checkout head is ..." guard deferred by the
-					// checkout-contention classifier).
+					// (the daemon pre-flight "checkout head is ..." guard
+					// deferred by the checkout-contention classifier).
 					request.ReviewTaskHeadDivergence = fmt.Sprintf(
 						"review rebound to task %s owning branch %s although its registered checkout HEAD %s differs from the requested head %s (#1530); the review runs in an exact-head read-only worktree, so the rebind affects attribution only",
 						task.ID, request.Branch, head, request.HeadSHA)
@@ -1548,330 +1483,8 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	return request, nil
 }
 
-// disposedReviewTaskError refuses a review dispatch onto a terminally disposed
-// task. Before #2205 a `dismissed` task got its own message pointing at
-// `gitmoot task recover`; that verb is gone, so every disposed state now gets
-// the one remedy that still exists - a successor task.
 func disposedReviewTaskError(task db.Task) error {
 	return fmt.Errorf("task %s is %s; create a successor task before dispatching another review", task.ID, task.State)
-}
-
-func prepareLocalImplementDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (db.Task, localAgentDispatchRequest, error) {
-	paths, err := initializedPaths(request.Home)
-	if err != nil {
-		return db.Task{}, localAgentDispatchRequest{}, err
-	}
-	baseSHA := strings.TrimSpace(request.ImplementBase)
-	deferImplicitPRBase := request.PullRequest > 0 && !request.ImplementBaseResolved && baseSHA == ""
-	if !request.ImplementBaseResolved && !deferImplicitPRBase {
-		baseSHA, err = resolveLocalImplementBaseForRunner(ctx, paths, record, baseSHA, localDispatchJobRunner(request))
-		if err != nil {
-			return db.Task{}, localAgentDispatchRequest{}, err
-		}
-	}
-	taskID := strings.TrimSpace(request.TaskID)
-	taskTitle := strings.TrimSpace(request.TaskTitle)
-	goalID := strings.TrimSpace(request.GoalID)
-	branchHint := strings.TrimSpace(request.Branch)
-	validatedPRBinding := request.ImplementPRValidated
-	if request.PullRequest > 0 && !validatedPRBinding {
-		request, err = bindLocalImplementRequestToPullRequest(ctx, store, record, repo, request)
-		if err != nil {
-			return db.Task{}, localAgentDispatchRequest{}, err
-		}
-		validatedPRBinding = true
-		taskID = strings.TrimSpace(request.TaskID)
-		taskTitle = strings.TrimSpace(request.TaskTitle)
-		goalID = strings.TrimSpace(request.GoalID)
-		branchHint = strings.TrimSpace(request.Branch)
-	}
-	if (taskID == "" || validatedPRBinding) && branchHint != "" {
-		existing, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), branchHint)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return db.Task{}, localAgentDispatchRequest{}, err
-		}
-		if err == nil {
-			if taskID != "" && existing.ID != taskID {
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s, not requested task %s", branchHint, existing.ID, taskID)
-			}
-			if validatedPRBinding {
-				if err := validateFixPassTaskWorktreeHead(ctx, existing, github.PullRequest{
-					Number:  int64(request.PullRequest),
-					HeadRef: branchHint,
-					HeadSHA: request.HeadSHA,
-				}, localDispatchJobRunner(request)); err != nil {
-					return db.Task{}, localAgentDispatchRequest{}, err
-				}
-			}
-			prOpenFixPass := validatedPRBinding && workflow.TaskState(existing.State) == workflow.TaskPullRequestOpen
-			if !taskBranchReusableForImplement(existing.State) && !prOpenFixPass {
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s belongs to task %s in state %s; choose a fresh branch or review the existing task", branchHint, existing.ID, existing.State)
-			}
-			if active, ok, err := findActiveImplementJobForTask(ctx, store, repo.FullName(), branchHint, existing.ID); err != nil {
-				return db.Task{}, localAgentDispatchRequest{}, err
-			} else if ok {
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s already has active implement job %s for task %s", branchHint, active.ID, existing.ID)
-			}
-			if strings.TrimSpace(existing.WorktreePath) != "" && taskWorktreeHasLiveProcess(existing.WorktreePath) {
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has a live process still inside task worktree %s; wait for it to exit or stop the orphaned implementer before retrying implement", branchHint, existing.WorktreePath)
-			}
-			if dirty, err := taskWorktreeDirtyWithRunner(ctx, existing, localDispatchJobRunner(request)); err != nil {
-				return db.Task{}, localAgentDispatchRequest{}, err
-			} else if dirty {
-				if baseSHA != "" {
-					handled, blockErr := (workflow.Engine{Store: store}).ReconcileDirtyTaskWorktreeLineage(
-						ctx,
-						jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
-						existing,
-						existing.WorktreePath,
-						baseSHA,
-					)
-					if handled {
-						return db.Task{}, localAgentDispatchRequest{}, blockErr
-					}
-				}
-				if prOpenFixPass {
-					return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying the PR fix-pass", branchHint, existing.WorktreePath)
-				}
-				// #2205: the implement leg used to name `gitmoot task recover` as the way
-				// to commit the worktree and open the PR. That verb is gone, so the only
-				// remaining remedy is the one the fix-pass leg always gave.
-				return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("branch %s has uncommitted changes in task worktree %s; inspect and commit/push them, or clean/stash them before retrying implement", branchHint, existing.WorktreePath)
-			}
-			taskID = existing.ID
-			taskTitle = firstNonEmpty(taskTitle, existing.Title)
-			goalID = firstNonEmpty(goalID, existing.GoalID)
-			request.TaskID = taskID
-			request.TaskTitle = taskTitle
-			request.GoalID = goalID
-		}
-	}
-	if taskID == "" {
-		taskID = "adhoc-" + shortHash(request.Instructions+"\x00"+time.Now().UTC().Format(time.RFC3339Nano))
-		taskTitle = firstNonEmpty(taskTitle, shortTaskTitle(request.Instructions))
-		goalID = firstNonEmpty(goalID, "local-agent")
-		if err := store.UpsertTask(ctx, db.Task{
-			ID:           taskID,
-			RepoFullName: repo.FullName(),
-			GoalID:       goalID,
-			Title:        taskTitle,
-			State:        string(workflow.TaskPlanned),
-			Branch:       firstNonEmpty(request.Branch, "gitmoot/"+taskID),
-		}); err != nil {
-			return db.Task{}, localAgentDispatchRequest{}, err
-		}
-	}
-	task, err := store.GetTask(ctx, taskID)
-	if err != nil {
-		return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("load task %q: %w", taskID, err)
-	}
-	if strings.TrimSpace(task.RepoFullName) != "" && task.RepoFullName != repo.FullName() {
-		return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("task %s belongs to repo %s, not %s", task.ID, task.RepoFullName, repo.FullName())
-	}
-	if strings.TrimSpace(task.RepoFullName) == "" {
-		task.RepoFullName = repo.FullName()
-	}
-	if strings.TrimSpace(task.Title) == "" {
-		task.Title = firstNonEmpty(taskTitle, shortTaskTitle(request.Instructions))
-	}
-	if strings.TrimSpace(task.GoalID) == "" {
-		task.GoalID = firstNonEmpty(goalID, "local-agent")
-	}
-	branch := firstNonEmpty(request.Branch, task.Branch, "gitmoot/"+task.ID)
-	if deferImplicitPRBase {
-		expectedWorktree, pathErr := workflow.TaskWorktreePath(paths.Home, repo.FullName(), task.ID)
-		if pathErr != nil {
-			return db.Task{}, localAgentDispatchRequest{}, pathErr
-		}
-		if task.Branch != branch || strings.TrimSpace(task.WorktreePath) == "" || task.WorktreePath != expectedWorktree {
-			baseSHA, err = resolveLocalImplementBaseForRunner(ctx, paths, record, "", localDispatchJobRunner(request))
-			if err != nil {
-				return db.Task{}, localAgentDispatchRequest{}, err
-			}
-		}
-	}
-	owner := strings.TrimSpace(request.Agent)
-	started, err := (workflow.Engine{Store: store}).AllocateTaskWorktree(ctx, workflow.TaskWorktreeRequest{
-		Home:           paths.Home,
-		Repo:           repo.FullName(),
-		GoalID:         task.GoalID,
-		TaskID:         task.ID,
-		TaskTitle:      task.Title,
-		Branch:         branch,
-		BaseBranch:     baseSHA,
-		LineageUnknown: deferImplicitPRBase && baseSHA == "",
-		Owner:          owner,
-		Checkout:       record.CheckoutPath,
-	}, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)))
-	if err != nil {
-		return db.Task{}, localAgentDispatchRequest{}, err
-	}
-	headSHA, err := jobGitClient(started.WorktreePath, localDispatchJobRunner(request)).HeadSHA(ctx)
-	if err != nil {
-		return db.Task{}, localAgentDispatchRequest{}, fmt.Errorf("resolve task worktree head: %w", err)
-	}
-	request.TaskID = started.ID
-	request.GoalID = started.GoalID
-	request.TaskTitle = started.Title
-	request.Branch = started.Branch
-	request.HeadSHA = headSHA
-	request.LeadAgent = owner
-	return started, request, nil
-}
-
-func bindLocalImplementRequestToPullRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
-	pr, err := jobGitHubClient(
-		record.CheckoutPath,
-		newAgentDispatchGitHubClient(record.CheckoutPath),
-		localDispatchJobRunner(request),
-	).GetPullRequest(ctx, repo, int64(request.PullRequest))
-	if err != nil {
-		return localAgentDispatchRequest{}, fmt.Errorf("resolve pull request #%d for implement fix-pass: %w", request.PullRequest, err)
-	}
-	if pr.Merged || strings.TrimSpace(pr.MergedAt) != "" || strings.EqualFold(strings.TrimSpace(pr.State), "merged") {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d is merged; implement fix-pass requires an open pull request", request.PullRequest)
-	}
-	if !strings.EqualFold(strings.TrimSpace(pr.State), "open") {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d is %s; implement fix-pass requires an open pull request", request.PullRequest, firstNonEmpty(strings.TrimSpace(pr.State), "not open"))
-	}
-	headRepo := strings.TrimSpace(pr.HeadRepoFullName)
-	if headRepo == "" || !strings.EqualFold(headRepo, repo.FullName()) {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d head belongs to %s, not %s; fork or unrelated heads cannot enter the implement fix-pass", request.PullRequest, firstNonEmpty(headRepo, "an unknown repository"), repo.FullName())
-	}
-	headBranch := strings.TrimSpace(pr.HeadRef)
-	if headBranch == "" {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d has no head branch; cannot bind an implement fix-pass", request.PullRequest)
-	}
-	if requested := strings.TrimSpace(request.Branch); requested != "" && requested != headBranch {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d head branch %s does not match requested branch %s", request.PullRequest, headBranch, requested)
-	}
-	task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), headBranch)
-	if errors.Is(err, sql.ErrNoRows) {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d head branch %s is not bound to an existing task", request.PullRequest, headBranch)
-	}
-	if err != nil {
-		return localAgentDispatchRequest{}, err
-	}
-	if requested := strings.TrimSpace(request.TaskID); requested != "" && requested != task.ID {
-		return localAgentDispatchRequest{}, fmt.Errorf("pull request #%d head branch %s belongs to task %s, not requested task %s", request.PullRequest, headBranch, task.ID, requested)
-	}
-	switch workflow.TaskState(strings.TrimSpace(task.State)) {
-	case workflow.TaskReviewing, workflow.TaskReadyToMerge:
-		return localAgentDispatchRequest{}, fmt.Errorf("task %s is %s; implement fix-pass is refused while review or merge is in progress", task.ID, task.State)
-	case workflow.TaskAwaitingHumanMerge:
-		return localAgentDispatchRequest{}, fmt.Errorf("task %s is awaiting a human merge decision; implement fix-pass is refused until it resolves", task.ID)
-	}
-	if err := validateFixPassTaskWorktreeHead(ctx, task, pr, localDispatchJobRunner(request)); err != nil {
-		return localAgentDispatchRequest{}, err
-	}
-	request.Branch = headBranch
-	request.TaskID = task.ID
-	request.TaskTitle = firstNonEmpty(request.TaskTitle, task.Title)
-	request.GoalID = firstNonEmpty(request.GoalID, task.GoalID)
-	request.HeadSHA = strings.TrimSpace(pr.HeadSHA)
-	return request, nil
-}
-
-func validateFixPassTaskWorktreeHead(ctx context.Context, task db.Task, pr github.PullRequest, runner subprocess.Runner) error {
-	path := strings.TrimSpace(task.WorktreePath)
-	expectedBranch := strings.TrimSpace(pr.HeadRef)
-	expectedHead := strings.TrimSpace(pr.HeadSHA)
-	guidance := fmt.Sprintf("inspect or stash local changes, then run `git -C %q fetch origin refs/pull/%d/head` and `git -C %q reset --hard FETCH_HEAD`; retry the fix-pass after synchronization", path, pr.Number, path)
-	if path == "" {
-		return fmt.Errorf("pull request #%d is bound to task %s, but the task has no worktree path; restore the task worktree, then %s", pr.Number, task.ID, guidance)
-	}
-	if expectedHead == "" {
-		return fmt.Errorf("pull request #%d returned no head SHA; cannot prove task worktree %s is current; %s", pr.Number, path, guidance)
-	}
-	git := jobGitClient(path, runner)
-	branch, err := git.CurrentBranch(ctx)
-	if err != nil {
-		return fmt.Errorf("inspect task worktree branch for pull request #%d: %w; %s", pr.Number, err, guidance)
-	}
-	localHead, err := git.HeadSHA(ctx)
-	if err != nil {
-		return fmt.Errorf("inspect task worktree HEAD for pull request #%d: %w; %s", pr.Number, err, guidance)
-	}
-	if branch != expectedBranch || !strings.EqualFold(localHead, expectedHead) {
-		return fmt.Errorf("pull request #%d head is %s at %s, but task %s worktree is %s at %s; refusing to run against stale code; %s", pr.Number, expectedBranch, expectedHead, task.ID, branch, localHead, guidance)
-	}
-	return nil
-}
-
-// resolveLocalImplementBaseForRunner returns the exact commit an implement
-// worktree must start from. A CLI value wins over [workflow].implement_base.
-// With neither set, HEAD preserves checkout-following behavior after the
-// stale-feature guard.
-func resolveLocalImplementBaseForRunner(ctx context.Context, paths config.Paths, record db.Repo, requested string, runner subprocess.Runner) (string, error) {
-	base := strings.TrimSpace(requested)
-	if base == "" {
-		configured, err := config.LoadImplementBase(paths)
-		if err != nil {
-			return "", fmt.Errorf("load workflow implement_base: %w", err)
-		}
-		base = strings.TrimSpace(configured)
-	}
-	git := jobGitClient(record.CheckoutPath, runner)
-	if base == "" {
-		if err := guardImplicitImplementBase(ctx, git, record.DefaultBranch); err != nil {
-			return "", err
-		}
-		base = "HEAD"
-	}
-	if strings.HasPrefix(base, "origin/") {
-		if err := git.FetchRemote(ctx, "origin"); err != nil {
-			return "", fmt.Errorf("fetch origin for implement base %q: %w", base, err)
-		}
-	}
-	sha, err := git.RevParse(ctx, base+"^{commit}")
-	if err != nil {
-		return "", fmt.Errorf("unknown implement base ref %q: %w", base, err)
-	}
-	return sha, nil
-}
-
-func guardImplicitImplementBase(ctx context.Context, git gitutil.Client, defaultBranch string) error {
-	defaultBranch = strings.TrimSpace(defaultBranch)
-	if defaultBranch == "" {
-		return nil
-	}
-	branch, err := git.CurrentBranch(ctx)
-	if err != nil {
-		// Detached HEAD has no branch to compare or name. Preserve the existing
-		// checkout-HEAD behavior rather than turning a detached checkout into a new
-		// refusal mode.
-		if strings.Contains(err.Error(), "current git branch is empty") {
-			return nil
-		}
-		return fmt.Errorf("inspect checkout branch before implement: %w", err)
-	}
-	if branch == defaultBranch {
-		return nil
-	}
-	upstream := "origin/" + defaultBranch
-	if err := git.FetchRemote(ctx, "origin"); err != nil {
-		return fmt.Errorf("check whether checkout branch %s is behind %s: fetch origin: %w; pass --base HEAD to use checkout HEAD", branch, upstream, err)
-	}
-	behind, err := git.BehindCount(ctx, upstream)
-	if err != nil {
-		return fmt.Errorf("check whether checkout branch %s is behind %s: %w; pass --base HEAD to use checkout HEAD", branch, upstream, err)
-	}
-	if behind > 0 {
-		return fmt.Errorf("checkout is on %s, %d behind %s; pass --base %s or --base HEAD", branch, behind, upstream, upstream)
-	}
-	return nil
-}
-
-func shortTaskTitle(message string) string {
-	fields := strings.Fields(strings.TrimSpace(message))
-	if len(fields) > 8 {
-		fields = fields[:8]
-	}
-	title := strings.Join(fields, " ")
-	if title == "" {
-		return "Local agent implementation"
-	}
-	return title
 }
 
 func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
@@ -1901,9 +1514,7 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 	// the `ask` action AND only when the resolved name maps to a configured
 	// managed agent type; otherwise preserve the historical "agent not found"
 	// error so a name that resolves to neither a single instance nor a type still
-	// fails as before. Scoped to `ask`: `implement` keeps its existing
-	// read-only/finalize semantics (readOnlyManagedImplementationBlock), and
-	// `review` carries required params (--pr / --head-sha) that the foreground
+	// fails as before. Scoped to `ask`: `review` carries required params (--pr / --head-sha) that the foreground
 	// path does not validate before this point — letting a heuristic-selected
 	// `run`->`review` reach the managed path would spin an instance and then fail
 	// downstream (#395).
@@ -1943,37 +1554,6 @@ func managedAgentTypeExists(home string, typeName string) (bool, error) {
 	}
 	_, ok := types[typeName]
 	return ok, nil
-}
-
-func readOnlyManagedImplementationBlock(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (runtime.Agent, bool, error) {
-	if strings.TrimSpace(request.Action) != "implement" {
-		return runtime.Agent{}, false, nil
-	}
-	forceType := strings.TrimSpace(request.Type)
-	if forceType == "" {
-		if _, err := store.GetAgent(ctx, request.Agent); err == nil {
-			return runtime.Agent{}, false, nil
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return runtime.Agent{}, false, err
-		}
-	}
-	if !request.Background && !request.AllowManagedSync {
-		return runtime.Agent{}, false, nil
-	}
-	typeName := firstNonEmpty(forceType, request.Agent)
-	types, err := loadAgentTypeConfig(request.Home)
-	if err != nil {
-		return runtime.Agent{}, false, err
-	}
-	agentType, ok := types[typeName]
-	if !ok {
-		return runtime.Agent{}, false, nil
-	}
-	agent := runtimeAgentFromType(agentType, repo, typeName)
-	if !agentHasCapability(agent.Capabilities, request.Action) {
-		return runtime.Agent{}, false, fmt.Errorf("agent %q lacks %s capability", agent.Name, request.Action)
-	}
-	return agent, readOnlyImplementationBlocked(request.Action, agent), nil
 }
 
 func noopAgentReservationRelease(context.Context) error {

@@ -81,7 +81,10 @@ Each delegation requires four fields:
 
 - `id`: stable identifier for the delegation within this result.
 - `agent`: name of the Gitmoot agent to run.
-- `action`: job action, e.g. `ask`, `review`, or `implement`.
+- `action`: job action — `ask` or `review`. An `implement` leg is refused with
+  the action named: Gitmoot does not dispatch implementation (#2203), so a seat
+  implements in its own session and records it with
+  `gitmoot job record --type implement`.
 - `prompt`: instructions for the delegated job.
 
 Optional advanced controls are also supported: `worktree`, `artifacts`, `deps`,
@@ -100,17 +103,17 @@ the Plan Approval Gate above):
 {
   "gitmoot_result": {
     "decision": "approved",
-    "summary": "Approved plan 1234 received; delegating implementation and review.",
+    "summary": "Approved plan 1234 received; delegating the design read and the plan review.",
     "findings": [],
     "changes_made": [],
     "tests_run": [],
     "needs": [],
     "delegations": [
       {
-        "id": "build-api",
+        "id": "survey-api",
         "agent": "backend-coder",
-        "action": "implement",
-        "prompt": "Implement approved plan 1234: the REST API it describes."
+        "action": "ask",
+        "prompt": "Survey the existing REST surface approved plan 1234 touches and report the exact files, handlers, and contracts an implementer must change."
       },
       {
         "id": "review-plan",

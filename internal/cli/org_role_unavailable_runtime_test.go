@@ -409,13 +409,12 @@ func TestLocalAgentDispatchScopesRoleUnavailabilityToTheSelectedRuntime(t *testi
 	})
 }
 
-// #1952 review P2: the wall must be checked against the runtime that will
-// EXECUTE. daemon_worker materializes an ephemeral worker unconditionally from
-// payload.Ephemeral.Runtime and upserts it over any same-name agent row, so a
-// resolver that consults the agents table first checks a runtime that never
-// runs. Every test below plants an extant same-name agent row of a DIFFERENT
-// runtime, which is the condition that made the defect invisible.
-
+// TestRunTaskRunScopesRoleUnavailabilityToTheOwnersRuntime is the test arm for
+// the workflow.go callsite. `task run` has no --runtime flag, so the owner
+// agent's runtime IS the selection. The refused half asserts exactly what the
+// pre-existing TestRunTaskRunRefusesUnavailableRoleBeforeWorktreeAllocation
+// asserts; the proceeding half asserts the same facts inverted, so the pair is
+// directly comparable rather than differently shaped.
 const ephemeralWalledJobAgent = "wave-impl-ephemeral"
 
 func seedEphemeralWalledJob(t *testing.T, store *db.Store, home, jobID, storedRuntime, specRuntime, walledRuntime string) {

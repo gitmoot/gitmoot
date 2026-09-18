@@ -458,7 +458,7 @@ is **exactly one** of `cmd`, `agent`, or `gate`. There are five agent-stage kind
 | Kind | Declared by | What it does |
 | ---- | ----------- | ------------ |
 | **ask / review** (#757/#813) | `action: ask\|review` (review may add `source:`) | Read-only leaf; optionally reviews one upstream implement PR at its exact head. |
-| **implement** (#768) | `action: implement` + `write: true` | Mutates the repo; `implemented` folds on PR-opened, while other configured successes settle without promising a PR. The implement job never merges. |
+| **implement** (#768) | `action: implement` + `write: true` | Declarable but NOT dispatchable: #2203 removed the pipeline-stage writable-worktree allocator and its enqueue, so the kind validates and no run can execute it (#2213 holds the refuse-at-`pipeline add` decision). Documented model: mutates the repo; `implemented` folds on PR-opened, while other configured successes settle without promising a PR. The implement job never merges. |
 | **produce** (#814/#825) | `action: produce` + `write: true` + `writes:` (+ optional `reads:`) | Sandboxed data writer: Codex, plus Claude/Kimi on Landlock-capable Linux; never creates repo/branch/task/PR state. |
 | **orchestrate** (#758) | `orchestrate: true` | Sub-tree coordinator — fans out owned children, waits, folds the synthesis. |
 | **gate** (#768) | `gate: pr_merged` + `source:` (no `agent`) | Jobless waiter — human merge by default; reviewed auto-merge is an explicit double-key opt-in. |

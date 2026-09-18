@@ -340,6 +340,58 @@ func TestRetiredPlannerHereTemplateIsHiddenAndBlocked(t *testing.T) {
 	}
 }
 
+// TestRetiredTemplateRefusalNamesItsOwnSuccessor pins the PER-ID successor. Round-1
+// review of #2215 caught retiredAgentTemplateError hardcoding the planner for every
+// retired id, so a `decompose-and-verify` caller was told to use `planner` - a
+// template that does not do what it asked for. Its real successor is `verifier`.
+//
+// TestRetiredPlannerHereTemplateIsHiddenAndBlocked above covers the OTHER retired id
+// and would keep passing with the bug, because for `planner-here` the hardcoded
+// answer happened to be right. That is why this second arm exists.
+func TestRetiredTemplateRefusalNamesItsOwnSuccessor(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
+	}
+	retiredID := agenttemplate.DecomposeAndVerifyTemplateID
+	seedCachedAgentTemplate(t, home, db.AgentTemplate{
+		ID:             retiredID,
+		Name:           "Retired Decompose And Verify",
+		Description:    "Old cached recipe",
+		SourceRepo:     "gitmoot/gitmoot",
+		SourceRef:      "main",
+		SourcePath:     "skills/gitmoot/agent-templates/" + retiredID + ".md",
+		ResolvedCommit: "old",
+		Content:        "Old recipe prompt.\n",
+	})
+
+	want, ok := agenttemplate.RetiredReplacement(retiredID)
+	if !ok {
+		t.Fatalf("RetiredReplacement(%s) reported not retired", retiredID)
+	}
+	if want == agenttemplate.PlannerTemplateID {
+		t.Fatalf("fixture is useless: %s's successor is the planner, so the hardcoding bug would pass", retiredID)
+	}
+
+	for _, args := range [][]string{
+		{"agent", "template", "show", "--home", home, retiredID},
+		{"agent", "prompt", "--home", home, retiredID},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(args, &stdout, &stderr); code == 0 {
+			t.Fatalf("%v exit code = 0, stdout=%s", args, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "agent template "+retiredID+" is retired; use "+want) {
+			t.Fatalf("%v stderr must name %s as the successor:\n%s", args, want, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "use "+agenttemplate.PlannerTemplateID) {
+			t.Fatalf("%v still points at the planner:\n%s", args, stderr.String())
+		}
+	}
+}
+
 func seedCachedAgentTemplate(t *testing.T, home string, template db.AgentTemplate) {
 	t.Helper()
 	store, err := dbtest.Open(t, filepath.Join(home, ".gitmoot", "gitmoot.db"))

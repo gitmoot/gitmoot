@@ -15,8 +15,9 @@ import (
 
 func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	definitions := Builtins()
-	if len(definitions) != 5 {
-		t.Fatalf("builtin count = %d, want 5", len(definitions))
+	// 4 since #2203 retired decompose-and-verify.
+	if len(definitions) != 4 {
+		t.Fatalf("builtin count = %d, want 4", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
@@ -45,21 +46,21 @@ func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	if reviewPanel.SourceRepo != "gitmoot/gitmoot" || reviewPanel.SourcePath != "skills/gitmoot/agent-templates/review-panel.md" {
 		t.Fatalf("review-panel source = %+v", reviewPanel)
 	}
-	decompose, ok := Lookup(DecomposeAndVerifyTemplateID)
-	if !ok {
-		t.Fatal("decompose-and-verify template missing")
+	// decompose-and-verify was RETIRED by #2203: it must no longer be a built-in,
+	// and its id must still be recognised so `agent template add decompose-and-verify`
+	// is refused by name with a successor instead of reported unknown.
+	if _, ok := Lookup(DecomposeAndVerifyTemplateID); ok {
+		t.Fatal("decompose-and-verify is retired and must not be a built-in definition")
 	}
-	if !decompose.Mutation || decompose.DefaultRole != "coordinator" || !reflect.DeepEqual(decompose.DefaultCapabilities, []string{"ask", "review", "implement"}) {
-		t.Fatalf("decompose-and-verify definition = %+v", decompose)
-	}
-	if decompose.SourceRepo != "gitmoot/gitmoot" || decompose.SourcePath != "skills/gitmoot/agent-templates/decompose-and-verify.md" {
-		t.Fatalf("decompose-and-verify source = %+v", decompose)
+	replacement, retired := RetiredReplacement(DecomposeAndVerifyTemplateID)
+	if !retired || replacement != VerifierTemplateID {
+		t.Fatalf("RetiredReplacement(decompose-and-verify) = %q, %v; want verifier, true", replacement, retired)
 	}
 	verifier, ok := Lookup(VerifierTemplateID)
 	if !ok {
 		t.Fatal("verifier template missing")
 	}
-	if !verifier.Mutation || verifier.DefaultRole != "coordinator" || !reflect.DeepEqual(verifier.DefaultCapabilities, []string{"ask", "review", "implement"}) {
+	if verifier.Mutation || verifier.DefaultRole != "coordinator" || !reflect.DeepEqual(verifier.DefaultCapabilities, []string{"ask", "review"}) {
 		t.Fatalf("verifier definition = %+v", verifier)
 	}
 	if verifier.SourceRepo != "gitmoot/gitmoot" || verifier.SourcePath != "skills/gitmoot/agent-templates/verifier.md" {
@@ -138,7 +139,7 @@ func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
 		// frontmatter) must agree with the embedded file's frontmatter for the
 		// coordinator recipes, or a no-frontmatter fetch would report different
 		// tags/inputs/outputs than the template actually declares.
-		if def.ID == ReviewPanelTemplateID || def.ID == DecomposeAndVerifyTemplateID || def.ID == VerifierTemplateID {
+		if def.ID == ReviewPanelTemplateID || def.ID == VerifierTemplateID {
 			fallback := MetadataForDefinition(def)
 			if !reflect.DeepEqual(fallback.Tags, parsed.Metadata.Tags) ||
 				!reflect.DeepEqual(fallback.Inputs, parsed.Metadata.Inputs) ||

@@ -102,18 +102,28 @@ var builtins = []Definition{
 		Description: "Coordinator recipe that fans a PR or change out to a panel of ephemeral reviewers with diverse lenses, then synthesizes their findings.",
 		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review"}, Mutation: false,
 		SourceRepo: "gitmoot/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/review-panel.md"},
-	{ID: DecomposeAndVerifyTemplateID, Name: "Decompose and Verify Coordinator",
-		Description: "Coordinator recipe that decomposes a task into parallel ephemeral implementation subtasks, then runs a verify step that depends on all of them.",
-		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review", "implement"}, Mutation: true,
-		SourceRepo: "gitmoot/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/decompose-and-verify.md"},
 	{ID: VerifierTemplateID, Name: "Verifier Coordinator",
 		Description: "Coordinator recipe that runs one producer leg, then an independent read-only verify leg on a different runtime that checks the combined result against the original goal before reporting back.",
-		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review", "implement"}, Mutation: true,
+		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review"}, Mutation: false,
 		SourceRepo: "gitmoot/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/verifier.md"},
 }
 
-var retiredIDs = map[string]struct{}{
-	"planner-" + "here": {},
+// retiredIDs maps a built-in template id that NO LONGER SHIPS to the recipe
+// that supersedes it. Membership is what keeps a removed id recognisable:
+// Lookup misses it, so without an entry here `agent template add`/pull would
+// report an unknown template, while a retired entry refuses by name and points
+// at something real.
+//
+// decompose-and-verify joined after #2203 removed the implement delegation
+// action. That recipe existed to split one task into parallel WRITE legs and
+// merge them for a verify gate; with DelegationActions reduced to ask|review
+// there is no writable delegation action to retarget it to, so it is retired
+// BECAUSE gitmoot no longer dispatches implementation — not for lack of use,
+// which was never measured. Its successor is verifier: the same
+// producer-then-independent-verify shape with a read-only producer.
+var retiredIDs = map[string]string{
+	"planner-" + "here":          PlannerTemplateID,
+	DecomposeAndVerifyTemplateID: VerifierTemplateID,
 }
 
 func Builtins() []Definition {
@@ -135,6 +145,14 @@ func Lookup(id string) (Definition, bool) {
 func IsRetired(id string) bool {
 	_, ok := retiredIDs[strings.TrimSpace(id)]
 	return ok
+}
+
+// RetiredReplacement returns the recipe that supersedes a retired id, so a
+// refusal can name a successor that actually exists instead of always pointing
+// at the planner.
+func RetiredReplacement(id string) (string, bool) {
+	replacement, ok := retiredIDs[strings.TrimSpace(id)]
+	return replacement, ok
 }
 
 func ValidateID(id string) error {
@@ -196,10 +214,6 @@ func MetadataForDefinition(definition Definition) Metadata {
 		metadata.Tags = []string{"coordinator", "review", "orchestra"}
 		metadata.Inputs = []string{"repo", "pull_request", "task"}
 		metadata.Outputs = []string{"delegations", "review_synthesis"}
-	case DecomposeAndVerifyTemplateID:
-		metadata.Tags = []string{"coordinator", "implement", "orchestra"}
-		metadata.Inputs = []string{"repo", "task"}
-		metadata.Outputs = []string{"delegations", "verification_report"}
 	case VerifierTemplateID:
 		metadata.Tags = []string{"coordinator", "review", "orchestra"}
 		metadata.Inputs = []string{"repo", "task"}

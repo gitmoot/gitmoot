@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/github"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -100,6 +99,17 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 				request, worktreePath, worktreeErr = allocatePipelineStageReadOnlyWorktreeForRunner(ctx, store, home, request, runner)
 			}
 		}
+		// #2203: a pipeline implement stage is no longer dispatchable. The writable
+		// task-worktree allocator this stage required was removed with implementer
+		// dispatch, so enqueueing one produced a job with nowhere to write and the
+		// run failed late with "stage job produced no gitmoot_result". Refuse here
+		// instead: a spec that declares an implement stage is a spec that cannot
+		// run, and saying so at enqueue is the only honest answer. Owner-authorized
+		// (workflow note 173859); the validate path still ACCEPTS the stage kind so
+		// existing specs parse rather than erroring at load.
+		if strings.TrimSpace(request.Action) == "implement" {
+			return db.Job{}, fmt.Errorf("pipeline implement stages are not dispatchable: implementer dispatch was removed in #2203, so no writable task worktree can be allocated for stage %q", strings.TrimSpace(request.Fingerprint))
+		}
 		if strings.TrimSpace(request.Action) == "produce" && strings.TrimSpace(request.WorktreePath) == "" {
 			reason := "produce stage requires a disposable detached worktree; managed repo checkout is unavailable"
 			if worktreeErr != nil {
@@ -121,15 +131,6 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 				return db.Job{}, fmt.Errorf("allocate read-only pipeline %s worktree: %w", request.Action, worktreeErr)
 			}
 			return db.Job{}, fmt.Errorf("allocate read-only pipeline %s worktree: managed repo checkout is unavailable", request.Action)
-		}
-		// #768: a MUTATING implement stage takes the WRITABLE task-worktree path
-		// instead of the read-only committed-tip worktree — it must commit + push.
-		// This allocation is also fail-closed, preventing retries from duplicating
-		// or clobbering a branch/PR.
-		var writableErr error
-		request, writableErr = allocatePipelineStageWritableWorktreeForRunner(ctx, store, home, request, runner)
-		if writableErr != nil {
-			return db.Job{}, writableErr
 		}
 		job, err := mailbox.Enqueue(ctx, request)
 		if err != nil {
@@ -371,101 +372,4 @@ func allocatePipelineStageReadOnlyWorktreeForRunner(ctx context.Context, store *
 		request.Instructions += note
 	}
 	return request, path, nil
-}
-
-// pipelineStageImplementWorktreeEligible reports whether a stage job request is a
-// repo-bound MUTATING implement stage (#768) that needs a WRITABLE task-worktree.
-// True only for a pipeline-sender implement job bound to a named agent, running
-// against a repo, that carries NO runtime override (the shell runner sets one) and NO
-// worktree yet. Every read-only agent stage (ask/review) and every shell stage is
-// excluded — the read-only allocator (which itself excludes non-ask/review) owns those.
-func pipelineStageImplementWorktreeEligible(request workflow.JobRequest) bool {
-	if request.Sender != workflow.PipelineJobSender {
-		return false
-	}
-	if strings.TrimSpace(request.RuntimeOverride) != "" {
-		return false
-	}
-	if strings.TrimSpace(request.Agent) == "" {
-		return false
-	}
-	if strings.TrimSpace(request.Action) != "implement" {
-		return false
-	}
-	if strings.TrimSpace(request.Repo) == "" {
-		return false
-	}
-	return strings.TrimSpace(request.WorktreePath) == ""
-}
-
-// allocatePipelineStageWritableWorktreeForRunner gives a MUTATING implement stage
-// (#768) a real WRITABLE task-worktree on its DETERMINISTIC branch by REUSING the
-// existing implement dispatch preparation (prepareLocalImplementDispatchRequest): its
-// GetTaskByRepoBranch reuse lands a retry in the SAME branch/worktree (never a
-// duplicate PR), and its fail-closed guards (an active implement job, a live process
-// still inside the worktree, or uncommitted changes) reject a retry that would clobber
-// or duplicate work. Unlike the read-only allocator it is FAIL-CLOSED: any error
-// propagates so the stage is NOT enqueued. An ineligible request (every non-implement
-// stage) returns unchanged with a nil error. On success the request carries the task
-// worktree path + the resolved deterministic branch/task/head, so the enqueued job keys
-// worktree:<path> (mutating same-repo stages parallelize; the only serialization is the
-// brief checkout-mutation lock during allocation). ReadOnlyWorktree is deliberately
-// left false — the task worktree is durable (disposed by the task lifecycle, not the
-// #739 read-only cleanup).
-func allocatePipelineStageWritableWorktreeForRunner(ctx context.Context, store *db.Store, home string, request workflow.JobRequest, runner subprocess.Runner) (workflow.JobRequest, error) {
-	if !pipelineStageImplementWorktreeEligible(request) {
-		return request, nil
-	}
-	record, err := store.GetRepo(ctx, request.Repo)
-	if err != nil {
-		return request, fmt.Errorf("resolve repo %q for implement stage: %w", request.Repo, err)
-	}
-	repo, err := github.ParseRepository(request.Repo)
-	if err != nil {
-		return request, err
-	}
-	// Ensure the DETERMINISTIC task row exists so prepareLocalImplementDispatchRequest's
-	// BRANCH-reuse path adopts THIS run+stage's task id — and, crucially, so its
-	// fail-closed guards (active job / live process / uncommitted changes) run on EVERY
-	// attempt. We therefore hand it an EMPTY TaskID (which routes through that guarded
-	// branch-reuse block) plus the deterministic Branch; passing a non-empty TaskID would
-	// skip the guards entirely. Idempotent: created once (Planned), reused thereafter.
-	if _, gerr := store.GetTask(ctx, request.TaskID); gerr != nil {
-		if !errors.Is(gerr, sql.ErrNoRows) {
-			return request, gerr
-		}
-		if uerr := store.UpsertTask(ctx, db.Task{
-			ID:           request.TaskID,
-			RepoFullName: request.Repo,
-			GoalID:       firstNonEmpty(request.GoalID, "pipeline"),
-			Title:        firstNonEmpty(request.TaskTitle, request.TaskID),
-			State:        string(workflow.TaskPlanned),
-			Branch:       request.Branch,
-		}); uerr != nil {
-			return request, uerr
-		}
-	}
-	dispatch := localAgentDispatchRequest{
-		Home:         home,
-		Agent:        request.Agent,
-		Action:       "implement",
-		Instructions: request.Instructions,
-		Branch:       request.Branch,
-		GoalID:       request.GoalID,
-		TaskTitle:    request.TaskTitle,
-		RepoFlag:     request.Repo,
-		jobRunner:    runner,
-	}
-	task, dispatch, err := prepareLocalImplementDispatchRequest(ctx, store, record, repo, dispatch)
-	if err != nil {
-		return request, err
-	}
-	request.WorktreePath = task.WorktreePath
-	request.Branch = dispatch.Branch
-	request.TaskID = dispatch.TaskID
-	request.HeadSHA = dispatch.HeadSHA
-	request.GoalID = firstNonEmpty(request.GoalID, dispatch.GoalID)
-	request.TaskTitle = firstNonEmpty(request.TaskTitle, dispatch.TaskTitle)
-	request.LeadAgent = firstNonEmpty(request.LeadAgent, dispatch.LeadAgent)
-	return request, nil
 }

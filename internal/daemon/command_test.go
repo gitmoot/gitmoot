@@ -1,6 +1,10 @@
 package daemon
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+)
 
 // parseCommandsWithoutAuthorization sanitizes and parses addressed command lines
 // without checking repository permission, exactly as the production comment
@@ -27,12 +31,55 @@ func TestParseCommandAgentFirstActions(t *testing.T) {
 		t.Fatalf("command = %+v", command)
 	}
 
-	command, ok = ParseCommand("/gitmoot @builder implement fix tests")
+	command, ok = ParseCommand("/gitmoot @builder ask which tests fail")
 	if !ok {
-		t.Fatal("ParseCommand did not parse implement command")
+		t.Fatal("ParseCommand did not parse mention-form ask command")
 	}
-	if command.Agent != "builder" || command.Action != "implement" || command.Instructions != "fix tests" {
+	if command.Agent != "builder" || command.Action != "ask" || command.Instructions != "which tests fail" {
 		t.Fatalf("command = %+v", command)
+	}
+}
+
+// TestCommandValidateRefusesImplementAsAnUnknownAction is route 2 of #2203: an
+// `implement` PR comment must not be accepted.
+//
+// The line still PARSES — the parser is generic (`/gitmoot <agent> <action> …`), so
+// any word lands in Action — which is exactly why the refusal has to live in
+// Validate. And it must be the SAME refusal a garbage action gets: handleCommand
+// treats ErrUnsupportedAction by logging and staying silent on the thread (#1355),
+// so routing implement through that one sentinel is what keeps it on the existing
+// unknown-command path instead of inventing a new shape.
+//
+// MUTATION PROOF: put "implement" back in Validate's case list and the refusal
+// assertions fail; the control half fails if the case list loses a surviving action.
+func TestCommandValidateRefusesImplementAsAnUnknownAction(t *testing.T) {
+	command, ok := ParseCommand("/gitmoot @builder implement fix tests")
+	if !ok {
+		t.Fatal("ParseCommand did not parse the implement line: this test must exercise Validate, not the parser")
+	}
+	if command.Action != "implement" || command.Agent != "builder" {
+		t.Fatalf("command = %+v", command)
+	}
+	err := command.Validate()
+	if !errors.Is(err, ErrUnsupportedAction) {
+		t.Fatalf("Validate(implement) error = %v, want ErrUnsupportedAction so it takes the silent unknown-command path", err)
+	}
+	if !strings.Contains(err.Error(), `"implement"`) {
+		t.Fatalf("refusal %q does not name the action", err)
+	}
+	// The SAME disposition as any other unrecognized action.
+	garbage := Command{Action: "private(set)", Agent: "builder"}
+	if !errors.Is(garbage.Validate(), ErrUnsupportedAction) {
+		t.Fatal("the unknown-action sentinel moved: implement no longer shares the unknown-command path")
+	}
+
+	// CONTROL: the surviving comment actions still validate, so the refusal is not
+	// over-broad.
+	for _, action := range []string{"review", "ask"} {
+		surviving := Command{Action: action, Agent: "builder"}
+		if err := surviving.Validate(); err != nil {
+			t.Fatalf("Validate(%s) = %v, want nil", action, err)
+		}
 	}
 }
 

@@ -235,7 +235,11 @@ Delegation fields:
   `delegation_preflight_failed` event listing the agents valid for the repo and
   routes the coordinator through a corrective continuation (see
   [Termination bounds](#termination-bounds) below).
-- `action` (required): job action, e.g. `ask`, `review`, or `implement`.
+- `action` (required): job action — `ask` or `review`. An `implement` leg is
+  refused with the action named: Gitmoot does not dispatch implementation
+  (#2203), and the writable per-delegation worktree allocation plus its enqueue
+  are what was removed. Delegation-origin implement legs totalled 47 over the
+  store's lifetime and zero in the last 30 days.
 - `prompt` (required): instructions for the delegated job.
 - `deps` (optional): array of sibling delegation `id`s. This delegation runs
   only after every listed sibling succeeds. Each entry must reference a known
@@ -321,9 +325,8 @@ Delegation fields:
     (autonomous correction in the coordinator continuation) or `escalate_human` (a
     human-in-the-loop pause); the **coordinator** hand-rolls the verify→replan loop
     in its continuation. The merge gate independently blocks merge on the non-ready
-    decision. The shipped `decompose-and-verify` recipe is one instance of this
-    (parallel producers + one verify gate), and the `verifier` recipe is its
-    minimal one-producer form — both are templates under
+    decision. The shipped `verifier` recipe is one instance of this (one producer
+    plus one verify gate), a template under
     `skills/gitmoot/agent-templates/`. No new primitive is involved: `EphemeralSpec`,
     `failure_policy`, and the merge gate already ship.
   - **Engine-enforced rule (#439).** Tag the verify leg with
@@ -427,15 +430,16 @@ Delegation fields:
   - `capabilities` (optional): an array of capability strings advertised by the
     worker.
   - `autonomy_policy` (optional): the worker's sandbox autonomy. Defaults to
-    `read-only`. An **implement** ephemeral worker (`action: "implement"` or an
-    explicit `"implement"` capability) **must** carry a write policy
+    `read-only`, which is what an `ask`/`review` leg needs. A worker that
+    advertises the `implement` capability **must** still carry a write policy
     (`workspace-write` or `danger-full-access`); an empty/`auto`/`read-only`
     policy is rejected at validation with the same fail-closed guidance the CLI
     emits, because an unset policy normalizes to `auto`, which grants no
-    deterministic headless write. Note `workspace-write` (`acceptEdits`) auto-
-    accepts file edits but does NOT unblock Bash (`go`/`git`/`gh`), so full
-    headless implementation needs `danger-full-access`. See
-    `references/SAFETY.md` for the policy→permission-mode mapping.
+    deterministic headless write. That check survives on the capability even
+    though `action: "implement"` is refused (#2203). Note `workspace-write`
+    (`acceptEdits`) auto-accepts file edits but does NOT unblock Bash
+    (`go`/`git`/`gh`). See `references/SAFETY.md` for the
+    policy→permission-mode mapping.
 
   Ephemeral delegations are bounded by the same delegation limits as any other
   delegation (see [Termination bounds](#termination-bounds)); they do not relax
@@ -465,15 +469,13 @@ state, Gitmoot enqueues exactly one coordinator "continuation" job — back to
 the delegating agent — to synthesize the children's results.
 
 Sibling children that share the repo run in isolated git worktrees so they do
-not serialize on the shared checkout: `implement` children each get their own
-branch worktree, and when a coordinator fans out **two or more read-only**
-(`ask`/`review`) children, each gets a throwaway detached worktree (no branch).
-A read-only child that **`deps` on `implement` legs** (e.g. a decompose-and-verify
-verify gate) runs in a detached worktree with those legs' branches **merged in**,
-so it sees their combined work rather than the base checkout; if the legs are not
-file-disjoint the merge conflicts and the parent is blocked. The worktrees are
-disposed automatically when each child finishes. This is internal scheduling —
-coordinators do not request it.
+not serialize on the shared checkout: when a coordinator fans out **two or
+more** children, each gets a throwaway detached worktree (no branch). Every
+delegation leg is read-only now — `ask` and `review` are the only accepted
+actions — so no leg gets a writable branch worktree, and the merged-in detached
+worktree that once let a verify gate `deps` on implement legs has nothing to
+merge. The worktrees are disposed automatically when each child finishes. This
+is internal scheduling — coordinators do not request it.
 
 Each child job carries `parent_job_id`, `delegation_id`, `root_job_id`,
 `delegation_depth`, and `task_id`, so a child can be traced to its parent, its

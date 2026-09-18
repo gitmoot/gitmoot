@@ -155,39 +155,3 @@ func TestBlockTaskSucceedsWithoutAnInterleave(t *testing.T) {
 		t.Fatalf("task state = %q, want blocked", task.State)
 	}
 }
-
-// TestDirtyWorktreeBlockClassifiesAMergeThatLandsInTheSeam is the same class on the
-// allocation path, which carries its own copy of the classification.
-//
-// MUTATION PROOF: classify from fromState in blockTaskForDirtyWorktree and the
-// allocation returns a raw store error instead of a BlockedError.
-func TestDirtyWorktreeBlockClassifiesAMergeThatLandsInTheSeam(t *testing.T) {
-	ctx, store, engine, manager, request, _, _, _ := setupOffLineageTaskWorktree(t, true)
-	mergeInsideTheSeam(t, store)
-
-	_, err := engine.AllocateTaskWorktree(ctx, request, manager)
-	var blocked BlockedError
-	if !errors.As(err, &blocked) {
-		t.Fatalf("AllocateTaskWorktree error = %v, want BlockedError: a merge in the seam hard-failed allocation", err)
-	}
-	task, err := store.GetTask(ctx, request.TaskID)
-	if err != nil {
-		t.Fatalf("GetTask: %v", err)
-	}
-	if task.State != string(TaskMerged) {
-		t.Fatalf("task state = %q, want the landed-work record kept", task.State)
-	}
-	events, err := store.ListTaskEvents(ctx, request.TaskID)
-	if err != nil {
-		t.Fatalf("ListTaskEvents: %v", err)
-	}
-	refusals := 0
-	for _, event := range events {
-		if event.Kind == TaskEventMergedRegressionRefused {
-			refusals++
-		}
-	}
-	if refusals != 1 {
-		t.Fatalf("%s events = %d, want 1", TaskEventMergedRegressionRefused, refusals)
-	}
-}

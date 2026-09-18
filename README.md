@@ -71,7 +71,7 @@ it names one of omp's accepted levels; Claude and Kimi ignore it.
 
 ### Built for unattended runs
 
-Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
+Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `job retry` that explicitly restores a dismissed task before re-running its job; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
 
 ### Driven from GitHub, visible everywhere
 
@@ -147,10 +147,9 @@ Built-in coordinator recipes turn the Orchestra pattern into one command:
 
 - **Review panel**: a panel of diverse-lens reviewers over a PR, synthesized into one verdict.
   `gitmoot orchestrate lead "Review PR #123." --repo owner/repo --recipe review-panel`
-- **Decompose and verify**: split a task into parallel file-disjoint legs plus a verify step that depends on all of them.
-  `gitmoot orchestrate lead "Implement the export feature." --repo owner/repo --recipe decompose-and-verify`
-- **Producer vs. checker**: one implementation leg, one independent read-only verification on a different runtime.
-  `gitmoot orchestrate lead "Implement the rate limiter and prove it works." --repo owner/repo --recipe verifier`
+- **Decompose and verify**: retired with implementer dispatch — Gitmoot no longer dispatches implementation, so parallel implementation legs have no action to run under.
+- **Producer vs. checker**: one producer leg, one independent read-only verification on a different runtime.
+  `gitmoot orchestrate lead "Produce the rate-limiter migration plan and prove it is complete." --repo owner/repo --recipe verifier`
 
 More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
 

@@ -157,12 +157,6 @@ func (w jobWorker) deferPreDeliveryAllocationContention(ctx context.Context, job
 }
 
 func (w jobWorker) holdCheckoutContention(ctx context.Context, job db.Job, payload workflow.JobPayload, cause error, allowDelegationChild bool) (bool, error) {
-	// A fix round has no shared-checkout fallback: allocation already succeeded
-	// before enqueue, and any later checkout failure must settle visibly rather
-	// than masquerade as contention in a registered checkout it never uses.
-	if payload.FixWorktree {
-		return false, nil
-	}
 	kind, action := classifyCheckoutContention(cause)
 	if kind == checkoutContentionNone {
 		return false, nil

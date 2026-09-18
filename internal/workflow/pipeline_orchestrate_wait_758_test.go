@@ -188,33 +188,40 @@ func TestPipelineOrchestrateRootVoteGateFinalizesInsteadOfBlocking(t *testing.T)
 }
 
 // TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking proves the
-// DISPATCH-side terminal e.block sites are routed too: a coordinator that fans out
-// an implement child whose worktree/branch-lock allocation blocks at dispatch time
-// must mint a foldable finalize tail, not a bare BlockedError. Here the engine has no
-// worktree manager (shared-checkout fallback) and the coordinator carries no branch,
-// so allocateAndEnqueueDelegation's ensureBranchLock blocks ("branch is required") —
-// exactly the one-shot dispatch path that, on an orchestrate root's empty taskRef,
-// would strand the stage's chain with no continuation for the advancer to fold.
+// DISPATCH-side terminal e.block sites are routed too: a coordinator whose child's
+// worktree allocation blocks at dispatch time must mint a foldable finalize tail, not
+// a bare BlockedError. The trigger is a read-only fan-out whose detached-worktree
+// allocation is refused with a BlockedError — exactly the one-shot dispatch path
+// that, on an orchestrate root's empty taskRef, would strand the stage's chain with
+// no continuation for the advancer to fold. It used an implement leg's branch-lock
+// refusal until #2203 removed that arm; the routed block is the same choke point.
 func TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
+	seedAgent(t, store, "impl", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
+	engine.Home = t.TempDir()
+	engine.DelegationCheckout = t.TempDir()
+	// The allocation the read-only fan-out reaches REFUSES with a BlockedError, which
+	// is the production dispatch-time block this test is about.
+	engine.DelegationWorktrees = &blockingWorktreeManager{}
 
 	// The stage job IS the sub-tree root (OrchestrateStage, RootJobID = own id, NO
-	// TaskID and NO branch), fanning out a single implement child. With no
-	// DelegationWorktrees manager the child takes the shared-checkout branch-lock path,
-	// which blocks on the empty branch — a dispatch-time BlockedError on an empty ref.
+	// TaskID and NO branch), fanning out two read-only children — >=2 read-only
+	// siblings is what makes the engine allocate a detached worktree per leg.
 	insertCompletedJob(t, store, db.Job{ID: "stage-job", Agent: "coord", Type: "ask"}, JobPayload{
 		Repo:             "gitmoot/gitmoot",
 		Sender:           "coord",
 		RootJobID:        "stage-job",
 		OrchestrateStage: true,
 		Result: &AgentResult{
-			Decision:    "approved",
-			Summary:     "fan out an implement leg",
-			Delegations: []Delegation{{ID: "impl", Agent: "impl", Action: "implement", Prompt: "ship it"}},
+			Decision: "approved",
+			Summary:  "fan out a read-only leg",
+			Delegations: []Delegation{
+				{ID: "impl", Agent: "impl", Action: "review", Prompt: "check it"},
+				{ID: "other", Agent: "impl", Action: "review", Prompt: "check it too"},
+			},
 		},
 	})
 
@@ -239,7 +246,7 @@ func TestPipelineOrchestrateRootDispatchBlockFinalizesInsteadOfBlocking(t *testi
 		t.Fatalf("orchestrate-root dispatch-block tail must carry DelegationFinalize: %+v", cont)
 	}
 	if jobExists(t, store, "stage-job/delegation/impl") {
-		t.Fatalf("no implement child should be enqueued after the dispatch block minted the finalize tail")
+		t.Fatalf("no child should be enqueued after the dispatch block minted the finalize tail")
 	}
 	if got := countJobEvents(t, store, "stage-job", "delegation_finalize_enqueued"); got != 1 {
 		t.Fatalf("delegation_finalize_enqueued events = %d, want 1", got)

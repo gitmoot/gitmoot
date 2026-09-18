@@ -177,67 +177,24 @@ func TestAgentHeartbeatAddReviewSucceedsWithCapability(t *testing.T) {
 	}
 }
 
-// TestAgentHeartbeatAddImplementRejectsReadOnlyPolicy proves the write path
-// refuses an implement heartbeat for an agent whose autonomy policy grants no
-// headless write (the default auto), even when it holds the implement capability.
-func TestAgentHeartbeatAddImplementRejectsReadOnlyPolicy(t *testing.T) {
-	home := t.TempDir()
-	if err := withStore(home, func(store *db.Store) error {
-		return store.UpsertAgent(context.Background(), db.Agent{
-			Name: "builder", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
-			Capabilities: []string{"ask", "implement"}, AutonomyPolicy: "auto", RuntimeRef: "last",
-		})
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "heartbeat", "add", "builder", "nightly",
-		"--repo", "gitmoot/gitmoot", "--interval", "24h", "--action", "implement",
-		"--prompt", "p", "--home", home}, &stdout, &stderr)
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for implement heartbeat under read-only policy")
-	}
-	if !strings.Contains(stderr.String(), "write") {
-		t.Fatalf("stderr=%q", stderr.String())
-	}
-	heartbeats, err := config.LoadHeartbeats(config.PathsForHome(home))
-	if err != nil {
-		t.Fatalf("LoadHeartbeats: %v", err)
-	}
-	if len(heartbeats) != 0 {
-		t.Fatalf("implement heartbeat was written despite read-only policy: %+v", heartbeats)
-	}
-}
-
-// TestAgentHeartbeatAddImplementRejectsMissingCapability proves an implement
-// heartbeat is refused for a write-policy agent that lacks the implement capability.
-func TestAgentHeartbeatAddImplementRejectsMissingCapability(t *testing.T) {
-	home := t.TempDir()
-	if err := withStore(home, func(store *db.Store) error {
-		return store.UpsertAgent(context.Background(), db.Agent{
-			Name: "builder", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
-			Capabilities: []string{"ask"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
-		})
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "heartbeat", "add", "builder", "nightly",
-		"--repo", "gitmoot/gitmoot", "--interval", "24h", "--action", "implement",
-		"--prompt", "p", "--home", home}, &stdout, &stderr)
-	if code == 0 {
-		t.Fatalf("expected non-zero exit for implement heartbeat without implement capability")
-	}
-	if !strings.Contains(stderr.String(), "implement capability") {
-		t.Fatalf("stderr=%q", stderr.String())
-	}
-}
-
-// TestAgentHeartbeatAddImplementSucceedsWithWritePolicy is the positive
-// counterpart: an agent with the implement capability AND a write-granting policy
-// may register an implement heartbeat, and a per-heartbeat --runtime override is
-// persisted alongside it.
-func TestAgentHeartbeatAddImplementSucceedsWithWritePolicy(t *testing.T) {
+// TestAgentHeartbeatAddRefusesImplementAction is route 3 of #2203, and the route
+// that was a TRAP rather than merely dead: `--action implement` used to VALIDATE
+// here and load cleanly, while phase 2 had already removed the heartbeat's
+// implement worktree allocator — so the heartbeat would have enqueued a branchless
+// implement job that can never resolve a checkout.
+//
+// The agent below is the most permissive case there is: it holds the implement
+// capability AND danger-full-access, which is exactly the configuration that used
+// to SUCCEED. It must now be refused at config validation, before any write.
+//
+// The second half is the property that stops the trap coming back: the CLI's
+// allow-list and the pure config LOADER must agree. A hand-written config naming
+// the action must be refused by LoadHeartbeats too, so a heartbeat cannot be
+// smuggled past the CLI by editing the file.
+//
+// MUTATION PROOF: put "implement" back in config.HeartbeatActions() and both
+// halves fail (the CLI writes the heartbeat and the loader accepts it).
+func TestAgentHeartbeatAddRefusesImplementAction(t *testing.T) {
 	home := t.TempDir()
 	if err := withStore(home, func(store *db.Store) error {
 		return store.UpsertAgent(context.Background(), db.Agent{
@@ -250,16 +207,68 @@ func TestAgentHeartbeatAddImplementSucceedsWithWritePolicy(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"agent", "heartbeat", "add", "builder", "nightly",
 		"--repo", "gitmoot/gitmoot", "--interval", "24h", "--action", "implement",
-		"--runtime", "claude", "--prompt", "Fix the top lint error.", "--home", home}, &stdout, &stderr)
+		"--prompt", "Fix the top lint error.", "--home", home}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatal("agent heartbeat add --action implement succeeded: a heartbeat that cannot resolve a checkout was configured")
+	}
+	for _, want := range []string{`"implement"`, "ask, review"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr %q does not name %q", stderr.String(), want)
+		}
+	}
+	heartbeats, err := config.LoadHeartbeats(config.PathsForHome(home))
+	if err != nil {
+		t.Fatalf("LoadHeartbeats: %v", err)
+	}
+	if len(heartbeats) != 0 {
+		t.Fatalf("a refused heartbeat was written anyway: %+v", heartbeats)
+	}
+
+	// THE LOADER AGREES. Hand-write the section the CLI refused and load it.
+	paths := config.PathsForHome(home)
+	existing, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	smuggled := string(existing) + "\n[agents.builder.heartbeats.smuggled]\nenabled = true\nrepo = \"gitmoot/gitmoot\"\ninterval = \"24h\"\naction = \"implement\"\nprompt = \"Fix the top lint error.\"\n"
+	if err := os.WriteFile(paths.ConfigFile, []byte(smuggled), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := config.LoadHeartbeats(paths); err == nil {
+		t.Fatal("LoadHeartbeats accepted a hand-written implement heartbeat: the loader and the CLI disagree again")
+	} else if !strings.Contains(err.Error(), `"implement"`) {
+		t.Fatalf("loader refusal %q does not name the action", err)
+	}
+}
+
+// TestAgentHeartbeatAddPersistsRuntimeOverride is the positive counterpart on a
+// SURVIVING action: a review heartbeat registers, and a per-heartbeat --runtime
+// override is persisted and surfaced by `show`. It was written against an
+// implement heartbeat until #2203 refused that action; the runtime-override
+// behaviour it actually pins is unchanged.
+func TestAgentHeartbeatAddPersistsRuntimeOverride(t *testing.T) {
+	home := t.TempDir()
+	if err := withStore(home, func(store *db.Store) error {
+		return store.UpsertAgent(context.Background(), db.Agent{
+			Name: "builder", Runtime: "codex", RepoScope: "gitmoot/gitmoot",
+			Capabilities: []string{"ask", "review"}, AutonomyPolicy: "danger-full-access", RuntimeRef: "last",
+		})
+	}); err != nil {
+		t.Fatalf("UpsertAgent: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"agent", "heartbeat", "add", "builder", "nightly",
+		"--repo", "gitmoot/gitmoot", "--interval", "24h", "--action", "review",
+		"--runtime", "claude", "--prompt", "Review the open PR.", "--home", home}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("implement add exit=%d stderr=%s", code, stderr.String())
+		t.Fatalf("review add exit=%d stderr=%s", code, stderr.String())
 	}
 	heartbeats, err := config.LoadHeartbeats(config.PathsForHome(home))
 	if err != nil || len(heartbeats) != 1 {
-		t.Fatalf("implement heartbeat not persisted: %+v err=%v", heartbeats, err)
+		t.Fatalf("review heartbeat not persisted: %+v err=%v", heartbeats, err)
 	}
-	if heartbeats[0].Action != "implement" || heartbeats[0].Runtime != "claude" {
-		t.Fatalf("implement/runtime not persisted: %+v", heartbeats[0])
+	if heartbeats[0].Action != "review" || heartbeats[0].Runtime != "claude" {
+		t.Fatalf("action/runtime not persisted: %+v", heartbeats[0])
 	}
 	// The show surface must report the runtime override.
 	stdout.Reset()

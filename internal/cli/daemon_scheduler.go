@@ -3245,7 +3245,7 @@ func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) stri
 // against other users of that shared repository.
 func pendingAdvancementCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {
 	payload, err := daemonJobPayload(job)
-	if err == nil && strings.TrimSpace(payload.Repo) != "" && reviewAdvanceUsesRegisteredCheckout(job, payload) {
+	if err == nil && strings.TrimSpace(payload.Repo) != "" && reviewAdvanceUsesRegisteredCheckout(job) {
 		return "repo:" + payload.Repo
 	}
 	return queuedJobCheckoutKey(ctx, store, job)
