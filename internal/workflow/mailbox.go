@@ -1310,8 +1310,17 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// best-effort contract as the diagnostics above - it must never change the
 		// failure path - and it deliberately leaves the decision "failed", so a
 		// partial can satisfy no merge gate and suppress no re-review.
-		m.salvagePartialReviewFindings(ctx, job, &payload)
+		salvaged := m.salvagePartialReviewFindings(ctx, job, &payload)
 		_ = m.fail(ctx, job.ID, fmt.Sprintf("delivery failed: %v", firstErr))
+		if salvaged {
+			// STRICTLY AFTER the terminal transition. The ledger writer's guard that
+			// stops a failed review's quoted-only findings becoming merge obligations
+			// is conditioned on the job reading JobFailed, and the writer re-fetches
+			// the job. Calling before fail() left it reading "running", silently
+			// disabling the guard. Round 1 review of #2225 found that; see
+			// recordSalvagedFindingsToLedger.
+			m.recordSalvagedFindingsToLedger(ctx, job.ID)
+		}
 		// #1726: classify a SIGNALLED death beside the failure so the abandoned
 		// population is findable. Recording only; nothing requeues.
 		m.recordDeliverySignalKill(ctx, job.ID, firstErr)

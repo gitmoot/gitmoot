@@ -146,3 +146,87 @@ func TestSalvageIsANoOpWithoutALog(t *testing.T) {
 		}
 	}
 }
+
+// TestSalvageWritesTheLedgerOnlyAfterTheJobIsFailed is the round-1 regression
+// for #2225's P1.
+//
+// The ledger writer stops a failed review's QUOTED-ONLY findings from becoming
+// merge obligations, and that guard is conditioned on the job reading
+// JobFailed. The writer re-fetches the job itself, so the guard is silently
+// disabled if the hook runs before the terminal transition - which is what the
+// first version did. A quoted-only finding recovered from a crashed reviewer
+// would then have become a P1/P2 the merge gate demands an answer to.
+//
+// This wires the hook the PR's other tests leave nil - the P3 coverage gap from
+// the same review - and asserts the STATE THE WRITER WOULD OBSERVE.
+//
+// MUTATION: move recordSalvagedFindingsToLedger back above m.fail() in
+// mailbox.go and this goes red with observed state "running".
+func TestSalvageWritesTheLedgerOnlyAfterTheJobIsFailed(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	worktree := t.TempDir()
+
+	// A QUOTED-ONLY finding: severity and title, no file, no line. This is the
+	// shape the guard exists for and the shape a killed writer leaves.
+	log := filepath.Join(worktree, ".gitmoot-findings.jsonl")
+	if err := os.WriteFile(log, []byte(`{"severity":"P1","title":"unverified text from a crashed reviewer"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(findings log) returned error: %v", err)
+	}
+
+	var observed []string
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox.RecordReviewFindings = func(ctx context.Context, jobID string) error {
+		job, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			return err
+		}
+		observed = append(observed, job.State)
+		return nil
+	}
+
+	agent := shellCrashAgent(`echo "died mid-review" >&2; exit 7`)
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "job-ledger-order", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot",
+		PullRequest: 2225, HeadSHA: strings.Repeat("d", 40), WorktreePath: worktree,
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-ledger-order", agent, runtime.ShellAdapter{}); err == nil {
+		t.Fatal("Run succeeded despite the runtime exiting non-zero")
+	}
+
+	if len(observed) != 1 {
+		t.Fatalf("ledger writer invocations = %d, want 1", len(observed))
+	}
+	if observed[0] != string(JobFailed) {
+		t.Fatalf("job state observed BY THE LEDGER WRITER = %q, want %q: the quoted-only guard is conditioned on this and is silently disabled otherwise",
+			observed[0], string(JobFailed))
+	}
+}
+
+// TestSalvageSkipsTheLedgerWhenNothingWasSalvaged pins that an ordinary delivery
+// failure - no findings log, the common case today - performs no ledger write at
+// all. Without this, every crashed job would touch the ledger for nothing.
+func TestSalvageSkipsTheLedgerWhenNothingWasSalvaged(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+
+	calls := 0
+	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox.RecordReviewFindings = func(context.Context, string) error { calls++; return nil }
+
+	agent := shellCrashAgent(`exit 4`)
+	if _, err := mailbox.Enqueue(ctx, JobRequest{
+		ID: "job-no-ledger", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot",
+		PullRequest: 9, HeadSHA: strings.Repeat("e", 40), WorktreePath: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+	if _, err := mailbox.Run(ctx, "job-no-ledger", agent, runtime.ShellAdapter{}); err == nil {
+		t.Fatal("Run succeeded despite the runtime exiting non-zero")
+	}
+	if calls != 0 {
+		t.Fatalf("ledger writer invocations = %d, want 0: nothing was salvaged", calls)
+	}
+}
