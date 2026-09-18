@@ -64,6 +64,11 @@ git diff --binary --full-index --no-ext-diff --no-renames --cached HEAD --`
 type Options struct {
 	TemplateID string
 	Envd       e2b.EnvdOptions
+	// ShouldRenewTTL is asked before each keepalive renewal for a job. Returning
+	// false stops buying provider time for work nobody wants any more - a killed
+	// tree's in-flight job, or one that has already left the running state. Nil
+	// renews on the deadline alone.
+	ShouldRenewTTL func(jobID string) bool
 }
 
 // Backend owns E2B sandboxes for one daemon process.
@@ -77,6 +82,8 @@ type Backend struct {
 	ownerPID     int
 	ownerStart   string
 	ownerAlive   func(pid int, bootID, startTime string) bool
+
+	shouldRenewTTL func(jobID string) bool
 
 	mu        sync.Mutex
 	sandboxes map[string]*sandboxState
@@ -115,15 +122,16 @@ func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
 	}
 	pid := os.Getpid()
 	return &Backend{
-		client:       client,
-		templateID:   templateID,
-		envd:         options.Envd,
-		bootID:       hostBootID(),
-		pidNamespace: processPIDNamespace(),
-		ownerPID:     pid,
-		ownerStart:   processStartTime(pid),
-		ownerAlive:   processOwnerAlive,
-		sandboxes:    make(map[string]*sandboxState),
+		client:         client,
+		templateID:     templateID,
+		envd:           options.Envd,
+		shouldRenewTTL: options.ShouldRenewTTL,
+		bootID:         hostBootID(),
+		pidNamespace:   processPIDNamespace(),
+		ownerPID:       pid,
+		ownerStart:     processStartTime(pid),
+		ownerAlive:     processOwnerAlive,
+		sandboxes:      make(map[string]*sandboxState),
 	}, nil
 }
 
@@ -211,7 +219,11 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 	b.sandboxes[sandbox.ID] = state
 	b.mu.Unlock()
 	if needsRefresh {
-		b.startTTLKeepalive(state, scope.TTL)
+		var liveness func() bool
+		if b.shouldRenewTTL != nil {
+			liveness = func() bool { return b.shouldRenewTTL(jobID) }
+		}
+		b.startTTLKeepaliveWithLiveness(state, scope.TTL, liveness)
 	}
 	return state.instance(), nil
 }
@@ -229,6 +241,27 @@ func (b *Backend) Provision(ctx context.Context, scope execbackend.JobScope) (*e
 // context ends when Provision returns, and a refresher tied to it would stop
 // immediately. stopTTLKeepalive is the only thing that ends it early.
 func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration) {
+	b.startTTLKeepaliveWithLiveness(state, requested, nil)
+}
+
+// startTTLKeepaliveWithLiveness is startTTLKeepalive with an optional predicate
+// asked before each renewal.
+//
+// THE PREDICATE EXISTS BECAUSE THE DEADLINE IS NOT THE ONLY REASON TO STOP.
+// `job kill` is graceful by contract - it stops new delegations and lets
+// in-flight work finish - so a killed tree's running remote job keeps its
+// sandbox. That was harmless while the sandbox lapsed at the provider's one-hour
+// ceiling. Once this keepalive renews to the full requested TTL, a review-class
+// job holds a billed instance for three hours after the operator killed its
+// tree, which round 2 review of #2226 identified as tripling the blast radius of
+// #1539.
+//
+// Renewing is the only thing that stops. The job still runs to completion, which
+// is what kill promises; it simply stops buying more provider time.
+//
+// A nil predicate renews on the deadline alone, which is the correct behaviour
+// for any caller that cannot observe job state.
+func (b *Backend) startTTLKeepaliveWithLiveness(state *sandboxState, requested time.Duration, shouldRenew func() bool) {
 	if state == nil || requested <= ProviderMaxTTL {
 		return
 	}
@@ -251,13 +284,40 @@ func (b *Backend) startTTLKeepalive(state *sandboxState, requested time.Duration
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if time.Until(deadline) <= 0 {
+				if !b.keepaliveTick(ctx, sandboxID, deadline, shouldRenew) {
 					return
 				}
-				b.renewWithinLead(ctx, sandboxID, deadline)
 			}
 		}
 	}()
+}
+
+// keepaliveTick is one iteration of the renewal loop, extracted so it can be
+// tested at the depth it actually runs. The loop's own interval is 50 minutes,
+// so a test driving the goroutine would either sleep for an hour or prove
+// nothing about this logic.
+//
+// It reports whether the loop should continue.
+func (b *Backend) keepaliveTick(ctx context.Context, sandboxID string, deadline time.Time, shouldRenew func() bool) bool {
+	return b.keepaliveTickUsing(ctx, sandboxID, deadline, shouldRenew, func(ctx context.Context, id string, ttl time.Duration) error {
+		_, err := b.client.SetTimeout(ctx, id, ttl)
+		return err
+	})
+}
+
+// keepaliveTickUsing is keepaliveTick with the provider call injected, so a test
+// drives the same branching production takes.
+func (b *Backend) keepaliveTickUsing(ctx context.Context, sandboxID string, deadline time.Time, shouldRenew func() bool, setTimeout func(context.Context, string, time.Duration) error) bool {
+	if time.Until(deadline) <= 0 {
+		return false
+	}
+	// Ask BEFORE renewing, not after: the point is to avoid buying provider time
+	// for work nobody wants any more.
+	if shouldRenew != nil && !shouldRenew() {
+		return false
+	}
+	b.renewWithinLeadUsing(ctx, sandboxID, deadline, setTimeout)
+	return true
 }
 
 // renewWithinLead renews the provider TTL, RETRYING UNTIL THE LEAD IS SPENT.
