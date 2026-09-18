@@ -98,6 +98,7 @@ type sandboxState struct {
 	generation   int64
 	hostWorktree string
 	hostBase     string
+	diffBase     string
 	remoteBase   string
 
 	// stopKeepalive ends the TTL refresh loop. Nil when no refresh is running,
@@ -421,14 +422,18 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 		return fmt.Errorf("read remote execution host base HEAD: %w", err)
 	}
 	hostBase = strings.TrimSpace(hostBase)
-	inputChanges, err := execbackend.BuildChangeSet(ctx, hostWorktree, hostBase)
+	diffBase := strings.TrimSpace(materials.DiffBaseHEAD)
+	if diffBase == "" {
+		diffBase = hostBase
+	}
+	inputChanges, err := execbackend.BuildChangeSetFromBase(ctx, hostWorktree, hostBase, diffBase)
 	if err != nil {
 		return fmt.Errorf("capture remote execution sync input: %w", err)
 	}
 
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if err := execbackend.StageAt(ctx, hostWorktree, hostBase, func(stage string) error {
+	if err := execbackend.StageAt(ctx, hostWorktree, diffBase, func(stage string) error {
 		var inputPatch []byte
 		if len(inputChanges.Patch) > 0 || len(inputChanges.Manifest) > 0 {
 			if err := execbackend.ImportChangeSet(ctx, stage, inputChanges); err != nil {
@@ -464,8 +469,18 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 	if remoteBase == "" || strings.ContainsAny(remoteBase, "\r\n\t ") {
 		return fmt.Errorf("initialize remote execution workspace: invalid base HEAD %q", remoteBase)
 	}
+	if diffBase != hostBase {
+		if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
+			Name: "git",
+			Args: []string{"add", "-N", "."},
+			Dir:  workspacePath,
+		}); err != nil {
+			return fmt.Errorf("expose projected review additions: %w", err)
+		}
+	}
 	state.hostWorktree = hostWorktree
 	state.hostBase = hostBase
+	state.diffBase = diffBase
 	state.remoteBase = remoteBase
 	instance.BaseHEAD = hostBase
 	return nil
@@ -556,6 +571,9 @@ func (b *Backend) Collect(ctx context.Context, instance *execbackend.Instance) (
 	defer state.mu.Unlock()
 	if state.remoteBase == "" || state.hostBase == "" || state.hostWorktree == "" {
 		return execbackend.ChangeSet{}, errors.New("remote execution instance has no synced base HEAD")
+	}
+	if state.diffBase != "" && state.diffBase != state.hostBase {
+		return execbackend.ChangeSet{}, errors.New("collect is unavailable for a projected review diff workspace")
 	}
 	head, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name:           "git",

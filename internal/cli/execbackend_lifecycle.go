@@ -18,6 +18,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -174,6 +175,14 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 			return nil, nil, nil, nil, err
 		}
 	}
+	materials := execbackend.Materials{SourceWorktree: checkout}
+	if backend == execbackend.Remote && strings.EqualFold(job.Type, "review") {
+		diffBase, err := w.remoteReviewDiffBaseHEAD(ctx, job, checkout)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("resolve review diff base for job %s: %w", job.ID, err)
+		}
+		materials.DiffBaseHEAD = diffBase
+	}
 	lifecycle, err := w.ExecutionBackendFactory(backend, cfg)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
@@ -185,7 +194,8 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		// before handling the error; discarding them here strands a billed sandbox.
 		return lifecycle, instance, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
-	if err := lifecycle.SyncIn(ctx, instance, execbackend.Materials{SourceWorktree: checkout}); err != nil {
+
+	if err := lifecycle.SyncIn(ctx, instance, materials); err != nil {
 		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
 	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
@@ -193,6 +203,64 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		return lifecycle, instance, lease, nil, err
 	}
 	return lifecycle, instance, lease, env, nil
+}
+
+func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, checkout string) (string, error) {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return "", err
+	}
+	if payload.PullRequest <= 0 {
+		return "", nil
+	}
+	head := strings.TrimSpace(payload.HeadSHA)
+	if head == "" {
+		return "", fmt.Errorf("review job for PR #%d has no head SHA", payload.PullRequest)
+	}
+	git := gitutil.NewHostClient(checkout)
+	head, err = git.RevParse(ctx, head+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve review head %q: %w", payload.HeadSHA, err)
+	}
+
+	base := ""
+	if payload.ReviewScope != nil {
+		base = strings.TrimSpace(payload.ReviewScope.PreviousHeadSHA)
+	}
+	if base == "" {
+		pull, err := w.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
+		if err != nil {
+			return "", fmt.Errorf("load PR #%d: %w", payload.PullRequest, err)
+		}
+		baseBranch := strings.TrimSpace(pull.BaseBranch)
+		if baseBranch == "" {
+			return "", fmt.Errorf("PR #%d has no base branch", payload.PullRequest)
+		}
+		// A queued review resolves its scope from origin/<base>. A stale
+		// remote-tracking ref silently widens that scope to commits already
+		// merged into the base, so refresh it first and fail loudly rather
+		// than hand the sandbox a wrong review subject.
+		if err := git.FetchRemote(ctx, "origin"); err != nil {
+			return "", fmt.Errorf("refresh origin before resolving PR #%d base: %w", payload.PullRequest, err)
+		}
+		base, err = git.MergeBase(ctx, "origin/"+baseBranch, head)
+		if err != nil {
+			return "", fmt.Errorf("resolve merge base of origin/%s and %s: %w", baseBranch, head, err)
+		}
+	} else {
+		base, err = git.RevParse(ctx, base+"^{commit}")
+		if err != nil {
+			return "", fmt.Errorf("resolve prior review head %q: %w", payload.ReviewScope.PreviousHeadSHA, err)
+		}
+	}
+	ancestor, err := git.IsAncestor(ctx, base, head)
+	if err != nil {
+		return "", fmt.Errorf("verify review diff base %s: %w", base, err)
+	}
+	if !ancestor {
+		return "", fmt.Errorf("review diff base %s is not an ancestor of head %s", base, head)
+	}
+	return base, nil
 }
 
 func executionChangeSetCollector(lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, liveBackend execbackend.Backend, liveJobID string) func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {

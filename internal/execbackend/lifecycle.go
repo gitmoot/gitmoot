@@ -84,11 +84,14 @@ type JobScope struct {
 	TTL                 time.Duration
 }
 
-// Materials are non-secret inputs staged into one execution instance. The
-// local provider uses the existing BuildChangeSet/ImportChangeSet pair to copy
-// any uncommitted source state after creating its independent detached clone.
+// Materials are non-secret inputs staged into one execution instance.
 type Materials struct {
 	SourceWorktree string
+	// DiffBaseHEAD optionally projects SourceWorktree as an uncommitted diff
+	// against this exact ancestor. Review sandboxes use it so ordinary
+	// `git status` and `git diff HEAD` expose the review scope without copying
+	// the host repository's .git directory.
+	DiffBaseHEAD string
 }
 
 const (

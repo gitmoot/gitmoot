@@ -950,6 +950,27 @@ func (c Client) IsAncestor(ctx context.Context, ancestor, descendant string) (bo
 	return false, err
 }
 
+// MergeBase returns the exact common ancestor used by a three-dot diff.
+func (c Client) MergeBase(ctx context.Context, left, right string) (string, error) {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if err := validateRef(left); err != nil {
+		return "", err
+	}
+	if err := validateRef(right); err != nil {
+		return "", err
+	}
+	result, err := c.run(ctx, "merge-base", left, right)
+	if err != nil {
+		return "", err
+	}
+	base := strings.TrimSpace(result.Stdout)
+	if base == "" {
+		return "", errors.New("git merge-base returned an empty SHA")
+	}
+	return base, nil
+}
+
 // ChangedFiles enumerates the paths a merge-base range changed, matching the
 // `base...head` semantics of GitHub's compare endpoint (`git diff A...B` is
 // `git diff $(git merge-base A B) B`). Unlike every hosted enumeration of that
