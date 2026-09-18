@@ -32,11 +32,12 @@ type remoteCredentialGatewayPlan struct {
 	// keyName names the proxied keychain key supplying the upstream and
 	// credential. Empty keeps the Anthropic default read from runtime-auth.env,
 	// so an existing configuration behaves exactly as before.
-	keyName      string
-	upstream     string
-	authKind     credgw.ProxyAuthKind
-	authHeader   string
-	allowedHosts []string
+	keyName       string
+	allowLoopback bool
+	upstream      string
+	authKind      credgw.ProxyAuthKind
+	authHeader    string
+	allowedHosts  []string
 }
 
 // prepareRemoteCredentialGateway performs every check that can fail before a
@@ -79,7 +80,7 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 	}
 	if _, _, err := credgw.ValidateProxyPolicy(credgw.ProxyPolicy{
 		Upstream: upstream, AuthKind: authKind, Header: authHeader,
-		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP,
+		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP || credentialsCfg.ModelGatewayAllowLoopbackUpstream,
 		SandboxID:         "preflight", Runtime: runtime.ShellRuntime, ExpiresAt: time.Now().Add(ttl),
 		AllowedHosts: append([]string(nil), credentialsCfg.ModelGatewayAllowHosts...),
 	}); err != nil {
@@ -94,7 +95,8 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 	}
 	return remoteCredentialGatewayPlan{
 		gateway: gateway, home: paths.Home, keyName: keyName,
-		upstream: upstream, authKind: authKind, authHeader: authHeader,
+		allowLoopback: credentialsCfg.ModelGatewayAllowLoopbackUpstream,
+		upstream:      upstream, authKind: authKind, authHeader: authHeader,
 		allowedHosts: append([]string(nil), credentialsCfg.ModelGatewayAllowHosts...),
 	}, nil
 }
@@ -114,7 +116,7 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 	}
 	policy := credgw.ProxyPolicy{
 		Upstream: plan.upstream, AuthKind: plan.authKind, Header: plan.authHeader,
-		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP,
+		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP || plan.allowLoopback,
 		SandboxID:         instance.ID, Runtime: runtimeName, ExpiresAt: time.Now().Add(ttl),
 		AllowedHosts: append([]string(nil), plan.allowedHosts...),
 	}

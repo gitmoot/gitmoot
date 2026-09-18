@@ -38,6 +38,21 @@ type CredentialsConfig struct {
 	// address any /v1/messages model, so a box whose only working model credential
 	// belongs to another provider could not use the model gateway at all.
 	ModelGatewayKey string
+	// ModelGatewayAllowLoopbackUpstream permits a plaintext http:// upstream when
+	// - and only when - its host is genuinely loopback. credgw enforces the
+	// loopback part itself (isLoopbackHost); this flag is the operator's explicit
+	// consent to the plaintext part.
+	//
+	// IT EXISTS FOR ONE REAL TOPOLOGY: a local credential broker such as `omp
+	// auth-gateway`, which holds the subscription accounts and speaks each
+	// provider's login protocol. The chain is sandbox -> credgw over public mTLS
+	// -> broker over 127.0.0.1, so the plaintext hop never leaves the host's
+	// loopback interface and is reachable only by processes already on the box.
+	// Requiring HTTPS there would demand a certificate for 127.0.0.1 without
+	// protecting against any attacker the mTLS hop does not already stop.
+	//
+	// Default false, so nothing changes unless an operator turns it on.
+	ModelGatewayAllowLoopbackUpstream bool
 	// KeychainPath optionally overrides the base-home-derived
 	// ~/.config/gitmoot/keychain.env path. Empty selects that default.
 	KeychainPath string
@@ -108,6 +123,12 @@ func LoadCredentialsConfig(paths Paths) (CredentialsConfig, error) {
 				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway_allow_hosts: %w", err)
 			}
 			cfg.ModelGatewayAllowHosts = parsed
+		case "model_gateway_allow_loopback_upstream":
+			parsed, err := parseConfigBool(value)
+			if err != nil {
+				return CredentialsConfig{}, fmt.Errorf("parse [credentials].model_gateway_allow_loopback_upstream: %w", err)
+			}
+			cfg.ModelGatewayAllowLoopbackUpstream = parsed
 		case "model_gateway_key":
 			parsed, err := parseConfigString(value)
 			if err != nil {
