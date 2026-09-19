@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -43,11 +44,13 @@ func TestRemoteExecutionBackendDispatchesReview(t *testing.T) {
 		t.Fatalf("UpsertPullRequest returned error: %v", err)
 	}
 
+	remoteBackend := string(execbackend.Remote)
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("provisioning is not reached in this test"))
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-review-admitted", Agent: "remote-review-agent", Action: "review",
 		Repo: "owner/repo", PullRequest: 2225, HeadSHA: headSHA, Branch: "remote-review",
 		Instructions: "review the head",
+		ExecBackend:  &remoteBackend,
 	})
 	if err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
@@ -55,6 +58,11 @@ func TestRemoteExecutionBackendDispatchesReview(t *testing.T) {
 
 	factoryCalls := 0
 	worker := defaultJobWorker(store, io.Discard, home)
+	worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub {
+		return remoteReviewAdmissionGitHubStub{
+			pull: github.PullRequest{Number: 2225, HeadSHA: headSHA},
+		}
+	}
 	worker.ExecutionBackendFactory = func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		factoryCalls++
 		return nil, errors.New("stop here: admission is what this test measures")

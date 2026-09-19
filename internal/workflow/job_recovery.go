@@ -124,9 +124,10 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		return db.Job{}, err
 	}
 	retryEvent := db.JobEvent{
-		JobID:   job.ID,
-		Kind:    "retry_queued",
-		Message: fmt.Sprintf("retry requested from %s", job.State),
+		JobID: job.ID,
+		Kind:  "retry_queued",
+		Message: fmt.Sprintf("retry requested from %s for lifecycle_generation=%d",
+			job.State, job.LifecycleGeneration+1),
 	}
 	transitioned := false
 	// NOT `if task, ok, err := ...`: that form SHADOWS err, so an error from either
@@ -554,6 +555,15 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 	payload, perr := unmarshalPayload(job.Payload)
 	if perr != nil {
 		return
+	}
+	if cause == abortCauseCancel && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		purpose := strings.TrimSpace(payload.ReviewPurpose)
+		if purpose == "" {
+			purpose = db.DefaultReviewPurpose
+		}
+		if subjectKey, keyErr := db.ReviewRequestSubjectKey(payload.Repo, payload.PullRequest, payload.HeadSHA, purpose); keyErr == nil {
+			_ = store.ReleaseReviewRequest(ctx, subjectKey, job.ID)
+		}
 	}
 	if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
 		_ = store.AddJobEvent(ctx, db.JobEvent{

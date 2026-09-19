@@ -173,12 +173,41 @@ native_fanout_enabled = true
 	}
 }
 
+func TestReviewConfigRemoteRequireCIGreenIsExplicitAndRepositoryScoped(t *testing.T) {
+	paths := writeReviewConfig(t, `[review]
+remote_require_ci_green = true
+
+[repos."owner/relaxed".review]
+remote_require_ci_green = false
+`)
+	cfg, err := LoadReviewConfig(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.For("owner/strict").RemoteRequireCIGreen {
+		t.Fatal("global remote CI requirement was not applied")
+	}
+	if cfg.For("owner/relaxed").RemoteRequireCIGreen {
+		t.Fatal("repository override did not disable the remote CI requirement")
+	}
+
+	defaults, err := LoadReviewConfig(writeReviewConfig(t, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.For("owner/repo").RemoteRequireCIGreen {
+		t.Fatal("remote CI requirement defaulted on without explicit policy")
+	}
+}
+
 func TestDefaultConfigDocumentsReviewBlockingSeverity(t *testing.T) {
 	content := DefaultConfig(PathsForHome(t.TempDir()))
 	for _, want := range []string{
 		`# blocking_severity = "P3"`,
 		`# [repos."owner/repo".review]`,
 		`# blocking_severity = "P1"`,
+		`# remote_require_ci_green = false`,
+		`# remote_require_ci_green = true`,
 		`findings remain posted`,
 	} {
 		if !strings.Contains(content, want) {

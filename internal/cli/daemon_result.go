@@ -47,6 +47,27 @@ func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string
 	return w.afterQueuedJobTransition(ctx, jobID, state, cause, transitioned)
 }
 
+// finishAdmittedReviewJob closes a remote review whose admission gate already
+// won the atomic queued->running claim before provider reservation. It shares
+// the pre-delivery continuation so delegation failures still advance.
+func (w jobWorker) finishAdmittedReviewJob(ctx context.Context, job db.Job, state workflow.JobState, cause error) error {
+	event := db.JobEvent{JobID: job.ID, Kind: string(state), Message: cause.Error()}
+	transitioned, err := w.Store.TransitionJobStateWithEventAtGeneration(
+		ctx, job.ID, string(workflow.JobRunning), job.LifecycleGeneration, string(state), event,
+	)
+	if err != nil {
+		return err
+	}
+	return w.afterQueuedJobTransition(ctx, job.ID, state, cause, transitioned)
+}
+
+func (w jobWorker) finishPreDeliveryJob(ctx context.Context, job db.Job, admitted bool, state workflow.JobState, cause error) error {
+	if admitted {
+		return w.finishAdmittedReviewJob(ctx, job, state, cause)
+	}
+	return w.finishQueuedJob(ctx, job, state, cause)
+}
+
 func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, state workflow.JobState, cause error, transitioned bool) error {
 	if transitioned {
 		writeLine(w.Stdout, "job %s %s: %v", jobID, state, cause)

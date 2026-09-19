@@ -18,6 +18,16 @@ import (
 )
 
 func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
+	return e.runJob(ctx, jobID, agent, adapter, false)
+}
+
+// RunClaimedJob continues a job claimed by the remote-review admission gate
+// immediately before execution-backend reservation.
+func (e Engine) RunClaimedJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
+	return e.runJob(ctx, jobID, agent, adapter, true)
+}
+
+func (e Engine) runJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter, claimed bool) (AgentResult, error) {
 	if err := e.validate(); err != nil {
 		return AgentResult{}, err
 	}
@@ -28,7 +38,12 @@ func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err := e.ensureJobExecutorAllowed(ctx, job, payload, taskRefFromPayload(payload)); err != nil {
 		return AgentResult{}, err
 	}
-	result, err := e.mailbox().Run(ctx, jobID, agent, adapter)
+	var result AgentResult
+	if claimed {
+		result, err = e.mailbox().RunClaimed(ctx, jobID, agent, adapter)
+	} else {
+		result, err = e.mailbox().Run(ctx, jobID, agent, adapter)
+	}
 	if err != nil {
 		return result, err
 	}

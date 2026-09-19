@@ -280,6 +280,7 @@ path = ""
 # [review]
 # native_fanout_enabled = false
 # blocking_severity = "P3"
+# remote_require_ci_green = false
 # risk_tiers_enabled = false
 # high_risk_paths = ["**/auth/**", "cmd/**"]
 # risk_label_high = "risk:high"
@@ -300,6 +301,7 @@ path = ""
 # [repos."owner/repo".review]
 # native_fanout_enabled = true
 # blocking_severity = "P1"
+# remote_require_ci_green = true
 # findings_consumption = "advisory"
 
 # [merge_gate] controls native task merges. Native auto-merge is enabled by

@@ -31,6 +31,31 @@ Remote OMP uploads the host OMP executable into the instance, requires
 `e2b_omp_template` with at least 2 GiB RAM, and refuses before provider
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
+
+Before reserving cost or calling E2B, remote review admission re-reads the pull
+request head and refuses stale jobs, duplicate repo/PR/head/purpose subjects,
+unsupported runtime/backend pairs, and unapproved repeat attempts. One accepted
+active or terminal review owns its exact-head subject. A cancelled review
+releases that ownership. The first cloud attempt is the default; a later
+lifecycle generation needs either `gitmoot job retry` or a classified transient
+provider create failure.
+
+Current-head CI is optional and off by default. Enable it globally or override it
+per repository:
+
+```toml
+[review]
+remote_require_ci_green = true
+
+[repos."owner/repo".review]
+remote_require_ci_green = false
+```
+
+When enabled, admission requires at least one reported check and every check must
+be passing, skipped, or neutral.
+Refusals record durable `remote_review_admission_avoided_<reason>` job events,
+where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`, or `retry`.
+
 For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance

@@ -103,6 +103,9 @@ type jobWorker struct {
 	// otherwise adjacent. Production leaves it nil.
 	beforeDeliveryDiagnosticsWrite func()
 	CommenterFactory               func(string) github.Client
+	// ReviewAdmissionGitHubFactory is the current-head/check reader at the one
+	// remote-review pre-provision boundary. Production leaves it nil.
+	ReviewAdmissionGitHubFactory func(string) remoteReviewAdmissionGitHub
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool
@@ -800,6 +803,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	remoteReviewAdmitted, admissionErr := w.admitRemoteReview(ctx, job, payload, agent, execBackend, checkout, jobRunner)
+	if admissionErr != nil {
+		if errors.Is(admissionErr, errRemoteReviewAdmissionCancelled) {
+			return nil
+		}
+		return w.recordRemoteReviewAdmissionRefusal(ctx, job, admissionErr)
+	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
 	// delivery and is destroyed synchronously on every return path. Host checkout,
@@ -813,7 +823,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		defer credentialLease.Revoke()
 	}
 	if lifecycleErr != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, lifecycleErr); finishErr != nil {
+		w.recordRetryableRemoteProviderFailure(ctx, job, lifecycleErr)
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, lifecycleErr); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, lifecycleErr)
@@ -831,7 +842,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout)
 		}
 		if err != nil {
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -856,7 +867,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if toolCacheErr != nil {
 		if agent.ReadOnlySeat {
 			err := fmt.Errorf("prepare read-only tool cache: %w", toolCacheErr)
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -866,7 +877,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, job.ID, agent.Runtime)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -875,7 +886,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if produceStateDir != "" {
 		produceStateDir, err = newProduceRunStateDir(produceStateDir)
 		if err != nil {
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -885,7 +896,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter, produceStateDir)
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -939,7 +950,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 	}
 	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -965,7 +976,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatRuntimeUnavailableEvent, Message: refusal.Error()}); eventErr != nil {
 			writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatRuntimeUnavailableEvent, eventErr)
 		}
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, refusal); finishErr != nil {
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobBlocked, refusal); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
@@ -989,7 +1000,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatToolchainUnavailableEvent, Message: refusal.Error()}); eventErr != nil {
 			writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatToolchainUnavailableEvent, eventErr)
 		}
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, refusal); finishErr != nil {
+		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobBlocked, refusal); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
@@ -1039,7 +1050,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 
 	if managed.Instance {
 		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), jobTimeout); err != nil {
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
 			}
 			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
@@ -1108,7 +1119,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// staged clone instead, which the child may legitimately rewrite - so seats
 	// are excluded here rather than filtered later).
 	credentialBefore, credentialObserved := observeNonSeatKimiCredential(agent)
-	_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	if remoteReviewAdmitted {
+		_, err = engine.RunClaimedJob(runCtx, job.ID, agent, adapter)
+	} else {
+		_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
+	}
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	stopKillPending()
 	stopProgress()

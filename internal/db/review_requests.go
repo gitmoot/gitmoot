@@ -93,8 +93,9 @@ WHERE subject_key = ? AND job_id = ?`, toJobID, strings.TrimSpace(requester),
 	return updated == 1, err
 }
 
-// ReleaseReviewRequest deletes a claim whose job was never enqueued. It is
-// scoped to the job id so a claim that has since moved to another job survives.
+// ReleaseReviewRequest deletes a claim whose review will not produce a verdict:
+// either enqueue/admission did not complete or cancellation revoked the accepted
+// work. It is scoped to job id so a claim moved to another job survives.
 func (s *Store) ReleaseReviewRequest(ctx context.Context, subjectKey, jobID string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM review_requests WHERE subject_key = ? AND job_id = ?`, subjectKey, jobID)
 	return err
