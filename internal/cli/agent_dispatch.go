@@ -58,6 +58,35 @@ var localAgentDispatchExecBackendFor = func(home string) (execbackend.Backend, e
 	return backend, err
 }
 
+func optionalStringPointer(value string, present bool) *string {
+	if !present {
+		return nil
+	}
+	value = strings.TrimSpace(value)
+	return &value
+}
+
+func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
+	if override == nil {
+		return execbackend.Local, nil
+	}
+	return execbackend.ParseImplemented(*override)
+}
+
+// validateRuntimeExecutionBackend refuses an unsupported runtime/backend pair
+// at DISPATCH — before cost reservation, provisioning, or comment noise
+// (#2234). It asks remoteCapableRuntime rather than restating the set: this
+// predicate and the one enforced later at provision time must never disagree,
+// because a dispatch that admits what provisioning rejects fails after the
+// reservation this check exists to avoid.
+func validateRuntimeExecutionBackend(runtimeName string, backend execbackend.Backend) error {
+	runtimeName = strings.TrimSpace(runtimeName)
+	if backend == execbackend.Remote && !remoteCapableRuntime(runtimeName) {
+		return fmt.Errorf("runtime %q is not supported on execution backend %q; supported remote runtimes are %s", runtimeName, backend, remoteCapableRuntimeNames())
+	}
+	return nil
+}
+
 func foregroundRuntimeAdapterFactoryFor(backend execbackend.Backend) (foregroundRuntimeAdapterFactory, error) {
 	return execbackend.Consume(backend, func() (foregroundRuntimeAdapterFactory, error) {
 		return localAgentDispatchRuntimeAdapterFor, nil
@@ -95,6 +124,9 @@ type localAgentDispatchRequest struct {
 	WorkflowID               string
 	ActingOrgRole            string
 	OperatorOrigin           bool
+	// ExecBackend is nil when the operator omitted the per-job selector. A
+	// pointer preserves explicit-local as distinct from absence.
+	ExecBackend *string
 	// ExecsDeclaredBinary is EXPLICIT and CALLER-SUPPLIED (#1817, ruling 123815):
 	// the dispatch entry declares that this request will build a REAL runtime
 	// adapter which execs its runtime's declared CLI binary. It is deliberately
@@ -336,7 +368,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// The claiming worker resolves it again from the durable payload/config at
 	// execution time; this ingress decision governs only pre-enqueue work.
 	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
-	execBackend, err := localAgentDispatchExecBackendFor(request.Home)
+	execBackend, err := reviewDispatchExecBackend(request.ExecBackend)
+	if request.Action != "review" && request.ExecBackend == nil {
+		execBackend, err = localAgentDispatchExecBackendFor(request.Home)
+	}
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -427,6 +462,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	// #1641: role unavailability is refused HERE, not at the --org-role ingress
 	// above, because only now is the selected runtime authoritative — a claude
+	if err := validateRuntimeExecutionBackend(effectiveAgent.Runtime, execBackend); err != nil {
+		return localAgentJobOutput{}, err
+	}
 	// quota wall must not refuse a codex dispatch, and an override to the walled
 	// runtime must still refuse. effectiveAgent is the same expression the
 	// claiming worker resolves (daemon_worker.go), so the two agree by
@@ -773,6 +811,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Model:                    request.Model,
 		Effort:                   request.Effort,
 		WorkflowID:               request.WorkflowID,
+		ExecBackend:              request.ExecBackend,
 		RuntimeOverride:          overrideRuntime,
 		RuntimeOverrideRef:       overrideRef,
 		RuntimeConfigDir:         effectiveAgent.RuntimeConfigDir,

@@ -9,6 +9,7 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -167,8 +168,8 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 		return nil, nil, nil, nil, nil
 	}
-	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
-		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; supported runtimes are %s and %s", runtimeName, runtime.ShellRuntime, runtime.OmpRuntime)
+	if backend == execbackend.Remote && !remoteCapableRuntime(runtimeName) {
+		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; supported runtimes are %s", runtimeName, remoteCapableRuntimeNames())
 	}
 	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
 		ompTemplate := strings.TrimSpace(cfg.E2BOMPTemplate)
@@ -431,3 +432,25 @@ func rootJobIDForTTLLiveness(job db.Job) string {
 // sandboxTTLLivenessTimeout bounds the liveness read so a slow store cannot
 // delay a renewal past its lead.
 const sandboxTTLLivenessTimeout = 5 * time.Second
+
+// remoteCapableRuntimes is the ONE authoritative answer to "may this runtime
+// run on the remote execution backend".
+//
+// It replaces three independent copies of the same allowlist (#2234 review):
+// provisionExecutionBackend here, provisionRemoteCredentialGateway in
+// execbackend_credentials.go, and validateRuntimeExecutionBackend in
+// agent_dispatch.go. The drift directions are asymmetric: dispatch admitting a
+// runtime that the gateway rejects fails only after cost reservation and
+// provisioning. Every predicate and refusal message must derive from this list.
+var remoteCapableRuntimes = [...]string{
+	runtime.ShellRuntime,
+	runtime.OmpRuntime,
+}
+
+func remoteCapableRuntime(runtimeName string) bool {
+	return slices.Contains(remoteCapableRuntimes[:], strings.TrimSpace(runtimeName))
+}
+
+func remoteCapableRuntimeNames() string {
+	return strings.Join(remoteCapableRuntimes[:], " and ")
+}

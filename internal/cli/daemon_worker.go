@@ -303,6 +303,20 @@ func remoteExecutionSupportsJobType(jobType string) bool {
 	return false
 }
 
+// resolveExecutionBackendForJob is the single job-aware normalization boundary
+// for every backend consumer. Review dispatch is job-scoped: an older or
+// manually-created review with no selector stays local even while process config
+// names a remote backend; only an explicit payload override may move it off-host
+// (#2234).
+func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.JobPayload) (execbackend.Backend, config.RemoteExecConfig, error) {
+	name, present := payload.ExecBackendOverride()
+	if strings.EqualFold(strings.TrimSpace(job.Type), "review") && !present {
+		name = string(execbackend.Local)
+		present = true
+	}
+	return daemonJobExecBackendFor(w, name, present)
+}
+
 func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -312,8 +326,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// an adapter. In particular, ephemeral jobs materialize and start a host
 	// runtime below, so delaying this decision until after agent lookup would let
 	// them bypass the backend boundary entirely.
-	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
-	execBackend, execConfig, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
+	execBackend, execConfig, err := w.resolveExecutionBackendForJob(job, payload)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -4461,8 +4474,7 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_retry_skipped", Message: err.Error()})
 	}
 	agent := runtimeAgent(dbAgent)
-	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
-	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	backend, _, err := w.resolveExecutionBackendForJob(job, payload)
 	if err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend resolution failed: "+err.Error())
 	}

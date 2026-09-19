@@ -109,8 +109,8 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 	if backend != execbackend.Remote {
 		return nil, nil, nil
 	}
-	if runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
-		return nil, nil, fmt.Errorf("runtime %q cannot present the remote credential gateway mTLS identity; supported runtimes are %s and %s", runtimeName, runtime.ShellRuntime, runtime.OmpRuntime)
+	if !remoteCapableRuntime(runtimeName) {
+		return nil, nil, fmt.Errorf("runtime %q cannot present the remote credential gateway mTLS identity; supported runtimes are %s", runtimeName, remoteCapableRuntimeNames())
 	}
 	if plan.gateway == nil {
 		return nil, nil, nil

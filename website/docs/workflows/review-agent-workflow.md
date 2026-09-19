@@ -33,6 +33,11 @@ For a local review, name that implementer explicitly:
 gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
 ```
 
+Add `--exec-backend remote` to either `agent review` or `review request` to run
+that one review remotely. Omit it for local execution. The selector is stored
+on the job and never changes where another review runs; remote review supports
+only `shell` and `omp`, and unsupported pairs are refused before enqueue.
+
 Gitmoot validates the lead's agents-database row before it creates the review
 job: the lead must exist, have access to the repository, hold `implement`, and
 use a write-granting policy. If the review returns `changes_requested`, its fix

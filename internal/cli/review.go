@@ -89,7 +89,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
@@ -128,6 +128,8 @@ type reviewRequestOptions struct {
 	reviewer                string
 	full                    bool
 	allowPromptHeadMismatch bool
+	execBackend             string
+	execBackendSet          bool
 	// runtime is the operator escape from the omp pin below (#2180). A pinned
 	// runtime with no override is a dead end whenever an unavailability hold is
 	// written for that runtime: the caller has no second choice to reach for.
@@ -155,6 +157,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.session, "session", "", "runtime session the review reuses")
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
+	fs.StringVar(&opts.execBackend, "exec-backend", "", "execution backend for this review: local or remote (default local)")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -163,6 +166,11 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
+	fs.Visit(func(current *flag.Flag) {
+		if current.Name == "exec-backend" {
+			opts.execBackendSet = true
+		}
+	})
 	if fs.NArg() == 1 {
 		opts.message = strings.TrimSpace(fs.Arg(0))
 	}
@@ -280,11 +288,10 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if _, ok := orgConfig.Role(opts.role); !ok {
 		return reviewRequestOutput{}, fmt.Errorf("unknown organization role %q: the requester must be a registered role so the verdict can be delivered", opts.role)
 	}
-	// One runner for the whole request, resolved from the configured execution
-	// backend before anything touches git: repo resolution now reads the remote
-	// (#2146), and probing it from this host under a remote backend would answer
-	// about the wrong machine.
-	execBackend, err := localAgentDispatchExecBackendFor(opts.home)
+	// A review with no job-scoped selector is local regardless of process-wide
+	// configuration. This makes one remote review unable to reroute another.
+	selectedExecBackend := optionalStringPointer(opts.execBackend, opts.execBackendSet)
+	execBackend, err := reviewDispatchExecBackend(selectedExecBackend)
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -382,6 +389,11 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			output.Baseline = scope.PreviousHeadSHA
 		}
 	}
+	effectiveRuntime := effectiveReviewRuntime(opts.runtime, selectedRuntime)
+	if err := validateRuntimeExecutionBackend(effectiveRuntime, execBackend); err != nil {
+		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+		return reviewRequestOutput{}, err
+	}
 	request := localAgentDispatchRequest{
 		RepoFlag:     repo.FullName(),
 		Agent:        reviewer.Name,
@@ -398,6 +410,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		Effort:         strings.TrimSpace(opts.effort),
 		WorkflowID:     strings.TrimSpace(opts.workflowID),
 		RuntimeSession: strings.TrimSpace(opts.session),
+		ExecBackend:    selectedExecBackend,
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability

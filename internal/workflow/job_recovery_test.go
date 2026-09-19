@@ -16,7 +16,7 @@ import (
 func TestRetryJobRequeuesTerminalJobAndPreservesPayload(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	payload := `{"repo":"owner/repo","template_id":"thermo","template_resolved_commit":"abc123","template_content":"Review deeply.","raw_outputs":["raw"],"result":{"decision":"approved","summary":"stale"}}`
+	payload := `{"repo":"owner/repo","exec_backend":"remote","template_id":"thermo","template_resolved_commit":"abc123","template_content":"Review deeply.","raw_outputs":["raw"],"result":{"decision":"approved","summary":"stale"}}`
 	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "job-1", Agent: "audit", Type: "ask", State: string(JobFailed), Payload: payload}, db.JobEvent{
 		Kind:    string(JobFailed),
 		Message: "failed",
@@ -39,6 +39,9 @@ func TestRetryJobRequeuesTerminalJobAndPreservesPayload(t *testing.T) {
 	if storedPayload.Result != nil || len(storedPayload.RawOutputs) != 1 || storedPayload.RawOutputs[0] != "raw" ||
 		storedPayload.TemplateID != "thermo" || storedPayload.TemplateResolvedCommit != "abc123" || storedPayload.TemplateContent != "Review deeply." {
 		t.Fatalf("payload after retry = %+v, want stale result cleared and raw output preserved", storedPayload)
+	}
+	if backend, present := storedPayload.ExecBackendOverride(); !present || backend != "remote" {
+		t.Fatalf("ExecBackendOverride after retry = %q, %v; want explicit remote preserved", backend, present)
 	}
 	events, err := store.ListJobEvents(ctx, "job-1")
 	if err != nil {

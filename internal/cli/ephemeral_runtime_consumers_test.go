@@ -82,6 +82,30 @@ func TestAuthProbeProbesTheEphemeralSpecRuntimeNotTheStoredRow(t *testing.T) {
 	}
 }
 
+func TestAuthProbeUsesReviewLocalDefaultInsteadOfProcessBackend(t *testing.T) {
+	store, home := ephemeralConsumerStore(t)
+	seedDaemonWorkerAgent(t, store, "review-probe", runtime.ClaudeRuntime, "unused", []string{"review"}, "owner/repo")
+	worker := defaultJobWorker(store, io.Discard, home)
+	job := db.Job{ID: "review-auth-probe", Agent: "review-probe", Type: "review"}
+
+	previousResolver := daemonJobExecBackendFor
+	daemonJobExecBackendFor = func(_ jobWorker, name string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		if name != string(execbackend.Local) || !present {
+			t.Fatalf("auth probe backend override = %q, %v; want review-local default", name, present)
+		}
+		return execbackend.Local, config.RemoteExecConfig{}, nil
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	calls := countClaudeLiveChecks(t, errors.Join(errors.New("rejected"), runtime.ErrClaudeAuthFailed))
+	if verdict := worker.defaultAuthProbe(context.Background(), job, workflow.JobPayload{Repo: "owner/repo"}); verdict != authProbeInvalid {
+		t.Fatalf("verdict = %v, want invalid from local Claude credential probe", verdict)
+	}
+	if *calls != 1 {
+		t.Fatalf("live Claude probe calls = %d, want 1", *calls)
+	}
+}
+
 // TestAuthProbeLeavesANonEphemeralNonClaudeJobAlone is the should-SUCCEED
 // control: the fix must not make everything probe Claude. An ordinary shell
 // agent job still performs zero live checks and stays Unknown.

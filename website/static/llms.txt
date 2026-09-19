@@ -74,3 +74,4 @@ retryable and bounded by the gate `timeout` or 24h from the episode's start.
 - [Raw SKILL.md](https://gitmoot.io/SKILL.md): Agent skill entrypoint.
 - [Full LLM Context](https://gitmoot.io/llms-full.txt): Expanded Markdown context for agents.
 - [GitHub Repository](https://github.com/gitmoot/gitmoot): Source code and releases.
+- [Per-job review execution backend](https://gitmoot.io/docs/reference/cli#review-router): `gitmoot review request` and `gitmoot agent review` accept `--exec-backend local|remote`. Omission keeps that review local; the selector is persisted before enqueue, never reroutes another job, and remote review refuses runtimes other than shell or omp before enqueue.
