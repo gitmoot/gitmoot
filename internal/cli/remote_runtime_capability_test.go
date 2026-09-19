@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -45,7 +46,7 @@ func TestRemoteCapableRuntimeIsTheOnlyAllowlist(t *testing.T) {
 	}
 
 	for _, runtimeName := range runtimes {
-		supported := remoteCapableRuntime(runtimeName)
+		supported := slices.Contains(remoteCapableRuntimes[:], strings.TrimSpace(runtimeName))
 
 		dispatchErr := validateRuntimeExecutionBackend(runtimeName, execbackend.Remote)
 		if supported && dispatchErr != nil {
@@ -87,10 +88,18 @@ func TestRemoteCapableRuntimeRefusalNamesTheSupportedSet(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected claude to be refused on the remote backend")
 	}
-	for _, want := range []string{runtime.ShellRuntime, runtime.OmpRuntime} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q does not name supported runtime %q", err.Error(), want)
+	rendered := remoteCapableRuntimeNames()
+	for _, runtimeName := range runtime.SupportedRuntimes() {
+		expected := slices.Contains(remoteCapableRuntimes[:], runtimeName)
+		if actual := remoteCapableRuntime(runtimeName); actual != expected {
+			t.Fatalf("runtime %q: capability predicate=%v, canonical list=%v", runtimeName, actual, expected)
 		}
+		if named := strings.Contains(rendered, runtimeName); named != expected {
+			t.Fatalf("runtime %q: rendered names %q membership=%v, canonical list=%v", runtimeName, rendered, named, expected)
+		}
+	}
+	if !strings.Contains(err.Error(), rendered) {
+		t.Fatalf("refusal %q does not include canonical supported set %q", err.Error(), rendered)
 	}
 	if !strings.Contains(err.Error(), runtime.ClaudeRuntime) {
 		t.Fatalf("refusal %q does not name the refused runtime, so the operator cannot tell which job it applies to", err.Error())

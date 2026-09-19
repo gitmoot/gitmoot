@@ -9,6 +9,7 @@ import (
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -432,33 +433,24 @@ func rootJobIDForTTLLiveness(job db.Job) string {
 // delay a renewal past its lead.
 const sandboxTTLLivenessTimeout = 5 * time.Second
 
-// remoteCapableRuntime is the ONE authoritative answer to "may this runtime run
-// on the remote execution backend".
+// remoteCapableRuntimes is the ONE authoritative answer to "may this runtime
+// run on the remote execution backend".
 //
-// It replaces three independent copies of the same predicate (#2234 review):
+// It replaces three independent copies of the same allowlist (#2234 review):
 // provisionExecutionBackend here, provisionRemoteCredentialGateway in
 // execbackend_credentials.go, and validateRuntimeExecutionBackend in
-// agent_dispatch.go. Three lists answering one question is a second and third
-// copy of the truth, and nothing failed when only one changed.
-//
-// The drift directions are ASYMMETRIC, which is why this is centralised rather
-// than merely kept consistent by hand. If the gateway admits a runtime dispatch
-// validation rejects, a supported combination is refused loudly at dispatch. If
-// dispatch validation admits one the gateway rejects, the job passes dispatch
-// and dies AFTER cost reservation and provisioning — the outcome #2234's
-// refuse-before-reserve requirement exists to prevent. Adding a runtime is now
-// a one-line change that cannot be half-applied.
-func remoteCapableRuntime(runtimeName string) bool {
-	switch strings.TrimSpace(runtimeName) {
-	case runtime.ShellRuntime, runtime.OmpRuntime:
-		return true
-	default:
-		return false
-	}
+// agent_dispatch.go. The drift directions are asymmetric: dispatch admitting a
+// runtime that the gateway rejects fails only after cost reservation and
+// provisioning. Every predicate and refusal message must derive from this list.
+var remoteCapableRuntimes = [...]string{
+	runtime.ShellRuntime,
+	runtime.OmpRuntime,
 }
 
-// remoteCapableRuntimeNames renders the supported set for refusal messages, so
-// the operator-visible list cannot drift from the predicate that enforces it.
+func remoteCapableRuntime(runtimeName string) bool {
+	return slices.Contains(remoteCapableRuntimes[:], strings.TrimSpace(runtimeName))
+}
+
 func remoteCapableRuntimeNames() string {
-	return fmt.Sprintf("%s and %s", runtime.ShellRuntime, runtime.OmpRuntime)
+	return strings.Join(remoteCapableRuntimes[:], " and ")
 }
