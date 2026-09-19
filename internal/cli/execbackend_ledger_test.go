@@ -31,7 +31,11 @@ func TestProvisionExecutionBackendPreservesInstanceOnProvisionError(t *testing.T
 	inner := &ledgerTestBackend{provision: func(execbackend.JobScope) (*execbackend.Instance, error) {
 		return instance, errors.New("persist running row")
 	}}
-	worker := jobWorker{ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatal(err)
+	}
+	worker := jobWorker{ConfigHome: home, ConfigHomeExplicit: true, ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		return inner, nil
 	}}
 	lifecycle, got, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), "shell", db.Job{ID: instance.JobID}, time.Minute, "/checkout")

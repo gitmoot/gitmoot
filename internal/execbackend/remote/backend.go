@@ -111,6 +111,7 @@ var _ execbackend.ExecutionBackend = (*Backend)(nil)
 var _ execbackend.Reaper = (*Backend)(nil)
 var _ execbackend.InventoryReaper = (*Backend)(nil)
 var _ execbackend.CredentialMaterialInstaller = (*Backend)(nil)
+var _ execbackend.InstanceFileInstaller = (*Backend)(nil)
 
 // NewBackend constructs an unwired E2B lifecycle provider.
 func NewBackend(client *e2b.Client, options Options) (*Backend, error) {
@@ -519,6 +520,40 @@ func (b *Backend) InstallCredentialMaterial(ctx context.Context, instance *execb
 	}
 	if strings.TrimSpace(result.Stderr) != "" {
 		return errors.New("protect remote credential material returned stderr")
+	}
+	return nil
+}
+
+// InstallInstanceFile streams one runtime-owned file into the sandbox.
+// Material is kept outside the repository, protected by the requested mode,
+// and destroyed with the instance.
+func (b *Backend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) error {
+	state, err := b.stateFor(instance)
+	if err != nil {
+		return err
+	}
+	destination = path.Clean(strings.TrimSpace(destination))
+	if !strings.HasPrefix(destination, execbackend.RuntimeMaterialDir+"/") {
+		return fmt.Errorf("remote runtime file %q must be below %s", destination, execbackend.RuntimeMaterialDir)
+	}
+	if reader == nil {
+		return errors.New("remote runtime file reader is required")
+	}
+	if mode != 0o600 && mode != 0o700 {
+		return fmt.Errorf("remote runtime file %q has unsupported mode %04o", destination, mode)
+	}
+	if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
+		Name: "mkdir", Args: []string{"-p", path.Dir(destination)}, Dir: "/home/user", MaxOutputBytes: 256,
+	}); err != nil {
+		return fmt.Errorf("create remote runtime directory: %w", err)
+	}
+	if err := state.envd.Upload(ctx, destination, reader); err != nil {
+		return fmt.Errorf("upload remote runtime file %s: %w", path.Base(destination), err)
+	}
+	if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
+		Name: "chmod", Args: []string{fmt.Sprintf("%04o", mode.Perm()), destination}, Dir: "/home/user", MaxOutputBytes: 256,
+	}); err != nil {
+		return fmt.Errorf("protect remote runtime file %s: %w", path.Base(destination), err)
 	}
 	return nil
 }

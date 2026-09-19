@@ -38,8 +38,12 @@ type RemoteExecConfig struct {
 	// provider. Secret bytes are deliberately never retained in this config.
 	E2BAPIKeyFile string
 	E2BTemplate   string
-	E2BBaseURL    string
-	E2BDomain     string
+	// E2BOMPTemplate is a purpose-built template with enough memory for the OMP
+	// runtime. The public base template has 512 MiB, and a 1 GiB proof sandbox
+	// was OOM-killed during OMP startup.
+	E2BOMPTemplate string
+	E2BBaseURL     string
+	E2BDomain      string
 	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
 	// origin reachable from a sandbox. They are configured together and are
 	// used only for opt-in broker material, never for the provider control key.
@@ -110,7 +114,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].local_root: %w", err)
 			}
 			cfg.LocalRoot = strings.TrimSpace(parsed)
-		case "e2b_api_key_file", "e2b_template", "e2b_base_url", "e2b_domain", "credential_gateway_listen", "credential_gateway_url":
+		case "e2b_api_key_file", "e2b_template", "e2b_omp_template", "e2b_base_url", "e2b_domain", "credential_gateway_listen", "credential_gateway_url":
 			parsed, err := parseConfigString(value)
 			if err != nil {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: %w", key, err)
@@ -121,6 +125,8 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				cfg.E2BAPIKeyFile = parsed
 			case "e2b_template":
 				cfg.E2BTemplate = parsed
+			case "e2b_omp_template":
+				cfg.E2BOMPTemplate = parsed
 			case "e2b_base_url":
 				cfg.E2BBaseURL = parsed
 			case "e2b_domain":

@@ -298,7 +298,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// context is in job.Prompt — so the validated ref is deliberately unused and
 	// every job starts its own in-memory session.
 	_ = agent.RuntimeRef
-	promptArg, attachArgs, cleanup, err := ompPromptDelivery(job.Prompt)
+	promptArg, attachArgs, cleanup, err := ompPromptDeliveryForRunner(ctx, a.runner(), job.Prompt)
 	if err != nil {
 		return Result{}, err
 	}
@@ -329,6 +329,9 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// reporting 0/0 would hide the most expensive failures from every spend audit.
 	// The usage is whatever the partial stream proved before the process went down.
 	if err != nil {
+		if strings.TrimSpace(result.Stderr) == "" && parseErr != nil {
+			err = fmt.Errorf("%v: %w", parseErr, err)
+		}
 		return Result{
 			Raw:          result.Stdout + result.Stderr,
 			InputTokens:  usage.InputTokens,
@@ -656,8 +659,23 @@ func ompMaxTimeArg(ctx context.Context) string {
 // no message would be a turn with no instruction), so it is a short pointer at the
 // attached content; the real instructions travel inside the file.
 //
-// Staging into a dedicated temp dir (never the job worktree) keeps the file out of
-// an implement job's `git add`, and RemoveAll on cleanup leaves nothing behind.
+// Local staging uses a dedicated temp dir (never the job worktree), and remote
+// staging uses the instance runtime-material dir. Neither can enter `git add`.
+func ompPromptDeliveryForRunner(ctx context.Context, runner subprocess.Runner, prompt string) (promptArg string, attachArgs []string, cleanup func(), err error) {
+	if len(prompt) < ompMaxArgvPromptBytes || len(prompt) > ompMaxAttachmentBytes {
+		return ompPromptDelivery(prompt)
+	}
+	stager, ok := runner.(subprocess.AttachmentStager)
+	if !ok {
+		return ompPromptDelivery(prompt)
+	}
+	staged, cleanup, err := stager.StageAttachment(ctx, "prompt.md", []byte(prompt))
+	if err != nil {
+		return "", nil, func() {}, fmt.Errorf("stage oversize omp prompt in execution backend: %w", err)
+	}
+	return ompAttachedPromptPointer(), []string{"@" + staged}, cleanup, nil
+}
+
 func ompPromptDelivery(prompt string) (promptArg string, attachArgs []string, cleanup func(), err error) {
 	noop := func() {}
 	if len(prompt) < ompMaxArgvPromptBytes {

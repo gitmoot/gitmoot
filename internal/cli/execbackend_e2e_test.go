@@ -729,7 +729,7 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 			t.Fatalf("remote non-instance runner error = %v, want attached-instance refusal", err)
 		}
 	})
-	t.Run("runtime composition is shell-only without path grants", func(t *testing.T) {
+	t.Run("runtime composition supports shell and omp without path grants", func(t *testing.T) {
 		backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
 		if err != nil {
 			t.Fatal(err)
@@ -742,10 +742,19 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 		if _, ok := adapter.(runtime.ShellAdapter); !ok {
 			t.Fatalf("remote shell adapter = %T, want runtime.ShellAdapter", adapter)
 		}
+		ompAgent := agent
+		ompAgent.Runtime = runtime.OmpRuntime
+		adapter, err = buildRuntimeAdapter("", ompAgent, t.TempDir(), runner)
+		if err != nil {
+			t.Fatalf("build remote omp adapter: %v", err)
+		}
+		if _, ok := adapter.(runtime.OmpAdapter); !ok {
+			t.Fatalf("remote omp adapter = %T, want runtime.OmpAdapter", adapter)
+		}
 		unsupportedRuntime := agent
 		unsupportedRuntime.Runtime = runtime.CodexRuntime
 		if _, err := buildRuntimeAdapter("", unsupportedRuntime, t.TempDir(), runner); err == nil {
-			t.Fatal("remote runtime composition accepted a non-shell runtime")
+			t.Fatal("remote runtime composition accepted an unsupported runtime")
 		}
 		for _, granted := range []runtime.Agent{
 			{Runtime: runtime.ShellRuntime, ExecBackend: string(execbackend.Remote), WritablePaths: []string{"/write"}},

@@ -61,6 +61,7 @@ model_gateway_allow_hosts = ["127.0.0.1"]
 backend = "remote"
 e2b_api_key_file = %q
 e2b_template = "template-test"
+e2b_omp_template = "omp-template-test"
 credential_gateway_listen = %q
 credential_gateway_url = %q
 `, keyFile, listenAddress, "https://"+listenAddress)
@@ -121,6 +122,59 @@ credential_gateway_url = %q
 	if got := authLoads.Load(); got != 0 {
 		t.Fatalf("provider credential loaded during provisioning: %d", got)
 	}
+
+	hostOmp := filepath.Join(t.TempDir(), "omp")
+	if err := os.WriteFile(hostOmp, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	originalLookPath := lookPathRemoteRuntime
+	lookPathRemoteRuntime = func(string) (string, error) { return hostOmp, nil }
+	t.Cleanup(func() { lookPathRemoteRuntime = originalLookPath })
+
+	ompInner := &credentialTestBackend{instance: &execbackend.Instance{ID: "sandbox-omp", JobID: "job-omp", Workspace: "/home/user/workspace"}}
+	ompLifecycle := &credentialRevokingExecutionBackend{inner: ompInner, home: paths.Home}
+	ompWorker := worker
+	ompWorker.ExecutionBackendFactory = func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+		return ompLifecycle, nil
+	}
+	_, ompInstance, ompLease, ompEnv, err := ompWorker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, ompWorker), runtime.OmpRuntime, db.Job{ID: "job-omp"}, time.Minute, "/checkout")
+	if err != nil {
+		t.Fatalf("provision remote omp: %v", err)
+	}
+	if ompInstance != ompInner.instance || ompLease == nil || ompInner.installs != 1 {
+		t.Fatalf("remote omp instance=%+v lease=%v credential-installs=%d", ompInstance, ompLease, ompInner.installs)
+	}
+	if ompInner.runtimeFiles[execbackend.RuntimeOmpExecutablePath] != 0o700 || ompInner.runtimeFiles[remoteOmpForwarderPath] != 0o700 {
+		t.Fatalf("remote omp runtime files = %v", ompInner.runtimeFiles)
+	}
+	if len(ompInner.execCalls) != 1 || ompInner.execCalls[0].Name != "python3" {
+		t.Fatalf("remote omp forwarder starts = %+v", ompInner.execCalls)
+	}
+	if args := strings.Join(ompInner.execCalls[0].Args, " "); !strings.Contains(args, "--curl-config "+execbackend.CredentialClientConfigPath) {
+		t.Fatalf("remote omp forwarder args omit capability config: %v", ompInner.execCalls[0].Args)
+	}
+	joinedOmpEnv := strings.Join(ompEnv, "\n")
+	for _, want := range []string{
+		credentialGatewayConfigEnv + "=" + execbackend.CredentialClientConfigPath,
+		credentialGatewayURLEnv + "=" + ompLease.RemoteMaterial().URL,
+		"ANTHROPIC_BASE_URL=" + remoteOmpForwarderURL,
+		"ANTHROPIC_API_KEY=gitmoot-job-gateway",
+		"PATH=" + remoteOmpRuntimePATH,
+	} {
+		if !strings.Contains(joinedOmpEnv, want) {
+			t.Fatalf("remote omp env missing %q: %v", want, ompEnv)
+		}
+	}
+	if bytes.Contains(bytes.Join([][]byte{
+		ompInner.material.CACertificate,
+		ompInner.material.ClientCertificate,
+		ompInner.material.ClientPrivateKey,
+		ompInner.material.ClientConfig,
+		[]byte(joinedOmpEnv),
+	}, nil), []byte(remoteBrokerTestKey)) {
+		t.Fatal("remote omp sandbox material contains the provider credential")
+	}
+	t.Cleanup(func() { _ = ompLifecycle.Destroy(context.Background(), ompInstance) })
 
 	material := lease.RemoteMaterial()
 	client := credentialMaterialHTTPClient(t, material)
@@ -212,7 +266,39 @@ func TestRemoteModelRuntimeRefusesBeforeProviderSpend(t *testing.T) {
 		return nil, errors.New("must not construct")
 	}}
 	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), runtime.ClaudeRuntime, db.Job{ID: "job-no-fallback"}, time.Minute, "/checkout")
-	if err == nil || !strings.Contains(err.Error(), "raw-key fallback is forbidden") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
+	if err == nil || !strings.Contains(err.Error(), `runtime "claude" is not supported`) || !strings.Contains(err.Error(), "supported runtimes are shell and omp") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
+		t.Fatalf("refusal instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
+	}
+}
+
+func TestRemoteOmpRequiresDedicatedTemplateBeforeProviderSpend(t *testing.T) {
+	var factoryCalls atomic.Int32
+	worker := jobWorker{ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+		factoryCalls.Add(1)
+		return nil, errors.New("must not construct")
+	}}
+	cfg := config.DefaultRemoteExecConfig()
+	cfg.E2BTemplate = "shell-template"
+	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, cfg, runtime.OmpRuntime, db.Job{ID: "job-omp-no-template"}, time.Minute, "/checkout")
+	if err == nil || !strings.Contains(err.Error(), "e2b_omp_template") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
+		t.Fatalf("refusal instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
+	}
+}
+
+func TestRemoteOmpRequiresGatewayBeforeProviderSpend(t *testing.T) {
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatal(err)
+	}
+	var factoryCalls atomic.Int32
+	worker := jobWorker{ConfigHome: home, ConfigHomeExplicit: true, ExecutionBackendFactory: func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+		factoryCalls.Add(1)
+		return nil, errors.New("must not construct")
+	}}
+	cfg := executionBackendConfigForTest(t, worker)
+	cfg.E2BOMPTemplate = "omp-template-test"
+	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, cfg, runtime.OmpRuntime, db.Job{ID: "job-omp-no-gateway"}, time.Minute, "/checkout")
+	if err == nil || !strings.Contains(err.Error(), "remote omp requires the model credential gateway") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
 		t.Fatalf("refusal instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
 	}
 }
@@ -293,15 +379,23 @@ func TestRemoteCredentialMaterialTraversesLifecycleWrappers(t *testing.T) {
 	if materialMatch := reflect.DeepEqual(inner.material, material); inner.installs != 1 || !materialMatch {
 		t.Fatalf("wrapped install count=%d material-match=%t", inner.installs, materialMatch)
 	}
+	if err := lifecycle.InstallInstanceFile(context.Background(), &execbackend.Instance{ID: "sandbox-wrapped"}, execbackend.RuntimeOmpExecutablePath, strings.NewReader("omp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if inner.runtimeFiles[execbackend.RuntimeOmpExecutablePath] != 0o700 {
+		t.Fatalf("wrapped runtime files = %v", inner.runtimeFiles)
+	}
 }
 
 type credentialTestBackend struct {
-	instance   *execbackend.Instance
-	material   execbackend.CredentialMaterial
-	installs   int
-	destroyErr error
-	report     execbackend.ReapReport
-	reportErr  error
+	instance     *execbackend.Instance
+	material     execbackend.CredentialMaterial
+	installs     int
+	runtimeFiles map[string]os.FileMode
+	execCalls    []execbackend.Command
+	destroyErr   error
+	report       execbackend.ReapReport
+	reportErr    error
 }
 
 func (*credentialTestBackend) Name() execbackend.Backend { return execbackend.Remote }
@@ -319,8 +413,16 @@ func (b *credentialTestBackend) InstallCredentialMaterial(_ context.Context, _ *
 	b.material = material
 	return nil
 }
-func (*credentialTestBackend) Exec(context.Context, *execbackend.Instance, execbackend.Command) (execbackend.Stream, error) {
-	return nil, errors.New("not executed")
+func (b *credentialTestBackend) InstallInstanceFile(_ context.Context, _ *execbackend.Instance, destination string, _ io.Reader, mode os.FileMode) error {
+	if b.runtimeFiles == nil {
+		b.runtimeFiles = make(map[string]os.FileMode)
+	}
+	b.runtimeFiles[destination] = mode
+	return nil
+}
+func (b *credentialTestBackend) Exec(_ context.Context, _ *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
+	b.execCalls = append(b.execCalls, command)
+	return credentialTestStream{result: execbackend.ExecResult{Stdout: "123\n"}}, nil
 }
 func (*credentialTestBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
 	return execbackend.ChangeSet{}, nil
@@ -335,6 +437,14 @@ func (b *credentialTestBackend) ReapInventory(context.Context) (execbackend.Reap
 	return b.report, b.reportErr
 }
 
+type credentialTestStream struct {
+	result execbackend.ExecResult
+	err    error
+}
+
+func (s credentialTestStream) Wait() (execbackend.ExecResult, error) {
+	return s.result, s.err
+}
 func unusedLoopbackAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

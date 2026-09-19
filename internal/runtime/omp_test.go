@@ -2945,6 +2945,24 @@ func TestOmpAuthFailureClassified(t *testing.T) {
 		}
 	})
 
+	t.Run("non-zero exit with stream error", func(t *testing.T) {
+		stdout := ompHeaderLine(ompFixtureSessionID) +
+			ompFailedAssistantEnd("error", "401 Unauthorized: invalid api key", 401) +
+			ompAgentEnd()
+		runner := &fakeRunner{
+			results: []subprocess.Result{{Stdout: stdout}},
+			errs:    []error{errors.New("exit status 1")},
+		}
+		adapter := OmpAdapter{Runner: runner, Dir: "/repo"}
+		_, err := adapter.Deliver(context.Background(), ompTestAgent(), Job{Prompt: "work"})
+		if err == nil {
+			t.Fatal("Deliver succeeded despite an auth failure")
+		}
+		if !strings.Contains(err.Error(), "401 Unauthorized") || !strings.Contains(err.Error(), "exit status 1") {
+			t.Fatalf("error %q must carry both stream and process failures", err.Error())
+		}
+	})
+
 	t.Run("exit zero with a stream error", func(t *testing.T) {
 		stdout := ompHeaderLine(ompFixtureSessionID) +
 			ompFailedAssistantEnd("error", "401 Unauthorized: invalid api key", 401) +
@@ -3374,6 +3392,48 @@ func TestOmpOversizePromptStaged(t *testing.T) {
 			t.Fatalf("a prompt of exactly the ceiling was not staged; argv=%v", runner.lastArgs)
 		}
 	})
+}
+
+type remoteOmpAttachmentRunner struct {
+	name    string
+	content []byte
+	cleaned bool
+}
+
+func (*remoteOmpAttachmentRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
+	return subprocess.Result{}, nil
+}
+
+func (*remoteOmpAttachmentRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+func (r *remoteOmpAttachmentRunner) StageAttachment(_ context.Context, name string, content []byte) (string, func(), error) {
+	r.name = name
+	r.content = append([]byte(nil), content...)
+	return "/home/user/.gitmoot/runtime/attachments/hash/" + name, func() { r.cleaned = true }, nil
+}
+
+func TestOmpOversizePromptUsesExecutionBackendAttachment(t *testing.T) {
+	prompt := strings.Repeat("remote prompt\n", ompMaxArgvPromptBytes/8)
+	runner := &remoteOmpAttachmentRunner{}
+	promptArg, attachArgs, cleanup, err := ompPromptDeliveryForRunner(context.Background(), runner, prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promptArg != ompAttachedPromptPointer() {
+		t.Fatalf("prompt arg = %q, want attachment pointer", promptArg)
+	}
+	if !reflect.DeepEqual(attachArgs, []string{"@/home/user/.gitmoot/runtime/attachments/hash/prompt.md"}) {
+		t.Fatalf("attachment args = %v", attachArgs)
+	}
+	if runner.name != "prompt.md" || string(runner.content) != prompt {
+		t.Fatalf("staged attachment name=%q bytes=%d, want prompt.md bytes=%d", runner.name, len(runner.content), len(prompt))
+	}
+	cleanup()
+	if !runner.cleaned {
+		t.Fatal("remote attachment cleanup was not forwarded")
+	}
 }
 
 // TestOmpDeliverMaxTimeFromDeadline: omp's own deadline flushes a complete NDJSON

@@ -1,8 +1,10 @@
 package execbackend
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -100,6 +103,9 @@ const (
 	CredentialClientCertificatePath = CredentialMaterialDir + "/client.pem"
 	CredentialClientPrivateKeyPath  = CredentialMaterialDir + "/client-key.pem"
 	CredentialClientConfigPath      = CredentialMaterialDir + "/client.conf"
+	RuntimeMaterialDir              = "/home/user/.gitmoot/runtime"
+	RuntimeOmpExecutablePath        = RuntimeMaterialDir + "/bin/omp"
+	RuntimeAttachmentDir            = RuntimeMaterialDir + "/attachments"
 )
 
 // CredentialMaterial contains only an ephemeral broker identity and client
@@ -116,6 +122,13 @@ type CredentialMaterial struct {
 // installing a job-scoped broker identity after provider provisioning.
 type CredentialMaterialInstaller interface {
 	InstallCredentialMaterial(context.Context, *Instance, CredentialMaterial) error
+}
+
+// InstanceFileInstaller is the optional data-plane capability for installing a
+// non-secret runtime executable or attachment inside one execution instance.
+// Implementations must confine destination to RuntimeMaterialDir.
+type InstanceFileInstaller interface {
+	InstallInstanceFile(context.Context, *Instance, string, io.Reader, os.FileMode) error
 }
 
 type Instance struct {
@@ -805,6 +818,26 @@ func (r InstanceRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env
 }
 
 func (InstanceRunner) LookPath(file string) (string, error) { return exec.LookPath(file) }
+
+// StageAttachment places a large runtime prompt inside the execution instance.
+// The sandbox teardown owns cleanup; content-addressed names avoid collisions
+// across mailbox repair turns in the same instance.
+func (r InstanceRunner) StageAttachment(ctx context.Context, name string, content []byte) (string, func(), error) {
+	installer, ok := r.Backend.(InstanceFileInstaller)
+	if !ok {
+		return "", func() {}, errors.New("execution backend cannot stage runtime attachments")
+	}
+	name = path.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == ".." || name == "/" {
+		return "", func() {}, errors.New("runtime attachment name is required")
+	}
+	sum := sha256.Sum256(content)
+	destination := path.Join(RuntimeAttachmentDir, hex.EncodeToString(sum[:]), name)
+	if err := installer.InstallInstanceFile(ctx, r.Instance, destination, bytes.NewReader(content), 0o600); err != nil {
+		return "", func() {}, err
+	}
+	return destination, func() {}, nil
+}
 
 var (
 	_ ExecutionBackend              = (*LocalBackend)(nil)
