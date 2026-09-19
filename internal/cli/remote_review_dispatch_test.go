@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -31,13 +32,21 @@ func TestRemoteExecutionBackendDispatchesReview(t *testing.T) {
 	home, paths, store := heartbeatLoopE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, "")
 	checkout := createDaemonWorkerGitCheckout(t, "remote-review")
+	headSHA := daemonWorkerHeadSHA(t, checkout)
+	makeReviewFixOriginFetchable(t, checkout, "remote-review")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "remote-review-agent", runtime.ShellRuntime, heartbeatShellResultScript, []string{"review"}, "owner/repo")
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "owner/repo", Number: 2225, URL: "https://example.invalid/owner/repo/pull/2225",
+		HeadBranch: "remote-review", BaseBranch: "remote-review", HeadSHA: headSHA, State: "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
 
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("provisioning is not reached in this test"))
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-review-admitted", Agent: "remote-review-agent", Action: "review",
-		Repo: "owner/repo", PullRequest: 2225, HeadSHA: daemonWorkerHeadSHA(t, checkout), Branch: "remote-review",
+		Repo: "owner/repo", PullRequest: 2225, HeadSHA: headSHA, Branch: "remote-review",
 		Instructions: "review the head",
 	})
 	if err != nil {
@@ -54,12 +63,12 @@ func TestRemoteExecutionBackendDispatchesReview(t *testing.T) {
 		t.Fatalf("worker.run returned error: %v", err)
 	}
 
-	if factoryCalls != 1 {
-		t.Fatalf("execution backend factory calls = %d, want 1: the review was refused before provisioning", factoryCalls)
-	}
 	events, err := store.ListJobEvents(ctx, job.ID)
 	if err != nil {
 		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("execution backend factory calls = %d, want 1: events=%+v", factoryCalls, events)
 	}
 	for _, event := range events {
 		if strings.Contains(event.Message, "jobs are not supported on the") {
