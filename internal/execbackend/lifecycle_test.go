@@ -204,6 +204,68 @@ func TestLocalBackendWorkspaceTraverseLimitedToConfiguredGroup(t *testing.T) {
 	}
 }
 
+func TestLocalBackendRuntimeInstallDoesNotFollowPlantedSymlink(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("runtime ownership proof requires a root test process")
+	}
+	identity := testUnprivilegedIdentities(t, 1)[0]
+	backend := newPrivilegedTestLocalBackend(t, identity)
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "runtime-symlink-ownership"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if _, err := backend.InstallInstanceFile(context.Background(), instance, RuntimeAttachmentDir+"/first/prompt.md", strings.NewReader("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantUID, wantGID := pathOwnership(t, outside)
+	if err := os.Symlink(outside, filepath.Join(instance.root, "runtime", "planted-link")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.InstallInstanceFile(context.Background(), instance, RuntimeAttachmentDir+"/second/prompt.md", strings.NewReader("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if uid, gid := pathOwnership(t, outside); uid != wantUID || gid != wantGID {
+		t.Fatalf("outside ownership changed through planted symlink: got %d:%d want %d:%d", uid, gid, wantUID, wantGID)
+	}
+}
+
+func TestLocalBackendRuntimeInstallRejectsSymlinkedDirectory(t *testing.T) {
+	backend, err := NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := backend.Provision(context.Background(), JobScope{JobID: "runtime-symlink-directory"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+	if _, err := backend.InstallInstanceFile(context.Background(), instance, RuntimeAttachmentDir+"/first/prompt.md", strings.NewReader("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	attachments := filepath.Join(instance.root, "runtime", "attachments")
+	if err := os.RemoveAll(attachments); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, attachments); err != nil {
+		t.Fatal(err)
+	}
+	destination := RuntimeAttachmentDir + "/second/prompt.md"
+	if _, err := backend.InstallInstanceFile(context.Background(), instance, destination, strings.NewReader("second"), 0o600); err == nil || !strings.Contains(err.Error(), "not a real directory") {
+		t.Fatalf("symlinked runtime directory error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "second", "prompt.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime install escaped through symlink: %v", err)
+	}
+}
+
 func TestLocalBackendWorkspaceTraverseParentPermissions(t *testing.T) {
 	identity := LocalIdentity{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())}
 	if identity.UID == 0 || identity.GID == 0 {

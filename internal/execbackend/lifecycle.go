@@ -351,10 +351,11 @@ func (b *LocalBackend) InstallInstanceFile(ctx context.Context, instance *Instan
 	if filepath.Clean(target) == runtimeRoot || !strings.HasPrefix(filepath.Clean(target), runtimeRoot+string(os.PathSeparator)) {
 		return "", fmt.Errorf("runtime file destination %q escapes instance storage", destination)
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return "", fmt.Errorf("create local runtime file directory: %w", err)
+	parent := filepath.Dir(target)
+	if err := b.ensureLocalRuntimeDir(runtimeRoot, parent); err != nil {
+		return "", err
 	}
-	temporary, err := os.CreateTemp(filepath.Dir(target), ".runtime-*")
+	temporary, err := os.CreateTemp(parent, ".runtime-*")
 	if err != nil {
 		return "", fmt.Errorf("create local runtime file: %w", err)
 	}
@@ -371,20 +372,58 @@ func (b *LocalBackend) InstallInstanceFile(ctx context.Context, instance *Instan
 	if err := temporary.Close(); err != nil {
 		return "", fmt.Errorf("close local runtime file: %w", err)
 	}
-	if b.identity != nil {
-		if err := filepath.Walk(runtimeRoot, func(path string, _ os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			return b.chown(path, int(b.identity.UID), int(b.identity.GID))
-		}); err != nil {
-			return "", fmt.Errorf("hand off local runtime material: %w", err)
-		}
-	}
 	if err := os.Rename(temporaryName, target); err != nil {
 		return "", fmt.Errorf("install local runtime file: %w", err)
 	}
+	if b.identity != nil {
+		if err := os.Lchown(target, int(b.identity.UID), int(b.identity.GID)); err != nil {
+			_ = os.Remove(target)
+			return "", fmt.Errorf("hand off local runtime file: %w", err)
+		}
+	}
 	return target, nil
+}
+
+func (b *LocalBackend) ensureLocalRuntimeDir(runtimeRoot, parent string) error {
+	relative, err := filepath.Rel(runtimeRoot, parent)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("local runtime directory %q escapes runtime root", parent)
+	}
+	directories := []string{runtimeRoot}
+	if relative != "." {
+		current := runtimeRoot
+		for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+			current = filepath.Join(current, component)
+			directories = append(directories, current)
+		}
+	}
+	for _, directory := range directories {
+		info, statErr := os.Lstat(directory)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				return fmt.Errorf("create local runtime directory %q: %w", directory, err)
+			}
+			info, statErr = os.Lstat(directory)
+			if statErr != nil {
+				return fmt.Errorf("inspect local runtime directory %q: %w", directory, statErr)
+			}
+		case statErr != nil:
+			return fmt.Errorf("inspect local runtime directory %q: %w", directory, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("local runtime path %q is not a real directory", directory)
+		}
+		if b.identity != nil {
+			if err := os.Lchown(directory, -1, int(b.identity.GID)); err != nil {
+				return fmt.Errorf("assign local runtime directory %q to gid %d: %w", directory, b.identity.GID, err)
+			}
+			if err := os.Chmod(directory, 0o710); err != nil {
+				return fmt.Errorf("make local runtime directory %q traversable for gid %d: %w", directory, b.identity.GID, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Command) (Stream, error) {
