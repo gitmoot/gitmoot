@@ -217,16 +217,21 @@ func (s *Store) MarkExecBackendAttemptDestroying(ctx context.Context, key ExecBa
 	return s.transitionExecBackendAttemptState(ctx, key, ExecBackendAttemptStateCollecting, ExecBackendAttemptStateDestroying)
 }
 
-// MarkExecBackendAttemptDestroyed completes teardown and records compute cost
-// separately from model cost. Cost enforcement remains outside the store.
-func (s *Store) MarkExecBackendAttemptDestroyed(ctx context.Context, key ExecBackendAttemptKey, costActualUSD float64) (bool, error) {
-	if costActualUSD < 0 {
-		return false, errors.New("execution backend actual cost must be non-negative")
+// MarkExecBackendAttemptDestroyed completes teardown. costActualUSD is nil when
+// the provider did not expose a dollar cost; NULL must remain distinguishable
+// from a measured zero. Cost enforcement remains outside the store.
+func (s *Store) MarkExecBackendAttemptDestroyed(ctx context.Context, key ExecBackendAttemptKey, costActualUSD *float64) (bool, error) {
+	var persistedCost any
+	if costActualUSD != nil {
+		if *costActualUSD < 0 {
+			return false, errors.New("execution backend actual cost must be non-negative")
+		}
+		persistedCost = *costActualUSD
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE execbackend_attempts
 		SET state = ?, cost_actual_usd = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE job_id = ? AND attempt = ? AND lifecycle_generation = ? AND state = ?`,
-		ExecBackendAttemptStateDestroyed, costActualUSD, key.JobID, key.Attempt, key.LifecycleGeneration,
+		ExecBackendAttemptStateDestroyed, persistedCost, key.JobID, key.Attempt, key.LifecycleGeneration,
 		ExecBackendAttemptStateDestroying)
 	if err != nil {
 		return false, err
@@ -253,15 +258,19 @@ func (s *Store) MarkExecBackendAttemptDestroyed(ctx context.Context, key ExecBac
 // one. So a provider-CONFIRMED destroy was recorded as an orphan - and orphaned
 // is both a billing state for the compute cap and terminal-unreachable, so the
 // reservation was held forever with no repair path.
-func (s *Store) MarkExecBackendAttemptReconciledDestroyed(ctx context.Context, key ExecBackendAttemptKey, costActualUSD float64) (bool, error) {
-	if costActualUSD < 0 {
-		return false, errors.New("execution backend actual cost must be non-negative")
+func (s *Store) MarkExecBackendAttemptReconciledDestroyed(ctx context.Context, key ExecBackendAttemptKey, costActualUSD *float64) (bool, error) {
+	var persistedCost any
+	if costActualUSD != nil {
+		if *costActualUSD < 0 {
+			return false, errors.New("execution backend actual cost must be non-negative")
+		}
+		persistedCost = *costActualUSD
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE execbackend_attempts
 		SET state = ?, cost_actual_usd = ?, updated_at = CURRENT_TIMESTAMP
 		WHERE job_id = ? AND attempt = ? AND lifecycle_generation = ?
 			AND state IN (?, ?, ?, ?, ?)`,
-		ExecBackendAttemptStateDestroyed, costActualUSD, key.JobID, key.Attempt, key.LifecycleGeneration,
+		ExecBackendAttemptStateDestroyed, persistedCost, key.JobID, key.Attempt, key.LifecycleGeneration,
 		ExecBackendAttemptStateReserved, ExecBackendAttemptStateProvisioning,
 		ExecBackendAttemptStateRunning, ExecBackendAttemptStateCollecting,
 		ExecBackendAttemptStateDestroying)

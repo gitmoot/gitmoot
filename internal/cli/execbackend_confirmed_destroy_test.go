@@ -66,8 +66,12 @@ func TestReapInventoryConfirmedDestroyReleasesAndInconclusiveDoesNot(t *testing.
 			if _, err := backend.ReapInventory(context.Background()); err != nil {
 				t.Fatalf("ReapInventory returned error: %v", err)
 			}
-			if got := execBackendAttemptForTest(t, store, key).State; got != test.wantState {
-				t.Fatalf("attempt state = %q, want %q", got, test.wantState)
+			attempt := execBackendAttemptForTest(t, store, key)
+			if attempt.State != test.wantState {
+				t.Fatalf("attempt state = %q, want %q", attempt.State, test.wantState)
+			}
+			if attempt.CostActualUSD != nil {
+				t.Fatalf("cost_actual_usd = %v, want NULL because reconciliation observed no dollar cost", *attempt.CostActualUSD)
 			}
 		})
 	}
@@ -90,7 +94,7 @@ func TestOrphanedExecBackendAttemptHasNoRepairPath(t *testing.T) {
 	if changed, err := store.MarkExecBackendAttemptOrphaned(ctx, key); err != nil || !changed {
 		t.Fatalf("mark orphaned: changed=%v err=%v", changed, err)
 	}
-	changed, err := store.MarkExecBackendAttemptDestroyed(ctx, key, 0)
+	changed, err := store.MarkExecBackendAttemptDestroyed(ctx, key, nil)
 	if err != nil {
 		t.Fatalf("mark destroyed after orphaned returned error: %v", err)
 	}

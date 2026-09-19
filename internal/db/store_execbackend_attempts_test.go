@@ -178,7 +178,8 @@ func TestMarkExecBackendAttemptDestroyed(t *testing.T) {
 	store, key := runningTestExecBackendAttempt(t, "destroyed")
 	requireExecBackendTransition(t)(store.MarkExecBackendAttemptCollecting(context.Background(), key))
 	requireExecBackendTransition(t)(store.MarkExecBackendAttemptDestroying(context.Background(), key))
-	requireExecBackendTransition(t)(store.MarkExecBackendAttemptDestroyed(context.Background(), key, 1.25))
+	costActualUSD := 1.25
+	requireExecBackendTransition(t)(store.MarkExecBackendAttemptDestroyed(context.Background(), key, &costActualUSD))
 	attempt := getTestExecBackendAttempt(t, store, key)
 	if attempt.State != ExecBackendAttemptStateDestroyed {
 		t.Fatalf("state = %q, want destroyed", attempt.State)
@@ -186,7 +187,7 @@ func TestMarkExecBackendAttemptDestroyed(t *testing.T) {
 	if attempt.CostActualUSD == nil || *attempt.CostActualUSD != 1.25 {
 		t.Fatalf("cost_actual_usd = %v, want 1.25", attempt.CostActualUSD)
 	}
-	requireExecBackendTransitionRejected(t)(store.MarkExecBackendAttemptDestroyed(context.Background(), key, 2.5))
+	requireExecBackendTransitionRejected(t)(store.MarkExecBackendAttemptDestroyed(context.Background(), key, &costActualUSD))
 }
 
 func TestMarkExecBackendAttemptOrphaned(t *testing.T) {
