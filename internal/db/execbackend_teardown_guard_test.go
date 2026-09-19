@@ -101,7 +101,7 @@ func TestMarkExecBackendAttemptDestroyedAdmitsOnlyDestroying(t *testing.T) {
 			}
 			from := test.advance(must, store, key)
 
-			changed, err := store.MarkExecBackendAttemptDestroyed(ctx, key, 0)
+			changed, err := store.MarkExecBackendAttemptDestroyed(ctx, key, nil)
 			if err != nil {
 				t.Fatalf("MarkExecBackendAttemptDestroyed from %s returned error: %v", from, err)
 			}

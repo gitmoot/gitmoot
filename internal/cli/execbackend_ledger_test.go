@@ -193,8 +193,12 @@ func TestExecBackendLedgerTeardownUpdatesEveryPath(t *testing.T) {
 				t.Fatalf("teardown error = %v, wantError=%v", err, test.wantError)
 			}
 			key := db.ExecBackendAttemptKey{JobID: "job-" + test.name, Attempt: 1, LifecycleGeneration: 2}
-			if got := execBackendAttemptForTest(t, store, key).State; got != test.wantState {
-				t.Fatalf("state = %q, want %q", got, test.wantState)
+			attempt := execBackendAttemptForTest(t, store, key)
+			if attempt.State != test.wantState {
+				t.Fatalf("state = %q, want %q", attempt.State, test.wantState)
+			}
+			if attempt.CostActualUSD != nil {
+				t.Fatalf("cost_actual_usd = %v, want NULL because the provider exposes no dollar cost", *attempt.CostActualUSD)
 			}
 			if inner.destroys != test.wantDestroy || inner.cancels != test.wantCancel {
 				t.Fatalf("destroy calls=%d cancel calls=%d, want %d/%d", inner.destroys, inner.cancels, test.wantDestroy, test.wantCancel)
@@ -221,8 +225,12 @@ func TestExecBackendLedgerTeardownUpdatesEveryPath(t *testing.T) {
 		// orphaned (#2147). This assertion previously pinned orphaned, which was
 		// the defect: the reconciler could only reach orphaned from a live state,
 		// and orphaned bills against the compute cap and is terminal-unreachable.
-		if got := execBackendAttemptForTest(t, store, key).State; got != db.ExecBackendAttemptStateDestroyed {
-			t.Fatalf("startup-reaped state = %q, want destroyed: the provider confirmed this sandbox is gone, so recording it as an orphan holds its reservation forever", got)
+		attempt := execBackendAttemptForTest(t, store, key)
+		if attempt.State != db.ExecBackendAttemptStateDestroyed {
+			t.Fatalf("startup-reaped state = %q, want destroyed: the provider confirmed this sandbox is gone, so recording it as an orphan holds its reservation forever", attempt.State)
+		}
+		if attempt.CostActualUSD != nil {
+			t.Fatalf("startup-reaped cost_actual_usd = %v, want NULL because reconciliation observed no dollar cost", *attempt.CostActualUSD)
 		}
 	})
 }

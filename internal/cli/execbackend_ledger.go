@@ -210,7 +210,7 @@ func (b *ledgeredExecutionBackend) teardown(ctx context.Context, instance *execb
 
 	providerErr := destroy(ctx, instance)
 	if providerErr == nil && tracked {
-		changed, err := b.store.MarkExecBackendAttemptDestroyed(context.WithoutCancel(ctx), key, 0)
+		changed, err := b.store.MarkExecBackendAttemptDestroyed(context.WithoutCancel(ctx), key, nil)
 		if err != nil {
 			ledgerErrs = append(ledgerErrs, fmt.Errorf("mark execution backend attempt destroyed: %w", err))
 		} else if !changed {
@@ -315,13 +315,9 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		id := *attempt.SandboxID
 		if _, ok := destroyed[id]; ok {
 			// THE PROVIDER CONFIRMED THIS ONE IS GONE, so it is destroyed, not
-			// orphaned (#2147). This branch previously recorded an orphan while
-			// its own log line said "reaped" - and orphaned bills against the
-			// compute cap and is terminal-unreachable, so the reservation was
-			// held forever. costActualUSD is 0 because a reconciled destroy has
-			// no cost figure we observed: teardown passes 0 for the same reason,
-			// and inventing one would put a fabricated number in a cost ledger.
-			if changed, markErr := b.store.MarkExecBackendAttemptReconciledDestroyed(context.WithoutCancel(ctx), key, 0); markErr != nil || !changed {
+			// orphaned (#2147). This releases the reservation without inventing
+			// a dollar cost: the provider reported destruction, not billing.
+			if changed, markErr := b.store.MarkExecBackendAttemptReconciledDestroyed(context.WithoutCancel(ctx), key, nil); markErr != nil || !changed {
 				reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark reaped execution backend attempt %+v destroyed", key), markErr))
 			}
 			continue
