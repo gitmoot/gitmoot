@@ -180,8 +180,7 @@ func (w jobWorker) defaultAuthProbe(ctx context.Context, job db.Job, payload wor
 	if strings.TrimSpace(agent.Runtime) != runtime.ClaudeRuntime {
 		return authProbeUnknown
 	}
-	jobBackend, jobBackendPresent := payload.ExecBackendOverride()
-	backend, _, err := daemonJobExecBackendFor(w, jobBackend, jobBackendPresent)
+	backend, _, err := w.resolveExecutionBackendForJob(job, payload)
 	if err != nil {
 		return authProbeUnknown
 	}

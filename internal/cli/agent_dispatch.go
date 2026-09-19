@@ -73,10 +73,16 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 	return execbackend.ParseImplemented(*override)
 }
 
+// validateRuntimeExecutionBackend refuses an unsupported runtime/backend pair
+// at DISPATCH — before cost reservation, provisioning, or comment noise
+// (#2234). It asks remoteCapableRuntime rather than restating the set: this
+// predicate and the one enforced later at provision time must never disagree,
+// because a dispatch that admits what provisioning rejects fails after the
+// reservation this check exists to avoid.
 func validateRuntimeExecutionBackend(runtimeName string, backend execbackend.Backend) error {
 	runtimeName = strings.TrimSpace(runtimeName)
-	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
-		return fmt.Errorf("runtime %q is not supported on execution backend %q; supported remote runtimes are %s and %s", runtimeName, backend, runtime.ShellRuntime, runtime.OmpRuntime)
+	if backend == execbackend.Remote && !remoteCapableRuntime(runtimeName) {
+		return fmt.Errorf("runtime %q is not supported on execution backend %q; supported remote runtimes are %s", runtimeName, backend, remoteCapableRuntimeNames())
 	}
 	return nil
 }

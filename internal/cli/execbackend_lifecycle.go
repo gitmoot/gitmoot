@@ -167,8 +167,8 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 		return nil, nil, nil, nil, nil
 	}
-	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
-		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; supported runtimes are %s and %s", runtimeName, runtime.ShellRuntime, runtime.OmpRuntime)
+	if backend == execbackend.Remote && !remoteCapableRuntime(runtimeName) {
+		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; supported runtimes are %s", runtimeName, remoteCapableRuntimeNames())
 	}
 	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
 		ompTemplate := strings.TrimSpace(cfg.E2BOMPTemplate)
@@ -431,3 +431,34 @@ func rootJobIDForTTLLiveness(job db.Job) string {
 // sandboxTTLLivenessTimeout bounds the liveness read so a slow store cannot
 // delay a renewal past its lead.
 const sandboxTTLLivenessTimeout = 5 * time.Second
+
+// remoteCapableRuntime is the ONE authoritative answer to "may this runtime run
+// on the remote execution backend".
+//
+// It replaces three independent copies of the same predicate (#2234 review):
+// provisionExecutionBackend here, provisionRemoteCredentialGateway in
+// execbackend_credentials.go, and validateRuntimeExecutionBackend in
+// agent_dispatch.go. Three lists answering one question is a second and third
+// copy of the truth, and nothing failed when only one changed.
+//
+// The drift directions are ASYMMETRIC, which is why this is centralised rather
+// than merely kept consistent by hand. If the gateway admits a runtime dispatch
+// validation rejects, a supported combination is refused loudly at dispatch. If
+// dispatch validation admits one the gateway rejects, the job passes dispatch
+// and dies AFTER cost reservation and provisioning — the outcome #2234's
+// refuse-before-reserve requirement exists to prevent. Adding a runtime is now
+// a one-line change that cannot be half-applied.
+func remoteCapableRuntime(runtimeName string) bool {
+	switch strings.TrimSpace(runtimeName) {
+	case runtime.ShellRuntime, runtime.OmpRuntime:
+		return true
+	default:
+		return false
+	}
+}
+
+// remoteCapableRuntimeNames renders the supported set for refusal messages, so
+// the operator-visible list cannot drift from the predicate that enforces it.
+func remoteCapableRuntimeNames() string {
+	return fmt.Sprintf("%s and %s", runtime.ShellRuntime, runtime.OmpRuntime)
+}
