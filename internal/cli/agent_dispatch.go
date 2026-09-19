@@ -705,6 +705,14 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if brief := briefEngine.ReviewObligationBrief(ctx, repo.FullName(), request.PullRequest, request.HeadSHA, request.TaskID); brief != "" {
 			request.Instructions += brief
 		}
+		// THE REVIEWER-SIDE HALF OF #2224. The daemon can already salvage a dead
+		// review's findings log, and until now nothing wrote one - so the salvage
+		// recovered nothing in production and the feature was inert.
+		//
+		// Stated as a RELATIVE path because that is the only form available here:
+		// the worktree is allocated by the worker, long after this brief is
+		// composed, and the runtime runs with its working directory set to it.
+		request.Instructions += workflow.ReviewFindingsLogBrief()
 	}
 	// STAGED REVIEW (#1821). Placed here for the same reason as the brief above,
 	// and the reason is #1819's scan: this append must land AFTER
