@@ -527,35 +527,35 @@ func (b *Backend) InstallCredentialMaterial(ctx context.Context, instance *execb
 // InstallInstanceFile streams one runtime-owned file into the sandbox.
 // Material is kept outside the repository, protected by the requested mode,
 // and destroyed with the instance.
-func (b *Backend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) error {
+func (b *Backend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
 	state, err := b.stateFor(instance)
 	if err != nil {
-		return err
+		return "", err
 	}
 	destination = path.Clean(strings.TrimSpace(destination))
 	if !strings.HasPrefix(destination, execbackend.RuntimeMaterialDir+"/") {
-		return fmt.Errorf("remote runtime file %q must be below %s", destination, execbackend.RuntimeMaterialDir)
+		return "", fmt.Errorf("remote runtime file %q must be below %s", destination, execbackend.RuntimeMaterialDir)
 	}
 	if reader == nil {
-		return errors.New("remote runtime file reader is required")
+		return "", errors.New("remote runtime file reader is required")
 	}
 	if mode != 0o600 && mode != 0o700 {
-		return fmt.Errorf("remote runtime file %q has unsupported mode %04o", destination, mode)
+		return "", fmt.Errorf("remote runtime file %q has unsupported mode %04o", destination, mode)
 	}
 	if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name: "mkdir", Args: []string{"-p", path.Dir(destination)}, Dir: "/home/user", MaxOutputBytes: 256,
 	}); err != nil {
-		return fmt.Errorf("create remote runtime directory: %w", err)
+		return "", fmt.Errorf("create remote runtime directory: %w", err)
 	}
 	if err := state.envd.Upload(ctx, destination, reader); err != nil {
-		return fmt.Errorf("upload remote runtime file %s: %w", path.Base(destination), err)
+		return "", fmt.Errorf("upload remote runtime file %s: %w", path.Base(destination), err)
 	}
 	if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name: "chmod", Args: []string{fmt.Sprintf("%04o", mode.Perm()), destination}, Dir: "/home/user", MaxOutputBytes: 256,
 	}); err != nil {
-		return fmt.Errorf("protect remote runtime file %s: %w", path.Base(destination), err)
+		return "", fmt.Errorf("protect remote runtime file %s: %w", path.Base(destination), err)
 	}
-	return nil
+	return destination, nil
 }
 
 func (b *Backend) Exec(ctx context.Context, instance *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {

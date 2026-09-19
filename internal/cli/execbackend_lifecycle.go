@@ -248,7 +248,7 @@ func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.Executio
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return fmt.Errorf("host omp executable %q is not an executable regular file", source)
 	}
-	if err := installer.InstallInstanceFile(ctx, instance, execbackend.RuntimeOmpExecutablePath, file, 0o700); err != nil {
+	if _, err := installer.InstallInstanceFile(ctx, instance, execbackend.RuntimeOmpExecutablePath, file, 0o700); err != nil {
 		return fmt.Errorf("install omp runtime in remote execution backend: %w", err)
 	}
 	return nil

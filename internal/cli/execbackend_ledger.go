@@ -163,10 +163,10 @@ func (b *ledgeredExecutionBackend) InstallCredentialMaterial(ctx context.Context
 	return installer.InstallCredentialMaterial(ctx, instance, material)
 }
 
-func (b *ledgeredExecutionBackend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) error {
+func (b *ledgeredExecutionBackend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
 	installer, ok := b.inner.(execbackend.InstanceFileInstaller)
 	if !ok {
-		return fmt.Errorf("execution backend %q cannot install runtime files", b.inner.Name())
+		return "", fmt.Errorf("execution backend %q cannot install runtime files", b.inner.Name())
 	}
 	return installer.InstallInstanceFile(ctx, instance, destination, reader, mode)
 }

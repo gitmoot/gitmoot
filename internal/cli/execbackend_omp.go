@@ -152,7 +152,7 @@ func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.Executio
 	if !ok {
 		return nil, fmt.Errorf("execution backend %q cannot install the omp model gateway forwarder", lifecycle.Name())
 	}
-	if err := installer.InstallInstanceFile(ctx, instance, remoteOmpForwarderPath, strings.NewReader(remoteOmpForwarder), 0o700); err != nil {
+	if _, err := installer.InstallInstanceFile(ctx, instance, remoteOmpForwarderPath, strings.NewReader(remoteOmpForwarder), 0o700); err != nil {
 		return nil, fmt.Errorf("install remote omp model gateway forwarder: %w", err)
 	}
 	stream, err := lifecycle.Exec(ctx, instance, execbackend.Command{

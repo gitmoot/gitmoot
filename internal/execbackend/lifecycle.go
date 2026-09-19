@@ -125,10 +125,12 @@ type CredentialMaterialInstaller interface {
 }
 
 // InstanceFileInstaller is the optional data-plane capability for installing a
-// non-secret runtime executable or attachment inside one execution instance.
+// runtime executable or attachment inside one execution instance. The returned
+// path is the path visible to the runtime; remote backends normally return
+// destination, while local backends map it into instance-owned storage.
 // Implementations must confine destination to RuntimeMaterialDir.
 type InstanceFileInstaller interface {
-	InstallInstanceFile(context.Context, *Instance, string, io.Reader, os.FileMode) error
+	InstallInstanceFile(context.Context, *Instance, string, io.Reader, os.FileMode) (string, error)
 }
 
 type Instance struct {
@@ -323,6 +325,66 @@ func (b *LocalBackend) SyncIn(ctx context.Context, instance *Instance, materials
 		return err
 	}
 	return writeLocalMetadata(instance.root, metadataForInstance(instance, "running"))
+}
+
+func (b *LocalBackend) InstallInstanceFile(ctx context.Context, instance *Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
+	if err := b.validateInstance(instance); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if reader == nil {
+		return "", errors.New("local runtime file reader is required")
+	}
+	if mode != 0o600 && mode != 0o700 {
+		return "", fmt.Errorf("local runtime file %q has unsupported mode %04o", destination, mode)
+	}
+	clean := path.Clean(strings.TrimSpace(destination))
+	prefix := RuntimeMaterialDir + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return "", fmt.Errorf("runtime file destination %q is outside %s", destination, RuntimeMaterialDir)
+	}
+	relative := strings.TrimPrefix(clean, prefix)
+	runtimeRoot := filepath.Join(instance.root, "runtime")
+	target := filepath.Join(runtimeRoot, filepath.FromSlash(relative))
+	if filepath.Clean(target) == runtimeRoot || !strings.HasPrefix(filepath.Clean(target), runtimeRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("runtime file destination %q escapes instance storage", destination)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return "", fmt.Errorf("create local runtime file directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(target), ".runtime-*")
+	if err != nil {
+		return "", fmt.Errorf("create local runtime file: %w", err)
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := io.Copy(temporary, reader); err != nil {
+		temporary.Close()
+		return "", fmt.Errorf("write local runtime file: %w", err)
+	}
+	if err := temporary.Chmod(mode.Perm()); err != nil {
+		temporary.Close()
+		return "", fmt.Errorf("set local runtime file mode: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return "", fmt.Errorf("close local runtime file: %w", err)
+	}
+	if b.identity != nil {
+		if err := filepath.Walk(runtimeRoot, func(path string, _ os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			return b.chown(path, int(b.identity.UID), int(b.identity.GID))
+		}); err != nil {
+			return "", fmt.Errorf("hand off local runtime material: %w", err)
+		}
+	}
+	if err := os.Rename(temporaryName, target); err != nil {
+		return "", fmt.Errorf("install local runtime file: %w", err)
+	}
+	return target, nil
 }
 
 func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Command) (Stream, error) {
@@ -833,10 +895,11 @@ func (r InstanceRunner) StageAttachment(ctx context.Context, name string, conten
 	}
 	sum := sha256.Sum256(content)
 	destination := path.Join(RuntimeAttachmentDir, hex.EncodeToString(sum[:]), name)
-	if err := installer.InstallInstanceFile(ctx, r.Instance, destination, bytes.NewReader(content), 0o600); err != nil {
+	installed, err := installer.InstallInstanceFile(ctx, r.Instance, destination, bytes.NewReader(content), 0o600)
+	if err != nil {
 		return "", func() {}, err
 	}
-	return destination, func() {}, nil
+	return installed, func() {}, nil
 }
 
 var (

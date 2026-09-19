@@ -379,7 +379,7 @@ func TestRemoteCredentialMaterialTraversesLifecycleWrappers(t *testing.T) {
 	if materialMatch := reflect.DeepEqual(inner.material, material); inner.installs != 1 || !materialMatch {
 		t.Fatalf("wrapped install count=%d material-match=%t", inner.installs, materialMatch)
 	}
-	if err := lifecycle.InstallInstanceFile(context.Background(), &execbackend.Instance{ID: "sandbox-wrapped"}, execbackend.RuntimeOmpExecutablePath, strings.NewReader("omp"), 0o700); err != nil {
+	if _, err := lifecycle.InstallInstanceFile(context.Background(), &execbackend.Instance{ID: "sandbox-wrapped"}, execbackend.RuntimeOmpExecutablePath, strings.NewReader("omp"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if inner.runtimeFiles[execbackend.RuntimeOmpExecutablePath] != 0o700 {
@@ -413,12 +413,12 @@ func (b *credentialTestBackend) InstallCredentialMaterial(_ context.Context, _ *
 	b.material = material
 	return nil
 }
-func (b *credentialTestBackend) InstallInstanceFile(_ context.Context, _ *execbackend.Instance, destination string, _ io.Reader, mode os.FileMode) error {
+func (b *credentialTestBackend) InstallInstanceFile(_ context.Context, _ *execbackend.Instance, destination string, _ io.Reader, mode os.FileMode) (string, error) {
 	if b.runtimeFiles == nil {
 		b.runtimeFiles = make(map[string]os.FileMode)
 	}
 	b.runtimeFiles[destination] = mode
-	return nil
+	return destination, nil
 }
 func (b *credentialTestBackend) Exec(_ context.Context, _ *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
 	b.execCalls = append(b.execCalls, command)

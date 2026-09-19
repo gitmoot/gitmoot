@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -3392,6 +3393,47 @@ func TestOmpOversizePromptStaged(t *testing.T) {
 			t.Fatalf("a prompt of exactly the ceiling was not staged; argv=%v", runner.lastArgs)
 		}
 	})
+}
+
+func TestOmpOversizePromptUsesLocalInstanceAttachment(t *testing.T) {
+	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "job-local-omp-prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
+
+	prompt := strings.Repeat("local prompt\n", ompMaxArgvPromptBytes/8)
+	runner := execbackend.InstanceRunner{Backend: backend, Instance: instance}
+	promptArg, attachArgs, cleanup, err := ompPromptDeliveryForRunner(context.Background(), runner, prompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if promptArg != ompAttachedPromptPointer() || len(attachArgs) != 1 || !strings.HasPrefix(attachArgs[0], "@") {
+		t.Fatalf("prompt delivery arg=%q attachments=%v", promptArg, attachArgs)
+	}
+	attachment := strings.TrimPrefix(attachArgs[0], "@")
+	if strings.HasPrefix(attachment, instance.Workspace+string(os.PathSeparator)) {
+		t.Fatalf("attachment entered job worktree: %s", attachment)
+	}
+	content, err := os.ReadFile(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != prompt {
+		t.Fatalf("staged prompt bytes=%d, want %d", len(content), len(prompt))
+	}
+	info, err := os.Stat(attachment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("attachment mode=%04o, want 0600", info.Mode().Perm())
+	}
 }
 
 type remoteOmpAttachmentRunner struct {

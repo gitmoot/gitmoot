@@ -209,10 +209,10 @@ func (b *credentialRevokingExecutionBackend) InstallCredentialMaterial(ctx conte
 	}
 	return installer.InstallCredentialMaterial(ctx, instance, material)
 }
-func (b *credentialRevokingExecutionBackend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) error {
+func (b *credentialRevokingExecutionBackend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
 	installer, ok := b.inner.(execbackend.InstanceFileInstaller)
 	if !ok {
-		return fmt.Errorf("execution backend %q cannot install runtime files", b.inner.Name())
+		return "", fmt.Errorf("execution backend %q cannot install runtime files", b.inner.Name())
 	}
 	return installer.InstallInstanceFile(ctx, instance, destination, reader, mode)
 }
