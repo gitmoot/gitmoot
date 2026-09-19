@@ -810,12 +810,20 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		return w.recordRemoteReviewAdmissionRefusal(ctx, job, admissionErr)
 	}
+	runCtx := ctx
+	stopRun := func() {}
+	if remoteReviewAdmitted {
+		// Admission owns the queued->running claim, so cancellation observation
+		// must begin before the cost ledger or provider can see this job.
+		runCtx, stopRun = w.runningJobContext(ctx, job.ID)
+		defer stopRun()
+	}
 	// Acquire the execution-backend lifecycle only after checkout validation and
 	// runtime-session admission. The instance then survives every Mailbox repair
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
-	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(ctx, execBackend, execConfig, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
+	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(runCtx, execBackend, execConfig, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
 	}
@@ -1076,8 +1084,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// classifies as a retryable operational blocker the mailbox re-queues the job
 	// BEFORE the terminal transition, so no job.failed reaches the [events] sink.
 	engine.BlockerDeferrer = w.deferOperationalBlockerPreTerminal
-	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
-	defer stopRun()
+	if !remoteReviewAdmitted {
+		runCtx, stopRun = w.runningJobContext(ctx, job.ID)
+		defer stopRun()
+	}
 	runStartedAt := time.Now().UTC()
 	var cancel context.CancelFunc
 	runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)

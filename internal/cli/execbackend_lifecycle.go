@@ -209,6 +209,9 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return lifecycle, nil, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+	}
 	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
 	if err != nil {
 		// A provider can create an instance and then fail to persist its handle in

@@ -7,8 +7,9 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,17 +64,18 @@ func (*remoteReviewProbeBackend) Cancel(context.Context, *execbackend.Instance) 
 func (*remoteReviewProbeBackend) Destroy(context.Context, *execbackend.Instance) error { return nil }
 
 type remoteReviewAdmissionFixture struct {
-	ctx          context.Context
-	home         string
-	paths        config.Paths
-	store        *db.Store
-	job          db.Job
-	head         string
-	worker       jobWorker
-	github       *remoteReviewAdmissionGitHubStub
-	backend      *remoteReviewProbeBackend
-	factoryCalls int
-	commentCalls int
+	ctx                        context.Context
+	home                       string
+	paths                      config.Paths
+	store                      *db.Store
+	job                        db.Job
+	head                       string
+	worker                     jobWorker
+	github                     *remoteReviewAdmissionGitHubStub
+	backend                    *remoteReviewProbeBackend
+	factoryCalls               int
+	commentCalls               int
+	beforeBackendFactoryReturn func()
 }
 
 func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteReviewAdmissionFixture {
@@ -109,6 +111,9 @@ func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteRe
 	fixture.worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub { return fixture.github }
 	fixture.worker.ExecutionBackendFactory = func(_ execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
 		fixture.factoryCalls++
+		if fixture.beforeBackendFactoryReturn != nil {
+			fixture.beforeBackendFactoryReturn()
+		}
 		return fixture.backend, nil
 	}
 	fixture.worker.CommenterFactory = func(string) github.Client {
@@ -295,27 +300,34 @@ func TestRemoteReviewAdmissionAllowsExplicitOperatorRetry(t *testing.T) {
 	}
 }
 
-func TestRemoteReviewProviderRetryClassification(t *testing.T) {
+func TestRemoteReviewProviderRetryClassificationUsesRealClientSignal(t *testing.T) {
 	for _, test := range []struct {
+		name      string
 		status    int
 		retryable bool
 	}{
-		{status: 408, retryable: true},
-		{status: 429, retryable: true},
-		{status: 500, retryable: true},
-		{status: 502, retryable: true},
-		{status: 503, retryable: true},
-		{status: 504, retryable: true},
-		{status: 400, retryable: false},
-		{status: 401, retryable: false},
-		{status: 409, retryable: false},
+		{name: "conflict proves no allocation", status: http.StatusConflict, retryable: true},
+		{name: "rate limit remains ambiguous", status: http.StatusTooManyRequests, retryable: false},
+		{name: "server error remains ambiguous", status: http.StatusServiceUnavailable, retryable: false},
 	} {
-		t.Run(strconv.Itoa(test.status), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, `{"message":"provider response"}`)
+			}))
+			t.Cleanup(server.Close)
+			client, err := e2b.NewClient("test-api-key", e2b.Options{BaseURL: server.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, providerErr := client.Create(context.Background(), "review-template", time.Minute, e2b.CreateOptions{})
+			if providerErr == nil {
+				t.Fatal("Create returned nil error")
+			}
+
 			f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
-			f.worker.recordRetryableRemoteProviderFailure(f.ctx, f.job, &e2b.RequestRefusedError{
-				StatusCode: test.status,
-				Operation:  e2b.OperationCreate,
-			})
+			f.worker.recordRetryableRemoteProviderFailure(f.ctx, f.job, providerErr)
 			events, err := f.store.ListJobEvents(f.ctx, f.job.ID)
 			if err != nil {
 				t.Fatal(err)
@@ -325,7 +337,7 @@ func TestRemoteReviewProviderRetryClassification(t *testing.T) {
 				found = found || event.Kind == "remote_review_provider_retryable"
 			}
 			if found != test.retryable {
-				t.Fatalf("retryable provider event present = %v, want %v; events=%+v", found, test.retryable, events)
+				t.Fatalf("retryable provider event present = %v, want %v; provider error=%T %v; events=%+v", found, test.retryable, providerErr, providerErr, events)
 			}
 		})
 	}
@@ -348,5 +360,32 @@ func TestRemoteReviewAdmissionAllowsSuccessfulExplicitCIPolicy(t *testing.T) {
 	f.run(t)
 	if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
 		t.Fatalf("backend factory/provider calls = %d/%d, want 1/1", f.factoryCalls, f.backend.provisionCalls)
+	}
+}
+
+func TestRemoteReviewCancellationAfterAdmissionStopsBeforeProvider(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	f.beforeBackendFactoryReturn = func() {
+		if _, err := workflow.CancelJob(f.ctx, f.store, f.job.ID); err != nil {
+			t.Fatalf("CancelJob after admission: %v", err)
+		}
+		// Let the running-state observer propagate cancellation to the provider
+		// context before factory construction returns.
+		time.Sleep(2 * daemonJobCancelPollInterval)
+	}
+
+	f.run(t)
+	if f.factoryCalls != 1 || f.backend.provisionCalls != 0 {
+		t.Fatalf("backend factory/provider calls after admitted cancellation = %d/%d, want 1/0", f.factoryCalls, f.backend.provisionCalls)
+	}
+	attempts, err := f.store.ListExecBackendAttemptsForJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("attempt ledger rows after admitted cancellation = %d, want 0", len(attempts))
+	}
+	if _, err := workflow.RetryJob(f.ctx, f.store, f.job.ID); err != nil {
+		t.Fatalf("cancelled admitted review was not settled for retry: %v", err)
 	}
 }

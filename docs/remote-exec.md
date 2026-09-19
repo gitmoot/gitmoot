@@ -37,8 +37,8 @@ request head and refuses stale jobs, duplicate repo/PR/head/purpose subjects,
 unsupported runtime/backend pairs, and unapproved repeat attempts. One accepted
 active or terminal review owns its exact-head subject. A cancelled review
 releases that ownership. The first cloud attempt is the default; a later
-lifecycle generation needs either `gitmoot job retry` or a classified transient
-provider create failure.
+lifecycle generation needs either `gitmoot job retry` or a provider create
+conflict classified as authoritative proof that nothing was allocated.
 
 Current-head CI is optional and off by default. Enable it globally or override it
 per repository:

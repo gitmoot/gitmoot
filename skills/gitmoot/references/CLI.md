@@ -321,8 +321,8 @@ startup reaps instances whose recorded owner process is gone.
 Remote review admission runs after exact-head checkout binding and before cost
 reservation or provider calls. It re-reads the PR head; deduplicates
 repo/PR/head/purpose through the durable review claim; checks runtime/backend
-support; and allows only the first cloud attempt unless an operator retry or
-classified transient provider create failure authorized the new lifecycle
+support; and allows only the first cloud attempt unless an operator retry or a
+provider create conflict that proves no allocation authorized the new lifecycle
 generation. Cancellation releases the review claim. Refusals emit durable
 `remote_review_admission_avoided_<reason>` events for `stale`, `duplicate`,
 `unsupported`, `red_ci`, and `retry`.

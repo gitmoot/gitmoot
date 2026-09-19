@@ -58,6 +58,16 @@ func (w jobWorker) finishAdmittedReviewJob(ctx context.Context, job db.Job, stat
 	if err != nil {
 		return err
 	}
+	if !transitioned {
+		latest, latestErr := w.Store.GetJob(ctx, job.ID)
+		if latestErr != nil {
+			return latestErr
+		}
+		if latest.State == string(workflow.JobCancelled) {
+			_, settleErr := workflow.SettleCancelledRunningJob(ctx, w.Store, job.ID, "cancelled remote review settled during pre-delivery")
+			return settleErr
+		}
+	}
 	return w.afterQueuedJobTransition(ctx, job.ID, state, cause, transitioned)
 }
 

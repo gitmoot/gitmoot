@@ -237,10 +237,8 @@ func (w jobWorker) recordRetryableRemoteProviderFailure(ctx context.Context, job
 }
 
 func remoteReviewProviderStatusRetryable(status int) bool {
-	switch status {
-	case 408, 429, 500, 502, 503, 504:
-		return true
-	default:
-		return false
-	}
+	// Conflict is both production-reachable as RequestRefusedError and
+	// authoritative proof that CREATE allocated nothing. Rate limits, timeouts,
+	// and 5xx remain ambiguous in the E2B client and must never authorize spend.
+	return status == 409
 }
