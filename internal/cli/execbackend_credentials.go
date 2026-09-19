@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -108,8 +109,8 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 	if backend != execbackend.Remote {
 		return nil, nil, nil
 	}
-	if runtimeName != runtime.ShellRuntime {
-		return nil, nil, fmt.Errorf("runtime %q cannot present the remote credential gateway mTLS identity; raw-key fallback is forbidden", runtimeName)
+	if runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
+		return nil, nil, fmt.Errorf("runtime %q cannot present the remote credential gateway mTLS identity; supported runtimes are %s and %s", runtimeName, runtime.ShellRuntime, runtime.OmpRuntime)
 	}
 	if plan.gateway == nil {
 		return nil, nil, nil
@@ -145,10 +146,18 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 	if err != nil {
 		return lease, nil, fmt.Errorf("install remote credential gateway material: %w", err)
 	}
-	return lease, []string{
+	env := []string{
 		credentialGatewayConfigEnv + "=" + execbackend.CredentialClientConfigPath,
 		credentialGatewayURLEnv + "=" + material.URL,
-	}, nil
+	}
+	if runtimeName == runtime.OmpRuntime {
+		ompEnv, err := startRemoteOmpForwarder(ctx, lifecycle, instance, material.URL)
+		if err != nil {
+			return lease, nil, err
+		}
+		env = append(env, ompEnv...)
+	}
+	return lease, env, nil
 }
 
 func lazyModelGatewayResolver(home string) credgw.CredentialResolver {
@@ -199,6 +208,13 @@ func (b *credentialRevokingExecutionBackend) InstallCredentialMaterial(ctx conte
 		return fmt.Errorf("execution backend %q cannot install credential gateway material", b.inner.Name())
 	}
 	return installer.InstallCredentialMaterial(ctx, instance, material)
+}
+func (b *credentialRevokingExecutionBackend) InstallInstanceFile(ctx context.Context, instance *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
+	installer, ok := b.inner.(execbackend.InstanceFileInstaller)
+	if !ok {
+		return "", fmt.Errorf("execution backend %q cannot install runtime files", b.inner.Name())
+	}
+	return installer.InstallInstanceFile(ctx, instance, destination, reader, mode)
 }
 func (b *credentialRevokingExecutionBackend) Exec(ctx context.Context, instance *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
 	return b.inner.Exec(ctx, instance, command)

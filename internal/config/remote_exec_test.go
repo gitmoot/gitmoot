@@ -49,7 +49,7 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 				if err := os.WriteFile(keyFile, []byte("api-key-GITMOOT-IMPL\n"), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				content += fmt.Sprintf("e2b_api_key_file = %q\ne2b_template = \"template-test\"\ne2b_base_url = \"https://control.example\"\ne2b_domain = \"sandboxes.example\"\ncredential_gateway_listen = \"127.0.0.1:8443\"\ncredential_gateway_url = \"https://broker.example:8443\"\n", keyFile)
+				content += fmt.Sprintf("e2b_api_key_file = %q\ne2b_template = \"template-test\"\ne2b_omp_template = \"omp-template-test\"\ne2b_base_url = \"https://control.example\"\ne2b_domain = \"sandboxes.example\"\ncredential_gateway_listen = \"127.0.0.1:8443\"\ncredential_gateway_url = \"https://broker.example:8443\"\n", keyFile)
 			}
 			paths := remoteExecTestPaths(t, content)
 			cfg, err := LoadRemoteExecConfig(paths)
@@ -59,7 +59,7 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 			if cfg.Backend != backend {
 				t.Fatalf("Backend = %q, want %q", cfg.Backend, backend)
 			}
-			if backend == "remote" && (cfg.E2BTemplate != "template-test" || cfg.E2BBaseURL != "https://control.example" || cfg.E2BDomain != "sandboxes.example" || cfg.CredentialGatewayListen != "127.0.0.1:8443" || cfg.CredentialGatewayURL != "https://broker.example:8443") {
+			if backend == "remote" && (cfg.E2BTemplate != "template-test" || cfg.E2BOMPTemplate != "omp-template-test" || cfg.E2BBaseURL != "https://control.example" || cfg.E2BDomain != "sandboxes.example" || cfg.CredentialGatewayListen != "127.0.0.1:8443" || cfg.CredentialGatewayURL != "https://broker.example:8443") {
 				t.Fatalf("remote provider config = %+v", cfg)
 			}
 		})

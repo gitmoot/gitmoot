@@ -4617,13 +4617,17 @@ func buildRemoteRuntimeAdapter(agent runtime.Agent, checkout string, runner subp
 	if !runnerReachesExecutionInstance(runner) {
 		return nil, errors.New("remote execution backend runtime runner is not attached to an instance")
 	}
-	if agent.Runtime != runtime.ShellRuntime {
-		return nil, fmt.Errorf("runtime %q is not supported on the remote execution backend", agent.Runtime)
-	}
 	if len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0 {
 		return nil, errors.New("runtime path grants are not supported on the remote execution backend")
 	}
-	return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
+	switch agent.Runtime {
+	case runtime.ShellRuntime:
+		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
+	case runtime.OmpRuntime:
+		return runtime.OmpAdapter{Dir: checkout, Runner: runner}, nil
+	default:
+		return nil, fmt.Errorf("runtime %q is not supported on the remote execution backend", agent.Runtime)
+	}
 }
 
 func runnerReachesExecutionInstance(runner subprocess.Runner) bool {

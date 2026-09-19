@@ -139,6 +139,7 @@ artifact_blobs = %q
 # local_root = "/var/tmp/gitmoot-local" # absolute; parents must be traversable by local_uid
 # e2b_api_key_file = "/run/secrets/e2b-api-key" # required for remote; owner-only regular file or symlink to one
 # e2b_template = "gitmoot-shell" # required for remote
+# e2b_omp_template = "gitmoot-omp" # required for remote OMP; build with >= 2 GiB RAM
 # e2b_base_url = "https://api.e2b.app" # optional control-plane override
 # e2b_domain = "e2b.app" # optional sandbox-domain override
 # credential_gateway_listen = "0.0.0.0:8443" # pair: daemon bind address

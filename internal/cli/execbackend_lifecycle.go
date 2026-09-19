@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -146,6 +147,8 @@ func (w jobWorker) executionBackendConfig() (config.RemoteExecConfig, error) {
 	}
 }
 
+var lookPathRemoteRuntime = osexec.LookPath
+
 func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execbackend.Backend, cfg config.RemoteExecConfig, runtimeName string, job db.Job, ttl time.Duration, checkout string) (execbackend.ExecutionBackend, *execbackend.Instance, *credgw.Lease, []string, error) {
 	if w.ExecutionBackendFactory == nil {
 		// A worker WITHOUT the lifecycle factory is the foreground/unit-test seam,
@@ -164,8 +167,15 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 		return nil, nil, nil, nil, nil
 	}
-	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime {
-		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; raw-key fallback is forbidden", runtimeName)
+	if backend == execbackend.Remote && runtimeName != runtime.ShellRuntime && runtimeName != runtime.OmpRuntime {
+		return nil, nil, nil, nil, fmt.Errorf("runtime %q is not supported on the remote execution backend; supported runtimes are %s and %s", runtimeName, runtime.ShellRuntime, runtime.OmpRuntime)
+	}
+	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
+		ompTemplate := strings.TrimSpace(cfg.E2BOMPTemplate)
+		if ompTemplate == "" {
+			return nil, nil, nil, nil, errors.New("remote omp requires [remote_exec].e2b_omp_template built with at least 2 GiB RAM")
+		}
+		cfg.E2BTemplate = ompTemplate
 	}
 	var credentialPlan remoteCredentialGatewayPlan
 	if backend == execbackend.Remote {
@@ -173,6 +183,17 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		credentialPlan, err = w.prepareRemoteCredentialGateway(cfg, ttl)
 		if err != nil {
 			return nil, nil, nil, nil, err
+		}
+	}
+	var ompExecutable string
+	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
+		if credentialPlan.gateway == nil {
+			return nil, nil, nil, nil, errors.New("remote omp requires the model credential gateway; raw-key fallback is forbidden")
+		}
+		var err error
+		ompExecutable, err = lookPathRemoteRuntime(runtime.OmpRuntime)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("resolve host omp executable for remote runtime: %w", err)
 		}
 	}
 	materials := execbackend.Materials{SourceWorktree: checkout}
@@ -198,11 +219,39 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if err := lifecycle.SyncIn(ctx, instance, materials); err != nil {
 		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
+	if ompExecutable != "" {
+		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable); err != nil {
+			return lifecycle, instance, nil, nil, err
+		}
+	}
 	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
 	if err != nil {
 		return lifecycle, instance, lease, nil, err
 	}
 	return lifecycle, instance, lease, env, nil
+}
+
+func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, source string) error {
+	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
+	if !ok {
+		return fmt.Errorf("execution backend %q cannot install the omp runtime", lifecycle.Name())
+	}
+	file, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open host omp executable: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat host omp executable: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("host omp executable %q is not an executable regular file", source)
+	}
+	if _, err := installer.InstallInstanceFile(ctx, instance, execbackend.RuntimeOmpExecutablePath, file, 0o700); err != nil {
+		return fmt.Errorf("install omp runtime in remote execution backend: %w", err)
+	}
+	return nil
 }
 
 func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, checkout string) (string, error) {

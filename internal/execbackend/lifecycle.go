@@ -1,8 +1,10 @@
 package execbackend
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -100,6 +103,9 @@ const (
 	CredentialClientCertificatePath = CredentialMaterialDir + "/client.pem"
 	CredentialClientPrivateKeyPath  = CredentialMaterialDir + "/client-key.pem"
 	CredentialClientConfigPath      = CredentialMaterialDir + "/client.conf"
+	RuntimeMaterialDir              = "/home/user/.gitmoot/runtime"
+	RuntimeOmpExecutablePath        = RuntimeMaterialDir + "/bin/omp"
+	RuntimeAttachmentDir            = RuntimeMaterialDir + "/attachments"
 )
 
 // CredentialMaterial contains only an ephemeral broker identity and client
@@ -116,6 +122,15 @@ type CredentialMaterial struct {
 // installing a job-scoped broker identity after provider provisioning.
 type CredentialMaterialInstaller interface {
 	InstallCredentialMaterial(context.Context, *Instance, CredentialMaterial) error
+}
+
+// InstanceFileInstaller is the optional data-plane capability for installing a
+// runtime executable or attachment inside one execution instance. The returned
+// path is the path visible to the runtime; remote backends normally return
+// destination, while local backends map it into instance-owned storage.
+// Implementations must confine destination to RuntimeMaterialDir.
+type InstanceFileInstaller interface {
+	InstallInstanceFile(context.Context, *Instance, string, io.Reader, os.FileMode) (string, error)
 }
 
 type Instance struct {
@@ -310,6 +325,105 @@ func (b *LocalBackend) SyncIn(ctx context.Context, instance *Instance, materials
 		return err
 	}
 	return writeLocalMetadata(instance.root, metadataForInstance(instance, "running"))
+}
+
+func (b *LocalBackend) InstallInstanceFile(ctx context.Context, instance *Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
+	if err := b.validateInstance(instance); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if reader == nil {
+		return "", errors.New("local runtime file reader is required")
+	}
+	if mode != 0o600 && mode != 0o700 {
+		return "", fmt.Errorf("local runtime file %q has unsupported mode %04o", destination, mode)
+	}
+	clean := path.Clean(strings.TrimSpace(destination))
+	prefix := RuntimeMaterialDir + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return "", fmt.Errorf("runtime file destination %q is outside %s", destination, RuntimeMaterialDir)
+	}
+	relative := strings.TrimPrefix(clean, prefix)
+	runtimeRoot := filepath.Join(instance.root, "runtime")
+	target := filepath.Join(runtimeRoot, filepath.FromSlash(relative))
+	if filepath.Clean(target) == runtimeRoot || !strings.HasPrefix(filepath.Clean(target), runtimeRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("runtime file destination %q escapes instance storage", destination)
+	}
+	parent := filepath.Dir(target)
+	if err := b.ensureLocalRuntimeDir(runtimeRoot, parent); err != nil {
+		return "", err
+	}
+	temporary, err := os.CreateTemp(parent, ".runtime-*")
+	if err != nil {
+		return "", fmt.Errorf("create local runtime file: %w", err)
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if _, err := io.Copy(temporary, reader); err != nil {
+		temporary.Close()
+		return "", fmt.Errorf("write local runtime file: %w", err)
+	}
+	if err := temporary.Chmod(mode.Perm()); err != nil {
+		temporary.Close()
+		return "", fmt.Errorf("set local runtime file mode: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return "", fmt.Errorf("close local runtime file: %w", err)
+	}
+	if err := os.Rename(temporaryName, target); err != nil {
+		return "", fmt.Errorf("install local runtime file: %w", err)
+	}
+	if b.identity != nil {
+		if err := os.Lchown(target, int(b.identity.UID), int(b.identity.GID)); err != nil {
+			_ = os.Remove(target)
+			return "", fmt.Errorf("hand off local runtime file: %w", err)
+		}
+	}
+	return target, nil
+}
+
+func (b *LocalBackend) ensureLocalRuntimeDir(runtimeRoot, parent string) error {
+	relative, err := filepath.Rel(runtimeRoot, parent)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("local runtime directory %q escapes runtime root", parent)
+	}
+	directories := []string{runtimeRoot}
+	if relative != "." {
+		current := runtimeRoot
+		for _, component := range strings.Split(relative, string(os.PathSeparator)) {
+			current = filepath.Join(current, component)
+			directories = append(directories, current)
+		}
+	}
+	for _, directory := range directories {
+		info, statErr := os.Lstat(directory)
+		switch {
+		case errors.Is(statErr, os.ErrNotExist):
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				return fmt.Errorf("create local runtime directory %q: %w", directory, err)
+			}
+			info, statErr = os.Lstat(directory)
+			if statErr != nil {
+				return fmt.Errorf("inspect local runtime directory %q: %w", directory, statErr)
+			}
+		case statErr != nil:
+			return fmt.Errorf("inspect local runtime directory %q: %w", directory, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("local runtime path %q is not a real directory", directory)
+		}
+		if b.identity != nil {
+			if err := os.Lchown(directory, -1, int(b.identity.GID)); err != nil {
+				return fmt.Errorf("assign local runtime directory %q to gid %d: %w", directory, b.identity.GID, err)
+			}
+			if err := os.Chmod(directory, 0o710); err != nil {
+				return fmt.Errorf("make local runtime directory %q traversable for gid %d: %w", directory, b.identity.GID, err)
+			}
+		}
+	}
+	return nil
 }
 
 func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Command) (Stream, error) {
@@ -805,6 +919,27 @@ func (r InstanceRunner) RunEnvStreamWithPID(ctx context.Context, dir string, env
 }
 
 func (InstanceRunner) LookPath(file string) (string, error) { return exec.LookPath(file) }
+
+// StageAttachment places a large runtime prompt inside the execution instance.
+// The sandbox teardown owns cleanup; content-addressed names avoid collisions
+// across mailbox repair turns in the same instance.
+func (r InstanceRunner) StageAttachment(ctx context.Context, name string, content []byte) (string, func(), error) {
+	installer, ok := r.Backend.(InstanceFileInstaller)
+	if !ok {
+		return "", func() {}, errors.New("execution backend cannot stage runtime attachments")
+	}
+	name = path.Base(strings.TrimSpace(name))
+	if name == "" || name == "." || name == ".." || name == "/" {
+		return "", func() {}, errors.New("runtime attachment name is required")
+	}
+	sum := sha256.Sum256(content)
+	destination := path.Join(RuntimeAttachmentDir, hex.EncodeToString(sum[:]), name)
+	installed, err := installer.InstallInstanceFile(ctx, r.Instance, destination, bytes.NewReader(content), 0o600)
+	if err != nil {
+		return "", func() {}, err
+	}
+	return installed, func() {}, nil
+}
 
 var (
 	_ ExecutionBackend              = (*LocalBackend)(nil)

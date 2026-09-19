@@ -15,16 +15,23 @@ local_uid = 1000
 local_gid = 1000
 # Use a traversable root when the Gitmoot home is below /root.
 local_root = "/var/tmp/gitmoot-local"
+# Remote E2B templates. OMP needs a dedicated template with at least 2 GiB RAM.
+# e2b_api_key_file = "/run/secrets/e2b-api-key"
+# e2b_template = "gitmoot-shell"
+# e2b_omp_template = "gitmoot-omp"
 # For opt-in broker access from a remote shell, configure both:
 # credential_gateway_listen = "0.0.0.0:8443"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
-`local` is the default. `remote` provisions E2B for engine-driven shell
+`local` is the default. `remote` provisions E2B for engine-driven shell and OMP
 review jobs -- implement remains on the allowlist but #2203 removed every way to
-dispatch one, so `review` is the type that actually reaches the backend;
-unsupported job types and model runtimes refuse before
-provider allocation. For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
+dispatch one, so `review` is the type that actually reaches the backend.
+Remote OMP uploads the host OMP executable into the instance, requires
+`e2b_omp_template` with at least 2 GiB RAM, and refuses before provider
+allocation when that template or the credential gateway is missing.
+Unsupported job types and other model runtimes also refuse before allocation.
+For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
 collects changes, and destroys the instance after the job. The same instance
 survives Mailbox repair deliveries. Only an implement job imports changes, and none can be dispatched; a review
@@ -141,12 +148,12 @@ daemon restarts instead of silently reusing a stale endpoint. Foreground
 dispatch refuses `remote` because it has no daemon-owned lifecycle, ledger, or
 reaper.
 
-When `[credentials].model_gateway = true`, a remote shell job receives the
+When `[credentials].model_gateway = true`, a remote shell or OMP job receives the
 non-secret route in `GITMOOT_CREDENTIAL_GATEWAY_URL` and a path to an owner-only
 curl configuration in `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` for the
 sandbox-reachable credential gateway. The second listener requires a per-job
 mTLS certificate and an opaque
-capability bound to the sandbox id, the `shell` runtime, the job lease expiry,
+capability bound to the sandbox id, runtime, job lease expiry,
 and the exact upstream allowlist. Provider keys remain host-side and are loaded
 only after those checks pass. The route is revoked before sandbox teardown.
 Before release, the host refuses an initial residual `Content-Encoding` or an
@@ -158,8 +165,10 @@ URL/base encodings remain best-effort defense in depth. The contract covers an
 accidental exact-byte reflection by the trusted, operator-selected upstream;
 malicious upstreams and transformed application payloads, including
 application-layer compression without `Content-Encoding`, are out of scope.
-Claude, Codex, Kimi, and omp remain unsupported on `remote` until their clients
-can target this mTLS path; Gitmoot never supplies a raw key as a fallback.
+Claude, Codex, and Kimi remain unsupported on `remote` until their clients can
+target this mTLS path. OMP targets it through an instance-local HTTP forwarder;
+the sandbox receives only a job-scoped mTLS identity, capability, and
+placeholder. Gitmoot never supplies a raw provider key as a fallback.
 
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;

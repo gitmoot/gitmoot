@@ -22,6 +22,13 @@ type Runner interface {
 	LookPath(file string) (string, error)
 }
 
+// AttachmentStager is an optional Runner capability for runtimes whose input
+// exceeds execve's per-argument limit. The returned path must be readable by
+// commands executed through the same runner.
+type AttachmentStager interface {
+	StageAttachment(ctx context.Context, name string, content []byte) (path string, cleanup func(), err error)
+}
+
 // EnvRunner is an optional Runner capability: it runs a command with extra
 // environment variables (KEY=VALUE entries) appended to the inherited
 // environment. It is opt-in so callers that only need the env override (e.g. the
@@ -192,6 +199,14 @@ func (t TeeRunner) LookPath(file string) (string, error) {
 	return t.inner().LookPath(file)
 }
 
+func (t TeeRunner) StageAttachment(ctx context.Context, name string, content []byte) (string, func(), error) {
+	stager, ok := t.inner().(AttachmentStager)
+	if !ok {
+		return "", func() {}, errors.New("tee runner inner cannot stage attachments")
+	}
+	return stager.StageAttachment(ctx, name, content)
+}
+
 // EnvInjectingRunner wraps a runner to always append Env (KEY=VALUE entries)
 // to the runtime subprocess environment while preserving process-group kill.
 // Inner defaults to GroupRunner, preserving the historical behavior when
@@ -282,6 +297,14 @@ func (r EnvInjectingRunner) RunEnvStreamWithPID(ctx context.Context, dir string,
 
 func (r EnvInjectingRunner) LookPath(file string) (string, error) {
 	return r.inner().LookPath(file)
+}
+
+func (r EnvInjectingRunner) StageAttachment(ctx context.Context, name string, content []byte) (string, func(), error) {
+	stager, ok := r.inner().(AttachmentStager)
+	if !ok {
+		return "", func() {}, errors.New("environment-injecting runner inner cannot stage attachments")
+	}
+	return stager.StageAttachment(ctx, name, content)
 }
 
 // SyncWriter serializes writes to w. Stream tees and any sibling writers
