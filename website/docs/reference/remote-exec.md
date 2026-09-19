@@ -24,6 +24,48 @@ local_root = "/var/tmp/gitmoot-local"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
+## Versioned OMP review template
+
+The credential-free OMP review image is defined in
+`templates/e2b/omp-review/Dockerfile`. It pins both the E2B base-image digest
+and the Go archive checksum. Root is used only for image construction; the
+final image user and its runtime directories are UID/GID 1000 (`user`).
+Gitmoot uploads the OMP binary and job-scoped gateway identity after
+provisioning.
+
+Build a new immutable version from the template directory:
+
+```sh
+cd templates/e2b/omp-review
+npm ci --ignore-scripts
+E2B_TEMPLATE_NAME=gitmoot-omp-go126-v2 npm run build
+```
+
+`E2B_API_KEY` must be present in the process environment. The command prints
+the template ID and build ID; record both in the workflow evidence before
+changing `e2b_omp_template`. Never put the API key, GitHub credentials,
+repository data, runtime sessions, or job state in this directory.
+
+Every Dockerfile, base digest, Go version, or checksum change gets a new
+versioned template name. Verify a fresh sandbox by reading the pinned tool
+versions without installation, uploading an exact-head source archive, running
+build, vet, and focused tests, and checking that no credential paths or secret
+environment variables exist.
+
+Activation changes only the operator config:
+
+```toml
+[remote_exec]
+e2b_omp_template = "gitmoot-omp-go126-v2"
+```
+
+Gitmoot reloads this value while provisioning each job, so the next remote OMP
+dispatch uses the new template without a daemon restart. Rollback restores the
+previously recorded template name (`gitmoot-omp-full-review` for the initial
+build); the next dispatch uses it. Do not delete the rollback template until
+the replacement canary is complete. Listener-coordinate changes remain
+process-bound and still require a restart.
+
 `local` is the default. `remote` provisions E2B for engine-driven shell and OMP
 review jobs -- implement remains on the allowlist but #2203 removed every way to
 dispatch one, so `review` is the type that actually reaches the backend.

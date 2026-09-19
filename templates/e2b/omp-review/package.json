@@ -1,0 +1,11 @@
+{
+  "name": "gitmoot-e2b-omp-review-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "e2b": "2.51.0"
+  }
+}
