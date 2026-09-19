@@ -369,11 +369,7 @@ func TestRemoteReviewCancellationAfterAdmissionStopsBeforeProvider(t *testing.T)
 		if _, err := workflow.CancelJob(f.ctx, f.store, f.job.ID); err != nil {
 			t.Fatalf("CancelJob after admission: %v", err)
 		}
-		// Let the running-state observer propagate cancellation to the provider
-		// context before factory construction returns.
-		time.Sleep(2 * daemonJobCancelPollInterval)
 	}
-
 	f.run(t)
 	if f.factoryCalls != 1 || f.backend.provisionCalls != 0 {
 		t.Fatalf("backend factory/provider calls after admitted cancellation = %d/%d, want 1/0", f.factoryCalls, f.backend.provisionCalls)

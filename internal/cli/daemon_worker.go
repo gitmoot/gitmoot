@@ -4326,9 +4326,21 @@ func originalAgentForTempWorkerType(typ string) string {
 
 func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context.Context, func()) {
 	runCtx, cancel := context.WithCancel(ctx)
+	cancelIfCancelled := func() bool {
+		job, err := w.Store.GetJob(ctx, jobID)
+		if err == nil && job.State == string(workflow.JobCancelled) {
+			cancel()
+			return true
+		}
+		return false
+	}
+	cancelled := cancelIfCancelled()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		if cancelled {
+			return
+		}
 		ticker := time.NewTicker(daemonJobCancelPollInterval)
 		defer ticker.Stop()
 		for {
@@ -4336,9 +4348,7 @@ func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context
 			case <-runCtx.Done():
 				return
 			case <-ticker.C:
-				job, err := w.Store.GetJob(ctx, jobID)
-				if err == nil && job.State == string(workflow.JobCancelled) {
-					cancel()
+				if cancelIfCancelled() {
 					return
 				}
 			}
