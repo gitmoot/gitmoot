@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/github/githubtest"
@@ -94,6 +96,204 @@ func runReviewRequestJSON(t *testing.T, args ...string) (reviewRequestOutput, st
 		t.Fatalf("decode %q: %v", stdout.String(), err)
 	}
 	return output, ""
+}
+
+func TestReviewRequestPersistsPerJobExecutionBackend(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	output, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--exec-backend", "remote", "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	job, err := store.GetJob(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend, present := payload.ExecBackendOverride(); !present || backend != "remote" {
+		t.Fatalf("ExecBackendOverride = %q, %v; want explicit remote", backend, present)
+	}
+	previousResolver := daemonJobExecBackendFor
+	var resolutions []string
+	daemonJobExecBackendFor = func(_ jobWorker, override string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		resolutions = append(resolutions, fmt.Sprintf("%s:%t", override, present))
+		return "", config.RemoteExecConfig{}, fmt.Errorf("stop after backend resolution")
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	worker := defaultJobWorker(store, io.Discard, home)
+	if err := worker.run(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := workflow.RetryJob(context.Background(), store, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fresh worker models recovery after a daemon restart. It must resolve
+	// from the retried job's durable payload, not process-wide state.
+	recoveredWorker := defaultJobWorker(store, io.Discard, home)
+	if err := recoveredWorker.run(context.Background(), retried); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(resolutions, []string{"remote:true", "remote:true"}) {
+		t.Fatalf("worker backend resolutions = %v, want remote from original and retried payload", resolutions)
+	}
+}
+
+func TestReviewRequestPersistsExplicitLocalExecutionBackend(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	output, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--exec-backend", "local", "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	job, err := store.GetJob(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend, present := payload.ExecBackendOverride(); !present || backend != "local" {
+		t.Fatalf("ExecBackendOverride = %q, %v; want explicit local", backend, present)
+	}
+}
+
+func TestReviewRequestAbsentSelectorResolvesLocalInWorker(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	output, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home, "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	job, err := store.GetJob(context.Background(), output.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousResolver := daemonJobExecBackendFor
+	var override string
+	var present bool
+	daemonJobExecBackendFor = func(_ jobWorker, got string, gotPresent bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		override, present = got, gotPresent
+		return "", config.RemoteExecConfig{}, fmt.Errorf("stop after backend resolution")
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+	if err := defaultJobWorker(store, io.Discard, home).run(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if override != "local" || !present {
+		t.Fatalf("worker backend resolution = %q, %v; absent review selector must resolve explicit local", override, present)
+	}
+}
+
+func TestConcurrentReviewBackendSelectionIsolation(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	remoteOutput, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/remote", "--role", "joltra", "--home", home,
+		"--runtime", runtime.OmpRuntime, "--exec-backend", "remote", "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	localOutput, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "13", "--head", head,
+		"--branch", "feature/local", "--role", "joltra", "--home", home,
+		"--runtime", runtime.ClaudeRuntime, "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	ctx := context.Background()
+	remoteJob, err := store.GetJob(ctx, remoteOutput.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localJob, err := store.GetJob(ctx, localOutput.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type observation struct {
+		override string
+		present  bool
+	}
+	observed := make(chan observation, 2)
+	releaseRemote := make(chan struct{})
+	previousResolver := daemonJobExecBackendFor
+	daemonJobExecBackendFor = func(_ jobWorker, override string, present bool) (execbackend.Backend, config.RemoteExecConfig, error) {
+		observed <- observation{override: override, present: present}
+		if override == "remote" {
+			<-releaseRemote
+		}
+		return "", config.RemoteExecConfig{}, fmt.Errorf("stop after backend resolution")
+	}
+	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
+
+	remoteDone := make(chan error, 1)
+	go func() {
+		remoteDone <- defaultJobWorker(store, io.Discard, home).run(ctx, remoteJob)
+	}()
+	first := <-observed
+	if first != (observation{override: "remote", present: true}) {
+		close(releaseRemote)
+		t.Fatalf("remote worker resolved %+v, want explicit remote", first)
+	}
+
+	localDone := make(chan error, 1)
+	go func() {
+		localDone <- defaultJobWorker(store, io.Discard, home).run(ctx, localJob)
+	}()
+	second := <-observed
+	if second != (observation{override: "local", present: true}) {
+		close(releaseRemote)
+		t.Fatalf("local worker resolved %+v while remote worker was blocked, want explicit local", second)
+	}
+	// The remote worker is still held in resolution here. Observing local while
+	// that hold is active is the concurrency discriminator; sequential runs
+	// cannot satisfy it.
+	close(releaseRemote)
+	if err := <-remoteDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-localDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewRequestRefusesUnsupportedRuntimeBackendBeforeEnqueue(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	before, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.ClaudeRuntime, "--exec-backend", "remote", "--json",
+	)
+	if !strings.Contains(failure, runtime.ClaudeRuntime) || !strings.Contains(failure, "remote") {
+		t.Fatalf("failure = %q, want both runtime and backend operands", failure)
+	}
+	after, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("jobs before=%d after=%d, unsupported pair reached enqueue", len(before), len(after))
+	}
 }
 
 // One head, three requesters: exactly one review is dispatched, later callers

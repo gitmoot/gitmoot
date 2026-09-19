@@ -1389,6 +1389,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
 		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
 		"--effort", "high", "--home", home,
+		"--exec-backend", "remote",
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -1406,6 +1407,9 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if backend, present := payload.ExecBackendOverride(); !present || backend != "remote" {
+		t.Fatalf("ExecBackendOverride = %q, %v; want agent review to forward explicit remote", backend, present)
+	}
 	// 1. THE ROUTER PATH, not the direct one. Asserted on the route_selected
 	// event because that is the SAME field the adoption measurement read: 687
 	// "via agent_review" against 1 "via review_request". A test keyed to the

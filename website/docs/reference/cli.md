@@ -1313,8 +1313,9 @@ own surface — it NAMES a reviewer, carries a review message, and takes
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
-    [--runtime <name>] [--model <provider/model>] [--effort <level>] [--workflow <id>] \
-    [--session <ref>] [--lead <implementer>] [--full] [--allow-prompt-head-mismatch] [--json] \
+    [--runtime <name>] [--exec-backend local|remote] [--model <provider/model>] \
+    [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer>] \
+    [--full] [--allow-prompt-head-mismatch] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 ```
@@ -1324,6 +1325,13 @@ gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 message is appended to the router's own brief under a labelled header, so a
 reviewer can tell operator instructions from generated framing — pass it after
 `--` if it starts with a dash.
+
+`--exec-backend local|remote` selects where this review's runtime executes. It
+is persisted on the job before enqueue and affects no other queued or future
+job. Omit it for local execution; process-wide `[remote_exec].backend` does not
+reroute reviews. Remote reviews currently support only `shell` and `omp`;
+Gitmoot refuses any other runtime/backend pair before enqueue and names both
+operands. `agent review` forwards the same flag through the review router.
 
 Two things `agent review` reports that are easy to miss:
 

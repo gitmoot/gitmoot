@@ -32,7 +32,7 @@ gitmoot agent template show thermo-nuclear-code-quality-review
 gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo --path . --template thermo-nuclear-code-quality-review --start-daemon
 gitmoot agent subscribe <name> --runtime codex|claude|kimi|omp|shell --session <id|name|last|command> --role <role> --repo owner/repo --capability <capability>
 gitmoot agent run <name> "message" --repo owner/repo [--pr number] [--lead implementer] [--background]
-gitmoot agent review <name> "message" --repo owner/repo --pr number [--lead implementer] [--background] # exact-head loop guard applies
+gitmoot agent review <name> "message" --repo owner/repo --pr number [--lead implementer] [--exec-backend local|remote] [--background] # exact-head loop guard applies
 gitmoot agent ask <name> "message" --repo owner/repo
 gitmoot agent ask <name> --background --repo owner/repo "message"
 gitmoot agent type list
@@ -64,6 +64,11 @@ gitmoot daemon start --repo owner/repo --poll 30s --workers 1
 gitmoot daemon start
 gitmoot daemon status
 ```
+
+`agent review` and `review request` accept `--exec-backend local|remote` for
+that job only. Omission keeps the review local even if process-wide remote
+execution is configured. Remote review is limited to `shell` and `omp`;
+unsupported runtime/backend pairs are refused before enqueue.
 
 `--lead` is valid only for review-resolved `agent review` and `agent run`
 dispatches. Gitmoot loads that lead from the agents database before creating the

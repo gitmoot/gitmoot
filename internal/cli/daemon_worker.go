@@ -313,6 +313,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// runtime below, so delaying this decision until after agent lookup would let
 	// them bypass the backend boundary entirely.
 	jobExecBackend, jobExecBackendPresent := payload.ExecBackendOverride()
+	// Review dispatch is job-scoped. An older or manually-created review with no
+	// selector stays local even while process config names a remote backend;
+	// only an explicit payload override may move that review off-host (#2234).
+	if strings.EqualFold(strings.TrimSpace(job.Type), "review") && !jobExecBackendPresent {
+		jobExecBackend = string(execbackend.Local)
+		jobExecBackendPresent = true
+	}
 	execBackend, execConfig, err := daemonJobExecBackendFor(w, jobExecBackend, jobExecBackendPresent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {

@@ -281,6 +281,11 @@ type JobRequest struct {
 	// the legacy payload byte-for-byte; non-empty values are inherited by every
 	// delegation child and continuation in the coordination tree.
 	WorkflowID string
+	// ExecBackend preserves an explicit per-job execution backend selector.
+	// Nil means the caller did not choose one; a pointer to "local" remains
+	// distinguishable from that absence across enqueue, retry, and recovery.
+	ExecBackend *string
+
 	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
 	// instead of the agent's registered default runtime (#531). The agent's
 	// stored runtime/session are untouched: the job runs on RuntimeOverrideRef
@@ -385,6 +390,13 @@ type JobRequest struct {
 	CheckRetries     int
 }
 
+func jobRequestExecBackend(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
 type JobPayload struct {
 	Repo             string `json:"repo"`
 	Branch           string `json:"branch"`
@@ -481,11 +493,11 @@ type JobPayload struct {
 	RuntimeOverride    string `json:"runtime_override,omitempty"`
 	RuntimeOverrideRef string `json:"runtime_override_ref,omitempty"`
 	RuntimeConfigDir   string `json:"runtime_config_dir,omitempty"`
-	// ExecBackend is the per-job execution-backend override (#1536 P1): when
-	// set it wins over the [remote_exec].backend config value at dispatch.
-	// "local" (the only implemented backend) is a byte-for-byte passthrough;
-	// any other value fails the job LOUDLY at dispatch. Additive/omitempty so
-	// a payload without it serializes byte-identically.
+	// ExecBackend is the per-job execution-backend override (#1536, #2234).
+	// Review dispatch persists local or remote here before enqueue; the worker
+	// resolves this field rather than process-wide config. Presence is tracked
+	// separately so absent and explicit-local remain distinguishable while an
+	// absent review selector still defaults to local.
 	ExecBackend        string `json:"exec_backend,omitempty"`
 	execBackendPresent bool
 	unknownJSONFields  map[string]json.RawMessage
@@ -828,6 +840,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Effort:                 request.Effort,
+		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
 		Plan:                   request.Plan,
 		PlanInto:               strings.TrimSpace(request.PlanInto),
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
