@@ -209,6 +209,19 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("construct %s execution backend: %w", backend, err)
 	}
+	if backend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		latest, stateErr := w.Store.GetJob(context.WithoutCancel(ctx), job.ID)
+		if stateErr != nil {
+			return lifecycle, nil, nil, nil, fmt.Errorf("verify remote review %s before provider call: %w", job.ID, stateErr)
+		}
+		if latest.State != string(workflow.JobRunning) || latest.LifecycleGeneration != job.LifecycleGeneration {
+			return lifecycle, nil, nil, nil, fmt.Errorf("provision remote execution backend for review job %s: durable state moved to %s generation %d: %w",
+				job.ID, latest.State, latest.LifecycleGeneration, context.Canceled)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return lifecycle, nil, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
+	}
 	instance, err := lifecycle.Provision(ctx, execbackend.JobScope{JobID: job.ID, LifecycleGeneration: job.LifecycleGeneration, TTL: ttl})
 	if err != nil {
 		// A provider can create an instance and then fail to persist its handle in

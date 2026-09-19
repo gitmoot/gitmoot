@@ -1239,6 +1239,17 @@ func resumedSelfDirtyWorktreeNotice() string {
 }
 
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
+	return m.run(ctx, jobID, agent, adapter, false)
+}
+
+// RunClaimed continues a job whose pre-provision admission boundary already
+// performed Mailbox's queued->running claim. It exists only to keep provider
+// reservation behind cancellation's atomic state race.
+func (m Mailbox) RunClaimed(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
+	return m.run(ctx, jobID, agent, adapter, true)
+}
+
+func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter, claimed bool) (AgentResult, error) {
 	if m.store == nil {
 		return AgentResult{}, errors.New("mailbox store is required")
 	}
@@ -1269,7 +1280,11 @@ func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// success terminal included — writes fresh diagnostics state.
 	payload.FailureDiagnostics = nil
 
-	if err := m.claim(ctx, job); err != nil {
+	if claimed {
+		if job.State != string(JobRunning) {
+			return AgentResult{}, fmt.Errorf("job %q is %s, not running", job.ID, job.State)
+		}
+	} else if err := m.claim(ctx, job); err != nil {
 		return AgentResult{}, err
 	}
 	// Execution clock for #530 routing telemetry: measured from the claim (the real

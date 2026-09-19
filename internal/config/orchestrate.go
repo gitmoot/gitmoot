@@ -456,6 +456,10 @@ type ReviewPolicy struct {
 	// (risk:high / risk:routine).
 	RiskLabelHigh    string
 	RiskLabelRoutine string
+	// RemoteRequireCIGreen opts remote review admission into a current-head CI
+	// requirement. Default false preserves local and remote review behavior;
+	// only an explicit global or repository declaration spends this check.
+	RemoteRequireCIGreen bool
 	// FindingsConsumption declares whether a repository CONSUMES review findings
 	// or treats them as ADVISORY (#1969). Three values, and the empty one is not
 	// a synonym for either:
@@ -568,13 +572,15 @@ func ReviewConfigErrorsOnlyBlockingSeverity(err error) bool {
 }
 
 type reviewPolicyOverride struct {
-	nativeFanoutEnabled *bool
-	blockingSeverity    *string
-	findingsConsumption *string
+	nativeFanoutEnabled  *bool
+	blockingSeverity     *string
+	findingsConsumption  *string
+	remoteRequireCIGreen *bool
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
-// native fanout and blocking severity support repository overrides.
+// native fanout, blocking severity, findings consumption, and remote CI
+// admission support repository overrides.
 func (c ReviewConfig) For(repo string) ReviewPolicy {
 	policy := c.Global
 	policy.HighRiskPaths = append([]string(nil), policy.HighRiskPaths...)
@@ -587,6 +593,9 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 	}
 	if ok && override.findingsConsumption != nil {
 		policy.FindingsConsumption = *override.findingsConsumption
+	}
+	if ok && override.remoteRequireCIGreen != nil {
+		policy.RemoteRequireCIGreen = *override.remoteRequireCIGreen
 	}
 	return policy
 }
@@ -684,6 +693,13 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 		}
 		policy.NativeFanoutEnabled = parsed
 		return nil
+	case "remote_require_ci_green":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		policy.RemoteRequireCIGreen = parsed
+		return nil
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)
 		if err != nil {
@@ -744,6 +760,13 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 			return err
 		}
 		override.nativeFanoutEnabled = &parsed
+		return nil
+	case "remote_require_ci_green":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		override.remoteRequireCIGreen = &parsed
 		return nil
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)

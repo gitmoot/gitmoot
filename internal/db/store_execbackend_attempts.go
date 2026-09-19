@@ -326,6 +326,34 @@ func (s *Store) GetExecBackendAttempt(ctx context.Context, key ExecBackendAttemp
 	return scanExecBackendAttempt(row)
 }
 
+// ListExecBackendAttemptsForJob returns every cloud lifecycle attempt for one
+// durable job. Admission uses this to distinguish the first exact-head attempt
+// from an explicitly authorized retry without inventing a second subject key.
+func (s *Store) ListExecBackendAttemptsForJob(ctx context.Context, jobID string) ([]ExecBackendAttempt, error) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return nil, errors.New("execution backend attempt job id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+execBackendAttemptColumns+`
+		FROM execbackend_attempts
+		WHERE job_id = ?
+		ORDER BY lifecycle_generation, attempt`, jobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var attempts []ExecBackendAttempt
+	for rows.Next() {
+		attempt, err := scanExecBackendAttempt(rows)
+		if err != nil {
+			return nil, err
+		}
+		attempts = append(attempts, attempt)
+	}
+	return attempts, rows.Err()
+}
+
 // ListExecBackendAttemptsWithoutSandboxID exposes the deliberate NULL-handle
 // crash window to the bidirectional reaper. Rows are returned across all states:
 // the stored state is evidence the reaper needs when deciding what to do.

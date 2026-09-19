@@ -310,18 +310,27 @@ remain P3.
 ## Execution Backend
 
 `[remote_exec] backend = "local"` is the default. `remote` provisions E2B for
-engine-driven shell implement jobs; unsupported job types and model runtimes
-refuse before provider allocation. Engine-driven daemon jobs provision one job-scoped detached worktree,
-run the runtime there with streaming preserved, transactionally import implement
-changes into the host worktree before result observation, and then destroy the
-instance. The host finalizer remains the only committer and pusher. The instance
+engine-driven shell and OMP review jobs. The retained implement execution arm is
+not dispatchable; ask and other job types refuse before provider allocation.
+Engine-driven daemon jobs provision one job-scoped detached worktree, run the
+runtime there with streaming preserved, and then destroy the instance. A review
+returns findings in its result envelope and imports no change set. The instance
 persists across Mailbox repair deliveries; cancellation destroys it, and daemon
 startup reaps instances whose recorded owner process is gone.
 
-The implement arm of this description is the daemon worker's EXECUTION path,
-which #2203 kept on purpose because it is entangled with review and produce
-execution. Nothing dispatches an implement job any more, so in practice the
-remote backend runs ask, review, and produce work today.
+Remote review admission runs after exact-head checkout binding and before cost
+reservation or provider calls. It re-reads the PR head; deduplicates
+repo/PR/head/purpose through the durable review claim; checks runtime/backend
+support; and allows only the first cloud attempt unless an operator retry or a
+provider create conflict that proves no allocation authorized the new lifecycle
+generation. Cancellation releases the review claim. Refusals emit durable
+`remote_review_admission_avoided_<reason>` events for `stale`, `duplicate`,
+`unsupported`, `red_ci`, and `retry`.
+
+Set `[review] remote_require_ci_green = true` to require at least one successful
+current-head check and no pending or failed checks before remote provisioning.
+The default is `false`. A `[repos."owner/repo".review]` value overrides the
+global policy for that repository.
 
 Local worktrees use Git's absolute gitdir pointer successfully because they share
 the host filesystem, so bundle/base-ref hydration is reserved for a future remote

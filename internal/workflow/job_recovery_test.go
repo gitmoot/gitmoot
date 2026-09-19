@@ -300,6 +300,37 @@ func TestCancelJobCancelsQueuedOrRunningJob(t *testing.T) {
 	}
 }
 
+func TestCancelJobReleasesReviewSubjectClaim(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	head := strings.Repeat("a", 40)
+	payload, err := json.Marshal(JobPayload{
+		Repo: "owner/repo", PullRequest: 2238, HeadSHA: head,
+		ReviewPurpose: db.DefaultReviewPurpose,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := db.Job{ID: "review-cancel", Agent: "audit", Type: "review", State: string(JobQueued), Payload: string(payload)}
+	if err := store.CreateJobWithEvent(ctx, job, db.JobEvent{Kind: string(JobQueued), Message: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	key, err := db.ReviewRequestSubjectKey("owner/repo", 2238, head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, won, err := store.ClaimReviewRequest(ctx, key, job.ID, db.DefaultReviewPurpose, "requester", db.ReviewRequestOwner{}); err != nil || !won {
+		t.Fatalf("ClaimReviewRequest: won=%v err=%v", won, err)
+	}
+
+	if _, err := CancelJob(ctx, store, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetReviewRequest(ctx, key); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("review subject claim after cancellation: %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestCancelJobReleasesRuntimeSessionLock(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
