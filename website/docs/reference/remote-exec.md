@@ -38,13 +38,16 @@ Build a new immutable version from the template directory:
 ```sh
 cd templates/e2b/omp-review
 npm ci --ignore-scripts
-E2B_TEMPLATE_NAME=gitmoot-omp-go126-v2 npm run build
+E2B_TEMPLATE_NAME=gitmoot-omp-go126-v3 \
+E2B_CPU_COUNT=4 E2B_MEMORY_MB=4096 npm run build
 ```
 
-`E2B_API_KEY` must be present in the process environment. The command prints
-the template ID and build ID; record both in the workflow evidence before
-changing `e2b_omp_template`. Never put the API key, GitHub credentials,
-repository data, runtime sessions, or job state in this directory.
+`E2B_API_KEY` and a new `E2B_TEMPLATE_NAME` are required.
+`E2B_CPU_COUNT` defaults to 4 and `E2B_MEMORY_MB` defaults to 4096. The command
+prints the template ID and build ID; record both with the selected resources in
+the workflow evidence before changing `e2b_omp_template`. Never put the API
+key, GitHub credentials, repository data, runtime sessions, or job state in
+this directory.
 
 Every Dockerfile, base digest, Go version, or checksum change gets a new
 versioned template name. Verify a fresh sandbox by reading the pinned tool
