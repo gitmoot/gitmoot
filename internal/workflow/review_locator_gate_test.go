@@ -284,3 +284,62 @@ func TestGateReadsEveryLocationKeyTheLedgerReaderReads(t *testing.T) {
 		})
 	}
 }
+
+// Round 2 of the independent review found two more fail-open paths in the prose
+// search: title and rationale were never searched, and the extension whitelist
+// silently folded findings that named a build file. Erring WIDE is the safe
+// direction for this predicate — a match keeps the block.
+func TestProseLocatorsTheGateMustSee(t *testing.T) {
+	located := []string{
+		"internal/db/store.go:88 dereferences nil",
+		"see website/styles.css for the broken rule",
+		"go.mod is missing a require line",
+		"the Makefile target is wrong",
+		"Dockerfile pins an old base image",
+		"LICENSE text is stale",
+		".gitignore misses dist/",
+		"CODEOWNERS does not cover internal/db",
+	}
+	for _, prose := range located {
+		t.Run(prose, func(t *testing.T) {
+			if !pathShapedInProse.MatchString(prose) {
+				t.Fatalf("prose %q was read as pointing nowhere; a blocking finding carrying it would fold", prose)
+			}
+		})
+	}
+	unlocated := []string{
+		"Sibling abort cleanups remain unanchored after the guard commits.",
+		"This worries me but I cannot say why.",
+		"Concurrent child advances can open two shared human rounds.",
+	}
+	for _, prose := range unlocated {
+		t.Run("nowhere: "+prose, func(t *testing.T) {
+			if pathShapedInProse.MatchString(prose) {
+				t.Fatalf("prose %q matched; the gate would never fold anything", prose)
+			}
+		})
+	}
+}
+
+// title and rationale are prose the ledger reader already consumes, so a finding
+// whose only locator rides in either of them still blocks.
+func TestTitleAndRationaleCountAsSayingWhere(t *testing.T) {
+	for _, key := range []string{"title", "rationale"} {
+		t.Run(key, func(t *testing.T) {
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot",
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: "P1",
+					Findings: []json.RawMessage{findingJSON(t, map[string]string{
+						"severity": "P1",
+						key:        "nil deref in internal/cli/agent_dispatch.go:1442",
+					})},
+				},
+			}
+			if got := effectiveReviewDecisionForPayload(payload, "P2"); got != "changes_requested" {
+				t.Fatalf("finding located via %q folded to %q", key, got)
+			}
+		})
+	}
+}

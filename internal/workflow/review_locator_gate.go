@@ -16,12 +16,25 @@ const (
 	reviewFoldUnlocated      = "unlocated_blocking_findings"
 )
 
-// pathShapedInProse matches a repo-relative path, optionally with a line number,
-// appearing anywhere in a prose field: `internal/db/store.go:88`, `store.go:88`,
-// `website/docs/x.md`. It is deliberately narrow — a bare sentence mentioning a
-// function name does not match — because the question this gate asks is whether
-// a reader can OPEN what the finding points at.
-var pathShapedInProse = regexp.MustCompile(`[\w./-]+\.(?:go|ts|tsx|js|md|toml|ya?ml|json|sql|sh|py|txt)(?::\d+)?`)
+// pathShapedInProse matches something a reader could open, mentioned anywhere in
+// a prose field: `internal/db/store.go:88`, `store.go:88`, `website/styles.css`,
+// `go.mod`, `Makefile`, `.gitignore`.
+//
+// ERRING WIDE IS THE SAFE DIRECTION HERE, which is the opposite of the rest of
+// this gate. A match means the finding said where, which KEEPS the block; a miss
+// folds the verdict to advisory. Round 1 of review on #2253 shipped an extension
+// whitelist and round 2 showed it silently folded findings that named `go.mod`,
+// `Makefile`, `Dockerfile`, `LICENSE`, `.gitignore` or a `.css` file. So this now
+// accepts three shapes rather than one enumerated list of extensions:
+//
+//	any/slashed/path      — a token containing a slash
+//	name.ext / name.ext:12 — any dotted filename, with an optional line
+//	bare build filenames   — the extensionless names a repo actually carries
+var pathShapedInProse = regexp.MustCompile(
+	`(?i)(?:[\w.-]+/[\w./-]+(?::\d+)?` + // a slashed path
+		`|[\w-]+\.[A-Za-z][\w]{0,9}(?::\d+)?` + // a dotted filename
+		`|\.[A-Za-z][\w-]{1,20}` + // a dotfile such as .gitignore
+		`|\b(?:Makefile|Dockerfile|LICENSE|CODEOWNERS|Procfile|Justfile|Rakefile)\b)`)
 
 // locatorFinding is the minimum shape the locator gate needs. AgentResult keeps
 // findings as raw JSON on purpose (reviewers add fields), so this decodes the
@@ -54,8 +67,11 @@ type locatorFinding struct {
 	Summary     string `json:"summary"`
 	Message     string `json:"message"`
 	Finding     string `json:"finding"`
-	// Title is read only to tell an EMPTY finding object from a real one.
-	Title string `json:"title"`
+	// Rationale is read by the ledger writer (findings_ledger_writer.go:64) and
+	// carries a locator often enough to matter. Title is prose too: a finding
+	// titled "nil deref in agent_dispatch.go:1442" has said where.
+	Rationale string `json:"rationale"`
+	Title     string `json:"title"`
 }
 
 // isEmpty reports whether the decoded finding carried no content at all. `[{}]`
@@ -66,7 +82,8 @@ type locatorFinding struct {
 func (f locatorFinding) isEmpty() bool {
 	for _, field := range []string{
 		f.Severity, f.EvidenceLocator, f.Locator, f.File, f.Location, f.Evidence,
-		f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding, f.Title,
+		f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding,
+		f.Rationale, f.Title,
 	} {
 		if strings.TrimSpace(field) != "" {
 			return false
@@ -82,7 +99,10 @@ func (f locatorFinding) saysWhere() bool {
 			return true
 		}
 	}
-	for _, prose := range []string{f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding} {
+	for _, prose := range []string{
+		f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding,
+		f.Rationale, f.Title,
+	} {
 		if pathShapedInProse.MatchString(prose) {
 			return true
 		}
