@@ -48,7 +48,7 @@ func effectiveReviewDecision(result *AgentResult, blockingSeverity string) strin
 		return ""
 	}
 	decision := strings.TrimSpace(result.Decision)
-	if decision == "changes_requested" && !reviewseverity.Blocks(result.Severity, normalizedReviewBlockingSeverity(blockingSeverity)) {
+	if decision == "changes_requested" && reviewFoldReason(result, blockingSeverity) != "" {
 		return "approved"
 	}
 	return decision
