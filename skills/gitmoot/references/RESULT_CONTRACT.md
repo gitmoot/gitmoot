@@ -92,6 +92,19 @@ resolve as approved-with-notes. Gitmoot still stores and posts the original
 `changes_requested` result and its findings. The default threshold is `P3`, so
 all valid severities block unless configured otherwise.
 
+A blocking verdict must also say WHERE. If a `changes_requested` result blocks at
+the threshold, carries findings, and no finding at or above the threshold names a
+location — `evidence_locator`, `locator`, `file`, `location`, cited `evidence`, or
+a path like `internal/db/store.go:88` inside its prose — the round resolves as
+approved-with-notes instead of blocking. The findings are still stored and posted;
+only the block is withdrawn, because a merge cannot be stopped on a defect nobody
+can open. The `review_approved_with_notes` event names this reason, distinct from
+the below-threshold fold.
+
+This is deliberately conservative and keeps blocking whenever the gate cannot see
+the whole picture: no findings at all, findings that are empty objects, a finding
+that does not decode, or a severity Gitmoot cannot rank.
+
 Session review jobs use the same rule. Pass `--severity P0|P1|P2|P3` to
 `job close` or `job record` when the decision is `changes_requested`.
 

@@ -178,3 +178,109 @@ func TestFoldMessageNamesTheReason(t *testing.T) {
 		t.Fatalf("below-threshold message = %q, want it to contain %q", below, want)
 	}
 }
+
+// Round 1 of the independent review on PR #2253 found four fail-open paths, all
+// reproduced by execution. Each gets a case here so a regression cannot restore
+// one quietly. The shared failure mode is the same: the gate read a narrower
+// finding than the reader beside it, or treated an input it could not rank as an
+// input it had ranked as empty.
+func TestGateFailsClosedOnTheRoundOneFailOpenPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		severity string
+		findings []json.RawMessage
+		want     string
+	}{
+		{
+			name:     "canonical evidence_locator key counts as saying where",
+			severity: "P1",
+			findings: []json.RawMessage{findingJSON(t, map[string]string{
+				"severity": "P1", "title": "nil deref",
+				"evidence_locator": "internal/db/store.go:88",
+			})},
+			want: "changes_requested",
+		},
+		{
+			name:     "a locator carried in prose counts as saying where",
+			severity: "P1",
+			findings: []json.RawMessage{findingJSON(t, map[string]string{
+				"severity": "P1", "title": "nil deref",
+				"detail": "internal/cli/agent_dispatch.go:1442 dereferences a nil worktree path",
+			})},
+			want: "changes_requested",
+		},
+		{
+			name:     "prose with no path shape does not count",
+			severity: "P1",
+			findings: []json.RawMessage{findingJSON(t, map[string]string{
+				"severity": "P1", "title": "cleanups feel unanchored",
+				"detail": "The sibling abort cleanups remain unanchored and this worries me.",
+			})},
+			want: "approved",
+		},
+		{
+			name:     "an unrankable verdict severity keeps blocking",
+			severity: "sev:high",
+			findings: []json.RawMessage{findingJSON(t, map[string]string{"title": "no locator here"})},
+			want:     "changes_requested",
+		},
+		{
+			name:     "an unrankable finding severity keeps blocking",
+			severity: "P1",
+			findings: []json.RawMessage{findingJSON(t, map[string]string{
+				"severity": "critical", "title": "no locator here",
+			})},
+			want: "changes_requested",
+		},
+		{
+			name:     "an empty finding object keeps blocking",
+			severity: "P1",
+			findings: []json.RawMessage{json.RawMessage(`{}`)},
+			want:     "changes_requested",
+		},
+		{
+			name:     "a null finding element keeps blocking",
+			severity: "P1",
+			findings: []json.RawMessage{json.RawMessage(`null`)},
+			want:     "changes_requested",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot",
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: tc.severity,
+					Findings: tc.findings,
+				},
+			}
+			if got := effectiveReviewDecisionForPayload(payload, "P2"); got != tc.want {
+				t.Fatalf("effective decision = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The gate's location key set must not be narrower than the ledger reader's, or
+// the two disagree about the same finding — which is how the canonical
+// evidence_locator key went unread in round 1.
+func TestGateReadsEveryLocationKeyTheLedgerReaderReads(t *testing.T) {
+	for _, key := range []string{"evidence_locator", "locator", "file", "location", "evidence"} {
+		t.Run(key, func(t *testing.T) {
+			payload := JobPayload{
+				Repo: "gitmoot/gitmoot",
+				Result: &AgentResult{
+					Decision: "changes_requested",
+					Severity: "P1",
+					Findings: []json.RawMessage{findingJSON(t, map[string]string{
+						"severity": "P1", "title": "located finding", key: "internal/db/store.go:88",
+					})},
+				},
+			}
+			if got := effectiveReviewDecisionForPayload(payload, "P2"); got != "changes_requested" {
+				t.Fatalf("finding located by %q folded to %q; the gate cannot see that key", key, got)
+			}
+		})
+	}
+}

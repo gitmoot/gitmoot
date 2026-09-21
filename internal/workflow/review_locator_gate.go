@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -15,27 +16,74 @@ const (
 	reviewFoldUnlocated      = "unlocated_blocking_findings"
 )
 
+// pathShapedInProse matches a repo-relative path, optionally with a line number,
+// appearing anywhere in a prose field: `internal/db/store.go:88`, `store.go:88`,
+// `website/docs/x.md`. It is deliberately narrow — a bare sentence mentioning a
+// function name does not match — because the question this gate asks is whether
+// a reader can OPEN what the finding points at.
+var pathShapedInProse = regexp.MustCompile(`[\w./-]+\.(?:go|ts|tsx|js|md|toml|ya?ml|json|sql|sh|py|txt)(?::\d+)?`)
+
 // locatorFinding is the minimum shape the locator gate needs. AgentResult keeps
 // findings as raw JSON on purpose (reviewers add fields), so this decodes the
 // keys the gate reasons about and ignores everything else.
 //
-// There is no single locator convention in this repo, and assuming one is how
-// the first cut of this gate got it wrong: measured over every review finding
-// since 2026-08-01, `file` appears 7,989 times and `line` 6,334, against 806 for
-// `location`. A gate that only understood `locator` would have read almost every
-// located finding as unlocated.
+// THE KEY SET IS MEASURED, NEVER GUESSED, and it is deliberately the same set
+// findings_ledger_writer.go reads (reviewFindingWire, :39-132). Two earlier cuts
+// of this gate got it wrong in the same way from opposite ends: the first read
+// only `locator` and so read almost every located finding as unlocated (`file`
+// appears 7,989 times against 806 for `location` since 2026-08-01); the second
+// still missed `evidence_locator`, which the ledger declares canonical with
+// `locator` as its alternate. A gate whose key set is narrower than the reader
+// beside it will disagree with that reader about the same finding.
 type locatorFinding struct {
 	Severity string `json:"severity"`
-	Locator  string `json:"locator"`
-	File     string `json:"file"`
-	Location string `json:"location"`
-	Evidence string `json:"evidence"`
+	// Location keys, canonical first.
+	EvidenceLocator string `json:"evidence_locator"`
+	Locator         string `json:"locator"`
+	File            string `json:"file"`
+	Location        string `json:"location"`
+	Evidence        string `json:"evidence"`
+	// Prose keys. A finding whose only locator rides inside its prose still told
+	// the reader where to look, so these are searched for a path shape rather
+	// than accepted whole: prose is present on ~88% of findings, and accepting
+	// any prose at all would disable this gate rather than narrow it.
+	Detail      string `json:"detail"`
+	Details     string `json:"details"`
+	Description string `json:"description"`
+	Body        string `json:"body"`
+	Summary     string `json:"summary"`
+	Message     string `json:"message"`
+	Finding     string `json:"finding"`
+	// Title is read only to tell an EMPTY finding object from a real one.
+	Title string `json:"title"`
+}
+
+// isEmpty reports whether the decoded finding carried no content at all. `[{}]`
+// and `[null]` decode cleanly into a zero value, and without this they would
+// inherit the verdict severity, count as unlocated, and fold the verdict — which
+// would turn the no-findings guard into a way to unblock a head by sending
+// nothing. An empty element is treated as the no-findings case: keep blocking.
+func (f locatorFinding) isEmpty() bool {
+	for _, field := range []string{
+		f.Severity, f.EvidenceLocator, f.Locator, f.File, f.Location, f.Evidence,
+		f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding, f.Title,
+	} {
+		if strings.TrimSpace(field) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // saysWhere reports whether the finding points at anything a reader could open.
 func (f locatorFinding) saysWhere() bool {
-	for _, field := range []string{f.Locator, f.File, f.Location, f.Evidence} {
+	for _, field := range []string{f.EvidenceLocator, f.Locator, f.File, f.Location, f.Evidence} {
 		if strings.TrimSpace(field) != "" {
+			return true
+		}
+	}
+	for _, prose := range []string{f.Detail, f.Details, f.Description, f.Body, f.Summary, f.Message, f.Finding} {
+		if pathShapedInProse.MatchString(prose) {
 			return true
 		}
 	}
@@ -56,17 +104,21 @@ func (f locatorFinding) saysWhere() bool {
 // It is deliberately conservative, and returns false — keep blocking — whenever
 // the gate cannot see the whole picture:
 //
-//   - no findings at all: nothing to inspect, so the severity stands. A reviewer
-//     that reports a blocking verdict with no structured findings is a separate
-//     defect and must not be quietly downgraded by this one.
+//   - no findings at all, or only contentless elements such as `[{}]` / `[null]`:
+//     nothing to inspect, so the severity stands. A reviewer that reports a
+//     blocking verdict with no readable findings is a separate defect and must
+//     not be quietly downgraded by this one — nor may an empty element become a
+//     way to unblock a head by sending nothing.
 //   - a finding that does not decode: an unreadable finding is not evidence of
 //     absence.
-//   - any blocking finding carrying a locator: one located finding is enough to
-//     justify the block, however many unlocated ones sit beside it.
+//   - a severity this repository cannot rank, on the verdict or on a finding:
+//     reviewseverity.Blocks fails closed on unrankable input, and this gate must
+//     not undo that by reading "unrankable" as "unlocated".
+//   - any blocking finding that says where: one located finding justifies the
+//     block, however many vague ones sit beside it.
 //
-// Evidence counts as a locator when the locator field is empty: a reviewer that
-// quotes the command output proving the defect has said where to look, even
-// without a file:line.
+// Evidence counts as saying where: a reviewer that quotes the command output
+// proving the defect has told the reader where to look, even without a file:line.
 func blockingFindingsAreUnlocated(result *AgentResult, blockingSeverity string) bool {
 	if result == nil || len(result.Findings) == 0 {
 		return false
@@ -78,11 +130,18 @@ func blockingFindingsAreUnlocated(result *AgentResult, blockingSeverity string) 
 		if err := json.Unmarshal(raw, &finding); err != nil {
 			return false
 		}
+		if finding.isEmpty() {
+			return false
+		}
 		severity := strings.TrimSpace(finding.Severity)
 		if severity == "" {
 			// A finding that declines to rate itself inherits the verdict's
 			// severity: that is the severity the gate would act on.
-			severity = result.Severity
+			severity = strings.TrimSpace(result.Severity)
+		}
+		if !reviewseverity.Valid(severity) {
+			// Unrankable severity: Blocks() would fail closed, and so does this.
+			return false
 		}
 		if !reviewseverity.Blocks(severity, bar) {
 			continue
@@ -101,6 +160,12 @@ func blockingFindingsAreUnlocated(result *AgentResult, blockingSeverity string) 
 // decision itself.
 func reviewFoldReason(result *AgentResult, blockingSeverity string) string {
 	if result == nil || strings.TrimSpace(result.Decision) != "changes_requested" {
+		return ""
+	}
+	if !reviewseverity.Valid(strings.TrimSpace(result.Severity)) {
+		// An unrankable verdict severity blocks (reviewseverity.Blocks fails
+		// closed) and must stay blocking: the gate cannot reason about a
+		// severity it cannot rank.
 		return ""
 	}
 	if !reviewseverity.Blocks(result.Severity, normalizedReviewBlockingSeverity(blockingSeverity)) {
