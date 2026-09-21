@@ -20,21 +20,26 @@ const (
 // a prose field: `internal/db/store.go:88`, `store.go:88`, `website/styles.css`,
 // `go.mod`, `Makefile`, `.gitignore`.
 //
-// ERRING WIDE IS THE SAFE DIRECTION HERE, which is the opposite of the rest of
-// this gate. A match means the finding said where, which KEEPS the block; a miss
-// folds the verdict to advisory. Round 1 of review on #2253 shipped an extension
-// whitelist and round 2 showed it silently folded findings that named `go.mod`,
-// `Makefile`, `Dockerfile`, `LICENSE`, `.gitignore` or a `.css` file. So this now
-// accepts three shapes rather than one enumerated list of extensions:
+// THE WIDTH OF THIS PATTERN IS THE WHOLE RULE, and two review rounds moved it in
+// opposite directions:
 //
-//	any/slashed/path      — a token containing a slash
-//	name.ext / name.ext:12 — any dotted filename, with an optional line
-//	bare build filenames   — the extensionless names a repo actually carries
+//   - Round 2: an extension whitelist missed `go.mod`, `Makefile`, `Dockerfile`,
+//     `LICENSE`, `.gitignore` and `.css`, folding verdicts that did say where.
+//   - Round 3: the replacement was so wide that `e.g.`, `i.e.`, `n/a`, `and/or`,
+//     `I/O` and `U.S.` all matched — ordinary English in any finding kept the
+//     block, which made the rule inert rather than conservative.
+//
+// So the slash arm now requires a path segment that looks like a filename
+// (a dot-extension or a known extensionless build file), not merely a slash, and
+// the dotted arm requires a plausible file extension of 2-9 characters rather
+// than any single letter. `n/a` and `e.g.` are excluded by construction; a real
+// locator is not.
 var pathShapedInProse = regexp.MustCompile(
-	`(?i)(?:[\w.-]+/[\w./-]+(?::\d+)?` + // a slashed path
-		`|[\w-]+\.[A-Za-z][\w]{0,9}(?::\d+)?` + // a dotted filename
-		`|\.[A-Za-z][\w-]{1,20}` + // a dotfile such as .gitignore
-		`|\b(?:Makefile|Dockerfile|LICENSE|CODEOWNERS|Procfile|Justfile|Rakefile)\b)`)
+	`(?:[\w.-]+/)+[\w.-]*[\w-]\.[A-Za-z][A-Za-z0-9]{1,8}(?::\d+)?` + // path/to/file.ext[:12]
+		`|(?:^|[\s"'` + "`" + `(\[])[\w-]{2,}\.[A-Za-z][A-Za-z0-9]{1,8}(?::\d+)?\b` + // file.ext[:12]
+		`|(?:^|[\s"'` + "`" + `(\[])\.[A-Za-z][\w-]{2,20}\b` + // .gitignore
+		`|\b(?:Makefile|Dockerfile|LICENSE|CODEOWNERS|Procfile|Justfile|Rakefile|go\.mod|go\.sum)\b` +
+		`|(?:[\w.-]+/)+[\w-]{2,}(?::\d+)\b`) // path/to/thing:88
 
 // locatorFinding is the minimum shape the locator gate needs. AgentResult keeps
 // findings as raw JSON on purpose (reviewers add fields), so this decodes the

@@ -343,3 +343,22 @@ func TestTitleAndRationaleCountAsSayingWhere(t *testing.T) {
 		})
 	}
 }
+
+// Round 3 of the independent review (grok-4.7) executed the round-2 pattern and
+// showed it matching ordinary English: "e.g.", "i.e.", "n/a", "and/or", "I/O",
+// "U.S." all matched, so any finding containing normal prose kept the block and
+// the rule was inert rather than conservative. These strings are the contract.
+func TestProsePatternRejectsOrdinaryEnglish(t *testing.T) {
+	for _, prose := range []string{
+		"e.g. the cleanup path", "i.e. the second writer", "n/a", "and/or",
+		"on/off", "I/O contention", "U.S. english spelling", "a.k.a the wedge",
+		"Sibling abort cleanups remain unanchored after the guard commits.",
+		"Concurrent child advances can open two shared human rounds.",
+	} {
+		t.Run(prose, func(t *testing.T) {
+			if pathShapedInProse.MatchString(prose) {
+				t.Fatalf("prose %q matched a path shape; the gate would never fold anything", prose)
+			}
+		})
+	}
+}
