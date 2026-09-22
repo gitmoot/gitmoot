@@ -385,7 +385,30 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 var (
 	code429Re = regexp.MustCompile(`\b429\b`)
 	code401Re = regexp.MustCompile(`\b401\b`)
+	// 403 is NOT a quota code on its own — it is the ordinary "you may not do
+	// that" status, and a permission refusal misclassified as quota would be
+	// retried forever against a wall. It only counts when a billing word sits on
+	// the SAME line, which is how xAI reports an exhausted subscription.
+	code403Re = regexp.MustCompile(`\b403\b`)
 )
+
+// billingExhaustionRe matches a provider saying the account cannot pay for the
+// call: out of credits, needs a subscription, needs an upgrade, payment required.
+//
+// Measured from a live outage on 2026-09-21: xAI answered
+//
+//	403 You have run out of credits or need a Grok subscription.
+//	Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.
+//
+// which matched none of the existing signatures — no "usage limit", no "rate
+// limit", no "quota", no 429 — so two review jobs died as ordinary failures
+// instead of falling through to the next model in the pool. The account was out
+// of money, which is the same operational fact as a quota: this provider cannot
+// serve the job now, another one can.
+var billingExhaustionRe = regexp.MustCompile(
+	`\b(?:out of credits|insufficient credits|no credits|add credits|` +
+		`need a [\w -]*subscription|requires? a [\w -]*subscription|` +
+		`upgrade (?:your plan|at|to)|payment required|billing)\b`)
 
 // classifyAuthQuotaStrict is the #552 classifyAuthQuota matcher with the extra
 // precision the BEHAVIORAL #532 call site needs. Adapter failures concatenate a
@@ -411,7 +434,9 @@ func classifyAuthQuotaStrict(text string) string {
 			strings.Contains(l, "weekly limit"),
 			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
-			httpCtx && code429Re.MatchString(l):
+			billingExhaustionRe.MatchString(l),
+			httpCtx && code429Re.MatchString(l),
+			code403Re.MatchString(l) && billingExhaustionRe.MatchString(l):
 			return "throttled"
 		case strings.Contains(l, "authentication"), strings.Contains(l, "unauthorized"),
 			httpCtx && code401Re.MatchString(l),
