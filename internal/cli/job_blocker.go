@@ -408,6 +408,7 @@ var (
 var billingExhaustionRe = regexp.MustCompile(
 	`\b(?:out of credits|insufficient credits|no credits|add credits|` +
 		`need a [\w -]*subscription|requires? a [\w -]*subscription|` +
+		`disabled [\w ]*subscription access|use an anthropic api key instead|` +
 		`upgrade (?:your plan|at|to)|payment required|billing)\b`)
 
 // classifyAuthQuotaStrict is the #552 classifyAuthQuota matcher with the extra

@@ -92,3 +92,15 @@ func TestBillingMatcherIgnoresOrdinaryProse(t *testing.T) {
 		})
 	}
 }
+
+// Second live outage, same day, different provider: every claude-runtime review
+// in the fleet now fails with an entitlement revocation rather than a balance.
+// Verbatim from job local-review-joltra-claude-review-18d7a22b230e09f3-1.
+// An entitlement the account no longer holds is the same operational fact as an
+// empty balance: this provider cannot serve the job, another one can.
+func TestEntitlementRevocationClassifiesAsThrottled(t *testing.T) {
+	text := "delivery failed: claude: Your organization has disabled Claude subscription access for Claude Code \u00b7 Use an Anthropic API key instead, or ask your admin to enable access (api_error_status 403): exit status 1"
+	if got := classifyAuthQuotaStrict(text); got != "throttled" {
+		t.Fatalf("classifyAuthQuotaStrict = %q, want \"throttled\" so the pool falls through to the next model", got)
+	}
+}
