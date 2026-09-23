@@ -159,6 +159,12 @@ func TestReviewPolicyProtectsSandboxChangesButNotDraftsOrStaleHeads(t *testing.T
 		"internal/cli/execbackend_credentials.go",
 		"internal/cli/remote_review_admission.go",
 		"internal/cli/agent_dispatch.go",
+		"internal/cli/auth.go",
+		"internal/cli/daemon_runtime_auth.go",
+		"internal/cli/job_blocker_auth_probe.go",
+		"internal/cli/sandbox.go",
+		"internal/cli/daemon_lifecycle.go",
+		"internal/cli/workflow_lifecycle.go",
 		".github/workflows/release.yml",
 	} {
 		client.files = []github.PullRequestFile{{Filename: filename}}
