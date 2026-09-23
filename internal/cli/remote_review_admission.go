@@ -93,7 +93,7 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 	if err != nil {
 		return false, fmt.Errorf("load remote review admission policy: %w", err)
 	}
-	if reviewConfig.For(repo.FullName()).RemoteRequireCIGreen {
+	if payload.PolicyRoutedReview || reviewConfig.For(repo.FullName()).RemoteRequireCIGreen {
 		checks, err := client.ListPullRequestChecks(ctx, repo, int64(payload.PullRequest))
 		if err != nil {
 			return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, fmt.Sprintf("remote review CI policy could not read current-head checks: %v", err))

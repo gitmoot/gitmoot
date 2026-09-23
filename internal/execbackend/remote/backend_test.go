@@ -187,6 +187,12 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 		{ID: "stale-local", TemplateID: "template-test", State: "paused", Metadata: map[string]string{
 			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "2147483647", metadataOwnerStartTime: "2",
 		}},
+		{ID: "missing-start", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "2147483647",
+		}},
+		{ID: "invalid-owner", TemplateID: "template-test", State: "running", Metadata: map[string]string{
+			metadataBootID: reaper.bootID, metadataOwnerPIDNamespace: reaper.pidNamespace, metadataOwnerPID: "0", metadataOwnerStartTime: "2",
+		}},
 		{ID: "malformed-generation", TemplateID: "template-test", State: "running", Metadata: map[string]string{
 			metadataJobID: "malformed", metadataAttempt: "1", metadataLifecycleGeneration: "not-an-integer",
 			metadataDaemonFencingToken: "fence-malformed", metadataBootID: reaper.bootID,
@@ -200,17 +206,30 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 	if !report.InventoryObserved || report.InventoryComplete {
 		t.Fatalf("E2B inventory authority = observed:%v complete:%v, want true/false", report.InventoryObserved, report.InventoryComplete)
 	}
-	reaped := report.Destroyed
-	if !reflect.DeepEqual(reaped, []string{"stale-local"}) {
-		t.Fatalf("reaped = %v", reaped)
+	if len(report.Destroyed) != 0 {
+		t.Fatalf("provider deleted without ledger authority: %v", report.Destroyed)
 	}
-	var foundForeignOwner, foundMalformedGeneration bool
+	var foundForeignOwner, foundMalformedGeneration, foundOldBoot, foundStaleLocal bool
 	for _, instance := range report.Inventory {
 		switch instance.ID {
+		case "foreign-boot":
+			foundOldBoot = true
+			if !instance.Reapable {
+				t.Fatal("prior boot was not identified as a candidate for ledger-gated recovery")
+			}
 		case "foreign-namespace-live":
 			foundForeignOwner = true
-			if instance.JobID != "foreign-live" || instance.Attempt != 1 || instance.LifecycleGeneration != 0 || instance.BootID != reaper.bootID {
+			if instance.JobID != "foreign-live" || instance.Attempt != 1 || instance.LifecycleGeneration != 0 || instance.BootID != reaper.bootID || instance.Reapable {
 				t.Fatalf("inventory identity = %+v", instance)
+			}
+		case "stale-local":
+			foundStaleLocal = true
+			if !instance.Reapable {
+				t.Fatal("dead local owner was not identified as a recovery candidate")
+			}
+		case "live-local", "missing-namespace", "missing-start", "invalid-owner":
+			if instance.Reapable {
+				t.Fatalf("live or unprovable owner was marked reapable: %+v", instance)
 			}
 		case "malformed-generation":
 			foundMalformedGeneration = true
@@ -219,11 +238,11 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 			}
 		}
 	}
-	if !foundForeignOwner || !foundMalformedGeneration {
-		t.Fatalf("inventory omitted provisioned sandbox: %+v", report.Inventory)
+	if !foundForeignOwner || !foundMalformedGeneration || !foundOldBoot || !foundStaleLocal {
+		t.Fatalf("inventory omitted a sandbox: %+v", report.Inventory)
 	}
-	if got := harness.deletedIDs(); !reflect.DeepEqual(got, []string{"stale-local"}) {
-		t.Fatalf("deleted sandboxes = %v; foreign scope and live owner must remain", got)
+	if got := harness.deletedIDs(); len(got) != 0 {
+		t.Fatalf("provider deleted without local ledger ownership: %v", got)
 	}
 
 	// GITMOOT-IMPL: kills R34, which makes two absent namespace identities
@@ -238,12 +257,12 @@ func TestRemoteReapScopesOwnerLivenessToPIDNamespace(t *testing.T) {
 	blindReaper.bootID = "boot-blind"
 	blindReaper.pidNamespace = ""
 	blindReaper.ownerAlive = func(int, string, string) bool { return false }
-	reaped, err = blindReaper.Reap(context.Background())
+	blindReport, err := blindReaper.ReapInventory(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reaped) != 0 || len(blindHarness.deletedIDs()) != 0 {
-		t.Fatalf("blind reaper deleted namespace-less sandbox: reaped=%v deleted=%v", reaped, blindHarness.deletedIDs())
+	if len(blindReport.Inventory) != 1 || blindReport.Inventory[0].Reapable || len(blindHarness.deletedIDs()) != 0 {
+		t.Fatalf("blind reaper admitted namespace-less sandbox: %+v deleted=%v", blindReport, blindHarness.deletedIDs())
 	}
 }
 

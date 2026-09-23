@@ -108,8 +108,8 @@ type sandboxState struct {
 }
 
 var _ execbackend.ExecutionBackend = (*Backend)(nil)
-var _ execbackend.Reaper = (*Backend)(nil)
 var _ execbackend.InventoryReaper = (*Backend)(nil)
+var _ execbackend.ObservedInstanceDestroyer = (*Backend)(nil)
 var _ execbackend.CredentialMaterialInstaller = (*Backend)(nil)
 var _ execbackend.InstanceFileInstaller = (*Backend)(nil)
 
@@ -685,18 +685,9 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 	return nil
 }
 
-// Reap is account-global, unlike LocalBackend.Reap's filesystem-root scope.
-// boot_id separates machines, but is shared by every PID namespace on one
-// kernel. Require both identities before interpreting PID/start-time liveness,
-// so one container cannot reap another container's live sandbox.
-func (b *Backend) Reap(ctx context.Context) ([]string, error) {
-	report, err := b.ReapInventory(ctx)
-	return report.Destroyed, err
-}
-
-// ReapInventory returns the provider observations used for the reap decision
-// and the directly deleted subset. E2B cannot prove all-state completeness, so
-// consumers may reconcile positive observations but not infer absence.
+// ReapInventory observes account-wide sandboxes without deleting any. A
+// reapable observation still requires an exact local ledger match before
+// DestroyObserved may delete it. E2B cannot prove all-state completeness.
 func (b *Backend) ReapInventory(ctx context.Context) (execbackend.ReapReport, error) {
 	if b == nil {
 		return execbackend.ReapReport{}, errors.New("remote execution backend is nil")
@@ -707,13 +698,10 @@ func (b *Backend) ReapInventory(ctx context.Context) (execbackend.ReapReport, er
 	}
 	report := execbackend.ReapReport{
 		// E2B has no all-state total. A successful List proves every returned
-		// sandbox exists, but a dropped continuation header can still hide a
-		// later page, so absence from this inventory is not authoritative.
+		// sandbox exists, but absence from this inventory is not authoritative.
 		InventoryObserved: true,
 		Inventory:         make([]execbackend.ProviderInstance, 0, len(sandboxes)),
 	}
-	var reaped []string
-	var reapErrs []error
 	for _, sandbox := range sandboxes {
 		metadata := sandbox.Metadata
 		attempt, _ := strconv.Atoi(strings.TrimSpace(metadata[metadataAttempt]))
@@ -721,36 +709,50 @@ func (b *Backend) ReapInventory(ctx context.Context) (execbackend.ReapReport, er
 		if parsed, parseErr := strconv.ParseInt(strings.TrimSpace(metadata[metadataLifecycleGeneration]), 10, 64); parseErr == nil && parsed >= 0 {
 			generation = parsed
 		}
-		report.Inventory = append(report.Inventory, execbackend.ProviderInstance{
+		bootID := strings.TrimSpace(metadata[metadataBootID])
+		instance := execbackend.ProviderInstance{
 			ID:                  sandbox.ID,
 			JobID:               strings.TrimSpace(metadata[metadataJobID]),
 			Attempt:             attempt,
 			LifecycleGeneration: generation,
 			DaemonFencingToken:  strings.TrimSpace(metadata[metadataDaemonFencingToken]),
-			BootID:              strings.TrimSpace(metadata[metadataBootID]),
-		})
-		if strings.TrimSpace(metadata[metadataBootID]) == "" || strings.TrimSpace(metadata[metadataBootID]) != b.bootID {
-			continue
+			BootID:              bootID,
 		}
-		if !matchingNonEmptyIdentity(metadata[metadataOwnerPIDNamespace], b.pidNamespace) {
-			continue
+		switch {
+		case bootID == "":
+			// Legacy or unowned metadata is never deletion authority.
+		case bootID != b.bootID:
+			// A prior host boot cannot still own a running process. The ledger
+			// decides whether this is OUR prior boot, not another host's.
+			instance.Reapable = true
+		case matchingNonEmptyIdentity(metadata[metadataOwnerPIDNamespace], b.pidNamespace):
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(metadata[metadataOwnerPID]))
+			startTime := strings.TrimSpace(metadata[metadataOwnerStartTime])
+			instance.Reapable = parseErr == nil && pid > 0 && startTime != "" && !b.ownerAlive(pid, bootID, startTime)
 		}
-		pid, parseErr := strconv.Atoi(strings.TrimSpace(metadata[metadataOwnerPID]))
-		if parseErr != nil || b.ownerAlive(pid, metadata[metadataBootID], metadata[metadataOwnerStartTime]) {
-			continue
-		}
-		state, deleteErr := b.client.Delete(ctx, sandbox.ID)
-		if deleteErr != nil || state != e2b.Gone {
-			reapErrs = append(reapErrs, errors.Join(fmt.Errorf("reap remote execution sandbox %q", sandbox.ID), deleteErr))
-			continue
-		}
-		b.mu.Lock()
-		delete(b.sandboxes, sandbox.ID)
-		b.mu.Unlock()
-		reaped = append(reaped, sandbox.ID)
+		report.Inventory = append(report.Inventory, instance)
 	}
-	report.Destroyed = reaped
-	return report, errors.Join(reapErrs...)
+	return report, nil
+}
+
+// DestroyObserved is called only after the ledger matches an observed
+// instance's full identity to an active local attempt. An ambiguous provider
+// response cannot release that attempt's cost reservation.
+func (b *Backend) DestroyObserved(ctx context.Context, instance execbackend.ProviderInstance) error {
+	if b == nil || !instance.Reapable || strings.TrimSpace(instance.ID) == "" {
+		return errors.New("remote execution observed instance is not eligible for destruction")
+	}
+	state, err := b.client.Delete(ctx, instance.ID)
+	if err != nil {
+		return fmt.Errorf("destroy observed remote execution sandbox %q: %w", instance.ID, err)
+	}
+	if state != e2b.Gone {
+		return fmt.Errorf("destroy observed remote execution sandbox %q was inconclusive: %s", instance.ID, state)
+	}
+	b.mu.Lock()
+	delete(b.sandboxes, instance.ID)
+	b.mu.Unlock()
+	return nil
 }
 
 func matchingNonEmptyIdentity(left, right string) bool {

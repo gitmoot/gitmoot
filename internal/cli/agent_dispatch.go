@@ -73,6 +73,121 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 	return execbackend.ParseImplemented(*override)
 }
 
+var remoteReviewProtectedPaths = []string{
+	"**/auth/**",
+	"**/security/**",
+	"**/payment/**",
+	"**/migration/**",
+	"go.mod",
+	"**/agent_dispatch.go",
+	"**/remote_review_*",
+	"**/execbackend_*",
+	"**/*credential*",
+	"**/*auth*.go",
+	"**/*sandbox*.go",
+	"**/*deploy*.go",
+	"**/*release*.go",
+	"**/*lifecycle*.go",
+	".github/workflows/release.yml",
+	"**/execbackend/**",
+	"**/sandbox/**",
+	"**/credential/**",
+	"**/credentials/**",
+	"**/deploy/**",
+	"**/release/**",
+	"**/lifecycle/**",
+}
+
+// reviewPolicyBackend makes an opt-in, deterministic decision before enqueue
+// and before the execution backend can reserve cloud capacity. The boolean
+// records whether an enabled policy evaluated the review, even if it stayed
+// local. An explicit job override wins unchanged.
+func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest, repo github.Repository, checkout string) (execbackend.Backend, bool, string) {
+	if request.ExecBackend != nil {
+		backend, _ := reviewDispatchExecBackend(request.ExecBackend) // validated at ingress
+		return backend, false, "explicit per-job selector"
+	}
+	if !request.Background {
+		return execbackend.Local, false, "foreground review stays local"
+	}
+	paths, err := pathsFromFlag(request.Home)
+	if err != nil {
+		return execbackend.Local, false, "review policy paths unavailable: " + err.Error()
+	}
+	reviewConfig, err := config.LoadReviewConfig(paths)
+	if err != nil {
+		return execbackend.Local, false, "review policy invalid: " + err.Error()
+	}
+	policy := reviewConfig.For(repo.FullName())
+	if !policy.RemoteRoutingEnabled {
+		return execbackend.Local, false, "automatic routing disabled"
+	}
+	head := strings.ToLower(strings.TrimSpace(request.HeadSHA))
+	if request.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil {
+		return execbackend.Local, true, "no exact review head"
+	}
+	client := jobGitHubClient(checkout, newAgentDispatchGitHubClient(checkout), localDispatchJobRunner(request))
+	pr, err := client.GetPullRequest(ctx, repo, int64(request.PullRequest))
+	if err != nil {
+		return execbackend.Local, true, "current pull request unavailable: " + err.Error()
+	}
+	if pr.Draft || pr.DraftUnknown || pr.Merged || !strings.EqualFold(pr.State, "open") {
+		return execbackend.Local, true, "draft, merged, or unconfirmed pull request"
+	}
+	if !strings.EqualFold(strings.TrimSpace(pr.HeadSHA), head) {
+		return execbackend.Local, true, "review head is stale"
+	}
+	checks, err := client.ListPullRequestChecks(ctx, repo, int64(request.PullRequest))
+	if err != nil {
+		return execbackend.Local, true, "current-head CI unavailable: " + err.Error()
+	}
+	if green, reason := remoteReviewChecksGreen(checks); !green {
+		return execbackend.Local, true, reason
+	}
+	labels := make([]string, 0, len(pr.Labels))
+	for _, label := range pr.Labels {
+		labels = append(labels, label.Name)
+	}
+	labelRisk := workflow.ClassifyRisk(nil, policy.RiskLabelHigh, policy.RiskLabelRoutine, labels, nil)
+	if labelRisk.Source == "label" {
+		if labelRisk.Tier == workflow.RiskTierHigh {
+			return execbackend.Remote, true, "green current-head CI and " + labelRisk.Reason
+		}
+		return execbackend.Local, true, labelRisk.Reason
+	}
+	purpose := strings.ToLower(strings.TrimSpace(request.ReviewPurpose))
+	if purpose == "" {
+		purpose = "code"
+	}
+	for _, configured := range policy.RemotePurposes {
+		if purpose == strings.ToLower(strings.TrimSpace(configured)) {
+			return execbackend.Remote, true, "green current-head CI and configured purpose " + purpose
+		}
+	}
+	if policy.RemoteFinalReviews {
+		return execbackend.Remote, true, "ready exact head with green CI"
+	}
+	files, err := client.ListPullRequestFiles(ctx, repo, int64(request.PullRequest))
+	if err != nil {
+		return execbackend.Local, true, "changed paths unavailable: " + err.Error()
+	}
+	pathsChanged := make([]string, 0, len(files))
+	for _, file := range files {
+		pathsChanged = append(pathsChanged, file.Filename)
+	}
+	risk := workflow.ClassifyRisk(policy.HighRiskPaths, policy.RiskLabelHigh, policy.RiskLabelRoutine, nil, pathsChanged)
+	if risk.Source == "default" {
+		// These protected surfaces stay high risk even if a repository
+		// customizes its general high-risk path list. The label decision has
+		// already been applied above.
+		risk = workflow.ClassifyRisk(remoteReviewProtectedPaths, policy.RiskLabelHigh, policy.RiskLabelRoutine, nil, pathsChanged)
+	}
+	if risk.Tier == "high" {
+		return execbackend.Remote, true, "green current-head CI and " + risk.Reason
+	}
+	return execbackend.Local, true, "routine review without a final-head route"
+}
+
 // validateRuntimeExecutionBackend refuses an unsupported runtime/backend pair
 // at DISPATCH — before cost reservation, provisioning, or comment noise
 // (#2234). It asks remoteCapableRuntime rather than restating the set: this
@@ -181,6 +296,8 @@ type localAgentDispatchRequest struct {
 	// Recorded as a job event so the reason is queryable rather than living in
 	// one terminal's scrollback (#2199).
 	RouterBypassReason string
+	ReviewRouteReason  string
+	PolicyRoutedReview bool
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)
@@ -423,6 +540,27 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
+	if request.Action == "review" {
+		route, policyEvaluated, reason := reviewPolicyBackend(ctx, request, repo, record.CheckoutPath)
+		source := "default"
+		if request.ExecBackend != nil {
+			source = "explicit"
+		}
+		if policyEvaluated {
+			source = "policy"
+		}
+		request.ReviewRouteReason = fmt.Sprintf("backend=%s source=%s reason=%s", route, source, reason)
+		if policyEvaluated && route == execbackend.Remote {
+			selected := string(route)
+			request.ExecBackend = &selected
+			request.PolicyRoutedReview = true
+			execBackend = route
+			request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
+			if err != nil {
+				return localAgentJobOutput{}, err
+			}
+		}
+	}
 	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -460,11 +598,23 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
 		}
 	}
-	// #1641: role unavailability is refused HERE, not at the --org-role ingress
-	// above, because only now is the selected runtime authoritative — a claude
+	if request.PolicyRoutedReview && !remoteCapableRuntime(effectiveAgent.Runtime) {
+		// An opt-in policy must not turn an otherwise valid local review into a
+		// failed dispatch when its selected runtime is not remote-capable.
+		request.ExecBackend = nil
+		request.PolicyRoutedReview = false
+		execBackend = execbackend.Local
+		request.ReviewRouteReason = "backend=local source=policy reason=selected runtime is not remote-capable"
+		request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	if err := validateRuntimeExecutionBackend(effectiveAgent.Runtime, execBackend); err != nil {
 		return localAgentJobOutput{}, err
 	}
+	// #1641: role unavailability is refused HERE, not at the --org-role ingress
+	// above, because only now is the selected runtime authoritative — a claude
 	// quota wall must not refuse a codex dispatch, and an override to the walled
 	// runtime must still refuse. effectiveAgent is the same expression the
 	// claiming worker resolves (daemon_worker.go), so the two agree by
@@ -780,6 +930,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if divergence := strings.TrimSpace(request.ReviewTaskHeadDivergence); divergence != "" {
 		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_task_head_divergence", Message: divergence})
 	}
+	if request.Action == "review" {
+		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_backend_route_selected", Message: request.ReviewRouteReason})
+	}
 	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("local agent enqueue"))
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 	mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
@@ -812,6 +965,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Effort:                   request.Effort,
 		WorkflowID:               request.WorkflowID,
 		ExecBackend:              request.ExecBackend,
+		PolicyRoutedReview:       request.PolicyRoutedReview,
 		RuntimeOverride:          overrideRuntime,
 		RuntimeOverrideRef:       overrideRef,
 		RuntimeConfigDir:         effectiveAgent.RuntimeConfigDir,

@@ -102,6 +102,43 @@ blocking_severity = "P1"
 	}
 }
 
+func TestLoadReviewConfigRoutesOnlyOptedInRepositoryAndPurpose(t *testing.T) {
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, `
+[review]
+remote_routing_enabled = false
+remote_purposes = ["security"]
+[repos."owner/opt-in".review]
+remote_routing_enabled = true
+remote_purposes = ["architecture"]
+remote_final_reviews = true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.For("owner/other").RemoteRoutingEnabled {
+		t.Fatal("a different repository inherited remote routing")
+	}
+	policy := cfg.For("owner/opt-in")
+	if !policy.RemoteRoutingEnabled || !policy.RemoteFinalReviews || len(policy.RemotePurposes) != 1 || policy.RemotePurposes[0] != "architecture" {
+		t.Fatalf("opted-in review policy = %+v", policy)
+	}
+}
+
+func TestInvalidRemotePurposeCannotEnableCloudRouting(t *testing.T) {
+	cfg, err := LoadReviewConfig(writeReviewConfig(t, `
+[review]
+remote_routing_enabled = true
+[repos."owner/repo".review]
+remote_purposes = ["unrecognized"]
+`))
+	if err == nil {
+		t.Fatal("invalid remote review purpose was accepted")
+	}
+	if cfg.For("owner/repo").RemoteRoutingEnabled {
+		t.Fatal("invalid repository route inherited enabled global policy")
+	}
+}
+
 func TestLoadReviewConfigRejectsBadBool(t *testing.T) {
 	_, err := LoadReviewConfig(writeReviewConfig(t, "[review]\nnative_fanout_enabled = yes\n"))
 	if err == nil {

@@ -285,6 +285,9 @@ type JobRequest struct {
 	// Nil means the caller did not choose one; a pointer to "local" remains
 	// distinguishable from that absence across enqueue, retry, and recovery.
 	ExecBackend *string
+	// PolicyRoutedReview requires a fresh green current-head CI check before a
+	// policy-selected remote review can reserve cloud capacity.
+	PolicyRoutedReview bool
 
 	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
 	// instead of the agent's registered default runtime (#531). The agent's
@@ -499,6 +502,7 @@ type JobPayload struct {
 	// separately so absent and explicit-local remain distinguishable while an
 	// absent review selector still defaults to local.
 	ExecBackend        string `json:"exec_backend,omitempty"`
+	PolicyRoutedReview bool   `json:"policy_routed_review,omitempty"`
 	execBackendPresent bool
 	unknownJSONFields  map[string]json.RawMessage
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
@@ -841,6 +845,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Model:                  request.Model,
 		Effort:                 request.Effort,
 		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
+		PolicyRoutedReview:     request.PolicyRoutedReview,
 		Plan:                   request.Plan,
 		PlanInto:               strings.TrimSpace(request.PlanInto),
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),

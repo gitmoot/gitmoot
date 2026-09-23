@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -376,6 +377,29 @@ func TestRemoteReviewAdmissionAllowsSuccessfulExplicitCIPolicy(t *testing.T) {
 	if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
 		t.Fatalf("backend factory/provider calls = %d/%d, want 1/1", f.factoryCalls, f.backend.provisionCalls)
 	}
+}
+
+func TestPolicyRoutedReviewRechecksCIImmediatelyBeforeProvision(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	payload, err := daemonJobPayload(f.job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.PolicyRoutedReview = true
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.UpdateJobPayload(f.ctx, f.job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	f.job.Payload = string(encoded)
+	// The dispatch-time green result has since changed. Even with the
+	// repository's optional CI policy disabled, policy-selected cloud work
+	// cannot reserve or provision against a now-red head.
+	f.github.checks = []github.PullRequestCheck{{Name: "build", Bucket: "fail"}}
+	f.run(t)
+	f.assertRefusedBeforeProvision(t, remoteReviewAvoidedRedCI, 0)
 }
 
 func TestRemoteReviewCancellationAfterAdmissionStopsBeforeProvider(t *testing.T) {

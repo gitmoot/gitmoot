@@ -98,6 +98,205 @@ func runReviewRequestJSON(t *testing.T, args ...string) (reviewRequestOutput, st
 	return output, ""
 }
 
+type reviewRoutingFixtureClient struct {
+	githubtest.NoopClient
+	head   string
+	draft  bool
+	labels []github.PullRequestLabel
+	checks []github.PullRequestCheck
+	files  []github.PullRequestFile
+}
+
+func (c *reviewRoutingFixtureClient) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
+	return github.PullRequest{Number: number, State: "open", HeadSHA: c.head, Draft: c.draft, Labels: c.labels}, nil
+}
+
+func (c *reviewRoutingFixtureClient) ListPullRequestChecks(context.Context, github.Repository, int64) ([]github.PullRequestCheck, error) {
+	return c.checks, nil
+}
+
+func (c *reviewRoutingFixtureClient) ListPullRequestFiles(context.Context, github.Repository, int64) ([]github.PullRequestFile, error) {
+	return c.files, nil
+}
+
+func TestReviewPolicyProtectsSandboxChangesButNotDraftsOrStaleHeads(t *testing.T) {
+	home, _, head := reviewRouterHome(t)
+	paths := config.PathsForHome(home)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[review]\nremote_routing_enabled = true\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client := &reviewRoutingFixtureClient{
+		head:   head,
+		checks: []github.PullRequestCheck{{Name: "CI", Bucket: "pass"}},
+		files:  []github.PullRequestFile{{Filename: "internal/execbackend/remote/backend.go"}},
+	}
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return client }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+	runner, err := jobSubprocessRunnerForBackend(execbackend.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := localAgentDispatchRequest{
+		Action: "review", Background: true, Home: home, PullRequest: 12,
+		HeadSHA: head, ReviewPurpose: "code", jobRunner: runner,
+	}
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	backend, selected, reason := reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Remote || !selected || !strings.Contains(reason, "execbackend") {
+		t.Fatalf("protected path route = %s selected=%v reason=%q", backend, selected, reason)
+	}
+	for _, filename := range []string{
+		"internal/cli/execbackend_ledger.go",
+		"internal/cli/execbackend_credentials.go",
+		"internal/cli/remote_review_admission.go",
+		"internal/cli/agent_dispatch.go",
+		"internal/cli/auth.go",
+		"internal/cli/daemon_runtime_auth.go",
+		"internal/cli/job_blocker_auth_probe.go",
+		"internal/cli/sandbox.go",
+		"internal/cli/daemon_lifecycle.go",
+		"internal/cli/workflow_lifecycle.go",
+		".github/workflows/release.yml",
+	} {
+		client.files = []github.PullRequestFile{{Filename: filename}}
+		backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+		if backend != execbackend.Remote || !selected || !strings.Contains(reason, filename) {
+			t.Fatalf("protected %s route = %s selected=%v reason=%q", filename, backend, selected, reason)
+		}
+	}
+	client.draft = true
+	backend, selected, _ = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected {
+		t.Fatalf("draft protected path decision = %s policy_evaluated=%v", backend, selected)
+	}
+	client.draft = false
+	client.head = strings.Repeat("b", 40)
+	backend, selected, _ = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected {
+		t.Fatalf("stale protected path decision = %s policy_evaluated=%v", backend, selected)
+	}
+	request.HeadSHA = ""
+	backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected || reason != "no exact review head" {
+		t.Fatalf("missing review head decision = %s policy_evaluated=%v reason=%q", backend, selected, reason)
+	}
+	request.HeadSHA = head
+	client.head = head
+	client.labels = []github.PullRequestLabel{{Name: "risk:routine"}}
+	file, err = os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("remote_final_reviews = true\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected || !strings.Contains(reason, "risk:routine") {
+		t.Fatalf("routine label over final route = %s policy_evaluated=%v reason=%q", backend, selected, reason)
+	}
+}
+
+func TestReviewRequestRoutesOnlyReadyGreenPolicyReviews(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	paths := config.PathsForHome(home)
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[repos.\"owner/repo\".review]\nremote_routing_enabled = true\nremote_purposes = [\"code\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client := &reviewRoutingFixtureClient{head: head, checks: []github.PullRequestCheck{{Name: "CI", Bucket: "pass"}}}
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return client }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+	check := func(pr string, remote bool) {
+		t.Helper()
+		output, failure := runReviewRequestJSON(t,
+			"--repo", "owner/repo", "--pr", pr, "--head", head,
+			"--branch", "feature/review", "--role", "joltra", "--home", home,
+			"--runtime", runtime.OmpRuntime, "--json",
+		)
+		if failure != "" {
+			t.Fatal(failure)
+		}
+		job, err := store.GetJob(context.Background(), output.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend, present := payload.ExecBackendOverride()
+		if remote {
+			if !present || backend != "remote" || !payload.PolicyRoutedReview {
+				t.Fatalf("green review persisted backend=%q present=%v policy=%v", backend, present, payload.PolicyRoutedReview)
+			}
+		} else if present || payload.PolicyRoutedReview {
+			t.Fatalf("red review persisted backend=%q present=%v policy=%v", backend, present, payload.PolicyRoutedReview)
+		}
+		events, err := store.ListJobEvents(context.Background(), output.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRoute := "backend=local source=policy"
+		if remote {
+			wantRoute = "backend=remote source=policy"
+		}
+		found := false
+		for _, event := range events {
+			if event.Kind == "review_backend_route_selected" && strings.Contains(event.Message, wantRoute) {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("review %s missing durable route decision: %+v", pr, events)
+		}
+	}
+	check("12", true)
+	client.checks = []github.PullRequestCheck{{Name: "CI", Bucket: "fail"}}
+	check("13", false)
+	client.checks = []github.PullRequestCheck{{Name: "CI", Bucket: "pass"}}
+	explicit, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "14", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.OmpRuntime, "--exec-backend", "local", "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	job, err := store.GetJob(context.Background(), explicit.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, present := payload.ExecBackendOverride()
+	if !present || backend != "local" || payload.PolicyRoutedReview {
+		t.Fatalf("explicit local override lost: backend=%q present=%v policy=%v", backend, present, payload.PolicyRoutedReview)
+	}
+}
+
 func TestReviewRequestPersistsPerJobExecutionBackend(t *testing.T) {
 	home, store, head := reviewRouterHome(t)
 	output, failure := runReviewRequestJSON(t,

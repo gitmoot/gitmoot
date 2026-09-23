@@ -460,6 +460,14 @@ type ReviewPolicy struct {
 	// requirement. Default false preserves local and remote review behavior;
 	// only an explicit global or repository declaration spends this check.
 	RemoteRequireCIGreen bool
+	// RemoteRoutingEnabled opts this repository into automatic review routing.
+	// Absent config stays local even when the process-wide backend is remote.
+	RemoteRoutingEnabled bool
+	// RemotePurposes are review purposes eligible for the high-risk route.
+	// A green current-head CI result is required for every policy route.
+	RemotePurposes []string
+	// RemoteFinalReviews also routes routine, ready exact heads after green CI.
+	RemoteFinalReviews bool
 	// FindingsConsumption declares whether a repository CONSUMES review findings
 	// or treats them as ADVISORY (#1969). Three values, and the empty one is not
 	// a synonym for either:
@@ -491,6 +499,7 @@ func DefaultReviewPolicy() ReviewPolicy {
 		NativeFanoutEnabled: false,
 		BlockingSeverity:    reviewseverity.DefaultBlocking,
 		RiskTiersEnabled:    false,
+		RemotePurposes:      []string{"security"},
 		// Undeclared, which behaves as consuming. Defaulting to "consuming" here
 		// would make an operator's explicit declaration indistinguishable from
 		// never having made one, and the whole point is that the absence shows.
@@ -576,6 +585,9 @@ type reviewPolicyOverride struct {
 	blockingSeverity     *string
 	findingsConsumption  *string
 	remoteRequireCIGreen *bool
+	remoteRoutingEnabled *bool
+	remotePurposes       *[]string
+	remoteFinalReviews   *bool
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
@@ -584,6 +596,7 @@ type reviewPolicyOverride struct {
 func (c ReviewConfig) For(repo string) ReviewPolicy {
 	policy := c.Global
 	policy.HighRiskPaths = append([]string(nil), policy.HighRiskPaths...)
+	policy.RemotePurposes = append([]string(nil), policy.RemotePurposes...)
 	override, ok := c.repos[strings.TrimSpace(repo)]
 	if ok && override.nativeFanoutEnabled != nil {
 		policy.NativeFanoutEnabled = *override.nativeFanoutEnabled
@@ -596,6 +609,15 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 	}
 	if ok && override.remoteRequireCIGreen != nil {
 		policy.RemoteRequireCIGreen = *override.remoteRequireCIGreen
+	}
+	if ok && override.remoteRoutingEnabled != nil {
+		policy.RemoteRoutingEnabled = *override.remoteRoutingEnabled
+	}
+	if ok && override.remotePurposes != nil {
+		policy.RemotePurposes = append([]string(nil), (*override.remotePurposes)...)
+	}
+	if ok && override.remoteFinalReviews != nil {
+		policy.RemoteFinalReviews = *override.remoteFinalReviews
 	}
 	return policy
 }
@@ -684,6 +706,22 @@ func parseReviewSection(section string) (string, bool) {
 	return rest, true
 }
 
+func parseRemoteReviewPurposes(value string) ([]string, error) {
+	purposes, err := parseConfigStringArray(value)
+	if err != nil {
+		return nil, err
+	}
+	for i, purpose := range purposes {
+		switch normalized := strings.ToLower(strings.TrimSpace(purpose)); normalized {
+		case "code", "security", "ui", "architecture":
+			purposes[i] = normalized
+		default:
+			return nil, fmt.Errorf("unsupported review purpose %q (use code, security, ui, or architecture)", purpose)
+		}
+	}
+	return purposes, nil
+}
+
 func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) error {
 	switch key {
 	case "native_fanout_enabled":
@@ -699,6 +737,27 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 			return err
 		}
 		policy.RemoteRequireCIGreen = parsed
+		return nil
+	case "remote_routing_enabled":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		policy.RemoteRoutingEnabled = parsed
+		return nil
+	case "remote_final_reviews":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			return err
+		}
+		policy.RemoteFinalReviews = parsed
+		return nil
+	case "remote_purposes":
+		parsed, err := parseRemoteReviewPurposes(value)
+		if err != nil {
+			return err
+		}
+		policy.RemotePurposes = parsed
 		return nil
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)
@@ -767,6 +826,33 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 			return err
 		}
 		override.remoteRequireCIGreen = &parsed
+		return nil
+	case "remote_routing_enabled":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			safe := false
+			override.remoteRoutingEnabled = &safe
+			return err
+		}
+		override.remoteRoutingEnabled = &parsed
+		return nil
+	case "remote_final_reviews":
+		parsed, err := parseConfigBool(value)
+		if err != nil {
+			safe := false
+			override.remoteRoutingEnabled = &safe
+			return err
+		}
+		override.remoteFinalReviews = &parsed
+		return nil
+	case "remote_purposes":
+		parsed, err := parseRemoteReviewPurposes(value)
+		if err != nil {
+			safe := false
+			override.remoteRoutingEnabled = &safe
+			return err
+		}
+		override.remotePurposes = &parsed
 		return nil
 	case "blocking_severity":
 		parsed, err := parseReviewBlockingSeverity(value)

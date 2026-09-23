@@ -77,6 +77,34 @@ Remote OMP uploads the host OMP executable into the instance, requires
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
 
+Automatic review routing is opt-in and job-scoped. With no policy, even a
+process-wide remote backend setting does not reroute reviews. For example:
+
+```toml
+[review]
+remote_routing_enabled = true
+remote_purposes = ["security"] # code, security, ui, or architecture
+remote_final_reviews = false  # opt in to every ready, green exact head
+
+[repos."owner/repo".review]
+remote_routing_enabled = false # repo override; keep this repo local
+```
+
+For background reviews, a configured purpose or high-risk path/`risk:high`
+label selects E2B only when the PR is open, not a draft, the requested head is
+current, and at least one current-head CI check exists with no pending or failed
+checks. Auth/security, credentials, sandbox/execbackend, deployment/release,
+lifecycle paths and their matching CLI files are protected. `risk:routine`
+overrides any automatic remote route, including `remote_final_reviews`.
+If no purpose, label, final-review rule, or known high-risk path qualifies,
+the review stays local. With
+`remote_final_reviews = true`, any ready exact-head review with green CI is
+eligible. Drafts, stale heads, missing/red CI, unsupported runtimes, and
+foreground reviews stay local. An explicit per-job `--exec-backend` always
+wins. Each dispatch persists a `review_backend_route_selected` event with its
+reason and the chosen backend. The remote worker rechecks current head and CI
+immediately before reserving capacity; a later red result refuses the cloud job.
+
 Before reserving cost or calling E2B, remote review admission re-reads the pull
 request head and refuses stale jobs, duplicate repo/PR/head/purpose subjects,
 unsupported runtime/backend pairs, and unapproved repeat attempts. One accepted
@@ -85,8 +113,8 @@ releases that ownership. The first cloud attempt is the default; a later
 lifecycle generation needs either `gitmoot job retry` or a provider create
 conflict classified as authoritative proof that nothing was allocated.
 
-Current-head CI is optional and off by default. Enable it globally or override it
-per repository:
+For explicitly selected remote reviews, current-head CI is optional and off by
+default. Enable it globally or override it per repository:
 
 ```toml
 [review]
@@ -97,7 +125,8 @@ remote_require_ci_green = false
 ```
 
 When enabled, admission requires at least one reported check and every check must
-be passing, skipped, or neutral.
+be passing, skipped, or neutral. Policy-routed remote reviews always require
+this, regardless of `remote_require_ci_green`.
 Refusals record durable `remote_review_admission_avoided_<reason>` job events,
 where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`, or `retry`.
 
@@ -151,10 +180,15 @@ process identity. When `local_uid` is absent, daemon jobs do the same.
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
 bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
-kills active command groups and destroys the instance. A restarted daemon reaps
-instances whose recorded owner process is gone. A partially-created non-empty
-directory that Git never registered remains the known orphaned-but-present
-cleanup limitation tracked in #1572.
+kills active command groups and destroys the instance. On daemon restart, the
+remote reaper positively observes provider inventory and matches the complete
+sandbox identity (job, attempt, generation, fencing token, boot ID, and sandbox
+ID) against the durable local ledger before deleting an old-boot or dead-owner
+sandbox. A foreign account sandbox with no matching ledger row is never deleted.
+An incomplete E2B inventory cannot prove a missing sandbox was destroyed; only
+provider-confirmed deletion releases its cost reservation. A partially-created
+non-empty directory that Git never registered remains the known
+orphaned-but-present cleanup limitation tracked in #1572.
 
 ## Proving a Parallel Local Wave
 
