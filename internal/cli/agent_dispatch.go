@@ -79,6 +79,15 @@ var remoteReviewProtectedPaths = []string{
 	"**/payment/**",
 	"**/migration/**",
 	"go.mod",
+	"**/agent_dispatch.go",
+	"**/remote_review_*",
+	"**/execbackend_*",
+	"**/*credential*",
+	"**/sandbox_*",
+	"**/deploy_*",
+	"**/release_*",
+	"**/lifecycle_*",
+	".github/workflows/release.yml",
 	"**/execbackend/**",
 	"**/sandbox/**",
 	"**/credential/**",
@@ -113,7 +122,7 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 		return execbackend.Local, false, "automatic routing disabled"
 	}
 	head := strings.ToLower(strings.TrimSpace(request.HeadSHA))
-	if request.PullRequest <= 0 || dispatchHeadSHAError(head) != nil {
+	if request.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil {
 		return execbackend.Local, true, "no exact review head"
 	}
 	client := jobGitHubClient(checkout, newAgentDispatchGitHubClient(checkout), localDispatchJobRunner(request))
@@ -134,6 +143,17 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	if green, reason := remoteReviewChecksGreen(checks); !green {
 		return execbackend.Local, true, reason
 	}
+	labels := make([]string, 0, len(pr.Labels))
+	for _, label := range pr.Labels {
+		labels = append(labels, label.Name)
+	}
+	labelRisk := workflow.ClassifyRisk(nil, policy.RiskLabelHigh, policy.RiskLabelRoutine, labels, nil)
+	if labelRisk.Source == "label" {
+		if labelRisk.Tier == workflow.RiskTierHigh {
+			return execbackend.Remote, true, "green current-head CI and " + labelRisk.Reason
+		}
+		return execbackend.Local, true, labelRisk.Reason
+	}
 	purpose := strings.ToLower(strings.TrimSpace(request.ReviewPurpose))
 	if purpose == "" {
 		purpose = "code"
@@ -145,17 +165,6 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	}
 	if policy.RemoteFinalReviews {
 		return execbackend.Remote, true, "ready exact head with green CI"
-	}
-	labels := make([]string, 0, len(pr.Labels))
-	for _, label := range pr.Labels {
-		labels = append(labels, label.Name)
-	}
-	labelRisk := workflow.ClassifyRisk(nil, policy.RiskLabelHigh, policy.RiskLabelRoutine, labels, nil)
-	if labelRisk.Source == "label" {
-		if labelRisk.Tier == workflow.RiskTierHigh {
-			return execbackend.Remote, true, "green current-head CI and " + labelRisk.Reason
-		}
-		return execbackend.Local, true, labelRisk.Reason
 	}
 	files, err := client.ListPullRequestFiles(ctx, repo, int64(request.PullRequest))
 	if err != nil {

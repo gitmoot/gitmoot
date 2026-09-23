@@ -93,8 +93,9 @@ remote_routing_enabled = false # repo override; keep this repo local
 For background reviews, a configured purpose or high-risk path/`risk:high`
 label selects E2B only when the PR is open, not a draft, the requested head is
 current, and at least one current-head CI check exists with no pending or failed
-checks. Auth/security, credentials, sandbox/execbackend, deployment/release and
-lifecycle paths are protected; `risk:routine` can explicitly de-escalate a path.
+checks. Auth/security, credentials, sandbox/execbackend, deployment/release,
+lifecycle paths and their matching CLI files are protected. `risk:routine`
+overrides any automatic remote route, including `remote_final_reviews`.
 If no purpose, label, final-review rule, or known high-risk path qualifies,
 the review stays local. With
 `remote_final_reviews = true`, any ready exact-head review with green CI is

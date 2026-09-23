@@ -340,9 +340,11 @@ Automatic background review routing is separately opt-in. Configure
 `remote_purposes = ["security"]` makes a ready, green security review eligible.
 `remote_final_reviews = true` additionally selects other ready exact heads
 with green current-head CI. A `risk:high` label or matching auth/security,
-credentials, sandbox/execbackend, deployment/release, or lifecycle path also
-qualifies; `risk:routine` can de-escalate a path. Drafts, stale heads, unknown
-or red CI, foreground reviews, and unsupported runtimes stay local. Explicit
+credentials, sandbox/execbackend, deployment/release, lifecycle paths, and
+their matching CLI files also qualify. `risk:routine` keeps an otherwise
+eligible review local, even with `remote_final_reviews = true`.
+Drafts, stale heads, unknown or red CI, foreground reviews, and unsupported
+runtimes stay local. Explicit
 per-job `--exec-backend` overrides policy. Each review stores its chosen route
 and reason in `review_backend_route_selected`; a policy-selected remote job
 rechecks green current-head CI before reserving capacity, even when

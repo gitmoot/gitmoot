@@ -138,7 +138,9 @@ func TestReviewPolicyProtectsSandboxChangesButNotDraftsOrStaleHeads(t *testing.T
 		checks: []github.PullRequestCheck{{Name: "CI", Bucket: "pass"}},
 		files:  []github.PullRequestFile{{Filename: "internal/execbackend/remote/backend.go"}},
 	}
+	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return client }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 	runner, err := jobSubprocessRunnerForBackend(execbackend.Local)
 	if err != nil {
 		t.Fatal(err)
@@ -152,6 +154,19 @@ func TestReviewPolicyProtectsSandboxChangesButNotDraftsOrStaleHeads(t *testing.T
 	if backend != execbackend.Remote || !selected || !strings.Contains(reason, "execbackend") {
 		t.Fatalf("protected path route = %s selected=%v reason=%q", backend, selected, reason)
 	}
+	for _, filename := range []string{
+		"internal/cli/execbackend_ledger.go",
+		"internal/cli/execbackend_credentials.go",
+		"internal/cli/remote_review_admission.go",
+		"internal/cli/agent_dispatch.go",
+		".github/workflows/release.yml",
+	} {
+		client.files = []github.PullRequestFile{{Filename: filename}}
+		backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+		if backend != execbackend.Remote || !selected || !strings.Contains(reason, filename) {
+			t.Fatalf("protected %s route = %s selected=%v reason=%q", filename, backend, selected, reason)
+		}
+	}
 	client.draft = true
 	backend, selected, _ = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
 	if backend != execbackend.Local || !selected {
@@ -162,6 +177,29 @@ func TestReviewPolicyProtectsSandboxChangesButNotDraftsOrStaleHeads(t *testing.T
 	backend, selected, _ = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
 	if backend != execbackend.Local || !selected {
 		t.Fatalf("stale protected path decision = %s policy_evaluated=%v", backend, selected)
+	}
+	request.HeadSHA = ""
+	backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected || reason != "no exact review head" {
+		t.Fatalf("missing review head decision = %s policy_evaluated=%v reason=%q", backend, selected, reason)
+	}
+	request.HeadSHA = head
+	client.head = head
+	client.labels = []github.PullRequestLabel{{Name: "risk:routine"}}
+	file, err = os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("remote_final_reviews = true\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend, selected, reason = reviewPolicyBackend(context.Background(), request, repo, "/checkout")
+	if backend != execbackend.Local || !selected || !strings.Contains(reason, "risk:routine") {
+		t.Fatalf("routine label over final route = %s policy_evaluated=%v reason=%q", backend, selected, reason)
 	}
 }
 
@@ -180,7 +218,9 @@ func TestReviewRequestRoutesOnlyReadyGreenPolicyReviews(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &reviewRoutingFixtureClient{head: head, checks: []github.PullRequestCheck{{Name: "CI", Bucket: "pass"}}}
+	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return client }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 	check := func(pr string, remote bool) {
 		t.Helper()
 		output, failure := runReviewRequestJSON(t,
