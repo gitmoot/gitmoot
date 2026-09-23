@@ -1,8 +1,16 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
 // TestExecBackendReconcileCadenceAdvancesOnSuccess pins the cadence contract
@@ -74,5 +82,52 @@ func TestExecBackendReconcileCadenceIsPerBackend(t *testing.T) {
 	}
 	if cadence.due("remote", now) {
 		t.Fatal("the failing backend is still due immediately; its back-off was not recorded")
+	}
+}
+
+func TestLocalDefaultReconcilesForeignBootRemoteAttempt(t *testing.T) {
+	store := openExecBackendLedgerTestStore(t)
+	key := seedRunningExecBackendAttempt(t, store, "job-before-restart", "sandbox-before-restart", "old-fence", "old-boot")
+	inner := &ledgerTestBackend{report: execbackend.ReapReport{
+		InventoryObserved: true,
+		Inventory: []execbackend.ProviderInstance{
+			{ID: "sandbox-before-restart", JobID: key.JobID, Attempt: key.Attempt, LifecycleGeneration: key.LifecycleGeneration, DaemonFencingToken: "old-fence", BootID: "old-boot", Reapable: true},
+		},
+	}}
+	var output bytes.Buffer
+	remote := newExecBackendLedgerForTest(t, store, inner, &output, "new-fence", "new-boot")
+	home := t.TempDir()
+	if err := config.Initialize(config.PathsForHome(home)); err != nil {
+		t.Fatal(err)
+	}
+	remoteBuilds := 0
+	worker := jobWorker{
+		Store: store, ConfigHome: home, ConfigHomeExplicit: true,
+		ExecutionBackendFactory: func(backend execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
+			if backend == execbackend.Remote {
+				remoteBuilds++
+				return remote, nil
+			}
+			return &ledgerTestBackend{}, nil
+		},
+	}
+	prior := execBackendReconcileState
+	execBackendReconcileState = &execBackendReconcileCadence{nextAt: map[string]time.Time{}, streak: map[string]int{}}
+	t.Cleanup(func() { execBackendReconcileState = prior })
+	now := time.Now()
+	if err := reconcileExecBackendInventory(context.Background(), worker, io.Discard, now); err != nil {
+		t.Fatal(err)
+	}
+	if attempt := execBackendAttemptForTest(t, store, key); attempt.State != db.ExecBackendAttemptStateDestroyed {
+		t.Fatalf("foreign-boot sandbox remains %q under local default", attempt.State)
+	}
+	if !reflect.DeepEqual(inner.observedIDs, []string{"sandbox-before-restart"}) {
+		t.Fatalf("provider-confirmed destroys = %v", inner.observedIDs)
+	}
+	if err := reconcileExecBackendInventory(context.Background(), worker, io.Discard, now.Add(execBackendReconcileBaseInterval)); err != nil {
+		t.Fatal(err)
+	}
+	if remoteBuilds != 1 {
+		t.Fatalf("remote inventory constructed %d times after attempt became terminal, want 1", remoteBuilds)
 	}
 }
