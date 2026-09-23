@@ -206,7 +206,14 @@ func (w jobWorker) remoteReviewRetryAdmission(ctx context.Context, job db.Job) e
 	}
 	marker := "lifecycle_generation=" + strconv.FormatInt(generation, 10)
 	for _, event := range events {
-		if (event.Kind == "retry_queued" || event.Kind == "remote_review_provider_retryable") && strings.Contains(event.Message, marker) {
+		// A review model fallback is a classified provider failure by
+		// construction: the pool only advances on runtime_quota/runtime_auth.
+		// It re-queues the job onto a DIFFERENT model precisely so that model
+		// can run, so it must grant the new lifecycle its cloud attempt. Before
+		// #2245 it did not, and a remote review could never fall through its
+		// pool: the new model was refused before it ever started.
+		if (event.Kind == "retry_queued" || event.Kind == "remote_review_provider_retryable" ||
+			event.Kind == reviewModelFallbackEventKind) && strings.Contains(event.Message, marker) {
 			return nil
 		}
 	}

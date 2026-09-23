@@ -803,6 +803,29 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
+	// #2245: remote review admission must reason about the job's CURRENT
+	// lifecycle generation, and its refusal must close that same generation.
+	// The snapshot this function was handed can predate a re-queue: a review
+	// model fallback moves running -> queued, which bumps lifecycle_generation,
+	// and a worker holding the pre-bump row then refused "cloud attempt consumed
+	// for lifecycle_generation=0" against a row already at 1. The refusal's
+	// generation-anchored CAS matched nothing, afterQueuedJobTransition treated
+	// transitioned=false as success, and the job re-entered the queue forever:
+	// measured on local-review-review-router-18d71359f53e810a-1, 2420
+	// runtime_override and 152 admission-refusal events, no terminal event, until
+	// an operator cancelled it an hour later. Re-reading here makes admission and
+	// its refusal agree on one generation.
+	if execBackend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		current, err := w.Store.GetJob(ctx, job.ID)
+		if err != nil {
+			return err
+		}
+		if current.State != string(workflow.JobQueued) {
+			// Someone else moved it (cancel, another worker). Nothing to admit.
+			return nil
+		}
+		job = current
+	}
 	remoteReviewAdmitted, admissionErr := w.admitRemoteReview(ctx, job, payload, agent, execBackend, checkout, jobRunner)
 	if admissionErr != nil {
 		if errors.Is(admissionErr, errRemoteReviewAdmissionCancelled) {
