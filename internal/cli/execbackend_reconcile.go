@@ -79,15 +79,32 @@ func (c *execBackendReconcileCadence) failed(key string, now time.Time) time.Dur
 }
 
 // reconcileExecBackendInventory runs one periodic bidirectional reconciliation
-// pass when the configured backend exposes a provider inventory.
-//
-// It returns an error only so the caller can log it in the tick's existing
-// idiom; the caller MUST NOT abort on it. A backend with no inventory (the local
-// backend) is a no-op, not a failure: there is nothing off-box to reconcile.
+// pass for the selected provider. A local-first daemon must still reconcile
+// outstanding remote attempts after a restart, without waiting for another
+// remote dispatch to construct the provider backend.
 func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout io.Writer, now time.Time) error {
 	backend, cfg, err := daemonJobExecBackendFor(worker, "", false)
 	if err != nil {
 		return fmt.Errorf("resolve execution backend for reconciliation: %w", err)
+	}
+	if backend == execbackend.Local {
+		if worker.Store == nil || !execBackendReconcileState.due(string(execbackend.Remote), now) {
+			return nil
+		}
+		attempts, err := worker.Store.ListRecoverableExecBackendAttempts(ctx, e2bAttemptProvider)
+		if err != nil {
+			interval := execBackendReconcileState.failed(string(execbackend.Remote), now)
+			return fmt.Errorf("list remote execution attempts for reconciliation (next attempt in %s): %w", interval, err)
+		}
+		if len(attempts) == 0 {
+			execBackendReconcileState.succeeded(string(execbackend.Remote), now)
+			return nil
+		}
+		backend, cfg, err = daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
+		if err != nil {
+			interval := execBackendReconcileState.failed(string(execbackend.Remote), now)
+			return fmt.Errorf("resolve remote execution backend for reconciliation (next attempt in %s): %w", interval, err)
+		}
 	}
 	// THE CADENCE KEY IS THE BACKEND, AND THAT IS DELIBERATE ON TWO AXES.
 	//
@@ -121,8 +138,6 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 	}
 	reaper, ok := built.(execbackend.InventoryReaper)
 	if !ok {
-		// No provider inventory to read. Record success so a local-only daemon
-		// does not re-resolve the backend on every single tick.
 		execBackendReconcileState.succeeded(key, now)
 		return nil
 	}

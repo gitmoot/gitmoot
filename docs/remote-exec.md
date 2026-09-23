@@ -185,6 +185,11 @@ remote reaper positively observes provider inventory and matches the complete
 sandbox identity (job, attempt, generation, fencing token, boot ID, and sandbox
 ID) against the durable local ledger before deleting an old-boot or dead-owner
 sandbox. A foreign account sandbox with no matching ledger row is never deleted.
+The periodic daemon pass checks active remote ledger rows even when `local` is
+the configured default; a restart does not require a new remote dispatch to
+reclaim an old-boot sandbox. With no active remote rows, the local-first pass
+does not query E2B inventory. A provider-only allocation without a matching
+ledger row is not deleted by Gitmoot; it remains subject to the provider TTL.
 An incomplete E2B inventory cannot prove a missing sandbox was destroyed; only
 provider-confirmed deletion releases its cost reservation. A partially-created
 non-empty directory that Git never registered remains the known
