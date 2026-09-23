@@ -224,10 +224,15 @@ func classifyAuthQuota(msg string) string {
 	switch {
 	case strings.Contains(l, "usage limit"), strings.Contains(l, "rate limit"),
 		strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
+		// Same provider phrases the behavioural classifier uses (#2254), so the
+		// stuck-reason label and the routing decision cannot disagree about one
+		// message.
+		billingExhaustionRe.MatchString(l),
 		httpCtx && strings.Contains(l, "429"):
 		return "throttled"
 	case strings.Contains(l, "authentication"), strings.Contains(l, "unauthorized"),
 		httpCtx && strings.Contains(l, "401"),
+		entitlementRevokedRe.MatchString(l),
 		authWordRe.MatchString(l) && strings.Contains(l, "invalid"):
 		return "auth failing"
 	}

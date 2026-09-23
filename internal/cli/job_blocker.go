@@ -385,31 +385,50 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 var (
 	code429Re = regexp.MustCompile(`\b429\b`)
 	code401Re = regexp.MustCompile(`\b401\b`)
-	// 403 is NOT a quota code on its own — it is the ordinary "you may not do
-	// that" status, and a permission refusal misclassified as quota would be
-	// retried forever against a wall. It only counts when a billing word sits on
-	// the SAME line, which is how xAI reports an exhausted subscription.
-	code403Re = regexp.MustCompile(`\b403\b`)
 )
 
-// billingExhaustionRe matches a provider saying the account cannot pay for the
-// call: out of credits, needs a subscription, needs an upgrade, payment required.
+// billingExhaustionRe matches a provider saying the account cannot PAY for the
+// call. Every alternative is a provider PHRASE, never a bare topic word.
 //
 // Measured from a live outage on 2026-09-21: xAI answered
 //
 //	403 You have run out of credits or need a Grok subscription.
 //	Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok.
 //
-// which matched none of the existing signatures — no "usage limit", no "rate
-// limit", no "quota", no 429 — so two review jobs died as ordinary failures
-// instead of falling through to the next model in the pool. The account was out
-// of money, which is the same operational fact as a quota: this provider cannot
-// serve the job now, another one can.
+// which matched no existing signature, so two review jobs died with a healthy
+// model pool behind them. An empty account is the same operational fact as a
+// quota — this provider cannot serve the job now, another one can — so it is
+// classified throttled.
+//
+// WHY NO BARE WORDS. The first cut matched `billing` and `upgrade (at|to)` on
+// their own, and independent review (opus-5-5, PR #2254) executed it: "the
+// billing module is untested" and "upgrade to the new API before merging" both
+// classified as an account outage. This classifier sees agent-authored text, and
+// reviews talk about billing and upgrades as SUBJECT MATTER. So each alternative
+// here is wording a provider uses to refuse a call, measured, and `upgrade` only
+// counts when it is followed by the provider's own URL.
 var billingExhaustionRe = regexp.MustCompile(
-	`\b(?:out of credits|insufficient credits|no credits|add credits|` +
-		`need a [\w -]*subscription|requires? a [\w -]*subscription|` +
-		`disabled [\w ]*subscription access|use an anthropic api key instead|` +
-		`upgrade (?:your plan|at|to)|payment required|billing)\b`)
+	`\b(?:run out of credits|out of credits|insufficient credits|insufficient balance|` +
+		`credit balance is too low|add credits at|payment required|` +
+		`need a [\w -]*subscription|requires? a [\w -]*subscription to|` +
+		`upgrade at https?://)`)
+
+// entitlementRevokedRe matches a provider saying the account is no longer
+// ALLOWED to use this product, as distinct from being unable to pay for it.
+//
+// Measured, 2026-09-22, every claude-runtime review in the fleet:
+//
+//	Your organization has disabled Claude subscription access for Claude Code ·
+//	Use an Anthropic API key instead, or ask your admin to enable access (403)
+//
+// Review of #2254 caught the first cut classifying this as throttled, which gave
+// it the quota treatment: no reset hint, so a 15-minute fallback hold, and an
+// operator told to wait for a reset that does not exist. It is an entitlement,
+// not a balance — only an admin action clears it — so it is classified as an
+// AUTH failure. The pool advances on runtime_auth exactly as it does on
+// runtime_quota, so routing is unchanged; only the promise about time is.
+var entitlementRevokedRe = regexp.MustCompile(
+	`\b(?:disabled [\w ]*subscription access|use an [\w ]*api key instead|ask your admin to enable access)`)
 
 // classifyAuthQuotaStrict is the #552 classifyAuthQuota matcher with the extra
 // precision the BEHAVIORAL #532 call site needs. Adapter failures concatenate a
@@ -436,11 +455,11 @@ func classifyAuthQuotaStrict(text string) string {
 			claudeHitYourQuotaLimit(l),
 			strings.Contains(l, "quota"), strings.Contains(l, "limit resets"),
 			billingExhaustionRe.MatchString(l),
-			httpCtx && code429Re.MatchString(l),
-			code403Re.MatchString(l) && billingExhaustionRe.MatchString(l):
+			httpCtx && code429Re.MatchString(l):
 			return "throttled"
 		case strings.Contains(l, "authentication"), strings.Contains(l, "unauthorized"),
 			httpCtx && code401Re.MatchString(l),
+			entitlementRevokedRe.MatchString(l),
 			authWordRe.MatchString(l) && strings.Contains(l, "invalid"):
 			return "auth failing"
 		}
