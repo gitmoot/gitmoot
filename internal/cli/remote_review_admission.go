@@ -135,7 +135,6 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		Message: "remote review admitted before execution-backend reservation",
 	}, os.Getpid(), db.BootID())
 	if err != nil {
-		_ = w.Store.ReleaseReviewRequest(context.WithoutCancel(ctx), subjectKey, job.ID)
 		return false, err
 	}
 	// A concurrent winner may already be running under this same job ID.

@@ -4,6 +4,7 @@ package cli
 
 import (
 	"encoding/json"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"testing"
 	"time"
 
@@ -131,5 +132,61 @@ func TestRemoteReviewStaleWorkerLeavesFallbackForFreshPoll(t *testing.T) {
 	}
 	if current.State != string(workflow.JobQueued) {
 		t.Fatalf("stale worker state = %s, want queued for a fresh poll", current.State)
+	}
+}
+
+func TestRemoteReviewAdmissionRejectsUnexaminedGeneration(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	requeueToNextGeneration(t, f, true)
+	payload, err := daemonJobPayload(f.job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := f.worker.admitRemoteReview(f.ctx, f.job, payload,
+		runtime.Agent{Runtime: runtime.ShellRuntime}, execbackend.Remote, "", nil)
+	if admitted || err == nil {
+		t.Fatalf("stale generation admission = (%v, %v), want refusal", admitted, err)
+	}
+	current, err := f.store.GetJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != string(workflow.JobQueued) || current.LifecycleGeneration != 1 {
+		t.Fatalf("stale admission claimed a new run: state=%s generation=%d", current.State, current.LifecycleGeneration)
+	}
+	key, err := db.ReviewRequestSubjectKey("owner/repo", 2238, f.head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim, err := f.store.GetReviewRequest(f.ctx, key); err != nil || claim.JobID != f.job.ID {
+		t.Fatalf("lost claim removed the subject dedup record: claim=%+v err=%v", claim, err)
+	}
+}
+
+func TestRemoteReviewLosingWorkerKeepsWinnerSubjectClaim(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	current := requeueToNextGeneration(t, f, true)
+	key, err := db.ReviewRequestSubjectKey("owner/repo", 2238, f.head, db.DefaultReviewPurpose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.store.ClaimReviewRequest(f.ctx, key, f.job.ID, db.DefaultReviewPurpose, "owner", reviewRequestOwner()); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := f.store.ClaimRunningJobAtGeneration(f.ctx, f.job.ID, string(workflow.JobQueued), current.LifecycleGeneration, string(workflow.JobRunning),
+		db.JobEvent{JobID: f.job.ID, Kind: string(workflow.JobRunning)}, 1234, db.BootID()); err != nil || !claimed {
+		t.Fatalf("winner claim = %v, %v", claimed, err)
+	}
+	payload, err := daemonJobPayload(f.job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, err := f.worker.admitRemoteReview(f.ctx, f.job, payload,
+		runtime.Agent{Runtime: runtime.ShellRuntime}, execbackend.Remote, "", nil)
+	if admitted || err == nil {
+		t.Fatalf("loser admission = (%v, %v), want refusal", admitted, err)
+	}
+	if claim, err := f.store.GetReviewRequest(f.ctx, key); err != nil || claim.JobID != f.job.ID {
+		t.Fatalf("winner lost its subject claim: claim=%+v err=%v", claim, err)
 	}
 }
