@@ -263,6 +263,12 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		// string on a PR with no ledger history, so the default brief is
 		// byte-identical.
 		instructions += e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID)
+		// #2224: the same brief the CLI dispatch path appends. Round 1 review of
+		// #2230 found it wired into one call site while its sibling above had
+		// three, so a review reaching the daemon through THIS fan-out was never
+		// asked for a findings log - and its partials stayed unrecoverable. That
+		// is the identical omission #1969 fixed for the obligation brief.
+		instructions += ReviewFindingsLogBrief()
 		request := JobRequest{
 			PolicyExempt: "exempt",
 			// #1250: fanout children were enqueued with NO attribution — measured at
@@ -481,7 +487,7 @@ func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEve
 	// must disclose the ledger too or its rounds cannot discharge what the gate
 	// will demand.
 	delegations := highRiskLensDelegations(reviewers, event, reviewScopes,
-		e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID))
+		e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID)+ReviewFindingsLogBrief())
 	if len(delegations) < 2 {
 		// Defensive: no reviewers to fan out to. Fall back to recording the baseline
 		// rather than silently dropping the PR (should not happen — callers guarantee
