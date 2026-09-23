@@ -57,6 +57,10 @@ type ProviderInstance struct {
 	LifecycleGeneration int64
 	DaemonFencingToken  string
 	BootID              string
+	// Reapable means the provider could establish that the original owner is
+	// gone. It is not permission to delete: the local durable ledger must also
+	// match this complete identity before provider deletion.
+	Reapable bool
 }
 
 // ReapReport keeps the inventory that a reaper inspected beside the subset it
@@ -75,6 +79,12 @@ type ReapReport struct {
 // be reconciled against the durable execution-attempt ledger.
 type InventoryReaper interface {
 	ReapInventory(context.Context) (ReapReport, error)
+}
+
+// ObservedInstanceDestroyer deletes a positively observed, ledger-owned
+// instance. A nil error means the provider confirmed destruction.
+type ObservedInstanceDestroyer interface {
+	DestroyObserved(context.Context, ProviderInstance) error
 }
 
 type JobScope struct {

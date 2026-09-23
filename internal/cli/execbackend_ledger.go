@@ -239,27 +239,30 @@ func (b *ledgeredExecutionBackend) ReapInventory(ctx context.Context) (execbacke
 		}
 		return report, reapErr
 	}
-	reconcileErr := b.reconcileInventory(context.WithoutCancel(ctx), report)
+	reconcileErr := b.reconcileInventory(ctx, &report)
 	return report, errors.Join(reapErr, reconcileErr)
 }
 
-func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, report execbackend.ReapReport) error {
-	attempts, err := b.store.ListRecoverableExecBackendAttempts(ctx, b.provider)
+func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, report *execbackend.ReapReport) error {
+	// A cancelled worker must not discard a provider-confirmed destroy, but
+	// provider calls still obey the reaper's timeout.
+	persistCtx := context.WithoutCancel(ctx)
+	attempts, err := b.store.ListRecoverableExecBackendAttempts(persistCtx, b.provider)
 	if err != nil {
 		return fmt.Errorf("list execution backend attempts for recovery: %w", err)
 	}
 	byKey := make(map[db.ExecBackendAttemptKey]*db.ExecBackendAttempt, len(attempts))
-	bySandbox := make(map[string]*db.ExecBackendAttempt, len(attempts))
 	for i := range attempts {
 		attempt := &attempts[i]
 		byKey[attempt.ExecBackendAttemptKey] = attempt
-		if attempt.SandboxID != nil {
-			bySandbox[*attempt.SandboxID] = attempt
-		}
 	}
 
 	observed := make(map[string]struct{}, len(report.Inventory))
 	matched := make(map[db.ExecBackendAttemptKey]struct{}, len(report.Inventory))
+	destroyed := make(map[string]struct{}, len(report.Destroyed))
+	for _, id := range report.Destroyed {
+		destroyed[strings.TrimSpace(id)] = struct{}{}
+	}
 	var reconcileErrs []error
 	for _, instance := range report.Inventory {
 		id := strings.TrimSpace(instance.ID)
@@ -267,36 +270,49 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 			continue
 		}
 		observed[id] = struct{}{}
-		if attempt := bySandbox[id]; attempt != nil {
-			matched[attempt.ExecBackendAttemptKey] = struct{}{}
-			continue
-		}
 		key := db.ExecBackendAttemptKey{JobID: instance.JobID, Attempt: instance.Attempt, LifecycleGeneration: instance.LifecycleGeneration}
 		attempt := byKey[key]
-		if attempt != nil && attempt.SandboxID == nil && attempt.DaemonFencingToken == instance.DaemonFencingToken && attempt.BootID == instance.BootID {
+		// Provider inventory is account-wide. Even a matching sandbox ID is
+		// insufficient authority without the exact durable allocation identity.
+		if attempt == nil || attempt.DaemonFencingToken != instance.DaemonFencingToken ||
+			attempt.BootID != instance.BootID || (attempt.SandboxID != nil && *attempt.SandboxID != id) {
+			writeLine(b.stdout, "execution backend recovery: provider sandbox %s has no matching ledger row", id)
+			continue
+		}
+		if attempt.SandboxID == nil {
 			if attempt.State == db.ExecBackendAttemptStateReserved {
-				if changed, markErr := b.store.MarkExecBackendAttemptProvisioning(ctx, key); markErr != nil || !changed {
+				if changed, markErr := b.store.MarkExecBackendAttemptProvisioning(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("recover execution backend attempt %+v to provisioning", key), markErr))
 					continue
 				}
 			}
-			if changed, markErr := b.store.MarkExecBackendAttemptRunning(ctx, key, id); markErr != nil || !changed {
+			if changed, markErr := b.store.MarkExecBackendAttemptRunning(persistCtx, key, id); markErr != nil || !changed {
 				reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("recover execution backend attempt %+v sandbox %q", key, id), markErr))
 				continue
 			}
 			attempt.SandboxID = &id
 			attempt.State = db.ExecBackendAttemptStateRunning
-			bySandbox[id] = attempt
-			matched[key] = struct{}{}
+		}
+		matched[key] = struct{}{}
+		if !instance.Reapable {
 			continue
 		}
-		writeLine(b.stdout, "execution backend recovery: provider sandbox %s has no matching ledger row", id)
+		if _, alreadyDestroyed := destroyed[id]; alreadyDestroyed {
+			continue
+		}
+		destroyer, ok := b.inner.(execbackend.ObservedInstanceDestroyer)
+		if !ok {
+			reconcileErrs = append(reconcileErrs, fmt.Errorf("execution backend %q cannot destroy observed sandbox %s", b.inner.Name(), id))
+			continue
+		}
+		if err := destroyer.DestroyObserved(ctx, instance); err != nil {
+			reconcileErrs = append(reconcileErrs, err)
+			continue
+		}
+		report.Destroyed = append(report.Destroyed, id)
+		destroyed[id] = struct{}{}
 	}
 
-	destroyed := make(map[string]struct{}, len(report.Destroyed))
-	for _, id := range report.Destroyed {
-		destroyed[strings.TrimSpace(id)] = struct{}{}
-	}
 	for i := range attempts {
 		attempt := &attempts[i]
 		key := attempt.ExecBackendAttemptKey
@@ -306,26 +322,27 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 			}
 			writeLine(b.stdout, "execution backend recovery: ledger attempt %s/%d/%d was not observed in provider inventory", key.JobID, key.LifecycleGeneration, key.Attempt)
 			if report.InventoryComplete {
-				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(ctx, key); markErr != nil || !changed {
+				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark execution backend attempt %+v orphaned", key), markErr))
 				}
 			}
 			continue
 		}
 		id := *attempt.SandboxID
-		if _, ok := destroyed[id]; ok {
-			// THE PROVIDER CONFIRMED THIS ONE IS GONE, so it is destroyed, not
-			// orphaned (#2147). This releases the reservation without inventing
-			// a dollar cost: the provider reported destruction, not billing.
-			if changed, markErr := b.store.MarkExecBackendAttemptReconciledDestroyed(context.WithoutCancel(ctx), key, nil); markErr != nil || !changed {
-				reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark reaped execution backend attempt %+v destroyed", key), markErr))
+		if _, ok := matched[key]; ok {
+			if _, gone := destroyed[id]; gone {
+				// Only a provider-confirmed deletion of this exact allocation
+				// releases its reservation; no billed amount was reported.
+				if changed, markErr := b.store.MarkExecBackendAttemptReconciledDestroyed(persistCtx, key, nil); markErr != nil || !changed {
+					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark reaped execution backend attempt %+v destroyed", key), markErr))
+				}
 			}
 			continue
 		}
 		if _, ok := observed[id]; !ok {
 			writeLine(b.stdout, "execution backend recovery: ledger sandbox %s was not observed in provider inventory", id)
 			if report.InventoryComplete {
-				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(ctx, key); markErr != nil || !changed {
+				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark execution backend attempt %+v orphaned", key), markErr))
 				}
 			}

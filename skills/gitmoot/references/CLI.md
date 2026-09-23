@@ -315,8 +315,10 @@ not dispatchable; ask and other job types refuse before provider allocation.
 Engine-driven daemon jobs provision one job-scoped detached worktree, run the
 runtime there with streaming preserved, and then destroy the instance. A review
 returns findings in its result envelope and imports no change set. The instance
-persists across Mailbox repair deliveries; cancellation destroys it, and daemon
-startup reaps instances whose recorded owner process is gone.
+persists across Mailbox repair deliveries; cancellation destroys it. On
+restart, the reaper deletes a prior-boot or dead-owner sandbox only after a
+positive provider observation matches its full local ledger identity. Missing
+E2B inventory entries never prove deletion or release cost reservations.
 
 Remote review admission runs after exact-head checkout binding and before cost
 reservation or provider calls. It re-reads the PR head; deduplicates
@@ -331,6 +333,20 @@ Set `[review] remote_require_ci_green = true` to require at least one successful
 current-head check and no pending or failed checks before remote provisioning.
 The default is `false`. A `[repos."owner/repo".review]` value overrides the
 global policy for that repository.
+
+Automatic background review routing is separately opt-in. Configure
+`[review] remote_routing_enabled = true` globally or in
+`[repos."owner/repo".review]`; absent config remains local. By default,
+`remote_purposes = ["security"]` makes a ready, green security review eligible.
+`remote_final_reviews = true` additionally selects other ready exact heads
+with green current-head CI. A `risk:high` label or matching auth/security,
+credentials, sandbox/execbackend, deployment/release, or lifecycle path also
+qualifies; `risk:routine` can de-escalate a path. Drafts, stale heads, unknown
+or red CI, foreground reviews, and unsupported runtimes stay local. Explicit
+per-job `--exec-backend` overrides policy. Each review stores its chosen route
+and reason in `review_backend_route_selected`; a policy-selected remote job
+rechecks green current-head CI before reserving capacity, even when
+`remote_require_ci_green = false`.
 
 Local worktrees use Git's absolute gitdir pointer successfully because they share
 the host filesystem, so bundle/base-ref hydration is reserved for a future remote

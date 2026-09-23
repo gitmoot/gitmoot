@@ -17,13 +17,15 @@ import (
 )
 
 type ledgerTestBackend struct {
-	provision  func(execbackend.JobScope) (*execbackend.Instance, error)
-	report     execbackend.ReapReport
-	reapErr    error
-	destroyErr error
-	cancelErr  error
-	destroys   int
-	cancels    int
+	provision   func(execbackend.JobScope) (*execbackend.Instance, error)
+	report      execbackend.ReapReport
+	reapErr     error
+	destroyErr  error
+	cancelErr   error
+	destroys    int
+	cancels     int
+	observedErr error
+	observedIDs []string
 }
 
 func TestProvisionExecutionBackendPreservesInstanceOnProvisionError(t *testing.T) {
@@ -91,6 +93,11 @@ func (b *ledgerTestBackend) Reap(context.Context) ([]string, error) {
 
 func (b *ledgerTestBackend) ReapInventory(context.Context) (execbackend.ReapReport, error) {
 	return b.report, b.reapErr
+}
+
+func (b *ledgerTestBackend) DestroyObserved(_ context.Context, instance execbackend.ProviderInstance) error {
+	b.observedIDs = append(b.observedIDs, instance.ID)
+	return b.observedErr
 }
 
 func TestExecBackendLedgerReservesBeforeProviderProvision(t *testing.T) {
@@ -293,6 +300,75 @@ func TestExecBackendLedgerRefusesIncompleteInventory(t *testing.T) {
 				t.Fatalf("incomplete inventory produced mismatch conclusions: %q", output.String())
 			}
 		})
+	}
+}
+
+func TestExecBackendLedgerReapsOnlyOwnedForeignBoot(t *testing.T) {
+	store := openExecBackendLedgerTestStore(t)
+	owned := seedRunningExecBackendAttempt(t, store, "job-owned", "sandbox-owned", "old-fence", "old-boot")
+	mismatch := seedRunningExecBackendAttempt(t, store, "job-mismatch", "sandbox-mismatch", "our-fence", "old-boot")
+	live := seedRunningExecBackendAttempt(t, store, "job-live", "sandbox-live", "current-fence", "current-boot")
+	missingID := db.ExecBackendAttemptKey{JobID: "job-create-crash", Attempt: 1, LifecycleGeneration: 3}
+	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
+		ExecBackendAttemptKey: missingID, Provider: e2bAttemptProvider,
+		DaemonFencingToken: "old-fence", BootID: "old-boot", TTLExpiresAt: time.Now().Add(time.Minute),
+	}, testCLIExecBackendUncappedPolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.MarkExecBackendAttemptProvisioning(context.Background(), missingID); err != nil || !changed {
+		t.Fatalf("mark provisioning: changed=%v err=%v", changed, err)
+	}
+	inner := &ledgerTestBackend{report: execbackend.ReapReport{
+		InventoryObserved: true,
+		Inventory: []execbackend.ProviderInstance{
+			{ID: "sandbox-owned", JobID: owned.JobID, Attempt: 1, LifecycleGeneration: 3, DaemonFencingToken: "old-fence", BootID: "old-boot", Reapable: true},
+			{ID: "sandbox-other-host", JobID: "job-other-host", Attempt: 1, LifecycleGeneration: 3, DaemonFencingToken: "foreign-fence", BootID: "foreign-boot", Reapable: true},
+			{ID: "sandbox-mismatch", JobID: mismatch.JobID, Attempt: 1, LifecycleGeneration: 3, DaemonFencingToken: "foreign-fence", BootID: "old-boot", Reapable: true},
+			{ID: "sandbox-live", JobID: live.JobID, Attempt: 1, LifecycleGeneration: 3, DaemonFencingToken: "current-fence", BootID: "current-boot"},
+			{ID: "sandbox-create-crash", JobID: missingID.JobID, Attempt: 1, LifecycleGeneration: 3, DaemonFencingToken: "old-fence", BootID: "old-boot", Reapable: true},
+		},
+	}}
+	var output bytes.Buffer
+	backend := newExecBackendLedgerForTest(t, store, inner, &output, "new-fence", "current-boot")
+	report, err := backend.ReapInventory(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"sandbox-owned", "sandbox-create-crash"}
+	if !reflect.DeepEqual(inner.observedIDs, want) || !reflect.DeepEqual(report.Destroyed, want) {
+		t.Fatalf("provider deletes = %v, confirmed = %v, want %v", inner.observedIDs, report.Destroyed, want)
+	}
+	for _, key := range []db.ExecBackendAttemptKey{owned, missingID} {
+		attempt := execBackendAttemptForTest(t, store, key)
+		if attempt.State != db.ExecBackendAttemptStateDestroyed || attempt.SandboxID == nil || attempt.CostActualUSD != nil {
+			t.Fatalf("reclaimed attempt %+v = %+v", key, attempt)
+		}
+	}
+	for _, key := range []db.ExecBackendAttemptKey{mismatch, live} {
+		if attempt := execBackendAttemptForTest(t, store, key); attempt.State != db.ExecBackendAttemptStateRunning {
+			t.Fatalf("unowned or live attempt %+v moved to %q", key, attempt.State)
+		}
+	}
+}
+
+func TestExecBackendLedgerKeepsReservationOnInconclusiveDelete(t *testing.T) {
+	store := openExecBackendLedgerTestStore(t)
+	key := seedRunningExecBackendAttempt(t, store, "job-uncertain", "sandbox-uncertain", "old-fence", "old-boot")
+	inner := &ledgerTestBackend{
+		report: execbackend.ReapReport{InventoryObserved: true, Inventory: []execbackend.ProviderInstance{{
+			ID: "sandbox-uncertain", JobID: key.JobID, Attempt: 1, LifecycleGeneration: 3,
+			DaemonFencingToken: "old-fence", BootID: "old-boot", Reapable: true,
+		}}},
+		observedErr: errors.New("provider delete inconclusive"),
+	}
+	var output bytes.Buffer
+	backend := newExecBackendLedgerForTest(t, store, inner, &output, "new-fence", "current-boot")
+	report, err := backend.ReapInventory(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "provider delete inconclusive") {
+		t.Fatalf("reap error = %v, want inconclusive provider error", err)
+	}
+	if len(report.Destroyed) != 0 || execBackendAttemptForTest(t, store, key).State != db.ExecBackendAttemptStateRunning {
+		t.Fatalf("inconclusive delete released reservation: report=%+v", report)
 	}
 }
 
