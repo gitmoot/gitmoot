@@ -30,6 +30,7 @@ scope=["*"]
 parent="owner"
 scope=["*"]
 [org.roles."jarvis"]
+pane="w1:p1"
 parent="owner"
 scope=["*"]
 [org.roles."deimos"]
@@ -39,6 +40,7 @@ scope=["*"]
 parent="gitmoot"
 scope=["gitmoot/nag"]
 [org.roles."gm-omp-impl"]
+pane="w2:p2"
 parent="gitmoot"
 scope=["gitmoot/implementation"]
 [org.roles."gm-omp-verdict"]
@@ -139,9 +141,51 @@ func TestOrgMessageSendAllowsDifferentlyScopedSameParentSiblings(t *testing.T) {
 	if prompt := eventRuleWakePrompt("reply", wakeEvent); !strings.Contains(prompt, retrievalCommand) {
 		t.Fatalf("recipient prompt=%q, want retrieval command %q", prompt, retrievalCommand)
 	}
+	wake := &fakeEventWake{}
+	sink := synchronousEventRuleTestSink{sink: &eventRuleSink{store: store, home: home, wake: wake}}
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err != nil {
+		t.Fatalf("direct message drain: %v", err)
+	}
+	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || wake.promptCalls != 1 ||
+		wake.pane != "w2:p2" || !strings.Contains(wake.prompt, retrievalCommand) {
+		t.Fatalf("without a rule: delivered=%+v prompts=%q pane=%q err=%v", delivered, wake.prompts, wake.pane, err)
+	}
 	unacknowledged, err := store.ListUnacknowledgedOrgDirectives(context.Background(), "gm-omp-impl")
 	if err != nil || len(unacknowledged) != 0 {
 		t.Fatalf("message created directive obligations=%+v err=%v", unacknowledged, err)
+	}
+}
+
+func TestOrgMessageWithoutRecipientPaneRecordsUndeliveredAttempt(t *testing.T) {
+	home := orgMessageTestHome(t)
+	orgMessageSeedWorkflow(t, home, "gitmoot/1692-missing-pane")
+	t.Setenv("GITMOOT_ORG_ROLE", "gm-omp-nag")
+	var stdout, stderr bytes.Buffer
+	if code := runOrg([]string{
+		"message", "send", "--home", home, "--to", "gm-omp-verdict",
+		"--workflow", "gitmoot/1692-missing-pane", "A direct heads-up",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("message send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+	}
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	wake := &fakeEventWake{}
+	sink := synchronousEventRuleTestSink{sink: &eventRuleSink{store: store, home: home, wake: wake}}
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err != nil {
+		t.Fatalf("missing-pane drain: %v", err)
+	}
+	stalled, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateStalled)
+	if err != nil || len(stalled) != 1 || wake.promptCalls != 0 ||
+		!strings.Contains(stalled[0].LastError, "role pane binding unresolved") {
+		t.Fatalf("missing-pane outcome=%+v prompts=%d err=%v", stalled, wake.promptCalls, err)
+	}
+	audit, err := store.ListJobEvents(context.Background(), fmt.Sprintf("wake-outbox:%d", stalled[0].ID))
+	if err != nil || len(audit) != 1 || audit[0].Kind != db.WakeOutboxDeliveryFailedEventKind {
+		t.Fatalf("missing-pane failure audit=%+v err=%v", audit, err)
 	}
 }
 

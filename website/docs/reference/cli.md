@@ -1822,8 +1822,8 @@ is invalid. Peer questions are refused by a safe command-level default because
 Gitmoot has no configurable peer-question policy. This formalizes the earlier
 ad-hoc practice of typing organization questions into notes or panes; there is
 no code-level marker to migrate. The note and a `pending` wake outbox row commit
-atomically. With an opt-in `reply` rule, a daemon tick wakes the addressed role
-through its configured Herdr pane.
+atomically. The daemon wakes the addressed role through its configured Herdr pane
+without requiring a `reply` rule.
 
 `gitmoot org message send --to <role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
@@ -1832,9 +1832,10 @@ message each other if and only if their non-empty `parent` values are equal.
 Repository scope does not grant this channel, and `owner` has no special case.
 The typed note
 `[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
-`reply:<role>` wake row commit atomically. The wake includes the exact
+`reply:<role>` wake row commit atomically. The daemon delivers to the named role
+without a subscription rule. The wake includes the exact
 `gitmoot workflow show-note <id>` retrieval command; that command renders the
-citable row's workflow, author, optional repository, timestamp, and body, or
+citable row's workflow, author, optional repository, timestamp, and body. `--json`
 returns the row as JSON. **Plain output prints the whole body**: a single-note
 view is the one place a body must not be cut, and the 512-rune line cap applies
 to timeline and list lines instead. Control characters and ANSI escapes are
@@ -1847,8 +1848,8 @@ directive, acknowledgment, completion, TTL, or nag obligation.
 workflow journal. `--by` defaults to the escalation's target role, and `--note`
 optionally links the workflow note containing the answer. The resolution marker
 is addressed to the escalation's parsed asker and atomically records a pending
-reply wake-outbox row, so an opt-in `reply` rule wakes the asker. A legacy typed
-escalation with no identifiable asker still resolves, prints a warning, and
+reply wake-outbox row; the daemon wakes the asker without a `reply` rule. A legacy
+typed escalation with no identifiable asker still resolves, prints a warning, and
 records no invented target. Resolved escalations are omitted from org dashboard
 projections while the original journal entry remains intact.
 
@@ -1856,9 +1857,9 @@ projections while the original journal entry remains intact.
 <file> | <text>) [--home <dir>]` writes a typed downward assignment from
 `GITMOOT_ORG_ROLE`. The sender must be an ancestor of the target; peer, upward,
 and same-role sends are refused. Its note and pending `directive:<role>` wake
-obligation commit atomically and never share reply coalescing. With no matching
-directive rule, the durable row stays pending without making the drain
-unhealthy.
+obligation commit atomically and never share reply coalescing. The daemon wakes
+the target without a directive rule. A missing pane or failed delivery remains
+visible in the durable outbox; delivery is not proof of reading.
 
 `gitmoot org directive ack <id> [--by <role>] [--home <dir>]` is restricted to
 the addressed target or one of its configured ancestors and records receipt,

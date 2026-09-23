@@ -661,10 +661,9 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	return event, nil
 }
 
-// Deliberately scope-blind pending a later durable-outbox slice: among enabled,
-// filter-matching rules for the event's own kind, WakeRole == WakeTargetRole
-// authorizes the claim. An observer-scoped rule can therefore claim for its own
-// addressed role, but not for a different target.
+// A workflow note already names its recipient; optional event subscriptions
+// must not turn direct messages, escalation replies, or directives into inert
+// obligations. Other wake kinds still require a configured rule.
 func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule {
 	for _, rule := range rules {
 		if rule.Enabled &&
@@ -673,6 +672,15 @@ func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule 
 			eventRuleMatches(rule.MatchFilter, event) {
 			return []db.EventRule{rule}
 		}
+	}
+	if event.WakeTargetRole != "" &&
+		(event.WakeKind == db.WakeOutboxKindReply || event.WakeKind == db.WakeOutboxKindDirective) &&
+		strings.HasPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":") {
+		return []db.EventRule{{
+			ID: "addressed-workflow-note", OnKind: event.WakeKind,
+			WakeRole: event.WakeTargetRole, Scope: db.EventRuleScopeAddressed,
+			Enabled: true,
+		}}
 	}
 	return nil
 }

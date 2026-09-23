@@ -346,8 +346,17 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				slog.Warn("org event unresolved wake counter failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
 			}
 			slog.Warn("org event wake skipped", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "reason", "role pane binding unresolved")
-			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateStalled, "role pane binding unresolved"); err != nil {
+			if err := s.retryOrFailWakeOutbox(
+				ctx, event, rule.WakeRole, db.WakeOutboxStateStalled, "role pane binding unresolved", 1,
+			); err != nil {
 				return err
+			}
+			// A missing pane is a completed (undelivered) attempt, not an
+			// unmatched route. Do not try to finish the same outbox row again
+			// through the addressed-wake fallback below.
+			if isAddressedNoteWake {
+				replyHandled = true
+				addressedWakeHandled[wakeRole] = true
 			}
 			continue
 		}
