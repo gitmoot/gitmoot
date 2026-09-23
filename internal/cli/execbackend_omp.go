@@ -151,8 +151,8 @@ http.server.ThreadingHTTPServer((args.host, args.port), Proxy).serve_forever()
 
 // Both fallback providers use OMP's native gateway transport. The model
 // credential is resolved on the host; the sandbox only knows this loopback
-// forwarder and an inert placeholder. Devin is not in a fresh OMP catalog, so
-// it needs an explicit model entry; Codex is built in but needs a route.
+// forwarder and an inert placeholder. Devin's swe-2 is not in a fresh OMP
+// catalog, so it needs an explicit entry; Codex is built in but needs a route.
 const remoteOmpModels = `providers:
   openai-codex:
     baseUrl: %s

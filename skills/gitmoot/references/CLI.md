@@ -266,6 +266,12 @@ and capability. Remote OMP uses an instance-local forwarder and a job-scoped
 model catalog for `openai-codex/gpt-6-sol` and `devin/swe-2`; provider credentials
 remain host-side.
 
+Those two remote OMP models require `[credentials].model_gateway_key` to
+point to a proxied host key for the host OMP auth-gateway, with Codex and
+Devin credentials in its broker. The default Anthropic upstream does not
+serve `/v1/pi/stream`. Allowlist the upstream host; a loopback route also
+requires `model_gateway_allow_loopback_upstream = true`.
+
 With `env_curation = false`, runtime subprocesses inherit the full foreground or
 daemon environment exactly as before. With it enabled, the base allowlist is:
 `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TMP`, `TEMP`, `TZ`,

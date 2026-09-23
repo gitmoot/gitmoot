@@ -282,6 +282,14 @@ gateway transport. The sandbox receives only an mTLS identity, capability,
 loopback route, and inert placeholder. Provider credentials must exist in the
 host OMP broker; Gitmoot never supplies a raw provider key as a fallback.
 
+For these two models, `[credentials].model_gateway_key` must name a proxied
+host key whose upstream is the host OMP auth-gateway, backed by broker
+credentials for Codex and Devin. Allow that upstream host in
+`model_gateway_allow_hosts`; a loopback upstream also requires
+`model_gateway_allow_loopback_upstream = true`. The default
+`api.anthropic.com` upstream cannot serve OMP's `/v1/pi/stream` route.
+The uploaded host OMP binary must support `pi-native` (verified with 18.2.11).
+
 A job payload's `exec_backend` field overrides the config value for that one
 job. When either selector is explicitly present its value must be non-blank;
 an absent selector defaults to `local`, while `backend = ""` or an explicit
