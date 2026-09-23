@@ -396,6 +396,16 @@ func TestOrgEscalateResolveLifecycle(t *testing.T) {
 		store.Close()
 		t.Fatalf("resolution wake outbox = %+v, want stored pending workflow-note row source=%d addressed to operator", outbox, resolutions[0].ID)
 	}
+	wake := &fakeEventWake{labelToPane: map[string]string{"operator-pane": "w3:p3"}}
+	sink := synchronousEventRuleTestSink{sink: &eventRuleSink{store: store, home: home, wake: wake}}
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err != nil {
+		t.Fatalf("escalation reply drain: %v", err)
+	}
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || wake.promptCalls != 1 ||
+		wake.pane != "w3:p3" || !strings.Contains(wake.prompt, fmt.Sprintf("gitmoot workflow show-note %d", resolutions[0].ID)) {
+		t.Fatalf("escalation reply delivered=%+v prompts=%q pane=%q err=%v", delivered, wake.prompts, wake.pane, err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -620,7 +630,7 @@ func writeOrgEscalateConfig(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	content := "[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"maintainer\"]\nparent=\"owner\"\nscope=[\"*\"]\n[org.roles.\"operator\"]\nparent=\"maintainer\"\nscope=[\"*\"]\n[org.roles.\"auditor\"]\nparent=\"owner\"\nscope=[\"*\"]\n"
+	content := "[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"maintainer\"]\nparent=\"owner\"\nscope=[\"*\"]\n[org.roles.\"operator\"]\nparent=\"maintainer\"\nscope=[\"*\"]\npane=\"operator-pane\"\n[org.roles.\"auditor\"]\nparent=\"owner\"\nscope=[\"*\"]\n"
 	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

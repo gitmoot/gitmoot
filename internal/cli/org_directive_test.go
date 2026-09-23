@@ -295,7 +295,7 @@ func TestOrgDirectiveCancelIsRestrictedToSender(t *testing.T) {
 	}
 }
 
-func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
+func TestDirectiveWakeOutboxDeliversWithoutRule(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
@@ -312,7 +312,7 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 		t.Fatalf("stored directives=%+v err=%v", notes, err)
 	}
 	directive := notes[0]
-	wake := &fakeEventWake{}
+	wake := &fakeEventWake{labelToPane: map[string]string{"worker-pane": "w1:p1"}}
 	deliverySink := synchronousEventRuleTestSink{sink: &eventRuleSink{store: store, home: home, wake: wake}}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 ||
@@ -324,10 +324,8 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 	}
 	createdAt, _ := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
 
-	// MUTANT F3: treating an unmatched directive as an unhealthy obligation
-	// makes this zero-directive-rule drain return a permanent error.
-	if _, err := drainReplyWakeOutboxWithHealth(context.Background(), store, createdAt.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(deliverySink)); err != nil {
-		t.Fatalf("config-inert drain for directive %d: %v", directive.ID, err)
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, deliverySink); err != nil {
+		t.Fatalf("directive %d direct drain: %v", directive.ID, err)
 	}
 	health, err := wakeOutboxObligationHealth(
 		context.Background(),
@@ -337,12 +335,13 @@ func TestDirectiveWakeOutboxIsConfigInert(t *testing.T) {
 		replyWakeCoalescingWindow,
 		replyWakeTestDeliveryResolver(deliverySink),
 	)
-	if err != nil || health.pending != 0 || health.inert != 1 {
-		t.Fatalf("config-inert directive health: %s err=%v", health, err)
+	if err != nil || health.pending != 0 || health.inert != 0 {
+		t.Fatalf("directive delivery health: %s err=%v", health, err)
 	}
-	stillPending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
-	if err != nil || len(stillPending) != 1 || wake.promptCalls != 0 {
-		t.Fatalf("pending=%+v prompts=%d err=%v", stillPending, wake.promptCalls, err)
+	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || wake.promptCalls != 1 ||
+		wake.pane != "w1:p1" || !strings.Contains(wake.prompt, fmt.Sprintf("directive %d", directive.ID)) {
+		t.Fatalf("delivered=%+v prompts=%q pane=%q err=%v", delivered, wake.prompts, wake.pane, err)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -240,23 +241,37 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 	}
 }
 
+func insertOptionalBlockedWake(t *testing.T, store *db.Store, target string) {
+	t.Helper()
+	event := events.NewEvent(
+		events.EventJobBlocked, "job-"+target, "blocked-"+target, "owner/repo",
+		"blocked", "requires attention", time.Now().UTC(), workflow.RedactCommentText,
+	)
+	event.WakeTargetRole = target
+	payload, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertWakeOutbox(
+		context.Background(), db.WakeOutboxSourceBlocked, string(payload),
+		db.WakeOutboxKindBlocked, []string{target},
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWakeOutboxHealthDistinguishesRemovedRouteFromNeverConfigured(t *testing.T) {
 	store := daemonWorkerStore(t)
 	ctx := context.Background()
 	if err := store.AddEventRule(ctx, db.EventRule{
-		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
+		ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	for _, target := range []string{"owner", "worker"} {
-		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: "release/route-history", Author: "worker", Body: target,
-			AddressedTarget: target,
-		}); err != nil {
-			t.Fatal(err)
-		}
+		insertOptionalBlockedWake(t, store, target)
 	}
-	if err := store.DeleteEventRule(ctx, "reply-owner"); err != nil {
+	if err := store.DeleteEventRule(ctx, "blocked-owner"); err != nil {
 		t.Fatal(err)
 	}
 	health, err := wakeOutboxObligationHealth(
@@ -279,23 +294,18 @@ func TestWakeOutboxHealthBoundsDeletedRuleLookupToPendingRoutes(t *testing.T) {
 	store := daemonWorkerStore(t)
 	ctx := context.Background()
 	rules := []db.EventRule{{
-		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
+		ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true,
 	}}
 	for i := 0; i < 100; i++ {
 		rules = append(rules, db.EventRule{
-			ID: fmt.Sprintf("unrelated-%03d", i), OnKind: "reply", WakeRole: "unrelated", Enabled: true,
+			ID: fmt.Sprintf("unrelated-%03d", i), OnKind: "blocked", WakeRole: "unrelated", Enabled: true,
 		})
 	}
 	if err := store.AddEventRules(ctx, rules); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/bounded-route-history", Author: "worker", Body: "owner",
-		AddressedTarget: "owner",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteEventRule(ctx, "reply-owner"); err != nil {
+	insertOptionalBlockedWake(t, store, "owner")
+	if err := store.DeleteEventRule(ctx, "blocked-owner"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.DeleteEventRulesForRole(ctx, "unrelated"); err != nil {
@@ -424,12 +434,7 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/drain-streak", Author: "worker", Body: "persistently unroutable",
-		AddressedTarget: "owner",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	insertOptionalBlockedWake(t, store, "owner")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -966,18 +971,16 @@ func TestUnroutableWakeIsRecordedOncePerRow(t *testing.T) {
 		{"stranded", "w1:p2"},
 	})
 	ctx := context.Background()
-	// The harness gives every role a reply rule, so removing this one leaves a
-	// role that is configured, paned, and unreachable for `reply`.
-	if err := store.DeleteEventRule(ctx, "reply-1"); err != nil {
+	// Optional blocked alerts still require a rule; direct workflow notes do not.
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "blocked-stranded", OnKind: "blocked", WakeRole: "stranded", Enabled: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/unroutable", Author: "worker", Body: "nobody can receive this",
-		AddressedTarget: "stranded",
-	})
-	if err != nil {
+	if err := store.DeleteEventRule(ctx, "blocked-stranded"); err != nil {
 		t.Fatal(err)
 	}
+	insertOptionalBlockedWake(t, store, "stranded")
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
@@ -988,7 +991,7 @@ func TestUnroutableWakeIsRecordedOncePerRow(t *testing.T) {
 	// nanosecond precision, so a rule deleted microseconds BEFORE this row can
 	// still compare as deleted after it and read as a retirement. Production
 	// separates the two by seconds or days; a test has to say which it means.
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), fmt.Sprint(note.ID), time.Now().UTC().Add(time.Minute))
+	setWakeOutboxCreatedAt(t, store.DatabasePath(), pending[0].SourceID, time.Now().UTC().Add(time.Minute))
 
 	// Two drains: the condition is re-observed every tick, and the record must
 	// not grow with the ticks. A per-tick append is what took job_events past a
@@ -1015,8 +1018,8 @@ func TestUnroutableWakeIsRecordedOncePerRow(t *testing.T) {
 	}
 	for _, want := range []string{
 		"role=stranded",
-		"kind=" + db.WakeOutboxKindReply,
-		fmt.Sprintf("source=%s:%d", db.WakeOutboxSourceWorkflowNote, note.ID),
+		"kind=" + db.WakeOutboxKindBlocked,
+		"source=" + db.WakeOutboxSourceBlocked,
 		"condition=" + db.WakeOutboxUnroutableNeverConfigured,
 	} {
 		if !strings.Contains(events[0].Message, want) {
@@ -1042,20 +1045,19 @@ func TestUnroutableWakeDistinguishesARetiredRoleFromAGap(t *testing.T) {
 		{"retired", "w1:p2"},
 	})
 	ctx := context.Background()
-	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/retired", Author: "worker", Body: "addressed before the seat retired",
-		AddressedTarget: "retired",
-	})
-	if err != nil {
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "blocked-retired", OnKind: "blocked", WakeRole: "retired", Enabled: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
+	insertOptionalBlockedWake(t, store, "retired")
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(note.ID) {
+	if err != nil || len(pending) != 1 || pending[0].SourceKind != db.WakeOutboxSourceBlocked {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	// The route existed while the row was created and is removed afterwards,
 	// which is exactly the retirement ordering.
-	if err := store.DeleteEventRule(ctx, "reply-1"); err != nil {
+	if err := store.DeleteEventRule(ctx, "blocked-retired"); err != nil {
 		t.Fatal(err)
 	}
 	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err == nil {
@@ -1158,12 +1160,7 @@ func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/zero-rules", Author: "worker", Body: "must stay pending",
-		AddressedTarget: "owner",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	insertOptionalBlockedWake(t, store, "owner")
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	var stdout bytes.Buffer
@@ -1199,16 +1196,11 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *tes
 	}
 	defer store.Close()
 	if err := store.AddEventRule(context.Background(), db.EventRule{
-		ID: "unrelated-blocked", OnKind: "blocked", WakeRole: "owner", Enabled: true,
+		ID: "unrelated-escalation", OnKind: "escalation", WakeRole: "owner", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/unrelated-rule", Author: "worker", Body: "must remain visible",
-		AddressedTarget: "owner",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	insertOptionalBlockedWake(t, store, "owner")
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
@@ -1369,80 +1361,35 @@ func TestReplyWakeOutboxProvenAgedDeliveryDoesNotReportUnknown(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
-	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+func TestOptionalWakeRuleDeletedMidDrainRefusesLaterBatch(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{
+		{"owner", "w1:p1"}, {"worker", "w1:p2"},
+	})
 	ctx := context.Background()
-	// The later batch has to exist for a reason coalescing cannot remove: the
-	// COUNT BOUND, not a second creation window (#1978). Since every due
-	// pending row for one key now joins one batch, replyWakeMaxCoalescedItems+1
-	// rows are what splits a key into two batches.
-	noteIDs := make([]int64, 0, replyWakeMaxCoalescedItems+1)
-	for index := 0; index <= replyWakeMaxCoalescedItems; index++ {
-		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: "release/rule-generation", Author: "worker",
-			Body: fmt.Sprintf("item %d", index), AddressedTarget: "owner",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		noteIDs = append(noteIDs, note.ID)
+	if err := store.AddEventRules(ctx, []db.EventRule{
+		{ID: "blocked-owner", OnKind: "blocked", WakeRole: "owner", Enabled: true},
+		{ID: "blocked-worker", OnKind: "blocked", WakeRole: "worker", Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
 	}
-	first, last := noteIDs[0], noteIDs[len(noteIDs)-1]
-	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	for index, noteID := range noteIDs {
-		setWakeOutboxCreatedAt(
-			t, store.DatabasePath(), fmt.Sprint(noteID),
-			base.Add(time.Duration(index)*time.Millisecond),
-		)
-	}
-	wake.onPrompt = func() error {
-		return store.DeleteEventRule(ctx, "reply-0")
-	}
+	insertOptionalBlockedWake(t, store, "owner")
+	insertOptionalBlockedWake(t, store, "worker")
+	wake.onPrompt = func() error { return store.DeleteEventRule(ctx, "blocked-worker") }
 
-	worker := defaultJobWorker(store, io.Discard, home)
-	installReplyWakeProductionSink(t, worker, sink.sink)
-	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		ctx, store, worker, 0, "", &stdout,
-		base.Add(2*replyWakeCoalescingWindow+time.Second), nil, nil,
-	)
-	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on later batch refusal: %v", tickErr)
+	err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
+	if err == nil || !strings.Contains(err.Error(), "route_removed=1") {
+		t.Fatalf("later optional wake after rule removal: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
-		t.Fatalf("fleet tick log = %q, want later batch refusal", stdout.String())
-	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("wake calls = %d, want only the authorized first batch; prompts=%v", wake.promptCalls, wake.prompts)
+	if wake.promptCalls != 1 || wake.pane != "w1:p1" {
+		t.Fatalf("wake calls=%d pane=%q prompts=%v", wake.promptCalls, wake.pane, wake.prompts)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(first) {
-		t.Fatalf("delivered = %+v, err=%v", delivered, err)
-	}
-	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
-	if err != nil || len(superseded) != replyWakeMaxCoalescedItems-1 {
-		t.Fatalf("superseded = %+v, err=%v", superseded, err)
+	if err != nil || len(delivered) != 1 || delivered[0].TargetRole != "owner" {
+		t.Fatalf("delivered=%+v err=%v", delivered, err)
 	}
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 1 || pending[0].SourceID != fmt.Sprint(last) || pending[0].AttemptCount != 0 {
-		t.Fatalf("pending later batch = %+v, err=%v", pending, err)
-	}
-
-	stdout.Reset()
-	tickErr = runEnabledRepoWorkerTicksTracked(
-		ctx, store, worker, 0, "", &stdout,
-		base.Add(2*replyWakeCoalescingWindow+2*time.Second), nil, nil,
-	)
-	if tickErr != nil {
-		t.Fatalf("second fleet tick aborted on durable route removal: %v", tickErr)
-	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 held=0 inert=0 route_removed=1 aged_attempted=0") {
-		t.Fatalf("second fleet tick log = %q, want durable later-batch refusal", stdout.String())
-	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("second tick re-emitted refused batch: calls=%d prompts=%v", wake.promptCalls, wake.prompts)
+	if err != nil || len(pending) != 1 || pending[0].TargetRole != "worker" {
+		t.Fatalf("pending=%+v err=%v", pending, err)
 	}
 }
 
@@ -1824,12 +1771,7 @@ func TestReplyWakeOutboxDrainProjectsOnceWhenNothingIsClaimed(t *testing.T) {
 func TestReplyWakeOutboxReusedProjectionGradesIdentically(t *testing.T) {
 	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
-	if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/reuse-grade", Author: "worker", Body: "unroutable",
-		AddressedTarget: "nobody",
-	}); err != nil {
-		t.Fatal(err)
-	}
+	insertOptionalBlockedWake(t, store, "nobody")
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
 	if err != nil || len(pending) == 0 {
 		t.Fatalf("pending rows = %+v, err=%v", pending, err)
