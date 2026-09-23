@@ -144,7 +144,9 @@ credential_gateway_url = %q
 	if ompInstance != ompInner.instance || ompLease == nil || ompInner.installs != 1 {
 		t.Fatalf("remote omp instance=%+v lease=%v credential-installs=%d", ompInstance, ompLease, ompInner.installs)
 	}
-	if ompInner.runtimeFiles[execbackend.RuntimeOmpExecutablePath] != 0o700 || ompInner.runtimeFiles[remoteOmpForwarderPath] != 0o700 {
+	if ompInner.runtimeFiles[execbackend.RuntimeOmpExecutablePath] != 0o700 ||
+		ompInner.runtimeFiles[remoteOmpForwarderPath] != 0o700 ||
+		ompInner.runtimeFiles[remoteOmpModelsPath] != 0o600 {
 		t.Fatalf("remote omp runtime files = %v", ompInner.runtimeFiles)
 	}
 	if len(ompInner.execCalls) != 1 || ompInner.execCalls[0].Name != "python3" {
@@ -159,11 +161,19 @@ credential_gateway_url = %q
 		credentialGatewayURLEnv + "=" + ompLease.RemoteMaterial().URL,
 		"ANTHROPIC_BASE_URL=" + remoteOmpForwarderURL,
 		"ANTHROPIC_API_KEY=gitmoot-job-gateway",
+		"PI_CODING_AGENT_DIR=" + remoteOmpAgentDir,
 		"PATH=" + remoteOmpRuntimePATH,
 	} {
 		if !strings.Contains(joinedOmpEnv, want) {
 			t.Fatalf("remote omp env missing %q: %v", want, ompEnv)
 		}
+	}
+	if catalog := ompInner.runtimeContents[remoteOmpModelsPath]; !bytes.Contains(catalog, []byte("devin:")) ||
+		!bytes.Contains(catalog, []byte("id: swe-2")) ||
+		!bytes.Contains(catalog, []byte("openai-codex:")) ||
+		!bytes.Contains(catalog, []byte("transport: pi-native")) ||
+		!bytes.Contains(catalog, []byte(remoteOmpForwarderURL)) {
+		t.Fatalf("remote omp fallback catalog is not routed through the job gateway: %s", catalog)
 	}
 	if bytes.Contains(bytes.Join([][]byte{
 		ompInner.material.CACertificate,
@@ -171,6 +181,7 @@ credential_gateway_url = %q
 		ompInner.material.ClientPrivateKey,
 		ompInner.material.ClientConfig,
 		[]byte(joinedOmpEnv),
+		ompInner.runtimeContents[remoteOmpModelsPath],
 	}, nil), []byte(remoteBrokerTestKey)) {
 		t.Fatal("remote omp sandbox material contains the provider credential")
 	}
@@ -388,14 +399,15 @@ func TestRemoteCredentialMaterialTraversesLifecycleWrappers(t *testing.T) {
 }
 
 type credentialTestBackend struct {
-	instance     *execbackend.Instance
-	material     execbackend.CredentialMaterial
-	installs     int
-	runtimeFiles map[string]os.FileMode
-	execCalls    []execbackend.Command
-	destroyErr   error
-	report       execbackend.ReapReport
-	reportErr    error
+	instance        *execbackend.Instance
+	material        execbackend.CredentialMaterial
+	installs        int
+	runtimeFiles    map[string]os.FileMode
+	runtimeContents map[string][]byte
+	execCalls       []execbackend.Command
+	destroyErr      error
+	report          execbackend.ReapReport
+	reportErr       error
 }
 
 func (*credentialTestBackend) Name() execbackend.Backend { return execbackend.Remote }
@@ -413,11 +425,17 @@ func (b *credentialTestBackend) InstallCredentialMaterial(_ context.Context, _ *
 	b.material = material
 	return nil
 }
-func (b *credentialTestBackend) InstallInstanceFile(_ context.Context, _ *execbackend.Instance, destination string, _ io.Reader, mode os.FileMode) (string, error) {
+func (b *credentialTestBackend) InstallInstanceFile(_ context.Context, _ *execbackend.Instance, destination string, reader io.Reader, mode os.FileMode) (string, error) {
 	if b.runtimeFiles == nil {
 		b.runtimeFiles = make(map[string]os.FileMode)
+		b.runtimeContents = make(map[string][]byte)
+	}
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
 	}
 	b.runtimeFiles[destination] = mode
+	b.runtimeContents[destination] = content
 	return destination, nil
 }
 func (b *credentialTestBackend) Exec(_ context.Context, _ *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {

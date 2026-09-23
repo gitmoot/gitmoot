@@ -255,13 +255,22 @@ model_gateway_allow_hosts = ["api.anthropic.com"]
 ```
 
 Set `model_gateway = true` to opt local Claude into the daemon-owned loopback
-model gateway and to make broker material available to remote shell jobs. Each local Claude delivery receives a random job-scoped placeholder and
+model gateway and to make broker material available to remote shell and OMP
+jobs. Each local Claude delivery receives a random job-scoped placeholder and
 `ANTHROPIC_BASE_URL`; only the gateway holds the snapshotted real credential and
 it forwards only to an exact allowlisted hostname. Gateway startup, credential,
 and allowlist failures are fail-closed. The option is off by default and does
-not enable Codex, Claude, Kimi, or omp on the remote backend. Remote shells get
-only `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG`, whose owner-only file carries a
-lease-bounded mTLS identity and capability; the provider key remains host-side.
+not enable standalone Codex, Claude, or Kimi runtimes on `remote`. Remote shells
+get `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` with a lease-bounded mTLS identity
+and capability. Remote OMP uses an instance-local forwarder and a job-scoped
+model catalog for `openai-codex/gpt-6-sol` and `devin/swe-2`; provider credentials
+remain host-side.
+
+Those two remote OMP models require `[credentials].model_gateway_key` to
+point to a proxied host key for the host OMP auth-gateway, with Codex and
+Devin credentials in its broker. The default Anthropic upstream does not
+serve `/v1/pi/stream`. Allowlist the upstream host; a loopback route also
+requires `model_gateway_allow_loopback_upstream = true`.
 
 With `env_curation = false`, runtime subprocesses inherit the full foreground or
 daemon environment exactly as before. With it enabled, the base allowlist is:

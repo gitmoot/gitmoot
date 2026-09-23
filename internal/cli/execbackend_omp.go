@@ -12,6 +12,8 @@ import (
 const (
 	remoteOmpForwarderPath = execbackend.RuntimeMaterialDir + "/gateway-forwarder.py"
 	remoteOmpForwarderURL  = "http://127.0.0.1:43123"
+	remoteOmpAgentDir      = execbackend.RuntimeMaterialDir + "/omp-agent"
+	remoteOmpModelsPath    = remoteOmpAgentDir + "/models.yml"
 	remoteOmpRuntimePATH   = execbackend.RuntimeMaterialDir + "/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
@@ -147,6 +149,34 @@ if daemonize_and_wait(args.host, args.port):
 http.server.ThreadingHTTPServer((args.host, args.port), Proxy).serve_forever()
 `
 
+// Both fallback providers use OMP's native gateway transport. The model
+// credential is resolved on the host; the sandbox only knows this loopback
+// forwarder and an inert placeholder. Devin's swe-2 is not in a fresh OMP
+// catalog, so it needs an explicit entry; Codex is built in but needs a route.
+const remoteOmpModels = `providers:
+  openai-codex:
+    baseUrl: %s
+    apiKey: gitmoot-job-gateway
+    transport: pi-native
+  devin:
+    baseUrl: %s
+    apiKey: gitmoot-job-gateway
+    transport: pi-native
+    api: openai-completions
+    models:
+      - id: swe-2
+        name: SWE-2
+        reasoning: true
+        input: [text, image]
+        contextWindow: 262000
+        maxTokens: 128000
+        cost:
+          input: 0.75
+          output: 3.75
+          cacheRead: 0.075
+          cacheWrite: 0.75
+`
+
 func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, gatewayURL string) ([]string, error) {
 	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
 	if !ok {
@@ -154,6 +184,10 @@ func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.Executio
 	}
 	if _, err := installer.InstallInstanceFile(ctx, instance, remoteOmpForwarderPath, strings.NewReader(remoteOmpForwarder), 0o700); err != nil {
 		return nil, fmt.Errorf("install remote omp model gateway forwarder: %w", err)
+	}
+	if _, err := installer.InstallInstanceFile(ctx, instance, remoteOmpModelsPath,
+		strings.NewReader(fmt.Sprintf(remoteOmpModels, remoteOmpForwarderURL, remoteOmpForwarderURL)), 0o600); err != nil {
+		return nil, fmt.Errorf("install remote omp gateway model catalog: %w", err)
 	}
 	stream, err := lifecycle.Exec(ctx, instance, execbackend.Command{
 		Dir:  instance.Workspace,
@@ -180,6 +214,7 @@ func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.Executio
 	return []string{
 		"ANTHROPIC_BASE_URL=" + remoteOmpForwarderURL,
 		"ANTHROPIC_API_KEY=gitmoot-job-gateway",
+		"PI_CODING_AGENT_DIR=" + remoteOmpAgentDir,
 		"NO_PROXY=127.0.0.1,localhost",
 		"PATH=" + remoteOmpRuntimePATH,
 	}, nil
