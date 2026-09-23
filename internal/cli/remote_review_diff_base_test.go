@@ -11,8 +11,19 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
+
+type diffBaseForgeStub struct{ pull github.PullRequest }
+
+func (s diffBaseForgeStub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
+	return s.pull, nil
+}
+
+func (s diffBaseForgeStub) ListPullRequestChecks(context.Context, github.Repository, int64) ([]github.PullRequestCheck, error) {
+	return nil, nil
+}
 
 // A queued review resolves its sandbox scope from origin/<base>. When the
 // checkout's remote-tracking ref lags the real base branch, the merge base is
@@ -84,6 +95,55 @@ func TestRemoteReviewDiffBaseHEADRefreshesStaleBaseRef(t *testing.T) {
 	changed := strings.Fields(gitOutputForTest(t, checkout, "diff", "--name-only", base, head))
 	if len(changed) != 1 || changed[0] != "under-review.txt" {
 		t.Fatalf("review scope = %v, want only under-review.txt", changed)
+	}
+}
+
+// The forge is authoritative for a PR that the local watcher has never cached.
+// A missing row must not prevent a valid exact-head review from reaching the
+// remote sandbox, nor substitute an unverified local branch name for its base.
+func TestRemoteReviewDiffBaseHEADUsesForgeOnCacheMiss(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	origin := createDaemonWorkerGitCheckout(t, "main")
+	runDaemonWorkerGit(t, origin, "remote", "remove", "origin")
+	base := gitOutputForTest(t, origin, "rev-parse", "HEAD")
+	runDaemonWorkerGit(t, origin, "switch", "-c", "review-head")
+	writeReviewBaseFile(t, origin, "under-review.txt", "review subject\n")
+	runDaemonWorkerGit(t, origin, "add", "-A")
+	runDaemonWorkerGit(t, origin, "commit", "-m", "review head")
+	head := gitOutputForTest(t, origin, "rev-parse", "HEAD")
+	runDaemonWorkerGit(t, origin, "switch", "main")
+
+	checkout := t.TempDir()
+	runDaemonWorkerGit(t, checkout, "clone", origin, checkout)
+	runDaemonWorkerGit(t, checkout, "fetch", "origin", "review-head")
+	const repo = "owner/repo"
+	seedDaemonWorkerRepo(t, store, repo, checkout)
+	payload, err := json.Marshal(workflow.JobPayload{Repo: repo, Branch: "review-head", PullRequest: 2211, HeadSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub {
+		return diffBaseForgeStub{pull: github.PullRequest{BaseRef: "main", HeadSHA: head}}
+	}
+	job := db.Job{ID: "review-uncached-pr", Agent: "reviewer", Type: "review", Payload: string(payload)}
+	resolved, err := worker.remoteReviewDiffBaseHEAD(ctx, job, checkout)
+	if err != nil {
+		t.Fatalf("uncached review diff base: %v", err)
+	}
+	if resolved != base {
+		t.Fatalf("uncached review diff base = %s, want %s", resolved, base)
+	}
+	changed := strings.Fields(gitOutputForTest(t, checkout, "diff", "--name-only", resolved, head))
+	if len(changed) != 1 || changed[0] != "under-review.txt" {
+		t.Fatalf("uncached review scope = %v, want only under-review.txt", changed)
+	}
+	worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub {
+		return diffBaseForgeStub{pull: github.PullRequest{BaseRef: "main", HeadSHA: base}}
+	}
+	if _, err := worker.remoteReviewDiffBaseHEAD(ctx, job, checkout); err == nil || !strings.Contains(err.Error(), "head moved") {
+		t.Fatalf("moved uncached PR head should be refused, got %v", err)
 	}
 }
 

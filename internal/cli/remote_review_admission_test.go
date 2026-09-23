@@ -158,6 +158,21 @@ func (f *remoteReviewAdmissionFixture) assertRefusedBeforeProvision(t *testing.T
 	t.Fatalf("events = %+v, want durable counter %q", events, wantKind)
 }
 
+func TestRemoteReviewUncachedPRReachesProvider(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	if err := f.store.ExecForTest(f.ctx, `DELETE FROM pull_requests WHERE repo_full_name = ? AND number = ?`, "owner/repo", 2238); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.GetPullRequest(f.ctx, "owner/repo", 2238); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("pull request cache state = %v, want sql.ErrNoRows", err)
+	}
+	f.github.pull.BaseRef = "remote-review-admission"
+	f.run(t)
+	if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
+		t.Fatalf("uncached PR provider calls = factory %d, provision %d; want 1 each", f.factoryCalls, f.backend.provisionCalls)
+	}
+}
+
 // This exercises the production dispatch payload through jobWorker.run and the
 // exact boundary immediately before the ledger reservation/provider factory.
 // Each refused case must leave both observable side-effect counts at zero.

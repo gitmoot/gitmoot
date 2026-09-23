@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -292,10 +294,28 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 	}
 	if base == "" {
 		pull, err := w.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
-		if err != nil {
+		baseBranch := ""
+		switch {
+		case err == nil:
+			baseBranch = strings.TrimSpace(pull.BaseBranch)
+		case errors.Is(err, sql.ErrNoRows):
+			repo, parseErr := github.ParseRepository(payload.Repo)
+			if parseErr != nil {
+				return "", fmt.Errorf("parse repo for PR #%d: %w", payload.PullRequest, parseErr)
+			}
+			// The watcher only caches PRs it has seen. A merged or older PR
+			// can still be a valid exact-head review subject without a row.
+			forgePull, fetchErr := w.remoteReviewAdmissionClient(checkout, hostJobSubprocessRunner{}).GetPullRequest(ctx, repo, int64(payload.PullRequest))
+			if fetchErr != nil {
+				return "", fmt.Errorf("load uncached PR #%d from forge: %w", payload.PullRequest, fetchErr)
+			}
+			if strings.TrimSpace(forgePull.HeadSHA) != head {
+				return "", fmt.Errorf("PR #%d head moved from %s to %s", payload.PullRequest, head, forgePull.HeadSHA)
+			}
+			baseBranch = strings.TrimSpace(forgePull.BaseRef)
+		default:
 			return "", fmt.Errorf("load PR #%d: %w", payload.PullRequest, err)
 		}
-		baseBranch := strings.TrimSpace(pull.BaseBranch)
 		if baseBranch == "" {
 			return "", fmt.Errorf("PR #%d has no base branch", payload.PullRequest)
 		}
