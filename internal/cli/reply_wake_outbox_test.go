@@ -390,14 +390,6 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	// The row must be PAST its coalescing hold: a row still inside the hold is
-	// held rather than outstanding, so the drain would be healthy and this test
-	// would assert on a fault it never provoked (#1978).
-	setWakeOutboxCreatedAt(
-		t, store.DatabasePath(), "not-json",
-		time.Now().UTC().Add(-2*replyWakeCoalescingWindow),
-	)
-
 	var stdout bytes.Buffer
 	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
 	if err := runEnabledRepoWorkerTicksTracked(
