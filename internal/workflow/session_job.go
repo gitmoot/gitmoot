@@ -287,7 +287,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 			extraEvents = append(extraEvents, db.JobEvent{
 				JobID: jobID,
 				Kind:  ReviewApprovedWithNotesEventKind,
-				Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+				Message: reviewFoldMessage(reviewFoldReason(payload.Result, blockingSeverity),
 					payload.Result.Severity, blockingSeverity),
 			})
 		}

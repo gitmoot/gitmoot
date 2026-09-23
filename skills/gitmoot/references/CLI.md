@@ -1031,6 +1031,19 @@ The threshold is inclusive. `P1` blocks `P0` and `P1`; `P2` and `P3` still post
 their findings and record the raw `changes_requested` result, but Gitmoot treats
 the round as approved-with-notes and does not dispatch a fix. The global default
 is `P3`, so every valid finding blocks unless a repository overrides it.
+
+A blocking verdict must also say WHERE. If a `changes_requested` result blocks at
+the threshold, carries findings, and no finding at or above the threshold names a
+location — `evidence_locator`, `locator`, `file`, `location`, cited `evidence`, or
+a path like `internal/db/store.go:88` inside its prose — the round resolves as
+approved-with-notes instead of blocking. The findings are still stored and posted;
+only the block is withdrawn, because a merge cannot be stopped on a defect nobody
+can open. The `review_approved_with_notes` event names this reason, distinct from
+the below-threshold fold.
+
+This is deliberately conservative and keeps blocking whenever the gate cannot see
+the whole picture: no findings at all, findings that are empty objects, a finding
+that does not decode, or a severity Gitmoot cannot rank.
 Configured values must be `P0`, `P1`, `P2`, or `P3`.
 An invalid `blocking_severity` value falls back to `P3` while other valid review
 fields remain active. Any other review-policy parse or read error rejects the
