@@ -129,7 +129,7 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		return false, newRemoteReviewRefusal(remoteReviewAvoidedDuplicate, fmt.Sprintf("remote review subject %s is already owned by job %s", subjectKey, claim.JobID))
 	}
 
-	claimed, err := w.Store.ClaimRunningJob(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{
+	claimed, err := w.Store.ClaimRunningJobAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(workflow.JobRunning),
 		Message: "remote review admitted before execution-backend reservation",
@@ -138,8 +138,10 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		_ = w.Store.ReleaseReviewRequest(context.WithoutCancel(ctx), subjectKey, job.ID)
 		return false, err
 	}
+	// A concurrent winner may already be running under this same job ID.
+	// Cancellation cleanup owns the subject claim; a losing worker must not
+	// release the winner's in-flight dedup record.
 	if !claimed {
-		_ = w.Store.ReleaseReviewRequest(context.WithoutCancel(ctx), subjectKey, job.ID)
 		latest, getErr := w.Store.GetJob(ctx, job.ID)
 		if getErr != nil {
 			return false, getErr

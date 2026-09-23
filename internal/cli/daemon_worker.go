@@ -824,6 +824,22 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			// Someone else moved it (cancel, another worker). Nothing to admit.
 			return nil
 		}
+		// Runtime persistence above updates this job's payload even on a healthy
+		// first run, so compare delivery identity rather than raw JSON.
+		// A fallback may replace the model/runtime while this worker prepares
+		// the old snapshot: let the next poll rebuild its adapter and session
+		// lock instead of spending the cloud attempt with the old runtime.
+		freshPayload, err := daemonJobPayload(current)
+		if err != nil {
+			return err
+		}
+		if current.Agent != job.Agent || freshPayload.Model != payload.Model ||
+			freshPayload.RuntimeOverride != payload.RuntimeOverride ||
+			freshPayload.RuntimeOverrideRef != payload.RuntimeOverrideRef ||
+			freshPayload.HeadSHA != payload.HeadSHA {
+			return nil
+		}
+		payload = freshPayload
 		job = current
 	}
 	remoteReviewAdmitted, admissionErr := w.admitRemoteReview(ctx, job, payload, agent, execBackend, checkout, jobRunner)

@@ -984,13 +984,29 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 // recovery applies. It returns false (no event written) when the row was not in
 // `from` state, exactly like TransitionJobStateWithEvent.
 func (s *Store) ClaimRunningJob(ctx context.Context, id string, from string, to string, event JobEvent, runnerPID int, runnerBootID string) (bool, error) {
+	return s.claimRunningJob(ctx, id, from, to, event, runnerPID, runnerBootID, nil)
+}
+
+// ClaimRunningJobAtGeneration claims only the lifecycle that passed admission.
+// Re-queues between admission and claim cannot consume a later generation.
+func (s *Store) ClaimRunningJobAtGeneration(ctx context.Context, id string, from string, generation int64, to string, event JobEvent, runnerPID int, runnerBootID string) (bool, error) {
+	return s.claimRunningJob(ctx, id, from, to, event, runnerPID, runnerBootID, &generation)
+}
+
+func (s *Store) claimRunningJob(ctx context.Context, id string, from string, to string, event JobEvent, runnerPID int, runnerBootID string, generation *int64) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, runner_pid = ?, runner_boot_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, runnerPID, strings.TrimSpace(runnerBootID), id, from)
+	query := `UPDATE jobs SET state = ?, ` + bumpLifecycleGenerationSQL + `, runner_pid = ?, runner_boot_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`
+	args := []any{to, to, runnerPID, strings.TrimSpace(runnerBootID), id, from}
+	if generation != nil {
+		query += ` AND lifecycle_generation = ?`
+		args = append(args, *generation)
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}

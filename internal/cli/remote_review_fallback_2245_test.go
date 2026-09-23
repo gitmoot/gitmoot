@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -95,5 +96,40 @@ func TestRemoteReviewRefusalFromStaleSnapshotReachesTerminal(t *testing.T) {
 	if after.State != string(workflow.JobFailed) {
 		t.Fatalf("job state after refusal = %q, want %q: a refused remote review left queued is re-admitted and refused forever",
 			after.State, workflow.JobFailed)
+	}
+}
+
+// A stale worker must not claim the fallback generation using the old runtime:
+// provisioning would then spend the new model's only remote attempt on the old
+// adapter. The next scheduler poll gets a fresh row and can use the new model.
+func TestRemoteReviewStaleWorkerLeavesFallbackForFreshPoll(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	stale := f.job
+	reserveFirstAttempt(t, f)
+	current := requeueToNextGeneration(t, f, true)
+	payload, err := daemonJobPayload(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.Model = "devin/swe-2"
+	payload.RuntimeOverride = "omp"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.UpdateJobPayload(f.ctx, f.job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	f.job = stale
+	f.run(t)
+	if f.factoryCalls != 0 || f.backend.provisionCalls != 0 {
+		t.Fatalf("stale worker spent fallback attempt: factory/provider calls = %d/%d", f.factoryCalls, f.backend.provisionCalls)
+	}
+	current, err = f.store.GetJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != string(workflow.JobQueued) {
+		t.Fatalf("stale worker state = %s, want queued for a fresh poll", current.State)
 	}
 }
