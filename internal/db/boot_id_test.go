@@ -130,6 +130,31 @@ func TestClaimRunningJobStampsRunnerIdentity(t *testing.T) {
 	}
 }
 
+func TestClaimRunningJobAtGenerationRejectsStaleAdmission(t *testing.T) {
+	ctx := context.Background()
+	store := openBootTestStore(t)
+	seedBootQueuedJob(t, store, "job-generation")
+	if ok, err := store.TransitionJobStateWithEvent(ctx, "job-generation", "queued", "running", JobEvent{Kind: "running"}); err != nil || !ok {
+		t.Fatalf("seed running: transitioned=%v err=%v", ok, err)
+	}
+	if ok, err := store.TransitionJobStateWithEvent(ctx, "job-generation", "running", "queued", JobEvent{Kind: "retry_queued"}); err != nil || !ok {
+		t.Fatalf("seed next lifecycle: transitioned=%v err=%v", ok, err)
+	}
+	if ok, err := store.ClaimRunningJobAtGeneration(ctx, "job-generation", "queued", 0, "running", JobEvent{Kind: "running"}, 4321, "stale"); err != nil || ok {
+		t.Fatalf("stale generation claimed: claimed=%v err=%v", ok, err)
+	}
+	job, err := store.GetJob(ctx, "job-generation")
+	if err != nil || job.State != "queued" || job.LifecycleGeneration != 1 {
+		t.Fatalf("stale claim mutated lifecycle: job=%+v err=%v", job, err)
+	}
+	if ok, err := store.ClaimRunningJobAtGeneration(ctx, "job-generation", "queued", 1, "running", JobEvent{Kind: "running"}, 9876, "current"); err != nil || !ok {
+		t.Fatalf("fresh generation failed: claimed=%v err=%v", ok, err)
+	}
+	if pid, boot := jobRunnerIdentity(t, store, "job-generation"); pid != 9876 || boot != "current" {
+		t.Fatalf("runner identity = (%d, %q), want (9876, current)", pid, boot)
+	}
+}
+
 func TestListRunningJobIDsFromForeignBoot(t *testing.T) {
 	ctx := context.Background()
 	store := openBootTestStore(t)

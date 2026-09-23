@@ -129,17 +129,18 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		return false, newRemoteReviewRefusal(remoteReviewAvoidedDuplicate, fmt.Sprintf("remote review subject %s is already owned by job %s", subjectKey, claim.JobID))
 	}
 
-	claimed, err := w.Store.ClaimRunningJob(ctx, job.ID, string(workflow.JobQueued), string(workflow.JobRunning), db.JobEvent{
+	claimed, err := w.Store.ClaimRunningJobAtGeneration(ctx, job.ID, string(workflow.JobQueued), job.LifecycleGeneration, string(workflow.JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(workflow.JobRunning),
 		Message: "remote review admitted before execution-backend reservation",
 	}, os.Getpid(), db.BootID())
 	if err != nil {
-		_ = w.Store.ReleaseReviewRequest(context.WithoutCancel(ctx), subjectKey, job.ID)
 		return false, err
 	}
+	// A concurrent winner may already be running under this same job ID.
+	// Cancellation cleanup owns the subject claim; a losing worker must not
+	// release the winner's in-flight dedup record.
 	if !claimed {
-		_ = w.Store.ReleaseReviewRequest(context.WithoutCancel(ctx), subjectKey, job.ID)
 		latest, getErr := w.Store.GetJob(ctx, job.ID)
 		if getErr != nil {
 			return false, getErr
@@ -206,7 +207,14 @@ func (w jobWorker) remoteReviewRetryAdmission(ctx context.Context, job db.Job) e
 	}
 	marker := "lifecycle_generation=" + strconv.FormatInt(generation, 10)
 	for _, event := range events {
-		if (event.Kind == "retry_queued" || event.Kind == "remote_review_provider_retryable") && strings.Contains(event.Message, marker) {
+		// A review model fallback is a classified provider failure by
+		// construction: the pool only advances on runtime_quota/runtime_auth.
+		// It re-queues the job onto a DIFFERENT model precisely so that model
+		// can run, so it must grant the new lifecycle its cloud attempt. Before
+		// #2245 it did not, and a remote review could never fall through its
+		// pool: the new model was refused before it ever started.
+		if (event.Kind == "retry_queued" || event.Kind == "remote_review_provider_retryable" ||
+			event.Kind == reviewModelFallbackEventKind) && strings.Contains(event.Message, marker) {
 			return nil
 		}
 	}

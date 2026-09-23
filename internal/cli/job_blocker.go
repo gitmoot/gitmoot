@@ -788,23 +788,35 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	if err != nil {
 		return false, err
 	}
-	// Payload first, transition second: a crash in between leaves the job RUNNING
-	// with extra context in the payload — the stale-running recovery requeues it —
-	// never a queued job missing its hold timestamp.
-	if err := w.Store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
-		return false, err
-	}
 	message := fmt.Sprintf("%s: attempt %d/%d, retry at %s: %s",
 		classification.Class, attempt, maxOperationalBlockerRetries, retryAt, classification.Detail)
 	if eventKind == reviewModelFallbackEventKind {
-		message = fmt.Sprintf("%s on %s; falling back to review model %s on runtime %s (attempt %d/%d): %s",
-			classification.Class, previousModel, payload.Model, payload.RuntimeOverride, attempt, maxOperationalBlockerRetries, classification.Detail)
+		// The running -> queued transition below bumps lifecycle_generation by
+		// exactly one (bumpLifecycleGenerationSQL). Stamping the generation the
+		// fallback CREATES is what lets remote review admission recognise this
+		// re-queue as a sanctioned new attempt on a different model (#2245),
+		// using the same marker convention as retry_queued.
+		message = fmt.Sprintf("%s on %s; falling back to review model %s on runtime %s (attempt %d/%d) lifecycle_generation=%d: %s",
+			classification.Class, previousModel, payload.Model, payload.RuntimeOverride, attempt, maxOperationalBlockerRetries,
+			latest.LifecycleGeneration+1, classification.Detail)
 	}
-	transitioned, err := w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
-		JobID:   jobID,
-		Kind:    eventKind,
-		Message: message,
-	})
+	var transitioned bool
+	if eventKind == reviewModelFallbackEventKind {
+		// Keep the replacement payload, generation marker and transition in one
+		// CAS. A stale delivery must not overwrite a newer model or stamp the
+		// wrong generation after another worker re-claimed the job.
+		transitioned, err = w.Store.TransitionJobStatePayloadWithEventAtGeneration(
+			ctx, jobID, string(workflow.JobRunning), latest.LifecycleGeneration, string(workflow.JobQueued),
+			string(encoded), db.JobEvent{JobID: jobID, Kind: eventKind, Message: message})
+	} else {
+		// A crash between payload and transition leaves the running job with
+		// resumable blocker context for stale-running recovery.
+		if err := w.Store.UpdateJobPayload(ctx, jobID, string(encoded)); err != nil {
+			return false, err
+		}
+		transitioned, err = w.Store.TransitionJobStateWithEvent(ctx, jobID, string(workflow.JobRunning), string(workflow.JobQueued),
+			db.JobEvent{JobID: jobID, Kind: eventKind, Message: message})
+	}
 	if err != nil {
 		return false, err
 	}
