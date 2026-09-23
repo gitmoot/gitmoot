@@ -384,25 +384,19 @@ func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
 		ID: "job-after-unhealthy-wake", Agent: "audit", Action: "ask",
 		Repo: "owner/repo", Branch: "main", PullRequest: 1,
 	})
-	note, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
-		WorkflowID: "release/drain-isolation", Author: "worker", Body: "matching route without a delivery sink",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
+	if err := store.InsertWakeOutbox(
+		context.Background(), db.WakeOutboxSourceBlocked, "not-json",
+		db.WakeOutboxKindBlocked, []string{"owner"},
+	); err != nil {
 		t.Fatal(err)
 	}
 	// The row must be PAST its coalescing hold: a row still inside the hold is
 	// held rather than outstanding, so the drain would be healthy and this test
 	// would assert on a fault it never provoked (#1978).
 	setWakeOutboxCreatedAt(
-		t, store.DatabasePath(), fmt.Sprint(note.ID),
+		t, store.DatabasePath(), "not-json",
 		time.Now().UTC().Add(-2*replyWakeCoalescingWindow),
 	)
-	if err := store.AddEventRule(context.Background(), db.EventRule{
-		ID: "reply-owner", OnKind: "reply", WakeRole: "owner", Enabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	var stdout bytes.Buffer
 	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
@@ -971,27 +965,12 @@ func TestUnroutableWakeIsRecordedOncePerRow(t *testing.T) {
 		{"stranded", "w1:p2"},
 	})
 	ctx := context.Background()
-	// Optional blocked alerts still require a rule; direct workflow notes do not.
-	if err := store.AddEventRule(ctx, db.EventRule{
-		ID: "blocked-stranded", OnKind: "blocked", WakeRole: "stranded", Enabled: true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.DeleteEventRule(ctx, "blocked-stranded"); err != nil {
-		t.Fatal(err)
-	}
 	insertOptionalBlockedWake(t, store, "stranded")
 	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending = %+v, err=%v", pending, err)
 	}
 	rowID := pending[0].ID
-	// STAMPED, not left to wall-clock ordering. workflow_notes.created_at has
-	// millisecond precision while event_rule_deletions.deleted_at has
-	// nanosecond precision, so a rule deleted microseconds BEFORE this row can
-	// still compare as deleted after it and read as a retirement. Production
-	// separates the two by seconds or days; a test has to say which it means.
-	setWakeOutboxCreatedAt(t, store.DatabasePath(), pending[0].SourceID, time.Now().UTC().Add(time.Minute))
 
 	// Two drains: the condition is re-observed every tick, and the record must
 	// not grow with the ticks. A per-tick append is what took job_events past a

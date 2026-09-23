@@ -1835,7 +1835,7 @@ The typed note
 `reply:<role>` wake row commit atomically. The daemon delivers to the named role
 without a subscription rule. The wake includes the exact
 `gitmoot workflow show-note <id>` retrieval command; that command renders the
-citable row's workflow, author, optional repository, timestamp, and body, or
+citable row's workflow, author, optional repository, timestamp, and body. `--json`
 returns the row as JSON. **Plain output prints the whole body**: a single-note
 view is the one place a body must not be cut, and the 512-rune line cap applies
 to timeline and list lines instead. Control characters and ANSI escapes are
