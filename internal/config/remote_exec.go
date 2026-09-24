@@ -246,6 +246,10 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 		if strings.TrimSpace(cfg.E2BBaseURL) == "" || (strings.TrimSpace(cfg.E2BDomain) == "" && cfg.E2BEnvdBaseURL == "") {
 			return fmt.Errorf("[remote_exec].provider = \"mac\" requires explicit e2b_base_url and either e2b_domain or e2b_envd_base_url")
 		}
+		control, err := url.Parse(cfg.E2BBaseURL)
+		if err != nil || control.Scheme != "https" || control.User != nil || control.Path != "" {
+			return fmt.Errorf("[remote_exec].provider = \"mac\" requires e2b_base_url to be an HTTPS origin")
+		}
 		if cfg.ExecBackendCost.MaxConcurrent <= 0 {
 			return fmt.Errorf("[remote_exec].provider = \"mac\" requires positive cost_max_concurrent for capacity")
 		}
