@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
@@ -87,15 +88,20 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		// GITMOOT-IMPL: production resolves provider envd endpoints; the injected
 		// resolver exists only so the lifecycle E2E remains offline and spend-free.
 		resolver := w.RemoteEnvdEndpointResolver
-		if resolver == nil && cfg.E2BDomain != "" {
-			domain := cfg.E2BDomain
-			resolver = func(sandboxID string, port int) string {
-				return fmt.Sprintf("https://%d-%s.%s", port, sandboxID, domain)
+		if resolver == nil {
+			if cfg.E2BEnvdBaseURL != "" {
+				origin := cfg.E2BEnvdBaseURL
+				resolver = func(string, int) string { return origin }
+			} else if cfg.E2BDomain != "" {
+				domain := cfg.E2BDomain
+				resolver = func(sandboxID string, port int) string {
+					return fmt.Sprintf("https://%d-%s.%s", port, sandboxID, domain)
+				}
 			}
 		}
 		remoteBackend, err := remoteexec.NewBackend(client, remoteexec.Options{
 			TemplateID:     cfg.E2BTemplate,
-			Envd:           e2b.EnvdOptions{EndpointResolver: resolver},
+			Envd:           e2b.EnvdOptions{EndpointResolver: resolver, FixedHostRouting: cfg.E2BEnvdBaseURL != ""},
 			ShouldRenewTTL: w.shouldRenewSandboxTTL,
 		})
 		if err != nil {
@@ -105,7 +111,11 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		if err != nil {
 			return nil, fmt.Errorf("create execution backend daemon fencing token: %w", err)
 		}
-		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, e2bAttemptProvider, fencingToken, db.BootID(), w.Stdout, execBackendStoreCap(cfg.ExecBackendCost))
+		cap := execBackendStoreCap(cfg.ExecBackendCost)
+		if cfg.Provider == "mac" {
+			cap = execBackendMacCap(cfg.ExecBackendCost)
+		}
+		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, cfg.Provider, fencingToken, db.BootID(), w.Stdout, cap)
 		if err != nil {
 			return nil, err
 		}
@@ -114,7 +124,7 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 			baseURL = e2b.DefaultBaseURL
 		}
 		accountKey := sha256.Sum256([]byte(apiKey))
-		reapKey := fmt.Sprintf("%s|%s|%x", backend, baseURL, accountKey)
+		reapKey := fmt.Sprintf("%s|%s|%s|%x", backend, cfg.Provider, baseURL, accountKey)
 		home := w.workflowHome()
 		revokingBackend := &credentialRevokingExecutionBackend{inner: ledgeredBackend, home: home}
 		if _, loaded := reapedExecutionBackendRoots.LoadOrStore(reapKey, struct{}{}); !loaded {
@@ -189,14 +199,23 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 	}
 	var ompExecutable string
+	var ompARM64File *os.File
 	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
 		if credentialPlan.gateway == nil {
 			return nil, nil, nil, nil, errors.New("remote omp requires the model credential gateway; raw-key fallback is forbidden")
 		}
 		var err error
-		ompExecutable, err = lookPathRemoteRuntime(runtime.OmpRuntime)
+		if cfg.Provider == "mac" {
+			ompARM64File, err = verifiedLinuxARM64Omp(cfg.OMPLinuxARM64File)
+			ompExecutable = cfg.OMPLinuxARM64File
+		} else {
+			ompExecutable, err = lookPathRemoteRuntime(runtime.OmpRuntime)
+		}
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("resolve host omp executable for remote runtime: %w", err)
+		}
+		if ompARM64File != nil {
+			defer ompARM64File.Close()
 		}
 	}
 	materials := execbackend.Materials{SourceWorktree: checkout}
@@ -236,7 +255,7 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
 	if ompExecutable != "" {
-		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable); err != nil {
+		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable, ompARM64File); err != nil {
 			return lifecycle, instance, nil, nil, err
 		}
 	}
@@ -247,16 +266,66 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 	return lifecycle, instance, lease, env, nil
 }
 
-func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, source string) error {
+func verifiedLinuxARM64Omp(path string) (*os.File, error) {
+	if !filepath.IsAbs(path) {
+		return nil, errors.New("[remote_exec].omp_linux_arm64_file must name an absolute Linux ARM64 executable")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open [remote_exec].omp_linux_arm64_file: %w", err)
+	}
+	verified := false
+	defer func() {
+		if !verified {
+			file.Close()
+		}
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat [remote_exec].omp_linux_arm64_file: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q must be an executable regular file", path)
+	}
+	executable, err := elf.NewFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q is not an ELF executable: %w", path, err)
+	}
+	if executable.Class != elf.ELFCLASS64 || executable.Machine != elf.EM_AARCH64 ||
+		(executable.Type != elf.ET_EXEC && executable.Type != elf.ET_DYN) ||
+		(executable.OSABI != elf.ELFOSABI_NONE && executable.OSABI != elf.ELFOSABI_LINUX) {
+		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q must be a Linux ARM64 ELF executable", path)
+	}
+	for _, program := range executable.Progs {
+		if program.Type != elf.PT_INTERP {
+			continue
+		}
+		interpreter, err := io.ReadAll(program.Open())
+		if err != nil {
+			return nil, fmt.Errorf("read ARM64 ELF interpreter: %w", err)
+		}
+		name := strings.TrimRight(string(interpreter), "\x00")
+		if name != "/lib/ld-linux-aarch64.so.1" && name != "/lib/ld-musl-aarch64.so.1" && name != "/lib64/ld-linux-aarch64.so.1" {
+			return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q uses unsupported Linux ARM64 interpreter %q", path, name)
+		}
+	}
+	verified = true
+	return file, nil
+}
+
+func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, source string, file *os.File) error {
 	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
 	if !ok {
 		return fmt.Errorf("execution backend %q cannot install the omp runtime", lifecycle.Name())
 	}
-	file, err := os.Open(source)
-	if err != nil {
-		return fmt.Errorf("open host omp executable: %w", err)
+	if file == nil {
+		var err error
+		file, err = os.Open(source)
+		if err != nil {
+			return fmt.Errorf("open host omp executable: %w", err)
+		}
+		defer file.Close()
 	}
-	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("stat host omp executable: %w", err)

@@ -9,15 +9,12 @@ import (
 	"time"
 )
 
-// ExecBackendBillingStates are the attempt states in which a provider resource
-// is believed to exist and therefore to be COSTING MONEY. They are the
-// population the compute-dollar cap sums over.
+// ExecBackendBillingStates are attempts in which a provider resource may still
+// exist. Cloud E2B sums their dollar reservations; Mac capacity counts them.
 //
-// orphaned IS billing and that is the load-bearing entry (#1540). An orphaned
-// attempt is one whose sandbox was created and never confirmed destroyed, so it
-// is the single class of spend nobody is managing. Excluding it would make the
-// meter blind at exactly the moment spend is out of control, which is the
-// fail-open direction this gate exists to close.
+// Orphaned is included even if the provider resource is not yet observed:
+// an attempt was created and never confirmed destroyed, so excluding it would
+// make both the dollar cap and capacity gate blind when cleanup is most needed.
 //
 // destroyed is excluded because destruction is confirmed. failed is excluded
 // because it is only reachable for an attempt that never obtained a handle: the
@@ -52,17 +49,17 @@ var ExecBackendNonBillingStates = []string{
 // the default is deliberately not mirrored.
 type ExecBackendCostCap struct {
 	Configured bool
-	// MaxReservedUSD bounds the summed worst-case reservation of all billing
-	// attempts. Must be > 0 when Configured.
+	// CapacityOnly selects an explicit per-provider concurrency bound without
+	// fictitious dollars. Cloud E2B never selects this mode.
+	CapacityOnly bool
+	// MaxReservedUSD bounds dollar reservations of this provider's billing
+	// attempts. Must be > 0 in dollar-capped mode.
 	MaxReservedUSD float64
-	// MaxConcurrent bounds the number of billing attempts. 0 disables only the
-	// concurrency clause; it never disables the dollar clause.
+	// MaxConcurrent bounds active attempts of this provider. In capacity-only
+	// mode it must be positive; for dollar-capped cloud it is optional.
 	MaxConcurrent int
-	// PerAttemptUSD is the worst-case dollar amount one attempt reserves before
-	// the provider is called. Must be > 0 when Configured: a zero reservation
-	// sums to zero however many attempts run, so it would pass any dollar cap
-	// forever. That is precisely the state on main today, where the only
-	// production writer passes the literal 0.
+	// PerAttemptUSD is the worst-case dollar amount a cloud attempt reserves.
+	// It must be > 0 in dollar-capped mode; capacity-only Mac reserves zero.
 	PerAttemptUSD float64
 	// DenyReason explains WHY this policy denies, in the words of whatever
 	// produced it. The unset policy is the shipping state (owner decision,
@@ -151,10 +148,11 @@ func billingStatePlaceholders() (string, []any) {
 // describeBillingLoad reads the operands for a refusal message. It is diagnostic
 // only: it runs AFTER the admission has already been refused, so its failure
 // degrades the message and never converts a refusal into an admission.
-func (s *Store) describeBillingLoad(ctx context.Context, refusal *ExecBackendCapRefusal) {
-	marks, args := billingStatePlaceholders()
+func (s *Store) describeBillingLoad(ctx context.Context, provider string, refusal *ExecBackendCapRefusal) {
+	marks, states := billingStatePlaceholders()
+	args := append([]any{provider}, states...)
 	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*), MIN(created_at)
-		FROM execbackend_attempts WHERE state IN (`+marks+`) GROUP BY state`, args...)
+		FROM execbackend_attempts WHERE provider = ? AND state IN (`+marks+`) GROUP BY state`, args...)
 	if err != nil {
 		refusal.OperandsErr = err
 		return

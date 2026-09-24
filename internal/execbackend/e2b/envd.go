@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,10 @@ type EnvdOptions struct {
 	// tight control-plane deadline cannot truncate a workspace transfer.
 	UploadTimeout    time.Duration
 	EndpointResolver func(sandboxID string, port int) string
+	// FixedHostRouting sends E2B Embed-style sandbox routing headers to an
+	// explicitly configured shared HTTPS origin. Default wildcard routing does
+	// not send these headers.
+	FixedHostRouting bool
 
 	// OnUnknownEndEventFields, when set, is called once when a decoded process
 	// end event carries keys this client does not model. It runs before the
@@ -54,6 +59,7 @@ type EnvdOptions struct {
 type Envd struct {
 	sandboxID               string
 	credential              EnvdCredential
+	fixedHostRouting        bool
 	httpClient              *http.Client
 	requestTimeout          time.Duration
 	uploadTimeout           time.Duration
@@ -104,12 +110,13 @@ func NewEnvd(sandbox Sandbox, credential EnvdCredential, options EnvdOptions) (*
 	}
 
 	envd := &Envd{
-		sandboxID:       sandboxID,
-		credential:      credential,
-		httpClient:      &httpClientCopy,
-		requestTimeout:  timeout,
-		uploadTimeout:   uploadTimeout,
-		resolveEndpoint: resolver,
+		sandboxID:        sandboxID,
+		credential:       credential,
+		httpClient:       &httpClientCopy,
+		requestTimeout:   timeout,
+		uploadTimeout:    uploadTimeout,
+		fixedHostRouting: options.FixedHostRouting,
+		resolveEndpoint:  resolver,
 
 		onUnknownEndEventFields: options.OnUnknownEndEventFields,
 	}
@@ -684,6 +691,10 @@ func (e *Envd) endpoint(suffix string) (string, error) {
 
 func (e *Envd) authenticate(request *http.Request) {
 	request.Header.Set("X-Access-Token", e.credential.token)
+	if e.fixedHostRouting {
+		request.Header.Set("E2b-Sandbox-Id", e.sandboxID)
+		request.Header.Set("E2b-Sandbox-Port", strconv.Itoa(envdPort))
+	}
 }
 
 func (e *Envd) errorf(cause error, format string, args ...any) error {

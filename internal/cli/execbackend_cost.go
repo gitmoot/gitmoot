@@ -27,3 +27,14 @@ func execBackendStoreCap(cfg config.ExecBackendCostConfig) db.ExecBackendCostCap
 		PerAttemptUSD:  cfg.PerAttemptUSD,
 	}
 }
+
+// execBackendMacCap tracks finite on-prem capacity, not cloud dollar spend.
+func execBackendMacCap(cfg config.ExecBackendCostConfig) db.ExecBackendCostCap {
+	if err := cfg.Validate(); err != nil {
+		return db.ExecBackendCostCap{DenyReason: err.Error()}
+	}
+	if cfg.MaxConcurrent <= 0 {
+		return db.ExecBackendCostCap{DenyReason: "[remote_exec].cost_max_concurrent must be positive for Mac capacity"}
+	}
+	return db.ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: cfg.MaxConcurrent}
+}

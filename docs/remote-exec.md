@@ -24,6 +24,9 @@ local_root = "/var/tmp/gitmoot-local"
 # credential_gateway_url = "https://broker.example.com:8443"
 ```
 
+The default remote provider is cloud E2B, using its existing dollar caps.
+Mac sandboxd is an explicit canary, never an automatic route.
+
 ## Versioned OMP review template
 
 The credential-free OMP review image is defined in
@@ -76,6 +79,87 @@ Remote OMP uploads the host OMP executable into the instance, requires
 `e2b_omp_template` with at least 2 GiB RAM, and refuses before provider
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
+
+### Explicit Mac ARM64 canary
+
+The Mac sandboxd endpoint speaks the E2B control and envd protocols; Gitmoot
+does not run a second backend. Configure a separate canary Gitmoot home, and
+keep the existing cloud E2B config available for rollback. Do not switch an
+installation with outstanding cloud attempts: reconciliation addresses only
+the selected provider, and old attempts must first be destroyed or recovered
+against their original endpoint.
+
+The `sandboxd` host requires Apple `container` 1.4.1 and its Linux kernel
+(`container system start --enable-kernel-install`). Build the credential-free
+`sandboxd/images/linux-arm64/Dockerfile` with `container build --platform
+linux/arm64 --tag sandboxd/review-go126:<version> <image-directory>` and
+allowlist that exact image in `sandboxd --image`. Create an owned host-only
+network with `container network create --internal --label
+gitmoot.sandboxd.network=apple-v1 sandboxd-internal` and pass
+`sandboxd --network sandboxd-internal`; provisioning refuses a missing or NAT
+network. Each guest uses a read-only root, a private 10 GiB volume at
+`/home/user`, and bounded `/tmp` mounts. Keep the SQLite ledger and 0600
+control-key file outside disposable paths; serve sandboxd's loopback listener
+only through an authenticated private HTTPS gateway. Neither building the
+image nor starting Apple's runtime activates Gitmoot's Mac provider.
+
+**Do not run untrusted PR code yet.** Apple's `hostOnly` network blocks
+external egress but still reaches Mac services listening on all interfaces.
+On this Mac a guest reached the host gateway at `192.168.128.1`; Mac services
+were listening on ports 5000, 7000, and 58267. An administrator must install
+and verify deny-by-default guest-subnet-to-host firewall rules, with only a
+fixed model-gateway relay exception. `pfctl` requires Mac admin privileges;
+no such rule was installed during the development canary. A private Tailscale
+Serve HTTPS endpoint must also be enabled before Gitmoot can use this host.
+The SSH loopback tunnel used for protocol conformance is not a production
+gateway.
+
+The metrics endpoint samples Apple VM CPU and memory usage; it does not
+invent disk consumption or cloud charges for the fixed-size volume.
+
+For ARM64 OMP reviews, configure `omp_linux_arm64_file` to a verified Linux
+AArch64 executable. The published `omp-linux-arm64` asset for OMP v17.3.5 has
+SHA-256 `c79aba4859d71e6ead797bed2f510a9de97c9d576af9842e7fe63dbc9f4157af`;
+verify it before use. Gitmoot refuses a non-ELF or wrong-architecture file.
+
+```toml
+[remote_exec]
+backend = "remote"
+provider = "mac"
+e2b_api_key_file = "/run/secrets/mac-sandboxd-key"
+e2b_template = "mac-shell"
+e2b_omp_template = "mac-omp"
+e2b_base_url = "https://mac-control.example"
+e2b_envd_base_url = "https://mac-envd.example"
+omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
+cost_max_concurrent = 2
+credential_gateway_listen = "127.0.0.1:8443"
+credential_gateway_url = "https://192.168.128.1:8443"
+```
+
+Those gateway coordinates are an example only: the Gitmoot-side mTLS
+listener stays on loopback and its advertised certificate names the guest's
+Mac gateway IP. A supervised, fixed-destination tunnel on the Mac must
+forward the firewall-allowed port to that listener; no general-purpose
+proxy or secret is exposed to the VM. Verify the actual VM subnet, tunnel,
+firewall, mTLS lease expiry, and model request before a review canary.
+
+`provider = "mac"` is opt-in and requires an explicit control URL and a
+positive `cost_max_concurrent`. Mac attempts have a distinct ledger identity
+and reserve zero E2B dollars; cloud E2B continues to require positive
+`cost_max_reserved_usd` and `cost_per_attempt_usd`. The optional
+`e2b_envd_base_url` must be a single HTTPS origin for the Mac provider; it
+sends `E2b-Sandbox-Id`, `E2b-Sandbox-Port: 49983`, and `X-Access-Token` to
+that host on both upload and process streaming. Without it, the existing
+`https://49983-<id>.<e2b_domain>` wildcard route is unchanged.
+
+Mac OMP uploads only the configured absolute-path executable after verifying
+an executable Linux ARM64 ELF header and interpreter, before provider
+allocation. No x86 fallback or emulation is attempted. Supply a real Linux
+ARM64 build of OMP and a matching guest image and credential gateway. The
+private endpoint's control, upload, streaming, and token behavior must be
+verified before a canary; configuring these values alone does not assert
+compatibility.
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:
