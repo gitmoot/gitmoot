@@ -93,6 +93,49 @@ func TestLedgeredBackendRefusesWhenTheCapIsFull(t *testing.T) {
 	}
 }
 
+func TestMacCapacitySeparatesFromCloudDollarReservations(t *testing.T) {
+	store := openExecBackendLedgerTestStore(t)
+	var output bytes.Buffer
+	provisions := 0
+	inner := &ledgerTestBackend{provision: func(scope execbackend.JobScope) (*execbackend.Instance, error) {
+		provisions++
+		return &execbackend.Instance{ID: scope.JobID}, nil
+	}}
+	cloud, err := newLedgeredExecutionBackend(store, inner, e2bAttemptProvider, "fence", "boot", &output,
+		execBackendStoreCap(config.ExecBackendCostConfig{MaxReservedUSD: 1, PerAttemptUSD: 1, MaxConcurrent: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac, err := newLedgeredExecutionBackend(store, inner, "mac", "fence", "boot", &output,
+		execBackendMacCap(config.ExecBackendCostConfig{MaxConcurrent: 1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	provision := func(backend *ledgeredExecutionBackend, id string) error {
+		_, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: id, Attempt: 1, TTL: time.Minute})
+		return err
+	}
+	if err := provision(cloud, "cloud-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := provision(mac, "mac-one"); err != nil {
+		t.Fatalf("Mac refused while cloud dollar cap is full: %v", err)
+	}
+	attempt := execBackendAttemptForTest(t, store, db.ExecBackendAttemptKey{JobID: "mac-one", Attempt: 1})
+	if attempt.Provider != "mac" || attempt.CostReservedUSD == nil || *attempt.CostReservedUSD != 0 {
+		t.Fatalf("Mac persisted provider/cost = %q/%v, want mac and zero dollars", attempt.Provider, attempt.CostReservedUSD)
+	}
+	if err := provision(mac, "mac-two"); err == nil {
+		t.Fatal("Mac admitted a second sandbox past its capacity")
+	}
+	if err := provision(cloud, "cloud-two"); err == nil {
+		t.Fatal("cloud dollar/concurrency cap weakened by Mac capacity")
+	}
+	if provisions != 2 {
+		t.Fatalf("provider called %d times, want only the two admitted attempts", provisions)
+	}
+}
+
 // TestUnsetCapIsTheShippingStateAndDeniesWithAnOperand pins the arm that
 // actually runs in production. The owner decided (2026-09-10) to ship with NO
 // budget value set, so "no cap configured" is the operating state rather than

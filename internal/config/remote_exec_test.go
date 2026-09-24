@@ -35,6 +35,9 @@ func TestLoadRemoteExecConfigDefaultsToLocal(t *testing.T) {
 	if cfg.Backend != "local" {
 		t.Fatalf("Backend = %q, want the local default", cfg.Backend)
 	}
+	if cfg.Provider != "e2b" {
+		t.Fatalf("default remote provider = %q, want cloud E2B", cfg.Provider)
+	}
 	if cfg.LocalIdentity() != nil || cfg.LocalRoot != "" {
 		t.Fatalf("default local privilege config = uid %v gid %v root %q, want unset", cfg.LocalUID, cfg.LocalGID, cfg.LocalRoot)
 	}
@@ -63,6 +66,37 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 				t.Fatalf("remote provider config = %+v", cfg)
 			}
 		})
+	}
+}
+
+func TestLoadRemoteExecConfigMacFixedHostRequiresCapacity(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "mac-api-key")
+	if err := os.WriteFile(keyFile, []byte("private-mac-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content := fmt.Sprintf(`[remote_exec]
+backend = "remote"
+provider = "mac"
+e2b_api_key_file = %q
+e2b_template = "mac-shell"
+e2b_omp_template = "mac-omp"
+e2b_base_url = "https://control.example"
+e2b_envd_base_url = "https://envd.example"
+omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
+cost_max_concurrent = 2
+`, keyFile)
+	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != "mac" || cfg.E2BEnvdBaseURL != "https://envd.example" || cfg.OMPLinuxARM64File != "/opt/gitmoot/omp-linux-arm64" || cfg.ExecBackendCost.MaxConcurrent != 2 {
+		t.Fatalf("Mac config not loaded: %+v", cfg)
+	}
+	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, strings.Replace(content, "cost_max_concurrent = 2", "cost_max_concurrent = 0", 1))); err == nil || !strings.Contains(err.Error(), "cost_max_concurrent") {
+		t.Fatalf("unbounded Mac capacity accepted: %v", err)
+	}
+	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, strings.Replace(content, `provider = "mac"`, `provider = "e2b"`, 1))); err == nil || !strings.Contains(err.Error(), "e2b_envd_base_url") {
+		t.Fatalf("cloud fixed-host override accepted: %v", err)
 	}
 }
 

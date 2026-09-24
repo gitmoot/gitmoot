@@ -44,6 +44,15 @@ type RemoteExecConfig struct {
 	E2BOMPTemplate string
 	E2BBaseURL     string
 	E2BDomain      string
+	// E2BEnvdBaseURL uses one HTTPS origin with sandbox routing headers in
+	// place of wildcard hosts, only with provider=mac.
+	E2BEnvdBaseURL string
+	// Provider identifies the remote E2B-protocol endpoint for ledger and
+	// admission purposes. "e2b" is the default; "mac" is explicit opt-in.
+	Provider string
+	// OMPLinuxARM64File is a host-side Linux ARM64 executable installed only
+	// for remote OMP jobs on the Mac provider.
+	OMPLinuxARM64File string
 	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
 	// origin reachable from a sandbox. They are configured together and are
 	// used only for opt-in broker material, never for the provider control key.
@@ -55,9 +64,9 @@ type RemoteExecConfig struct {
 	ExecBackendCost ExecBackendCostConfig
 }
 
-// DefaultRemoteExecConfig preserves today's behaviour: the local backend.
+// DefaultRemoteExecConfig preserves today's local backend and cloud identity.
 func DefaultRemoteExecConfig() RemoteExecConfig {
-	return RemoteExecConfig{Backend: string(execbackend.Local)}
+	return RemoteExecConfig{Backend: string(execbackend.Local), Provider: "e2b"}
 }
 
 // LoadRemoteExecConfig parses the optional [remote_exec] section. A missing
@@ -114,7 +123,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].local_root: %w", err)
 			}
 			cfg.LocalRoot = strings.TrimSpace(parsed)
-		case "e2b_api_key_file", "e2b_template", "e2b_omp_template", "e2b_base_url", "e2b_domain", "credential_gateway_listen", "credential_gateway_url":
+		case "e2b_api_key_file", "e2b_template", "e2b_omp_template", "e2b_base_url", "e2b_domain", "e2b_envd_base_url", "provider", "omp_linux_arm64_file", "credential_gateway_listen", "credential_gateway_url":
 			parsed, err := parseConfigString(value)
 			if err != nil {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: %w", key, err)
@@ -131,6 +140,12 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				cfg.E2BBaseURL = parsed
 			case "e2b_domain":
 				cfg.E2BDomain = parsed
+			case "e2b_envd_base_url":
+				cfg.E2BEnvdBaseURL = parsed
+			case "provider":
+				cfg.Provider = parsed
+			case "omp_linux_arm64_file":
+				cfg.OMPLinuxARM64File = parsed
 			case "credential_gateway_listen":
 				cfg.CredentialGatewayListen = parsed
 			case "credential_gateway_url":
@@ -165,6 +180,12 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	if err := cfg.ExecBackendCost.Validate(); err != nil {
 		return err
+	}
+	if cfg.Provider != "e2b" && cfg.Provider != "mac" {
+		return fmt.Errorf("[remote_exec].provider must be \"e2b\" or \"mac\", got %q", cfg.Provider)
+	}
+	if cfg.OMPLinuxARM64File != "" && !filepath.IsAbs(cfg.OMPLinuxARM64File) {
+		return fmt.Errorf("[remote_exec].omp_linux_arm64_file must be an absolute path")
 	}
 	backend, err := execbackend.ParseImplemented(cfg.Backend)
 	if err != nil {
@@ -213,6 +234,21 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	}
 	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
 		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
+	}
+	if cfg.E2BEnvdBaseURL != "" {
+		parsed, err := url.Parse(cfg.E2BEnvdBaseURL)
+		if cfg.Provider != "mac" || err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+			parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("[remote_exec].e2b_envd_base_url requires provider=\"mac\" and an HTTPS origin without path, query, credentials, or fragment")
+		}
+	}
+	if cfg.Provider == "mac" {
+		if strings.TrimSpace(cfg.E2BBaseURL) == "" || (strings.TrimSpace(cfg.E2BDomain) == "" && cfg.E2BEnvdBaseURL == "") {
+			return fmt.Errorf("[remote_exec].provider = \"mac\" requires explicit e2b_base_url and either e2b_domain or e2b_envd_base_url")
+		}
+		if cfg.ExecBackendCost.MaxConcurrent <= 0 {
+			return fmt.Errorf("[remote_exec].provider = \"mac\" requires positive cost_max_concurrent for capacity")
+		}
 	}
 	if err := cfg.ValidateCredentialGateway(); err != nil {
 		return err
