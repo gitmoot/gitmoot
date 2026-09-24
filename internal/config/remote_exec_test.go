@@ -98,6 +98,12 @@ cost_max_concurrent = 2
 	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, strings.Replace(content, `provider = "mac"`, `provider = "e2b"`, 1))); err == nil || !strings.Contains(err.Error(), "e2b_envd_base_url") {
 		t.Fatalf("cloud fixed-host override accepted: %v", err)
 	}
+	for _, controlURL := range []string{"http://control.example", "https://user:pass@control.example", "https://control.example/path"} {
+		invalid := strings.Replace(content, "https://control.example", controlURL, 1)
+		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, invalid)); err == nil || !strings.Contains(err.Error(), "HTTPS origin") {
+			t.Fatalf("insecure Mac control URL %q accepted: %v", controlURL, err)
+		}
+	}
 }
 
 func TestLoadE2BAPIKeyAcceptsSecureSecretDelivery(t *testing.T) {
