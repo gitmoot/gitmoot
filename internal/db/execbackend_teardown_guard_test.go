@@ -89,7 +89,7 @@ func TestMarkExecBackendAttemptDestroyedAdmitsOnlyDestroying(t *testing.T) {
 			if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
 				ExecBackendAttemptKey: key, Provider: "e2b",
 				DaemonFencingToken: "fence", BootID: "boot",
-				TTLExpiresAt: time.Now().Add(time.Minute),
+				TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 			}, testExecBackendUncappedPolicy()); err != nil {
 				t.Fatal(err)
 			}
@@ -201,7 +201,7 @@ func TestExecBackendLifecycleTransitionsRefuseNonAdjacentSources(t *testing.T) {
 				key := ExecBackendAttemptKey{JobID: "job-" + transition.name + "-" + from, Attempt: 1, LifecycleGeneration: 1}
 				if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
 					ExecBackendAttemptKey: key, Provider: "e2b", DaemonFencingToken: "fence", BootID: "boot",
-					TTLExpiresAt: time.Now().Add(time.Minute),
+					TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 				}, testExecBackendUncappedPolicy()); err != nil {
 					t.Fatal(err)
 				}
@@ -221,7 +221,7 @@ func TestExecBackendLifecycleTransitionsRefuseNonAdjacentSources(t *testing.T) {
 			key := ExecBackendAttemptKey{JobID: "job-ok-" + transition.name, Attempt: 1, LifecycleGeneration: 1}
 			if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
 				ExecBackendAttemptKey: key, Provider: "e2b", DaemonFencingToken: "fence", BootID: "boot",
-				TTLExpiresAt: time.Now().Add(time.Minute),
+				TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 			}, testExecBackendUncappedPolicy()); err != nil {
 				t.Fatal(err)
 			}

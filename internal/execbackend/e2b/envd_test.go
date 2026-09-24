@@ -308,6 +308,53 @@ func TestEnvdUploadUsesProcessUserAndCredential(t *testing.T) {
 	}
 }
 
+func TestEnvdFixedHostRoutesUploadAndProcessWithoutWildcardHost(t *testing.T) {
+	t.Parallel()
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("E2b-Sandbox-Id") != "sbx-test" || r.Header.Get("E2b-Sandbox-Port") != "49983" ||
+			r.Header.Get("X-Access-Token") != testEnvdToken {
+			t.Errorf("sandbox routing/auth headers = %v", r.Header)
+		}
+		if r.Host != strings.TrimPrefix(server.URL, "https://") {
+			t.Errorf("unexpected request Host %q", r.Host)
+		}
+		switch r.URL.Path {
+		case "/files":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"name":"input","path":"/home/user/input","type":"file"}]`))
+		case "/process.Process/Start":
+			if _, _, err := readConnectFrame(r.Body); err != nil {
+				t.Errorf("read process request frame: %v", err)
+			}
+			w.Header().Set("Content-Type", connectProtocolMediaType)
+			writeConnectTestFrame(t, w, 0, `{"event":{"start":{"pid":123}}}`)
+			writeConnectTestFrame(t, w, 0, `{"event":{"end":{"exitCode":0,"exited":true,"status":"exit status 0","error":""}}}`)
+			writeConnectTestFrame(t, w, connectEndStreamFlag, `{}`)
+		default:
+			t.Errorf("unexpected route %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	envd, err := NewEnvd(Sandbox{ID: "sbx-test"}, EnvdCredential{token: testEnvdToken}, EnvdOptions{
+		HTTPClient: server.Client(), EndpointResolver: func(string, int) string { return server.URL }, FixedHostRouting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := envd.Upload(context.Background(), "/home/user/input", strings.NewReader("payload")); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := envd.Start(context.Background(), StartRequest{Name: "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEnvdRejectsMissingCredentialBeforeRequest(t *testing.T) {
 	t.Parallel()
 
@@ -524,6 +571,9 @@ func assertEnvdRequest(t *testing.T, request *http.Request, path, contentType st
 	}
 	if got := request.Header.Get("X-Access-Token"); got != testEnvdToken {
 		t.Errorf("X-Access-Token = %q", got)
+	}
+	if request.Header.Get("E2b-Sandbox-Id") != "" || request.Header.Get("E2b-Sandbox-Port") != "" {
+		t.Errorf("cloud E2B request unexpectedly has fixed-host routing headers: %v", request.Header)
 	}
 	if got := request.Header.Get("Content-Type"); got != contentType {
 		t.Errorf("Content-Type = %q, want %q", got, contentType)

@@ -117,29 +117,46 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 	if !policy.Configured {
 		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD, DenyReason: policy.DenyReason}
 	}
-	if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {
-		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
-			DenyReason: "an execution backend cost cap of exactly 0 denies. Unlike the model-token budget, 0 here does not mean unlimited. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
-	}
-	if policy.MaxReservedUSD < 0 || policy.PerAttemptUSD < 0 {
-		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
-			DenyReason: "a negative execution backend cost cap denies. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
+	if policy.CapacityOnly {
+		if reservation.Provider != "mac" || policy.MaxConcurrent <= 0 || reservation.CostReservedUSD != 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "Mac capacity requires provider mac, positive cost_max_concurrent, and zero dollar reservation"}
+		}
+	} else {
+		if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
+				DenyReason: "an execution backend cost cap of exactly 0 denies. Unlike the model-token budget, 0 here does not mean unlimited. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
+		}
+		if policy.MaxReservedUSD < 0 || policy.PerAttemptUSD < 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
+				DenyReason: "a negative execution backend cost cap denies. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd to positive values in config.toml."}
+		}
+		if reservation.CostReservedUSD <= 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD,
+				DenyReason: "cloud execution backend must reserve a positive per-attempt dollar amount"}
+		}
 	}
 
 	marks, stateArgs := billingStatePlaceholders()
-	// One statement: both cap clauses and the insert. The concurrency clause is
-	// skipped only when MaxConcurrent <= 0; the dollar clause never is.
+	// Both provider-scoped predicates and the insert share one statement, so
+	// simultaneous cloud and Mac attempts contend only with their own provider.
 	concurrency := "1=1"
+	dollar := "1=1"
 	args := []any{
 		reservation.JobID, reservation.Attempt, reservation.LifecycleGeneration,
 		reservation.Provider, reservation.DaemonFencingToken, reservation.BootID,
 		reservation.TTLExpiresAt.UTC().Format(time.RFC3339Nano),
 		ExecBackendAttemptStateReserved, reservation.CostReservedUSD,
 	}
-	args = append(args, stateArgs...)
-	args = append(args, reservation.CostReservedUSD, policy.MaxReservedUSD)
+	if !policy.CapacityOnly {
+		dollar = `(SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts
+			WHERE provider = ? AND state IN (` + marks + `)) + ? <= ?`
+		args = append(args, reservation.Provider)
+		args = append(args, stateArgs...)
+		args = append(args, reservation.CostReservedUSD, policy.MaxReservedUSD)
+	}
 	if policy.MaxConcurrent > 0 {
-		concurrency = `(SELECT COUNT(*) FROM execbackend_attempts WHERE state IN (` + marks + `)) + 1 <= ?`
+		concurrency = `(SELECT COUNT(*) FROM execbackend_attempts WHERE provider = ? AND state IN (` + marks + `)) + 1 <= ?`
+		args = append(args, reservation.Provider)
 		args = append(args, stateArgs...)
 		args = append(args, policy.MaxConcurrent)
 	}
@@ -148,9 +165,7 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		daemon_fencing_token, boot_id, ttl_expires_at, state,
 		cost_reserved_usd, cost_actual_usd
 	) SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL
-	WHERE (SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts
-		WHERE state IN (`+marks+`)) + ? <= ?
-	  AND `+concurrency, args...)
+	WHERE `+dollar+` AND `+concurrency, args...)
 	if err != nil {
 		// An unreadable meter refuses. The statement that reads the meter is the
 		// statement that writes the row, so a failure here cannot have admitted.
@@ -169,12 +184,15 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		MaxReservedUSD: policy.MaxReservedUSD,
 		MaxConcurrent:  policy.MaxConcurrent,
 	}
-	s.describeBillingLoad(ctx, refusal)
+	if policy.CapacityOnly {
+		refusal.Clause = "concurrency"
+	}
+	s.describeBillingLoad(ctx, reservation.Provider, refusal)
 	for _, n := range refusal.ByState {
 		refusal.LiveCount += n
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(cost_reserved_usd), 0)
-		FROM execbackend_attempts WHERE state IN (`+marks+`)`, stateArgs...).Scan(&refusal.ReservedUSD); err != nil && refusal.OperandsErr == nil {
+		FROM execbackend_attempts WHERE provider = ? AND state IN (`+marks+`)`, append([]any{reservation.Provider}, stateArgs...)...).Scan(&refusal.ReservedUSD); err != nil && refusal.OperandsErr == nil {
 		refusal.OperandsErr = err
 	}
 	if policy.MaxConcurrent > 0 && refusal.LiveCount+1 > policy.MaxConcurrent {

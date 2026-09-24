@@ -247,7 +247,7 @@ func TestExecBackendLedgerReconcilesBothInventoryDirections(t *testing.T) {
 	ledgerOnly := seedRunningExecBackendAttempt(t, store, "job-ledger-only", "sandbox-ledger-only", "fence-ledger", "boot-ledger")
 	crashKey := db.ExecBackendAttemptKey{JobID: "job-crash", Attempt: 1, LifecycleGeneration: 8}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
-		ExecBackendAttemptKey: crashKey, Provider: e2bAttemptProvider, DaemonFencingToken: "fence-crash", BootID: "boot-crash", TTLExpiresAt: time.Now().Add(time.Minute),
+		ExecBackendAttemptKey: crashKey, Provider: e2bAttemptProvider, DaemonFencingToken: "fence-crash", BootID: "boot-crash", TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 	}, testCLIExecBackendUncappedPolicy()); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestExecBackendLedgerReapsOnlyOwnedForeignBoot(t *testing.T) {
 	missingID := db.ExecBackendAttemptKey{JobID: "job-create-crash", Attempt: 1, LifecycleGeneration: 3}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
 		ExecBackendAttemptKey: missingID, Provider: e2bAttemptProvider,
-		DaemonFencingToken: "old-fence", BootID: "old-boot", TTLExpiresAt: time.Now().Add(time.Minute),
+		DaemonFencingToken: "old-fence", BootID: "old-boot", TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 	}, testCLIExecBackendUncappedPolicy()); err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func seedRunningExecBackendAttempt(t *testing.T, store *db.Store, jobID, sandbox
 	t.Helper()
 	key := db.ExecBackendAttemptKey{JobID: jobID, Attempt: 1, LifecycleGeneration: 3}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
-		ExecBackendAttemptKey: key, Provider: e2bAttemptProvider, DaemonFencingToken: fencingToken, BootID: bootID, TTLExpiresAt: time.Now().Add(time.Minute),
+		ExecBackendAttemptKey: key, Provider: e2bAttemptProvider, DaemonFencingToken: fencingToken, BootID: bootID, TTLExpiresAt: time.Now().Add(time.Minute), CostReservedUSD: 0.01,
 	}, testCLIExecBackendUncappedPolicy()); err != nil {
 		t.Fatal(err)
 	}
