@@ -106,10 +106,7 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		return false, err
 	}
 
-	purpose := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
-	if purpose == "" {
-		purpose = db.DefaultReviewPurpose
-	}
+	purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
 	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), payload.PullRequest, head, purpose)
 	if err != nil {
 		return false, err

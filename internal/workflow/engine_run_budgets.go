@@ -681,6 +681,13 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if err := e.RecordReviewFindingsToLedger(ctx, job, payload); err != nil {
 			return err
 		}
+		// A POST-MERGE REVIEW (#2265 level 2) reviews a head that already shipped.
+		// Its findings are recorded above like any review's, but nothing here may
+		// set changes_requested, dispatch a fix, or run the merge gate: the
+		// follow-ups go to the requesting role instead.
+		if payload.PostMergeReview {
+			return e.handlePostMergeReview(ctx, job, payload)
+		}
 	}
 	// AN ASK THAT REVIEWED SOMETHING LOSES ITS FINDINGS SILENTLY (#1962). Both
 	// RecordReviewFindingsToLedger call sites above are inside `job.Type ==

@@ -91,6 +91,42 @@ func wireReviewRiskSignals(engine *workflow.Engine, gh github.Client) {
 	}
 }
 
+// wireReviewPostMergeIssues installs the engine seam that files one issue per
+// P2 finding from a post-merge review (#2265). A body carries its
+// "finding-uid: <job>/<index>" line; a retried advance finds that line among
+// the repo's open issues and returns the issue it already filed. The listing is
+// used rather than search because search indexing lags a just-filed issue.
+func wireReviewPostMergeIssues(engine *workflow.Engine, gh github.Client) {
+	if engine == nil || gh == nil {
+		return
+	}
+	engine.PostMergeFollowUpIssue = func(ctx context.Context, repo, title, body string, labels []string) (string, error) {
+		r, err := github.ParseRepository(repo)
+		if err != nil {
+			return "", err
+		}
+		if _, uid, ok := strings.Cut(body, "finding-uid: "); ok {
+			line := "finding-uid: " + strings.TrimSpace(uid)
+			existing, err := gh.ListIssues(ctx, r, "open")
+			if err != nil {
+				return "", err
+			}
+			for _, issue := range existing {
+				for _, candidate := range strings.Split(issue.Body, "\n") {
+					if strings.TrimSpace(candidate) == line {
+						return issue.URL, nil
+					}
+				}
+			}
+		}
+		issue, err := gh.CreateIssue(ctx, github.CreateIssueInput{Repo: r, Title: title, Body: body, Labels: labels})
+		if err != nil {
+			return "", err
+		}
+		return issue.URL, nil
+	}
+}
+
 // wireReviewChangedFiles installs the engine seam that scopes an incremental
 // review to the files a follow-up range actually changed.
 //

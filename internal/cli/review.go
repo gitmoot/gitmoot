@@ -80,6 +80,8 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 		return runReviewRequest(args[1:], stdout, stderr)
 	case "status":
 		return runReviewStatus(args[1:], stdout, stderr)
+	case "level":
+		return runReviewLevel(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown review subcommand %q\n\n", args[0])
 		printReviewUsage(stderr)
@@ -89,8 +91,9 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
 	fmt.Fprintln(w, "Gitmoot picks a review-capable agent, runs it on omp with the [review_router] model pool")
@@ -128,8 +131,11 @@ type reviewRequestOptions struct {
 	reviewer                string
 	full                    bool
 	allowPromptHeadMismatch bool
-	execBackend             string
-	execBackendSet          bool
+	// postMerge reviews an already-merged head (#2265 level 2): findings become
+	// follow-ups for the requesting role instead of blocking a merge.
+	postMerge      bool
+	execBackend    string
+	execBackendSet bool
 	// runtime is the operator escape from the omp pin below (#2180). A pinned
 	// runtime with no override is a dead end whenever an unavailability hold is
 	// written for that runtime: the caller has no second choice to reach for.
@@ -159,6 +165,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.StringVar(&opts.execBackend, "exec-backend", "", "execution backend for this review: local or remote (default local)")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
+	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -176,6 +183,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
+		return 2
+	}
+	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
+		fmt.Fprintln(stderr, "review request: --post-merge and --lead are mutually exclusive")
 		return 2
 	}
 	if opts.ttl <= 0 {
@@ -320,7 +331,10 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err := dispatchHeadSHAError(head); err != nil {
 		return reviewRequestOutput{}, err
 	}
-	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, opts.purpose)
+	// claimPurpose is the purpose component for everything keyed on the review
+	// question: claim, subscription, verdict history, loop guard, baseline.
+	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge)
+	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, claimPurpose)
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -341,7 +355,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	// absent" as "claim is dead" steals the claim and both requesters dispatch,
 	// which is the duplicate this table exists to prevent.
 	jobID := localAgentJobID("review", "review-router")
-	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, opts.purpose, opts.role, reviewRequestOwner())
+	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, claimPurpose, opts.role, reviewRequestOwner())
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -373,7 +387,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer, opts.role)
+	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, claimPurpose, opts.reviewer, opts.role)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -384,7 +398,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if opts.full {
 		output.BaselineSkipped = "flag --full"
 	} else {
-		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, opts.purpose)
+		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, claimPurpose)
 		if scope != nil {
 			output.Baseline = scope.PreviousHeadSHA
 		}
@@ -427,6 +441,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// a changes-requested verdict has nowhere to route and says so; a caller
 		// that names an implementer gets the routing it asked for (#2196).
 		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
+		PostMergeReview:      opts.postMerge,
 		SelectedAction:       "review",
 		SelectedActionReason: "review router " + opts.purpose,
 		ExecutionPath:        reviewRequestExecutionPath,
@@ -528,10 +543,7 @@ func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), s.headSHA) {
 		return false
 	}
-	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
-	if got == "" {
-		got = db.DefaultReviewPurpose
-	}
+	got := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
 	want := s.purpose
 	if want == "" {
 		want = db.DefaultReviewPurpose
@@ -873,7 +885,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 // later wakes it from the job's own state transition — never from gate
 // advancement and never from a process that has to still be alive.
 func subscribeReviewRequester(ctx context.Context, store *db.Store, output *reviewRequestOutput, opts reviewRequestOptions) error {
-	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, output.Purpose, opts.ttl)
+	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, db.ReviewRequestPurpose(output.Purpose, opts.postMerge), opts.ttl)
 	if err != nil {
 		return err
 	}

@@ -340,7 +340,11 @@ type JobRequest struct {
 	// not invent one. It has to live on the payload rather than only in a job
 	// event, because AdvanceJob is what decides whether to dispatch a fix.
 	NoFixTarget bool
-	Ephemeral   *EphemeralSpec
+	// PostMergeReview marks a review of an already-merged head (#2265 level 2):
+	// its findings become follow-ups for the requesting role, and it never
+	// enters the changes_requested/approved lifecycle or the merge gate.
+	PostMergeReview bool
+	Ephemeral       *EphemeralSpec
 	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
 	// coordinator continuation enqueued by the `answer` resume verb. Empty for
 	// every other job, so the stored payload is byte-identical by default.
@@ -524,6 +528,7 @@ type JobPayload struct {
 	Phase                  string              `json:"phase,omitempty"`
 	SkipNativeReviewFanout bool                `json:"skip_native_review_fanout,omitempty"`
 	NoFixTarget            bool                `json:"no_fix_target,omitempty"`
+	PostMergeReview        bool                `json:"post_merge_review,omitempty"`
 	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
 	HumanAnswer            string              `json:"human_answer,omitempty"`
 	// OrchestrateStage marks a #758 pipeline orchestrate stage job whose delegations[]
@@ -867,6 +872,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		// #2054: carried onto the payload because AdvanceJob is what records a
 		// changes_requested verdict's ownership of the follow-up.
 		NoFixTarget:              noFixTarget,
+		PostMergeReview:          request.PostMergeReview,
 		Ephemeral:                request.Ephemeral,
 		HumanAnswer:              request.HumanAnswer,
 		RiskTier:                 strings.TrimSpace(request.RiskTier),

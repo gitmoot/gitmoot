@@ -145,11 +145,39 @@ func reviewPayloadServesPurpose(payload reviewVerdictPayload, want string) bool 
 	if want == "" {
 		return true
 	}
-	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
-	if got == "" {
-		got = DefaultReviewPurpose
+	return ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview) == want
+}
+
+// postMergePurposeSuffix scopes a post-merge review (#2265) apart from the
+// pre-merge review of the same head and purpose. Without it the post-merge
+// request would attach to the earlier claim and its verdict, and never run.
+const postMergePurposeSuffix = "-post-merge"
+
+// ReviewRequestPurpose is the purpose component of a review request's claim and
+// purpose-scoped verdict key. Every site that builds that key from a request or
+// a stored review payload must go through it, so claim, subscription, verdict
+// resolution and release always agree.
+func ReviewRequestPurpose(purpose string, postMerge bool) string {
+	purpose = strings.ToLower(strings.TrimSpace(purpose))
+	if purpose == "" {
+		purpose = DefaultReviewPurpose
 	}
-	return got == want
+	if postMerge {
+		return purpose + postMergePurposeSuffix
+	}
+	return purpose
+}
+
+// verdictHistoryPurpose is the purpose a stored verdict is indexed under in
+// verdict history (loop detection, reviewer selection, delta baselines). A
+// post-merge verdict gets the scoped purpose, so it neither blocks nor answers
+// a pre-merge request at the same head, and vice versa. An unrecorded purpose
+// on a pre-merge verdict stays "" so legacy consumers keep defaulting it.
+func verdictHistoryPurpose(purpose string, postMerge bool) string {
+	if postMerge {
+		return ReviewRequestPurpose(purpose, true)
+	}
+	return strings.ToLower(strings.TrimSpace(purpose))
 }
 
 // DefaultReviewPurpose is the purpose a review carries when none was recorded.
@@ -391,6 +419,9 @@ type reviewVerdictPayload struct {
 	// ReviewPurpose scopes a #2171 router verdict to the question it answers, so
 	// a code review cannot satisfy a security waiter at the same head.
 	ReviewPurpose string `json:"review_purpose"`
+	// PostMergeReview marks a review of an already-merged head (#2265); it
+	// answers only post-merge waiters for its purpose.
+	PostMergeReview bool `json:"post_merge_review"`
 }
 
 // isFanOut reports whether a decoded review result is a coordinator announcement
@@ -506,14 +537,15 @@ WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_reque
 		// fields still parse. A payload that is not valid JSON at all fails
 		// here too, and that is the unplaceable case.
 		var lenient struct {
-			HeadSHA       string `json:"head_sha"`
-			ReviewPurpose string `json:"review_purpose"`
+			HeadSHA         string `json:"head_sha"`
+			ReviewPurpose   string `json:"review_purpose"`
+			PostMergeReview bool   `json:"post_merge_review"`
 		}
 		readable := json.Unmarshal([]byte(payload), &lenient) == nil
 		undecodable = append(undecodable, UndecodableReviewVerdict{
 			JobID:         jobID,
 			HeadSHA:       strings.ToLower(strings.TrimSpace(lenient.HeadSHA)),
-			ReviewPurpose: strings.ToLower(strings.TrimSpace(lenient.ReviewPurpose)),
+			ReviewPurpose: verdictHistoryPurpose(lenient.ReviewPurpose, lenient.PostMergeReview),
 			UpdatedAt:     updatedAt,
 			Readable:      readable,
 		})
@@ -563,7 +595,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		verdicts = append(verdicts, SucceededReviewVerdict{
 			JobID:            strings.TrimSpace(jobID),
 			Agent:            strings.TrimSpace(agent),
-			ReviewPurpose:    strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose)),
+			ReviewPurpose:    verdictHistoryPurpose(decoded.ReviewPurpose, decoded.PostMergeReview),
 			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),
@@ -683,13 +715,7 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
 	// waiter, because the router deliberately runs those as separate reviews.
 	keys := []any{key}
-	purpose := strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose))
-	if purpose == "" {
-		// A verdict that recorded no purpose answers the default one, matching
-		// reviewPayloadServesPurpose so the producer and the subscribe-time
-		// recheck cannot disagree about which waiters a verdict serves.
-		purpose = DefaultReviewPurpose
-	}
+	purpose := ReviewRequestPurpose(decoded.ReviewPurpose, decoded.PostMergeReview)
 	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, purpose); purposeErr == nil {
 		keys = append(keys, purposed)
 	}

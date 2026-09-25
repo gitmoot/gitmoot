@@ -1315,9 +1315,10 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer>] \
-    [--full] [--allow-prompt-head-mismatch] [--json] \
+    [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
+gitmoot review level --repo owner/repo --pr 2170 [--json]
 ```
 
 `--lead` names the implementer a changes-requested verdict routes to; with no
@@ -1332,6 +1333,38 @@ job. Omit it for local execution; process-wide `[remote_exec].backend` does not
 reroute reviews. Remote reviews currently support only `shell` and `omp`;
 Gitmoot refuses any other runtime/backend pair before enqueue and names both
 operands. `agent review` forwards the same flag through the review router.
+
+### Review levels (#2265)
+
+`gitmoot review level` decides whether a pull request head needs a review
+before merge. It prints `level`, `head` and `reason`, and posts an informational
+`gitmoot/review-level` commit status on that head:
+
+| Level | Meaning |
+|---|---|
+| `level1_no_review` | Merge and deploy once CI/tests pass. |
+| `level2_background` | Merge and deploy once CI/tests pass, then run `gitmoot review request --pr N --head <head> --role <role> --post-merge`. |
+| `level3_required` | One independent review at the exact head before merge. |
+
+Rules, first match wins:
+1. `gitmoot/gitmoot` is always `level3_required`.
+2. A fixed path is always `level3_required`: agent instructions, CI workflows, deploy config, dependency locks, migrations, the merge gate, or the credential gateway.
+3. With no `OPENROUTER_API_KEY` (env or keychain), a classifier error, or an `uncertain` answer, the result is `level3_required`.
+4. When JEV (`typesafe/jev-1.13`) puts the chance of a high-impact change above 0.35, the result is `level3_required`. High-impact means security or permissions, unrecoverable data, deploy/merge/review rules, spending money or contacting outside people, or weakened tests.
+5. A truncated diff is never `level1_no_review`.
+
+Re-run it whenever the head moves. The status is advisory: it does not block a merge.
+
+`--post-merge` reviews an already-merged head. Its findings become follow-ups for
+the requesting role instead of blocking anything. The verdict still wakes the role.
+- **P0/P1:** a note to fix or revert the same day.
+- **P2:** an issue labelled `review-p2` and `agent:<role>`, plus a note.
+- **P3:** no follow-up.
+
+Job events record `post_merge_followups_done`, or `post_merge_followup_error`
+if a follow-up could not be filed. `--post-merge` refuses `--lead`. Through
+`agent review` it needs the router path: `--org-role` and `--no-fix-target`,
+without `--foreground` or `--json`.
 
 Two things `agent review` reports that are easy to miss:
 

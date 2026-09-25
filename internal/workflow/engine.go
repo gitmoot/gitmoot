@@ -308,6 +308,11 @@ type Engine struct {
 	// wired only in cli (a GitHub read), keeping the engine free of the github
 	// client coupling.
 	PullRequestSignals func(ctx context.Context, repo string, number int) (labels []string, changedPaths []string, err error)
+	// PostMergeFollowUpIssue files one GitHub issue for a P2 finding from a
+	// post-merge review (#2265) and returns its URL. Like PullRequestSignals it
+	// is wired only in cli, keeping the engine free of the github client; when
+	// nil, the follow-up is recorded as a job event instead.
+	PostMergeFollowUpIssue func(ctx context.Context, repo, title, body string, labels []string) (url string, err error)
 	// LedgerResolvers is the #1822 ledger's SHARED resolver value. The merge gate
 	// holds the SAME value, assigned from one construction in the daemon, so the
 	// review brief and the gate cannot compute different obligation sets. Two

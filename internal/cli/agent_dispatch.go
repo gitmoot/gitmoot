@@ -285,7 +285,10 @@ type localAgentDispatchRequest struct {
 	LeadAgent        string
 	// NoFixTarget states that this review has NO implementer to route a
 	// changes_requested verdict to (#2054). It is the review-only dispatch.
-	NoFixTarget            bool
+	NoFixTarget bool
+	// PostMergeReview reviews an already-merged head (#2265 level 2); its
+	// findings become follow-ups instead of blocking a merge.
+	PostMergeReview        bool
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -973,6 +976,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		RequiredEvents:           requiredEvents,
 		SkipNativeReviewFanout:   request.SkipNativeReviewFanout,
 		NoFixTarget:              request.NoFixTarget,
+		PostMergeReview:          request.PostMergeReview,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
@@ -1508,6 +1512,9 @@ func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, req
 	// choice is recorded on the job so a later changes_requested is attributable
 	// to a decision instead of looking like a missing lead. An unstated absence
 	// still refuses.
+	if request.PostMergeReview && strings.TrimSpace(request.LeadAgent) != "" {
+		return localAgentDispatchRequest{}, errors.New("--post-merge and --lead are mutually exclusive: a post-merge review has no implementer to route a fix to")
+	}
 	if request.NoFixTarget {
 		if strings.TrimSpace(request.LeadAgent) != "" {
 			return localAgentDispatchRequest{}, errors.New("--no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
@@ -1569,7 +1576,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, request.ReviewPurpose); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, db.ReviewRequestPurpose(request.ReviewPurpose, request.PostMergeReview)); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
