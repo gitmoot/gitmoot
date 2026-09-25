@@ -331,7 +331,10 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err := dispatchHeadSHAError(head); err != nil {
 		return reviewRequestOutput{}, err
 	}
-	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, db.ReviewRequestPurpose(opts.purpose, opts.postMerge))
+	// claimPurpose is the purpose component for everything keyed on the review
+	// question: claim, subscription, verdict history, loop guard, baseline.
+	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge)
+	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, claimPurpose)
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -352,7 +355,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	// absent" as "claim is dead" steals the claim and both requesters dispatch,
 	// which is the duplicate this table exists to prevent.
 	jobID := localAgentJobID("review", "review-router")
-	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, opts.purpose, opts.role, reviewRequestOwner())
+	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, claimPurpose, opts.role, reviewRequestOwner())
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -384,7 +387,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return finishReviewAttach(ctx, store, output, attach, current, opts)
 		}
 	}
-	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, opts.purpose, opts.reviewer, opts.role)
+	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, claimPurpose, opts.reviewer, opts.role)
 	if err != nil {
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
@@ -395,7 +398,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if opts.full {
 		output.BaselineSkipped = "flag --full"
 	} else {
-		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, opts.purpose)
+		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, claimPurpose)
 		if scope != nil {
 			output.Baseline = scope.PreviousHeadSHA
 		}
@@ -540,10 +543,7 @@ func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), s.headSHA) {
 		return false
 	}
-	got := strings.ToLower(strings.TrimSpace(payload.ReviewPurpose))
-	if got == "" {
-		got = db.DefaultReviewPurpose
-	}
+	got := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
 	want := s.purpose
 	if want == "" {
 		want = db.DefaultReviewPurpose

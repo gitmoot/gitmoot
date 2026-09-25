@@ -168,6 +168,18 @@ func ReviewRequestPurpose(purpose string, postMerge bool) string {
 	return purpose
 }
 
+// verdictHistoryPurpose is the purpose a stored verdict is indexed under in
+// verdict history (loop detection, reviewer selection, delta baselines). A
+// post-merge verdict gets the scoped purpose, so it neither blocks nor answers
+// a pre-merge request at the same head, and vice versa. An unrecorded purpose
+// on a pre-merge verdict stays "" so legacy consumers keep defaulting it.
+func verdictHistoryPurpose(purpose string, postMerge bool) string {
+	if postMerge {
+		return ReviewRequestPurpose(purpose, true)
+	}
+	return strings.ToLower(strings.TrimSpace(purpose))
+}
+
 // DefaultReviewPurpose is the purpose a review carries when none was recorded.
 const DefaultReviewPurpose = "code"
 
@@ -525,14 +537,15 @@ WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_reque
 		// fields still parse. A payload that is not valid JSON at all fails
 		// here too, and that is the unplaceable case.
 		var lenient struct {
-			HeadSHA       string `json:"head_sha"`
-			ReviewPurpose string `json:"review_purpose"`
+			HeadSHA         string `json:"head_sha"`
+			ReviewPurpose   string `json:"review_purpose"`
+			PostMergeReview bool   `json:"post_merge_review"`
 		}
 		readable := json.Unmarshal([]byte(payload), &lenient) == nil
 		undecodable = append(undecodable, UndecodableReviewVerdict{
 			JobID:         jobID,
 			HeadSHA:       strings.ToLower(strings.TrimSpace(lenient.HeadSHA)),
-			ReviewPurpose: strings.ToLower(strings.TrimSpace(lenient.ReviewPurpose)),
+			ReviewPurpose: verdictHistoryPurpose(lenient.ReviewPurpose, lenient.PostMergeReview),
 			UpdatedAt:     updatedAt,
 			Readable:      readable,
 		})
@@ -582,7 +595,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		verdicts = append(verdicts, SucceededReviewVerdict{
 			JobID:            strings.TrimSpace(jobID),
 			Agent:            strings.TrimSpace(agent),
-			ReviewPurpose:    strings.ToLower(strings.TrimSpace(decoded.ReviewPurpose)),
+			ReviewPurpose:    verdictHistoryPurpose(decoded.ReviewPurpose, decoded.PostMergeReview),
 			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),

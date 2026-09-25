@@ -644,9 +644,7 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 		if job, err := store.GetJob(context.Background(), output.JobID); err == nil {
 			var payload workflow.JobPayload
 			if json.Unmarshal([]byte(job.Payload), &payload) == nil {
-				if recorded := strings.TrimSpace(payload.ReviewPurpose); recorded != "" {
-					purpose = recorded
-				}
+				purpose = db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
 			}
 		}
 		factID, holds, err := subscribeRoleToReviewVerdict(context.Background(), store, role,
