@@ -80,6 +80,8 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 		return runReviewRequest(args[1:], stdout, stderr)
 	case "status":
 		return runReviewStatus(args[1:], stdout, stderr)
+	case "level":
+		return runReviewLevel(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown review subcommand %q\n\n", args[0])
 		printReviewUsage(stderr)
@@ -89,8 +91,9 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
 	fmt.Fprintln(w, "Gitmoot picks a review-capable agent, runs it on omp with the [review_router] model pool")
@@ -128,8 +131,11 @@ type reviewRequestOptions struct {
 	reviewer                string
 	full                    bool
 	allowPromptHeadMismatch bool
-	execBackend             string
-	execBackendSet          bool
+	// postMerge reviews an already-merged head (#2265 level 2): findings become
+	// follow-ups for the requesting role instead of blocking a merge.
+	postMerge      bool
+	execBackend    string
+	execBackendSet bool
 	// runtime is the operator escape from the omp pin below (#2180). A pinned
 	// runtime with no override is a dead end whenever an unavailability hold is
 	// written for that runtime: the caller has no second choice to reach for.
@@ -159,6 +165,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.StringVar(&opts.execBackend, "exec-backend", "", "execution backend for this review: local or remote (default local)")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
+	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -176,6 +183,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
+		return 2
+	}
+	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
+		fmt.Fprintln(stderr, "review request: --post-merge and --lead are mutually exclusive")
 		return 2
 	}
 	if opts.ttl <= 0 {
@@ -427,6 +438,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// a changes-requested verdict has nowhere to route and says so; a caller
 		// that names an implementer gets the routing it asked for (#2196).
 		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
+		PostMergeReview:      opts.postMerge,
 		SelectedAction:       "review",
 		SelectedActionReason: "review router " + opts.purpose,
 		ExecutionPath:        reviewRequestExecutionPath,

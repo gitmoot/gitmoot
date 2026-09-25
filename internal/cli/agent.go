@@ -397,6 +397,7 @@ type agentRunOptions struct {
 	skipNativeReviewFanout  bool
 	allowPromptHeadMismatch bool
 	noFixTarget             bool
+	postMerge               bool
 	recipe                  string
 }
 
@@ -561,6 +562,10 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		} else {
 			return runReviewRequest(reviewRequestArgsFromAgentReview(options), stdout, stderr)
 		}
+	}
+	if options.postMerge {
+		fmt.Fprintln(stderr, "agent review: --post-merge requires the review router (pass --org-role and --no-fix-target, without --foreground or --json)")
+		return 2
 	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
 	// REQUIRES --role because the role is who the verdict is delivered to, and a
@@ -731,6 +736,9 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 	if options.allowPromptHeadMismatch {
 		args = append(args, "--allow-prompt-head-mismatch")
 	}
+	if options.postMerge {
+		args = append(args, "--post-merge")
+	}
 	if options.jsonOutput {
 		args = append(args, "--json")
 	}
@@ -763,6 +771,10 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	}
 	if options.noFixTarget && action != "review" {
 		fmt.Fprintf(stderr, "%s: --no-fix-target is only supported when routing to review\n", errLabel)
+		return localAgentJobOutput{}, 2
+	}
+	if options.postMerge {
+		fmt.Fprintf(stderr, "%s: --post-merge is only supported by `agent review` through the review router\n", errLabel)
 		return localAgentJobOutput{}, 2
 	}
 	if strings.TrimSpace(options.lead) != "" && action != "review" {
@@ -892,6 +904,8 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.skipNativeReviewFanout = true
 		case arg == "--no-fix-target":
 			options.noFixTarget = true
+		case arg == "--post-merge":
+			options.postMerge = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
 		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
