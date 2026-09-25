@@ -163,7 +163,7 @@ func riskAnswer(response jev.Response) (float64, error) {
 	if !ok {
 		return 0, fmt.Errorf("%s answer missing", questionRisk)
 	}
-	if answer.Noul == nil || *answer.Noul < 0 || *answer.Noul > 1 {
+	if answer.Noul == nil || !(*answer.Noul >= 0 && *answer.Noul <= 1) {
 		return 0, fmt.Errorf("%s answer has no probability in [0,1]", questionRisk)
 	}
 	return *answer.Noul, nil
@@ -181,9 +181,11 @@ func levelAnswer(response jev.Response) (jev.Answer, error) {
 	return answer, fmt.Errorf("%s answer %q is not an offered option", questionLevel, answer.Choice)
 }
 
-// BuildState renders the model input. Every file path is always listed; if the
-// diff exceeds StateBudgetBytes each file gets a fair share of the budget,
-// smallest first, so one huge file cannot hide the others.
+// BuildState renders the model input. Every file path is always listed in
+// "files"; if the diff exceeds StateBudgetBytes each file gets a fair share of
+// the budget, smallest first, so one huge file cannot hide the others. A file
+// whose share cannot even hold the truncation marker is left out of "diff"
+// (its path is still in "files"), so the diff never exceeds the budget.
 func BuildState(in Input) (map[string]any, bool) {
 	complete := true
 	texts := make([]string, len(in.Files))
@@ -218,11 +220,11 @@ func BuildState(in Input) (map[string]any, bool) {
 		for n, index := range order {
 			share := remaining / (len(order) - n)
 			if len(texts[index]) > share {
-				cut := share - len(truncatedMarker)
-				if cut < 0 {
-					cut = 0
+				if share < len(truncatedMarker) {
+					texts[index] = ""
+				} else {
+					texts[index] = texts[index][:share-len(truncatedMarker)] + truncatedMarker
 				}
-				texts[index] = texts[index][:cut] + truncatedMarker
 			}
 			remaining -= len(texts[index])
 		}

@@ -65,7 +65,7 @@ func (e Engine) handlePostMergeReview(ctx context.Context, job db.Job, payload J
 		for _, finding := range urgent {
 			titles = append(titles, finding.severity+": "+finding.title)
 		}
-		body := fmt.Sprintf("Post-merge review of %s found %d P1 finding(s): %s. Fix or revert today, and pause further deploys of this area until it is handled. Review job %s.",
+		body := fmt.Sprintf("Post-merge review of %s found %d P0/P1 finding(s): %s. Fix or revert today, and pause further deploys of this area until it is handled. Review job %s.",
 			subject, len(urgent), strings.Join(titles, "; "), job.ID)
 		if err := e.addressPostMergeRole(ctx, payload, role, body); err != nil {
 			e.addPostMergeEvent(ctx, job.ID, postMergeFollowupErrorEvent, "P1 note: "+err.Error())
@@ -84,7 +84,7 @@ func (e Engine) handlePostMergeReview(ctx context.Context, job db.Job, payload J
 		}
 		title := "[review-p2] " + finding.title
 		if len(title) > postMergeIssueTitleMax {
-			title = title[:postMergeIssueTitleMax]
+			title = strings.ToValidUTF8(title[:postMergeIssueTitleMax], "")
 		}
 		body := fmt.Sprintf("Post-merge review found a P2 finding in %s.\n\n- Pull request: #%d\n- Merged head: `%s`\n- Review job: `%s`\n- Severity: %s\n- Location: %s\n\n%s\n\nFix within a few days.\n\nfinding-uid: %s\n",
 			payload.Repo, payload.PullRequest, payload.HeadSHA, job.ID, finding.severity, finding.location, finding.detail, finding.uid)

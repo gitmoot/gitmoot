@@ -3,6 +3,8 @@ package reviewlevel
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -108,5 +110,30 @@ func TestBuildStateTruncatesFairlyAndKeepsEveryPath(t *testing.T) {
 	files := state["files"].([]string)
 	if len(files) != 2 || files[0] != "big/generated.ts (+1/-0)" || files[1] != "src/small.ts (+1/-1)" {
 		t.Fatalf("files = %v", files)
+	}
+}
+
+func TestDecideRejectsNaNRisk(t *testing.T) {
+	judge := &fakeJudge{risk: math.NaN(), choice: LevelNoReview}
+	got := Decide(context.Background(), judge, jev.DefaultModel, appInput())
+	if got.Level != LevelRequired || got.Source != "classifier_error" {
+		t.Fatalf("NaN risk decided %s/%s, want level3_required/classifier_error", got.Level, got.Source)
+	}
+}
+
+func TestBuildStateStaysWithinBudgetForManyFiles(t *testing.T) {
+	var files []File
+	for i := range 3000 {
+		files = append(files, File{Path: fmt.Sprintf("gen/file%04d.ts", i), Patch: "@@ -0,0 +1 @@\n+" + strings.Repeat("y", 40)})
+	}
+	state, complete := BuildState(appInput(files...))
+	if complete {
+		t.Fatal("complete = true for a truncated diff")
+	}
+	if diff := state["diff"].(string); len(diff) > StateBudgetBytes {
+		t.Fatalf("diff length %d exceeds budget %d", len(diff), StateBudgetBytes)
+	}
+	if listed := state["files"].([]string); len(listed) != 3000 {
+		t.Fatalf("files listed = %d, want every path", len(listed))
 	}
 }

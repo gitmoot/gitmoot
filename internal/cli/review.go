@@ -331,7 +331,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err := dispatchHeadSHAError(head); err != nil {
 		return reviewRequestOutput{}, err
 	}
-	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, opts.purpose)
+	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, db.ReviewRequestPurpose(opts.purpose, opts.postMerge))
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -885,7 +885,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 // later wakes it from the job's own state transition — never from gate
 // advancement and never from a process that has to still be alive.
 func subscribeReviewRequester(ctx context.Context, store *db.Store, output *reviewRequestOutput, opts reviewRequestOptions) error {
-	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, output.Purpose, opts.ttl)
+	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, db.ReviewRequestPurpose(output.Purpose, opts.postMerge), opts.ttl)
 	if err != nil {
 		return err
 	}

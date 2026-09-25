@@ -106,14 +106,16 @@ func wireReviewPostMergeIssues(engine *workflow.Engine, gh github.Client) {
 			return "", err
 		}
 		if _, uid, ok := strings.Cut(body, "finding-uid: "); ok {
-			uid = strings.TrimSpace(uid)
+			line := "finding-uid: " + strings.TrimSpace(uid)
 			existing, err := gh.ListIssues(ctx, r, "open")
 			if err != nil {
 				return "", err
 			}
 			for _, issue := range existing {
-				if strings.Contains(issue.Body, "finding-uid: "+uid) {
-					return issue.URL, nil
+				for _, candidate := range strings.Split(issue.Body, "\n") {
+					if strings.TrimSpace(candidate) == line {
+						return issue.URL, nil
+					}
 				}
 			}
 		}

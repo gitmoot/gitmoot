@@ -881,6 +881,52 @@ func TestReviewSubscribeRecheckRespectsPurpose(t *testing.T) {
 	}
 }
 
+// #2266 review P1: --post-merge shared the pre-merge claim key, so on a head
+// that already carried a review it attached to that verdict and never ran its
+// follow-ups. Each must get its own job, wait, and verdict, in both directions.
+func TestReviewRequestPostMergeDoesNotShareThePreMergeClaim(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json"}
+
+	preMerge, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	saveReviewRouterVerdict(t, store, preMerge.JobID)
+
+	postMerge, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "joltra", "--post-merge")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	if postMerge.JobID == preMerge.JobID || postMerge.State == reviewRequestVerdictExists {
+		t.Fatalf("post-merge request = %+v, want its own review, not the pre-merge verdict on %s", postMerge, preMerge.JobID)
+	}
+	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, postMerge.JobID).Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !payload.PostMergeReview {
+		t.Fatalf("post-merge job %s payload lost post_merge_review", postMerge.JobID)
+	}
+	fact, err := store.GetAwaitedFact(ctx, postMerge.AwaitedFactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fact.State != db.AwaitedFactStateWaiting {
+		t.Fatalf("post-merge wait = %s (%q), want waiting: the pre-merge verdict does not answer it", fact.State, fact.ResolutionDetail)
+	}
+
+	// The reverse: a post-merge verdict must not answer a later pre-merge
+	// request at the same head as if a blocking review existed.
+	saveReviewRouterVerdict(t, store, postMerge.JobID)
+	repeat, failure := runReviewRequestJSON(t, append(append([]string{}, base...), "--role", "owner")...)
+	if failure == "" && repeat.JobID == postMerge.JobID {
+		t.Fatalf("pre-merge request attached to the post-merge job %s", postMerge.JobID)
+	}
+}
+
 // A failed or cancelled job can carry a stored verdict. Honouring it pinned the
 // claim and reported verdict_exists while the awaited fact — satisfied only
 // from a SUCCEEDED transition — left the requester waiting out its TTL.

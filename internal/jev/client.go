@@ -70,7 +70,9 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 	}
 	exchange := Exchange{Body: body}
 
-	attempts := c.MaxRetries + 1
+	// At least one attempt: a negative MaxRetries must not return success
+	// without ever contacting the server.
+	attempts := max(c.MaxRetries, 0) + 1
 	var last error
 	for attempt := range attempts {
 		if err := c.pace(ctx); err != nil {
