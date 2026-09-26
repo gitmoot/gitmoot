@@ -74,6 +74,7 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 	// without ever contacting the server.
 	attempts := max(c.MaxRetries, 0) + 1
 	var last error
+	forbiddenRetried := false
 	for attempt := range attempts {
 		if err := c.pace(ctx); err != nil {
 			return exchange, &APIError{Message: "cancelled: " + err.Error()}
@@ -87,8 +88,19 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 		last = err
 
 		var apiErr *APIError
-		if !errors.As(err, &apiErr) || !apiErr.Retryable || attempt == attempts-1 {
+		if !errors.As(err, &apiErr) || attempt == attempts-1 {
 			break
+		}
+		// A 403 is usually a real refusal, but the provider behind OpenRouter
+		// has also returned a transient "RBAC: access denied" for a valid key.
+		// Retry it exactly once, after a short pause; a second 403 is final.
+		retryForbidden := apiErr.Status == http.StatusForbidden && !forbiddenRetried
+		if !apiErr.Retryable && !retryForbidden {
+			break
+		}
+		if retryForbidden {
+			forbiddenRetried = true
+			wait = forbiddenRetryWait
 		}
 		if wait <= 0 {
 			wait = c.backoff(attempt)
@@ -102,6 +114,9 @@ func (c *Client) Evaluate(ctx context.Context, request Request) (Exchange, error
 	}
 	return exchange, last
 }
+
+// forbiddenRetryWait is the pause before the single retry of a 403.
+const forbiddenRetryWait = 2 * time.Second
 
 // once performs a single attempt. The returned duration is a server-requested
 // wait, when one was given.
@@ -156,7 +171,7 @@ func (c *Client) once(ctx context.Context, body []byte) (Response, time.Duration
 
 // retryableStatus: 429 and 529 ask the client to back off and retry, and a 5xx
 // is a server fault worth another try. A 401 or 422 fails the same way every
-// time.
+// time. A 403 is not retryable here; Evaluate gives it one extra attempt.
 func retryableStatus(status int) bool {
 	switch {
 	case status == http.StatusTooManyRequests, status == 529:
