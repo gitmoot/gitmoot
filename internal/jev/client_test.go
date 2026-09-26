@@ -118,6 +118,39 @@ func TestClientDoesNotRetryAuthFailureAndRedactsKey(t *testing.T) {
 	}
 }
 
+// A transient provider 403 ("RBAC: access denied" for a valid key) gets one
+// retry; a lasting 403 fails after exactly two attempts, never more.
+func TestClientRetriesOneForbiddenOnly(t *testing.T) {
+	transient := newFakeServer(t, func(n int) (int, http.Header, string) {
+		if n == 1 {
+			return http.StatusForbidden, nil, `{"error":{"message":"HTTP 403: RBAC: access denied","code":403}}`
+		}
+		return http.StatusOK, nil, okAnswer
+	})
+	var waits []time.Duration
+	client := testClient(transient.server.URL)
+	client.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+	exchange, err := client.Evaluate(context.Background(), Request{Model: DefaultModel})
+	if err != nil || exchange.Attempts != 2 {
+		t.Fatalf("transient 403: attempts = %d, err = %v; want success on attempt 2", exchange.Attempts, err)
+	}
+	if len(waits) != 1 || waits[0] != forbiddenRetryWait {
+		t.Fatalf("waits = %v, want [%v]", waits, forbiddenRetryWait)
+	}
+
+	lasting := newFakeServer(t, func(int) (int, http.Header, string) {
+		return http.StatusForbidden, nil, "denied"
+	})
+	exchange, err = testClient(lasting.server.URL).Evaluate(context.Background(), Request{Model: DefaultModel})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Fatalf("lasting 403: err = %v", err)
+	}
+	if exchange.Attempts != 2 {
+		t.Fatalf("lasting 403: attempts = %d, want 2 (MaxRetries is %d)", exchange.Attempts, testClient("").MaxRetries)
+	}
+}
+
 func TestClientCapsRetryAfterAtMaxBackoff(t *testing.T) {
 	server := newFakeServer(t, func(n int) (int, http.Header, string) {
 		if n == 1 {
