@@ -3,10 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/jev"
 	"github.com/gitmoot/gitmoot/internal/reviewlevel"
@@ -86,5 +90,36 @@ func TestReviewLevelGitHubReadFailurePrintsNoDecision(t *testing.T) {
 	}
 	if len(gh.statuses) != 0 {
 		t.Fatalf("status posted without a decision: %+v", gh.statuses)
+	}
+}
+
+func TestReviewLevelKeepsEveryDecision(t *testing.T) {
+	gh := &reviewLevelFakeGitHub{files: []github.PullRequestFile{{Filename: "README.md", Patch: "+typo"}}}
+	stubReviewLevel(t, gh, &reviewLevelCountingJudge{})
+	home := t.TempDir()
+	for _, pr := range []string{"7", "8"} {
+		var stdout, stderr bytes.Buffer
+		if code := Run([]string{"review", "level", "--repo", "gitmoot/gitmoot", "--pr", pr, "--home", home}, &stdout, &stderr); code != 0 {
+			t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(config.PathsForHome(home).Home, reviewLevelLogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("%d lines, want one per decision:\n%s", len(lines), raw)
+	}
+	var entry reviewLevelLogEntry
+	if err := json.Unmarshal([]byte(lines[1]), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.Repo != "gitmoot/gitmoot" || entry.PR != 8 || entry.Level != "level3_required" || entry.Source != "repo" ||
+		entry.HeadSHA != "0123456789abcdef0123456789abcdef01234567" || entry.Time == "" {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if info, _ := os.Stat(filepath.Join(config.PathsForHome(home).Home, reviewLevelLogName)); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", info.Mode().Perm())
 	}
 }

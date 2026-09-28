@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -91,6 +93,10 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "warning: could not post %s status: %v\n", reviewLevelStatusContext, err)
 	}
 
+	if err := appendReviewLevelLog(*home, repo.FullName(), *pr, decision, time.Now()); err != nil {
+		fmt.Fprintf(stderr, "warning: could not save the decision to %s: %v\n", reviewLevelLogName, err)
+	}
+
 	if *asJSON {
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
@@ -108,6 +114,45 @@ func runReviewLevel(args []string, stdout, stderr io.Writer) int {
 			repo.FullName(), *pr, decision.HeadSHA)
 	}
 	return 0
+}
+
+// reviewLevelLogName is the file, in the Gitmoot home, that keeps every level
+// decision. The commit status shows only the latest decision per head, and
+// only on GitHub; without this record nobody could count how many changes
+// skipped review, by which rule, or how often JEV was unavailable (#2265).
+const reviewLevelLogName = "review-levels.jsonl"
+
+type reviewLevelLogEntry struct {
+	Time string `json:"time"`
+	Repo string `json:"repo"`
+	PR   int    `json:"pr"`
+	reviewlevel.Decision
+}
+
+// appendReviewLevelLog adds one JSON line per decision. It never blocks the
+// answer: a failure is a warning, since the decision itself is still sound.
+func appendReviewLevelLog(home, repo string, pr int, decision reviewlevel.Decision, now time.Time) error {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	line, err := json.Marshal(reviewLevelLogEntry{Time: now.UTC().Format(time.RFC3339), Repo: repo, PR: pr, Decision: decision})
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(paths.Home, reviewLevelLogName), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	// One write of a short line with O_APPEND: concurrent runs do not interleave.
+	_, err = f.Write(append(line, '\n'))
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 // reviewLevelAPIKey prefers the process environment, then the Gitmoot keychain.
