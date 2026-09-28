@@ -174,7 +174,30 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	if head == "" || repo == "" || payload.PullRequest <= 0 || len(payload.Result.Findings) == 0 {
 		return nil
 	}
-	written, skipped, downgrades, refused := 0, 0, 0, 0
+	// ONE REVIEW RESULT IS RECORDED ONCE. This runs on every post-delivery
+	// advance retry, and a finished review whose advance keeps failing (for
+	// example an approval that cannot be bound to a current head) is retried
+	// every few seconds for days. Each pass minted fresh uids for the same
+	// findings: 10 such jobs wrote ~80,000 rows a day from ~50 findings. So a
+	// finding this job already recorded at this head is skipped, silently: a
+	// retry is not a new observation, and a per-retry event would repeat the
+	// same growth in job_events.
+	seen, err := e.ledgerFindingsAlreadyRecorded(ctx, job.ID, repo, int64(payload.PullRequest), head)
+	if err != nil {
+		// Unknown is not "none": recording again would resume the runaway. A
+		// later retry reads the ledger again.
+		e.recordLedgerSkip(ctx, job.ID, -1, fmt.Sprintf("could not read the ledger to skip findings already recorded: %v", err))
+		return nil
+	}
+	written, skipped, downgrades, refused, already := 0, 0, 0, 0, 0
+	// A retry already reported its skips and refusals on the first pass.
+	retry := len(seen) > 0
+	skip := func(index int, reason string) {
+		skipped++
+		if !retry {
+			e.recordLedgerSkip(ctx, job.ID, index, reason)
+		}
+	}
 	for index, raw := range payload.Result.Findings {
 		var wire reviewFindingWire
 		if err := json.Unmarshal(raw, &wire); err != nil {
@@ -183,16 +206,14 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			// title rather than dropped.
 			var text string
 			if textErr := json.Unmarshal(raw, &text); textErr != nil {
-				skipped++
-				e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
+				skip(index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
 				continue
 			}
 			wire = wireFromBareFindingText(text)
 		}
 		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
+			skip(index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
 			continue
 		}
 		// A failed review whose only support is quoted output has not established
@@ -202,8 +223,11 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		if job.State == string(JobFailed) &&
 			strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") &&
 			obs.EvidenceKind == db.EvidenceQuoted {
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
+			skip(index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
+			continue
+		}
+		if key := ledgerDedupeKey(obs); seen[key] {
+			already++
 			continue
 		}
 		if _, err := e.Store.RecordReviewFindingObservation(ctx, obs); err != nil {
@@ -222,11 +246,12 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			// findings in the same result and the verdict with them.
 			if errors.Is(err, db.ErrFindingNoConcern) {
 				refused++
-				e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
+				if !retry {
+					e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
+				}
 				continue
 			}
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("store refused the observation: %v", err))
+			skip(index, fmt.Sprintf("store refused the observation: %v", err))
 			continue
 		}
 		written++
@@ -265,6 +290,9 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	// is the same defect class the directive describes - a stale premise one line
 	// above the code that violates it - so the fix is BOTH the code and the
 	// sentence, not either alone.
+	if written == 0 && retry {
+		return nil // a retry that added nothing is not news
+	}
 	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  "findings_ledger_recorded",
@@ -272,10 +300,34 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		// skipped)" was true of the WRITE and false of the OUTCOME: three of those
 		// four rows had their declared disposition reversed. A summary that cannot
 		// distinguish those two facts is the false-success half of this defect.
-		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern)",
-			written, len(payload.Result.Findings), head, skipped, downgrades, refused),
+		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern, %d already recorded by this job)",
+			written, len(payload.Result.Findings), head, skipped, downgrades, refused, already),
 	})
 	return nil
+}
+
+// ledgerDedupeKey identifies a finding within one job's observations at one
+// head: what it says and where. The minted uid is not part of it, because the
+// uid is exactly what each retry minted afresh.
+func ledgerDedupeKey(obs db.ReviewFindingObservation) string {
+	return strings.Join([]string{obs.Severity, string(obs.State), string(obs.EvidenceKind), obs.File,
+		strconv.FormatInt(obs.Line, 10), obs.Title, obs.Detail}, "\x00")
+}
+
+// ledgerFindingsAlreadyRecorded returns the dedupe keys of what this job has
+// already written to the ledger at head.
+func (e Engine) ledgerFindingsAlreadyRecorded(ctx context.Context, jobID, repo string, pullRequest int64, head string) (map[string]bool, error) {
+	rows, err := e.Store.ListReviewFindingObservations(ctx, repo, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		if row.ObserverJob == jobID && row.HeadSHA == head {
+			seen[ledgerDedupeKey(row)] = true
+		}
+	}
+	return seen, nil
 }
 
 // ledgerObservationFor builds the observation, choosing the evidence kind from
