@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -65,6 +66,83 @@ func TestRecordingTheSameReviewAgainAddsNothing(t *testing.T) {
 	rows, _ = store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300)
 	if len(rows) != 5 {
 		t.Fatalf("got %d observations, want 5 (2 + 1 from another reviewer + 2 at a new head)", len(rows))
+	}
+}
+
+// The first fix keyed "already done" on rows written, so a review whose
+// findings were ALL refused wrote none and repeated its refusal and summary
+// events on every retry: the same runaway, moved to job_events (#2269 review).
+func TestRetriesOfAnAllRefusedReviewAddNoEvents(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "rev", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	job := insertLedgerRetryJob(t, store, "rev-refused", strings.Repeat("c", 40), []string{
+		refusalEchoFixture, refusalEchoFixture,
+	})
+	count := func() map[string]int {
+		events, err := store.ListJobEvents(ctx, job.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]int{}
+		for _, e := range events {
+			if strings.HasPrefix(e.Kind, "findings_ledger") {
+				out[e.Kind]++
+			}
+		}
+		return out
+	}
+	if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+		t.Fatal(err)
+	}
+	first := count()
+	if first["findings_ledger_refused"] != 2 || first[ledgerDoneEventKind] != 1 {
+		t.Fatalf("first pass events %v, want 2 refusals and the done marker", first)
+	}
+	for i := 0; i < 5; i++ {
+		if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := count(); fmt.Sprint(after) != fmt.Sprint(first) {
+		t.Fatalf("events after 5 retries %v, want unchanged %v", after, first)
+	}
+}
+
+// A pass that stopped part-way (the daemon died after writing some findings,
+// before the done marker) is finished by the next retry without writing its
+// first findings again.
+func TestAnInterruptedPassIsFinishedWithoutDuplicates(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "rev", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	first := `{"severity":"P2","title":"nil map write","file":"a.go","line":1}`
+	job := insertLedgerRetryJob(t, store, "rev-crash", strings.Repeat("d", 40), []string{first})
+	// The interrupted pass: it recorded the first finding (built exactly as
+	// the writer builds it, with this job as observer) and died before its
+	// done marker.
+	var wire reviewFindingWire
+	if err := json.Unmarshal([]byte(first), &wire); err != nil {
+		t.Fatal(err)
+	}
+	obs, ok := engine.ledgerObservationFor(mustJob(t, store, job.id), job.payload, wire, job.payload.HeadSHA, "gitmoot/gitmoot")
+	if !ok {
+		t.Fatal("fixture finding is not recordable")
+	}
+	if _, err := store.RecordReviewFindingObservation(ctx, obs); err != nil {
+		t.Fatal(err)
+	}
+	full := job.payload
+	full.Result = &AgentResult{Decision: "changes_requested", Severity: "P2", Summary: "s", TestsRun: []string{"go test ./..."}, Evidence: "EXECUTED",
+		Findings: []json.RawMessage{json.RawMessage(first), json.RawMessage(`{"severity":"P3","title":"stale comment","file":"b.go","line":2}`)}}
+	if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), full); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300)
+	if len(rows) != 2 {
+		t.Fatalf("got %d observations after the resumed pass, want 2 (the first not repeated)", len(rows))
 	}
 }
 

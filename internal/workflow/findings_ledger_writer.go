@@ -174,29 +174,43 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	if head == "" || repo == "" || payload.PullRequest <= 0 || len(payload.Result.Findings) == 0 {
 		return nil
 	}
-	// ONE REVIEW RESULT IS RECORDED ONCE. This runs on every post-delivery
-	// advance retry, and a finished review whose advance keeps failing (for
-	// example an approval that cannot be bound to a current head) is retried
-	// every few seconds for days. Each pass minted fresh uids for the same
-	// findings: 10 such jobs wrote ~80,000 rows a day from ~50 findings. So a
-	// finding this job already recorded at this head is skipped, silently: a
-	// retry is not a new observation, and a per-retry event would repeat the
-	// same growth in job_events.
-	seen, err := e.ledgerFindingsAlreadyRecorded(ctx, job.ID, repo, int64(payload.PullRequest), head)
+	// ONE REVIEW RESULT IS RECORDED ONCE (#2268). This runs on every
+	// post-delivery advance retry, and a finished review whose advance keeps
+	// failing (for example an approval that cannot be bound to a current head)
+	// is retried every few seconds for days. Each pass minted fresh uids for
+	// the same findings - 10 such jobs wrote ~80,000 rows a day from ~50
+	// findings - and repeated its skip, refusal and summary events.
+	//
+	// A complete pass ends with a findings_ledger_done marker for this head,
+	// whatever it wrote (a pass whose findings were all refused wrote nothing
+	// and must stop too). Every later pass returns here, silently.
+	done, err := e.Store.JobHasEventWithPrefix(ctx, job.ID, ledgerDoneEventKind, head)
 	if err != nil {
-		// Unknown is not "none": recording again would resume the runaway. A
-		// later retry reads the ledger again.
-		e.recordLedgerSkip(ctx, job.ID, -1, fmt.Sprintf("could not read the ledger to skip findings already recorded: %v", err))
+		return nil // unknown is not "not done": a later retry asks again
+	}
+	if done {
 		return nil
 	}
+	// A pass that stopped part-way (a crash after some writes) left no marker:
+	// the findings it already wrote are skipped, the rest are written.
+	seen := map[string]bool{}
+	recorded, err := e.Store.ListReviewFindingObservationsByJob(ctx, repo, int64(payload.PullRequest), job.ID, head)
+	if err != nil {
+		// Unknown is not "none": recording again could duplicate. Say so once
+		// per head, not once per retry.
+		if said, _ := e.Store.JobHasEventWithPrefix(ctx, job.ID, ledgerReadFailedEventKind, head); !said {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: ledgerReadFailedEventKind,
+				Message: head + ": could not read this job's earlier ledger observations, so none were recorded: " + err.Error()})
+		}
+		return nil
+	}
+	for _, row := range recorded {
+		seen[ledgerDedupeKey(row)] = true
+	}
 	written, skipped, downgrades, refused, already := 0, 0, 0, 0, 0
-	// A retry already reported its skips and refusals on the first pass.
-	retry := len(seen) > 0
 	skip := func(index int, reason string) {
 		skipped++
-		if !retry {
-			e.recordLedgerSkip(ctx, job.ID, index, reason)
-		}
+		e.recordLedgerSkip(ctx, job.ID, index, reason)
 	}
 	for index, raw := range payload.Result.Findings {
 		var wire reviewFindingWire
@@ -246,9 +260,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			// findings in the same result and the verdict with them.
 			if errors.Is(err, db.ErrFindingNoConcern) {
 				refused++
-				if !retry {
-					e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
-				}
+				e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
 				continue
 			}
 			skip(index, fmt.Sprintf("store refused the observation: %v", err))
@@ -290,9 +302,6 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	// is the same defect class the directive describes - a stale premise one line
 	// above the code that violates it - so the fix is BOTH the code and the
 	// sentence, not either alone.
-	if written == 0 && retry {
-		return nil // a retry that added nothing is not news
-	}
 	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  "findings_ledger_recorded",
@@ -303,6 +312,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern, %d already recorded by this job)",
 			written, len(payload.Result.Findings), head, skipped, downgrades, refused, already),
 	})
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: ledgerDoneEventKind, Message: head})
 	return nil
 }
 
@@ -314,21 +324,14 @@ func ledgerDedupeKey(obs db.ReviewFindingObservation) string {
 		strconv.FormatInt(obs.Line, 10), obs.Title, obs.Detail}, "\x00")
 }
 
-// ledgerFindingsAlreadyRecorded returns the dedupe keys of what this job has
-// already written to the ledger at head.
-func (e Engine) ledgerFindingsAlreadyRecorded(ctx context.Context, jobID, repo string, pullRequest int64, head string) (map[string]bool, error) {
-	rows, err := e.Store.ListReviewFindingObservations(ctx, repo, pullRequest)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	for _, row := range rows {
-		if row.ObserverJob == jobID && row.HeadSHA == head {
-			seen[ledgerDedupeKey(row)] = true
-		}
-	}
-	return seen, nil
-}
+const (
+	// ledgerDoneEventKind marks a complete ledger pass for one head (message:
+	// the head). See RecordReviewFindingsToLedger.
+	ledgerDoneEventKind = "findings_ledger_done"
+	// ledgerReadFailedEventKind reports, once per head, that the job's earlier
+	// observations could not be read, so nothing was recorded.
+	ledgerReadFailedEventKind = "findings_ledger_read_failed"
+)
 
 // ledgerObservationFor builds the observation, choosing the evidence kind from
 // what the review ACTUALLY did rather than from what would be convenient.

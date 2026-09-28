@@ -692,3 +692,43 @@ ORDER BY rowid`, []any{strings.TrimSpace(repo), pullRequest},
 			return obs, nil
 		})
 }
+
+// ListReviewFindingObservationsByJob returns what one review job observed at
+// one head. The ledger writer reads it on retries; filtering in SQL keeps a
+// large pull request's other rows (and any damage in them) out of that path.
+func (s *Store) ListReviewFindingObservationsByJob(ctx context.Context, repo string, pullRequest int64, observerJob, headSHA string) ([]ReviewFindingObservation, error) {
+	return queryList(ctx, s.db, `SELECT finding_uid, repo, pull_request, head_sha, observed_at,
+	observer_job, state, severity, round_label, label_absent, title, detail, file, line,
+	relevance_keys, evidence_kind, executed_commands, executed_count, evidence_locator,
+	rationale, source_job, withdraw_reason
+FROM review_finding_observations
+WHERE repo = ? AND pull_request = ? AND observer_job = ? AND head_sha = ?
+ORDER BY rowid`, []any{strings.TrimSpace(repo), pullRequest, observerJob, headSHA},
+		func(row rowScanner) (ReviewFindingObservation, error) {
+			var obs ReviewFindingObservation
+			var state, kind, keys, cmds string
+			var labelAbsent int
+			if err := row.Scan(&obs.FindingUID, &obs.Repo, &obs.PullRequest, &obs.HeadSHA, &obs.ObservedAt,
+				&obs.ObserverJob, &state, &obs.Severity, &obs.RoundLabel, &labelAbsent, &obs.Title,
+				&obs.Detail, &obs.File, &obs.Line, &keys, &kind, &cmds, &obs.ExecutedCount,
+				&obs.EvidenceLocator, &obs.Rationale, &obs.SourceJob, &obs.WithdrawReason); err != nil {
+				return ReviewFindingObservation{}, err
+			}
+			obs.State = FindingState(state)
+			obs.EvidenceKind = EvidenceKind(kind)
+			obs.LabelAbsent = labelAbsent == 1
+			// DECODE ERRORS ARE RETURNED, NOT SWALLOWED (#1850 review F10). A
+			// malformed relevance_keys value used to yield a nil key set, which
+			// matches nothing, which silently stops an answered finding being
+			// mandatory forever. normaliseKeys guarantees a non-empty array on
+			// write, so a decode failure here is real corruption and it is
+			// indistinguishable from reviewer judgement unless it is reported.
+			if err := json.Unmarshal([]byte(keys), &obs.RelevanceKeys); err != nil {
+				return ReviewFindingObservation{}, fmt.Errorf("decode relevance_keys for finding %q at %s: %w", obs.FindingUID, obs.HeadSHA, err)
+			}
+			if err := json.Unmarshal([]byte(cmds), &obs.ExecutedCommands); err != nil {
+				return ReviewFindingObservation{}, fmt.Errorf("decode executed_commands for finding %q at %s: %w", obs.FindingUID, obs.HeadSHA, err)
+			}
+			return obs, nil
+		})
+}
