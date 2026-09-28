@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -168,4 +169,116 @@ func insertLedgerRetryJob(t *testing.T, store *db.Store, id, head string, findin
 	}
 	insertCompletedJob(t, store, db.Job{ID: id, Agent: "rev", Type: "review"}, payload)
 	return ledgerRetryJob{id: id, payload: payload}
+}
+
+// RetryJob re-runs the same job id and keeps its events, so a "done" marker
+// keyed on the head alone dropped the retried run's different findings at that
+// head (#2269 review).
+func TestARetriedJobRecordsItsNewFindingsAtTheSameHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "rev", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	job := insertLedgerRetryJob(t, store, "rev-rerun", strings.Repeat("e", 40), []string{
+		`{"severity":"P2","title":"nil map write","file":"a.go","line":1}`,
+	})
+	if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+		t.Fatal(err)
+	}
+	rerun := job.payload
+	rerun.Result = &AgentResult{Decision: "changes_requested", Severity: "P1", Summary: "s", TestsRun: []string{"go test ./..."}, Evidence: "EXECUTED",
+		Findings: []json.RawMessage{json.RawMessage(`{"severity":"P1","title":"token logged","file":"b.go","line":9}`)}}
+	for i := 0; i < 3; i++ {
+		if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), rerun); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, _ := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300)
+	if len(rows) != 2 {
+		t.Fatalf("got %d observations, want 2 (one per run, the rerun's written once)", len(rows))
+	}
+}
+
+// A store failure is not a verdict on the finding: the next retry must write
+// what the failed pass could not, instead of treating that pass as complete.
+func TestAFindingTheStoreFailedToWriteIsWrittenOnTheNextPass(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "rev", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	job := insertLedgerRetryJob(t, store, "rev-busy", strings.Repeat("f", 40), []string{
+		`{"severity":"P2","title":"nil map write","file":"a.go","line":1}`,
+	})
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.ExecContext(ctx, `
+CREATE TRIGGER fail_ledger_insert
+BEFORE INSERT ON review_finding_observations
+BEGIN
+	SELECT RAISE(ABORT, 'database is locked');
+END`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows, _ := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300); len(rows) != 0 {
+		t.Fatalf("the trigger did not fire: %d observations written", len(rows))
+	}
+	events, _ := store.ListJobEvents(ctx, job.id)
+	pending := 0
+	for _, e := range events {
+		if e.Kind == ledgerRetryPendingEventKind {
+			pending++
+		}
+	}
+	if pending != 1 {
+		t.Fatalf("%d retry-pending events after 3 failed passes, want 1", pending)
+	}
+	if _, err := raw.ExecContext(ctx, `DROP TRIGGER fail_ledger_insert`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rows, _ := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300); len(rows) != 1 {
+		t.Fatalf("got %d observations once the store recovered, want 1", len(rows))
+	}
+}
+
+// A resumed pass must not mistake a different finding for one it already
+// wrote just because the two share their text: here only relevance_keys differ.
+func TestAResumedPassKeepsFindingsThatDifferOnlyInRelevanceKeys(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "rev", []string{"review"}, "gitmoot/gitmoot")
+	engine := testEngine(store)
+	first := `{"severity":"P2","title":"stale cache","file":"a.go","line":1,"relevance_keys":["a.go"]}`
+	second := `{"severity":"P2","title":"stale cache","file":"a.go","line":1,"relevance_keys":["internal/b.go"]}`
+	job := insertLedgerRetryJob(t, store, "rev-keys", strings.Repeat("c", 40), []string{first, second})
+	var wire reviewFindingWire
+	if err := json.Unmarshal([]byte(first), &wire); err != nil {
+		t.Fatal(err)
+	}
+	obs, ok := engine.ledgerObservationFor(mustJob(t, store, job.id), job.payload, wire, job.payload.HeadSHA, "gitmoot/gitmoot")
+	if !ok || len(obs.RelevanceKeys) == 0 {
+		t.Fatalf("fixture must carry relevance keys: ok=%v keys=%v", ok, obs.RelevanceKeys)
+	}
+	if _, err := store.RecordReviewFindingObservation(ctx, obs); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.RecordReviewFindingsToLedger(ctx, mustJob(t, store, job.id), job.payload); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := store.ListReviewFindingObservations(ctx, "gitmoot/gitmoot", 2300)
+	if len(rows) != 2 {
+		t.Fatalf("got %d observations, want 2 (the second finding differs in relevance_keys)", len(rows))
+	}
 }
