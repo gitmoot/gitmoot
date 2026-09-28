@@ -1355,6 +1355,14 @@ Rules, first match wins:
 
 Re-run it whenever the head moves. The status is advisory: it does not block a merge.
 
+Every decision is also appended as one JSON line to `review-levels.jsonl` in the
+Gitmoot home (`~/.gitmoot/`, mode 600): time, repo, PR, level, source, reason,
+head, and JEV's risk probability and choice when it was asked. The commit status
+keeps only the latest decision per head; this file keeps them all, so decisions
+can be counted by level and by rule. A failed write is a warning and does not
+change the decision. On a classifier error the reason holds the error text (at
+most 300 characters, API key redacted), the same text the command prints.
+
 `--post-merge` reviews an already-merged head. Its findings become follow-ups for
 the requesting role instead of blocking anything. The verdict still wakes the role.
 - **P0/P1:** a note to fix or revert the same day.
