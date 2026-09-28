@@ -2,9 +2,12 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -174,7 +177,46 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 	if head == "" || repo == "" || payload.PullRequest <= 0 || len(payload.Result.Findings) == 0 {
 		return nil
 	}
-	written, skipped, downgrades, refused := 0, 0, 0, 0
+	// ONE REVIEW RESULT IS RECORDED ONCE (#2268). This runs on every
+	// post-delivery advance retry, and a finished review whose advance keeps
+	// failing (for example an approval that cannot be bound to a current head)
+	// is retried every few seconds for days. Each pass minted fresh uids for
+	// the same findings - 10 such jobs wrote ~80,000 rows a day from ~50
+	// findings - and repeated its skip, refusal and summary events.
+	//
+	// A complete pass ends with a findings_ledger_done marker for this head and
+	// this result, whatever it wrote (a pass whose findings were all refused
+	// wrote nothing and must stop too). Every later pass returns here, silently.
+	// The result is part of the marker because a RetryJob can report different
+	// findings at the same head, and those must be recorded. A pass that hit a
+	// store error writes no marker, so the next retry writes what it missed.
+	pass := ledgerPassKey(head, payload.Result.Findings)
+	done, err := e.Store.JobHasEventWithPrefix(ctx, job.ID, ledgerDoneEventKind, pass)
+	if err != nil {
+		return nil // unknown is not "not done": a later retry asks again
+	}
+	if done {
+		return nil
+	}
+	// A pass that stopped part-way (a crash after some writes) left no marker:
+	// the findings it already wrote are skipped, the rest are written.
+	seen := map[string]bool{}
+	recorded, err := e.Store.ListReviewFindingObservationsByJob(ctx, repo, int64(payload.PullRequest), job.ID, head)
+	if err != nil {
+		// Unknown is not "none": recording again could duplicate. Say so once
+		// per head, not once per retry.
+		e.noteOncePerPass(ctx, job.ID, ledgerReadFailedEventKind, pass,
+			"could not read this job's earlier ledger observations, so none were recorded: "+err.Error())
+		return nil
+	}
+	for _, row := range recorded {
+		seen[ledgerDedupeKey(row)] = true
+	}
+	written, skipped, downgrades, refused, already, transient := 0, 0, 0, 0, 0, 0
+	skip := func(index int, reason string) {
+		skipped++
+		e.recordLedgerSkip(ctx, job.ID, index, reason)
+	}
 	for index, raw := range payload.Result.Findings {
 		var wire reviewFindingWire
 		if err := json.Unmarshal(raw, &wire); err != nil {
@@ -183,16 +225,14 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 			// title rather than dropped.
 			var text string
 			if textErr := json.Unmarshal(raw, &text); textErr != nil {
-				skipped++
-				e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
+				skip(index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
 				continue
 			}
 			wire = wireFromBareFindingText(text)
 		}
 		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
+			skip(index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
 			continue
 		}
 		// A failed review whose only support is quoted output has not established
@@ -202,8 +242,11 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		if job.State == string(JobFailed) &&
 			strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") &&
 			obs.EvidenceKind == db.EvidenceQuoted {
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
+			skip(index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
+			continue
+		}
+		if key := ledgerDedupeKey(obs); seen[key] {
+			already++
 			continue
 		}
 		if _, err := e.Store.RecordReviewFindingObservation(ctx, obs); err != nil {
@@ -225,8 +268,16 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 				e.recordLedgerContentRefusal(ctx, job.ID, index, obs.Severity, raw)
 				continue
 			}
-			skipped++
-			e.recordLedgerSkip(ctx, job.ID, index, fmt.Sprintf("store refused the observation: %v", err))
+			if !ledgerValidationError(err) {
+				// A store hiccup (a locked database, a full disk) is not a verdict
+				// on the finding: leave the pass unmarked so a later retry writes
+				// it, and say so once per pass rather than once per tick.
+				transient++
+				e.noteOncePerPass(ctx, job.ID, ledgerRetryPendingEventKind, pass,
+					fmt.Sprintf("finding[%d] not recorded yet, will retry: %v", index, err))
+				continue
+			}
+			skip(index, fmt.Sprintf("store refused the observation: %v", err))
 			continue
 		}
 		written++
@@ -272,11 +323,87 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		// skipped)" was true of the WRITE and false of the OUTCOME: three of those
 		// four rows had their declared disposition reversed. A summary that cannot
 		// distinguish those two facts is the false-success half of this defect.
-		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern)",
-			written, len(payload.Result.Findings), head, skipped, downgrades, refused),
+		Message: fmt.Sprintf("recorded %d of %d reported finding(s) to the #1822 ledger at head %s (%d skipped, %d downgraded, %d refused for articulating no concern, %d already recorded by this job)",
+			written, len(payload.Result.Findings), head, skipped, downgrades, refused, already),
 	})
+	if transient == 0 {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: ledgerDoneEventKind, Message: pass})
+	}
 	return nil
 }
+
+// ledgerPassKey names one result at one head: the head, then a digest of the
+// findings exactly as reported.
+func ledgerPassKey(head string, findings []json.RawMessage) string {
+	h := sha256.New()
+	for _, f := range findings {
+		h.Write(f)
+		h.Write([]byte{0})
+	}
+	return head + ":" + hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// noteOncePerPass adds an event of kind unless this pass already has one.
+func (e Engine) noteOncePerPass(ctx context.Context, jobID, kind, pass, message string) {
+	if said, err := e.Store.JobHasEventWithPrefix(ctx, jobID, kind, pass); err == nil && !said {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: kind, Message: pass + ": " + message})
+	}
+}
+
+// ledgerValidationError reports whether the store refused an observation for
+// what it says (deterministic: retrying changes nothing) rather than for a
+// failure of the store itself.
+func ledgerValidationError(err error) bool {
+	for _, known := range []error{db.ErrFindingHeadSHA, db.ErrFindingEvidence, db.ErrFindingDischarge, db.ErrFindingQuotedDischarge,
+		db.ErrFindingDuplicateObservation, db.ErrFindingRelevanceKey, db.ErrFindingWithdrawReason, db.ErrFindingObservedAt,
+		db.ErrFindingUnknownContinues, db.ErrFindingSeverity, db.ErrFindingNoConcern} {
+		if errors.Is(err, known) {
+			return true
+		}
+	}
+	return false
+}
+
+// ledgerDedupeKey identifies a finding within one job's observations at one
+// head: what it says and where. The minted uid is not part of it, because the
+// uid is exactly what each retry minted afresh.
+func ledgerDedupeKey(obs db.ReviewFindingObservation) string {
+	return strings.Join([]string{obs.Severity, string(obs.State), string(obs.EvidenceKind), obs.File,
+		strconv.FormatInt(obs.Line, 10), obs.Title, obs.Detail, ledgerRelevanceKey(obs),
+		obs.ContinuesUID, obs.Rationale, obs.EvidenceLocator, obs.WithdrawReason}, "\x00")
+}
+
+// ledgerRelevanceKey is the finding's relevance keys as a sorted set without
+// its own file, which the store adds to every stored row: the same finding
+// read back must give the same key as the one about to be written.
+func ledgerRelevanceKey(obs db.ReviewFindingObservation) string {
+	file := strings.TrimSpace(obs.File)
+	path, _, _ := strings.Cut(file, ":")
+	set := map[string]bool{}
+	for _, key := range obs.RelevanceKeys {
+		if key = strings.TrimSpace(key); key != "" && key != file && key != path {
+			set[key] = true
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "\x01")
+}
+
+const (
+	// ledgerDoneEventKind marks a complete ledger pass for one result at one
+	// head (message: ledgerPassKey). See RecordReviewFindingsToLedger.
+	ledgerDoneEventKind = "findings_ledger_done"
+	// ledgerRetryPendingEventKind reports, once per pass, that a store error
+	// left findings unrecorded for a later retry.
+	ledgerRetryPendingEventKind = "findings_ledger_retry_pending"
+	// ledgerReadFailedEventKind reports, once per pass, that the job's earlier
+	// observations could not be read, so nothing was recorded.
+	ledgerReadFailedEventKind = "findings_ledger_read_failed"
+)
 
 // ledgerObservationFor builds the observation, choosing the evidence kind from
 // what the review ACTUALLY did rather than from what would be convenient.

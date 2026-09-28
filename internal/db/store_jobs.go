@@ -1771,6 +1771,17 @@ func (s *Store) jobEventsByKindExtreme(ctx context.Context, jobIDs []string, kin
 	return out, rows.Err()
 }
 
+// JobHasEventWithPrefix reports whether the job has an event of kind whose
+// message starts with prefix. It reads one index entry range (kind, job_id),
+// not the job's whole event history.
+func (s *Store) JobHasEventWithPrefix(ctx context.Context, jobID, kind, prefix string) (bool, error) {
+	var found int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM job_events WHERE kind = ? AND job_id = ? AND substr(message, 1, ?) = ?)`,
+		kind, jobID, len(prefix), prefix).Scan(&found)
+	return found == 1, err
+}
+
 func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT job_id, kind, message, created_at, runtime, provider FROM job_events WHERE job_id = ? ORDER BY id`, jobID)
 	if err != nil {
