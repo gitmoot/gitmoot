@@ -1364,6 +1364,68 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 // UpdateJobPayload itself is deliberately left alone: its callers write payloads
 // that are not anchored to an observed run, and giving them a CAS they never
 // consented to would silently start dropping their writes.
+// RerouteQueuedJobPayload replaces a job's payload and records event in one
+// transaction, only while the job is still queued at atGeneration. It reports
+// false, changing nothing, if the job was claimed, cancelled or re-queued.
+func (s *Store) RerouteQueuedJobPayload(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent) (bool, error) {
+	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, "", nil)
+}
+
+// RouteQueuedJobRemote is RerouteQueuedJobPayload for a payload that moves the
+// job to the remote backend. It is admitted only if one more attempt at
+// perAttemptUSD would fit the cost cap ReserveExecBackendAttempt enforces,
+// counting every attempt already billing at its own reserved dollars and every
+// queued or running remote job that has not reserved yet at perAttemptUSD. The
+// count and the write are one statement, so concurrent callers cannot both
+// take the last slot.
+func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, cap ExecBackendCostCap, event JobEvent) (bool, error) {
+	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
+		return false, nil
+	}
+	marks, states := billingStatePlaceholders()
+	pending := `(SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote'
+		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.state IN (` + marks + `)))`
+	clause := ` AND (SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts WHERE state IN (` + marks + `))
+		+ (` + pending + ` + 1) * ? <= ?`
+	args := append(append(append([]any{}, states...), states...), cap.PerAttemptUSD, cap.MaxReservedUSD)
+	if cap.MaxConcurrent > 0 {
+		clause += ` AND (SELECT COUNT(*) FROM execbackend_attempts WHERE state IN (` + marks + `)) + ` + pending + ` + 1 <= ?`
+		args = append(append(append(args, states...), states...), cap.MaxConcurrent)
+	}
+	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, args)
+}
+
+func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	projection := jobProjectionFromPayload(payload)
+	args := []any{payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration}
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ? AND state = 'queued'`+clause,
+		append(args, clauseArgs...)...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider) VALUES (?, ?, ?, ?, ?)`,
+		id, event.Kind, event.Message, event.Runtime, event.Provider); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) UpdateJobPayloadAtGeneration(ctx context.Context, id string, payload string, atGeneration int64) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

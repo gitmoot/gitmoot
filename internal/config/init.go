@@ -80,6 +80,8 @@ artifact_blobs = %q
 # enabled = true
 # min_free_bytes = 2147483648 # 2 GiB
 # min_free_percent = 5
+# remote_reviews = false # true: while low, run reviews on the remote backend
+#                        # within the [remote_exec] cost cap; all else waits
 
 # [daemon] is the OPTIONAL warm-reloadable runtime config (issue #577). CLI flags to
 # "daemon start" / "daemon run" remain the initial value; a key here is applied only

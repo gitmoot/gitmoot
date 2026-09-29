@@ -23,6 +23,10 @@ type DiskGuardPolicy struct {
 	Enabled        bool
 	MinFreeBytes   uint64
 	MinFreePercent float64
+	// RemoteReviews ([disk_guard] remote_reviews, default false) lets queued
+	// reviews run on the remote execution backend while the guard pauses local
+	// dispatch, within the [remote_exec] cost cap. Everything else still waits.
+	RemoteReviews bool
 }
 
 func DefaultDiskGuardPolicy() DiskGuardPolicy {
@@ -81,6 +85,12 @@ func LoadDiskGuardPolicy(paths Paths) (DiskGuardPolicy, error) {
 				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].min_free_bytes: %w", err)
 			}
 			policy.MinFreeBytes = parsed
+		case "remote_reviews":
+			parsed, err := strconv.ParseBool(value)
+			if err != nil {
+				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].remote_reviews: %w", err)
+			}
+			policy.RemoteReviews = parsed
 		case "min_free_percent":
 			parsed, err := strconv.ParseFloat(value, 64)
 			if err != nil {

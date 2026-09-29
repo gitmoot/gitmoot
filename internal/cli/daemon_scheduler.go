@@ -2245,9 +2245,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	// pass through this exact forDispatch path immediately before selecting work.
 	// Returning an empty eligible set pauses dispatch without changing job state,
 	// so low disk is retriable and queued work resumes automatically once healthy.
-	if forDispatch && !diskGuardAllowsQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter) {
-		return nil, nil
-	}
 	// #1207 (bounded half): A DRAINING DAEMON STOPS CLAIMING AND LOSES NOTHING.
 	//
 	// Placed beside the disk guard because it is the same shape and the same
@@ -2267,6 +2264,14 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 			return nil, err
 		}
 		if draining {
+			return nil, nil
+		}
+		// While low, the guard may still let reviews through on the remote
+		// backend ([disk_guard] remote_reviews); every other job waits. After
+		// the drain check, because switching a review is a durable change that
+		// must not happen while dispatch is off.
+		jobs = diskGuardQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
+		if len(jobs) == 0 {
 			return nil, nil
 		}
 	}

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
@@ -209,11 +212,13 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 	return paths, nil
 }
 
-// diskGuardAllowsQueuedDispatch is called only by the normal queued-job
-// dispatch listing. Daemon maintenance and reconciliation do not pass through
-// this function, so future in-process reclaim remains able to free disk while
-// agent dispatch is paused.
-func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) bool {
+// diskGuardQueuedDispatch returns the queued jobs the disk guard lets dispatch:
+// all of jobs while the disk is healthy; otherwise only the reviews that run on
+// the remote backend (diskGuardRemoteReviews, opt-in), or none. It is called
+// only by the normal queued-job dispatch listing. Daemon maintenance and
+// reconciliation do not pass through this function, so future in-process
+// reclaim remains able to free disk while agent dispatch is paused.
+func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
 	matching := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
@@ -221,7 +226,7 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		}
 	}
 	if len(matching) == 0 {
-		return true
+		return jobs
 	}
 
 	paths, err := diskGuardPaths(worker)
@@ -237,10 +242,18 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	}
 	if evaluation.allowsDispatch() {
 		clearDiskGuardRefusal(evaluation.Path)
-		return true
+		return jobs
 	}
 
 	detail := evaluation.detail()
+	var remote []db.Job
+	if evaluation.Err == nil && evaluation.Policy.RemoteReviews {
+		remote = diskGuardRemoteReviews(ctx, worker, matching, detail)
+	}
+	routed := make(map[string]bool, len(remote))
+	for _, job := range remote {
+		routed[job.ID] = true
+	}
 	fingerprint := evaluation.refusalFingerprint()
 	now := time.Now()
 	if shouldLogDiskGuardRefusal(evaluation.Path, fingerprint, now) {
@@ -249,6 +262,9 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	failedEventWrites := 0
 	var firstEventWriteErr error
 	for _, job := range matching {
+		if routed[job.ID] {
+			continue
+		}
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
@@ -271,7 +287,133 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 			firstEventWriteErr,
 		)
 	}
-	return false
+	return remote
+}
+
+const (
+	diskGuardRoutedRemoteEventKind = "disk_guard_routed_remote"
+	diskGuardRouteUndoneEventKind  = "disk_guard_route_undone"
+)
+
+// diskGuardRemoteReviews picks, while the guard pauses local dispatch, the
+// queued reviews that may run on the remote backend instead: reviews already
+// set to remote, and reviews with no backend of their own that this pass
+// switches to remote while the [remote_exec] cost cap has room. A switched
+// review also requires green current-head CI at remote admission
+// (PolicyRoutedReview), and any refusal of its remote run puts it back to
+// waiting locally (undoDiskGuardRoute) instead of failing it. An explicit local
+// backend is respected, and a review is switched at most once.
+func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
+	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
+	if err != nil || backend != execbackend.Remote {
+		return nil
+	}
+	cap := execBackendStoreCap(cfg.ExecBackendCost)
+	var allowed []db.Job
+	for _, job := range jobs {
+		if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			continue
+		}
+		if name, present := payload.ExecBackendOverride(); present {
+			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
+				allowed = append(allowed, job)
+			}
+			continue
+		}
+		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+			continue
+		}
+		payload.ExecBackend = string(execbackend.Remote)
+		payload.PolicyRoutedReview = true
+		payload.DiskGuardRouted = true
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			continue
+		}
+		routed, err := worker.Store.RouteQueuedJobRemote(ctx, job.ID, string(encoded), job.LifecycleGeneration, cap, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    diskGuardRoutedRemoteEventKind,
+			Message: "disk guard paused local dispatch, so this review runs on the remote backend: " + reason,
+		})
+		if err != nil || !routed {
+			continue
+		}
+		job.Payload = string(encoded)
+		allowed = append(allowed, job)
+	}
+	return allowed
+}
+
+// diskGuardCanRouteRemote reports whether a local review can run remotely at
+// all: an exact pull-request head, a registered agent whose runtime runs
+// remotely, and no earlier cloud attempt (remote admission allows one).
+func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) bool {
+	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
+	if payload.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil || payload.Ephemeral != nil {
+		return false
+	}
+	runtimeName := strings.TrimSpace(payload.RuntimeOverride)
+	if runtimeName == "" {
+		agent, err := store.GetAgent(ctx, job.Agent)
+		if err != nil {
+			return false
+		}
+		runtimeName = agent.Runtime
+	}
+	if !remoteCapableRuntime(runtimeName) {
+		return false
+	}
+	attempts, err := store.ListExecBackendAttemptsForJob(ctx, job.ID)
+	return err == nil && len(attempts) == 0
+}
+
+// undoDiskGuardRoute is called by every path that would fail or block a job
+// before delivery (finishQueuedJob, finishAdmittedReviewJob). For a review the
+// disk guard switched to remote it instead puts the stored job back to waiting
+// locally and marks it declined, so the opt-in never turns a review that would
+// have waited into a failed one; if the cause is not about the remote run, the
+// review meets it again locally. running is true once remote admission has
+// claimed the job. It reports whether it took ownership of the job's outcome.
+func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state workflow.JobState, running bool, cause error) bool {
+	if state != workflow.JobFailed && state != workflow.JobBlocked {
+		return false
+	}
+	// The stored row, not the caller's snapshot: pre-delivery steps (a
+	// native review's worktree allocation) persist fields the job must keep.
+	latest, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil || latest.LifecycleGeneration != job.LifecycleGeneration {
+		return false
+	}
+	payload, err := daemonJobPayload(latest)
+	if err != nil || !payload.DiskGuardRouted {
+		return false
+	}
+	payload.ClearExecBackendOverride()
+	payload.PolicyRoutedReview = false
+	payload.DiskGuardRouted = false
+	payload.DiskGuardRouteDeclined = true
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	event := db.JobEvent{JobID: job.ID, Kind: diskGuardRouteUndoneEventKind,
+		Message: "remote run did not start, so this review waits for local disk again: " + cause.Error()}
+	var undone bool
+	if running {
+		undone, err = w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobRunning),
+			job.LifecycleGeneration, string(workflow.JobQueued), string(encoded), event)
+	} else {
+		undone, err = w.Store.RerouteQueuedJobPayload(ctx, job.ID, string(encoded), job.LifecycleGeneration, event)
+	}
+	if err != nil || !undone {
+		return false
+	}
+	writeLine(w.Stdout, "job %s: disk-guard remote route undone, waiting locally: %v", job.ID, cause)
+	return true
 }
 
 func daemonDiskGuardLine(paths config.Paths) string {

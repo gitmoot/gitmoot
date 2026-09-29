@@ -507,8 +507,14 @@ type JobPayload struct {
 	// absent review selector still defaults to local.
 	ExecBackend        string `json:"exec_backend,omitempty"`
 	PolicyRoutedReview bool   `json:"policy_routed_review,omitempty"`
-	execBackendPresent bool
-	unknownJSONFields  map[string]json.RawMessage
+	// DiskGuardRouted marks a review the disk guard switched to the remote
+	// backend while local disk was low ([disk_guard] remote_reviews). Any
+	// refusal of that remote run puts it back to waiting locally instead of
+	// failing it, and sets DiskGuardRouteDeclined so it is not switched again.
+	DiskGuardRouted        bool `json:"disk_guard_routed,omitempty"`
+	DiskGuardRouteDeclined bool `json:"disk_guard_route_declined,omitempty"`
+	execBackendPresent     bool
+	unknownJSONFields      map[string]json.RawMessage
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
