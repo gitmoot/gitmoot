@@ -2232,58 +2232,20 @@ func TestPolicyMergeGateAdvancesIntegrationWorktreeReviewAsDelegationChild(t *te
 	}
 }
 
-func TestPolicyMergeGatePreservesSelfApprovalReasonWhenHeadMismatchSortsFirst(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	basePayload := JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-9",
-		PullRequest: 9,
-		TaskID:      "task-9",
-	}
-	implementPayload := basePayload
-	implementPayload.Result = &AgentResult{Decision: "implemented", Summary: "implemented"}
-	insertCompletedJob(t, store, db.Job{ID: "implement-job", Agent: "sol", Type: "implement"}, implementPayload)
-
-	selfReview := basePayload
-	selfReview.HeadSHA = "head123"
-	selfReview.ReviewRound = "review-1"
-	selfReview.Result = &AgentResult{Decision: "approved", Summary: "self-approved"}
-	insertCompletedJob(t, store, db.Job{ID: "review-z-self", Agent: "sol", Type: "review"}, selfReview)
-
-	staleReview := basePayload
-	staleReview.HeadSHA = "old123"
-	staleReview.ReviewRound = "review-1"
-	staleReview.Result = &AgentResult{Decision: "approved", Summary: "stale approval"}
-	insertCompletedJob(t, store, db.Job{ID: "review-a-stale", Agent: "audit", Type: "review"}, staleReview)
-
-	mergeable := true
-	gh := &fakeMergeGateGitHub{
-		pr: github.PullRequest{
-			Number: 9, State: "open", HeadRef: "task-9", BaseRef: "main",
-			HeadSHA: "head123", Mergeable: &mergeable,
-		},
-		status: github.CombinedStatus{State: "success", Statuses: []github.CommitStatus{{Context: "ci", State: "success"}}},
-		checks: []github.PullRequestCheck{{Name: "ci", Bucket: "pass", State: "SUCCESS"}},
-	}
-	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}}
-
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9"})
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Ready || decision.Merged {
-		t.Fatalf("decision = %+v, want escalating LeaveOpen", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "approval was authored by sol, the implementing agent") {
-		t.Fatalf("decision reason lost self-approval cause: %q", decision.Reason)
-	}
-	if strings.Contains(decision.Reason.Render(), "not the current head") {
-		t.Fatalf("incidental stale-head error replaced self-approval cause: %q", decision.Reason)
+// The self-approval cause must survive whichever review row sorts first: a
+// stale-head approval sorting ahead of it must not replace the reason.
+func TestPolicyMergeGatePreservesSelfApprovalReasonWhicheverReviewSortsFirst(t *testing.T) {
+	for _, order := range []struct{ name, selfID, staleID string }{
+		{"head mismatch sorts first", "review-z-self", "review-a-stale"},
+		{"self approval sorts first", "review-a-self", "review-z-stale"},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			policyMergeGatePreservesSelfApprovalReason(t, order.selfID, order.staleID)
+		})
 	}
 }
 
-func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t *testing.T) {
+func policyMergeGatePreservesSelfApprovalReason(t *testing.T, selfID, staleID string) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	basePayload := JobPayload{
@@ -2300,13 +2262,13 @@ func TestPolicyMergeGatePreservesSelfApprovalReasonWhenSelfApprovalSortsFirst(t 
 	selfReview.HeadSHA = "head123"
 	selfReview.ReviewRound = "review-1"
 	selfReview.Result = &AgentResult{Decision: "approved", Summary: "self-approved"}
-	insertCompletedJob(t, store, db.Job{ID: "review-a-self", Agent: "sol", Type: "review"}, selfReview)
+	insertCompletedJob(t, store, db.Job{ID: selfID, Agent: "sol", Type: "review"}, selfReview)
 
 	staleReview := basePayload
 	staleReview.HeadSHA = "old123"
 	staleReview.ReviewRound = "review-1"
 	staleReview.Result = &AgentResult{Decision: "approved", Summary: "stale approval"}
-	insertCompletedJob(t, store, db.Job{ID: "review-z-stale", Agent: "audit", Type: "review"}, staleReview)
+	insertCompletedJob(t, store, db.Job{ID: staleID, Agent: "audit", Type: "review"}, staleReview)
 
 	mergeable := true
 	gh := &fakeMergeGateGitHub{
@@ -3526,59 +3488,43 @@ func TestPolicyMergeGateNonEvidenceVerdictDoesNotSupersedeObjection(t *testing.T
 	}
 }
 
-func TestPolicyMergeGateWaitsForQueuedReviewAtEvaluatedHead(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-queued", agent: "reviewer-b", state: JobQueued,
-		recorded: "2026-07-31 12:01:00",
-	})
+// A review still queued or running at the evaluated head makes the gate wait,
+// naming the reviewer and job, without escalating.
+func TestPolicyMergeGateWaitsForUnfinishedReviewAtEvaluatedHead(t *testing.T) {
+	for _, tc := range []struct {
+		state JobState
+		id    string
+	}{
+		{JobQueued, "review-queued"},
+		{JobRunning, "review-running"},
+	} {
+		t.Run(string(tc.state), func(t *testing.T) {
+			store, gh, gate, request := newMergeGateQuorumScenario(t)
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
+				recorded: "2026-07-31 12:00:00",
+			})
+			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
+				id: tc.id, agent: "reviewer-b", state: tc.state,
+				recorded: "2026-07-31 12:01:00",
+			})
 
-	decision, err := gate.Evaluate(context.Background(), request)
+			decision, err := gate.Evaluate(context.Background(), request)
 
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if decision.Merged || decision.Reason.IsGateMiss() {
-		t.Fatalf("decision = %+v, want queued review to wait without escalating", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-b") ||
-		!strings.Contains(decision.Reason.Render(), "review-queued") {
-		t.Fatalf("decision reason = %q, want queued reviewer and job", decision.Reason)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateWaitsForRunningReviewAtEvaluatedHead(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-approved", agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: "review-running", agent: "reviewer-b", state: JobRunning,
-		recorded: "2026-07-31 12:01:00",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if decision.Merged || decision.Reason.IsGateMiss() {
-		t.Fatalf("decision = %+v, want running review to wait without escalating", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-b") ||
-		!strings.Contains(decision.Reason.Render(), "review-running") {
-		t.Fatalf("decision reason = %q, want running reviewer and job", decision.Reason)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
+			if err != nil {
+				t.Fatalf("Evaluate returned error: %v", err)
+			}
+			if decision.Merged || decision.Reason.IsGateMiss() {
+				t.Fatalf("decision = %+v, want %s review to wait without escalating", decision, tc.state)
+			}
+			if !strings.Contains(decision.Reason.Render(), "waiting for reviewer reviewer-b") ||
+				!strings.Contains(decision.Reason.Render(), tc.id) {
+				t.Fatalf("decision reason = %q, want %s reviewer and job", decision.Reason, tc.state)
+			}
+			if len(gh.merges) != 0 {
+				t.Fatalf("merge calls = %+v, want none", gh.merges)
+			}
+		})
 	}
 }
 
