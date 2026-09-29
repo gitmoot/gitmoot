@@ -382,7 +382,13 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 	if state != workflow.JobFailed && state != workflow.JobBlocked {
 		return false
 	}
-	payload, err := daemonJobPayload(job)
+	// The stored row, not the caller's snapshot: pre-delivery steps (a
+	// native review's worktree allocation) persist fields the job must keep.
+	latest, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil || latest.LifecycleGeneration != job.LifecycleGeneration {
+		return false
+	}
+	payload, err := daemonJobPayload(latest)
 	if err != nil || !payload.DiskGuardRouted {
 		return false
 	}

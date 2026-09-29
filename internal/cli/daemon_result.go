@@ -730,6 +730,12 @@ func (w jobWorker) postJobResultComment(ctx context.Context, jobID string, agent
 	if job.State == string(workflow.JobCancelled) {
 		return nil
 	}
+	// A disk-guard-switched review whose remote run did not start went back to
+	// waiting (undoDiskGuardRoute): it has no result yet, and posting one would
+	// suppress the real result comment later.
+	if job.State == string(workflow.JobQueued) && payload.DiskGuardRouteDeclined {
+		return nil
+	}
 	if payload.PullRequest <= 0 || strings.TrimSpace(payload.Repo) == "" {
 		return nil
 	}

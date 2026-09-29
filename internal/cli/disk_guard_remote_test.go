@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -310,5 +313,47 @@ func TestUndoingADiskRouteIsOnlyForFailures(t *testing.T) {
 	}
 	if b := storedBackend(t, ctx, store, "routed"); b != "remote" {
 		t.Fatalf("backend %q after a non-failure outcome, want it left as remote", b)
+	}
+}
+
+// An undone route must keep what pre-delivery steps stored (a native review's
+// allocated worktree) and must not post a result comment for a review that is
+// only waiting again (#2273 review).
+func TestUndoingADiskRouteKeepsTheStoredWorktreeAndPostsNoResult(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "routed", "rev-omp", "review", "")
+	if got := pendingIDs(t, ctx, worker); len(got) != 1 {
+		t.Fatalf("pending = %v", got)
+	}
+	snapshot, err := store.GetJob(ctx, "routed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The worker allocates a worktree and persists its path, then checkout
+	// validation fails with the snapshot it read before allocation.
+	allocated := storedPayload(t, ctx, store, "routed")
+	allocated.WorktreePath = "/worktrees/routed"
+	allocated.ReadOnlyWorktree = true
+	encoded, err := json.Marshal(allocated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateJobPayload(ctx, "routed", string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	comments := &cliPollFakeGitHub{}
+	worker.CommenterFactory = func(string) github.Client { return comments }
+	cause := errors.New("checkout validation failed")
+	if err := worker.finishQueuedJob(ctx, snapshot, workflow.JobFailed, cause); err != nil {
+		t.Fatal(err)
+	}
+	_ = worker.postJobResultComment(ctx, "routed", runtime.Agent{Name: "rev-omp"}, "", cause)
+
+	after := storedPayload(t, ctx, store, "routed")
+	if after.WorktreePath != "/worktrees/routed" || !after.ReadOnlyWorktree {
+		t.Fatalf("undo dropped the allocated worktree: %+v", after)
+	}
+	if len(comments.posted) != 0 {
+		t.Fatalf("posted %d result comments for a review that is waiting again", len(comments.posted))
 	}
 }
