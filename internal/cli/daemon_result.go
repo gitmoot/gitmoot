@@ -18,6 +18,9 @@ import (
 // pre-flight caller passes the db.Job it admitted so the state transition is
 // atomic in both the job id and that row's lifecycle generation.
 func (w jobWorker) finishQueuedJob(ctx context.Context, job db.Job, state workflow.JobState, cause error) error {
+	if w.undoDiskGuardRoute(ctx, job, state, false, cause) {
+		return nil
+	}
 	return w.finishQueuedJobAtGeneration(ctx, job.ID, job.LifecycleGeneration, state, cause)
 }
 
@@ -51,6 +54,9 @@ func (w jobWorker) finishQueuedJobAtGeneration(ctx context.Context, jobID string
 // won the atomic queued->running claim before provider reservation. It shares
 // the pre-delivery continuation so delegation failures still advance.
 func (w jobWorker) finishAdmittedReviewJob(ctx context.Context, job db.Job, state workflow.JobState, cause error) error {
+	if w.undoDiskGuardRoute(ctx, job, state, true, cause) {
+		return nil
+	}
 	event := db.JobEvent{JobID: job.ID, Kind: string(state), Message: cause.Error()}
 	transitioned, err := w.Store.TransitionJobStateWithEventAtGeneration(
 		ctx, job.ID, string(workflow.JobRunning), job.LifecycleGeneration, string(state), event,

@@ -1372,17 +1372,27 @@ func (s *Store) RerouteQueuedJobPayload(ctx context.Context, id string, payload 
 }
 
 // RouteQueuedJobRemote is RerouteQueuedJobPayload for a payload that moves the
-// job to the remote backend, admitted only while fewer than remoteLimit jobs
-// hold or are about to hold a cloud attempt: queued or running jobs whose
-// payload selects remote, plus billing attempts of any other job. The count and
-// the write are one statement, so concurrent callers cannot both take the last
-// slot.
-func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, remoteLimit int, event JobEvent) (bool, error) {
+// job to the remote backend. It is admitted only if one more attempt at
+// perAttemptUSD would fit the cost cap ReserveExecBackendAttempt enforces,
+// counting every attempt already billing at its own reserved dollars and every
+// queued or running remote job that has not reserved yet at perAttemptUSD. The
+// count and the write are one statement, so concurrent callers cannot both
+// take the last slot.
+func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, cap ExecBackendCostCap, event JobEvent) (bool, error) {
+	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
+		return false, nil
+	}
 	marks, states := billingStatePlaceholders()
-	clause := ` AND (SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote')
-		+ (SELECT COUNT(*) FROM execbackend_attempts a WHERE a.state IN (` + marks + `) AND a.job_id NOT IN
-			(SELECT r2.id FROM jobs r2 WHERE r2.state IN ('queued','running') AND json_extract(r2.payload, '$.exec_backend') = 'remote')) < ?`
-	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, append(states, remoteLimit))
+	pending := `(SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote'
+		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.state IN (` + marks + `)))`
+	clause := ` AND (SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts WHERE state IN (` + marks + `))
+		+ (` + pending + ` + 1) * ? <= ?`
+	args := append(append(append([]any{}, states...), states...), cap.PerAttemptUSD, cap.MaxReservedUSD)
+	if cap.MaxConcurrent > 0 {
+		clause += ` AND (SELECT COUNT(*) FROM execbackend_attempts WHERE state IN (` + marks + `)) + ` + pending + ` + 1 <= ?`
+		args = append(append(append(args, states...), states...), cap.MaxConcurrent)
+	}
+	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, args)
 }
 
 func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {

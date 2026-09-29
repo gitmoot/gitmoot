@@ -218,10 +218,7 @@ func (w jobWorker) remoteReviewRetryAdmission(ctx context.Context, job db.Job) e
 	return newRemoteReviewRefusal(remoteReviewAvoidedRetry, fmt.Sprintf("remote review job %s already used its one cloud attempt for this exact-head subject; retry requires explicit operator action or a classified retryable provider failure", job.ID))
 }
 
-func (w jobWorker) recordRemoteReviewAdmissionRefusal(ctx context.Context, job db.Job, payload workflow.JobPayload, err error) error {
-	if w.undoDiskGuardRoute(ctx, job, payload, false, err) {
-		return nil
-	}
+func (w jobWorker) recordRemoteReviewAdmissionRefusal(ctx context.Context, job db.Job, err error) error {
 	var refusal *remoteReviewAdmissionRefusal
 	if !errors.As(err, &refusal) {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)

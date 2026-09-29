@@ -548,12 +548,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	nativeReviewDeliveryStarted := false
-	beforeWorktree := payload
 	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
 	if err != nil {
-		if w.undoDiskGuardRoute(ctx, job, beforeWorktree, false, err) {
-			return nil
-		}
 		// An exact-head allocation that spent its checkout-mutation-lock budget is
 		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
 		// failing the leg here BURNED the verdict — the payload is left unmutated, so
@@ -851,7 +847,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		if errors.Is(admissionErr, errRemoteReviewAdmissionCancelled) {
 			return nil
 		}
-		return w.recordRemoteReviewAdmissionRefusal(ctx, job, payload, admissionErr)
+		return w.recordRemoteReviewAdmissionRefusal(ctx, job, admissionErr)
 	}
 	runCtx := ctx
 	stopRun := func() {}
@@ -875,9 +871,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if lifecycleErr != nil {
 		w.recordRetryableRemoteProviderFailure(ctx, job, lifecycleErr)
-		if w.undoDiskGuardRoute(ctx, job, payload, remoteReviewAdmitted, lifecycleErr) {
-			return nil
-		}
 		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, lifecycleErr); finishErr != nil {
 			return finishErr
 		}

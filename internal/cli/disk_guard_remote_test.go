@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -252,5 +253,62 @@ func TestLowDiskDoesNotSwitchADeclinedReviewAgain(t *testing.T) {
 	queueDiskGuardJob(t, ctx, store, "declined", "rev-omp", "review", `,"disk_guard_route_declined":true`)
 	if got := pendingIDs(t, ctx, worker); len(got) != 0 || storedBackend(t, ctx, store, "declined") == "remote" {
 		t.Fatalf("declined review switched again (pending %v)", got)
+	}
+}
+
+// Every pre-delivery failure path ends in finishQueuedJob (or, once admitted,
+// finishAdmittedReviewJob). For a review the disk guard switched, that must put
+// it back to waiting locally, whatever the cause, including host checkout
+// validation after the worktree was allocated (#2273 review).
+func TestFailingADiskRoutedReviewBeforeDeliveryPutsItBackToWaiting(t *testing.T) {
+	for _, state := range []workflow.JobState{workflow.JobFailed, workflow.JobBlocked} {
+		t.Run(string(state), func(t *testing.T) {
+			ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+			queueDiskGuardJob(t, ctx, store, "routed", "rev-omp", "review", "")
+			queueDiskGuardJob(t, ctx, store, "plain", "rev-omp", "review", `,"exec_backend":"local"`)
+			if got := pendingIDs(t, ctx, worker); len(got) != 1 {
+				t.Fatalf("pending = %v, want the routed review", got)
+			}
+			for _, id := range []string{"routed", "plain"} {
+				job, err := store.GetJob(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := worker.finishQueuedJob(ctx, job, state, errors.New("checkout validation: git status failed: no space left on device")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			routed, _ := store.GetJob(ctx, "routed")
+			if routed.State != string(workflow.JobQueued) {
+				t.Fatalf("routed review is %s, want queued (waiting locally)", routed.State)
+			}
+			p := storedPayload(t, ctx, store, "routed")
+			if _, present := p.ExecBackendOverride(); present || p.DiskGuardRouted || p.PolicyRoutedReview || !p.DiskGuardRouteDeclined {
+				t.Fatalf("payload after undo %+v", p)
+			}
+			if plain, _ := store.GetJob(ctx, "plain"); plain.State != string(state) {
+				t.Fatalf("a review the guard did not switch is %s, want %s: the undo is only for switched reviews", plain.State, state)
+			}
+		})
+	}
+}
+
+// A switched review that ends any other way (e.g. cancelled by an operator)
+// keeps that outcome: only a failure or block is turned back into waiting.
+func TestUndoingADiskRouteIsOnlyForFailures(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "routed", "rev-omp", "review", "")
+	if got := pendingIDs(t, ctx, worker); len(got) != 1 {
+		t.Fatalf("pending = %v", got)
+	}
+	job, err := store.GetJob(ctx, "routed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker.undoDiskGuardRoute(ctx, job, workflow.JobCancelled, false, errors.New("operator cancel")) {
+		t.Fatal("a cancelled switched review was put back to waiting")
+	}
+	if b := storedBackend(t, ctx, store, "routed"); b != "remote" {
+		t.Fatalf("backend %q after a non-failure outcome, want it left as remote", b)
 	}
 }

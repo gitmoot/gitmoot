@@ -308,7 +308,7 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 	if err != nil || backend != execbackend.Remote {
 		return nil
 	}
-	limit := remoteAttemptLimit(execBackendStoreCap(cfg.ExecBackendCost))
+	cap := execBackendStoreCap(cfg.ExecBackendCost)
 	var allowed []db.Job
 	for _, job := range jobs {
 		if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
@@ -324,7 +324,7 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 			}
 			continue
 		}
-		if limit <= 0 || payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
 			continue
 		}
 		payload.ExecBackend = string(execbackend.Remote)
@@ -334,7 +334,7 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 		if err != nil {
 			continue
 		}
-		routed, err := worker.Store.RouteQueuedJobRemote(ctx, job.ID, string(encoded), job.LifecycleGeneration, limit, db.JobEvent{
+		routed, err := worker.Store.RouteQueuedJobRemote(ctx, job.ID, string(encoded), job.LifecycleGeneration, cap, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRoutedRemoteEventKind,
 			Message: "disk guard paused local dispatch, so this review runs on the remote backend: " + reason,
@@ -371,27 +371,19 @@ func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, p
 	return err == nil && len(attempts) == 0
 }
 
-// remoteAttemptLimit is how many cloud attempts the cost cap admits at once:
-// the dollar cap in whole attempts, bounded by the concurrency cap.
-func remoteAttemptLimit(cap db.ExecBackendCostCap) int {
-	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
-		return 0
+// undoDiskGuardRoute is called by every path that would fail or block a job
+// before delivery (finishQueuedJob, finishAdmittedReviewJob). For a review the
+// disk guard switched to remote it instead puts the stored job back to waiting
+// locally and marks it declined, so the opt-in never turns a review that would
+// have waited into a failed one; if the cause is not about the remote run, the
+// review meets it again locally. running is true once remote admission has
+// claimed the job. It reports whether it took ownership of the job's outcome.
+func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state workflow.JobState, running bool, cause error) bool {
+	if state != workflow.JobFailed && state != workflow.JobBlocked {
+		return false
 	}
-	limit := int(math.Floor(cap.MaxReservedUSD/cap.PerAttemptUSD + 1e-9))
-	if cap.MaxConcurrent > 0 && cap.MaxConcurrent < limit {
-		limit = cap.MaxConcurrent
-	}
-	return limit
-}
-
-// undoDiskGuardRoute puts a review the disk guard switched to remote back to
-// waiting locally when its remote run is refused (red CI, a moved head, a
-// duplicate subject, no worktree, the cost cap, the provider), so the opt-in
-// never turns a review that would have waited into a failed one. running is
-// true once remote admission has claimed the job. It reports whether it took
-// ownership of the job's outcome; false leaves the caller's failure path.
-func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, payload workflow.JobPayload, running bool, cause error) bool {
-	if !payload.DiskGuardRouted {
+	payload, err := daemonJobPayload(job)
+	if err != nil || !payload.DiskGuardRouted {
 		return false
 	}
 	payload.ClearExecBackendOverride()
@@ -403,7 +395,7 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, payload w
 		return false
 	}
 	event := db.JobEvent{JobID: job.ID, Kind: diskGuardRouteUndoneEventKind,
-		Message: "remote run refused, so this review waits for local disk again: " + cause.Error()}
+		Message: "remote run did not start, so this review waits for local disk again: " + cause.Error()}
 	var undone bool
 	if running {
 		undone, err = w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobRunning),

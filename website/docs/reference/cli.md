@@ -538,11 +538,12 @@ still waits. A review already set to `--exec-backend remote` runs; a review with
 no backend of its own is switched to remote (event `disk_guard_routed_remote`)
 when it has an exact pull-request head, its agent's runtime runs remotely, it
 has not used its one cloud attempt, and the `[remote_exec]` cost cap has room
-(checked in the same database write, so concurrent passes cannot overshoot).
-A switched review needs green current-head CI at remote admission. If its remote
-run is refused for any reason (red CI, a moved head, a duplicate, no worktree,
-the cost cap, the provider), it goes back to waiting locally (event
-`disk_guard_route_undone`) instead of failing, and is not switched again. A
+for one more attempt in dollars and in number (checked in the same database
+write as the switch, so concurrent passes cannot overshoot). A switched review
+needs green current-head CI at remote admission. If it would fail or block for
+any reason before its remote run starts (red CI, a moved head, a duplicate, the
+worktree or checkout, the cost cap, the provider), it goes back to waiting
+locally (event `disk_guard_route_undone`) instead, and is not switched again. A
 review pinned to `--exec-backend local` keeps waiting, and nothing is switched
 while the daemon is draining. It spends money, so it needs a configured
 `[remote_exec]` cost cap and is off unless set.

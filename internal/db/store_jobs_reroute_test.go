@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // A queued job may be claimed between the scheduler's read and its reroute.
@@ -43,17 +44,46 @@ func TestRouteQueuedJobRemoteTakesOnlyTheSlotsLeft(t *testing.T) {
 	insertWorktreeRefJob(t, store, "running-remote", "running", `{"repo":"o/r","exec_backend":"remote"}`)
 	insertWorktreeRefJob(t, store, "a", "queued", `{"repo":"o/r"}`)
 	insertWorktreeRefJob(t, store, "b", "queued", `{"repo":"o/r"}`)
+	cap := ExecBackendCostCap{Configured: true, MaxReservedUSD: 100, PerAttemptUSD: 1, MaxConcurrent: 2}
 	remote := `{"repo":"o/r","exec_backend":"remote"}`
 	ev := JobEvent{Kind: "disk_guard_routed_remote", Message: "m"}
-	first, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, 2, ev)
-	if err != nil || !first {
+	if first, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, cap, ev); err != nil || !first {
 		t.Fatalf("first route with one slot left: %v %v", first, err)
 	}
-	second, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, 2, ev)
-	if err != nil || second {
+	if second, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, cap, ev); err != nil || second {
 		t.Fatalf("second route with no slot left: routed=%v err=%v", second, err)
 	}
 	if job, _ := store.GetJob(ctx, "b"); job.Payload != `{"repo":"o/r"}` {
 		t.Fatalf("refused route changed the payload: %q", job.Payload)
+	}
+}
+
+// The route must admit exactly what ReserveExecBackendAttempt will: attempts
+// still billing count at the dollars they reserved, even after the configured
+// per-attempt price changed (#2273 review).
+func TestRouteQueuedJobRemoteCountsBillingAttemptsAtTheirReservedDollars(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreOperationsTestStore(t)
+	insertWorktreeRefJob(t, store, "old", "running", `{"repo":"o/r","exec_backend":"remote"}`)
+	for _, id := range []string{"a", "b"} {
+		insertWorktreeRefJob(t, store, id, "queued", `{"repo":"o/r"}`)
+	}
+	if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
+		ExecBackendAttemptKey: ExecBackendAttemptKey{JobID: "old", Attempt: 1},
+		Provider:              "e2b", DaemonFencingToken: "t", BootID: "b",
+		TTLExpiresAt: time.Now().Add(time.Hour), CostReservedUSD: 3,
+	}, ExecBackendCostCap{Configured: true, MaxReservedUSD: 4, PerAttemptUSD: 3}); err != nil {
+		t.Fatal(err)
+	}
+	// The price drops to $1 with a $4 cap: $3 is still reserved, so exactly
+	// one more $1 attempt fits.
+	cap := ExecBackendCostCap{Configured: true, MaxReservedUSD: 4, PerAttemptUSD: 1}
+	remote := `{"repo":"o/r","exec_backend":"remote"}`
+	ev := JobEvent{Kind: "disk_guard_routed_remote", Message: "m"}
+	if ok, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, cap, ev); err != nil || !ok {
+		t.Fatalf("the one $1 slot left: routed=%v err=%v", ok, err)
+	}
+	if ok, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, cap, ev); err != nil || ok {
+		t.Fatalf("a second $1 route over a $4 cap with $3 billing: routed=%v err=%v", ok, err)
 	}
 }
