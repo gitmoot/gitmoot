@@ -203,7 +203,7 @@ func TestDispatchDiskGuardAggregatesAndRateLimitsEventWriteFailures(t *testing.T
 	}
 
 	for range 2 {
-		if diskGuardAllowsQueuedDispatch(ctx, worker, jobs, "owner/repo", "") {
+		if len(diskGuardQueuedDispatch(ctx, worker, jobs, "owner/repo", "")) > 0 {
 			t.Fatal("dispatch allowed below disk floor")
 		}
 	}

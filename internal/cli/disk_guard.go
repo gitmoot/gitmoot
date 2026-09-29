@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
@@ -209,11 +212,13 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 	return paths, nil
 }
 
-// diskGuardAllowsQueuedDispatch is called only by the normal queued-job
-// dispatch listing. Daemon maintenance and reconciliation do not pass through
-// this function, so future in-process reclaim remains able to free disk while
-// agent dispatch is paused.
-func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) bool {
+// diskGuardQueuedDispatch returns the queued jobs the disk guard lets dispatch:
+// all of jobs while the disk is healthy; otherwise only the reviews that run on
+// the remote backend (diskGuardRemoteReviews, opt-in), or none. It is called
+// only by the normal queued-job dispatch listing. Daemon maintenance and
+// reconciliation do not pass through this function, so future in-process
+// reclaim remains able to free disk while agent dispatch is paused.
+func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
 	matching := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
@@ -221,7 +226,7 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		}
 	}
 	if len(matching) == 0 {
-		return true
+		return jobs
 	}
 
 	paths, err := diskGuardPaths(worker)
@@ -237,10 +242,18 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	}
 	if evaluation.allowsDispatch() {
 		clearDiskGuardRefusal(evaluation.Path)
-		return true
+		return jobs
 	}
 
 	detail := evaluation.detail()
+	var remote []db.Job
+	if evaluation.Err == nil && evaluation.Policy.RemoteReviews {
+		remote = diskGuardRemoteReviews(ctx, worker, matching, detail)
+	}
+	routed := make(map[string]bool, len(remote))
+	for _, job := range remote {
+		routed[job.ID] = true
+	}
 	fingerprint := evaluation.refusalFingerprint()
 	now := time.Now()
 	if shouldLogDiskGuardRefusal(evaluation.Path, fingerprint, now) {
@@ -249,6 +262,9 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	failedEventWrites := 0
 	var firstEventWriteErr error
 	for _, job := range matching {
+		if routed[job.ID] {
+			continue
+		}
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
@@ -271,7 +287,129 @@ func diskGuardAllowsQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 			firstEventWriteErr,
 		)
 	}
-	return false
+	return remote
+}
+
+const diskGuardRoutedRemoteEventKind = "disk_guard_routed_remote"
+
+// diskGuardRemoteReviews picks, while the guard pauses local dispatch, the
+// queued reviews that may run on the remote backend instead: reviews already
+// set to remote, and reviews with no backend of their own that this pass
+// switches to remote, as many as the [remote_exec] cost cap has room for. A
+// review switched here is exactly one a requester could have sent with
+// --exec-backend remote, so remote admission, the one-cloud-attempt rule and
+// the cost cap still apply unchanged. An explicit local backend is respected.
+func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
+	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
+	if err != nil || backend != execbackend.Remote {
+		return nil
+	}
+	free, err := remoteSlotsFree(ctx, worker.Store, execBackendStoreCap(cfg.ExecBackendCost))
+	if err != nil {
+		return nil
+	}
+	var allowed []db.Job
+	for _, job := range jobs {
+		if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			continue
+		}
+		if name, present := payload.ExecBackendOverride(); present {
+			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
+				allowed = append(allowed, job)
+				free--
+			}
+			continue
+		}
+		if free <= 0 || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+			continue
+		}
+		payload.ExecBackend = string(execbackend.Remote)
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			continue
+		}
+		rerouted, err := worker.Store.RerouteQueuedJobPayload(ctx, job.ID, string(encoded), job.LifecycleGeneration, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    diskGuardRoutedRemoteEventKind,
+			Message: "disk guard paused local dispatch, so this review runs on the remote backend: " + reason,
+		})
+		if err != nil || !rerouted {
+			continue
+		}
+		job.Payload = string(encoded)
+		allowed = append(allowed, job)
+		free--
+	}
+	return allowed
+}
+
+// diskGuardCanRouteRemote reports whether a local review can run remotely at
+// all: an exact pull-request head, a registered agent whose runtime runs
+// remotely, and no earlier cloud attempt (remote admission allows one).
+func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) bool {
+	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
+	if payload.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil || payload.Ephemeral != nil {
+		return false
+	}
+	runtimeName := strings.TrimSpace(payload.RuntimeOverride)
+	if runtimeName == "" {
+		agent, err := store.GetAgent(ctx, job.Agent)
+		if err != nil {
+			return false
+		}
+		runtimeName = agent.Runtime
+	}
+	if !remoteCapableRuntime(runtimeName) {
+		return false
+	}
+	attempts, err := store.ListExecBackendAttemptsForJob(ctx, job.ID)
+	return err == nil && len(attempts) == 0
+}
+
+// remoteSlotsFree is how many more cloud attempts the cost cap admits now. It
+// counts the attempts the cap already bills plus running remote jobs that have
+// not reserved yet, so a pass cannot hand out a slot a just-started job is
+// about to take.
+func remoteSlotsFree(ctx context.Context, store *db.Store, cap db.ExecBackendCostCap) (int, error) {
+	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
+		return 0, nil
+	}
+	count, reserved, err := store.ExecBackendBillingLoad(ctx)
+	if err != nil {
+		return 0, err
+	}
+	billing, err := store.ExecBackendBillingJobIDs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	running, err := store.ListJobsByState(ctx, string(workflow.JobRunning))
+	if err != nil {
+		return 0, err
+	}
+	for _, job := range running {
+		if billing[job.ID] {
+			continue
+		}
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			continue
+		}
+		if name, present := payload.ExecBackendOverride(); present {
+			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
+				count++
+				reserved += cap.PerAttemptUSD
+			}
+		}
+	}
+	free := int(math.Floor((cap.MaxReservedUSD-reserved)/cap.PerAttemptUSD + 1e-9))
+	if cap.MaxConcurrent > 0 && cap.MaxConcurrent-count < free {
+		free = cap.MaxConcurrent - count
+	}
+	return max(free, 0), nil
 }
 
 func daemonDiskGuardLine(paths config.Paths) string {

@@ -2245,8 +2245,13 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	// pass through this exact forDispatch path immediately before selecting work.
 	// Returning an empty eligible set pauses dispatch without changing job state,
 	// so low disk is retriable and queued work resumes automatically once healthy.
-	if forDispatch && !diskGuardAllowsQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter) {
-		return nil, nil
+	// While low, the guard may still let reviews through on the remote backend
+	// ([disk_guard] remote_reviews); every other job waits.
+	if forDispatch {
+		jobs = diskGuardQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
+		if len(jobs) == 0 {
+			return nil, nil
+		}
 	}
 	// #1207 (bounded half): A DRAINING DAEMON STOPS CLAIMING AND LOSES NOTHING.
 	//

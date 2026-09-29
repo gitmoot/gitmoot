@@ -721,6 +721,15 @@ cannot be established or a floor is breached. The guard applies only to normal
 agent-job dispatch; daemon maintenance/reconciliation remains runnable so an
 internal reclaim pass can free space.
 
+While the disk is low, `remote_reviews = true` (default `false`) lets queued
+reviews run on the remote execution backend instead of waiting; every other job
+still waits. A review already set to `--exec-backend remote` runs; a review with
+no backend of its own is switched to remote (event `disk_guard_routed_remote`)
+when it has an exact pull-request head, its agent's runtime runs remotely, it
+has not used its one cloud attempt, and the `[remote_exec]` cost cap has room.
+A review pinned to `--exec-backend local` keeps waiting. It spends money, so it
+needs a configured `[remote_exec]` cost cap and is off unless set.
+
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
 (including the never-fit case, which names the cap), a checkout key held by an

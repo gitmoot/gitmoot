@@ -148,6 +148,35 @@ func billingStatePlaceholders() (string, []any) {
 	return strings.Join(marks, ","), args
 }
 
+// ExecBackendBillingLoad returns what the cost cap currently counts: the
+// attempts in a billing state and the sum of their reservations.
+func (s *Store) ExecBackendBillingLoad(ctx context.Context) (count int, reservedUSD float64, err error) {
+	marks, args := billingStatePlaceholders()
+	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(cost_reserved_usd), 0)
+		FROM execbackend_attempts WHERE state IN (`+marks+`)`, args...).Scan(&count, &reservedUSD)
+	return count, reservedUSD, err
+}
+
+// ExecBackendBillingJobIDs returns the jobs that own an attempt in a billing
+// state.
+func (s *Store) ExecBackendBillingJobIDs(ctx context.Context) (map[string]bool, error) {
+	marks, args := billingStatePlaceholders()
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT job_id FROM execbackend_attempts WHERE state IN (`+marks+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	return ids, rows.Err()
+}
+
 // describeBillingLoad reads the operands for a refusal message. It is diagnostic
 // only: it runs AFTER the admission has already been refused, so its failure
 // degrades the message and never converts a refusal into an admission.
