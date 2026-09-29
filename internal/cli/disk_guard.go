@@ -290,24 +290,25 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	return remote
 }
 
-const diskGuardRoutedRemoteEventKind = "disk_guard_routed_remote"
+const (
+	diskGuardRoutedRemoteEventKind = "disk_guard_routed_remote"
+	diskGuardRouteUndoneEventKind  = "disk_guard_route_undone"
+)
 
 // diskGuardRemoteReviews picks, while the guard pauses local dispatch, the
 // queued reviews that may run on the remote backend instead: reviews already
 // set to remote, and reviews with no backend of their own that this pass
-// switches to remote, as many as the [remote_exec] cost cap has room for. A
-// review switched here is exactly one a requester could have sent with
-// --exec-backend remote, so remote admission, the one-cloud-attempt rule and
-// the cost cap still apply unchanged. An explicit local backend is respected.
+// switches to remote while the [remote_exec] cost cap has room. A switched
+// review also requires green current-head CI at remote admission
+// (PolicyRoutedReview), and any refusal of its remote run puts it back to
+// waiting locally (undoDiskGuardRoute) instead of failing it. An explicit local
+// backend is respected, and a review is switched at most once.
 func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
 	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
 	if err != nil || backend != execbackend.Remote {
 		return nil
 	}
-	free, err := remoteSlotsFree(ctx, worker.Store, execBackendStoreCap(cfg.ExecBackendCost))
-	if err != nil {
-		return nil
-	}
+	limit := remoteAttemptLimit(execBackendStoreCap(cfg.ExecBackendCost))
 	var allowed []db.Job
 	for _, job := range jobs {
 		if !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
@@ -320,29 +321,29 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 		if name, present := payload.ExecBackendOverride(); present {
 			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
 				allowed = append(allowed, job)
-				free--
 			}
 			continue
 		}
-		if free <= 0 || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+		if limit <= 0 || payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
 			continue
 		}
 		payload.ExecBackend = string(execbackend.Remote)
+		payload.PolicyRoutedReview = true
+		payload.DiskGuardRouted = true
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			continue
 		}
-		rerouted, err := worker.Store.RerouteQueuedJobPayload(ctx, job.ID, string(encoded), job.LifecycleGeneration, db.JobEvent{
+		routed, err := worker.Store.RouteQueuedJobRemote(ctx, job.ID, string(encoded), job.LifecycleGeneration, limit, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRoutedRemoteEventKind,
 			Message: "disk guard paused local dispatch, so this review runs on the remote backend: " + reason,
 		})
-		if err != nil || !rerouted {
+		if err != nil || !routed {
 			continue
 		}
 		job.Payload = string(encoded)
 		allowed = append(allowed, job)
-		free--
 	}
 	return allowed
 }
@@ -370,46 +371,51 @@ func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, p
 	return err == nil && len(attempts) == 0
 }
 
-// remoteSlotsFree is how many more cloud attempts the cost cap admits now. It
-// counts the attempts the cap already bills plus running remote jobs that have
-// not reserved yet, so a pass cannot hand out a slot a just-started job is
-// about to take.
-func remoteSlotsFree(ctx context.Context, store *db.Store, cap db.ExecBackendCostCap) (int, error) {
+// remoteAttemptLimit is how many cloud attempts the cost cap admits at once:
+// the dollar cap in whole attempts, bounded by the concurrency cap.
+func remoteAttemptLimit(cap db.ExecBackendCostCap) int {
 	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
-		return 0, nil
+		return 0
 	}
-	count, reserved, err := store.ExecBackendBillingLoad(ctx)
+	limit := int(math.Floor(cap.MaxReservedUSD/cap.PerAttemptUSD + 1e-9))
+	if cap.MaxConcurrent > 0 && cap.MaxConcurrent < limit {
+		limit = cap.MaxConcurrent
+	}
+	return limit
+}
+
+// undoDiskGuardRoute puts a review the disk guard switched to remote back to
+// waiting locally when its remote run is refused (red CI, a moved head, a
+// duplicate subject, no worktree, the cost cap, the provider), so the opt-in
+// never turns a review that would have waited into a failed one. running is
+// true once remote admission has claimed the job. It reports whether it took
+// ownership of the job's outcome; false leaves the caller's failure path.
+func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, payload workflow.JobPayload, running bool, cause error) bool {
+	if !payload.DiskGuardRouted {
+		return false
+	}
+	payload.ClearExecBackendOverride()
+	payload.PolicyRoutedReview = false
+	payload.DiskGuardRouted = false
+	payload.DiskGuardRouteDeclined = true
+	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return 0, err
+		return false
 	}
-	billing, err := store.ExecBackendBillingJobIDs(ctx)
-	if err != nil {
-		return 0, err
+	event := db.JobEvent{JobID: job.ID, Kind: diskGuardRouteUndoneEventKind,
+		Message: "remote run refused, so this review waits for local disk again: " + cause.Error()}
+	var undone bool
+	if running {
+		undone, err = w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobRunning),
+			job.LifecycleGeneration, string(workflow.JobQueued), string(encoded), event)
+	} else {
+		undone, err = w.Store.RerouteQueuedJobPayload(ctx, job.ID, string(encoded), job.LifecycleGeneration, event)
 	}
-	running, err := store.ListJobsByState(ctx, string(workflow.JobRunning))
-	if err != nil {
-		return 0, err
+	if err != nil || !undone {
+		return false
 	}
-	for _, job := range running {
-		if billing[job.ID] {
-			continue
-		}
-		payload, err := daemonJobPayload(job)
-		if err != nil {
-			continue
-		}
-		if name, present := payload.ExecBackendOverride(); present {
-			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
-				count++
-				reserved += cap.PerAttemptUSD
-			}
-		}
-	}
-	free := int(math.Floor((cap.MaxReservedUSD-reserved)/cap.PerAttemptUSD + 1e-9))
-	if cap.MaxConcurrent > 0 && cap.MaxConcurrent-count < free {
-		free = cap.MaxConcurrent - count
-	}
-	return max(free, 0), nil
+	writeLine(w.Stdout, "job %s: disk-guard remote route undone, waiting locally: %v", job.ID, cause)
+	return true
 }
 
 func daemonDiskGuardLine(paths config.Paths) string {

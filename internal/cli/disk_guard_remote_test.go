@@ -68,7 +68,7 @@ func pendingIDs(t *testing.T, ctx context.Context, worker jobWorker) []string {
 	return ids
 }
 
-func storedBackend(t *testing.T, ctx context.Context, store *db.Store, id string) string {
+func storedPayload(t *testing.T, ctx context.Context, store *db.Store, id string) workflow.JobPayload {
 	t.Helper()
 	job, err := store.GetJob(ctx, id)
 	if err != nil {
@@ -78,7 +78,12 @@ func storedBackend(t *testing.T, ctx context.Context, store *db.Store, id string
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend, _ := payload.ExecBackendOverride()
+	return payload
+}
+
+func storedBackend(t *testing.T, ctx context.Context, store *db.Store, id string) string {
+	t.Helper()
+	backend, _ := storedPayload(t, ctx, store, id).ExecBackendOverride()
 	return backend
 }
 
@@ -96,6 +101,9 @@ func TestLowDiskSendsReviewsRemoteAndKeepsEverythingElseWaiting(t *testing.T) {
 	}
 	if b := storedBackend(t, ctx, store, "review-local"); b != "remote" {
 		t.Fatalf("routed review stored backend %q, want remote (the worker reads the stored payload)", b)
+	}
+	if p := storedPayload(t, ctx, store, "review-local"); !p.PolicyRoutedReview || !p.DiskGuardRouted {
+		t.Fatalf("routed review payload %+v: want green-CI admission (policy_routed_review) and the disk_guard_routed mark", p)
 	}
 	for _, id := range []string{"implement", "review-claude", "review-pinned-local", "review-no-head"} {
 		if b := storedBackend(t, ctx, store, id); b == "remote" {
@@ -218,4 +226,31 @@ func hasEventKind(events []db.JobEvent, kind string) bool {
 		}
 	}
 	return false
+}
+
+// Switching is durable, so it must not happen while the daemon is draining:
+// otherwise a review that was only waiting would run (and bill) remotely after
+// drain clears, even if the disk had recovered by then.
+func TestLowDiskDoesNotSwitchReviewsWhileDraining(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "review-local", "rev-omp", "review", "")
+	worker.DrainSentinelPath = filepath.Join(t.TempDir(), "drain")
+	if err := os.WriteFile(worker.DrainSentinelPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingIDs(t, ctx, worker); len(got) != 0 {
+		t.Fatalf("pending while draining = %v", got)
+	}
+	if b := storedBackend(t, ctx, store, "review-local"); b == "remote" {
+		t.Fatal("review switched to remote while the daemon was draining")
+	}
+}
+
+// A review whose remote run was refused once waits locally from then on.
+func TestLowDiskDoesNotSwitchADeclinedReviewAgain(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "declined", "rev-omp", "review", `,"disk_guard_route_declined":true`)
+	if got := pendingIDs(t, ctx, worker); len(got) != 0 || storedBackend(t, ctx, store, "declined") == "remote" {
+		t.Fatalf("declined review switched again (pending %v)", got)
+	}
 }

@@ -34,3 +34,26 @@ func TestRerouteQueuedJobPayloadLeavesAClaimedJobAlone(t *testing.T) {
 		}
 	}
 }
+
+// Two scheduler passes can race for the last cloud slot. The count and the
+// switch are one statement, so only one of them can take it.
+func TestRouteQueuedJobRemoteTakesOnlyTheSlotsLeft(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreOperationsTestStore(t)
+	insertWorktreeRefJob(t, store, "running-remote", "running", `{"repo":"o/r","exec_backend":"remote"}`)
+	insertWorktreeRefJob(t, store, "a", "queued", `{"repo":"o/r"}`)
+	insertWorktreeRefJob(t, store, "b", "queued", `{"repo":"o/r"}`)
+	remote := `{"repo":"o/r","exec_backend":"remote"}`
+	ev := JobEvent{Kind: "disk_guard_routed_remote", Message: "m"}
+	first, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, 2, ev)
+	if err != nil || !first {
+		t.Fatalf("first route with one slot left: %v %v", first, err)
+	}
+	second, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, 2, ev)
+	if err != nil || second {
+		t.Fatalf("second route with no slot left: routed=%v err=%v", second, err)
+	}
+	if job, _ := store.GetJob(ctx, "b"); job.Payload != `{"repo":"o/r"}` {
+		t.Fatalf("refused route changed the payload: %q", job.Payload)
+	}
+}

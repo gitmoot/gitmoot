@@ -1368,15 +1368,34 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 // transaction, only while the job is still queued at atGeneration. It reports
 // false, changing nothing, if the job was claimed, cancelled or re-queued.
 func (s *Store) RerouteQueuedJobPayload(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent) (bool, error) {
+	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, "", nil)
+}
+
+// RouteQueuedJobRemote is RerouteQueuedJobPayload for a payload that moves the
+// job to the remote backend, admitted only while fewer than remoteLimit jobs
+// hold or are about to hold a cloud attempt: queued or running jobs whose
+// payload selects remote, plus billing attempts of any other job. The count and
+// the write are one statement, so concurrent callers cannot both take the last
+// slot.
+func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, remoteLimit int, event JobEvent) (bool, error) {
+	marks, states := billingStatePlaceholders()
+	clause := ` AND (SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote')
+		+ (SELECT COUNT(*) FROM execbackend_attempts a WHERE a.state IN (` + marks + `) AND a.job_id NOT IN
+			(SELECT r2.id FROM jobs r2 WHERE r2.state IN ('queued','running') AND json_extract(r2.payload, '$.exec_backend') = 'remote')) < ?`
+	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, append(states, remoteLimit))
+}
+
+func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ? AND state = 'queued'`,
-		payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
-		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration)
+	args := []any{payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, projection.WorkflowID, atGeneration}
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND workflow_id = ? AND lifecycle_generation = ? AND state = 'queued'`+clause,
+		append(args, clauseArgs...)...)
 	if err != nil {
 		return false, err
 	}

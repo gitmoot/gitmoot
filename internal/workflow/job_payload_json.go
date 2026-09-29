@@ -40,6 +40,13 @@ func (p JobPayload) ExecBackendOverride() (string, bool) {
 	return p.ExecBackend, p.execBackendPresent || p.ExecBackend != ""
 }
 
+// ClearExecBackendOverride removes the job-scoped selector, so the job falls
+// back to the default (local) backend.
+func (p *JobPayload) ClearExecBackendOverride() {
+	p.ExecBackend = ""
+	p.execBackendPresent = false
+}
+
 // UnmarshalJSON retains unknown members so a newer payload can pass through an
 // older daemon without losing fields that daemon does not understand.
 func (p *JobPayload) UnmarshalJSON(data []byte) error {

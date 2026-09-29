@@ -537,9 +537,15 @@ reviews run on the remote execution backend instead of waiting; every other job
 still waits. A review already set to `--exec-backend remote` runs; a review with
 no backend of its own is switched to remote (event `disk_guard_routed_remote`)
 when it has an exact pull-request head, its agent's runtime runs remotely, it
-has not used its one cloud attempt, and the `[remote_exec]` cost cap has room.
-A review pinned to `--exec-backend local` keeps waiting. It spends money, so it
-needs a configured `[remote_exec]` cost cap and is off unless set.
+has not used its one cloud attempt, and the `[remote_exec]` cost cap has room
+(checked in the same database write, so concurrent passes cannot overshoot).
+A switched review needs green current-head CI at remote admission. If its remote
+run is refused for any reason (red CI, a moved head, a duplicate, no worktree,
+the cost cap, the provider), it goes back to waiting locally (event
+`disk_guard_route_undone`) instead of failing, and is not switched again. A
+review pinned to `--exec-backend local` keeps waiting, and nothing is switched
+while the daemon is draining. It spends money, so it needs a configured
+`[remote_exec]` cost cap and is off unless set.
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
