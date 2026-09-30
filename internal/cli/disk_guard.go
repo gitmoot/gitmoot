@@ -305,7 +305,9 @@ const (
 // backend is respected, and a review is switched at most once.
 func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
 	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
-	if err != nil || backend != execbackend.Remote {
+	// Only the cloud E2B provider: the Mac provider (sandboxd) takes no
+	// automatic routing until its real-review canary passes (sandboxd#10).
+	if err != nil || backend != execbackend.Remote || cfg.Provider != "e2b" {
 		return nil
 	}
 	cap := execBackendStoreCap(cfg.ExecBackendCost)

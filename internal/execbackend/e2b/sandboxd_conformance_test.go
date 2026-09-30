@@ -168,7 +168,7 @@ func TestSandboxdPinnedClientConformance(t *testing.T) {
 			t.Fatalf("long guest process was not canceled after startup: started=%v err=%v", signal.seen, err)
 		}
 		reaped := false
-		for deadline := time.Now().Add(20*time.Second); time.Now().Before(deadline); {
+		for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
 			observed, err := client.List(ctx)
 			if err == nil {
 				reaped = true

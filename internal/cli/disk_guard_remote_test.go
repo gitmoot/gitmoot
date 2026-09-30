@@ -357,3 +357,25 @@ func TestUndoingADiskRouteKeepsTheStoredWorktreeAndPostsNoResult(t *testing.T) {
 		t.Fatalf("posted %d result comments for a review that is waiting again", len(comments.posted))
 	}
 }
+
+// The Mac provider (sandboxd) is opted into explicitly and is not yet proven
+// on real reviews, so the disk guard never routes to it (sandboxd#10).
+func TestLowDiskDoesNotRouteReviewsToTheMacProvider(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	paths := config.PathsForHome(worker.ConfigHome)
+	f, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprint(f, "provider = \"mac\"\n")
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, cfg, err := daemonJobExecBackendFor(worker, "remote", true); err != nil || cfg.Provider != "mac" {
+		t.Fatalf("fixture did not select the Mac provider: provider=%q err=%v", cfg.Provider, err)
+	}
+	queueDiskGuardJob(t, ctx, store, "review-local", "rev-omp", "review", "")
+	if got := pendingIDs(t, ctx, worker); len(got) != 0 || storedBackend(t, ctx, store, "review-local") == "remote" {
+		t.Fatalf("review routed to the Mac provider (pending %v)", got)
+	}
+}
