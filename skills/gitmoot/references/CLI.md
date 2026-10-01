@@ -360,10 +360,12 @@ rechecks green current-head CI before reserving capacity, even when
 `remote_require_ci_green = false`.
 
 Local worktrees use Git's absolute gitdir pointer successfully because they share
-the host filesystem, so bundle/base-ref hydration is reserved for a future remote
-provider. Foreground dispatch remains on the host path. Unknown backend names and
-explicit blank selectors fail loudly; a job payload's `exec_backend` overrides
-the config for that job.
+the host filesystem. A remote instance instead receives the exact head commit
+and its history back to the review diff base as a credential-free object store,
+so its `HEAD` is the exact head and the base is local (see
+`docs/remote-exec.md`). Foreground dispatch remains on the host path. Unknown
+backend names and explicit blank selectors fail loudly; a job payload's
+`exec_backend` overrides the config for that job.
 
 Remote broker access additionally requires paired
 `credential_gateway_listen` and `credential_gateway_url` values. The first is

@@ -38,22 +38,39 @@ const (
 	metadataOwnerStartTime      = "owner_start_time"
 )
 
+// syncWorkspaceScript runs in /home/user with the exact host HEAD as $1 and the
+// review diff base as $2. The archive carries a credential-free object store
+// (objects/ plus the shallow boundary), never a host .git directory, so the
+// workspace HEAD is the real commit and the base is a real local commit.
+// For a review the checked-out branch tracks gitmoot-review-base, so plain
+// `git status`, `git log @{upstream}..` and `git diff @{upstream}` show the
+// review scope without any remote.
 const syncWorkspaceScript = `set -eu
-rm -rf /home/user/workspace /home/user/.gitmoot-sync
-mkdir -p /home/user/.gitmoot-sync
-tar -xzf /home/user/.gitmoot-sync.tar.gz -C /home/user/.gitmoot-sync
-mv /home/user/.gitmoot-sync/workspace /home/user/workspace
-cd /home/user/workspace
-git init -q
+head=$1
+base=$2
+rm -rf workspace .gitmoot-sync
+mkdir .gitmoot-sync
+tar -xzf .gitmoot-sync.tar.gz -C .gitmoot-sync
+git init -q workspace
+rm -rf workspace/.git/objects
+mv .gitmoot-sync/objects workspace/.git/objects
+if [ -f .gitmoot-sync/shallow ]; then
+  mv .gitmoot-sync/shallow workspace/.git/shallow
+fi
+cd workspace
 git config user.name gitmoot
 git config user.email gitmoot@localhost
-git add -A
-git commit -q --allow-empty -m 'gitmoot sync base'
-if [ -s /home/user/.gitmoot-sync/changes.patch ]; then
-  git apply --binary --whitespace=nowarn /home/user/.gitmoot-sync/changes.patch
+git checkout -q -B gitmoot-head "$head"
+if [ "$base" != "$head" ]; then
+  git branch gitmoot-review-base "$base"
+  git branch -q --set-upstream-to=gitmoot-review-base gitmoot-head
 fi
-rm -rf /home/user/.gitmoot-sync /home/user/.gitmoot-sync.tar.gz
-git rev-parse HEAD`
+if [ -s ../.gitmoot-sync/changes.patch ]; then
+  git apply --binary --whitespace=nowarn ../.gitmoot-sync/changes.patch
+fi
+cd ..
+rm -rf .gitmoot-sync .gitmoot-sync.tar.gz
+git -C workspace rev-parse HEAD`
 
 const collectPatchScript = `set -eu
 git add -A
@@ -98,8 +115,6 @@ type sandboxState struct {
 	generation   int64
 	hostWorktree string
 	hostBase     string
-	diffBase     string
-	remoteBase   string
 
 	// stopKeepalive ends the TTL refresh loop. Nil when no refresh is running,
 	// which is the case whenever the requested TTL fits inside the provider's
@@ -423,68 +438,101 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 		return fmt.Errorf("read remote execution host base HEAD: %w", err)
 	}
 	hostBase = strings.TrimSpace(hostBase)
-	diffBase := strings.TrimSpace(materials.DiffBaseHEAD)
-	if diffBase == "" {
-		diffBase = hostBase
+	diffBase := hostBase
+	if requested := strings.TrimSpace(materials.DiffBaseHEAD); requested != "" {
+		resolved, err := hostGitOutput(ctx, hostWorktree, "rev-parse", "--verify", "--quiet", requested+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve remote review diff base %q: %w", requested, err)
+		}
+		diffBase = strings.TrimSpace(resolved)
 	}
-	inputChanges, err := execbackend.BuildChangeSetFromBase(ctx, hostWorktree, hostBase, diffBase)
+	inputChanges, err := execbackend.BuildChangeSet(ctx, hostWorktree, hostBase)
 	if err != nil {
 		return fmt.Errorf("capture remote execution sync input: %w", err)
 	}
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if err := execbackend.StageAt(ctx, hostWorktree, diffBase, func(stage string) error {
-		var inputPatch []byte
-		if len(inputChanges.Patch) > 0 || len(inputChanges.Manifest) > 0 {
+	historyRoot, err := os.MkdirTemp("", "gitmoot-remote-sync-")
+	if err != nil {
+		return fmt.Errorf("create remote sync history directory: %w", err)
+	}
+	defer os.RemoveAll(historyRoot)
+	history, err := exportExactHistory(ctx, hostWorktree, historyRoot, hostBase, diffBase)
+	if err != nil {
+		return fmt.Errorf("export remote execution history: %w", err)
+	}
+	var inputPatch []byte
+	if len(inputChanges.Patch) > 0 || len(inputChanges.Manifest) > 0 {
+		if err := execbackend.StageAt(ctx, hostWorktree, hostBase, func(stage string) error {
 			if err := execbackend.ImportChangeSet(ctx, stage, inputChanges); err != nil {
 				return fmt.Errorf("materialize remote sync staging tree: %w", err)
 			}
 			if _, err := hostGitOutput(ctx, stage, "add", "-A"); err != nil {
 				return fmt.Errorf("index remote sync input: %w", err)
 			}
+			var err error
 			inputPatch, err = hostGitBytes(ctx, stage, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-renames", "--cached", "HEAD", "--")
 			if err != nil {
 				return fmt.Errorf("capture remote sync patch: %w", err)
 			}
-			if _, err := hostGitOutput(ctx, stage, "reset", "--hard", "HEAD"); err != nil {
-				return fmt.Errorf("restore remote sync base: %w", err)
-			}
-			if _, err := hostGitOutput(ctx, stage, "clean", "-fdx"); err != nil {
-				return fmt.Errorf("clean remote sync base: %w", err)
-			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("stage remote execution workspace: %w", err)
 		}
-		return uploadWorkspaceArchive(ctx, state.envd, stage, inputPatch)
-	}); err != nil {
-		return fmt.Errorf("stage remote execution workspace: %w", err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if err := uploadWorkspaceArchive(ctx, state.envd, history, inputPatch); err != nil {
+		return fmt.Errorf("upload remote execution workspace: %w", err)
 	}
 	result, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name: "sh",
-		Args: []string{"-c", syncWorkspaceScript},
+		Args: []string{"-c", syncWorkspaceScript, "gitmoot-sync", hostBase, diffBase},
 		Dir:  "/home/user",
 	})
 	if err != nil {
 		return fmt.Errorf("initialize remote execution workspace: %w", err)
 	}
-	remoteBase := strings.TrimSpace(result.Stdout)
-	if remoteBase == "" || strings.ContainsAny(remoteBase, "\r\n\t ") {
-		return fmt.Errorf("initialize remote execution workspace: invalid base HEAD %q", remoteBase)
-	}
-	if diffBase != hostBase {
-		if _, err := runEnvd(ctx, state.envd, e2b.StartRequest{
-			Name: "git",
-			Args: []string{"add", "-N", "."},
-			Dir:  workspacePath,
-		}); err != nil {
-			return fmt.Errorf("expose projected review additions: %w", err)
-		}
+	// The workspace must BE the exact host commit. A reviewer handed any other
+	// HEAD cannot authenticate what it read as the head it was asked about.
+	if remoteHead := strings.TrimSpace(result.Stdout); remoteHead != hostBase {
+		return fmt.Errorf("initialize remote execution workspace: HEAD %q is not the exact host HEAD %s", remoteHead, hostBase)
 	}
 	state.hostWorktree = hostWorktree
 	state.hostBase = hostBase
-	state.diffBase = diffBase
-	state.remoteBase = remoteBase
 	instance.BaseHEAD = hostBase
 	return nil
+}
+
+// exportExactHistory fetches head and every commit back to base out of source
+// into a fresh bare repository under root, and returns that repository. Only
+// its object store and shallow boundary are shipped, so host refs, remotes,
+// config, hooks and credential helpers are structurally absent from the
+// instance rather than filtered out.
+func exportExactHistory(ctx context.Context, source, root, head, base string) (string, error) {
+	count, err := hostGitOutput(ctx, source, "rev-list", "--count", base+".."+head)
+	if err != nil {
+		return "", fmt.Errorf("count commits from %s to %s: %w", base, head, err)
+	}
+	commits, err := strconv.Atoi(strings.TrimSpace(count))
+	if err != nil {
+		return "", fmt.Errorf("count commits from %s to %s: %w", base, head, err)
+	}
+	// Each commit in base..head is reachable from head along a path inside
+	// base..head, so this depth reaches base and all of base..head however
+	// merges interleave. A base that is not an ancestor is never fetched, so
+	// the instance cannot create gitmoot-review-base and the sync fails.
+	depth := commits + 1
+	repo := filepath.Join(root, "history.git")
+	if _, err := hostGitOutput(ctx, root, "init", "--quiet", "--bare", "--template=", repo); err != nil {
+		return "", fmt.Errorf("create history repository: %w", err)
+	}
+	if _, err := hostGitOutput(ctx, repo, "-c", "gc.auto=0", "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+		"--depth="+strconv.Itoa(depth),
+		"--upload-pack=git -c uploadpack.allowAnySHA1InWant=true upload-pack",
+		source, head); err != nil {
+		return "", fmt.Errorf("fetch exact history: %w", err)
+	}
+	return repo, nil
 }
 
 // InstallCredentialMaterial writes only the short-lived broker identity. The
@@ -576,7 +624,7 @@ func (b *Backend) Exec(ctx context.Context, instance *execbackend.Instance, comm
 	}
 	state.mu.Lock()
 	envd := state.envd
-	ready := state.remoteBase != ""
+	ready := state.hostBase != ""
 	state.mu.Unlock()
 	if !ready {
 		return nil, errors.New("remote execution instance has not been synced")
@@ -604,11 +652,8 @@ func (b *Backend) Collect(ctx context.Context, instance *execbackend.Instance) (
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.remoteBase == "" || state.hostBase == "" || state.hostWorktree == "" {
+	if state.hostBase == "" || state.hostWorktree == "" {
 		return execbackend.ChangeSet{}, errors.New("remote execution instance has no synced base HEAD")
-	}
-	if state.diffBase != "" && state.diffBase != state.hostBase {
-		return execbackend.ChangeSet{}, errors.New("collect is unavailable for a projected review diff workspace")
 	}
 	head, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name:           "git",
@@ -619,8 +664,8 @@ func (b *Backend) Collect(ctx context.Context, instance *execbackend.Instance) (
 	if err != nil {
 		return execbackend.ChangeSet{}, fmt.Errorf("read remote execution HEAD: %w", err)
 	}
-	if got := strings.TrimSpace(head.Stdout); got != state.remoteBase {
-		return execbackend.ChangeSet{}, fmt.Errorf("sandbox-created commits are forbidden: sandbox HEAD %s, expected base %s", got, state.remoteBase)
+	if got := strings.TrimSpace(head.Stdout); got != state.hostBase {
+		return execbackend.ChangeSet{}, fmt.Errorf("sandbox-created commits are forbidden: sandbox HEAD %s, expected base %s", got, state.hostBase)
 	}
 	patchResult, err := runEnvd(ctx, state.envd, e2b.StartRequest{
 		Name:           "sh",
@@ -810,11 +855,11 @@ func runEnvd(ctx context.Context, envd *e2b.Envd, request e2b.StartRequest) (exe
 	return stream.Wait()
 }
 
-func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, stage string, inputPatch []byte) error {
+func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, history string, inputPatch []byte) error {
 	reader, writer := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		archiveErr := writeWorkspaceArchive(writer, stage, inputPatch)
+		archiveErr := writeWorkspaceArchive(writer, history, inputPatch)
 		_ = writer.CloseWithError(archiveErr)
 		done <- archiveErr
 	}()
@@ -824,41 +869,18 @@ func uploadWorkspaceArchive(ctx context.Context, envd *e2b.Envd, stage string, i
 	return errors.Join(uploadErr, archiveErr)
 }
 
-func writeWorkspaceArchive(destination io.Writer, root string, inputPatch []byte) error {
+// writeWorkspaceArchive packs ONLY the history repository's object store and
+// shallow boundary, plus the host's uncommitted changes. Nothing else from
+// the history repository is a candidate, so no config can ride along.
+func writeWorkspaceArchive(destination io.Writer, history string, inputPatch []byte) error {
 	gzipWriter := gzip.NewWriter(destination)
 	tarWriter := tar.NewWriter(gzipWriter)
-	if err := tarWriter.WriteHeader(&tar.Header{Name: "workspace/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
-		return errors.Join(err, tarWriter.Close(), gzipWriter.Close())
-	}
-	walkErr := filepath.Walk(root, func(filePath string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(root, filePath)
+	writeFile := func(name, filePath string, info os.FileInfo) error {
+		header, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err
 		}
-		if relative == "." {
-			return nil
-		}
-		if relative == ".git" {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		link := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			link, err = os.Readlink(filePath)
-			if err != nil {
-				return err
-			}
-		}
-		header, err := tar.FileInfoHeader(info, link)
-		if err != nil {
-			return err
-		}
-		header.Name = path.Join("workspace", filepath.ToSlash(relative))
+		header.Name = name
 		header.Uid, header.Gid = 0, 0
 		header.Uname, header.Gname = "", ""
 		if err := tarWriter.WriteHeader(header); err != nil {
@@ -874,7 +896,30 @@ func writeWorkspaceArchive(destination io.Writer, root string, inputPatch []byte
 		_, copyErr := io.Copy(tarWriter, file)
 		closeErr := file.Close()
 		return errors.Join(copyErr, closeErr)
+	}
+	objects := filepath.Join(history, "objects")
+	walkErr := filepath.Walk(objects, func(filePath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("history object store entry %s is not a regular file", filePath)
+		}
+		relative, err := filepath.Rel(history, filePath)
+		if err != nil {
+			return err
+		}
+		return writeFile(filepath.ToSlash(relative), filePath, info)
 	})
+	if walkErr == nil {
+		shallow := filepath.Join(history, "shallow")
+		switch info, err := os.Stat(shallow); {
+		case err == nil:
+			walkErr = writeFile("shallow", shallow, info)
+		case !os.IsNotExist(err):
+			walkErr = err
+		}
+	}
 	if walkErr == nil {
 		walkErr = tarWriter.WriteHeader(&tar.Header{Name: "changes.patch", Mode: 0o600, Size: int64(len(inputPatch))})
 		if walkErr == nil && len(inputPatch) > 0 {

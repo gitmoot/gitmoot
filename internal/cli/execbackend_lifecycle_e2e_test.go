@@ -335,7 +335,6 @@ type byteIdentityHostFinalizer struct {
 const (
 	remoteLifecycleAPIKey      = "api-key-GITMOOT-IMPL-remote-lifecycle"
 	remoteLifecycleAccessToken = "envd-access-token-GITMOOT-IMPL"
-	remoteLifecycleWorkspace   = "/home/user/workspace"
 )
 
 type remoteLifecycleCreateRequest struct {
@@ -366,7 +365,7 @@ type remoteLifecycleHarness struct {
 	deleted        []string
 	listCalls      int
 	listStatus     int
-	upload         []byte
+	uploads        map[string][]byte
 	workspace      string
 	runtimeEnv     map[string]string
 	runtimeStarted bool
@@ -377,7 +376,7 @@ type remoteLifecycleHarness struct {
 // client request still crosses HTTP and Connect framing exactly as it would off-box.
 func newRemoteLifecycleHarness(t *testing.T) *remoteLifecycleHarness {
 	t.Helper()
-	h := &remoteLifecycleHarness{t: t, workspace: filepath.Join(t.TempDir(), "sandbox-workspace")}
+	h := &remoteLifecycleHarness{t: t, workspace: filepath.Join(t.TempDir(), "workspace"), uploads: make(map[string][]byte)}
 	h.control = httptest.NewServer(http.HandlerFunc(h.serveControl))
 	h.envd = httptest.NewServer(http.HandlerFunc(h.serveEnvd))
 	t.Cleanup(h.control.Close)
@@ -443,8 +442,12 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 	}
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/files":
-		if got := r.URL.Query().Get("path"); got != "/home/user/.gitmoot-sync.tar.gz" {
-			h.t.Errorf("upload path = %q", got)
+		remotePath := r.URL.Query().Get("path")
+		local, err := h.guestPath(remotePath)
+		if err != nil {
+			h.t.Errorf("upload path = %q: %v", remotePath, err)
+			http.Error(w, "bad upload path", http.StatusBadRequest)
+			return
 		}
 		if got := r.URL.Query().Get("username"); got != "user" {
 			h.t.Errorf("upload username = %q", got)
@@ -455,8 +458,15 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 			http.Error(w, "bad upload", http.StatusBadRequest)
 			return
 		}
+		// Land the upload where the instance would see it, so the REAL guest
+		// scripts run against it rather than a Go re-implementation.
+		if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+			h.t.Errorf("stage upload: %v", err)
+		} else if err := os.WriteFile(local, data, 0o600); err != nil {
+			h.t.Errorf("stage upload: %v", err)
+		}
 		h.mu.Lock()
-		h.upload = append([]byte(nil), data...)
+		h.uploads[remotePath] = append([]byte(nil), data...)
 		h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "{}")
@@ -488,14 +498,15 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *remoteLifecycleHarness) runStart(request remoteLifecycleStartRequest) ([]byte, []byte, int) {
-	if request.Process.Command == "sh" && len(request.Process.Args) == 2 && request.Process.Args[0] == "-c" && strings.Contains(request.Process.Args[1], ".gitmoot-sync.tar.gz") {
-		return h.initializeWorkspace()
-	}
-	dir, err := h.remoteDir(request.Process.Dir)
+	dir, err := h.guestPath(request.Process.Dir)
 	if err != nil {
 		return nil, []byte(err.Error()), 1
 	}
-	cmd := exec.Command(request.Process.Command, request.Process.Args...)
+	args := make([]string, len(request.Process.Args))
+	for index, arg := range request.Process.Args {
+		args[index] = h.hostPathFor(arg)
+	}
+	cmd := exec.Command(request.Process.Command, args...)
 	cmd.Dir = dir
 	env := []string{"HOME=" + filepath.Dir(h.workspace), "PATH=" + os.Getenv("PATH")}
 	keys := make([]string, 0, len(request.Process.Env))
@@ -504,7 +515,7 @@ func (h *remoteLifecycleHarness) runStart(request remoteLifecycleStartRequest) (
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		env = append(env, key+"="+request.Process.Env[key])
+		env = append(env, key+"="+h.hostPathFor(request.Process.Env[key]))
 	}
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
@@ -540,65 +551,6 @@ func (h *remoteLifecycleHarness) runStart(request remoteLifecycleStartRequest) (
 	return stdout.Bytes(), stderr.Bytes(), exitCode
 }
 
-func (h *remoteLifecycleHarness) initializeWorkspace() ([]byte, []byte, int) {
-	h.mu.Lock()
-	upload := append([]byte(nil), h.upload...)
-	h.mu.Unlock()
-	if len(upload) == 0 {
-		return nil, []byte("workspace archive was not uploaded"), 1
-	}
-	stage := h.t.TempDir()
-	if err := extractRemoteLifecycleArchive(stage, upload); err != nil {
-		return nil, []byte(err.Error()), 1
-	}
-	if err := os.RemoveAll(h.workspace); err != nil {
-		return nil, []byte(err.Error()), 1
-	}
-	if err := os.Rename(filepath.Join(stage, "workspace"), h.workspace); err != nil {
-		return nil, []byte(err.Error()), 1
-	}
-	commands := [][]string{
-		{"init", "-q"},
-		{"config", "user.name", "gitmoot"},
-		{"config", "user.email", "gitmoot@localhost"},
-		{"add", "-A"},
-		{"commit", "-q", "--allow-empty", "-m", "gitmoot sync base"},
-	}
-	for _, args := range commands {
-		if output, err := runRemoteLifecycleGit(h.workspace, args...); err != nil {
-			return nil, output, 1
-		}
-	}
-	patch, err := os.ReadFile(filepath.Join(stage, "changes.patch"))
-	if err != nil {
-		return nil, []byte(err.Error()), 1
-	}
-	if len(patch) > 0 {
-		cmd := exec.Command("git", "-C", h.workspace, "apply", "--binary", "--whitespace=nowarn", "-")
-		cmd.Stdin = bytes.NewReader(patch)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return nil, append(output, []byte(err.Error())...), 1
-		}
-	}
-	head, err := runRemoteLifecycleGit(h.workspace, "rev-parse", "HEAD")
-	if err != nil {
-		return nil, head, 1
-	}
-	return head, nil, 0
-}
-
-func (h *remoteLifecycleHarness) remoteDir(remote string) (string, error) {
-	remote = filepath.ToSlash(filepath.Clean(remote))
-	if remote == remoteLifecycleWorkspace {
-		return h.workspace, nil
-	}
-	prefix := remoteLifecycleWorkspace + "/"
-	if strings.HasPrefix(remote, prefix) {
-		return filepath.Join(h.workspace, filepath.FromSlash(strings.TrimPrefix(remote, prefix))), nil
-	}
-	return "", fmt.Errorf("unexpected remote cwd %q", remote)
-}
-
 func (h *remoteLifecycleHarness) snapshot() ([]remoteLifecycleCreateRequest, []string, int, map[string]string, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -611,53 +563,56 @@ func (h *remoteLifecycleHarness) snapshot() ([]remoteLifecycleCreateRequest, []s
 	return creates, deleted, h.listCalls, env, h.runtimeStarted
 }
 
-func extractRemoteLifecycleArchive(destination string, data []byte) error {
+// guestPath maps an instance path below /home/user onto the harness root.
+func (h *remoteLifecycleHarness) guestPath(remote string) (string, error) {
+	remote = filepath.ToSlash(filepath.Clean(remote))
+	root := filepath.Dir(h.workspace)
+	if remote == "/home/user" {
+		return root, nil
+	}
+	if strings.HasPrefix(remote, "/home/user/") {
+		return filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(remote, "/home/user/"))), nil
+	}
+	return "", fmt.Errorf("unexpected instance path %q", remote)
+}
+
+// hostPathFor rewrites an absolute instance path argument so a command run
+// on the test host touches the harness root, never the host's /home/user.
+func (h *remoteLifecycleHarness) hostPathFor(value string) string {
+	if !strings.HasPrefix(value, "/home/user/") {
+		return value
+	}
+	local, err := h.guestPath(value)
+	if err != nil {
+		return value
+	}
+	return local
+}
+
+// remoteLifecycleArchiveEntries returns every entry of an uploaded archive.
+func remoteLifecycleArchiveEntries(t *testing.T, data []byte) map[string][]byte {
+	t.Helper()
 	gzipReader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return err
+		t.Fatal(err)
 	}
 	defer gzipReader.Close()
 	tarReader := tar.NewReader(gzipReader)
+	entries := make(map[string][]byte)
 	for {
 		header, err := tarReader.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return entries
 		}
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
-		name := filepath.Clean(filepath.FromSlash(header.Name))
-		if name == "." || filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("unsafe archive path %q", header.Name)
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			t.Fatal(err)
 		}
-		target := filepath.Join(destination, name)
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode))
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(file, tarReader)
-			closeErr := file.Close()
-			if err := errors.Join(copyErr, closeErr); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported archive entry %q type %d", header.Name, header.Typeflag)
-		}
+		entries[header.Name] = content
 	}
-}
-
-func runRemoteLifecycleGit(dir string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	return cmd.CombinedOutput()
 }
 
 func readRemoteLifecycleConnectFrame(reader io.Reader) (byte, []byte, error) {

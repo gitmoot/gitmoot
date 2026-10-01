@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -240,11 +241,59 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 			return lifecycle, instance, nil, nil, err
 		}
 	}
+	var evidenceEnv []string
+	if backend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		var err error
+		evidenceEnv, err = w.installRemotePriorVerdicts(ctx, lifecycle, instance, job)
+		if err != nil {
+			return lifecycle, instance, nil, nil, err
+		}
+	}
 	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
 	if err != nil {
 		return lifecycle, instance, lease, nil, err
 	}
-	return lifecycle, instance, lease, env, nil
+	return lifecycle, instance, lease, append(env, evidenceEnv...), nil
+}
+
+// remotePriorVerdictsPath is where a remote review finds the same rendered,
+// repo-scoped prior-verdict list a host read-only seat gets through
+// GITMOOT_PRIOR_VERDICTS (#2281).
+const remotePriorVerdictsPath = execbackend.RuntimeMaterialDir + "/evidence/prior-verdicts.json"
+
+// installRemotePriorVerdicts gives a remote review the prior-verdict list
+// that a host read-only seat stages in its cache root. The instance cannot
+// read the host store or GitHub, so without this a review told to answer
+// every prior finding can only end blocked. A render failure is not fatal,
+// exactly as on the host seat, but it is recorded rather than silent.
+func (w jobWorker) installRemotePriorVerdicts(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, job db.Job) ([]string, error) {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := w.configPaths()
+	if err != nil {
+		return nil, fmt.Errorf("resolve prior-verdict store for remote review: %w", err)
+	}
+	evidenceCtx, cancelEvidence := context.WithTimeout(ctx, 30*time.Second)
+	body, diagnostic := renderPriorVerdictsFile(evidenceCtx, paths, payload.Repo)
+	cancelEvidence()
+	if body == nil {
+		if diagnostic != "" && w.Store != nil {
+			if eventErr := w.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: job.ID, Kind: "remote_review_evidence_unavailable", Message: diagnostic}); eventErr != nil {
+				writeLine(w.Stdout, "job %s remote_review_evidence_unavailable event failed: %v", job.ID, eventErr)
+			}
+		}
+		return nil, nil
+	}
+	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
+	if !ok {
+		return nil, fmt.Errorf("execution backend %q cannot install the prior-verdict list", lifecycle.Name())
+	}
+	if _, err := installer.InstallInstanceFile(ctx, instance, remotePriorVerdictsPath, bytes.NewReader(body), 0o600); err != nil {
+		return nil, fmt.Errorf("install prior-verdict list in remote execution backend: %w", err)
+	}
+	return []string{"GITMOOT_PRIOR_VERDICTS=" + remotePriorVerdictsPath}, nil
 }
 
 func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, source string) error {
