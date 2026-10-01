@@ -1598,7 +1598,11 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	if strings.TrimSpace(request.Branch) != "" {
 		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil {
 			if workflow.IsDisposedTaskState(task.State) {
-				return localAgentDispatchRequest{}, disposedReviewTaskError(task)
+				// #2277: an operator-created successor carries the work on.
+				task, err = liveReviewTaskSuccessor(ctx, store, task.ID)
+				if err != nil {
+					return localAgentDispatchRequest{}, err
+				}
 			}
 			if strings.TrimSpace(task.WorktreePath) != "" {
 				head, headErr := jobGitClient(task.WorktreePath, localDispatchJobRunner(request)).HeadSHA(ctx)
@@ -1639,7 +1643,13 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	}
 	if existing, err := store.GetTask(ctx, taskID); err == nil {
 		if workflow.IsDisposedTaskState(existing.State) {
-			return localAgentDispatchRequest{}, disposedReviewTaskError(existing)
+			// #2277: a disposed review task is never resurrected; the review
+			// binds to the live successor an operator created for it.
+			successor, err := liveReviewTaskSuccessor(ctx, store, existing.ID)
+			if err != nil {
+				return localAgentDispatchRequest{}, err
+			}
+			taskID = successor.ID
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return localAgentDispatchRequest{}, err
@@ -1683,8 +1693,21 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 	return request, nil
 }
 
+// liveReviewTaskSuccessor returns the newest task in a disposed task's
+// successor chain, or the refusal naming the command that creates one.
+func liveReviewTaskSuccessor(ctx context.Context, store *db.Store, disposedID string) (db.Task, error) {
+	latest, err := store.LatestTaskInChain(ctx, disposedID)
+	if err != nil {
+		return db.Task{}, err
+	}
+	if workflow.IsDisposedTaskState(latest.State) {
+		return db.Task{}, disposedReviewTaskError(latest)
+	}
+	return latest, nil
+}
+
 func disposedReviewTaskError(task db.Task) error {
-	return fmt.Errorf("task %s is %s; create a successor task before dispatching another review", task.ID, task.State)
+	return fmt.Errorf("task %s is %s; create a successor task with `gitmoot task successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
 }
 
 func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {

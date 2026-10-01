@@ -2253,12 +2253,25 @@ gitmoot task list --repo owner/repo
 gitmoot task list --repo owner/repo --state implementing --json
 gitmoot task list --repo owner/repo --state stranded --json
 gitmoot task events task-001 --json
+gitmoot task successor review-pr-46-06cf76fc --reason "PR still open"
 gitmoot job record --agent lead --repo owner/repo --type implement --task task-001 \
   --decision implemented --summary "What changed and why."
 ```
 
-`task list` and `task events` are the whole surviving verb set;
-`gitmoot task --help` prints exactly those two.
+`task list`, `task events` and `task successor` are the whole verb set.
+
+A disposed task (`stranded`, `superseded`, `dismissed`) is never resurrected,
+so review dispatch refuses it. When its work must continue, for example a
+`stranded` review task whose pull request is still open and needs another
+exact-head review, `gitmoot task successor <id>` creates
+`<id>-successor-<n>` in `planned`. It copies the repository, goal and title,
+and records `successor_created` on the disposed task and `created_as_successor`
+on the new one. Dispatch then binds the review to the newest live task of that
+chain, both by derived `review-pr-*` id and by branch. The successor takes over
+the disposed task's branch (a branch belongs to one task), so workflow
+advancement of the successor's review verdicts reaches the live task.
+Repeating the command returns the existing live successor. A live task is
+refused. The dispatch refusal names the exact command to run.
 
 `task events <id>` lists the append-only trail, including daemon
 `task_dismissed_auto`, opt-in

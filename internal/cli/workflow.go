@@ -134,6 +134,8 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		return runTaskList(args[1:], stdout, stderr)
 	case "events":
 		return runTaskEvents(args[1:], stdout, stderr)
+	case "successor":
+		return runTaskSuccessor(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown task command %q\n\n", args[0])
 		printTaskUsage(stderr)
@@ -145,6 +147,68 @@ func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot task events <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
+	fmt.Fprintln(w, "  gitmoot task successor <id> [--reason text] [--json]")
+}
+
+// runTaskSuccessor creates the successor of a disposed (stranded, superseded,
+// dismissed) task, so its work can continue without resurrecting the disposed
+// row (#2277). Dispatch binds to the newest live task of the chain. Repeating
+// the command returns the existing live successor.
+func runTaskSuccessor(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task successor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	reason := fs.String("reason", "", "why the work continues (recorded on both tasks)")
+	jsonOutput := fs.Bool("json", false, "print the successor as JSON")
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		fs.Usage()
+		if len(args) == 0 {
+			fmt.Fprintln(stderr, "task successor requires exactly one id")
+			return 2
+		}
+		return 0
+	}
+	taskID := strings.TrimSpace(args[0])
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 || taskID == "" {
+		fmt.Fprintln(stderr, "task successor requires exactly one id")
+		return 2
+	}
+	disposed := []string{string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded)}
+	var successor db.Task
+	var created bool
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		successor, created, err = store.CreateTaskSuccessor(context.Background(), taskID, disposed, string(workflow.TaskPlanned), *reason)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("task %q not found", taskID)
+		}
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "task successor: %v\n", err)
+		return 1
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, struct {
+			Task    db.Task `json:"task"`
+			Created bool    `json:"created"`
+		}{successor, created}); err != nil {
+			fmt.Fprintf(stderr, "task successor: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	verb := "created"
+	if !created {
+		verb = "already exists"
+	}
+	fmt.Fprintf(stdout, "successor %s %s for %s; dispatch the review again and it binds to %s\n", successor.ID, verb, db.TaskSuccessorRoot(taskID), successor.ID)
+	return 0
 }
 
 type taskListOutput struct {
