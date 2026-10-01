@@ -755,6 +755,28 @@ func (b *Backend) DestroyObserved(ctx context.Context, instance execbackend.Prov
 	return nil
 }
 
+// DestroyUnobserved is called only for a ledger attempt whose teardown already
+// began and whose sandbox a successful List in the same reconcile pass did not
+// return. E2B's List cannot prove absence, so this retries the delete: a
+// deletion or E2B's exact per-instance absence response confirms the sandbox is
+// gone; anything else stays inconclusive and keeps the reservation.
+func (b *Backend) DestroyUnobserved(ctx context.Context, sandboxID string) error {
+	if b == nil || strings.TrimSpace(sandboxID) == "" {
+		return errors.New("remote execution unobserved sandbox is not eligible for destruction")
+	}
+	state, err := b.client.DeleteConfirmingAbsence(ctx, sandboxID)
+	if err != nil {
+		return fmt.Errorf("destroy unobserved remote execution sandbox %q: %w", sandboxID, err)
+	}
+	if state != e2b.Gone {
+		return fmt.Errorf("destroy unobserved remote execution sandbox %q was inconclusive: %s", sandboxID, state)
+	}
+	b.mu.Lock()
+	delete(b.sandboxes, sandboxID)
+	b.mu.Unlock()
+	return nil
+}
+
 func matchingNonEmptyIdentity(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)

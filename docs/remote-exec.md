@@ -191,9 +191,14 @@ reclaim an old-boot sandbox. With no active remote rows, the local-first pass
 does not query E2B inventory. A provider-only allocation without a matching
 ledger row is not deleted by Gitmoot; it remains subject to the provider TTL.
 An incomplete E2B inventory cannot prove a missing sandbox was destroyed; only
-provider-confirmed deletion releases its cost reservation. A partially-created
-non-empty directory that Git never registered remains the known
-orphaned-but-present cleanup limitation tracked in #1572.
+provider-confirmed deletion releases its cost reservation. An attempt left in
+`destroying` (its teardown DELETE was inconclusive) whose sandbox a successful
+inventory pass no longer lists is retried with one DELETE: a deletion, or E2B's
+exact `Sandbox "<id>" doesn't exist` 404 for that sandbox ID, settles it to
+`destroyed` with an `execbackend_destroy_confirmed` job event and frees its cap
+slot. A failed inventory, a routing 404, or any other answer keeps the slot. A
+partially-created non-empty directory that Git never registered remains the
+known orphaned-but-present cleanup limitation tracked in #1572.
 
 ## Proving a Parallel Local Wave
 

@@ -87,6 +87,15 @@ type ObservedInstanceDestroyer interface {
 	DestroyObserved(context.Context, ProviderInstance) error
 }
 
+// UnobservedInstanceDestroyer settles a ledger instance whose teardown already
+// began but which a valid, NON-exhaustive inventory did not list. A nil error
+// means the provider confirmed the instance no longer exists, either by
+// deleting it now or by an exact per-instance absence response. Callers MUST
+// hold a successful inventory from the same pass that omitted the instance.
+type UnobservedInstanceDestroyer interface {
+	DestroyUnobserved(context.Context, string) error
+}
+
 type JobScope struct {
 	JobID string
 	// Attempt is one provider allocation within a lifecycle generation. Zero is

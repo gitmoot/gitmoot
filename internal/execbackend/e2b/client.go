@@ -441,6 +441,38 @@ func (c *Client) Delete(ctx context.Context, sandboxID string) (State, error) {
 	return Gone, nil
 }
 
+// DeleteConfirmingAbsence retries teardown of a sandbox the caller has just
+// failed to find in a SUCCESSFUL List in the same reconcile pass. A deletion is
+// Gone, as with Delete. A per-ID 404 is ambiguous on its own - "never existed",
+// "already gone" and a misrouted request all return it - so it becomes Gone
+// only when E2B's measured per-instance absence response names this exact
+// sandbox ID. The same-pass List is what rules out the rest: it proves this key
+// reaches this account's control plane and that the account no longer lists the
+// sandbox. Every other response stays Unknown.
+func (c *Client) DeleteConfirmingAbsence(ctx context.Context, sandboxID string) (State, error) {
+	state, err := c.Delete(ctx, sandboxID)
+	var notFound *instanceNotFoundError
+	if err != nil && errors.As(err, &notFound) && notFound.statusCode == http.StatusNotFound &&
+		reportsSandboxAbsent(notFound.body, sandboxID) {
+		return Gone, nil
+	}
+	return state, err
+}
+
+// reportsSandboxAbsent matches E2B's measured per-instance 404 body,
+// {"code":404,"message":"Sandbox \"<id>\" doesn't exist or you don't have access to it"}.
+// A routing 404 ("no matching operation was found") or a body naming another
+// sandbox does not match.
+func reportsSandboxAbsent(body []byte, sandboxID string) bool {
+	var response struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return false
+	}
+	return strings.HasPrefix(response.Message, `Sandbox "`+sandboxID+`" doesn't exist`)
+}
+
 // SetTimeout replaces the provider-side TTL from the time of the request.
 func (c *Client) SetTimeout(ctx context.Context, sandboxID string, ttl time.Duration) (State, error) {
 	seconds, err := durationSeconds(ttl)
@@ -535,7 +567,13 @@ func (c *Client) doJSONState(ctx context.Context, method, path string, input any
 				Err: c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody),
 			}
 		}
-		return Unknown, resp.Header, c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody)
+		// DeleteConfirmingAbsence is the one caller that may resolve it, and only
+		// for the measured absence body naming the exact ID it deleted.
+		return Unknown, resp.Header, &instanceNotFoundError{
+			statusCode: resp.StatusCode,
+			body:       responseBody,
+			err:        c.errorf(nil, "%s %s: E2B returned inconclusive HTTP %d: %s", method, path, resp.StatusCode, responseBody),
+		}
 	}
 	if resp.StatusCode != expectedStatus {
 		refusal := c.errorf(nil, "%s %s: E2B returned HTTP %d: %s", method, path, resp.StatusCode, responseBody)
@@ -667,6 +705,19 @@ func requestRefused(status int) bool {
 		return false
 	}
 }
+
+// instanceNotFoundError is the inconclusive per-instance 404/410. It keeps the
+// bounded response body so DeleteConfirmingAbsence can recognize E2B's measured
+// absence response; to every other caller it is the plain inconclusive error.
+type instanceNotFoundError struct {
+	statusCode int
+	body       []byte
+	err        error
+}
+
+func (e *instanceNotFoundError) Error() string { return e.err.Error() }
+
+func (e *instanceNotFoundError) Unwrap() error { return e.err }
 
 type clientError struct {
 	message string

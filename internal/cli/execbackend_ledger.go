@@ -341,6 +341,12 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		}
 		if _, ok := observed[id]; !ok {
 			writeLine(b.stdout, "execution backend recovery: ledger sandbox %s was not observed in provider inventory", id)
+			if attempt.State == db.ExecBackendAttemptStateDestroying {
+				if settleErr := b.settleUnobservedTeardown(ctx, report, key, id); settleErr != nil {
+					reconcileErrs = append(reconcileErrs, settleErr)
+				}
+				continue
+			}
 			if report.InventoryComplete {
 				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark execution backend attempt %+v orphaned", key), markErr))
@@ -349,6 +355,48 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		}
 	}
 	return errors.Join(reconcileErrs...)
+}
+
+// settleUnobservedTeardown releases a `destroying` attempt whose sandbox the
+// provider confirms is gone (#2282). Teardown had already begun, so the job no
+// longer uses the sandbox, and `orphaned` - a billing state nothing leaves -
+// would hold a cap slot forever for a delete that took effect.
+//
+// A complete inventory proves absence by itself. A non-exhaustive one (E2B has
+// no all-state total) cannot, so the provider must confirm it for this exact
+// sandbox ID by retrying the delete; an inconclusive answer keeps the
+// reservation. The write admits only `destroying` and the exact (job,
+// generation, attempt) key, so a live re-provision of the same job, which is a
+// different attempt with its own sandbox, is never settled.
+func (b *ledgeredExecutionBackend) settleUnobservedTeardown(ctx context.Context, report *execbackend.ReapReport, key db.ExecBackendAttemptKey, sandboxID string) error {
+	evidence := "absent from a complete provider inventory"
+	if !report.InventoryComplete {
+		destroyer, ok := b.inner.(execbackend.UnobservedInstanceDestroyer)
+		if !ok {
+			return nil
+		}
+		if err := destroyer.DestroyUnobserved(ctx, sandboxID); err != nil {
+			return fmt.Errorf("confirm teardown of execution backend attempt %+v: %w", key, err)
+		}
+		evidence = "absent from provider inventory and confirmed gone by the provider's delete"
+	}
+	persistCtx := context.WithoutCancel(ctx)
+	changed, err := b.store.MarkExecBackendAttemptDestroyed(persistCtx, key, nil)
+	if err != nil || !changed {
+		return errors.Join(fmt.Errorf("mark execution backend attempt %+v destroyed after confirmed teardown", key), err)
+	}
+	b.mu.Lock()
+	if b.attempt[sandboxID] == key {
+		delete(b.attempt, sandboxID)
+	}
+	b.mu.Unlock()
+	message := fmt.Sprintf("execution backend sandbox %s (generation %d, attempt %d) settled destroyed: %s; its cost reservation is released",
+		sandboxID, key.LifecycleGeneration, key.Attempt, evidence)
+	writeLine(b.stdout, "execution backend recovery: %s", message)
+	if err := b.store.AddJobEvent(persistCtx, db.JobEvent{JobID: key.JobID, Kind: "execbackend_destroy_confirmed", Message: message}); err != nil {
+		return fmt.Errorf("record confirmed teardown of execution backend attempt %+v: %w", key, err)
+	}
+	return nil
 }
 
 func (b *ledgeredExecutionBackend) keyFor(instance *execbackend.Instance) (db.ExecBackendAttemptKey, bool) {

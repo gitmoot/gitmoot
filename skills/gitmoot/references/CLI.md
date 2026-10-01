@@ -327,7 +327,10 @@ returns findings in its result envelope and imports no change set. The instance
 persists across Mailbox repair deliveries; cancellation destroys it. On
 restart, the reaper deletes a prior-boot or dead-owner sandbox only after a
 positive provider observation matches its full local ledger identity. Missing
-E2B inventory entries never prove deletion or release cost reservations.
+E2B inventory entries never prove deletion or release cost reservations on their
+own; a `destroying` attempt absent from a successful inventory settles to
+`destroyed` (event `execbackend_destroy_confirmed`, cap slot freed) only after a
+retried DELETE succeeds or returns E2B's exact "doesn't exist" 404 for its ID.
 
 Remote review admission runs after exact-head checkout binding and before cost
 reservation or provider calls. It re-reads the PR head; deduplicates
