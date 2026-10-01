@@ -800,6 +800,25 @@ func (b *Backend) DestroyObserved(ctx context.Context, instance execbackend.Prov
 	return nil
 }
 
+// providerTTLGrace bounds how long after the ledger's ttl_expires_at an E2B
+// sandbox this backend created can still exist (#2282).
+//
+// The ledger stamps ttl_expires_at = reserve time + scope.TTL BEFORE Provision.
+// Provision then creates with timeout min(scope.TTL, ProviderMaxTTL) and
+// AutoPause false, so E2B kills (not pauses) the sandbox at that timeout. A TTL
+// above the ceiling is reached only by the keepalive, whose deadline is
+// Create-return + scope.TTL and whose every SetTimeout asks for at most the time
+// left until that deadline. Nothing else in gitmoot extends an E2B timeout. So
+// the provider deadline trails ttl_expires_at by at most the reserve-to-create
+// gap (one SQLite write, busy_timeout 15s) plus one Create and one SetTimeout
+// request (DefaultRequestTimeout 15s each): under a minute. The remainder is
+// headroom for E2B's own enforcement latency, which gitmoot cannot measure.
+const providerTTLGrace = 15 * time.Minute
+
+// ProviderTTLGrace reports that E2B itself kills every sandbox this backend
+// creates no later than its ledger ttl_expires_at plus providerTTLGrace.
+func (b *Backend) ProviderTTLGrace() time.Duration { return providerTTLGrace }
+
 func matchingNonEmptyIdentity(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)

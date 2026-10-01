@@ -210,7 +210,15 @@ func (b *ledgeredExecutionBackend) teardown(ctx context.Context, instance *execb
 
 	providerErr := destroy(ctx, instance)
 	if providerErr == nil && tracked {
-		changed, err := b.store.MarkExecBackendAttemptDestroyed(context.WithoutCancel(ctx), key, nil)
+		persistCtx := context.WithoutCancel(ctx)
+		changed, err := b.store.MarkExecBackendAttemptDestroyed(persistCtx, key, nil)
+		if err == nil && !changed {
+			// A reconcile pass may settle this exact attempt between the
+			// provider's delete and this write (settleUnobservedTeardown). The
+			// row already records the outcome this teardown achieved.
+			current, getErr := b.store.GetExecBackendAttempt(persistCtx, key)
+			changed = getErr == nil && current.State == db.ExecBackendAttemptStateDestroyed
+		}
 		if err != nil {
 			ledgerErrs = append(ledgerErrs, fmt.Errorf("mark execution backend attempt destroyed: %w", err))
 		} else if !changed {
@@ -341,6 +349,12 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		}
 		if _, ok := observed[id]; !ok {
 			writeLine(b.stdout, "execution backend recovery: ledger sandbox %s was not observed in provider inventory", id)
+			if attempt.State == db.ExecBackendAttemptStateDestroying {
+				if settleErr := b.settleUnobservedTeardown(persistCtx, report, attempt, id); settleErr != nil {
+					reconcileErrs = append(reconcileErrs, settleErr)
+				}
+				continue
+			}
 			if report.InventoryComplete {
 				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark execution backend attempt %+v orphaned", key), markErr))
@@ -349,6 +363,56 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 		}
 	}
 	return errors.Join(reconcileErrs...)
+}
+
+// settleUnobservedTeardown releases a `destroying` attempt whose sandbox can no
+// longer exist (#2282). Teardown had already begun, so the job no longer uses
+// the sandbox, and `orphaned` - a billing state nothing leaves - would hold a
+// cap slot forever for a sandbox that is gone.
+//
+// A complete inventory proves absence by itself. A non-exhaustive one (E2B has
+// no all-state total) cannot, and neither can a per-ID 404, which E2B also
+// returns for a live sandbox the key cannot access. Such a provider settles
+// only on its own timeout: once the attempt is past ttl_expires_at plus the
+// provider's enforcement grace, the provider has killed the sandbox whatever
+// any request can see. The write admits only `destroying` and the exact (job,
+// generation, attempt) key, so a live re-provision of the same job, which is a
+// different attempt with its own sandbox, is never settled.
+func (b *ledgeredExecutionBackend) settleUnobservedTeardown(ctx context.Context, report *execbackend.ReapReport, attempt *db.ExecBackendAttempt, sandboxID string) error {
+	key := attempt.ExecBackendAttemptKey
+	evidence := "absent from a complete provider inventory"
+	if !report.InventoryComplete {
+		enforcer, ok := b.inner.(execbackend.ProviderTTLEnforcer)
+		if !ok {
+			return nil
+		}
+		ttlExpiresAt, err := time.Parse(time.RFC3339Nano, attempt.TTLExpiresAt)
+		if err != nil {
+			return fmt.Errorf("parse ttl_expires_at of execution backend attempt %+v: %w", key, err)
+		}
+		killedBy := ttlExpiresAt.Add(enforcer.ProviderTTLGrace())
+		if !b.now().After(killedBy) {
+			return nil
+		}
+		evidence = fmt.Sprintf("absent from provider inventory and past its provider-enforced timeout (ttl_expires_at %s + %s grace)",
+			ttlExpiresAt.UTC().Format(time.RFC3339), enforcer.ProviderTTLGrace())
+	}
+	changed, err := b.store.MarkExecBackendAttemptDestroyed(ctx, key, nil)
+	if err != nil || !changed {
+		return errors.Join(fmt.Errorf("mark execution backend attempt %+v destroyed after confirmed teardown", key), err)
+	}
+	b.mu.Lock()
+	if b.attempt[sandboxID] == key {
+		delete(b.attempt, sandboxID)
+	}
+	b.mu.Unlock()
+	message := fmt.Sprintf("execution backend sandbox %s (generation %d, attempt %d) settled destroyed: %s; its cost reservation is released",
+		sandboxID, key.LifecycleGeneration, key.Attempt, evidence)
+	writeLine(b.stdout, "execution backend recovery: %s", message)
+	if err := b.store.AddJobEvent(ctx, db.JobEvent{JobID: key.JobID, Kind: "execbackend_destroy_confirmed", Message: message}); err != nil {
+		return fmt.Errorf("record confirmed teardown of execution backend attempt %+v: %w", key, err)
+	}
+	return nil
 }
 
 func (b *ledgeredExecutionBackend) keyFor(instance *execbackend.Instance) (db.ExecBackendAttemptKey, bool) {

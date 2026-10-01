@@ -87,6 +87,18 @@ type ObservedInstanceDestroyer interface {
 	DestroyObserved(context.Context, ProviderInstance) error
 }
 
+// ProviderTTLEnforcer is implemented by a backend whose provider itself kills
+// every instance it creates at a deadline fixed when the instance is created,
+// and never extends it past the ledger's ttl_expires_at. ProviderTTLGrace bounds
+// how long after ttl_expires_at such an instance can still exist. Recovery may
+// use that bound to settle an instance whose teardown already began once a
+// valid inventory no longer lists it, even when the inventory is not
+// exhaustive. That conclusion rests on the provider's own timeout and needs no
+// per-instance response, which an access failure could make ambiguous.
+type ProviderTTLEnforcer interface {
+	ProviderTTLGrace() time.Duration
+}
+
 type JobScope struct {
 	JobID string
 	// Attempt is one provider allocation within a lifecycle generation. Zero is
