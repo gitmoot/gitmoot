@@ -207,7 +207,7 @@ func runTaskSuccessor(args []string, stdout, stderr io.Writer) int {
 	if !created {
 		verb = "already exists"
 	}
-	fmt.Fprintf(stdout, "successor %s %s for %s; dispatch the review again and it binds to %s\n", successor.ID, verb, db.TaskSuccessorRoot(taskID), successor.ID)
+	fmt.Fprintf(stdout, "successor %s %s for %s; dispatch the review again and it binds to %s\n", successor.ID, verb, taskID, successor.ID)
 	return 0
 }
 
