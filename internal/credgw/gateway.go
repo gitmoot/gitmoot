@@ -70,10 +70,14 @@ type ProxyPolicy struct {
 	AllowLoopbackHTTP bool
 	// SandboxID and Runtime are an indivisible remote-lease identity. When set,
 	// the capability and client certificate are bound to both values and expire
-	// at ExpiresAt. Local loopback leases leave all four fields empty.
+	// at ExpiresAt. AdvertiseURL names which of the remote listener's advertised
+	// origins the sandbox uses; empty selects the primary origin. The lease
+	// accepts requests only for that origin's authority. Local loopback leases
+	// leave all remote fields empty.
 	SandboxID    string
 	Runtime      string
 	ExpiresAt    time.Time
+	AdvertiseURL string
 	AllowedHosts []string
 }
 
@@ -108,7 +112,7 @@ type Gateway struct {
 	server         *http.Server
 	remoteListener net.Listener
 	remoteServer   *http.Server
-	remoteURL      string
+	remoteOrigins  []*url.URL
 	remoteCA       *certificateAuthority
 	remoteOptions  RemoteListenerOptions
 	client         *http.Client
@@ -136,6 +140,9 @@ type proxyEntry struct {
 	resolver          CredentialResolver
 	capability        proxyCapability
 	clientCertificate [sha256.Size]byte
+	// remoteAuthority is the advertised origin host[:port] a remote lease was
+	// issued for; requests reaching it under any other authority are refused.
+	remoteAuthority string
 }
 
 type proxyCapability struct {
@@ -243,24 +250,30 @@ func (g *Gateway) RegisterProxy(jobID string, policy ProxyPolicy, resolver Crede
 	expiresAt := now.Add(proxyCapabilityTTL)
 	var remoteMaterial RemoteMaterial
 	var clientCertificate [sha256.Size]byte
+	var remoteAuthority string
 	if validated.SandboxID != "" {
-		if g.remoteCA == nil || g.remoteServer == nil || g.remoteURL == "" {
+		if g.remoteCA == nil || g.remoteServer == nil || len(g.remoteOrigins) == 0 {
 			return nil, errors.New("remote credential gateway is not configured")
+		}
+		origin, err := g.remoteOriginFor(validated.AdvertiseURL)
+		if err != nil {
+			return nil, err
 		}
 		expiresAt = validated.ExpiresAt
 		remoteMaterial, clientCertificate, err = g.remoteCA.issueClient(validated.SandboxID, validated.Runtime, expiresAt)
 		if err != nil {
 			return nil, err
 		}
-		remoteMaterial.URL = g.remoteURL + route
+		remoteMaterial.URL = origin.String() + route
 		remoteMaterial.Capability = capability
 		remoteMaterial.Placeholder = placeholder
+		remoteAuthority = origin.Host
 	}
 	g.proxyEntries[route] = proxyEntry{
 		jobID: jobID, placeholder: placeholder, policy: validated,
 		upstream: upstream, resolver: resolver,
 		capability:        proxyCapability{hash: capabilityHash, expiresAt: expiresAt},
-		clientCertificate: clientCertificate,
+		clientCertificate: clientCertificate, remoteAuthority: remoteAuthority,
 	}
 	return &Lease{gateway: g, placeholder: placeholder, route: route, capability: capability, remote: remoteMaterial}, nil
 }
@@ -442,9 +455,11 @@ func (g *Gateway) serveProxy(w http.ResponseWriter, r *http.Request, route strin
 }
 
 type proxyRequestAccess struct {
-	route             string
-	capability        string
-	suffixRoute       string
+	route       string
+	capability  string
+	suffixRoute string
+	// authority is the loopback listener's address. Remote requests leave it
+	// empty: they are checked against the lease's own advertised origin.
 	authority         string
 	clientCertificate [sha256.Size]byte
 	remote            bool
@@ -464,7 +479,11 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusUnauthorized, registered.jobID)
 		return
 	}
-	if r.URL.IsAbs() || r.URL.Host != "" || !strings.EqualFold(r.Host, access.authority) {
+	authority := access.authority
+	if access.remote {
+		authority = registered.remoteAuthority
+	}
+	if r.URL.IsAbs() || r.URL.Host != "" || authority == "" || !strings.EqualFold(r.Host, authority) {
 		http.Error(w, "request target refused", http.StatusBadRequest)
 		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusBadRequest, registered.jobID)
 		return
@@ -598,9 +617,9 @@ func ValidateProxyPolicy(policy ProxyPolicy) (ProxyPolicy, *url.URL, error) {
 		Upstream: upstream.String(), AuthKind: policy.AuthKind,
 		AllowLoopbackHTTP: policy.AllowLoopbackHTTP,
 		SandboxID:         strings.TrimSpace(policy.SandboxID), Runtime: strings.TrimSpace(policy.Runtime),
-		ExpiresAt: policy.ExpiresAt,
+		ExpiresAt: policy.ExpiresAt, AdvertiseURL: strings.TrimSpace(policy.AdvertiseURL),
 	}
-	remote := validated.SandboxID != "" || validated.Runtime != "" || !validated.ExpiresAt.IsZero() || len(policy.AllowedHosts) > 0
+	remote := validated.SandboxID != "" || validated.Runtime != "" || !validated.ExpiresAt.IsZero() || validated.AdvertiseURL != "" || len(policy.AllowedHosts) > 0
 	if remote {
 		if validated.SandboxID == "" || validated.Runtime == "" || validated.ExpiresAt.IsZero() {
 			return ProxyPolicy{}, nil, errors.New("remote proxy policy requires sandbox id, runtime, and expiry")

@@ -44,6 +44,20 @@ type RemoteExecConfig struct {
 	E2BOMPTemplate string
 	E2BBaseURL     string
 	E2BDomain      string
+	// Provider names the remote E2B-protocol endpoint the fields above describe,
+	// for the ledger, admission and reconciliation. The [remote_exec] section
+	// itself always describes cloud E2B; ForProvider returns the view of an
+	// opted-in job, whose provider is chosen per job, never home-wide.
+	Provider string
+	// E2BEnvdBaseURL and OMPLinuxARM64File are set only in the Mac view from
+	// [remote_exec.mac]: one HTTPS envd origin with sandbox routing headers in
+	// place of wildcard hosts, and the host-side Linux ARM64 OMP executable.
+	E2BEnvdBaseURL    string
+	OMPLinuxARM64File string
+	// Mac is the optional [remote_exec.mac] section. It declares the Mac
+	// Studio's sandboxd provider beside E2B; a job runs there only when its
+	// payload names it (exec_provider = "mac").
+	Mac *MacProviderConfig
 	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
 	// origin reachable from a sandbox. They are configured together and are
 	// used only for opt-in broker material, never for the provider control key.
@@ -55,9 +69,33 @@ type RemoteExecConfig struct {
 	ExecBackendCost ExecBackendCostConfig
 }
 
-// DefaultRemoteExecConfig preserves today's behaviour: the local backend.
+// Remote execution providers. E2B is the default for every remote job; the Mac
+// provider is used only by a job that opts in explicitly.
+const (
+	RemoteExecProviderE2B = "e2b"
+	RemoteExecProviderMac = "mac"
+)
+
+// MacProviderConfig is the [remote_exec.mac] section: the Mac Studio's sandboxd,
+// an E2B-compatible API, as an opt-in remote provider. It is capacity-limited
+// on-prem compute, so it has a concurrency cap and no dollar cost.
+type MacProviderConfig struct {
+	APIKeyFile        string
+	Template          string
+	OMPTemplate       string
+	BaseURL           string
+	EnvdBaseURL       string
+	OMPLinuxARM64File string
+	// CredentialGatewayURL is the gateway origin Mac guests dial (the sandboxd
+	// relay). The daemon's one gateway listener also advertises it, beside
+	// [remote_exec].credential_gateway_url. Empty means Mac guests use that URL.
+	CredentialGatewayURL string
+	MaxConcurrent        int
+}
+
+// DefaultRemoteExecConfig preserves today's local backend and cloud identity.
 func DefaultRemoteExecConfig() RemoteExecConfig {
-	return RemoteExecConfig{Backend: string(execbackend.Local)}
+	return RemoteExecConfig{Backend: string(execbackend.Local), Provider: RemoteExecProviderE2B}
 }
 
 // LoadRemoteExecConfig parses the optional [remote_exec] section. A missing
@@ -71,7 +109,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		return RemoteExecConfig{}, err
 	}
 	cfg := DefaultRemoteExecConfig()
-	current := false
+	current, mac := false, false
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -79,9 +117,13 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		if section, ok := sectionHeader(line); ok {
 			current = section == "remote_exec"
+			mac = section == "remote_exec.mac"
+			if mac && cfg.Mac == nil {
+				cfg.Mac = &MacProviderConfig{}
+			}
 			continue
 		}
-		if !current {
+		if !current && !mac {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -90,7 +132,18 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
+		if mac {
+			if err := parseMacProviderKey(cfg.Mac, key, value); err != nil {
+				return RemoteExecConfig{}, err
+			}
+			continue
+		}
 		switch key {
+		case "provider", "e2b_envd_base_url", "omp_linux_arm64_file":
+			// These once selected the Mac provider for the whole home. The
+			// provider is now chosen per job, so a home-wide value is refused
+			// rather than ignored.
+			return RemoteExecConfig{}, fmt.Errorf("[remote_exec].%s is not supported: declare the Mac provider in [remote_exec.mac] and opt a job in with --exec-provider mac", key)
 		case "backend":
 			parsed, err := parseConfigString(value)
 			if err != nil {
@@ -166,6 +219,11 @@ func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	if err := cfg.ExecBackendCost.Validate(); err != nil {
 		return err
 	}
+	if cfg.Mac != nil {
+		if err := cfg.Mac.validate(cfg); err != nil {
+			return err
+		}
+	}
 	backend, err := execbackend.ParseImplemented(cfg.Backend)
 	if err != nil {
 		return fmt.Errorf("unsupported [remote_exec].backend: %w", err)
@@ -214,8 +272,136 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
 		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
 	}
+	if cfg.Provider == RemoteExecProviderMac {
+		if cfg.Mac == nil {
+			return fmt.Errorf("the mac remote provider is not configured: add a [remote_exec.mac] section")
+		}
+		if err := cfg.Mac.validate(cfg); err != nil {
+			return err
+		}
+	}
 	if err := cfg.ValidateCredentialGateway(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ForProvider returns the configuration one remote job runs with. An empty
+// name is the default, cloud E2B. "mac" substitutes [remote_exec.mac] for the
+// E2B endpoint, credentials, templates and caps; the gateway listener and the
+// rest of the section are shared. Any other name, or "mac" without its section,
+// is refused rather than falling back to E2B.
+func (cfg RemoteExecConfig) ForProvider(name string) (RemoteExecConfig, error) {
+	switch strings.TrimSpace(name) {
+	case "", RemoteExecProviderE2B:
+		cfg.Provider = RemoteExecProviderE2B
+		return cfg, nil
+	case RemoteExecProviderMac:
+		if cfg.Mac == nil {
+			return RemoteExecConfig{}, fmt.Errorf("remote execution provider %q is not configured: add a [remote_exec.mac] section to config.toml", RemoteExecProviderMac)
+		}
+		mac := *cfg.Mac
+		cfg.Provider = RemoteExecProviderMac
+		cfg.E2BAPIKeyFile = mac.APIKeyFile
+		cfg.E2BTemplate = mac.Template
+		cfg.E2BOMPTemplate = mac.OMPTemplate
+		cfg.E2BBaseURL = mac.BaseURL
+		cfg.E2BDomain = ""
+		cfg.E2BEnvdBaseURL = mac.EnvdBaseURL
+		cfg.OMPLinuxARM64File = mac.OMPLinuxARM64File
+		cfg.ExecBackendCost = ExecBackendCostConfig{MaxConcurrent: mac.MaxConcurrent}
+		return cfg, nil
+	default:
+		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %q and %q", name, RemoteExecProviderE2B, RemoteExecProviderMac)
+	}
+}
+
+// ValidateProvider preflights the named provider for a job that requests it,
+// including its API key file, without any network call.
+func (cfg RemoteExecConfig) ValidateProvider(name string) error {
+	view, err := cfg.ForProvider(name)
+	if err != nil {
+		return err
+	}
+	return view.ValidateE2BProvider()
+}
+
+// ProviderCredentialGatewayURL is the gateway origin guests of this view's
+// provider dial.
+func (cfg RemoteExecConfig) ProviderCredentialGatewayURL() string {
+	if cfg.Provider == RemoteExecProviderMac && cfg.Mac != nil && cfg.Mac.CredentialGatewayURL != "" {
+		return cfg.Mac.CredentialGatewayURL
+	}
+	return cfg.CredentialGatewayURL
+}
+
+// CredentialGatewayURLs lists every origin the one gateway listener serves,
+// [remote_exec].credential_gateway_url first. The list does not depend on which
+// provider a job uses, so every job shares one listener.
+func (cfg RemoteExecConfig) CredentialGatewayURLs() []string {
+	urls := []string{cfg.CredentialGatewayURL}
+	if cfg.Mac != nil && cfg.Mac.CredentialGatewayURL != "" && cfg.Mac.CredentialGatewayURL != cfg.CredentialGatewayURL {
+		urls = append(urls, cfg.Mac.CredentialGatewayURL)
+	}
+	return urls
+}
+
+func parseMacProviderKey(mac *MacProviderConfig, key, value string) error {
+	if key == "max_concurrent" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("parse [remote_exec.mac].max_concurrent: expected an integer: %w", err)
+		}
+		mac.MaxConcurrent = parsed
+		return nil
+	}
+	fields := map[string]*string{
+		"api_key_file": &mac.APIKeyFile, "template": &mac.Template, "omp_template": &mac.OMPTemplate,
+		"base_url": &mac.BaseURL, "envd_base_url": &mac.EnvdBaseURL,
+		"omp_linux_arm64_file": &mac.OMPLinuxARM64File, "credential_gateway_url": &mac.CredentialGatewayURL,
+	}
+	field, ok := fields[key]
+	if !ok {
+		// Ignore unknown keys so the section remains forward-compatible.
+		return nil
+	}
+	parsed, err := parseConfigString(value)
+	if err != nil {
+		return fmt.Errorf("parse [remote_exec.mac].%s: %w", key, err)
+	}
+	*field = strings.TrimSpace(parsed)
+	return nil
+}
+
+// validate checks [remote_exec.mac] without reading its API key, so a declared
+// Mac provider cannot break a home that never uses it.
+func (mac MacProviderConfig) validate(cfg RemoteExecConfig) error {
+	if mac.APIKeyFile == "" || !filepath.IsAbs(mac.APIKeyFile) {
+		return fmt.Errorf("[remote_exec.mac].api_key_file must be an absolute path")
+	}
+	if mac.Template == "" {
+		return fmt.Errorf("[remote_exec.mac].template is required")
+	}
+	for key, value := range map[string]string{"base_url": mac.BaseURL, "envd_base_url": mac.EnvdBaseURL} {
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+			parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("[remote_exec.mac].%s must be an HTTPS origin without path, query, credentials, or fragment", key)
+		}
+	}
+	if mac.OMPLinuxARM64File != "" && !filepath.IsAbs(mac.OMPLinuxARM64File) {
+		return fmt.Errorf("[remote_exec.mac].omp_linux_arm64_file must be an absolute path")
+	}
+	if mac.MaxConcurrent <= 0 {
+		return fmt.Errorf("[remote_exec.mac].max_concurrent must be positive: it is the Mac's sandbox capacity")
+	}
+	if mac.CredentialGatewayURL != "" {
+		if strings.TrimSpace(cfg.CredentialGatewayListen) == "" {
+			return fmt.Errorf("[remote_exec.mac].credential_gateway_url requires [remote_exec].credential_gateway_listen and credential_gateway_url")
+		}
+		if err := (RemoteExecConfig{CredentialGatewayListen: cfg.CredentialGatewayListen, CredentialGatewayURL: mac.CredentialGatewayURL}).ValidateCredentialGateway(); err != nil {
+			return fmt.Errorf("[remote_exec.mac].credential_gateway_url: %w", err)
+		}
 	}
 	return nil
 }

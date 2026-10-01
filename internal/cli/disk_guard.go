@@ -304,6 +304,9 @@ const (
 // waiting locally (undoDiskGuardRoute) instead of failing it. An explicit local
 // backend is respected, and a review is switched at most once.
 func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
+	// Only the cloud E2B provider: a routed payload never gets exec_provider,
+	// and the cap below is the E2B dollar cap. The Mac provider is used only by
+	// a job that opted in at request time; nothing routes there automatically.
 	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
 	if err != nil || backend != execbackend.Remote {
 		return nil

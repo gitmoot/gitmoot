@@ -87,3 +87,30 @@ func TestRouteQueuedJobRemoteCountsBillingAttemptsAtTheirReservedDollars(t *test
 		t.Fatalf("a second $1 route over a $4 cap with $3 billing: routed=%v err=%v", ok, err)
 	}
 }
+
+// The routing cap is E2B's. A running opted-in Mac review and its Mac attempt
+// hold Mac capacity, so neither may take the one E2B slot from a waiting
+// review; an E2B attempt still fills it.
+func TestRouteQueuedJobRemoteCountsOnlyTheRoutedProvider(t *testing.T) {
+	ctx := context.Background()
+	store := openStoreOperationsTestStore(t)
+	insertWorktreeRefJob(t, store, "mac-running", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`)
+	insertWorktreeRefJob(t, store, "mac-billing", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`)
+	if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
+		ExecBackendAttemptKey: ExecBackendAttemptKey{JobID: "mac-billing", Attempt: 1},
+		Provider:              "mac", DaemonFencingToken: "t", BootID: "b", TTLExpiresAt: time.Now().Add(time.Hour),
+	}, ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: 2}); err != nil {
+		t.Fatal(err)
+	}
+	insertWorktreeRefJob(t, store, "a", "queued", `{"repo":"o/r"}`)
+	insertWorktreeRefJob(t, store, "b", "queued", `{"repo":"o/r"}`)
+	cap := ExecBackendCostCap{Configured: true, MaxReservedUSD: 1, PerAttemptUSD: 1, MaxConcurrent: 1}
+	remote := `{"repo":"o/r","exec_backend":"remote"}`
+	ev := JobEvent{Kind: "disk_guard_routed_remote", Message: "m"}
+	if routed, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, cap, ev); err != nil || !routed {
+		t.Fatalf("Mac work took the E2B slot: routed=%v err=%v", routed, err)
+	}
+	if routed, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, cap, ev); err != nil || routed {
+		t.Fatalf("second E2B route with the slot taken: routed=%v err=%v", routed, err)
+	}
+}

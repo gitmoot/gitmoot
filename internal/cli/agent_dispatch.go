@@ -73,6 +73,51 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 	return execbackend.ParseImplemented(*override)
 }
 
+// requestExecProvider resolves the --exec-provider opt-in. A provider implies
+// the remote backend when --exec-backend is omitted and contradicts an
+// explicit non-remote one. "e2b", the default, is stored as absent so payloads
+// carry exec_provider only for the Mac opt-in.
+func requestExecProvider(provider string, backend *string) (string, *string, error) {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return "", backend, nil
+	}
+	if provider != config.RemoteExecProviderE2B && provider != config.RemoteExecProviderMac {
+		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %q and %q", provider, config.RemoteExecProviderE2B, config.RemoteExecProviderMac)
+	}
+	if backend == nil {
+		remote := string(execbackend.Remote)
+		backend = &remote
+	} else if strings.TrimSpace(*backend) != string(execbackend.Remote) {
+		return "", nil, fmt.Errorf("--exec-provider %s requires --exec-backend remote, got %q", provider, *backend)
+	}
+	if provider == config.RemoteExecProviderE2B {
+		provider = ""
+	}
+	return provider, backend, nil
+}
+
+// validateRequestExecProvider refuses an opted-in provider that this home does
+// not configure, before anything is enqueued. Request time is the loud place
+// to fail: the daemon would otherwise fail the job long after the request.
+func validateRequestExecProvider(home, provider string) error {
+	if provider == "" {
+		return nil
+	}
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.LoadRemoteExecConfig(paths)
+	if err != nil {
+		return fmt.Errorf("load [remote_exec] for --exec-provider %s: %w", provider, err)
+	}
+	if err := cfg.ValidateProvider(provider); err != nil {
+		return fmt.Errorf("--exec-provider %s: %w", provider, err)
+	}
+	return nil
+}
+
 var remoteReviewProtectedPaths = []string{
 	"**/auth/**",
 	"**/security/**",
@@ -242,6 +287,11 @@ type localAgentDispatchRequest struct {
 	// ExecBackend is nil when the operator omitted the per-job selector. A
 	// pointer preserves explicit-local as distinct from absence.
 	ExecBackend *string
+	// ExecProvider is the remote provider an explicitly remote job runs on:
+	// empty for the default E2B, or "mac" for the opt-in Mac provider. It is
+	// refused at dispatch unless the job is remote and the provider is
+	// configured, so a typo can never quietly run on E2B instead.
+	ExecProvider string
 	// ExecsDeclaredBinary is EXPLICIT and CALLER-SUPPLIED (#1817, ruling 123815):
 	// the dispatch entry declares that this request will build a REAL runtime
 	// adapter which execs its runtime's declared CLI binary. It is deliberately
@@ -488,6 +538,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// The claiming worker resolves it again from the durable payload/config at
 	// execution time; this ingress decision governs only pre-enqueue work.
 	var foregroundAdapterFactory foregroundRuntimeAdapterFactory
+	request.ExecProvider, request.ExecBackend, err = requestExecProvider(request.ExecProvider, request.ExecBackend)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	if err := validateRequestExecProvider(request.Home, request.ExecProvider); err != nil {
+		return localAgentJobOutput{}, err
+	}
 	execBackend, err := reviewDispatchExecBackend(request.ExecBackend)
 	if request.Action != "review" && request.ExecBackend == nil {
 		execBackend, err = localAgentDispatchExecBackendFor(request.Home)
@@ -968,6 +1025,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		Effort:                   request.Effort,
 		WorkflowID:               request.WorkflowID,
 		ExecBackend:              request.ExecBackend,
+		ExecProvider:             request.ExecProvider,
 		PolicyRoutedReview:       request.PolicyRoutedReview,
 		RuntimeOverride:          overrideRuntime,
 		RuntimeOverrideRef:       overrideRef,

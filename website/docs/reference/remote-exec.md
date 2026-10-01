@@ -69,13 +69,28 @@ build); the next dispatch uses it. Do not delete the rollback template until
 the replacement canary is complete. Listener-coordinate changes remain
 process-bound and still require a restart.
 
-`local` is the default. `remote` provisions E2B for engine-driven shell and OMP
+`local` is the default. `remote` provisions the selected provider for engine-driven shell and OMP
 review jobs -- implement remains on the allowlist but #2203 removed every way to
 dispatch one, so `review` is the type that actually reaches the backend.
 Remote OMP uploads the host OMP executable into the instance, requires
 `e2b_omp_template` with at least 2 GiB RAM, and refuses before provider
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
+
+Cloud E2B is the default remote provider. A home may also declare the Mac
+Studio's private `sandboxd` (Linux ARM64 VMs, the same E2B-compatible client)
+in a `[remote_exec.mac]` section with `api_key_file`, `template`,
+`omp_template`, HTTPS-origin `base_url` and `envd_base_url`,
+`omp_linux_arm64_file` (a verified Linux AArch64 OMP), the guests'
+`credential_gateway_url`, and a positive `max_concurrent`. A review runs there
+only when requested with `--exec-provider mac`; the provider is stored on the
+job, survives retries, and is never chosen automatically (the disk guard and
+routing policy use E2B only). An unknown provider, or `mac` without its
+section, is refused at request time. Mac attempts count only against
+`max_concurrent` and reserve no dollars; E2B attempts count only against the
+E2B caps. Reconciliation lists and settles each provider separately. One
+credential gateway listener serves both providers' origins. See
+`docs/remote-exec.md` for the Mac configuration and operator runbook.
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:

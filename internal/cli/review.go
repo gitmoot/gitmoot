@@ -91,7 +91,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -136,6 +136,9 @@ type reviewRequestOptions struct {
 	postMerge      bool
 	execBackend    string
 	execBackendSet bool
+	// execProvider opts this review into a remote provider other than the
+	// default E2B ("mac"); it implies --exec-backend remote.
+	execProvider string
 	// runtime is the operator escape from the omp pin below (#2180). A pinned
 	// runtime with no override is a dead end whenever an unavailability hold is
 	// written for that runtime: the caller has no second choice to reach for.
@@ -164,6 +167,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.StringVar(&opts.execBackend, "exec-backend", "", "execution backend for this review: local or remote (default local)")
+	fs.StringVar(&opts.execProvider, "exec-provider", "", "remote provider for this review: e2b (default) or mac; mac implies --exec-backend remote and requires [remote_exec.mac]")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
@@ -301,7 +305,13 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	// A review with no job-scoped selector is local regardless of process-wide
 	// configuration. This makes one remote review unable to reroute another.
-	selectedExecBackend := optionalStringPointer(opts.execBackend, opts.execBackendSet)
+	execProvider, selectedExecBackend, err := requestExecProvider(opts.execProvider, optionalStringPointer(opts.execBackend, opts.execBackendSet))
+	if err != nil {
+		return reviewRequestOutput{}, err
+	}
+	if err := validateRequestExecProvider(opts.home, execProvider); err != nil {
+		return reviewRequestOutput{}, err
+	}
 	execBackend, err := reviewDispatchExecBackend(selectedExecBackend)
 	if err != nil {
 		return reviewRequestOutput{}, err
@@ -425,6 +435,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		WorkflowID:     strings.TrimSpace(opts.workflowID),
 		RuntimeSession: strings.TrimSpace(opts.session),
 		ExecBackend:    selectedExecBackend,
+		ExecProvider:   execProvider,
 		// The router SELECTS the reviewer, so it also chooses the runtime: omp
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability

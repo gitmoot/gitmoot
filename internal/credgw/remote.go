@@ -18,18 +18,24 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // RemoteListenerOptions configures the independently authenticated listener
-// reachable from execution sandboxes. AdvertiseURL is the HTTPS origin the
-// sandbox uses; ListenAddress is the local bind address and may differ when a
-// load balancer forwards the public endpoint.
+// reachable from execution sandboxes. ListenAddress is the local bind address.
+// AdvertiseURLs are the HTTPS origins sandboxes use to reach it; they may differ
+// from the bind address and from each other when a load balancer or a reverse
+// tunnel forwards a public endpoint, so one listener can serve sandbox
+// providers that reach it by different routes. The first entry is the primary
+// origin, used by leases that name none. An empty list advertises
+// https://<listener address>. Every entry must be an HTTPS origin; blank
+// entries and duplicate origins are refused rather than silently dropped.
 type RemoteListenerOptions struct {
 	ListenAddress string
-	AdvertiseURL  string
+	AdvertiseURLs []string
 }
 
 // RemoteMaterial contains only job-scoped broker credentials. It never
@@ -83,7 +89,7 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	if err != nil {
 		return fmt.Errorf("listen for remote credential gateway: %w", err)
 	}
-	advertiseURL, err := remoteAdvertiseURL(configuredOptions.AdvertiseURL, listener.Addr())
+	origins, err := remoteAdvertiseOrigins(configuredOptions.AdvertiseURLs, listener.Addr())
 	if err != nil {
 		_ = listener.Close()
 		return err
@@ -93,7 +99,11 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 		_ = listener.Close()
 		return err
 	}
-	serverCertificate, err := ca.issueServer(advertiseURL.Hostname())
+	hosts := make([]string, len(origins))
+	for index, origin := range origins {
+		hosts[index] = origin.Hostname()
+	}
+	serverCertificate, err := ca.issueServer(hosts)
 	if err != nil {
 		_ = listener.Close()
 		return err
@@ -107,7 +117,7 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 		ClientCAs:    clientRoots,
 	})
 	server := &http.Server{
-		Handler:           remoteGatewayHandler{gateway: g, authority: advertiseURL.Host},
+		Handler:           remoteGatewayHandler{gateway: g},
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       90 * time.Second,
@@ -127,7 +137,7 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 	}
 	g.remoteListener = tlsListener
 	g.remoteServer = server
-	g.remoteURL = advertiseURL.String()
+	g.remoteOrigins = origins
 	g.remoteCA = ca
 	g.remoteOptions = configuredOptions
 	g.mu.Unlock()
@@ -136,10 +146,11 @@ func (g *Gateway) EnableRemote(options RemoteListenerOptions) error {
 }
 
 func normalizedRemoteListenerOptions(options RemoteListenerOptions) RemoteListenerOptions {
-	return RemoteListenerOptions{
-		ListenAddress: strings.TrimSpace(options.ListenAddress),
-		AdvertiseURL:  strings.TrimSpace(options.AdvertiseURL),
+	normalized := RemoteListenerOptions{ListenAddress: strings.TrimSpace(options.ListenAddress)}
+	for _, raw := range options.AdvertiseURLs {
+		normalized.AdvertiseURLs = append(normalized.AdvertiseURLs, strings.TrimSpace(raw))
 	}
+	return normalized
 }
 
 // remoteConfiguredFor allows immutable listener reuse only when a later
@@ -154,19 +165,41 @@ func (g *Gateway) remoteConfiguredFor(options RemoteListenerOptions) (bool, erro
 	if g.remoteServer == nil {
 		return false, nil
 	}
-	if g.remoteOptions != normalizedRemoteListenerOptions(options) {
+	requested := normalizedRemoteListenerOptions(options)
+	if g.remoteOptions.ListenAddress != requested.ListenAddress || !slices.Equal(g.remoteOptions.AdvertiseURLs, requested.AdvertiseURLs) {
 		return true, errors.New("remote credential gateway configuration changed; restart the daemon to apply listener coordinates")
 	}
 	return true, nil
 }
 
+// RemoteURL returns the primary advertised origin, or "" when the remote
+// listener is not configured.
 func (g *Gateway) RemoteURL() string {
 	if g == nil {
 		return ""
 	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.remoteURL
+	if len(g.remoteOrigins) == 0 {
+		return ""
+	}
+	return g.remoteOrigins[0].String()
+}
+
+// remoteOriginFor resolves a remote lease's requested origin against the
+// advertised set: empty selects the primary origin, anything not advertised is
+// refused so a lease never hands a sandbox a URL the server certificate does
+// not cover. The caller holds g.mu.
+func (g *Gateway) remoteOriginFor(advertiseURL string) (*url.URL, error) {
+	if advertiseURL == "" {
+		return g.remoteOrigins[0], nil
+	}
+	for _, origin := range g.remoteOrigins {
+		if strings.EqualFold(origin.String(), advertiseURL) {
+			return origin, nil
+		}
+	}
+	return nil, fmt.Errorf("remote credential gateway does not advertise %q", advertiseURL)
 }
 
 // remoteRequestRefusalReason names the precondition a remote gateway request
@@ -197,8 +230,7 @@ func remoteRequestRefusalReason(routed bool, r *http.Request) string {
 }
 
 type remoteGatewayHandler struct {
-	gateway   *Gateway
-	authority string
+	gateway *Gateway
 }
 
 func (h remoteGatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -230,9 +262,10 @@ func (h remoteGatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		}
 		return
 	}
+	// The Host check against the lease's own advertised origin happens in
+	// serveProxyRequest, which has the registered lease in hand.
 	h.gateway.serveProxyRequest(w, r, proxyRequestAccess{
-		route: route, capability: capability, suffixRoute: route,
-		authority: h.authority, remote: true,
+		route: route, capability: capability, suffixRoute: route, remote: true,
 		clientCertificate: sha256.Sum256(r.TLS.PeerCertificates[0].Raw),
 	})
 }
@@ -245,11 +278,27 @@ func validCapabilitySyntax(capability string) bool {
 	return err == nil && len(decoded) == proxyCapabilityBytes
 }
 
-func remoteAdvertiseURL(raw string, address net.Addr) (*url.URL, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		raw = "https://" + address.String()
+// remoteAdvertiseOrigins validates the advertised origins in order. An empty
+// list advertises the listener's own address.
+func remoteAdvertiseOrigins(raws []string, address net.Addr) ([]*url.URL, error) {
+	if len(raws) == 0 {
+		raws = []string{"https://" + address.String()}
 	}
+	origins := make([]*url.URL, 0, len(raws))
+	for _, raw := range raws {
+		origin, err := remoteAdvertiseURL(raw)
+		if err != nil {
+			return nil, err
+		}
+		if slices.ContainsFunc(origins, func(existing *url.URL) bool { return strings.EqualFold(existing.Host, origin.Host) }) {
+			return nil, fmt.Errorf("invalid remote credential gateway URL %q: duplicate advertised origin", raw)
+		}
+		origins = append(origins, origin)
+	}
+	return origins, nil
+}
+
+func remoteAdvertiseURL(raw string) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Opaque != "" {
 		return nil, fmt.Errorf("invalid remote credential gateway URL %q: require an HTTPS origin", raw)
@@ -284,21 +333,27 @@ func newCertificateAuthority() (*certificateAuthority, error) {
 		certificatePEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}, nil
 }
 
-func (ca *certificateAuthority) issueServer(host string) (tls.Certificate, error) {
+// issueServer issues one leaf covering every advertised host: an IP SAN for
+// addresses and a DNS SAN otherwise. The first host is the subject name.
+func (ca *certificateAuthority) issueServer(hosts []string) (tls.Certificate, error) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate remote credential gateway server key: %w", err)
 	}
 	now := time.Now().UTC()
 	template := &x509.Certificate{
-		SerialNumber: newCertificateSerial(), Subject: pkix.Name{CommonName: host},
+		SerialNumber: newCertificateSerial(), Subject: pkix.Name{CommonName: hosts[0]},
 		NotBefore: now.Add(-time.Minute), NotAfter: now.AddDate(0, 1, 0),
 		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		template.IPAddresses = []net.IP{ip}
-	} else {
-		template.DNSNames = []string{host}
+	for _, host := range hosts {
+		if ip := net.ParseIP(host); ip != nil {
+			if !slices.ContainsFunc(template.IPAddresses, ip.Equal) {
+				template.IPAddresses = append(template.IPAddresses, ip)
+			}
+		} else if !slices.ContainsFunc(template.DNSNames, func(name string) bool { return strings.EqualFold(name, host) }) {
+			template.DNSNames = append(template.DNSNames, host)
+		}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, ca.certificate, publicKey, ca.privateKey)
 	if err != nil {

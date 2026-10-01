@@ -35,6 +35,9 @@ func TestLoadRemoteExecConfigDefaultsToLocal(t *testing.T) {
 	if cfg.Backend != "local" {
 		t.Fatalf("Backend = %q, want the local default", cfg.Backend)
 	}
+	if cfg.Provider != "e2b" {
+		t.Fatalf("default remote provider = %q, want cloud E2B", cfg.Provider)
+	}
 	if cfg.LocalIdentity() != nil || cfg.LocalRoot != "" {
 		t.Fatalf("default local privilege config = uid %v gid %v root %q, want unset", cfg.LocalUID, cfg.LocalGID, cfg.LocalRoot)
 	}
@@ -63,6 +66,95 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 				t.Fatalf("remote provider config = %+v", cfg)
 			}
 		})
+	}
+}
+
+// The Mac provider is declared beside E2B and selected only per job: the
+// home's remote view stays E2B, the Mac view swaps in every provider-specific
+// value, and an unknown or undeclared provider is refused instead of quietly
+// running on E2B.
+func TestRemoteExecMacProviderIsAnOptInViewBesideE2B(t *testing.T) {
+	keyDir := t.TempDir()
+	e2bKey := filepath.Join(keyDir, "e2b-api-key")
+	macKey := filepath.Join(keyDir, "mac-api-key")
+	for _, file := range []string{e2bKey, macKey} {
+		if err := os.WriteFile(file, []byte("private-"+filepath.Base(file)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e2bSection := fmt.Sprintf(`[remote_exec]
+backend = "remote"
+e2b_api_key_file = %q
+e2b_template = "base"
+e2b_omp_template = "omp-x86"
+credential_gateway_listen = "0.0.0.0:8443"
+credential_gateway_url = "https://203.0.113.7:8443"
+cost_max_reserved_usd = 9
+cost_per_attempt_usd = 4.5
+cost_max_concurrent = 2
+`, e2bKey)
+	macSection := fmt.Sprintf(`
+[remote_exec.mac]
+api_key_file = %q
+template = "review-arm64"
+omp_template = "review-arm64"
+base_url = "https://mac.example:8443"
+envd_base_url = "https://mac.example:8443"
+omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
+credential_gateway_url = "https://192.168.128.1:43181"
+max_concurrent = 1
+`, macKey)
+	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+macSection))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Provider != RemoteExecProviderE2B || cfg.E2BTemplate != "base" || cfg.E2BEnvdBaseURL != "" {
+		t.Fatalf("declaring the Mac changed the home's default remote view: %+v", cfg)
+	}
+	defaultView, err := cfg.ForProvider("")
+	if err != nil || defaultView.Provider != RemoteExecProviderE2B || defaultView.E2BAPIKeyFile != e2bKey || defaultView.ExecBackendCost.PerAttemptUSD != 4.5 {
+		t.Fatalf("default provider view = %+v, %v; want E2B", defaultView, err)
+	}
+	mac, err := cfg.ForProvider(RemoteExecProviderMac)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mac.Provider != RemoteExecProviderMac || mac.E2BAPIKeyFile != macKey || mac.E2BBaseURL != "https://mac.example:8443" ||
+		mac.E2BEnvdBaseURL != "https://mac.example:8443" || mac.E2BTemplate != "review-arm64" || mac.E2BOMPTemplate != "review-arm64" ||
+		mac.OMPLinuxARM64File != "/opt/gitmoot/omp-linux-arm64" || mac.E2BDomain != "" ||
+		mac.ExecBackendCost != (ExecBackendCostConfig{MaxConcurrent: 1}) {
+		t.Fatalf("Mac view kept E2B values: %+v", mac)
+	}
+	if mac.ProviderCredentialGatewayURL() != "https://192.168.128.1:43181" || defaultView.ProviderCredentialGatewayURL() != "https://203.0.113.7:8443" {
+		t.Fatalf("gateway origins: mac %q e2b %q", mac.ProviderCredentialGatewayURL(), defaultView.ProviderCredentialGatewayURL())
+	}
+	if err := cfg.ValidateProvider(RemoteExecProviderMac); err != nil {
+		t.Fatalf("configured Mac provider refused: %v", err)
+	}
+	if err := cfg.ValidateProvider("mac-studio"); err == nil || !strings.Contains(err.Error(), "unknown remote execution provider") {
+		t.Fatalf("unknown provider accepted: %v", err)
+	}
+
+	e2bOnly, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e2bOnly.ValidateProvider(RemoteExecProviderMac); err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") {
+		t.Fatalf("undeclared Mac provider accepted: %v", err)
+	}
+
+	for name, broken := range map[string]string{
+		"zero capacity":          strings.Replace(macSection, "max_concurrent = 1", "max_concurrent = 0", 1),
+		"plain HTTP control":     strings.Replace(macSection, `base_url = "https://mac.example:8443"`, `base_url = "http://mac.example:8443"`, 1),
+		"envd with a path":       strings.Replace(macSection, `envd_base_url = "https://mac.example:8443"`, `envd_base_url = "https://mac.example:8443/envd"`, 1),
+		"relative ARM64 runtime": strings.Replace(macSection, `"/opt/gitmoot/omp-linux-arm64"`, `"omp-linux-arm64"`, 1),
+	} {
+		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+broken)); err == nil {
+			t.Errorf("%s: invalid [remote_exec.mac] accepted", name)
+		}
+	}
+	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+"provider = \"mac\"\n")); err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") {
+		t.Fatalf("home-wide provider selection accepted: %v", err)
 	}
 }
 

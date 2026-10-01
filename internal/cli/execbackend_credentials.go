@@ -39,6 +39,9 @@ type remoteCredentialGatewayPlan struct {
 	authKind      credgw.ProxyAuthKind
 	authHeader    string
 	allowedHosts  []string
+	// advertiseURL is the gateway origin this job's provider reaches the
+	// listener through; one listener serves every provider's origin.
+	advertiseURL string
 }
 
 // prepareRemoteCredentialGateway performs every check that can fail before a
@@ -89,7 +92,7 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 	}
 	gateway, err := credgw.DefaultRegistry.RemoteGateway(paths.Home, credgw.DefaultLogf, credgw.RemoteListenerOptions{
 		ListenAddress: remoteCfg.CredentialGatewayListen,
-		AdvertiseURL:  remoteCfg.CredentialGatewayURL,
+		AdvertiseURLs: remoteCfg.CredentialGatewayURLs(),
 	})
 	if err != nil {
 		return remoteCredentialGatewayPlan{}, fmt.Errorf("start remote credential gateway: %w", err)
@@ -99,6 +102,7 @@ func (w jobWorker) prepareRemoteCredentialGateway(remoteCfg config.RemoteExecCon
 		allowLoopback: credentialsCfg.ModelGatewayAllowLoopbackUpstream,
 		upstream:      upstream, authKind: authKind, authHeader: authHeader,
 		allowedHosts: append([]string(nil), credentialsCfg.ModelGatewayAllowHosts...),
+		advertiseURL: remoteCfg.ProviderCredentialGatewayURL(),
 	}, nil
 }
 
@@ -120,6 +124,7 @@ func (w jobWorker) provisionRemoteCredentialGateway(ctx context.Context, backend
 		AllowLoopbackHTTP: remoteModelGatewayAllowLoopbackHTTP || plan.allowLoopback,
 		SandboxID:         instance.ID, Runtime: runtimeName, ExpiresAt: time.Now().Add(ttl),
 		AllowedHosts: append([]string(nil), plan.allowedHosts...),
+		AdvertiseURL: plan.advertiseURL,
 	}
 	resolver := lazyModelGatewayResolver(plan.home)
 	if plan.keyName != "" {

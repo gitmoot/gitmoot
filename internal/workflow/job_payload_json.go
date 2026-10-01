@@ -40,10 +40,11 @@ func (p JobPayload) ExecBackendOverride() (string, bool) {
 	return p.ExecBackend, p.execBackendPresent || p.ExecBackend != ""
 }
 
-// ClearExecBackendOverride removes the job-scoped selector, so the job falls
-// back to the default (local) backend.
+// ClearExecBackendOverride removes the job-scoped selector and its remote
+// provider, so the job falls back to the default (local) backend.
 func (p *JobPayload) ClearExecBackendOverride() {
 	p.ExecBackend = ""
+	p.ExecProvider = ""
 	p.execBackendPresent = false
 }
 

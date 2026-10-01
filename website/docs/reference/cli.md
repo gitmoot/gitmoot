@@ -1329,7 +1329,7 @@ own surface — it NAMES a reviewer, carries a review message, and takes
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
-    [--runtime <name>] [--exec-backend local|remote] [--model <provider/model>] \
+    [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer>] \
     [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] \
     [-- "review instructions"]
@@ -1349,6 +1349,13 @@ job. Omit it for local execution; process-wide `[remote_exec].backend` does not
 reroute reviews. Remote reviews currently support only `shell` and `omp`;
 Gitmoot refuses any other runtime/backend pair before enqueue and names both
 operands. `agent review` forwards the same flag through the review router.
+
+`--exec-provider e2b|mac` picks the remote provider for this review and implies
+`--exec-backend remote`. `e2b`, the default, is cloud E2B; `mac` runs the
+review on the Mac Studio's sandboxd and requires a `[remote_exec.mac]` section,
+otherwise the request is refused before enqueue. The choice is stored on the
+job and kept across retries; nothing is ever routed to the Mac automatically.
+`agent review` forwards the same flag.
 
 ### Review levels (#2265)
 

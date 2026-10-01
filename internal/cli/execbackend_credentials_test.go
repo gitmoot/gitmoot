@@ -217,7 +217,7 @@ credential_gateway_url = %q
 		t.Fatalf("post-teardown status=%d auth-loads=%d upstream=%d", status, authLoads.Load(), upstreamCalls.Load())
 	}
 
-	gateway, err := credgw.DefaultRegistry.RemoteGateway(paths.Home, nil, credgw.RemoteListenerOptions{ListenAddress: listenAddress, AdvertiseURL: "https://" + listenAddress})
+	gateway, err := credgw.DefaultRegistry.RemoteGateway(paths.Home, nil, credgw.RemoteListenerOptions{ListenAddress: listenAddress, AdvertiseURLs: []string{"https://" + listenAddress}})
 	if err != nil {
 		t.Fatal(err)
 	}

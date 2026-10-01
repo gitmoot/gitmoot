@@ -733,6 +733,15 @@ func (b *Backend) Destroy(ctx context.Context, instance *execbackend.Instance) e
 // ReapInventory observes account-wide sandboxes without deleting any. A
 // reapable observation still requires an exact local ledger match before
 // DestroyObserved may delete it. E2B cannot prove all-state completeness.
+//
+// The Mac provider (sandboxd) is reported partial too, although its list is
+// complete for its worker (docs/compatibility.md in gitmoot/sandboxd: a failed
+// inventory is a 503, never a short success). Gitmoot reads that list and its
+// own ledger in separate steps, so an attempt this daemon reserved after the
+// list was read would look absent, and a complete report orphans an absent
+// attempt that has no sandbox ID yet - a billing state that would hold one of
+// the Mac's few slots for good. A destroying attempt settles by the
+// provider-enforced timeout instead, which sandboxd also guarantees.
 func (b *Backend) ReapInventory(ctx context.Context) (execbackend.ReapReport, error) {
 	if b == nil {
 		return execbackend.ReapReport{}, errors.New("remote execution backend is nil")
@@ -815,8 +824,16 @@ func (b *Backend) DestroyObserved(ctx context.Context, instance execbackend.Prov
 // headroom for E2B's own enforcement latency, which gitmoot cannot measure.
 const providerTTLGrace = 15 * time.Minute
 
-// ProviderTTLGrace reports that E2B itself kills every sandbox this backend
-// creates no later than its ledger ttl_expires_at plus providerTTLGrace.
+// The same bound holds for the Mac provider (sandboxd). It persists each
+// sandbox's deadline from the create timeout and SetTimeout, measured on its
+// own clock, and a one-second sweep destroys any sandbox past it; a timeout
+// above its --max-ttl is refused, never stretched. A sandbox whose kill fails stays
+// in sandboxd's list, and a failed inventory fails the list, so absence from a
+// successful List still means the sandbox is gone. A sandboxd restart destroys
+// every guest it owns.
+//
+// ProviderTTLGrace reports that the provider itself kills every sandbox this
+// backend creates no later than its ledger ttl_expires_at plus providerTTLGrace.
 func (b *Backend) ProviderTTLGrace() time.Duration { return providerTTLGrace }
 
 func matchingNonEmptyIdentity(left, right string) bool {

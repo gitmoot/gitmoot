@@ -310,14 +310,31 @@ func remoteExecutionSupportsJobType(jobType string) bool {
 // for every backend consumer. Review dispatch is job-scoped: an older or
 // manually-created review with no selector stays local even while process config
 // names a remote backend; only an explicit payload override may move it off-host
-// (#2234).
+// (#2234). A remote job's provider is job-scoped too: the payload's
+// exec_provider selects it, and absent means cloud E2B. The returned config is
+// that provider's view, so admission, provisioning, envd routing, keepalive and
+// teardown all use the provider the job was requested on.
 func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.JobPayload) (execbackend.Backend, config.RemoteExecConfig, error) {
 	name, present := payload.ExecBackendOverride()
 	if strings.EqualFold(strings.TrimSpace(job.Type), "review") && !present {
 		name = string(execbackend.Local)
 		present = true
 	}
-	return daemonJobExecBackendFor(w, name, present)
+	backend, cfg, err := daemonJobExecBackendFor(w, name, present)
+	if err != nil {
+		return backend, cfg, err
+	}
+	if backend != execbackend.Remote {
+		if provider := strings.TrimSpace(payload.ExecProvider); provider != "" {
+			return "", config.RemoteExecConfig{}, fmt.Errorf("exec_provider %q requires the remote execution backend, but job %s resolved to %s", provider, job.ID, backend)
+		}
+		return backend, cfg, nil
+	}
+	cfg, err = cfg.ForProvider(payload.ExecProvider)
+	if err != nil {
+		return "", config.RemoteExecConfig{}, err
+	}
+	return backend, cfg, nil
 }
 
 func (w jobWorker) run(ctx context.Context, job db.Job) error {
