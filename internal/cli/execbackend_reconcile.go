@@ -2,11 +2,13 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 )
 
@@ -79,34 +81,31 @@ func (c *execBackendReconcileCadence) failed(key string, now time.Time) time.Dur
 }
 
 // reconcileExecBackendInventory runs one periodic bidirectional reconciliation
-// pass for the selected provider. A local-first daemon must still reconcile
+// pass for every remote provider. A local-first daemon must still reconcile
 // outstanding remote attempts after a restart, without waiting for another
-// remote dispatch to construct the provider backend.
+// remote dispatch to construct the provider backend. Each provider is listed
+// and settled on its own: an attempt is only ever compared with the inventory
+// of the provider that created it, so a Mac attempt is never settled because
+// E2B does not list it, nor the reverse. One provider's failure does not skip
+// the others.
 func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout io.Writer, now time.Time) error {
-	backend, cfg, err := daemonJobExecBackendFor(worker, "", false)
+	backend, _, err := daemonJobExecBackendFor(worker, "", false)
 	if err != nil {
 		return fmt.Errorf("resolve execution backend for reconciliation: %w", err)
 	}
-	remoteKey := string(execbackend.Remote) + "|" + cfg.Provider
-	if backend == execbackend.Local {
-		if worker.Store == nil || !execBackendReconcileState.due(remoteKey, now) {
-			return nil
-		}
-		attempts, err := worker.Store.ListRecoverableExecBackendAttempts(ctx, cfg.Provider)
-		if err != nil {
-			interval := execBackendReconcileState.failed(remoteKey, now)
-			return fmt.Errorf("list remote execution attempts for reconciliation (next attempt in %s): %w", interval, err)
-		}
-		if len(attempts) == 0 {
-			execBackendReconcileState.succeeded(remoteKey, now)
-			return nil
-		}
-		backend, cfg, err = daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
-		if err != nil {
-			interval := execBackendReconcileState.failed(remoteKey, now)
-			return fmt.Errorf("resolve remote execution backend for reconciliation (next attempt in %s): %w", interval, err)
+	var errs []error
+	for _, provider := range []string{config.RemoteExecProviderE2B, config.RemoteExecProviderMac} {
+		// A remote-default home reconciles E2B every pass; anything else
+		// reconciles a provider only while it has recoverable attempts.
+		always := backend == execbackend.Remote && provider == config.RemoteExecProviderE2B
+		if err := reconcileExecBackendProvider(ctx, worker, stdout, now, provider, always); err != nil {
+			errs = append(errs, err)
 		}
 	}
+	return errors.Join(errs...)
+}
+
+func reconcileExecBackendProvider(ctx context.Context, worker jobWorker, stdout io.Writer, now time.Time, provider string, always bool) error {
 	// The cadence is scoped to backend and provider, not repo.
 	// Across REPOS: runDaemonWorkerTickTracked runs per repo, so several ticks
 	// share one cadence entry - which is correct rather than starvation, because
@@ -118,12 +117,34 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 	//
 	// The construction guard keys the exact target (URL and API-key digest)
 	// because non-daemon callers can build several targets. This daemon serves
-	// one config home, so its provider target cannot vary across ticks. If one
+	// one config home, so each provider's target cannot vary across ticks. If one
 	// daemon ever serves multiple homes/accounts, include that target identity
 	// in the cadence key as well.
-	key := string(backend) + "|" + cfg.Provider
+	key := string(execbackend.Remote) + "|" + provider
 	if !execBackendReconcileState.due(key, now) {
 		return nil
+	}
+	if !always {
+		if worker.Store == nil {
+			return nil
+		}
+		attempts, err := worker.Store.ListRecoverableExecBackendAttempts(ctx, provider)
+		if err != nil {
+			interval := execBackendReconcileState.failed(key, now)
+			return fmt.Errorf("list %s execution attempts for reconciliation (next attempt in %s): %w", provider, interval, err)
+		}
+		if len(attempts) == 0 {
+			execBackendReconcileState.succeeded(key, now)
+			return nil
+		}
+	}
+	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
+	if err == nil {
+		cfg, err = cfg.ForProvider(provider)
+	}
+	if err != nil {
+		interval := execBackendReconcileState.failed(key, now)
+		return fmt.Errorf("resolve remote execution provider %s for reconciliation (next attempt in %s): %w", provider, interval, err)
 	}
 	if worker.ExecutionBackendFactory == nil {
 		return nil
@@ -131,7 +152,7 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 	built, err := worker.ExecutionBackendFactory(backend, cfg)
 	if err != nil {
 		interval := execBackendReconcileState.failed(key, now)
-		return fmt.Errorf("build execution backend %q for reconciliation (next attempt in %s): %w", backend, interval, err)
+		return fmt.Errorf("build execution backend %q provider %s for reconciliation (next attempt in %s): %w", backend, provider, interval, err)
 	}
 	reaper, ok := built.(execbackend.InventoryReaper)
 	if !ok {
@@ -141,11 +162,11 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 	report, err := reaper.ReapInventory(ctx)
 	if err != nil {
 		interval := execBackendReconcileState.failed(key, now)
-		return fmt.Errorf("reconcile execution backend %q inventory (next attempt in %s): %w", backend, interval, err)
+		return fmt.Errorf("reconcile execution backend %q provider %s inventory (next attempt in %s): %w", backend, provider, interval, err)
 	}
 	execBackendReconcileState.succeeded(key, now)
 	if len(report.Destroyed) > 0 {
-		writeLine(stdout, "execution backend reconciliation: destroyed %d orphaned instance(s) on %s", len(report.Destroyed), backend)
+		writeLine(stdout, "execution backend reconciliation: destroyed %d orphaned instance(s) on %s provider %s", len(report.Destroyed), backend, provider)
 	}
 	return nil
 }

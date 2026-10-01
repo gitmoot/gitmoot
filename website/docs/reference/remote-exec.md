@@ -77,19 +77,20 @@ Remote OMP uploads the host OMP executable into the instance, requires
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
 
-`provider = "e2b"` remains the remote default. The opt-in `provider = "mac"`
-uses a private `sandboxd` Linux ARM64 VM and the same E2B-compatible client;
-it does not change cloud E2B routing. It requires an explicit HTTPS-origin
-`e2b_base_url`, a positive `cost_max_concurrent` limit, an API key file, and
-either `e2b_domain` or a single HTTPS-origin `e2b_envd_base_url` for fixed-host
-guest routing. For OMP reviews, set `omp_linux_arm64_file` to a verified
-executable Linux AArch64 ELF. Mac attempts consume a concurrency slot, not
-E2B dollar reservations. Keep cloud attempts on their original provider until
-reconciliation completes; do not switch a home with outstanding cloud jobs.
-See `docs/remote-exec.md` for the Mac configuration and operator runbook.
-The development Mac's host-only guests can still reach host wildcard listeners:
-do not run untrusted PR code until guest-to-host firewall rules, a fixed mTLS
-model relay, and the private HTTPS endpoint are installed and verified.
+Cloud E2B is the default remote provider. A home may also declare the Mac
+Studio's private `sandboxd` (Linux ARM64 VMs, the same E2B-compatible client)
+in a `[remote_exec.mac]` section with `api_key_file`, `template`,
+`omp_template`, HTTPS-origin `base_url` and `envd_base_url`,
+`omp_linux_arm64_file` (a verified Linux AArch64 OMP), the guests'
+`credential_gateway_url`, and a positive `max_concurrent`. A review runs there
+only when requested with `--exec-provider mac`; the provider is stored on the
+job, survives retries, and is never chosen automatically (the disk guard and
+routing policy use E2B only). An unknown provider, or `mac` without its
+section, is refused at request time. Mac attempts count only against
+`max_concurrent` and reserve no dollars; E2B attempts count only against the
+E2B caps. Reconciliation lists and settles each provider separately. One
+credential gateway listener serves both providers' origins. See
+`docs/remote-exec.md` for the Mac configuration and operator runbook.
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:

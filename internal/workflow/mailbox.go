@@ -285,6 +285,9 @@ type JobRequest struct {
 	// Nil means the caller did not choose one; a pointer to "local" remains
 	// distinguishable from that absence across enqueue, retry, and recovery.
 	ExecBackend *string
+	// ExecProvider names the remote provider an explicitly remote job runs on.
+	// Empty is the default, cloud E2B; "mac" is the opt-in Mac provider.
+	ExecProvider string
 	// PolicyRoutedReview requires a fresh green current-head CI check before a
 	// policy-selected remote review can reserve cloud capacity.
 	PolicyRoutedReview bool
@@ -505,7 +508,11 @@ type JobPayload struct {
 	// resolves this field rather than process-wide config. Presence is tracked
 	// separately so absent and explicit-local remain distinguishable while an
 	// absent review selector still defaults to local.
-	ExecBackend        string `json:"exec_backend,omitempty"`
+	ExecBackend string `json:"exec_backend,omitempty"`
+	// ExecProvider is the remote provider an opted-in job runs on. Empty means
+	// the default, cloud E2B. It is set only at request time and is never
+	// inferred, so nothing is routed to the Mac provider automatically.
+	ExecProvider       string `json:"exec_provider,omitempty"`
 	PolicyRoutedReview bool   `json:"policy_routed_review,omitempty"`
 	// DiskGuardRouted marks a review the disk guard switched to the remote
 	// backend while local disk was low ([disk_guard] remote_reviews). Any
@@ -856,6 +863,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Model:                  request.Model,
 		Effort:                 request.Effort,
 		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
+		ExecProvider:           strings.TrimSpace(request.ExecProvider),
 		PolicyRoutedReview:     request.PolicyRoutedReview,
 		Plan:                   request.Plan,
 		PlanInto:               strings.TrimSpace(request.PlanInto),

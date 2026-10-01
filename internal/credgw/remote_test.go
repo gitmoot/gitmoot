@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -556,15 +557,19 @@ func TestRegistryRemoteGatewayRejectsChangedCoordinates(t *testing.T) {
 			options.ListenAddress = "127.0.0.1:1"
 			return options
 		}},
-		{name: "advertise URL", change: func(options RemoteListenerOptions) RemoteListenerOptions {
-			options.AdvertiseURL = "https://replacement.example:9443"
+		{name: "advertise URLs", change: func(options RemoteListenerOptions) RemoteListenerOptions {
+			options.AdvertiseURLs = []string{"https://replacement.example:9443"}
+			return options
+		}},
+		{name: "advertise URL order", change: func(options RemoteListenerOptions) RemoteListenerOptions {
+			options.AdvertiseURLs = []string{options.AdvertiseURLs[1], options.AdvertiseURLs[0]}
 			return options
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			registry := NewRegistry()
 			home := t.TempDir()
-			options := RemoteListenerOptions{ListenAddress: "127.0.0.1:0", AdvertiseURL: "https://initial.example:8443"}
+			options := RemoteListenerOptions{ListenAddress: "127.0.0.1:0", AdvertiseURLs: []string{"https://initial.example:8443", "https://second.example:8443"}}
 			gateway, err := registry.RemoteGateway(home, nil, options)
 			if err != nil {
 				t.Fatal(err)
@@ -578,6 +583,79 @@ func TestRegistryRemoteGatewayRejectsChangedCoordinates(t *testing.T) {
 				t.Fatalf("changed options gateway=%v error=%v", stale != nil, err)
 			}
 		})
+	}
+}
+
+// One listener serves sandboxes of two providers that reach it through
+// different origins (a public IP for E2B, a reverse tunnel name for the Mac).
+// The server certificate must cover both, and a lease must stay bound to the
+// origin its sandbox was given.
+func TestRemoteProxyServesEachLeaseOnlyOnItsAdvertisedOrigin(t *testing.T) {
+	const primaryOrigin, tunnelOrigin = "https://192.0.2.10:8443", "https://mac-relay.example:43181"
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	gateway, err := Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close(context.Background())
+	if err := gateway.EnableRemote(RemoteListenerOptions{ListenAddress: "127.0.0.1:0", AdvertiseURLs: []string{primaryOrigin, tunnelOrigin}}); err != nil {
+		t.Fatal(err)
+	}
+	listenAddress := gateway.remoteListener.Addr().String()
+	policy := ProxyPolicy{
+		Upstream: upstream.URL, AuthKind: ProxyAuthResolved, AllowLoopbackHTTP: true,
+		SandboxID: "sandbox-mac", Runtime: "shell", ExpiresAt: time.Now().Add(time.Minute),
+		AdvertiseURL: tunnelOrigin, AllowedHosts: []string{"127.0.0.1"},
+	}
+	resolver := func(context.Context) (ResolvedCredential, error) {
+		return ResolvedCredential{Value: testRealCredential, Upstream: upstream.URL, AuthKind: ProxyAuthBearer}, nil
+	}
+	lease, err := gateway.RegisterProxy("mac-job", policy, resolver)
+	if err != nil {
+		t.Fatal(err)
+	}
+	material := lease.RemoteMaterial()
+	if !strings.HasPrefix(material.URL, tunnelOrigin+"/") {
+		t.Fatalf("lease URL does not use its advertised origin")
+	}
+	client := remoteMaterialClient(t, material)
+	// Both origins resolve to this listener, as the tunnel and the public
+	// address do in production. TLS still verifies the certificate against the
+	// URL's host, so each request proves that host is in the SANs.
+	client.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, listenAddress)
+	}
+	call := func(target string) int {
+		request, err := http.NewRequest(http.MethodGet, target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(CapabilityHeader, material.Capability)
+		request.Header.Set("Authorization", "Bearer "+material.Placeholder)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatalf("request over TLS: %v", err)
+		}
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+	if status := call(material.URL); status != http.StatusNoContent || upstreamCalls.Load() != 1 {
+		t.Fatalf("own origin status=%d upstream=%d, want 204 forwarded once", status, upstreamCalls.Load())
+	}
+	crossOrigin := primaryOrigin + strings.TrimPrefix(material.URL, tunnelOrigin)
+	if status := call(crossOrigin); status != http.StatusBadRequest || upstreamCalls.Load() != 1 {
+		t.Fatalf("other origin status=%d upstream=%d, want 400 and no forward", status, upstreamCalls.Load())
+	}
+
+	policy.AdvertiseURL = "https://unadvertised.example:8443"
+	before := len(gateway.proxyEntries)
+	if stray, err := gateway.RegisterProxy("stray-job", policy, resolver); err == nil || stray != nil || len(gateway.proxyEntries) != before {
+		t.Fatalf("unadvertised origin lease=%v error=%v", stray != nil, err)
 	}
 }
 

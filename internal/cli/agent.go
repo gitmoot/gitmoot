@@ -93,7 +93,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|mac] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
@@ -385,6 +385,7 @@ type agentRunOptions struct {
 	session        string
 	execBackend    string
 	execBackendSet bool
+	execProvider   string
 	prNumber       int
 	headSHA        string
 	branch         string
@@ -723,6 +724,7 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 		{"--role", options.orgRole},
 		{"--reviewer", options.agent},
 		{"--exec-backend", options.execBackend},
+		{"--exec-provider", options.execProvider},
 		{"--runtime", options.runtime},
 		{"--lead", options.lead},
 		{"--home", options.home},
@@ -840,6 +842,7 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		ActingOrgRole:           options.orgRole,
 		OperatorOrigin:          true,
 		ExecBackend:             optionalStringPointer(options.execBackend, options.execBackendSet),
+		ExecProvider:            options.execProvider,
 		Runtime:                 options.runtime,
 		RuntimeSession:          options.session,
 		Home:                    options.home,
@@ -906,7 +909,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.postMerge = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -940,6 +943,10 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--exec-backend="):
 			if !setAgentRunOption(&options, "--exec-backend", strings.TrimPrefix(arg, "--exec-backend="), stderr) {
+				return agentRunOptions{}, false
+			}
+		case strings.HasPrefix(arg, "--exec-provider="):
+			if !setAgentRunOption(&options, "--exec-provider", strings.TrimPrefix(arg, "--exec-provider="), stderr) {
 				return agentRunOptions{}, false
 			}
 		case strings.HasPrefix(arg, "--home="):
@@ -1007,6 +1014,10 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s: --exec-backend is only supported for agent review\n", label)
 		return agentRunOptions{}, false
 	}
+	if options.execProvider != "" && command != "review" {
+		fmt.Fprintf(stderr, "%s: --exec-provider is only supported for agent review\n", label)
+		return agentRunOptions{}, false
+	}
 	if err := validateAgentRunActionOptions(command, options); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return agentRunOptions{}, false
@@ -1057,6 +1068,8 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		}
 		options.execBackend = string(backend)
 		options.execBackendSet = true
+	case "--exec-provider":
+		options.execProvider = strings.TrimSpace(value)
 	case "--repo":
 		options.repo = value
 	case "--home":

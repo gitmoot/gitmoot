@@ -25,7 +25,9 @@ local_root = "/var/tmp/gitmoot-local"
 ```
 
 The default remote provider is cloud E2B, using its existing dollar caps.
-Mac sandboxd is an explicit canary, never an automatic route.
+The Mac sandboxd provider is declared beside it in `[remote_exec.mac]` and is
+used only by a job that opts in with `--exec-provider mac`; nothing routes to
+it automatically.
 
 ## Versioned OMP review template
 
@@ -80,14 +82,17 @@ Remote OMP uploads the host OMP executable into the instance, requires
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
 
-### Explicit Mac ARM64 canary
+### Opt-in Mac ARM64 provider
 
 The Mac sandboxd endpoint speaks the E2B control and envd protocols; Gitmoot
-does not run a second backend. Configure a separate canary Gitmoot home, and
-keep the existing cloud E2B config available for rollback. Do not switch an
-installation with outstanding cloud attempts: reconciliation addresses only
-the selected provider, and old attempts must first be destroyed or recovered
-against their original endpoint.
+does not run a second backend. The home keeps cloud E2B as its default remote
+provider and declares the Mac beside it. A review runs on the Mac only when it
+is requested with `--exec-provider mac`; the choice is stored in the job
+payload (`exec_provider`), survives retries and model fallbacks, and drives
+that job's admission, reservation, provisioning, envd routing, keepalive and
+teardown. The disk guard and review routing policy only ever route to E2B.
+A request for a provider that is unknown, or for `mac` on a home without
+`[remote_exec.mac]`, is refused before anything is enqueued.
 
 The `sandboxd` host requires Apple `container` 1.4.1 and its Linux kernel
 (`container system start --enable-kernel-install`). Build the credential-free
@@ -103,55 +108,61 @@ control-key file outside disposable paths; serve sandboxd's loopback listener
 only through an authenticated private HTTPS gateway. Neither building the
 image nor starting Apple's runtime activates Gitmoot's Mac provider.
 
-**Do not run untrusted PR code yet.** Apple's `hostOnly` network blocks
-external egress but still reaches Mac services listening on all interfaces.
-On this Mac a guest reached the host gateway at `192.168.128.1`; Mac services
-were listening on ports 5000, 7000, and 58267. An administrator must install
-and verify deny-by-default guest-subnet-to-host firewall rules, with only a
-fixed model-gateway relay exception. `pfctl` requires Mac admin privileges;
-no such rule was installed during the development canary. A private Tailscale
-Serve HTTPS endpoint must also be enabled before Gitmoot can use this host.
-The SSH loopback tunnel used for protocol conformance is not a production
-gateway.
+Apple's `hostOnly` network blocks external egress but still reaches Mac
+services listening on all interfaces, so sandboxd v0.1.5 installs
+deny-by-default guest-subnet-to-host firewall rules with only the fixed
+model-gateway relay (`192.168.128.1:43181`) allowed. The control and envd API
+is served privately through Tailscale Serve HTTPS.
 
 The metrics endpoint samples Apple VM CPU and memory usage; it does not
 invent disk consumption or cloud charges for the fixed-size volume.
 
-For ARM64 OMP reviews, configure `omp_linux_arm64_file` to a verified Linux
-AArch64 executable. The published `omp-linux-arm64` asset for OMP v17.3.5 has
-SHA-256 `c79aba4859d71e6ead797bed2f510a9de97c9d576af9842e7fe63dbc9f4157af`;
-verify it before use. Gitmoot refuses a non-ELF or wrong-architecture file.
+For ARM64 OMP reviews, set `omp_linux_arm64_file` to a checksum-verified
+Linux AArch64 build of the same OMP release the host runs (verify the release
+`SHA256SUMS` entry before use). Gitmoot refuses a non-ELF or wrong-architecture
+file; it does not compare versions.
 
 ```toml
 [remote_exec]
-backend = "remote"
-provider = "mac"
-e2b_api_key_file = "/run/secrets/mac-sandboxd-key"
-e2b_template = "mac-shell"
-e2b_omp_template = "mac-omp"
-e2b_base_url = "https://mac-control.example"
-e2b_envd_base_url = "https://mac-envd.example"
+# ... the existing cloud E2B keys stay unchanged and remain the default ...
+credential_gateway_listen = "0.0.0.0:8443"
+credential_gateway_url = "https://203.0.113.7:8443"
+
+[remote_exec.mac]
+api_key_file = "/run/secrets/mac-sandboxd-key"
+template = "review-arm64"
+omp_template = "review-arm64"
+base_url = "https://mac.example.ts.net:8443"
+envd_base_url = "https://mac.example.ts.net:8443"
 omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
-cost_max_concurrent = 2
-credential_gateway_listen = "127.0.0.1:8443"
-credential_gateway_url = "https://192.168.128.1:8443"
+credential_gateway_url = "https://192.168.128.1:43181"
+max_concurrent = 1
 ```
 
-Those gateway coordinates are an example only: the Gitmoot-side mTLS
-listener stays on loopback and its advertised certificate names the guest's
-Mac gateway IP. A supervised, fixed-destination tunnel on the Mac must
-forward the firewall-allowed port to that listener; no general-purpose
-proxy or secret is exposed to the VM. Verify the actual VM subnet, tunnel,
-firewall, mTLS lease expiry, and model request before a review canary.
+`base_url` and `envd_base_url` must be HTTPS origins; `envd_base_url` sends
+`E2b-Sandbox-Id`, `E2b-Sandbox-Port: 49983`, and `X-Access-Token` to that one
+host on both upload and process streaming. `max_concurrent` is the Mac's
+sandbox capacity: Mac attempts reserve zero dollars and count only against
+it, while E2B attempts count only against the E2B dollar and concurrency caps,
+so neither provider can take the other's slot.
 
-`provider = "mac"` is opt-in and requires an explicit control URL and a
-positive `cost_max_concurrent`. Mac attempts have a distinct ledger identity
-and reserve zero E2B dollars; cloud E2B continues to require positive
-`cost_max_reserved_usd` and `cost_per_attempt_usd`. The optional
-`e2b_envd_base_url` must be a single HTTPS origin for the Mac provider; it
-sends `E2b-Sandbox-Id`, `E2b-Sandbox-Port: 49983`, and `X-Access-Token` to
-that host on both upload and process streaming. Without it, the existing
-`https://49983-<id>.<e2b_domain>` wildcard route is unchanged.
+One credential gateway listener serves both providers. Its certificate names
+every advertised host (`credential_gateway_url` and the Mac's
+`credential_gateway_url`), and each job's lease is bound to its own provider's
+origin. Mac guests reach it through sandboxd's relay at
+`192.168.128.1:43181`, which forwards to the Mac's `127.0.0.1:43184`; a
+supervised `ssh -R 127.0.0.1:43184:127.0.0.1:8443` tunnel then carries it to
+the daemon's existing listener port (the port of `credential_gateway_listen`).
+No general-purpose proxy or secret is exposed to the VM.
+
+Reconciliation lists each provider's inventory separately and settles or
+orphans only that provider's attempts, so a Mac attempt is never settled
+because E2B does not list it, nor the reverse. sandboxd's list is complete for
+its worker (a failed inventory is a 503, never a short list) and sandboxd kills
+each sandbox at its persisted deadline, but Gitmoot still treats the Mac list
+as partial: it reads the list and its ledger in separate steps, so an attempt
+reserved in between would look absent. A `destroying` Mac attempt settles by
+the same provider-TTL grace rule as E2B.
 
 Mac OMP uploads only the configured absolute-path executable after verifying
 an executable Linux ARM64 ELF header and interpreter, before provider

@@ -113,7 +113,7 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 			return nil, fmt.Errorf("create execution backend daemon fencing token: %w", err)
 		}
 		cap := execBackendStoreCap(cfg.ExecBackendCost)
-		if cfg.Provider == "mac" {
+		if cfg.Provider == config.RemoteExecProviderMac {
 			cap = execBackendMacCap(cfg.ExecBackendCost)
 		}
 		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, cfg.Provider, fencingToken, db.BootID(), w.Stdout, cap)
@@ -206,7 +206,7 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 			return nil, nil, nil, nil, errors.New("remote omp requires the model credential gateway; raw-key fallback is forbidden")
 		}
 		var err error
-		if cfg.Provider == "mac" {
+		if cfg.Provider == config.RemoteExecProviderMac {
 			ompARM64File, err = verifiedLinuxARM64Omp(cfg.OMPLinuxARM64File)
 			ompExecutable = cfg.OMPLinuxARM64File
 		} else {

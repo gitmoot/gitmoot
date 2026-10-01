@@ -1373,24 +1373,40 @@ func (s *Store) RerouteQueuedJobPayload(ctx context.Context, id string, payload 
 
 // RouteQueuedJobRemote is RerouteQueuedJobPayload for a payload that moves the
 // job to the remote backend. It is admitted only if one more attempt at
-// perAttemptUSD would fit the cost cap ReserveExecBackendAttempt enforces,
-// counting every attempt already billing at its own reserved dollars and every
-// queued or running remote job that has not reserved yet at perAttemptUSD. The
-// count and the write are one statement, so concurrent callers cannot both
-// take the last slot.
+// perAttemptUSD would fit the cost cap ReserveExecBackendAttempt enforces for
+// the payload's provider, counting that provider's attempts already billing at
+// their own reserved dollars and its queued or running remote jobs that have
+// not reserved yet at perAttemptUSD. Another provider's attempts and jobs hold
+// none of this cap. A job's provider is its payload exec_provider, absent
+// meaning e2b. The count and the write are one statement, so concurrent callers
+// cannot both take the last slot.
 func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload string, atGeneration int64, cap ExecBackendCostCap, event JobEvent) (bool, error) {
 	if !cap.Configured || cap.MaxReservedUSD <= 0 || cap.PerAttemptUSD <= 0 {
 		return false, nil
 	}
+	var routed struct {
+		ExecProvider string `json:"exec_provider"`
+	}
+	if err := json.Unmarshal([]byte(payload), &routed); err != nil {
+		return false, fmt.Errorf("decode routed job payload: %w", err)
+	}
+	provider := strings.TrimSpace(routed.ExecProvider)
+	if provider == "" {
+		provider = "e2b"
+	}
 	marks, states := billingStatePlaceholders()
 	pending := `(SELECT COUNT(*) FROM jobs r WHERE r.state IN ('queued','running') AND json_extract(r.payload, '$.exec_backend') = 'remote'
-		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.state IN (` + marks + `)))`
-	clause := ` AND (SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts WHERE state IN (` + marks + `))
+		AND COALESCE(NULLIF(json_extract(r.payload, '$.exec_provider'), ''), 'e2b') = ?
+		AND r.id NOT IN (SELECT a.job_id FROM execbackend_attempts a WHERE a.provider = ? AND a.state IN (` + marks + `)))`
+	pendingArgs := append([]any{provider, provider}, states...)
+	billing := `FROM execbackend_attempts WHERE provider = ? AND state IN (` + marks + `)`
+	billingArgs := append([]any{provider}, states...)
+	clause := ` AND (SELECT COALESCE(SUM(cost_reserved_usd), 0) ` + billing + `)
 		+ (` + pending + ` + 1) * ? <= ?`
-	args := append(append(append([]any{}, states...), states...), cap.PerAttemptUSD, cap.MaxReservedUSD)
+	args := append(append(append([]any{}, billingArgs...), pendingArgs...), cap.PerAttemptUSD, cap.MaxReservedUSD)
 	if cap.MaxConcurrent > 0 {
-		clause += ` AND (SELECT COUNT(*) FROM execbackend_attempts WHERE state IN (` + marks + `)) + ` + pending + ` + 1 <= ?`
-		args = append(append(append(args, states...), states...), cap.MaxConcurrent)
+		clause += ` AND (SELECT COUNT(*) ` + billing + `) + ` + pending + ` + 1 <= ?`
+		args = append(append(append(args, billingArgs...), pendingArgs...), cap.MaxConcurrent)
 	}
 	return s.rerouteQueuedJob(ctx, id, payload, atGeneration, event, clause, args)
 }

@@ -119,7 +119,7 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 	}
 	if policy.CapacityOnly {
 		if reservation.Provider != "mac" || policy.MaxConcurrent <= 0 || reservation.CostReservedUSD != 0 {
-			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "Mac capacity requires provider mac, positive cost_max_concurrent, and zero dollar reservation"}
+			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "Mac capacity requires provider mac, positive [remote_exec.mac].max_concurrent, and zero dollar reservation"}
 		}
 	} else {
 		if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {

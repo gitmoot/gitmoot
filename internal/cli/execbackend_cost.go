@@ -34,7 +34,7 @@ func execBackendMacCap(cfg config.ExecBackendCostConfig) db.ExecBackendCostCap {
 		return db.ExecBackendCostCap{DenyReason: err.Error()}
 	}
 	if cfg.MaxConcurrent <= 0 {
-		return db.ExecBackendCostCap{DenyReason: "[remote_exec].cost_max_concurrent must be positive for Mac capacity"}
+		return db.ExecBackendCostCap{DenyReason: "[remote_exec.mac].max_concurrent must be positive for Mac capacity"}
 	}
 	return db.ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: cfg.MaxConcurrent}
 }
