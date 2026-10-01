@@ -2649,8 +2649,9 @@ exact-head review, `gitmoot task successor <id>` creates
 `<id>-successor-<n>` in `planned`. It copies the repository, goal and title,
 and records `successor_created` on the disposed task and `created_as_successor`
 on the new one. Dispatch then binds the review to the newest live task of that
-chain, both by derived `review-pr-*` id and by the disposed task's branch; the
-branch itself stays with the disposed task, since a branch belongs to one task.
+chain, both by derived `review-pr-*` id and by branch. The successor takes over
+the disposed task's branch (a branch belongs to one task), so workflow
+advancement of the successor's review verdicts reaches the live task.
 Repeating the command returns the existing live successor. A live task is
 refused. The dispatch refusal names the exact command to run.
 
