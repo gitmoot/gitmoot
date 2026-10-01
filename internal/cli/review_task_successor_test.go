@@ -77,3 +77,26 @@ func TestStrandedReviewTaskGetsANewReviewThroughItsSuccessor(t *testing.T) {
 		})
 	}
 }
+
+// The success line names the task the operator gave, never a root derived
+// from the id's text: x-successor-2 that was never created as a successor is
+// its own chain (#2278 review P3).
+func TestTaskSuccessorOutputNamesTheGivenTask(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertTask(ctx, db.Task{ID: "x", RepoFullName: "o/r", State: string(workflow.TaskPlanned)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "x-successor-2", RepoFullName: "o/r", State: string(workflow.TaskStranded)}); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	var stdout, stderr bytes.Buffer
+	if code := runTask([]string{"successor", "x-successor-2", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "x-successor-2-successor-2 created for x-successor-2;") {
+		t.Fatalf("output %q misnames the task", stdout.String())
+	}
+}
