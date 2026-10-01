@@ -100,10 +100,11 @@ type JobScope struct {
 // Materials are non-secret inputs staged into one execution instance.
 type Materials struct {
 	SourceWorktree string
-	// DiffBaseHEAD optionally projects SourceWorktree as an uncommitted diff
-	// against this exact ancestor. Review sandboxes use it so ordinary
-	// `git status` and `git diff HEAD` expose the review scope without copying
-	// the host repository's .git directory.
+	// DiffBaseHEAD optionally names the ancestor of SourceWorktree's HEAD that
+	// a review diffs against. A copying backend ships the exact HEAD commit
+	// and its history back to this commit, so the instance's HEAD is the
+	// reviewed commit and the base is a local commit, without copying the host
+	// repository's .git directory.
 	DiffBaseHEAD string
 }
 

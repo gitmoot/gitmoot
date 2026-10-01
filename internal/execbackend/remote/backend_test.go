@@ -286,15 +286,30 @@ func TestRemoteSyncInAppliesHostChanges(t *testing.T) {
 	}
 }
 
-func TestRemoteSyncInProjectsCommittedReviewDiff(t *testing.T) {
+// #2281: a remote review must sit ON the exact head commit, with the review
+// base present locally, or it can only end blocked ("commit <head> is absent
+// locally"). The guest gets that history without anything from which a
+// credential could be read: no host .git directory, config or remote.
+func TestRemoteSyncInShipsExactHeadAndReviewBase(t *testing.T) {
+	const secret = "ghs_GITMOOT2281secretTOKEN"
 	source := testSourceRepo(t)
 	testGit(t, source, "add", "-A")
 	testGit(t, source, "commit", "-q", "-m", "review base")
-	diffBase := strings.TrimSpace(testGit(t, source, "rev-parse", "HEAD"))
+	base := strings.TrimSpace(testGit(t, source, "rev-parse", "HEAD"))
+	// A merged side branch puts more than one path between head and base.
+	testGit(t, source, "switch", "-q", "-c", "side")
+	testWriteFile(t, source, "side.txt", []byte("side change\n"), 0o644)
+	testGit(t, source, "add", "-A")
+	testGit(t, source, "commit", "-q", "-m", "side change")
+	testGit(t, source, "switch", "-q", "-")
 	testWriteFile(t, source, "input.txt", []byte("reviewed change\n"), 0o644)
 	testWriteFile(t, source, "review-new.txt", []byte("new review file\n"), 0o644)
 	testGit(t, source, "add", "-A")
-	testGit(t, source, "commit", "-q", "-m", "review head")
+	testGit(t, source, "commit", "-q", "-m", "review change")
+	testGit(t, source, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+	head := strings.TrimSpace(testGit(t, source, "rev-parse", "HEAD"))
+	testGit(t, source, "remote", "add", "origin", "https://x-access-token:"+secret+"@github.com/owner/repo.git")
+	testGit(t, source, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic "+secret)
 
 	harness := newProviderHarness(t)
 	backend := harness.backend(t)
@@ -304,17 +319,73 @@ func TestRemoteSyncInProjectsCommittedReviewDiff(t *testing.T) {
 	}
 	if err := backend.SyncIn(context.Background(), instance, execbackend.Materials{
 		SourceWorktree: source,
-		DiffBaseHEAD:   diffBase,
+		DiffBaseHEAD:   base,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	changed := strings.Fields(testGit(t, harness.workspace, "diff", "--name-only", "HEAD", "--"))
-	if want := []string{"input.txt", "review-new.txt"}; !reflect.DeepEqual(changed, want) {
-		t.Fatalf("sandbox review diff files = %v, want %v", changed, want)
+	if got := strings.TrimSpace(testGit(t, harness.workspace, "rev-parse", "HEAD")); got != head {
+		t.Fatalf("instance HEAD = %s, want exact head %s", got, head)
 	}
-	if _, err := backend.Collect(context.Background(), instance); err == nil || !strings.Contains(err.Error(), "projected review diff") {
-		t.Fatalf("Collect projected review workspace error = %v, want refusal", err)
+	testGit(t, harness.workspace, "cat-file", "-e", base+"^{commit}")
+	// Ordinary git, with no remote, names the review base and its diff.
+	if got := strings.TrimSpace(testGit(t, harness.workspace, "rev-parse", "@{upstream}")); got != base {
+		t.Fatalf("instance @{upstream} = %s, want review base %s", got, base)
+	}
+	changed := strings.Fields(testGit(t, harness.workspace, "diff", "--name-only", "@{upstream}", "HEAD", "--"))
+	if want := []string{"input.txt", "review-new.txt", "side.txt"}; !reflect.DeepEqual(changed, want) {
+		t.Fatalf("instance review diff %s..HEAD files = %v, want %v", base, changed, want)
+	}
+	if got, want := testGit(t, harness.workspace, "rev-list", base+"..HEAD"), testGit(t, source, "rev-list", base+".."+head); got != want {
+		t.Fatalf("instance review history =\n%s\nwant\n%s", got, want)
+	}
+	if status := testGit(t, harness.workspace, "status", "--porcelain"); status != "" {
+		t.Fatalf("instance exact-head checkout is dirty: %q", status)
+	}
+	if remotes := testGit(t, harness.workspace, "remote"); remotes != "" {
+		t.Fatalf("instance repository has remotes %q", remotes)
+	}
+	guestConfig, err := os.ReadFile(filepath.Join(harness.workspace, ".git", "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(guestConfig), secret) {
+		t.Fatalf("instance git config carries the host credential:\n%s", guestConfig)
+	}
+	archive := harness.uploads[syncArchivePath]
+	if len(archive) == 0 {
+		t.Fatal("workspace archive was not uploaded")
+	}
+	for name, content := range readTestArchive(t, archive) {
+		if name != "objects" && !strings.HasPrefix(name, "objects/") && name != "shallow" && name != "changes.patch" {
+			t.Fatalf("workspace archive carries %q outside the object store", name)
+		}
+		if bytes.Contains(content, []byte(secret)) {
+			t.Fatalf("workspace archive entry %q carries the host credential", name)
+		}
+	}
+	changes, err := backend.Collect(context.Background(), instance)
+	if err != nil || len(changes.Patch) != 0 || len(changes.Manifest) != 0 {
+		t.Fatalf("Collect on an untouched review workspace = %+v, %v; want no changes", changes, err)
+	}
+}
+
+// A workspace that did not land on the exact host commit is refused rather
+// than handed to a runtime that would review something else as that head.
+func TestRemoteSyncInRefusesWorkspaceOffExactHead(t *testing.T) {
+	source := testSourceRepo(t)
+	harness := newProviderHarness(t)
+	harness.syncReportsHEAD = strings.Repeat("a", 40)
+	backend := harness.backend(t)
+	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "review-job", TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.SyncIn(context.Background(), instance, execbackend.Materials{SourceWorktree: source}); err == nil {
+		t.Fatal("SyncIn accepted an instance HEAD that is not the exact host HEAD")
+	}
+	if _, err := backend.Exec(context.Background(), instance, execbackend.Command{Name: "true", Dir: workspacePath}); err == nil || !strings.Contains(err.Error(), "has not been synced") {
+		t.Fatal("Exec ran in a workspace whose sync was refused")
 	}
 }
 
@@ -527,9 +598,13 @@ type providerHarness struct {
 	creates               []createRequest
 	deleted               []string
 	inventory             []e2b.Sandbox
-	upload                []byte
 	uploads               map[string][]byte
 	credentialModeApplied bool
+
+	// syncReportsHEAD, when set, is what the instance claims its synced HEAD
+	// is instead of running the sync script: a provider-side workspace that
+	// did not land on the exact host commit.
+	syncReportsHEAD string
 
 	workspace string
 	control   *httptest.Server
@@ -538,7 +613,7 @@ type providerHarness struct {
 
 func newProviderHarness(t *testing.T) *providerHarness {
 	t.Helper()
-	harness := &providerHarness{t: t, workspace: filepath.Join(t.TempDir(), "sandbox-workspace"), uploads: make(map[string][]byte)}
+	harness := &providerHarness{t: t, workspace: filepath.Join(t.TempDir(), "workspace"), uploads: make(map[string][]byte)}
 	harness.control = httptest.NewServer(http.HandlerFunc(harness.serveControl))
 	harness.envd = httptest.NewServer(http.HandlerFunc(harness.serveEnvd))
 	t.Cleanup(harness.control.Close)
@@ -622,9 +697,19 @@ func (h *providerHarness) serveEnvd(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		remotePath := r.URL.Query().Get("path")
+		// Land the upload where the instance would see it, so the REAL sync
+		// script runs against it instead of a Go re-implementation.
+		if strings.HasPrefix(remotePath, "/home/user/") {
+			local := filepath.Join(filepath.Dir(h.workspace), filepath.FromSlash(strings.TrimPrefix(remotePath, "/home/user/")))
+			if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
+				h.t.Errorf("stage upload: %v", err)
+			} else if err := os.WriteFile(local, data, 0o600); err != nil {
+				h.t.Errorf("stage upload: %v", err)
+			}
+		}
 		h.mu.Lock()
-		h.upload = data
-		h.uploads[r.URL.Query().Get("path")] = append([]byte(nil), data...)
+		h.uploads[remotePath] = append([]byte(nil), data...)
 		h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[]`))
@@ -684,51 +769,14 @@ func (h *providerHarness) runProcess(ctx context.Context, command string, args [
 		h.mu.Unlock()
 		return nil, nil, 0, ""
 	}
-	if command == "sh" && reflect.DeepEqual(args, []string{"-c", syncWorkspaceScript}) {
+	if command == "sh" && len(args) >= 2 && args[1] == syncWorkspaceScript {
 		h.mu.Lock()
-		archive := append([]byte(nil), h.upload...)
+		reported := h.syncReportsHEAD
 		h.mu.Unlock()
-		staging := filepath.Join(filepath.Dir(h.workspace), "sync-staging")
-		if err := os.RemoveAll(h.workspace); err != nil {
-			return nil, nil, 1, err.Error()
+		if reported != "" {
+			return []byte(reported + "\n"), nil, 0, ""
 		}
-		if err := os.RemoveAll(staging); err != nil {
-			return nil, nil, 1, err.Error()
-		}
-		if err := extractTestArchive(archive, staging); err != nil {
-			return nil, nil, 1, err.Error()
-		}
-		if err := os.Rename(filepath.Join(staging, "workspace"), h.workspace); err != nil {
-			return nil, nil, 1, err.Error()
-		}
-		for _, gitArgs := range [][]string{{"init", "-q"}, {"config", "user.name", "gitmoot"}, {"config", "user.email", "gitmoot@localhost"}, {"add", "-A"}, {"commit", "-q", "--allow-empty", "-m", "gitmoot sync base"}} {
-			cmd := exec.CommandContext(ctx, "git", append([]string{"-C", h.workspace}, gitArgs...)...)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return nil, output, 1, err.Error()
-			}
-		}
-		inputPatch, err := os.ReadFile(filepath.Join(staging, "changes.patch"))
-		if err != nil {
-			return nil, nil, 1, err.Error()
-		}
-		if len(inputPatch) > 0 && strings.Contains(syncWorkspaceScript, "git apply --binary --whitespace=nowarn /home/user/.gitmoot-sync/changes.patch") {
-			cmd := exec.CommandContext(ctx, "git", "-C", h.workspace, "apply", "--binary", "--whitespace=nowarn", "-")
-			cmd.Stdin = bytes.NewReader(inputPatch)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return nil, output, 1, err.Error()
-			}
-		}
-		if err := os.RemoveAll(staging); err != nil {
-			return nil, nil, 1, err.Error()
-		}
-		cmd := exec.CommandContext(ctx, "git", "-C", h.workspace, "rev-parse", "HEAD")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return nil, output, 1, err.Error()
-		}
-		return output, nil, 0, ""
 	}
-
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = h.localDir(remoteDir)
 	cmd.Env = os.Environ()
@@ -824,54 +872,28 @@ func writeTestConnectJSON(t *testing.T, writer io.Writer, flag byte, value any) 
 	}
 }
 
-func extractTestArchive(data []byte, destination string) error {
-	if err := os.MkdirAll(destination, 0o755); err != nil {
-		return err
-	}
+// readTestArchive returns every entry of an uploaded workspace archive.
+func readTestArchive(t *testing.T, data []byte) map[string][]byte {
+	t.Helper()
 	gzipReader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return err
+		t.Fatal(err)
 	}
 	defer gzipReader.Close()
 	tarReader := tar.NewReader(gzipReader)
+	entries := make(map[string][]byte)
 	for {
 		header, err := tarReader.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return entries
 		}
 		if err != nil {
-			return err
+			t.Fatal(err)
 		}
-		clean := filepath.Clean(filepath.FromSlash(header.Name))
-		if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("unsafe archive path %q", header.Name)
+		content, err := io.ReadAll(tarReader)
+		if err != nil {
+			t.Fatal(err)
 		}
-		filePath := filepath.Join(destination, clean)
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(filePath, os.FileMode(header.Mode)); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-				return err
-			}
-			if err := os.Symlink(header.Linkname, filePath); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(filePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode))
-			if err != nil {
-				return err
-			}
-			_, copyErr := io.Copy(file, tarReader)
-			closeErr := file.Close()
-			if err := errors.Join(copyErr, closeErr); err != nil {
-				return err
-			}
-		}
+		entries[header.Name] = content
 	}
 }

@@ -960,6 +960,11 @@ everything else is structurally absent rather than merely unmentioned.
 If a seat has no single repo scope, no list is staged and the reason is recorded
 in the job's `dropped` diagnostics rather than passing silently.
 
+A review on the remote execution backend gets the same list at
+`/home/user/.gitmoot/runtime/evidence/prior-verdicts.json`, also named by
+`GITMOOT_PRIOR_VERDICTS`; when it cannot be rendered the job records a
+`remote_review_evidence_unavailable` event with the reason.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

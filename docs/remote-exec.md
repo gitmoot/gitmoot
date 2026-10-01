@@ -140,6 +140,23 @@ the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
 result observation; host Git commands and the finalizer still run against the
 host worktree, and backend-created commits are refused.
 
+On the remote backend the instance workspace is a Git repository whose `HEAD`
+is the exact host commit, not a copy re-committed under a new SHA. Gitmoot
+fetches that commit and its history back to the review diff base into a
+throwaway host repository and uploads only its object store and shallow
+boundary, plus a patch of any uncommitted host changes. No host `.git`
+directory, config, remote, credential helper or GitHub token is uploaded, and
+the instance has no `origin`. For a pull-request review the diff base is the
+merge base with the refreshed `origin/<base>` (or the prior reviewed head for a
+bounded re-review); the instance gets it as the local branch
+`gitmoot-review-base`, which the checked-out `gitmoot-head` branch tracks, so
+`git status`, `git log @{upstream}..` and `git diff @{upstream}` show the
+review scope. A remote review also receives the same rendered, repo-scoped
+prior-verdict list a host read-only seat gets, at
+`/home/user/.gitmoot/runtime/evidence/prior-verdicts.json`, named by
+`GITMOOT_PRIOR_VERDICTS`. If the list cannot be rendered the review still runs
+and the job records a `remote_review_evidence_unavailable` event.
+
 `local_uid` and `local_gid` opt agent commands into a kernel-enforced non-root
 identity. Gitmoot never guesses a host account: both numeric values must be set
 together and both must be non-zero. After sync, Gitmoot hands the independent
@@ -179,7 +196,7 @@ process identity. When `local_uid` is absent, daemon jobs do the same.
 
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
-bundle/base-ref hydration; hydration remains a remote-provider concern. Cancel
+history hydration; the remote backend ships exact history as described above. Cancel
 kills active command groups and destroys the instance. On daemon restart, the
 remote reaper positively observes provider inventory and matches the complete
 sandbox identity (job, attempt, generation, fencing token, boot ID, and sandbox

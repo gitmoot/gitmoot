@@ -1960,48 +1960,12 @@ func selectedRuntimeConfigDir(runtimeName string) string {
 // A failure here is NEVER fatal: the seat loses evidence and says so through
 // the returned diagnostic.
 func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot string, reviewRepo string) (string, string) {
-	if strings.TrimSpace(paths.Database) == "" || strings.TrimSpace(cacheRoot) == "" {
+	if strings.TrimSpace(cacheRoot) == "" {
 		return "", ""
 	}
-	switch info, err := os.Stat(paths.Database); {
-	case err != nil && os.IsNotExist(err):
-		// No store yet is the normal case on a fresh home, not a defect, and
-		// it is the ONLY error that may pass silently.
-		return "", ""
-	case err != nil:
-		// Everything else - EACCES, ENOTDIR, EIO, a dangling symlink - used to
-		// return silently here and read as "fresh home", so the seat reviewed
-		// with no prior verdicts and the operator saw no diagnostic. That is
-		// the silent degradation this function exists to remove.
-		return "", fmt.Sprintf("workflow evidence: stat store %s: %v", paths.Database, err)
-	case info.IsDir():
-		return "", fmt.Sprintf("workflow evidence: store path %s is a directory", paths.Database)
-	}
-	repo := strings.TrimSpace(reviewRepo)
-	if repo == "" || strings.Contains(repo, "*") {
-		// Without the repo of the job in hand there is nothing to scope TO,
-		// and an unscoped copy is the defect this function exists to remove.
-		//
-		// The key is deliberately the REVIEWED repo and not agent.RepoScope. A
-		// seat's registered scope is an authorisation boundary - it may be a
-		// wildcard, and nothing in the tree makes it agree with a job's repo -
-		// so keying on it could hand a seat a different repo's verdicts than
-		// the one it is reviewing while the artifact claimed otherwise.
-		return "", "workflow evidence: no repo under review, so no prior-verdict list was staged"
-	}
-	store, err := db.OpenReadOnly(paths.Database)
-	if err != nil {
-		return "", fmt.Sprintf("workflow evidence: open store read-only: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-	jobs, err := store.ListJobsByRepo(ctx, repo)
-	if err != nil {
-		return "", fmt.Sprintf("workflow evidence: list prior verdicts: %v", err)
-	}
-	rendered := renderPriorVerdicts(repo, jobs)
-	body, err := json.MarshalIndent(rendered, "", "  ")
-	if err != nil {
-		return "", fmt.Sprintf("workflow evidence: render prior verdicts: %v", err)
+	body, diagnostic := renderPriorVerdictsFile(ctx, paths, reviewRepo)
+	if body == nil {
+		return "", diagnostic
 	}
 	dir := filepath.Join(cacheRoot, "evidence")
 	// The daemon owns this root and has just re-created it, so a leftover from
@@ -2015,10 +1979,61 @@ func stagePriorVerdicts(ctx context.Context, paths config.Paths, cacheRoot strin
 		return "", fmt.Sprintf("workflow evidence: create %s: %v", dir, err)
 	}
 	file := filepath.Join(dir, "prior-verdicts.json")
-	if err := os.WriteFile(file, append(body, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(file, body, 0o600); err != nil {
 		return "", fmt.Sprintf("workflow evidence: write %s: %v", file, err)
 	}
 	return file, ""
+}
+
+// renderPriorVerdictsFile renders the repo-scoped prior-verdict list that
+// GITMOOT_PRIOR_VERDICTS names, for a host seat or a remote instance. A nil
+// body means nothing can be staged; the diagnostic says why unless the absence
+// is the normal fresh-home case.
+func renderPriorVerdictsFile(ctx context.Context, paths config.Paths, reviewRepo string) ([]byte, string) {
+	if strings.TrimSpace(paths.Database) == "" {
+		return nil, ""
+	}
+	switch info, err := os.Stat(paths.Database); {
+	case err != nil && os.IsNotExist(err):
+		// No store yet is the normal case on a fresh home, not a defect, and
+		// it is the ONLY error that may pass silently.
+		return nil, ""
+	case err != nil:
+		// Everything else - EACCES, ENOTDIR, EIO, a dangling symlink - used to
+		// return silently here and read as "fresh home", so the seat reviewed
+		// with no prior verdicts and the operator saw no diagnostic. That is
+		// the silent degradation this function exists to remove.
+		return nil, fmt.Sprintf("workflow evidence: stat store %s: %v", paths.Database, err)
+	case info.IsDir():
+		return nil, fmt.Sprintf("workflow evidence: store path %s is a directory", paths.Database)
+	}
+	repo := strings.TrimSpace(reviewRepo)
+	if repo == "" || strings.Contains(repo, "*") {
+		// Without the repo of the job in hand there is nothing to scope TO,
+		// and an unscoped copy is the defect this function exists to remove.
+		//
+		// The key is deliberately the REVIEWED repo and not agent.RepoScope. A
+		// seat's registered scope is an authorisation boundary - it may be a
+		// wildcard, and nothing in the tree makes it agree with a job's repo -
+		// so keying on it could hand a seat a different repo's verdicts than
+		// the one it is reviewing while the artifact claimed otherwise.
+		return nil, "workflow evidence: no repo under review, so no prior-verdict list was staged"
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		return nil, fmt.Sprintf("workflow evidence: open store read-only: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	jobs, err := store.ListJobsByRepo(ctx, repo)
+	if err != nil {
+		return nil, fmt.Sprintf("workflow evidence: list prior verdicts: %v", err)
+	}
+	rendered := renderPriorVerdicts(repo, jobs)
+	body, err := json.MarshalIndent(rendered, "", "  ")
+	if err != nil {
+		return nil, fmt.Sprintf("workflow evidence: render prior verdicts: %v", err)
+	}
+	return append(body, '\n'), ""
 }
 
 // priorVerdictList is the rendered artifact's shape. It states its own scope
