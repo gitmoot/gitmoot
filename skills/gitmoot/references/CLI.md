@@ -329,8 +329,9 @@ restart, the reaper deletes a prior-boot or dead-owner sandbox only after a
 positive provider observation matches its full local ledger identity. Missing
 E2B inventory entries never prove deletion or release cost reservations on their
 own; a `destroying` attempt absent from a successful inventory settles to
-`destroyed` (event `execbackend_destroy_confirmed`, cap slot freed) only after a
-retried DELETE succeeds or returns E2B's exact "doesn't exist" 404 for its ID.
+`destroyed` (event `execbackend_destroy_confirmed`, cap slot freed) only once it
+is past `ttl_expires_at` plus a 15-minute grace, when E2B's own timeout has
+killed the sandbox. A per-ID 404 never settles it.
 
 Remote review admission runs after exact-head checkout binding and before cost
 reservation or provider calls. It re-reads the PR head; deduplicates
