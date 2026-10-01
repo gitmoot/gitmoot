@@ -152,7 +152,8 @@ bounded re-review); the instance gets it as the local branch
 `gitmoot-review-base`, which the checked-out `gitmoot-head` branch tracks, so
 `git status`, `git log @{upstream}..` and `git diff @{upstream}` show the
 review scope. A remote review also receives the same rendered, repo-scoped
-prior-verdict list a host read-only seat gets, at
+prior-verdict list a host read-only seat gets, including each verdict's
+individual findings (`finding_details`) as recorded, at
 `/home/user/.gitmoot/runtime/evidence/prior-verdicts.json`, named by
 `GITMOOT_PRIOR_VERDICTS`. If the list cannot be rendered the review still runs
 and the job records a `remote_review_evidence_unavailable` event.

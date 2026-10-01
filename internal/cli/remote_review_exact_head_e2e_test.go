@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"path/filepath"
 	"testing"
@@ -23,7 +24,7 @@ const remoteReviewWorkspaceProbe = `head=$(git rev-parse HEAD)
 base=$(git rev-parse "@{upstream}")
 files=$(git diff --name-only "@{upstream}" HEAD | tr '\n' ',')
 prior=absent
-if [ -n "${GITMOOT_PRIOR_VERDICTS:-}" ] && grep -q PRIOR-FINDING-2281 "$GITMOOT_PRIOR_VERDICTS"; then
+if [ -n "${GITMOOT_PRIOR_VERDICTS:-}" ] && grep -q PRIOR-TITLE-2281 "$GITMOOT_PRIOR_VERDICTS" && grep -q PRIOR-DETAIL-2281 "$GITMOOT_PRIOR_VERDICTS"; then
   prior=present
 fi
 printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"head=%s base=%s files=%s prior=%s","findings":[],"changes_made":[],"tests_run":["git rev-parse HEAD"],"needs":[],"delegations":[]}}' "$head" "$base" "$files" "$prior"`
@@ -54,7 +55,29 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	const repo = "owner/repo"
 	seedDaemonWorkerRepo(t, store, repo, checkout)
 	seedDaemonWorkerAgent(t, store, "remote-review-agent", runtime.ShellRuntime, remoteReviewWorkspaceProbe, []string{"review"}, repo)
-	seedVerdict(t, paths, repo, "prior-review-2281", "PRIOR-FINDING-2281")
+	// The summary deliberately does not enumerate the finding: only the
+	// individual finding carries its title and detail, as on PR #1202 where a
+	// three-finding verdict summarised one failure.
+	priorPayload, err := json.Marshal(workflow.JobPayload{
+		Repo: repo, PullRequest: 2281, HeadSHA: base,
+		Result: &workflow.AgentResult{
+			Decision: "changes_requested", Severity: "P2", Evidence: workflow.EvidenceExecuted,
+			Summary: "one failure",
+			Findings: []json.RawMessage{
+				json.RawMessage(`{"severity":"P2","title":"PRIOR-TITLE-2281","location":"main.go:1","description":"PRIOR-DETAIL-2281 the base is not refreshed"}`),
+				json.RawMessage(`"a second, bare finding"`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "prior-review-2281", Agent: "earlier-reviewer", Type: "review",
+		State: string(workflow.JobSucceeded), Payload: string(priorPayload),
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "verdict"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: repo, Number: 2281, URL: "https://example.invalid/owner/repo/pull/2281",
 		HeadBranch: "feature", BaseBranch: "main", HeadSHA: head, State: "open",

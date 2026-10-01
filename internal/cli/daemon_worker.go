@@ -2047,17 +2047,21 @@ type priorVerdictList struct {
 }
 
 // priorVerdict carries only what a reviewer needs to enumerate what came
-// before: who decided what, at which head, on what evidence.
+// before: who decided what, at which head, on what evidence, and every
+// finding as the reviewer recorded it. A summary need not enumerate its
+// findings, and a seat without GitHub access (a remote instance) has no other
+// way to read them, so it could not answer each prior finding (#2281).
 type priorVerdict struct {
-	JobID       string `json:"job_id"`
-	Agent       string `json:"agent"`
-	PullRequest int    `json:"pull_request,omitempty"`
-	HeadSHA     string `json:"head_sha,omitempty"`
-	Decision    string `json:"decision,omitempty"`
-	Severity    string `json:"severity,omitempty"`
-	Evidence    string `json:"evidence,omitempty"`
-	Findings    int    `json:"findings"`
-	Summary     string `json:"summary,omitempty"`
+	JobID          string            `json:"job_id"`
+	Agent          string            `json:"agent"`
+	PullRequest    int               `json:"pull_request,omitempty"`
+	HeadSHA        string            `json:"head_sha,omitempty"`
+	Decision       string            `json:"decision,omitempty"`
+	Severity       string            `json:"severity,omitempty"`
+	Evidence       string            `json:"evidence,omitempty"`
+	Findings       int               `json:"findings"`
+	FindingDetails []json.RawMessage `json:"finding_details,omitempty"`
+	Summary        string            `json:"summary,omitempty"`
 }
 
 // renderPriorVerdicts projects review jobs onto the artifact. Anything not
@@ -2082,15 +2086,16 @@ func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
 			continue
 		}
 		list.Verdicts = append(list.Verdicts, priorVerdict{
-			JobID:       job.ID,
-			Agent:       job.Agent,
-			PullRequest: payload.PullRequest,
-			HeadSHA:     payload.HeadSHA,
-			Decision:    payload.Result.Decision,
-			Severity:    payload.Result.Severity,
-			Evidence:    payload.Result.Evidence,
-			Findings:    len(payload.Result.Findings),
-			Summary:     payload.Result.Summary,
+			JobID:          job.ID,
+			Agent:          job.Agent,
+			PullRequest:    payload.PullRequest,
+			HeadSHA:        payload.HeadSHA,
+			Decision:       payload.Result.Decision,
+			Severity:       payload.Result.Severity,
+			Evidence:       payload.Result.Evidence,
+			Findings:       len(payload.Result.Findings),
+			FindingDetails: payload.Result.Findings,
+			Summary:        payload.Result.Summary,
 		})
 	}
 	return list
