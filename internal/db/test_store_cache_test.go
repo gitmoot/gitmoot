@@ -54,7 +54,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestBackfillGhostSessionJobsReusesReaperAndIsIdempotent":                true,
 		"TestCleanupObligationsMigrationFreshAndUpgrade":                         true,
 		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
-		"TestMigrationsUpgradeFromPreviousReleasedVersion":                       true,
+		"TestMigrationsUpgradeFromBeforeAutoFixRetirement":                       true,
 		"TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows":           true,
 		"TestPresetDeliveryRemovalMigrationOnFreshHome":                          true,
 		"TestPresetDeliveryRemovalMigrationOnPreChangeHome":                      true,
