@@ -34,7 +34,7 @@ func TestHerdrOrgProviderSnapshotMapping(t *testing.T) {
 {"pane_id":"w1:p13","label":"pending-unknown","agent_status":"unknown","input_pending":true}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{
+	provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{
 		{Name: "owner", Pane: "owner"}, {Name: "review", Pane: "review"}, {Name: "done", Pane: "done"},
 		{Name: "idle", Pane: "idle"}, {Name: "future", Pane: "future"}, {Name: "duplicate", Pane: "duplicate"},
 		{Name: "missing", Pane: "missing"}, {Name: "whitespace-label", Pane: "whitespace-label"},
@@ -189,7 +189,7 @@ func TestHerdrOrgProviderSnapshotPaneBindings(t *testing.T) {
 {"pane_id":"w1:p8","label":"Gitmoot Pending","agent_status":"working","input_pending":true}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{
+	provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{
 		{Name: "idle-role", Pane: "Gitmoot Idle"},
 		{Name: "working-role", Pane: "Gitmoot Working"},
 		{Name: "blocked-role", Pane: "Gitmoot Blocked"},
@@ -247,7 +247,7 @@ func TestHerdrOrgProviderSnapshotAbsentTurnIsOmitted(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"idle"}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
+	provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
@@ -274,7 +274,7 @@ func TestHerdrOrgProviderSnapshotPartialTurnIsAbsent(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":{"turn":1,"turn_epoch":2}}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
+	provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
 	if err != nil {
 		t.Fatalf("Snapshot() error = %v", err)
@@ -304,7 +304,7 @@ func TestHerdrOrgProviderSnapshotInvalidTurnValuesAreAbsent(t *testing.T) {
 {"pane_id":"w1:p1","label":"owner","agent_status":"working","last_completed_turn":` + test.turn + `}
 ]}}}`, nil
 			}
-			provider := newHerdrOrgProvider(run, []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
+			provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{{Name: "owner", Pane: "owner"}}, time.Now)
 			snapshot, err := provider.Snapshot(context.Background())
 			if err != nil {
 				t.Fatalf("Snapshot() error = %v", err)
@@ -324,7 +324,7 @@ func TestHerdrOrgProviderSnapshotOversizedUint64TurnEpochFailsClosedPerPane(t *t
 {"pane_id":"w1:p3","label":"absent","agent_status":"blocked"}
 ]}}}`, nil
 	}
-	provider := newHerdrOrgProvider(run, []config.OrgRole{
+	provider := newHerdrOrgProvider(snapshotWithRegisteredPanes(t, run), []config.OrgRole{
 		{Name: "oversized", Pane: "oversized"}, {Name: "valid", Pane: "valid"}, {Name: "absent", Pane: "absent"},
 	}, time.Now)
 	snapshot, err := provider.Snapshot(context.Background())
@@ -442,5 +442,59 @@ func TestHerdrOrgProviderRecycleFailureIsActionable(t *testing.T) {
 	err := provider.Recycle(context.Background(), org.RecycleRequest{Role: "owner", Pane: "w1:p2", Kind: "codex", AgentName: "owner", BootPrompt: "brief"})
 	if err == nil || !strings.Contains(err.Error(), "interactive shell prompt") || !strings.Contains(err.Error(), "pane is not at shell") {
 		t.Fatalf("Recycle() error = %v", err)
+	}
+}
+
+// Existing lifecycle fixtures describe registered panes; expose their registry
+// separately from the terminal snapshot used to report activity.
+func snapshotWithRegisteredPanes(t *testing.T, run runner) runner {
+	t.Helper()
+	return func(ctx context.Context, args ...string) (string, error) {
+		if strings.Join(args, " ") != "agent list" {
+			return run(ctx, args...)
+		}
+		out, err := run(ctx, "api", "snapshot")
+		if err != nil {
+			return "", err
+		}
+		var snapshot herdrOrgSnapshotResult
+		if err := json.Unmarshal([]byte(out), &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		agents := make([]map[string]string, 0, len(snapshot.Result.Snapshot.Panes))
+		for _, pane := range snapshot.Result.Snapshot.Panes {
+			agents = append(agents, map[string]string{"pane_id": pane.PaneID})
+		}
+		encoded, err := json.Marshal(map[string]any{"result": map[string]any{"agents": agents}})
+		return string(encoded), err
+	}
+}
+
+func TestHerdrPresenceRejectsUnregisteredShellBindings(t *testing.T) {
+	run := func(_ context.Context, args ...string) (string, error) {
+		switch strings.Join(args, " ") {
+		case "api snapshot":
+			return `{"result":{"snapshot":{"version":"0.9.3","panes":[{"pane_id":"w1:old","label":"seat"},{"pane_id":"w1:live","agent":"omp","agent_status":"done"}]}}}`, nil
+		case "agent list":
+			return `{"result":{"agents":[{"name":"seat","pane_id":"w1:live"}]}}`, nil
+		default:
+			t.Fatalf("unexpected command %v", args)
+			return "", nil
+		}
+	}
+	snapshot, err := newHerdrOrgProvider(run, []config.OrgRole{
+		{Name: "label", Pane: "seat"}, {Name: "id", Pane: "w1:old"},
+		{Name: "registered", Pane: "agent:seat"},
+	}, time.Now).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"label", "id"} {
+		if snapshot.PaneBindings[role].PaneID != "" || snapshot.States[role].State != org.StateUnknown {
+			t.Fatalf("shell accepted for %s: %+v", role, snapshot)
+		}
+	}
+	if snapshot.PaneBindings["registered"].PaneID != "w1:live" {
+		t.Fatalf("registered seat did not resolve: %+v", snapshot)
 	}
 }
