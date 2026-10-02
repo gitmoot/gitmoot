@@ -208,27 +208,30 @@ const workflowSummarySelectSQL = `WITH job_summary AS (
 	SELECT workflow_id FROM job_summary
 	UNION
 	SELECT workflow_id FROM note_summary
+	UNION
+	SELECT workflow_id FROM workflow_meta
 )
 SELECT labels.workflow_id,
 	COALESCE(j.job_count, 0), COALESCE(j.queued, 0), COALESCE(j.running, 0),
 	COALESCE(j.succeeded, 0), COALESCE(j.failed, 0), COALESCE(j.blocked, 0),
 	COALESCE(j.cancelled, 0), COALESCE(j.input_tokens, 0), COALESCE(j.output_tokens, 0),
 	COALESCE(n.note_count, 0),
-	CASE
+	COALESCE(CASE
 		WHEN j.first_at IS NULL THEN n.first_at
 		WHEN n.first_at IS NULL THEN j.first_at
 		WHEN j.first_at <= n.first_at THEN j.first_at ELSE n.first_at
-	END AS first_at,
-	CASE
+	END, m.updated_at) AS first_at,
+	COALESCE(CASE
 		WHEN j.last_at IS NULL THEN n.last_at
 		WHEN n.last_at IS NULL THEN j.last_at
 		WHEN j.last_at >= n.last_at THEN j.last_at ELSE n.last_at
-	END AS last_at,
+	END, m.updated_at) AS last_at,
 	COALESCE(n.last_note, ''), COALESCE(n.last_author, ''), COALESCE(n.last_human_author, ''),
 	COALESCE(j.last_failure_at, ''), COALESCE(n.last_at, ''), COALESCE(n.last_human_at, ''), COALESCE(n.last_merged_at, '')
 FROM labels
 LEFT JOIN job_summary j ON j.workflow_id = labels.workflow_id
-LEFT JOIN note_summary n ON n.workflow_id = labels.workflow_id`
+LEFT JOIN note_summary n ON n.workflow_id = labels.workflow_id
+LEFT JOIN workflow_meta m ON m.workflow_id = labels.workflow_id`
 
 const ListWorkflowSummariesSQL = workflowSummarySelectSQL + `
 ORDER BY last_at DESC, labels.workflow_id`
@@ -690,6 +693,30 @@ ON CONFLICT(workflow_id) DO UPDATE SET
 	summary = excluded.summary,
 	description = excluded.description,
 	updated_at = CURRENT_TIMESTAMP`, strings.TrimSpace(workflowID), description, description)
+	return err
+}
+
+// WorkflowExists accepts explicitly registered workflows as well as workflows
+// established by jobs or notes; a job is not an existence requirement.
+func (s *Store) WorkflowExists(ctx context.Context, workflowID string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `SELECT
+		EXISTS(SELECT 1 FROM workflow_meta WHERE workflow_id = ?) OR
+		EXISTS(SELECT 1 FROM jobs WHERE workflow_id = ?) OR
+		EXISTS(SELECT 1 FROM workflow_notes WHERE workflow_id = ?)`,
+		workflowID, workflowID, workflowID).Scan(&exists)
+	return exists, err
+}
+
+// RegisterWorkflow creates durable intent without fabricating a job. Repeating
+// registration never overwrites an existing description or lifecycle state.
+func (s *Store) RegisterWorkflow(ctx context.Context, workflowID, description string) error {
+	if strings.TrimSpace(workflowID) == "" || strings.TrimSpace(description) == "" || len(description) > WorkflowMetaTextMax {
+		return fmt.Errorf("workflow registration requires a label and description of at most %d bytes", WorkflowMetaTextMax)
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO workflow_meta(workflow_id, summary, description, updated_at)
+		VALUES (?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(workflow_id) DO NOTHING`,
+		workflowID, description, description)
 	return err
 }
 
@@ -1482,9 +1509,6 @@ func (s *Store) WorkflowSummary(ctx context.Context, workflowID string) (Workflo
 		&item.LastMergedReceiptAt)
 	if err != nil {
 		return WorkflowSummary{}, err
-	}
-	if item.JobCount == 0 && item.NoteCount == 0 {
-		return WorkflowSummary{}, sql.ErrNoRows
 	}
 	item.FirstAt, item.LastAt = firstAt.String, lastAt.String
 	return item, nil

@@ -38,6 +38,8 @@ func runWorkflowJournal(args []string, stdout, stderr io.Writer) int {
 		return runWorkflowNoteShow(args[1:], stdout, stderr)
 	case "describe":
 		return runWorkflowDescribe(args[1:], stdout, stderr)
+	case "register":
+		return runWorkflowRegister(args[1:], stdout, stderr)
 	case "note":
 		return runWorkflowNote(args[1:], stdout, stderr)
 	case "close":
@@ -57,6 +59,7 @@ func printWorkflowJournalUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot workflow show-note <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
 	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
+	fmt.Fprintln(w, "  gitmoot workflow register <label> \"<description>\" [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]")
 	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
 }
@@ -651,12 +654,12 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	var out workflowNoteOutput
 	err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		ctx := context.Background()
-		count, err := store.CountJobsByWorkflow(ctx, label)
+		exists, err := store.WorkflowExists(ctx, label)
 		if err != nil {
 			return err
 		}
-		if count == 0 {
-			return fmt.Errorf("workflow %q has no jobs; refusing note to guard against a typo", label)
+		if !exists {
+			return fmt.Errorf("workflow %q is not registered; use workflow register first", label)
 		}
 		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body, Repo: noteRepo}
 		meta := db.WorkflowMeta{
@@ -686,6 +689,6 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "noted workflow %s as entry %d\n", label, out.Note.ID)
+	fmt.Fprintf(stdout, "saved workflow %s as entry %d; journal only, no notification queued\n", label, out.Note.ID)
 	return 0
 }

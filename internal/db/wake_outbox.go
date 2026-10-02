@@ -91,6 +91,7 @@ const (
 	wakeOutboxStateAgedAttemptObligation
 	wakeOutboxStateTerminal
 	wakeOutboxStateDeliveryUnknown
+	wakeOutboxStateFailedObligation
 )
 
 type wakeOutboxStateDefinition struct {
@@ -102,8 +103,8 @@ var wakeOutboxStateDefinitions = [...]wakeOutboxStateDefinition{
 	{WakeOutboxStatePending, wakeOutboxStatePendingObligation},
 	{WakeOutboxStateAttempted, wakeOutboxStateAgedAttemptObligation},
 	{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
-	{WakeOutboxStateStalled, wakeOutboxStateTerminal},
-	{WakeOutboxStateFailed, wakeOutboxStateTerminal},
+	{WakeOutboxStateStalled, wakeOutboxStateFailedObligation},
+	{WakeOutboxStateFailed, wakeOutboxStateFailedObligation},
 	{WakeOutboxStateSuperseded, wakeOutboxStateTerminal},
 	{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
 }
@@ -153,10 +154,11 @@ type WakeOutboxObligation struct {
 type WakeOutboxObligationProjection struct {
 	Pending       []WakeOutboxObligation
 	AgedAttempted []WakeOutboxObligation
+	Blocked       []WakeOutboxObligation
 }
 
 func (p WakeOutboxObligationProjection) Len() int {
-	return len(p.Pending) + len(p.AgedAttempted)
+	return len(p.Pending) + len(p.AgedAttempted) + len(p.Blocked)
 }
 
 func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int64, targetRole, wakeKind string) error {
@@ -352,9 +354,8 @@ FROM wake_outbox`
 	return out, rows.Err()
 }
 
-// ListWakeOutboxObligations is the authoritative health projection for durable
-// wake delivery. Pending rows and attempted rows older than attemptedBefore are
-// the only non-terminal obligations; terminal outcomes never appear.
+// ListWakeOutboxObligations projects undelivered work. Failed and uncertain
+// attempts remain visible, but are never returned as automatically retryable.
 func (s *Store) ListWakeOutboxObligations(
 	ctx context.Context,
 	attemptedBefore time.Time,
@@ -407,6 +408,13 @@ func listWakeOutboxObligations(
 			out.Pending = append(out.Pending, obligation)
 		case wakeOutboxStateAgedAttemptObligation:
 			out.AgedAttempted = append(out.AgedAttempted, obligation)
+		case wakeOutboxStateFailedObligation, wakeOutboxStateDeliveryUnknown:
+			// Destination evidence outranks an old transport failure. A directive
+			// already received or closed is not lost mail and must not wake again.
+			if directivePhase == WakeOutboxDirectivePhaseCompletion || directivePhase == WakeOutboxDirectivePhaseTerminal {
+				continue
+			}
+			out.Blocked = append(out.Blocked, obligation)
 		default:
 			return WakeOutboxObligationProjection{}, fmt.Errorf(
 				"wake outbox obligation query returned non-obligation state %q", entry.State,
@@ -742,7 +750,7 @@ func (s *Store) FinishOrRetryWakeOutbox(
 	at time.Time,
 ) (retried bool, attempts int, err error) {
 	interpretation, ok := interpretWakeOutboxState(state)
-	if !ok || interpretation != wakeOutboxStateTerminal {
+	if !ok || (interpretation != wakeOutboxStateTerminal && interpretation != wakeOutboxStateFailedObligation) {
 		return false, 0, fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
 	if len(ids) == 0 {
@@ -860,7 +868,7 @@ const wakeOutboxCoalescedPrefix = "coalesced into wake outbox row "
 // delivered on anyone's behalf (#1982).
 func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
 	interpretation, ok := interpretWakeOutboxState(state)
-	if !ok || interpretation != wakeOutboxStateTerminal {
+	if !ok || interpretation == wakeOutboxStatePendingObligation || interpretation == wakeOutboxStateAgedAttemptObligation {
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
 	if state == WakeOutboxStateDelivered && len(ids) > 1 {
@@ -950,14 +958,14 @@ func wakeOutboxObligationPredicate(attemptedBefore time.Time) (string, []any) {
 			panic(fmt.Sprintf("wake outbox state %q has no interpretation", definition.state))
 		}
 		switch interpretation {
-		case wakeOutboxStatePendingObligation:
+		case wakeOutboxStatePendingObligation, wakeOutboxStateFailedObligation, wakeOutboxStateDeliveryUnknown:
 			clauses = append(clauses, "state = ?")
 			args = append(args, definition.state)
 		case wakeOutboxStateAgedAttemptObligation:
 			clauses = append(clauses, "(state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)")
 			args = append(args, definition.state)
 			args = append(args, attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
-		case wakeOutboxStateTerminal, wakeOutboxStateDeliveryUnknown:
+		case wakeOutboxStateTerminal:
 			continue
 		default:
 			panic(fmt.Sprintf("wake outbox state %q has invalid interpretation %d", definition.state, interpretation))

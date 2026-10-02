@@ -1771,8 +1771,14 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
 	switch {
 	case err != nil:
+		if health.blocked > 0 {
+			if !tracker.replyWakeOutboxHealthChanged(health) {
+				break
+			}
+		} else {
+			tracker.forgetReplyWakeOutboxHealth()
+		}
 		writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-		tracker.forgetReplyWakeOutboxHealth()
 	case health.inert > 0:
 		// Log on CHANGE only (#1758): inert obligations persist until an
 		// operator adds a matching rule, so the unchanged line is pure noise.

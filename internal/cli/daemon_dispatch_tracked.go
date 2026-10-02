@@ -475,9 +475,8 @@ func (t *inflightJobTracker) replyWakeOutboxHealthChanged(health replyWakeOutbox
 }
 
 // forgetReplyWakeOutboxHealth drops the remembered line so the next health line
-// logs even when it repeats the last one. Every tick that does NOT print a
-// health line calls it — a drain error, or a clean drain with nothing inert — so
-// leaving the inert state and returning to it is always visible in the journal.
+// logs even when it repeats the last one. Clean drains and unreadable-store
+// errors clear the memory; stable blocked or unrouted work logs on change.
 func (t *inflightJobTracker) forgetReplyWakeOutboxHealth() {
 	if t == nil {
 		return

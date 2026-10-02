@@ -2104,13 +2104,12 @@ The registry uses `[org] enforce = "warn"|"block"` and
 cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding (used by
 live presence and org event-rule wakes).
-For backward compatibility, a configured binding resolves as a literal pane id
-or a unique exact live label. A literal id tracks one pane; a label tracks
-whichever current pane uniquely carries that cosmetic value. `org seat add`
-canonicalizes new bindings to ids. Roles without a binding report unknown live
-presence, and event wakes for them are skipped with an observable log and
-increment the role's missed-wake counter rather than being inferred from a pane
-label. There is
+Use `org seat bind --name ROLE --agent NAME` for a registered local seat binding
+(`pane = "agent:NAME"`), which follows its current pane after recreation.
+The command validates a unique live local agent and leaves routes and old
+notices unchanged. Legacy literal pane IDs and exact labels remain supported,
+but a delivery target must contain a registered agent, not merely a live shell.
+Missing or ambiguous bindings fail closed. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
 `owner/repo`, and each child scope must be covered by its parent. Malformed
 org configuration fails closed and loudly. `brief` records passive last-seen
@@ -2235,9 +2234,11 @@ without requiring a `reply` rule.
 
 `gitmoot org message send --to <role> --workflow <label> [--org-role
 <from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
-sender-attributed heads-up between two distinct configured roles. The roles may
-message each other if and only if their non-empty `parent` values are equal.
-Repository scope does not grant this channel, and `owner` has no special case.
+sender-attributed heads-up between two distinct configured roles: parent,
+child, or same-parent siblings. Repository scope does not authorize messages
+between unrelated roles. Success reports `queued` with a message ID, not read
+or submitted. Register a new workflow without jobs using
+`workflow register LABEL DESCRIPTION`; a plain journal note never sends.
 The typed note
 `[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
 `reply:<role>` wake row commit atomically. The daemon delivers to the named role
@@ -2492,18 +2493,24 @@ case-insensitive and exact. Job IDs always use case-insensitive substring
 matching, including slash-bearing delegation IDs. Without a slash, repositories
 also use substring matching; omit either flag to match every event of that kind.
 Pass only one of `--match` and `--repo`. `--wake` must name a declared
-role whose config sets `pane = "<pane-id-or-label>"`. Gitmoot
-first resolves the value as an exact pane label and otherwise uses it as a
-literal pane id. The daemon calls `herdr agent prompt <pane> <text> --wait --timeout
-8000` and treats delivered (`result.type = "agent_prompted"`, or a post-delivery
-`error.code = "timeout"`) apart from stalled (`error.code =
-"agent_prompt_stalled"`). Stalls increment the role's consecutive missed-wake
-counter and delivery resets it; transport failures leave it unchanged. A stall
-and an `agent_blocked` pane are **transient**: the claimed rows return to
-`pending` with the cause recorded and are re-delivered as one coalesced wake,
-bounded at three attempts. Any other cause, and an exhausted budget, end the
-rows terminally and record a `wake_delivery_failed` job event on
-`wake-outbox:<id>` naming the role, cause and attempts.
+role with an explicit registered-agent, pane-ID or label binding. The daemon
+calls `herdr agent prompt <pane> <text> --wait --timeout 8000`.
+Only a structured `delivery = "submitted"` receipt or
+`agent_status_unobserved_after_submit` confirms submission. `written_to_pty`,
+generic timeouts, legacy stalls, lost receipts and visible drafts are
+`delivery_unknown`, never automatic retry candidates. Confirmed delivery resets
+missed-wake counters; uncertain input leaves them unchanged. A pre-write
+`agent_blocked` refusal can retry within the three-attempt budget.
+
+`org wake list --state STATE [--json]` and `org wake show ID` expose destination,
+age, attempts and the recorded outcome. Failed and uncertain mandatory notices
+remain visible in health. After checking relevance and ownership,
+`org wake retry ID --reason TEXT` requeues only proven-unsent failures and
+requires a live repaired recipient. Unknown delivery is refused.
+`org wake supersede ID --reason TEXT` records obsolete/already-handled work
+without claiming delivery. Recovery is audited and rejects stale row snapshots.
+Explicit awaited-fact subscriptions notify their requester without an optional
+`fact` rule; matching disabled addressed rules remain explicit mutes.
 An aged row whose delivery the store can PROVE is recorded `delivered` with a
 `wake_delivered` job event carrying `policy=resolved_by_destination_evidence`,
 rather than `delivery_unknown`. The proof is a note in the directive's own

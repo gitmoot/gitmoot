@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -267,6 +268,22 @@ func (e Engine) mailbox() Mailbox {
 					if owner != "" && !strings.EqualFold(owner, requesterRole) {
 						event.WakeTargetRoles = append(event.WakeTargetRoles, owner)
 					}
+					// An explicit waiter receives the durable fact notice. The
+					// legacy event is only for recipients without that obligation.
+					targets := event.WakeTargetRoles[:0]
+					for _, role := range event.WakeTargetRoles {
+						subscribed, err := e.Store.HasReviewSubscription(ctx, role, payload.Repo, payload.PullRequest,
+							payload.HeadSHA, db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview))
+						if err != nil {
+							slog.Warn("review notification subscription lookup failed", "job_id", jobID, "role", role, "error", err)
+						}
+						if !subscribed {
+							targets = append(targets, role)
+						} else if role == wakeTargetRole {
+							wakeTargetRole = ""
+						}
+					}
+					event.WakeTargetRoles = targets
 				}
 			}
 		}

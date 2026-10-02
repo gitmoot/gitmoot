@@ -245,8 +245,11 @@ work merges or completes — never-closed workflows accumulate and bury live
 work in the dashboard's active buckets and every workflow-picking surface. Linked PR lifecycle transitions also add deduped
 `daemon` journal notes and advance live status.
 In org mode, `gitmoot org message send --to <role> --workflow <label>
-"<message>"` gives distinct same-parent siblings a durable sender-attributed
-heads-up. It creates no acknowledgment, completion, TTL, or nag obligation.
+"<message>"` gives parents, children and same-parent siblings a durable
+sender-attributed heads-up. Success means queued, not read. It creates no
+acknowledgment, completion, TTL, or nag obligation. Register a jobless workflow
+first with `gitmoot workflow register <label> "<description>"`. Plain journal
+notes do not send notifications, even if their body contains `to=...`.
 In org mode, obligations and questions have a full lifecycle and closing it is
 part of the work: `gitmoot org directive send --to <role> --workflow <label>`
 mints a tracked, TTL-nudged obligation; RECEIPT is recorded by the transport

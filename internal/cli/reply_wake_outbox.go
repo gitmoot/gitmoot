@@ -58,16 +58,20 @@ type replyWakeOutboxHealth struct {
 	// deleted after the pending row existed.
 	routeRemoved  int
 	agedAttempted int
+	blocked       int
+	suppressed    int
 }
 
 func (h replyWakeOutboxHealth) String() string {
 	return fmt.Sprintf(
-		"pending=%d held=%d inert=%d route_removed=%d aged_attempted=%d",
+		"pending=%d held=%d inert=%d route_removed=%d aged_attempted=%d blocked=%d suppressed=%d",
 		h.pending,
 		h.held,
 		h.inert,
 		h.routeRemoved,
 		h.agedAttempted,
+		h.blocked,
+		h.suppressed,
 	)
 }
 
@@ -289,9 +293,9 @@ func classifyWakeOutboxObligations(
 	hold time.Duration,
 	resolve replyWakeDeliveryResolver,
 ) (replyWakeOutboxHealth, error) {
-	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted)}
+	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted), blocked: len(obligations.Blocked)}
 	if len(obligations.Pending) == 0 {
-		if health.agedAttempted == 0 {
+		if health.agedAttempted == 0 && health.blocked == 0 {
 			return health, nil
 		}
 		return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
@@ -333,6 +337,10 @@ func classifyWakeOutboxObligations(
 			health.pending++
 			continue
 		}
+		if wakeExplicitlyMuted(delivery.rules, event) {
+			health.suppressed++
+			continue
+		}
 		createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
 		if err != nil {
 			return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
@@ -366,7 +374,7 @@ func classifyWakeOutboxObligations(
 		}
 		recordUnroutableWake(ctx, store, obligation.id, obligation.sourceKind, obligation.sourceID, obligation.event, condition)
 	}
-	if health.pending == 0 && health.routeRemoved == 0 && health.agedAttempted == 0 {
+	if health.pending == 0 && health.routeRemoved == 0 && health.agedAttempted == 0 && health.blocked == 0 {
 		return health, nil
 	}
 	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
@@ -661,23 +669,38 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 	return event, nil
 }
 
-// A workflow note already names its recipient; optional event subscriptions
-// must not turn direct messages, escalation replies, or directives into inert
-// obligations. Other wake kinds still require a configured rule.
-func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule {
+func wakeExplicitlyMuted(rules []db.EventRule, event events.Event) bool {
 	for _, rule := range rules {
-		if rule.Enabled &&
+		if !rule.Enabled && rule.Scope != db.EventRuleScopeObserver &&
 			strings.EqualFold(strings.TrimSpace(rule.OnKind), strings.TrimSpace(event.WakeKind)) &&
+			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) &&
+			eventRuleMatches(rule.MatchFilter, event) {
+			return true
+		}
+	}
+	return false
+}
+
+// An addressed subscription is itself the request for notification. Optional
+// observer rules must not strand the requester's completion notice.
+func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule {
+	if wakeExplicitlyMuted(rules, event) {
+		return nil
+	}
+	for _, rule := range rules {
+		if rule.Enabled && strings.EqualFold(strings.TrimSpace(rule.OnKind), strings.TrimSpace(event.WakeKind)) &&
 			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) &&
 			eventRuleMatches(rule.MatchFilter, event) {
 			return []db.EventRule{rule}
 		}
 	}
-	if event.WakeTargetRole != "" &&
-		(event.WakeKind == db.WakeOutboxKindReply || event.WakeKind == db.WakeOutboxKindDirective) &&
-		strings.HasPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":") {
+	addressedNote := (event.WakeKind == db.WakeOutboxKindReply || event.WakeKind == db.WakeOutboxKindDirective) &&
+		strings.HasPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
+	addressedFact := event.WakeKind == db.WakeOutboxKindFact &&
+		strings.HasPrefix(event.RootID, "awaited-fact:")
+	if event.WakeTargetRole != "" && (addressedNote || addressedFact) {
 		return []db.EventRule{{
-			ID: "addressed-workflow-note", OnKind: event.WakeKind,
+			ID: "addressed-obligation", OnKind: event.WakeKind,
 			WakeRole: event.WakeTargetRole, Scope: db.EventRuleScopeAddressed,
 			Enabled: true,
 		}}

@@ -34,6 +34,13 @@ gitmoot workflow note release-42 "Canary passed." --author operator
 gitmoot workflow show release-42
 gitmoot workflow close release-42 --reason "Release 42 shipped and verified."
 ```
+Before any job exists, explicitly register durable intent with
+`gitmoot workflow register <label> "<description>"`. Repeating registration
+does not overwrite existing intent. The registered workflow appears in workflow
+reads and accepts notes, messages and escalations without a dummy job.
+`workflow note` reports a journal save, not message delivery; use
+`org message send` when a recipient needs a notification.
+
 
 `description` is the stable human "what/why" line. Gitmoot seeds it on the first
 note from a referenced issue title available in local workflow jobs, otherwise
