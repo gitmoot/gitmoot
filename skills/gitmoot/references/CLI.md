@@ -2232,25 +2232,42 @@ code-level marker to migrate. The note and a `pending` wake outbox row commit
 atomically. The daemon wakes the addressed role through its configured Herdr pane
 without requiring a `reply` rule.
 
-`gitmoot org message send --to <role> --workflow <label> [--org-role
-<from-role>] [--repo <owner/repo>] [--json] "<message>"` records a durable
-sender-attributed heads-up between two distinct configured roles: parent,
-child, or same-parent siblings. Repository scope does not authorize messages
-between unrelated roles. Success reports `queued` with a message ID, not read
-or submitted. Register a new workflow without jobs using
-`workflow register LABEL DESCRIPTION`; a plain journal note never sends.
-The typed note
-`[org:message to=<to> from=<from> wf=<workflow>] <message>` and its addressed
-`reply:<role>` wake row commit atomically. The daemon delivers to the named role
-without a subscription rule. The wake includes the exact
-`gitmoot workflow show-note <id>` retrieval command; that command renders the
-citable row's workflow, author, optional repository, timestamp, and body. `--json`
-returns the row as JSON. **Plain output prints the whole body**: a single-note
-view is the one place a body must not be cut, and the 512-rune line cap applies
-to timeline and list lines instead. Control characters and ANSI escapes are
-still scrubbed from plain output; JSON preserves the stored body byte for byte.
-Messages create no directive, acknowledgment, completion, TTL, or nag
-obligation.
+Ordinary conversation uses one top-level interface:
+
+```sh
+gitmoot message send deimos "The review is ready."
+gitmoot message inbox --limit 20
+gitmoot message show 123
+gitmoot message reply 123 "Checking it now."
+gitmoot message send deimos "Related context" --workflow release-42
+```
+
+Flags follow positional arguments. All commands accept `--json`, `--home DIR`,
+and `--role ROLE`. Sender selection uses the explicit operator role, then
+`GITMOOT_ORG_ROLE`, then an unambiguous registered current `HERDR_PANE_ID`.
+Role selection is attribution on the shared local host, not authentication.
+Any configured fleet role may message any other configured role. That does
+not grant directive authority, repository scope, or permission to do the work.
+
+No workflow, job, subscription, acknowledgment, or completion obligation is
+required. Optional `--workflow` validates an existing registered workflow
+without creating jobs or reopening it. A message, journal representation,
+and addressed notification obligation commit together. Replies derive their
+recipient and thread from the referenced message; an unrelated role cannot
+read or reply through this interface. `inbox` lists received messages newest
+first; `--before ID` provides a stable older-page cursor, with `--limit 1..100`.
+`show` renders one full message and its thread/reply IDs, not a truncated preview.
+
+JSON exposes `notification_status`: `queued`, `submitting`, `submitted`,
+`uncertain`, `failed`, `stalled`, or `resolved`. None implies read, accepted,
+or completed. Mail remains readable without Herdr; notification uncertainty
+does not remove it or trigger a blind resend. Plain terminal output scrubs
+escape/control sequences; JSON preserves the stored body.
+
+This replaces `org message send`, with no command alias. Existing journal
+notes remain citable, and historical message notes are not replayed by the
+migration. Escalation/directive commands retain their current lifecycle until
+their separate inbox cutovers (#2292, #2293); review integration is #2294.
 
 `gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
 <answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same

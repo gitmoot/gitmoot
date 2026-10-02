@@ -203,6 +203,7 @@ const workflowSummarySelectSQL = `WITH job_summary AS (
 		MAX(CASE WHEN n.author != 'daemon' AND substr(n.body, 1, length('[org:escalate ')) != '[org:escalate ' THEN n.created_at END) AS last_human_at,
 		MAX(CASE WHEN n.author = 'daemon' AND substr(n.body, 1, instr(n.body, ']')) LIKE '[auto:pr:%:merged]' THEN n.created_at END) AS last_merged_at
 	FROM workflow_notes n INDEXED BY idx_workflow_notes_wid
+	WHERE n.workflow_id != ''
 	GROUP BY n.workflow_id
 ), labels AS (
 	SELECT workflow_id FROM job_summary

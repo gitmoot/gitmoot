@@ -118,8 +118,6 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgEscalate(args[1:], stdout, stderr)
 	case "directive":
 		return runOrgDirective(args[1:], stdout, stderr)
-	case "message":
-		return runOrgMessage(args[1:], stdout, stderr)
 	case "wake":
 		return runOrgWake(args[1:], stdout, stderr)
 	case "await":
@@ -150,7 +148,6 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
-	fmt.Fprintln(w, "  gitmoot org message send --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"MESSAGE\"")
 	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")

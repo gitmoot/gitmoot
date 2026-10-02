@@ -39,7 +39,8 @@ Before any job exists, explicitly register durable intent with
 does not overwrite existing intent. The registered workflow appears in workflow
 reads and accepts notes, messages and escalations without a dummy job.
 `workflow note` reports a journal save, not message delivery; use
-`org message send` when a recipient needs a notification.
+`message send ROLE "TEXT"` when a recipient needs a notification. Ordinary
+messages do not need a workflow; `--workflow LABEL` optionally associates one.
 
 
 `description` is the stable human "what/why" line. Gitmoot seeds it on the first

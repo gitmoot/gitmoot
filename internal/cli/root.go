@@ -31,6 +31,7 @@ var rootCommands = []command{
 	{name: "version", summary: "show Gitmoot version and build metadata", run: runVersion},
 	{name: "config", summary: "show local Gitmoot config paths", run: runConfig},
 	{name: "org", summary: "org registry, attribution, and brief/chart/status (RFC #1042)", run: runOrg},
+	{name: "message", summary: "send, read and reply to durable fleet messages", run: runMessage},
 	{name: "auth", summary: "manage runtime authentication", run: runAuth},
 	{name: "key", summary: "manage keycard registry metadata and grants", run: runKey},
 	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},

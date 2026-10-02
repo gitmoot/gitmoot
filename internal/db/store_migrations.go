@@ -2881,4 +2881,19 @@ DROP INDEX IF EXISTS idx_jobs_memory_harvest_terminal;
 	`
 DROP TABLE IF EXISTS pull_request_auto_fix_policies;
 	`,
+	// #2290: structured ordinary messages share the existing journal/outbox
+	// transaction. History is not backfilled or re-notified by this migration.
+	`
+CREATE TABLE messages (
+	id INTEGER PRIMARY KEY REFERENCES workflow_notes(id),
+	thread_id INTEGER NOT NULL REFERENCES messages(id),
+	reply_to INTEGER REFERENCES messages(id),
+	sender TEXT NOT NULL,
+	recipient TEXT NOT NULL,
+	body TEXT NOT NULL,
+	CHECK(sender != recipient)
+);
+CREATE INDEX idx_messages_recipient_id ON messages(recipient, id DESC);
+CREATE INDEX idx_messages_thread_id ON messages(thread_id, id);
+	`,
 }
