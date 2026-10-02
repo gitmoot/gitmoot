@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +13,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func TestReviewRequesterFactDoesNotRequireOptionalRoute(t *testing.T) {
@@ -85,14 +85,14 @@ func TestExplicitFactMuteDoesNotDeliverOrReportLostMail(t *testing.T) {
 }
 
 func TestRegisteredJoblessWorkflowMessagesAcrossAuthorizedRelationships(t *testing.T) {
-	for _, roles := range [][2]string{{"jarvis", "owner"}, {"owner", "jarvis"}, {"gm-omp-nag", "gm-omp-impl"}} {
+	for _, roles := range [][2]string{{"jarvis", "owner"}, {"owner", "jarvis"}, {"gm-omp-nag", "deimos"}} {
 		t.Run(roles[0]+"-"+roles[1], func(t *testing.T) {
-			home := orgMessageTestHome(t)
+			home := messageTestHome(t)
 			var out, diag bytes.Buffer
 			if code := runWorkflowJournal([]string{"register", "delivery/fresh", "coordinate delivery repair", "--home", home}, &out, &diag); code != 0 {
 				t.Fatalf("register code=%d: %s", code, diag.String())
 			}
-			if code := runOrg([]string{"message", "send", "--home", home, "--org-role", roles[0], "--to", roles[1], "--workflow", "delivery/fresh", "please inspect the review"}, &out, &diag); code != 0 {
+			if code := Run([]string{"message", "send", roles[1], "please inspect the review", "--home", home, "--role", roles[0], "--workflow", "delivery/fresh"}, &out, &diag); code != 0 {
 				t.Fatalf("send code=%d: %s", code, diag.String())
 			}
 			store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -108,9 +108,10 @@ func TestRegisteredJoblessWorkflowMessagesAcrossAuthorizedRelationships(t *testi
 			if err != nil || len(notes) != 1 {
 				t.Fatalf("notes=%v err=%v", notes, err)
 			}
-			from, to, label, body, ok := workflow.ParseOrgMessageNote(notes[0].Body)
-			if !ok || from != roles[0] || to != roles[1] || label != "delivery/fresh" || body != "please inspect the review" {
-				t.Fatalf("wrong addressed content: %+v", notes[0])
+			var message messageTestResult
+			err = json.Unmarshal(messageCLI(t, home, roles[1], "show", fmt.Sprint(notes[0].ID)), &message)
+			if err != nil || message.Sender != roles[0] || message.Recipient != roles[1] || message.WorkflowID != "delivery/fresh" || message.Body != "please inspect the review" {
+				t.Fatalf("wrong addressed content: %+v err=%v", message, err)
 			}
 			rows, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 			if err != nil || len(rows) != 1 || rows[0].TargetRole != roles[1] || rows[0].SourceID != fmt.Sprint(notes[0].ID) {
