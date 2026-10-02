@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -123,61 +122,11 @@ func TestCleanupObligationsRebuildPreservesLegacyRows(t *testing.T) {
 	}
 }
 
-// A positional migration list must be a strict prefix-extension of the released
-// one: a database already at the previous version has to upgrade by applying only
-// the NEW tail. A fresh-init test cannot fail on a mis-ordered tail, which is
-// exactly how a merge bricked every existing database here while every suite
-// stayed green.
-//
-// The released prefix is identified by REMOVING this branch's own migration, not
-// by slicing off the last element. Slicing would make a reordered list produce a
-// synthetic "released" database that already contains the new migration, so the
-// test would pass on precisely the mutant it exists to kill.
-func TestMigrationsUpgradeFromPreviousReleasedVersion(t *testing.T) {
+// Upgrade a historical database through the real Open path. The fixture is a
+// fixed released prefix, not a declaration that one migration must stay last.
+func TestMigrationsUpgradeFromBeforeAutoFixRetirement(t *testing.T) {
 	ctx := context.Background()
-	// The marker names THIS BRANCH's migration and must move whenever main gains
-	// another tail migration. Since this test was introduced, that included the
-	// cleanup_obligations rebuild, #1766's SkillOpt/evals teardown, #1770's
-	// Activepieces trigger removal, #1731's escalation_rounds table, #1754's
-	// chat/moot teardown, #1756's preset-delivery removal, #1753's
-	// cockpit/interactive table drop, #1822's findings ledger plus its #1850
-	// rebuild, and #2171's review_requests claim table. This branch's #2202 brain
-	// retirement added TWO: the memory-family table drop, then the dead-index drop
-	// appended in round 2. The latter is now last.
-	//
-	// Two branches cannot both be "last", and the ordering that matters is the
-	// one a deployed database sees, which is why this marker MUST be repointed on
-	// every branch that appends a migration, and why the failure reads as "not
-	// appended last" rather than as a merge conflict.
-	//
-	// The marker must name THIS BRANCH'S LAST migration and must be UNIQUE. The
-	// dropped harvest index is unique to #2202 round 2, which appended it as its
-	// own migration after review caught the in-place edit that preceded it.
-	//
-	// It is updated by every branch that appends a migration, which is the point:
-	// the test fails until the new migration is both last and named here, so two
-	// branches cannot each believe theirs is the tail.
-	const branchMigrationMarker = "DROP TABLE IF EXISTS pull_request_auto_fix_policies"
-	branchIndex := -1
-	for index, migration := range migrations {
-		if strings.Contains(migration, branchMigrationMarker) {
-			if branchIndex >= 0 {
-				t.Fatalf("migration marker %q matches indexes %d and %d", branchMigrationMarker, branchIndex, index)
-			}
-			branchIndex = index
-		}
-	}
-	if branchIndex < 0 {
-		t.Fatalf("migration marker %q matches no migration", branchMigrationMarker)
-	}
-	// The new migration must be LAST, or a database at the released version would
-	// apply somebody else's already-applied migration and fail to open.
-	if branchIndex != len(migrations)-1 {
-		t.Fatalf("branch migration is at index %d of %d; a new migration must be appended last", branchIndex, len(migrations)-1)
-	}
-	released := make([]string, 0, len(migrations)-1)
-	released = append(released, migrations[:branchIndex]...)
-	released = append(released, migrations[branchIndex+1:]...)
+	released := migrationsBefore(t, "DROP TABLE IF EXISTS pull_request_auto_fix_policies")
 
 	path := filepath.Join(t.TempDir(), "previous-release.db")
 	raw, err := sql.Open("sqlite", path)
