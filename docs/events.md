@@ -212,9 +212,10 @@ observation, or once the subject stops matching for a short grace
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
-`reply`, `blocked`, and `escalation` consume durable wake-outbox obligations.
-Reply obligations come from addressed workflow notes and only wake the role
-named by both the note and the rule. Blocked and escalation obligations
+`reply`, `fact`, `directive`, `blocked`, and `escalation` consume durable
+wake-outbox obligations. Addressed notes and awaited facts carry their own
+recipient and do not need optional subscription rules. A disabled matching
+addressed rule explicitly mutes delivery. Blocked and escalation obligations
 retain the redacted source event. Reply rows commit in the source note
 transaction. Resolving a typed org escalation addresses the resolution marker
 to its parsed asker, so the same transaction records a pending reply
@@ -282,21 +283,33 @@ row itself is NOT failed and NOT retried: a wake nobody can receive is not a
 wake that is wrong, and a rule added later still delivers it. The distinction
 rests on the deletion tombstones, so a role retired before that table existed
 reads as never-configured.
-`delivery_unknown` remains terminal and is still never retried: a row aged out
-of `attempted` may in fact have been delivered before its outcome write was
-lost, so re-emitting it would risk a duplicate interrupt to prove a negative.
-The wake role's config sets `pane = "<pane-id-or-label>"`: a `wX:pY` value must
-name a currently live pane, while any other value is a unique pane label
-resolved to the current id at wake time (so a recycled pane is still reached).
-The same explicit binding drives live org presence; an unresolved binding
-reports unknown presence, skips the wake with an observable log, and increments
-the role's missed-wake counter. `gitmoot org validate` reports unresolved roles,
-roles without enabled wake routes, and unclaimed labeled panes. Wake delivery runs
-`herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
-`result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
-as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
-bindings, unavailable Herdr, stalls, and transport errors never block or fail
-the emitting job; durable outcomes remain recorded on their outbox rows.
+Failed, stalled and `delivery_unknown` rows remain visible as blocked obligations
+in delivery health; they are not automatically resent. Unknown includes a lost
+receipt after a daemon crash, `written_to_pty`, generic timeouts, legacy stalls,
+and unsubmitted drafts. None proves it is safe to send the text again.
+
+Use `gitmoot org seat bind --name ROLE --agent NAME` to explicitly bind an
+existing role to an exact registered local Herdr agent. It stores
+`pane = "agent:NAME"`, follows that registered seat across pane replacement, and
+does not change subscriptions or replay old notices. Missing, archived, remote
+or ambiguous names fail closed. Literal pane IDs and exact labels still work,
+but only when the resolved pane contains a registered agent; an abandoned
+shell is not a delivery target. The agent binding also drives org presence.
+
+Delivery calls `herdr agent prompt <pane> <prompt> --wait --timeout 8000`.
+Only `delivery = "submitted"` or `agent_status_unobserved_after_submit` confirms
+submission. This does not mean the recipient read or completed the work.
+Uncertain input does not increment missed-wake counters.
+
+Inspect notices with `org wake list --state STATE` and `org wake show ID`.
+After checking the current review head and recipient ownership, use
+`org wake retry ID --reason TEXT` for a proven pre-write failure with a repaired
+live recipient. Unknown delivery is refused. Use
+`org wake supersede ID --reason TEXT` for obsolete or already-handled work;
+this is an operator disposition, not a delivery claim. Both operations record
+an audit and reject concurrent changes to the inspected row. Never bulk replay
+the backlog: adding a route or enabling addressed delivery can immediately
+release previously pending notices.
 
 Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
 for the wake role; a delivered prompt resets that role's counter. Transport

@@ -120,6 +120,8 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgDirective(args[1:], stdout, stderr)
 	case "message":
 		return runOrgMessage(args[1:], stdout, stderr)
+	case "wake":
+		return runOrgWake(args[1:], stdout, stderr)
 	case "await":
 		return runOrgAwait(args[1:], stdout, stderr)
 	case "events":
@@ -145,6 +147,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org status [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
 	fmt.Fprintln(w, "  gitmoot org message send --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"MESSAGE\"")
@@ -154,6 +157,9 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org wake list [--state STATE] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org wake show ID [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org wake retry|supersede ID --reason TEXT [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule add --on KIND [--match FILTER | --repo SUBSTRING] --wake ROLE [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule list [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org events rule set-scope [--home DIR] ID observer|addressed")
@@ -173,6 +179,8 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "add":
 		return runOrgSeatAdd(args[1:], stdout, stderr)
+	case "bind":
+		return runOrgSeatBind(args[1:], stdout, stderr)
 	case "rm":
 		return runOrgSeatRemove(args[1:], stdout, stderr)
 	default:
@@ -185,6 +193,7 @@ func runOrgSeat(args []string, stdout, stderr io.Writer) int {
 func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 }
 
@@ -1517,6 +1526,14 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	snapshotCtx, cancelSnapshot := context.WithTimeout(ctx, orgRecycleSnapshotTimeout)
 	snapshot, snapshotErr := provider.Snapshot(snapshotCtx)
 	cancelSnapshot()
+	if strings.HasPrefix(pane, "agent:") {
+		binding, found := snapshot.PaneBindings[role.Name]
+		if snapshotErr != nil || !found || binding.PaneID == "" {
+			fmt.Fprintln(stderr, "org recycle: registered seat does not resolve; refusing handoff")
+			return 1
+		}
+		pane = binding.PaneID
+	}
 	brief := buildOrgBriefOutput(cfg, presence, role, snapshot, snapshotErr)
 	var boot strings.Builder
 	printOrgBrief(&boot, brief)
@@ -1928,12 +1945,12 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := withStore(*home, func(store *db.Store) error {
-		count, err := store.CountJobsByWorkflow(context.Background(), label)
+		exists, err := store.WorkflowExists(context.Background(), label)
 		if err != nil {
 			return err
 		}
-		if count == 0 {
-			return fmt.Errorf("workflow %q has no jobs; refusing note to guard against a typo", label)
+		if !exists {
+			return fmt.Errorf("workflow %q is not registered; use workflow register first", label)
 		}
 		_, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 			WorkflowID: label, Author: from, Body: body, Repo: strings.TrimSpace(*repo),

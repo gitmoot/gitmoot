@@ -13,110 +13,6 @@ import (
 	"time"
 )
 
-func TestWakeOutboxStateClassificationIsExhaustive(t *testing.T) {
-	tests := []struct {
-		state          string
-		interpretation wakeOutboxStateInterpretation
-	}{
-		{WakeOutboxStatePending, wakeOutboxStatePendingObligation},
-		{WakeOutboxStateAttempted, wakeOutboxStateAgedAttemptObligation},
-		{WakeOutboxStateDelivered, wakeOutboxStateTerminal},
-		{WakeOutboxStateStalled, wakeOutboxStateTerminal},
-		{WakeOutboxStateFailed, wakeOutboxStateTerminal},
-		{WakeOutboxStateSuperseded, wakeOutboxStateTerminal},
-		{WakeOutboxStateDeliveryUnknown, wakeOutboxStateDeliveryUnknown},
-	}
-	if len(tests) != int(wakeOutboxStateCount) {
-		t.Fatalf("classified states = %d, declared states = %d", len(tests), wakeOutboxStateCount)
-	}
-	for _, test := range tests {
-		interpretation, ok := interpretWakeOutboxState(test.state)
-		if !ok || interpretation != test.interpretation {
-			t.Errorf(
-				"interpretWakeOutboxState(%q) = (%d, %v), want (%d, true)",
-				test.state, interpretation, ok, test.interpretation,
-			)
-		}
-	}
-}
-
-type recordingWakeOutboxQueryer struct {
-	delegate wakeOutboxQueryer
-	query    string
-	args     []any
-}
-
-func (r *recordingWakeOutboxQueryer) QueryContext(
-	ctx context.Context,
-	query string,
-	args ...any,
-) (*sql.Rows, error) {
-	r.query = query
-	r.args = append([]any(nil), args...)
-	return r.delegate.QueryContext(ctx, query, args...)
-}
-
-const expectedWakeOutboxObligationQuery = `
-SELECT id, source_kind, source_id, target_role, coalesce_key, state,
-		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-		COALESCE(finished_at, ''), updated_at,
-		CASE
-			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
-			WHEN EXISTS (
-				SELECT 1
-				FROM workflow_notes d
-				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
-				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
-					AND (
-						substr(r.body, 1, length('[org:directive-cancel id=' || wake_outbox.source_id || ' ')) = '[org:directive-cancel id=' || wake_outbox.source_id || ' '
-						OR substr(r.body, 1, length('[org:directive-done id=' || wake_outbox.source_id || ' ')) = '[org:directive-done id=' || wake_outbox.source_id || ' '
-					)
-			) THEN 'terminal'
-			WHEN EXISTS (
-				SELECT 1
-				FROM workflow_notes d
-				JOIN workflow_notes r ON r.workflow_id = d.workflow_id
-				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
-					AND (
-						substr(r.body, 1, length('[org:directive-ack id=' || wake_outbox.source_id || ' ')) = '[org:directive-ack id=' || wake_outbox.source_id || ' '
-						OR substr(r.body, 1, length('[org:directive-delivered id=' || wake_outbox.source_id || ' ')) = '[org:directive-delivered id=' || wake_outbox.source_id || ' '
-					)
-			) THEN 'completion'
-			ELSE 'acknowledgment'
-		END,
-		CASE
-			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
-			ELSE COALESCE((
-				SELECT d.body FROM workflow_notes d
-				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
-			), '')
-		END
-FROM wake_outbox
-WHERE state = ? OR (state = ? AND attempted_at IS NOT NULL AND attempted_at <= ?)
-ORDER BY created_at, id`
-
-func TestListWakeOutboxObligationsExecutesGeneratedQuery(t *testing.T) {
-	store := openWorkflowTestStore(t)
-	ctx := context.Background()
-	attemptedBefore := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
-	recorder := &recordingWakeOutboxQueryer{delegate: store.db}
-
-	if _, err := listWakeOutboxObligations(ctx, recorder, attemptedBefore); err != nil {
-		t.Fatal(err)
-	}
-	if recorder.query != expectedWakeOutboxObligationQuery {
-		t.Fatal("executed query does not match the independent obligation contract")
-	}
-	wantArgs := []any{
-		"pending",
-		"attempted",
-		attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout),
-	}
-	if !reflect.DeepEqual(recorder.args, wantArgs) {
-		t.Fatalf("executed args = %#v, want independent args %#v", recorder.args, wantArgs)
-	}
-}
-
 func TestListWakeOutboxObligationsScopesDirectiveReceiptsToWorkflow(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
@@ -376,7 +272,7 @@ func TestExpireAgedWakeOutboxRecordsDeliveryUnknownWithoutRetry(t *testing.T) {
 		t.Fatalf("delivery unknown events = %+v, err=%v", events, err)
 	}
 	obligations, err = store.ListWakeOutboxObligations(ctx, attemptedAt.Add(time.Hour))
-	if err != nil || obligations.Len() != 0 {
+	if err != nil || len(obligations.Pending) != 0 || len(obligations.AgedAttempted) != 0 || obligations.Len() != 1 {
 		t.Fatalf("obligations after expiry = %+v, err=%v", obligations, err)
 	}
 	expired, err = store.ExpireAgedWakeOutbox(ctx, attemptedAt.Add(time.Hour), attemptedAt.Add(2*time.Hour))

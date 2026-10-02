@@ -595,8 +595,14 @@ func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, stor
 		health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
 		switch {
 		case err != nil:
+			if health.blocked > 0 {
+				if !tracker.replyWakeOutboxHealthChanged(health) {
+					break
+				}
+			} else {
+				tracker.forgetReplyWakeOutboxHealth()
+			}
 			writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-			tracker.forgetReplyWakeOutboxHealth()
 		case health.inert > 0:
 			// Log on CHANGE only (#1758); see the fleet loop for the rationale.
 			if tracker.replyWakeOutboxHealthChanged(health) {

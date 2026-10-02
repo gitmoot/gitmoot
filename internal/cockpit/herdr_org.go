@@ -104,6 +104,16 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		}
 	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
+	var agents []registeredAgent
+	for _, role := range p.roles {
+		if strings.HasPrefix(strings.TrimSpace(role.Pane), "agent:") {
+			agents, err = (herdrClient{run: p.run}).registeredAgents(ctx)
+			if err != nil {
+				return org.Snapshot{}, fmt.Errorf("resolve registered org seats: %w", err)
+			}
+			break
+		}
+	}
 	bindings := make(map[string]org.PaneBinding, len(p.roles))
 	sessions := make(map[string]org.SessionActivity, len(p.roles))
 	for _, role := range p.roles {
@@ -117,6 +127,9 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 		paneID, _ := config.ResolveRolePaneBinding(ctx, binding, func(_ context.Context, label string) (string, bool) {
 			if _, present := paneByID[label]; present {
 				return label, true
+			}
+			if strings.HasPrefix(label, "agent:") {
+				return registeredRecipient(agents, label)
 			}
 			ids := labelToPaneIDs[label]
 			if len(ids) == 1 {

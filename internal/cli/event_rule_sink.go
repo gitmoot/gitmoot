@@ -367,7 +367,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 		// needs delivery confirmation, so agentPrompt's bounded --timeout returns as
 		// soon as the prompt is confirmed landed and never blocks on the agent settling.
 		callCtx, cancel := context.WithTimeout(ctx, eventRuleWakeTimeout)
-		delivered, stalled, err := s.wake.AgentPrompt(callCtx, pane, prompt, "")
+		delivered, uncertain, err := s.wake.AgentPrompt(callCtx, pane, prompt, "")
 		cancel()
 		switch {
 		case delivered:
@@ -384,20 +384,13 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateDelivered, ""); err != nil {
 				return err
 			}
-		case stalled:
-			counterCtx, ccancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
-			if incrementErr := s.store.IncrementRoleMissedWake(counterCtx, rule.WakeRole, time.Now().UTC()); incrementErr != nil {
-				slog.Warn("org event wake counter increment failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", incrementErr)
+		case uncertain:
+			detail := "agent prompt submission is unconfirmed; inspect recipient before any retry"
+			if err != nil {
+				detail = err.Error()
 			}
-			ccancel()
-			// #1982: a stall is herdr reporting that the pane did not take the
-			// prompt, which is transient by construction, so it earns another
-			// attempt against the same coalesced rows rather than dropping the
-			// obligation. Every one of the 674 undelivered rows measured on the
-			// live store had attempt_count = 1.
-			if err := s.retryOrFailWakeOutbox(
-				ctx, event, rule.WakeRole, db.WakeOutboxStateStalled, "agent_prompt_stalled", wakeDeliveryMaxAttempts,
-			); err != nil {
+			slog.Warn("org event wake delivery unknown", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "detail", detail)
+			if err := s.finishWakeOutbox(ctx, event, db.WakeOutboxStateDeliveryUnknown, detail); err != nil {
 				return err
 			}
 		case err != nil:
@@ -408,6 +401,13 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// clears when the dialog is answered, and 60 of the 108 failed rows
 			// on the live store carry `agent_blocked`.
 			if wakeFailureIsTransient(err) {
+				if isAddressedNoteWake {
+					replyHandled = true
+				}
+				if deduplicateAddressedWake && !observer {
+					addressedWakeHandled[wakeRole] = true
+				}
+				s.progress.Add(1)
 				if retryErr := s.retryOrFailWakeOutbox(
 					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
 				); retryErr != nil {
@@ -420,7 +420,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// An odd non-delivery is not proof that the role ignored a delivered
 			// prompt, so leave the counter unchanged just as for infrastructure errors.
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
-			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, "agent prompt was not delivered", errors.New("agent prompt was not delivered"))
+			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateDeliveryUnknown, "agent prompt submission unconfirmed", errors.New("agent prompt submission unconfirmed"))
 		}
 		// One rule's wake attempt is finished. The join watches this counter, so
 		// recording it here is what lets a multi-rule config extend the wait

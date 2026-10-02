@@ -802,8 +802,8 @@ func TestPaneInputPendingRuleObservationWakesAndTracksDelivery(t *testing.T) {
 		t.Fatalf("input-pending wake = %+v", wake)
 	}
 	misses, err := store.ListRoleMissedWakes(context.Background())
-	if err != nil || len(misses) != 1 || misses[0].Role != "owner" || misses[0].Consecutive != 1 {
-		t.Fatalf("missed-wake tracking after stalled input-pending wake = %+v, err=%v", misses, err)
+	if err != nil || len(misses) != 0 {
+		t.Fatalf("uncertain submission must not claim a missed wake: %+v, err=%v", misses, err)
 	}
 
 	wake.stalled = false

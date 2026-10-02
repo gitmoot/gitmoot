@@ -21,6 +21,7 @@ type orgMessageOutput struct {
 	To       string `json:"to"`
 	Workflow string `json:"workflow"`
 	Message  string `json:"message"`
+	Status   string `json:"status"`
 }
 
 func runOrgMessage(args []string, stdout, stderr io.Writer) int {
@@ -40,14 +41,14 @@ func printOrgMessageUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org message send --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] MESSAGE")
 	fmt.Fprintln(w, "Messages are durable sender-attributed heads-ups with no acknowledgment or completion obligation.")
-	fmt.Fprintln(w, "The sender and recipient must be distinct roles with the same parent.")
+	fmt.Fprintln(w, "Messages may address a parent, child, or same-parent sibling. Success means queued, not submitted or read.")
 }
 
 func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("org message send", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	toFlag := fs.String("to", "", "same-parent sibling role receiving the message")
+	toFlag := fs.String("to", "", "parent, child or same-parent sibling receiving the message")
 	workflowID := fs.String("workflow", "", "workflow label for the durable message note")
 	fromFlag := fs.String("org-role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the message note")
@@ -101,8 +102,9 @@ func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org message send: --to %q must differ from acting role %q\n", to, from)
 		return 2
 	}
-	if fromRole.Parent == "" || fromRole.Parent != toRole.Parent {
-		fmt.Fprintf(stderr, "org message send: roles %q and %q do not share a parent\n", from, to)
+	siblings := fromRole.Parent != "" && fromRole.Parent == toRole.Parent
+	if !siblings && fromRole.Parent != to && toRole.Parent != from {
+		fmt.Fprintf(stderr, "org message send: roles %q and %q are not parent, child or siblings\n", from, to)
 		return 2
 	}
 
@@ -118,12 +120,12 @@ func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 	}
 	var note db.WorkflowNote
 	if err := withStore(*home, func(store *db.Store) error {
-		count, err := store.CountJobsByWorkflow(context.Background(), label)
+		exists, err := store.WorkflowExists(context.Background(), label)
 		if err != nil {
 			return err
 		}
-		if count == 0 {
-			return fmt.Errorf("workflow %q has no jobs; refusing message to guard against a typo", label)
+		if !exists {
+			return fmt.Errorf("workflow %q is not registered; use workflow register first", label)
 		}
 		note, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 			WorkflowID:      label,
@@ -138,7 +140,7 @@ func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	out := orgMessageOutput{ID: note.ID, From: from, To: to, Workflow: label, Message: message}
+	out := orgMessageOutput{ID: note.ID, From: from, To: to, Workflow: label, Message: message, Status: "queued"}
 	if *jsonOutput {
 		if err := json.NewEncoder(stdout).Encode(out); err != nil {
 			fmt.Fprintf(stderr, "org message send: %v\n", err)
@@ -146,6 +148,6 @@ func runOrgMessageSend(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "sent message %d from %s to %s in workflow %s\n", note.ID, from, to, label)
+	fmt.Fprintf(stdout, "queued message %d from %s to %s in workflow %s; submission not yet confirmed\n", note.ID, from, to, label)
 	return 0
 }

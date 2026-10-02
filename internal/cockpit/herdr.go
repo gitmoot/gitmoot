@@ -94,8 +94,10 @@ func (c herdrClient) available(ctx context.Context) bool {
 }
 
 type agentPromptResult struct {
+	ID     string `json:"id"`
 	Result struct {
-		Type string `json:"type"`
+		Type     string `json:"type"`
+		Delivery string `json:"delivery"`
 	} `json:"result"`
 	Error struct {
 		Code    string `json:"code"`
@@ -103,27 +105,13 @@ type agentPromptResult struct {
 	} `json:"error"`
 }
 
-// herdrWakeTimeoutMS bounds herdr's --wait on the herdr side so a delivered wake
-// never blocks indefinitely (herdr's settled-state wait is unbounded without a
-// --timeout) and this client's context never has to kill it mid-response. It MUST
-// exceed herdr's 5000ms prompt-effect window: a --timeout at or below that window
-// makes herdr report a genuine non-response as a plain `timeout` instead of
-// `agent_prompt_stalled`, erasing the stall signal a wake depends on.
+// Bound both submission observation and the optional settled-state wait.
 const herdrWakeTimeoutMS = 8000
 
-// agentPrompt runs `herdr agent prompt <pane> <prompt> --wait --timeout N`,
-// optionally with `--until <until>`. Outcomes, from herdr's contract:
-//   - result.type=agent_prompted (stdout): delivered.
-//   - error.code=timeout (stderr, non-zero exit): delivery WAS observed but the
-//     agent had not reached a settled state within the window. For a wake that is
-//     a successful landing — we never wait for the woken agent to finish — so it
-//     counts as delivered.
-//   - error.code=agent_prompt_stalled (stderr, non-zero exit): submitted but no
-//     state change in herdr's effect window: not delivered, but a normal outcome,
-//     not a transport error.
-//
-// It reads the combined stream so the stderr envelopes above stay parseable.
-func (c herdrClient) agentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, stalled bool, err error) {
+// agentPrompt distinguishes confirmed submission, uncertain delivery, and a
+// proven rejection before input. Uncertain input must never be blindly retried.
+// A confirmed submission does not imply that the recipient has read or acted.
+func (c herdrClient) agentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, uncertain bool, err error) {
 	args := []string{"agent", "prompt", pane, prompt, "--wait", "--timeout", strconv.Itoa(herdrWakeTimeoutMS)}
 	if strings.TrimSpace(until) != "" {
 		args = append(args, "--until", strings.TrimSpace(until))
@@ -135,27 +123,23 @@ func (c herdrClient) agentPrompt(ctx context.Context, pane, prompt, until string
 	out, runErr := run(ctx, args...)
 	var response agentPromptResult
 	if err := json.Unmarshal([]byte(out), &response); err != nil {
-		if runErr != nil {
-			return false, false, fmt.Errorf("agent prompt failed: %w (parse response: %v)", runErr, err)
-		}
-		return false, false, fmt.Errorf("parse agent prompt response: %w", err)
+		return false, true, fmt.Errorf("agent prompt receipt unreadable: %w (transport: %v)", err, runErr)
 	}
-	switch response.Error.Code {
-	case "agent_prompt_stalled":
-		return false, true, nil
-	case "timeout":
+	if response.Error.Code == "agent_status_unobserved_after_submit" ||
+		(response.Error.Code == "" && response.Result.Type == "agent_prompted" && response.Result.Delivery == "submitted") {
 		return true, false, nil
 	}
-	if runErr != nil {
-		if response.Error.Code != "" {
-			return false, false, fmt.Errorf("agent prompt %s: %s: %w", response.Error.Code, response.Error.Message, runErr)
-		}
-		return false, false, fmt.Errorf("agent prompt failed: %w", runErr)
+	detail := fmt.Errorf("agent prompt receipt %q code=%q delivery=%q (transport: %v)",
+		response.ID, response.Error.Code, response.Result.Delivery, runErr)
+	switch response.Error.Code {
+	case "agent_not_found", "agent_blocked", "agent_input_pending":
+		// These are explicit pre-write refusals. Do not classify by error prose.
+		return false, false, detail
+	default:
+		// Includes written_to_pty, legacy stalled, unsubmitted drafts, timeouts,
+		// missing delivery evidence and errors after a possibly successful write.
+		return false, true, detail
 	}
-	if response.Result.Type != "agent_prompted" {
-		return false, false, fmt.Errorf("agent prompt returned result type %q", response.Result.Type)
-	}
-	return true, false, nil
 }
 
 // paneListResult mirrors `herdr pane list`: only each pane's id is load-bearing
@@ -169,14 +153,68 @@ type paneListResult struct {
 	} `json:"result"`
 }
 
-// resolvePaneByLabel returns the CURRENT pane id matching a literal pane id or
-// exact label. It is resolved at call (wake) time: ids stay pinned to one live
-// pane, while labels follow whichever live pane uniquely has that cosmetic
-// value. Stale ids, absent labels, and ambiguous labels fail.
+type registeredAgent struct {
+	Name             string          `json:"name"`
+	PaneID           string          `json:"pane_id"`
+	MachineID        string          `json:"machine_id"`
+	MachineProfileID string          `json:"machine_profile_id"`
+	Archived         json.RawMessage `json:"archived"`
+}
+
+func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, error) {
+	out, err := c.run(ctx, "agent", "list")
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Result struct {
+			Agents []registeredAgent `json:"agents"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		return nil, fmt.Errorf("parse agent list: %w", err)
+	}
+	if result.Result.Agents == nil {
+		return nil, fmt.Errorf("agent list is missing registered recipients")
+	}
+	return result.Result.Agents, nil
+}
+
+func registeredRecipient(agents []registeredAgent, binding string) (string, bool) {
+	name, byName := strings.CutPrefix(binding, "agent:")
+	resolved := ""
+	for _, agent := range agents {
+		if agent.PaneID == "" || (len(agent.Archived) != 0 && string(agent.Archived) != "null") {
+			continue
+		}
+		match := agent.PaneID == binding
+		if byName {
+			match = name != "" && agent.Name == name && agent.MachineID == "" && agent.MachineProfileID == ""
+		}
+		if match {
+			if resolved != "" {
+				return "", false
+			}
+			resolved = agent.PaneID
+		}
+	}
+	return resolved, resolved != ""
+}
+
+// Explicit agent:name bindings follow registered local seats across terminal
+// replacement. Legacy pane ids/labels remain pinned, but must name an agent.
 func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (string, bool, error) {
 	binding = strings.TrimSpace(binding)
 	if binding == "" {
 		return "", false, nil
+	}
+	agents, err := c.registeredAgents(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	if strings.HasPrefix(binding, "agent:") {
+		pane, ok := registeredRecipient(agents, binding)
+		return pane, ok, nil
 	}
 	out, err := c.run(ctx, "pane", "list")
 	if err != nil {
@@ -188,7 +226,8 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (st
 	}
 	for _, p := range pl.Result.Panes {
 		if p.PaneID == binding && p.PaneID != "" {
-			return p.PaneID, true, nil
+			pane, ok := registeredRecipient(agents, p.PaneID)
+			return pane, ok, nil
 		}
 	}
 	resolved := ""
@@ -200,5 +239,6 @@ func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (st
 			resolved = p.PaneID
 		}
 	}
-	return resolved, resolved != "", nil
+	pane, ok := registeredRecipient(agents, resolved)
+	return pane, ok, nil
 }

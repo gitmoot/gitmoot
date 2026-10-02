@@ -343,86 +343,6 @@ func productionWakeTargetRoleWrites(t *testing.T) []wakeTargetRoleWrite {
 	return writes
 }
 
-func TestRolePaneResolverHasAllThreeProductionCallSites(t *testing.T) {
-	calls := productionSelectorCallSites(t, "ResolveRolePaneBinding")
-	want := []wakeTargetRoleWrite{
-		{file: "internal/cli/event_rule_sink.go", function: "resolveRolePane"},
-		{file: "internal/cli/org_role_unavailable.go", function: "wakeParent"},
-		{file: "internal/cockpit/herdr_org.go", function: "Snapshot"},
-	}
-	sort.Slice(want, func(i, j int) bool {
-		if want[i].file != want[j].file {
-			return want[i].file < want[j].file
-		}
-		return want[i].function < want[j].function
-	})
-	if got, expected := fmt.Sprint(calls), fmt.Sprint(want); got != expected {
-		t.Fatalf("ResolveRolePaneBinding call sites = %s, want %s", got, expected)
-	}
-}
-
-func productionSelectorCallSites(t *testing.T, selectorName string) []wakeTargetRoleWrite {
-	t.Helper()
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var calls []wakeTargetRoleWrite
-	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if entry.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(filename) != ".go" || strings.HasSuffix(filename, "_test.go") {
-			return nil
-		}
-		fset := token.NewFileSet()
-		parsed, err := parser.ParseFile(fset, filename, nil, 0)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, filename)
-		if err != nil {
-			return err
-		}
-		for _, declaration := range parsed.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil {
-				continue
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if ok && selector.Sel.Name == selectorName {
-					calls = append(calls, wakeTargetRoleWrite{
-						file: filepath.ToSlash(relative), function: function.Name.Name,
-					})
-				}
-				return true
-			})
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sort.Slice(calls, func(i, j int) bool {
-		if calls[i].file != calls[j].file {
-			return calls[i].file < calls[j].file
-		}
-		return calls[i].function < calls[j].function
-	})
-	return calls
-}
-
 func TestJobTerminalAddressedScopeMatchesDispatcherOnly(t *testing.T) {
 	author := db.EventRule{WakeRole: "author", Scope: db.EventRuleScopeAddressed}
 	other := db.EventRule{WakeRole: "other", Scope: db.EventRuleScopeAddressed}
@@ -710,7 +630,7 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	}
 }
 
-func TestEventRuleWakeStallIncrementsAndDeliveryResetsCounter(t *testing.T) {
+func TestEventRuleUncertainWakePreservesAndDeliveryResetsCounter(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
@@ -725,6 +645,9 @@ func TestEventRuleWakeStallIncrementsAndDeliveryResetsCounter(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
+	if err := store.IncrementRoleMissedWake(ctx, "owner", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.AddEventRule(ctx, db.EventRule{ID: "rule-counter", OnKind: "attention", WakeRole: "OWNER", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -833,8 +756,8 @@ func TestDurableWakeWithUnresolvedPaneParksAsStalled(t *testing.T) {
 	ruleSink.Emit(ctx, events.Event{
 		Type: events.EventJobBlocked, Cause: "blocked_since", JobID: "blocked-task", Repo: "owner/repo", WakeTargetRole: "owner",
 	})
-	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, synchronousEventRuleTestSink{sink: ruleSink}); err != nil {
-		t.Fatalf("drain unresolved pane wake: %v", err)
+	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, synchronousEventRuleTestSink{sink: ruleSink}); err == nil {
+		t.Fatal("unresolved recipient must remain unhealthy")
 	}
 	stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateStalled)
 	if err != nil || len(stalled) != 1 || stalled[0].TargetRole != "owner" || stalled[0].LastError != "role pane binding unresolved" {

@@ -77,6 +77,25 @@ func ReviewVerdictSubjectKey(repo string, pullRequest int, headSHA string) (stri
 	return fmt.Sprintf("%s#%d@%s", repo, pullRequest, headSHA), nil
 }
 
+// HasReviewSubscription identifies recipients already owed an exact-head fact
+// notice, so the legacy review-verdict observer path cannot notify them twice.
+func (s *Store) HasReviewSubscription(ctx context.Context, role, repo string, pr int, head, purpose string) (bool, error) {
+	bare, err := ReviewVerdictSubjectKey(repo, pr, head)
+	if err != nil {
+		return false, err
+	}
+	scoped, err := ReviewRequestSubjectKey(repo, pr, head, purpose)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	err = s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM awaited_facts
+		WHERE waiter_role = ? AND subject_kind = ? AND subject_key IN (?, ?)
+		AND state IN ('waiting', 'satisfied'))`,
+		strings.ToLower(strings.TrimSpace(role)), AwaitedFactSubjectReviewVerdict, bare, scoped).Scan(&exists)
+	return exists, err
+}
+
 // parseReviewVerdictSubjectKey is the exact inverse of the two constructors
 // above: it accepts the bare repo#pr@head key and the purpose-scoped
 // repo#pr@head|purpose key the review router subscribes with.

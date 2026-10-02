@@ -108,6 +108,8 @@ func TestHerdrOrgProviderPresenceWakePaneBindingParity(t *testing.T) {
 			return `{"result":{"snapshot":{"version":"0.7.5","panes":` + panes + `}}}`, nil
 		case "pane list":
 			return `{"result":{"panes":` + panes + `}}`, nil
+		case "agent list":
+			return `{"result":{"agents":` + panes + `}}`, nil
 		default:
 			t.Fatalf("unexpected Herdr args: %v", args)
 			return "", nil

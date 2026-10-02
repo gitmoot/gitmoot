@@ -87,19 +87,18 @@ func (c *Cockpit) Available(ctx context.Context) bool {
 	return ok
 }
 
-// AgentPrompt sends a delivery-verified prompt to an existing herdr pane. It is
-// the narrow exported seam used by the organization event-rule evaluator.
-func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, stalled bool, err error) {
+// AgentPrompt returns confirmed submission, uncertain input, and diagnostic
+// evidence. Uncertain input must be reconciled, never automatically resent.
+func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, uncertain bool, err error) {
 	if c == nil {
 		return false, false, fmt.Errorf("cockpit is nil")
 	}
 	return c.client.agentPrompt(ctx, pane, prompt, until)
 }
 
-// ResolvePaneByLabel resolves a herdr pane binding (a literal pane id or exact
-// label) to its current live pane id. Literal ids remain pinned to one pane;
-// labels follow whichever current pane uniquely carries that cosmetic value.
-// Stale ids, absent labels, and ambiguous labels fail.
+// ResolvePaneByLabel resolves a registered recipient from an explicit agent:name
+// binding, or a pane id/label. A terminal without a registered agent is not a
+// recipient. Agent names are exact, local and fail closed on ambiguity.
 func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string, bool) {
 	if c == nil {
 		return "", false
