@@ -55,6 +55,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestCleanupObligationsMigrationFreshAndUpgrade":                         true,
 		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
 		"TestMigrationsUpgradeFromBeforeAutoFixRetirement":                       true,
+		"TestMessageInboxUpgradeIsAtomicAndNeverReplaysHistory":                  true,
 		"TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows":           true,
 		"TestPresetDeliveryRemovalMigrationOnFreshHome":                          true,
 		"TestPresetDeliveryRemovalMigrationOnPreChangeHome":                      true,

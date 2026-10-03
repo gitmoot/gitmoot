@@ -26,7 +26,7 @@ type OrgRoleUnavailable struct {
 // and never shortens the declared unavailability window. A stale row starts a
 // fresh incident and resets the escalation claim.
 func (s *Store) UpsertOrgRoleUnavailable(ctx context.Context, role, reason string, until, now time.Time) error {
-	return s.upsertOrgRoleUnavailable(ctx, role, "", reason, until, now)
+	return upsertOrgRoleUnavailable(ctx, s.db, role, "", reason, until, now)
 }
 
 // UpsertOrgRoleUnavailableForRuntime opens or refreshes a role incident
@@ -36,10 +36,10 @@ func (s *Store) UpsertOrgRoleUnavailableForRuntime(ctx context.Context, role, ru
 	if runtimeName == "" {
 		return errors.New("org role unavailable runtime is required")
 	}
-	return s.upsertOrgRoleUnavailable(ctx, role, runtimeName, reason, until, now)
+	return upsertOrgRoleUnavailable(ctx, s.db, role, runtimeName, reason, until, now)
 }
 
-func (s *Store) upsertOrgRoleUnavailable(ctx context.Context, role, runtimeName, reason string, until, now time.Time) error {
+func upsertOrgRoleUnavailable(ctx context.Context, exec sqlExecer, role, runtimeName, reason string, until, now time.Time) error {
 	role = strings.ToLower(strings.TrimSpace(role))
 	runtimeName = strings.ToLower(strings.TrimSpace(runtimeName))
 	reason = strings.ToLower(strings.TrimSpace(reason))
@@ -54,7 +54,7 @@ func (s *Store) upsertOrgRoleUnavailable(ctx context.Context, role, runtimeName,
 	}
 	nowStamp := now.UTC().Format(BlockedEpisodeTimeLayout)
 	untilStamp := until.UTC().Format(BlockedEpisodeTimeLayout)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO org_role_unavailable(role, runtime, reason, unavailable_until, escalated_at, updated_at)
+	_, err := exec.ExecContext(ctx, `INSERT INTO org_role_unavailable(role, runtime, reason, unavailable_until, escalated_at, updated_at)
 		VALUES (?, ?, ?, ?, '', ?)
 		ON CONFLICT(role) DO UPDATE SET
 			runtime = excluded.runtime,
@@ -77,43 +77,53 @@ func (s *Store) upsertOrgRoleUnavailable(ctx context.Context, role, runtimeName,
 	return err
 }
 
-// MarkOrgRoleUnavailableEscalated atomically claims the incident's one
-// escalation attempt. Mark-before-delivery prevents concurrent quota failures
-// from producing a wake storm. A missing/already-claimed row returns false.
-func (s *Store) MarkOrgRoleUnavailableEscalated(ctx context.Context, role string, at time.Time) (bool, error) {
-	return s.markOrgRoleUnavailableEscalated(ctx, role, "", at, false)
-}
-
-// MarkOrgRoleUnavailableEscalatedForRuntime claims an escalation only for the
-// incident attributed to runtimeName.
-func (s *Store) MarkOrgRoleUnavailableEscalatedForRuntime(ctx context.Context, role, runtimeName string, at time.Time) (bool, error) {
-	runtimeName = strings.ToLower(strings.TrimSpace(runtimeName))
-	if runtimeName == "" {
-		return false, errors.New("org role unavailable runtime is required")
-	}
-	return s.markOrgRoleUnavailableEscalated(ctx, role, runtimeName, at, true)
-}
-
-func (s *Store) markOrgRoleUnavailableEscalated(ctx context.Context, role, runtimeName string, at time.Time, scoped bool) (bool, error) {
+func markOrgRoleUnavailableEscalated(ctx context.Context, exec sqlExecer, role, runtimeName string, at time.Time) (bool, error) {
 	role = strings.ToLower(strings.TrimSpace(role))
 	if role == "" {
 		return false, errors.New("org role is required")
 	}
 	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
-	query := `UPDATE org_role_unavailable
+	result, err := exec.ExecContext(ctx, `UPDATE org_role_unavailable
 		SET escalated_at = ?, updated_at = ?
-		WHERE role = ? AND escalated_at = '' AND unavailable_until > ?`
-	args := []any{stamp, stamp, role, stamp}
-	if scoped {
-		query += ` AND runtime = ?`
-		args = append(args, runtimeName)
-	}
-	result, err := s.db.ExecContext(ctx, query, args...)
+		WHERE role = ? AND escalated_at = '' AND unavailable_until > ? AND runtime = ?`,
+		stamp, stamp, role, stamp, runtimeName)
 	if err != nil {
 		return false, err
 	}
 	n, err := result.RowsAffected()
 	return n == 1, err
+}
+
+// RecordOrgRoleUnavailableWithNotification first records availability, then
+// commits the parent notification and its one-shot claim together.
+func (s *Store) RecordOrgRoleUnavailableWithNotification(ctx context.Context, role, runtimeName, reason string, until, now time.Time, notice *Message) error {
+	runtimeName = strings.ToLower(strings.TrimSpace(runtimeName))
+	if runtimeName == "" {
+		return errors.New("org role unavailable runtime is required")
+	}
+	ctx, cancel := s.durableWriteContext(ctx, 3)
+	defer cancel()
+	if err := upsertOrgRoleUnavailable(ctx, s.db, role, runtimeName, reason, until, now); err != nil {
+		return err
+	}
+	if notice == nil {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	claimed, err := markOrgRoleUnavailableEscalated(ctx, tx, role, runtimeName, now)
+	if err != nil {
+		return err
+	}
+	if claimed {
+		if err := enqueueMessageNotificationTx(ctx, tx, *notice, []string{notice.Recipient}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // GetActiveOrgRoleUnavailable returns the role's active incident. An expired

@@ -2,17 +2,16 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -36,95 +35,24 @@ const (
 
 type eventWakeClient interface {
 	Available(context.Context) bool
-	AgentPrompt(context.Context, string, string, string) (bool, bool, error)
-	ResolvePaneByLabel(context.Context, string) (string, bool)
+	AgentNotify(context.Context, cockpit.NotificationTarget, string) (bool, bool, error)
+	ResolveNotificationTarget(context.Context, string) (cockpit.NotificationTarget, bool)
 }
 
-// eventRuleSink decorates the existing outbound sink. Durable event families
-// persist their obligations before Emit returns; remaining rule work is detached
-// and timeout-bounded so delivery failures cannot fail the emitting job.
-//
-// DETACHED IS NOT UNOWNED (#1938). The detached work reads event rules from the
-// SAME store the emitting command owns, and a one-shot CLI closes that store as
-// soon as its command function returns. Nothing used to join those goroutines,
-// so `gitmoot job record` closed the store underneath an outstanding
-// ListEventRules: the row committed, the command printed success and exited 0,
-// and the only trace was `org event rules list failed ... sql: database is
-// closed` - on a SUCCESS path. The wake that read was supposed to decide never
-// happened either, so a subscribed role waited forever in front of a green
-// command. pending lets a command wait for its own rule work before releasing
-// the store; the daemon, whose store outlives every emit, simply never waits.
+// eventRuleSink persists inbox mail and wake obligations before Emit returns.
+// Only the daemon drains notification transport; short-lived producers never
+// retain background work against their closing store.
 type eventRuleSink struct {
 	inner events.Sink
 	store *db.Store
 	home  string
 	wake  eventWakeClient
 
-	// pending counts detached rule goroutines spawned by Emit. It is NOT a
-	// substitute for the goroutines' own timeouts: each herdr call stays bounded,
-	// and waitForPendingRuleWork bounds the join itself, so a hung wake delays a
-	// command by at most that bound rather than pinning it to herdr's liveness.
-	pending sync.WaitGroup
-
-	// progress counts rules whose wake attempt has finished. The join watches it
-	// instead of trusting a single wall-clock budget, because evaluateRules
-	// processes matching rules SERIALLY and each one may spend its own probe plus
-	// prompt: a bound sized for one sequence expires mid-config the moment a
-	// second observer rule matches (#1942 review, P2). Watching progress makes the
-	// join scale with the work actually outstanding rather than with a guess about
-	// how much work a supported config contains.
-	progress atomic.Uint64
-
-	// released records that the store owner has stopped waiting and is about to
-	// close the store. Rule work checks it before every store access, so residual
-	// work reports "abandoned" instead of reaching a closed handle - the failure
-	// mode this whole change exists to remove, one layer out.
+	// released prevents cached sinks from using a closed producer store.
 	released atomic.Bool
 }
 
-// waitForPendingRuleWork blocks until every detached rule goroutine spawned by
-// Emit has returned, and reports whether that happened before it gave up.
-//
-// It is a PROGRESS watchdog, not a total budget. perRuleBound sizes ONE rule's
-// worst case - herdr probe plus one prompt plus the bounded counter write - and
-// the wait extends for as long as rules keep completing. A supported multi-rule
-// config therefore finishes with the store still open, while genuinely wedged
-// work is abandoned after one idle bound instead of holding a one-shot command
-// open for as many multiples of that bound as someone happened to configure.
-//
-// Giving up MARKS THE STORE RELEASED before returning. Cancelling the work would
-// not be enough on its own: an in-flight iteration can already be past its
-// cancellation check and about to touch the store, which would convert the
-// closed-store warning into a cancelled-context one rather than removing it. The
-// flag is what makes residual work stop asking the store anything at all.
-func (s *eventRuleSink) waitForPendingRuleWork(perRuleBound time.Duration) bool {
-	if s == nil {
-		return true
-	}
-	done := make(chan struct{})
-	go func() {
-		s.pending.Wait()
-		close(done)
-	}()
-	for {
-		before := s.progress.Load()
-		select {
-		case <-done:
-			return true
-		case <-time.After(perRuleBound):
-			if s.progress.Load() != before {
-				// A rule completed inside the window, so the work is advancing and
-				// the store is still needed. Extend rather than abandon it.
-				continue
-			}
-			s.released.Store(true)
-			return false
-		}
-	}
-}
-
-// storeReleased reports whether the store owner has stopped waiting. Rule work
-// must consult it immediately before any store access on the detached path.
+// storeReleased prevents a cached sink from using a closed producer store.
 func (s *eventRuleSink) storeReleased() bool {
 	return s != nil && s.released.Load()
 }
@@ -138,126 +66,59 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	if s.store == nil {
 		return
 	}
-	// Classify BEFORE spawning: the webhook's normal (non-classifiable) traffic
-	// never touches the wake path, so it costs no goroutine or context.
+	// Unclassified webhook traffic does not create inbox notifications.
 	kinds := classifyEventRuleKinds(event)
 	if len(kinds) == 0 {
 		return
 	}
-	if wakeKind, durable := durableWakeKind(kinds); durable {
-		rules, err := s.store.ListEventRules(ctx)
-		if err != nil {
-			slog.Warn("org event rules list failed", "job_id", event.JobID, "error", err)
-			return
-		}
-		targetRoles, remainingRules := partitionDurableWakeRules(rules, kinds, wakeKind, event)
-		if len(targetRoles) > 0 {
-			payload, err := json.Marshal(event)
-			if err != nil {
-				slog.Warn("durable wake event encode failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
-				return
-			}
-			// #1352 B4: a directive nag is stored as source_kind=workflow_note,
-			// which is the shape the drain (wakeOutboxKindForSource) already
-			// recognises. ONLY the source kind is adjusted here.
-			//
-			// The COALESCE KEY IS THE STORE'S TO DERIVE — wakeOutboxCoalesceKey
-			// validates the kind and builds kind+":"+role. An earlier revision
-			// hand-built that key and passed it as the FOURTH argument, which is
-			// wakeKind, not a coalesce key; all three parameters are strings so the
-			// compiler could not see it, and the store rejected the key as an
-			// unsupported wake kind. Derive-don't-restate: pass the kind, let the
-			// store build the key.
-			sourceKind := wakeKind
-			sourceID := string(payload)
-			if wakeKind == db.WakeOutboxKindDirective {
-				sourceKind = db.WakeOutboxSourceWorkflowNote
-				// #1352 F3: source_id must be the LITERAL DIRECTIVE ID. The decoder
-				// (wakeOutboxEvent) renders it straight into the operator's command —
-				// "directive id %s for %s" — so storing the serialized event here
-				// produced `gitmoot org directive ack {"schema_version":1,...}`
-				// instead of `... ack 4242`. The row inserted fine and the command it
-				// delivered was garbage: written correctly, read wrongly.
-				sourceID = strings.TrimSpace(event.JobID)
-			}
-			if err := s.store.InsertWakeOutbox(
-				ctx, sourceKind, sourceID, wakeKind, targetRoles,
-			); err != nil {
-				slog.Warn("durable wake outbox insert failed", "job_id", event.JobID, "kind", wakeKind, "error", err)
-				return
-			}
-		}
-		if s.wake == nil || len(remainingRules) == 0 {
-			return
-		}
-		base := context.WithoutCancel(ctx)
-		s.pending.Add(1)
-		go func() {
-			defer s.pending.Done()
-			if err := s.evaluateSafely(base, event, remainingRules); err != nil {
-				slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
-			}
-		}()
+	rules, err := s.store.ListEventRules(ctx)
+	if err != nil {
+		slog.Warn("org event rules list failed", "job_id", event.JobID, "error", err)
 		return
 	}
-	if s.wake == nil {
+	targetRoles := eventNotificationRoles(rules, kinds, event)
+	if len(targetRoles) == 0 {
 		return
 	}
-	// Detach from the emitting job's ctx (a cancelled job must never cancel a
-	// wake) with NO deadline of its own: each herdr call below bounds itself, so a
-	// slow earlier rule cannot starve a later rule's wake.
-	base := context.WithoutCancel(ctx)
-	s.pending.Add(1)
-	go func() {
-		defer s.pending.Done()
-		if err := s.evaluateSafely(base, event, nil); err != nil {
-			slog.Warn("org event wake failed", "job_id", event.JobID, "error", err)
-		}
-	}()
+	if containsEventRuleKind(kinds, db.WakeOutboxKindDirective) {
+		// TTL wakes refer to the existing directive ID, never to a new notice.
+		err = s.store.InsertWakeOutbox(ctx, db.WakeOutboxSourceWorkflowNote,
+			strings.TrimSpace(event.JobID), db.WakeOutboxKindDirective, targetRoles)
+	} else {
+		err = s.persistMessageEvent(ctx, event, targetRoles)
+	}
+	if err != nil {
+		slog.Warn("durable inbox notification insert failed", "job_id", event.JobID, "error", err)
+	}
 }
 
-// durableWakeKind selects the outbox kind for an event, or reports that the
-// event takes the live path.
-//
-// #1352: directive TTL nags are admitted. They were previously live-only, so
-// every due directive produced one prompt per sweep with no coalescing — a noise
-// factory at any directive volume, and the one wake class GUARANTEED to repeat
-// on a timer rather than on an external trigger. Routing them through the outbox
-// gives them the same batching every other recurring wake already has, and the
-// same durable record when delivery fails.
-func durableWakeKind(kinds []string) (string, bool) {
-	for _, kind := range kinds {
-		switch kind {
-		case db.WakeOutboxKindBlocked, db.WakeOutboxKindEscalation, db.WakeOutboxKindDirective, db.WakeOutboxKindFact:
-			return kind, true
+func eventNotificationRoles(rules []db.EventRule, kinds []string, event events.Event) []string {
+	var roles []string
+	seen := make(map[string]bool)
+	add := func(role string) {
+		role = strings.ToLower(strings.TrimSpace(role))
+		if role != "" && !seen[role] {
+			seen[role] = true
+			roles = append(roles, role)
 		}
 	}
-	return "", false
-}
-
-func partitionDurableWakeRules(
-	rules []db.EventRule,
-	kinds []string,
-	wakeKind string,
-	event events.Event,
-) (targetRoles []string, remaining []db.EventRule) {
+	add(event.WakeTargetRole)
+	for _, role := range event.WakeTargetRoles {
+		add(role)
+	}
 	for _, rule := range rules {
 		if !rule.Enabled || !containsEventRuleKind(kinds, rule.OnKind) || !eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(rule.OnKind), wakeKind) {
-			targetRoles = append(targetRoles, rule.WakeRole)
-			continue
-		}
-		remaining = append(remaining, rule)
+		add(rule.WakeRole)
 	}
-	return targetRoles, remaining
+	return roles
 }
 
 // emitWakeOutbox evaluates one already-claimed durable wake synchronously. The
 // daemon tick is the delivery owner after the short-lived producer exits, so it
 // must not return while an untracked goroutine still owns the attempted row.
-// Ordinary event emissions retain Emit's detached, best-effort behavior.
+// Producer emissions persist their obligations synchronously through Emit.
 func (s *eventRuleSink) emitWakeOutbox(ctx context.Context, event events.Event, rules []db.EventRule) error {
 	if s == nil {
 		return fmt.Errorf("event-rule sink is nil")
@@ -274,7 +135,7 @@ func (s *eventRuleSink) evaluateSafely(ctx context.Context, event events.Event, 
 		if recovered := recover(); recovered != nil {
 			slog.Warn("org event wake panicked", "job_id", event.JobID, "error", recovered)
 			panicErr := fmt.Errorf("event-rule wake panicked: %v", recovered)
-			err = errors.Join(panicErr, s.finishWakeOutbox(ctx, event, db.WakeOutboxStateFailed, panicErr.Error()))
+			err = errors.Join(panicErr, s.finishWakeOutbox(ctx, event, db.WakeOutboxStateDeliveryUnknown, panicErr.Error()))
 		}
 	}()
 	if rules == nil {
@@ -360,15 +221,29 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			}
 			continue
 		}
+		// Coalesced addressed wakes give each target role one attempt per event.
+		// Observer rules are independent copies and do not consume that attempt.
+		if isAddressedNoteWake {
+			replyHandled = true
+		}
+		if deduplicateAddressedWake && !observer {
+			addressedWakeHandled[wakeRole] = true
+		}
 		prompt := eventRuleWakePrompt(rule.OnKind, event)
-		// A FRESH per-rule budget (> herdr's 8s --timeout) so a slow wake for one
-		// rule cannot consume a shared budget and leave a later rule's wake to be
-		// SIGKILLed mid-call. until="" uses herdr's default settled set; a wake only
-		// needs delivery confirmation, so agentPrompt's bounded --timeout returns as
-		// soon as the prompt is confirmed landed and never blocks on the agent settling.
+		// Give each runtime admission its own bounded transport budget. This
+		// never waits for a busy turn to settle or types into the composer.
 		callCtx, cancel := context.WithTimeout(ctx, eventRuleWakeTimeout)
-		delivered, uncertain, err := s.wake.AgentPrompt(callCtx, pane, prompt, "")
+		delivered, uncertain, err := s.wake.AgentNotify(callCtx, pane, prompt)
 		cancel()
+		var deferred *cockpit.NotificationDeferred
+		if !delivered && !uncertain && errors.As(err, &deferred) {
+			if s.store != nil && len(event.WakeOutboxIDs) > 0 {
+				if err := s.store.DeferAttemptedWakeOutbox(context.WithoutCancel(ctx), event.WakeOutboxIDs, deferred.Error(), time.Now().UTC()); err != nil {
+					return fmt.Errorf("retain deferred notification: %w", err)
+				}
+			}
+			continue
+		}
 		switch {
 		case delivered:
 			// Bound the best-effort counter write like every other op on this path,
@@ -385,7 +260,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				return err
 			}
 		case uncertain:
-			detail := "agent prompt submission is unconfirmed; inspect recipient before any retry"
+			detail := "runtime notification admission is unconfirmed; inspect recipient before any retry"
 			if err != nil {
 				detail = err.Error()
 			}
@@ -401,13 +276,6 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// clears when the dialog is answered, and 60 of the 108 failed rows
 			// on the live store carry `agent_blocked`.
 			if wakeFailureIsTransient(err) {
-				if isAddressedNoteWake {
-					replyHandled = true
-				}
-				if deduplicateAddressedWake && !observer {
-					addressedWakeHandled[wakeRole] = true
-				}
-				s.progress.Add(1)
 				if retryErr := s.retryOrFailWakeOutbox(
 					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
 				); retryErr != nil {
@@ -421,18 +289,6 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// prompt, so leave the counter unchanged just as for infrastructure errors.
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateDeliveryUnknown, "agent prompt submission unconfirmed", errors.New("agent prompt submission unconfirmed"))
-		}
-		// One rule's wake attempt is finished. The join watches this counter, so
-		// recording it here is what lets a multi-rule config extend the wait
-		// instead of being abandoned on a bound sized for a single rule.
-		s.progress.Add(1)
-		// Coalesced addressed wakes give each target role one attempt per event.
-		// Observer rules are independent copies and do not consume that attempt.
-		if isAddressedNoteWake {
-			replyHandled = true
-		}
-		if deduplicateAddressedWake && !observer {
-			addressedWakeHandled[wakeRole] = true
 		}
 	}
 	if isAddressedNoteWake && !replyHandled {
@@ -593,16 +449,18 @@ const wakeDeliveryMaxAttempts = 3
 // exists and holds an interactive dialog, so the same prompt can land once the
 // dialog is answered.
 //
-// Everything else stays terminal on purpose. `agent_not_found` and an
-// unresolved pane binding are configuration, not weather, and retrying them
-// only spends the budget. `agent_prompt_unsubmitted` is deliberately excluded
-// even though it looks transient: the prompt text may already be sitting in
-// the composer, so a re-attempt risks delivering it twice.
+// Only recorded pre-write refusals may retry. The scheduler now waits for a
+// live idle seat before claiming mail; these cover a seat/draft/modal change
+// between that snapshot and Herdr's guarded write. Unsubmitted or uncertain
+// input remains terminal because retrying could duplicate it.
 func wakeFailureIsTransient(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "agent_blocked")
+	detail := strings.ToLower(err.Error())
+	return strings.Contains(detail, "agent_blocked") ||
+		strings.Contains(detail, `code="agent_input_pending"`) ||
+		strings.Contains(detail, `code="agent_not_found"`)
 }
 
 // retryOrFailWakeOutbox records a non-delivered outcome for the claimed batch,
@@ -703,20 +561,15 @@ func (s *eventRuleSink) loadOrgConfig() (config.OrgConfig, bool) {
 	return cfg, true
 }
 
-// resolveRolePane is the v1 config-backed role→pane binding seam. Keeping it in
-// one small method lets a later live registry replace config without changing
-// classification, matching, or wake delivery.
-func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfig, role string) (pane string, ok bool) {
+// Resolve identity at the live registry, then fence it again at admission.
+func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfig, role string) (cockpit.NotificationTarget, bool) {
 	orgRole, ok := cfg.Role(role)
-	if !ok {
-		return "", false
+	if !ok || strings.TrimSpace(orgRole.Pane) == "" {
+		return cockpit.NotificationTarget{}, false
 	}
-	return config.ResolveRolePaneBinding(ctx, orgRole.Pane, func(ctx context.Context, label string) (string, bool) {
-		// Bound the `pane list` resolution so it cannot hang the wake path.
-		resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
-		defer cancel()
-		return s.wake.ResolvePaneByLabel(resolveCtx, label)
-	})
+	resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
+	defer cancel()
+	return s.wake.ResolveNotificationTarget(resolveCtx, strings.TrimSpace(orgRole.Pane))
 }
 
 func classifyEventRuleKinds(event events.Event) []string {
@@ -742,7 +595,7 @@ func classifyEventRuleKinds(event events.Event) []string {
 		}
 	case events.EventJobNeedsAttention:
 		switch event.Cause {
-		case "escalation":
+		case "escalation", "role_quota_unavailable":
 			return []string{"escalation"}
 		case "ask_gate":
 			return []string{"attention"}
@@ -810,7 +663,7 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 		switch event.Cause {
 		case directiveCompletionOverdueCause:
 			return fmt.Sprintf(
-				"gitmoot directive %s for %s is acknowledged but incomplete; finish the assigned deliverable, then record completion with: gitmoot org directive done %s --by %s",
+				"gitmoot directive %s for %s is acknowledged but incomplete; finish the assigned deliverable, then record completion with: gitmoot message directive done %s --role %s",
 				directiveID, event.WakeTargetRole, directiveID, event.WakeTargetRole,
 			)
 		case directiveTerminalCause:
@@ -827,7 +680,7 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 			// here rather than assumed short, and an over-long body says how
 			// much was omitted instead of stopping mid-clause.
 			return fmt.Sprintf(
-				"gitmoot directive %s for %s: %s -- record completion with: gitmoot org directive done %s --by %s",
+				"gitmoot directive %s for %s: %s -- record completion with: gitmoot message directive done %s --role %s",
 				directiveID, event.WakeTargetRole,
 				directiveWakeBody(strings.TrimSpace(event.Detail), directiveID),
 				directiveID, event.WakeTargetRole,

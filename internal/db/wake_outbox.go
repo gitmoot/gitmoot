@@ -69,10 +69,12 @@ const (
 	WakeOutboxKindEscalation = "escalation"
 	WakeOutboxKindDirective  = "directive"
 	WakeOutboxKindFact       = "fact"
+	WakeOutboxKindEvent      = "event"
 
 	WakeOutboxSourceWorkflowNote = "workflow_note"
 	WakeOutboxSourceBlocked      = WakeOutboxKindBlocked
 	WakeOutboxSourceEscalation   = WakeOutboxKindEscalation
+	WakeOutboxSourceEvent        = WakeOutboxKindEvent
 	WakeOutboxSourceAwaitedFact  = "awaited_fact"
 
 	WakeOutboxReplyCoalescePrefix     = WakeOutboxKindReply + ":"
@@ -147,7 +149,13 @@ type WakeOutboxObligation struct {
 	// same query that derives the phase (#1981). A prompt that names a row
 	// instead of carrying its body forces the seat to fetch, and the fetch is
 	// another turn; carrying it is the whole point of the delivery.
-	DirectiveBody string
+	DirectiveBody        string
+	MessageID            int64
+	MessageThreadID      int64
+	MessageKind          string
+	MessageSender        string
+	MessageBody          string
+	MessageSourcePayload string
 }
 
 // WakeOutboxObligationProjection exposes decisions, not persisted states.
@@ -155,6 +163,8 @@ type WakeOutboxObligationProjection struct {
 	Pending       []WakeOutboxObligation
 	AgedAttempted []WakeOutboxObligation
 	Blocked       []WakeOutboxObligation
+	// Unknown counts blocked obligations without conclusive submission evidence.
+	Unknown int
 }
 
 func (p WakeOutboxObligationProjection) Len() int {
@@ -234,7 +244,7 @@ func (s *Store) InsertWakeOutbox(
 // workflow-note writer passes its own source id. Directives
 // alone carry a LITERAL directive id, because the decoder (wakeOutboxEvent)
 // renders source_id straight into the command an operator reads back:
-// `gitmoot org directive ack <id>`. Storing a payload there instead produced
+// `gitmoot message directive ack <id>`. Storing a payload there instead produced
 // `ack {"schema_version":1,...}`.
 //
 // That literal id is STABLE ACROSS NAGS, so repeated nags are the SAME
@@ -257,6 +267,9 @@ func insertWakeOutboxTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, w
 	}
 	coalesceKey, err := wakeOutboxCoalesceKey(wakeKind, role)
 	if err != nil {
+		return err
+	}
+	if err := indexWakeMessageTx(ctx, tx, sourceKind, sourceID, role, false); err != nil {
 		return err
 	}
 	// #1352: REVIVE SEMANTICS BIND TO THE DIRECTIVE BRANCH ONLY. The other writer
@@ -311,7 +324,7 @@ VALUES (?, ?, ?, ?)`,
 func wakeOutboxCoalesceKey(wakeKind, role string) (string, error) {
 	kind := strings.ToLower(strings.TrimSpace(wakeKind))
 	switch kind {
-	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective, WakeOutboxKindFact:
+	case WakeOutboxKindReply, WakeOutboxKindBlocked, WakeOutboxKindEscalation, WakeOutboxKindDirective, WakeOutboxKindFact, WakeOutboxKindEvent:
 	default:
 		return "", fmt.Errorf("unsupported wake outbox kind %q", wakeKind)
 	}
@@ -383,11 +396,13 @@ func listWakeOutboxObligations(
 		var entry WakeOutboxEntry
 		var directivePhase string
 		var directiveBody string
+		var message Message
 		if err := rows.Scan(
 			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
 			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
 			&entry.FinishedAt, &entry.UpdatedAt, &directivePhase, &directiveBody,
+			&message.ID, &message.ThreadID, &message.Kind, &message.Sender, &message.Body, &message.SourcePayload,
 		); err != nil {
 			return WakeOutboxObligationProjection{}, err
 		}
@@ -396,6 +411,9 @@ func listWakeOutboxObligations(
 			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
 			CreatedAt: entry.CreatedAt, DirectivePhase: directivePhase,
 			DirectiveBody: directiveBody,
+			MessageID:     message.ID, MessageThreadID: message.ThreadID,
+			MessageKind: message.Kind, MessageSender: message.Sender,
+			MessageBody: message.Body, MessageSourcePayload: message.SourcePayload,
 		}
 		interpretation, ok := interpretWakeOutboxState(entry.State)
 		if !ok {
@@ -415,6 +433,9 @@ func listWakeOutboxObligations(
 				continue
 			}
 			out.Blocked = append(out.Blocked, obligation)
+			if entry.State == WakeOutboxStateDeliveryUnknown {
+				out.Unknown++
+			}
 		default:
 			return WakeOutboxObligationProjection{}, fmt.Errorf(
 				"wake outbox obligation query returned non-obligation state %q", entry.State,
@@ -461,11 +482,11 @@ const wakeOutboxDirectiveClass = `source_kind = 'workflow_note' AND coalesce_key
 func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
 	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
 	return `
-SELECT id, source_kind, source_id, target_role, coalesce_key, state,
+SELECT wake_outbox.id, wake_outbox.source_kind, wake_outbox.source_id, target_role, coalesce_key, state,
 		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
 		COALESCE(finished_at, ''), updated_at,
 		CASE
-			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			WHEN wake_outbox.source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
 			WHEN EXISTS (
 				SELECT 1
 				FROM workflow_notes d
@@ -480,15 +501,18 @@ SELECT id, source_kind, source_id, target_role, coalesce_key, state,
 			ELSE 'acknowledgment'
 		END,
 		CASE
-			WHEN source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
+			WHEN wake_outbox.source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
 			ELSE COALESCE((
 				SELECT d.body FROM workflow_notes d
 				WHERE d.id = CAST(wake_outbox.source_id AS INTEGER)
 			), '')
-		END
+		END,
+		COALESCE(inbox.id,0), COALESCE(inbox.thread_id,0), COALESCE(inbox.kind,''),
+		COALESCE(inbox.sender,''), COALESCE(inbox.body,''), COALESCE(inbox.source_payload,'')
 FROM wake_outbox
+LEFT JOIN messages inbox ON inbox.source_kind=wake_outbox.source_kind AND inbox.source_id=wake_outbox.source_id AND inbox.recipient=wake_outbox.target_role
 WHERE ` + predicate + `
-ORDER BY created_at, id`, args
+ORDER BY created_at, wake_outbox.id`, args
 }
 
 // ExpireAgedWakeOutbox marks delivery-unknown rows terminal without re-emitting

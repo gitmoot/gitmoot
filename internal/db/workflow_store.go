@@ -75,6 +75,9 @@ type WorkflowNote struct {
 	// AddressedWakeKind selects the durable addressed-note route. Empty keeps
 	// the established reply route for every existing caller.
 	AddressedWakeKind string `json:"-"`
+	// Inbox carries structured conversation metadata from an authorized producer.
+	// Ordinary message text is never parsed as a directive or escalation.
+	Inbox *Message `json:"-"`
 	// DirectiveDoneTTLSeconds is evaluator-only metadata. When Set is false the
 	// row stores -1 and inherits [org].directive_done_ttl; zero explicitly turns
 	// completion nudges off for this directive.
@@ -436,6 +439,11 @@ UPDATE workflow_notes SET workflow_id = workflow_id WHERE id = ?`, directiveID)
 		}
 	}
 
+	if kind != "delivered" {
+		if err := linkMessageReceiptTx(ctx, tx, &note, directiveID, false); err != nil {
+			return false, err
+		}
+	}
 	if _, err := insertWorkflowNoteTx(ctx, tx, note); err != nil {
 		return false, err
 	}
@@ -543,7 +551,8 @@ func (s *Store) insertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNot
 		return WorkflowNote{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if !writeMeta || !meta.StatusSet {
+	journalOnly := note.Inbox == nil && note.AddressedTarget == ""
+	if (writeMeta || journalOnly) && (!writeMeta || !meta.StatusSet) {
 		status, err := workflowMetaStatusTx(ctx, tx, note.WorkflowID)
 		if err != nil {
 			return WorkflowNote{}, err
@@ -576,7 +585,7 @@ func (s *Store) insertWorkflowNoteWithMeta(ctx context.Context, note WorkflowNot
 			return WorkflowNote{}, err
 		}
 	}
-	if !writeMeta || !meta.DescriptionSet {
+	if note.WorkflowID != "" && (writeMeta || journalOnly) && (!writeMeta || !meta.DescriptionSet) {
 		if err := ensureWorkflowDescriptionTx(ctx, tx, note.WorkflowID); err != nil {
 			return WorkflowNote{}, err
 		}
@@ -613,6 +622,13 @@ VALUES (?, ?, ?, ?, ?)`, note.WorkflowID, note.Author, note.Body, note.Repo, don
 	noteID, err := res.LastInsertId()
 	if err != nil {
 		return 0, err
+	}
+	if note.Inbox != nil {
+		message := *note.Inbox
+		message.ID = noteID
+		if err := insertInboxMessageTx(ctx, tx, message); err != nil {
+			return 0, err
+		}
 	}
 	if note.AddressedTarget != "" {
 		wakeKind := note.AddressedWakeKind

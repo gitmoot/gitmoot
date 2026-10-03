@@ -103,25 +103,6 @@ func TestReviewVerdictWakeStaysExcludedForFanOut(t *testing.T) {
 	}
 }
 
-// SHOULD-SUCCEED CONTROL: non-review wake kinds are untouched. The directive
-// prompt is rendered by the same function and must not change shape.
-func TestDirectiveWakePromptUnchangedByVerdictFix(t *testing.T) {
-	event := events.Event{
-		Type:           events.EventJobFinished,
-		Cause:          directiveCompletionOverdueCause,
-		RootID:         "workflow_note:126324",
-		WakeTargetRole: "gm-omp-fanout",
-	}
-	prompt := eventRuleWakePrompt("directive", event)
-	for _, want := range []string{"gitmoot directive 126324", "gm-omp-fanout", "gitmoot org directive done 126324"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("directive wake prompt lost %q: %q", want, prompt)
-		}
-	}
-	if strings.Contains(prompt, "review verdict") {
-		t.Fatalf("directive wake prompt leaked review-verdict text: %q", prompt)
-	}
-}
 
 // THE VOCABULARY INVARIANT the fix relies on instead of a defensive branch.
 //

@@ -358,10 +358,10 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	if deps.eventSink != nil {
 		sink, err = deps.eventSink(ctx, store, home)
 		if err != nil {
-			writeLine(stdout, "org directive TTL event sink unavailable: %v", err)
+			writeLine(stdout, "message directive TTL event sink unavailable: %v", err)
 		} else if sink != nil {
 			if err := evaluateOrgDirectiveTTLs(ctx, store, sink, orgConfig, stdout, now.UTC(), deps.directives); err != nil {
-				writeLine(stdout, "org directive TTL evaluation failed: %v", err)
+				writeLine(stdout, "message directive TTL evaluation failed: %v", err)
 			}
 		}
 	}
@@ -490,9 +490,9 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		if !ok {
 			parked, parkErr := store.ParkMalformedOrgDirective(ctx, item.ID, now)
 			if parkErr != nil {
-				writeLine(stdout, "org directive %d malformed marker park failed: %v", item.ID, parkErr)
+				writeLine(stdout, "message directive %d malformed marker park failed: %v", item.ID, parkErr)
 			} else if parked {
-				writeLine(stdout, "org directive %d parked: malformed directive marker", item.ID)
+				writeLine(stdout, "message directive %d parked: malformed directive marker", item.ID)
 			}
 			continue
 		}
@@ -532,7 +532,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 		if !unacked {
 			if olderID, held := oldestOpenPerTarget[directiveQueueKey(to, item.WorkflowID)]; held && olderID != item.ID {
 				writeLine(stdout,
-					"org directive %d completion ladder held: %s has older open directive %d (queue order, not a stall)",
+					"message directive %d completion ladder held: %s has older open directive %d (queue order, not a stall)",
 					item.ID, to, olderID)
 				continue
 			}
@@ -541,7 +541,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			switch directiveCompletionNagDecision(workingSeats, to, anchor, ttl, orgConfig.DirectiveMaxNudges(), now) {
 			case directiveNagDefer:
 				writeLine(stdout,
-					"org directive %d completion nudge deferred: %s is working (obligation open %s)",
+					"message directive %d completion nudge deferred: %s is working (obligation open %s)",
 					item.ID, to, now.Sub(anchor).Round(time.Second))
 				continue
 			case directiveNagEscalate:
@@ -556,7 +556,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 				events.EmitEvent(ctx, sink,
 					buildDirectiveWorkingEscalationEvent(item, orgConfig, from, to, anchor, now))
 				writeLine(stdout,
-					"org directive %d completion nudge escalated instead of interrupting %s, working past its nudge budget",
+					"message directive %d completion nudge escalated instead of interrupting %s, working past its nudge budget",
 					item.ID, to)
 				continue
 			}
@@ -570,7 +570,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			newCount, claimed, err = deps.markDoneNudged(ctx, store, item, now)
 		}
 		if err != nil {
-			writeLine(stdout, "org directive %d nudge mark failed: %v", item.ID, err)
+			writeLine(stdout, "message directive %d nudge mark failed: %v", item.ID, err)
 			continue
 		}
 		if !claimed {
@@ -590,7 +590,7 @@ func evaluateOrgDirectiveTTLs(ctx context.Context, store *db.Store, sink events.
 			// not block the phase that follows it.
 			if !unacked {
 				if terminateDirectiveCompletionLadder(ctx, store, deps, item, to, stdout, now) {
-					writeLine(stdout, "org directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
+					writeLine(stdout, "message directive %d %s ladder exhausted after %d nudges; obligation remains open and queryable", item.ID, phase, newCount)
 				}
 			}
 		}
@@ -621,7 +621,7 @@ func directiveWorkingSeats(ctx context.Context, store *db.Store, deps directiveT
 	working := map[string]struct{}{}
 	rows, err := deps.livePresence(ctx, store)
 	if err != nil {
-		writeLine(stdout, "org directive nudge presence read failed, nudging as if idle: %v", err)
+		writeLine(stdout, "message directive nudge presence read failed, nudging as if idle: %v", err)
 		return working
 	}
 	for _, row := range rows {
@@ -677,7 +677,7 @@ func terminateDirectiveCompletionLadder(
 ) bool {
 	stamped, err := deps.markExhausted(ctx, store, item, now)
 	if err != nil {
-		writeLine(stdout, "org directive %d exhausted mark failed: %v", item.ID, err)
+		writeLine(stdout, "message directive %d exhausted mark failed: %v", item.ID, err)
 		return false
 	}
 	if !stamped {
@@ -689,7 +689,7 @@ func terminateDirectiveCompletionLadder(
 		Body:       workflow.FormatOrgDirectiveExhaustedNote(item.ID, target),
 		Repo:       item.Repo,
 	}); err != nil {
-		writeLine(stdout, "org directive %d exhausted marker note failed: %v", item.ID, err)
+		writeLine(stdout, "message directive %d exhausted marker note failed: %v", item.ID, err)
 	}
 	return true
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 )
 
@@ -93,11 +92,14 @@ func (c herdrClient) available(ctx context.Context) bool {
 	return st.Server.Running
 }
 
-type agentPromptResult struct {
+type agentNotificationResult struct {
 	ID     string `json:"id"`
 	Result struct {
-		Type     string `json:"type"`
-		Delivery string `json:"delivery"`
+		Type    string `json:"type"`
+		Outcome struct {
+			Status string `json:"status"`
+			Reason string `json:"reason"`
+		} `json:"outcome"`
 	} `json:"result"`
 	Error struct {
 		Code    string `json:"code"`
@@ -105,40 +107,62 @@ type agentPromptResult struct {
 	} `json:"error"`
 }
 
-// Bound both submission observation and the optional settled-state wait.
-const herdrWakeTimeoutMS = 8000
+// NotificationDeferred proves that runtime admission did not happen.
+// The durable obligation remains pending without spending delivery retry budget.
+type NotificationDeferred struct {
+	Reason string
+}
 
-// agentPrompt distinguishes confirmed submission, uncertain delivery, and a
-// proven rejection before input. Uncertain input must never be blindly retried.
-// A confirmed submission does not imply that the recipient has read or acted.
-func (c herdrClient) agentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, uncertain bool, err error) {
-	args := []string{"agent", "prompt", pane, prompt, "--wait", "--timeout", strconv.Itoa(herdrWakeTimeoutMS)}
-	if strings.TrimSpace(until) != "" {
-		args = append(args, "--until", strings.TrimSpace(until))
+func (e *NotificationDeferred) Error() string {
+	return "notification deferred: " + e.Reason
+}
+
+// NotificationTarget carries the runtime identity observed during resolution.
+// The selector alone is mutable and cannot pin a later admission request.
+type NotificationTarget struct {
+	Selector string
+	Runtime  *NotificationRuntime
+}
+
+type NotificationRuntime struct {
+	RuntimeID  string `json:"runtimeId"`
+	SessionID  string `json:"sessionId"`
+	Generation uint64 `json:"generation"`
+}
+
+// agentNotify never types into a pane or waits for a running turn to settle.
+// A missing receipt is unknown, even when the command exits unsuccessfully.
+func (c herdrClient) agentNotify(ctx context.Context, target NotificationTarget, prompt string) (delivered bool, uncertain bool, err error) {
+	if target.Runtime == nil || target.Runtime.RuntimeID == "" || target.Runtime.SessionID == "" {
+		return false, false, &NotificationDeferred{Reason: "runtime notification capability unavailable"}
+	}
+	expected, encodeErr := json.Marshal(target.Runtime)
+	if encodeErr != nil {
+		return false, false, &NotificationDeferred{Reason: encodeErr.Error()}
 	}
 	run := c.runCombined
 	if run == nil {
 		run = c.run
 	}
-	out, runErr := run(ctx, args...)
-	var response agentPromptResult
+	out, runErr := run(ctx, "agent", "prompt-safe", target.Selector, prompt, "--expected-target", string(expected))
+	var response agentNotificationResult
 	if err := json.Unmarshal([]byte(out), &response); err != nil {
-		return false, true, fmt.Errorf("agent prompt receipt unreadable: %w (transport: %v)", err, runErr)
+		return false, true, fmt.Errorf("notification receipt unreadable: %w (transport: %v)", err, runErr)
 	}
-	if response.Error.Code == "agent_status_unobserved_after_submit" ||
-		(response.Error.Code == "" && response.Result.Type == "agent_prompted" && response.Result.Delivery == "submitted") {
-		return true, false, nil
+	if response.Error.Code == "" && response.Result.Type == "agent_prompt_safe" {
+		switch response.Result.Outcome.Status {
+		case "accepted":
+			return true, false, nil
+		case "deferred":
+			return false, false, &NotificationDeferred{Reason: response.Result.Outcome.Reason}
+		}
 	}
-	detail := fmt.Errorf("agent prompt receipt %q code=%q delivery=%q (transport: %v)",
-		response.ID, response.Error.Code, response.Result.Delivery, runErr)
 	switch response.Error.Code {
-	case "agent_not_found", "agent_blocked", "agent_input_pending":
-		// These are explicit pre-write refusals. Do not classify by error prose.
-		return false, false, detail
+	case "agent_not_found", "invalid_notification", "method_not_found":
+		return false, false, &NotificationDeferred{Reason: response.Error.Code}
 	default:
-		// Includes written_to_pty, legacy stalled, unsubmitted drafts, timeouts,
-		// missing delivery evidence and errors after a possibly successful write.
-		return false, true, detail
+		return false, true, fmt.Errorf("notification receipt %q code=%q status=%q (transport: %v)",
+			response.ID, response.Error.Code, response.Result.Outcome.Status, runErr)
 	}
 }
 
@@ -154,11 +178,12 @@ type paneListResult struct {
 }
 
 type registeredAgent struct {
-	Name             string          `json:"name"`
-	PaneID           string          `json:"pane_id"`
-	MachineID        string          `json:"machine_id"`
-	MachineProfileID string          `json:"machine_profile_id"`
-	Archived         json.RawMessage `json:"archived"`
+	Name               string               `json:"name"`
+	PaneID             string               `json:"pane_id"`
+	MachineID          string               `json:"machine_id"`
+	MachineProfileID   string               `json:"machine_profile_id"`
+	Archived           json.RawMessage      `json:"archived"`
+	NotificationTarget *NotificationRuntime `json:"notification_target"`
 }
 
 func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, error) {
@@ -180,65 +205,83 @@ func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, e
 	return result.Result.Agents, nil
 }
 
-func registeredRecipient(agents []registeredAgent, binding string) (string, bool) {
+func registeredAgentForBinding(agents []registeredAgent, binding string) (*registeredAgent, bool) {
 	name, byName := strings.CutPrefix(binding, "agent:")
-	resolved := ""
-	for _, agent := range agents {
-		if agent.PaneID == "" || (len(agent.Archived) != 0 && string(agent.Archived) != "null") {
+	var resolved *registeredAgent
+	for i := range agents {
+		agent := &agents[i]
+		if agent.PaneID == "" || agent.MachineID != "" || agent.MachineProfileID != "" ||
+			(len(agent.Archived) != 0 && string(agent.Archived) != "null") {
 			continue
 		}
 		match := agent.PaneID == binding
 		if byName {
-			match = name != "" && agent.Name == name && agent.MachineID == "" && agent.MachineProfileID == ""
+			match = name != "" && agent.Name == name
 		}
 		if match {
-			if resolved != "" {
-				return "", false
+			if resolved != nil {
+				return nil, false
 			}
-			resolved = agent.PaneID
+			resolved = agent
 		}
 	}
-	return resolved, resolved != ""
+	return resolved, resolved != nil
+}
+
+func registeredRecipient(agents []registeredAgent, binding string) (string, bool) {
+	agent, ok := registeredAgentForBinding(agents, binding)
+	if !ok {
+		return "", false
+	}
+	return agent.PaneID, true
+}
+
+func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (string, bool, error) {
+	agent, ok, err := c.resolveRegisteredRecipient(ctx, binding)
+	if !ok || err != nil {
+		return "", false, err
+	}
+	return agent.PaneID, true, nil
 }
 
 // Explicit agent:name bindings follow registered local seats across terminal
 // replacement. Legacy pane ids/labels remain pinned, but must name an agent.
-func (c herdrClient) resolvePaneByLabel(ctx context.Context, binding string) (string, bool, error) {
+func (c herdrClient) resolveRegisteredRecipient(ctx context.Context, binding string) (*registeredAgent, bool, error) {
 	binding = strings.TrimSpace(binding)
 	if binding == "" {
-		return "", false, nil
+		return nil, false, nil
 	}
 	agents, err := c.registeredAgents(ctx)
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	if strings.HasPrefix(binding, "agent:") {
-		pane, ok := registeredRecipient(agents, binding)
-		return pane, ok, nil
+		agent, ok := registeredAgentForBinding(agents, binding)
+		return agent, ok, nil
 	}
 	out, err := c.run(ctx, "pane", "list")
 	if err != nil {
-		return "", false, err
+		return nil, false, err
 	}
 	var pl paneListResult
 	if err := json.Unmarshal([]byte(out), &pl); err != nil {
-		return "", false, fmt.Errorf("parse pane list: %w", err)
+		return nil, false, fmt.Errorf("parse pane list: %w", err)
 	}
 	for _, p := range pl.Result.Panes {
 		if p.PaneID == binding && p.PaneID != "" {
-			pane, ok := registeredRecipient(agents, p.PaneID)
-			return pane, ok, nil
+			agent, ok := registeredAgentForBinding(agents, p.PaneID)
+			return agent, ok, nil
 		}
 	}
 	resolved := ""
 	for _, p := range pl.Result.Panes {
 		if p.PaneID != "" && p.Label == binding {
 			if resolved != "" {
-				return "", false, nil
+				return nil, false, nil
 			}
 			resolved = p.PaneID
 		}
 	}
-	pane, ok := registeredRecipient(agents, resolved)
-	return pane, ok, nil
+	agent, ok := registeredAgentForBinding(agents, resolved)
+	return agent, ok, nil
 }

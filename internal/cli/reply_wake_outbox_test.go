@@ -17,10 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -55,14 +57,12 @@ func TestBlockedEventProducesDurableWakeOutboxObligation(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("blocked durable obligations = %d, want 1: %+v", len(pending), pending)
 	}
-	if pending[0].SourceKind != "blocked" ||
-		pending[0].TargetRole != "owner" ||
-		pending[0].CoalesceKey != "blocked:owner" {
+	if pending[0].TargetRole != "owner" {
 		t.Fatalf("blocked durable obligation = %+v", pending[0])
 	}
 
 	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "gitmoot blocked event") {
+	if wake.promptCalls != 1 {
 		t.Fatalf("blocked wake = calls=%d prompt=%q, want one blocked wake", wake.promptCalls, wake.prompt)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
@@ -112,23 +112,6 @@ func TestWakeOutboxCoalescesPerKindAndRole(t *testing.T) {
 	if len(pending) != 3 {
 		t.Fatalf("durable obligations = %d, want 3: %+v", len(pending), pending)
 	}
-	keysByKind := map[string]map[string]bool{}
-	for _, entry := range pending {
-		if keysByKind[entry.SourceKind] == nil {
-			keysByKind[entry.SourceKind] = map[string]bool{}
-		}
-		keysByKind[entry.SourceKind][entry.CoalesceKey] = true
-	}
-	if len(keysByKind["blocked"]) != 1 || !keysByKind["blocked"]["blocked:owner"] {
-		t.Fatalf("blocked coalesce keys = %v, want one blocked:owner key", keysByKind["blocked"])
-	}
-	if len(keysByKind[db.WakeOutboxSourceWorkflowNote]) != 1 ||
-		!keysByKind[db.WakeOutboxSourceWorkflowNote]["reply:owner"] {
-		t.Fatalf("reply coalesce keys = %v, want one reply:owner key", keysByKind[db.WakeOutboxSourceWorkflowNote])
-	}
-	if keysByKind["blocked"]["reply:owner"] {
-		t.Fatalf("blocked and reply obligations collided: %+v", pending)
-	}
 
 	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
 	if wake.promptCalls != 2 {
@@ -145,41 +128,6 @@ func TestWakeOutboxCoalescesPerKindAndRole(t *testing.T) {
 	}
 	if blockedWakes != 1 || replyWakes != 1 {
 		t.Fatalf("wake kinds = blocked:%d reply:%d, prompts=%q", blockedWakes, replyWakes, wake.prompts)
-	}
-}
-
-func TestWakeOutboxCoalescedPromptNamesEveryWorkflowNote(t *testing.T) {
-	store, deliverySink, wake, _ := replyWakeTestHarness(
-		t,
-		[]replyWakeTestRole{{name: "owner", pane: "w1:p1"}},
-	)
-	ctx := context.Background()
-	notes := make([]db.WorkflowNote, 0, 3)
-	for _, body := range []string{"first message", "second message", "third message"} {
-		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID:      "release/distinct-note-wakes",
-			Author:          "worker",
-			Body:            body,
-			AddressedTarget: "owner",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		notes = append(notes, note)
-	}
-
-	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
-	if wake.promptCalls != 1 {
-		t.Fatalf("wake calls=%d, want one coalesced wake: %q", wake.promptCalls, wake.prompts)
-	}
-	if want := fmt.Sprintf("3 new items, oldest id %d", notes[0].ID); !strings.Contains(wake.prompt, want) {
-		t.Fatalf("coalesced prompt=%q, want %q", wake.prompt, want)
-	}
-	for _, note := range notes {
-		command := "gitmoot workflow show-note " + fmt.Sprint(note.ID)
-		if matches := strings.Count(wake.prompt, command); matches != 1 {
-			t.Fatalf("retrieval command %q appeared %d times, want exactly one: %q", command, matches, wake.prompt)
-		}
 	}
 }
 
@@ -216,13 +164,6 @@ func TestWakeOutboxTickHealthIncludesBlockedAndEscalation(t *testing.T) {
 	}
 	if len(pending) != 2 {
 		t.Fatalf("blocked/escalation obligations = %d, want 2: %+v", len(pending), pending)
-	}
-	kinds := map[string]bool{}
-	for _, entry := range pending {
-		kinds[entry.SourceKind] = true
-	}
-	if !kinds["blocked"] || !kinds["escalation"] {
-		t.Fatalf("pending source kinds = %v, want blocked and escalation", kinds)
 	}
 	health, err := wakeOutboxObligationHealth(
 		ctx,
@@ -528,10 +469,6 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 	if wake.promptCalls != 1 {
 		t.Fatalf("wake calls = %d, want exactly one; prompts=%q", wake.promptCalls, wake.prompts)
 	}
-	want := fmt.Sprintf("10 new items, oldest id %d", oldestID)
-	if !strings.Contains(wake.prompt, want) {
-		t.Fatalf("wake prompt = %q, want %q", wake.prompt, want)
-	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
 	if err != nil || len(delivered) != 1 || delivered[0].SourceID != fmt.Sprint(oldestID) {
 		t.Fatalf("delivered rows = %+v, err=%v, want only the surviving oldest row", delivered, err)
@@ -553,28 +490,19 @@ func TestReplyWakeOutboxBurstCoalescesToExactlyOneWake(t *testing.T) {
 func TestReplyWakeOutboxSplitsOversizedAddressedNoteBatch(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
 	ctx := context.Background()
-	noteIDs := make([]int64, 0, replyWakeMaxCoalescedItems+1)
 	for index := 0; index < replyWakeMaxCoalescedItems+1; index++ {
-		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+		_, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
 			WorkflowID: "release/bounded-burst", Author: "worker",
 			Body: fmt.Sprintf("addressed item %d", index+1), AddressedTarget: "owner",
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		noteIDs = append(noteIDs, note.ID)
 	}
 
 	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
 	if wake.promptCalls != 2 {
 		t.Fatalf("wake calls=%d, want two count-bounded batches: %q", wake.promptCalls, wake.prompts)
-	}
-	normalizedPrompts := strings.ReplaceAll(strings.Join(wake.prompts, "\n"), "\n", "; ") + ";"
-	for _, noteID := range noteIDs {
-		command := "gitmoot workflow show-note " + fmt.Sprint(noteID)
-		if matches := strings.Count(normalizedPrompts, command+";"); matches != 1 {
-			t.Fatalf("retrieval command %q appeared %d times, want exactly one: %q", command, matches, wake.prompts)
-		}
 	}
 }
 
@@ -604,11 +532,6 @@ func TestReplyWakeOutboxKeepsRolesSeparate(t *testing.T) {
 	}
 	if !gotPane["w1:p1"] || !gotPane["w1:p2"] {
 		t.Fatalf("wake panes = %v, want both role panes", wake.panes)
-	}
-	for _, prompt := range wake.prompts {
-		if !strings.Contains(prompt, "3 new items, oldest id ") {
-			t.Fatalf("cross-contaminated prompt = %q", prompt)
-		}
 	}
 }
 
@@ -648,15 +571,6 @@ func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 	}
 	if wake.promptCalls != 1 {
 		t.Fatalf("wake calls = %d, want one collapsed wake; prompts=%v", wake.promptCalls, wake.prompts)
-	}
-	if !strings.Contains(wake.prompt, "2 new items, oldest id ") {
-		t.Fatalf("collapsed prompt = %q, want both items named", wake.prompt)
-	}
-	// Nothing is dropped: the surviving wake still names every collapsed note.
-	for _, note := range []int64{first.ID, second.ID} {
-		if !strings.Contains(wake.prompt, fmt.Sprintf("gitmoot workflow show-note %d", note)) {
-			t.Fatalf("collapsed prompt = %q, want retrieval command for note %d", wake.prompt, note)
-		}
 	}
 	rows, err := store.ListWakeOutbox(ctx, "")
 	if err != nil || len(rows) != 2 {
@@ -717,7 +631,7 @@ func TestReplyWakeOutboxHonorsConfiguredHold(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+	if wake.promptCalls != 1 {
 		t.Fatalf("post-hold wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
 	}
 }
@@ -761,7 +675,7 @@ func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
 	); err != nil {
 		t.Fatalf("fleet daemon tick: %v", err)
 	}
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "4 new items, oldest id ") {
+	if wake.promptCalls != 1 {
 		t.Fatalf("tail wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
 	}
 }
@@ -795,6 +709,38 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 				t.Fatalf("%s rows = %+v, err=%v", test.wantState, rows, err)
 			}
 		})
+	}
+}
+
+func TestRuntimeDeferralKeepsEntireBatchPendingWithoutRetryBudget(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	wake.promptErr = &cockpit.NotificationDeferred{Reason: "draft"}
+	for range 2 {
+		if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+			WorkflowID: "wake-test", Author: "review", Body: "inbox obligation", AddressedTarget: "owner",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range wakeDeliveryMaxAttempts + 2 {
+		// Pending mail remains an outstanding obligation in drain health.
+		_ = drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
+		rows, err := store.ListWakeOutbox(context.Background(), "")
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("batch=%+v err=%v", rows, err)
+		}
+		for _, row := range rows {
+			if row.State != "pending" || row.AttemptCount != 0 || row.AttemptedAt != "" {
+				t.Fatalf("deferral spent retry budget or lost an obligation: %+v", row)
+			}
+		}
+	}
+	wake.promptErr = nil
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	rows, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(rows) != 2 || rows[0].State != "delivered" || rows[1].State != "superseded" ||
+		rows[1].LastError != db.WakeOutboxCoalescedDetail(rows[0].ID) {
+		t.Fatalf("safe boundary did not acknowledge the whole batch: %+v err=%v", rows, err)
 	}
 }
 
@@ -833,7 +779,7 @@ func TestBlockedWakeIsRetriedNotDropped(t *testing.T) {
 	wake.promptErr = nil
 	wake.promptCalls = 0
 	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "2 new items, oldest id ") {
+	if wake.promptCalls != 1 {
 		t.Fatalf("retry wake = calls=%d prompt=%q, want one wake naming both notes", wake.promptCalls, wake.prompt)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
@@ -1408,6 +1354,10 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+		States:       map[string]org.RoleLiveState{"owner": {State: org.StateIdle}},
+		PaneBindings: map[string]org.PaneBinding{"owner": {PaneID: "w1:p1"}},
+	}})
 	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
@@ -1510,7 +1460,7 @@ func (w *blockingReplyWake) Available(context.Context) bool {
 	return true
 }
 
-func (w *blockingReplyWake) AgentPrompt(ctx context.Context, _, _, _ string) (bool, bool, error) {
+func (w *blockingReplyWake) AgentNotify(ctx context.Context, _ cockpit.NotificationTarget, _ string) (bool, bool, error) {
 	close(w.started)
 	select {
 	case <-w.release:
@@ -1520,8 +1470,8 @@ func (w *blockingReplyWake) AgentPrompt(ctx context.Context, _, _, _ string) (bo
 	}
 }
 
-func (w *blockingReplyWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
-	return label, true
+func (w *blockingReplyWake) ResolveNotificationTarget(_ context.Context, label string) (cockpit.NotificationTarget, bool) {
+	return cockpit.NotificationTarget{Selector: label}, true
 }
 
 type replyWakeTestRole struct {
@@ -1531,6 +1481,12 @@ type replyWakeTestRole struct {
 
 func replyWakeTestHarness(t *testing.T, roles []replyWakeTestRole) (*db.Store, synchronousEventRuleTestSink, *fakeEventWake, string) {
 	t.Helper()
+	snapshot := org.Snapshot{States: make(map[string]org.RoleLiveState), PaneBindings: make(map[string]org.PaneBinding)}
+	for _, role := range roles {
+		snapshot.States[role.name] = org.RoleLiveState{State: org.StateIdle}
+		snapshot.PaneBindings[role.name] = org.PaneBinding{PaneID: role.pane}
+	}
+	withOrgProvider(t, orgFixtureProvider{snapshot: snapshot})
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {

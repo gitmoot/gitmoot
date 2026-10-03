@@ -309,7 +309,7 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("parse [org].directive_ack_ttl: %w", err)
 				}
 				if v <= 0 {
-					return OrgConfig{}, fmt.Errorf("org directive_ack_ttl must be positive")
+					return OrgConfig{}, fmt.Errorf("message directive_ack_ttl must be positive")
 				}
 				cfg.directiveAckTTL = v
 			case "directive_done_ttl":
@@ -332,7 +332,7 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("parse [org].directive_max_nudges: expected integer")
 				}
 				if v <= 0 {
-					return OrgConfig{}, fmt.Errorf("org directive_max_nudges must be positive")
+					return OrgConfig{}, fmt.Errorf("message directive_max_nudges must be positive")
 				}
 				cfg.directiveMaxNudges = v
 			case "wake_coalesce_hold":
@@ -532,13 +532,13 @@ func ValidateOrg(cfg OrgConfig) error {
 		return fmt.Errorf("org recycle_after must not be negative")
 	}
 	if cfg.directiveAckTTL < 0 {
-		return fmt.Errorf("org directive_ack_ttl must not be negative")
+		return fmt.Errorf("message directive_ack_ttl must not be negative")
 	}
 	if cfg.directiveDoneTTL < 0 {
-		return fmt.Errorf("org directive_done_ttl must not be negative")
+		return fmt.Errorf("message directive_done_ttl must not be negative")
 	}
 	if cfg.directiveMaxNudges < 0 {
-		return fmt.Errorf("org directive_max_nudges must not be negative")
+		return fmt.Errorf("message directive_max_nudges must not be negative")
 	}
 	if cfg.wakeCoalesceHold < 0 {
 		return fmt.Errorf("org wake_coalesce_hold must not be negative")

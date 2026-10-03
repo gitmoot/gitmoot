@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -49,16 +50,104 @@ pane = "w1:p2"
 	return home, paths
 }
 
-func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) {
+func assertQuotaInboxNotice(t *testing.T, store *db.Store, jobID string) db.Message {
+	t.Helper()
+	messages, err := store.ListMessages(context.Background(), "owner", 0, 100)
+	if err != nil || len(messages) != 1 {
+		t.Fatalf("parent inbox = %+v, err=%v; want one durable quota notice", messages, err)
+	}
+	message := messages[0]
+	if message.Kind != "notification" || message.Sender != db.MessageSystemSender ||
+		message.SourceState != "blocked" || (jobID != "" && message.SourceJobID != jobID) {
+		t.Fatalf("quota provenance = %+v", message)
+	}
+	rows, err := store.ListWakeOutbox(context.Background(), "pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := 0
+	for _, row := range rows {
+		if row.TargetRole == "owner" && row.SourceID == message.SourceID {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("pending parent delivery matches=%d: %+v", matches, rows)
+	}
+	return message
+}
+
+func TestQuotaNotificationFailureDoesNotConsumeIncidentClaim(t *testing.T) {
 	home, paths := setupQuotaUnavailableOrgHome(t)
 	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	wake := &fakeEventWake{}
+	raw, err := sql.Open("sqlite", store.DatabasePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec(`CREATE TRIGGER refuse_quota_mail BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'inbox unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	hooks := quotaRoleUnavailableHooks{store: store, home: home}
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	capture := func() error {
+		return hooks.captureFailure(context.Background(), db.Job{ID: "job-quota"},
+			workflow.JobPayload{Repo: "gitmoot/gitmoot", ActingOrgRole: "review"},
+			runtime.Agent{Runtime: runtime.ClaudeRuntime},
+			workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}, now)
+	}
+	if err := capture(); err == nil {
+		t.Fatal("failed inbox write must report notification failure")
+	}
+	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found || incident.EscalatedAt != "" {
+		t.Fatalf("quota guard must survive without consuming its claim: incident=%+v found=%v err=%v", incident, found, err)
+	}
+	if _, err := raw.Exec(`DROP TRIGGER refuse_quota_mail`); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture(); err != nil {
+		t.Fatal(err)
+	}
+	assertQuotaInboxNotice(t, store, "job-quota")
+}
+
+func TestQuotaConfigurationFailureStillPausesRuntime(t *testing.T) {
+	home, paths := setupQuotaUnavailableOrgHome(t)
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.bad]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	hooks := quotaRoleUnavailableHooks{store: store, home: home}
+	err = hooks.captureFailure(context.Background(), db.Job{ID: "job-quota"},
+		workflow.JobPayload{ActingOrgRole: "review"}, runtime.Agent{Runtime: runtime.ClaudeRuntime},
+		workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}, now)
+	if err == nil {
+		t.Fatal("invalid notification configuration must be reported")
+	}
+	incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now)
+	if err != nil || !found || incident.Runtime != runtime.ClaudeRuntime || incident.EscalatedAt != "" {
+		t.Fatalf("configuration failure lost the quota guard or consumed the notification: %+v found=%v err=%v", incident, found, err)
+	}
+}
+
+func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) {
+	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}, {"review", "w1:p2"}})
+	if err := store.AddEventRule(context.Background(), db.EventRule{
+		ID: "quota-parent", OnKind: "escalation", WakeRole: "owner", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	var output bytes.Buffer
-	worker := jobWorker{Store: store, ConfigHome: home, ConfigHomeExplicit: true, Stdout: &output, QuotaWake: wake}
+	worker := jobWorker{Store: store, ConfigHome: home, ConfigHomeExplicit: true, Stdout: &output}
 	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	job := db.Job{ID: "job-quota", Agent: "claude-agent"}
 	payload := workflow.JobPayload{Repo: "gitmoot/gitmoot", ActingOrgRole: "review"}
@@ -68,12 +157,7 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), job, payload, agent, cause, now); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 1 || wake.pane != "w1:p1" {
-		t.Fatalf("wake = calls=%d pane=%q prompt=%q", wake.promptCalls, wake.pane, wake.prompt)
-	}
-	if !strings.Contains(wake.prompt, "review is UNAVAILABLE") || !strings.Contains(wake.prompt, "reason=quota") {
-		t.Fatalf("wake prompt = %q", wake.prompt)
-	}
+	first := assertQuotaInboxNotice(t, store, "job-quota")
 	incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now)
 	if err != nil || !found || incident.Runtime != runtime.ClaudeRuntime || incident.EscalatedAt == "" {
 		t.Fatalf("incident = %+v found=%v err=%v", incident, found, err)
@@ -82,8 +166,13 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), job, payload, agent, cause, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("repeat quota failure woke %d times, want exactly once", wake.promptCalls)
+	if next := assertQuotaInboxNotice(t, store, "job-quota"); next.ID != first.ID {
+		t.Fatalf("repeat quota failure created another message: %d -> %d", first.ID, next.ID)
+	}
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 || delivered[0].SourceID != first.SourceID || wake.pane != "w1:p1" {
+		t.Fatalf("parent notification did not reach its registered runtime: rows=%+v target=%q err=%v", delivered, wake.pane, err)
 	}
 
 	if err := worker.quotaRoleUnavailableHooks().clearOnSuccess(context.Background(), "review", runtime.ClaudeRuntime); err != nil {
@@ -94,7 +183,7 @@ func TestCaptureQuotaRoleUnavailableEscalatesOnceAndSuccessClears(t *testing.T) 
 	}
 }
 
-func TestQuotaRoleUnavailableNudgeCountsUnresolvedParentBinding(t *testing.T) {
+func TestQuotaRoleUnavailableKeepsMailForUnresolvedParentBinding(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
@@ -116,30 +205,15 @@ pane = "w1:p2"
 		t.Fatal(err)
 	}
 	defer store.Close()
-	var output bytes.Buffer
-	wake := &fakeEventWake{}
-	hooks := quotaRoleUnavailableHooks{store: store, home: home, stdout: &output, wake: wake}
-	hooks.wakeParent(
-		context.Background(),
-		db.Job{ID: "job-quota"},
+	hooks := quotaRoleUnavailableHooks{store: store, home: home}
+	err = hooks.captureFailure(context.Background(), db.Job{ID: "job-quota"},
 		workflow.JobPayload{Repo: "gitmoot/gitmoot", ActingOrgRole: "review"},
-		db.OrgRoleUnavailable{Role: "review", Until: time.Now().Add(time.Hour).Format(db.BlockedEpisodeTimeLayout)},
-		true,
-		true,
-	)
-	missed, err := store.ListRoleMissedWakes(context.Background())
+		runtime.Agent{Runtime: runtime.ClaudeRuntime},
+		workflow.DeliveryError{Err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(missed) != 1 || missed[0].Role != "owner" || missed[0].Consecutive != 1 {
-		t.Fatalf("unresolved parent missed wakes = %+v, want owner count 1", missed)
-	}
-	if !strings.Contains(output.String(), "parent role owner has no pane") {
-		t.Fatalf("output = %q", output.String())
-	}
-	if wake.promptCalls != 0 {
-		t.Fatalf("unresolved parent prompted %d times", wake.promptCalls)
-	}
+	assertQuotaInboxNotice(t, store, "job-quota")
 }
 
 func TestCaptureQuotaRoleUnavailableClaudeOnly(t *testing.T) {
@@ -177,10 +251,6 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 		return adapter, nil
 	}
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapterFactory })
-	wake := &fakeEventWake{}
-	previousWakeFactory := newQuotaRoleUnavailableWakeClient
-	newQuotaRoleUnavailableWakeClient = func() eventWakeClient { return wake }
-	t.Cleanup(func() { newQuotaRoleUnavailableWakeClient = previousWakeFactory })
 
 	request := localAgentDispatchRequest{
 		RepoFlag:       "gitmoot/gitmoot",
@@ -199,9 +269,7 @@ func TestForegroundDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found {
 		t.Fatalf("foreground quota incident = %+v found=%v err=%v", incident, found, err)
 	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("foreground quota escalation calls = %d, want 1", wake.promptCalls)
-	}
+	assertQuotaInboxNotice(t, store, "")
 
 	if err := store.ClearOrgRoleUnavailable(context.Background(), "review"); err != nil {
 		t.Fatal(err)
@@ -243,7 +311,6 @@ func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T)
 		t.Fatal(err)
 	}
 	worker := blockerE2EWorker(store, home, checkout)
-	worker.QuotaWake = nil
 	job, err := store.GetJob(context.Background(), "job-success-clear")
 	if err != nil {
 		t.Fatal(err)
@@ -293,11 +360,9 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 
 	starter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440003"}
 	delivery := &cliWorkerFakeAdapter{err: errors.New("API error: You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
-	wake := &fakeEventWake{}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) { return starter, nil }
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return delivery, nil }
-	worker.QuotaWake = wake
 	policy := config.DefaultParallelSessionPolicy()
 	policy.MergeBack = config.ParallelSessionMergeBackOff
 
@@ -325,9 +390,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 	if incident, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || !found {
 		t.Fatalf("temp-worker quota incident = %+v found=%v err=%v", incident, found, err)
 	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("temp-worker escalation calls = %d, want 1", wake.promptCalls)
-	}
+	assertQuotaInboxNotice(t, store, "job-temp-quota")
 
 	if err := store.ClearOrgRoleUnavailable(context.Background(), "review"); err != nil {
 		t.Fatal(err)

@@ -22,17 +22,18 @@ func TestOrgRoleUnavailableLifecycle(t *testing.T) {
 	if err != nil || !found || got.Role != "review" || got.Reason != "quota" || got.EscalatedAt != "" {
 		t.Fatalf("GetActiveOrgRoleUnavailable = %+v, %v, %v", got, found, err)
 	}
-	claimed, err := store.MarkOrgRoleUnavailableEscalated(ctx, "review", now.Add(time.Minute))
-	if err != nil || !claimed {
-		t.Fatalf("first escalation claim = %v, %v", claimed, err)
+	notice := Message{SourceID: "quota-a", SourcePayload: "{}", Kind: "notification", Recipient: "owner", Body: "Quota pause"}
+	for _, at := range []time.Time{now.Add(time.Minute), now.Add(2 * time.Minute)} {
+		if err := store.RecordOrgRoleUnavailableWithNotification(ctx, "review", "claude", "quota", now.Add(time.Hour), at, &notice); err != nil {
+			t.Fatal(err)
+		}
 	}
-	claimed, err = store.MarkOrgRoleUnavailableEscalated(ctx, "review", now.Add(2*time.Minute))
-	if err != nil || claimed {
-		t.Fatalf("second escalation claim = %v, %v", claimed, err)
+	if mail, err := store.ListMessages(ctx, "owner", 0, 100); err != nil || len(mail) != 1 {
+		t.Fatalf("same incident should create one notification: %+v err=%v", mail, err)
 	}
 
 	// Refreshing the same live incident neither shortens it nor resets escalation.
-	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(30*time.Minute), now.Add(3*time.Minute)); err != nil {
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", "claude", "quota", now.Add(30*time.Minute), now.Add(3*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	got, found, err = store.GetActiveOrgRoleUnavailable(ctx, "review", now.Add(4*time.Minute))
@@ -48,13 +49,13 @@ func TestOrgRoleUnavailableLifecycle(t *testing.T) {
 		t.Fatalf("expired incident found=%v err=%v", found, err)
 	}
 
-	// A new incident after expiry receives a fresh escalation claim.
-	if err := store.UpsertOrgRoleUnavailable(ctx, "review", "quota", now.Add(2*time.Hour), now.Add(time.Hour)); err != nil {
+	// A new incident after expiry receives another durable notification.
+	notice.SourceID = "quota-b"
+	if err := store.RecordOrgRoleUnavailableWithNotification(ctx, "review", "claude", "quota", now.Add(2*time.Hour), now.Add(time.Hour), &notice); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err = store.MarkOrgRoleUnavailableEscalated(ctx, "review", now.Add(time.Hour))
-	if err != nil || !claimed {
-		t.Fatalf("new incident escalation claim = %v, %v", claimed, err)
+	if mail, err := store.ListMessages(ctx, "owner", 0, 100); err != nil || len(mail) != 2 || mail[0].SourceID != "quota-b" {
+		t.Fatalf("new incident notification missing: %+v err=%v", mail, err)
 	}
 	if err := store.ClearOrgRoleUnavailable(ctx, "review"); err != nil {
 		t.Fatal(err)

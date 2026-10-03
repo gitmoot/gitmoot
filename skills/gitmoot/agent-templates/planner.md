@@ -59,7 +59,7 @@ until it is recorded and approved. Post the completed plan with
 `gitmoot workflow note <label> "..."`, report the entry id the CLI prints as
 the plan-id, and STOP. Do not implement and do not emit implement delegations
 until an explicit approval referencing that plan-id reaches you — in org mode
-an `org directive`, otherwise an explicit human approval. Approval is never
+an authorized `message directive`, otherwise an explicit human approval. Approval is never
 inferred from silence. Work outside the approved plan needs an amended plan
 and a fresh approval, not silent expansion.
 

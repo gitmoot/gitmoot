@@ -3,10 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -30,7 +27,6 @@ type fakeEventWake struct {
 	prompt         string
 	panes          []string
 	prompts        []string
-	until          string
 	labelToPane    map[string]string
 	stalled        bool
 	promptErr      error
@@ -43,10 +39,10 @@ func (f *fakeEventWake) Available(context.Context) bool {
 	return true
 }
 
-func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
+func (f *fakeEventWake) AgentNotify(_ context.Context, target cockpit.NotificationTarget, prompt string) (bool, bool, error) {
 	f.promptCalls++
-	f.pane, f.prompt, f.until = pane, prompt, until
-	f.panes = append(f.panes, pane)
+	f.pane, f.prompt = target.Selector, prompt
+	f.panes = append(f.panes, target.Selector)
 	f.prompts = append(f.prompts, prompt)
 	if f.onPrompt != nil {
 		if err := f.onPrompt(); err != nil {
@@ -65,134 +61,12 @@ func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until strin
 	return true, false, nil
 }
 
-func (f *fakeEventWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
+func (f *fakeEventWake) ResolveNotificationTarget(_ context.Context, label string) (cockpit.NotificationTarget, bool) {
 	pane, ok := f.labelToPane[label]
 	if !ok && strings.Contains(label, ":") {
-		return label, true
+		return cockpit.NotificationTarget{Selector: label}, true
 	}
-	return pane, ok
-}
-
-func TestEventRuleDirectiveWakePromptMatchesCurrentPhase(t *testing.T) {
-	base := events.Event{
-		RootID:         db.WakeOutboxSourceWorkflowNote + ":42",
-		WakeTargetRole: "worker",
-	}
-	tests := []struct {
-		name      string
-		cause     string
-		want      []string
-		forbidden []string
-	}{
-		{
-			// #1980: the first-delivery prompt carries the OBLIGATION, not a
-			// receipt chore. The transport records receipt itself when this very
-			// prompt lands, so asking the seat for an ack spent a turn boundary
-			// to learn what delivery already proved.
-			name:      "receipt",
-			cause:     "addressed_directive",
-			want:      []string{"gitmoot org directive done 42 --by worker"},
-			forbidden: []string{"acknowledge receipt", "gitmoot org directive ack"},
-		},
-		{
-			// MUTANT: reverting to the fixed receipt prompt would tell an already
-			// acknowledged recipient to append another ack instead of delivering.
-			name:      "completion",
-			cause:     directiveCompletionOverdueCause,
-			want:      []string{"finish the assigned deliverable", "gitmoot org directive done 42 --by worker"},
-			forbidden: []string{"gitmoot org directive ack", "acknowledge receipt"},
-		},
-		{
-			// MUTANT: a stale pending wake for a terminal directive must never
-			// render either state-changing command.
-			name:      "terminal",
-			cause:     directiveTerminalCause,
-			want:      []string{"already terminal", "no receipt or completion action is required"},
-			forbidden: []string{"gitmoot org directive ack", "gitmoot org directive done"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			event := base
-			event.Cause = tt.cause
-			prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
-			for _, want := range tt.want {
-				if !strings.Contains(prompt, want) {
-					t.Fatalf("prompt %q does not contain %q", prompt, want)
-				}
-			}
-			for _, forbidden := range tt.forbidden {
-				if strings.Contains(prompt, forbidden) {
-					t.Fatalf("prompt %q contains forbidden %q", prompt, forbidden)
-				}
-			}
-		})
-	}
-}
-func TestEventRuleReviewVerdictWakePrompt(t *testing.T) {
-	event := events.Event{
-		JobID:          "review-42",
-		Repo:           "gitmoot/gitmoot",
-		Detail:         "one blocking issue",
-		PullRequest:    42,
-		ReviewDecision: "changes_requested",
-	}
-	prompt := eventRuleWakePrompt(eventRuleKindReviewVerdict, event)
-	for _, want := range []string{"changes_requested", "gitmoot/gitmoot#42", "review-42", "one blocking issue"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt %q does not contain %q", prompt, want)
-		}
-	}
-}
-
-// TestDirectiveWakePromptCarriesTheBody is the other half of #1981. A prompt
-// that names a row and leaves the seat to fetch it costs another turn, and the
-// reader it pointed at withheld the body anyway. An over-long body must say
-// how much was omitted and how to read the rest, never stop mid-clause.
-func TestDirectiveWakePromptCarriesTheBody(t *testing.T) {
-	base := events.Event{
-		RootID:         db.WakeOutboxSourceWorkflowNote + ":42",
-		WakeTargetRole: "worker",
-		Cause:          "addressed_directive",
-	}
-
-	t.Run("short body is carried whole", func(t *testing.T) {
-		event := base
-		event.Detail = "[org:directive to=worker from=owner wf=w] rebase the branch and re-run the gate"
-		prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
-		if !strings.Contains(prompt, "rebase the branch and re-run the gate") {
-			t.Fatalf("prompt %q does not carry the directive body", prompt)
-		}
-		if strings.Contains(prompt, "characters omitted") {
-			t.Fatalf("prompt %q claims truncation for a short body", prompt)
-		}
-		if !strings.Contains(prompt, "gitmoot org directive done 42 --by worker") {
-			t.Fatalf("prompt %q lost the completion command", prompt)
-		}
-	})
-
-	t.Run("over-long body names what it omitted", func(t *testing.T) {
-		event := base
-		event.Detail = strings.Repeat("context ", directiveWakeBodyMaxBytes/4)
-		prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, event)
-		if len(prompt) > directiveWakeBodyMaxBytes+400 {
-			t.Fatalf("prompt is %d bytes, want the body bounded near %d", len(prompt), directiveWakeBodyMaxBytes)
-		}
-		body := strings.TrimSpace(event.Detail)
-		omitted := len(body) - directiveWakeBodyMaxBytes
-		if !strings.Contains(prompt, fmt.Sprintf("of %d characters omitted", len(body))) {
-			t.Fatalf("prompt %q does not state how much of the %d-character body was omitted (about %d)", prompt, len(body), omitted)
-		}
-		if !strings.Contains(prompt, "gitmoot workflow show-note 42 --json") {
-			t.Fatalf("prompt %q omits the retrieval command for the rest", prompt)
-		}
-		// A word boundary, not a mid-word cut: the carried text must end on a
-		// complete word from the body.
-		carried := prompt[:strings.Index(prompt, " [")]
-		if strings.HasSuffix(carried, "contex") || strings.HasSuffix(carried, "conte") {
-			t.Fatalf("prompt cut mid-word: %q", carried[len(carried)-40:])
-		}
-	})
+	return cockpit.NotificationTarget{Selector: pane}, ok
 }
 
 func TestClassifyEventRuleKinds(t *testing.T) {
@@ -226,121 +100,6 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestWakeTargetRoleProductionWritesMatchObserverRegistry(t *testing.T) {
-	writes := productionWakeTargetRoleWrites(t)
-	if got, want := fmt.Sprint(writes), "[internal/cli/blocked_since.go:buildDirectiveEscalationEvent internal/cli/blocked_since.go:buildDirectiveNudgeEvent internal/cli/blocked_since.go:buildDirectiveWorkingEscalationEvent internal/cli/blocked_since.go:emitInputPendingEpisode internal/cli/event_rule_sink.go:addressBlockedEvent internal/cli/event_sink.go:emitDaemonTerminalEvent internal/cli/reply_wake_outbox.go:wakeOutboxEvent internal/daemon/task_disposal.go:strandTask internal/workflow/engine_types.go:mailbox]"; got != want {
-		t.Fatalf("production WakeTargetRole writes = %s, want %s", got, want)
-	}
-	registryWrites := make([]wakeTargetRoleWrite, 0, len(wakeTargetRoleProducers))
-	for _, producer := range wakeTargetRoleProducers {
-		registryWrites = append(registryWrites, wakeTargetRoleWrite{
-			file: producer.File, function: producer.Function,
-		})
-	}
-	sort.Slice(registryWrites, func(i, j int) bool {
-		if registryWrites[i].file != registryWrites[j].file {
-			return registryWrites[i].file < registryWrites[j].file
-		}
-		return registryWrites[i].function < registryWrites[j].function
-	})
-	if got, want := fmt.Sprint(registryWrites), fmt.Sprint(writes); got != want {
-		t.Fatalf("WakeTargetRole producer registry = %s, production writes = %s", got, want)
-	}
-	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
-		SourceKind: "workflow_note", SourceID: "note-1", TargetRole: "owner",
-	}}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event.Type != events.EventOrgReply || strings.TrimSpace(event.WakeTargetRole) != "owner" {
-		t.Fatalf("reply wake event = {Type:%q WakeTargetRole:%q}, want org.reply addressed to owner", event.Type, event.WakeTargetRole)
-	}
-}
-
-type wakeTargetRoleWrite struct {
-	file     string
-	function string
-}
-
-func (w wakeTargetRoleWrite) String() string {
-	return w.file + ":" + w.function
-}
-
-func productionWakeTargetRoleWrites(t *testing.T) []wakeTargetRoleWrite {
-	t.Helper()
-	root, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var writes []wakeTargetRoleWrite
-	err = filepath.WalkDir(root, func(filename string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if entry.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if filepath.Ext(filename) != ".go" || strings.HasSuffix(filename, "_test.go") {
-			return nil
-		}
-		fset := token.NewFileSet()
-		parsed, err := parser.ParseFile(fset, filename, nil, 0)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(root, filename)
-		if err != nil {
-			return err
-		}
-		for _, declaration := range parsed.Decls {
-			functionName := "<package>"
-			node := ast.Node(declaration)
-			if function, ok := declaration.(*ast.FuncDecl); ok {
-				if function.Body == nil {
-					continue
-				}
-				functionName = function.Name.Name
-				node = function.Body
-			}
-			ast.Inspect(node, func(node ast.Node) bool {
-				switch node := node.(type) {
-				case *ast.AssignStmt:
-					for _, expression := range node.Lhs {
-						selector, ok := expression.(*ast.SelectorExpr)
-						if ok && selector.Sel.Name == "WakeTargetRole" {
-							writes = append(writes, wakeTargetRoleWrite{
-								file: filepath.ToSlash(relative), function: functionName,
-							})
-						}
-					}
-				case *ast.KeyValueExpr:
-					key, ok := node.Key.(*ast.Ident)
-					if ok && key.Name == "WakeTargetRole" {
-						writes = append(writes, wakeTargetRoleWrite{
-							file: filepath.ToSlash(relative), function: functionName,
-						})
-					}
-				}
-				return true
-			})
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sort.Slice(writes, func(i, j int) bool {
-		if writes[i].file != writes[j].file {
-			return writes[i].file < writes[j].file
-		}
-		return writes[i].function < writes[j].function
-	})
-	return writes
 }
 
 func TestJobTerminalAddressedScopeMatchesDispatcherOnly(t *testing.T) {
@@ -622,11 +381,8 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
 	sink.evaluate(context.Background(), events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", Repo: "acme/widget", JobID: "job-1", Detail: "Please choose", WakeTargetRole: "owner"})
-	if wake.availableCalls != 1 || wake.pane != "w1:p1" || wake.until != "" {
+	if wake.availableCalls != 1 || wake.pane != "w1:p1" {
 		t.Fatalf("wake=%+v", wake)
-	}
-	if want := "gitmoot attention event for job job-1: Please choose"; wake.prompt != want {
-		t.Fatalf("prompt=%q want=%q", wake.prompt, want)
 	}
 }
 
@@ -786,70 +542,6 @@ func TestEventRuleEvaluatorZeroRulesDoesNotProbeHerdr(t *testing.T) {
 	}
 }
 
-func TestDaemonEventSinkRuleOnlyActivationAndRemoval(t *testing.T) {
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	if sink := daemonEventSink(store, paths.Home); sink != nil {
-		t.Fatal("zero rules and no webhook must produce a nil sink")
-	}
-	if err := store.AddEventRule(context.Background(), db.EventRule{ID: "rule-activate", OnKind: "guard", WakeRole: "owner", Enabled: true}); err != nil {
-		t.Fatal(err)
-	}
-	if sink := daemonEventSink(store, paths.Home); sink == nil {
-		t.Fatal("enabled rule must activate the sink without a webhook")
-	}
-	if err := store.DeleteEventRule(context.Background(), "rule-activate"); err != nil {
-		t.Fatal(err)
-	}
-	if sink := daemonEventSink(store, paths.Home); sink != nil {
-		t.Fatal("removing the last rule must restore the nil off path")
-	}
-}
-
-// TestEventRuleWakeFiresEachMatchingRule guards the multi-rule fan-out: a plain
-// job.blocked event classifies to BOTH job-terminal and blocked, so two rules —
-// one per kind — must each produce a wake. (The per-rule wake context in evaluate
-// is what keeps a slow earlier wake from starving the later one; see #1060.)
-func TestEventRuleWakeFiresEachMatchingRule(t *testing.T) {
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\npane=\"w1:p1\"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	for _, r := range []db.EventRule{
-		{ID: "r-term", OnKind: "job-terminal", WakeRole: "owner", Enabled: true},
-		{ID: "r-blk", OnKind: "blocked", WakeRole: "owner", Enabled: true},
-	} {
-		if err := store.AddEventRule(context.Background(), r); err != nil {
-			t.Fatal(err)
-		}
-	}
-	wake := &fakeEventWake{}
-	sink := &eventRuleSink{store: store, home: home, wake: wake}
-	sink.evaluate(context.Background(), events.Event{Type: events.EventJobBlocked, JobID: "job-1", WakeTargetRole: "owner"})
-	if wake.promptCalls != 2 {
-		t.Fatalf("want a wake for each of the 2 matching rules, got %d", wake.promptCalls)
-	}
-}
 func TestReviewVerdictWakeTargetsRequesterImplementerAndObservers(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)

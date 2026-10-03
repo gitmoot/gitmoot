@@ -76,6 +76,11 @@ func (s *Store) applyMigration(ctx context.Context, version int, migration strin
 	if _, err := tx.ExecContext(ctx, migration); err != nil {
 		return fmt.Errorf("apply migration %d: %w", version, err)
 	}
+	if strings.Contains(migration, "-- shared-inbox-backfill") {
+		if err := backfillMessageInboxTx(ctx, tx); err != nil {
+			return fmt.Errorf("backfill shared inbox migration %d: %w", version, err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)`, version, time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return err
 	}
@@ -2895,5 +2900,17 @@ CREATE TABLE messages (
 );
 CREATE INDEX idx_messages_recipient_id ON messages(recipient, id DESC);
 CREATE INDEX idx_messages_thread_id ON messages(thread_id, id);
+	`,
+	// Shared inbox metadata is a projection of existing immutable journal and
+	// outbox identities. Backfill never creates or revives a notification.
+	`
+-- shared-inbox-backfill
+ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message';
+ALTER TABLE messages ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'workflow_note';
+ALTER TABLE messages ADD COLUMN source_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN source_payload TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN historical INTEGER NOT NULL DEFAULT 0;
+UPDATE messages SET source_id=CAST(id AS TEXT);
+CREATE UNIQUE INDEX idx_messages_source ON messages(source_kind,source_id,recipient);
 	`,
 }
