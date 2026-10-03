@@ -12,20 +12,22 @@ const OrgEscalateResolvedPrefix = "[org:escalate-resolved "
 // schema. Invalid delimiter-bearing fields return an empty string; normal CLI
 // callers validate role and workflow values before reaching this helper.
 func FormatOrgEscalateNote(from, to, wf, question string) string {
-	return formatAddressedOrgNote("escalate", []addressedOrgNoteField{
-		{key: "to", value: to}, {key: "from", value: from}, {key: "wf", value: wf},
-	}, question)
+	fields := []addressedOrgNoteField{{key: "to", value: to}, {key: "from", value: from}}
+	if wf != "" {
+		fields = append(fields, addressedOrgNoteField{key: "wf", value: wf})
+	}
+	return formatAddressedOrgNote("escalate", fields, question)
 }
 
 // ParseOrgEscalateNote decodes the typed escalation prefix. The first closing
 // bracket ends the key block, so brackets in the question are preserved.
 func ParseOrgEscalateNote(body string) (from, to, wf, question string, ok bool) {
 	values, question, ok := parseAddressedOrgNote("escalate", body)
-	if !ok || len(values) != 3 {
+	if !ok || (len(values) != 2 && len(values) != 3) || (len(values) == 3 && values["wf"] == "") {
 		return "", "", "", "", false
 	}
 	from, to, wf = values["from"], values["to"], values["wf"]
-	if from == "" || to == "" || wf == "" || strings.TrimSpace(question) == "" {
+	if from == "" || to == "" || strings.TrimSpace(question) == "" {
 		return "", "", "", "", false
 	}
 	return from, to, wf, question, true

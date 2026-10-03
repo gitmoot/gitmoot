@@ -33,7 +33,7 @@ func runOrgDirective(args []string, stdout, stderr io.Writer) int {
 	case "done":
 		return runOrgDirectiveReceipt("done", args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown org directive command %q\n", args[0])
+		fmt.Fprintf(stderr, "unknown message directive command %q\n", args[0])
 		printOrgDirectiveUsage(stderr)
 		return 2
 	}
@@ -41,10 +41,10 @@ func runOrgDirective(args []string, stdout, stderr io.Writer) int {
 
 func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive done ID [--by ROLE] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot message directive send --to ROLE [--workflow LABEL] [--role ROLE] [--json] [--home DIR] (--stdin | -F FILE | TEXT)")
+	fmt.Fprintln(w, "  gitmoot message directive ack ID [--role ROLE] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot message directive cancel ID [--role ROLE] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot message directive done ID [--role ROLE] [--json] [--home DIR]")
 	fmt.Fprintln(w, "Acknowledgment records receipt and is open to the target or an ancestor.")
 	fmt.Fprintln(w, "`done` records COMPLETION and ends the obligation, including its TTL nudges;")
 	fmt.Fprintln(w, "it is restricted to the TARGET SUBTREE -- the addressed role or one below it.")
@@ -53,11 +53,13 @@ func printOrgDirectiveUsage(w io.Writer) {
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("org directive send", flag.ContinueOnError)
+	fs := flag.NewFlagSet("message directive send", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	toFlag := fs.String("to", "", "descendant organization role receiving the directive")
 	workflowID := fs.String("workflow", "", "workflow label for the directive note")
+	roleFlag := fs.String("role", "", "acting issuer role")
+	jsonOutput := fs.Bool("json", false, "JSON output")
 	stdin := fs.Bool("stdin", false, "read directive body from stdin")
 	file := fs.String("F", "", "read directive body from file")
 	if err := fs.Parse(args); err != nil {
@@ -68,41 +70,41 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 	}
 	body, err := readOrgDirectiveBody(fs.Args(), *stdin, *file)
 	if err != nil {
-		fmt.Fprintf(stderr, "org directive send: %v\n", err)
+		fmt.Fprintf(stderr, "message directive send: %v\n", err)
 		return 2
 	}
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "org directive send: resolve paths: %v\n", err)
+		fmt.Fprintf(stderr, "message directive send: resolve paths: %v\n", err)
 		return 1
 	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		fmt.Fprintf(stderr, "org directive send: %v\n", err)
+		fmt.Fprintf(stderr, "message directive send: %v\n", err)
 		return 1
 	}
-	from := strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
-	if _, ok := cfg.Role(from); !ok {
-		fmt.Fprintf(stderr, "org directive send: unknown acting org role %q; set GITMOOT_ORG_ROLE\n", from)
+	from, err := messageActingRole(context.Background(), cfg, *roleFlag)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
 	to := strings.ToLower(strings.TrimSpace(*toFlag))
 	if _, ok := cfg.Role(to); !ok {
-		fmt.Fprintf(stderr, "org directive send: unknown target org role %q\n", to)
+		fmt.Fprintf(stderr, "message directive send: unknown target org role %q\n", to)
 		return 2
 	}
 	if from == to || !slicesContains(cfg.Ancestors(to), from) {
-		fmt.Fprintf(stderr, "org directive send: role %q is not an ancestor of target %q; peer and upward directives are refused\n", from, to)
+		fmt.Fprintf(stderr, "message directive send: role %q is not an ancestor of target %q; peer and upward directives are refused\n", from, to)
 		return 2
 	}
 	label := strings.TrimSpace(*workflowID)
-	if err := workflow.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "org directive send: %v\n", err)
+	if err := workflow.ValidateWorkflowID(label); label != "" && err != nil {
+		fmt.Fprintf(stderr, "message directive send: %v\n", err)
 		return 2
 	}
 	noteBody := workflow.FormatOrgDirectiveNote(from, to, label, body)
 	if noteBody == "" || len(noteBody) > workflowNoteBodyMax {
-		fmt.Fprintf(stderr, "org directive send: body must produce a note of at most %d bytes\n", workflowNoteBodyMax)
+		fmt.Fprintf(stderr, "message directive send: body must produce a note of at most %d bytes\n", workflowNoteBodyMax)
 		return 2
 	}
 	var note db.WorkflowNote
@@ -114,10 +116,13 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 		})
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "org directive send: %v\n", err)
+		fmt.Fprintf(stderr, "message directive send: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "sent directive %d from %s to %s in workflow %s\n", note.ID, from, to, label)
+	if *jsonOutput {
+		return writeMessageResult(*home, note.ID, from, stdout, stderr)
+	}
+	fmt.Fprintf(stdout, "directive message %d queued from %s to %s\n", note.ID, from, to)
 	return 0
 }
 
@@ -155,10 +160,11 @@ func readOrgDirectiveBody(args []string, stdin bool, file string) (string, error
 }
 
 func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("org directive "+kind, flag.ContinueOnError)
+	fs := flag.NewFlagSet("message directive "+kind, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	byFlag := fs.String("by", "", "organization role recording the "+kind)
+	byFlag := fs.String("role", "", "organization role recording the "+kind)
+	jsonOutput := fs.Bool("json", false, "JSON output")
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			_ = fs.Parse([]string{"--help"})
@@ -167,7 +173,7 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 	}
 	idText, flagArgs, ok := orgDirectiveReceiptIDAndFlags(args)
 	if !ok {
-		fmt.Fprintf(stderr, "org directive %s requires exactly one directive id\n", kind)
+		fmt.Fprintf(stderr, "message directive %s requires exactly one directive id\n", kind)
 		return 2
 	}
 	if err := fs.Parse(flagArgs); err != nil {
@@ -178,28 +184,26 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 	}
 	directiveID, err := strconv.ParseInt(idText, 10, 64)
 	if err != nil || directiveID <= 0 {
-		fmt.Fprintf(stderr, "org directive %s: invalid directive id %q\n", kind, idText)
+		fmt.Fprintf(stderr, "message directive %s: invalid directive id %q\n", kind, idText)
 		return 2
 	}
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "org directive %s: resolve paths: %v\n", kind, err)
+		fmt.Fprintf(stderr, "message directive %s: resolve paths: %v\n", kind, err)
 		return 1
 	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		fmt.Fprintf(stderr, "org directive %s: %v\n", kind, err)
+		fmt.Fprintf(stderr, "message directive %s: %v\n", kind, err)
 		return 1
 	}
-	by := strings.ToLower(strings.TrimSpace(*byFlag))
-	if by == "" {
-		by = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
-	}
-	if by == "" {
-		fmt.Fprintf(stderr, "org directive %s: acting org role is required; pass --by or set GITMOOT_ORG_ROLE\n", kind)
+	by, err := messageActingRole(context.Background(), cfg, *byFlag)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	var workflowID string
+	var issuer string
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		target, err := store.GetWorkflowNote(ctx, directiveID)
@@ -211,8 +215,9 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		}
 		from, to, _, _, ok := workflow.ParseOrgDirectiveNote(target.Body)
 		if !ok {
-			return fmt.Errorf("note %d is not an org directive", directiveID)
+			return fmt.Errorf("note %d is not an message directive", directiveID)
 		}
+		issuer = from
 		if _, ok := cfg.Role(by); !ok {
 			return fmt.Errorf("unknown org role %q", by)
 		}
@@ -256,8 +261,11 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 		workflowID = target.WorkflowID
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "org directive %s: %v\n", kind, err)
+		fmt.Fprintf(stderr, "message directive %s: %v\n", kind, err)
 		return 1
+	}
+	if *jsonOutput {
+		return writeMessageResult(*home, directiveID, issuer, stdout, stderr)
 	}
 	fmt.Fprintf(stdout, "%s directive %d in workflow %s\n", orgDirectiveReceiptPastTense(kind), directiveID, workflowID)
 	return 0
@@ -276,7 +284,7 @@ func orgDirectiveReceiptPastTense(kind string) string {
 }
 
 func orgDirectiveReceiptIDAndFlags(args []string) (string, []string, bool) {
-	needsValue := map[string]bool{"--home": true, "--by": true}
+	needsValue := map[string]bool{"--home": true, "--role": true}
 	idIndex := -1
 	for i := 0; i < len(args); i++ {
 		if needsValue[args[i]] {
@@ -286,7 +294,7 @@ func orgDirectiveReceiptIDAndFlags(args []string) (string, []string, bool) {
 			}
 			continue
 		}
-		if strings.HasPrefix(args[i], "--home=") || strings.HasPrefix(args[i], "--by=") {
+		if args[i] == "--json" || strings.HasPrefix(args[i], "--json=") || strings.HasPrefix(args[i], "--home=") || strings.HasPrefix(args[i], "--role=") {
 			continue
 		}
 		if strings.HasPrefix(args[i], "-") || idIndex >= 0 {
@@ -307,4 +315,19 @@ func slicesContains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func writeMessageResult(home string, id int64, role string, stdout, stderr io.Writer) int {
+	err := withStore(home, func(store *db.Store) error {
+		message, err := store.GetMessage(context.Background(), id, role)
+		if err != nil {
+			return err
+		}
+		return writeJSON(stdout, message)
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
 }

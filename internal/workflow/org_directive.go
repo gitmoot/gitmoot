@@ -18,14 +18,16 @@ const (
 )
 
 func FormatOrgDirectiveNote(from, to, wf, directive string) string {
-	return formatAddressedOrgNote("directive", []addressedOrgNoteField{
-		{key: "to", value: to}, {key: "from", value: from}, {key: "wf", value: wf},
-	}, directive)
+	fields := []addressedOrgNoteField{{key: "to", value: to}, {key: "from", value: from}}
+	if wf != "" {
+		fields = append(fields, addressedOrgNoteField{key: "wf", value: wf})
+	}
+	return formatAddressedOrgNote("directive", fields, directive)
 }
 
 func ParseOrgDirectiveNote(body string) (from, to, wf, directive string, ok bool) {
 	values, directive, ok := parseAddressedOrgNote("directive", body)
-	if !ok || directive == "" || len(values) != 3 || values["from"] == "" || values["to"] == "" || values["wf"] == "" {
+	if !ok || directive == "" || (len(values) != 2 && len(values) != 3) || (len(values) == 3 && values["wf"] == "") || values["from"] == "" || values["to"] == "" {
 		return "", "", "", "", false
 	}
 	return values["from"], values["to"], values["wf"], directive, true

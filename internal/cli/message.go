@@ -20,15 +20,18 @@ func printMessageUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]
   gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
-  gitmoot message show ID [--role ROLE] [--json] [--home DIR]
+  gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
   gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]
+  gitmoot message escalate [--workflow LABEL] [--to ROLE] [--role ROLE] [--json] "QUESTION"
+  gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json]
+  gitmoot message directive send|ack|done|cancel --help
 
 Messages are durable ordinary conversation between registered fleet roles.
 No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
 --role is an operator attribution override, not an authentication credential.
 Saved mail, notification submission, reading and task completion are separate facts.
-Escalations and directives retain their existing authorized commands until their cutover.`)
+Escalations track decisions; directives retain issuer and recipient authority checks.`)
 }
 
 func messageActingRole(ctx context.Context, cfg config.OrgConfig, explicit string) (string, error) {
@@ -70,6 +73,14 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 	action := args[0]
 	positional := 0
 	switch action {
+	case "escalate":
+		return runOrgEscalate(args[1:], stdout, stderr)
+	case "resolve":
+		return runOrgEscalateResolve(args[1:], stdout, stderr)
+	case "directive":
+		return runOrgDirective(args[1:], stdout, stderr)
+	}
+	switch action {
 	case "send", "reply":
 		positional = 2
 	case "show":
@@ -95,10 +106,14 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 	workflowID := ""
 	before := int64(0)
 	limit := 20
+	thread := false
+	if action == "show" {
+		fs.BoolVar(&thread, "thread", false, "show the conversation thread")
+	}
 	if action == "send" {
 		fs.StringVar(&workflowID, "workflow", "", "optional registered workflow")
 	}
-	if action == "inbox" {
+	if action == "inbox" || action == "show" {
 		fs.Int64Var(&before, "before", 0, "older than this message ID")
 		fs.IntVar(&limit, "limit", 20, "page size 1–100")
 	}
@@ -142,6 +157,22 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
+		if action == "show" && thread {
+			messages, err := store.ListMessageThread(ctx, id, role, before, limit)
+			if err != nil {
+				return err
+			}
+			if *jsonOutput {
+				return writeJSON(stdout, messages)
+			}
+			for _, message := range messages {
+				printInboxMessage(stdout, message)
+			}
+			if len(messages) == limit {
+				fmt.Fprintf(stdout, "Older thread messages: gitmoot message show %d --thread --before %d\n", id, messages[len(messages)-1].ID)
+			}
+			return nil
+		}
 		if action == "inbox" {
 			messages, err := store.ListMessages(ctx, role, before, limit)
 			if err != nil {
@@ -154,7 +185,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stdout, "No messages.")
 			}
 			for _, m := range messages {
-				fmt.Fprintf(stdout, "%d  from %s  thread %d  notification=%s\n  %s\n", m.ID, m.Sender, m.ThreadID, m.Status, terminalSafeWorkflowText(m.Body))
+				fmt.Fprintf(stdout, "%d  %s  from %s  thread %d  notification=%s  lifecycle=%s\n  %s\n", m.ID, m.Kind, m.Sender, m.ThreadID, m.Status, m.Lifecycle, terminalSafeWorkflowText(m.Body))
 			}
 			if len(messages) == limit {
 				fmt.Fprintf(stdout, "Older messages: gitmoot message inbox --before %d\n", messages[len(messages)-1].ID)
@@ -175,7 +206,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				if recipient == role {
 					recipient = parent.Recipient
 				}
-				if _, ok := cfg.Role(recipient); !ok {
+				if _, ok := cfg.Role(recipient); !ok && recipient != db.MessageSystemSender {
 					return fmt.Errorf("recipient role %q is retired", recipient)
 				}
 				input.ReplyTo = id
@@ -200,14 +231,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stdout, "saved message %d from %s to %s; notification=%s; no acknowledgment required\n", message.ID, message.Sender, message.Recipient, message.Status)
 			return nil
 		}
-		fmt.Fprintf(stdout, "Message %d · thread %d · from %s to %s · notification=%s\n", message.ID, message.ThreadID, message.Sender, message.Recipient, message.Status)
-		if message.ReplyTo != 0 {
-			fmt.Fprintf(stdout, "Reply to message %d\n", message.ReplyTo)
-		}
-		if message.WorkflowID != "" {
-			fmt.Fprintf(stdout, "Workflow: %s\n", message.WorkflowID)
-		}
-		fmt.Fprintln(stdout, scrubWorkflowText(message.Body, 0))
+		printInboxMessage(stdout, message)
 		return nil
 	})
 	if err != nil {
@@ -215,4 +239,32 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func printInboxMessage(stdout io.Writer, message db.Message) {
+	fmt.Fprintf(stdout, "Message %d · %s · thread %d · from %s to %s · notification=%s\n", message.ID, message.Kind, message.ThreadID, message.Sender, message.Recipient, message.Status)
+	if message.Historical {
+		fmt.Fprintln(stdout, "Historical record; not replayed by migration.")
+	}
+	if message.Lifecycle != "" {
+		fmt.Fprintf(stdout, "Lifecycle: %s\n", message.Lifecycle)
+	}
+	if message.NotificationReason != "" {
+		fmt.Fprintf(stdout, "Notification detail: %s\n", terminalSafeWorkflowText(message.NotificationReason))
+	}
+	if message.ReplyTo != 0 {
+		fmt.Fprintf(stdout, "Reply to message %d\n", message.ReplyTo)
+	}
+	if message.WorkflowID != "" {
+		fmt.Fprintf(stdout, "Workflow: %s\n", message.WorkflowID)
+	}
+	if message.SourceJobID != "" {
+		fmt.Fprintf(stdout, "Source: job %s · state=%s\n", message.SourceJobID, terminalSafeWorkflowText(message.SourceState))
+	}
+	if message.HeadSHA != "" {
+		fmt.Fprintf(stdout, "Review: %s#%d · head=%s · purpose=%s · decision=%s\n",
+			terminalSafeWorkflowText(message.Repo), message.PullRequest, terminalSafeWorkflowText(message.HeadSHA),
+			terminalSafeWorkflowText(message.ReviewPurpose), terminalSafeWorkflowText(message.ReviewDecision))
+	}
+	fmt.Fprintln(stdout, scrubWorkflowText(message.Body, 0))
 }

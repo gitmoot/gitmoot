@@ -236,7 +236,7 @@ gitmoot workflow note feature-42 "PLAN: <the complete plan text>"
 
 # 3. Approve explicitly (org mode). Approval never comes from silence:
 #    the directive is tracked, TTL-nudged, and visible until completed.
-GITMOOT_ORG_ROLE=<approver-role> gitmoot org directive send \
+GITMOOT_ORG_ROLE=<approver-role> gitmoot message directive send \
   --to implementer-role --workflow feature-42 \
   "approved: implement plan 1234 as written; the plan is the scope fence"
 
@@ -249,10 +249,9 @@ gitmoot job record --agent builder --repo owner/repo --workflow feature-42 \
   --summary "Implemented plan 1234 (workflow note in feature-42), inside its
    fence; work outside the plan needs an amended plan and a fresh approval."
 
-# 5. Completion ends the obligation; merge closes the workflow — in this
-#    order: a `done` posted after `close` reopens the workflow, because
-#    any note into a closed workflow does.
-gitmoot org directive done <directive-id> --by implementer-role
+# 5. Completion ends the directive; closing the workflow is a separate action.
+#    Message and receipt traffic does not reopen closed workflows.
+gitmoot message directive done <directive-id> --role implementer-role
 gitmoot workflow close feature-42 --reason "Plan 1234 implemented and merged."
 ```
 

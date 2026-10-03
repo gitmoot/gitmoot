@@ -212,22 +212,19 @@ observation, or once the subject stops matching for a short grace
 within that grace never resets it, and a later re-block starts a fresh episode.
 Each synthesized event's `detail` carries the stable since-time, so a re-nudge
 (same `job_id` + same since) is distinguishable from a fresh episode.
-`reply`, `fact`, `directive`, `blocked`, and `escalation` consume durable
-wake-outbox obligations. Addressed notes and awaited facts carry their own
-recipient and do not need optional subscription rules. A disabled matching
-addressed rule explicitly mutes delivery. Blocked and escalation obligations
-retain the redacted source event. Reply rows commit in the source note
-transaction. Resolving a typed org escalation addresses the resolution marker
-to its parsed asker, so the same transaction records a pending reply
-obligation that wakes the asker. A legacy typed escalation with
-no identifiable asker still resolves, prints a warning, and records no invented
-target. Blocked and escalation rows are synchronously
-persisted after the source transition; insert failure is logged but cannot roll
-back the emitting job. `gitmoot org escalate` addresses the same durable note
-and reply obligation upward to an ancestor or downward to a descendant. Upward
-questions remain escalations; downward questions are asks. Same-role questions
-are invalid, and peers are refused by a safe command-level default because no
-configurable peer-question policy exists. The daemon holds each pending group
+All classified system events persist an immutable inbox notice and its outbox
+obligation together before the producer returns. Addressed recipients do not
+depend on optional rules; enabled observer rules can add recipients. A disabled
+addressed rule explicitly mutes delivery, while an observer mute cannot suppress
+an addressed obligation. Review notices retain repo, PR, exact head and canonical
+purpose, including post-merge scope. Awaited-fact notices suppress duplicate
+legacy review wakes for the same recipient.
+
+`gitmoot message escalate` creates a tracked request in the shared inbox.
+Resolving it records an answer and receipt in its thread and notifies the actual
+requester. Historical requests without an identifiable requester use system
+provenance, not an invented target. Historical import creates no new wakes and
+preserves uncertain delivery evidence. The daemon holds each pending group
 for `[org].wake_coalesce_hold` (default `5m`) after its OLDEST row, then
 delivers every due pending row for
 that event kind and role as ONE wake, bounded at ten rows per wake, so a
@@ -247,17 +244,17 @@ A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
-A TRANSIENT delivery failure is retried against the same coalesced rows rather
-than dropped: `agent_prompt_stalled` (the pane did not take the prompt) and
-`agent_blocked` (an interactive dialog holds the pane) return the whole claimed
-batch to `pending` with the cause recorded, keeping the attempt count, so the
-next due tick re-coalesces every note into one wake. Delivery is bounded at
-three attempts. When the budget is spent, or when the cause is not transient
-(an unresolved pane binding, `agent_not_found`, a Herdr outage, or an
-unexplained non-delivery), the batch becomes terminal AND a
-`wake_delivery_failed` job event is recorded on `wake-outbox:<id>` naming the
-target role, the cause and the attempts spent, so an undelivered obligation is
-attributable from the store rather than only from a daemon log line.
+Before claiming a notice, the daemon checks the registered recipient's live
+binding and input state. Busy, blocked, unknown and offline recipients keep
+their pending notices and a visible deferral reason without spending attempts.
+A later safe snapshot makes proven-unsent notices eligible again; it does not
+authorize replay of an uncertain attempt.
+After a claim, an explicit pre-write `agent_blocked` or `agent_input_pending`
+refusal can return the same batch to `pending`, with its attempt count retained.
+These attempted refusals have a three-attempt bound. Other conclusive failures
+remain visible with a `wake_delivery_failed` event on `wake-outbox:<id>`.
+A stall, timeout or unexplained non-delivery is not proof that no text reached
+the composer: uncertain outcomes are retained without automatic retyping.
 An aged-out row whose delivery the store can PROVE is recorded as `delivered`
 rather than `delivery_unknown`, with a `wake_delivered` job event on
 `wake-outbox:<id>` carrying `policy=resolved_by_destination_evidence`. The proof

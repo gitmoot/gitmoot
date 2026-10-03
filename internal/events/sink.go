@@ -124,12 +124,15 @@ type Event struct {
 	// primary target for single-address producers; WakeTargetRoles carries the
 	// complete target set for multi-address events. Neither alters the public
 	// event JSON contract.
-	WakeKind        string   `json:"-"`
-	WakeTargetRole  string   `json:"-"`
-	WakeTargetRoles []string `json:"-"`
-	WakeOutboxIDs   []int64  `json:"-"`
-	PullRequest     int      `json:"-"`
-	ReviewDecision  string   `json:"-"`
+	WakeKind       string `json:"-"`
+	WakeTargetRole string `json:"-"`
+	// WakeRecipientRole is the persisted delivery destination; unlike source
+	// addressees, it may name an explicitly subscribed observer.
+	WakeRecipientRole string   `json:"-"`
+	WakeTargetRoles   []string `json:"-"`
+	WakeOutboxIDs     []int64  `json:"-"`
+	PullRequest       int      `json:"-"`
+	ReviewDecision    string   `json:"-"`
 }
 
 // Sink is the injected outbound seam the engine and daemon call from the

@@ -111,7 +111,7 @@ func TestEvaluateOrgDirectiveTTLsParksMalformedDirectiveOnce(t *testing.T) {
 	malformed, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 		WorkflowID: "release/ttl",
 		Author:     "sender",
-		Body:       "[org:directive to=worker from=sender] missing-wf",
+		Body:       "[org:directive to=worker wf=release/ttl] missing issuer",
 		Repo:       "gitmoot/gitmoot",
 	})
 	if err != nil {
@@ -913,86 +913,6 @@ func TestDirectiveNagInsertToDrainDelivers(t *testing.T) {
 // outbox row, so the drain must recover the CURRENT phase from durable receipts.
 // A unit call with a hand-built Cause would pass while production still decoded
 // every row as addressed_directive and emitted another ack command.
-func TestDirectiveCompletionNagInsertToDrainRequestsDeliverable(t *testing.T) {
-	ctx := context.Background()
-	home := directiveTestHome(t)
-	t.Setenv("GITMOOT_ORG_ROLE", "owner")
-	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{
-		"directive", "send", "--home", home, "--to", "worker",
-		"--workflow", "release/completion-prompt", "ship the deliverable",
-	}, &stdout, &stderr); code != 0 {
-		t.Fatalf("send code=%d err=%q", code, stderr.String())
-	}
-	directiveID := strings.Fields(stdout.String())[2]
-	stdout.Reset()
-	stderr.Reset()
-	if code := runOrg([]string{
-		"directive", "ack", directiveID, "--home", home, "--by", "worker",
-	}, &stdout, &stderr); code != 0 {
-		t.Fatalf("ack code=%d err=%q", code, stderr.String())
-	}
-
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	if err := store.AddEventRule(ctx, db.EventRule{
-		ID:       "completion-directive",
-		OnKind:   db.WakeOutboxKindDirective,
-		WakeRole: "worker",
-		Scope:    db.EventRuleScopeObserver,
-		Enabled:  true,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	before, err := store.ListWakeOutbox(ctx, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(before) != 1 || before[0].State != db.WakeOutboxStateSuperseded {
-		t.Fatalf("receipt wake before completion nag = %+v, want one superseded row", before)
-	}
-
-	nag := events.NewEvent(
-		events.EventOrgDirective,
-		directiveID,
-		db.WakeOutboxSourceWorkflowNote+":"+directiveID,
-		"gitmoot/gitmoot",
-		"overdue",
-		"directive "+directiveID+" to worker awaits completion",
-		time.Now().UTC(),
-		workflow.RedactCommentText,
-	)
-	nag.Cause = directiveCompletionOverdueCause
-	nag.WakeTargetRole = "worker"
-	(&eventRuleSink{store: store, home: home, wake: &fakeEventWake{}}).Emit(ctx, nag)
-
-	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC().Add(-time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(obligations.Pending) != 1 {
-		t.Fatalf("pending completion wakes = %+v, want one revived row", obligations.Pending)
-	}
-	decoded, err := wakeOutboxEvent(obligations.Pending, time.Now().UTC())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if decoded.Cause != directiveCompletionOverdueCause {
-		t.Fatalf("decoded cause = %q, want %q", decoded.Cause, directiveCompletionOverdueCause)
-	}
-	prompt := eventRuleWakePrompt(db.WakeOutboxKindDirective, decoded)
-	if !strings.Contains(prompt, "finish the assigned deliverable") ||
-		!strings.Contains(prompt, "gitmoot org directive done "+directiveID+" --by worker") {
-		t.Fatalf("completion prompt = %q, want deliverable and done command", prompt)
-	}
-	if strings.Contains(prompt, "gitmoot org directive ack") || strings.Contains(prompt, "acknowledge receipt") {
-		t.Fatalf("completion prompt regressed to receipt ceremony: %q", prompt)
-	}
-}
 
 // #1352 F1 — the count-error FALLBACK, exercised rather than assumed. Changing
 // sweepWindow's fallback from 200 to 1 previously left all 17 directive tests
@@ -1042,7 +962,7 @@ func TestDirectiveTTLSweepFallsBackToFullWindowOnCountError(t *testing.T) {
 // keeps the count at one while REPLACING row id 1 with id 2). COUNT CANNOT
 // DISTINGUISH A REVIVED ROW FROM A RECREATED ONE — only the id can.
 //
-// So: initial row via `org directive send` (writer 1, the workflow-note path),
+// So: initial row via `message directive send` (writer 1, the workflow-note path),
 // nag via the TTL sink (writer 2), then assert a STABLE ROW ID and, for a
 // repeat against a pending row, UNCHANGED FIELDS.
 func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) {
@@ -1071,7 +991,7 @@ func TestDirectiveNagRevivesTheDeliveredWakeRowWithoutDuplicating(t *testing.T) 
 	// WRITER 1: the directive-send path commits the note and its pending wake
 	// obligation together. This is the row production actually starts from.
 	var out, errOut bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/revive", "do the thing"}, &out, &errOut); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/revive", "do the thing"}, &out, &errOut); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, errOut.String())
 	}
 	directiveID := strings.Fields(out.String())[2]
@@ -1172,12 +1092,12 @@ func TestDirectiveCompletionLadderRunsOldestObligationOnly(t *testing.T) {
 
 	text := output.String()
 	for _, held := range []db.WorkflowNote{second, third} {
-		want := fmt.Sprintf("org directive %d completion ladder held", held.ID)
+		want := fmt.Sprintf("message directive %d completion ladder held", held.ID)
 		if !strings.Contains(text, want) {
 			t.Fatalf("queued directive %d was not held: output=%q", held.ID, text)
 		}
 	}
-	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", first.ID)) {
+	if strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", first.ID)) {
 		t.Fatalf("the OLDEST obligation was held, so nothing would ever escalate: output=%q", text)
 	}
 
@@ -1217,7 +1137,7 @@ func TestDirectiveCompletionLadderRunsOldestObligationOnly(t *testing.T) {
 	if err := evaluateOrgDirectiveTTLs(context.Background(), store, sink, cfg, &second_output, now.Add(time.Hour), directiveTTLDependencies{}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(second_output.String(), fmt.Sprintf("org directive %d completion ladder held", second.ID)) {
+	if strings.Contains(second_output.String(), fmt.Sprintf("message directive %d completion ladder held", second.ID)) {
 		t.Fatalf("hold did not lift after the oldest completed: output=%q", second_output.String())
 	}
 }
@@ -1257,7 +1177,7 @@ func TestExhaustedObligationDoesNotHoldLaterOnes(t *testing.T) {
 		now.Add(10*time.Hour), directiveTTLDependencies{}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(output.String(), fmt.Sprintf("org directive %d completion ladder held", later.ID)) {
+	if strings.Contains(output.String(), fmt.Sprintf("message directive %d completion ladder held", later.ID)) {
 		t.Fatalf("later obligation held behind an EXHAUSTED one: it would never be reported. output=%q", output.String())
 	}
 	if got := readDirectiveTTLObligation(t, store, later.ID); got.DoneNudgeCount == 0 && strings.TrimSpace(got.ExhaustedAt) == "" {
@@ -1342,7 +1262,7 @@ func TestNeverAckedObligationDoesNotSilenceTheQueue(t *testing.T) {
 		base.Add(12*time.Hour), directiveTTLDependencies{}); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(output.String(), fmt.Sprintf("org directive %d completion ladder held", later.ID)) {
+	if strings.Contains(output.String(), fmt.Sprintf("message directive %d completion ladder held", later.ID)) {
 		t.Fatalf("acked obligation held behind a never-acked silent one: its queue is now invisible. output=%q", output.String())
 	}
 	if got := readDirectiveTTLObligation(t, store, later.ID); got.DoneNudgeCount == 0 && strings.TrimSpace(got.ExhaustedAt) == "" {
@@ -1394,13 +1314,13 @@ func TestDirectiveQueueHoldDoesNotCrossWorkflows(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
-	if !strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", secondInA.ID)) {
+	if !strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", secondInA.ID)) {
 		t.Fatalf("item two of workflow A was not held behind item one: output=%q", text)
 	}
-	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", onlyInB.ID)) {
+	if strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", onlyInB.ID)) {
 		t.Fatalf("workflow B's only item was held behind workflow A: an unrelated sender's queue is now silent. output=%q", text)
 	}
-	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", firstInA.ID)) {
+	if strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", firstInA.ID)) {
 		t.Fatalf("the oldest item in workflow A was held: output=%q", text)
 	}
 }
@@ -1447,10 +1367,10 @@ func TestDirectiveQueueKeyIgnoresTargetCase(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
-	if !strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", second.ID)) {
+	if !strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", second.ID)) {
 		t.Fatalf("capitalised target got its own queue, so the hold was bypassed: output=%q", text)
 	}
-	if strings.Contains(text, fmt.Sprintf("org directive %d completion ladder held", first.ID)) {
+	if strings.Contains(text, fmt.Sprintf("message directive %d completion ladder held", first.ID)) {
 		t.Fatalf("the oldest item was held: output=%q", text)
 	}
 }

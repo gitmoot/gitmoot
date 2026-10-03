@@ -11,10 +11,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/doctor"
 )
 
-// wakeTargetRoleProducer records a production write site and derives every
-// event-rule kind it directs from that producer's source-kind definition. An
-// AST guard binds this registry to every production
-// WakeTargetRole assignment so a new producer cannot silently bypass doctor.
+// wakeTargetRoleProducer groups source families for observer diagnostics.
+// Durable event decoding replays these sources; it does not add a new family.
 type wakeTargetRoleProducer struct {
 	File     string
 	Function string

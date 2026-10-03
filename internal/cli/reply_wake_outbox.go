@@ -19,7 +19,7 @@ import (
 const (
 	// replyWakeCoalescingWindow is the DEFAULT hold, overridable by
 	// [org].wake_coalesce_hold. It absorbs a burst of separate short-lived
-	// `org escalate` processes and, since the owner decision of 2026-09-07,
+	// `message escalate` processes and, since the owner decision of 2026-09-07,
 	// deliberately trades up to five minutes of wake latency for a measured
 	// 32.1% fewer interrupts on this fleet's own arrival history.
 	//
@@ -41,6 +41,7 @@ const (
 type replyWakeDelivery struct {
 	sink  events.Sink
 	rules []db.EventRule
+	ready func(context.Context, string) (string, error)
 }
 
 type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
@@ -60,11 +61,12 @@ type replyWakeOutboxHealth struct {
 	agedAttempted int
 	blocked       int
 	suppressed    int
+	unknown       int
 }
 
 func (h replyWakeOutboxHealth) String() string {
 	return fmt.Sprintf(
-		"pending=%d held=%d inert=%d route_removed=%d aged_attempted=%d blocked=%d suppressed=%d",
+		"pending=%d held=%d inert=%d route_removed=%d aged_attempted=%d blocked=%d suppressed=%d unknown=%d",
 		h.pending,
 		h.held,
 		h.inert,
@@ -72,6 +74,7 @@ func (h replyWakeOutboxHealth) String() string {
 		h.agedAttempted,
 		h.blocked,
 		h.suppressed,
+		h.unknown,
 	)
 }
 
@@ -219,11 +222,19 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 				break
 			}
 			matchingRules := matchingWakeRules(delivery.rules, event)
+			if batch[0].SourceKind == db.WakeOutboxSourceEvent {
+				batch, event, matchingRules, err = authorizedMessageEventBatch(delivery.rules, batch, event, now, hold)
+				if err != nil {
+					return replyWakeOutboxHealth{}, err
+				}
+			}
 			if len(matchingRules) == 0 {
 				// Pending remains an explicit never-attempted state. A rule added
 				// later can deliver the same batch; nothing is silently erased.
-				break
+				start = end
+				continue
 			}
+			inboxWakeDetail(batch, &event)
 			survivor := 0
 			if batch[0].SourceKind == db.WakeOutboxSourceAwaitedFact {
 				survivor = len(batch) - 1
@@ -233,6 +244,23 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			for index, entry := range batch {
 				if index != survivor {
 					ids = append(ids, entry.ID)
+				}
+			}
+			if delivery.ready != nil {
+				reason, err := delivery.ready(ctx, wakeRecipient(event))
+				if err != nil {
+					return replyWakeOutboxHealth{}, err
+				}
+				if reason != "" {
+					if recorder, ok := store.(interface {
+						DeferMessageNotifications(context.Context, []int64, string) error
+					}); ok {
+						if err := recorder.DeferMessageNotifications(ctx, ids, reason); err != nil {
+							return replyWakeOutboxHealth{}, err
+						}
+					}
+					start = end
+					continue
 				}
 			}
 			// Generic batches keep their oldest row as the delivered survivor.
@@ -293,7 +321,7 @@ func classifyWakeOutboxObligations(
 	hold time.Duration,
 	resolve replyWakeDeliveryResolver,
 ) (replyWakeOutboxHealth, error) {
-	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted), blocked: len(obligations.Blocked)}
+	health := replyWakeOutboxHealth{agedAttempted: len(obligations.AgedAttempted), blocked: len(obligations.Blocked), unknown: obligations.Unknown}
 	if len(obligations.Pending) == 0 {
 		if health.agedAttempted == 0 && health.blocked == 0 {
 			return health, nil
@@ -349,10 +377,12 @@ func classifyWakeOutboxObligations(
 			id: obligation.ID, sourceKind: obligation.SourceKind, sourceID: obligation.SourceID,
 			event: event, createdAt: createdAt,
 		})
-		key := wakeRuleRouteKey(event.WakeTargetRole, event.WakeKind)
-		if _, ok := seenRoutes[key]; !ok {
-			seenRoutes[key] = struct{}{}
-			routes = append(routes, db.EventRuleRoute{OnKind: event.WakeKind, WakeRole: event.WakeTargetRole})
+		for _, kind := range wakeRuleKinds(event) {
+			key := wakeRuleRouteKey(wakeRecipient(event), kind)
+			if _, ok := seenRoutes[key]; !ok {
+				seenRoutes[key] = struct{}{}
+				routes = append(routes, db.EventRuleRoute{OnKind: kind, WakeRole: wakeRecipient(event)})
+			}
 		}
 	}
 	deletedRules, err := store.ListDeletedEventRulesForRoutes(ctx, routes)
@@ -364,9 +394,16 @@ func classifyWakeOutboxObligations(
 		return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox obligations against deleted rules: %w", err)
 	}
 	for _, obligation := range unmatched {
-		deletions := deletedRulesAt[wakeRuleRouteKey(obligation.event.WakeTargetRole, obligation.event.WakeKind)]
+		removed := false
+		for _, kind := range wakeRuleKinds(obligation.event) {
+			deletions := deletedRulesAt[wakeRuleRouteKey(wakeRecipient(obligation.event), kind)]
+			if matchesDeletedWakeRule(deletions, obligation.event, obligation.createdAt) {
+				removed = true
+				break
+			}
+		}
 		condition := db.WakeOutboxUnroutableNeverConfigured
-		if matchesDeletedWakeRule(deletions, obligation.event, obligation.createdAt) {
+		if removed {
 			condition = db.WakeOutboxUnroutableRouteRemoved
 			health.routeRemoved++
 		} else {
@@ -416,7 +453,7 @@ func recordUnroutableWake(
 	}
 	message := fmt.Sprintf(
 		"role=%s kind=%s source=%s condition=%s",
-		strings.TrimSpace(event.WakeTargetRole),
+		strings.TrimSpace(wakeRecipient(event)),
 		strings.TrimSpace(event.WakeKind),
 		source,
 		condition,
@@ -429,7 +466,7 @@ func recordUnroutableWake(
 		Message: message,
 	}); err != nil {
 		slog.Warn("unroutable wake record failed",
-			"wake_outbox_row", rowID, "role", event.WakeTargetRole, "kind", event.WakeKind, "error", err)
+			"wake_outbox_row", rowID, "role", wakeRecipient(event), "kind", event.WakeKind, "error", err)
 	}
 }
 
@@ -481,6 +518,7 @@ var wakeOutboxSourceKinds = []wakeOutboxSourceKind{
 	{sourceKind: db.WakeOutboxSourceBlocked, wakeKind: db.WakeOutboxKindBlocked},
 	{sourceKind: db.WakeOutboxSourceEscalation, wakeKind: db.WakeOutboxKindEscalation},
 	{sourceKind: db.WakeOutboxSourceAwaitedFact, wakeKind: db.WakeOutboxKindFact},
+	{sourceKind: db.WakeOutboxSourceEvent, wakeKind: db.WakeOutboxKindEvent},
 }
 
 func wakeOutboxKindForSource(sourceKind, coalesceKey string) (string, bool) {
@@ -658,6 +696,12 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 			workflow.RedactCommentText,
 		)
 		event.Cause = "awaited_fact_" + payload.State
+	case db.WakeOutboxSourceEvent:
+		var err error
+		event, err = decodeMessageEvent(oldest)
+		if err != nil {
+			return events.Event{}, err
+		}
 	default:
 		return events.Event{}, fmt.Errorf(
 			"wake outbox row %d has unsupported source kind %q",
@@ -665,20 +709,35 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		)
 	}
 	event.WakeKind = wakeKind
-	event.WakeTargetRole = role
+	event.WakeRecipientRole = role
+	if oldest.SourceKind != db.WakeOutboxSourceEvent {
+		event.WakeTargetRole = role
+	}
 	return event, nil
 }
 
 func wakeExplicitlyMuted(rules []db.EventRule, event events.Event) bool {
+	var observerDisabled, observerEnabled bool
+	kinds := wakeRuleKinds(event)
 	for _, rule := range rules {
-		if !rule.Enabled && rule.Scope != db.EventRuleScopeObserver &&
-			strings.EqualFold(strings.TrimSpace(rule.OnKind), strings.TrimSpace(event.WakeKind)) &&
-			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) &&
-			eventRuleMatches(rule.MatchFilter, event) {
+		if !containsEventRuleKind(kinds, rule.OnKind) ||
+			!strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(wakeRecipient(event))) ||
+			!eventRuleMatches(rule.MatchFilter, event) || !eventRuleMatchesAddressee(rule, event) {
+			continue
+		}
+		if rule.Scope != db.EventRuleScopeObserver && !rule.Enabled {
 			return true
 		}
+		if event.WakeKind == db.WakeOutboxKindEvent && rule.Scope == db.EventRuleScopeObserver {
+			if rule.Enabled {
+				observerEnabled = true
+			} else {
+				observerDisabled = true
+			}
+		}
 	}
-	return false
+	addressed := eventRuleMatchesAddressee(db.EventRule{WakeRole: wakeRecipient(event), Scope: db.EventRuleScopeAddressed}, event)
+	return !addressed && observerDisabled && !observerEnabled
 }
 
 // An addressed subscription is itself the request for notification. Optional
@@ -688,9 +747,9 @@ func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule 
 		return nil
 	}
 	for _, rule := range rules {
-		if rule.Enabled && strings.EqualFold(strings.TrimSpace(rule.OnKind), strings.TrimSpace(event.WakeKind)) &&
-			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(event.WakeTargetRole)) &&
-			eventRuleMatches(rule.MatchFilter, event) {
+		if rule.Enabled && containsEventRuleKind(wakeRuleKinds(event), rule.OnKind) &&
+			strings.EqualFold(strings.TrimSpace(rule.WakeRole), strings.TrimSpace(wakeRecipient(event))) &&
+			eventRuleMatches(rule.MatchFilter, event) && eventRuleMatchesAddressee(rule, event) {
 			return []db.EventRule{rule}
 		}
 	}
@@ -698,6 +757,13 @@ func matchingWakeRules(rules []db.EventRule, event events.Event) []db.EventRule 
 		strings.HasPrefix(event.RootID, db.WakeOutboxSourceWorkflowNote+":")
 	addressedFact := event.WakeKind == db.WakeOutboxKindFact &&
 		strings.HasPrefix(event.RootID, "awaited-fact:")
+	if event.WakeKind == db.WakeOutboxKindEvent &&
+		eventRuleMatchesAddressee(db.EventRule{WakeRole: wakeRecipient(event), Scope: db.EventRuleScopeAddressed}, event) {
+		kinds := wakeRuleKinds(event)
+		if len(kinds) != 0 {
+			return []db.EventRule{{ID: "addressed-obligation", OnKind: kinds[0], WakeRole: wakeRecipient(event), Scope: db.EventRuleScopeAddressed, Enabled: true}}
+		}
+	}
 	if event.WakeTargetRole != "" && (addressedNote || addressedFact) {
 		return []db.EventRule{{
 			ID: "addressed-obligation", OnKind: event.WakeKind,

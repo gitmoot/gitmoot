@@ -3,9 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +13,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -114,10 +111,6 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgStatus(args[1:], stdout, stderr)
 	case "recycle":
 		return runOrgRecycle(args[1:], stdout, stderr)
-	case "escalate":
-		return runOrgEscalate(args[1:], stdout, stderr)
-	case "directive":
-		return runOrgDirective(args[1:], stdout, stderr)
 	case "wake":
 		return runOrgWake(args[1:], stdout, stderr)
 	case "await":
@@ -147,11 +140,6 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org escalate --to ROLE --workflow LABEL [--org-role ROLE] [--repo OWNER/REPO] [--json] [--home DIR] \"QUESTION\"")
-	fmt.Fprintln(w, "  gitmoot org escalate resolve NOTE_ID [--by ROLE] [--note ANSWER_NOTE_ID] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive send --to ROLE --workflow LABEL (--stdin | -F FILE | TEXT) [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive ack ID [--by ROLE] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org directive cancel ID [--by ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org wake list [--state STATE] [--json] [--home DIR]")
@@ -1838,28 +1826,18 @@ func formatOrgRecycleAfter(value time.Duration) string {
 	}
 }
 
-type orgEscalateOutput struct {
-	From     string `json:"from"`
-	To       string `json:"to"`
-	Workflow string `json:"workflow"`
-	Question string `json:"question"`
-}
-
 func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "resolve" {
-		return runOrgEscalateResolve(args[1:], stdout, stderr)
-	}
-	fs := flag.NewFlagSet("org escalate", flag.ContinueOnError)
+	fs := flag.NewFlagSet("message escalate", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	toFlag := fs.String("to", "", "ancestor or descendant role to ask")
 	workflowID := fs.String("workflow", "", "workflow label for the organization question note")
-	fromFlag := fs.String("org-role", "", "acting organization role")
+	fromFlag := fs.String("role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
 	question, flagArgs, ok := orgAddressedTextAndFlags(args)
 	if !ok {
-		fmt.Fprintln(stderr, "org escalate requires exactly one question")
+		fmt.Fprintln(stderr, "message escalate requires exactly one question")
 		return 2
 	}
 	if err := fs.Parse(flagArgs); err != nil {
@@ -1869,50 +1847,45 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "org escalate requires exactly one question")
+		fmt.Fprintln(stderr, "message escalate requires exactly one question")
 		return 2
 	}
 	if question == "" {
-		fmt.Fprintln(stderr, "org escalate question must be non-empty")
+		fmt.Fprintln(stderr, "message escalate question must be non-empty")
 		return 2
 	}
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "org escalate: resolve paths: %v\n", err)
+		fmt.Fprintf(stderr, "message escalate: resolve paths: %v\n", err)
 		return 1
 	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
-		fmt.Fprintf(stderr, "org escalate: %v\n", err)
+		fmt.Fprintf(stderr, "message escalate: %v\n", err)
 		return 1
 	}
 	if !cfg.Enabled() {
-		fmt.Fprintln(stderr, "org escalate requires an [org] registry")
+		fmt.Fprintln(stderr, "message escalate requires an [org] registry")
 		return 2
 	}
-	from := strings.ToLower(strings.TrimSpace(*fromFlag))
-	if from == "" {
-		from = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
-	}
-	if _, ok := cfg.Role(from); !ok {
-		fmt.Fprintf(stderr, "unknown org role %q\n", from)
+	from, err := messageActingRole(context.Background(), cfg, *fromFlag)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
 		return 2
 	}
 	to := strings.ToLower(strings.TrimSpace(*toFlag))
 	if to == "" {
-		fmt.Fprintln(stderr, "org escalate requires --to")
-		return 2
+		acting, _ := cfg.Role(from)
+		to = acting.Parent
 	}
 	if _, ok := cfg.Role(to); !ok {
 		fmt.Fprintf(stderr, "unknown org role %q\n", to)
 		return 2
 	}
-	downwardAsk := false
 	switch {
 	case slices.Contains(cfg.Ancestors(from), to):
 		// Preserve the established upward escalation path.
 	case slices.Contains(cfg.Ancestors(to), from):
-		downwardAsk = true
 	case from == to:
 		fmt.Fprintf(stderr, "--to %q must differ from acting role %q\n", to, from)
 		return 2
@@ -1923,146 +1896,36 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	label := strings.TrimSpace(*workflowID)
-	if label == "" {
-		fmt.Fprintln(stderr, "org escalate requires --workflow")
-		return 2
-	}
-	if err := workflow.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "org escalate: %v\n", err)
+	if err := workflow.ValidateWorkflowID(label); label != "" && err != nil {
+		fmt.Fprintf(stderr, "message escalate: %v\n", err)
 		return 2
 	}
 	body := workflow.FormatOrgEscalateNote(from, to, label, question)
 	if body == "" || len(body) > workflowNoteBodyMax {
-		fmt.Fprintf(stderr, "org escalate question must produce a note of at most %d bytes\n", workflowNoteBodyMax)
+		fmt.Fprintf(stderr, "message escalate question must produce a note of at most %d bytes\n", workflowNoteBodyMax)
 		return 2
 	}
 	_, addressedTarget, _, _, parsed := workflow.ParseOrgEscalateNote(body)
 	if !parsed {
-		fmt.Fprintln(stderr, "org escalate: formatted escalation could not be parsed")
+		fmt.Fprintln(stderr, "message escalate: formatted escalation could not be parsed")
 		return 1
 	}
+	var stored db.WorkflowNote
 	if err := withStore(*home, func(store *db.Store) error {
-		exists, err := store.WorkflowExists(context.Background(), label)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			return fmt.Errorf("workflow %q is not registered; use workflow register first", label)
-		}
-		_, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+		var err error
+		stored, err = store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
 			WorkflowID: label, Author: from, Body: body, Repo: strings.TrimSpace(*repo),
 			AddressedTarget: addressedTarget,
 		})
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "org escalate: %v\n", err)
+		fmt.Fprintf(stderr, "message escalate: %v\n", err)
 		return 1
 	}
-	out := orgEscalateOutput{From: from, To: to, Workflow: label, Question: question}
 	if *jsonOutput {
-		if err := json.NewEncoder(stdout).Encode(out); err != nil {
-			fmt.Fprintf(stderr, "org escalate: %v\n", err)
-			return 1
-		}
-		return 0
+		return writeMessageResult(*home, stored.ID, from, stdout, stderr)
 	}
-	if downwardAsk {
-		fmt.Fprintf(stdout, "asked from %s to %s in workflow %s\n", from, to, label)
-	} else {
-		fmt.Fprintf(stdout, "escalated from %s to %s in workflow %s\n", from, to, label)
-	}
-	return 0
-}
-
-func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("org escalate resolve", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	byFlag := fs.String("by", "", "organization role resolving the escalation")
-	answerNoteFlag := fs.String("note", "", "workflow note id containing the answer")
-	// A bare --help/-h anywhere in args is a skippable flag to the id-extraction
-	// scan below (it never sets idIndex), which previously fell through to the
-	// generic "requires exactly one escalation note id" error before flag.Parse
-	// ever ran — so help never printed. Detect it first and let the flag package
-	// handle it the normal way, regardless of where it appears among the other args.
-	for _, arg := range args {
-		if arg == "-h" || arg == "--help" {
-			_ = fs.Parse([]string{"--help"})
-			return 0
-		}
-	}
-	escalationIDText, flagArgs, ok := orgEscalateResolveIDAndFlags(args)
-	if !ok {
-		fmt.Fprintln(stderr, "org escalate resolve requires exactly one escalation note id")
-		return 2
-	}
-	if err := fs.Parse(flagArgs); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "org escalate resolve requires exactly one escalation note id")
-		return 2
-	}
-	escalationNoteID, err := strconv.ParseInt(escalationIDText, 10, 64)
-	if err != nil || escalationNoteID <= 0 {
-		fmt.Fprintf(stderr, "org escalate resolve: invalid escalation note id %q\n", escalationIDText)
-		return 2
-	}
-	var answerNoteID int64
-	if value := strings.TrimSpace(*answerNoteFlag); value != "" {
-		answerNoteID, err = strconv.ParseInt(value, 10, 64)
-		if err != nil || answerNoteID <= 0 {
-			fmt.Fprintf(stderr, "org escalate resolve: invalid answer note id %q\n", value)
-			return 2
-		}
-	}
-
-	var workflowID string
-	var unaddressedResolution bool
-	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
-		target, err := store.GetWorkflowNote(ctx, escalationNoteID)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("escalation note %d not found", escalationNoteID)
-		}
-		if err != nil {
-			return err
-		}
-		asker, to, parsed := orgEscalationResolveParties(target.Body)
-		if !parsed {
-			return fmt.Errorf("note %d is not an org escalation", escalationNoteID)
-		}
-		resolvedBy := strings.ToLower(strings.TrimSpace(*byFlag))
-		if resolvedBy == "" {
-			resolvedBy = to
-		}
-		body := workflow.FormatOrgEscalateResolvedNote(escalationNoteID, resolvedBy, answerNoteID)
-		if body == "" {
-			return fmt.Errorf("invalid resolving role %q", resolvedBy)
-		}
-		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID:      target.WorkflowID,
-			Author:          resolvedBy,
-			Body:            body,
-			Repo:            target.Repo,
-			AddressedTarget: asker,
-		}); err != nil {
-			return err
-		}
-		workflowID = target.WorkflowID
-		unaddressedResolution = asker == ""
-		return nil
-	}); err != nil {
-		fmt.Fprintf(stderr, "org escalate resolve: %v\n", err)
-		return 1
-	}
-	if unaddressedResolution {
-		fmt.Fprintf(stderr, "org escalate resolve: warning: escalation note %d has no identifiable asker; resolution recorded without wake\n", escalationNoteID)
-	}
-	fmt.Fprintf(stdout, "resolved escalation %d in workflow %s\n", escalationNoteID, workflowID)
+	fmt.Fprintf(stdout, "queued escalation message %d from %s to %s\n", stored.ID, from, to)
 	return 0
 }
 
@@ -2109,7 +1972,7 @@ func orgEscalationResolveParties(body string) (asker, to string, ok bool) {
 }
 
 func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
-	needsValue := map[string]bool{"--home": true, "--by": true, "--note": true}
+	needsValue := map[string]bool{"--home": true, "--role": true, "--note": true, "--answer": true}
 	idIndex := -1
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -2120,7 +1983,7 @@ func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
 			}
 			continue
 		}
-		if arg == "-h" || arg == "--help" || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--by=") || strings.HasPrefix(arg, "--note=") || strings.HasPrefix(arg, "-") {
+		if strings.HasPrefix(arg, "-") {
 			continue
 		}
 		if idIndex >= 0 {
@@ -2138,7 +2001,7 @@ func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
 }
 
 func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
-	needsValue := map[string]bool{"--home": true, "--to": true, "--workflow": true, "--org-role": true, "--repo": true}
+	needsValue := map[string]bool{"--home": true, "--to": true, "--workflow": true, "--role": true, "--repo": true}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if needsValue[arg] {
@@ -2148,7 +2011,7 @@ func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
 			}
 			continue
 		}
-		if arg == "--json" || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--to=") || strings.HasPrefix(arg, "--workflow=") || strings.HasPrefix(arg, "--org-role=") || strings.HasPrefix(arg, "--repo=") {
+		if arg == "--json" || strings.HasPrefix(arg, "--json=") || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--to=") || strings.HasPrefix(arg, "--workflow=") || strings.HasPrefix(arg, "--role=") || strings.HasPrefix(arg, "--repo=") {
 			continue
 		}
 		if i != len(args)-1 {

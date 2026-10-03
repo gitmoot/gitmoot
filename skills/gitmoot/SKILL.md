@@ -253,21 +253,20 @@ Sender defaults to the session role/current registered pane; `--role` is an
 operator attribution override, not authentication. Success means queued, not
 read. Ordinary messages have no acknowledgment, completion, TTL or nag duty.
 Plain journal notes do not send notifications, even if their body says `to=...`.
-In org mode, obligations and questions have a full lifecycle and closing it is
-part of the work: `gitmoot org directive send --to <role> --workflow <label>`
-mints a tracked, TTL-nudged obligation; RECEIPT is recorded by the transport
-when the prompt lands in your pane, so you do not owe an `ack` (`org directive
-ack <id>` still exists for the rare case where a receipt must be asserted by
-hand); `org directive done <id>` records COMPLETION and ends the
-obligation with its nudges (target subtree only — the sender cancels with
-`org directive cancel` instead). Finished work left un-`done` stays an outstanding
-obligation on every owed-work surface (and, where completion TTLs are
-enabled, keeps nudging — and finally escalating — over work that was
-already delivered). Symmetrically, answer an
-escalation on its merits and then close it with
-`gitmoot org escalate resolve <note-id> [--by <role>]` — an
-answered-but-unresolved escalation stays on every owed-work surface and camouflages real
-blocks. Jobs join a group through
+Escalations and directives use the same inbox, thread IDs and optional workflow
+association. `gitmoot message escalate "QUESTION"` normally addresses your
+coordinator; `message resolve ID --answer "ANSWER"` resolves the tracked request
+and notifies its requester. Reading or discussing it does not resolve it.
+`gitmoot message directive send --to ROLE "ASSIGNMENT"` requires issuer authority.
+Confirmed transport receipt needs no manual acknowledgment; `message directive
+ack ID` remains available for explicit acceptance. `message directive done ID`
+records completion by the target subtree and ends its nudges; the issuer instead
+uses `message directive cancel ID` when the work is no longer required.
+All actions use session identity or `--role ROLE`, not an identity inferred from
+the target. Replies and prose cannot grant authority or certify completion.
+Exact-head review notices carry system provenance and remain separate from
+ordinary discussion of a review. A queued or uncertain notification is not proof
+of submission, reading, acceptance or completion. Jobs join a group through
 `--workflow <label>` on agent
 ask/run/review, orchestrate, or `job open`; orchestration descendants
 inherit the label automatically. Use
@@ -321,7 +320,7 @@ Claude, Kimi, and omp seats.
 2. **Record the plan.** Post it with `gitmoot workflow note <label> "..."` and
    keep the entry id the CLI prints — that id is the plan-id.
 3. **Stop.** Approval is an explicit act, never inferred from silence. In org
-   mode the approver sends `gitmoot org directive send --to <role> --workflow
+   mode the approver sends `gitmoot message directive send --to <role> --workflow
    <label> "approved: implement plan <plan-id> …"`; outside org mode an
    explicit human approval message referencing the plan-id serves the same
    role.

@@ -345,17 +345,17 @@ compatibility but always returns zero verdicts since #1752.
 
 Route: `/comms` (or `/comms?note=<id>` to open a specific note)
 
-Comms is the read-only operator inbox for typed org escalations and workflow
-engine markers. It projects one conversation thread per workflow, keeps every
-unresolved obligation discoverable, and floats workflows with open escalations
-above resolved traffic. Search, role, resolution, date, and engine-marker
-filters narrow the conversations without mutating their source notes.
+Comms is the read-only operator view of the shared message inbox. Conversations
+use durable thread IDs, with optional workflow association. Ordinary messages,
+escalations, directives and review/system notices appear together; open formal
+obligations remain discoverable and sort before closed traffic.
+Notification submission and task lifecycle have separate labels. Review notices
+show their source job, repo, PR, exact head and purpose.
 
-Org-note bodies are operator-visible on this page. A note deep link selects its
-workflow, includes the requested note even when it is older than the ordinary
-per-thread payload window, and scrolls to the matching escalation, reply,
-resolution footer, or system marker. Comms is strictly read-only: resolve an
-escalation from the CLI with `gitmoot org escalate resolve`.
+Message bodies are operator-visible here. Deep links select the original message
+even when it is outside the ordinary history window. Search, role, resolution,
+date and engine-marker filters do not mutate messages. Resolve escalations with
+`gitmoot message resolve`; directive lifecycle actions use `message directive`.
 
 ## Config
 

@@ -18,7 +18,6 @@ func TestParseOrgEscalateNoteRejectsMalformedOrDuplicateKeys(t *testing.T) {
 		"[org:escalate to=owner from=operator wf=release/one]",
 		"[org:escalate to=owner from=operator wf=release/one] ",
 		"[org:escalate to=owner to=lead wf=release/one] question",
-		"[org:escalate to=owner from=operator] question",
 		"[org:escalate to=owner from=operator wf=release/one extra=x] question",
 		"[org:escalate to=owner from=operator wf=release/one question",
 		"[org:escalate to=owner from=operator wf=release/one]question",

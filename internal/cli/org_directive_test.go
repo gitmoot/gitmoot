@@ -75,7 +75,7 @@ func TestOrgDirectiveSendBodySourcesAndDirectionPolicy(t *testing.T) {
 			orgDirectiveStdin = strings.NewReader(test.body)
 			t.Cleanup(func() { orgDirectiveStdin = oldStdin })
 			var stdout, stderr bytes.Buffer
-			if code := runOrg(test.args(home), &stdout, &stderr); code != 0 {
+			if code := runMessage(test.args(home), &stdout, &stderr); code != 0 {
 				t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 			}
 			store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -98,7 +98,7 @@ func TestOrgDirectiveSendBodySourcesAndDirectionPolicy(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "peer")
 	var stdout, stderr bytes.Buffer
-	code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/peer", "must fail"}, &stdout, &stderr)
+	code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/peer", "must fail"}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "peer and upward directives are refused") {
 		t.Fatalf("peer send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
@@ -108,7 +108,7 @@ func TestOrgDirectiveSendRefusesUpward(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "worker")
 	var stdout, stderr bytes.Buffer
-	code := runOrg([]string{"directive", "send", "--home", home, "--to", "owner", "--workflow", "release/upward", "must fail"}, &stdout, &stderr)
+	code := runMessage([]string{"directive", "send", "--home", home, "--to", "owner", "--workflow", "release/upward", "must fail"}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "peer and upward directives are refused") {
 		t.Fatalf("upward send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
@@ -118,7 +118,7 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/ack", "inspect the result"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/ack", "inspect the result"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	fields := strings.Fields(stdout.String())
@@ -130,7 +130,7 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 	// MUTANT: trusting --by without checking the addressed target would accept peer.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "ack", fmt.Sprint(directiveID), "--home", home, "--by", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot acknowledge") {
+	if code := runMessage([]string{"directive", "ack", fmt.Sprint(directiveID), "--home", home, "--role", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot acknowledge") {
 		t.Fatalf("unauthorized ack code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -145,7 +145,7 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "ack", fmt.Sprint(directiveID), "--home", home, "--by", "worker"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "ack", fmt.Sprint(directiveID), "--home", home, "--role", "worker"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("ack code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	unacked, err = store.ListUnacknowledgedOrgDirectives(context.Background(), "worker")
@@ -155,13 +155,13 @@ func TestOrgDirectiveAckAuthorizationAndUnackedQuery(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/ancestor-ack", "inspect another result"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/ancestor-ack", "inspect another result"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("second send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	ancestorDirectiveID := strings.Fields(stdout.String())[2]
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "ack", ancestorDirectiveID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "ack", ancestorDirectiveID, "--home", home, "--role", "owner"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("ancestor ack code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -174,10 +174,8 @@ func TestOrgDirectiveReceiptsAreIdempotentAndRetireStaleWakes(t *testing.T) {
 		t.Helper()
 		stdout.Reset()
 		stderr.Reset()
-		if code := runOrg([]string{
-			"directive", "send", "--home", home, "--to", "worker",
-			"--workflow", workflowID, "deliver the result",
-		}, &stdout, &stderr); code != 0 {
+		if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker",
+			"--workflow", workflowID, "deliver the result"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 		}
 		return strings.Fields(stdout.String())[2]
@@ -186,9 +184,7 @@ func TestOrgDirectiveReceiptsAreIdempotentAndRetireStaleWakes(t *testing.T) {
 		t.Helper()
 		stdout.Reset()
 		stderr.Reset()
-		if code := runOrg([]string{
-			"directive", kind, id, "--home", home, "--by", "worker",
-		}, &stdout, &stderr); code != 0 {
+		if code := runMessage([]string{"directive", kind, id, "--home", home, "--role", "worker"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("%s %s code=%d out=%q err=%q", kind, id, code, stdout.String(), stderr.String())
 		}
 	}
@@ -243,13 +239,22 @@ func TestOrgDirectiveReceiptsAreIdempotentAndRetireStaleWakes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(wakes) != 2 {
-		t.Fatalf("wake rows = %+v, want one stable row per directive", wakes)
-	}
+	directiveWakes, receiptWakes := 0, 0
 	for _, wake := range wakes {
-		if wake.State != db.WakeOutboxStateSuperseded {
-			t.Fatalf("wake %d state = %q, want superseded after receipt", wake.ID, wake.State)
+		if wake.TargetRole == "worker" {
+			directiveWakes++
+			if wake.State != db.WakeOutboxStateSuperseded {
+				t.Fatalf("directive wake %d state = %q, want superseded", wake.ID, wake.State)
+			}
+		} else {
+			receiptWakes++
+			if wake.TargetRole != "owner" || wake.State != db.WakeOutboxStatePending {
+				t.Fatalf("receipt wake = %+v, want one queued issuer notification", wake)
+			}
 		}
+	}
+	if directiveWakes != 2 || receiptWakes != 3 {
+		t.Fatalf("wake rows = %+v, want two retired directives and three distinct receipts, without replay", wakes)
 	}
 }
 
@@ -257,7 +262,7 @@ func TestOrgDirectiveReceiptRequiresActingRole(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/actorless", "inspect the result"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/actorless", "inspect the result"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	directiveID := strings.Fields(stdout.String())[2]
@@ -267,8 +272,8 @@ func TestOrgDirectiveReceiptRequiresActingRole(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			stdout.Reset()
 			stderr.Reset()
-			code := runOrg([]string{"directive", kind, directiveID, "--home", home}, &stdout, &stderr)
-			if code != 1 || !strings.Contains(stderr.String(), "acting org role is required") {
+			code := runMessage([]string{"directive", kind, directiveID, "--home", home}, &stdout, &stderr)
+			if code != 1 {
 				t.Fatalf("actorless %s code=%d out=%q err=%q", kind, code, stdout.String(), stderr.String())
 			}
 		})
@@ -279,18 +284,18 @@ func TestOrgDirectiveCancelIsRestrictedToSender(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/cancel", "stop if obsolete"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/cancel", "stop if obsolete"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	id := strings.Fields(stdout.String())[2]
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "cancel", id, "--home", home, "--by", "worker"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot cancel") {
+	if code := runMessage([]string{"directive", "cancel", id, "--home", home, "--role", "worker"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot cancel") {
 		t.Fatalf("target cancel code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "cancel", id, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "cancel", id, "--home", home, "--role", "owner"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("sender cancel code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -299,7 +304,7 @@ func TestDirectiveWakeOutboxDeliversWithoutRule(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/inert", "act"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/inert", "act"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -391,21 +396,25 @@ func TestDirectiveWakeOutboxUsesSeparateCoalesceNamespace(t *testing.T) {
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, latest.Add(replyWakeCoalescingWindow+time.Second), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(deliverySink)); err != nil {
 		t.Fatalf("coalesced drain: %v", err)
 	}
-	directivePrompt := ""
-	for _, prompt := range wake.prompts {
-		if strings.Contains(prompt, "gitmoot org directive") {
-			directivePrompt = prompt
+	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 2 {
+		t.Fatalf("delivered independent obligations=%+v err=%v", delivered, err)
+	}
+	directiveDelivered := false
+	for _, row := range delivered {
+		if row.SourceKind == db.WakeOutboxSourceWorkflowNote && row.SourceID == fmt.Sprint(directive.ID) {
+			directiveDelivered = true
 		}
 	}
-	if wake.promptCalls != 2 || !strings.Contains(directivePrompt, fmt.Sprintf("directive %d", directive.ID)) {
-		t.Fatalf("directive wake calls=%d prompts=%q", wake.promptCalls, wake.prompts)
+	if wake.promptCalls != 2 || !directiveDelivered {
+		t.Fatalf("directive was coalesced into ordinary mail: calls=%d rows=%+v", wake.promptCalls, delivered)
 	}
 }
 
 // TestDeliveredDirectiveRecordsReceiptWithoutASeatTurn is #1980's
 // reproduction. An acknowledgement is a state transition the transport can
 // observe: it is the pane accepting the prompt. Asking the seat to run
-// `gitmoot org directive ack` spent a whole turn boundary on bookkeeping, and
+// `gitmoot message directive ack` spent a whole turn boundary on bookkeeping, and
 // the turn boundary is the scarce resource. Measured on this fleet: 3,306 ack
 // markers all-time, 125 in one day, and 124 of those 125 were recorded by the
 // addressed seat itself with a median 96 seconds from directive to receipt.
@@ -557,7 +566,7 @@ func TestDirectiveWakeDrainDoesNotCoalesceDifferentObligations(t *testing.T) {
 	nag.WakeTargetRole = "worker"
 	deliverySink.sink.Emit(ctx, nag)
 
-	unread, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+	_, err = store.InsertWorkflowNote(ctx, db.WorkflowNote{
 		WorkflowID:        "release/mixed-ack",
 		Author:            "owner",
 		Body:              workflow.FormatOrgDirectiveNote("owner", "worker", "release/mixed-ack", "start"),
@@ -569,25 +578,15 @@ func TestDirectiveWakeDrainDoesNotCoalesceDifferentObligations(t *testing.T) {
 	}
 	drainReplyWakeAfterAllRowsAreDue(t, store, deliverySink)
 
-	var completionPrompt, acknowledgmentPrompt string
-	for _, prompt := range wake.prompts {
-		switch {
-		case strings.Contains(prompt, fmt.Sprintf("directive %d for worker is acknowledged but incomplete", completion.ID)):
-			completionPrompt = prompt
-		// #1980: the first-delivery prompt no longer asks for a receipt, so the
-		// two phases are told apart by their own wording rather than by which
-		// receipt command they carry.
-		// #1981: the first-delivery prompt CARRIES the directive text, so the
-		// phase is recognised by the deliverable rather than by a fetch command.
-		case strings.Contains(prompt, fmt.Sprintf("gitmoot directive %d for worker: start", unread.ID)):
-			acknowledgmentPrompt = prompt
-		}
+	byPane := map[string]int{}
+	for _, pane := range wake.panes {
+		byPane[pane]++
 	}
-	if wake.promptCalls != 2 || completionPrompt == "" || acknowledgmentPrompt == "" {
-		t.Fatalf("directive prompts calls=%d prompts=%q", wake.promptCalls, wake.prompts)
+	if wake.promptCalls != 3 || byPane["w1:p2"] != 2 || byPane["w1:p1"] != 1 {
+		t.Fatalf("distinct obligations or issuer receipt were coalesced away: panes=%v", wake.panes)
 	}
 	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 2 {
+	if err != nil || len(delivered) != 3 {
 		t.Fatalf("delivered directive rows=%+v err=%v", delivered, err)
 	}
 }
@@ -604,7 +603,7 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done", "finish the thing"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done", "finish the thing"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	directiveID := strings.Fields(stdout.String())[2]
@@ -612,14 +611,14 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 	// A peer with no relationship to the target cannot complete it.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot record done") {
+	if code := runMessage([]string{"directive", "done", directiveID, "--home", home, "--role", "peer"}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "cannot record done") {
 		t.Fatalf("unauthorized done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 
 	// The target may. The confirmation must read "completed", not "doneed".
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "worker"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "done", directiveID, "--home", home, "--role", "worker"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	if got := stdout.String(); !strings.Contains(got, "completed directive") || strings.Contains(got, "doneed") {
@@ -663,13 +662,13 @@ func TestOrgDirectiveDoneVerbAuthorizationAndCompletion(t *testing.T) {
 	// A role BELOW the target may complete — someone who plausibly did the work.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-subtree", "and this one"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-subtree", "and this one"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("second send code=%d err=%q", code, stderr.String())
 	}
 	secondID := strings.Fields(stdout.String())[2]
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "done", secondID, "--home", home, "--by", "helper"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "done", secondID, "--home", home, "--role", "helper"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("subtree done code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 }
@@ -688,7 +687,7 @@ func TestOrgDirectiveDoneRefusesSenderAndAncestors(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/no-self-complete", "do the work"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/no-self-complete", "do the work"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	directiveID := strings.Fields(stdout.String())[2]
@@ -696,7 +695,7 @@ func TestOrgDirectiveDoneRefusesSenderAndAncestors(t *testing.T) {
 	// The SENDER — necessarily an ancestor — must not be able to complete it.
 	stdout.Reset()
 	stderr.Reset()
-	code := runOrg([]string{"directive", "done", directiveID, "--home", home, "--by", "owner"}, &stdout, &stderr)
+	code := runMessage([]string{"directive", "done", directiveID, "--home", home, "--role", "owner"}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("the SENDER completed its own directive: self-certification is exactly what this predicate forbids (out=%q)", stdout.String())
 	}
@@ -727,7 +726,7 @@ func TestOrgDirectiveDoneRefusesSenderAndAncestors(t *testing.T) {
 	// The ancestor's real recourse still works: it may CANCEL.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "cancel", directiveID, "--home", home, "--by", "owner"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "cancel", directiveID, "--home", home, "--role", "owner"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("ancestor cancel code=%d err=%q; excluding ancestors from done must not strand them", code, stderr.String())
 	}
 }
@@ -744,7 +743,7 @@ func TestOrgDirectiveDoneClearsUnackedListWithoutAck(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-noack", "do it"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/done-noack", "do it"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	directiveID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)
@@ -809,7 +808,7 @@ func TestOrgDirectiveNudgeClaimRefusesTerminatedObligation(t *testing.T) {
 	home := directiveTestHome(t)
 	t.Setenv("GITMOOT_ORG_ROLE", "owner")
 	var stdout, stderr bytes.Buffer
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race", "race me"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race", "race me"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("send code=%d err=%q", code, stderr.String())
 	}
 	directiveID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)
@@ -859,7 +858,7 @@ func TestOrgDirectiveNudgeClaimRefusesTerminatedObligation(t *testing.T) {
 	// And the claim must still work for an obligation that is genuinely open.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race2", "still open"}, &stdout, &stderr); code != 0 {
+	if code := runMessage([]string{"directive", "send", "--home", home, "--to", "worker", "--workflow", "release/race2", "still open"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("second send code=%d err=%q", code, stderr.String())
 	}
 	openID, err := strconv.ParseInt(strings.Fields(stdout.String())[2], 10, 64)

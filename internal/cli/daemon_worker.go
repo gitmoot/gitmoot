@@ -185,6 +185,7 @@ func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, er
 	return replyWakeDelivery{
 		sink:  resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
 		rules: rules,
+		ready: messageRecipientReadiness(w.workflowHome()),
 	}, nil
 }
 

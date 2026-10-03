@@ -25,6 +25,7 @@ type dashboardCommsResponse struct {
 }
 
 type dashboardCommsThread struct {
+	ThreadID   int64                   `json:"thread_id,omitempty"`
 	WorkflowID string                  `json:"workflow_id"`
 	Repo       string                  `json:"repo,omitempty"`
 	UpdatedAt  string                  `json:"updated_at"`
@@ -33,13 +34,23 @@ type dashboardCommsThread struct {
 }
 
 type dashboardCommsMessage struct {
-	ID         int64                     `json:"id"`
-	Kind       string                    `json:"kind"`
-	From       string                    `json:"from,omitempty"`
-	To         string                    `json:"to,omitempty"`
-	Body       string                    `json:"body"`
-	CreatedAt  string                    `json:"created_at"`
-	Resolution *dashboardCommsResolution `json:"resolution,omitempty"`
+	ID                 int64                     `json:"id"`
+	Kind               string                    `json:"kind"`
+	From               string                    `json:"from,omitempty"`
+	To                 string                    `json:"to,omitempty"`
+	Body               string                    `json:"body"`
+	CreatedAt          string                    `json:"created_at"`
+	Lifecycle          string                    `json:"lifecycle,omitempty"`
+	NotificationStatus string                    `json:"notification_status,omitempty"`
+	NotificationReason string                    `json:"notification_reason,omitempty"`
+	Repo               string                    `json:"repo,omitempty"`
+	PullRequest        int                       `json:"pull_request,omitempty"`
+	HeadSHA            string                    `json:"head_sha,omitempty"`
+	ReviewPurpose      string                    `json:"review_purpose,omitempty"`
+	SourceJobID        string                    `json:"source_job_id,omitempty"`
+	SourceState        string                    `json:"source_state,omitempty"`
+	ReviewDecision     string                    `json:"review_decision,omitempty"`
+	Resolution         *dashboardCommsResolution `json:"resolution,omitempty"`
 }
 
 type dashboardCommsResolution struct {
@@ -215,7 +226,8 @@ func (d *webDataSource) comms(ctx context.Context, requestedNoteID int64) (dashb
 				out.Threads = append(out.Threads, dashboardCommsBoundThread(thread, requestedNoteID))
 			}
 		}
-		return nil
+		out.Threads, err = dashboardInboxThreads(ctx, store, out.Threads, requestedNoteID)
+		return err
 	})
 	if err != nil {
 		return dashboardCommsResponse{}, err
@@ -247,7 +259,7 @@ func dashboardCommsBoundThread(thread dashboardCommsThread, requestedNoteID int6
 	for i, message := range thread.Messages {
 		requested := message.ID == requestedNoteID ||
 			(message.Resolution != nil && message.Resolution.NoteID == requestedNoteID)
-		unresolved := message.Kind == "escalation" && message.Resolution == nil
+		unresolved := dashboardMessageIsOpen(message)
 		if requested || unresolved {
 			keep[i] = true
 			if ordinaryBudget > 0 {
@@ -436,7 +448,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
           <div class="messages" id="messages"><div class="state"><strong>No thread selected</strong>Choose a workflow from the thread rail.</div></div>
         </section>
       </section>
-      <footer class="comms-footer"><span class="pulse"></span>Read-only org traffic · resolve escalations with <code style="margin-left:4px">gitmoot org escalate resolve</code></footer>
+      <footer class="comms-footer"><span class="pulse"></span>Read-only org traffic · resolve escalations with <code style="margin-left:4px">gitmoot message resolve</code></footer>
     </section>
   </div>
   <!-- gitmoot-dashboard-mobile-nav -->
@@ -444,6 +456,9 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
 <script>
 (()=>{
   const $=id=>document.getElementById(id), state={data:[],selected:'',mode:'all',deep:'',error:false};
+  const threadKey=t=>t.thread_id?'message:'+t.thread_id:t.workflow_id;
+  const threadTitle=t=>t.thread_id?'Conversation #'+t.thread_id+(t.workflow_id?' · '+t.workflow_id:''):t.workflow_id;
+  const isOpen=m=>(m.kind==='escalation'&&!m.resolution&&m.lifecycle!=='resolved')||(m.kind==='directive'&&!['completed','cancelled'].includes(m.lifecycle));
   const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const when=v=>{const d=new Date(v);return isNaN(d)?v:d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'})};
   const age=v=>{const ms=Math.max(0,Date.now()-new Date(v).getTime()),m=Math.floor(ms/60000);if(m<60)return m+'m open';const h=Math.floor(m/60);if(h<48)return h+'h open';return Math.floor(h/24)+'d open'};
@@ -451,8 +466,8 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   const matchesMessage=(m,q,from,to,res,date,systems)=>{
     if(m.kind==='system'&&!systems)return false;
     if(from&&m.from!==from)return false;if(to&&m.to!==to)return false;
-    if(res==='open'&&(m.kind!=='escalation'||m.resolution))return false;
-    if(res==='resolved'&&(m.kind!=='escalation'||!m.resolution))return false;
+    if(res==='open'&&!isOpen(m))return false;
+    if(res==='resolved'&&!m.resolution&&!['resolved','completed','cancelled'].includes(m.lifecycle))return false;
     if(date&&String(m.created_at).slice(0,10)<date)return false;
     return !q||[m.body,m.from,m.to,String(m.id)].join(' ').toLowerCase().includes(q);
   };
@@ -463,32 +478,36 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   };
   const stateBox=(title,copy,cls='')=>'<div class="state '+cls+'" role="status"><strong>'+esc(title)+'</strong>'+esc(copy)+'</div>';
   const renderThreads=()=>{
-    if(state.error){$('threads').innerHTML=stateBox('Comms source unavailable','The workflow-note store could not be read. Retry after the dashboard source recovers.','source-down');return;}
+    if(state.error){$('threads').innerHTML=stateBox('Comms source unavailable','The inbox store could not be read. Retry after the dashboard source recovers.','source-down');return;}
     const list=visible();
-    if(!list.length){$('threads').innerHTML=stateBox('No matching comms','No workflow threads match the current filters.');$('messages').innerHTML=stateBox('No matching conversation','Change the filters or switch from Open to All.');return;}
-    $('threads').innerHTML=list.map(t=>'<button class="thread '+(t.workflow_id===state.selected?'active':'')+'" data-thread="'+esc(t.workflow_id)+'"><span class="threadtop"><span class="workflow">'+esc(t.workflow_id)+'</span>'+(t.unresolved?'<span class="badge" title="Unresolved escalations">'+t.unresolved+'</span>':'')+'</span><span class="threadmeta"><span>'+esc(t.repo||'workflow notes')+'</span><span>'+esc(latest(t))+'</span></span></button>').join('');
+    if(!list.length){$('threads').innerHTML=stateBox('No matching comms','No conversations match the current filters.');$('messages').innerHTML=stateBox('No matching conversation','Change the filters or switch from Open to All.');return;}
+    $('threads').innerHTML=list.map(t=>'<button class="thread '+(threadKey(t)===state.selected?'active':'')+'" data-thread="'+esc(threadKey(t))+'"><span class="threadtop"><span class="workflow">'+esc(threadTitle(t))+'</span>'+(t.unresolved?'<span class="badge" title="Open obligations">'+t.unresolved+'</span>':'')+'</span><span class="threadmeta"><span>'+esc(t.repo||'durable conversation')+'</span><span>'+esc(latest(t))+'</span></span></button>').join('');
     document.querySelectorAll('[data-thread]').forEach(el=>el.onclick=()=>select(el.dataset.thread));
-    if(!state.selected||!list.some(t=>t.workflow_id===state.selected))select(list[0].workflow_id,false);else renderConversation();
+    if(!state.selected||!list.some(t=>threadKey(t)===state.selected))select(threadKey(list[0]),false);else renderConversation();
   };
   const messageHTML=m=>{
     if(m.kind==='system')return '<div class="message system" id="note-'+m.id+'"><div class="systemline"><span>'+esc(m.body)+'</span><a class="note" href="?note='+m.id+'#note-'+m.id+'">#'+m.id+'</a><span>'+esc(when(m.created_at))+'</span></div></div>';
-    const open=m.kind==='escalation'&&!m.resolution,reply=m.kind==='reply';
+    const open=isOpen(m),reply=m.kind==='reply'||m.kind.endsWith('_receipt');
     let foot='';
     if(open)foot='<div class="footer open">● Unresolved · '+esc(age(m.created_at))+'</div>';
     if(m.resolution)foot='<div class="footer" id="note-'+m.resolution.note_id+'">Resolved by <b>'+esc(m.resolution.by)+'</b> · '+esc(when(m.resolution.created_at))+' <a href="?note='+m.resolution.note_id+'#note-'+m.resolution.note_id+'">marker #'+m.resolution.note_id+'</a></div>';
+    if(m.notification_status)foot+='<div class="footer">Notification: '+esc(m.notification_status)+(m.notification_reason?' · '+esc(m.notification_reason):'')+'</div>';
+    if(m.lifecycle)foot+='<div class="footer">Lifecycle: '+esc(m.lifecycle)+'</div>';
+    if(m.source_job_id)foot+='<div class="footer">Source job: '+esc(m.source_job_id)+(m.source_state?' · '+esc(m.source_state):'')+'</div>';
+    if(m.head_sha)foot+='<div class="footer">Review: '+esc(m.repo)+'#'+esc(m.pull_request)+' · head '+esc(m.head_sha)+' · '+esc(m.review_purpose)+(m.review_decision?' · '+esc(m.review_decision):'')+'</div>';
     return '<article class="message '+(reply?'reply ':'')+(open?'open':'')+'" id="note-'+m.id+'"><div class="bubble"><div class="meta"><span class="role">'+esc(m.from||'unknown')+'</span><span class="arrow">→</span><span class="role">'+esc(m.to||'unknown')+'</span><span class="chip">'+esc(m.kind)+'</span><span>'+esc(when(m.created_at))+'</span><a class="note" href="?note='+m.id+'#note-'+m.id+'">#'+m.id+'</a></div><div class="body">'+esc(m.body)+'</div><button class="expand" type="button">Expand</button>'+foot+'</div></article>';
   };
   const renderConversation=()=>{
-    const t=visible().find(x=>x.workflow_id===state.selected)||state.data.find(x=>x.workflow_id===state.selected);
+    const t=visible().find(x=>threadKey(x)===state.selected)||state.data.find(x=>threadKey(x)===state.selected);
     if(!t)return;
-    $('conversation-head').innerHTML='<button class="navlink mobile-back" id="back" type="button">← Threads</button><div><h1>'+esc(t.workflow_id)+'</h1><small>'+(t.unresolved?t.unresolved+' unresolved escalation'+(t.unresolved===1?'':'s'):'All escalations resolved')+(t.repo?' · '+esc(t.repo):'')+'</small></div>';
+    $('conversation-head').innerHTML='<button class="navlink mobile-back" id="back" type="button">← Threads</button><div><h1>'+esc(threadTitle(t))+'</h1><small>'+(t.unresolved?t.unresolved+' open obligation'+(t.unresolved===1?'':'s'):'No open formal obligations')+(t.repo?' · '+esc(t.repo):'')+'</small></div>';
     $('back').onclick=()=>{$('rail').classList.remove('thread-open');$('conversation').classList.remove('thread-open')};
     const msgs=t._messages||t.messages;
     $('messages').innerHTML=msgs.length?msgs.map(messageHTML).join(''):stateBox('No matching conversation','This workflow has traffic, but none matches the active filters.');
     document.querySelectorAll('.body').forEach(body=>{const btn=body.nextElementSibling;if(body.scrollHeight>body.clientHeight+2){btn.style.display='inline-block';btn.onclick=()=>{body.classList.toggle('expanded');btn.textContent=body.classList.contains('expanded')?'Collapse':'Expand'}}});
     if(state.deep){requestAnimationFrame(()=>{const node=$('note-'+state.deep);if(node){node.scrollIntoView({block:'center'});node.classList.add('focus');setTimeout(()=>node.classList.remove('focus'),1900)}state.deep=''})}
   };
-  const select=(id,push=true)=>{state.selected=id;$('rail').classList.add('thread-open');$('conversation').classList.add('thread-open');if(push){const u=new URL(location.href);u.searchParams.set('workflow',id);u.searchParams.delete('note');history.replaceState({},'',u)}renderThreads()};
+  const select=(id,push=true)=>{state.selected=id;$('rail').classList.add('thread-open');$('conversation').classList.add('thread-open');if(push){const u=new URL(location.href);if(id.startsWith('message:')){u.searchParams.set('thread',id.slice(8));u.searchParams.delete('workflow')}else{u.searchParams.set('workflow',id);u.searchParams.delete('thread')}u.searchParams.delete('note');history.replaceState({},'',u)}renderThreads()};
   const roleOptions=()=>{
     const roles=new Set();state.data.forEach(t=>t.messages.forEach(m=>{if(m.from)roles.add(m.from);if(m.to)roles.add(m.to)}));
     [...roles].sort().forEach(role=>{$('from').insertAdjacentHTML('beforeend','<option>'+esc(role)+'</option>');$('to').insertAdjacentHTML('beforeend','<option>'+esc(role)+'</option>')});
@@ -504,15 +523,16 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   const closeMobileNav=()=>{$('dashboard-sidebar').classList.remove('mobile-open');$('mobile-backdrop').classList.remove('mobile-open')};
   const toggleMobileNav=()=>{$('dashboard-sidebar').classList.toggle('mobile-open');$('mobile-backdrop').classList.toggle('mobile-open')};
   $('mobile-menu').onclick=toggleMobileNav;$('mobile-more').onclick=toggleMobileNav;$('mobile-backdrop').onclick=closeMobileNav;
-  const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow');
+  const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow'),wantedThread=p.get('thread');
   const api=new URL('/api/comms',location.origin);if(note)api.searchParams.set('note',note);
   fetch(api.pathname+api.search,{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
     state.data=Array.isArray(data.threads)?data.threads:[];roleOptions();
-    if(note){state.deep=String(note);const found=state.data.find(t=>t.messages.some(m=>String(m.id)===state.deep||(m.resolution&&String(m.resolution.note_id)===state.deep)));if(found)state.selected=found.workflow_id}
-    if(!state.selected&&wanted&&state.data.some(t=>t.workflow_id===wanted))state.selected=wanted;
-    if(!state.data.length){$('threads').innerHTML=stateBox('No org traffic yet','Typed escalations and engine markers will appear here when workflow notes are written.');$('messages').innerHTML=stateBox('Conversation is empty','There are no Comms threads to display.');return}
-    renderThreads();
-  }).catch(()=>{state.error=true;renderThreads();$('messages').innerHTML=stateBox('Comms source unavailable','The workflow-note store could not be read.','source-down')});
+    if(note){state.deep=String(note);const found=state.data.find(t=>t.messages.some(m=>String(m.id)===state.deep||(m.resolution&&String(m.resolution.note_id)===state.deep)));if(found)state.selected=threadKey(found)}
+    if(!state.selected&&wantedThread){const found=state.data.find(t=>String(t.thread_id)===wantedThread);if(found)state.selected=threadKey(found)}
+    if(!state.selected&&wanted){const found=state.data.find(t=>t.workflow_id===wanted);if(found)state.selected=threadKey(found)}
+    if(!state.data.length){$('threads').innerHTML=stateBox('No messages yet','Fleet conversations and addressed notifications will appear here.');$('messages').innerHTML=stateBox('Conversation is empty','There are no Comms threads to display.');return}
+    if(state.selected)select(state.selected,false);else renderThreads();
+  }).catch(()=>{state.error=true;renderThreads();$('messages').innerHTML=stateBox('Comms source unavailable','The inbox store could not be read.','source-down')});
 })();
 </script>
 </body>

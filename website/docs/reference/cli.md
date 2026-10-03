@@ -1658,9 +1658,8 @@ calculation; its stored consecutive counter remains unchanged for the next real
 delivery attempt. `status --json` also exposes `active_jobs`, the live
 queued-plus-running job count attributed to the role through `ActingOrgRole`
 (#1057); it is distinct from daily or historical job counts. Escalations are
-recorded with `gitmoot org escalate` and resolved with
-`gitmoot org escalate resolve`; correlation beyond the optional `--note` link
-remains phase 2 work.
+recorded with `gitmoot message escalate` and resolved with
+`gitmoot message resolve`, using an answer or a linked journal note.
 
 For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
 weekly-quota rejection marks that role `unavailable` until the provider's
@@ -1874,20 +1873,14 @@ When a role configures `model`, recycle passes `--model <value>` to the successo
 only for the verified Herdr kinds `codex`, `claude`, and `kimi`; other accepted
 `--kind` values silently ignore the pin without an error or warning.
 
-`gitmoot org escalate --to <role> --workflow <label> [--org-role
-<from-role>] [--repo <owner/repo>] "<question>"` writes a workflow journal
-note. The acting role is `--org-role` when given, otherwise `GITMOOT_ORG_ROLE`;
-it must be configured. An ancestor target preserves the upward escalation
-behavior; a descendant target records a downward ask. Both directions use the
-same typed note schema
-`[org:escalate to=<to> from=<from> wf=<workflow>] <question>` and set the
-from-role as author; `--json` prints the stored question fields. The same role
-is invalid. Peer questions are refused by a safe command-level default because
-Gitmoot has no configurable peer-question policy. This formalizes the earlier
-ad-hoc practice of typing organization questions into notes or panes; there is
-no code-level marker to migrate. The note and a `pending` wake outbox row commit
-atomically. The daemon wakes the addressed role through its configured Herdr pane
-without requiring a `reply` rule.
+`gitmoot message escalate [--to ROLE] [--workflow LABEL] [--role ROLE]
+"QUESTION"` records a tracked decision request in the shared inbox. The default
+recipient is the sender's coordinator. An explicit ancestor or descendant is
+allowed; the same role and peers are refused. Ordinary cross-tree conversation
+uses `message send` instead and grants no assignment authority.
+The escalation and its notification obligation commit atomically. No workflow
+is required, and association does not reopen closed work. `--json` returns the
+canonical message, thread ID, lifecycle and notification status.
 
 Ordinary fleet conversation uses `gitmoot message`:
 
@@ -1914,35 +1907,35 @@ stored text; plain output scrubs terminal escape/control sequences.
 
 `notification_status` distinguishes queued, submitting, submitted, uncertain,
 failed, stalled, and resolved; none means read or completed. Uncertain pane
-input is not blindly resent. This replaces `org message send`, without an
-alias. Historical notes remain readable and are not replayed. Formal
-escalations/directives keep their existing lifecycle commands until the
-separate inbox integration steps in #2289.
+input is not blindly resent. This replaces the old `org message`, `org escalate`
+and `org directive` sending surfaces, without aliases. Historical addressed
+notes retain their IDs and source links. Import creates inbox projections,
+never new wake obligations; unknown delivery stays unknown.
 
-`gitmoot org escalate resolve <escalation-note-id> [--by <role>] [--note
-<answer-note-id>] [--home <dir>]` appends a typed resolution marker to the same
-workflow journal. `--by` defaults to the escalation's target role, and `--note`
-optionally links the workflow note containing the answer. The resolution marker
-is addressed to the escalation's parsed asker and atomically records a pending
-reply wake-outbox row; the daemon wakes the asker without a `reply` rule. A legacy
-typed escalation with no identifiable asker still resolves, prints a warning, and
-records no invented target. Resolved escalations are omitted from org dashboard
-projections while the original journal entry remains intact.
+`gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE]`
+records an answer and resolution in the original thread and queues one notice
+to the original requester. `--note` accepts a message in this thread or a plain
+journal note in the associated nonempty workflow, never another private thread.
+Only the requester or addressed coordinator can resolve it. Identity uses the
+same explicit/session selection as other message commands. Identical retries
+return the existing receipt; a different resolver or answer fails with a conflict.
+Reading or conversational replies never resolve an escalation. Historical
+requests with no identifiable sender have system provenance, not an invented
+recipient.
 
-`gitmoot org directive send --to <role> --workflow <label> (--stdin | -F
-<file> | <text>) [--home <dir>]` writes a typed downward assignment from
-`GITMOOT_ORG_ROLE`. The sender must be an ancestor of the target; peer, upward,
-and same-role sends are refused. Its note and pending `directive:<role>` wake
-obligation commit atomically and never share reply coalescing. The daemon wakes
-the target without a directive rule. A missing pane or failed delivery remains
-visible in the durable outbox; delivery is not proof of reading.
+`gitmoot message directive send --to ROLE [--workflow LABEL] [--role ROLE]
+(--stdin | -F FILE | TEXT)` records an authorized assignment in the shared inbox.
+Put send flags before the body. The issuer must be an ancestor of the target;
+peer, upward and same-role directives fail closed. A workflow is optional.
+The directive and its pending notification commit atomically. Missing panes,
+unsafe input states and uncertain submissions retain durable mail; a directive
+does not grant permission to interrupt a busy seat.
 
-`gitmoot org directive ack <id> [--by <role>] [--home <dir>]` is restricted to
-the addressed target or one of its configured ancestors and records receipt,
-not completion. `gitmoot org directive cancel <id> [--by <role>] [--home
-<dir>]` is restricted to the sender. Both commands require an acting identity
-from `--by` or `GITMOOT_ORG_ROLE`; missing identity fails closed. They append
-typed markers to the directive's workflow journal.
+`gitmoot message directive ack ID [--role ROLE]` is restricted to the target or
+one of its ancestors and records acceptance, not completion.
+`gitmoot message directive cancel ID [--role ROLE]` is restricted to the issuer.
+Both require explicit or session-derived identity; missing identity fails closed.
+The receipt remains linked to the directive's thread and notifies its issuer.
 
 Receipt is normally recorded by the **transport**, not by the seat. When Herdr
 confirms that a directive prompt landed in the addressed role's pane, Gitmoot
@@ -1954,7 +1947,7 @@ carries `to=` rather than `by=`, because an acknowledgment is the seat's own
 assertion and a machine must not write one on its behalf. Nothing in the
 delivered marker claims the seat read the directive.
 
-`gitmoot org directive ack` therefore remains available but is no longer part
+`gitmoot message directive ack` therefore remains available but is no longer part
 of the delivery path, and the first-delivery prompt no longer asks for it. An
 acknowledgment answers "did this reach you", which the delivery confirmation
 already answers, and routing that question through a model turn spent the turn
@@ -1968,7 +1961,7 @@ keeps running for exactly the directives whose arrival nobody can demonstrate.
 
 **The first-delivery prompt carries the directive itself**, not a pointer to
 its row: `gitmoot directive <id> for <role>: <directive text> -- record
-completion with: gitmoot org directive done <id> --by <role>`. Fetching a row
+completion with: gitmoot message directive done <id> --role <role>`. Fetching a row
 costs another turn, which is the whole cost this transport work is removing.
 The carried text is the directive body with its `[org:directive to=… from=…
 wf=…]` marker header stripped, since the prompt already states the addressee.
@@ -1979,7 +1972,7 @@ workflow show-note 42 --json]`. Directive bodies on a live fleet have a median
 of about 2,800 characters, so most arrive whole, and none stops mid-clause
 without saying so.
 
-`gitmoot org directive done <id> [--by <role>] [--home <dir>]` records
+`gitmoot message directive done <id> [--role <role>] [--home <dir>]` records
 COMPLETION and ends the obligation, including its TTL nudges. **Completion
 authority is the target subtree**: the addressed role, or a role below it in the
 chart — someone who plausibly did the work.
