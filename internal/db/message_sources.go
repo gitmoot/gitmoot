@@ -58,7 +58,9 @@ func inboxNoteHeader(body string) (string, map[string]string, string) {
 func inboxMessageForNote(note WorkflowNote, recipient string) Message {
 	kind, attrs, body := inboxNoteHeader(note.Body)
 	m := Message{ID: note.ID, Sender: MessageSystemSender, Recipient: recipient, Body: note.Body, Kind: "notification", WorkflowID: note.WorkflowID, CreatedAt: note.CreatedAt}
-	if attrs["to"] == recipient && ((attrs["from"] != "" && attrs["from"] == note.Author) || (kind == "escalate" && attrs["from"] == "")) {
+	// Legacy self-addressed notes are journal notifications, not conversations.
+	// Keep their original body and source identity without claiming a participant.
+	if note.Author != recipient && attrs["to"] == recipient && ((attrs["from"] != "" && attrs["from"] == note.Author) || (kind == "escalate" && attrs["from"] == "")) {
 		switch kind {
 		case "message", "escalate", "directive":
 			if attrs["from"] != "" {

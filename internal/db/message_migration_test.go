@@ -33,13 +33,15 @@ func TestMessageInboxUpgradeIsAtomicAndNeverReplaysHistory(t *testing.T) {
  (41,'historic','worker','[org:directive-done id=40 by=worker] completed','2026-09-15 12:04:00'),
  (50,'historic','worker','[org:escalate to=owner from=worker wf=historic] Old decision.','2026-09-15 12:05:00'),
  (51,'historic','owner','[org:escalate-resolved id=50 by=owner] resolved','2026-09-15 12:06:00'),
- (52,'unrelated','owner','[org:escalate-resolved id=30 by=owner] unrelated resolution','2026-09-15 12:07:00');
+ (52,'unrelated','owner','[org:escalate-resolved id=30 by=owner] unrelated resolution','2026-09-15 12:07:00'),
+ (60,'historic','worker','[org:message from=worker to=worker wf=historic] Self-addressed journal.','2026-09-15 12:08:00');
  INSERT INTO wake_outbox(source_kind,source_id,target_role,coalesce_key,state,attempt_count,last_error) VALUES
  ('workflow_note','10','worker','directive:worker','pending',0,''),
  ('workflow_note','20','owner','reply:owner','delivery_unknown',1,'PTY write not confirmed'),
  ('workflow_note','40','worker','directive:worker','delivered',1,''),
  ('workflow_note','50','owner','reply:owner','delivered',1,''),
- ('workflow_note','51','worker','reply:worker','delivery_unknown',1,'old uncertain resolution');
+ ('workflow_note','51','worker','reply:worker','delivery_unknown',1,'old uncertain resolution'),
+ ('workflow_note','60','worker','reply:worker','delivered',1,'');
  CREATE TRIGGER fail_inbox_upgrade BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT,'injected inbox migration failure'); END;
  `)
 	if err != nil {
@@ -91,6 +93,7 @@ func TestMessageInboxUpgradeIsAtomicAndNeverReplaysHistory(t *testing.T) {
 		{41, 40, "owner", "directive_receipt", "not_notified", "completed", "[org:directive-done id=40 by=worker] completed"},
 		{50, 50, "owner", "escalation", "submitted", "resolved", "Old decision."},
 		{51, 50, "worker", "escalation_receipt", "uncertain", "resolved", "[org:escalate-resolved id=50 by=owner] resolved"},
+		{60, 60, "worker", "notification", "submitted", "", "[org:message from=worker to=worker wf=historic] Self-addressed journal."},
 	} {
 		stored, err := upgraded.GetMessage(ctx, want.id, want.role)
 		if err != nil {

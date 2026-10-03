@@ -224,7 +224,9 @@ legacy review wakes for the same recipient.
 Resolving it records an answer and receipt in its thread and notifies the actual
 requester. Historical requests without an identifiable requester use system
 provenance, not an invented target. Historical import creates no new wakes and
-preserves uncertain delivery evidence. The daemon holds each pending group
+preserves uncertain delivery evidence. Legacy self-addressed journal notes remain
+system notifications with their original body, not self-conversations; their
+existing delivery evidence is unchanged. The daemon holds each pending group
 for `[org].wake_coalesce_hold` (default `5m`) after its OLDEST row, then
 delivers every due pending row for
 that event kind and role as ONE wake, bounded at ten rows per wake, so a
