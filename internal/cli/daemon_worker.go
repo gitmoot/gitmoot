@@ -130,10 +130,6 @@ type jobWorker struct {
 	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
 	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
 	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
-	// QuotaWake is the existing Herdr agent-prompt client used for the direct,
-	// one-shot parent-role escalation when a Claude job makes its acting org role
-	// unavailable. nil keeps non-daemon/test workers wake-free.
-	QuotaWake eventWakeClient
 	// SandboxProbe is the cached host capability check used only for Claude/Kimi
 	// produce stages. nil selects sandbox.SandboxProbe; tests inject deterministic
 	// supported/unsupported results without depending on the test binary's argv.
@@ -226,7 +222,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.AuthProbe = worker.defaultAuthProbe
 	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
-	worker.QuotaWake = newQuotaRoleUnavailableWakeClient()
 	recoverKillPendingAtWorkerStartup.Do(func() {
 		if err := recoverKillPendingJobs(context.Background(), store, worker.Stdout); err != nil {
 			writeLine(worker.Stdout, "job kill-pending recovery failed: %v", err)

@@ -1232,7 +1232,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey), Runtime: effectiveAgent.Runtime}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home, io.Discard)
+	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home)
 	recordRuntimeOutcome := func(runErr error) {
 		// Availability bookkeeping is deliberately best-effort here, as it is in
 		// the daemon worker: it must never replace the foreground job's outcome.

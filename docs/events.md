@@ -247,14 +247,23 @@ retried on a later tick without aborting unrelated repository work.
 Before claiming a notice, the daemon checks the registered recipient's live
 binding and input state. Busy, blocked, unknown and offline recipients keep
 their pending notices and a visible deferral reason without spending attempts.
-A later safe snapshot makes proven-unsent notices eligible again; it does not
-authorize replay of an uncertain attempt.
-After a claim, an explicit pre-write `agent_blocked` or `agent_input_pending`
-refusal can return the same batch to `pending`, with its attempt count retained.
-These attempted refusals have a three-attempt bound. Other conclusive failures
-remain visible with a `wake_delivery_failed` event on `wake-outbox:<id>`.
-A stall, timeout or unexplained non-delivery is not proof that no text reached
-the composer: uncertain outcomes are retained without automatic retyping.
+A later eligible snapshot allows another admission attempt, never replay of an
+uncertain attempt. Delivery uses only Herdr's private `agent.prompt_safe` endpoint.
+Gitmoot pins the runtime nonce, session and generation observed while resolving
+the recipient; Herdr and OMP reject a replaced registration or stale session.
+OMP checks active work, drafts, attachments, paste/clipboard work and modal UI
+atomically with reserving the turn. No PTY typing or draft restoration is used.
+An explicit runtime deferral returns the entire batch to `pending` without
+spending retry budget. `accepted` means runtime admission, not persistence, reading
+or completion. A missing receipt remains `delivery_unknown` without automatic
+retry, including a CLI failure after admission.
+
+Quota failures pause the runtime even if notification configuration is invalid.
+The incident's one-shot parent notification claim commits with its shared inbox
+message and outbox row; enqueue failure leaves the claim available for retry.
+Quota notices use the addressed `escalation` wake policy, but remain ordinary
+system notifications rather than creating an escalation duty.
+
 An aged-out row whose delivery the store can PROVE is recorded as `delivered`
 rather than `delivery_unknown`, with a `wake_delivered` job event on
 `wake-outbox:<id>` carrying `policy=resolved_by_destination_evidence`. The proof
@@ -282,8 +291,8 @@ rests on the deletion tombstones, so a role retired before that table existed
 reads as never-configured.
 Failed, stalled and `delivery_unknown` rows remain visible as blocked obligations
 in delivery health; they are not automatically resent. Unknown includes a lost
-receipt after a daemon crash, `written_to_pty`, generic timeouts, legacy stalls,
-and unsubmitted drafts. None proves it is safe to send the text again.
+receipt after a daemon crash, generic timeouts, legacy PTY writes, stalls and
+unsubmitted drafts. None proves it is safe to send the text again.
 
 Use `gitmoot org seat bind --name ROLE --agent NAME` to explicitly bind an
 existing role to an exact registered local Herdr agent. It stores

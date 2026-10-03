@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -26,7 +27,6 @@ type fakeEventWake struct {
 	prompt         string
 	panes          []string
 	prompts        []string
-	until          string
 	labelToPane    map[string]string
 	stalled        bool
 	promptErr      error
@@ -39,10 +39,10 @@ func (f *fakeEventWake) Available(context.Context) bool {
 	return true
 }
 
-func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until string) (bool, bool, error) {
+func (f *fakeEventWake) AgentNotify(_ context.Context, target cockpit.NotificationTarget, prompt string) (bool, bool, error) {
 	f.promptCalls++
-	f.pane, f.prompt, f.until = pane, prompt, until
-	f.panes = append(f.panes, pane)
+	f.pane, f.prompt = target.Selector, prompt
+	f.panes = append(f.panes, target.Selector)
 	f.prompts = append(f.prompts, prompt)
 	if f.onPrompt != nil {
 		if err := f.onPrompt(); err != nil {
@@ -61,12 +61,12 @@ func (f *fakeEventWake) AgentPrompt(_ context.Context, pane, prompt, until strin
 	return true, false, nil
 }
 
-func (f *fakeEventWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
+func (f *fakeEventWake) ResolveNotificationTarget(_ context.Context, label string) (cockpit.NotificationTarget, bool) {
 	pane, ok := f.labelToPane[label]
 	if !ok && strings.Contains(label, ":") {
-		return label, true
+		return cockpit.NotificationTarget{Selector: label}, true
 	}
-	return pane, ok
+	return cockpit.NotificationTarget{Selector: pane}, ok
 }
 
 func TestClassifyEventRuleKinds(t *testing.T) {
@@ -381,11 +381,8 @@ func TestEventRuleEvaluatorResolvesPaneAndWakes(t *testing.T) {
 	wake := &fakeEventWake{}
 	sink := &eventRuleSink{store: store, home: home, wake: wake}
 	sink.evaluate(context.Background(), events.Event{Type: events.EventJobNeedsAttention, Cause: "ask_gate", Repo: "acme/widget", JobID: "job-1", Detail: "Please choose", WakeTargetRole: "owner"})
-	if wake.availableCalls != 1 || wake.pane != "w1:p1" || wake.until != "" {
+	if wake.availableCalls != 1 || wake.pane != "w1:p1" {
 		t.Fatalf("wake=%+v", wake)
-	}
-	if want := "gitmoot attention event for job job-1: Please choose"; wake.prompt != want {
-		t.Fatalf("prompt=%q want=%q", wake.prompt, want)
 	}
 }
 

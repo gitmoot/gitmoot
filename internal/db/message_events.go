@@ -30,6 +30,17 @@ func (s *Store) EnqueueMessageNotification(ctx context.Context, message Message,
 	if _, err := tx.ExecContext(ctx, `UPDATE messages SET id=id WHERE source_kind=? AND source_id=?`, WakeOutboxSourceEvent, message.SourceID); err != nil {
 		return err
 	}
+	if err := enqueueMessageNotificationTx(ctx, tx, message, recipients); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// The caller must hold the SQLite writer lock before checking deduplication.
+func enqueueMessageNotificationTx(ctx context.Context, tx *sql.Tx, message Message, recipients []string) error {
+	if message.SourceID == "" || message.SourcePayload == "" || (message.Kind != "review" && message.Kind != "notification") {
+		return fmt.Errorf("system notification requires a source and notification kind")
+	}
 	for _, recipient := range recipients {
 		recipient = strings.ToLower(strings.TrimSpace(recipient))
 		if recipient == "" || recipient == MessageSystemSender {
@@ -55,7 +66,7 @@ func (s *Store) EnqueueMessageNotification(ctx context.Context, message Message,
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func populateMessageProvenance(message *Message) error {
@@ -78,12 +89,12 @@ func populateMessageProvenance(message *Message) error {
 		}
 	} else if message.SourceKind == WakeOutboxSourceEvent {
 		var source struct {
-			Repo          string `json:"repo"`
-			PullRequest   int    `json:"pull_request"`
-			HeadSHA       string `json:"head_sha"`
-			ReviewPurpose string `json:"review_purpose"`
-			JobID         string `json:"job_id"`
-			Status string `json:"status"`
+			Repo           string `json:"repo"`
+			PullRequest    int    `json:"pull_request"`
+			HeadSHA        string `json:"head_sha"`
+			ReviewPurpose  string `json:"review_purpose"`
+			JobID          string `json:"job_id"`
+			Status         string `json:"status"`
 			ReviewDecision string `json:"review_decision"`
 		}
 		if err := json.Unmarshal([]byte(message.SourcePayload), &source); err != nil {

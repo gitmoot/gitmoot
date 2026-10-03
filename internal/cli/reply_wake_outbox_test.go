@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
@@ -708,6 +709,38 @@ func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 				t.Fatalf("%s rows = %+v, err=%v", test.wantState, rows, err)
 			}
 		})
+	}
+}
+
+func TestRuntimeDeferralKeepsEntireBatchPendingWithoutRetryBudget(t *testing.T) {
+	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
+	wake.promptErr = &cockpit.NotificationDeferred{Reason: "draft"}
+	for range 2 {
+		if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{
+			WorkflowID: "wake-test", Author: "review", Body: "inbox obligation", AddressedTarget: "owner",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range wakeDeliveryMaxAttempts + 2 {
+		// Pending mail remains an outstanding obligation in drain health.
+		_ = drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
+		rows, err := store.ListWakeOutbox(context.Background(), "")
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("batch=%+v err=%v", rows, err)
+		}
+		for _, row := range rows {
+			if row.State != "pending" || row.AttemptCount != 0 || row.AttemptedAt != "" {
+				t.Fatalf("deferral spent retry budget or lost an obligation: %+v", row)
+			}
+		}
+	}
+	wake.promptErr = nil
+	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
+	rows, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil || len(rows) != 2 || rows[0].State != "delivered" || rows[1].State != "superseded" ||
+		rows[1].LastError != db.WakeOutboxCoalescedDetail(rows[0].ID) {
+		t.Fatalf("safe boundary did not acknowledge the whole batch: %+v err=%v", rows, err)
 	}
 }
 
@@ -1427,7 +1460,7 @@ func (w *blockingReplyWake) Available(context.Context) bool {
 	return true
 }
 
-func (w *blockingReplyWake) AgentPrompt(ctx context.Context, _, _, _ string) (bool, bool, error) {
+func (w *blockingReplyWake) AgentNotify(ctx context.Context, _ cockpit.NotificationTarget, _ string) (bool, bool, error) {
 	close(w.started)
 	select {
 	case <-w.release:
@@ -1437,8 +1470,8 @@ func (w *blockingReplyWake) AgentPrompt(ctx context.Context, _, _, _ string) (bo
 	}
 }
 
-func (w *blockingReplyWake) ResolvePaneByLabel(_ context.Context, label string) (string, bool) {
-	return label, true
+func (w *blockingReplyWake) ResolveNotificationTarget(_ context.Context, label string) (cockpit.NotificationTarget, bool) {
+	return cockpit.NotificationTarget{Selector: label}, true
 }
 
 type replyWakeTestRole struct {

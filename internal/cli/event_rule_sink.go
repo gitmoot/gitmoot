@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
@@ -34,8 +35,8 @@ const (
 
 type eventWakeClient interface {
 	Available(context.Context) bool
-	AgentPrompt(context.Context, string, string, string) (bool, bool, error)
-	ResolvePaneByLabel(context.Context, string) (string, bool)
+	AgentNotify(context.Context, cockpit.NotificationTarget, string) (bool, bool, error)
+	ResolveNotificationTarget(context.Context, string) (cockpit.NotificationTarget, bool)
 }
 
 // eventRuleSink persists inbox mail and wake obligations before Emit returns.
@@ -220,15 +221,29 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			}
 			continue
 		}
+		// Coalesced addressed wakes give each target role one attempt per event.
+		// Observer rules are independent copies and do not consume that attempt.
+		if isAddressedNoteWake {
+			replyHandled = true
+		}
+		if deduplicateAddressedWake && !observer {
+			addressedWakeHandled[wakeRole] = true
+		}
 		prompt := eventRuleWakePrompt(rule.OnKind, event)
-		// A FRESH per-rule budget (> herdr's 8s --timeout) so a slow wake for one
-		// rule cannot consume a shared budget and leave a later rule's wake to be
-		// SIGKILLed mid-call. until="" uses herdr's default settled set; a wake only
-		// needs delivery confirmation, so agentPrompt's bounded --timeout returns as
-		// soon as the prompt is confirmed landed and never blocks on the agent settling.
+		// Give each runtime admission its own bounded transport budget. This
+		// never waits for a busy turn to settle or types into the composer.
 		callCtx, cancel := context.WithTimeout(ctx, eventRuleWakeTimeout)
-		delivered, uncertain, err := s.wake.AgentPrompt(callCtx, pane, prompt, "")
+		delivered, uncertain, err := s.wake.AgentNotify(callCtx, pane, prompt)
 		cancel()
+		var deferred *cockpit.NotificationDeferred
+		if !delivered && !uncertain && errors.As(err, &deferred) {
+			if s.store != nil && len(event.WakeOutboxIDs) > 0 {
+				if err := s.store.DeferAttemptedWakeOutbox(context.WithoutCancel(ctx), event.WakeOutboxIDs, deferred.Error(), time.Now().UTC()); err != nil {
+					return fmt.Errorf("retain deferred notification: %w", err)
+				}
+			}
+			continue
+		}
 		switch {
 		case delivered:
 			// Bound the best-effort counter write like every other op on this path,
@@ -245,7 +260,7 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 				return err
 			}
 		case uncertain:
-			detail := "agent prompt submission is unconfirmed; inspect recipient before any retry"
+			detail := "runtime notification admission is unconfirmed; inspect recipient before any retry"
 			if err != nil {
 				detail = err.Error()
 			}
@@ -261,12 +276,6 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// clears when the dialog is answered, and 60 of the 108 failed rows
 			// on the live store carry `agent_blocked`.
 			if wakeFailureIsTransient(err) {
-				if isAddressedNoteWake {
-					replyHandled = true
-				}
-				if deduplicateAddressedWake && !observer {
-					addressedWakeHandled[wakeRole] = true
-				}
 				if retryErr := s.retryOrFailWakeOutbox(
 					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
 				); retryErr != nil {
@@ -280,14 +289,6 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// prompt, so leave the counter unchanged just as for infrastructure errors.
 			slog.Info("org event wake not delivered", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "delivered", false)
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateDeliveryUnknown, "agent prompt submission unconfirmed", errors.New("agent prompt submission unconfirmed"))
-		}
-		// Coalesced addressed wakes give each target role one attempt per event.
-		// Observer rules are independent copies and do not consume that attempt.
-		if isAddressedNoteWake {
-			replyHandled = true
-		}
-		if deduplicateAddressedWake && !observer {
-			addressedWakeHandled[wakeRole] = true
 		}
 	}
 	if isAddressedNoteWake && !replyHandled {
@@ -560,20 +561,15 @@ func (s *eventRuleSink) loadOrgConfig() (config.OrgConfig, bool) {
 	return cfg, true
 }
 
-// resolveRolePane is the v1 config-backed role→pane binding seam. Keeping it in
-// one small method lets a later live registry replace config without changing
-// classification, matching, or wake delivery.
-func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfig, role string) (pane string, ok bool) {
+// Resolve identity at the live registry, then fence it again at admission.
+func (s *eventRuleSink) resolveRolePane(ctx context.Context, cfg config.OrgConfig, role string) (cockpit.NotificationTarget, bool) {
 	orgRole, ok := cfg.Role(role)
-	if !ok {
-		return "", false
+	if !ok || strings.TrimSpace(orgRole.Pane) == "" {
+		return cockpit.NotificationTarget{}, false
 	}
-	return config.ResolveRolePaneBinding(ctx, orgRole.Pane, func(ctx context.Context, label string) (string, bool) {
-		// Bound the `pane list` resolution so it cannot hang the wake path.
-		resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
-		defer cancel()
-		return s.wake.ResolvePaneByLabel(resolveCtx, label)
-	})
+	resolveCtx, cancel := context.WithTimeout(ctx, eventRuleProbeTimeout)
+	defer cancel()
+	return s.wake.ResolveNotificationTarget(resolveCtx, strings.TrimSpace(orgRole.Pane))
 }
 
 func classifyEventRuleKinds(event events.Event) []string {
@@ -599,7 +595,7 @@ func classifyEventRuleKinds(event events.Event) []string {
 		}
 	case events.EventJobNeedsAttention:
 		switch event.Cause {
-		case "escalation":
+		case "escalation", "role_quota_unavailable":
 			return []string{"escalation"}
 		case "ask_gate":
 			return []string{"attention"}

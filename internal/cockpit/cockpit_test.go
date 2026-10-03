@@ -162,8 +162,8 @@ func TestNilCockpitDegrades(t *testing.T) {
 	if c.Available(context.Background()) {
 		t.Fatal("nil cockpit must report unavailable")
 	}
-	if _, _, err := c.AgentPrompt(context.Background(), "w1:p1", "hi", ""); err == nil {
-		t.Fatal("nil cockpit AgentPrompt must error")
+	if _, _, err := c.AgentNotify(context.Background(), NotificationTarget{}, "hi"); err == nil {
+		t.Fatal("nil cockpit AgentNotify must error")
 	}
 	if pane, ok := c.ResolvePaneByLabel(context.Background(), "seat"); ok || pane != "" {
 		t.Fatalf("nil cockpit ResolvePaneByLabel = (%q, %v), want (\"\", false)", pane, ok)

@@ -87,13 +87,13 @@ func (c *Cockpit) Available(ctx context.Context) bool {
 	return ok
 }
 
-// AgentPrompt returns confirmed submission, uncertain input, and diagnostic
-// evidence. Uncertain input must be reconciled, never automatically resent.
-func (c *Cockpit) AgentPrompt(ctx context.Context, pane, prompt, until string) (delivered bool, uncertain bool, err error) {
+// AgentNotify reports atomic runtime admission, an unknown receipt, or rejection.
+// Unknown outcomes must be reconciled, never automatically resent.
+func (c *Cockpit) AgentNotify(ctx context.Context, target NotificationTarget, prompt string) (delivered bool, uncertain bool, err error) {
 	if c == nil {
 		return false, false, fmt.Errorf("cockpit is nil")
 	}
-	return c.client.agentPrompt(ctx, pane, prompt, until)
+	return c.client.agentNotify(ctx, target, prompt)
 }
 
 // ResolvePaneByLabel resolves a registered recipient from an explicit agent:name
@@ -108,4 +108,21 @@ func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string,
 		return "", false
 	}
 	return pane, ok
+}
+
+// ResolveNotificationTarget pins the runtime observed in the live registration.
+// Renaming or replacing the recipient before admission invalidates this target.
+func (c *Cockpit) ResolveNotificationTarget(ctx context.Context, binding string) (NotificationTarget, bool) {
+	if c == nil {
+		return NotificationTarget{}, false
+	}
+	agent, ok, err := c.client.resolveRegisteredRecipient(ctx, binding)
+	if !ok || err != nil {
+		return NotificationTarget{}, false
+	}
+	selector := agent.Name
+	if selector == "" {
+		selector = agent.PaneID
+	}
+	return NotificationTarget{Selector: selector, Runtime: agent.NotificationTarget}, true
 }
