@@ -111,6 +111,7 @@ func runOrg(args []string, stdout, stderr io.Writer) int {
 		return runOrgStatus(args[1:], stdout, stderr)
 	case "recycle":
 		return runOrgRecycle(args[1:], stdout, stderr)
+
 	case "wake":
 		return runOrgWake(args[1:], stdout, stderr)
 	case "await":
@@ -140,6 +141,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
+
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org wake list [--state STATE] [--json] [--home DIR]")

@@ -1884,6 +1884,7 @@ canonical message, thread ID, lifecycle and notification status.
 
 Ordinary fleet conversation uses `gitmoot message`:
 
+
 ```sh
 gitmoot message send deimos "The review is ready."
 gitmoot message inbox

@@ -2227,6 +2227,7 @@ canonical message, thread ID, lifecycle and notification status.
 
 Ordinary conversation uses one top-level interface:
 
+
 ```sh
 gitmoot message send deimos "The review is ready."
 gitmoot message inbox --limit 20

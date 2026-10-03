@@ -140,6 +140,7 @@ func (s *Store) CreateMessage(ctx context.Context, input Message) (Message, erro
 	if err != nil {
 		return Message{}, err
 	}
+
 	if err = tx.Commit(); err != nil {
 		return Message{}, err
 	}
