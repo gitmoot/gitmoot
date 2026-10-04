@@ -348,14 +348,53 @@ const (
 	sessionStartMatcher = "startup|resume|clear|compact"
 	hookStatusMessage   = "Loading Gitmoot context"
 	hookTimeoutSeconds  = 5
+	// turnHookTimeoutSeconds exceeds every budget inside `gitmoot message
+	// pending` (claim by 5s, receipts by 8s), so the runtime never cancels the
+	// process after a claim committed and discards the output that carried it.
+	turnHookTimeoutSeconds = 15
+	// postToolUseMatcher is the documented match-every-tool value for both
+	// runtimes; UserPromptSubmit and Stop ignore matchers and omit it.
+	postToolUseMatcher = "*"
 )
+
+// hookSpec is one generated hook event. Turn hooks (#2302) carry no status
+// message: PostToolUse runs after every tool call, and a spinner there is noise.
+type hookSpec struct {
+	event   string
+	matcher string
+	args    string
+	timeout int
+	status  string
+}
+
+func hookSpecs(provider Provider) []hookSpec {
+	specs := []hookSpec{{
+		event:   "SessionStart",
+		matcher: sessionStartMatcher,
+		args:    "plugin hook-context",
+		timeout: hookTimeoutSeconds,
+		status:  hookStatusMessage,
+	}}
+	for _, event := range []string{"UserPromptSubmit", "PostToolUse", "Stop"} {
+		spec := hookSpec{
+			event:   event,
+			args:    "message pending --claim --hook " + event + " --runtime " + string(provider),
+			timeout: turnHookTimeoutSeconds,
+		}
+		if event == "PostToolUse" {
+			spec.matcher = postToolUseMatcher
+		}
+		specs = append(specs, spec)
+	}
+	return specs
+}
 
 type hooksFile struct {
 	Hooks map[string][]hookMatcher `json:"hooks"`
 }
 
 type hookMatcher struct {
-	Matcher string        `json:"matcher"`
+	Matcher string        `json:"matcher,omitempty"`
 	Hooks   []commandHook `json:"hooks"`
 }
 
@@ -365,89 +404,107 @@ type commandHook struct {
 	CommandWindows string `json:"commandWindows,omitempty"`
 	Shell          string `json:"shell,omitempty"`
 	Timeout        int    `json:"timeout"`
-	StatusMessage  string `json:"statusMessage"`
+	StatusMessage  string `json:"statusMessage,omitempty"`
 }
 
 func hooksManifest(provider Provider, gitmootBinary string, goos string) (hooksFile, error) {
-	handler := commandHook{
-		Type:          "command",
-		Command:       posixHookCommand(gitmootBinary),
-		Timeout:       hookTimeoutSeconds,
-		StatusMessage: hookStatusMessage,
+	if _, err := validateProvider(provider); err != nil {
+		return hooksFile{}, err
 	}
-	switch provider {
-	case ProviderCodex:
-		handler.CommandWindows = powershellHookCommand(gitmootBinary)
-	case ProviderClaude:
-		if goos == "windows" {
-			handler.Command = powershellHookCommand(gitmootBinary)
-			handler.Shell = "powershell"
+	hooks := hooksFile{Hooks: map[string][]hookMatcher{}}
+	for _, spec := range hookSpecs(provider) {
+		handler := commandHook{
+			Type:          "command",
+			Command:       posixHookCommand(gitmootBinary, spec.args),
+			Timeout:       spec.timeout,
+			StatusMessage: spec.status,
 		}
-	default:
-		return hooksFile{}, fmt.Errorf("unknown plugin runtime %q", provider)
+		switch provider {
+		case ProviderCodex:
+			handler.CommandWindows = powershellHookCommand(gitmootBinary, spec.args)
+		case ProviderClaude:
+			if goos == "windows" {
+				handler.Command = powershellHookCommand(gitmootBinary, spec.args)
+				handler.Shell = "powershell"
+			}
+		}
+		hooks.Hooks[spec.event] = []hookMatcher{{
+			Matcher: spec.matcher,
+			Hooks:   []commandHook{handler},
+		}}
 	}
-	return hooksFile{
-		Hooks: map[string][]hookMatcher{
-			"SessionStart": {{
-				Matcher: sessionStartMatcher,
-				Hooks:   []commandHook{handler},
-			}},
-		},
-	}, nil
+	return hooks, nil
 }
 
 func validateHooksManifest(hooks hooksFile, provider Provider) error {
-	if len(hooks.Hooks) != 1 {
-		return fmt.Errorf("hook manifest has %d hook events, want exactly SessionStart", len(hooks.Hooks))
+	specs := hookSpecs(provider)
+	if len(hooks.Hooks) != len(specs) {
+		return fmt.Errorf("hook manifest has %d hook events, want exactly %d (%s)", len(hooks.Hooks), len(specs), hookEventNames(specs))
 	}
-	groups := hooks.Hooks["SessionStart"]
-	if len(groups) != 1 {
-		return fmt.Errorf("SessionStart hook groups = %d, want one", len(groups))
+	for _, spec := range specs {
+		groups, ok := hooks.Hooks[spec.event]
+		if !ok {
+			return fmt.Errorf("hook manifest is missing %s; want exactly %s", spec.event, hookEventNames(specs))
+		}
+		if len(groups) != 1 {
+			return fmt.Errorf("%s hook groups = %d, want one", spec.event, len(groups))
+		}
+		group := groups[0]
+		if group.Matcher != spec.matcher {
+			return fmt.Errorf("%s matcher = %q, want %q", spec.event, group.Matcher, spec.matcher)
+		}
+		if len(group.Hooks) != 1 {
+			return fmt.Errorf("%s command hooks = %d, want one", spec.event, len(group.Hooks))
+		}
+		if err := validateHookCommand(group.Hooks[0], provider, spec); err != nil {
+			return fmt.Errorf("%s %w", spec.event, err)
+		}
 	}
-	group := groups[0]
-	if group.Matcher != sessionStartMatcher {
-		return fmt.Errorf("SessionStart matcher = %q, want %q", group.Matcher, sessionStartMatcher)
-	}
-	if len(group.Hooks) != 1 {
-		return fmt.Errorf("SessionStart command hooks = %d, want one", len(group.Hooks))
-	}
-	return validateHookCommand(group.Hooks[0], provider)
+	return nil
 }
 
-func validateHookCommand(hook commandHook, provider Provider) error {
+func hookEventNames(specs []hookSpec) string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.event)
+	}
+	return strings.Join(names, ", ")
+}
+
+func validateHookCommand(hook commandHook, provider Provider, spec hookSpec) error {
 	if hook.Type != "command" {
 		return fmt.Errorf("hook type = %q, want command", hook.Type)
 	}
-	if hook.Timeout != hookTimeoutSeconds {
-		return fmt.Errorf("hook timeout = %d, want %d", hook.Timeout, hookTimeoutSeconds)
+	if hook.Timeout != spec.timeout {
+		return fmt.Errorf("hook timeout = %d, want %d", hook.Timeout, spec.timeout)
 	}
-	if hook.StatusMessage != hookStatusMessage {
-		return fmt.Errorf("hook statusMessage = %q, want %q", hook.StatusMessage, hookStatusMessage)
+	if hook.StatusMessage != spec.status {
+		return fmt.Errorf("hook statusMessage = %q, want %q", hook.StatusMessage, spec.status)
 	}
 	switch provider {
 	case ProviderCodex:
-		if err := validatePOSIXHookCommand("command", hook.Command); err != nil {
+		if err := validatePOSIXHookCommand("command", hook.Command, spec.args); err != nil {
 			return err
 		}
-		return validatePowerShellHookCommand("commandWindows", hook.CommandWindows)
+		return validatePowerShellHookCommand("commandWindows", hook.CommandWindows, spec.args)
 	case ProviderClaude:
 		if hook.Shell == "powershell" {
-			return validatePowerShellHookCommand("command", hook.Command)
+			return validatePowerShellHookCommand("command", hook.Command, spec.args)
 		}
 		if strings.TrimSpace(hook.Shell) != "" {
 			return fmt.Errorf("hook shell = %q, want empty or powershell", hook.Shell)
 		}
-		return validatePOSIXHookCommand("command", hook.Command)
+		return validatePOSIXHookCommand("command", hook.Command, spec.args)
 	default:
 		return fmt.Errorf("unknown plugin runtime %q", provider)
 	}
 }
 
-func validatePOSIXHookCommand(label string, command string) error {
+func validatePOSIXHookCommand(label string, command string, args string) error {
 	command = strings.TrimSpace(command)
-	const suffix = " plugin hook-context || true"
+	suffix := " " + args + " || true"
 	if !strings.HasSuffix(command, suffix) {
-		return fmt.Errorf("%s has unexpected shape; want <gitmoot-binary> plugin hook-context || true", label)
+		return fmt.Errorf("%s has unexpected shape; want <gitmoot-binary>%s", label, suffix)
 	}
 	binary, ok := parsePOSIXCommandWord(strings.TrimSuffix(command, suffix))
 	if !ok {
@@ -456,11 +513,12 @@ func validatePOSIXHookCommand(label string, command string) error {
 	return validateHookBinary(label, binary)
 }
 
-func validatePowerShellHookCommand(label string, command string) error {
+func validatePowerShellHookCommand(label string, command string, args string) error {
 	command = strings.TrimSpace(command)
 	const prefix = `& "`
+	suffix := `" ` + args + `; exit 0`
 	if !strings.HasPrefix(command, prefix) {
-		return fmt.Errorf("%s has unexpected shape; want & \"<gitmoot-binary>\" plugin hook-context; exit 0", label)
+		return fmt.Errorf("%s has unexpected shape; want & \"<gitmoot-binary>%s", label, suffix)
 	}
 	end := len(prefix)
 	var binary strings.Builder
@@ -483,9 +541,8 @@ func validatePowerShellHookCommand(label string, command string) error {
 			if end == len(prefix) {
 				return fmt.Errorf("%s gitmoot binary is empty", label)
 			}
-			const suffix = `" plugin hook-context; exit 0`
 			if command[end:] != suffix {
-				return fmt.Errorf("%s has unexpected shape; want & \"<gitmoot-binary>\" plugin hook-context; exit 0", label)
+				return fmt.Errorf("%s has unexpected shape; want & \"<gitmoot-binary>%s", label, suffix)
 			}
 			return validateHookBinary(label, binary.String())
 		default:
@@ -558,12 +615,12 @@ func hookBinaryHasPath(binary string) bool {
 	return filepath.IsAbs(binary) || strings.ContainsAny(binary, `/\`)
 }
 
-func posixHookCommand(gitmootBinary string) string {
-	return posixShellQuote(hookBinary(gitmootBinary)) + " plugin hook-context || true"
+func posixHookCommand(gitmootBinary string, args string) string {
+	return posixShellQuote(hookBinary(gitmootBinary)) + " " + args + " || true"
 }
 
-func powershellHookCommand(gitmootBinary string) string {
-	return "& " + powershellDoubleQuote(hookBinary(gitmootBinary)) + " plugin hook-context; exit 0"
+func powershellHookCommand(gitmootBinary string, args string) string {
+	return "& " + powershellDoubleQuote(hookBinary(gitmootBinary)) + " " + args + "; exit 0"
 }
 
 func hookBinary(gitmootBinary string) string {

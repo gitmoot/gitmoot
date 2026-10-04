@@ -24,6 +24,7 @@ func printMessageUsage(w io.Writer) {
   gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]
   gitmoot message escalate [--workflow LABEL] [--to ROLE] [--role ROLE] [--json] "QUESTION"
   gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json]
+  gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop --runtime claude|codex
   gitmoot message directive send|ack|done|cancel --help
 
 Messages are durable ordinary conversation between registered fleet roles.
@@ -79,6 +80,8 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		return runOrgEscalateResolve(args[1:], stdout, stderr)
 	case "directive":
 		return runOrgDirective(args[1:], stdout, stderr)
+	case "pending":
+		return runMessagePending(args[1:], stdout, stderr)
 	}
 	switch action {
 	case "send", "reply":

@@ -316,24 +316,123 @@ func TestValidateHooksManifestRejectsUnavailableGitmootPath(t *testing.T) {
 }
 
 func TestHookCommandsFallbackToGitmoot(t *testing.T) {
-	if got := posixHookCommand(""); got != "gitmoot plugin hook-context || true" {
+	if got := posixHookCommand("", "plugin hook-context"); got != "gitmoot plugin hook-context || true" {
 		t.Fatalf("posixHookCommand fallback = %q", got)
 	}
-	if got := powershellHookCommand(""); got != `& "gitmoot" plugin hook-context; exit 0` {
+	if got := powershellHookCommand("", "plugin hook-context"); got != `& "gitmoot" plugin hook-context; exit 0` {
 		t.Fatalf("powershellHookCommand fallback = %q", got)
+	}
+}
+
+// The turn hooks are the only way Claude Code and Codex seats see their mail
+// (#2302). A pack that drops one event, or wires a runtime's hook with the other
+// runtime's output shape, silently strands or misformats that seat's mail.
+func TestBuildPackagesIncludeTurnHooksForTheirRuntime(t *testing.T) {
+	for _, provider := range []Provider{ProviderClaude, ProviderCodex} {
+		t.Run(string(provider), func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "gitmoot")
+			if _, err := Build(BuildOptions{
+				Provider:      provider,
+				OutDir:        out,
+				SourceFS:      validSkillFS(),
+				GitmootBinary: "/opt/gitmoot/bin/gitmoot",
+			}); err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			raw := readJSON(t, HooksPath(out))["hooks"].(map[string]any)
+			for _, event := range []string{"UserPromptSubmit", "PostToolUse", "Stop"} {
+				groups, ok := raw[event].([]any)
+				if !ok || len(groups) != 1 {
+					t.Fatalf("%s groups = %#v, want one", event, raw[event])
+				}
+				group := groups[0].(map[string]any)
+				matcher, hasMatcher := group["matcher"]
+				if event == "PostToolUse" {
+					if matcher != "*" {
+						t.Fatalf("PostToolUse matcher = %#v, want every tool", matcher)
+					}
+				} else if hasMatcher {
+					t.Fatalf("%s matcher = %#v; the event ignores matchers, so none is written", event, matcher)
+				}
+				handler := group["hooks"].([]any)[0].(map[string]any)
+				want := "/opt/gitmoot/bin/gitmoot message pending --claim --hook " + event + " --runtime " + string(provider) + " || true"
+				if provider == ProviderClaude && runtime.GOOS == "windows" {
+					want = `& "/opt/gitmoot/bin/gitmoot" message pending --claim --hook ` + event + " --runtime claude; exit 0"
+				}
+				if handler["command"] != want {
+					t.Fatalf("%s command = %#v, want %q", event, handler["command"], want)
+				}
+				if provider == ProviderCodex {
+					wantWindows := `& "/opt/gitmoot/bin/gitmoot" message pending --claim --hook ` + event + " --runtime codex; exit 0"
+					if handler["commandWindows"] != wantWindows {
+						t.Fatalf("%s commandWindows = %#v, want %q", event, handler["commandWindows"], wantWindows)
+					}
+				}
+				if handler["timeout"] != float64(turnHookTimeoutSeconds) {
+					t.Fatalf("%s timeout = %#v, want %d", event, handler["timeout"], turnHookTimeoutSeconds)
+				}
+				if _, ok := handler["statusMessage"]; ok {
+					t.Fatalf("%s statusMessage = %#v; turn hooks show no spinner", event, handler["statusMessage"])
+				}
+			}
+		})
+	}
+}
+
+func TestValidateHooksManifestRejectsTurnHookForOtherRuntime(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "gitmoot")
+	if _, err := Build(BuildOptions{
+		Provider:      ProviderCodex,
+		OutDir:        out,
+		SourceFS:      validSkillFS(),
+		GitmootBinary: "gitmoot",
+	}); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	hooks := readHooksFile(t, HooksPath(out))
+	stop := &hooks.Hooks["Stop"][0].Hooks[0]
+	stop.Command = strings.Replace(stop.Command, "--runtime codex", "--runtime claude", 1)
+	if err := writeJSON(HooksPath(out), hooks); err != nil {
+		t.Fatalf("write hooks manifest: %v", err)
+	}
+	err := ValidateHooksManifest(out, ProviderCodex)
+	if err == nil || !strings.Contains(err.Error(), "Stop") || !strings.Contains(err.Error(), "unexpected shape") {
+		t.Fatalf("ValidateHooksManifest() error = %v, want Stop shape error", err)
+	}
+}
+
+func TestValidateHooksManifestRejectsMissingTurnHook(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "gitmoot")
+	if _, err := Build(BuildOptions{
+		Provider:      ProviderClaude,
+		OutDir:        out,
+		SourceFS:      validSkillFS(),
+		GitmootBinary: "gitmoot",
+	}); err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	hooks := readHooksFile(t, HooksPath(out))
+	delete(hooks.Hooks, "PostToolUse")
+	hooks.Hooks["Notification"] = hooks.Hooks["Stop"]
+	if err := writeJSON(HooksPath(out), hooks); err != nil {
+		t.Fatalf("write hooks manifest: %v", err)
+	}
+	err := ValidateHooksManifest(out, ProviderClaude)
+	if err == nil || !strings.Contains(err.Error(), "missing PostToolUse") {
+		t.Fatalf("ValidateHooksManifest() error = %v, want missing PostToolUse", err)
 	}
 }
 
 func TestHookCommandQuoting(t *testing.T) {
 	posixPath := "/tmp/git moot/it's/bin/gitmoot"
 	wantPOSIX := `'/tmp/git moot/it'"'"'s/bin/gitmoot' plugin hook-context || true`
-	if got := posixHookCommand(posixPath); got != wantPOSIX {
+	if got := posixHookCommand(posixPath, "plugin hook-context"); got != wantPOSIX {
 		t.Fatalf("posixHookCommand() = %q, want %q", got, wantPOSIX)
 	}
 
 	powershellPath := "C:\\Program Files\\Git\"moot`\\git$moot.exe"
 	wantPowerShell := "& \"C:\\Program Files\\Git`\"moot``\\git`$moot.exe\" plugin hook-context; exit 0"
-	if got := powershellHookCommand(powershellPath); got != wantPowerShell {
+	if got := powershellHookCommand(powershellPath, "plugin hook-context"); got != wantPowerShell {
 		t.Fatalf("powershellHookCommand() = %q, want %q", got, wantPowerShell)
 	}
 }
