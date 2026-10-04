@@ -38,7 +38,7 @@ SELECT stale.target_role, COUNT(*), MIN(stale.created_at),
 			AND reason.target_role = stale.target_role
 			AND reason.last_error != ''
 			AND julianday(reason.created_at) <= julianday(?)
-		ORDER BY reason.updated_at DESC, reason.id DESC
+		ORDER BY julianday(reason.updated_at) DESC, reason.id DESC
 		LIMIT 1
 	), '')
 FROM wake_outbox stale
