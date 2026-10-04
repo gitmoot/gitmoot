@@ -59,6 +59,8 @@ interface Ui {
 	onTerminalInput?: (handler: (data: string) => undefined) => () => void;
 	setWidget?: (key: string, content: ((tui: TuiHandle) => { render(width: number): string[]; invalidate(): void }) | undefined) => void;
 	getEditorText(): string;
+	// Official OMP extension API (proposed upstream, gitmoot/gitmoot#2305). Preferred when present.
+	getInputActivity?: () => { editorFocused: boolean; dialogOpen: boolean; hasDraft: boolean; submitting: boolean };
 }
 interface Context {
 	hasUI: boolean;
@@ -164,9 +166,24 @@ export default function gitmootInbox(pi: Api) {
 	const active = (since: number, now: number) => since !== 0 && now - since < MAINTENANCE_CAP_MS;
 	const submissionPending = (now: number) => submissionAt !== 0 && now - submissionAt < SUBMISSION_HOLD_MS;
 
+	// The official snapshot when this OMP has it; undefined on older OMP or if it throws.
+	function officialActivity() {
+		try {
+			return ctx?.ui.getInputActivity?.();
+		} catch {
+			return undefined;
+		}
+	}
+
 	// Why an idle session cannot take a note right now, or undefined.
 	function idleGate(now: number): Reason | undefined {
-		if (submissionPending(now) || now - lastKeyAt < RECENT_KEY_MS) return "operator_active";
+		const official = officialActivity();
+		if (official?.submitting || submissionPending(now) || now - lastKeyAt < RECENT_KEY_MS) return "operator_active";
+		if (official) {
+			if (now - Math.max(lastKeyAt, loadedAt) >= INACTIVITY_OVERRIDE_MS) return undefined;
+			if (official.dialogOpen || !official.editorFocused) return "dialog";
+			return official.hasDraft ? "draft" : undefined;
+		}
 		const ui = uiState();
 		// Without the TUI handle nothing proves the prompt is free: fail closed.
 		if (!ui.tuiAvailable) return "dialog";
@@ -225,6 +242,7 @@ export default function gitmootInbox(pi: Api) {
 				idle: ctx.isIdle(),
 				pendingMessages: ctx.hasPendingMessages(),
 				...uiState(),
+				activitySource: officialActivity() ? "official" : "fallback",
 				draft: ctx.ui.getEditorText() !== "",
 				msSinceKey: lastKeyAt === 0 ? null : now - lastKeyAt,
 				submissionPending: submissionPending(now),
