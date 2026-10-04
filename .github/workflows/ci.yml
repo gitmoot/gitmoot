@@ -18,7 +18,8 @@ name: CI
 #   - E2E: the same `go test ./...` WITH `-tags e2e`, which is the only lane that
 #     compiles those 36 files. Tagging them without this job would have stopped
 #     them running forever, silently, and a green suite is exactly what that
-#     failure looks like.
+#     failure looks like. It runs AS ROOT, because read-only seat tests skip
+#     unprivileged on a runner with Docker (#2318).
 #   - RACE BUILD: five package jobs compile one -race test binary each. Every
 #     package's full current test list is partitioned and asserted to appear
 #     exactly once before its binary + shard plan are uploaded.
@@ -116,17 +117,6 @@ jobs:
       - name: Test
         run: go test -timeout 25m ./...
 
-      # Read-only seats hide the host container runtime in a private mount
-      # namespace, which needs CAP_SYS_ADMIN (#2318). The runner has Docker, so as
-      # the unprivileged runner user the read-only seat E2E tests above skip: a
-      # read-only seat refuses to start there by design. Run the sandbox package
-      # again as root so the hiding path and the read-only seat boundary stay
-      # covered. -E keeps setup-go's GOROOT and caches; PATH is passed explicitly
-      # because sudo resets it. Last in the job, so root-owned cache entries
-      # cannot affect an earlier step.
-      - name: Test sandbox as root
-        run: sudo -E env "PATH=$PATH" go test -count=1 -timeout 15m -v ./internal/sandbox/
-
   e2e:
     name: e2e (tagged)
     needs: changes
@@ -149,8 +139,19 @@ jobs:
       # silent-stop this job exists to prevent, one level up. The cost is that the
       # untagged tests run here a second time; that is the price of a lane that
       # cannot drift, and it runs concurrently with build-test rather than after.
-      - name: Test (e2e tag)
-        run: go test -tags e2e -timeout 30m ./...
+      #
+      # AS ROOT (#2318). A read-only seat hides the host container runtime in a
+      # private mount namespace, which needs CAP_SYS_ADMIN, and refuses to start
+      # without it while a runtime exists. The runner has Docker, so in the
+      # unprivileged build-test lane every test that runs a read-only seat skips
+      # with that reason. This lane runs them all as root, so the hiding path and
+      # every read-only seat E2E stay covered. -E plus the explicit PATH, GOCACHE,
+      # and GOMODCACHE keep setup-go's toolchain and restored caches, because sudo
+      # resets PATH and may reset HOME.
+      - name: Test (e2e tag, as root)
+        run: >-
+          sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
+          go test -tags e2e -timeout 30m ./...
 
   race-build:
     name: race build (internal/${{ matrix.package }})

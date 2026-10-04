@@ -9,6 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"os/exec"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -120,4 +123,33 @@ func removeTestTempRoot(dir string) error {
 		return nil
 	})
 	return os.RemoveAll(dir)
+}
+
+var readOnlySeatLaunch struct {
+	once   sync.Once
+	reason string
+}
+
+// requireReadOnlySeatLaunchable skips a test that runs a read-only seat when
+// this host cannot start one at all: a host container runtime exists and the
+// test process lacks the privilege to hide it, so sandbox-exec refuses by
+// design (#2318). CI reruns the sandbox E2E tests as root; locally, run as root.
+func requireReadOnlySeatLaunchable(t *testing.T) {
+	t.Helper()
+	readOnlySeatLaunch.once.Do(func() {
+		executable, err := os.Executable()
+		if err != nil {
+			return
+		}
+		command := exec.Command(executable, "sandbox-exec", "--read-only-workdir", "--", "/bin/true")
+		command.Dir = os.TempDir()
+		output, err := command.CombinedOutput()
+		if err != nil && strings.Contains(string(output), "to hide the host container runtime") {
+			readOnlySeatLaunch.reason = strings.TrimSpace(string(output))
+		}
+	})
+	if readOnlySeatLaunch.reason != "" {
+		t.Logf("read-only seats cannot start unprivileged on this host: %s", readOnlySeatLaunch.reason)
+		t.Skip("read-only seat refuses to start without CAP_SYS_ADMIN while a host container runtime exists; run as root")
+	}
 }

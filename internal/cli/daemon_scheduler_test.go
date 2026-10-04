@@ -2715,6 +2715,7 @@ func TestRunQueuedJobsPoolHonorsCheckoutSafety(t *testing.T) {
 }
 
 func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	// Two same-repo read (ask) jobs under the pool with isolation enabled
 	// (ConfigHome + a real checkout): one runs in the shared checkout, the other is
 	// auto-isolated into a detached worktree so it runs beside it (#394 part 2)
@@ -2807,6 +2808,7 @@ func (b *concurrentOutputProbe) String() string {
 }
 
 func TestPoolIsolationAppendsCommittedTipNote(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	// #696: three same-repo top-level read-only (ask) jobs submitted together under
 	// the pool run concurrently — one in the shared checkout, the other two
 	// auto-isolated into detached committed-tip worktrees (#394 part 2). Each

@@ -42,6 +42,7 @@ import (
 // `<staged>/bin:/usr/local/bin:/usr/bin:/bin`, so both probes report MISSING and
 // this fails.
 func TestReadOnlySeatJobRunShipsAPathThatResolvesRuntimeBinariesE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
 	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))

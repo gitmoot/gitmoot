@@ -197,6 +197,7 @@ func TestEffectiveRuntimeRecordedWithoutOverrideForegroundE2E(t *testing.T) {
 // TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E drives the DAEMON path:
 // a background job with no override, claimed and run by the REAL worker tick.
 func TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "shell-default-ran-daemon")
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))

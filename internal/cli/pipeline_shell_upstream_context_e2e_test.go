@@ -33,6 +33,7 @@ type pipelineShellUpstreamStage struct {
 }
 
 func TestPipelineShellStageUpstreamContextE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	const extractSummary = "arxiv record one\narxiv record two with `ticks` and \"quotes\""
 	const downstreamSummary = "round-trip: arxiv record one\narxiv record two with `ticks` and \"quotes\""
 	runID, store := runPipelineShellUpstreamContextE2E(
@@ -67,6 +68,7 @@ func TestPipelineShellStageUpstreamContextE2E(t *testing.T) {
 }
 
 func TestPipelineShellStageUpstreamContextTruncationE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	oversize := strings.Repeat("界", maxPipelineShellUpstreamSummaryBytes)
 	runID, store := runPipelineShellUpstreamContextE2E(
 		t,

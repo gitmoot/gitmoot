@@ -32,6 +32,7 @@ import (
 // its dependent is enqueued), the second blocks with needs (so the run parks
 // blocked with the needs persisted at the run level).
 func TestPipelineAgentStageAdvanceAndParkE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
 
@@ -147,6 +148,7 @@ func TestPipelineAgentStageAdvanceAndParkE2E(t *testing.T) {
 // the upstream stage's result summary, AND the stage's own prompt — proving the
 // extract → triage dataflow reaches the runtime the agent runs.
 func TestPipelineAgentStageUpstreamContextE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
 
@@ -264,6 +266,7 @@ func TestPipelineAgentStageUpstreamContextE2E(t *testing.T) {
 // If isolation regresses and the seats serialize, the first times out and emits
 // `failed`, flipping the both-succeeded assertion red.
 func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	home, _, store := heartbeatLoopE2EHome(t)
 

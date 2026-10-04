@@ -666,6 +666,7 @@ func TestRunJobRunRefusesUnavailableRoleAndAllowsExpiredIncident(t *testing.T) {
 }
 
 func TestTranscriptRetentionForegroundAndDaemonShellE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
 	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "throwaway.sock"))

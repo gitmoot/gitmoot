@@ -153,6 +153,7 @@ func assertExecBackendLocalSucceeded(t *testing.T, store *db.Store, jobID string
 // TestExecBackendLocalDefaultDaemonE2E is ACCEPTANCE 1: no [remote_exec]
 // config at all — the default path is byte-for-byte main.
 func TestExecBackendLocalDefaultDaemonE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	jobID := execBackendDispatchAsk(t, home)
 	execBackendRunOneTick(t, home, store)
@@ -163,6 +164,7 @@ func TestExecBackendLocalDefaultDaemonE2E(t *testing.T) {
 // backend = "local" behaves IDENTICALLY to the default path — same event
 // sequence, same result contract.
 func TestExecBackendLocalExplicitDaemonE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	execBackendAppendConfig(t, home, "\n[remote_exec]\nbackend = \"local\"\n")
 	jobID := execBackendDispatchAsk(t, home)
