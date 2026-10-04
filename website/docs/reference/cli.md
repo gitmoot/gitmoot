@@ -1913,6 +1913,16 @@ and `org directive` sending surfaces, without aliases. Historical addressed
 notes retain their IDs and source links. Import creates inbox projections,
 never new wake obligations; unknown delivery stays unknown.
 
+Claude Code and Codex seats receive mail at turn boundaries through the
+Gitmoot plugin's hooks, which run
+`gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop
+--runtime claude|codex`. The command marks the acting role's queued
+notifications submitted with a `turn-hook:<runtime>:<event>` receipt, then
+prints hook JSON naming each message once (ID, kind, sender, scrubbed preview,
+`gitmoot message show ID`), at most 10 per hook. No mail prints nothing; it
+always exits 0 and reports problems on stderr. See
+[Codex and Claude plugins](../plugins/codex-claude.md) for event support.
+
 `gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE]`
 records an answer and resolution in the original thread and queues one notice
 to the original requester. `--note` accepts a message in this thread or a plain
@@ -2164,13 +2174,13 @@ also use substring matching; omit either flag to match every event of that kind.
 Pass only one of `--match` and `--repo`. The wake role must exist and set
 `pane = "<herdr-pane>"`; Gitmoot resolves that value as an exact pane label first
 and otherwise treats it as a literal pane id.
-Delivery is verified with Herdr's `agent_prompted` versus
-`agent_prompt_stalled` result. A stall, and an `agent_blocked` pane, are
-**transient**: the claimed rows return to `pending` with the cause recorded and
-are re-delivered as one coalesced wake, bounded at three attempts. Anything
-else, and an exhausted budget, ends the rows terminally and records a
-`wake_delivery_failed` job event on `wake-outbox:<id>` naming the role, cause
-and attempts. `attention`, `guard`, `job-terminal`,
+Delivery goes to the recipient's Gitmoot OMP inbox add-on; Claude Code and
+Codex seats stay `pending` with `waiting for recipient's next turn`. A runtime
+deferral, or any failure before the request is written, keeps the rows
+`pending` with the reason and spends no attempt. A lost receipt is
+`delivery_unknown` and is never resent automatically. Other conclusive failures
+end the rows and record a `wake_delivery_failed` job event on
+`wake-outbox:<id>` naming the role and cause. `attention`, `guard`, `job-terminal`,
 `review-verdict`, `recycle-overdue`, and `pane_input_pending` wakes remain
 best-effort; zero rules leaves the feature off.
 

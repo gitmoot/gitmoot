@@ -18,8 +18,8 @@ type runner func(ctx context.Context, args ...string) (output string, err error)
 // its STDOUT only. When the caller sets HERDR_SOCKET_PATH, it is passed through
 // to the child process so the spike's reachability gating (a background/daemon
 // context reaching the single herdr server) holds; an unset value defaults to
-// herdr's own socket. Every verb but agentPrompt uses this stdout-only runner so
-// a stray herdr stderr line can never corrupt a success-path JSON parse.
+// herdr's own socket. Only stdout is returned so a stray herdr stderr line can
+// never corrupt a success-path JSON parse.
 func newExecRunner(bin string) runner {
 	return func(ctx context.Context, args ...string) (string, error) {
 		cmd := exec.CommandContext(ctx, bin, args...)
@@ -31,30 +31,12 @@ func newExecRunner(bin string) runner {
 	}
 }
 
-// newExecRunnerCombined is newExecRunner but returns COMBINED stdout+stderr. Only
-// agentPrompt uses it: herdr writes its delivery-outcome envelopes
-// (agent_prompt_stalled / timeout) to stderr on a non-zero exit, so the combined
-// stream keeps them parseable. Scoping the merge to this one verb leaves every
-// other verb on the stdout-only runner above.
-func newExecRunnerCombined(bin string) runner {
-	return func(ctx context.Context, args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, bin, args...)
-		cmd.Env = os.Environ()
-		out, err := cmd.CombinedOutput()
-		return string(out), err
-	}
-}
-
 // herdrClient is a thin, typed wrapper over the verified herdr CLI surface. It
 // owns no state beyond the runner and binary name; every call is a one-shot
 // invocation. JSON parsing targets only the fields the spike verified.
 type herdrClient struct {
 	run runner
-	// runCombined runs the one verb (agentPrompt) that must read herdr's stderr
-	// error envelope. It falls back to run when nil so a test that injects only
-	// run still drives agentPrompt.
-	runCombined runner
-	bin         string
+	bin string
 	// lookPath resolves the herdr binary on PATH; injectable so tests can drive
 	// availability deterministically without a real herdr install.
 	lookPath func(string) (string, error)
@@ -92,21 +74,6 @@ func (c herdrClient) available(ctx context.Context) bool {
 	return st.Server.Running
 }
 
-type agentNotificationResult struct {
-	ID     string `json:"id"`
-	Result struct {
-		Type    string `json:"type"`
-		Outcome struct {
-			Status string `json:"status"`
-			Reason string `json:"reason"`
-		} `json:"outcome"`
-	} `json:"result"`
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 // NotificationDeferred proves that runtime admission did not happen.
 // The durable obligation remains pending without spending delivery retry budget.
 type NotificationDeferred struct {
@@ -117,53 +84,14 @@ func (e *NotificationDeferred) Error() string {
 	return "notification deferred: " + e.Reason
 }
 
-// NotificationTarget carries the runtime identity observed during resolution.
-// The selector alone is mutable and cannot pin a later admission request.
+// NotificationTarget is the recipient resolved from the live Herdr registry.
+// Delivery re-reads the pane's foreground processes, so a replaced runtime is
+// matched to its own add-on registration rather than to this snapshot.
 type NotificationTarget struct {
 	Selector string
-	Runtime  *NotificationRuntime
-}
-
-type NotificationRuntime struct {
-	RuntimeID  string `json:"runtimeId"`
-	SessionID  string `json:"sessionId"`
-	Generation uint64 `json:"generation"`
-}
-
-// agentNotify never types into a pane or waits for a running turn to settle.
-// A missing receipt is unknown, even when the command exits unsuccessfully.
-func (c herdrClient) agentNotify(ctx context.Context, target NotificationTarget, prompt string) (delivered bool, uncertain bool, err error) {
-	if target.Runtime == nil || target.Runtime.RuntimeID == "" || target.Runtime.SessionID == "" {
-		return false, false, &NotificationDeferred{Reason: "runtime notification capability unavailable"}
-	}
-	expected, encodeErr := json.Marshal(target.Runtime)
-	if encodeErr != nil {
-		return false, false, &NotificationDeferred{Reason: encodeErr.Error()}
-	}
-	run := c.runCombined
-	if run == nil {
-		run = c.run
-	}
-	out, runErr := run(ctx, "agent", "prompt-safe", target.Selector, prompt, "--expected-target", string(expected))
-	var response agentNotificationResult
-	if err := json.Unmarshal([]byte(out), &response); err != nil {
-		return false, true, fmt.Errorf("notification receipt unreadable: %w (transport: %v)", err, runErr)
-	}
-	if response.Error.Code == "" && response.Result.Type == "agent_prompt_safe" {
-		switch response.Result.Outcome.Status {
-		case "accepted":
-			return true, false, nil
-		case "deferred":
-			return false, false, &NotificationDeferred{Reason: response.Result.Outcome.Reason}
-		}
-	}
-	switch response.Error.Code {
-	case "agent_not_found", "invalid_notification", "method_not_found":
-		return false, false, &NotificationDeferred{Reason: response.Error.Code}
-	default:
-		return false, true, fmt.Errorf("notification receipt %q code=%q status=%q (transport: %v)",
-			response.ID, response.Error.Code, response.Result.Outcome.Status, runErr)
-	}
+	PaneID   string
+	// Kind is Herdr's detected agent kind ("omp", "claude", "codex", ...).
+	Kind string
 }
 
 // paneListResult mirrors `herdr pane list`: only each pane's id is load-bearing
@@ -178,12 +106,12 @@ type paneListResult struct {
 }
 
 type registeredAgent struct {
-	Name               string               `json:"name"`
-	PaneID             string               `json:"pane_id"`
-	MachineID          string               `json:"machine_id"`
-	MachineProfileID   string               `json:"machine_profile_id"`
-	Archived           json.RawMessage      `json:"archived"`
-	NotificationTarget *NotificationRuntime `json:"notification_target"`
+	Name             string          `json:"name"`
+	PaneID           string          `json:"pane_id"`
+	Agent            string          `json:"agent"`
+	MachineID        string          `json:"machine_id"`
+	MachineProfileID string          `json:"machine_profile_id"`
+	Archived         json.RawMessage `json:"archived"`
 }
 
 func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, error) {

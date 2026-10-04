@@ -2,15 +2,16 @@ package cli
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/org"
 )
 
-// Check before claiming an outbox row. Busy/offline mail remains pending, not
-// an attempted delivery, so a later safe boundary can drain it without replay.
+// Check before claiming an outbox row. Offline, unbound and unsupported
+// recipients keep their mail pending, not attempted, so nothing is replayed.
+// A working OMP recipient is not held back: its inbox add-on admits the notice
+// at the next step boundary or defers it itself.
 func messageRecipientReadiness(home string) func(context.Context, string) (string, error) {
 	return func(ctx context.Context, roleName string) (string, error) {
 		cfg, err := config.LoadOrg(config.Paths{ConfigFile: resolveConfigFile(home)})
@@ -28,21 +29,14 @@ func messageRecipientReadiness(home string) func(context.Context, string) (strin
 		defer cancel()
 		snapshot, err := orgProviderSnapshot(probe, cfg)
 		if err != nil {
-			return "recipient safety state unavailable; notification deferred", nil
+			return "recipient state unavailable; notification deferred", nil
 		}
 		binding, ok := snapshot.PaneBindings[role.Name]
 		if !ok || binding.PaneID == "" || binding.Ambiguous {
 			return "recipient is offline or its binding is unresolved", nil
 		}
-		state, ok := snapshot.States[role.Name]
-		if !ok {
-			return "recipient safety state unknown; notification deferred", nil
-		}
-		switch state.State {
-		case org.StateIdle, org.StateDone:
-			return "", nil
-		default:
-			return fmt.Sprintf("recipient is %s; waiting for a safe notification boundary", state.State), nil
-		}
+		// Claude Code and Codex collect mail from their own turn hooks; other
+		// runtimes have no notification transport. Neither is claimed here.
+		return cockpit.NotificationCapability(snapshot.Sessions[role.Name].Agent), nil
 	}
 }

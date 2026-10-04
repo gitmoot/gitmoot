@@ -2263,6 +2263,20 @@ surfaces, without aliases. Historical addressed notes retain their IDs and
 source links. Import creates inbox projections, never new wake obligations;
 unknown delivery stays unknown.
 
+Claude Code and Codex seats receive mail at turn boundaries through the
+Gitmoot plugin's hooks, which run
+`gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop
+--runtime claude|codex`. The acting role resolves like other message
+commands. The command moves that role's `queued` notifications to `submitted`
+with a `turn-hook:<runtime>:<event>` receipt in one transaction, then prints
+the runtime's hook JSON naming each message once: ID, kind, sender, a short
+scrubbed preview and `gitmoot message show ID`. At most 10 items are named per
+hook; the rest stay queued for the next hook point. No mail, a subagent hook,
+or a `Stop` that is already a stop-hook continuation prints nothing. It always
+exits 0, reporting problems on stderr only, so a hook never fails a turn. It
+never touches `submitting` or `uncertain` notifications and never types into a
+terminal.
+
 Rollout must use one notification daemon and one writer version per shared home.
 Preserve the current executable and a consistent database backup in a durable,
 access-controlled location before upgrade. First migrate a copy and verify that
@@ -2521,13 +2535,16 @@ matching, including slash-bearing delegation IDs. Without a slash, repositories
 also use substring matching; omit either flag to match every event of that kind.
 Pass only one of `--match` and `--repo`. `--wake` must name a declared
 role with an explicit registered-agent, pane-ID or label binding. The daemon
-calls `herdr agent prompt <pane> <text> --wait --timeout 8000`.
-Only a structured `delivery = "submitted"` receipt or
-`agent_status_unobserved_after_submit` confirms submission. `written_to_pty`,
-generic timeouts, legacy stalls, lost receipts and visible drafts are
-`delivery_unknown`, never automatic retry candidates. Confirmed delivery resets
-missed-wake counters; uncertain input leaves them unchanged. A pre-write
-`agent_blocked` refusal can retry within the three-attempt budget.
+delivers only to OMP seats, through the Gitmoot OMP inbox add-on registered
+under `<gitmoot home>/run/omp/` for the pane's foreground process, and never
+types into a terminal. Claude Code and Codex seats stay `pending` with
+`waiting for recipient's next turn`; other runtimes, or OMP without a trusted
+registration, stay `pending` with `runtime notification capability
+unavailable`. Only an `accepted` receipt marks a notice delivered. A
+`deferred` receipt or a failure before the request is written keeps it
+`pending` without spending an attempt; a lost or unreadable receipt is
+`delivery_unknown`, never an automatic retry candidate. Confirmed delivery
+resets missed-wake counters; uncertain delivery leaves them unchanged.
 
 `org wake list --state STATE [--json]` and `org wake show ID` expose destination,
 age, attempts and the recorded outcome. Failed and uncertain mandatory notices

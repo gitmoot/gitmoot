@@ -240,17 +240,26 @@ A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
-Before claiming a notice, the daemon checks the registered recipient's live
-binding and input state. Busy, blocked, unknown and offline recipients keep
-their pending notices and a visible deferral reason without spending attempts.
-A later safe snapshot makes proven-unsent notices eligible again; it does not
-authorize replay of an uncertain attempt.
-After a claim, an explicit pre-write `agent_blocked` or `agent_input_pending`
-refusal can return the same batch to `pending`, with its attempt count retained.
-These attempted refusals have a three-attempt bound. Other conclusive failures
-remain visible with a `wake_delivery_failed` event on `wake-outbox:<id>`.
-A stall, timeout or unexplained non-delivery is not proof that no text reached
-the composer: uncertain outcomes are retained without automatic retyping.
+Before claiming a notice, the daemon checks the recipient's registered seat and
+runtime. Unregistered, unseated, offline and ambiguous recipients keep their
+pending notices and a visible deferral reason without spending attempts. A busy
+recipient is not held back: the runtime decides. Only OMP seats (Herdr agent
+kind `omp`) are notified by the daemon, through the Gitmoot OMP inbox add-on
+(`gitmoot plugin install omp`). Claude Code and Codex seats stay `pending` with
+`waiting for recipient's next turn`; any other runtime, or an OMP process
+without a trusted add-on registration in `<gitmoot home>/run/omp/`, stays
+`pending` with `runtime notification capability unavailable`. Nothing ever
+types into a recipient's terminal.
+The daemon matches the registration whose `pid` is a foreground process of the
+seat's pane (`herdr pane process-info`), refuses symlinks, other owners and
+group or other permissions on the directory, file and socket, and sends one
+`deliver` request pinned to the registered runtime, session and generation.
+`accepted` marks the row `delivered`: runtime admission, not reading or
+completion. A `deferred` reply (for example `stale_session` or
+`operator_active`), or any failure before the request is written, returns the
+batch to `pending` without spending retry budget. Once the request is written,
+a missing, late or unreadable reply leaves the row `delivery_unknown`, which is
+retained without automatic resending.
 An aged-out row whose delivery the store can PROVE is recorded as `delivered`
 rather than `delivery_unknown`, with a `wake_delivered` job event on
 `wake-outbox:<id>` carrying `policy=resolved_by_destination_evidence`. The proof
@@ -285,17 +294,15 @@ resolved to the current id at wake time (so a recycled pane is still reached).
 The same explicit binding drives live org presence; an unresolved binding
 reports unknown presence, skips the wake with an observable log, and increments
 the role's missed-wake counter. `gitmoot org validate` reports unresolved roles,
-roles without enabled wake routes, and unclaimed labeled panes. Wake delivery runs
-`herdr agent prompt <pane> <prompt> --wait --timeout 8000` and treats
-`result.type = "agent_prompted"` — and a post-delivery `error.code = "timeout"` —
-as delivered, `error.code = "agent_prompt_stalled"` as not delivered. Missing
-bindings, unavailable Herdr, stalls, and transport errors are swallowed after
+roles without enabled wake routes, and unclaimed labeled panes. Missing
+bindings, unavailable Herdr and transport errors are swallowed after
 lightweight logging; they never block or fail a job.
 
-Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
-for the wake role; a delivered prompt resets that role's counter. Transport
-errors and other non-delivery outcomes do not change it because a Herdr outage
-is infrastructure failure, not evidence that every role ignored a wake. Set
+Each wake whose role binding cannot be resolved increments a durable,
+consecutive counter for the wake role; a delivered notice resets that role's
+counter. Transport errors, deferrals and other non-delivery outcomes do not
+change it because a Herdr outage is infrastructure failure, not evidence that
+every role ignored a wake. Set
 `[orchestrate].max_consecutive_missed_wakes` to a positive integer to append a
 `⚠ flagged (N missed wakes)` marker to that role in `gitmoot org chart` and
 `gitmoot org status`; their JSON rows expose `missed_wakes`, `flagged`, and

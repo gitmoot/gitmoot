@@ -19,11 +19,10 @@ import (
 )
 
 const (
-	// eventRuleWakeTimeout bounds a SINGLE herdr agent-prompt on the Go side. It
-	// MUST exceed herdr's own --timeout (herdrWakeTimeoutMS = 8s) so herdr returns
-	// a JSON outcome before the context kills the process. Each matching rule gets
-	// a FRESH context with this budget (rules are processed sequentially), so a
-	// slow earlier wake can never SIGKILL a later rule's wake.
+	// eventRuleWakeTimeout bounds a SINGLE notification: the pane process lookup
+	// plus the add-on's admission reply. Each matching rule gets a FRESH context
+	// with this budget (rules are processed sequentially), so a slow earlier wake
+	// never consumes a later rule's budget.
 	eventRuleWakeTimeout = 12 * time.Second
 	// eventRuleProbeTimeout bounds the availability probe and each pane-label
 	// resolution (a herdr `pane list`) so neither can hang the wake path.
@@ -272,17 +271,6 @@ func (s *eventRuleSink) evaluateRules(ctx context.Context, event events.Event, r
 			// A Herdr outage is infrastructure failure, not a role ignoring a wake;
 			// it must not falsely increment every role's missed-wake counter.
 			slog.Warn("org event wake failed", "rule_id", rule.ID, "role", rule.WakeRole, "job_id", event.JobID, "error", err)
-			// A pane blocked by an open dialog is the other transient cause: it
-			// clears when the dialog is answered, and 60 of the 108 failed rows
-			// on the live store carry `agent_blocked`.
-			if wakeFailureIsTransient(err) {
-				if retryErr := s.retryOrFailWakeOutbox(
-					ctx, event, rule.WakeRole, db.WakeOutboxStateFailed, err.Error(), wakeDeliveryMaxAttempts,
-				); retryErr != nil {
-					return errors.Join(err, retryErr)
-				}
-				continue
-			}
 			return s.completeWakeOutbox(ctx, event, db.WakeOutboxStateFailed, err.Error(), err)
 		default:
 			// An odd non-delivery is not proof that the role ignored a delivered
@@ -435,32 +423,6 @@ func (s *eventRuleSink) finishWakeOutbox(ctx context.Context, event events.Event
 		return fmt.Errorf("finish wake outbox as %s: %w", state, err)
 	}
 	return nil
-}
-
-// wakeDeliveryMaxAttempts bounds re-delivery of a transient failure (#1982).
-// Three attempts across daemon ticks span roughly seven minutes at the
-// observed 143-second median tick gap, which covers a dialog being answered
-// or a pane settling, without turning an unread pane into a permanent
-// retry source.
-const wakeDeliveryMaxAttempts = 3
-
-// wakeFailureIsTransient reports whether a herdr delivery error names a
-// condition that CLEARS ON ITS OWN. Only `agent_blocked` qualifies: the pane
-// exists and holds an interactive dialog, so the same prompt can land once the
-// dialog is answered.
-//
-// Only recorded pre-write refusals may retry. The scheduler now waits for a
-// live idle seat before claiming mail; these cover a seat/draft/modal change
-// between that snapshot and Herdr's guarded write. Unsubmitted or uncertain
-// input remains terminal because retrying could duplicate it.
-func wakeFailureIsTransient(err error) bool {
-	if err == nil {
-		return false
-	}
-	detail := strings.ToLower(err.Error())
-	return strings.Contains(detail, "agent_blocked") ||
-		strings.Contains(detail, `code="agent_input_pending"`) ||
-		strings.Contains(detail, `code="agent_not_found"`)
 }
 
 // retryOrFailWakeOutbox records a non-delivered outcome for the claimed batch,

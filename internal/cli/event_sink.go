@@ -91,10 +91,20 @@ func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.Ev
 		inner: webhook,
 		store: store,
 		home:  home,
-		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr"}),
+		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(home)}),
 	}
 	eventSinkCache.rules[key] = sink
 	return sink
+}
+
+// ompRuntimeDir is the OMP inbox add-on registry of the home whose config the
+// daemon routes by, so a --home daemon only dials add-ons installed for it.
+func ompRuntimeDir(home string) string {
+	configFile := resolveConfigFile(home)
+	if configFile == "" {
+		return ""
+	}
+	return config.Paths{Home: filepath.Dir(configFile)}.OMPRuntimeDir()
 }
 
 func buildDaemonEventSink(store *db.Store, home string) events.Sink {

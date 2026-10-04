@@ -373,7 +373,22 @@ func (s *Store) ListWakeOutboxObligations(
 	ctx context.Context,
 	attemptedBefore time.Time,
 ) (WakeOutboxObligationProjection, error) {
-	return listWakeOutboxObligations(ctx, s.db, attemptedBefore)
+	return listWakeOutboxObligations(ctx, s.db, attemptedBefore, "")
+}
+
+// ListWakeOutboxObligationsForRole is ListWakeOutboxObligations for one target
+// role. Turn hooks (#2302) read their own seat's pending mail through the same
+// state-derived projection the daemon drains.
+func (s *Store) ListWakeOutboxObligationsForRole(
+	ctx context.Context,
+	role string,
+	attemptedBefore time.Time,
+) (WakeOutboxObligationProjection, error) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		return WakeOutboxObligationProjection{}, errors.New("wake outbox role projection requires a role")
+	}
+	return listWakeOutboxObligations(ctx, s.db, attemptedBefore, role)
 }
 
 type wakeOutboxQueryer interface {
@@ -384,8 +399,9 @@ func listWakeOutboxObligations(
 	ctx context.Context,
 	queryer wakeOutboxQueryer,
 	attemptedBefore time.Time,
+	targetRole string,
 ) (WakeOutboxObligationProjection, error) {
-	query, args := wakeOutboxObligationQuery(attemptedBefore)
+	query, args := wakeOutboxObligationQuery(attemptedBefore, targetRole)
 	rows, err := queryer.QueryContext(ctx, query, args...)
 	if err != nil {
 		return WakeOutboxObligationProjection{}, err
@@ -479,8 +495,14 @@ const wakeOutboxDestinationEvidenceExists = `EXISTS (
 // keeps the unknown outcome rather than being laundered by an absent check.
 const wakeOutboxDirectiveClass = `source_kind = 'workflow_note' AND coalesce_key LIKE 'directive:%'`
 
-func wakeOutboxObligationQuery(attemptedBefore time.Time) (string, []any) {
+// wakeOutboxObligationQuery projects every obligation, or only targetRole's
+// when it is non-empty.
+func wakeOutboxObligationQuery(attemptedBefore time.Time, targetRole string) (string, []any) {
 	predicate, args := wakeOutboxObligationPredicate(attemptedBefore)
+	if targetRole != "" {
+		predicate = "(" + predicate + ") AND target_role = ?"
+		args = append(args, targetRole)
+	}
 	return `
 SELECT wake_outbox.id, wake_outbox.source_kind, wake_outbox.source_id, target_role, coalesce_key, state,
 		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
