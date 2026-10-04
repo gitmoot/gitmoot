@@ -28,7 +28,6 @@ import (
 // cannot be Landlock-wrapped, so reaching that refusal proves the fork path
 // applied the sandbox policy before any runtime launch.
 func TestTempWorkerForkStillSandboxesAReadOnlySeat(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)

@@ -23,7 +23,9 @@ import (
 // the limit and failed for a reason that had nothing to do with the code under
 // review. /tmp/gmr-<8 hex> is 17 bytes and leaves room for that whole suffix.
 // A short daemon TMPDIR is honoured as the parent, so an operator can move seat
-// scratch space off a small /tmp.
+// scratch space off a small /tmp, and so a gitmoot run INSIDE a seat (a
+// reviewer running this package's tests) nests its seats in its own
+// /tmp/gmr-<8 hex>, the only temp dir it may write.
 //
 // PRIVATE, because the temp parent is shared by every process on the host.
 // Only this directory is granted; the parent itself stays read-only, so a seat
@@ -38,9 +40,11 @@ import (
 // whose parent is one seatTempParent could have chosen (see removeSeatTempDir).
 const seatTempPrefix = "gmr-"
 
-// seatTempParentMaxLen keeps a TMPDIR-derived <parent>/gmr-<8 hex> at most 29
-// bytes, which still leaves a test 78 bytes of its own below the socket limit.
-const seatTempParentMaxLen = 16
+// seatTempParentMaxLen admits a seat's own /tmp/gmr-<8 hex> (17 bytes) as a
+// parent. A seat nested in one gets /tmp/gmr-<8 hex>/gmr-<8 hex>, 26 bytes,
+// leaving 81 for t.TempDir's suffix and a socket name; at the 24-byte bound,
+// 37 bytes, a test still has 70 of its own.
+const seatTempParentMaxLen = 24
 
 // seatTempParent is the daemon's TMPDIR when that is short enough for the
 // seat's sockets, and /tmp otherwise. A long daemon TMPDIR is exactly the
@@ -66,16 +70,52 @@ func seatTempRegistry(home string) string {
 
 // seatTempDir is one seat's temp dir together with the Gitmoot home whose
 // registry records it. The zero value is "no temp dir" and removes nothing.
+//
+// inCacheRoot marks the fallback form, <cache root>/tmp: no marker, no grant of
+// its own (the cache root grant covers it), removed directly at job end.
 type seatTempDir struct {
-	home string
-	dir  string
+	home        string
+	dir         string
+	inCacheRoot bool
 }
 
 func (s seatTempDir) remove() error {
 	if s.dir == "" {
 		return nil
 	}
+	if s.inCacheRoot {
+		if err := removeTreeForcibly(s.dir); err != nil {
+			return fmt.Errorf("remove seat cache-root temp dir %q: %w", s.dir, err)
+		}
+		return nil
+	}
 	return removeSeatTempDir(s.home, s.dir)
+}
+
+// errNoShortTempParent reports that seatTempParent() refuses writes. That is
+// the case inside a seat started by a daemon from before #2314, whose TMPDIR
+// is long (<cache root>/tmp) while /tmp is denied.
+var errNoShortTempParent = errors.New("no short writable temp parent")
+
+// createSeatTempDirOrFallback makes the seat's temp dir: a fresh short one
+// when seatTempParent() is writable, and otherwise the pre-#2314 form,
+// <cacheRoot>/tmp. The fallback keeps a gitmoot run nested in an older seat
+// working (it can write nothing but its cache) at the cost of long Unix socket
+// paths, so it is announced once on stderr.
+func createSeatTempDirOrFallback(home, cacheRoot string) (seatTempDir, error) {
+	dir, err := createSeatTempDir(home)
+	if err == nil {
+		return seatTempDir{home: home, dir: dir}, nil
+	}
+	if !errors.Is(err, errNoShortTempParent) {
+		return seatTempDir{}, err
+	}
+	fallback := filepath.Join(cacheRoot, "tmp")
+	fmt.Fprintf(os.Stderr, "gitmoot: no short writable temp parent; using cache-root temp %s (Unix socket paths may be long): %v\n", fallback, err)
+	if err := os.MkdirAll(fallback, 0o700); err != nil {
+		return seatTempDir{}, fmt.Errorf("create seat cache-root temp dir %q: %w", fallback, err)
+	}
+	return seatTempDir{home: home, dir: fallback, inCacheRoot: true}, nil
 }
 
 // createSeatTempDir makes a fresh seat temp dir, mode 0700 and owned by this
@@ -117,6 +157,9 @@ func createSeatTempDir(home string) (string, error) {
 			removeErr := os.Remove(marker)
 			if errors.Is(err, fs.ErrExist) && removeErr == nil {
 				continue
+			}
+			if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS) {
+				err = fmt.Errorf("%w: %w", errNoShortTempParent, err)
 			}
 			return "", errors.Join(fmt.Errorf("create seat temp dir %q: %w", dir, err), removeErr)
 		}
@@ -162,6 +205,11 @@ func verifySeatTempDir(dir string) error {
 // strand every seat dir made under the old parent, leaking it for good. The
 // bound kept is the length limit: it rules out a gmr-* directory anywhere deep
 // (a checkout, a cache, a Gitmoot home), not every short directory on the host.
+//
+// It also never removes the temp dir this process runs in, nor one holding it.
+// A gitmoot run inside a seat nests its seats in that seat's own gmr dir and
+// keeps its registry where the seat can write, so a marker there could name the
+// outer seat's dir; the nested run must not delete the ground it stands on.
 func removeSeatTempDir(home, dir string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -170,6 +218,9 @@ func removeSeatTempDir(home, dir string) error {
 	name := filepath.Base(dir)
 	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || !seatTempNamePattern.MatchString(name) || !isSeatTempParent(filepath.Dir(dir)) {
 		return fmt.Errorf("refuse to remove %q: not a seat temp dir", dir)
+	}
+	if own := filepath.Clean(os.TempDir()); own == dir || strings.HasPrefix(own, dir+string(filepath.Separator)) {
+		return fmt.Errorf("refuse to remove %q: it holds this process's own temp dir %q", dir, own)
 	}
 	if err := removeTreeForcibly(dir); err != nil {
 		return fmt.Errorf("remove seat temp dir %q: %w", dir, err)

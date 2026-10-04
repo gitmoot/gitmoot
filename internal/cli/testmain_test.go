@@ -46,8 +46,8 @@ func TestMain(m *testing.M) {
 	// No such parent is NOT fatal. Inside a read-only review seat the only
 	// writable temp dir is the seat's own TMPDIR and /tmp is denied, so the
 	// suite keeps that TMPDIR: the seat's job-end cleanup removes whatever the
-	// tests leave there. Only the tests that compose a nested seat need a
-	// short parent; everything else runs.
+	// tests leave there. Nested seats then use that TMPDIR as their parent when
+	// it is short (/tmp/gmr-<8 hex>), else <cache root>/tmp.
 	tempRoot, err := makeShortTestTempRoot(slices.Compact([]string{os.TempDir(), "/tmp"}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "no short test temp root, keeping TMPDIR=%s: %v\n", os.TempDir(), err)

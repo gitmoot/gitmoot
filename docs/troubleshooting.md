@@ -913,8 +913,13 @@ build error, not a silently wrong compiler.
 binds a Unix socket under `t.TempDir()` stays inside the 108-byte socket path
 limit. It used to be `<cache root>/tmp`, which was 57+ bytes on a real host, so
 socket tests failed for reasons unrelated to the code under review. When the
-daemon's own `TMPDIR` is a clean absolute path of at most 16 bytes, it is used
-as the parent instead of `/tmp`; a longer one is ignored. The directory is mode
+daemon's own `TMPDIR` is a clean absolute path of at most 24 bytes, it is used
+as the parent instead of `/tmp`; a longer one is ignored. That is also how
+gitmoot run inside a seat (a reviewer running gitmoot's own tests) nests its
+seats: in the outer seat's `/tmp/gmr-<8 hex>`. If no short parent is writable,
+as inside a seat of a daemon from before this change, the seat falls back to
+`<cache root>/tmp` and logs `no short writable temp parent; using cache-root
+temp`; it works, but its socket paths are long again. The directory is mode
 `0700`, owned by the daemon user, and only that seat is granted it: the parent
 directory, other seats' `gmr-*` directories, the checkout and the gitmoot home
 stay read-only. The daemon records each directory in
@@ -924,7 +929,9 @@ launch) removes every directory whose owner process is gone. The owner is the
 process that made the directory (the daemon or a foreground `job run`), so a
 seat process that outlives it loses its temp dir. A record that names a
 `gmr-*` directory under a parent no seat could have used (anything but an
-absolute path of at most 16 bytes) is kept and reported, never removed.
+absolute path of at most 24 bytes), or the sweeping process's own `TMPDIR` or
+a directory holding it, is kept and reported, never removed. The cache-root
+fallback has no record; it goes with the cache root.
 
 **Go module cache.** Offline `go build` and `go test` work in a seat. Before
 the seat starts, the daemon runs `go mod download` for the checkout's modules

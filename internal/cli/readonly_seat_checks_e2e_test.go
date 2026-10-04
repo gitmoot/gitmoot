@@ -19,6 +19,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -285,6 +287,96 @@ func TestSeatTempSweepKeepsADirOutsideAnySeatTempParent(t *testing.T) {
 	}
 }
 
+// TestSeatTempSweepNeverRemovesItsOwnTempDir covers a gitmoot run nested in a
+// seat: its registry is writable, so a marker in it can name the outer seat's
+// gmr dir, the TMPDIR the nested run stands in. The sweep must refuse it even
+// when the recorded owner is dead.
+func TestSeatTempSweepNeverRemovesItsOwnTempDir(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
+	home := t.TempDir()
+	exited := exec.Command("true")
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	registry := seatTempRegistry(home)
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := "gmr-" + randomSeatHex(t)
+	outer := filepath.Join(seatTempParent(), name)
+	if err := os.Mkdir(outer, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(outer) })
+	writeSeatFixtureFile(t, outer, "keep", "the outer seat's scratch")
+	marker := filepath.Join(registry, name)
+	if err := os.WriteFile(marker, []byte(strconv.Itoa(exited.Process.Pid)+"\n"+outer+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", outer)
+
+	removed, err := sweepStaleSeatTempDirs(home)
+	if removed != 0 || err == nil || !strings.Contains(err.Error(), "own temp dir") {
+		t.Fatalf("sweep = removed %d, err %v; want its own TMPDIR refused", removed, err)
+	}
+	if _, err := os.Lstat(filepath.Join(outer, "keep")); err != nil {
+		t.Fatalf("sweep removed the outer seat's temp dir: %v", err)
+	}
+}
+
+// TestReadOnlySeatFallsBackToCacheRootTempWithoutAShortWritableParent covers a
+// gitmoot run inside a seat of a daemon from before #2314: TMPDIR is long and
+// /tmp is denied, so no short seat temp dir can be made. The seat must still
+// be built, with the pre-#2314 <cache root>/tmp as TMPDIR, no extra write
+// grant, no registry marker, and that dir gone after the job's cleanup.
+func TestReadOnlySeatFallsBackToCacheRootTempWithoutAShortWritableParent(t *testing.T) {
+	// /sys refuses mkdir even to root (EPERM), the way Landlock refuses a seat.
+	if err := os.Mkdir("/sys/gmr-probe", 0o700); !errors.Is(err, fs.ErrPermission) {
+		_ = os.Remove("/sys/gmr-probe")
+		t.Skipf("needs a short parent that refuses mkdir; /sys gave %v", err)
+	}
+	home := t.TempDir()
+	checkout := filepath.Join(t.TempDir(), "review-worktree")
+	stateDir := filepath.Join(t.TempDir(), "claude-state")
+	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeSeatFixtureFile(t, stateDir, ".credentials.json", `{"claudeAiOauth":{"accessToken":"seat"}}`)
+	t.Setenv("TMPDIR", "/sys")
+	agent := runtime.Agent{
+		Runtime:          runtime.ClaudeRuntime,
+		AutonomyPolicy:   runtime.AutonomyPolicyReadOnly,
+		ReadOnlySeat:     true,
+		RuntimeConfigDir: stateDir,
+	}
+	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	if err != nil {
+		t.Fatalf("a seat without a short writable temp parent was refused: %v", err)
+	}
+	seat, ok := wrapped.(readOnlyRuntimeAdapter)
+	if !ok {
+		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
+	}
+	runner, ok := seat.Adapter.(runtime.ClaudeAdapter).Runner.(subprocess.WrappingRunner)
+	if !ok {
+		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", seat.Adapter.(runtime.ClaudeAdapter).Runner)
+	}
+	if !seat.cleanupTemp.inCacheRoot || seat.cleanupTemp.dir != filepath.Join(seat.cleanupRoot, "tmp") {
+		t.Fatalf("seat temp = %+v, want the fallback <cache root>/tmp under %s", seat.cleanupTemp, seat.cleanupRoot)
+	}
+	assertSeatTempDirGrant(t, runner.WritablePaths, seat.cleanupTemp, runner.Env)
+	registry := seatTempRegistry(config.PathsForHome(home).Home)
+	if entries, err := os.ReadDir(registry); err != nil || len(entries) != 0 {
+		t.Fatalf("seat temp registry %s = %v err=%v, want no marker for a cache-root temp dir", registry, entries, err)
+	}
+	if err := seat.cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(seat.cleanupTemp.dir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("cache-root seat temp %q survived cleanup: %v", seat.cleanupTemp.dir, err)
+	}
+}
+
 // TestShortTestTempRootReportsUnusableParents covers the read-only seat case
 // of TestMain: when no parent can hold a short test temp root (one refuses the
 // mkdir, as a seat's denied /tmp does; one is too long, as a seat's own TMPDIR
@@ -345,18 +437,17 @@ func randomSeatHex(t *testing.T) string {
 	return hex.EncodeToString(suffix[:])
 }
 
-// skipUnlessSeatTempParentWritable skips a test that builds a read-only seat
-// (or plants seat temp dirs) when seatTempParent() refuses writes. That is the
-// case when the suite itself runs inside a read-only seat: the seat's TMPDIR,
-// /tmp/gmr-<8 hex>, is 17 bytes, too long to parent nested seats, so
-// seatTempParent falls back to /tmp, which a seat may not write. Nested seats
-// are not supported; these tests need a host.
+// skipUnlessSeatTempParentWritable skips a test about the SHORT seat temp dir
+// itself when seatTempParent() refuses writes. That happens only inside a seat
+// started by a daemon from before #2314: its TMPDIR is a long <cache root>/tmp
+// and /tmp is denied, so nested seats fall back to <cache root>/tmp (they still
+// run) and no gmr-<8 hex> dir can exist for these tests to examine.
 func skipUnlessSeatTempParentWritable(t *testing.T) {
 	t.Helper()
 	parent := seatTempParent()
 	probe, err := os.MkdirTemp(parent, "gitmoot-seat-probe-")
 	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS) {
-		t.Skipf("seat temp parent %s is not writable (running inside a read-only seat?), so no nested seat can get a temp dir: %v", parent, err)
+		t.Skipf("seat temp parent %s is not writable (a seat from a daemon predating #2314?), so seats fall back to the cache-root temp and there is no short seat temp dir to test: %v", parent, err)
 	}
 	if err != nil {
 		t.Fatalf("probe seat temp parent %s: %v", parent, err)

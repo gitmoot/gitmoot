@@ -1591,8 +1591,9 @@ type readOnlySandboxGrants struct {
 	env       []string
 	cacheRoot string
 	stateDir  string
-	// tempDir is the seat's private /tmp/gmr-<hex> TMPDIR (#2314). It is a
-	// write grant of its own, outside cacheRoot, and is removed with it.
+	// tempDir is the seat's private /tmp/gmr-<hex> TMPDIR (#2314), a write
+	// grant of its own outside cacheRoot, or, when no short parent is
+	// writable, <cacheRoot>/tmp. Either is removed at the end of the job.
 	tempDir seatTempDir
 	// evidenceFile is the rendered, repo-scoped list of prior verdicts, or ""
 	// when none could be staged. It is inside cacheRoot, so it needs no grant
@@ -2148,12 +2149,15 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// before any staged root is placed, so every placement check below also
 	// proves no staged copy sits inside it. Any setup failure after this point
 	// removes it again; the adapter's cleanup removes it at the end of the job.
-	tempDir, err := createSeatTempDir(paths.Home)
+	// The cache-root fallback is already inside grants.cacheRoot.
+	grants.tempDir, err = createSeatTempDirOrFallback(paths.Home, grants.cacheRoot)
 	if err != nil {
 		return grants, err
 	}
-	grants.tempDir = seatTempDir{home: paths.Home, dir: tempDir}
-	grants.writes = append(grants.writes, tempDir)
+	tempDir := grants.tempDir.dir
+	if !grants.tempDir.inCacheRoot {
+		grants.writes = append(grants.writes, tempDir)
+	}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, grants.tempDir.remove())

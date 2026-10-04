@@ -152,7 +152,6 @@ func TestStageSeatToolchainShadowsMissingGo(t *testing.T) {
 // The fixture is a SMALL pinned installation on PATH rather than the host's real
 // 269 MiB toolchain, so the test proves the wiring without paying for a full copy.
 func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	live := config.PathsForHome(home)
 
@@ -278,7 +277,6 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 // not cost the toolchain pin, so `go` must still resolve INSIDE the staged copy
 // even though a different go sits earlier on the inherited PATH.
 func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	t.Setenv("GOWORK", "off")
 	home := t.TempDir()
 	live := config.PathsForHome(home)

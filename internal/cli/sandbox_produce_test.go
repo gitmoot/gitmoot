@@ -385,7 +385,6 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 }
 
 func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	stateDir := filepath.Join(t.TempDir(), "claude-state")
@@ -445,10 +444,10 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if containsPath(runner.ReadablePaths, "/") || containsPath(runner.ReadablePaths, stateDir) {
 		t.Fatalf("explicit reads %v expose the host root or source profile", runner.ReadablePaths)
 	}
-	if len(runner.WritablePaths) != 2 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
-		t.Fatalf("writes = %v, want the per-worktree cache, the seat's temp dir, and no source profile", runner.WritablePaths)
+	if len(runner.WritablePaths) == 0 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
+		t.Fatalf("writes = %v, want the per-worktree cache first and no source profile", runner.WritablePaths)
 	}
-	assertSeatTempDirGrant(t, runner.WritablePaths[1], stateAdapter.cleanupTemp, runner.Env)
+	assertSeatTempDirGrant(t, runner.WritablePaths, stateAdapter.cleanupTemp, runner.Env)
 	configEnv := envValue(runner.Env, "CLAUDE_CONFIG_DIR")
 	if configEnv == "" || configEnv == stateDir || !strings.HasPrefix(configEnv, runner.WritablePaths[0]+string(filepath.Separator)) {
 		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want isolated state under %q", configEnv, runner.WritablePaths[0])
@@ -466,7 +465,6 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 }
 
 func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	sourceState := filepath.Join(t.TempDir(), "claude-state")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -558,7 +556,6 @@ func TestReadOnlyRuntimeStateSurvivesRepairDeliveries(t *testing.T) {
 }
 
 func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -609,7 +606,6 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 }
 
 func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -664,7 +660,6 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 }
 
 func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -764,7 +759,6 @@ func (r *streamingReviewRunner) LookPath(file string) (string, error) { return f
 // stateful read-only adapter. Calling either helper directly would not prove
 // the production composition order.
 func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -884,7 +878,6 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 }
 
 func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -986,7 +979,6 @@ func TestWrapReadOnlySandboxAdapterRejectsOmpBeforeStagingWithoutCredentialBroke
 }
 
 func TestWrapReadOnlySandboxAdapterUsesScopedBrokerAndPrivateOmpState(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -1059,10 +1051,10 @@ func TestWrapReadOnlySandboxAdapterUsesScopedBrokerAndPrivateOmpState(t *testing
 	if !ok {
 		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", ompAdapter.Runner)
 	}
-	if !runner.ReadOnlyWorkdir || len(runner.WritablePaths) != 2 || runner.WritablePaths[0] != stateAdapter.cleanupRoot {
+	if !runner.ReadOnlyWorkdir || len(runner.WritablePaths) == 0 || runner.WritablePaths[0] != stateAdapter.cleanupRoot {
 		t.Fatalf("OMP sandbox workdir/write grants = readOnly:%v writes:%v", runner.ReadOnlyWorkdir, runner.WritablePaths)
 	}
-	assertSeatTempDirGrant(t, runner.WritablePaths[1], stateAdapter.cleanupTemp, runner.Env)
+	assertSeatTempDirGrant(t, runner.WritablePaths, stateAdapter.cleanupTemp, runner.Env)
 	if containsPath(runner.ReadablePaths, hostProfile) || containsPath(runner.ReadableFiles, filepath.Join(hostProfile, "agent.db")) {
 		t.Fatalf("OMP sandbox reads expose operator profile: dirs=%v files=%v", runner.ReadablePaths, runner.ReadableFiles)
 	}
@@ -1169,16 +1161,28 @@ func containsPath(paths []string, want string) bool {
 	return false
 }
 
-// assertSeatTempDirGrant proves a read-only seat's second write grant is that
-// seat's own private temp dir (#2314): the one the adapter will remove, the one
-// its TMPDIR names, a fresh gmr-<8 hex> directly under the seat temp parent.
-func assertSeatTempDirGrant(t *testing.T, grant string, owned seatTempDir, env []string) {
+// assertSeatTempDirGrant proves a read-only seat's write grants are its cache
+// root plus exactly its own private temp dir (#2314): the one the adapter will
+// remove, the one its TMPDIR names, a fresh gmr-<8 hex> directly under the seat
+// temp parent. Where no short parent is writable (a seat of an older daemon)
+// the temp dir is <cache root>/tmp instead, and the cache root is the only grant.
+func assertSeatTempDirGrant(t *testing.T, writes []string, owned seatTempDir, env []string) {
 	t.Helper()
-	if owned.dir == "" || grant != owned.dir {
-		t.Fatalf("seat temp write grant = %q, want the adapter's own seat temp dir %q", grant, owned.dir)
+	grant := owned.dir
+	if grant == "" {
+		t.Fatalf("the adapter owns no seat temp dir; writes = %v", writes)
 	}
-	if filepath.Dir(grant) != seatTempParent() || !seatTempNamePattern.MatchString(filepath.Base(grant)) {
-		t.Fatalf("seat temp write grant = %q, want %s/gmr-<8 hex>", grant, seatTempParent())
+	if owned.inCacheRoot {
+		if len(writes) != 1 || grant != filepath.Join(writes[0], "tmp") {
+			t.Fatalf("writes = %v with cache-root temp %q, want only the cache root holding <cache root>/tmp", writes, grant)
+		}
+	} else {
+		if len(writes) != 2 || writes[1] != grant {
+			t.Fatalf("writes = %v, want the cache root and the adapter's own seat temp dir %q", writes, grant)
+		}
+		if filepath.Dir(grant) != seatTempParent() || !seatTempNamePattern.MatchString(filepath.Base(grant)) {
+			t.Fatalf("seat temp write grant = %q, want %s/gmr-<8 hex>", grant, seatTempParent())
+		}
 	}
 	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
 		if got := envValue(env, name); got != grant {
@@ -1424,7 +1428,6 @@ func TestWorkerProduceRunRemovesTheStateRootItGranted(t *testing.T) {
 // produce grants never name it. The companion test in internal/sandbox pins the
 // helper side; this one pins that produce is on the implicit-root path at all.
 func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "operator-profile"))

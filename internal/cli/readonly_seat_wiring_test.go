@@ -25,7 +25,6 @@ func redactEnvNames(env []string) []string {
 // In particular, the default CuratedGroupRunner and execbackend InstanceRunner
 // must both carry the auth overlay and drop ambient GitHub credentials.
 func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-shape-token-value"
 	home := t.TempDir()
 	paths, err := pathsFromFlag(home)
@@ -87,7 +86,6 @@ func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
 // no overlay: injecting one would hand the sandboxed child a real token the
 // gateway exists to withhold.
 func TestWrapReadOnlySandboxAdapterWithholdsAuthInGatewayMode(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	paths, err := pathsFromFlag(home)
 	if err != nil {
@@ -187,7 +185,6 @@ func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv 
 // the composed adapter. If that ever rebuilds instead, a seat loses its sandbox
 // the same way, and this test fails the same way.
 func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-transcript-token-value"
 	home := t.TempDir()
 	paths, err := pathsFromFlag(home)

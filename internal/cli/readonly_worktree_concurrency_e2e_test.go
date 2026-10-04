@@ -249,7 +249,6 @@ func drivePoolConcurrently(t *testing.T, ctx context.Context, worker jobWorker, 
 // rather than asserted. Reverting the dispatch-time allocation, so both asks
 // key repo:owner/repo, produces the same failure by the same route.
 func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
-	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
