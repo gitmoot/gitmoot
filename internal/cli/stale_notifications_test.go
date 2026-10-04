@@ -127,6 +127,119 @@ func TestStaleNotificationsSurfaceEverywhereUntilDelivered(t *testing.T) {
 	}
 }
 
+// TestStaleNotificationsLeaveOutRowsPendingOnPurpose covers #2309: a row the
+// daemon leaves pending on purpose is not "waiting too long". A route the
+// operator muted (a disabled addressed rule, health "suppressed") and a row no
+// delivery rule routes (health "inert", like the owner's blocked wakes in
+// production) stay visible with their real label, but only the normal row past
+// the threshold is counted and warned about everywhere.
+func TestStaleNotificationsLeaveOutRowsPendingOnPurpose(t *testing.T) {
+	home := dashboardTestHome(t)
+	paths := config.PathsForHome(home)
+	appendFile(t, paths.ConfigFile, "\n[org]\nnotification_stale_after = \"20m\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n"+
+		"[org.roles.\"quiet\"]\nparent = \"owner\"\nscope = [\"*\"]\n[org.roles.\"normal\"]\nparent = \"owner\"\nscope = [\"*\"]\n")
+
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.AddEventRule(ctx, db.EventRule{
+		ID: "mute-quiet", OnKind: db.WakeOutboxKindReply, WakeRole: "quiet",
+		Scope: db.EventRuleScopeAddressed, Enabled: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for role, age := range map[string]time.Duration{"quiet": 2 * time.Hour, "normal": 45 * time.Minute} {
+		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
+			WorkflowID: "stale/" + role, Author: "owner", Body: "please look", AddressedTarget: role,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		setWakeOutboxCreatedAt(t, paths.Database, strconv.FormatInt(note.ID, 10), now.Add(-age))
+	}
+	insertOptionalBlockedWake(t, store, "owner")
+	execRaw(t, paths.Database, `UPDATE wake_outbox SET created_at = ? WHERE target_role = 'owner'`,
+		now.Add(-3*time.Hour).Format(db.BlockedEpisodeTimeLayout))
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	statesBefore := wakeOutboxStates(t, paths.Database)
+
+	type wireRole struct {
+		Role   string `json:"role"`
+		Count  int    `json:"count"`
+		Reason string `json:"reason"`
+	}
+	type wire struct {
+		Total            int        `json:"total"`
+		Roles            []wireRole `json:"roles"`
+		PendingOnPurpose []wireRole `json:"pendingOnPurpose"`
+	}
+	wantRoles := []wireRole{{Role: "normal", Count: 1, Reason: "no delivery attempt recorded yet"}}
+	wantOnPurpose := []wireRole{
+		{Role: "owner", Count: 1, Reason: "no delivery rule"},
+		{Role: "quiet", Count: 1, Reason: "muted"},
+	}
+	var stale wire
+	getDashboardJSON(t, home, "/api/stale-notifications", &stale)
+	if stale.Total != 1 || !reflect.DeepEqual(stale.Roles, wantRoles) || !reflect.DeepEqual(stale.PendingOnPurpose, wantOnPurpose) {
+		t.Fatalf("stale = %+v, want total 1, roles %+v, pending on purpose %+v", stale, wantRoles, wantOnPurpose)
+	}
+	var attention dashboard.Attention
+	getDashboardJSON(t, home, "/api/attention", &attention)
+	if attention.Total != 1 {
+		t.Fatalf("attention total = %d, want only the normal row counted as waiting", attention.Total)
+	}
+	var comms struct {
+		Stale wire `json:"stale_notifications"`
+	}
+	getDashboardJSON(t, home, "/api/comms", &comms)
+	if !reflect.DeepEqual(comms.Stale, stale) {
+		t.Fatalf("comms stale = %+v, want %+v", comms.Stale, stale)
+	}
+
+	wantDetail := "1 notification waiting longer than 20m (normal: 1 waiting, oldest 45m, last reason: no delivery attempt recorded yet); " +
+		"2 left pending on purpose, not counted (owner: 1 no delivery rule; quiet: 1 muted)"
+	check, ok := staleNotificationsDoctorCheck(paths)
+	if !ok || check.OK || check.Detail != wantDetail {
+		t.Fatalf("doctor check = %+v (ok %v), want warning %q", check, ok, wantDetail)
+	}
+	if line := daemonStaleNotificationsLine(paths); line != "WARNING: stale notifications: "+wantDetail {
+		t.Fatalf("daemon status line = %q", line)
+	}
+	// Reading must not have changed any delivery state.
+	if after := wakeOutboxStates(t, paths.Database); after != statesBefore {
+		t.Fatalf("flagging changed delivery states: before %v after %v", statesBefore, after)
+	}
+
+	// With the normal row delivered, only rows pending on purpose remain: no
+	// warning anywhere, but the labels stay.
+	execRaw(t, paths.Database, `UPDATE wake_outbox SET state = 'delivered', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE target_role = 'normal'`)
+	statesBefore = wakeOutboxStates(t, paths.Database)
+	stale = wire{}
+	getDashboardJSON(t, home, "/api/stale-notifications", &stale)
+	attention = dashboard.Attention{}
+	getDashboardJSON(t, home, "/api/attention", &attention)
+	if stale.Total != 0 || len(stale.Roles) != 0 || attention.Total != 0 || !reflect.DeepEqual(stale.PendingOnPurpose, wantOnPurpose) {
+		t.Fatalf("muted/unroutable only: stale = %+v attention total %d, want nothing waiting and labels kept", stale, attention.Total)
+	}
+	quietDetail := "none waiting longer than 20m; 2 left pending on purpose, not counted (owner: 1 no delivery rule; quiet: 1 muted)"
+	check, _ = staleNotificationsDoctorCheck(paths)
+	if !check.OK || check.Detail != quietDetail {
+		t.Fatalf("muted/unroutable only doctor check = %+v, want OK %q", check, quietDetail)
+	}
+	if line := daemonStaleNotificationsLine(paths); line != "stale notifications: "+quietDetail {
+		t.Fatalf("muted/unroutable only daemon status line = %q", line)
+	}
+	// Reading must not have changed any delivery state.
+	if after := wakeOutboxStates(t, paths.Database); after != statesBefore {
+		t.Fatalf("flagging changed delivery states: before %v after %v", statesBefore, after)
+	}
+}
+
 func getDashboardJSON(t *testing.T, home, path string, out any) {
 	t.Helper()
 	recorder := httptest.NewRecorder()

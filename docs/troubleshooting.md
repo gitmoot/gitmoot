@@ -603,6 +603,26 @@ delivery state, and nothing is ever typed into an agent's terminal. Only
 ones are not reported here. A notification disappears from every list as soon
 as it is delivered.
 
+Some notifications stay pending on purpose, and these are never counted as
+waiting too long:
+
+- **muted**: the operator turned the route off (a disabled event rule for that
+  role and kind). The daemon's drain health calls these `suppressed`.
+- **no delivery rule**: no event rule routes the notification to its role. The
+  daemon keeps the row pending so a rule added later can still deliver it, and
+  its drain health calls these `inert` or `route_removed`.
+
+The dashboard and `gitmoot doctor` decide this with the same rules the daemon
+uses to deliver. The Comms banner lists these rows under "Left pending on
+purpose, not counted as waiting too long", with the label `muted` or
+`no delivery rule`. Needs a human leaves them out. `gitmoot doctor` and
+`gitmoot daemon status` name them after the count without turning the check
+into a warning, for example:
+
+```text
+[ok] stale notifications: none waiting longer than 30m; 26 left pending on purpose, not counted (owner: 26 no delivery rule)
+```
+
 To change the threshold:
 
 ```toml

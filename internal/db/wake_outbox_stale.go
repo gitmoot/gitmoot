@@ -6,62 +6,36 @@ import (
 	"time"
 )
 
-// StaleNotificationRole summarizes one role's notifications that have stayed
-// pending at least as long as the stale threshold (#2303). It is a read-only
-// projection: nothing here changes a delivery state or schedules a retry.
-type StaleNotificationRole struct {
-	Role  string
-	Count int
-	// OldestCreatedAt is when the oldest stale notification for the role was
-	// created; its age is how long the role has gone without being told.
-	OldestCreatedAt time.Time
-	// LastError is the most recently recorded reason a stale row for the role
-	// was not delivered, or "" when no attempt or deferral was ever recorded.
-	LastError string
-}
-
-// ListStaleNotifications groups pending notification rows created at or
-// before staleBefore by target role, oldest role first. Only `pending` rows
-// count: delivered, superseded, failed, stalled and delivery-unknown rows have
-// an outcome, and an `attempted` row is in flight right now.
+// ListStaleNotifications returns, in Pending, the pending obligations created
+// at or before staleBefore (#2303); the other projection fields are left empty.
+// Only `pending` rows count: delivered, superseded, failed, stalled and
+// delivery-unknown rows have an outcome, and an `attempted` row is in flight
+// right now.
 //
-// Times are compared through julianday so a row stamped by SQLite
-// (millisecond layout) and a cutoff formatted by Go compare as instants, not as
-// strings whose fractional-second widths differ.
-func (s *Store) ListStaleNotifications(ctx context.Context, staleBefore time.Time) ([]StaleNotificationRole, error) {
-	cutoff := staleBefore.UTC().Format(BlockedEpisodeTimeLayout)
-	rows, err := s.db.QueryContext(ctx, `
-SELECT stale.target_role, COUNT(*), MIN(stale.created_at),
-	COALESCE((
-		SELECT reason.last_error FROM wake_outbox reason
-		WHERE reason.state = 'pending'
-			AND reason.target_role = stale.target_role
-			AND reason.last_error != ''
-			AND julianday(reason.created_at) <= julianday(?)
-		ORDER BY julianday(reason.updated_at) DESC, reason.id DESC
-		LIMIT 1
-	), '')
-FROM wake_outbox stale
-WHERE stale.state = 'pending' AND julianday(stale.created_at) <= julianday(?)
-GROUP BY stale.target_role
-ORDER BY MIN(stale.created_at), stale.target_role`, cutoff, cutoff)
+// It narrows the same obligation projection the daemon's drain classifies, so a
+// caller can set aside the rows the daemon leaves pending on purpose (a muted
+// route, or no delivery rule at all, #2309) with the daemon's own rules. It is
+// read-only: nothing here changes a delivery state or schedules a retry.
+//
+// created_at is compared as an instant, not as text, so a row stamped by SQLite
+// (millisecond layout) and a cutoff formatted by Go agree whatever their
+// fractional-second widths.
+func (s *Store) ListStaleNotifications(ctx context.Context, staleBefore time.Time) (WakeOutboxObligationProjection, error) {
+	projection, err := s.ListWakeOutboxObligations(ctx, staleBefore)
 	if err != nil {
-		return nil, err
+		return WakeOutboxObligationProjection{}, err
 	}
-	defer rows.Close()
-	out := []StaleNotificationRole{}
-	for rows.Next() {
-		var row StaleNotificationRole
-		var oldest string
-		if err := rows.Scan(&row.Role, &row.Count, &oldest, &row.LastError); err != nil {
-			return nil, err
-		}
-		parsed, err := time.Parse(time.RFC3339Nano, oldest)
+	cutoff := staleBefore.UTC()
+	stale := WakeOutboxObligationProjection{Pending: []WakeOutboxObligation{}}
+	for _, obligation := range projection.Pending {
+		created, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
 		if err != nil {
-			return nil, fmt.Errorf("parse stale notification created_at %q for role %q: %w", oldest, row.Role, err)
+			return WakeOutboxObligationProjection{}, fmt.Errorf("parse stale notification created_at %q for row %d: %w", obligation.CreatedAt, obligation.ID, err)
 		}
-		row.OldestCreatedAt = parsed.UTC()
-		out = append(out, row)
+		if created.After(cutoff) {
+			continue
+		}
+		stale.Pending = append(stale.Pending, obligation)
 	}
-	return out, rows.Err()
+	return stale, nil
 }
