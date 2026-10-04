@@ -139,6 +139,10 @@ func TestOrgConfigMethodSetIsPinned(t *testing.T) {
 		"DirectiveMaxNudges",
 		"Enabled",
 		"Enforce",
+		// NotificationStaleAfter is a scalar policy read like WakeCoalesceHold
+		// below: one duration, no role membership. It leaves the #1635
+		// single-choke-point policy untouched (#2303).
+		"NotificationStaleAfter",
 		"Path",
 		"RecycleAfterFor",
 		"RecycleEnforce",

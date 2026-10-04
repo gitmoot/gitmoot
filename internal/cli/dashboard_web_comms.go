@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -20,8 +21,9 @@ import (
 const dashboardCommsMessagesPerThread = 200
 
 type dashboardCommsResponse struct {
-	GeneratedAt string                 `json:"generated_at"`
-	Threads     []dashboardCommsThread `json:"threads"`
+	GeneratedAt        string                      `json:"generated_at"`
+	Threads            []dashboardCommsThread      `json:"threads"`
+	StaleNotifications dashboardStaleNotifications `json:"stale_notifications"`
 }
 
 type dashboardCommsThread struct {
@@ -186,11 +188,16 @@ func dashboardCommsNavIcon(href string) string {
 }
 
 func (d *webDataSource) comms(ctx context.Context, requestedNoteID int64) (dashboardCommsResponse, error) {
+	now := time.Now().UTC()
 	out := dashboardCommsResponse{
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: now.Format(time.RFC3339),
 		Threads:     []dashboardCommsThread{},
 	}
-	err := withStore(d.home, func(store *db.Store) error {
+	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
+		var err error
+		if out.StaleNotifications, err = buildDashboardStaleNotifications(ctx, paths, store, now); err != nil {
+			return err
+		}
 		workflows := map[string]struct{}{}
 		summaries, err := store.ListWorkflowSummaries(ctx)
 		if err != nil {
@@ -407,6 +414,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
 .state{margin:auto;max-width:480px;padding:44px;text-align:center;color:var(--muted)}.state strong{display:block;color:var(--text);font-size:17px;margin-bottom:7px}.source-down strong{color:var(--loud)}
 .comms-footer{min-height:36px;flex:none;display:flex;align-items:center;justify-content:center;border-top:1px solid var(--line);background:var(--panel);color:var(--faint);font-size:11px;padding:7px 12px;text-align:center}.pulse{width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:7px;flex:none}
 .focus{animation:flash 1.8s ease}@keyframes flash{0%,100%{outline:0 solid transparent}30%{outline:4px solid color-mix(in srgb,var(--accent) 30%,transparent)}}
+.stale{flex:none;padding:10px 14px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--loud) 9%,var(--panel));color:var(--text);font-size:12.5px}.stale[hidden]{display:none}.stale strong{color:var(--loud)}.stale ul{margin:6px 0 0;padding-left:18px}.stale li{margin:2px 0}.stale small{display:block;margin-top:5px;color:var(--muted)}
 @media(max-width:820px){.shell{height:100vh;height:100dvh;min-height:0}.gm-header{position:relative}.mobile-menu{display:grid}.crumb>span{display:none}.gm-aplink,.daemon-label{display:none}.gm-frame{display:flex;min-height:0}.gm-sidebar{display:none;position:fixed;z-index:80;top:54px;bottom:60px;left:0;width:min(84vw,320px);padding:18px 12px 14px;border-right:1px solid var(--shell-line);box-shadow:18px 0 50px rgba(0,0,0,.35)}.gm-sidebar.mobile-open{display:flex}.mobile-backdrop.mobile-open{display:block;position:fixed;z-index:70;inset:54px 0 60px;background:rgba(0,0,0,.48)}.gm-content{display:flex;min-height:0;overflow:hidden;padding-bottom:60px}.filters{grid-template-columns:1fr 1fr}.filters .search{grid-column:1/-1}.workspace{display:flex;flex:1;flex-direction:column;min-height:0;overflow:hidden}.rail{position:static;flex:1;min-height:0;overflow:hidden;border-right:0}.threads{overflow-y:auto}.rail.thread-open{display:none}.conversation{display:none}.conversation.thread-open{display:flex;flex:1;min-height:0;overflow:hidden}.conversation-head{padding:0 12px}.messages{overflow-y:auto;padding:16px 12px 34px}.mobile-back{display:inline-flex!important}.comms-footer{min-height:44px}.gm-mobile-nav{display:flex;position:fixed;z-index:60;left:0;right:0;bottom:0;height:calc(60px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom);background:var(--panel);border-top:1px solid rgba(160,168,220,.1)}.gm-mobile-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;min-width:0;min-height:44px;padding:6px 0;border:0;background:transparent;color:var(--mobile-nav);text-decoration:none}.gm-mobile-item.active{color:var(--mobile-active);background:var(--mobile-active-bg)}.gm-mobile-item svg{width:20px;height:20px;flex:none}.gm-mobile-item span{font:500 9px/1 Inter,Arial,sans-serif;letter-spacing:.02em}}
 @media(pointer:coarse) and (min-width:821px) and (max-width:1024px){.shell{height:100vh;height:100svh;min-height:0}.gm-frame,.gm-content,.workspace,.conversation{min-height:0;overflow:hidden}}
 @media(min-width:821px){.mobile-back{display:none!important}}
@@ -438,6 +446,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
         <label class="check"><input id="systems" type="checkbox" checked> Engine markers</label>
         <button class="theme" id="theme" type="button" aria-label="Toggle light and dark theme">◐</button>
       </section>
+      <section class="stale" id="stale" role="status" aria-label="Notifications waiting too long" hidden></section>
       <section class="workspace">
         <aside class="rail" id="rail">
           <div class="railhead"><div class="seg"><button id="open" type="button">Open</button><button id="all" class="active" type="button">All</button></div></div>
@@ -520,13 +529,20 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   $('theme').onclick=()=>{const next=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=next;localStorage.setItem('gitmoot-comms-theme',next)};
   const setDaemonState=running=>{$('daemon-state').classList.toggle('down',!running);$('daemon-label').textContent=running?'daemon':'';$('daemon-status').textContent=running?'LIVE':'daemon down'};
   fetch('/api/health',{cache:'no-store'}).then(r=>r.ok?r.json():Promise.reject()).then(data=>setDaemonState(Boolean(data.daemon&&data.daemon.running))).catch(()=>setDaemonState(false));
+  const renderStale=s=>{
+    const box=$('stale'),roles=s&&Array.isArray(s.roles)?s.roles:[];
+    if(!roles.length){box.hidden=true;box.innerHTML='';return;}
+    box.innerHTML='<strong>'+esc(s.total)+' notification'+(s.total===1?'':'s')+' waiting longer than '+esc(s.threshold)+'</strong><ul>'+roles.map(r=>'<li data-stale-role="'+esc(r.role)+'"><b>'+esc(r.role)+'</b>: '+esc(r.count)+' waiting · oldest '+esc(r.oldestAge)+' · last reason: '+esc(r.reason)+'</li>').join('')+'</ul><small>Messages are safe in the inbox, but these roles have not been told. Nothing is resent automatically.</small>';
+    box.hidden=false;
+  };
+  setInterval(()=>fetch('/api/stale-notifications',{cache:'no-store'}).then(r=>r.ok?r.json():Promise.reject()).then(renderStale).catch(()=>{}),10000);
   const closeMobileNav=()=>{$('dashboard-sidebar').classList.remove('mobile-open');$('mobile-backdrop').classList.remove('mobile-open')};
   const toggleMobileNav=()=>{$('dashboard-sidebar').classList.toggle('mobile-open');$('mobile-backdrop').classList.toggle('mobile-open')};
   $('mobile-menu').onclick=toggleMobileNav;$('mobile-more').onclick=toggleMobileNav;$('mobile-backdrop').onclick=closeMobileNav;
   const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow'),wantedThread=p.get('thread');
   const api=new URL('/api/comms',location.origin);if(note)api.searchParams.set('note',note);
   fetch(api.pathname+api.search,{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
-    state.data=Array.isArray(data.threads)?data.threads:[];roleOptions();
+    state.data=Array.isArray(data.threads)?data.threads:[];roleOptions();renderStale(data.stale_notifications);
     if(note){state.deep=String(note);const found=state.data.find(t=>t.messages.some(m=>String(m.id)===state.deep||(m.resolution&&String(m.resolution.note_id)===state.deep)));if(found)state.selected=threadKey(found)}
     if(!state.selected&&wantedThread){const found=state.data.find(t=>String(t.thread_id)===wantedThread);if(found)state.selected=threadKey(found)}
     if(!state.selected&&wanted){const found=state.data.find(t=>t.workflow_id===wanted);if(found)state.selected=threadKey(found)}

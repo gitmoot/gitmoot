@@ -342,6 +342,9 @@ path = ""
 #                           # wake. Owner-decided default: 5m trades up to five
 #                           # minutes of wake latency for a measured 32%% fewer
 #                           # interrupts; "5s" restores the pre-2026-09 cadence
+# notification_stale_after = "30m" # flag a notification still waiting to be
+#                                  # delivered after this long on the dashboard,
+#                                  # in doctor and in daemon status (never resends)
 # [org.roles."owner"]
 # scope = ["*"]
 # merge_rule = "owner"

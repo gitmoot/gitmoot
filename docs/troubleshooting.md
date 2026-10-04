@@ -573,6 +573,45 @@ Fixes:
   the single-job counterpart of `[orchestrate].escalation_ttl`, which
   auto-finalizes a whole paused delegation tree and is on by default (24h).
 
+## Notifications Waiting Too Long
+
+A message is saved in the inbox before Gitmoot tries to tell its recipient.
+If the recipient cannot be told (the agent is offline, its runtime has no way
+to receive notifications, or the operator is busy in its pane), the
+notification stays pending. Once it has waited longer than
+`[org].notification_stale_after` (default `30m`), Gitmoot shows it:
+
+- The dashboard's **Needs a human** page lists a "Notifications waiting too
+  long" section, one row per role: how many notifications are waiting, how
+  long the oldest has waited, and the last reason it was not delivered. They
+  count toward the page's "total waiting".
+- The dashboard's **Comms** page shows the same roles in a banner above the
+  threads.
+- `gitmoot doctor` reports a non-fatal `stale notifications` check, and
+  `gitmoot daemon status` prints a `stale notifications:` line (prefixed
+  `WARNING:` when any are waiting).
+
+Example:
+
+```text
+[warn] stale notifications: 3 notifications waiting longer than 30m (reviewer: 2 waiting, oldest 2h5m, last reason: runtime notification capability unavailable; builder: 1 waiting, oldest 45m, last reason: no delivery attempt recorded yet)
+```
+
+This is read-only. Flagging never resends a notification or changes its
+delivery state, and nothing is ever typed into an agent's terminal. Only
+`pending` notifications count; delivered, superseded, failed and uncertain
+ones are not reported here. A notification disappears from every list as soon
+as it is delivered.
+
+To change the threshold:
+
+```toml
+[org]
+notification_stale_after = "1h"
+```
+
+The value must be a positive duration; a zero or invalid value is rejected.
+
 ## Parallel Implementation And Worktrees
 
 Symptoms:

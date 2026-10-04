@@ -242,6 +242,10 @@ contribute to daemon tick health. A deliverable row still inside its hold is
 reported as `held` rather than `pending` and is NOT an outstanding obligation:
 it is waiting by design, so a hold longer than the tick interval does not make
 every tick read as unhealthy.
+A `pending` row older than `[org].notification_stale_after` (default `30m`) is
+flagged, per role, on the dashboard's "Needs a human" and Comms pages, in
+`gitmoot doctor` and in `gitmoot daemon status`; flagging is read-only and
+never resends (see "Notifications Waiting Too Long" in `troubleshooting.md`).
 A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and

@@ -208,6 +208,52 @@ func TestLoadOrgWakeCoalesceHold(t *testing.T) {
 	}
 }
 
+// TestLoadOrgNotificationStaleAfter pins the stale-notification threshold: it
+// defaults to 30m without any [org] section, is configurable, and refuses a
+// zero or garbage value that would flag every pending notice (or none).
+func TestLoadOrgNotificationStaleAfter(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := LoadOrg(paths); err != nil || cfg.NotificationStaleAfter() != 30*time.Minute {
+		t.Fatalf("no config: NotificationStaleAfter() = %s, err %v; want 30m", cfg.NotificationStaleAfter(), err)
+	}
+	for _, test := range []struct {
+		name    string
+		fields  string
+		want    time.Duration
+		wantErr string
+	}{
+		{name: "default", want: 30 * time.Minute},
+		{name: "configured", fields: "notification_stale_after = \"90s\"\n", want: 90 * time.Second},
+		{name: "hours", fields: "notification_stale_after = \"2h\"\n", want: 2 * time.Hour},
+		{name: "zero refused", fields: "notification_stale_after = \"0s\"\n", wantErr: "notification_stale_after must be positive"},
+		{name: "unparseable refused", fields: "notification_stale_after = \"later\"\n", wantErr: "parse [org].notification_stale_after"},
+		{name: "duplicate refused", fields: "notification_stale_after = \"1m\"\nnotification_stale_after = \"2m\"\n", wantErr: "duplicate [org].notification_stale_after"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := "[org]\n" + test.fields + "[org.roles.\"owner\"]\nscope=[\"*\"]\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadOrg(paths)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("LoadOrg() error = %v, want containing %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.NotificationStaleAfter(); got != test.want {
+				t.Fatalf("NotificationStaleAfter() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadOrgRecycleAfterFailsClosed(t *testing.T) {
 	paths := PathsForHome(t.TempDir())
 	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
