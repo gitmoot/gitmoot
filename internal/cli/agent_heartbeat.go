@@ -71,13 +71,13 @@ func runAgentHeartbeatAdd(args []string, stdout, stderr io.Writer) int {
 	jitter := fs.String("jitter", "", "random delay added to each interval, e.g. 15m (default 0s)")
 	maxConcurrent := fs.Int("max-concurrent", 1, "maximum concurrent jobs for this heartbeat")
 	enabled := fs.Bool("enabled", false, "enable the heartbeat immediately (default disabled)")
-	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
+	if len(args) < 2 {
 		fs.Usage()
-		if len(args) < 2 {
-			fmt.Fprintln(stderr, "agent heartbeat add requires <agent> and <name>")
-			return 2
-		}
-		return 0
+		fmt.Fprintln(stderr, "agent heartbeat add requires <agent> and <name>")
+		return 2
 	}
 	agent := strings.TrimSpace(args[0])
 	name := strings.TrimSpace(args[1])
@@ -97,6 +97,9 @@ func runAgentHeartbeatAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	if !validAgentTypeName(name) {
 		fmt.Fprintf(stderr, "invalid heartbeat name %q\n", name)
+		return 2
+	}
+	if refuseFlagLikeText("agent heartbeat add", *prompt, stderr) {
 		return 2
 	}
 	if !config.HeartbeatActionSupported(*action) {

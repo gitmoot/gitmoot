@@ -19,7 +19,7 @@ import (
 var orgDirectiveStdin io.Reader = os.Stdin
 
 func runOrgDirective(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if len(args) == 0 || helpRequested(args[:1]) {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}
@@ -50,6 +50,8 @@ func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "it is restricted to the TARGET SUBTREE -- the addressed role or one below it.")
 	fmt.Fprintln(w, "Ancestors cannot complete (a sender is always an ancestor, so that would be")
 	fmt.Fprintln(w, "self-certification); they may cancel instead. Only the sender may cancel.")
+	fmt.Fprintln(w, "-h, -help or --help prints this usage and saves nothing. A TEXT body that is a")
+	fmt.Fprintln(w, "single flag-like word, such as -x, is refused; put -- before it to send it anyway.")
 }
 
 func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
@@ -62,10 +64,20 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	stdin := fs.Bool("stdin", false, "read directive body from stdin")
 	file := fs.String("F", "", "read directive body from file")
+	if helpRequested(args) {
+		printOrgDirectiveUsage(stdout)
+		return 0
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
+		return 2
+	}
+	// A lone flag-like body is refused unless "--" marks it as explicit text.
+	rest := fs.Args()
+	explicit := len(rest) == 1 && len(args) >= 2 && args[len(args)-2] == "--"
+	if len(rest) == 1 && !explicit && refuseFlagLikeText("message directive send", rest[0], stderr) {
 		return 2
 	}
 	body, err := readOrgDirectiveBody(fs.Args(), *stdin, *file)
@@ -165,11 +177,9 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	byFlag := fs.String("role", "", "organization role recording the "+kind)
 	jsonOutput := fs.Bool("json", false, "JSON output")
-	for _, arg := range args {
-		if arg == "-h" || arg == "--help" {
-			_ = fs.Parse([]string{"--help"})
-			return 0
-		}
+	if helpRequested(args) {
+		printOrgDirectiveUsage(stdout)
+		return 0
 	}
 	idText, flagArgs, ok := orgDirectiveReceiptIDAndFlags(args)
 	if !ok {

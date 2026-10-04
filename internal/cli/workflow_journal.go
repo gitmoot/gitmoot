@@ -279,14 +279,18 @@ func runWorkflowDescribe(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the updated description as JSON")
-	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
-		if len(args) < 2 {
-			fmt.Fprintln(stderr, "workflow describe requires a label and text")
-			return 2
-		}
+	if helpRequested(args) {
+		printWorkflowJournalUsage(stdout)
 		return 0
 	}
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "workflow describe requires a label and text")
+		return 2
+	}
 	label, description := strings.TrimSpace(args[0]), strings.TrimSpace(args[1])
+	if refuseFlagLikeText("workflow describe", description, stderr) {
+		return 2
+	}
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
 		fmt.Fprintf(stderr, "workflow describe: %v\n", err)
 		return 2
@@ -332,12 +336,13 @@ func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	reason := fs.String("reason", "", "reason for closing the workflow")
 	jsonOutput := fs.Bool("json", false, "print the close result as JSON")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "workflow close requires a label")
-			return 2
-		}
+	if helpRequested(args) {
+		printWorkflowJournalUsage(stdout)
 		return 0
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "workflow close requires a label")
+		return 2
 	}
 	label := strings.TrimSpace(args[0])
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
@@ -352,6 +357,9 @@ func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "workflow close accepts one label")
+		return 2
+	}
+	if refuseFlagLikeText("workflow close", *reason, stderr) {
 		return 2
 	}
 	reasonText := strings.TrimSpace(*reason)
@@ -568,12 +576,13 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	// becomes structural rather than opt-in. The flag comes back on its own terms.
 	repo := fs.String("repo", "", "repo binding recorded on the note row, as owner/repo")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
-	if len(args) < 2 || args[0] == "-h" || args[0] == "--help" {
-		if len(args) < 2 {
-			fmt.Fprintln(stderr, "workflow note requires a label and body")
-			return 2
-		}
+	if helpRequested(args) {
+		printWorkflowJournalUsage(stdout)
 		return 0
+	}
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "workflow note requires a label and body")
+		return 2
 	}
 	label, body := strings.TrimSpace(args[0]), args[1]
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
@@ -582,6 +591,9 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	}
 	if body == "" || len(body) > workflowNoteBodyMax {
 		fmt.Fprintf(stderr, "workflow note body must be non-empty and at most %d bytes\n", workflowNoteBodyMax)
+		return 2
+	}
+	if refuseFlagLikeText("workflow note", body, stderr) {
 		return 2
 	}
 	if err := fs.Parse(args[2:]); err != nil {
@@ -627,6 +639,9 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(*summary) > workflowSummaryMax {
 		fmt.Fprintf(stderr, "workflow note summary must be at most %d bytes\n", workflowSummaryMax)
+		return 2
+	}
+	if refuseFlagLikeText("workflow note", *summary, stderr) {
 		return 2
 	}
 	if len(*status) > workflowSummaryMax {

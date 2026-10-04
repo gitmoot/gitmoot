@@ -16,23 +16,48 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func printMessageUsage(w io.Writer) {
-	fmt.Fprintln(w, `Usage:
-  gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]
-  gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
-  gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
-  gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]
-  gitmoot message escalate [--workflow LABEL] [--to ROLE] [--role ROLE] [--json] "QUESTION"
-  gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json]
-  gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop --runtime claude|codex
-  gitmoot message directive send|ack|done|cancel --help
+// messageUsage lists each message subcommand's usage line in display order, so
+// the full usage and a single subcommand's usage never drift apart.
+var messageUsage = []struct{ action, line string }{
+	{"send", `gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]`},
+	{"inbox", `gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]`},
+	{"show", `gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]`},
+	{"reply", `gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]`},
+	{"escalate", `gitmoot message escalate [--workflow LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"`},
+	{"resolve", `gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json] [--home DIR]`},
+	{"pending", `gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop --runtime claude|codex`},
+	{"directive", `gitmoot message directive send|ack|done|cancel --help`},
+}
 
-Messages are durable ordinary conversation between registered fleet roles.
+const messageUsageNotes = `Messages are durable ordinary conversation between registered fleet roles.
 No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+-h, -help or --help anywhere prints usage and saves nothing.
+Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
 --role is an operator attribution override, not an authentication credential.
 Saved mail, notification submission, reading and task completion are separate facts.
-Escalations track decisions; directives retain issuer and recipient authority checks.`)
+Escalations track decisions; directives retain issuer and recipient authority checks.`
+
+func printMessageUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	for _, usage := range messageUsage {
+		fmt.Fprintln(w, "  "+usage.line)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, messageUsageNotes)
+}
+
+// printMessageActionUsage prints one subcommand's usage line plus the shared
+// message notes.
+func printMessageActionUsage(w io.Writer, action string) {
+	fmt.Fprintln(w, "Usage:")
+	for _, usage := range messageUsage {
+		if usage.action == action {
+			fmt.Fprintln(w, "  "+usage.line)
+		}
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, messageUsageNotes)
 }
 
 func messageActingRole(ctx context.Context, cfg config.OrgConfig, explicit string) (string, error) {
@@ -67,7 +92,7 @@ func messageActingRole(ctx context.Context, cfg config.OrgConfig, explicit strin
 }
 
 func runMessage(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
+	if len(args) == 0 || helpRequested(args[:1]) {
 		printMessageUsage(stdout)
 		return 0
 	}
@@ -93,12 +118,15 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "unknown message command")
 		return 2
 	}
-	if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
-		printMessageUsage(stdout)
+	if helpRequested(args[1:]) {
+		printMessageActionUsage(stdout, action)
 		return 0
 	}
 	if len(args) < positional+1 {
-		printMessageUsage(stderr)
+		printMessageActionUsage(stderr, action)
+		return 2
+	}
+	if positional == 2 && refuseFlagLikeText("message "+action, args[2], stderr) {
 		return 2
 	}
 	fs := flag.NewFlagSet("message "+action, flag.ContinueOnError)

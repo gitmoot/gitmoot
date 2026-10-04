@@ -21,11 +21,9 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	answer := fs.String("answer", "", "decision or answer to record in the thread")
 	answerID := fs.Int64("note", 0, "existing answer note in the same workflow")
 	jsonOutput := fs.Bool("json", false, "JSON output")
-	for _, arg := range args {
-		if arg == "--help" || arg == "-h" {
-			fmt.Fprintln(stdout, "Usage: gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json] [--home DIR]")
-			return 0
-		}
+	if helpRequested(args) {
+		printMessageActionUsage(stdout, "resolve")
+		return 0
 	}
 	idText, flagArgs, ok := orgEscalateResolveIDAndFlags(args)
 	if !ok {
@@ -45,6 +43,9 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 || *answerID < 0 || (*answerID != 0 && *answer != "") {
 		fmt.Fprintln(stderr, "use either --answer TEXT or --note ID")
+		return 2
+	}
+	if refuseFlagLikeText("message resolve", *answer, stderr) {
 		return 2
 	}
 	err = withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {

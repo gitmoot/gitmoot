@@ -41,7 +41,7 @@ func runAgentPrompt(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo for the recorded session job (default: the agent's repo_scope); only used with --record")
 	typeName := fs.String("type", "implement", "session job type when recording: "+strings.Join(workflow.SessionJobActions, "|")+"; only used with --record")
 	id, flagArgs := leadingID(args)
-	if len(args) == 0 || containsHelpFlag(args) {
+	if len(args) == 0 || helpRequested(args) {
 		fs.Usage()
 		if len(args) == 0 {
 			fmt.Fprintln(stderr, "agent prompt requires exactly one agent or template id")

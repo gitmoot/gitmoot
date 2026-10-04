@@ -80,11 +80,9 @@ reported on stderr only.`)
 }
 
 func runMessagePending(args []string, stdout, stderr io.Writer) int {
-	for _, arg := range args {
-		if arg == "--help" || arg == "-h" {
-			printMessagePendingUsage(stdout)
-			return 0
-		}
+	if helpRequested(args) {
+		printMessagePendingUsage(stdout)
+		return 0
 	}
 	fs := flag.NewFlagSet("message pending", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
