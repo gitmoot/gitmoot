@@ -97,6 +97,8 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/fleet/activity/events", ds.handleFleetActivityEvents)
 	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.css", handleFleetActivityCSS)
 	mux.HandleFunc("GET /assets/gitmoot-fleet-activity.js", handleFleetActivityJS)
+	mux.HandleFunc("GET /assets/gitmoot-stale-notifications.js", handleStaleNotificationsJS)
+	mux.HandleFunc("GET /api/stale-notifications", ds.handleStaleNotificationsAPI)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
 	// Public pipeline receipts are deliberately narrow, read-only projections of
@@ -104,7 +106,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	// module fallback so no /api or module behavior changes.
 	mux.HandleFunc("GET /receipts/{id}", ds.handlePipelineReceipt)
 	mux.HandleFunc("GET /receipts/{id}/bundle", ds.handlePipelineReceiptBundle)
-	mux.Handle("/", withDashboardCommsNav(withFleetActivityAssets(dashboard.Serve(ds))))
+	mux.Handle("/", withDashboardCommsNav(withStaleNotificationAssets(withFleetActivityAssets(dashboard.Serve(ds)))))
 	return mux
 }
 

@@ -596,6 +596,9 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "%s", daemonDiskGuardLine(paths))
 	writeLine(stdout, "%s", daemonGitHubLimiterLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
+	if line := daemonStaleNotificationsLine(paths); line != "" {
+		writeLine(stdout, "%s", line)
+	}
 	for _, line := range daemonHeartbeatLines(paths, *home) {
 		writeLine(stdout, "%s", line)
 	}

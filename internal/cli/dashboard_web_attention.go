@@ -88,7 +88,14 @@ func (d *webDataSource) Attention(ctx context.Context) (dashboard.Attention, err
 	if err != nil {
 		return dashboard.Attention{}, err
 	}
-	out.Total = len(out.Gates)
+	// Stale notifications (#2303) count toward "total waiting" so the "Needs a
+	// human" nav marker lights while a role has gone too long without being
+	// told; their per-role detail is served by /api/stale-notifications.
+	stale, err := d.staleNotifications(ctx)
+	if err != nil {
+		return dashboard.Attention{}, err
+	}
+	out.Total = len(out.Gates) + stale.Total
 	return out, nil
 }
 

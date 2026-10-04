@@ -297,6 +297,10 @@ func TestDashboardCommsPageContract(t *testing.T) {
 	script := body[start+len("<script>") : end]
 	input, err := json.Marshal(map[string]any{
 		"script": script,
+		"stale": dashboardStaleNotifications{Threshold: "30m", Total: 3, Roles: []dashboardStaleNotificationRole{
+			{Role: "reviewer", Count: 2, OldestAge: "2h5m", Reason: "recipient offline"},
+			{Role: "builder", Count: 1, OldestAge: "45m", Reason: "no delivery attempt recorded yet"},
+		}},
 		"threads": []dashboardCommsThread{
 			{
 				WorkflowID: "release/alpha", UpdatedAt: "2026-07-31T01:00:00Z", Unresolved: 1,
@@ -590,10 +594,11 @@ class Element {
   }
   get innerHTML(){return this._innerHTML;}
 }
-for(const id of ['search','from','to','resolution','date','systems','threads','messages','conversation-head','back','rail','conversation','open','all','theme','dashboard-sidebar','mobile-menu','mobile-more','mobile-backdrop','daemon-state','daemon-label','daemon-status']){
+for(const id of ['search','from','to','resolution','date','systems','threads','messages','conversation-head','back','rail','conversation','open','all','theme','dashboard-sidebar','mobile-menu','mobile-more','mobile-backdrop','daemon-state','daemon-label','daemon-status','stale']){
   elements.set(id,new Element(id));
 }
 elements.get('all').classList.add('active');
+elements.get('stale').hidden=true;
 const documentElement={dataset:{theme:'dark'}};
 global.document={
   documentElement,
@@ -610,11 +615,16 @@ global.location={
 global.history={replaceState(){}};
 global.requestAnimationFrame=fn=>fn();
 global.setTimeout=fn=>{fn();return 0;};
+const intervals=[];
+global.setInterval=fn=>{intervals.push(fn);return intervals.length;};
 global.fetch=(url, options)=>{
   fetched.push(String(url));
   if(!options||options.cache!=='no-store')fail('fetch must disable caching');
   if(String(url)==='/api/health')return Promise.resolve({ok:true,json:()=>Promise.resolve({daemon:{running:true}})});
-  return Promise.resolve({ok:true,json:()=>Promise.resolve({threads:input.threads})});
+  // The stale-notification poll reads /api/stale-notifications; by then every
+  // stale notification has been delivered.
+  if(String(url)==='/api/stale-notifications')return Promise.resolve({ok:true,json:()=>Promise.resolve({threshold:'30m',total:0,roles:[]})});
+  return Promise.resolve({ok:true,json:()=>Promise.resolve({threads:input.threads,stale_notifications:input.stale})});
 };
 vm.runInThisContext(input.script,{filename:'dashboard-comms-inline.js'});
 setImmediate(()=>{
@@ -656,7 +666,19 @@ setImmediate(()=>{
     if(elements.get('dashboard-sidebar').classList.contains('mobile-open')||elements.get('mobile-backdrop').classList.contains('mobile-open')){
       fail('mobile dashboard navigation did not close');
     }
-    process.stdout.write('ok\n');
+    const stale=elements.get('stale');
+    for(const want of ['3 notifications waiting longer than 30m','<b>reviewer</b>: 2 waiting · oldest 2h5m · last reason: recipient offline','<b>builder</b>: 1 waiting · oldest 45m · last reason: no delivery attempt recorded yet']){
+      if(stale.hidden||!stale.innerHTML.includes(want))fail('stale notification banner missing '+JSON.stringify(want)+': hidden='+stale.hidden+' '+stale.innerHTML);
+    }
+    if(intervals.length!==1)fail('stale notification banner has no refresh poll');
+    intervals[0]();
+    setImmediate(()=>{
+      try{
+        if(!fetched.includes('/api/stale-notifications'))fail('stale notification poll did not fetch /api/stale-notifications: '+fetched);
+        if(!stale.hidden||stale.innerHTML!=='')fail('stale notification banner did not clear after delivery: '+stale.innerHTML);
+        process.stdout.write('ok\n');
+      }catch(error){console.error(error.stack||error);process.exitCode=1;}
+    });
   }catch(error){console.error(error.stack||error);process.exitCode=1;}
 });
 `
