@@ -351,6 +351,7 @@ export default function gitmootInbox(pi: Api) {
 			writeRegistration();
 		});
 		server = created;
+		process.removeListener("exit", cleanup);
 		process.once("exit", cleanup);
 	}
 
