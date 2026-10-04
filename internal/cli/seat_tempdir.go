@@ -41,9 +41,9 @@ import (
 const seatTempPrefix = "gmr-"
 
 // seatTempParentMaxLen admits a seat's own /tmp/gmr-<8 hex> (17 bytes) as a
-// parent. A seat nested in one gets /tmp/gmr-<8 hex>/gmr-<8 hex>, 26 bytes,
-// leaving 81 for t.TempDir's suffix and a socket name; at the 24-byte bound,
-// 37 bytes, a test still has 70 of its own.
+// parent. A seat nested in one gets /tmp/gmr-<8 hex>/gmr-<8 hex>, 30 bytes,
+// leaving 78 of the 108-byte sun_path for t.TempDir's suffix and a socket
+// name; at the 24-byte bound the nested path is 37 bytes, leaving 71.
 const seatTempParentMaxLen = 24
 
 // seatTempParent is the daemon's TMPDIR when that is short enough for the
