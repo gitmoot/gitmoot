@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -49,17 +50,19 @@ func TestContainerRuntimeProbeHelper(t *testing.T) {
 }
 
 // requirePrivateMountNamespace skips unless this process can create a mount
-// namespace for a child, which the test-owned runtime fixture needs.
+// namespace for a child and mount inside it, which the test-owned runtime
+// fixture needs. Both fail without CAP_SYS_ADMIN, and the mount also fails
+// inside an enclosing Landlock domain.
 func requirePrivateMountNamespace(t *testing.T) {
 	t.Helper()
-	command := exec.Command("/bin/true")
-	command.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
-	if err := command.Run(); err != nil {
-		t.Logf("cannot create a mount namespace: %v", err)
-		t.Skip("test-owned container runtime fixture needs CAP_SYS_ADMIN; run as root")
-	}
 	if _, err := exec.LookPath("mount"); err != nil {
 		t.Skipf("mount(8) unavailable: %v", err)
+	}
+	command := exec.Command("mount", "--make-rprivate", "/")
+	command.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNS}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Logf("cannot mount in a private mount namespace: %v: %s", err, strings.TrimSpace(string(output)))
+		t.Skip("test-owned container runtime fixture needs CAP_SYS_ADMIN outside any Landlock domain; run as root")
 	}
 }
 
@@ -108,12 +111,14 @@ func probeRefused(output, path string) bool {
 
 // TestSandboxExecReadOnlySeatHidesContainerRuntimeE2E proves the hiding
 // mechanism against TEST-OWNED sockets, never the host runtime. The fixture runs
-// in its own private mount namespace with an empty tmpfs over /run, and
-// bind-mounts one test-owned listening socket at the runtime socket paths a
-// read-only seat must hide: dockerd's API socket, containerd's API socket, a
-// containerd shim socket, and dockerd's embedded containerd. Both seats then run
-// inside that namespace, so the writable seat afterwards also proves the
-// read-only seat's mounts stayed in the seat's own namespace.
+// in its own private mount namespace with empty tmpfs mounts over /run (and
+// over /var/snap and /home when the test does not need them), and bind-mounts
+// one test-owned listening socket at runtime endpoints a read-only seat must
+// hide: dockerd's API socket and embedded containerd, containerd's API and
+// shim sockets, cri-dockerd, k0s, rootless podman, microk8s, and Colima in a
+// user's home. Both seats then run inside that namespace, so the writable seat
+// afterwards also proves the read-only seat's mounts stayed in the seat's own
+// namespace.
 func TestSandboxExecReadOnlySeatHidesContainerRuntimeE2E(t *testing.T) {
 	requireLandlockABI(t)
 	requirePrivateMountNamespace(t)
@@ -135,25 +140,72 @@ func TestSandboxExecReadOnlySeatHidesContainerRuntimeE2E(t *testing.T) {
 	socket := filepath.Join(base, "runtime.sock")
 	listenTestRuntimeSocket(t, socket)
 
-	targets := []string{
-		"/run/docker.sock",
-		"/run/containerd/containerd.sock",
-		"/run/containerd/s/0123456789abcdef",
-		"/run/docker/containerd/containerd.sock",
-	}
-	if resolved, err := filepath.EvalSymlinks("/var/run"); err == nil && resolved == "/run" {
-		targets = append(targets, "/var/run/docker.sock")
-	}
-	// The mounts a read-only seat lays over the fixture: /dev/null on the socket
-	// file, an empty tmpfs on each runtime state directory.
-	covers := []string{"/run/docker.sock", "/run/containerd", "/run/docker"}
-
 	readArgs := []string{"--read", workdir}
+	needed := []string{gitmoot, probe, base}
 	if resolved, err := exec.LookPath("go"); err == nil {
 		if root, ok := toolchainRootForTest(resolved); ok {
 			readArgs = append(readArgs, "--read", root)
+			needed = append(needed, root)
 		}
 	}
+
+	// Each fixture endpoint: the socket path the seat probes, and the cover the
+	// read-only seat must lay over it (/dev/null on a socket file, an empty
+	// tmpfs on a runtime directory).
+	type endpoint struct{ target, cover string }
+	endpoints := []endpoint{
+		{"/run/docker.sock", "/run/docker.sock"},
+		{"/run/containerd/containerd.sock", "/run/containerd"},
+		{"/run/containerd/s/0123456789abcdef", "/run/containerd"},
+		{"/run/docker/containerd/containerd.sock", "/run/docker"},
+		{"/run/cri-dockerd.sock", "/run/cri-dockerd.sock"},
+		{"/run/k0s/containerd.sock", "/run/k0s"},
+		{"/run/user/4242/podman/podman.sock", "/run/user/4242/podman"},
+	}
+	roots := []string{"/run"}
+	// /var/snap and /home are replaced only when nothing the seats run lives
+	// there, so the fixture never hides the toolchain or the test binaries.
+	for _, extra := range []struct {
+		root string
+		endpoint
+	}{
+		{"/var/snap", endpoint{"/var/snap/microk8s/common/run/containerd.sock", "/var/snap/microk8s/common/run"}},
+		{"/home", endpoint{"/home/gitmoot-fixture/.colima/default/docker.sock", "/home/gitmoot-fixture/.colima"}},
+	} {
+		if info, err := os.Stat(extra.root); err != nil || !info.IsDir() {
+			t.Logf("fixture skips %s: %s is not a directory here", extra.target, extra.root)
+			continue
+		}
+		if slices.ContainsFunc(needed, func(path string) bool { return strings.HasPrefix(path, extra.root+"/") }) {
+			t.Logf("fixture skips %s: the test needs files under %s", extra.target, extra.root)
+			continue
+		}
+		roots = append(roots, extra.root)
+		endpoints = append(endpoints, extra.endpoint)
+	}
+	if resolved, err := filepath.EvalSymlinks("/var/run"); err == nil && resolved == "/run" {
+		endpoints = append(endpoints, endpoint{"/var/run/docker.sock", "/run/docker.sock"})
+	}
+	var targets, covers []string
+	setup := []string{"set -eu", "mount --make-rprivate /"}
+	for _, root := range roots {
+		setup = append(setup, "mount -t tmpfs -o mode=0755 gitmoot-test "+shellQuote(root))
+	}
+	for _, e := range endpoints {
+		targets = append(targets, e.target)
+		if !slices.Contains(covers, e.cover) {
+			covers = append(covers, e.cover)
+		}
+		if strings.HasPrefix(e.target, "/var/run/") {
+			continue
+		}
+		setup = append(setup,
+			"mkdir -p "+shellQuote(filepath.Dir(e.target)),
+			": > "+shellQuote(e.target),
+			`mount --bind "$0" `+shellQuote(e.target))
+	}
+
+	t.Logf("fixture endpoints: %s", strings.Join(targets, ", "))
 	seat := func(readOnly bool) string {
 		args := []string{gitmoot, "sandbox-exec"}
 		if readOnly {
@@ -164,14 +216,7 @@ func TestSandboxExecReadOnlySeatHidesContainerRuntimeE2E(t *testing.T) {
 			`cat "$0" && echo && go version && exec "$1" -test.run '^TestContainerRuntimeProbeHelper$'`, source, probe)
 		return shellQuote(args...)
 	}
-	script := `set -eu
-mount --make-rprivate /
-mount -t tmpfs -o mode=0755 gitmoot-test-run /run
-mkdir -p /run/containerd/s /run/docker/containerd
-for target in /run/docker.sock /run/containerd/containerd.sock /run/containerd/s/0123456789abcdef /run/docker/containerd/containerd.sock; do
-	: > "$target"
-	mount --bind "$0" "$target"
-done
+	script := strings.Join(setup, "\n") + `
 echo '== read-only'
 ` + seat(true) + ` 2>&1 || echo "read-only seat exit $?"
 echo '== writable'
@@ -249,6 +294,16 @@ func hostContainerRuntimeSockets(t *testing.T) []string {
 		"/run/podman/podman.sock",
 		"/run/crio/crio.sock",
 		"/run/buildkit/buildkitd.sock",
+		"/run/cri-dockerd.sock",
+		"/run/k0s/containerd.sock",
+		"/run/k3s/containerd/containerd.sock",
+		"/var/snap/microk8s/common/run/containerd.sock",
+		"/run/user/*/docker.sock",
+		"/run/user/*/podman/podman.sock",
+		"/root/.docker/run/docker.sock",
+		"/home/*/.docker/run/docker.sock",
+		"/home/*/.colima/*/docker.sock",
+		"/home/*/.rd/docker.sock",
 	}
 	var sockets []string
 	for _, pattern := range patterns {

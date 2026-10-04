@@ -53,17 +53,20 @@ func requireLandlockABI(t *testing.T) int {
 }
 
 // requireReadOnlySeatLaunchable skips when this host cannot start a read-only
-// seat at all: a host container runtime exists and this process lacks the
-// privilege to hide it, so sandbox-exec refuses by design. CI runs these tests
-// as root to keep the coverage.
+// seat at all: a host container runtime exists and sandbox-exec cannot hide it
+// here, so it refuses by design. That covers every hiding failure: no
+// CAP_SYS_ADMIN for the mount namespace, or mounts denied because the test
+// already runs inside a Landlock domain (a review seat). CI runs these tests as
+// root to keep the coverage.
 func requireReadOnlySeatLaunchable(t *testing.T, gitmoot string) {
 	t.Helper()
 	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--", "/bin/true")
 	command.Dir = t.TempDir()
 	output, err := command.CombinedOutput()
-	if err != nil && strings.Contains(string(output), "to hide the host container runtime") {
-		t.Logf("read-only seats cannot start unprivileged on this host: %s", strings.TrimSpace(string(output)))
-		t.Skip("read-only seat refuses to start without CAP_SYS_ADMIN while a host container runtime exists; run as root")
+	// The literal pins the documented refusal text (ContainerRuntimeHidingRefusal).
+	if err != nil && strings.Contains(string(output), "read-only seat cannot hide the host container runtime") {
+		t.Logf("read-only seats cannot start on this host: %s", strings.TrimSpace(string(output)))
+		t.Skip("read-only seat refuses to start: a host container runtime exists and cannot be hidden here; run as root, outside any sandbox")
 	}
 }
 

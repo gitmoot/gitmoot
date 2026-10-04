@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/sandbox"
 )
 
 // TestMain MUST stay in the default build (#1760 step 3). It is the package's
@@ -131,9 +133,11 @@ var readOnlySeatLaunch struct {
 }
 
 // requireReadOnlySeatLaunchable skips a test that runs a read-only seat when
-// this host cannot start one at all: a host container runtime exists and the
-// test process lacks the privilege to hide it, so sandbox-exec refuses by
-// design (#2318). CI reruns the sandbox E2E tests as root; locally, run as root.
+// this host cannot start one at all: a host container runtime exists and
+// sandbox-exec cannot hide it here, so it refuses by design (#2318). That covers
+// every hiding failure: no CAP_SYS_ADMIN for the mount namespace, or mounts
+// denied because the test already runs inside a Landlock domain (a review
+// seat). The CI e2e lane runs as root; locally, run as root outside any sandbox.
 func requireReadOnlySeatLaunchable(t *testing.T) {
 	t.Helper()
 	readOnlySeatLaunch.once.Do(func() {
@@ -144,12 +148,12 @@ func requireReadOnlySeatLaunchable(t *testing.T) {
 		command := exec.Command(executable, "sandbox-exec", "--read-only-workdir", "--", "/bin/true")
 		command.Dir = os.TempDir()
 		output, err := command.CombinedOutput()
-		if err != nil && strings.Contains(string(output), "to hide the host container runtime") {
+		if err != nil && strings.Contains(string(output), sandbox.ContainerRuntimeHidingRefusal) {
 			readOnlySeatLaunch.reason = strings.TrimSpace(string(output))
 		}
 	})
 	if readOnlySeatLaunch.reason != "" {
-		t.Logf("read-only seats cannot start unprivileged on this host: %s", readOnlySeatLaunch.reason)
-		t.Skip("read-only seat refuses to start without CAP_SYS_ADMIN while a host container runtime exists; run as root")
+		t.Logf("read-only seats cannot start on this host: %s", readOnlySeatLaunch.reason)
+		t.Skip("read-only seat refuses to start: a host container runtime exists and cannot be hidden here; run as root, outside any sandbox")
 	}
 }

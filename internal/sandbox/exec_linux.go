@@ -125,7 +125,7 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		// thread that hides the host container runtime.
 		runtime.LockOSThread()
 		if err := hideContainerRuntime(); err != nil {
-			return fmt.Errorf("read-only seat: %w", err)
+			return fmt.Errorf("%s: %w", ContainerRuntimeHidingRefusal, err)
 		}
 	}
 
