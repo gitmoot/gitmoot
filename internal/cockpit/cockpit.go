@@ -26,14 +26,17 @@ const (
 )
 
 // Options configures the herdr client. HerdrBin is the herdr binary name or
-// path; empty defaults to "herdr".
+// path; empty defaults to "herdr". OMPRuntimeDir is the Gitmoot home's OMP
+// inbox add-on registry (config.Paths.OMPRuntimeDir); empty disables delivery.
 type Options struct {
-	HerdrBin string
+	HerdrBin      string
+	OMPRuntimeDir string
 }
 
 // Cockpit is the timeout-bounded herdr client.
 type Cockpit struct {
-	client herdrClient
+	client        herdrClient
+	ompRuntimeDir string
 
 	// availMu guards the memoized availability check; see availableTTL.
 	availMu     sync.Mutex
@@ -51,12 +54,12 @@ func New(opts Options) *Cockpit {
 	}
 	return &Cockpit{
 		client: herdrClient{
-			run:         newExecRunner(opts.HerdrBin),
-			runCombined: newExecRunnerCombined(opts.HerdrBin),
-			bin:         opts.HerdrBin,
-			lookPath:    exec.LookPath,
+			run:      newExecRunner(opts.HerdrBin),
+			bin:      opts.HerdrBin,
+			lookPath: exec.LookPath,
 		},
-		now: time.Now,
+		ompRuntimeDir: opts.OMPRuntimeDir,
+		now:           time.Now,
 	}
 }
 
@@ -87,13 +90,14 @@ func (c *Cockpit) Available(ctx context.Context) bool {
 	return ok
 }
 
-// AgentNotify reports atomic runtime admission, an unknown receipt, or rejection.
-// Unknown outcomes must be reconciled, never automatically resent.
+// AgentNotify reports atomic runtime admission, an unknown receipt, or a
+// *NotificationDeferred proving nothing reached the runtime. Unknown outcomes
+// must be reconciled, never automatically resent.
 func (c *Cockpit) AgentNotify(ctx context.Context, target NotificationTarget, prompt string) (delivered bool, uncertain bool, err error) {
 	if c == nil {
 		return false, false, fmt.Errorf("cockpit is nil")
 	}
-	return c.client.agentNotify(ctx, target, prompt)
+	return c.client.agentNotify(ctx, c.ompRuntimeDir, target, prompt)
 }
 
 // ResolvePaneByLabel resolves a registered recipient from an explicit agent:name
@@ -110,8 +114,8 @@ func (c *Cockpit) ResolvePaneByLabel(ctx context.Context, label string) (string,
 	return pane, ok
 }
 
-// ResolveNotificationTarget pins the runtime observed in the live registration.
-// Renaming or replacing the recipient before admission invalidates this target.
+// ResolveNotificationTarget resolves the registered recipient's pane and agent
+// kind. The runtime session is pinned later from the pane's live process.
 func (c *Cockpit) ResolveNotificationTarget(ctx context.Context, binding string) (NotificationTarget, bool) {
 	if c == nil {
 		return NotificationTarget{}, false
@@ -124,5 +128,5 @@ func (c *Cockpit) ResolveNotificationTarget(ctx context.Context, binding string)
 	if selector == "" {
 		selector = agent.PaneID
 	}
-	return NotificationTarget{Selector: selector, Runtime: agent.NotificationTarget}, true
+	return NotificationTarget{Selector: selector, PaneID: agent.PaneID, Kind: agent.Agent}, true
 }

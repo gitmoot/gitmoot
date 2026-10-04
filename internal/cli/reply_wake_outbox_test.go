@@ -722,7 +722,7 @@ func TestRuntimeDeferralKeepsEntireBatchPendingWithoutRetryBudget(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	for range wakeDeliveryMaxAttempts + 2 {
+	for range 5 {
 		// Pending mail remains an outstanding obligation in drain health.
 		_ = drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
 		rows, err := store.ListWakeOutbox(context.Background(), "")
@@ -741,100 +741,6 @@ func TestRuntimeDeferralKeepsEntireBatchPendingWithoutRetryBudget(t *testing.T) 
 	if err != nil || len(rows) != 2 || rows[0].State != "delivered" || rows[1].State != "superseded" ||
 		rows[1].LastError != db.WakeOutboxCoalescedDetail(rows[0].ID) {
 		t.Fatalf("safe boundary did not acknowledge the whole batch: %+v err=%v", rows, err)
-	}
-}
-
-// A pre-write modal refusal is safe to retry; an uncertain write is not.
-func TestBlockedWakeIsRetriedNotDropped(t *testing.T) {
-	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
-	ctx := context.Background()
-	wake.promptErr = errors.New("agent prompt agent_blocked: modal open")
-	for index := range 2 {
-		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: "release/retry", Author: "worker", Body: fmt.Sprint(index),
-			AddressedTarget: "owner",
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Input was refused before writing; the coalesced rows remain retryable.
-	if err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink); err == nil {
-		t.Fatal("stalled drain reported healthy; the obligation is still outstanding")
-	}
-	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil || len(pending) != 2 {
-		t.Fatalf("pending after stall = %+v, err=%v, want both rows retryable", pending, err)
-	}
-	for _, row := range pending {
-		if row.AttemptCount != 1 || row.LastError == "" || row.FinishedAt != "" {
-			t.Fatalf("retryable row = %+v, want one recorded attempt, a cause, and no finish stamp", row)
-		}
-	}
-	if stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateStalled); err != nil || len(stalled) != 0 {
-		t.Fatalf("stalled rows = %+v, err=%v, want none while the retry budget remains", stalled, err)
-	}
-
-	// The pane recovers, and the retry re-coalesces BOTH rows into one wake:
-	// the retry must not lose the notes a superseded sibling carried.
-	wake.promptErr = nil
-	wake.promptCalls = 0
-	drainReplyWakeAfterAllRowsAreDue(t, store, sink)
-	if wake.promptCalls != 1 {
-		t.Fatalf("retry wake = calls=%d prompt=%q, want one wake naming both notes", wake.promptCalls, wake.prompt)
-	}
-	delivered, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateDelivered)
-	if err != nil || len(delivered) != 1 || delivered[0].AttemptCount != 2 {
-		t.Fatalf("delivered = %+v, err=%v, want one survivor on its second attempt", delivered, err)
-	}
-	superseded, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateSuperseded)
-	if err != nil || len(superseded) != 1 ||
-		superseded[0].LastError != db.WakeOutboxCoalescedDetail(delivered[0].ID) {
-		t.Fatalf("superseded = %+v, err=%v, want the sibling collapsed into the survivor", superseded, err)
-	}
-}
-
-// Exhausting retries must not make an undelivered obligation disappear.
-func TestBlockedWakeStopsAtItsRetryBudget(t *testing.T) {
-	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
-	ctx := context.Background()
-	wake.promptErr = errors.New("agent prompt agent_blocked: modal open")
-	note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-		WorkflowID: "release/budget", Author: "worker", Body: "never lands",
-		AddressedTarget: "owner",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for attempt := 1; attempt <= wakeDeliveryMaxAttempts; attempt++ {
-		err := drainReplyWakeAfterAllRowsAreDueResult(t, store, sink)
-		if err == nil {
-			t.Fatalf("attempt %d hid the undelivered obligation", attempt)
-		}
-	}
-	if wake.promptCalls != wakeDeliveryMaxAttempts {
-		t.Fatalf("prompt calls = %d, want exactly %d attempts", wake.promptCalls, wakeDeliveryMaxAttempts)
-	}
-	stalled, err := store.ListWakeOutbox(ctx, db.WakeOutboxStateFailed)
-	if err != nil || len(stalled) != 1 || stalled[0].AttemptCount != wakeDeliveryMaxAttempts {
-		t.Fatalf("stalled = %+v, err=%v, want one exhausted row", stalled, err)
-	}
-	if stalled[0].FinishedAt == "" || !strings.Contains(stalled[0].LastError, "agent_blocked") {
-		t.Fatalf("exhausted row = %+v, want a finish stamp and the recorded cause", stalled[0])
-	}
-	// The failure is attributable without reading the daemon log: it names the
-	// role, the cause and how many attempts were spent.
-	events, err := store.ListJobEvents(ctx, fmt.Sprintf("wake-outbox:%d", stalled[0].ID))
-	if err != nil || len(events) != 1 || events[0].Kind != db.WakeOutboxDeliveryFailedEventKind {
-		t.Fatalf("delivery failure events = %+v, err=%v", events, err)
-	}
-	for _, want := range []string{"owner", "agent_blocked", fmt.Sprintf("attempts=%d", wakeDeliveryMaxAttempts)} {
-		if !strings.Contains(events[0].Message, want) {
-			t.Fatalf("failure event %q does not name %q", events[0].Message, want)
-		}
-	}
-	// And the note itself is still identifiable from the row.
-	if stalled[0].SourceID != fmt.Sprint(note.ID) {
-		t.Fatalf("exhausted row source = %q, want note %d", stalled[0].SourceID, note.ID)
 	}
 }
 
@@ -1357,6 +1263,7 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 	withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
 		States:       map[string]org.RoleLiveState{"owner": {State: org.StateIdle}},
 		PaneBindings: map[string]org.PaneBinding{"owner": {PaneID: "w1:p1"}},
+		Sessions:     map[string]org.SessionActivity{"owner": {PaneID: "w1:p1", Agent: "omp"}},
 	}})
 	store, err := dbtest.Open(t, paths.Database)
 	if err != nil {
@@ -1481,10 +1388,15 @@ type replyWakeTestRole struct {
 
 func replyWakeTestHarness(t *testing.T, roles []replyWakeTestRole) (*db.Store, synchronousEventRuleTestSink, *fakeEventWake, string) {
 	t.Helper()
-	snapshot := org.Snapshot{States: make(map[string]org.RoleLiveState), PaneBindings: make(map[string]org.PaneBinding)}
+	snapshot := org.Snapshot{
+		States:       make(map[string]org.RoleLiveState),
+		PaneBindings: make(map[string]org.PaneBinding),
+		Sessions:     make(map[string]org.SessionActivity),
+	}
 	for _, role := range roles {
 		snapshot.States[role.name] = org.RoleLiveState{State: org.StateIdle}
 		snapshot.PaneBindings[role.name] = org.PaneBinding{PaneID: role.pane}
+		snapshot.Sessions[role.name] = org.SessionActivity{PaneID: role.pane, Agent: "omp"}
 	}
 	withOrgProvider(t, orgFixtureProvider{snapshot: snapshot})
 	home := t.TempDir()

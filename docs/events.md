@@ -246,19 +246,38 @@ A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
 retried on a later tick without aborting unrelated repository work.
-Before claiming a notice, the daemon checks the registered recipient's live
-binding and input state. Busy, blocked, unknown and offline recipients keep
-their pending notices and a visible deferral reason without spending attempts.
-A later eligible snapshot allows another admission attempt, never replay of an
-uncertain attempt. Delivery uses only Herdr's private `agent.prompt_safe` endpoint.
-Gitmoot pins the runtime nonce, session and generation observed while resolving
-the recipient; Herdr and OMP reject a replaced registration or stale session.
-OMP checks active work, drafts, attachments, paste/clipboard work and modal UI
-atomically with reserving the turn. No PTY typing or draft restoration is used.
-An explicit runtime deferral returns the entire batch to `pending` without
-spending retry budget. `accepted` means runtime admission, not persistence, reading
-or completion. A missing receipt remains `delivery_unknown` without automatic
-retry, including a CLI failure after admission.
+Before claiming a notice, the daemon checks the recipient's registered seat and
+its runtime. Unregistered, unseated, offline and ambiguous recipients keep their
+pending notices and a visible deferral reason without spending attempts. A busy
+recipient is not held back: the runtime decides. Only OMP seats (Herdr agent
+kind `omp`) are notified by the daemon. Claude Code and Codex seats stay
+`pending` with `waiting for recipient's next turn` and are never claimed or
+attempted by the daemon; any other runtime stays `pending` with
+`runtime notification capability unavailable`. Nothing ever types into a
+recipient's terminal.
+
+Delivery goes straight to the Gitmoot OMP inbox add-on (`gitmoot plugin install
+omp`). The daemon reads the seat pane's foreground processes with
+`herdr pane process-info --pane ID` and picks the add-on registration in
+`<gitmoot home>/run/omp/` whose `pid` is one of them. The registry directory,
+the registration file and its Unix socket must belong to the daemon's user,
+must not be symlinks, and must have no group or other permissions; the socket
+must live in that directory. A missing, ambiguous or refused registration keeps
+the notice `pending` with `runtime notification capability unavailable`. The
+daemon connects, sends one `deliver` request pinned to the registration's
+runtime, session and generation, and waits a few seconds for one reply. The
+add-on refuses a replaced session (`stale_session`) and defers while the
+operator is typing, a dialog is open or a draft is in progress. A working
+session gets the note at its next step boundary; an idle one starts a turn.
+The note never touches the editor.
+
+`accepted` marks the row `delivered`. That means runtime admission, not
+reading or completion. A `deferred` reply, or any failure before the request
+is written (no process, no registration, refused connection), returns the whole
+batch to `pending` with the reason and spends no retry budget; a later tick
+pins the then-current session. Once the request is written, a missing, late or
+unreadable reply leaves the row `delivery_unknown`; it is never resent
+automatically.
 
 Quota failures pause the runtime even if notification configuration is invalid.
 The incident's one-shot parent notification claim commits with its shared inbox
@@ -304,10 +323,7 @@ or ambiguous names fail closed. Literal pane IDs and exact labels still work,
 but only when the resolved pane contains a registered agent; an abandoned
 shell is not a delivery target. The agent binding also drives org presence.
 
-Delivery calls `herdr agent prompt <pane> <prompt> --wait --timeout 8000`.
-Only `delivery = "submitted"` or `agent_status_unobserved_after_submit` confirms
-submission. This does not mean the recipient read or completed the work.
-Uncertain input does not increment missed-wake counters.
+Uncertain delivery does not increment missed-wake counters.
 
 Inspect notices with `org wake list --state STATE` and `org wake show ID`.
 After checking the current review head and recipient ownership, use
@@ -319,10 +335,11 @@ an audit and reject concurrent changes to the inspected row. Never bulk replay
 the backlog: adding a route or enabling addressed delivery can immediately
 release previously pending notices.
 
-Each `agent_prompt_stalled` outcome increments a durable, consecutive counter
-for the wake role; a delivered prompt resets that role's counter. Transport
-errors and other non-delivery outcomes do not change it because a Herdr outage
-is infrastructure failure, not evidence that every role ignored a wake. Set
+Each wake whose role binding cannot be resolved increments a durable,
+consecutive counter for the wake role; a delivered notice resets that role's
+counter. Transport errors, deferrals and other non-delivery outcomes do not
+change it because a Herdr outage is infrastructure failure, not evidence that
+every role ignored a wake. Set
 `[orchestrate].max_consecutive_missed_wakes` to a positive integer to append a
 `⚠ flagged (N missed wakes)` marker to that role in `gitmoot org chart` and
 `gitmoot org status`; their JSON rows expose `missed_wakes`, `flagged`, and

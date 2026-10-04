@@ -7,17 +7,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/cockpit"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func TestMessageDaemonDefersUnsafeRecipientsAndNeverReplaysUnknown(t *testing.T) {
+// Offline, unbound and non-OMP recipients keep mail pending without spending
+// an attempt; a working OMP recipient is notified (its add-on decides), and an
+// unknown outcome is never replayed.
+func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testing.T) {
 	for _, kind := range []string{"message", "directive"} {
 		t.Run(kind, func(t *testing.T) {
 			ctx := context.Background()
 			store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}, {"worker", "agent:worker"}})
-			snapshot := org.Snapshot{States: map[string]org.RoleLiveState{"worker": {State: org.StateWorking}}, PaneBindings: map[string]org.PaneBinding{"worker": {PaneID: "w1:p2"}}}
+			snapshot := org.Snapshot{
+				States:       map[string]org.RoleLiveState{"worker": {State: org.StateIdle}},
+				PaneBindings: map[string]org.PaneBinding{"worker": {PaneID: "w1:p2"}},
+				Sessions:     map[string]org.SessionActivity{},
+			}
 			withOrgProvider(t, orgFixtureProvider{snapshot: snapshot})
 			body := "[org:message to=worker from=owner wf=safety] Queued conversation"
 			if kind == "directive" {
@@ -37,33 +45,37 @@ func TestMessageDaemonDefersUnsafeRecipientsAndNeverReplaysUnknown(t *testing.T)
 				}
 			}
 			now := time.Now().UTC().Add(time.Hour)
-			for _, unsafe := range []struct {
-				name    string
-				state   org.LifecycleState
-				binding org.PaneBinding
+			for _, held := range []struct {
+				name, agent, reason string
+				binding             org.PaneBinding
 			}{
-				{"busy", org.StateWorking, org.PaneBinding{PaneID: "w1:p2"}},
-				{"dialog", org.StateBlocked, org.PaneBinding{PaneID: "w1:p2"}},
-				{"draft", org.StateInputPending, org.PaneBinding{PaneID: "w1:p2"}},
-				{"absent", org.StateIdle, org.PaneBinding{}},
-				{"ambiguous", org.StateIdle, org.PaneBinding{PaneID: "w1:p2", Ambiguous: true}},
+				{"absent", "omp", "recipient is offline or its binding is unresolved", org.PaneBinding{}},
+				{"ambiguous", "omp", "recipient is offline or its binding is unresolved", org.PaneBinding{PaneID: "w1:p2", Ambiguous: true}},
+				{"claude", "claude", cockpit.NotificationAwaitingNextTurn, org.PaneBinding{PaneID: "w1:p2"}},
+				{"codex", "codex", cockpit.NotificationAwaitingNextTurn, org.PaneBinding{PaneID: "w1:p2"}},
+				{"unsupported runtime", "pi", cockpit.NotificationCapabilityUnavailable, org.PaneBinding{PaneID: "w1:p2"}},
+				{"undetected runtime", "", cockpit.NotificationCapabilityUnavailable, org.PaneBinding{PaneID: "w1:p2"}},
 			} {
-				snapshot.States["worker"] = org.RoleLiveState{State: unsafe.state}
-				snapshot.PaneBindings["worker"] = unsafe.binding
-				tick(now)
+				snapshot.PaneBindings["worker"] = held.binding
+				snapshot.Sessions["worker"] = org.SessionActivity{PaneID: held.binding.PaneID, Agent: held.agent}
+				for range 2 {
+					tick(now)
+				}
 				rows, err := store.ListWakeOutbox(ctx, "")
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(rows) != 1 || rows[0].State != db.WakeOutboxStatePending || rows[0].AttemptCount != 0 || rows[0].LastError == "" || wake.promptCalls != 0 {
-					t.Fatalf("%s did not defer safely: rows=%+v calls=%d log=%s", unsafe.name, rows, wake.promptCalls, diagnostic.String())
+				if len(rows) != 1 || rows[0].State != db.WakeOutboxStatePending || rows[0].AttemptCount != 0 || rows[0].LastError != held.reason || wake.promptCalls != 0 {
+					t.Fatalf("%s was not held pending with reason %q: rows=%+v calls=%d log=%s", held.name, held.reason, rows, wake.promptCalls, diagnostic.String())
 				}
 				if _, err := store.GetMessage(ctx, note.ID, "worker"); err != nil {
-					t.Fatalf("%s lost durable inbox: %v", unsafe.name, err)
+					t.Fatalf("%s lost durable inbox: %v", held.name, err)
 				}
 			}
-			snapshot.States["worker"] = org.RoleLiveState{State: org.StateIdle}
+			// A working OMP recipient is notified now, not at the end of its turn.
+			snapshot.States["worker"] = org.RoleLiveState{State: org.StateWorking}
 			snapshot.PaneBindings["worker"] = org.PaneBinding{PaneID: "w1:p3"}
+			snapshot.Sessions["worker"] = org.SessionActivity{PaneID: "w1:p3", Agent: "omp"}
 			wake.labelToPane = map[string]string{"agent:worker": "w1:p3"}
 			wake.onPrompt = func() error { panic("transport crashed after input may have been written") }
 			tick(now)
