@@ -2263,6 +2263,20 @@ surfaces, without aliases. Historical addressed notes retain their IDs and
 source links. Import creates inbox projections, never new wake obligations;
 unknown delivery stays unknown.
 
+Claude Code and Codex seats receive mail at turn boundaries through the
+Gitmoot plugin's hooks, which run
+`gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop
+--runtime claude|codex`. The acting role resolves like other message
+commands. The command moves that role's `queued` notifications to `submitted`
+with a `turn-hook:<runtime>:<event>` receipt in one transaction, then prints
+the runtime's hook JSON naming each message once: ID, kind, sender, a short
+scrubbed preview and `gitmoot message show ID`. At most 10 items are named per
+hook; the rest stay queued for the next hook point. No mail, a subagent hook,
+or a `Stop` that is already a stop-hook continuation prints nothing. It always
+exits 0, reporting problems on stderr only, so a hook never fails a turn. It
+never touches `submitting` or `uncertain` notifications and never types into a
+terminal.
+
 Rollout must use one notification daemon and one writer version per shared home.
 Preserve the current executable and a consistent database backup in a durable,
 access-controlled location before upgrade. First migrate a copy and verify that

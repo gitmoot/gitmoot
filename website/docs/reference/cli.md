@@ -1913,6 +1913,16 @@ and `org directive` sending surfaces, without aliases. Historical addressed
 notes retain their IDs and source links. Import creates inbox projections,
 never new wake obligations; unknown delivery stays unknown.
 
+Claude Code and Codex seats receive mail at turn boundaries through the
+Gitmoot plugin's hooks, which run
+`gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop
+--runtime claude|codex`. The command marks the acting role's queued
+notifications submitted with a `turn-hook:<runtime>:<event>` receipt, then
+prints hook JSON naming each message once (ID, kind, sender, scrubbed preview,
+`gitmoot message show ID`), at most 10 per hook. No mail prints nothing; it
+always exits 0 and reports problems on stderr. See
+[Codex and Claude plugins](../plugins/codex-claude.md) for event support.
+
 `gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE]`
 records an answer and resolution in the original thread and queues one notice
 to the original requester. `--note` accepts a message in this thread or a plain

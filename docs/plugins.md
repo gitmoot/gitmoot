@@ -150,7 +150,8 @@ and runtime validation where supported.
 
 ## Presence Hooks
 
-Generated Codex and Claude packages include a `SessionStart` command hook. On
+Generated Codex and Claude packages include a `SessionStart` command hook and
+the inbox turn hooks described below. On
 startup, resume, clear, and compact events, the runtime runs
 `gitmoot plugin hook-context` with a 5-second timeout and passes the hook event
 JSON on stdin. The command reads the session working directory when available,
@@ -186,10 +187,63 @@ Role split:
 - Dashboard: live monitoring for humans, not a substitute for an agent answer.
 
 Hooks run local commands with the permissions of your runtime session. Review
-the generated hook command before enabling or trusting it. For Codex, plugin
-hooks are skipped until you review and trust the current hook definition. The
-expected Gitmoot command is limited to `gitmoot plugin hook-context` and does
-not mutate Gitmoot or repository state.
+the generated hook commands before enabling or trusting them. For Codex, plugin
+hooks are skipped until you review and trust the current hook definitions in
+`/hooks`; rebuilding or reinstalling the plugin changes the hash and asks again.
+The `SessionStart` command is limited to `gitmoot plugin hook-context` and does
+not mutate Gitmoot or repository state. The inbox hooks below run only
+`gitmoot message pending`, whose sole write is marking the seat's own delivered
+notifications.
+
+## Inbox Turn Hooks
+
+Claude Code and Codex cannot be woken safely from outside, so Gitmoot never
+types into their terminals. Instead the generated packages add three command
+hooks that deliver the seat's inbox mail at turn boundaries:
+
+| Event | When it fires | Claude Code output | Codex output |
+| --- | --- | --- | --- |
+| `UserPromptSubmit` | the operator (or a scheduled prompt) starts a turn | `hookSpecificOutput.additionalContext` | `hookSpecificOutput.additionalContext` |
+| `PostToolUse` (every tool) | after each tool call during a turn | `hookSpecificOutput.additionalContext` | `hookSpecificOutput.additionalContext` |
+| `Stop` | the turn is about to end | `hookSpecificOutput.additionalContext`, which continues the turn | `decision: "block"` with the mail as `reason`, which Codex runs as a continuation prompt |
+
+Each hook runs
+`gitmoot message pending --claim --hook <event> --runtime claude|codex` with a
+15-second timeout and no status message. The acting role comes from
+`GITMOOT_ORG_ROLE`, else the registered Herdr pane in `HERDR_PANE_ID`; a
+session with neither prints nothing. In one transaction the command moves that
+role's queued notifications to submitted with a
+`turn-hook:<runtime>:<event>` receipt, so each item is shown once even when
+hooks race, then lists each message's ID, kind, sender, a short scrubbed
+preview and `gitmoot message show ID`. At most 10 items are listed per hook;
+the rest wait for the next hook point. Directive notifications also record the
+same delivery receipt the daemon writes. Routing policy is the daemon's: a
+muted or unroutable notification is left queued. Notifications already being
+submitted or marked uncertain are never touched.
+
+The command always exits 0. Any problem is reported on stderr, which neither
+runtime shows to the model, and stdout stays empty so the turn proceeds.
+
+What each case looks like:
+
+- Mail sent while the seat is idle is seen when the operator next submits a
+  prompt. Neither runtime has a hook that starts a turn on its own.
+- Mail sent while the seat is working is seen after its next tool call.
+- Mail that arrives after the last tool call is seen at `Stop`, which continues
+  the turn once. A `Stop` that is already a stop-hook continuation
+  (`stop_hook_active: true`) prints nothing and leaves mail queued for the next
+  prompt, so the hook cannot loop. Claude Code also caps consecutive stop-hook
+  continuations at eight.
+- Hooks fired inside a subagent (`agent_id` in the hook input) print nothing,
+  because a subagent's context is not the seat's conversation.
+- Text is limited by the runtimes: Claude Code saves `additionalContext` over
+  10,000 characters to a file, and Codex spills it over about 2,500 tokens.
+  Ten short previews stay well below both.
+- A turn interrupted with Esc does not run `Stop`; its mail waits for the next
+  hook point.
+- Once claimed, mail is marked submitted even if the runtime then discards the
+  hook output, for example on its own timeout. It is not resent. It remains in
+  `gitmoot message inbox`.
 
 ## Use From Codex
 
