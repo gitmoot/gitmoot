@@ -429,7 +429,11 @@ func TestExecBackendLedgerTeardownRecordsRuntimeCost(t *testing.T) {
 	store := openExecBackendLedgerTestStore(t)
 	inner := &ledgerTestBackend{}
 	backend := newExecBackendLedgerForTest(t, store, inner, nil, "fence-cost", "boot-cost")
-	backend.perHourUSD = 0.166
+	// Through an interface so this test compiles on main and fails there on
+	// behaviour (NULL cost), not on the build.
+	if priced, ok := any(backend).(interface{ setPerHourUSD(float64) }); ok {
+		priced.setPerHourUSD(0.166)
+	}
 	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "job-cost", LifecycleGeneration: 1, TTL: time.Minute})
 	if err != nil {
 		t.Fatal(err)

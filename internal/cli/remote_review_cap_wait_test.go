@@ -118,9 +118,22 @@ func TestChecksRoutedReviewCapWaitIsBounded(t *testing.T) {
 	if waiting.State != string(workflow.JobQueued) {
 		t.Fatalf("first refusal state = %s; want queued", waiting.State)
 	}
-	previous := remoteReviewCapWaitNow
-	remoteReviewCapWaitNow = func() time.Time { return time.Now().UTC().Add(48 * time.Hour) }
-	t.Cleanup(func() { remoteReviewCapWaitNow = previous })
+	// Start the wait two days ago: far past any job timeout.
+	var aged map[string]any
+	if err := json.Unmarshal([]byte(waiting.Payload), &aged); err != nil {
+		t.Fatal(err)
+	}
+	aged["remote_cap_wait_since"] = time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339Nano)
+	encoded, err := json.Marshal(aged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.UpdateJobPayload(f.ctx, f.job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	if waiting, err = f.store.GetJob(f.ctx, f.job.ID); err != nil {
+		t.Fatal(err)
+	}
 	f.job = waiting
 	f.run(t)
 	failed, err := f.store.GetJob(f.ctx, f.job.ID)

@@ -235,6 +235,9 @@ func (b *ledgeredExecutionBackend) teardown(ctx context.Context, instance *execb
 	return errors.Join(append([]error{providerErr}, ledgerErrs...)...)
 }
 
+// setPerHourUSD prices a sandbox-hour for cost_actual_usd (#2316).
+func (b *ledgeredExecutionBackend) setPerHourUSD(rate float64) { b.perHourUSD = rate }
+
 // actualCostUSD is the compute cost of an attempt this teardown destroyed: its
 // lifetime, from the reservation row's created_at (just before the provider
 // create) to now, at the provider's configured cost_per_hour_usd (#2316). The
