@@ -948,7 +948,12 @@ operands. `agent review` forwards the same flag through the review router.
 `--exec-backend remote`. `e2b`, the default, is cloud E2B; `mac` runs the
 review on the Mac Studio's sandboxd and requires a `[remote_exec.mac]` section,
 otherwise the request is refused before enqueue. The choice is stored on the
-job and kept across retries; nothing is ever routed to the Mac automatically.
+job and kept across retries. A repository with `checks_backend = "remote"` in
+`[repos."owner/repo".review]` sends every review to its `checks_provider` and
+`checks_template`, whichever producer enqueued it (this command, PR fan-out,
+comment, heartbeat or pipeline reviews); a review without `--exec-provider`
+adopts `checks_provider`, and `--exec-backend local` or a different
+`--exec-provider` is refused (see the remote execution reference).
 `agent review` forwards the same flag.
 
 ### Review levels (#2265)

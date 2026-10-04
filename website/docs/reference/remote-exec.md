@@ -83,9 +83,9 @@ in a `[remote_exec.mac]` section with `api_key_file`, `template`,
 `omp_template`, HTTPS-origin `base_url` and `envd_base_url`,
 `omp_linux_arm64_file` (a verified Linux AArch64 OMP), the guests'
 `credential_gateway_url`, and a positive `max_concurrent`. A review runs there
-only when requested with `--exec-provider mac`; the provider is stored on the
-job, survives retries, and is never chosen automatically (the disk guard and
-routing policy use E2B only). An unknown provider, or `mac` without its
+only when requested with `--exec-provider mac` or when its repository sets
+`checks_provider = "mac"`; the provider is stored on the job and survives
+retries (the disk guard and `remote_routing_enabled` policy use E2B only). An unknown provider, or `mac` without its
 section, is refused at request time. Mac attempts count only against
 `max_concurrent` and reserve no dollars; E2B attempts count only against the
 E2B caps. Reconciliation lists and settles each provider separately. One
@@ -119,6 +119,69 @@ foreground reviews stay local. An explicit per-job `--exec-backend` always
 wins. Each dispatch persists a `review_backend_route_selected` event with its
 reason and the chosen backend. The remote worker rechecks current head and CI
 immediately before reserving capacity; a later red result refuses the cloud job.
+
+### Per-repository checks routing
+
+A repository whose review checks need a toolchain the local review seat lacks
+(Swift, Rust, Node, Flutter) can send every review to a remote provider and
+image (#2316):
+
+```toml
+[repos."owner/repo".review]
+checks_backend = "remote"          # the only value
+checks_provider = "e2b"            # or "mac"; default "e2b"
+checks_template = "gitmoot-swift"  # optional; replaces the provider's template
+```
+
+- Every review of that repository runs remotely on `checks_provider` with
+  `checks_template`, whichever producer enqueued it: policy-routed,
+  `agent review`, `review request`, native PR fan-out, comment-triggered,
+  heartbeat and pipeline review stages. The dispatch verbs record the route
+  when they enqueue; the worker applies it to any other review before it
+  resolves the job's backend, with the same `review_backend_route_selected`
+  event. The provider and template are stored in the job payload
+  (`exec_provider`, `exec_template`) so retries and model fallbacks keep them.
+  The template replaces the provider's `e2b_template`/`e2b_omp_template` for
+  that job only.
+- The `remote_routing_enabled` gates (CI-green, risk labels, purposes, stale
+  head at admission) are skipped: they control spend, and this routing is for
+  capability. Repositories without `checks_backend` are unchanged.
+- A review without `--exec-provider` (or `exec_provider`) adopts
+  `checks_provider`. Refused, with the repository and the setting named, at
+  dispatch or when the worker picks the job up: an explicit
+  `--exec-backend local`, an `--exec-provider` other than `checks_provider`, a
+  foreground review, and a reviewer whose runtime cannot run remotely (only
+  `shell` and `omp` can). There is no per-job override; to review the
+  repository locally, remove `checks_backend`.
+- `checks_provider` is validated when the config loads: an unknown provider, or
+  one with no `[remote_exec]`/`[remote_exec.mac]` API key file or no template
+  at all, makes every review of that repository refuse with that reason. Other
+  repositories keep loading. The `checks_*` keys are repository-scoped; in the
+  global `[review]` section they are an error.
+- Without `checks_template`, the template depends on the reviewer's runtime:
+  `omp` provisions the provider's `e2b_omp_template`, `shell` its
+  `e2b_template`. A provider that sets only one of them serves only that
+  runtime; a review on the other is refused naming the missing key.
+- When the provider's cost or concurrency cap is full, the review returns to
+  the queue instead of failing: a `remote_review_cap_waiting` job event names
+  the provider, the next retry time and the wait so far, and the scheduler
+  retries on its normal tick once `blocker_retry_at` passes (every 30 seconds).
+  When a slot frees, the review provisions and `remote_review_cap_admitted`
+  records how long it waited. The wait is bounded by the job timeout (one hour
+  when none is resolved); past it the job fails with the cap refusal as its
+  reason. An unconfigured cap fails immediately, because it never frees.
+- A remote review that declares `executed` evidence while its `tests_run`
+  reports a missing toolchain (`command not found`, exit 127, "toolchain
+  unavailable", "not installed") or names nothing that ran is recorded as
+  `static_only`, with a `remote_checks_evidence_clamped` job event.
+
+Actual cost: `[remote_exec].cost_per_hour_usd` is the provider's price for one
+sandbox-hour (for a 2 vCPU / 4 GiB E2B template, about `0.166`). When set, each
+destroyed attempt records `execbackend_attempts.cost_actual_usd` as its
+lifetime, from reservation to teardown, times that rate. The E2B API reports no
+per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The Mac
+provider has no dollar cost and records none. Attempts settled by
+reconciliation, whose teardown time is unknown, also stay NULL.
 
 Before reserving cost or calling E2B, remote review admission re-reads the pull
 request head and refuses stale jobs, duplicate repo/PR/head/purpose subjects,

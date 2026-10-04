@@ -588,6 +588,45 @@ type reviewPolicyOverride struct {
 	remoteRoutingEnabled *bool
 	remotePurposes       *[]string
 	remoteFinalReviews   *bool
+	checks               ReviewChecksRoute
+	// checksErr is why this repository's checks_* routing is unusable. It is
+	// kept per repository so dispatch refuses reviews of THAT repository
+	// instead of quietly running them locally, while other repositories load.
+	checksErr error
+}
+
+// Review checks routing (#2316). checks_backend has one value: a repository
+// that sets it runs every review remotely.
+const ReviewChecksBackendRemote = "remote"
+
+// ReviewChecksRoute is a repository's [repos."owner/repo".review] checks_*
+// routing (#2316). When Backend is "remote", every review of that repository
+// runs on Provider, with Template replacing that provider's default template
+// for those jobs only. It exists for capability, not spend: the CI-green,
+// risk-label and stale-head gates of remote_routing_enabled do not apply.
+type ReviewChecksRoute struct {
+	Backend  string
+	Provider string
+	Template string
+}
+
+// Enabled reports whether the repository routes its reviews remotely.
+func (r ReviewChecksRoute) Enabled() bool {
+	return r.Backend == ReviewChecksBackendRemote
+}
+
+// ChecksRoute returns repo's checks routing. An error means the repository
+// declared checks routing that cannot be honoured; callers must refuse rather
+// than fall back to a local review the operator opted out of.
+func (c ReviewConfig) ChecksRoute(repo string) (ReviewChecksRoute, error) {
+	override, ok := c.repos[strings.TrimSpace(repo)]
+	if !ok {
+		return ReviewChecksRoute{}, nil
+	}
+	if override.checksErr != nil {
+		return ReviewChecksRoute{}, override.checksErr
+	}
+	return override.checks, nil
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
@@ -681,7 +720,55 @@ func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
 		}
 		cfg.repos[repo] = override
 	}
+	validateReviewChecksRoutes(paths, &cfg)
 	return cfg, errors.Join(parseErrors...)
+}
+
+// validateReviewChecksRoutes completes each repository's checks_* routing
+// after its whole section is read: provider and template need the backend,
+// the provider defaults to e2b, and the provider must be configured in
+// [remote_exec]. A failure is kept on that repository only (ChecksRoute
+// returns it, and dispatch refuses that repository's reviews) and is not
+// joined into the load error, so one repository's unusable checks routing
+// never resets the review policy of every other repository. Readability of
+// the provider's API key file is checked again at dispatch.
+func validateReviewChecksRoutes(paths Paths, cfg *ReviewConfig) {
+	var remote *RemoteExecConfig
+	var remoteErr error
+	for repo, override := range cfg.repos {
+		route := override.checks
+		if override.checksErr == nil && route == (ReviewChecksRoute{}) {
+			continue
+		}
+		switch {
+		case override.checksErr != nil:
+			// A checks_* value failed to parse; keep that error.
+		case !route.Enabled():
+			override.checksErr = fmt.Errorf("checks_provider and checks_template require checks_backend = %q", ReviewChecksBackendRemote)
+		default:
+			if route.Provider == "" {
+				route.Provider = RemoteExecProviderE2B
+			}
+			if remote == nil && remoteErr == nil {
+				loaded, err := LoadRemoteExecConfig(paths)
+				if err != nil {
+					remoteErr = err
+				} else {
+					remote = &loaded
+				}
+			}
+			if remoteErr != nil {
+				override.checksErr = fmt.Errorf("checks_provider %q: load [remote_exec]: %w", route.Provider, remoteErr)
+			} else if err := remote.reviewChecksProviderConfigured(route); err != nil {
+				override.checksErr = err
+			}
+		}
+		if override.checksErr != nil {
+			override.checksErr = fmt.Errorf("[repos.%q.review]: %w", repo, override.checksErr)
+		}
+		override.checks = route
+		cfg.repos[repo] = override
+	}
 }
 
 func parseReviewSection(section string) (string, bool) {
@@ -806,6 +893,8 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 		}
 		policy.FindingsConsumption = parsed
 		return nil
+	case "checks_backend", "checks_provider", "checks_template":
+		return fmt.Errorf("%s is repository-scoped: set it in [repos.\"owner/repo\".review]", key)
 	default:
 		return nil
 	}
@@ -872,9 +961,42 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 		}
 		override.findingsConsumption = &parsed
 		return nil
+	case "checks_backend", "checks_provider", "checks_template":
+		// Errors stay on the repository (see validateReviewChecksRoutes) and
+		// are deliberately not returned into the joined load error.
+		if err := applyReviewChecksField(&override.checks, key, value); err != nil && override.checksErr == nil {
+			override.checksErr = fmt.Errorf("%s: %w", key, err)
+		}
+		return nil
 	default:
 		return nil
 	}
+}
+
+func applyReviewChecksField(route *ReviewChecksRoute, key string, value string) error {
+	parsed, err := parseConfigString(value)
+	if err != nil {
+		return err
+	}
+	parsed = strings.TrimSpace(parsed)
+	switch key {
+	case "checks_backend":
+		if parsed != ReviewChecksBackendRemote {
+			return fmt.Errorf("unsupported checks_backend %q: the only value is %q", parsed, ReviewChecksBackendRemote)
+		}
+		route.Backend = parsed
+	case "checks_provider":
+		if parsed != RemoteExecProviderE2B && parsed != RemoteExecProviderMac {
+			return fmt.Errorf("unknown checks_provider %q: allowed providers are %q and %q", parsed, RemoteExecProviderE2B, RemoteExecProviderMac)
+		}
+		route.Provider = parsed
+	default:
+		if parsed == "" {
+			return errors.New("checks_template must name a template")
+		}
+		route.Template = parsed
+	}
+	return nil
 }
 
 // parseFindingsConsumption accepts only the two declarations and the empty

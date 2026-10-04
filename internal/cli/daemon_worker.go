@@ -306,7 +306,9 @@ func remoteExecutionSupportsJobType(jobType string) bool {
 // for every backend consumer. Review dispatch is job-scoped: an older or
 // manually-created review with no selector stays local even while process config
 // names a remote backend; only an explicit payload override may move it off-host
-// (#2234). A remote job's provider is job-scoped too: the payload's
+// (#2234). run gives that override to a review of a repository with checks
+// routing (routeReviewChecks, #2316) before calling this, whichever producer
+// enqueued it. A remote job's provider is job-scoped too: the payload's
 // exec_provider selects it, and absent means cloud E2B. The returned config is
 // that provider's view, so admission, provisioning, envd routing, keepalive and
 // teardown all use the provider the job was requested on.
@@ -324,11 +326,21 @@ func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.Jo
 		if provider := strings.TrimSpace(payload.ExecProvider); provider != "" {
 			return "", config.RemoteExecConfig{}, fmt.Errorf("exec_provider %q requires the remote execution backend, but job %s resolved to %s", provider, job.ID, backend)
 		}
+		if template := strings.TrimSpace(payload.ExecTemplate); template != "" {
+			return "", config.RemoteExecConfig{}, fmt.Errorf("exec_template %q requires the remote execution backend, but job %s resolved to %s", template, job.ID, backend)
+		}
 		return backend, cfg, nil
 	}
 	cfg, err = cfg.ForProvider(payload.ExecProvider)
 	if err != nil {
 		return "", config.RemoteExecConfig{}, err
+	}
+	// A repository's checks_template (#2316) replaces this provider's
+	// templates for this job only; every runtime uses it, because it is the
+	// image that carries the repository's toolchain.
+	if template := strings.TrimSpace(payload.ExecTemplate); template != "" {
+		cfg.E2BTemplate = template
+		cfg.E2BOMPTemplate = template
 	}
 	return backend, cfg, nil
 }
@@ -337,6 +349,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
+	}
+	job, payload, owned, err := w.routeReviewChecks(ctx, job, payload)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
+	}
+	if !owned {
+		return nil
 	}
 	// Resolve WHERE the runtime executes before any path can construct or start
 	// an adapter. In particular, ephemeral jobs materialize and start a host
@@ -884,11 +907,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if lifecycleErr != nil {
 		w.recordRetryableRemoteProviderFailure(ctx, job, lifecycleErr)
+		if remoteReviewAdmitted {
+			requeued, expired := w.waitForRemoteReviewCapacity(ctx, job, execConfig.Provider, jobTimeout, lifecycleErr)
+			if requeued {
+				return nil
+			}
+			if expired != nil {
+				lifecycleErr = expired
+			}
+		}
 		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, lifecycleErr); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, lifecycleErr)
 		return nil
+	}
+	if remoteReviewAdmitted && payload.RemoteCapWaitSince != "" {
+		w.clearRemoteReviewCapWait(ctx, job, execConfig.Provider)
 	}
 	if lifecycle != nil && instance != nil {
 		deliveryCheckout = instance.Workspace

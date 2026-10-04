@@ -23,6 +23,11 @@ type ExecBackendCostConfig struct {
 	// Unset or <= 0 means DENIED: a zero reservation sums to zero however many
 	// attempts run, so it would pass any dollar cap forever.
 	PerAttemptUSD float64
+	// PerHourUSD is the provider's compute price for one sandbox-hour. It is
+	// not an admission limit: when set, an attempt's actual cost is recorded
+	// as its sandbox lifetime times this rate (#2316), because the provider
+	// API reports no per-sandbox cost. Unset records no actual cost.
+	PerHourUSD float64
 }
 
 // Validate reports why a configuration is malformed. It never silently
@@ -33,6 +38,9 @@ func (c ExecBackendCostConfig) Validate() error {
 	}
 	if c.PerAttemptUSD < 0 {
 		return fmt.Errorf("[remote_exec].cost_per_attempt_usd must be non-negative, got %v: fix it in config.toml", c.PerAttemptUSD)
+	}
+	if c.PerHourUSD < 0 {
+		return fmt.Errorf("[remote_exec].cost_per_hour_usd must be non-negative, got %v: fix it in config.toml", c.PerHourUSD)
 	}
 	if c.MaxConcurrent < 0 {
 		return fmt.Errorf("[remote_exec].cost_max_concurrent must be non-negative, got %d: fix it in config.toml", c.MaxConcurrent)

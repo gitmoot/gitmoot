@@ -120,6 +120,7 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		if err != nil {
 			return nil, err
 		}
+		ledgeredBackend.setPerHourUSD(cfg.ExecBackendCost.PerHourUSD)
 		baseURL := strings.TrimSpace(cfg.E2BBaseURL)
 		if baseURL == "" {
 			baseURL = e2b.DefaultBaseURL
