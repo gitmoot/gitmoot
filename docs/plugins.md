@@ -92,6 +92,50 @@ gitmoot plugin install claude --scope local
 
 Use `gitmoot plugin path claude` to print the generated package path.
 
+## Install The OMP Inbox Add-on
+
+```sh
+gitmoot plugin install omp [--home DIR]
+gitmoot plugin doctor omp [--live]
+gitmoot plugin path omp
+```
+
+OMP has no plugin package. `plugin install omp` writes one extension file,
+`00-gitmoot-inbox.ts`, into `${PI_CODING_AGENT_DIR:-<home>/.omp/agent}/extensions/`
+(mode 0644, written atomically; rerunning it is a no-op when nothing changed).
+The file carries the absolute registry directory of the chosen Gitmoot home
+(`<home>/.gitmoot/run/omp`), so install it once per Gitmoot home. A named OMP
+profile (`OMP_PROFILE`) uses its own agent directory; set
+`PI_CODING_AGENT_DIR` accordingly or copy the file there.
+
+The add-on uses only the official OMP extension API and never writes to the
+editor or the terminal. Each interactive session writes
+`<registry>/<runtimeId>.json` (0600, directory 0700) and listens on a private
+Unix socket next to it; the daemon delivers inbox notifications through that
+socket. A notification becomes an attributed custom message delivered as an
+aside: while the agent works it joins at the next step boundary; while idle it
+starts a turn, but only when the operator is not using the prompt (no key in
+the last 3 s, no submission still in its input hooks, no dialog or menu, an
+empty editor). After 10 minutes without a key a leftover draft or menu no
+longer blocks delivery; the note never touches either.
+
+OMP binds extensions from one directory in byte order of their file names and
+runs `input` hooks in that order. The `00-` prefix makes the add-on's input hook
+run before other user extensions' hooks, so it sees a slow operator submission
+first. Extensions passed with `-e` load after the extensions directory.
+
+Running OMP sessions pick up a new or updated add-on after `/restart` (which
+resumes the session) or a fresh `omp`. `/reload-plugins` does not reload
+extension modules.
+
+`plugin doctor omp` reports the add-on as installed (with its version),
+outdated (older version, hand edit, or installed for another Gitmoot home), or
+missing. `--live` starts the `omp` on `PATH` in a throwaway pseudo-terminal
+session with its own agent and registry directories and a local stand-in model
+(no network model calls), then checks registration, probe, an idle delivery
+that reaches the model, a deferral while typing, a stale-session refusal, and
+cleanup on exit.
+
 ## Verify
 
 ```sh
