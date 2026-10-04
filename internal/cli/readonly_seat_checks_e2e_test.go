@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -39,6 +40,7 @@ import (
 // WHY `shell`: no LLM, no runtime auth, no network. The seat reports what it
 // observed in its result summary, so a failure names the check that broke.
 func TestReadOnlySeatRunsSocketTestsAndOfflineModuleBuildsE2E(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
 	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))
@@ -103,7 +105,7 @@ func TestReviewerBindsAUnixSocketInItsTempDir(t *testing.T) {
 	// Places the seat must not write. otherSeat stands in for a concurrent
 	// review's private temp dir: same parent, same naming, same owner.
 	other := t.TempDir()
-	otherSeat := filepath.Join(os.TempDir(), "gmr-"+randomSeatHex(t))
+	otherSeat := filepath.Join(seatTempParent(), "gmr-"+randomSeatHex(t))
 	if err := os.Mkdir(otherSeat, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -150,22 +152,7 @@ printf '{"gitmoot_result":{"decision":"approved","summary":"tmpdir=%s mode=%s so
 		}),
 	}, "queued")
 
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "run", "job-seat-checks", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job run exit code = %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
-	}
-	job, err := store.GetJob(context.Background(), "job-seat-checks")
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("decode job payload: %v", err)
-	}
-	if !payload.ReadOnlySeat {
-		t.Fatalf("the job did not run as a read-only seat, so this test measured the wrong environment: payload=%+v", payload)
-	}
-	summary := payload.Result.Summary
+	summary, stdout, stderr := runSeatJobSummary(t, store, home, "job-seat-checks")
 	facts, _, _ := strings.Cut(summary, " || ")
 	got := map[string]string{}
 	for _, field := range strings.Fields(facts) {
@@ -173,7 +160,7 @@ printf '{"gitmoot_result":{"decision":"approved","summary":"tmpdir=%s mode=%s so
 		got[key] = value
 	}
 	if len(got) == 0 {
-		t.Fatalf("the seat reported nothing (summary %q)\nstdout=%s\nstderr=%s", summary, stdout.String(), stderr.String())
+		t.Fatalf("the seat reported nothing (summary %q)\nstdout=%s\nstderr=%s", summary, stdout, stderr)
 	}
 
 	seatTemp := got["tmpdir"]
@@ -216,6 +203,7 @@ printf '{"gitmoot_result":{"decision":"approved","summary":"tmpdir=%s mode=%s so
 // next daemon's startup removes every seat temp dir whose owner process is
 // gone, and leaves a live owner's dir alone.
 func TestDaemonStartupSweepsSeatTempDirsOfDeadOwners(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
@@ -320,6 +308,34 @@ func TestShortTestTempRootReportsUnusableParents(t *testing.T) {
 	}
 }
 
+// runSeatJobSummary runs a queued read-only seat job through `job run` and
+// returns its result summary with the command's output. `job run` exits 0 for
+// a failed or refused job too, so the job's own state is the gate: a seat that
+// never ran has no result to read, and the test fails naming why rather than
+// dereferencing a nil result and aborting the whole test binary.
+func runSeatJobSummary(t *testing.T, store *db.Store, home, jobID string) (summary, stdout, stderr string) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	if code := Run([]string{"job", "run", jobID, "--home", home}, &out, &errOut); code != 0 {
+		t.Fatalf("job run exit code = %d\nstdout=%s\nstderr=%s", code, out.String(), errOut.String())
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatalf("decode job payload: %v", err)
+	}
+	if !payload.ReadOnlySeat {
+		t.Fatalf("the job did not run as a read-only seat, so this test measured the wrong environment: payload=%+v", payload)
+	}
+	if job.State != string(workflow.JobSucceeded) || payload.Result == nil {
+		t.Fatalf("the seat job did not succeed: state %q, result %v\npayload=%+v\nstdout=%s\nstderr=%s", job.State, payload.Result, payload, out.String(), errOut.String())
+	}
+	return payload.Result.Summary, out.String(), errOut.String()
+}
+
 func randomSeatHex(t *testing.T) string {
 	t.Helper()
 	var suffix [4]byte
@@ -327,6 +343,27 @@ func randomSeatHex(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return hex.EncodeToString(suffix[:])
+}
+
+// skipUnlessSeatTempParentWritable skips a test that builds a read-only seat
+// (or plants seat temp dirs) when seatTempParent() refuses writes. That is the
+// case when the suite itself runs inside a read-only seat: the seat's TMPDIR,
+// /tmp/gmr-<8 hex>, is 17 bytes, too long to parent nested seats, so
+// seatTempParent falls back to /tmp, which a seat may not write. Nested seats
+// are not supported; these tests need a host.
+func skipUnlessSeatTempParentWritable(t *testing.T) {
+	t.Helper()
+	parent := seatTempParent()
+	probe, err := os.MkdirTemp(parent, "gitmoot-seat-probe-")
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		t.Skipf("seat temp parent %s is not writable (running inside a read-only seat?), so no nested seat can get a temp dir: %v", parent, err)
+	}
+	if err != nil {
+		t.Fatalf("probe seat temp parent %s: %v", parent, err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func writeSeatFixtureFile(t *testing.T, root, name, content string) {

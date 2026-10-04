@@ -385,6 +385,7 @@ func TestProduceRunnerComposesUnderTeeAndScopesByAction(t *testing.T) {
 }
 
 func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	stateDir := filepath.Join(t.TempDir(), "claude-state")
@@ -465,6 +466,7 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 }
 
 func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	sourceState := filepath.Join(t.TempDir(), "claude-state")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -556,6 +558,7 @@ func TestReadOnlyRuntimeStateSurvivesRepairDeliveries(t *testing.T) {
 }
 
 func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -606,6 +609,7 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 }
 
 func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -660,6 +664,7 @@ func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
 }
 
 func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -759,6 +764,7 @@ func (r *streamingReviewRunner) LookPath(file string) (string, error) { return f
 // stateful read-only adapter. Calling either helper directly would not prove
 // the production composition order.
 func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -878,6 +884,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 }
 
 func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -979,6 +986,7 @@ func TestWrapReadOnlySandboxAdapterRejectsOmpBeforeStagingWithoutCredentialBroke
 }
 
 func TestWrapReadOnlySandboxAdapterUsesScopedBrokerAndPrivateOmpState(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
@@ -1416,6 +1424,7 @@ func TestWorkerProduceRunRemovesTheStateRootItGranted(t *testing.T) {
 // produce grants never name it. The companion test in internal/sandbox pins the
 // helper side; this one pins that produce is on the implicit-root path at all.
 func TestProduceLaunchesOnTheImplicitWriteRootPathUnlikeAReadOnlySeat(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, "operator-profile"))

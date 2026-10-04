@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"bytes"
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,6 +42,7 @@ import (
 // `<staged>/bin:/usr/local/bin:/usr/bin:/bin`, so both probes report MISSING and
 // this fails.
 func TestReadOnlySeatJobRunShipsAPathThatResolvesRuntimeBinariesE2E(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
 	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))
@@ -87,23 +86,7 @@ func TestReadOnlySeatJobRunShipsAPathThatResolvesRuntimeBinariesE2E(t *testing.T
 		}),
 	}, "queued")
 
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "run", "job-seat-path", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("job run exit code = %d\nstdout=%s\nstderr=%s", code, stdout.String(), stderr.String())
-	}
-
-	job, err := store.GetJob(context.Background(), "job-seat-path")
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("decode job payload: %v", err)
-	}
-	if !payload.ReadOnlySeat {
-		t.Fatalf("the job did not run as a read-only seat, so this test measured the wrong environment: payload=%+v", payload)
-	}
-	summary := payload.Result.Summary
+	summary, _, _ := runSeatJobSummary(t, store, home, "job-seat-path")
 	live := config.PathsForHome(home)
 	for binary, hostDir := range map[string]string{"claude": claudeDir, "kimi": kimiDir} {
 		// The seat must resolve the binary (the #1918 availability half) and it

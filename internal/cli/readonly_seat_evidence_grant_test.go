@@ -159,6 +159,7 @@ func TestPriorVerdictsSurvivesAnUncleanedPredecessor(t *testing.T) {
 // builder rather than the helper - the "test pins a helper production never
 // reaches" trap, which a mutant deleting the wiring survived once already.
 func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
+	skipUnlessSeatTempParentWritable(t)
 	home := t.TempDir()
 	live := config.PathsForHome(home)
 	seedVerdict(t, live, "gitmoot/gitmoot", "mine-1", "prior verdict via production")
