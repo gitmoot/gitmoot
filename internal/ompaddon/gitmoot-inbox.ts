@@ -420,10 +420,19 @@ export default function gitmootInbox(pi: Api) {
 		writeRegistration();
 	});
 	const switched = (_event: unknown, next: Context) => {
+		if (!bind(next)) {
+			// The new conversation is not an operator-owned prompt. Stop serving
+			// rather than admit against the previous session's UI state.
+			cleanup();
+			ctx = undefined;
+			tui = undefined;
+			editor = undefined;
+			return;
+		}
 		// generation counts every switch (/new, resume, fork, branch) so the daemon
 		// can tell a replaced conversation even if a session id were reused.
-		if (!ctx || !bind(next)) return;
 		generation++;
+		startServer();
 		writeRegistration();
 	};
 	pi.on("session_switch", switched);

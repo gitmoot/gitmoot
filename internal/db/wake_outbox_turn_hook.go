@@ -14,8 +14,8 @@ import (
 // last_error, the detail column every delivered row already carries.
 const WakeOutboxTurnHookReceiptPrefix = "turn-hook:"
 
-// HasPendingInboxWakeOutbox reports whether any role has a never-attempted inbox
-// notification. Turn hooks run on every tool call, so this one indexed read lets
+// HasPendingInboxWakeOutbox reports whether any role has a pending inbox
+// notification, including one re-pended after a deferred attempt. Turn hooks run on every tool call, so this one indexed read lets
 // them skip resolving the acting role when there is nothing to deliver.
 func (s *Store) HasPendingInboxWakeOutbox(ctx context.Context) (bool, error) {
 	var exists bool

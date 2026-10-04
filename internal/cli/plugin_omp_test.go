@@ -15,7 +15,12 @@ import (
 // limit the installer enforces; t.TempDir paths embed the test name.
 func shortOMPHome(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "gmo")
+	base := os.TempDir()
+	if len(base) > 24 {
+		// Sandboxed runs can set a deep TMPDIR; the socket limit needs a short base.
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "gmo")
 	if err != nil {
 		t.Fatal(err)
 	}

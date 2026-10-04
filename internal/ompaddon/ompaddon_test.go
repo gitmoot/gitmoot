@@ -27,10 +27,15 @@ func bakedRegistryDir(t *testing.T, content []byte) string {
 }
 
 // shortDir keeps registry paths under the Unix socket limit that Render
-// enforces; t.TempDir paths embed the test name and can exceed it.
+// enforces. t.TempDir paths embed the test name, and sandboxed runs can set a
+// deep TMPDIR, so fall back to /tmp when the default base is too long.
 func shortDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "gmo")
+	base := os.TempDir()
+	if len(base) > 24 {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "gmo")
 	if err != nil {
 		t.Fatal(err)
 	}
