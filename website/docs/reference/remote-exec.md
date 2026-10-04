@@ -133,24 +133,35 @@ checks_provider = "e2b"            # or "mac"; default "e2b"
 checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 ```
 
-- Every review of that repository, whether policy-routed, `agent review` or
-  `review request`, runs remotely on `checks_provider` with `checks_template`.
-  The provider and template are stored in the job payload (`exec_provider`,
-  `exec_template`) so retries and model fallbacks keep them. The template
-  replaces the provider's `e2b_template`/`e2b_omp_template` for that job only.
+- Every review of that repository runs remotely on `checks_provider` with
+  `checks_template`, whichever producer enqueued it: policy-routed,
+  `agent review`, `review request`, native PR fan-out, comment-triggered,
+  heartbeat and pipeline review stages. The dispatch verbs record the route
+  when they enqueue; the worker applies it to any other review before it
+  resolves the job's backend, with the same `review_backend_route_selected`
+  event. The provider and template are stored in the job payload
+  (`exec_provider`, `exec_template`) so retries and model fallbacks keep them.
+  The template replaces the provider's `e2b_template`/`e2b_omp_template` for
+  that job only.
 - The `remote_routing_enabled` gates (CI-green, risk labels, purposes, stale
   head at admission) are skipped: they control spend, and this routing is for
   capability. Repositories without `checks_backend` are unchanged.
-- Refused at dispatch, with the repository and the setting named: an explicit
+- A review without `--exec-provider` (or `exec_provider`) adopts
+  `checks_provider`. Refused, with the repository and the setting named, at
+  dispatch or when the worker picks the job up: an explicit
   `--exec-backend local`, an `--exec-provider` other than `checks_provider`, a
   foreground review, and a reviewer whose runtime cannot run remotely (only
   `shell` and `omp` can). There is no per-job override; to review the
   repository locally, remove `checks_backend`.
 - `checks_provider` is validated when the config loads: an unknown provider, or
-  one with no `[remote_exec]`/`[remote_exec.mac]` API key file or template,
-  makes every review of that repository refuse with that reason. Other
+  one with no `[remote_exec]`/`[remote_exec.mac]` API key file or no template
+  at all, makes every review of that repository refuse with that reason. Other
   repositories keep loading. The `checks_*` keys are repository-scoped; in the
   global `[review]` section they are an error.
+- Without `checks_template`, the template depends on the reviewer's runtime:
+  `omp` provisions the provider's `e2b_omp_template`, `shell` its
+  `e2b_template`. A provider that sets only one of them serves only that
+  runtime; a review on the other is refused naming the missing key.
 - When the provider's cost or concurrency cap is full, the review returns to
   the queue instead of failing: a `remote_review_cap_waiting` job event names
   the provider, the next retry time and the wait so far, and the scheduler

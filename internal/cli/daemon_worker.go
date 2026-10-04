@@ -306,7 +306,9 @@ func remoteExecutionSupportsJobType(jobType string) bool {
 // for every backend consumer. Review dispatch is job-scoped: an older or
 // manually-created review with no selector stays local even while process config
 // names a remote backend; only an explicit payload override may move it off-host
-// (#2234). A remote job's provider is job-scoped too: the payload's
+// (#2234). run gives that override to a review of a repository with checks
+// routing (routeReviewChecks, #2316) before calling this, whichever producer
+// enqueued it. A remote job's provider is job-scoped too: the payload's
 // exec_provider selects it, and absent means cloud E2B. The returned config is
 // that provider's view, so admission, provisioning, envd routing, keepalive and
 // teardown all use the provider the job was requested on.
@@ -347,6 +349,17 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
+	}
+	job, payload, owned, err := w.routeReviewChecks(ctx, job, payload)
+	if err != nil {
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
+		return nil
+	}
+	if !owned {
+		return nil
 	}
 	// Resolve WHERE the runtime executes before any path can construct or start
 	// an adapter. In particular, ephemeral jobs materialize and start a host

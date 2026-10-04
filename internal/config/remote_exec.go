@@ -332,16 +332,15 @@ func (cfg RemoteExecConfig) ValidateProvider(name string) error {
 // reviewChecksProviderConfigured reports whether a repository's checks_*
 // routing (#2316) names a provider this home configures, without reading the
 // API key file: the view must exist, name a key file, and have a template once
-// checks_template is applied.
+// checks_template is applied. Which template a review provisions depends on
+// its runtime, which only dispatch knows; ReviewChecksTemplateError refuses
+// the runtime a view with one of the two templates cannot serve.
 func (cfg RemoteExecConfig) reviewChecksProviderConfigured(route ReviewChecksRoute) error {
 	view, err := cfg.ForProvider(route.Provider)
 	if err != nil {
 		return err
 	}
-	section := "[remote_exec]"
-	if view.Provider == RemoteExecProviderMac {
-		section = "[remote_exec.mac]"
-	}
+	section := view.reviewChecksSection()
 	if strings.TrimSpace(view.E2BAPIKeyFile) == "" {
 		return fmt.Errorf("checks_provider %q is not configured: %s has no API key file", route.Provider, section)
 	}
@@ -349,6 +348,36 @@ func (cfg RemoteExecConfig) reviewChecksProviderConfigured(route ReviewChecksRou
 		return fmt.Errorf("checks_provider %q is not configured: %s has no template and checks_template is unset", route.Provider, section)
 	}
 	return nil
+}
+
+// ReviewChecksTemplateError reports whether a review on an omp (omp=true) or
+// other runtime has a template under route. With checks_template set every
+// runtime uses it. Without it an omp review provisions the provider's
+// e2b_omp_template and every other runtime its e2b_template, so a view that
+// sets only one of them serves only those runtimes.
+func (cfg RemoteExecConfig) ReviewChecksTemplateError(route ReviewChecksRoute, omp bool) error {
+	if route.Template != "" {
+		return nil
+	}
+	view, err := cfg.ForProvider(route.Provider)
+	if err != nil {
+		return err
+	}
+	section := view.reviewChecksSection()
+	if omp && strings.TrimSpace(view.E2BOMPTemplate) == "" {
+		return fmt.Errorf("checks_provider %q has no template for an omp review: %s sets no e2b_omp_template, the template omp reviews provision, and checks_template is unset; set either", route.Provider, section)
+	}
+	if !omp && strings.TrimSpace(view.E2BTemplate) == "" {
+		return fmt.Errorf("checks_provider %q has no template for a non-omp review: %s sets only e2b_omp_template, which only omp reviews provision, and checks_template is unset; set e2b_template or checks_template", route.Provider, section)
+	}
+	return nil
+}
+
+func (cfg RemoteExecConfig) reviewChecksSection() string {
+	if cfg.Provider == RemoteExecProviderMac {
+		return "[remote_exec.mac]"
+	}
+	return "[remote_exec]"
 }
 
 // ProviderCredentialGatewayURL is the gateway origin guests of this view's

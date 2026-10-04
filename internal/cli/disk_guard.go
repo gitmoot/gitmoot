@@ -307,8 +307,9 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 	// Only the cloud E2B provider: a routed payload never gets exec_provider,
 	// and the cap below is the E2B dollar cap. The Mac provider is used only by
 	// a job that opted in at request time or whose repository's checks_provider
-	// names it (#2316); such a job already carries exec_backend and is passed
-	// through below without rerouting.
+	// names it (#2316); such a job carries exec_backend, or gets it from
+	// routeReviewChecks when it runs, and is passed through below without
+	// rerouting.
 	backend, cfg, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
 	if err != nil || backend != execbackend.Remote {
 		return nil
@@ -327,6 +328,10 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 			if selected, err := execbackend.Parse(name); err == nil && selected == execbackend.Remote {
 				allowed = append(allowed, job)
 			}
+			continue
+		}
+		if worker.reviewChecksRouteEnabled(payload.Repo) {
+			allowed = append(allowed, job)
 			continue
 		}
 		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {

@@ -1377,8 +1377,10 @@ review on the Mac Studio's sandboxd and requires a `[remote_exec.mac]` section,
 otherwise the request is refused before enqueue. The choice is stored on the
 job and kept across retries. A repository with `checks_backend = "remote"` in
 `[repos."owner/repo".review]` sends every review to its `checks_provider` and
-`checks_template`, and refuses `--exec-backend local` or a different
-`--exec-provider` (see the remote execution reference).
+`checks_template`, whichever producer enqueued it (this command, PR fan-out,
+comment, heartbeat or pipeline reviews); a review without `--exec-provider`
+adopts `checks_provider`, and `--exec-backend local` or a different
+`--exec-provider` is refused (see the remote execution reference).
 `agent review` forwards the same flag.
 
 ### Review levels (#2265)
