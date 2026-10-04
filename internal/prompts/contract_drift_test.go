@@ -143,6 +143,7 @@ func TestEnumValuesCoveredInJobPrompt(t *testing.T) {
 	values = append(values, workflow.DelegationSynthesisRules...)
 	values = append(values, workflow.EphemeralRuntimes...)
 	values = append(values, workflow.DelegationActions...)
+	values = append(values, workflow.ChecksBlockedKinds...)
 
 	for _, v := range values {
 		if !strings.Contains(prompt, v) {

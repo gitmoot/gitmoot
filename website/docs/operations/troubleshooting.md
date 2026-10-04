@@ -705,9 +705,10 @@ What to expect:
   could rewrite its own `go` binary, which is the defect the copy exists to remove.
 - **`CGO_ENABLED=0` is still required.** cgo reads `/usr/include`, which is outside
   the seat's grants, so `-race` remains unavailable in a seat.
-- **`TMPDIR`, `GOCACHE` and `GOMODCACHE` must still be concrete paths under the
-  seat's own cache root.** Both `/tmp` and the workspace return `EACCES` on
-  `mkdir`, and "a writable dir" reads as satisfied by `/tmp` when it is not.
+- **`TMPDIR` is a private, short directory, `/tmp/gmr-<8 hex>`.** Each seat gets
+  its own, mode `0700`, granted to that seat only and deleted when the job ends.
+  `TMP` and `TEMP` point at it too. `GOCACHE` and `HOME` stay under the seat's
+  own cache root. Writes anywhere else under `/tmp` still return `EACCES`.
 
 If a seat gets exit 126 running `go`, no usable toolchain was staged. The command
 is an engine-owned failure stub, not a fallthrough to an operator installation;
@@ -768,6 +769,64 @@ non-executable members such as `src` or `doc`, because re-hashing the whole 221.
 MiB tree on every seat launch would cost more than the copy itself. The
 consequence of a torn non-executable member is a visibly broken toolchain and a
 build error, not a silently wrong compiler.
+
+### Seat temp dir, Go module cache, and other toolchains
+
+**Temp dir.** A seat's `TMPDIR` is `/tmp/gmr-<8 hex>`, 17 bytes, so a test that
+binds a Unix socket under `t.TempDir()` stays inside the 108-byte socket path
+limit. It used to be `<cache root>/tmp`, which was 57+ bytes on a real host, so
+socket tests failed for reasons unrelated to the code under review. When the
+daemon's own `TMPDIR` is a clean absolute path of at most 24 bytes, it is used
+as the parent instead of `/tmp`; a longer one is ignored. That is also how
+gitmoot run inside a seat (a reviewer running gitmoot's own tests) nests its
+seats: in the outer seat's `/tmp/gmr-<8 hex>`. If no short parent is writable,
+as inside a seat of a daemon from before this change, the seat falls back to
+`<cache root>/tmp` and logs `no short writable temp parent; using cache-root
+temp`; it works, but its socket paths are long again. The directory is mode
+`0700`, owned by the daemon user, and only that seat is granted it: the parent
+directory, other seats' `gmr-*` directories, the checkout and the gitmoot home
+stay read-only. The daemon records each directory in
+`<gitmoot-home>/cache/seat-tmp/` with its owner's pid and removes it when the
+job ends. If the daemon crashes first, the next daemon start (and the next seat
+launch) removes every directory whose owner process is gone. The owner is the
+process that made the directory (the daemon or a foreground `job run`), so a
+seat process that outlives it loses its temp dir. A record that names a
+`gmr-*` directory under a parent no seat could have used (anything but an
+absolute path of at most 24 bytes), or the sweeping process's own `TMPDIR` or
+a directory holding it, is kept and reported, never removed. The cache-root
+fallback has no record; it goes with the cache root.
+
+**Go module cache.** Offline `go build` and `go test` work in a seat. Before
+the seat starts, the daemon runs `go mod download` for the checkout's modules
+into `<gitmoot-home>/cache/seat-go-mod/<repo hash>/`, one cache per repository,
+and grants the seat that cache read-only with `GOPROXY=off`. Repeat reviews of
+the same repository reuse it. The download runs under its own Landlock
+sandbox, with the checkout read-only and only the cache writable, the daemon's
+`GOPROXY` minus `direct` and `off`, `GOVCS=*:off` and `GOTOOLCHAIN=local`, so no
+version-control tool runs against a URL the checkout chose. A module the download could not fetch
+fails in the seat as `module lookup disabled by GOPROXY=off`; the cause is on
+the daemon's stderr as `gitmoot: read-only seat Go modules:`. A seat never
+writes this cache, so one review cannot plant a module for the next.
+
+Before #2314 each seat's `GOMODCACHE` was a new, empty directory keyed on the
+checkout path, so every offline build failed. Pointing a seat at a cache
+populated for another checkout path does not work either: the Landlock grant
+does not cover it.
+
+**Python and other toolchains are not available in a local seat.** `pytest`,
+`ruff` and `uv` fail with `Permission denied` because they live in
+operator-owned trees (`/usr/local`, `~/.local/bin`, Python's
+`dist-packages`) that a seat is not granted. Granting those trees is the
+operator-tree grant #1878 rejected, and copying them is unbounded: the
+interpreter's packages are hundreds of megabytes, include editable installs
+that point into operator checkouts, and a project's own dependencies are often
+not installed on the host at all. Rust, Node, Flutter/Dart and similar
+toolchains need their own staged toolchain and writable caches. These checks
+move to disposable VMs (sandboxd/E2B) under #2315. A local seat that cannot run
+them reports `evidence: static_only` with a `checks_blocked` reason such as
+`toolchain`. Terminal devices (`/dev/ptmx`) stay
+closed: seats run as root, and a terminal device would let a reviewer type into
+other agents' terminals.
 
 ### Read-only seat runtime executable is unavailable
 
