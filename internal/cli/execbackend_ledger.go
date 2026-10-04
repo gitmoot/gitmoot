@@ -29,6 +29,9 @@ type ledgeredExecutionBackend struct {
 	// cost is the compute-dollar admission policy (#1540). Its zero value denies,
 	// so a backend constructed without one cannot provision cloud compute.
 	cost db.ExecBackendCostCap
+	// perHourUSD prices a sandbox-hour for cost_actual_usd (#2316); zero
+	// records no actual cost.
+	perHourUSD float64
 
 	mu      sync.Mutex
 	attempt map[string]db.ExecBackendAttemptKey
@@ -211,7 +214,7 @@ func (b *ledgeredExecutionBackend) teardown(ctx context.Context, instance *execb
 	providerErr := destroy(ctx, instance)
 	if providerErr == nil && tracked {
 		persistCtx := context.WithoutCancel(ctx)
-		changed, err := b.store.MarkExecBackendAttemptDestroyed(persistCtx, key, nil)
+		changed, err := b.store.MarkExecBackendAttemptDestroyed(persistCtx, key, b.actualCostUSD(persistCtx, key))
 		if err == nil && !changed {
 			// A reconcile pass may settle this exact attempt between the
 			// provider's delete and this write (settleUnobservedTeardown). The
@@ -230,6 +233,32 @@ func (b *ledgeredExecutionBackend) teardown(ctx context.Context, instance *execb
 		}
 	}
 	return errors.Join(append([]error{providerErr}, ledgerErrs...)...)
+}
+
+// actualCostUSD is the compute cost of an attempt this teardown destroyed: its
+// lifetime, from the reservation row's created_at (just before the provider
+// create) to now, at the provider's configured cost_per_hour_usd (#2316). The
+// E2B API reports no per-sandbox cost, so this is the only measure available.
+// Nil when no rate is configured or the reservation time is unreadable, which
+// leaves cost_actual_usd NULL (unknown) rather than a fictitious 0.
+func (b *ledgeredExecutionBackend) actualCostUSD(ctx context.Context, key db.ExecBackendAttemptKey) *float64 {
+	if b.perHourUSD <= 0 {
+		return nil
+	}
+	attempt, err := b.store.GetExecBackendAttempt(ctx, key)
+	if err != nil {
+		return nil
+	}
+	created, ok := parseLockStatusTime(attempt.CreatedAt)
+	if !ok {
+		return nil
+	}
+	lifetime := b.now().UTC().Sub(created)
+	if lifetime < 0 {
+		lifetime = 0
+	}
+	cost := lifetime.Hours() * b.perHourUSD
+	return &cost
 }
 
 func (b *ledgeredExecutionBackend) Reap(ctx context.Context) ([]string, error) {

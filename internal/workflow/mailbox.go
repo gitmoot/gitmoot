@@ -288,9 +288,16 @@ type JobRequest struct {
 	// ExecProvider names the remote provider an explicitly remote job runs on.
 	// Empty is the default, cloud E2B; "mac" is the opt-in Mac provider.
 	ExecProvider string
+	// ExecTemplate replaces the provider's configured template for this job
+	// only. It is set by a repository's checks_template (#2316).
+	ExecTemplate string
 	// PolicyRoutedReview requires a fresh green current-head CI check before a
 	// policy-selected remote review can reserve cloud capacity.
 	PolicyRoutedReview bool
+	// ReviewChecksRouted marks a review routed remote by its repository's
+	// checks_backend (#2316). Such a review needs the remote toolchain, so
+	// admission skips the spend gates and a full provider cap makes it wait.
+	ReviewChecksRouted bool
 
 	// RuntimeOverride, when non-empty, runs THIS job through the named runtime
 	// instead of the agent's registered default runtime (#531). The agent's
@@ -509,11 +516,23 @@ type JobPayload struct {
 	// separately so absent and explicit-local remain distinguishable while an
 	// absent review selector still defaults to local.
 	ExecBackend string `json:"exec_backend,omitempty"`
-	// ExecProvider is the remote provider an opted-in job runs on. Empty means
-	// the default, cloud E2B. It is set only at request time and is never
-	// inferred, so nothing is routed to the Mac provider automatically.
-	ExecProvider       string `json:"exec_provider,omitempty"`
+	// ExecProvider is the remote provider a remote job runs on. Empty means
+	// the default, cloud E2B. It is set at request time by --exec-provider or
+	// by the repository's checks_provider (#2316); nothing else infers it.
+	ExecProvider string `json:"exec_provider,omitempty"`
+	// ExecTemplate replaces the provider's configured template for this job
+	// only (a repository's checks_template, #2316). Persisted so retries and
+	// model fallbacks keep the same image.
+	ExecTemplate       string `json:"exec_template,omitempty"`
 	PolicyRoutedReview bool   `json:"policy_routed_review,omitempty"`
+	// ReviewChecksRouted marks a review its repository's checks_backend routed
+	// remote (#2316): admission skips the CI-green and stale-head spend gates,
+	// and a full provider cap returns it to the queue instead of failing it.
+	ReviewChecksRouted bool `json:"review_checks_routed,omitempty"`
+	// RemoteCapWaitSince is when a checks-routed review first found its
+	// provider's cost or concurrency cap full (RFC 3339). The wait is bounded
+	// from this instant; it is cleared once the review provisions.
+	RemoteCapWaitSince string `json:"remote_cap_wait_since,omitempty"`
 	// DiskGuardRouted marks a review the disk guard switched to the remote
 	// backend while local disk was low ([disk_guard] remote_reviews). Any
 	// refusal of that remote run puts it back to waiting locally instead of
@@ -864,7 +883,9 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Effort:                 request.Effort,
 		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
 		ExecProvider:           strings.TrimSpace(request.ExecProvider),
+		ExecTemplate:           strings.TrimSpace(request.ExecTemplate),
 		PolicyRoutedReview:     request.PolicyRoutedReview,
+		ReviewChecksRouted:     request.ReviewChecksRouted,
 		Plan:                   request.Plan,
 		PlanInto:               strings.TrimSpace(request.PlanInto),
 		WorkflowID:             strings.TrimSpace(request.WorkflowID),
@@ -1673,6 +1694,14 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		_ = m.addEvent(ctx, job.ID, InheritedEvidenceClampedEvent, fmt.Sprintf(
 			"declared %s evidence was clamped to %s: the preflight stage for this exact head recorded %s, so nothing here could have run",
 			EvidenceExecuted, EvidenceStaticOnly, EvidenceStaticOnly))
+	}
+	// #2316: a remote review exists to run the checks the local seat cannot.
+	// When its own report says they did not run, record what it is: static.
+	if execBackend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		if reason, clamped := ApplyRemoteChecksEvidenceCeiling(&result); clamped {
+			_ = m.addEvent(ctx, job.ID, RemoteChecksEvidenceClampedEvent, fmt.Sprintf(
+				"declared %s evidence was recorded as %s: %s", EvidenceExecuted, EvidenceStaticOnly, reason))
+		}
 	}
 	payload.Result = &result
 	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {

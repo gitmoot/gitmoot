@@ -75,31 +75,38 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		return false, newRemoteReviewRefusal(remoteReviewAvoidedStale, fmt.Sprintf("remote review admission requires an exact head: %v", err))
 	}
 
-	client := w.remoteReviewAdmissionClient(checkout, runner)
-	pull, err := client.GetPullRequest(ctx, repo, int64(payload.PullRequest))
-	if err != nil {
-		return false, newRemoteReviewRefusal(remoteReviewAvoidedStale, fmt.Sprintf("re-read pull request head before remote review: %v", err))
-	}
-	currentHead := strings.ToLower(strings.TrimSpace(pull.HeadSHA))
-	if currentHead != head {
-		return false, newRemoteReviewRefusal(remoteReviewAvoidedStale, fmt.Sprintf("remote review head %s is stale; pull request #%d is now at %s", head, payload.PullRequest, currentHead))
-	}
-
-	paths, err := w.configPaths()
-	if err != nil {
-		return false, err
-	}
-	reviewConfig, err := config.LoadReviewConfig(paths)
-	if err != nil {
-		return false, fmt.Errorf("load remote review admission policy: %w", err)
-	}
-	if payload.PolicyRoutedReview || reviewConfig.For(repo.FullName()).RemoteRequireCIGreen {
-		checks, err := client.ListPullRequestChecks(ctx, repo, int64(payload.PullRequest))
+	// A review its repository's checks_backend routed remote (#2316) needs the
+	// remote toolchain to run its checks at all, so the stale-head and CI-green
+	// gates, which exist to avoid spending cloud capacity on a review that
+	// could run locally, do not apply; it is admitted the way a local review
+	// would run. The retry and duplicate-subject guards below still do.
+	if !payload.ReviewChecksRouted {
+		client := w.remoteReviewAdmissionClient(checkout, runner)
+		pull, err := client.GetPullRequest(ctx, repo, int64(payload.PullRequest))
 		if err != nil {
-			return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, fmt.Sprintf("remote review CI policy could not read current-head checks: %v", err))
+			return false, newRemoteReviewRefusal(remoteReviewAvoidedStale, fmt.Sprintf("re-read pull request head before remote review: %v", err))
 		}
-		if ok, detail := remoteReviewChecksGreen(checks); !ok {
-			return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, detail)
+		currentHead := strings.ToLower(strings.TrimSpace(pull.HeadSHA))
+		if currentHead != head {
+			return false, newRemoteReviewRefusal(remoteReviewAvoidedStale, fmt.Sprintf("remote review head %s is stale; pull request #%d is now at %s", head, payload.PullRequest, currentHead))
+		}
+
+		paths, err := w.configPaths()
+		if err != nil {
+			return false, err
+		}
+		reviewConfig, err := config.LoadReviewConfig(paths)
+		if err != nil {
+			return false, fmt.Errorf("load remote review admission policy: %w", err)
+		}
+		if payload.PolicyRoutedReview || reviewConfig.For(repo.FullName()).RemoteRequireCIGreen {
+			checks, err := client.ListPullRequestChecks(ctx, repo, int64(payload.PullRequest))
+			if err != nil {
+				return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, fmt.Sprintf("remote review CI policy could not read current-head checks: %v", err))
+			}
+			if ok, detail := remoteReviewChecksGreen(checks); !ok {
+				return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, detail)
+			}
 		}
 	}
 	if err := w.remoteReviewRetryAdmission(ctx, job); err != nil {
@@ -210,8 +217,10 @@ func (w jobWorker) remoteReviewRetryAdmission(ctx context.Context, job db.Job) e
 		// can run, so it must grant the new lifecycle its cloud attempt. Before
 		// #2245 it did not, and a remote review could never fall through its
 		// pool: the new model was refused before it ever started.
+		// #2316: a review requeued while its provider cap was full reserved
+		// nothing, so its next lifecycle keeps the cloud attempt it never used.
 		if (event.Kind == "retry_queued" || event.Kind == "remote_review_provider_retryable" ||
-			event.Kind == reviewModelFallbackEventKind) && strings.Contains(event.Message, marker) {
+			event.Kind == reviewModelFallbackEventKind || event.Kind == remoteReviewCapWaitingEventKind) && strings.Contains(event.Message, marker) {
 			return nil
 		}
 	}

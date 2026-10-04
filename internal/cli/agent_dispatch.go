@@ -233,6 +233,61 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	return execbackend.Local, true, "routine review without a final-head route"
 }
 
+// applyReviewChecksRoute applies the repository's [repos."o/r".review]
+// checks_backend routing (#2316) to a review dispatch and reports whether it
+// did. A configured repository sends EVERY review, policy-routed or explicit,
+// to its checks_provider with its checks_template, and skips the
+// remote_routing_enabled spend gates: the reason is capability, its checks need
+// a toolchain only the remote image has. Requests that would run the review
+// anywhere else are refused rather than quietly reviewed without that
+// toolchain; the only way back to local review is removing checks_backend.
+func applyReviewChecksRoute(request *localAgentDispatchRequest, repo string) (bool, error) {
+	paths, err := pathsFromFlag(request.Home)
+	if err != nil {
+		return false, err
+	}
+	// The joined error covers every [review] field; only this repository's
+	// checks routing decides here, and its error is kept per repository.
+	reviewConfig, _ := config.LoadReviewConfig(paths)
+	route, err := reviewConfig.ChecksRoute(repo)
+	if err != nil {
+		return false, fmt.Errorf("review of %s refused: its checks routing is invalid: %w", repo, err)
+	}
+	if !route.Enabled() {
+		return false, nil
+	}
+	setting := fmt.Sprintf("[repos.%q.review] checks_backend = %q", repo, route.Backend)
+	if request.ExecBackend != nil && strings.TrimSpace(*request.ExecBackend) != string(execbackend.Remote) {
+		return true, fmt.Errorf("--exec-backend %s refused for %s: %s runs every review of this repository remotely so its checks have their toolchain; remove that setting to review it locally", strings.TrimSpace(*request.ExecBackend), repo, setting)
+	}
+	provider := route.Provider
+	if provider == config.RemoteExecProviderE2B {
+		// Stored as absent, the same convention requestExecProvider uses.
+		provider = ""
+	}
+	if request.ExecProvider != provider {
+		return true, fmt.Errorf("--exec-provider %s refused for %s: %s routes every review of this repository to checks_provider %q", firstNonEmptyRemoteReview(request.ExecProvider, config.RemoteExecProviderE2B), repo, setting, route.Provider)
+	}
+	if !request.Background {
+		return true, fmt.Errorf("foreground review of %s refused: %s runs every review of this repository remotely, which only the daemon can run; dispatch it with --background or --org-role", repo, setting)
+	}
+	if err := validateRequestExecProvider(request.Home, provider); err != nil {
+		return true, fmt.Errorf("review of %s refused: %s: %w", repo, setting, err)
+	}
+	remote := string(execbackend.Remote)
+	request.ExecBackend = &remote
+	request.ExecProvider = provider
+	request.ExecTemplate = route.Template
+	request.ReviewChecksRouted = true
+	request.PolicyRoutedReview = false
+	template := route.Template
+	if template == "" {
+		template = "provider default"
+	}
+	request.ReviewRouteReason = fmt.Sprintf("backend=remote source=repo_checks reason=%s provider=%s template=%s", setting, route.Provider, template)
+	return true, nil
+}
+
 // validateRuntimeExecutionBackend refuses an unsupported runtime/backend pair
 // at DISPATCH — before cost reservation, provisioning, or comment noise
 // (#2234). It asks remoteCapableRuntime rather than restating the set: this
@@ -292,6 +347,10 @@ type localAgentDispatchRequest struct {
 	// refused at dispatch unless the job is remote and the provider is
 	// configured, so a typo can never quietly run on E2B instead.
 	ExecProvider string
+	// ExecTemplate and ReviewChecksRouted carry a repository's checks routing
+	// (#2316) onto the payload; see applyReviewChecksRoute.
+	ExecTemplate       string
+	ReviewChecksRouted bool
 	// ExecsDeclaredBinary is EXPLICIT and CALLER-SUPPLIED (#1817, ruling 123815):
 	// the dispatch entry declares that this request will build a REAL runtime
 	// adapter which execs its runtime's declared CLI binary. It is deliberately
@@ -601,23 +660,35 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 	}
 	if request.Action == "review" {
-		route, policyEvaluated, reason := reviewPolicyBackend(ctx, request, repo, record.CheckoutPath)
-		source := "default"
-		if request.ExecBackend != nil {
-			source = "explicit"
+		checksRouted, err := applyReviewChecksRoute(&request, repo.FullName())
+		if err != nil {
+			return localAgentJobOutput{}, err
 		}
-		if policyEvaluated {
-			source = "policy"
-		}
-		request.ReviewRouteReason = fmt.Sprintf("backend=%s source=%s reason=%s", route, source, reason)
-		if policyEvaluated && route == execbackend.Remote {
-			selected := string(route)
-			request.ExecBackend = &selected
-			request.PolicyRoutedReview = true
-			execBackend = route
+		if checksRouted {
+			execBackend = execbackend.Remote
 			request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
 			if err != nil {
 				return localAgentJobOutput{}, err
+			}
+		} else {
+			route, policyEvaluated, reason := reviewPolicyBackend(ctx, request, repo, record.CheckoutPath)
+			source := "default"
+			if request.ExecBackend != nil {
+				source = "explicit"
+			}
+			if policyEvaluated {
+				source = "policy"
+			}
+			request.ReviewRouteReason = fmt.Sprintf("backend=%s source=%s reason=%s", route, source, reason)
+			if policyEvaluated && route == execbackend.Remote {
+				selected := string(route)
+				request.ExecBackend = &selected
+				request.PolicyRoutedReview = true
+				execBackend = route
+				request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
+				if err != nil {
+					return localAgentJobOutput{}, err
+				}
 			}
 		}
 	}
@@ -657,6 +728,13 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if err := runtime.ValidateAgent(effectiveAgent); err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("runtime override: %w", err)
 		}
+	}
+	if request.ReviewChecksRouted && !remoteCapableRuntime(effectiveAgent.Runtime) {
+		// The repository opted every review into remote execution because its
+		// checks need the remote toolchain, so a local fallback would be the
+		// static review the operator configured away from.
+		return localAgentJobOutput{}, fmt.Errorf("review of %s refused: reviewer %s runs on runtime %q, which cannot run remotely, and [repos.%q.review] checks_backend = %q sends every review of %s to remote execution; use a reviewer or --runtime on %s",
+			repo.FullName(), effectiveAgent.Name, effectiveAgent.Runtime, repo.FullName(), config.ReviewChecksBackendRemote, repo.FullName(), remoteCapableRuntimeNames())
 	}
 	if request.PolicyRoutedReview && !remoteCapableRuntime(effectiveAgent.Runtime) {
 		// An opt-in policy must not turn an otherwise valid local review into a
@@ -1026,7 +1104,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		WorkflowID:               request.WorkflowID,
 		ExecBackend:              request.ExecBackend,
 		ExecProvider:             request.ExecProvider,
+		ExecTemplate:             request.ExecTemplate,
 		PolicyRoutedReview:       request.PolicyRoutedReview,
+		ReviewChecksRouted:       request.ReviewChecksRouted,
 		RuntimeOverride:          overrideRuntime,
 		RuntimeOverrideRef:       overrideRef,
 		RuntimeConfigDir:         effectiveAgent.RuntimeConfigDir,

@@ -189,15 +189,18 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 			case "credential_gateway_url":
 				cfg.CredentialGatewayURL = parsed
 			}
-		case "cost_max_reserved_usd", "cost_per_attempt_usd":
+		case "cost_max_reserved_usd", "cost_per_attempt_usd", "cost_per_hour_usd":
 			parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 			if err != nil {
 				return RemoteExecConfig{}, fmt.Errorf("parse [remote_exec].%s: expected a number: %w", key, err)
 			}
-			if key == "cost_max_reserved_usd" {
+			switch key {
+			case "cost_max_reserved_usd":
 				cfg.ExecBackendCost.MaxReservedUSD = parsed
-			} else {
+			case "cost_per_attempt_usd":
 				cfg.ExecBackendCost.PerAttemptUSD = parsed
+			default:
+				cfg.ExecBackendCost.PerHourUSD = parsed
 			}
 		case "cost_max_concurrent":
 			parsed, err := strconv.Atoi(strings.TrimSpace(value))
@@ -324,6 +327,28 @@ func (cfg RemoteExecConfig) ValidateProvider(name string) error {
 		return err
 	}
 	return view.ValidateE2BProvider()
+}
+
+// reviewChecksProviderConfigured reports whether a repository's checks_*
+// routing (#2316) names a provider this home configures, without reading the
+// API key file: the view must exist, name a key file, and have a template once
+// checks_template is applied.
+func (cfg RemoteExecConfig) reviewChecksProviderConfigured(route ReviewChecksRoute) error {
+	view, err := cfg.ForProvider(route.Provider)
+	if err != nil {
+		return err
+	}
+	section := "[remote_exec]"
+	if view.Provider == RemoteExecProviderMac {
+		section = "[remote_exec.mac]"
+	}
+	if strings.TrimSpace(view.E2BAPIKeyFile) == "" {
+		return fmt.Errorf("checks_provider %q is not configured: %s has no API key file", route.Provider, section)
+	}
+	if route.Template == "" && strings.TrimSpace(view.E2BTemplate) == "" && strings.TrimSpace(view.E2BOMPTemplate) == "" {
+		return fmt.Errorf("checks_provider %q is not configured: %s has no template and checks_template is unset", route.Provider, section)
+	}
+	return nil
 }
 
 // ProviderCredentialGatewayURL is the gateway origin guests of this view's

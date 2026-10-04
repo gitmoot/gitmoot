@@ -324,11 +324,21 @@ func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.Jo
 		if provider := strings.TrimSpace(payload.ExecProvider); provider != "" {
 			return "", config.RemoteExecConfig{}, fmt.Errorf("exec_provider %q requires the remote execution backend, but job %s resolved to %s", provider, job.ID, backend)
 		}
+		if template := strings.TrimSpace(payload.ExecTemplate); template != "" {
+			return "", config.RemoteExecConfig{}, fmt.Errorf("exec_template %q requires the remote execution backend, but job %s resolved to %s", template, job.ID, backend)
+		}
 		return backend, cfg, nil
 	}
 	cfg, err = cfg.ForProvider(payload.ExecProvider)
 	if err != nil {
 		return "", config.RemoteExecConfig{}, err
+	}
+	// A repository's checks_template (#2316) replaces this provider's
+	// templates for this job only; every runtime uses it, because it is the
+	// image that carries the repository's toolchain.
+	if template := strings.TrimSpace(payload.ExecTemplate); template != "" {
+		cfg.E2BTemplate = template
+		cfg.E2BOMPTemplate = template
 	}
 	return backend, cfg, nil
 }
@@ -884,11 +894,23 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	if lifecycleErr != nil {
 		w.recordRetryableRemoteProviderFailure(ctx, job, lifecycleErr)
+		if remoteReviewAdmitted {
+			requeued, expired := w.waitForRemoteReviewCapacity(ctx, job, execConfig.Provider, jobTimeout, lifecycleErr)
+			if requeued {
+				return nil
+			}
+			if expired != nil {
+				lifecycleErr = expired
+			}
+		}
 		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, lifecycleErr); finishErr != nil {
 			return finishErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, lifecycleErr)
 		return nil
+	}
+	if remoteReviewAdmitted && payload.RemoteCapWaitSince != "" {
+		w.clearRemoteReviewCapWait(ctx, job, execConfig.Provider)
 	}
 	if lifecycle != nil && instance != nil {
 		deliveryCheckout = instance.Workspace

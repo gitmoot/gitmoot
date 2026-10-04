@@ -422,3 +422,32 @@ func execBackendAttemptForTest(t *testing.T, store *db.Store, key db.ExecBackend
 func testCLIExecBackendUncappedPolicy() db.ExecBackendCostCap {
 	return db.ExecBackendCostCap{Configured: true, MaxReservedUSD: 1e9, PerAttemptUSD: 0.01}
 }
+
+// #2316: with [remote_exec].cost_per_hour_usd set, teardown records the
+// attempt's actual compute cost: lifetime since reservation times the rate.
+func TestExecBackendLedgerTeardownRecordsRuntimeCost(t *testing.T) {
+	store := openExecBackendLedgerTestStore(t)
+	inner := &ledgerTestBackend{}
+	backend := newExecBackendLedgerForTest(t, store, inner, nil, "fence-cost", "boot-cost")
+	backend.perHourUSD = 0.166
+	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "job-cost", LifecycleGeneration: 1, TTL: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := db.ExecBackendAttemptKey{JobID: "job-cost", Attempt: 1, LifecycleGeneration: 1}
+	created, ok := parseLockStatusTime(execBackendAttemptForTest(t, store, key).CreatedAt)
+	if !ok {
+		t.Fatal("attempt created_at unreadable")
+	}
+	backend.now = func() time.Time { return created.Add(30 * time.Minute) }
+	if err := backend.Destroy(context.Background(), instance); err != nil {
+		t.Fatal(err)
+	}
+	attempt := execBackendAttemptForTest(t, store, key)
+	if attempt.CostActualUSD == nil {
+		t.Fatal("cost_actual_usd = NULL; want lifetime x cost_per_hour_usd")
+	}
+	if got, want := *attempt.CostActualUSD, 0.083; got < want-1e-9 || got > want+1e-9 {
+		t.Fatalf("cost_actual_usd = %v, want %v (30 minutes at $0.166/h)", got, want)
+	}
+}
