@@ -528,8 +528,11 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	// to that command first; delegating without them would have silently dropped
 	// every seat's review instructions and its fix target.
 	//
-	// TWO PATHS STAY DIRECT, both because the router's contract cannot express
-	// them, and both SAY SO rather than degrading quietly.
+	// SOME PATHS STAY DIRECT because the router's contract cannot express them:
+	// --foreground, no acting role, and the inputs agentReviewInputsTheRouterCannotCarry
+	// names. Each one SAYS SO rather than degrading quietly. --json no longer
+	// stays direct: `review request --json` prints the keys this command printed
+	// (#2314), and bypassing on it skipped model routing for every scripted call.
 	// EVERY reason is recorded, not just the flag one: a bypass nobody can query
 	// is indistinguishable from a router that silently did not run (#2199).
 	switch {
@@ -562,7 +565,7 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if options.postMerge {
-		fmt.Fprintln(stderr, "agent review: --post-merge requires the review router (pass --org-role and --no-fix-target, without --foreground or --json)")
+		fmt.Fprintln(stderr, "agent review: --post-merge requires the review router (pass --org-role and --no-fix-target, without --foreground)")
 		return 2
 	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
@@ -685,11 +688,6 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 		{"--recipe", strings.TrimSpace(options.recipe) != ""},
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
 		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
-		// --json CHANGES SCHEMA on the delegated path: `review request` prints a
-		// different object. A programmatic caller parsing the old shape reads
-		// zeros or errors, silently. Keeping the direct path preserves the
-		// contract it was written against (#2196 review, P2).
-		{"--json", options.jsonOutput},
 		// NO --lead AND NO --no-fix-target IS A REFUSAL ON THE DIRECT PATH, NOT
 		// A REVIEW-ONLY DISPATCH (#2054): it falls back to the reviewer as lead
 		// and then VALIDATES that agent, refusing an unregistered or unsubscribed
@@ -735,6 +733,9 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 	}
 	if options.postMerge {
 		args = append(args, "--post-merge")
+	}
+	if options.noFixTarget {
+		args = append(args, "--no-fix-target")
 	}
 	if options.jsonOutput {
 		args = append(args, "--json")

@@ -153,11 +153,15 @@ independent and selects a managed agent type, not an action. Use
 analysis, planning, or questions. To get an independent review of a pull
 request, use `gitmoot review request --pr <number>` and let Gitmoot choose the
 reviewer, runtime and model, deduplicate on the exact head, and wake your role
-when the verdict is saved (CLI.md § Review Router). Use `gitmoot agent review
+when the verdict is saved (CLI.md § Review Router). When a script needs the job
+id, add `--json`: `gitmoot review request --pr <number> --head <40-hex>
+--no-fix-target --json` prints `job_id`, `agent`, `awaited_fact_id` and the
+same keys `agent review --json` printed. Use `gitmoot agent review
 <reviewer> --repo owner/repo --pr <number> --lead <implementer> "..."` only for
 a deliberate manual dispatch; there the lead must be a registered, repo-allowed
 agent with `implement` capability and a write-granting policy so requested
-changes can route to it.
+changes can route to it. With `--org-role` it still goes through the router and
+keeps the reviewer you named.
 
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
 `--action implement`, `task run`, `repo auto-fix`, and the implement heartbeat

@@ -1979,3 +1979,136 @@ func TestRoutedDispatchRecordsNoBypassAndForegroundRecordsOne(t *testing.T) {
 		}
 	})
 }
+
+// agentReviewJSONFixture is a home where `agent review` can route: an org role
+// to deliver the verdict to, two review agents so a named one is a real choice,
+// and no network.
+func agentReviewJSONFixture(t *testing.T) (string, *db.Store, string) {
+	t.Helper()
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	file.Close()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() { store.Close() })
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	seedDaemonWorkerAgentWithPolicy(t, store, "run-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	previousGitHubFactory := newAgentDispatchGitHubClient
+	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
+	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
+	return home, store, head
+}
+
+func onlyJobEvents(t *testing.T, store *db.Store) (db.Job, []db.JobEvent) {
+	t.Helper()
+	jobs, err := store.ListJobs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %+v, want exactly one", jobs)
+	}
+	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return jobs[0], events
+}
+
+// #2314: --json used to force the direct path, so every scripted review skipped
+// model routing. With only router-expressible flags it now routes, records no
+// bypass, keeps the reviewer the caller named, and still prints the job id.
+func TestAgentReviewJSONRoutesAndKeepsTheNamedReviewer(t *testing.T) {
+	home, store, head := agentReviewJSONFixture(t)
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview([]string{
+		"run-reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--no-fix-target",
+		"--org-role", "joltra", "--background", "--home", home, "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "WITHOUT the review router") {
+		t.Fatalf("stderr = %q: --json alone must not bypass the router", stderr.String())
+	}
+	var printed struct {
+		JobID         string `json:"job_id"`
+		Agent         string `json:"agent"`
+		Repo          string `json:"repo"`
+		AwaitedFactID int64  `json:"awaited_fact_id"`
+		ExecutionPath string `json:"execution_path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	job, events := onlyJobEvents(t, store)
+	if printed.JobID != job.ID || printed.Repo != "owner/repo" || printed.AwaitedFactID <= 0 {
+		t.Fatalf("printed %+v, want job %s in owner/repo with a verdict wait", printed, job.ID)
+	}
+	if job.Agent != "run-reviewer" || printed.Agent != "run-reviewer" {
+		t.Fatalf("job agent=%q printed agent=%q, want the named run-reviewer kept", job.Agent, printed.Agent)
+	}
+	if printed.ExecutionPath != reviewRequestExecutionPath {
+		t.Fatalf("execution_path = %q, want %q", printed.ExecutionPath, reviewRequestExecutionPath)
+	}
+	routed := false
+	for _, event := range events {
+		switch event.Kind {
+		case "router_bypassed":
+			t.Fatalf("router_bypassed recorded: %q", event.Message)
+		case "route_selected":
+			routed = strings.Contains(event.Message, "via "+reviewRequestExecutionPath)
+		}
+	}
+	if !routed {
+		t.Fatalf("no route_selected via %s: %+v", reviewRequestExecutionPath, events)
+	}
+}
+
+// #2314 (c): an input the router still cannot express keeps the direct path,
+// and the recorded reason names THAT input and nothing else - --json is no
+// longer one of them.
+func TestAgentReviewJSONStillBypassesForAnUnexpressibleFlagAndNamesOnlyIt(t *testing.T) {
+	home, store, head := agentReviewJSONFixture(t)
+	var stdout, stderr bytes.Buffer
+	if code := runAgentReview([]string{
+		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
+		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--org-role", "joltra", "--skip-native-review-fanout", "--home", home, "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	var printed localAgentJobOutput
+	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	job, events := onlyJobEvents(t, store)
+	if printed.JobID != job.ID {
+		t.Fatalf("printed job %q, want %q", printed.JobID, job.ID)
+	}
+	const want = "dispatched WITHOUT the review router: --skip-native-review-fanout cannot be expressed by `review request`"
+	for _, event := range events {
+		if event.Kind == "router_bypassed" {
+			if event.Message != want {
+				t.Fatalf("router_bypassed = %q, want exactly %q", event.Message, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("no router_bypassed event: %+v", events)
+}
