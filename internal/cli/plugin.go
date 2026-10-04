@@ -78,9 +78,9 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot plugin build codex|claude")
-	fmt.Fprintln(w, "  gitmoot plugin install codex|claude")
-	fmt.Fprintln(w, "  gitmoot plugin path codex|claude")
-	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude] [--live]")
+	fmt.Fprintln(w, "  gitmoot plugin install codex|claude|omp")
+	fmt.Fprintln(w, "  gitmoot plugin path codex|claude|omp")
+	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude|omp] [--live]")
 	fmt.Fprintln(w, "  gitmoot plugin codex-launch [--repo <path>] [--cli codex-face] [--config-snippet]")
 }
 
@@ -108,6 +108,9 @@ func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
 }
 
 func runPluginInstall(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == pluginOMP {
+		return runPluginInstallOMP(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("plugin install", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -233,6 +236,9 @@ func resolveGitmootBinary() string {
 }
 
 func runPluginPath(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == pluginOMP {
+		return runPluginPathOMP(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("plugin path", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -254,6 +260,9 @@ func runPluginPath(args []string, stdout, stderr io.Writer) int {
 }
 
 func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == pluginOMP {
+		return runPluginDoctorOMP(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("plugin doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
