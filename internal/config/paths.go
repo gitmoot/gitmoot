@@ -45,3 +45,9 @@ func PathsForHome(home string) Paths {
 		ArtifactBlobs: filepath.Join(root, EvalsDir, BlobsDir),
 	}
 }
+
+// OMPRuntimeDir is where the Gitmoot OMP inbox add-on registers each running
+// OMP runtime (registration JSON plus its private delivery socket). Mode 0700.
+func (p Paths) OMPRuntimeDir() string {
+	return filepath.Join(p.Home, "run", "omp")
+}
