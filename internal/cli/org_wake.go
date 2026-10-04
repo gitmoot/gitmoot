@@ -15,8 +15,8 @@ import (
 )
 
 func runOrgWake(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
-		fmt.Fprintln(stdout, "Usage: gitmoot org wake list [--state STATE] [--json] [--home DIR]\n       gitmoot org wake show ID [--json] [--home DIR]\n       gitmoot org wake retry ID --reason TEXT [--home DIR]\n       gitmoot org wake supersede ID --reason TEXT [--home DIR]\nRetry accepts only proven-unsent failures. Inspect current review head and ownership first; unknown delivery cannot be retried.")
+	if len(args) == 0 || messageHelpRequested(args) {
+		printOrgWakeUsage(stdout)
 		return 0
 	}
 	action := args[0]
@@ -53,6 +53,9 @@ func runOrgWake(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "unexpected argument")
+		return 2
+	}
+	if refuseFlagLikeText("org wake "+action, *reason, stderr) {
 		return 2
 	}
 	err := withStore(*home, func(store *db.Store) error {
@@ -113,4 +116,8 @@ func runOrgWake(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+func printOrgWakeUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: gitmoot org wake list [--state STATE] [--json] [--home DIR]\n       gitmoot org wake show ID [--json] [--home DIR]\n       gitmoot org wake retry ID --reason TEXT [--home DIR]\n       gitmoot org wake supersede ID --reason TEXT [--home DIR]\nRetry accepts only proven-unsent failures. Inspect current review head and ownership first; unknown delivery cannot be retried.\nA reason that is a single flag-like word, such as --help or -x, is refused.")
 }

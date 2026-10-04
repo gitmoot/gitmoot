@@ -1437,6 +1437,11 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	handoffFlag := fs.String("handoff", "", "handoff note for the successor session")
 	paneFlag := fs.String("pane", "", "Herdr pane id (overrides the role's configured pane)")
 	jsonOutput := fs.Bool("json", false, "print JSON")
+	if messageHelpRequested(args) {
+		fmt.Fprintln(stdout, "Usage: gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
+		fmt.Fprintln(stdout, "A handoff note that is a single flag-like word, such as --help or -x, is refused.")
+		return 0
+	}
 	roleArg := ""
 	flagArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -1461,6 +1466,9 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	handoff := strings.TrimSpace(*handoffFlag)
 	if handoff == "" {
 		fmt.Fprintln(stderr, "org recycle requires a non-empty --handoff note")
+		return 2
+	}
+	if refuseFlagLikeText("org recycle", handoff, stderr) {
 		return 2
 	}
 	kind := strings.ToLower(strings.TrimSpace(*kindFlag))
@@ -1837,6 +1845,10 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	fromFlag := fs.String("role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
+	if messageHelpRequested(args) {
+		printMessageActionUsage(stdout, "escalate")
+		return 0
+	}
 	question, flagArgs, ok := orgAddressedTextAndFlags(args)
 	if !ok {
 		fmt.Fprintln(stderr, "message escalate requires exactly one question")
@@ -1854,6 +1866,9 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	}
 	if question == "" {
 		fmt.Fprintln(stderr, "message escalate question must be non-empty")
+		return 2
+	}
+	if refuseFlagLikeText("message escalate", question, stderr) {
 		return 2
 	}
 	paths, err := pathsFromFlag(*home)

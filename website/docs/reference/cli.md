@@ -1899,6 +1899,15 @@ is required. All commands accept `--json`, `--home DIR`, and an operator
 `GITMOOT_ORG_ROLE` or an unambiguous current registered `HERDR_PANE_ID`.
 Role attribution is not authentication on the shared host.
 
+`-h`, `-help` or `--help` anywhere in a `gitmoot message` command prints that
+command's usage and saves nothing. Message text, questions, answers and
+directive bodies that are a single flag-like word, such as `--help` or `-x`, are
+refused so a misplaced flag is never delivered as mail. Text that starts with a
+dash but has more words, such as `"- see PR 12"`, is sent normally. The same
+rules apply to `org recycle --handoff` and `org wake retry|supersede --reason`.
+`message directive send` accepts `--` before a body to send flag-like text on
+purpose.
+
 Any configured role may talk to another; conversation grants no authority to
 assign work or change permissions. Replies stay between thread participants.
 The message and its notification obligation commit atomically. Inbox reads work
