@@ -123,13 +123,13 @@ func runEscalationRepair(args []string, stdout, stderr io.Writer) int {
 	reasonFlag := fs.String("reason", "", "required with --supersede: why the decision is being discarded")
 	byFlag := fs.String("by", "operator", "who is performing the repair, recorded in the trail")
 	jsonOutput := fs.Bool("json", false, "print the repair result as JSON")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fs.Usage()
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "escalation repair requires a coordinator job id")
-			return 2
-		}
+	if helpRequested(args) {
+		printEscalationUsage(stdout)
 		return 0
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "escalation repair requires a coordinator job id")
+		return 2
 	}
 	jobID := strings.TrimSpace(args[0])
 	if err := fs.Parse(args[1:]); err != nil {
@@ -149,6 +149,9 @@ func runEscalationRepair(args []string, stdout, stderr io.Writer) int {
 	}
 	if *supersede && strings.TrimSpace(*reasonFlag) == "" {
 		fmt.Fprintln(stderr, "--supersede discards a human decision, so it requires --reason")
+		return 2
+	}
+	if refuseFlagLikeText("escalation repair", *reasonFlag, stderr) {
 		return 2
 	}
 	output := escalationRepairOutput{JobID: jobID, RoundID: roundID, By: strings.TrimSpace(*byFlag)}

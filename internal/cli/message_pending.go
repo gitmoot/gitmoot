@@ -80,7 +80,7 @@ reported on stderr only.`)
 }
 
 func runMessagePending(args []string, stdout, stderr io.Writer) int {
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		printMessagePendingUsage(stdout)
 		return 0
 	}

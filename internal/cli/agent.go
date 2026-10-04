@@ -133,11 +133,12 @@ type agentAskOptions struct {
 }
 
 func runAgentAsk(args []string, stdout, stderr io.Writer) int {
+	if helpRequested(args) {
+		printAgentAskUsage(stdout)
+		return 0
+	}
 	options, ok := parseAgentAskOptions(args, stderr)
 	if !ok {
-		if containsHelpFlag(args) {
-			return 0
-		}
 		return 2
 	}
 	if !options.force && looksLikeWorkflowOrchestration(options.message) {
@@ -200,7 +201,7 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 }
 
 func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, bool) {
-	if len(args) == 0 || containsHelpFlag(args) {
+	if len(args) == 0 || helpRequested(args) {
 		printAgentAskUsage(stderr)
 		if len(args) == 0 {
 			fmt.Fprintln(stderr, "agent ask requires exactly one agent and one message")
@@ -317,6 +318,9 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 	}
 	options.agent = strings.TrimSpace(positionals[0])
 	options.message = strings.TrimSpace(positionals[1])
+	if refuseFlagLikeText("agent ask", options.message, stderr) {
+		return agentAskOptions{}, false
+	}
 	if options.orgRole == "" {
 		options.orgRole = strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE"))
 	}
@@ -337,15 +341,6 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 		return agentAskOptions{}, false
 	}
 	return options, true
-}
-
-func containsHelpFlag(args []string) bool {
-	for _, arg := range args {
-		if arg == "-h" || arg == "--help" {
-			return true
-		}
-	}
-	return false
 }
 
 func printAgentAskUsage(w io.Writer) {
@@ -403,11 +398,12 @@ type agentRunOptions struct {
 }
 
 func runAgentRun(args []string, stdout, stderr io.Writer) int {
+	if helpRequested(args) {
+		printAgentRunUsage(stdout, "run")
+		return 0
+	}
 	options, ok := parseAgentRunOptions("run", args, stderr)
 	if !ok {
-		if containsHelpFlag(args) {
-			return 0
-		}
 		return 2
 	}
 	selected, reason := selectAgentRunAction(options)
@@ -439,7 +435,7 @@ func runAgentRun(args []string, stdout, stderr io.Writer) int {
 // SAME dispatch as `agent run` with the run action and Background forced on, so
 // the engine and the delegations schema are untouched.
 func runOrchestrate(args []string, stdout, stderr io.Writer) int {
-	if containsHelpFlag(args) || len(args) == 0 {
+	if helpRequested(args) || len(args) == 0 {
 		printOrchestrateUsage(stdout)
 		if len(args) == 0 {
 			fmt.Fprintln(stderr, "orchestrate requires exactly one agent and one message")
@@ -497,11 +493,12 @@ func printOrchestrateUsage(w io.Writer) {
 }
 
 func runAgentReview(args []string, stdout, stderr io.Writer) int {
+	if helpRequested(args) {
+		printAgentRunUsage(stdout, "review")
+		return 0
+	}
 	options, ok := parseAgentRunOptions("review", args, stderr)
 	if !ok {
-		if containsHelpFlag(args) {
-			return 0
-		}
 		return 2
 	}
 	if strings.TrimSpace(options.repo) == "" {
@@ -873,7 +870,7 @@ func agentRunCommandLabel(command string) string {
 
 func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agentRunOptions, bool) {
 	label := agentRunCommandLabel(command)
-	if len(args) == 0 || containsHelpFlag(args) {
+	if len(args) == 0 || helpRequested(args) {
 		printAgentRunUsage(stderr, command)
 		if len(args) == 0 {
 			fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
@@ -976,6 +973,9 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	}
 	options.agent = strings.TrimSpace(positionals[0])
 	options.message = strings.TrimSpace(positionals[1])
+	if refuseFlagLikeText(label, options.message, stderr) {
+		return agentRunOptions{}, false
+	}
 	if options.orgRole == "" {
 		options.orgRole = strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE"))
 	}
@@ -1687,13 +1687,13 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
+	if len(args) == 0 {
 		fs.Usage()
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent start requires exactly one name")
-			return 2
-		}
-		return 0
+		fmt.Fprintln(stderr, "agent start requires exactly one name")
+		return 2
 	}
 	name := args[0]
 	if err := fs.Parse(args[1:]); err != nil {
@@ -1863,13 +1863,13 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	var capabilities repeatedFlag
 	fs.Var(&repos, "repo", "allowed repo as owner/repo, repeatable")
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
+	if len(args) == 0 {
 		fs.Usage()
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent subscribe requires exactly one name")
-			return 2
-		}
-		return 0
+		fmt.Fprintln(stderr, "agent subscribe requires exactly one name")
+		return 2
 	}
 	name := args[0]
 	if err := fs.Parse(args[1:]); err != nil {

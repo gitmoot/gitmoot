@@ -19,7 +19,7 @@ import (
 var orgDirectiveStdin io.Reader = os.Stdin
 
 func runOrgDirective(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || messageHelpRequested(args[:1]) {
+	if len(args) == 0 || helpRequested(args[:1]) {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}
@@ -64,7 +64,7 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	stdin := fs.Bool("stdin", false, "read directive body from stdin")
 	file := fs.String("F", "", "read directive body from file")
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}
@@ -177,7 +177,7 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	byFlag := fs.String("role", "", "organization role recording the "+kind)
 	jsonOutput := fs.Bool("json", false, "JSON output")
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}

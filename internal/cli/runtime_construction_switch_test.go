@@ -110,8 +110,8 @@ func TestSetupRuntimeFlagHelpIsDerivedFromRegistry(t *testing.T) {
 	}
 
 	// flag.PrintDefaults emits "  -runtime string" followed by the usage on its own
-	// indented line.
-	lines := strings.Split(stderr.String(), "\n")
+	// indented line. Help goes to stdout (#2306).
+	lines := strings.Split(stdout.String(), "\n")
 	got := ""
 	found := false
 	for i, line := range lines {
@@ -119,14 +119,14 @@ func TestSetupRuntimeFlagHelpIsDerivedFromRegistry(t *testing.T) {
 			continue
 		}
 		if i+1 >= len(lines) {
-			t.Fatalf("--runtime flag has no usage line; setup --help was:\n%s", stderr.String())
+			t.Fatalf("--runtime flag has no usage line; setup --help was:\n%s", stdout.String())
 		}
 		got = strings.TrimSpace(lines[i+1])
 		found = true
 		break
 	}
 	if !found {
-		t.Fatalf("setup --help does not register a --runtime flag:\n%s", stderr.String())
+		t.Fatalf("setup --help does not register a --runtime flag:\n%s", stdout.String())
 	}
 	if got != want {
 		t.Fatalf("setup --runtime usage = %q, want %q (derive it from runtime.SupportedRuntimes, never a literal)", got, want)

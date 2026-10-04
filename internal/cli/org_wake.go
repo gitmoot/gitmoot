@@ -15,7 +15,7 @@ import (
 )
 
 func runOrgWake(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 || messageHelpRequested(args) {
+	if len(args) == 0 || helpRequested(args) {
 		printOrgWakeUsage(stdout)
 		return 0
 	}

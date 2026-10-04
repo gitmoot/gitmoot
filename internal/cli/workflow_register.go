@@ -17,7 +17,7 @@ func runWorkflowRegister(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory")
 	jsonOutput := fs.Bool("json", false, "JSON output")
-	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
+	if helpRequested(args) {
 		fmt.Fprintln(stdout, "usage: workflow register LABEL DESCRIPTION [--home DIR] [--json]")
 		return 0
 	}
@@ -26,6 +26,9 @@ func runWorkflowRegister(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	label, description := strings.TrimSpace(args[0]), strings.TrimSpace(args[1])
+	if refuseFlagLikeText("workflow register", description, stderr) {
+		return 2
+	}
 	if err := fs.Parse(args[2:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0

@@ -2247,10 +2247,18 @@ not grant directive authority, repository scope, or permission to do the work.
 command's usage and saves nothing. Message text, questions, answers and
 directive bodies that are a single flag-like word, such as `--help` or `-x`, are
 refused so a misplaced flag is never delivered as mail. Text that starts with a
-dash but has more words, such as `"- see PR 12"`, is sent normally. The same
-rules apply to `org recycle --handoff` and `org wake retry|supersede --reason`.
-`message directive send` accepts `--` before a body to send flag-like text on
-purpose.
+dash but has more words, such as `"- see PR 12"`, or a dash before a number,
+such as `-1`, is sent normally. `message directive send` accepts `--` before a
+body to send flag-like text on purpose.
+
+The same rules apply to every other command that saves free text: `workflow
+note|describe|register|close --reason`, `task successor --reason`, `escalation
+repair --reason`, `job open|record --title`, `job close|record --summary`,
+`agent heartbeat add --prompt`, the message of `agent ask|run|review` and
+`orchestrate`, `org events rule add --match`, `org recycle --handoff` and
+`org wake retry|supersede --reason`. A help flag anywhere in those commands, and
+in `setup`, `agent start`, `agent subscribe` and `review request`, prints usage
+on stdout instead of saving anything.
 
 No workflow, job, subscription, acknowledgment, or completion obligation is
 required. Optional `--workflow` validates an existing registered workflow

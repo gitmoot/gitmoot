@@ -60,6 +60,9 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -84,6 +87,9 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
 		fmt.Fprintf(stderr, "job open: %v\n", err)
+		return 2
+	}
+	if refuseFlagLikeText("job open", *title, stderr) {
 		return 2
 	}
 
@@ -149,12 +155,12 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	// The job id is positional and precedes the flags (`job close <id> --decision
 	// …`), so pull it off args[0] before flag.Parse (which stops at the first
 	// non-flag token).
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "job close requires a job id")
-			return 2
-		}
-		return 0
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "job close requires a job id")
+		return 2
 	}
 	jobID := strings.TrimSpace(args[0])
 	if jobID == "" || strings.HasPrefix(jobID, "-") {
@@ -169,6 +175,9 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "job close accepts exactly one job id")
+		return 2
+	}
+	if refuseFlagLikeText("job close", *summary, stderr) {
 		return 2
 	}
 	if !validateSessionDecision(*decision, stderr) {
@@ -249,6 +258,9 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
 	outputTokens := fs.Int("output-tokens", 0, "output tokens used by the session work")
 	jsonOutput := fs.Bool("json", false, "print the recorded job as JSON")
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -257,6 +269,9 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, "job record does not accept positional arguments")
+		return 2
+	}
+	if refuseFlagLikeText("job record", *title, stderr) || refuseFlagLikeText("job record", *summary, stderr) {
 		return 2
 	}
 	action, ok := validateSessionAction(*typeName, stderr)

@@ -160,13 +160,13 @@ func runTaskSuccessor(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	reason := fs.String("reason", "", "why the work continues (recorded on both tasks)")
 	jsonOutput := fs.Bool("json", false, "print the successor as JSON")
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		fs.Usage()
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "task successor requires exactly one id")
-			return 2
-		}
+	if helpRequested(args) {
+		printTaskUsage(stdout)
 		return 0
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "task successor requires exactly one id")
+		return 2
 	}
 	taskID := strings.TrimSpace(args[0])
 	if err := fs.Parse(args[1:]); err != nil {
@@ -177,6 +177,9 @@ func runTaskSuccessor(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() != 0 || taskID == "" {
 		fmt.Fprintln(stderr, "task successor requires exactly one id")
+		return 2
+	}
+	if refuseFlagLikeText("task successor", *reason, stderr) {
 		return 2
 	}
 	disposed := []string{string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded)}

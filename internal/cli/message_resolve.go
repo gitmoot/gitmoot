@@ -21,7 +21,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	answer := fs.String("answer", "", "decision or answer to record in the thread")
 	answerID := fs.Int64("note", 0, "existing answer note in the same workflow")
 	jsonOutput := fs.Bool("json", false, "JSON output")
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		printMessageActionUsage(stdout, "resolve")
 		return 0
 	}

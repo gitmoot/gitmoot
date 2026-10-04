@@ -1437,7 +1437,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	handoffFlag := fs.String("handoff", "", "handoff note for the successor session")
 	paneFlag := fs.String("pane", "", "Herdr pane id (overrides the role's configured pane)")
 	jsonOutput := fs.Bool("json", false, "print JSON")
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		fmt.Fprintln(stdout, "Usage: gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 		fmt.Fprintln(stdout, "A handoff note that is a single flag-like word, such as --help or -x, is refused.")
 		return 0
@@ -1845,7 +1845,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	fromFlag := fs.String("role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
-	if messageHelpRequested(args) {
+	if helpRequested(args) {
 		printMessageActionUsage(stdout, "escalate")
 		return 0
 	}
@@ -2101,6 +2101,10 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repository alias; owner/name is exact against repo while job-ID substring matching remains active")
 	wake := fs.String("wake", "", "organization role to wake")
 	scopeFlag := fs.String("scope", string(db.EventRuleScopeAddressed), "rule scope: addressed or observer")
+	if helpRequested(args) {
+		printOrgEventRuleUsage(stdout)
+		return 0
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -2119,6 +2123,9 @@ func runOrgEventRuleAdd(args []string, stdout, stderr io.Writer) int {
 	}
 	if repoFilter != "" {
 		matchFilter = repoFilter
+	}
+	if refuseFlagLikeText("org events rule add", matchFilter, stderr) {
+		return 2
 	}
 	scope := db.EventRuleScope(strings.ToLower(strings.TrimSpace(*scopeFlag)))
 	if scope != db.EventRuleScopeAddressed && scope != db.EventRuleScopeObserver {

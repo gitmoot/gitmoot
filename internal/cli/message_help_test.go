@@ -120,6 +120,16 @@ func TestMessageRefusesFlagLikeText(t *testing.T) {
 	if sent.Body != "- see PR 12 first" {
 		t.Fatalf("dash-led text changed: %+v", sent)
 	}
+	// Dash-led numbers and arrows are text, not flags.
+	for _, text := range []string{"-1", "->"} {
+		var plain messageTestResult
+		if err := json.Unmarshal(messageCLI(t, home, "deimos", "send", "jarvis", text), &plain); err != nil {
+			t.Fatal(err)
+		}
+		if plain.Body != text {
+			t.Fatalf("dash-led text %q changed: %+v", text, plain)
+		}
+	}
 	var escalateOut, escalateDiag bytes.Buffer
 	if code := Run([]string{"message", "escalate", "--role", "deimos", "--home", home, "--json", "Ship the release?"}, &escalateOut, &escalateDiag); code != 0 {
 		t.Fatalf("escalate exit=%d: %s", code, escalateDiag.String())

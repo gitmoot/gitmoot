@@ -29,6 +29,9 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	role := fs.String("role", "agent", "agent role")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
 	watchIssues := fs.Bool("watch-issues", true, "watch open issues and route @<agent> ask comments to jobs (#389); on by default so the daemon is tagging-ready")
+	if helpRequested(args) {
+		return printFlagSetHelp(fs, stdout)
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
