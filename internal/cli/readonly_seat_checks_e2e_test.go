@@ -233,7 +233,7 @@ func TestDaemonStartupSweepsSeatTempDirsOfDeadOwners(t *testing.T) {
 	}
 	seed := func(pid int) (string, string) {
 		name := "gmr-" + randomSeatHex(t)
-		dir := filepath.Join(os.TempDir(), name)
+		dir := filepath.Join(seatTempParent(), name)
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -261,6 +261,62 @@ func TestDaemonStartupSweepsSeatTempDirsOfDeadOwners(t *testing.T) {
 		if _, err := os.Lstat(path); err != nil {
 			t.Errorf("startup removed %q of a live owner: %v", path, err)
 		}
+	}
+}
+
+// TestSeatTempSweepKeepsADirOutsideAnySeatTempParent bounds the sweep's
+// recursive delete: a marker of a dead owner that names a gmr-<8 hex> directory
+// deep in the filesystem, where seatTempParent never puts one under any
+// TMPDIR, is refused and kept, and the directory survives.
+func TestSeatTempSweepKeepsADirOutsideAnySeatTempParent(t *testing.T) {
+	home := t.TempDir()
+	exited := exec.Command("true")
+	if err := exited.Run(); err != nil {
+		t.Fatal(err)
+	}
+	registry := seatTempRegistry(home)
+	if err := os.MkdirAll(registry, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := "gmr-" + randomSeatHex(t)
+	dir := filepath.Join(t.TempDir(), "operator", "work", name)
+	writeSeatFixtureFile(t, dir, "keep", "not a seat's")
+	marker := filepath.Join(registry, name)
+	if err := os.WriteFile(marker, []byte(strconv.Itoa(exited.Process.Pid)+"\n"+dir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := sweepStaleSeatTempDirs(home)
+	if removed != 0 || err == nil || !strings.Contains(err.Error(), "not a seat temp dir") {
+		t.Fatalf("sweep = removed %d, err %v; want the deep directory refused", removed, err)
+	}
+	for _, path := range []string{filepath.Join(dir, "keep"), marker} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("sweep removed %q: %v", path, err)
+		}
+	}
+}
+
+// TestShortTestTempRootReportsUnusableParents covers the read-only seat case
+// of TestMain: when no parent can hold a short test temp root (one refuses the
+// mkdir, as a seat's denied /tmp does; one is too long, as a seat's own TMPDIR
+// is), it returns an error naming each (which TestMain reports and runs on)
+// and creates nothing.
+func TestShortTestTempRootReportsUnusableParents(t *testing.T) {
+	if _, err := os.Stat("/proc/self"); err != nil {
+		t.Skip("needs procfs: /proc is a short parent nobody can mkdir in")
+	}
+	long := t.TempDir()
+	root, err := makeShortTestTempRoot([]string{"/proc", long})
+	if err == nil {
+		_ = removeTestTempRoot(root)
+		t.Fatalf("makeShortTestTempRoot = %q, want an error", root)
+	}
+	if !strings.Contains(err.Error(), "mkdir /proc/gt") || !strings.Contains(err.Error(), "too long to parent seat temp dirs") {
+		t.Fatalf("makeShortTestTempRoot error = %v, want both parents named", err)
+	}
+	if entries, err := os.ReadDir(long); err != nil || len(entries) != 0 {
+		t.Fatalf("long parent %q = %v err=%v, want untouched", long, entries, err)
 	}
 }
 

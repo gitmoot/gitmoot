@@ -444,9 +444,10 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if containsPath(runner.ReadablePaths, "/") || containsPath(runner.ReadablePaths, stateDir) {
 		t.Fatalf("explicit reads %v expose the host root or source profile", runner.ReadablePaths)
 	}
-	if len(runner.WritablePaths) != 1 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
-		t.Fatalf("writes = %v, want one per-worktree cache and no source profile", runner.WritablePaths)
+	if len(runner.WritablePaths) != 2 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
+		t.Fatalf("writes = %v, want the per-worktree cache, the seat's temp dir, and no source profile", runner.WritablePaths)
 	}
+	assertSeatTempDirGrant(t, runner.WritablePaths[1], stateAdapter.cleanupTemp, runner.Env)
 	configEnv := envValue(runner.Env, "CLAUDE_CONFIG_DIR")
 	if configEnv == "" || configEnv == stateDir || !strings.HasPrefix(configEnv, runner.WritablePaths[0]+string(filepath.Separator)) {
 		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want isolated state under %q", configEnv, runner.WritablePaths[0])
@@ -1050,9 +1051,10 @@ func TestWrapReadOnlySandboxAdapterUsesScopedBrokerAndPrivateOmpState(t *testing
 	if !ok {
 		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", ompAdapter.Runner)
 	}
-	if !runner.ReadOnlyWorkdir || len(runner.WritablePaths) != 1 || runner.WritablePaths[0] != stateAdapter.cleanupRoot {
+	if !runner.ReadOnlyWorkdir || len(runner.WritablePaths) != 2 || runner.WritablePaths[0] != stateAdapter.cleanupRoot {
 		t.Fatalf("OMP sandbox workdir/write grants = readOnly:%v writes:%v", runner.ReadOnlyWorkdir, runner.WritablePaths)
 	}
+	assertSeatTempDirGrant(t, runner.WritablePaths[1], stateAdapter.cleanupTemp, runner.Env)
 	if containsPath(runner.ReadablePaths, hostProfile) || containsPath(runner.ReadableFiles, filepath.Join(hostProfile, "agent.db")) {
 		t.Fatalf("OMP sandbox reads expose operator profile: dirs=%v files=%v", runner.ReadablePaths, runner.ReadableFiles)
 	}
@@ -1157,6 +1159,27 @@ func containsPath(paths []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// assertSeatTempDirGrant proves a read-only seat's second write grant is that
+// seat's own private temp dir (#2314): the one the adapter will remove, the one
+// its TMPDIR names, a fresh gmr-<8 hex> directly under the seat temp parent.
+func assertSeatTempDirGrant(t *testing.T, grant string, owned seatTempDir, env []string) {
+	t.Helper()
+	if owned.dir == "" || grant != owned.dir {
+		t.Fatalf("seat temp write grant = %q, want the adapter's own seat temp dir %q", grant, owned.dir)
+	}
+	if filepath.Dir(grant) != seatTempParent() || !seatTempNamePattern.MatchString(filepath.Base(grant)) {
+		t.Fatalf("seat temp write grant = %q, want %s/gmr-<8 hex>", grant, seatTempParent())
+	}
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if got := envValue(env, name); got != grant {
+			t.Fatalf("seat %s = %q, want its temp dir grant %q", name, got, grant)
+		}
+	}
+	if info, err := os.Lstat(grant); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("seat temp dir %q = %v err=%v, want a 0700 directory", grant, info, err)
+	}
 }
 
 func containsEnv(env []string, want string) bool {

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -41,18 +42,24 @@ func TestMain(m *testing.M) {
 	// TMPDIR when that is short, else under /tmp. Tests compose many seats and
 	// not all of them run the job-end cleanup, so point TMPDIR at this run's own
 	// short parent and remove it afterwards.
-	tempRoot, err := makeShortTestTempRoot()
+	//
+	// No such parent is NOT fatal. Inside a read-only review seat the only
+	// writable temp dir is the seat's own TMPDIR and /tmp is denied, so the
+	// suite keeps that TMPDIR: the seat's job-end cleanup removes whatever the
+	// tests leave there. Only the tests that compose a nested seat need a
+	// short parent; everything else runs.
+	tempRoot, err := makeShortTestTempRoot(slices.Compact([]string{os.TempDir(), "/tmp"}))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "create test temp root: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.Setenv("TMPDIR", tempRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "no short test temp root, keeping TMPDIR=%s: %v\n", os.TempDir(), err)
+	} else if err := os.Setenv("TMPDIR", tempRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "set TMPDIR: %v\n", err)
 		os.Exit(1)
 	}
 	code := m.Run()
-	if err := removeTestTempRoot(tempRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "clean test temp root: %v\n", err)
+	if tempRoot != "" {
+		if err := removeTestTempRoot(tempRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "clean test temp root: %v\n", err)
+		}
 	}
 	if err := cleanupSharedGitmootTestBinary(); err != nil {
 		fmt.Fprintf(os.Stderr, "clean shared gitmoot test binary: %v\n", err)
@@ -63,15 +70,32 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// makeShortTestTempRoot makes /tmp/gt<8 hex>: 15 bytes, inside the 16-byte
-// limit a TMPDIR must meet to parent seat temp dirs.
-func makeShortTestTempRoot() (string, error) {
+// makeShortTestTempRoot makes <parent>/gt<8 hex> under the first parent that
+// accepts it and leaves it short enough to parent seat temp dirs: /tmp/gt<8 hex>
+// is 15 bytes. A parent too long for that is skipped, an unwritable one is
+// tried and passed over, and the error names every parent when none works.
+func makeShortTestTempRoot(parents []string) (string, error) {
+	var errs []error
+	for _, parent := range parents {
+		dir, err := makeTestTempRootUnder(parent)
+		if err == nil {
+			return dir, nil
+		}
+		errs = append(errs, err)
+	}
+	return "", errors.Join(errs...)
+}
+
+func makeTestTempRootUnder(parent string) (string, error) {
 	for range 16 {
 		var suffix [4]byte
 		if _, err := rand.Read(suffix[:]); err != nil {
 			return "", err
 		}
-		dir := "/tmp/gt" + hex.EncodeToString(suffix[:])
+		dir := filepath.Join(parent, "gt"+hex.EncodeToString(suffix[:]))
+		if !isSeatTempParent(dir) {
+			return "", fmt.Errorf("%s: too long to parent seat temp dirs", dir)
+		}
 		err := os.Mkdir(dir, 0o700)
 		if err == nil {
 			return dir, nil
@@ -80,7 +104,7 @@ func makeShortTestTempRoot() (string, error) {
 			return "", err
 		}
 	}
-	return "", errors.New("no free /tmp/gt<hex> name after 16 attempts")
+	return "", fmt.Errorf("no free %s/gt<hex> name after 16 attempts", parent)
 }
 
 // removeTestTempRoot also removes directories a test made read-only (the go

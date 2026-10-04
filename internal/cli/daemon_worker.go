@@ -2160,6 +2160,12 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 			grants.tempDir = seatTempDir{}
 		}
 	}()
+	// The write grants are final here. Validate them against the checkout
+	// before anything runs under them, including the module prefetch below,
+	// which writes scratch files beneath tempDir.
+	if err := validateReadOnlyWritablePaths(checkout, grants.writes); err != nil {
+		return grants, err
+	}
 
 	grants.reads = append(grants.reads, checkout)
 	metadata, err := reviewGitMetadataPaths(checkout)
@@ -2355,9 +2361,6 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		"TMP="+tempDir,
 		"TEMP="+tempDir,
 	)
-	if err := validateReadOnlyWritablePaths(checkout, grants.writes); err != nil {
-		return grants, err
-	}
 	for _, path := range append([]string{filepath.Join(grants.cacheRoot, "home")}, grants.writes...) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return grants, fmt.Errorf("create read-only sandbox write directory %q: %w", path, err)

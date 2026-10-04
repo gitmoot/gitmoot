@@ -920,7 +920,11 @@ directory, other seats' `gmr-*` directories, the checkout and the gitmoot home
 stay read-only. The daemon records each directory in
 `<gitmoot-home>/cache/seat-tmp/` with its owner's pid and removes it when the
 job ends. If the daemon crashes first, the next daemon start (and the next seat
-launch) removes every directory whose owner process is gone.
+launch) removes every directory whose owner process is gone. The owner is the
+process that made the directory (the daemon or a foreground `job run`), so a
+seat process that outlives it loses its temp dir. A record that names a
+`gmr-*` directory under a parent no seat could have used (anything but an
+absolute path of at most 16 bytes) is kept and reported, never removed.
 
 **Go module cache.** Offline `go build` and `go test` work in a seat. Before
 the seat starts, the daemon runs `go mod download` for the checkout's modules

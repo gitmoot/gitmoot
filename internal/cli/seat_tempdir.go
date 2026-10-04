@@ -34,7 +34,8 @@ import (
 // own cleanup. Each directory gets a marker in seatTempRegistry naming the
 // process that owns it and the directory's path. The registry is never granted
 // to a seat, so a seat cannot point the sweep at another path, and the sweep
-// only removes a directory whose base name is the marker's own gmr-<8 hex>.
+// only removes a directory whose base name is the marker's own gmr-<8 hex> and
+// whose parent is one seatTempParent could have chosen (see removeSeatTempDir).
 const seatTempPrefix = "gmr-"
 
 // seatTempParentMaxLen keeps a TMPDIR-derived <parent>/gmr-<8 hex> at most 29
@@ -45,11 +46,16 @@ const seatTempParentMaxLen = 16
 // seat's sockets, and /tmp otherwise. A long daemon TMPDIR is exactly the
 // defect this exists to fix, so it is never used.
 func seatTempParent() string {
-	parent := os.TempDir()
-	if !filepath.IsAbs(parent) || filepath.Clean(parent) != parent || len(parent) > seatTempParentMaxLen {
-		return "/tmp"
+	if parent := os.TempDir(); isSeatTempParent(parent) {
+		return parent
 	}
-	return parent
+	return "/tmp"
+}
+
+// isSeatTempParent reports whether seatTempParent can return parent under
+// some TMPDIR: /tmp, or any absolute, clean path within the length limit.
+func isSeatTempParent(parent string) bool {
+	return filepath.IsAbs(parent) && filepath.Clean(parent) == parent && len(parent) <= seatTempParentMaxLen
 }
 
 var seatTempNamePattern = regexp.MustCompile(`^gmr-[0-9a-f]{8}$`)
@@ -147,13 +153,22 @@ func verifySeatTempDir(dir string) error {
 
 // removeSeatTempDir deletes a seat temp dir and then its registry marker. The
 // marker is kept when removal fails, so the next sweep retries it.
+//
+// The path comes from a marker, which only the daemon's user can write, but a
+// corrupted marker must still not aim a recursive delete at an arbitrary
+// directory. So the parent recorded in the marker's path must be one that
+// seatTempParent can return. It is deliberately NOT required to equal today's
+// seatTempParent(): an operator who changes the daemon's TMPDIR would then
+// strand every seat dir made under the old parent, leaking it for good. The
+// bound kept is the length limit: it rules out a gmr-* directory anywhere deep
+// (a checkout, a cache, a Gitmoot home), not every short directory on the host.
 func removeSeatTempDir(home, dir string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return nil
 	}
 	name := filepath.Base(dir)
-	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || !seatTempNamePattern.MatchString(name) {
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir || !seatTempNamePattern.MatchString(name) || !isSeatTempParent(filepath.Dir(dir)) {
 		return fmt.Errorf("refuse to remove %q: not a seat temp dir", dir)
 	}
 	if err := removeTreeForcibly(dir); err != nil {
@@ -231,6 +246,13 @@ func sweepStaleSeatTempDirs(home string) (int, error) {
 	return removed, errors.Join(errs...)
 }
 
+// seatTempOwnerAlive answers for the process that CREATED the dir (the daemon
+// or a foreground dispatch), not for the seat that uses it. A seat process that
+// outlives its creator, such as a runtime orphaned by a killed daemon or one a
+// future runtime detaches on purpose, has its TMPDIR swept out from under it by
+// the next sweep. That fails closed: the seat loses its scratch space and gains
+// no access. A reused PID only makes the sweep keep a dead owner's dir, so that
+// gap leaks space rather than widening a seat.
 func seatTempOwnerAlive(pid int) bool {
 	if pid == os.Getpid() {
 		return true
