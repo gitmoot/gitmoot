@@ -297,6 +297,96 @@ func TestReviewRequestRoutesOnlyReadyGreenPolicyReviews(t *testing.T) {
 	}
 }
 
+// #2314: scripted callers used `agent review --json` because they needed the job
+// id as JSON, and every such call bypassed the router - so no model was routed.
+// The same request spelled with `agent review`'s flags (--head-sha, --org-role,
+// --no-fix-target, --background) must go THROUGH the router: a routed model,
+// a route event, no bypass event, and a parseable object with the keys
+// `agent review --json` printed.
+func TestReviewRequestJSONWithAgentReviewFlagsRoutesTheReview(t *testing.T) {
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	var stdout, stderr bytes.Buffer
+	if code := runReview([]string{
+		"request", "--repo", "owner/repo", "--pr", "12", "--head-sha", head,
+		"--branch", "feature/review", "--org-role", "joltra", "--no-fix-target",
+		"--background", "--home", home, "--json",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("review request exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var printed map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	jobID, _ := printed["job_id"].(string)
+	if jobID == "" {
+		t.Fatalf("job_id missing from %s", stdout.String())
+	}
+	for key, want := range map[string]any{"state": reviewRequestDispatched, "repo": "owner/repo", "action": "review", "head_sha": head} {
+		if printed[key] != want {
+			t.Fatalf("%s = %v, want %v in %s", key, printed[key], want, stdout.String())
+		}
+	}
+	if agent, _ := printed["agent"].(string); agent == "" {
+		t.Fatalf("agent missing from %s", stdout.String())
+	}
+	if fact, _ := printed["awaited_fact_id"].(float64); fact <= 0 {
+		t.Fatalf("awaited_fact_id = %v, want the requester's verdict wait in %s", printed["awaited_fact_id"], stdout.String())
+	}
+	if printed["job_state"] != "queued" {
+		t.Fatalf("job_state = %v, want queued", printed["job_state"])
+	}
+
+	payload := dispatchedReviewPayload(t, store, jobID)
+	if payload.Model != "sentinel/router-a" {
+		t.Fatalf("model = %q, want the router's pool head sentinel/router-a", payload.Model)
+	}
+	if !payload.NoFixTarget || payload.HeadSHA != head || payload.ReviewRequester != "joltra" {
+		t.Fatalf("payload no_fix_target=%v head=%q requester=%q, want true/%s/joltra", payload.NoFixTarget, payload.HeadSHA, payload.ReviewRequester, head)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed := false
+	for _, event := range events {
+		switch event.Kind {
+		case "router_bypassed":
+			t.Fatalf("routed request recorded router_bypassed: %q", event.Message)
+		case "route_selected":
+			routed = strings.Contains(event.Message, "via "+reviewRequestExecutionPath)
+		}
+	}
+	if !routed {
+		t.Fatalf("no route_selected event naming %s on %s: %+v", reviewRequestExecutionPath, jobID, events)
+	}
+}
+
+// --no-fix-target and --lead contradict each other; the router refuses the pair
+// the way the direct path does, and refuses a --head-sha that disagrees with --head.
+func TestReviewRequestRefusesContradictoryAgentReviewFlags(t *testing.T) {
+	home, _, head := reviewRouterHome(t)
+	for _, testCase := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"lead and no fix target", []string{"--head", head, "--lead", "implementer", "--no-fix-target"}, "mutually exclusive"},
+		{"two different heads", []string{"--head", head, "--head-sha", strings.Repeat("a", 40)}, "disagree"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"request", "--repo", "owner/repo", "--pr", "12", "--role", "joltra", "--home", home}, testCase.args...)
+			if code := runReview(args, &stdout, &stderr); code != 2 {
+				t.Fatalf("exit=%d stderr=%q, want 2", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), testCase.want) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), testCase.want)
+			}
+		})
+	}
+}
+
 func TestReviewRequestPersistsPerJobExecutionBackend(t *testing.T) {
 	home, store, head := reviewRouterHome(t)
 	output, failure := runReviewRequestJSON(t,

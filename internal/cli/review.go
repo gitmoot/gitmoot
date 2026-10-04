@@ -68,6 +68,18 @@ type reviewRequestOutput struct {
 	NotifyBy        string   `json:"notify_by"`
 	Holds           []string `json:"holds,omitempty"`
 	WatchCommand    string   `json:"watch_command,omitempty"`
+	// The fields below repeat the names `agent review --json` prints, so a
+	// caller that parsed that object reads the same keys here (#2314). `state`
+	// above keeps its router meaning (dispatched, attached, verdict_exists);
+	// the job's own state is `job_state`.
+	Agent                string   `json:"agent"`
+	Action               string   `json:"action"`
+	SelectedAction       string   `json:"selected_action,omitempty"`
+	SelectedActionReason string   `json:"selected_action_reason,omitempty"`
+	ExecutionPath        string   `json:"execution_path,omitempty"`
+	RawOutputCount       int      `json:"raw_output_count"`
+	DaemonRunning        bool     `json:"daemon_running,omitempty"`
+	SubscriptionHolds    []string `json:"subscription_holds,omitempty"`
 }
 
 func runReview(args []string, stdout, stderr io.Writer) int {
@@ -91,7 +103,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -110,6 +122,10 @@ type reviewRequestOptions struct {
 	// reason the other surface was still being used.
 	lead    string
 	message string
+	// noFixTarget states the default a request without --lead already gets, so
+	// `agent review --no-fix-target` routes here unchanged (#2314). It exists to
+	// refuse --lead alongside it, as the direct path does.
+	noFixTarget bool
 	// model, effort, workflowID and session are carried so delegation from
 	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
 	// is load-bearing: every dispatch on this campaign passes
@@ -171,6 +187,13 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
+	// Spellings `agent review` uses for the same inputs (#2314), so a caller
+	// can move to this command by changing only the verb.
+	var headSHA, orgRole string
+	fs.StringVar(&headSHA, "head-sha", "", "same as --head")
+	fs.StringVar(&orgRole, "org-role", "", "same as --role")
+	fs.BoolVar(&opts.noFixTarget, "no-fix-target", false, "state that this review has no implementer for a changes-requested verdict (the default without --lead); refused with --lead")
+	fs.Bool("background", false, "accepted for parity with `agent review`: the router always queues the review for the daemon")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
@@ -195,6 +218,28 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
 		fmt.Fprintln(stderr, "review request: --post-merge and --lead are mutually exclusive")
 		return 2
+	}
+	if opts.noFixTarget && strings.TrimSpace(opts.lead) != "" {
+		fmt.Fprintln(stderr, "review request: --no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
+		return 2
+	}
+	for _, alias := range []struct {
+		name, alias string
+		value       *string
+		aliasValue  string
+	}{
+		{"--head", "--head-sha", &opts.head, headSHA},
+		{"--role", "--org-role", &opts.role, orgRole},
+	} {
+		aliasValue := strings.TrimSpace(alias.aliasValue)
+		if aliasValue == "" {
+			continue
+		}
+		if current := strings.TrimSpace(*alias.value); current != "" && !strings.EqualFold(current, aliasValue) {
+			fmt.Fprintf(stderr, "review request: %s %q and %s %q disagree; pass one\n", alias.name, current, alias.alias, aliasValue)
+			return 2
+		}
+		*alias.value = aliasValue
 	}
 	if opts.ttl <= 0 {
 		fmt.Fprintln(stderr, "review request: --ttl must be positive")
@@ -351,15 +396,21 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
+	holds, daemonRunning := reviewRequestHolds(paths, opts.home)
 	output := reviewRequestOutput{
-		Repo:        repo.FullName(),
-		PullRequest: opts.pr,
-		HeadSHA:     head,
-		Purpose:     opts.purpose,
-		Requester:   opts.role,
-		ModelPool:   pool,
-		NotifyBy:    "awaited fact wake to " + opts.role,
-		Holds:       reviewRequestHolds(paths, opts.home),
+		Repo:                 repo.FullName(),
+		PullRequest:          opts.pr,
+		HeadSHA:              head,
+		Purpose:              opts.purpose,
+		Requester:            opts.role,
+		ModelPool:            pool,
+		NotifyBy:             "awaited fact wake to " + opts.role,
+		Holds:                holds,
+		Action:               "review",
+		SelectedAction:       "review",
+		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
+		ExecutionPath:        reviewRequestExecutionPath,
+		DaemonRunning:        daemonRunning,
 	}
 	// The claim is taken on a job id minted here. The claim row — NOT the jobs
 	// row — is the mutual exclusion: dispatch takes seconds (worktree allocation,
@@ -457,7 +508,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
 		PostMergeReview:      opts.postMerge,
 		SelectedAction:       "review",
-		SelectedActionReason: "review router " + opts.purpose,
+		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:        reviewRequestExecutionPath,
 		JobID:                jobID,
 		ReviewPurpose:        opts.purpose,
@@ -481,6 +532,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	output.JobID = dispatched.JobID
 	output.JobState = dispatched.State
 	output.Reviewer = reviewer.Name
+	output.Agent = reviewer.Name
 	// THE DISPATCHED VALUES, NOT THE POOL HEAD. output.Model was pool[0], which
 	// misreports an explicit --model and made a working override look dropped
 	// (#2196 review). request.Model and request.Runtime are what the job carries.
@@ -853,6 +905,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
 	output.Reviewer = job.Agent
+	output.Agent = job.Agent
 	output.Model = job.Model
 	output.Runtime = job.Runtime
 	output.WatchCommand = jobWatchCommand(output.JobID, opts.home)
@@ -904,6 +957,7 @@ func subscribeReviewRequester(ctx context.Context, store *db.Store, output *revi
 		return err
 	}
 	output.Holds = append(output.Holds, holds...)
+	output.SubscriptionHolds = holds
 	output.AwaitedFactID = factID
 	return nil
 }
@@ -1205,10 +1259,12 @@ func unavailableReviewRuntimeError(role string, incident db.OrgRoleUnavailable) 
 
 // reviewRequestHolds names admission states that keep a dispatched review from
 // starting. They are reported on the request itself so a requester can tell a
-// held review from a slow one instead of pinging its coordinator.
-func reviewRequestHolds(paths config.Paths, home string) []string {
+// held review from a slow one instead of pinging its coordinator. The second
+// result is whether the daemon is known to be running.
+func reviewRequestHolds(paths config.Paths, home string) ([]string, bool) {
 	var holds []string
-	if running, err := daemonIsRunning(home); err != nil {
+	running, err := daemonIsRunning(home)
+	if err != nil {
 		holds = append(holds, "daemon state unknown: "+err.Error())
 	} else if !running {
 		holds = append(holds, "daemon not running: the review stays queued until `gitmoot daemon run` starts")
@@ -1216,7 +1272,11 @@ func reviewRequestHolds(paths config.Paths, home string) []string {
 	if evaluation := evaluateConfiguredDiskGuard(paths); !evaluation.allowsDispatch() {
 		holds = append(holds, "disk guard paused dispatch: "+evaluation.detail())
 	}
-	return holds
+	return holds, err == nil && running
+}
+
+func reviewRequestSelectedActionReason(purpose string) string {
+	return "review router " + purpose
 }
 
 // resolveDeltaReviewScope picks the most recent terminal verdict for this repo,

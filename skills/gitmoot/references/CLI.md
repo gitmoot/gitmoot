@@ -897,14 +897,16 @@ beside it, which is why the router's machinery went unused: measured 2026-09-16,
 the delta baseline, availability-aware runtime choice and the verdict wake were
 reachable in principle and unused in practice. The lower-level form keeps its
 own surface — it NAMES a reviewer, carries a review message, and takes
-`--lead` — and those inputs are forwarded rather than discarded.
+`--lead` — and those inputs are forwarded rather than discarded. `--json` no
+longer forces the direct path: `agent review --json` routes too and prints the
+router's JSON object described below.
 
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model <provider/model>] \
-    [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer>] \
-    [--full] [--post-merge] [--allow-prompt-head-mismatch] [--json] \
+    [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
+    [--full] [--post-merge] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]
@@ -915,6 +917,25 @@ gitmoot review level --repo owner/repo --pr 2170 [--json]
 message is appended to the router's own brief under a labelled header, so a
 reviewer can tell operator instructions from generated framing — pass it after
 `--` if it starts with a dash.
+
+Scripts should use `gitmoot review request ... --json` to get the job id:
+
+```sh
+gitmoot review request --pr 2170 --repo owner/repo --head <40-hex> --role <org-role> --no-fix-target --json
+```
+
+The JSON object has the keys `agent review --json` prints — `job_id`, `repo`,
+`agent`, `action`, `execution_path`, `awaited_fact_id`, `subscription_holds`,
+`watch_command`, `daemon_running` — plus the router's own: `reviewer`, `model`,
+`runtime`, `head_sha`, `holds`. `state` says what the router did
+(`dispatched`, `attached` or `verdict_exists`); the job's own state, such as
+`queued`, is in `job_state`.
+
+`--head-sha`, `--org-role`, `--no-fix-target` and `--background` are the
+`agent review` spellings and are accepted here, so a script can switch commands
+without renaming flags. `--no-fix-target` is what a request without `--lead`
+already does, and is refused together with `--lead`. `--background` changes
+nothing: the router always queues the review for the daemon.
 
 `--exec-backend local|remote` selects where this review's runtime executes. It
 is persisted on the job before enqueue and affects no other queued or future
@@ -968,13 +989,16 @@ the requesting role instead of blocking anything. The verdict still wakes the ro
 Job events record `post_merge_followups_done`, or `post_merge_followup_error`
 if a follow-up could not be filed. `--post-merge` refuses `--lead`. Through
 `agent review` it needs the router path: `--org-role` and `--no-fix-target`,
-without `--foreground` or `--json`.
+without `--foreground`.
 
 Two things `agent review` reports that are easy to miss:
 
 - **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
   router requires a verdict recipient), `--foreground`, or any flag the router
-  cannot express keeps the direct path and writes a `router_bypassed` job event
+  cannot express (`--type`, `--recipe`, `--skip-native-review-fanout`, an
+  `--action` other than `review`, `--no-fix-target` together with `--lead`, or
+  neither `--lead` nor `--no-fix-target`) keeps the direct path and writes a
+  `router_bypassed` job event
   naming the reason — read it months later with `gitmoot job events <id>` (NOT
   `job show`, which prints the row and its payload and never lists events). The
   unexpressible-flag case also prints the reason to stderr; the other two arms
