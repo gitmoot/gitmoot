@@ -214,6 +214,27 @@ host's PATH. The two answers differ: a host can carry a working installation
 while every seat receives the exit-126 shim, so a dispatch-time `LookPath`
 reports the runtime present for a runtime no seat can run.
 
+#### Read-only seat scratch space and checks
+
+A read-only seat writes only its own cache root and a private temp dir,
+`/tmp/gmr-<8 hex>` (mode `0700`, granted to that seat alone). `TMPDIR`, `TMP`
+and `TEMP` point at it, and it is short enough for tests that bind Unix sockets
+under `t.TempDir()`. The checkout, the gitmoot home, the rest of `/tmp` and
+other seats' `gmr-*` directories stay read-only. The daemon removes the temp
+dir when the job ends; after a crash, the next daemon start removes every one
+whose owner process is gone. A short daemon `TMPDIR` (at most 16 bytes) replaces
+`/tmp` as the parent.
+
+Offline Go builds work: before the seat starts, the daemon downloads the
+checkout's modules into a per-repository cache under
+`<gitmoot-home>/cache/seat-go-mod/` and grants it to the seat read-only with
+`GOPROXY=off`. Python (`pytest`, `ruff`, `uv`), Rust, Node and Flutter/Dart
+checks do not run in a local seat: their toolchains live in operator-owned
+trees a seat is not granted, and granting or copying those trees is not
+bounded. They move to disposable VMs under #2315. A seat that cannot run its
+checks says so with `evidence: static_only` and a `checks_blocked` reason (see
+RESULT_CONTRACT.md).
+
 #### Shell runtime risk acceptance (2026-08-05)
 
 An operator-authored shell command is accepted as an explicit daemon-permission

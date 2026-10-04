@@ -368,6 +368,11 @@ workspace. A real review job records `seat_toolchain_unavailable` and blocks;
 host-specific staging detail is also written on daemon stderr as
 `gitmoot: read-only seat toolchain:`. When no Go installation exists, the event
 is the only recorded reason.
+The seat's `TMPDIR` is a private `/tmp/gmr-<hex>` directory removed when the
+job ends, and offline Go builds read a per-repository module cache the daemon
+fills before the seat starts (`GOPROXY=off`). Python, Rust, Node and
+Flutter/Dart checks are not available in a local seat; report them with
+`evidence: static_only` and `checks_blocked`.
 
 
 Preserve existing behavior unless the job explicitly changes it. Keep work

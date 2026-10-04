@@ -92,6 +92,7 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	// The empty entry still satisfies the every-field-accounted-for check, so a
 	// future rename cannot silently drop it.
 	"evidence_declared": {},
+	"checks_blocked":    {help: `top-level checks_blocked (string, optional, one of ` + enumList(workflow.ChecksBlockedKinds) + `): when you could not run some or all of the project's checks, name the main reason: toolchain (the language toolchain or test runner is missing or not runnable), dependencies (it ran but the project's dependencies were missing), sandbox (the sandbox refused a path or device), network, service (a database, browser or credentialed API was needed), or other. Say what you could not run in summary or tests_run as well. Omit it when every check you wanted to run ran.`},
 }
 
 // delegationFieldAnnotations covers every JSON field of workflow.Delegation.
@@ -264,6 +265,9 @@ func renderDelegationHelp() string {
 		b.WriteString("- " + h + "\n")
 	}
 	if h := resultFieldAnnotations["evidence"].help; h != "" {
+		b.WriteString("- " + h + "\n")
+	}
+	if h := resultFieldAnnotations["checks_blocked"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
 	// #1839: the seat is HANDED prior verdicts and had no way to learn it.

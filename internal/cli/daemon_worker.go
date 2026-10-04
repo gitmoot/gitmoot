@@ -1001,6 +1001,21 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if execBackend == execbackend.Local {
 		adapter, seatSetup, err = wrapReadOnlySandboxAdapter(w.ConfigHome, agent, deliveryCheckout, payload.Repo, adapter)
 	}
+	// Registered before any early return below, so a seat refused for an
+	// unavailable runtime or toolchain still has its cache root and private
+	// temp dir removed (#2314).
+	var readOnlyState *readOnlyRuntimeAdapter
+	readOnlyStateCleaned := false
+	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+		readOnlyState = &stateAdapter
+		defer func() {
+			if !readOnlyStateCleaned {
+				if cleanupErr := readOnlyState.cleanup(); cleanupErr != nil {
+					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
+				}
+			}
+		}()
+	}
 	if len(seatSetup.dropped) > 0 {
 		// Narrowing is not silent: a reviewer whose MCP tool is missing, or a
 		// seat that cannot authenticate to a provider whose key was withheld,
@@ -1065,18 +1080,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, refusal)
 		return nil
-	}
-	var readOnlyState *readOnlyRuntimeAdapter
-	readOnlyStateCleaned := false
-	if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
-		readOnlyState = &stateAdapter
-		defer func() {
-			if !readOnlyStateCleaned {
-				if cleanupErr := readOnlyState.cleanup(); cleanupErr != nil {
-					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
-				}
-			}
-		}()
 	}
 	if execBackend == execbackend.Local && len(toolCacheEnv) > 0 {
 		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, toolCacheEnv); envErr != nil {
@@ -1588,6 +1591,9 @@ type readOnlySandboxGrants struct {
 	env       []string
 	cacheRoot string
 	stateDir  string
+	// tempDir is the seat's private /tmp/gmr-<hex> TMPDIR (#2314). It is a
+	// write grant of its own, outside cacheRoot, and is removed with it.
+	tempDir seatTempDir
 	// evidenceFile is the rendered, repo-scoped list of prior verdicts, or ""
 	// when none could be staged. It is inside cacheRoot, so it needs no grant
 	// of its own.
@@ -1654,6 +1660,7 @@ func (s *readOnlyOmpBrokerSession) close() error {
 type readOnlyRuntimeAdapter struct {
 	runtime.Adapter
 	cleanupRoot string
+	cleanupTemp seatTempDir
 	ompSession  *readOnlyOmpBrokerSession
 }
 
@@ -1701,6 +1708,9 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove read-only seat cache: %w", err))
 		}
 	}
+	if err := a.cleanupTemp.remove(); err != nil {
+		cleanupErrors = append(cleanupErrors, err)
+	}
 	return errors.Join(cleanupErrors...)
 }
 
@@ -1742,7 +1752,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	var ompSession *readOnlyOmpBrokerSession
 	if ompConfig != nil {
 		if grants.stateDir == "" {
-			cleanupErr := os.RemoveAll(grants.cacheRoot)
+			cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
 			return nil, setup, errors.Join(errors.New("read-only omp broker requires isolated runtime state"), cleanupErr)
 		}
 		ompSession = &readOnlyOmpBrokerSession{config: *ompConfig, stateDir: grants.stateDir}
@@ -1771,23 +1781,28 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		// Staging and narrowing are already done at this point, so the
 		// withheld list is reported even though the wrap failed.
-		cleanupErr := os.RemoveAll(grants.cacheRoot)
+		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
 		return nil, setup, errors.Join(err, cleanupErr)
-	}
-	if grants.stateDir == "" {
-		return wrapped, setup, nil
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
 	if !ok {
 		// The narrowing already happened, so report it even though delivery
 		// cannot be built: a withheld credential is news whether or not the
 		// wrap succeeds.
-		cleanupErr := os.RemoveAll(grants.cacheRoot)
+		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
 		return nil, setup, errors.Join(fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped), cleanupErr)
+	}
+	// A seat without isolated runtime state (a shell seat) keeps its cache
+	// root as before, but its temp dir is still job-scoped, so it is wrapped
+	// for cleanup too (#2314).
+	cleanupRoot := grants.cacheRoot
+	if grants.stateDir == "" {
+		cleanupRoot = ""
 	}
 	return readOnlyRuntimeAdapter{
 		Adapter:     runtimeAdapter,
-		cleanupRoot: grants.cacheRoot,
+		cleanupRoot: cleanupRoot,
+		cleanupTemp: grants.tempDir,
 		ompSession:  ompSession,
 	}, setup, nil
 }
@@ -2114,8 +2129,7 @@ func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
 	return list
 }
 
-func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string, gatewayMode bool) (readOnlySandboxGrants, error) {
-	var grants readOnlySandboxGrants
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string, gatewayMode bool) (grants readOnlySandboxGrants, err error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return grants, fmt.Errorf("resolve read-only sandbox config paths: %w", err)
@@ -2130,6 +2144,22 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	grants.cacheRoot = agent.WritablePaths[0]
 	grants.writes = []string{grants.cacheRoot}
 	grants.env = append(grants.env, toolEnv...)
+	// The seat's private, short TMPDIR (#2314). It joins the write grants
+	// before any staged root is placed, so every placement check below also
+	// proves no staged copy sits inside it. Any setup failure after this point
+	// removes it again; the adapter's cleanup removes it at the end of the job.
+	tempDir, err := createSeatTempDir(paths.Home)
+	if err != nil {
+		return grants, err
+	}
+	grants.tempDir = seatTempDir{home: paths.Home, dir: tempDir}
+	grants.writes = append(grants.writes, tempDir)
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, grants.tempDir.remove())
+			grants.tempDir = seatTempDir{}
+		}
+	}()
 
 	grants.reads = append(grants.reads, checkout)
 	metadata, err := reviewGitMetadataPaths(checkout)
@@ -2194,10 +2224,36 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		// An explicit or enclosing workspace file can sit outside the checkout
 		// directory grant. WorkspaceGoRequirement validated one bounded regular
 		// file; grant that file only, never its parent directory.
+		gowork := "off"
 		for _, entry := range stagedEnv {
 			workFile, ok := strings.CutPrefix(entry, "GOWORK=")
-			if ok && filepath.IsAbs(workFile) {
+			if !ok {
+				continue
+			}
+			gowork = workFile
+			if filepath.IsAbs(workFile) {
 				grants.readFiles = append(grants.readFiles, workFile)
+			}
+		}
+		// #2314: a populated, read-only module cache, so an offline build in
+		// the seat finds its dependencies. See seat_go_modules.go for why the
+		// per-job cache was always empty.
+		if grants.toolchainUnavailable == "" {
+			modCache, modDiagnostic := stageSeatGoModules(seatGoModuleRequest{
+				paths:      paths,
+				checkout:   checkout,
+				reviewRepo: reviewRepo,
+				goroot:     staged,
+				gowork:     gowork,
+				scratch:    filepath.Join(tempDir, ".gitmoot-go-mod-download"),
+				writes:     grants.writes,
+			})
+			if modDiagnostic != "" {
+				fmt.Fprintf(os.Stderr, "gitmoot: read-only seat Go modules: %s\n", modDiagnostic)
+			}
+			if modCache != "" {
+				grants.reads = append(grants.reads, modCache)
+				grants.env = withSeatGoModuleCache(grants.env, modCache)
 			}
 		}
 	}
@@ -2286,7 +2342,6 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 		grants.dropped = append(grants.dropped, evidenceDiagnostic)
 	}
 
-	tempDir := filepath.Join(grants.cacheRoot, "tmp")
 	grants.env = append(grants.env,
 		"HOME="+filepath.Join(grants.cacheRoot, "home"),
 		"XDG_CONFIG_HOME="+filepath.Join(grants.cacheRoot, "xdg-config"),
@@ -2303,7 +2358,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	if err := validateReadOnlyWritablePaths(checkout, grants.writes); err != nil {
 		return grants, err
 	}
-	for _, path := range append([]string{tempDir, filepath.Join(grants.cacheRoot, "home")}, grants.writes...) {
+	for _, path := range append([]string{filepath.Join(grants.cacheRoot, "home")}, grants.writes...) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return grants, fmt.Errorf("create read-only sandbox write directory %q: %w", path, err)
 		}
@@ -3544,6 +3599,16 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		// ReadOnlySeat is set), so this cannot affect the common path.
 		var forkSetup readOnlySeatSetup
 		adapter, forkSetup, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
+		// Same job-end cleanup as run(): this path never had one, so a
+		// temp-worker seat leaked its cache root, and would leak its private
+		// temp dir (#2314).
+		if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
+			defer func() {
+				if cleanupErr := stateAdapter.cleanup(); cleanupErr != nil {
+					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
+				}
+			}()
+		}
 		if len(forkSetup.dropped) > 0 {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkSetup.dropped, ", ")}); eventErr != nil {
 				return eventErr

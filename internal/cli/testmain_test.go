@@ -1,8 +1,13 @@
 package cli
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -32,7 +37,23 @@ func TestMain(m *testing.M) {
 	if home := os.Getenv(daemonRunChildHomeEnv); home != "" {
 		os.Exit(Run([]string{"daemon", "run", "--home", home}, os.Stdout, os.Stderr))
 	}
+	// Read-only seats (#2314) make a private temp dir under the daemon's
+	// TMPDIR when that is short, else under /tmp. Tests compose many seats and
+	// not all of them run the job-end cleanup, so point TMPDIR at this run's own
+	// short parent and remove it afterwards.
+	tempRoot, err := makeShortTestTempRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create test temp root: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Setenv("TMPDIR", tempRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "set TMPDIR: %v\n", err)
+		os.Exit(1)
+	}
 	code := m.Run()
+	if err := removeTestTempRoot(tempRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "clean test temp root: %v\n", err)
+	}
 	if err := cleanupSharedGitmootTestBinary(); err != nil {
 		fmt.Fprintf(os.Stderr, "clean shared gitmoot test binary: %v\n", err)
 		if code == 0 {
@@ -40,4 +61,39 @@ func TestMain(m *testing.M) {
 		}
 	}
 	os.Exit(code)
+}
+
+// makeShortTestTempRoot makes /tmp/gt<8 hex>: 15 bytes, inside the 16-byte
+// limit a TMPDIR must meet to parent seat temp dirs.
+func makeShortTestTempRoot() (string, error) {
+	for range 16 {
+		var suffix [4]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", err
+		}
+		dir := "/tmp/gt" + hex.EncodeToString(suffix[:])
+		err := os.Mkdir(dir, 0o700)
+		if err == nil {
+			return dir, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("no free /tmp/gt<hex> name after 16 attempts")
+}
+
+// removeTestTempRoot also removes directories a test made read-only (the go
+// command does that to module directories).
+func removeTestTempRoot(dir string) error {
+	if err := os.RemoveAll(dir); err == nil {
+		return nil
+	}
+	_ = filepath.WalkDir(dir, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr == nil && entry.IsDir() {
+			_ = os.Chmod(path, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(dir)
 }

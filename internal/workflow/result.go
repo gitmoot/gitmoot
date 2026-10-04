@@ -47,6 +47,19 @@ var ReviewSeverities = reviewseverity.Values
 // cannot disagree about what a reviewer may say.
 var EvidenceKinds = []string{EvidenceExecuted, EvidenceStaticOnly}
 
+// ChecksBlockedKinds are the allowed values of AgentResult.ChecksBlocked: why a
+// reviewer could not run some or all of the project's checks (#2314). One
+// source so the prompt and the validator agree, and so the blocker table that
+// decides what moves to disposable VMs is counted rather than searched.
+var ChecksBlockedKinds = []string{
+	ChecksBlockedToolchain,
+	ChecksBlockedDependencies,
+	ChecksBlockedSandbox,
+	ChecksBlockedNetwork,
+	ChecksBlockedService,
+	ChecksBlockedOther,
+}
+
 // DelegationActions is the canonical set of actions a coordinator may DISPATCH
 // through delegations[]. "implement" is deliberately absent (#2203): Gitmoot no
 // longer dispatches implementation, so an implement delegation is REFUSED by
@@ -397,6 +410,14 @@ type AgentResult struct {
 	// EvidenceWasExecuted still answers the same question. This only makes the
 	// silence countable, which is the prerequisite for anyone acting on it.
 	EvidenceDeclared bool `json:"evidence_declared,omitempty"`
+	// ChecksBlocked names WHY a reviewer could not run some or all of the
+	// project's checks, one of ChecksBlockedKinds (#2314). It is optional and
+	// carries no policy: Evidence still says whether anything was executed. It
+	// exists so the reasons reviews end static-only can be counted from stored
+	// results instead of searched for in summaries. A non-empty value outside
+	// the enum is rejected, like Evidence, so a misspelling is a visible error
+	// rather than an uncountable row.
+	ChecksBlocked string `json:"checks_blocked,omitempty"`
 }
 
 // The two values Evidence accepts. A closed pair of strings rather than a
@@ -406,6 +427,43 @@ const (
 	EvidenceExecuted   = "executed"
 	EvidenceStaticOnly = "static_only"
 )
+
+// The values ChecksBlocked accepts.
+const (
+	// ChecksBlockedToolchain: the language toolchain or test runner is not
+	// available or not runnable (no python3/pytest, cargo, node, ...).
+	ChecksBlockedToolchain = "toolchain"
+	// ChecksBlockedDependencies: the toolchain ran but the project's
+	// dependencies were missing (empty module cache, packages not installed).
+	ChecksBlockedDependencies = "dependencies"
+	// ChecksBlockedSandbox: the sandbox refused a path or device the check
+	// needed (a write outside the seat, /dev/ptmx).
+	ChecksBlockedSandbox = "sandbox"
+	// ChecksBlockedNetwork: the check needed network access it did not have.
+	ChecksBlockedNetwork = "network"
+	// ChecksBlockedService: the check needed an external service (a database,
+	// a browser, a credentialed API).
+	ChecksBlockedService = "service"
+	ChecksBlockedOther   = "other"
+)
+
+// ValidChecksBlocked reports whether value is one of ChecksBlockedKinds.
+func ValidChecksBlocked(value string) bool {
+	value = strings.TrimSpace(value)
+	for _, kind := range ChecksBlockedKinds {
+		if value == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func validateChecksBlocked(result AgentResult) error {
+	if strings.TrimSpace(result.ChecksBlocked) != "" && !ValidChecksBlocked(result.ChecksBlocked) {
+		return fmt.Errorf("gitmoot_result checks_blocked %q is not recognised; use one of %s", result.ChecksBlocked, strings.Join(ChecksBlockedKinds, ", "))
+	}
+	return nil
+}
 
 // ValidEvidence reports whether value is one of the declared evidence modes.
 func ValidEvidence(value string) bool {
@@ -697,6 +755,9 @@ func validateAgentResultForAction(result AgentResult, action string) error {
 	if strings.TrimSpace(result.Evidence) != "" && !ValidEvidence(result.Evidence) {
 		return fmt.Errorf("gitmoot_result evidence %q is not recognised; use %q or %q", result.Evidence, EvidenceExecuted, EvidenceStaticOnly)
 	}
+	if err := validateChecksBlocked(result); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -744,6 +805,9 @@ func validateAgentResult(result AgentResult) error {
 		return fmt.Errorf("unsupported gitmoot_result decision %q", result.Decision)
 	}
 	if err := validateAgentResultSeverity(result); err != nil {
+		return err
+	}
+	if err := validateChecksBlocked(result); err != nil {
 		return err
 	}
 	if strings.TrimSpace(result.Summary) == "" {
@@ -1130,6 +1194,9 @@ func normalizeAgentResult(result *AgentResult) {
 	if !result.EvidenceDeclared {
 		result.Evidence = EvidenceStaticOnly
 	}
+	// Validation accepts surrounding whitespace; store the bare kind so the
+	// field counts cleanly (#2314).
+	result.ChecksBlocked = strings.TrimSpace(result.ChecksBlocked)
 	if result.Needs == nil {
 		result.Needs = []string{}
 	}

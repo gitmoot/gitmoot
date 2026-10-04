@@ -66,6 +66,29 @@ Two result checks consume this field:
   name something it actually ran? Declaring `static_only` always passes; a bare
   "everything looks fine" beside `executed` does not.
 
+## Why checks could not run: `checks_blocked`
+
+A review that could not run some or all of the project's checks may add a
+top-level `"checks_blocked"` field naming the main reason:
+
+- `"toolchain"` - the language toolchain or test runner is missing or not
+  runnable (no `pytest`, `cargo`, `node`).
+- `"dependencies"` - the toolchain ran, but the project's dependencies were
+  missing (an empty module cache, packages not installed).
+- `"sandbox"` - the sandbox refused a path or device the check needed.
+- `"network"` - the check needed network access.
+- `"service"` - the check needed a database, a browser or a credentialed API.
+- `"other"`.
+
+It is optional and carries no policy: `evidence` still says whether anything
+ran, and a review can declare `executed` for the checks it ran alongside a
+`checks_blocked` reason for the ones it could not. Say what you could not run in
+`summary` or `tests_run` as well. An unrecognised value is rejected outright,
+like `evidence`, so a misspelling is an error rather than an uncountable row.
+The field exists so the reasons reviews end static-only can be counted from
+stored results instead of searched for in summaries (#2314). The rollout
+ordering below applies to it too.
+
 ## Rollout ordering for the evidence field
 
 Upgrade PARSERS before EMITTERS. A daemon older than this change rejects

@@ -1633,6 +1633,14 @@ func daemonRunStartupReconcile(ctx context.Context, home string, argv []string, 
 		}
 		return nil
 	})
+	// A daemon that crashed mid-review never ran its seats' cleanup. Remove
+	// the private temp dirs whose owner process is gone (#2314).
+	if n, err := sweepStaleSeatTempDirs(paths.Home); n > 0 || err != nil {
+		writeLine(stdout, "removed %d stale read-only seat temp dir(s)", n)
+		if err != nil {
+			writeLine(stdout, "read-only seat temp sweep: %v", err)
+		}
+	}
 	return cleanup
 }
 
