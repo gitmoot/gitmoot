@@ -60,6 +60,14 @@ versions without installation, uploading an exact-head source archive, running
 build, vet, and focused tests, and checking that no credential paths or secret
 environment variables exist.
 
+Toolchain review images for Swift, Rust + Zig, Node + pnpm and Flutter
+repositories (`gitmoot-omp-review-{swift,rust,node,flutter}-v1`) sit beside it
+under `templates/e2b/` and share its base and runtime layout.
+`templates/e2b/README.md` lists each template's pins and resources and covers
+building, bumping and verifying them; `npm run build -- ../<template-dir>`
+builds one, and `templates/e2b/omp-review/verify.mjs` runs a repository's
+checks in a fresh sandbox.
+
 Activation changes only the operator config:
 
 ```toml
