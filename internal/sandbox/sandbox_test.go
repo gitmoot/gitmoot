@@ -52,6 +52,21 @@ func requireLandlockABI(t *testing.T) int {
 	return abi
 }
 
+// requireReadOnlySeatLaunchable skips when this host cannot start a read-only
+// seat at all: a host container runtime exists and this process lacks the
+// privilege to hide it, so sandbox-exec refuses by design. CI runs these tests
+// as root to keep the coverage.
+func requireReadOnlySeatLaunchable(t *testing.T, gitmoot string) {
+	t.Helper()
+	command := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--", "/bin/true")
+	command.Dir = t.TempDir()
+	output, err := command.CombinedOutput()
+	if err != nil && strings.Contains(string(output), "to hide the host container runtime") {
+		t.Logf("read-only seats cannot start unprivileged on this host: %s", strings.TrimSpace(string(output)))
+		t.Skip("read-only seat refuses to start without CAP_SYS_ADMIN while a host container runtime exists; run as root")
+	}
+}
+
 func TestSandboxExecKernelE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)
@@ -98,6 +113,7 @@ func TestSandboxExecKernelE2E(t *testing.T) {
 func TestSandboxExecReadOnlyWorkdirE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)
+	requireReadOnlySeatLaunchable(t, gitmoot)
 	base := t.TempDir()
 	workdir := filepath.Join(base, "review-worktree")
 	cacheDir := filepath.Join(base, "review-cache")
@@ -309,6 +325,7 @@ func TestSandboxProbeForcedUnsupported(t *testing.T) {
 func TestSandboxExecStrictReadModeReachesProcfsE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)
+	requireReadOnlySeatLaunchable(t, gitmoot)
 	base := t.TempDir()
 	workdir := filepath.Join(base, "work")
 	cacheDir := filepath.Join(base, "cache")

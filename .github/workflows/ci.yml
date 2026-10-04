@@ -116,6 +116,17 @@ jobs:
       - name: Test
         run: go test -timeout 25m ./...
 
+      # Read-only seats hide the host container runtime in a private mount
+      # namespace, which needs CAP_SYS_ADMIN (#2318). The runner has Docker, so as
+      # the unprivileged runner user the read-only seat E2E tests above skip: a
+      # read-only seat refuses to start there by design. Run the sandbox package
+      # again as root so the hiding path and the read-only seat boundary stay
+      # covered. -E keeps setup-go's GOROOT and caches; PATH is passed explicitly
+      # because sudo resets it. Last in the job, so root-owned cache entries
+      # cannot affect an earlier step.
+      - name: Test sandbox as root
+        run: sudo -E env "PATH=$PATH" go test -count=1 -timeout 15m -v ./internal/sandbox/
+
   e2e:
     name: e2e (tagged)
     needs: changes

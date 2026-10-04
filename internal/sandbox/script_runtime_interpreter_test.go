@@ -32,6 +32,7 @@ import (
 func TestSandboxExecScriptRuntimeNeedsItsInterpreterGrantedKernelE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)
+	requireReadOnlySeatLaunchable(t, gitmoot)
 
 	// NOT t.TempDir(): writableRoots grants os.TempDir() and /tmp implicitly, so
 	// a fixture under /tmp would be readable whatever the rules say and BOTH

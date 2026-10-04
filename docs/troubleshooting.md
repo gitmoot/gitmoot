@@ -1083,6 +1083,49 @@ A review on the remote execution backend gets the same list at
 `GITMOOT_PRIOR_VERDICTS`; when it cannot be rendered the job records a
 `remote_review_evidence_unavailable` event with the reason.
 
+## Read-Only Seat Cannot Reach Docker Or Containerd
+
+This is intended. A read-only seat (`review` and `ask` jobs, launched with
+`sandbox-exec --read-only-workdir`) does not see the host container runtime.
+Landlock governs file access but not connecting to a Unix socket, so the seat
+launcher hides the runtime itself. While still privileged, and before Landlock
+is applied, it:
+
+- creates a private mount namespace for the seat and makes the whole mount tree
+  private, so nothing it mounts reaches the host;
+- binds `/dev/null` over each existing runtime socket: `/run/docker.sock` (and
+  `/var/run/docker.sock`), the Podman, BuildKit, and CRI-O sockets, and rootless
+  Docker and Podman sockets under `/run/user/*`;
+- mounts an empty read-only tmpfs over each existing runtime state directory:
+  `/run/containerd`, `/run/docker`, `/run/k3s/containerd`, and the rootless
+  `containerd-rootless` and `dockerd-rootless` directories. These hold
+  containerd's API and per-container shim sockets and dockerd's embedded
+  containerd, which cannot be named in advance.
+
+Inside the seat, `docker version` reports `Cannot connect to the Docker daemon`
+and a connection to any covered path is refused. Reading the checkout, `git`,
+`go`, and the runtime itself work as before. The seat cannot remove the covers:
+Landlock denies mount changes to a sandboxed process, and denies access to the
+`/proc/<pid>/root` of processes outside the sandbox. Seats that write code
+(implementation and produce jobs) launch without this and keep their access to
+the runtime.
+
+No user namespace is used. Creating the mount namespace needs `CAP_SYS_ADMIN`,
+so when a runtime path exists and the daemon runs without it, the read-only seat
+refuses to start rather than run with the runtime reachable:
+
+```text
+sandbox-exec: read-only seat: cannot create a private mount namespace (requires CAP_SYS_ADMIN) to hide the host container runtime at /run/docker, /run/containerd, /run/docker.sock: operation not permitted
+```
+
+Run the daemon as root (or with `CAP_SYS_ADMIN`). A host with none of these paths
+has nothing to hide and starts read-only seats without the privilege.
+
+The covers are laid when the seat starts. Sockets inside a covered directory
+stay hidden, but a top-level socket such as `/run/docker.sock` that its daemon
+creates or recreates while a seat is running (a runtime start or restart) is
+not covered until the next seat starts.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

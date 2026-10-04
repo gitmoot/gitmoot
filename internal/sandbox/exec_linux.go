@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -46,7 +47,9 @@ func Exec(readPaths, readFiles, writePaths []string, argv []string) error {
 }
 
 // ExecReadOnlyWorkdir applies the same strict ruleset as Exec without granting
-// the current working directory implicit write access.
+// the current working directory implicit write access. Before Landlock is
+// applied it also hides the host container runtime in a private mount
+// namespace (see hideContainerRuntime), and refuses to exec when it cannot.
 func ExecReadOnlyWorkdir(readPaths, readFiles, writePaths []string, argv []string) error {
 	return execSandbox(readPaths, readFiles, writePaths, argv, true)
 }
@@ -115,6 +118,16 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		"/dev/urandom",
 		"/dev/tty",
 	).IgnoreIfMissing())
+
+	if readOnlyWorkdir {
+		// A mount namespace created by unshare(2) belongs to the calling OS
+		// thread until execve. Never unlock: the runtime must be exec'd from the
+		// thread that hides the host container runtime.
+		runtime.LockOSThread()
+		if err := hideContainerRuntime(); err != nil {
+			return fmt.Errorf("read-only seat: %w", err)
+		}
+	}
 
 	// Deliberately strict: no BestEffort downgrade. If V3 or any requested rule
 	// cannot be installed, the runtime must not start.
