@@ -138,12 +138,17 @@ type WakeOutboxEntry struct {
 // State is deliberately absent: ListWakeOutboxObligations classifies it before
 // returning across the package boundary.
 type WakeOutboxObligation struct {
-	ID             int64
-	SourceKind     string
-	SourceID       string
-	TargetRole     string
-	CoalesceKey    string
-	CreatedAt      string
+	ID          int64
+	SourceKind  string
+	SourceID    string
+	TargetRole  string
+	CoalesceKey string
+	CreatedAt   string
+	// LastError and UpdatedAt are the row's most recently recorded reason for
+	// not delivering ("" when none was recorded) and when it was recorded; the
+	// stale-notification flag reports them (#2303).
+	LastError      string
+	UpdatedAt      string
 	DirectivePhase string
 	// DirectiveBody is the directive's own actionable text, projected from the
 	// same query that derives the phase (#1981). A prompt that names a row
@@ -425,9 +430,10 @@ func listWakeOutboxObligations(
 		obligation := WakeOutboxObligation{
 			ID: entry.ID, SourceKind: entry.SourceKind, SourceID: entry.SourceID,
 			TargetRole: entry.TargetRole, CoalesceKey: entry.CoalesceKey,
-			CreatedAt: entry.CreatedAt, DirectivePhase: directivePhase,
-			DirectiveBody: directiveBody,
-			MessageID:     message.ID, MessageThreadID: message.ThreadID,
+			CreatedAt: entry.CreatedAt, LastError: entry.LastError, UpdatedAt: entry.UpdatedAt,
+			DirectivePhase: directivePhase,
+			DirectiveBody:  directiveBody,
+			MessageID:      message.ID, MessageThreadID: message.ThreadID,
 			MessageKind: message.Kind, MessageSender: message.Sender,
 			MessageBody: message.Body, MessageSourcePayload: message.SourcePayload,
 		}

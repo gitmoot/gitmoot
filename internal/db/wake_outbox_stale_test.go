@@ -7,12 +7,13 @@ import (
 	"time"
 )
 
-// TestListStaleNotificationsGroupsPendingRowsPastThreshold pins the stale
+// TestListStaleNotificationsListsPendingRowsPastThreshold pins the stale
 // projection the dashboard, doctor and daemon status share (#2303): a row
 // exactly at the threshold is stale and one a millisecond younger is not; only
-// pending rows count; rows are grouped per role with the oldest age and the
-// most recently recorded reason among that role's STALE rows.
-func TestListStaleNotificationsGroupsPendingRowsPastThreshold(t *testing.T) {
+// pending rows count; rows come oldest first and carry their recorded reason,
+// so the caller can group them after classifying each against the delivery
+// rules (#2309).
+func TestListStaleNotificationsListsPendingRowsPastThreshold(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()
 	cutoff := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
@@ -58,15 +59,21 @@ WHERE source_kind = 'workflow_note' AND source_id = ? AND target_role = ?`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []StaleNotificationRole{
-		{Role: "alpha", Count: 2, OldestCreatedAt: cutoff.Add(-time.Hour), LastError: "operator active"},
-		{Role: "gamma", Count: 1, OldestCreatedAt: cutoff.Add(-5 * time.Minute)},
+	type staleRow struct{ Role, LastError, CreatedAt, UpdatedAt string }
+	rows := make([]staleRow, 0, len(got.Pending))
+	for _, row := range got.Pending {
+		rows = append(rows, staleRow{row.TargetRole, row.LastError, row.CreatedAt, row.UpdatedAt})
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("ListStaleNotifications() =\n%+v\nwant\n%+v", got, want)
+	want := []staleRow{
+		{"alpha", "operator active", stamp(cutoff.Add(-time.Hour)), stamp(cutoff.Add(2 * time.Minute))},
+		{"gamma", "", stamp(cutoff.Add(-5 * time.Minute)), stamp(cutoff.Add(-5 * time.Minute))},
+		{"alpha", "recipient offline", stamp(cutoff), stamp(cutoff.Add(time.Minute))},
+	}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("ListStaleNotifications() =\n%+v\nwant\n%+v", rows, want)
 	}
 
-	// Delivering every stale row clears the role from the summary.
+	// Delivering every stale row clears it from the listing.
 	if _, err := store.db.ExecContext(ctx, `UPDATE wake_outbox SET state = 'delivered' WHERE target_role IN ('alpha', 'gamma') AND state = 'pending' AND created_at <= ?`, stamp(cutoff)); err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +81,7 @@ WHERE source_kind = 'workflow_note' AND source_id = ? AND target_role = ?`,
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
-		t.Fatalf("after delivery ListStaleNotifications() = %+v, want none", got)
+	if len(got.Pending) != 0 {
+		t.Fatalf("after delivery ListStaleNotifications() = %+v, want none", got.Pending)
 	}
 }

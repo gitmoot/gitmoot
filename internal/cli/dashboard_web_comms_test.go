@@ -297,9 +297,13 @@ func TestDashboardCommsPageContract(t *testing.T) {
 	script := body[start+len("<script>") : end]
 	input, err := json.Marshal(map[string]any{
 		"script": script,
-		"stale": dashboardStaleNotifications{Threshold: "30m", Total: 3, Roles: []dashboardStaleNotificationRole{
-			{Role: "reviewer", Count: 2, OldestAge: "2h5m", Reason: "recipient offline"},
-			{Role: "builder", Count: 1, OldestAge: "45m", Reason: "no delivery attempt recorded yet"},
+		// The wire form the page reads; spelled as JSON so the page contract is
+		// pinned independently of the Go struct.
+		"stale": map[string]any{"threshold": "30m", "total": 3, "roles": []map[string]any{
+			{"role": "reviewer", "count": 2, "oldestAge": "2h5m", "reason": "recipient offline"},
+			{"role": "builder", "count": 1, "oldestAge": "45m", "reason": "no delivery attempt recorded yet"},
+		}, "pendingOnPurpose": []map[string]any{
+			{"role": "owner", "count": 26, "oldestAge": "3d", "reason": "no delivery rule"},
 		}},
 		"threads": []dashboardCommsThread{
 			{
@@ -667,9 +671,10 @@ setImmediate(()=>{
       fail('mobile dashboard navigation did not close');
     }
     const stale=elements.get('stale');
-    for(const want of ['3 notifications waiting longer than 30m','<b>reviewer</b>: 2 waiting · oldest 2h5m · last reason: recipient offline','<b>builder</b>: 1 waiting · oldest 45m · last reason: no delivery attempt recorded yet']){
+    for(const want of ['3 notifications waiting longer than 30m','<b>reviewer</b>: 2 waiting · oldest 2h5m · last reason: recipient offline','<b>builder</b>: 1 waiting · oldest 45m · last reason: no delivery attempt recorded yet','Left pending on purpose, not counted as waiting too long','<b>owner</b>: 26 pending · oldest 3d · no delivery rule']){
       if(stale.hidden||!stale.innerHTML.includes(want))fail('stale notification banner missing '+JSON.stringify(want)+': hidden='+stale.hidden+' '+stale.innerHTML);
     }
+    if(stale.className!=='stale')fail('stale notification banner with waiting roles must stay loud: '+stale.className);
     if(intervals.length!==1)fail('stale notification banner has no refresh poll');
     intervals[0]();
     setImmediate(()=>{

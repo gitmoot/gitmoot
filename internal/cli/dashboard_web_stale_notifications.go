@@ -21,6 +21,10 @@ type dashboardStaleNotifications struct {
 	ThresholdSeconds int64                            `json:"thresholdSeconds"`
 	Total            int                              `json:"total"`
 	Roles            []dashboardStaleNotificationRole `json:"roles"`
+	// PendingOnPurpose lists rows older than the threshold that the daemon
+	// holds back on purpose ("muted" or "no delivery rule", #2309). Comms
+	// shows them; they are never part of Total or the warning.
+	PendingOnPurpose []dashboardStaleNotificationRole `json:"pendingOnPurpose"`
 }
 
 type dashboardStaleNotificationRole struct {
@@ -60,10 +64,16 @@ func buildDashboardStaleNotifications(ctx context.Context, paths config.Paths, s
 		Threshold:        formatOrgRecycleAfter(report.Threshold),
 		ThresholdSeconds: int64(report.Threshold / time.Second),
 		Total:            report.Total,
-		Roles:            make([]dashboardStaleNotificationRole, 0, len(report.Roles)),
+		Roles:            dashboardStaleNotificationRoles(report.Roles),
+		PendingOnPurpose: dashboardStaleNotificationRoles(report.PendingOnPurpose),
 	}
-	for _, role := range report.Roles {
-		out.Roles = append(out.Roles, dashboardStaleNotificationRole{
+	return out, nil
+}
+
+func dashboardStaleNotificationRoles(roles []staleNotificationRole) []dashboardStaleNotificationRole {
+	out := make([]dashboardStaleNotificationRole, 0, len(roles))
+	for _, role := range roles {
+		out = append(out, dashboardStaleNotificationRole{
 			Role:             role.Role,
 			Count:            role.Count,
 			OldestCreatedAt:  role.OldestCreatedAt.Format(time.RFC3339),
@@ -72,7 +82,7 @@ func buildDashboardStaleNotifications(ctx context.Context, paths config.Paths, s
 			Reason:           role.Reason,
 		})
 	}
-	return out, nil
+	return out
 }
 
 func handleStaleNotificationsJS(w http.ResponseWriter, _ *http.Request) {

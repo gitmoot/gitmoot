@@ -346,11 +346,11 @@ func classifyWakeOutboxObligations(
 	routes := make([]db.EventRuleRoute, 0, len(obligations.Pending))
 	seenRoutes := make(map[string]struct{})
 	for _, obligation := range obligations.Pending {
-		event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, attemptedBefore)
+		route, event, err := classifyPendingWakeRoute(delivery.rules, obligation, attemptedBefore)
 		if err != nil {
-			return replyWakeOutboxHealth{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
+			return replyWakeOutboxHealth{}, err
 		}
-		if len(matchingWakeRules(delivery.rules, event)) > 0 {
+		if route == pendingWakeDeliverable {
 			createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
@@ -365,7 +365,7 @@ func classifyWakeOutboxObligations(
 			health.pending++
 			continue
 		}
-		if wakeExplicitlyMuted(delivery.rules, event) {
+		if route == pendingWakeMuted {
 			health.suppressed++
 			continue
 		}
@@ -415,6 +415,37 @@ func classifyWakeOutboxObligations(
 		return health, nil
 	}
 	return health, fmt.Errorf("wake outbox has outstanding obligations: %s", health)
+}
+
+// pendingWakeRoute is what the current delivery rules make of one pending
+// outbox row. The drain's health pass and the stale-notification flag (#2309)
+// both classify through classifyPendingWakeRoute, so a row the daemon leaves
+// pending on purpose is never reported as stuck by a second, different rule set.
+type pendingWakeRoute int
+
+const (
+	// pendingWakeDeliverable: at least one rule routes the row to its recipient.
+	pendingWakeDeliverable pendingWakeRoute = iota
+	// pendingWakeMuted: the operator disabled the route (health: suppressed).
+	pendingWakeMuted
+	// pendingWakeUnroutable: no rule routes the row (health: inert or
+	// route_removed). It stays pending so a rule added later can deliver it.
+	pendingWakeUnroutable
+)
+
+func classifyPendingWakeRoute(rules []db.EventRule, obligation db.WakeOutboxObligation, now time.Time) (pendingWakeRoute, events.Event, error) {
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{obligation}, now)
+	if err != nil {
+		return 0, events.Event{}, fmt.Errorf("classify wake outbox row %d: %w", obligation.ID, err)
+	}
+	switch {
+	case len(matchingWakeRules(rules, event)) > 0:
+		return pendingWakeDeliverable, event, nil
+	case wakeExplicitlyMuted(rules, event):
+		return pendingWakeMuted, event, nil
+	default:
+		return pendingWakeUnroutable, event, nil
+	}
 }
 
 // recordUnroutableWake makes a dead-ended wake visible in ONE query instead of

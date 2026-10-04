@@ -245,7 +245,10 @@ every tick read as unhealthy.
 A `pending` row older than `[org].notification_stale_after` (default `30m`) is
 flagged, per role, on the dashboard's "Needs a human" and Comms pages, in
 `gitmoot doctor` and in `gitmoot daemon status`; flagging is read-only and
-never resends (see "Notifications Waiting Too Long" in `troubleshooting.md`).
+never resends. Rows the drain leaves pending on purpose (`suppressed`, shown as
+`muted`, and `inert`/`route_removed`, shown as `no delivery rule`) are not
+flagged; Comms, doctor and daemon status still list them by that label (see
+"Notifications Waiting Too Long" in `troubleshooting.md`).
 A quiet burst tail is flushed by a later daemon tick; it does not require
 another event. If the outbox or its delivery rules cannot be queried, or an
 outbox row cannot be parsed or claimed, the drain is logged as unhealthy and
