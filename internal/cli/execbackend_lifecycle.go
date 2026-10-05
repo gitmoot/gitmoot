@@ -389,6 +389,25 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		base = strings.TrimSpace(payload.ReviewScope.PreviousHeadSHA)
 	}
 	if base == "" {
+		var forgePull *github.PullRequest
+		loadForgePull := func() (github.PullRequest, error) {
+			if forgePull != nil {
+				return *forgePull, nil
+			}
+			repo, err := github.ParseRepository(payload.Repo)
+			if err != nil {
+				return github.PullRequest{}, fmt.Errorf("parse repo for PR #%d: %w", payload.PullRequest, err)
+			}
+			pull, err := w.remoteReviewAdmissionClient(checkout, hostJobSubprocessRunner{}).GetPullRequest(ctx, repo, int64(payload.PullRequest))
+			if err != nil {
+				return github.PullRequest{}, fmt.Errorf("load PR #%d from forge: %w", payload.PullRequest, err)
+			}
+			if strings.TrimSpace(pull.HeadSHA) != head {
+				return github.PullRequest{}, fmt.Errorf("PR #%d head moved from %s to %s", payload.PullRequest, head, pull.HeadSHA)
+			}
+			forgePull = &pull
+			return pull, nil
+		}
 		pull, err := w.Store.GetPullRequest(ctx, payload.Repo, int64(payload.PullRequest))
 		baseBranch := ""
 		switch {
@@ -403,18 +422,11 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 			// (e.g. recorded at merge time) carry no base branch. A merged or
 			// older PR is still a valid exact-head review subject, so ask the
 			// forge rather than refuse.
-			repo, parseErr := github.ParseRepository(payload.Repo)
-			if parseErr != nil {
-				return "", fmt.Errorf("parse repo for PR #%d: %w", payload.PullRequest, parseErr)
+			forge, err := loadForgePull()
+			if err != nil {
+				return "", err
 			}
-			forgePull, fetchErr := w.remoteReviewAdmissionClient(checkout, hostJobSubprocessRunner{}).GetPullRequest(ctx, repo, int64(payload.PullRequest))
-			if fetchErr != nil {
-				return "", fmt.Errorf("load PR #%d base from forge: %w", payload.PullRequest, fetchErr)
-			}
-			if strings.TrimSpace(forgePull.HeadSHA) != head {
-				return "", fmt.Errorf("PR #%d head moved from %s to %s", payload.PullRequest, head, forgePull.HeadSHA)
-			}
-			baseBranch = strings.TrimSpace(forgePull.BaseRef)
+			baseBranch = strings.TrimSpace(forge.BaseRef)
 		}
 		if baseBranch == "" {
 			return "", fmt.Errorf("PR #%d has no base branch", payload.PullRequest)
@@ -423,12 +435,27 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		// remote-tracking ref silently widens that scope to commits already
 		// merged into the base, so refresh it first and fail loudly rather
 		// than hand the sandbox a wrong review subject.
-		if err := git.FetchRemote(ctx, "origin"); err != nil {
+		if err := refreshRemoteReviewOrigin(ctx, git, checkout); err != nil {
 			return "", fmt.Errorf("refresh origin before resolving PR #%d base: %w", payload.PullRequest, err)
 		}
 		base, err = git.MergeBase(ctx, "origin/"+baseBranch, head)
 		if err != nil {
 			return "", fmt.Errorf("resolve merge base of origin/%s and %s: %w", baseBranch, head, err)
+		}
+		if base == head {
+			// The head is already inside the base branch. For a PR merged
+			// with a true merge commit that collapses the scope to nothing
+			// (#2327), so take the base from the merge commit's first parent:
+			// the base branch as it stood when the PR landed. Squash and
+			// rebase merges rewrite the head out of the base branch and never
+			// get here; an unmerged PR keeps the collapsed base.
+			forge, err := loadForgePull()
+			if err != nil {
+				return "", err
+			}
+			if base, err = mergedPullRequestDiffBase(ctx, git, forge, head); err != nil {
+				return "", fmt.Errorf("resolve merged PR #%d diff base: %w", payload.PullRequest, err)
+			}
 		}
 	} else {
 		base, err = git.RevParse(ctx, base+"^{commit}")
@@ -444,6 +471,74 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		return "", fmt.Errorf("review diff base %s is not an ancestor of head %s", base, head)
 	}
 	return base, nil
+}
+
+// mergedPullRequestDiffBase returns the scope base of a PR whose head is
+// already reachable from its base branch. A merged PR whose merge commit has a
+// second parent is diffed from the merge base of the commit's first parent and
+// the head. The forge's base.sha is not used: it is not refreshed when the
+// base branch moves, so it can predate base-branch merges into the PR branch
+// and widen the scope. Any other PR keeps head as its base.
+func mergedPullRequestDiffBase(ctx context.Context, git gitutil.Client, pull github.PullRequest, head string) (string, error) {
+	mergeSHA := strings.TrimSpace(pull.MergeSHA)
+	if !(pull.Merged || strings.TrimSpace(pull.MergedAt) != "") || mergeSHA == "" {
+		return head, nil
+	}
+	merge, err := git.RevParse(ctx, mergeSHA+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("resolve merge commit %s: %w", mergeSHA, err)
+	}
+	isMergeCommit, err := git.CommitExists(ctx, merge+"^2")
+	if err != nil {
+		return "", fmt.Errorf("inspect merge commit %s: %w", merge, err)
+	}
+	if !isMergeCommit {
+		return head, nil
+	}
+	base, err := git.MergeBase(ctx, merge+"^1", head)
+	if err != nil {
+		return "", fmt.Errorf("resolve merge base of %s^1 and %s: %w", merge, head, err)
+	}
+	return base, nil
+}
+
+// remoteReviewOriginRefreshLocks serialises the diff-base origin refresh per
+// checkout. Concurrent `git fetch origin` runs on one repository race on its
+// remote-tracking refs and fail with `cannot lock ref` (#2330).
+var remoteReviewOriginRefreshLocks repoCheckoutLocks
+
+// remoteReviewOriginRefreshRetryDelay lets a fetch outside this process (for
+// example another daemon's job runner) release the ref lock before the single
+// retry.
+const remoteReviewOriginRefreshRetryDelay = 250 * time.Millisecond
+
+// refreshRemoteReviewOrigin fetches origin for checkout. Refreshes in this
+// process are serialised per checkout; a ref-lock race with another process
+// is retried once.
+func refreshRemoteReviewOrigin(ctx context.Context, git gitutil.Client, checkout string) error {
+	lock := remoteReviewOriginRefreshLocks.For(filepath.Clean(checkout))
+	lock.Lock()
+	defer lock.Unlock()
+	err := git.FetchRemote(ctx, "origin")
+	if err == nil || !gitRefLockRace(err) {
+		return err
+	}
+	timer := time.NewTimer(remoteReviewOriginRefreshRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return err
+	case <-timer.C:
+	}
+	return git.FetchRemote(ctx, "origin")
+}
+
+// gitRefLockRace reports whether a git failure is a lost race for a ref lock:
+// another writer moved the ref under us, or still holds its lock file.
+func gitRefLockRace(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "cannot lock ref") ||
+		(strings.Contains(message, ".lock") && strings.Contains(message, "File exists"))
 }
 
 func executionChangeSetCollector(lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, liveBackend execbackend.Backend, liveJobID string) func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
