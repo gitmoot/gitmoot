@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -149,36 +150,62 @@ func reviewFallbackSwitchesToOmp(effectiveRuntime string) bool {
 // provider that the next entry does not share. A GitHub/network outage or
 // checkout contention is not solved by a different model, and a job with no
 // pool (every non-router job) never reaches the fallback.
-func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification) (string, bool) {
+//
+// usable, when non-nil, is the run's own eligibility rule: an entry it refuses
+// is passed over and returned in skipped so the caller can record why. A remote
+// review uses it to never spend a sandbox on a model that cannot authenticate
+// there (#2333); the pool itself is untouched, so local reviews keep the entry.
+func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification, usable func(model string) bool) (next string, skipped []string, ok bool) {
 	switch classification.Class {
 	case blockerClassRuntimeQuota, blockerClassRuntimeAuth:
 	case blockerClassNetworkOutage:
 		if !isOmpProviderTransportFailure(classification.Detail) {
-			return "", false
+			return "", nil, false
 		}
 	default:
-		return "", false
-	}
-	current := strings.TrimSpace(payload.Model)
-	for i, model := range payload.ReviewModelPool {
-		if model == current {
-			if i+1 < len(payload.ReviewModelPool) {
-				return payload.ReviewModelPool[i+1], true
-			}
-			// The pool is exhausted: fall through to the timed hold rather than
-			// restarting at the head, which would retry an entry that already
-			// failed this attempt sequence.
-			return "", false
-		}
+		return "", nil, false
 	}
 	// Not in the pool at all: a review that ran on its agent's own model, which
 	// is every `gitmoot agent review` dispatch (#2180). Before the pool reached
 	// these jobs this branch could not be taken; now the first pool entry is the
 	// first UNTRIED alternative, so a blocked review has somewhere to go.
-	if len(payload.ReviewModelPool) > 0 {
-		return payload.ReviewModelPool[0], true
+	untried := payload.ReviewModelPool
+	current := strings.TrimSpace(payload.Model)
+	for i, model := range payload.ReviewModelPool {
+		if model == current {
+			// A pool exhausted from here falls through to the timed hold rather
+			// than restarting at the head, which would retry an entry that
+			// already failed this attempt sequence.
+			untried = payload.ReviewModelPool[i+1:]
+			break
+		}
 	}
-	return "", false
+	for _, model := range untried {
+		if usable != nil && !usable(model) {
+			skipped = append(skipped, model)
+			continue
+		}
+		return model, skipped, true
+	}
+	return "", skipped, false
+}
+
+// reviewModelRemoteSkippedEventKind records pool entries a remote review's
+// fallback passed over because their provider cannot authenticate inside the
+// sandbox (#2333). Recorded whether or not a usable entry followed, so a pool
+// that runs out this way is as visible as one that falls back past it.
+const reviewModelRemoteSkippedEventKind = "review_model_remote_skipped"
+
+// reviewFallbackModelFilter is the eligibility rule a pool fallback applies to
+// this job: on the remote backend only models remote omp can authenticate,
+// otherwise every entry (nil). A backend that does not resolve leaves the pool
+// unfiltered; the run that follows refuses that job on its own.
+func (w jobWorker) reviewFallbackModelFilter(job db.Job, payload workflow.JobPayload) func(model string) bool {
+	backend, _, err := w.resolveExecutionBackendForJob(job, payload)
+	if err != nil || backend != execbackend.Remote {
+		return nil
+	}
+	return remoteOmpModelAuthenticates
 }
 
 // runtimeUnavailableSignatures are the renderings a capability refusal actually
@@ -743,7 +770,18 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	eventKind := blockerDeferredEventKind
 	previousModel := payload.Model
 	previousRuntime := strings.TrimSpace(payload.RuntimeOverride)
-	if next, ok := nextReviewPoolModel(payload, classification); ok {
+	next, skipped, ok := nextReviewPoolModel(payload, classification, w.reviewFallbackModelFilter(latest, payload))
+	if len(skipped) > 0 {
+		// Best effort, like the exhausted-budget event above: losing the record
+		// must not cost the job its fallback.
+		_ = w.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID: jobID,
+			Kind:  reviewModelRemoteSkippedEventKind,
+			Message: fmt.Sprintf("remote review fallback skipped %s: no credential route into the sandbox for that provider (remote omp authenticates only %s); the pool keeps them for local reviews",
+				strings.Join(skipped, ", "), strings.Join(remoteOmpAuthenticatedProviders(), ", ")),
+		})
+	}
+	if ok {
 		payload.Model = next
 		// OWNER DECISION 2026-09-14: a quota/auth blocker falls back by moving to
 		// omp with the next pool model, not by retrying the dead runtime.

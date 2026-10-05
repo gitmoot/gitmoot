@@ -456,7 +456,7 @@ func TestNextReviewPoolModelStartsAtFirstEntryWhenCurrentIsNotInPool(t *testing.
 		{"contention is not a provider fact", workflow.JobPayload{Model: "", ReviewModelPool: pool}, blockerClassification{Class: blockerClassCheckoutContention}, "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			model, ok := nextReviewPoolModel(tc.payload, tc.classification)
+			model, _, ok := nextReviewPoolModel(tc.payload, tc.classification, nil)
 			if model != tc.wantModel || ok != tc.wantOK {
 				t.Fatalf("nextReviewPoolModel = (%q, %v), want (%q, %v)", model, ok, tc.wantModel, tc.wantOK)
 			}
