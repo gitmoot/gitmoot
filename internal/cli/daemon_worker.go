@@ -926,13 +926,14 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if remoteReviewAdmitted && payload.RemoteCapWaitSince != "" {
 		w.clearRemoteReviewCapWait(ctx, job, execConfig.Provider)
 	}
+	var sandboxRunDeadline time.Time
 	if lifecycle != nil && instance != nil {
 		deliveryCheckout = instance.Workspace
 		// A cloud E2B sandbox has a fixed lifetime, so the run deadline has to
 		// end inside it: a review that outlives its sandbox dies mid-stream with
 		// no verdict instead of timing out cleanly (#2331).
 		sandboxLifetime := remoteSandboxLifetime(execBackend, execConfig)
-		jobTimeout = w.fitRunToSandboxLifetime(ctx, job.ID, jobTimeout, sandboxLifetime, provisionStartedAt)
+		sandboxRunDeadline = remoteSandboxRunDeadline(sandboxLifetime, provisionStartedAt)
 		w.executionRunner = execbackend.InstanceRunner{Backend: lifecycle, Instance: instance, Lifetime: sandboxLifetime, Started: provisionStartedAt}
 		if len(credentialEnv) > 0 {
 			w.executionRunner = subprocess.EnvInjectingRunner{Inner: w.executionRunner, Env: credentialEnv}
@@ -1186,7 +1187,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	runStartedAt := time.Now().UTC()
 	var cancel context.CancelFunc
-	runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
+	runCtx, cancel = context.WithDeadline(runCtx, w.runDeadline(ctx, job.ID, jobTimeout, sandboxRunDeadline))
 	defer cancel()
 	runDeadline, hasRunDeadline := runCtx.Deadline()
 	stopKillPending := func() {}

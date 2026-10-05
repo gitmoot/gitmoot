@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -331,6 +330,8 @@ type byteIdentityHostFinalizer struct {
 	checkout    string
 	expectedSHA string
 	called      *bool
+	// deadline, when set, receives the run context's deadline.
+	deadline *time.Time
 }
 
 const (
@@ -370,6 +371,15 @@ type remoteLifecycleHarness struct {
 	workspace      string
 	runtimeEnv     map[string]string
 	runtimeStarted bool
+	createdAt      time.Time
+}
+
+// firstCreateAt is when the provider received its first create request, or
+// zero before then.
+func (h *remoteLifecycleHarness) firstCreateAt() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.createdAt
 }
 
 // GITMOOT-IMPL: newRemoteLifecycleHarness stands in for both paid E2B planes.
@@ -412,6 +422,9 @@ func (h *remoteLifecycleHarness) serveControl(w http.ResponseWriter, r *http.Req
 		}
 		h.mu.Lock()
 		h.creates = append(h.creates, request)
+		if h.createdAt.IsZero() {
+			h.createdAt = time.Now()
+		}
 		h.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -644,6 +657,9 @@ func writeRemoteLifecycleConnectJSON(t *testing.T, writer io.Writer, flag byte, 
 
 func (f byteIdentityHostFinalizer) FinalizeImplementation(ctx context.Context, _ db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 	*f.called = true
+	if f.deadline != nil {
+		*f.deadline, _ = ctx.Deadline()
+	}
 	expected, err := os.ReadFile(f.expectedSHA)
 	if err != nil {
 		return payload, err
@@ -851,11 +867,20 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 	worker.PermissionPolicyEffectGit = func(string) permissionpolicy.EffectGit {
 		return &permissionPolicyEffectGitFake{remote: map[string]struct{}{branch: {}}}
 	}
+	// Worker setup between provisioning and arming the run context takes real
+	// time; stand in for it once the sandbox exists.
+	const remoteSetupDelay = 3 * time.Second
+	var runDeadline time.Time
+	setupDelayed := false
 	worker.WorkflowFactory = func(string) workflow.Engine {
+		if !setupDelayed && !harness.firstCreateAt().IsZero() {
+			setupDelayed = true
+			time.Sleep(remoteSetupDelay)
+		}
 		return workflow.Engine{
 			Store:                   store,
 			ResolveDeliveryWorktree: workflow.PayloadDeliveryWorktreeResolver,
-			ImplementationFinalizer: byteIdentityHostFinalizer{checkout: checkout, expectedSHA: expectedSHA, called: &finalizerCalled},
+			ImplementationFinalizer: byteIdentityHostFinalizer{checkout: checkout, expectedSHA: expectedSHA, called: &finalizerCalled, deadline: &runDeadline},
 		}
 	}
 	if err := worker.run(ctx, job); err != nil {
@@ -939,15 +964,22 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 			sandboxClamp = event.Message
 		}
 	}
-	// #2331: cloud E2B retires a sandbox one hour after creation and silently
-	// refuses to extend it, so the default 4h run deadline must be clamped to
-	// end inside that hour, or a long run dies mid-stream with no verdict.
-	match := regexp.MustCompile(`clamped to (\S+),`).FindStringSubmatch(sandboxClamp)
-	if match == nil {
+	if sandboxClamp == "" {
 		t.Fatalf("no job_timeout_clamped event fits the run into the 1h sandbox: events=%+v", events)
 	}
-	if clamped, err := time.ParseDuration(match[1]); err != nil || clamped <= 50*time.Minute || clamped > 55*time.Minute {
-		t.Fatalf("run deadline clamped to %q (%v), want just under 55m: %s", match[1], err, sandboxClamp)
+	// #2331: cloud E2B retires a sandbox one hour after creation and silently
+	// refuses to extend it, so the default 4h run deadline must end inside that
+	// hour, or a long run dies mid-stream with no verdict. The deadline is an
+	// INSTANT tied to the sandbox's creation: the worker setup delay injected
+	// above must not push it later (#2338 review).
+	if runDeadline.IsZero() {
+		t.Fatal("the host finalizer saw no run deadline")
+	}
+	createdAt := harness.firstCreateAt()
+	sandboxDeadline := createdAt.Add(time.Hour - 5*time.Minute)
+	if runDeadline.After(sandboxDeadline) || runDeadline.Before(sandboxDeadline.Add(-30*time.Second)) {
+		t.Fatalf("run deadline %s, want at most and just before %s (sandbox created %s + 55m, after a %s setup delay): %s",
+			runDeadline.Format(time.RFC3339Nano), sandboxDeadline.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano), remoteSetupDelay, sandboxClamp)
 	}
 }
 

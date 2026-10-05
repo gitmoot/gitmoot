@@ -64,28 +64,37 @@ func remoteSandboxLifetime(backend execbackend.Backend, cfg config.RemoteExecCon
 	return remoteexec.ProviderMaxTTL
 }
 
-// fitRunToSandboxLifetime returns the run deadline for a job whose sandbox
-// lives for lifetime from provisionStarted, so the run ends
-// remoteSandboxLifetimeMargin before the provider retires the sandbox. A
-// shortened deadline is recorded as job_timeout_clamped, the event that already
-// reports every other clamp of a job's deadline.
-func (w jobWorker) fitRunToSandboxLifetime(ctx context.Context, jobID string, jobTimeout, lifetime time.Duration, provisionStarted time.Time) time.Duration {
+// remoteSandboxRunDeadline is the latest instant a run on a sandbox with a
+// fixed lifetime may end: remoteSandboxLifetimeMargin before the provider
+// retires a sandbox whose create call started no earlier than
+// provisionStarted. Zero means the sandbox has no fixed lifetime.
+//
+// It is an INSTANT, not a duration, because the run context is armed only
+// after the rest of the worker's setup. A duration measured here and started
+// there would move the run's end past the sandbox's by however long that setup
+// took (#2338 review).
+func remoteSandboxRunDeadline(lifetime time.Duration, provisionStarted time.Time) time.Time {
 	if lifetime <= 0 {
-		return jobTimeout
+		return time.Time{}
 	}
-	remaining := time.Until(provisionStarted.Add(lifetime - remoteSandboxLifetimeMargin)).Truncate(time.Second)
-	if remaining >= jobTimeout {
-		return jobTimeout
+	return provisionStarted.Add(lifetime - remoteSandboxLifetimeMargin)
+}
+
+// runDeadline is the instant the run context is armed at: jobTimeout from now,
+// or sandboxDeadline when that comes first. A deadline the sandbox shortens is
+// recorded as job_timeout_clamped, the event that already reports every other
+// clamp of a job's deadline.
+func (w jobWorker) runDeadline(ctx context.Context, jobID string, jobTimeout time.Duration, sandboxDeadline time.Time) time.Time {
+	deadline := time.Now().Add(jobTimeout)
+	if sandboxDeadline.IsZero() || !sandboxDeadline.Before(deadline) {
+		return deadline
 	}
-	if remaining < 0 {
-		remaining = 0
-	}
-	message := fmt.Sprintf("job_timeout %s does not fit in the remote sandbox: the provider retires it %s after creation and does not extend it, so the run deadline is clamped to %s, ending %s before the sandbox does",
-		jobTimeout, lifetime, remaining, remoteSandboxLifetimeMargin)
+	message := fmt.Sprintf("job_timeout %s does not fit in the remote sandbox: the provider retires it %s after creation and does not extend it, so the run deadline is clamped to %s (%s from now), %s before the sandbox ends",
+		jobTimeout, remoteexec.ProviderMaxTTL, sandboxDeadline.UTC().Format(time.RFC3339), time.Until(sandboxDeadline).Truncate(time.Second), remoteSandboxLifetimeMargin)
 	if _, err := w.Store.ClaimJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "job_timeout_clamped", Message: message}); err != nil {
 		writeLine(w.Stdout, "job %s job_timeout_clamped event failed: %v", jobID, err)
 	}
-	return remaining
+	return sandboxDeadline
 }
 
 var reapedExecutionBackendRoots sync.Map
