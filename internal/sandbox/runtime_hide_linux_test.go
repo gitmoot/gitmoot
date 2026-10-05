@@ -387,11 +387,13 @@ func TestSandboxExecReadOnlySeatRefusesHostContainerRuntimeE2E(t *testing.T) {
 
 const runtimeHideHomesEnv = "GITMOOT_TEST_RUNTIME_HIDE_HOMES"
 
-// userRuntimeFixture is a fake /home holding one hostile user, mallory, whose
-// home has every shape a runtime path can take: an ordinary runtime directory
-// (.rd), a symlink loop (.lima), a symlink to /etc (.colima), and a symlink
-// one component up the path (.docker, toward .docker/run and .docker/desktop)
-// to a directory outside the home. Paths are symlink-resolved.
+// userRuntimeFixture is a fake /home holding one user, mallory, whose home has
+// every shape a runtime path can take. Final-component symlinks, each the
+// runtime path itself: a loop (.lima) and a link to /etc (.colima). Symlinks
+// partway along, to directories outside the home: a dotfiles-managed .config
+// with gh auth and no colima in it, and .docker, whose target holds a "run"
+// entry (so .docker/run exists behind the link) and no "desktop". And an
+// ordinary runtime directory (.rd). Paths are symlink-resolved.
 type userRuntimeFixture struct {
 	homes, home, outside string
 }
@@ -407,12 +409,16 @@ func newUserRuntimeFixture(t *testing.T) userRuntimeFixture {
 		home:    filepath.Join(base, "home", "mallory"),
 		outside: filepath.Join(base, "outside"),
 	}
-	for _, dir := range []string{filepath.Join(f.home, ".rd"), f.outside} {
+	for _, dir := range []string{filepath.Join(f.home, ".rd"), filepath.Join(f.outside, "dotfiles", "config", "gh")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, file := range []string{filepath.Join(f.home, ".rd", "docker.sock"), filepath.Join(f.outside, "run")} {
+	for _, file := range []string{
+		filepath.Join(f.home, ".rd", "docker.sock"),
+		filepath.Join(f.outside, "run"),
+		filepath.Join(f.outside, "dotfiles", "config", "gh", "hosts.yml"),
+	} {
 		if err := os.WriteFile(file, nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -420,6 +426,7 @@ func newUserRuntimeFixture(t *testing.T) userRuntimeFixture {
 	for link, target := range map[string]string{
 		".lima":   filepath.Join(f.home, ".lima"),
 		".colima": "/etc",
+		".config": filepath.Join(f.outside, "dotfiles", "config"),
 		".docker": f.outside,
 	} {
 		if err := os.Symlink(target, filepath.Join(f.home, link)); err != nil {
@@ -440,8 +447,10 @@ func (f userRuntimeFixture) candidates() runtimeCandidates {
 // TestDiscoverContainerRuntimeNeverFollowsUserSymlinks: a user's symlinks must
 // neither stop discovery (a loop used to refuse every read-only seat on the
 // host) nor send a cover to their target (a link to /etc used to cover /etc).
-// Each link is the endpoint itself, covered where it is; an ordinary runtime
-// directory is still found.
+// A link that is the runtime path itself is covered where it is. A link partway
+// along (.config, .docker) is never covered, since that would hide the user's
+// whole directory: the path is skipped, and reported only when something
+// exists behind it (.docker/run). An ordinary runtime directory is still found.
 func TestDiscoverContainerRuntimeNeverFollowsUserSymlinks(t *testing.T) {
 	f := newUserRuntimeFixture(t)
 	var logs []string
@@ -455,13 +464,14 @@ func TestDiscoverContainerRuntimeNeverFollowsUserSymlinks(t *testing.T) {
 		{path: filepath.Join(f.home, ".rd"), dir: true, userRoot: f.home},
 		{path: filepath.Join(f.home, ".colima"), userRoot: f.home},
 		{path: filepath.Join(f.home, ".lima"), userRoot: f.home},
-		{path: filepath.Join(f.home, ".docker"), userRoot: f.home},
 	}
 	if !slices.Equal(paths, want) {
 		t.Fatalf("discovered %+v, want %+v", paths, want)
 	}
-	if len(logs) != 0 {
-		t.Fatalf("discovery logged %q, want nothing: every path was inspectable", logs)
+	wantLogs := []string{fmt.Sprintf("not covering container runtime path %s: %s: %v",
+		filepath.Join(f.home, ".docker/run"), filepath.Join(f.home, ".docker"), errUserRuntimeViaSymlink)}
+	if !slices.Equal(logs, wantLogs) {
+		t.Fatalf("discovery logged %q, want %q", logs, wantLogs)
 	}
 }
 
@@ -533,7 +543,7 @@ func TestContainerRuntimeHideHelper(t *testing.T) {
 	report("stat /etc/passwd", err)
 	_, err = os.Stat(filepath.Join(f.outside, "run"))
 	report("stat outside/run", err)
-	for _, rel := range []string{".colima/passwd", ".lima/default", ".docker/run", ".rd/docker.sock"} {
+	for _, rel := range []string{".colima/passwd", ".lima/default", ".config/gh/hosts.yml", ".docker/run", ".rd/docker.sock"} {
 		_, err = os.Stat(filepath.Join(f.home, rel))
 		report("stat home/"+rel, err)
 	}
@@ -543,9 +553,10 @@ func TestContainerRuntimeHideHelper(t *testing.T) {
 
 // TestHideContainerRuntimeCoversUserPathsInPlaceE2E proves the covers land on
 // the user's own paths, in a child's private mount namespace: a link loop no
-// longer refuses, a link to /etc or to another directory is covered where it
-// is while its target stays intact, and an ordinary runtime directory is
-// covered with an empty tmpfs.
+// longer refuses, a final-component link to /etc is covered where it is while
+// /etc stays intact, an ordinary runtime directory is covered with an empty
+// tmpfs, and a link partway along a runtime path (a dotfiles-managed .config,
+// .docker) is not covered at all: gh auth under .config stays visible.
 func TestHideContainerRuntimeCoversUserPathsInPlaceE2E(t *testing.T) {
 	requirePrivateMountNamespace(t)
 	f := newUserRuntimeFixture(t)
@@ -564,15 +575,18 @@ func TestHideContainerRuntimeCoversUserPathsInPlaceE2E(t *testing.T) {
 		"stat outside/run: <nil>",
 		"stat home/.colima/passwd: stat " + filepath.Join(f.home, ".colima/passwd") + ": not a directory",
 		"stat home/.lima/default: stat " + filepath.Join(f.home, ".lima/default") + ": not a directory",
-		"stat home/.docker/run: stat " + filepath.Join(f.home, ".docker/run") + ": not a directory",
+		"stat home/.config/gh/hosts.yml: <nil>",
+		"stat home/.docker/run: <nil>",
 		"stat home/.rd/docker.sock: stat " + filepath.Join(f.home, ".rd/docker.sock") + ": no such file or directory",
 		"readdir home/.rd: 0 <nil>",
+		"hide log: not covering container runtime path " + filepath.Join(f.home, ".docker/run") + ": " +
+			filepath.Join(f.home, ".docker") + ": " + errUserRuntimeViaSymlink.Error(),
 	} {
 		if !strings.Contains(output, want+"\n") {
 			t.Errorf("hide helper output lacks %q:\n%s", want, output)
 		}
 	}
-	if strings.Contains(output, "hide log:") {
-		t.Errorf("hide helper logged a skipped path:\n%s", output)
+	if count := strings.Count(output, "hide log:"); count != 1 {
+		t.Errorf("hide helper logged %d skipped paths, want only .docker/run:\n%s", count, output)
 	}
 }

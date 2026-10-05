@@ -1108,13 +1108,16 @@ privileged, and before Landlock is applied, it:
   as containerd's per-container shim sockets.
 
 Paths under `/run/user/*` and the homes belong to their users, so the daemon
-never follows a symlink there. A runtime path that is itself a symlink, or that
-runs through one (such as `~/.docker` linked elsewhere), is covered where the
-link is, with `/dev/null`: every path through the link is then unreachable in
-the seat, and the link's target is never covered. A per-user path the daemon
-cannot inspect, such as a home it may not enter, is skipped with a
-`sandbox-exec: not covering container runtime path ...` line on the seat's
-stderr; it does not stop the seat. The `/run` and `/var/snap` paths are
+never follows a symlink there. A runtime path that is itself a symlink (such as
+`~/.colima` linked elsewhere) is covered where the link is, with `/dev/null`,
+and the link's target is never covered. A runtime path that runs through a
+symlink partway along (such as `~/.config/colima` under a dotfiles-managed
+`~/.config`, or `~/.docker/run` under a linked `~/.docker`) is not covered at
+all, so the rest of that directory stays visible in the seat; when something
+exists behind the link, the seat's stderr gets a
+`sandbox-exec: not covering container runtime path ...` line. A per-user path
+the daemon cannot inspect, such as a home it may not enter, is skipped with
+the same line; neither stops the seat. The `/run` and `/var/snap` paths are
 root's, and are resolved through symlinks.
 
 Each `/run` path is also checked under `/var/run`. Inside the seat,
@@ -1133,7 +1136,7 @@ boundary. A read-only seat can still reach:
 
 - **a runtime endpoint outside the list**, such as a socket at a custom
   `--host`/`-H` path or a per-user runtime in a home directory not named above,
-  or in one the daemon cannot inspect;
+  in one the daemon cannot inspect, or reached through a symlink partway along;
 - **a runtime listening on TCP** (for example `dockerd -H tcp://...`): the seat
   keeps network access, which the model API needs, so a TCP listener on the
   host or the network stays reachable;

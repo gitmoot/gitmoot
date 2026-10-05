@@ -221,12 +221,19 @@ func coverUserRuntimePath(p runtimePath, logf func(format string, args ...any)) 
 	return coverRuntimePath("/proc/self/fd/"+strconv.Itoa(fd), path, dir)
 }
 
+// errUserRuntimeViaSymlink marks a per-user runtime path that runs through a
+// symlink partway along, such as ~/.config/colima under a dotfiles-managed
+// ~/.config.
+var errUserRuntimeViaSymlink = errors.New("runs through a symlink its owner made")
+
 // openUserRuntimePath opens root/rel as an O_PATH descriptor without following
-// any symlink below root, one component at a time. It stops at the first
-// component that is a symlink and returns that link: the cover then lands on
-// the link itself, which makes every path through it unreachable, and never on
-// a target its owner chose. ok is false when the path does not exist. The
-// caller closes fd.
+// any symlink below root, one component at a time. When the final component is
+// a symlink it returns that link: the cover then lands on the link itself, so
+// the runtime path is unreachable, and never on a target its owner chose. A
+// symlink partway along is an errUserRuntimeViaSymlink error, never a cover:
+// that link is an ordinary directory of the user's (~/.config, ~/.docker) and
+// covering it would hide everything else in it. ok is false when the path does
+// not exist. The caller closes fd.
 func openUserRuntimePath(root, rel string) (fd int, path string, dir, ok bool, err error) {
 	fd, err = unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
@@ -256,7 +263,11 @@ func openUserRuntimePath(root, rel string) (fd int, path string, dir, ok bool, e
 		last := i == len(parts)-1
 		switch stat.Mode & unix.S_IFMT {
 		case unix.S_IFLNK:
-			return fd, path, false, true, nil
+			if last {
+				return fd, path, false, true, nil
+			}
+			unix.Close(fd)
+			return -1, "", false, false, fmt.Errorf("%s: %w", path, errUserRuntimeViaSymlink)
 		case unix.S_IFDIR:
 			if last {
 				return fd, path, true, true, nil
@@ -281,12 +292,19 @@ func openUserRuntimePath(root, rel string) (fd int, path string, dir, ok bool, e
 //
 // System paths are symlink-resolved, and any error other than not-found
 // refuses: only root controls them. A per-user path is never resolved through a
-// symlink its owner made: a link is covered where it is, so no user can point
-// a cover at a directory of their choosing (/usr, the toolchain, a checkout).
-// An error inspecting a per-user path (a permission denied to the daemon, which
-// the seat as the same user meets too) is reported through logf and the path
-// left uncovered; it never refuses, so no user can stop every read-only seat on
-// the host from starting.
+// symlink its owner made, so no user can point a cover at a directory of their
+// choosing (/usr, the toolchain, a checkout). When the runtime path itself is
+// a symlink, the link is covered where it is. When a symlink sits partway
+// along (a dotfiles-managed ~/.config or ~/.docker), nothing is covered: that
+// link is an ordinary directory of the user's, and the path is reported
+// through logf if something exists behind it. Following the link instead would
+// need proof that its target stays inside the same user's home, for a path a
+// user can retarget at will; the skip is the simpler sound choice, since a
+// runtime reached that way is outside the fixed list like any other custom
+// endpoint. An error inspecting a per-user path (a permission denied to the
+// daemon, which the seat as the same user meets too) is reported through logf
+// and the path left uncovered; it never refuses, so no user can stop every
+// read-only seat on the host from starting.
 func discoverContainerRuntime(candidates runtimeCandidates, logf func(format string, args ...any)) ([]runtimePath, error) {
 	var found []runtimePath
 	seen := make(map[string]bool)
@@ -335,6 +353,17 @@ func discoverContainerRuntime(candidates runtimeCandidates, logf func(format str
 				continue
 			}
 			fd, path, dir, ok, err := openUserRuntimePath(resolved, candidate.rel)
+			if errors.Is(err, errUserRuntimeViaSymlink) {
+				// Report it only when a runtime path might exist behind the
+				// link. The lookup follows the link but only reads metadata;
+				// nothing is covered on its result.
+				full := filepath.Join(resolved, candidate.rel)
+				if _, statErr := os.Lstat(full); errors.Is(statErr, fs.ErrNotExist) || errors.Is(statErr, syscall.ENOTDIR) {
+					continue
+				}
+				logf("not covering container runtime path %s: %v", full, err)
+				continue
+			}
 			if err != nil {
 				// One line per directory: a daemon that may not enter another
 				// user's home would otherwise report every path below it.
