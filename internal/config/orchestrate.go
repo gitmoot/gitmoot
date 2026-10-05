@@ -1010,8 +1010,8 @@ func applyReviewChecksField(route *ReviewChecksRoute, key string, value string) 
 		route.Backend = parsed
 	case "checks_provider":
 		canonical, alias := NormalizeRemoteExecProvider(parsed)
-		if canonical != RemoteExecProviderE2B && canonical != RemoteExecProviderSandboxd {
-			return false, fmt.Errorf("unknown checks_provider %q: allowed providers are %q and %q", parsed, RemoteExecProviderE2B, RemoteExecProviderSandboxd)
+		if !IsRemoteExecProvider(canonical) {
+			return false, fmt.Errorf("unknown checks_provider %q: allowed providers are %s", parsed, RemoteExecProviderChoices())
 		}
 		route.Provider = canonical
 		return alias, nil

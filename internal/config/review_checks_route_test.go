@@ -74,6 +74,43 @@ checks_template = "x"
 	}
 }
 
+// checks_provider accepts the Linux gateway: a repository routed to
+// "sandboxd-linux" resolves against [remote_exec."sandboxd-linux"], and a home
+// that does not declare it refuses that repository by naming the section.
+func TestReviewChecksRouteAcceptsSandboxdLinuxProvider(t *testing.T) {
+	routes := `[repos."o/linux".review]
+checks_backend = "remote"
+checks_provider = "sandboxd-linux"
+`
+	if _, err := mustLoadReviewChecksRoute(t, writeReviewChecksConfig(t, routes), "o/linux"); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd-linux]") {
+		t.Fatalf("undeclared sandboxd-linux route error = %v; want one naming the section", err)
+	}
+	key := filepath.Join(t.TempDir(), "sandboxd-linux.key")
+	if err := os.WriteFile(key, []byte("sandboxd-linux-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	section := `[remote_exec."sandboxd-linux"]
+api_key_file = "` + key + `"
+template = "review-amd64"
+base_url = "http://127.0.0.1:43190"
+envd_base_url = "http://127.0.0.1:43190"
+
+`
+	route, err := mustLoadReviewChecksRoute(t, writeReviewChecksConfig(t, section+routes), "o/linux")
+	if err != nil || route.Provider != RemoteExecProviderSandboxdLinux || !route.Enabled() {
+		t.Fatalf("sandboxd-linux route = %+v, %v", route, err)
+	}
+}
+
+func mustLoadReviewChecksRoute(t *testing.T, paths Paths, repo string) (ReviewChecksRoute, error) {
+	t.Helper()
+	cfg, err := LoadReviewConfig(paths)
+	if err != nil {
+		t.Fatalf("load review config: %v", err)
+	}
+	return cfg.ChecksRoute(repo)
+}
+
 func TestReviewChecksKeysAreRepositoryScoped(t *testing.T) {
 	paths := writeReviewChecksConfig(t, "[review]\nchecks_backend = \"remote\"\n")
 	if _, err := LoadReviewConfig(paths); err == nil || !strings.Contains(err.Error(), "repository-scoped") {

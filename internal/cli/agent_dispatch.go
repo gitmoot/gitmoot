@@ -76,15 +76,15 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 // requestExecProvider resolves the --exec-provider opt-in. A provider implies
 // the remote backend when --exec-backend is omitted and contradicts an
 // explicit non-remote one. "e2b", the default, is stored as absent so payloads
-// carry exec_provider only for the sandboxd opt-in. The deprecated alias "mac"
-// is stored as "sandboxd".
+// carry exec_provider only for a sandboxd opt-in ("sandboxd" or
+// "sandboxd-linux"). The deprecated alias "mac" is stored as "sandboxd".
 func requestExecProvider(provider string, backend *string) (string, *string, error) {
 	provider, _ = config.NormalizeRemoteExecProvider(provider)
 	if provider == "" {
 		return "", backend, nil
 	}
-	if provider != config.RemoteExecProviderE2B && provider != config.RemoteExecProviderSandboxd {
-		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %q and %q", provider, config.RemoteExecProviderE2B, config.RemoteExecProviderSandboxd)
+	if !config.IsRemoteExecProvider(provider) {
+		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %s", provider, config.RemoteExecProviderChoices())
 	}
 	if backend == nil {
 		remote := string(execbackend.Remote)
@@ -333,7 +333,8 @@ type localAgentDispatchRequest struct {
 	// pointer preserves explicit-local as distinct from absence.
 	ExecBackend *string
 	// ExecProvider is the remote provider an explicitly remote job runs on:
-	// empty for the default E2B, or "sandboxd" for the opt-in sandboxd gateway. It is
+	// empty for the default E2B, or "sandboxd" / "sandboxd-linux" for an opt-in
+	// sandboxd gateway. It is
 	// refused at dispatch unless the job is remote and the provider is
 	// configured, so a typo can never quietly run on E2B instead.
 	ExecProvider string

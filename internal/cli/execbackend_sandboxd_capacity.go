@@ -64,6 +64,7 @@ type sandboxdCapacitySource struct {
 	cache    *sandboxdCapacityCache
 	key      string
 	read     func(context.Context) (e2b.Capacity, error)
+	provider string
 	ceiling  int
 	template string
 }
@@ -72,7 +73,7 @@ type sandboxdCapacitySource struct {
 // admission policy, or a refusal that writes no row.
 func (s *sandboxdCapacitySource) policy(ctx context.Context) (db.ExecBackendCostCap, error) {
 	capacity, err := s.cache.get(ctx, s.key, s.read)
-	return execBackendSandboxdCap(s.ceiling, capacity, err, s.template)
+	return execBackendSandboxdCap(s.provider, s.ceiling, capacity, err, s.template)
 }
 
 // invalidate drops the cached report after sandboxd refused a create.

@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"debug/elf"
 	"errors"
 	"fmt"
 	"io"
@@ -119,13 +118,14 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		accountKey := sha256.Sum256([]byte(apiKey))
 		var capacity *sandboxdCapacitySource
 		cap := execBackendStoreCap(cfg.ExecBackendCost)
-		if cfg.Provider == config.RemoteExecProviderSandboxd {
+		if config.IsSandboxdProvider(cfg.Provider) {
 			// sandboxd's cap is read per provision from its capacity report;
-			// this zero policy is never used.
+			// this zero policy is never used. Each sandboxd provider has its
+			// own cache entry, ceiling and ledger rows, so caps never mix.
 			cap = db.ExecBackendCostCap{}
 			capacity = &sandboxdCapacitySource{
-				cache: sandboxdCapacityReports, key: fmt.Sprintf("%s|%x", baseURL, accountKey),
-				read: client.Capacity, ceiling: cfg.ExecBackendCost.MaxConcurrent, template: cfg.E2BTemplate,
+				cache: sandboxdCapacityReports, key: fmt.Sprintf("%s|%s|%x", cfg.Provider, baseURL, accountKey),
+				read: client.Capacity, provider: cfg.Provider, ceiling: cfg.ExecBackendCost.MaxConcurrent, template: cfg.E2BTemplate,
 			}
 		}
 		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, cfg.Provider, fencingToken, db.BootID(), w.Stdout, cap)
@@ -209,23 +209,18 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 	}
 	var ompExecutable string
-	var ompARM64File *os.File
+	var ompFile *os.File
 	if backend == execbackend.Remote && runtimeName == runtime.OmpRuntime {
 		if credentialPlan.gateway == nil {
 			return nil, nil, nil, nil, errors.New("remote omp requires the model credential gateway; raw-key fallback is forbidden")
 		}
 		var err error
-		if cfg.Provider == config.RemoteExecProviderSandboxd {
-			ompARM64File, err = verifiedLinuxARM64Omp(cfg.OMPLinuxARM64File)
-			ompExecutable = cfg.OMPLinuxARM64File
-		} else {
-			ompExecutable, err = lookPathRemoteRuntime(runtime.OmpRuntime)
-		}
+		ompExecutable, ompFile, err = remoteOmpExecutable(cfg)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("resolve host omp executable for remote runtime: %w", err)
 		}
-		if ompARM64File != nil {
-			defer ompARM64File.Close()
+		if ompFile != nil {
+			defer ompFile.Close()
 		}
 	}
 	materials := execbackend.Materials{SourceWorktree: checkout}
@@ -265,7 +260,7 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}
 	if ompExecutable != "" {
-		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable, ompARM64File); err != nil {
+		if err := installRemoteOmpRuntime(ctx, lifecycle, instance, ompExecutable, ompFile); err != nil {
 			return lifecycle, instance, nil, nil, err
 		}
 	}
@@ -324,51 +319,25 @@ func (w jobWorker) installRemotePriorVerdicts(ctx context.Context, lifecycle exe
 	return []string{"GITMOOT_PRIOR_VERDICTS=" + remotePriorVerdictsPath}, nil
 }
 
-func verifiedLinuxARM64Omp(path string) (*os.File, error) {
-	if !filepath.IsAbs(path) {
-		return nil, errors.New("[remote_exec].omp_linux_arm64_file must name an absolute Linux ARM64 executable")
+// remoteOmpExecutable picks the host omp executable a remote omp job uploads.
+// A sandboxd view uploads the file its section names for the provider's guest
+// architecture (omp_linux_arm64_file or omp_linux_amd64_file), verified as a
+// Linux ELF for that architecture and returned open so the verified bytes are
+// the uploaded bytes. Cloud E2B uploads the host's own omp from PATH.
+func remoteOmpExecutable(cfg config.RemoteExecConfig) (string, *os.File, error) {
+	if !config.IsSandboxdProvider(cfg.Provider) {
+		path, err := lookPathRemoteRuntime(runtime.OmpRuntime)
+		return path, nil, err
 	}
-	file, err := os.Open(path)
+	section := config.SandboxdProviderSection(cfg.Provider)
+	if cfg.OMPLinuxFile == "" {
+		return "", nil, fmt.Errorf("%s sets neither omp_linux_arm64_file nor omp_linux_amd64_file: name the Linux omp executable for the provider's guest architecture", section)
+	}
+	file, err := execbackend.OpenLinuxExecutable(cfg.OMPLinuxFile, cfg.OMPGuestArch)
 	if err != nil {
-		return nil, fmt.Errorf("open [remote_exec].omp_linux_arm64_file: %w", err)
+		return "", nil, fmt.Errorf("%s.%s: %w", section, config.OMPLinuxFileKey(cfg.OMPGuestArch), err)
 	}
-	verified := false
-	defer func() {
-		if !verified {
-			file.Close()
-		}
-	}()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat [remote_exec].omp_linux_arm64_file: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q must be an executable regular file", path)
-	}
-	executable, err := elf.NewFile(file)
-	if err != nil {
-		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q is not an ELF executable: %w", path, err)
-	}
-	if executable.Class != elf.ELFCLASS64 || executable.Machine != elf.EM_AARCH64 ||
-		(executable.Type != elf.ET_EXEC && executable.Type != elf.ET_DYN) ||
-		(executable.OSABI != elf.ELFOSABI_NONE && executable.OSABI != elf.ELFOSABI_LINUX) {
-		return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q must be a Linux ARM64 ELF executable", path)
-	}
-	for _, program := range executable.Progs {
-		if program.Type != elf.PT_INTERP {
-			continue
-		}
-		interpreter, err := io.ReadAll(program.Open())
-		if err != nil {
-			return nil, fmt.Errorf("read ARM64 ELF interpreter: %w", err)
-		}
-		name := strings.TrimRight(string(interpreter), "\x00")
-		if name != "/lib/ld-linux-aarch64.so.1" && name != "/lib/ld-musl-aarch64.so.1" && name != "/lib64/ld-linux-aarch64.so.1" {
-			return nil, fmt.Errorf("[remote_exec].omp_linux_arm64_file %q uses unsupported Linux ARM64 interpreter %q", path, name)
-		}
-	}
-	verified = true
-	return file, nil
+	return cfg.OMPLinuxFile, file, nil
 }
 
 func installRemoteOmpRuntime(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, source string, file *os.File) error {

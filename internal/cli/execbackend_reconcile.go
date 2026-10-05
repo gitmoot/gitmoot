@@ -86,15 +86,15 @@ func (c *execBackendReconcileCadence) failed(key string, now time.Time) time.Dur
 // remote dispatch to construct the provider backend. Each provider is listed
 // and settled on its own: an attempt is only ever compared with the inventory
 // of the provider that created it, so a sandboxd attempt is never settled because
-// E2B does not list it, nor the reverse. One provider's failure does not skip
-// the others.
+// E2B or the other sandboxd gateway does not list it, nor the reverse. One
+// provider's failure does not skip the others.
 func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout io.Writer, now time.Time) error {
 	backend, _, err := daemonJobExecBackendFor(worker, "", false)
 	if err != nil {
 		return fmt.Errorf("resolve execution backend for reconciliation: %w", err)
 	}
 	var errs []error
-	for _, provider := range []string{config.RemoteExecProviderE2B, config.RemoteExecProviderSandboxd} {
+	for _, provider := range append([]string{config.RemoteExecProviderE2B}, config.RemoteExecSandboxdProviders()...) {
 		// A remote-default home reconciles E2B every pass; anything else
 		// reconciles a provider only while it has recoverable attempts.
 		always := backend == execbackend.Remote && provider == config.RemoteExecProviderE2B

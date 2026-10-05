@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -50,16 +51,19 @@ type RemoteExecConfig struct {
 	// itself always describes cloud E2B; ForProvider returns the view of an
 	// opted-in job, whose provider is chosen per job, never home-wide.
 	Provider string
-	// E2BEnvdBaseURL and OMPLinuxARM64File are set only in the sandboxd view
-	// from [remote_exec.sandboxd]: one HTTPS envd origin with sandbox routing
-	// headers in place of wildcard hosts, and the host-side Linux ARM64 OMP
-	// executable.
-	E2BEnvdBaseURL    string
-	OMPLinuxARM64File string
-	// Sandboxd is the optional [remote_exec.sandboxd] section. It declares a
-	// local sandboxd provider beside E2B; a job runs there only when its
-	// payload names it (exec_provider = "sandboxd").
-	Sandboxd *SandboxdProviderConfig
+	// OMPLinuxFile and OMPGuestArch are set only in a sandboxd view: the
+	// host-side Linux OMP executable uploaded into that provider's guests and
+	// the guest architecture its key declares (omp_linux_arm64_file or
+	// omp_linux_amd64_file). E2BEnvdBaseURL is likewise sandboxd-only: one envd
+	// origin with sandbox routing headers in place of wildcard hosts.
+	E2BEnvdBaseURL string
+	OMPLinuxFile   string
+	OMPGuestArch   string
+	// SandboxdProviders holds the optional sandboxd provider sections, keyed by
+	// provider name: [remote_exec.sandboxd] and [remote_exec.sandboxd-linux].
+	// Each declares a sandboxd gateway beside E2B; a job runs there only when
+	// its payload names it (exec_provider = "sandboxd" or "sandboxd-linux").
+	SandboxdProviders map[string]*SandboxdProviderConfig
 	// Deprecations lists deprecated spellings this config was loaded with,
 	// each naming its replacement. The daemon prints them once at start.
 	Deprecations []string
@@ -74,12 +78,51 @@ type RemoteExecConfig struct {
 	ExecBackendCost ExecBackendCostConfig
 }
 
-// Remote execution providers. E2B is the default for every remote job; the
+// Remote execution providers. E2B is the default for every remote job; a
 // sandboxd provider is used only by a job that opts in explicitly.
+// RemoteExecProviderSandboxd is the Mac gateway; RemoteExecProviderSandboxdLinux
+// is a separate Linux (Firecracker) gateway with its own endpoint, key,
+// templates, caps and ledger rows.
 const (
-	RemoteExecProviderE2B      = "e2b"
-	RemoteExecProviderSandboxd = "sandboxd"
+	RemoteExecProviderE2B           = "e2b"
+	RemoteExecProviderSandboxd      = "sandboxd"
+	RemoteExecProviderSandboxdLinux = "sandboxd-linux"
 )
+
+// remoteExecSandboxdProviders lists the sandboxd providers in their stable
+// order: validation, gateway origins and reconciliation follow it.
+var remoteExecSandboxdProviders = []string{RemoteExecProviderSandboxd, RemoteExecProviderSandboxdLinux}
+
+// RemoteExecSandboxdProviders returns the sandboxd provider names.
+func RemoteExecSandboxdProviders() []string {
+	return append([]string(nil), remoteExecSandboxdProviders...)
+}
+
+// IsSandboxdProvider reports whether a canonical provider name is a sandboxd
+// gateway, admitted by reported capacity rather than dollars.
+func IsSandboxdProvider(name string) bool {
+	for _, provider := range remoteExecSandboxdProviders {
+		if name == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// IsRemoteExecProvider reports whether a canonical provider name is known.
+func IsRemoteExecProvider(name string) bool {
+	return name == RemoteExecProviderE2B || IsSandboxdProvider(name)
+}
+
+// RemoteExecProviderChoices renders the allowed provider names for errors.
+func RemoteExecProviderChoices() string {
+	return fmt.Sprintf("%q, %q and %q", RemoteExecProviderE2B, RemoteExecProviderSandboxd, RemoteExecProviderSandboxdLinux)
+}
+
+// SandboxdProviderSection names a sandboxd provider's config.toml section.
+func SandboxdProviderSection(provider string) string {
+	return "[remote_exec." + provider + "]"
+}
 
 // remoteExecProviderMacAlias is the provider's pre-rename name. Production
 // configs and queued payloads still carry it, so it is accepted for one
@@ -103,17 +146,30 @@ func RemoteExecProviderMacDeprecation(where string) string {
 	return fmt.Sprintf("%s: remote execution provider %q is deprecated and will be removed in the next release; use %q", where, remoteExecProviderMacAlias, RemoteExecProviderSandboxd)
 }
 
-// SandboxdProviderConfig is the [remote_exec.sandboxd] section: a sandboxd
+// OMPLinuxFileKey is the provider-section key naming the OMP executable for a
+// guest architecture (execbackend.GuestArchARM64 or GuestArchAMD64): the key
+// that names the file declares the architecture, omp_linux_arm64_file or
+// omp_linux_amd64_file.
+func OMPLinuxFileKey(arch string) string {
+	return "omp_linux_" + arch + "_file"
+}
+
+// SandboxdProviderConfig is one sandboxd provider section
+// ([remote_exec.sandboxd] or [remote_exec.sandboxd-linux]): a sandboxd
 // gateway, an E2B-compatible API, as an opt-in remote provider. It is
 // capacity-limited on-prem compute with no dollar cost: concurrency follows the
 // capacity the gateway reports at GET /sandboxd/capacity.
 type SandboxdProviderConfig struct {
-	APIKeyFile        string
-	Template          string
-	OMPTemplate       string
-	BaseURL           string
-	EnvdBaseURL       string
+	APIKeyFile  string
+	Template    string
+	OMPTemplate string
+	BaseURL     string
+	EnvdBaseURL string
+	// OMPLinuxARM64File and OMPLinuxAMD64File name the host-side OMP
+	// executable uploaded into the provider's guests; which one is set declares
+	// the guest architecture, so at most one may be.
 	OMPLinuxARM64File string
+	OMPLinuxAMD64File string
 	// CredentialGatewayURL is the gateway origin sandboxd guests dial (the
 	// sandboxd relay). The daemon's one gateway listener also advertises it,
 	// beside [remote_exec].credential_gateway_url. Empty means sandboxd guests
@@ -141,7 +197,8 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		return RemoteExecConfig{}, err
 	}
 	cfg := DefaultRemoteExecConfig()
-	current, provider := false, false
+	current := false
+	var provider *SandboxdProviderConfig
 	providerSection, sawSandboxd, sawMac := "", false, false
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
@@ -150,24 +207,30 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		if section, ok := sectionHeader(line); ok {
 			current = section == "remote_exec"
-			provider = section == "remote_exec.sandboxd" || section == "remote_exec.mac"
-			if provider {
+			provider = nil
+			name, declared := sandboxdProviderSectionName(section)
+			if declared {
 				providerSection = "[" + section + "]"
-				if section == "remote_exec.mac" {
+				switch section {
+				case "remote_exec.mac":
 					sawMac = true
-				} else {
+				case "remote_exec.sandboxd":
 					sawSandboxd = true
 				}
 				if sawMac && sawSandboxd {
 					return RemoteExecConfig{}, errors.New("config.toml declares both [remote_exec.sandboxd] and its deprecated alias [remote_exec.mac]: keep only [remote_exec.sandboxd]")
 				}
-				if cfg.Sandboxd == nil {
-					cfg.Sandboxd = &SandboxdProviderConfig{}
+				if cfg.SandboxdProviders == nil {
+					cfg.SandboxdProviders = map[string]*SandboxdProviderConfig{}
 				}
+				if cfg.SandboxdProviders[name] == nil {
+					cfg.SandboxdProviders[name] = &SandboxdProviderConfig{}
+				}
+				provider = cfg.SandboxdProviders[name]
 			}
 			continue
 		}
-		if !current && !provider {
+		if !current && provider == nil {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -176,18 +239,18 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
-		if provider {
-			if err := parseSandboxdProviderKey(cfg.Sandboxd, providerSection, key, value); err != nil {
+		if provider != nil {
+			if err := parseSandboxdProviderKey(provider, providerSection, key, value); err != nil {
 				return RemoteExecConfig{}, err
 			}
 			continue
 		}
 		switch key {
-		case "provider", "e2b_envd_base_url", "omp_linux_arm64_file":
+		case "provider", "e2b_envd_base_url", "omp_linux_arm64_file", "omp_linux_amd64_file":
 			// These once selected the sandboxd provider for the whole home. The
 			// provider is now chosen per job, so a home-wide value is refused
 			// rather than ignored.
-			return RemoteExecConfig{}, fmt.Errorf("[remote_exec].%s is not supported: declare the sandboxd provider in [remote_exec.sandboxd] and opt a job in with --exec-provider sandboxd", key)
+			return RemoteExecConfig{}, fmt.Errorf("[remote_exec].%s is not supported: declare the sandboxd provider in [remote_exec.sandboxd] or [remote_exec.sandboxd-linux] and opt a job in with --exec-provider", key)
 		case "backend":
 			parsed, err := parseConfigString(value)
 			if err != nil {
@@ -269,9 +332,11 @@ func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	if err := cfg.ExecBackendCost.Validate(); err != nil {
 		return err
 	}
-	if cfg.Sandboxd != nil {
-		if err := cfg.Sandboxd.validate(cfg); err != nil {
-			return err
+	for _, name := range remoteExecSandboxdProviders {
+		if sandboxd := cfg.SandboxdProviders[name]; sandboxd != nil {
+			if err := sandboxd.validate(cfg, name); err != nil {
+				return err
+			}
 		}
 	}
 	backend, err := execbackend.ParseImplemented(cfg.Backend)
@@ -322,11 +387,12 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
 		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
 	}
-	if cfg.Provider == RemoteExecProviderSandboxd {
-		if cfg.Sandboxd == nil {
-			return fmt.Errorf("the sandboxd remote provider is not configured: add a [remote_exec.sandboxd] section")
+	if IsSandboxdProvider(cfg.Provider) {
+		sandboxd := cfg.SandboxdProviders[cfg.Provider]
+		if sandboxd == nil {
+			return fmt.Errorf("the %s remote provider is not configured: add a %s section", cfg.Provider, SandboxdProviderSection(cfg.Provider))
 		}
-		if err := cfg.Sandboxd.validate(cfg); err != nil {
+		if err := sandboxd.validate(cfg, cfg.Provider); err != nil {
 			return err
 		}
 	}
@@ -336,48 +402,70 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	return nil
 }
 
+// ValidateOMPExecutable checks a sandboxd view's configured OMP executable:
+// it must exist, be an executable regular file, and be a Linux ELF for the
+// guest architecture its key declares. A view without one passes; an omp
+// review on it is refused at provision. Requests for the provider and doctor
+// run it; backend construction does not, so reconciliation never depends on
+// the upload file.
+func (cfg RemoteExecConfig) ValidateOMPExecutable() error {
+	if cfg.OMPLinuxFile == "" {
+		return nil
+	}
+	file, err := execbackend.OpenLinuxExecutable(cfg.OMPLinuxFile, cfg.OMPGuestArch)
+	if err != nil {
+		return fmt.Errorf("%s.%s: %w", SandboxdProviderSection(cfg.Provider), OMPLinuxFileKey(cfg.OMPGuestArch), err)
+	}
+	return file.Close()
+}
+
 // ForProvider returns the configuration one remote job runs with. An empty
 // name is the default, cloud E2B. "sandboxd" (or its deprecated alias "mac")
-// substitutes [remote_exec.sandboxd] for the E2B endpoint, credentials,
-// templates and caps; the gateway listener and the rest of the section are
-// shared. Any other name, or "sandboxd" without its section, is refused rather
-// than falling back to E2B.
+// and "sandboxd-linux" substitute their own section for the E2B endpoint,
+// credentials, templates and caps; the gateway listener and the rest of the
+// section are shared. Any other name, or a sandboxd provider without its
+// section, is refused rather than falling back to E2B.
 func (cfg RemoteExecConfig) ForProvider(name string) (RemoteExecConfig, error) {
 	canonical, _ := NormalizeRemoteExecProvider(name)
-	switch canonical {
-	case "", RemoteExecProviderE2B:
+	switch {
+	case canonical == "" || canonical == RemoteExecProviderE2B:
 		cfg.Provider = RemoteExecProviderE2B
 		return cfg, nil
-	case RemoteExecProviderSandboxd:
-		if cfg.Sandboxd == nil {
-			return RemoteExecConfig{}, fmt.Errorf("remote execution provider %q is not configured: add a [remote_exec.sandboxd] section to config.toml", RemoteExecProviderSandboxd)
+	case IsSandboxdProvider(canonical):
+		section := cfg.SandboxdProviders[canonical]
+		if section == nil {
+			return RemoteExecConfig{}, fmt.Errorf("remote execution provider %q is not configured: add a %s section to config.toml", canonical, SandboxdProviderSection(canonical))
 		}
-		sandboxd := *cfg.Sandboxd
-		cfg.Provider = RemoteExecProviderSandboxd
+		sandboxd := *section
+		cfg.Provider = canonical
 		cfg.E2BAPIKeyFile = sandboxd.APIKeyFile
 		cfg.E2BTemplate = sandboxd.Template
 		cfg.E2BOMPTemplate = sandboxd.OMPTemplate
 		cfg.E2BBaseURL = sandboxd.BaseURL
 		cfg.E2BDomain = ""
 		cfg.E2BEnvdBaseURL = sandboxd.EnvdBaseURL
-		cfg.OMPLinuxARM64File = sandboxd.OMPLinuxARM64File
+		cfg.OMPGuestArch, cfg.OMPLinuxFile = sandboxd.GuestArch()
 		// The ceiling only: the effective cap is read from the gateway's
 		// reported capacity at admission (#30).
 		cfg.ExecBackendCost = ExecBackendCostConfig{MaxConcurrent: sandboxd.MaxConcurrent}
 		return cfg, nil
 	default:
-		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %q and %q", strings.TrimSpace(name), RemoteExecProviderE2B, RemoteExecProviderSandboxd)
+		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %s", strings.TrimSpace(name), RemoteExecProviderChoices())
 	}
 }
 
 // ValidateProvider preflights the named provider for a job that requests it,
-// including its API key file, without any network call.
+// including its API key file and, for a sandboxd provider, its OMP
+// executable, without any network call.
 func (cfg RemoteExecConfig) ValidateProvider(name string) error {
 	view, err := cfg.ForProvider(name)
 	if err != nil {
 		return err
 	}
-	return view.ValidateE2BProvider()
+	if err := view.ValidateE2BProvider(); err != nil {
+		return err
+	}
+	return view.ValidateOMPExecutable()
 }
 
 // reviewChecksProviderConfigured reports whether a repository's checks_*
@@ -425,8 +513,8 @@ func (cfg RemoteExecConfig) ReviewChecksTemplateError(route ReviewChecksRoute, o
 }
 
 func (cfg RemoteExecConfig) reviewChecksSection() string {
-	if cfg.Provider == RemoteExecProviderSandboxd {
-		return "[remote_exec.sandboxd]"
+	if IsSandboxdProvider(cfg.Provider) {
+		return SandboxdProviderSection(cfg.Provider)
 	}
 	return "[remote_exec]"
 }
@@ -434,19 +522,24 @@ func (cfg RemoteExecConfig) reviewChecksSection() string {
 // ProviderCredentialGatewayURL is the gateway origin guests of this view's
 // provider dial.
 func (cfg RemoteExecConfig) ProviderCredentialGatewayURL() string {
-	if cfg.Provider == RemoteExecProviderSandboxd && cfg.Sandboxd != nil && cfg.Sandboxd.CredentialGatewayURL != "" {
-		return cfg.Sandboxd.CredentialGatewayURL
+	if sandboxd := cfg.SandboxdProviders[cfg.Provider]; IsSandboxdProvider(cfg.Provider) && sandboxd != nil && sandboxd.CredentialGatewayURL != "" {
+		return sandboxd.CredentialGatewayURL
 	}
 	return cfg.CredentialGatewayURL
 }
 
 // CredentialGatewayURLs lists every origin the one gateway listener serves,
-// [remote_exec].credential_gateway_url first. The list does not depend on which
-// provider a job uses, so every job shares one listener.
+// [remote_exec].credential_gateway_url first, then each sandboxd provider's
+// credential_gateway_url in provider order. The listener's certificate covers
+// exactly these hosts. The list does not depend on which provider a job uses,
+// so every job shares one listener.
 func (cfg RemoteExecConfig) CredentialGatewayURLs() []string {
 	urls := []string{cfg.CredentialGatewayURL}
-	if cfg.Sandboxd != nil && cfg.Sandboxd.CredentialGatewayURL != "" && cfg.Sandboxd.CredentialGatewayURL != cfg.CredentialGatewayURL {
-		urls = append(urls, cfg.Sandboxd.CredentialGatewayURL)
+	for _, name := range remoteExecSandboxdProviders {
+		sandboxd := cfg.SandboxdProviders[name]
+		if sandboxd != nil && sandboxd.CredentialGatewayURL != "" && !slices.Contains(urls, sandboxd.CredentialGatewayURL) {
+			urls = append(urls, sandboxd.CredentialGatewayURL)
+		}
 	}
 	return urls
 }
@@ -466,7 +559,8 @@ func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, va
 	fields := map[string]*string{
 		"api_key_file": &sandboxd.APIKeyFile, "template": &sandboxd.Template, "omp_template": &sandboxd.OMPTemplate,
 		"base_url": &sandboxd.BaseURL, "envd_base_url": &sandboxd.EnvdBaseURL,
-		"omp_linux_arm64_file": &sandboxd.OMPLinuxARM64File, "credential_gateway_url": &sandboxd.CredentialGatewayURL,
+		OMPLinuxFileKey(execbackend.GuestArchARM64): &sandboxd.OMPLinuxARM64File, OMPLinuxFileKey(execbackend.GuestArchAMD64): &sandboxd.OMPLinuxAMD64File,
+		"credential_gateway_url": &sandboxd.CredentialGatewayURL,
 	}
 	field, ok := fields[key]
 	if !ok {
@@ -481,39 +575,94 @@ func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, va
 	return nil
 }
 
-// validate checks [remote_exec.sandboxd] without reading its API key, so a
-// declared sandboxd provider cannot break a home that never uses it.
-func (sandboxd SandboxdProviderConfig) validate(cfg RemoteExecConfig) error {
+// sandboxdProviderSectionName maps a config.toml section to the sandboxd
+// provider it declares: [remote_exec.sandboxd], its deprecated alias
+// [remote_exec.mac], and [remote_exec.sandboxd-linux] (TOML also allows the
+// quoted spelling [remote_exec."sandboxd-linux"]).
+func sandboxdProviderSectionName(section string) (string, bool) {
+	switch section {
+	case "remote_exec.sandboxd", "remote_exec.mac":
+		return RemoteExecProviderSandboxd, true
+	case "remote_exec.sandboxd-linux", `remote_exec."sandboxd-linux"`:
+		return RemoteExecProviderSandboxdLinux, true
+	}
+	return "", false
+}
+
+// GuestArch is the guest architecture this section's OMP upload targets and
+// the configured file. The key that names the file declares the
+// architecture; empty means no OMP file is configured.
+func (sandboxd SandboxdProviderConfig) GuestArch() (arch, file string) {
+	switch {
+	case sandboxd.OMPLinuxAMD64File != "":
+		return execbackend.GuestArchAMD64, sandboxd.OMPLinuxAMD64File
+	case sandboxd.OMPLinuxARM64File != "":
+		return execbackend.GuestArchARM64, sandboxd.OMPLinuxARM64File
+	}
+	return "", ""
+}
+
+// validate checks one sandboxd provider section without reading its API key
+// or OMP executable, so a declared sandboxd provider cannot break a home that
+// never uses it. ValidateOMPExecutable checks the executable itself; doctor
+// and every request for the provider run it.
+func (sandboxd SandboxdProviderConfig) validate(cfg RemoteExecConfig, provider string) error {
+	section := SandboxdProviderSection(provider)
 	if sandboxd.APIKeyFile == "" || !filepath.IsAbs(sandboxd.APIKeyFile) {
-		return fmt.Errorf("[remote_exec.sandboxd].api_key_file must be an absolute path")
+		return fmt.Errorf("%s.api_key_file must be an absolute path", section)
 	}
 	if sandboxd.Template == "" {
-		return fmt.Errorf("[remote_exec.sandboxd].template is required")
+		return fmt.Errorf("%s.template is required", section)
 	}
-	for key, value := range map[string]string{"base_url": sandboxd.BaseURL, "envd_base_url": sandboxd.EnvdBaseURL} {
-		parsed, err := url.Parse(value)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
-			parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return fmt.Errorf("[remote_exec.sandboxd].%s must be an HTTPS origin without path, query, credentials, or fragment", key)
+	for _, key := range []string{"base_url", "envd_base_url"} {
+		value := sandboxd.BaseURL
+		if key == "envd_base_url" {
+			value = sandboxd.EnvdBaseURL
+		}
+		if err := validateSandboxdOrigin(value); err != nil {
+			return fmt.Errorf("%s.%s %w", section, key, err)
 		}
 	}
-	if sandboxd.OMPLinuxARM64File != "" && !filepath.IsAbs(sandboxd.OMPLinuxARM64File) {
-		return fmt.Errorf("[remote_exec.sandboxd].omp_linux_arm64_file must be an absolute path")
+	if sandboxd.OMPLinuxARM64File != "" && sandboxd.OMPLinuxAMD64File != "" {
+		return fmt.Errorf("%s sets both omp_linux_arm64_file and omp_linux_amd64_file: set only the one matching the provider's guest architecture", section)
+	}
+	if arch, file := sandboxd.GuestArch(); file != "" && !filepath.IsAbs(file) {
+		return fmt.Errorf("%s.%s must be an absolute path", section, OMPLinuxFileKey(arch))
 	}
 	// max_concurrent is an optional ceiling: the gateway reports the real
 	// capacity. Absent or 0 adds no ceiling; negative is a typo, not a policy.
 	if sandboxd.MaxConcurrent < 0 {
-		return fmt.Errorf("[remote_exec.sandboxd].max_concurrent must not be negative: it is an optional ceiling on the capacity sandboxd reports (0 or absent means no extra ceiling)")
+		return fmt.Errorf("%s.max_concurrent must not be negative: it is an optional ceiling on the capacity sandboxd reports (0 or absent means no extra ceiling)", section)
 	}
 	if sandboxd.CredentialGatewayURL != "" {
 		if strings.TrimSpace(cfg.CredentialGatewayListen) == "" {
-			return fmt.Errorf("[remote_exec.sandboxd].credential_gateway_url requires [remote_exec].credential_gateway_listen and credential_gateway_url")
+			return fmt.Errorf("%s.credential_gateway_url requires [remote_exec].credential_gateway_listen and credential_gateway_url", section)
 		}
 		if err := (RemoteExecConfig{CredentialGatewayListen: cfg.CredentialGatewayListen, CredentialGatewayURL: sandboxd.CredentialGatewayURL}).ValidateCredentialGateway(); err != nil {
-			return fmt.Errorf("[remote_exec.sandboxd].credential_gateway_url: %w", err)
+			return fmt.Errorf("%s.credential_gateway_url: %w", section, err)
 		}
 	}
 	return nil
+}
+
+// validateSandboxdOrigin requires an HTTPS origin, or a plain-HTTP origin on a
+// loopback address: a gateway on the daemon's own host (the Linux Firecracker
+// gateway listens on 127.0.0.1) has no network hop to protect.
+func validateSandboxdOrigin(value string) error {
+	const shape = "must be an HTTPS origin (or HTTP on a loopback address) without path, query, credentials, or fragment"
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New(shape)
+	}
+	switch parsed.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return errors.New(shape)
 }
 
 // ValidateCredentialGateway validates only transport coordinates. The mTLS CA

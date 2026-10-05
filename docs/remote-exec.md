@@ -25,10 +25,12 @@ local_root = "/var/tmp/gitmoot-local"
 ```
 
 The default remote provider is cloud E2B, using its existing dollar caps.
-The sandboxd provider (Linux ARM64 VMs on a Mac) is declared beside it in
-`[remote_exec.sandboxd]` and is used only by a job that opts in with
-`--exec-provider sandboxd` or by a repository whose
-`checks_provider = "sandboxd"`; nothing else routes to it.
+Two sandboxd providers can be declared beside it: `sandboxd` (Linux ARM64 VMs
+on a Mac) in `[remote_exec.sandboxd]`, and `sandboxd-linux` (Linux AMD64
+Firecracker VMs on the Gitmoot host) in `[remote_exec."sandboxd-linux"]`. Each
+is used only by a job that opts in with `--exec-provider sandboxd` /
+`--exec-provider sandboxd-linux` or by a repository whose `checks_provider`
+names it; nothing else routes to them.
 
 ## Versioned OMP review template
 
@@ -161,7 +163,8 @@ credential_gateway_url = "https://192.168.128.1:43181"
 # max_concurrent = 4  # optional ceiling; required only for a sandboxd without GET /sandboxd/capacity
 ```
 
-`base_url` and `envd_base_url` must be HTTPS origins; `envd_base_url` sends
+`base_url` and `envd_base_url` must be HTTPS origins, or plain HTTP on a
+loopback address (a gateway on the daemon's own host); `envd_base_url` sends
 `E2b-Sandbox-Id`, `E2b-Sandbox-Port: 49983`, and `X-Access-Token` to that one
 host on both upload and process streaming.
 
@@ -190,10 +193,10 @@ create sandboxd refuses with 409 (a race between the report and sandboxd's
 scheduler), waits in the queue as described under Per-repository checks
 routing, bounded by the job timeout. A cloud E2B 409 is handled as before.
 
-One credential gateway listener serves both providers. Its certificate names
-every advertised host (`credential_gateway_url` and
-`[remote_exec.sandboxd]`'s `credential_gateway_url`), and each job's lease is
-bound to its own provider's origin. sandboxd guests reach it through sandboxd's
+One credential gateway listener serves every provider. Its certificate names
+every advertised host (`credential_gateway_url` and each sandboxd section's
+`credential_gateway_url`, as DNS or IP SANs), and each job's lease is bound to
+its own provider's origin. sandboxd guests reach it through sandboxd's
 relay at `192.168.128.1:43181`, which forwards to the Mac's `127.0.0.1:43184`; a
 supervised `ssh -R 127.0.0.1:43184:127.0.0.1:8443` tunnel then carries it to
 the daemon's existing listener port (the port of `credential_gateway_listen`).
@@ -201,7 +204,7 @@ No general-purpose proxy or secret is exposed to the VM.
 
 Reconciliation lists each provider's inventory separately and settles or
 orphans only that provider's attempts, so a sandboxd attempt is never settled
-because E2B does not list it, nor the reverse. sandboxd's list is complete for
+because E2B or the other sandboxd gateway does not list it, nor the reverse. sandboxd's list is complete for
 its worker (a failed inventory is a 503, never a short list) and sandboxd kills
 each sandbox at its persisted deadline, but Gitmoot still treats the sandboxd
 list as partial: it reads the list and its ledger in separate steps, so an
@@ -209,12 +212,60 @@ attempt reserved in between would look absent. A `destroying` sandboxd attempt
 settles by the same provider-TTL grace rule as E2B.
 
 sandboxd OMP uploads only the configured absolute-path executable after verifying
-an executable Linux ARM64 ELF header and interpreter, before provider
-allocation. No x86 fallback or emulation is attempted. Supply a real Linux
-ARM64 build of OMP and a matching guest image and credential gateway. The
+an executable Linux ELF header and interpreter for the provider's guest
+architecture, before provider allocation. No cross-architecture fallback or
+emulation is attempted. Supply a real Linux build of OMP for that architecture
+and a matching guest image and credential gateway. The
 private endpoint's control, upload, streaming, and token behavior must be
 verified before a canary; configuring these values alone does not assert
 compatibility.
+
+### Opt-in sandboxd-linux AMD64 provider
+
+`sandboxd-linux` is a second, independent sandboxd gateway: sandboxd running
+its Firecracker driver on the Gitmoot host itself (see sandboxd's
+`docs/firecracker.md`). It is not enrolled behind the Mac gateway. It is
+declared in its own section with the same keys as `[remote_exec.sandboxd]`;
+`[remote_exec.sandboxd-linux]` and the quoted `[remote_exec."sandboxd-linux"]`
+are the same section. Everything is per provider: endpoint, API key,
+templates, guest gateway origin, OMP upload, `max_concurrent`, the capacity
+report and its cache, and the ledger rows (`provider = 'sandboxd-linux'`), so
+filling one gateway never consumes or frees the other's slots. Select it with
+`--exec-provider sandboxd-linux` or `checks_provider = "sandboxd-linux"`.
+
+The guest architecture is declared by which OMP key is set:
+`omp_linux_arm64_file` uploads to ARM64 guests and `omp_linux_amd64_file` to
+AMD64 guests. Setting both is a load error. The key name carries the
+architecture, so a separate `guest_arch` key cannot disagree with it, and
+`[remote_exec.sandboxd]` stays byte-for-byte valid. A missing file, a
+non-executable file, or an ELF for the other architecture is refused by
+`gitmoot doctor` (the `remote exec config` check) and when the provider is
+requested, not mid-review.
+
+Firecracker guests can reach exactly one host port, at slirp4netns's host
+alias `10.0.2.2` (sandboxd `-fc-host-port 8443`); slirp forwards it to the
+host's `127.0.0.1:8443`. So the provider's `credential_gateway_url` is
+`https://10.0.2.2:<credential_gateway_listen port>`, and the listener must
+accept loopback connections (`0.0.0.0:8443` does). The gateway certificate
+gets the IP SAN `10.0.2.2` because the address is advertised; guests dial the
+IP and send no SNI.
+
+```toml
+[remote_exec]
+# ... cloud E2B keys and [remote_exec.sandboxd] unchanged ...
+credential_gateway_listen = "0.0.0.0:8443"
+credential_gateway_url = "https://203.0.113.7:8443"
+
+[remote_exec."sandboxd-linux"]
+api_key_file = "/run/secrets/sandboxd-linux-key"
+template = "review-amd64"
+omp_template = "review-amd64"   # at least 2 GiB RAM
+base_url = "http://127.0.0.1:43190"
+envd_base_url = "http://127.0.0.1:43190"
+omp_linux_amd64_file = "/opt/gitmoot/omp-linux-amd64"
+credential_gateway_url = "https://10.0.2.2:8443"
+max_concurrent = 2
+```
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:
@@ -253,7 +304,7 @@ image (#2316):
 ```toml
 [repos."owner/repo".review]
 checks_backend = "remote"          # the only value
-checks_provider = "e2b"            # or "sandboxd"; default "e2b"
+checks_provider = "e2b"            # or "sandboxd" / "sandboxd-linux"; default "e2b"
 checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 ```
 

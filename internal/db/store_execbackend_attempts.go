@@ -121,8 +121,8 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD, DenyReason: policy.DenyReason}
 	}
 	if policy.CapacityOnly {
-		if reservation.Provider != ExecBackendProviderSandboxd || policy.MaxConcurrent <= 0 || policy.MaxConcurrentTemplate < 0 || reservation.CostReservedUSD != 0 {
-			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "capacity-only admission requires provider sandboxd, a positive concurrency cap (sandboxd's reported capacity or [remote_exec.sandboxd].max_concurrent), and zero dollar reservation"}
+		if !execBackendCapacityProvider(reservation.Provider) || policy.MaxConcurrent <= 0 || policy.MaxConcurrentTemplate < 0 || reservation.CostReservedUSD != 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "capacity-only admission requires a sandboxd provider (sandboxd or sandboxd-linux), a positive concurrency cap (sandboxd's reported capacity or the provider section's max_concurrent), and zero dollar reservation"}
 		}
 	} else {
 		if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {
