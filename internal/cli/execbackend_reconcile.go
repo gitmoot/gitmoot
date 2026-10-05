@@ -85,7 +85,7 @@ func (c *execBackendReconcileCadence) failed(key string, now time.Time) time.Dur
 // outstanding remote attempts after a restart, without waiting for another
 // remote dispatch to construct the provider backend. Each provider is listed
 // and settled on its own: an attempt is only ever compared with the inventory
-// of the provider that created it, so a Mac attempt is never settled because
+// of the provider that created it, so a sandboxd attempt is never settled because
 // E2B does not list it, nor the reverse. One provider's failure does not skip
 // the others.
 func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout io.Writer, now time.Time) error {
@@ -94,7 +94,7 @@ func reconcileExecBackendInventory(ctx context.Context, worker jobWorker, stdout
 		return fmt.Errorf("resolve execution backend for reconciliation: %w", err)
 	}
 	var errs []error
-	for _, provider := range []string{config.RemoteExecProviderE2B, config.RemoteExecProviderMac} {
+	for _, provider := range []string{config.RemoteExecProviderE2B, config.RemoteExecProviderSandboxd} {
 		// A remote-default home reconciles E2B every pass; anything else
 		// reconciles a provider only while it has recoverable attempts.
 		always := backend == execbackend.Remote && provider == config.RemoteExecProviderE2B

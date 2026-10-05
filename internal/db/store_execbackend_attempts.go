@@ -41,6 +41,9 @@ type ExecBackendAttemptReservation struct {
 	BootID             string
 	TTLExpiresAt       time.Time
 	CostReservedUSD    float64
+	// Template is the template this attempt provisions. A capacity-only
+	// policy with MaxConcurrentTemplate bounds attempts of the same template.
+	Template string
 }
 
 // ExecBackendAttempt is one durable execution-backend lifecycle row. SandboxID
@@ -118,8 +121,8 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		return &ExecBackendCapRefusal{Clause: "unconfigured", RequestUSD: reservation.CostReservedUSD, DenyReason: policy.DenyReason}
 	}
 	if policy.CapacityOnly {
-		if reservation.Provider != "mac" || policy.MaxConcurrent <= 0 || reservation.CostReservedUSD != 0 {
-			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "Mac capacity requires provider mac, positive [remote_exec.mac].max_concurrent, and zero dollar reservation"}
+		if reservation.Provider != ExecBackendProviderSandboxd || policy.MaxConcurrent <= 0 || policy.MaxConcurrentTemplate < 0 || reservation.CostReservedUSD != 0 {
+			return &ExecBackendCapRefusal{Clause: "unconfigured", DenyReason: "capacity-only admission requires provider sandboxd, a positive concurrency cap (sandboxd's reported capacity or [remote_exec.sandboxd].max_concurrent), and zero dollar reservation"}
 		}
 	} else {
 		if policy.MaxReservedUSD == 0 || policy.PerAttemptUSD == 0 {
@@ -136,16 +139,19 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		}
 	}
 
+	reservation.Template = strings.TrimSpace(reservation.Template)
 	marks, stateArgs := billingStatePlaceholders()
-	// Both provider-scoped predicates and the insert share one statement, so
-	// simultaneous cloud and Mac attempts contend only with their own provider.
+	// Every provider-scoped predicate and the insert share one statement, so
+	// simultaneous cloud and sandboxd attempts contend only with their own
+	// provider.
 	concurrency := "1=1"
+	templateConcurrency := "1=1"
 	dollar := "1=1"
 	args := []any{
 		reservation.JobID, reservation.Attempt, reservation.LifecycleGeneration,
 		reservation.Provider, reservation.DaemonFencingToken, reservation.BootID,
 		reservation.TTLExpiresAt.UTC().Format(time.RFC3339Nano),
-		ExecBackendAttemptStateReserved, reservation.CostReservedUSD,
+		ExecBackendAttemptStateReserved, reservation.CostReservedUSD, reservation.Template,
 	}
 	if !policy.CapacityOnly {
 		dollar = `(SELECT COALESCE(SUM(cost_reserved_usd), 0) FROM execbackend_attempts
@@ -160,12 +166,21 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 		args = append(args, stateArgs...)
 		args = append(args, policy.MaxConcurrent)
 	}
+	// A worker serving two templates counts in both templates' totals, so the
+	// per-template bound alone would over-admit; it narrows the provider-wide
+	// bound above, never replaces it.
+	if policy.MaxConcurrentTemplate > 0 && reservation.Template != "" {
+		templateConcurrency = `(SELECT COUNT(*) FROM execbackend_attempts WHERE provider = ? AND template = ? AND state IN (` + marks + `)) + 1 <= ?`
+		args = append(args, reservation.Provider, reservation.Template)
+		args = append(args, stateArgs...)
+		args = append(args, policy.MaxConcurrentTemplate)
+	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO execbackend_attempts(
 		job_id, attempt, lifecycle_generation, provider, sandbox_id,
 		daemon_fencing_token, boot_id, ttl_expires_at, state,
-		cost_reserved_usd, cost_actual_usd
-	) SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL
-	WHERE `+dollar+` AND `+concurrency, args...)
+		cost_reserved_usd, cost_actual_usd, template
+	) SELECT ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?
+	WHERE `+dollar+` AND `+concurrency+` AND `+templateConcurrency, args...)
 	if err != nil {
 		// An unreadable meter refuses. The statement that reads the meter is the
 		// statement that writes the row, so a failure here cannot have admitted.
@@ -197,6 +212,14 @@ func (s *Store) ReserveExecBackendAttempt(ctx context.Context, reservation ExecB
 	}
 	if policy.MaxConcurrent > 0 && refusal.LiveCount+1 > policy.MaxConcurrent {
 		refusal.Clause = "concurrency"
+	}
+	if policy.MaxConcurrentTemplate > 0 && reservation.Template != "" {
+		refusal.Template = reservation.Template
+		refusal.MaxConcurrentTemplate = policy.MaxConcurrentTemplate
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM execbackend_attempts
+			WHERE provider = ? AND template = ? AND state IN (`+marks+`)`, append([]any{reservation.Provider, reservation.Template}, stateArgs...)...).Scan(&refusal.TemplateLiveCount); err != nil && refusal.OperandsErr == nil {
+			refusal.OperandsErr = err
+		}
 	}
 	return refusal
 }

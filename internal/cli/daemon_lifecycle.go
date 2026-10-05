@@ -274,6 +274,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "daemon run: warning: could not bootstrap runtime auth: %v\n", bootstrapErr)
 		}
 		defer closeModelGatewayHome(paths.Home)
+		printConfigDeprecations(paths, stderr)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

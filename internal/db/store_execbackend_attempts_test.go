@@ -254,6 +254,7 @@ func assertExecBackendAttemptsTable(t *testing.T, ctx context.Context, store *St
 		{name: "cost_actual_usd", typeName: "REAL"},
 		{name: "created_at", typeName: "TIMESTAMP", notNull: true},
 		{name: "updated_at", typeName: "TIMESTAMP", notNull: true},
+		{name: "template", typeName: "TEXT", notNull: true},
 	}
 	rows, err := store.db.QueryContext(ctx, `PRAGMA table_info(execbackend_attempts)`)
 	if err != nil {

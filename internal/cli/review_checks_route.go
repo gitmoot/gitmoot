@@ -80,7 +80,8 @@ func (r reviewChecksRoute) selectionError(backend string, backendSet bool, provi
 		return fmt.Errorf("%s %s refused for %s: %s runs every review of this repository remotely so its checks have their toolchain; remove that setting to review it locally", backendName, firstNonEmptyRemoteReview(backend, `""`), r.repo, r.setting())
 	}
 	provider = strings.TrimSpace(provider)
-	normalized := provider
+	// A payload queued before the rename may carry the deprecated "mac".
+	normalized, _ := config.NormalizeRemoteExecProvider(provider)
 	if normalized == config.RemoteExecProviderE2B {
 		normalized = ""
 	}

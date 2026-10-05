@@ -76,14 +76,15 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 // requestExecProvider resolves the --exec-provider opt-in. A provider implies
 // the remote backend when --exec-backend is omitted and contradicts an
 // explicit non-remote one. "e2b", the default, is stored as absent so payloads
-// carry exec_provider only for the Mac opt-in.
+// carry exec_provider only for the sandboxd opt-in. The deprecated alias "mac"
+// is stored as "sandboxd".
 func requestExecProvider(provider string, backend *string) (string, *string, error) {
-	provider = strings.TrimSpace(provider)
+	provider, _ = config.NormalizeRemoteExecProvider(provider)
 	if provider == "" {
 		return "", backend, nil
 	}
-	if provider != config.RemoteExecProviderE2B && provider != config.RemoteExecProviderMac {
-		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %q and %q", provider, config.RemoteExecProviderE2B, config.RemoteExecProviderMac)
+	if provider != config.RemoteExecProviderE2B && provider != config.RemoteExecProviderSandboxd {
+		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %q and %q", provider, config.RemoteExecProviderE2B, config.RemoteExecProviderSandboxd)
 	}
 	if backend == nil {
 		remote := string(execbackend.Remote)
@@ -95,6 +96,13 @@ func requestExecProvider(provider string, backend *string) (string, *string, err
 		provider = ""
 	}
 	return provider, backend, nil
+}
+
+// warnDeprecatedExecProvider prints the deprecation for --exec-provider mac.
+func warnDeprecatedExecProvider(stderr io.Writer, provider string) {
+	if _, alias := config.NormalizeRemoteExecProvider(provider); alias && stderr != nil {
+		fmt.Fprintf(stderr, "warning: %s\n", config.RemoteExecProviderMacDeprecation("--exec-provider"))
+	}
 }
 
 // validateRequestExecProvider refuses an opted-in provider that this home does
@@ -325,7 +333,7 @@ type localAgentDispatchRequest struct {
 	// pointer preserves explicit-local as distinct from absence.
 	ExecBackend *string
 	// ExecProvider is the remote provider an explicitly remote job runs on:
-	// empty for the default E2B, or "mac" for the opt-in Mac provider. It is
+	// empty for the default E2B, or "sandboxd" for the opt-in sandboxd gateway. It is
 	// refused at dispatch unless the job is remote and the provider is
 	// configured, so a typo can never quietly run on E2B instead.
 	ExecProvider string

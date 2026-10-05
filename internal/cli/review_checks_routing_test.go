@@ -15,7 +15,7 @@ import (
 )
 
 // reviewChecksRoutingHome is a review-router home whose [remote_exec] configures
-// the default E2B provider and the Mac beside it, and whose repo (if
+// the default E2B provider and sandboxd beside it, and whose repo (if
 // non-empty) sets checks routing (#2316) to E2B with checks_template. The PR
 // has NO CI checks, so the remote_routing_enabled gates would keep every
 // review local.
@@ -35,14 +35,14 @@ func reviewChecksRoutingHomeWith(t *testing.T, e2bTemplates, extraConfig string)
 	home, store, head := reviewRouterHome(t)
 	paths := config.PathsForHome(home)
 	keyFile := filepath.Join(home, "e2b.key")
-	macKeyFile := filepath.Join(home, "mac.key")
-	for _, key := range []string{keyFile, macKeyFile} {
+	sandboxdKeyFile := filepath.Join(home, "sandboxd.key")
+	for _, key := range []string{keyFile, sandboxdKeyFile} {
 		if err := os.WriteFile(key, []byte("test-key-0123456789"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	extra := "\n[remote_exec]\ne2b_api_key_file = \"" + keyFile + "\"\n" + e2bTemplates +
-		"\n[remote_exec.mac]\napi_key_file = \"" + macKeyFile + "\"\ntemplate = \"review-arm64\"\nbase_url = \"https://mac.example:8443\"\nenvd_base_url = \"https://mac.example:8443\"\nmax_concurrent = 1\n" +
+		"\n[remote_exec.sandboxd]\napi_key_file = \"" + sandboxdKeyFile + "\"\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 1\n" +
 		extraConfig
 	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -159,23 +159,26 @@ func TestReviewChecksRoutingRefusesExplicitLocalBackend(t *testing.T) {
 }
 
 // A review with no --exec-provider adopts checks_provider; before the fix the
-// absent flag compared as "" != "mac" and every such review was refused,
-// attributed to an "--exec-provider e2b" nobody passed.
-func TestReviewChecksRoutingMacAdoptsProviderWithoutExecProvider(t *testing.T) {
-	home, store, head := reviewChecksRoutingHomeWith(t, "e2b_template = \"base-tmpl\"\n",
-		"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"mac\"\nchecks_template = \"swift-arm64\"\n")
-	output, failure := runReviewRequestJSON(t,
-		"--repo", "owner/repo", "--pr", "12", "--head", head,
-		"--branch", "feature/review", "--role", "joltra", "--home", home,
-		"--runtime", runtime.OmpRuntime, "--json",
-	)
-	if failure != "" {
-		t.Fatal(failure)
-	}
-	payload := reviewChecksPayload(t, store, output.JobID)
-	if payload["exec_backend"] != "remote" || payload["exec_provider"] != "mac" || payload["exec_template"] != "swift-arm64" || payload["review_checks_routed"] != true {
-		t.Fatalf("mac-routed payload exec_backend=%v exec_provider=%v exec_template=%v review_checks_routed=%v; want remote, mac, swift-arm64, true",
-			payload["exec_backend"], payload["exec_provider"], payload["exec_template"], payload["review_checks_routed"])
+// absent flag compared as "" != "sandboxd" and every such review was refused,
+// attributed to an "--exec-provider e2b" nobody passed. The deprecated alias
+// checks_provider = "mac" routes the same way and is stored as sandboxd.
+func TestReviewChecksRoutingSandboxdAdoptsProviderWithoutExecProvider(t *testing.T) {
+	for _, checksProvider := range []string{"sandboxd", "mac"} {
+		home, store, head := reviewChecksRoutingHomeWith(t, "e2b_template = \"base-tmpl\"\n",
+			"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \""+checksProvider+"\"\nchecks_template = \"swift-arm64\"\n")
+		output, failure := runReviewRequestJSON(t,
+			"--repo", "owner/repo", "--pr", "12", "--head", head,
+			"--branch", "feature/review", "--role", "joltra", "--home", home,
+			"--runtime", runtime.OmpRuntime, "--json",
+		)
+		if failure != "" {
+			t.Fatalf("checks_provider %s: %s", checksProvider, failure)
+		}
+		payload := reviewChecksPayload(t, store, output.JobID)
+		if payload["exec_backend"] != "remote" || payload["exec_provider"] != "sandboxd" || payload["exec_template"] != "swift-arm64" || payload["review_checks_routed"] != true {
+			t.Fatalf("checks_provider %s payload exec_backend=%v exec_provider=%v exec_template=%v review_checks_routed=%v; want remote, sandboxd, swift-arm64, true",
+				checksProvider, payload["exec_backend"], payload["exec_provider"], payload["exec_template"], payload["review_checks_routed"])
+		}
 	}
 }
 
@@ -184,12 +187,12 @@ func TestReviewChecksRoutingRefusesDifferentExplicitProvider(t *testing.T) {
 	_, failure := runReviewRequestJSON(t,
 		"--repo", "owner/repo", "--pr", "12", "--head", head,
 		"--branch", "feature/review", "--role", "joltra", "--home", home,
-		"--runtime", runtime.OmpRuntime, "--exec-provider", "mac", "--json",
+		"--runtime", runtime.OmpRuntime, "--exec-provider", "sandboxd", "--json",
 	)
 	if failure == "" {
-		t.Fatal("--exec-provider mac on an e2b checks-routed repo was dispatched; want refusal")
+		t.Fatal("--exec-provider sandboxd on an e2b checks-routed repo was dispatched; want refusal")
 	}
-	if !strings.Contains(failure, "--exec-provider mac refused") || !strings.Contains(failure, `checks_provider \"e2b\"`) {
+	if !strings.Contains(failure, "--exec-provider sandboxd refused") || !strings.Contains(failure, `checks_provider \"e2b\"`) {
 		t.Fatalf("refusal %q does not name the passed provider and checks_provider", failure)
 	}
 }

@@ -32,6 +32,9 @@ type ledgeredExecutionBackend struct {
 	// perHourUSD prices a sandbox-hour for cost_actual_usd (#2316); zero
 	// records no actual cost.
 	perHourUSD float64
+	// capacity, set only for sandboxd, replaces cost on every provision with
+	// the policy derived from the gateway's reported capacity (sandboxd #30).
+	capacity *sandboxdCapacitySource
 
 	mu      sync.Mutex
 	attempt map[string]db.ExecBackendAttemptKey
@@ -88,6 +91,18 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 	}
 	scope.Attempt = attempt
 	scope.DaemonFencingToken = b.fencingToken
+	cost := b.cost
+	template := ""
+	if b.capacity != nil {
+		// Read immediately before the guarded INSERT, so the read and the
+		// reservation are one decision per provision. A refusal here writes no
+		// row.
+		policy, refusal := b.capacity.policy(ctx)
+		if refusal != nil {
+			return nil, fmt.Errorf("reserve execution backend attempt: %w", refusal)
+		}
+		cost, template = policy, b.capacity.template
+	}
 	if err := b.store.ReserveExecBackendAttempt(ctx, db.ExecBackendAttemptReservation{
 		ExecBackendAttemptKey: key,
 		Provider:              b.provider,
@@ -98,8 +113,9 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 		// called. It is deliberately not an estimate refined later: the whole
 		// point of reserving before provisioning is that parallel legs contend
 		// on a bound that is already pessimistic.
-		CostReservedUSD: b.cost.PerAttemptUSD,
-	}, b.cost); err != nil {
+		CostReservedUSD: cost.PerAttemptUSD,
+		Template:        template,
+	}, cost); err != nil {
 		return nil, fmt.Errorf("reserve execution backend attempt: %w", err)
 	}
 	changed, err := b.store.MarkExecBackendAttemptProvisioning(ctx, key)
@@ -126,6 +142,11 @@ func (b *ledgeredExecutionBackend) Provision(ctx context.Context, scope execback
 		// #2226 found this shape.
 		var refused *e2b.RequestRefusedError
 		if errors.As(err, &refused) && refused.Operation == e2b.OperationCreate {
+			if b.capacity != nil && refused.StatusCode == 409 {
+				// The report said there was room and sandboxd said there was
+				// not: the next provision must read capacity afresh.
+				b.capacity.invalidate()
+			}
 			if _, failErr := b.store.MarkExecBackendAttemptFailed(context.WithoutCancel(ctx), key); failErr != nil {
 				return instance, errors.Join(err, fmt.Errorf("release refused execution backend reservation: %w", failErr))
 			}

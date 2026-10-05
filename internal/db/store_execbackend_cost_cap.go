@@ -10,7 +10,7 @@ import (
 )
 
 // ExecBackendBillingStates are attempts in which a provider resource may still
-// exist. Cloud E2B sums their dollar reservations; Mac capacity counts them.
+// exist. Cloud E2B sums their dollar reservations; sandboxd capacity counts them.
 //
 // Orphaned is included even if the provider resource is not yet observed:
 // an attempt was created and never confirmed destroyed, so excluding it would
@@ -58,8 +58,13 @@ type ExecBackendCostCap struct {
 	// MaxConcurrent bounds active attempts of this provider. In capacity-only
 	// mode it must be positive; for dollar-capped cloud it is optional.
 	MaxConcurrent int
+	// MaxConcurrentTemplate, when positive, also bounds active attempts of the
+	// reservation's template (sandboxd's per-template capacity). It narrows
+	// MaxConcurrent and never replaces it.
+	MaxConcurrentTemplate int
 	// PerAttemptUSD is the worst-case dollar amount a cloud attempt reserves.
-	// It must be > 0 in dollar-capped mode; capacity-only Mac reserves zero.
+	// It must be > 0 in dollar-capped mode; capacity-only sandboxd reserves
+	// zero.
 	PerAttemptUSD float64
 	// DenyReason explains WHY this policy denies, in the words of whatever
 	// produced it. The unset policy is the shipping state (owner decision,
@@ -87,7 +92,21 @@ type ExecBackendCapRefusal struct {
 	OldestAge      time.Duration
 	OperandsErr    error
 	DenyReason     string
+	// Template, TemplateLiveCount and MaxConcurrentTemplate describe the
+	// per-template bound when one applied.
+	Template              string
+	TemplateLiveCount     int
+	MaxConcurrentTemplate int
 }
+
+// ExecBackendProviderSandboxd is the only provider admitted by capacity rather
+// than dollars. It matches config.RemoteExecProviderSandboxd.
+const ExecBackendProviderSandboxd = "sandboxd"
+
+// ExecBackendCapClauseCapacity refuses before any row is written because the
+// provider reported no usable capacity, or its capacity could not be read. It
+// is transient, unlike "unconfigured": a waiting review retries it.
+const ExecBackendCapClauseCapacity = "capacity"
 
 func (r *ExecBackendCapRefusal) Error() string {
 	var b strings.Builder
@@ -97,9 +116,14 @@ func (r *ExecBackendCapRefusal) Error() string {
 			return "cloud provision denied: " + r.DenyReason
 		}
 		return "cloud provision denied: no execution backend cost cap is configured. Set [remote_exec].cost_max_reserved_usd and [remote_exec].cost_per_attempt_usd in config.toml. An unset cap denies rather than permitting unlimited spend."
+	case ExecBackendCapClauseCapacity:
+		return "execution backend capacity refused this provision: " + r.DenyReason
 	case "concurrency":
 		fmt.Fprintf(&b, "execution backend concurrency cap refused this provision: %d billing attempts, cap %d",
 			r.LiveCount, r.MaxConcurrent)
+		if r.MaxConcurrentTemplate > 0 {
+			fmt.Fprintf(&b, "; template %q: %d billing attempts, cap %d", r.Template, r.TemplateLiveCount, r.MaxConcurrentTemplate)
+		}
 	default:
 		fmt.Fprintf(&b, "execution backend cost cap refused this provision: reserving $%.4f against $%.4f already reserved, cap $%.4f",
 			r.RequestUSD, r.ReservedUSD, r.MaxReservedUSD)

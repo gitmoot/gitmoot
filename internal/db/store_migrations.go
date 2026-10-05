@@ -2913,4 +2913,13 @@ ALTER TABLE messages ADD COLUMN historical INTEGER NOT NULL DEFAULT 0;
 UPDATE messages SET source_id=CAST(id AS TEXT);
 CREATE UNIQUE INDEX idx_messages_source ON messages(source_kind,source_id,recipient);
 	`,
+	// sandboxd #30: the "mac" remote provider is renamed "sandboxd", so live
+	// attempts recorded under the old name keep counting against its cap, and
+	// each attempt records the template it provisions so sandboxd's
+	// per-template capacity bounds it exactly. Legacy rows keep template ''
+	// and count only provider-wide.
+	`
+ALTER TABLE execbackend_attempts ADD COLUMN template TEXT NOT NULL DEFAULT '';
+UPDATE execbackend_attempts SET provider = 'sandboxd' WHERE provider = 'mac';
+	`,
 }

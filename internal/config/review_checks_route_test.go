@@ -32,6 +32,10 @@ remote_routing_enabled = true
 checks_backend = "remote"
 checks_provider = "gcp"
 
+[repos."o/sandboxd".review]
+checks_backend = "remote"
+checks_provider = "sandboxd"
+
 [repos."o/mac".review]
 checks_backend = "remote"
 checks_provider = "mac"
@@ -52,7 +56,8 @@ checks_template = "x"
 	}
 	for repo, want := range map[string]string{
 		"o/unknown":   "unknown checks_provider",
-		"o/mac":       "[remote_exec.mac]",
+		"o/sandboxd":  "[remote_exec.sandboxd]",
+		"o/mac":       "[remote_exec.sandboxd]",
 		"o/nobackend": "require checks_backend",
 	} {
 		if _, err := cfg.ChecksRoute(repo); err == nil || !strings.Contains(err.Error(), want) {
@@ -61,6 +66,11 @@ checks_template = "x"
 	}
 	if route, err := cfg.ChecksRoute("o/unconfigured"); err != nil || route.Enabled() {
 		t.Fatalf("unconfigured repo route = %+v, %v", route, err)
+	}
+	// checks_provider = "mac" is the deprecated alias: one warning, for that
+	// repository only, naming the replacement.
+	if got := cfg.Deprecations(); len(got) != 1 || !strings.Contains(got[0], `"o/mac"`) || !strings.Contains(got[0], `use "sandboxd"`) {
+		t.Fatalf("deprecations = %q; want one for o/mac naming sandboxd", got)
 	}
 }
 

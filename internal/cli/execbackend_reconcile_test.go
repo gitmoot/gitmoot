@@ -136,21 +136,22 @@ func TestLocalDefaultReconcilesForeignBootRemoteAttempt(t *testing.T) {
 }
 
 // Each provider's attempts are reconciled against that provider's inventory
-// only. E2B returns a complete inventory without the Mac sandbox, which must
-// not settle or orphan the Mac attempt; the Mac's own inventory settles it.
+// only. E2B returns a complete inventory without the sandboxd sandbox, which
+// must not settle or orphan the sandboxd attempt; sandboxd's own inventory
+// settles it.
 func TestReconcileSettlesEachProviderOnlyFromItsOwnInventory(t *testing.T) {
 	store := openExecBackendLedgerTestStore(t)
 	e2bKey := seedRunningExecBackendAttempt(t, store, "job-e2b", "sandbox-e2b", "old-fence", "old-boot")
-	macKey := db.ExecBackendAttemptKey{JobID: "job-mac", Attempt: 1, LifecycleGeneration: 3}
+	sandboxdKey := db.ExecBackendAttemptKey{JobID: "job-sandboxd", Attempt: 1, LifecycleGeneration: 3}
 	if err := store.ReserveExecBackendAttempt(context.Background(), db.ExecBackendAttemptReservation{
-		ExecBackendAttemptKey: macKey, Provider: config.RemoteExecProviderMac, DaemonFencingToken: "old-fence", BootID: "old-boot", TTLExpiresAt: time.Now().Add(time.Minute),
+		ExecBackendAttemptKey: sandboxdKey, Provider: "sandboxd", DaemonFencingToken: "old-fence", BootID: "old-boot", TTLExpiresAt: time.Now().Add(time.Minute),
 	}, db.ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := store.MarkExecBackendAttemptProvisioning(context.Background(), macKey); err != nil || !changed {
+	if changed, err := store.MarkExecBackendAttemptProvisioning(context.Background(), sandboxdKey); err != nil || !changed {
 		t.Fatalf("mark provisioning: changed=%v err=%v", changed, err)
 	}
-	if changed, err := store.MarkExecBackendAttemptRunning(context.Background(), macKey, "sandbox-mac"); err != nil || !changed {
+	if changed, err := store.MarkExecBackendAttemptRunning(context.Background(), sandboxdKey, "sandbox-sandboxd"); err != nil || !changed {
 		t.Fatalf("mark running: changed=%v err=%v", changed, err)
 	}
 	instance := func(id string, key db.ExecBackendAttemptKey) execbackend.ProviderInstance {
@@ -159,23 +160,23 @@ func TestReconcileSettlesEachProviderOnlyFromItsOwnInventory(t *testing.T) {
 	}
 	e2bInner := &ledgerTestBackend{report: execbackend.ReapReport{InventoryObserved: true, InventoryComplete: true,
 		Inventory: []execbackend.ProviderInstance{instance("sandbox-e2b", e2bKey)}}}
-	macInner := &ledgerTestBackend{report: execbackend.ReapReport{InventoryObserved: true,
-		Inventory: []execbackend.ProviderInstance{instance("sandbox-mac", macKey)}}}
+	sandboxdInner := &ledgerTestBackend{report: execbackend.ReapReport{InventoryObserved: true,
+		Inventory: []execbackend.ProviderInstance{instance("sandbox-sandboxd", sandboxdKey)}}}
 
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
 		t.Fatal(err)
 	}
-	macAPIKey := filepath.Join(home, "mac-api-key")
-	if err := os.WriteFile(macAPIKey, []byte("private-mac-key"), 0o600); err != nil {
+	sandboxdAPIKey := filepath.Join(home, "sandboxd-api-key")
+	if err := os.WriteFile(sandboxdAPIKey, []byte("private-sandboxd-key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Fprintf(f, "\n[remote_exec.mac]\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://mac.example:8443\"\nenvd_base_url = \"https://mac.example:8443\"\nmax_concurrent = 1\n", macAPIKey)
+	fmt.Fprintf(f, "\n[remote_exec.sandboxd]\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 1\n", sandboxdAPIKey)
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -188,8 +189,8 @@ func TestReconcileSettlesEachProviderOnlyFromItsOwnInventory(t *testing.T) {
 			}
 			built[cfg.Provider] = cfg.E2BBaseURL
 			inner := e2bInner
-			if cfg.Provider == config.RemoteExecProviderMac {
-				inner = macInner
+			if cfg.Provider == "sandboxd" {
+				inner = sandboxdInner
 			}
 			return newLedgeredExecutionBackend(store, inner, cfg.Provider, "new-fence", "new-boot", io.Discard, testCLIExecBackendUncappedPolicy())
 		},
@@ -200,13 +201,13 @@ func TestReconcileSettlesEachProviderOnlyFromItsOwnInventory(t *testing.T) {
 	if err := reconcileExecBackendInventory(context.Background(), worker, io.Discard, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if built[config.RemoteExecProviderMac] != "https://mac.example:8443" {
-		t.Fatalf("reconcile built providers %v, want the Mac inventory read from the Mac endpoint", built)
+	if built["sandboxd"] != "https://sandboxd.example:8443" {
+		t.Fatalf("reconcile built providers %v, want the sandboxd inventory read from the sandboxd endpoint", built)
 	}
-	if !reflect.DeepEqual(e2bInner.observedIDs, []string{"sandbox-e2b"}) || !reflect.DeepEqual(macInner.observedIDs, []string{"sandbox-mac"}) {
-		t.Fatalf("destroyed via E2B %v and via Mac %v, want each provider to destroy only its own sandbox", e2bInner.observedIDs, macInner.observedIDs)
+	if !reflect.DeepEqual(e2bInner.observedIDs, []string{"sandbox-e2b"}) || !reflect.DeepEqual(sandboxdInner.observedIDs, []string{"sandbox-sandboxd"}) {
+		t.Fatalf("destroyed via E2B %v and via sandboxd %v, want each provider to destroy only its own sandbox", e2bInner.observedIDs, sandboxdInner.observedIDs)
 	}
-	for _, key := range []db.ExecBackendAttemptKey{e2bKey, macKey} {
+	for _, key := range []db.ExecBackendAttemptKey{e2bKey, sandboxdKey} {
 		if attempt := execBackendAttemptForTest(t, store, key); attempt.State != db.ExecBackendAttemptStateDestroyed {
 			t.Fatalf("%s attempt is %q, want destroyed by its own provider", attempt.Provider, attempt.State)
 		}

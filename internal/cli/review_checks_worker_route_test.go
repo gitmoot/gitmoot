@@ -140,27 +140,27 @@ func TestReviewChecksRoutingAppliesToReviewEnqueuedWithoutBackend(t *testing.T) 
 	}
 }
 
-// checks_provider = "mac" is adopted by a review that names no provider.
-func TestReviewChecksRoutingProducerReviewAdoptsMacProvider(t *testing.T) {
-	macKey := t.TempDir() + "/mac.key"
-	if err := os.WriteFile(macKey, []byte("mac-test-key-0123456789"), 0o600); err != nil {
+// checks_provider = "sandboxd" is adopted by a review that names no provider.
+func TestReviewChecksRoutingProducerReviewAdoptsSandboxdProvider(t *testing.T) {
+	sandboxdKey := t.TempDir() + "/sandboxd.key"
+	if err := os.WriteFile(sandboxdKey, []byte("sandboxd-test-key-0123456789"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	checks := "\n[remote_exec.mac]\napi_key_file = \"" + macKey + "\"\ntemplate = \"review-arm64\"\nbase_url = \"https://mac.example:8443\"\nenvd_base_url = \"https://mac.example:8443\"\nmax_concurrent = 1\ncost_max_reserved_usd = 5.0\ncost_per_attempt_usd = 0.5\n" +
-		"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"mac\"\nchecks_template = \"swift-arm64\"\n"
+	checks := "\n[remote_exec.sandboxd]\napi_key_file = \"" + sandboxdKey + "\"\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 1\ncost_max_reserved_usd = 5.0\ncost_per_attempt_usd = 0.5\n" +
+		"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"sandboxd\"\nchecks_template = \"swift-arm64\"\n"
 	f := newProducerReviewFixture(t, runtime.ShellRuntime, checks, workflow.JobRequest{
-		ID: "producer-review-mac", PullRequest: 2238,
+		ID: "producer-review-sandboxd", PullRequest: 2238,
 	})
 	f.run(t)
 
 	if len(f.views) != 1 || f.backends[0] != execbackend.Remote {
 		t.Fatalf("provisioned backends %v; want exactly one remote provision", f.backends)
 	}
-	if view := f.views[0]; view.Provider != config.RemoteExecProviderMac || view.E2BTemplate != "swift-arm64" {
-		t.Fatalf("provider view provider=%q e2b_template=%q; want mac with swift-arm64", view.Provider, view.E2BTemplate)
+	if view := f.views[0]; view.Provider != "sandboxd" || view.E2BTemplate != "swift-arm64" {
+		t.Fatalf("provider view provider=%q e2b_template=%q; want sandboxd with swift-arm64", view.Provider, view.E2BTemplate)
 	}
-	if _, payload, _ := f.jobAndEvents(t); payload["exec_provider"] != "mac" || payload["exec_template"] != "swift-arm64" {
-		t.Fatalf("stored payload exec_provider=%v exec_template=%v; want mac, swift-arm64", payload["exec_provider"], payload["exec_template"])
+	if _, payload, _ := f.jobAndEvents(t); payload["exec_provider"] != "sandboxd" || payload["exec_template"] != "swift-arm64" {
+		t.Fatalf("stored payload exec_provider=%v exec_template=%v; want sandboxd, swift-arm64", payload["exec_provider"], payload["exec_template"])
 	}
 }
 
