@@ -499,6 +499,21 @@ func (c Client) IsLinkedWorktree(ctx context.Context) (bool, error) {
 	return gitDir != commonDir, nil
 }
 
+// CommonDir returns the absolute git common directory of c.dir: the directory
+// whose refs and objects every linked worktree of the repository shares. Git
+// before 2.31 lacks --path-format=absolute, so a relative answer is resolved
+// against the client directory.
+func (c Client) CommonDir(ctx context.Context) (string, error) {
+	result, err := c.run(ctx, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		result, err = c.run(ctx, "rev-parse", "--git-common-dir")
+		if err != nil {
+			return "", err
+		}
+	}
+	return c.absoluteGitPath(result.Stdout)
+}
+
 // PrimaryWorktree returns the first non-bare record from git's porcelain
 // worktree list. Git writes the primary checkout first. A worktree-only repo
 // with no non-bare record falls back to the current checkout.
