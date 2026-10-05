@@ -79,18 +79,38 @@ Unsupported job types and other model runtimes also refuse before allocation.
 
 Cloud E2B is the default remote provider. A home may also declare the Mac
 Studio's private `sandboxd` (Linux ARM64 VMs, the same E2B-compatible client)
-in a `[remote_exec.mac]` section with `api_key_file`, `template`,
+in a `[remote_exec.sandboxd]` section with `api_key_file`, `template`,
 `omp_template`, HTTPS-origin `base_url` and `envd_base_url`,
 `omp_linux_arm64_file` (a verified Linux AArch64 OMP), the guests'
-`credential_gateway_url`, and a positive `max_concurrent`. A review runs there
-only when requested with `--exec-provider mac` or when its repository sets
-`checks_provider = "mac"`; the provider is stored on the job and survives
-retries (the disk guard and `remote_routing_enabled` policy use E2B only). An unknown provider, or `mac` without its
-section, is refused at request time. Mac attempts count only against
-`max_concurrent` and reserve no dollars; E2B attempts count only against the
-E2B caps. Reconciliation lists and settles each provider separately. One
-credential gateway listener serves both providers' origins. See
-`docs/remote-exec.md` for the Mac configuration and operator runbook.
+`credential_gateway_url`, and an optional `max_concurrent` ceiling. A review
+runs there only when requested with `--exec-provider sandboxd` or when its
+repository sets `checks_provider = "sandboxd"`; the provider is stored on the
+job and survives retries (the disk guard and `remote_routing_enabled` policy
+use E2B only). An unknown provider, or `sandboxd` without its section, is
+refused at request time. sandboxd attempts reserve no dollars; E2B attempts
+count only against the E2B caps. Reconciliation lists and settles each provider
+separately. One credential gateway listener serves both providers' origins.
+
+sandboxd's concurrency follows its `GET /sandboxd/capacity` report, read before
+each reservation and cached for 10 seconds (errors are not cached; a sandboxd
+create 409 drops the entry): the provider-wide cap is the reported cluster
+`totalSlots`, lowered to `max_concurrent` when that is set above 0 (negative is
+a load error), and attempts of one template also count against that template's
+reported slots. A report with no slots or no online worker for the template, a
+transport error, timeout, 5xx, 429 or malformed reply is a transient `capacity`
+refusal and the review waits. A 404 (sandboxd older than the endpoint) falls
+back to `max_concurrent`, or fails fast naming both fixes (upgrade sandboxd or
+set `max_concurrent`) when it is unset; 401/403 fail fast. Running attempts are
+never cancelled when capacity drops.
+
+The provider was named `mac` before: for one release `[remote_exec.mac]`,
+`--exec-provider mac`, `checks_provider = "mac"` and queued `mac` jobs are
+accepted as a deprecated alias with a warning naming the replacement, new
+jobs store `sandboxd`, and declaring both `[remote_exec.sandboxd]` and
+`[remote_exec.mac]` is a load error. The alias is removed in the next minor
+release; keep `max_concurrent` set until `GET /sandboxd/capacity` answers 200
+with the expected templates, then rename the section. See
+`docs/remote-exec.md` for the sandboxd configuration and operator runbook.
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:
@@ -129,7 +149,7 @@ image (#2316):
 ```toml
 [repos."owner/repo".review]
 checks_backend = "remote"          # the only value
-checks_provider = "e2b"            # or "mac"; default "e2b"
+checks_provider = "e2b"            # or "sandboxd"; default "e2b"
 checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 ```
 
@@ -154,7 +174,7 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
   `shell` and `omp` can). There is no per-job override; to review the
   repository locally, remove `checks_backend`.
 - `checks_provider` is validated when the config loads: an unknown provider, or
-  one with no `[remote_exec]`/`[remote_exec.mac]` API key file or no template
+  one with no `[remote_exec]`/`[remote_exec.sandboxd]` API key file or no template
   at all, makes every review of that repository refuse with that reason. Other
   repositories keep loading. The `checks_*` keys are repository-scoped; in the
   global `[review]` section they are an error.
@@ -164,12 +184,15 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
   runtime; a review on the other is refused naming the missing key.
 - When the provider's cost or concurrency cap is full, the review returns to
   the queue instead of failing: a `remote_review_cap_waiting` job event names
-  the provider, the next retry time and the wait so far, and the scheduler
-  retries on its normal tick once `blocker_retry_at` passes (every 30 seconds).
-  When a slot frees, the review provisions and `remote_review_cap_admitted`
-  records how long it waited. The wait is bounded by the job timeout (one hour
-  when none is resolved); past it the job fails with the cap refusal as its
-  reason. An unconfigured cap fails immediately, because it never frees.
+  the provider and the reason, the next retry time and the wait so far, and
+  the scheduler retries on its normal tick once `blocker_retry_at` passes
+  (every 30 seconds). When a slot frees, the review provisions and
+  `remote_review_cap_admitted` records how long it waited. The wait is bounded
+  by the job timeout (one hour when none is resolved); past it the job fails
+  with the cap refusal as its reason. An unconfigured cap fails immediately,
+  because it never frees. Every sandboxd review, routed here or not, waits the
+  same way on a full cap, a `capacity` refusal or a sandboxd create 409; a
+  cloud E2B 409 is unchanged.
 - A remote review that declares `executed` evidence while its `tests_run`
   reports a missing toolchain (`command not found`, exit 127, "toolchain
   unavailable", "not installed") or names nothing that ran is recorded as
@@ -179,7 +202,7 @@ Actual cost: `[remote_exec].cost_per_hour_usd` is the provider's price for one
 sandbox-hour (for a 2 vCPU / 4 GiB E2B template, about `0.166`). When set, each
 destroyed attempt records `execbackend_attempts.cost_actual_usd` as its
 lifetime, from reservation to teardown, times that rate. The E2B API reports no
-per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The Mac
+per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The sandboxd
 provider has no dollar cost and records none. Attempts settled by
 reconciliation, whose teardown time is unknown, also stay NULL.
 

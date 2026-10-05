@@ -88,17 +88,17 @@ func TestRouteQueuedJobRemoteCountsBillingAttemptsAtTheirReservedDollars(t *test
 	}
 }
 
-// The routing cap is E2B's. A running opted-in Mac review and its Mac attempt
-// hold Mac capacity, so neither may take the one E2B slot from a waiting
-// review; an E2B attempt still fills it.
+// The routing cap is E2B's. A running opted-in sandboxd review and its
+// sandboxd attempt hold sandboxd capacity, so neither may take the one E2B
+// slot from a waiting review; an E2B attempt still fills it.
 func TestRouteQueuedJobRemoteCountsOnlyTheRoutedProvider(t *testing.T) {
 	ctx := context.Background()
 	store := openStoreOperationsTestStore(t)
-	insertWorktreeRefJob(t, store, "mac-running", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`)
-	insertWorktreeRefJob(t, store, "mac-billing", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`)
+	insertWorktreeRefJob(t, store, "sandboxd-running", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"sandboxd"}`)
+	insertWorktreeRefJob(t, store, "sandboxd-billing", "running", `{"repo":"o/r","exec_backend":"remote","exec_provider":"sandboxd"}`)
 	if err := store.ReserveExecBackendAttempt(ctx, ExecBackendAttemptReservation{
-		ExecBackendAttemptKey: ExecBackendAttemptKey{JobID: "mac-billing", Attempt: 1},
-		Provider:              "mac", DaemonFencingToken: "t", BootID: "b", TTLExpiresAt: time.Now().Add(time.Hour),
+		ExecBackendAttemptKey: ExecBackendAttemptKey{JobID: "sandboxd-billing", Attempt: 1},
+		Provider:              "sandboxd", DaemonFencingToken: "t", BootID: "b", TTLExpiresAt: time.Now().Add(time.Hour),
 	}, ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestRouteQueuedJobRemoteCountsOnlyTheRoutedProvider(t *testing.T) {
 	remote := `{"repo":"o/r","exec_backend":"remote"}`
 	ev := JobEvent{Kind: "disk_guard_routed_remote", Message: "m"}
 	if routed, err := store.RouteQueuedJobRemote(ctx, "a", remote, 0, cap, ev); err != nil || !routed {
-		t.Fatalf("Mac work took the E2B slot: routed=%v err=%v", routed, err)
+		t.Fatalf("sandboxd work took the E2B slot: routed=%v err=%v", routed, err)
 	}
 	if routed, err := store.RouteQueuedJobRemote(ctx, "b", remote, 0, cap, ev); err != nil || routed {
 		t.Fatalf("second E2B route with the slot taken: routed=%v err=%v", routed, err)

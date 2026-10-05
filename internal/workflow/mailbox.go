@@ -286,7 +286,8 @@ type JobRequest struct {
 	// distinguishable from that absence across enqueue, retry, and recovery.
 	ExecBackend *string
 	// ExecProvider names the remote provider an explicitly remote job runs on.
-	// Empty is the default, cloud E2B; "mac" is the opt-in Mac provider.
+	// Empty is the default, cloud E2B; "sandboxd" is the opt-in sandboxd provider
+	// (older payloads may carry its deprecated alias "mac").
 	ExecProvider string
 	// ExecTemplate replaces the provider's configured template for this job
 	// only. It is set by a repository's checks_template (#2316).

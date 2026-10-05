@@ -1331,7 +1331,7 @@ router's JSON object described below.
 ```sh
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
-    [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|mac] [--model <provider/model>] \
+    [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
     [--full] [--post-merge] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
@@ -1371,10 +1371,14 @@ reroute reviews. Remote reviews currently support only `shell` and `omp`;
 Gitmoot refuses any other runtime/backend pair before enqueue and names both
 operands. `agent review` forwards the same flag through the review router.
 
-`--exec-provider e2b|mac` picks the remote provider for this review and implies
-`--exec-backend remote`. `e2b`, the default, is cloud E2B; `mac` runs the
-review on the Mac Studio's sandboxd and requires a `[remote_exec.mac]` section,
-otherwise the request is refused before enqueue. The choice is stored on the
+`--exec-provider e2b|sandboxd` picks the remote provider for this review and
+implies `--exec-backend remote`. `e2b`, the default, is cloud E2B; `sandboxd`
+runs the review on the Mac Studio's sandboxd and requires a
+`[remote_exec.sandboxd]` section, otherwise the request is refused before
+enqueue. `mac` is a deprecated alias for one release: it is accepted, prints
+`warning: --exec-provider: remote execution provider "mac" is deprecated and
+will be removed in the next release; use "sandboxd"` on stderr, and the job
+stores `sandboxd`. The choice is stored on the
 job and kept across retries. A repository with `checks_backend = "remote"` in
 `[repos."owner/repo".review]` sends every review to its `checks_provider` and
 `checks_template`, whichever producer enqueued it (this command, PR fan-out,

@@ -112,20 +112,28 @@ func (w jobWorker) defaultExecutionBackend(backend execbackend.Backend, cfg conf
 		if err != nil {
 			return nil, fmt.Errorf("create execution backend daemon fencing token: %w", err)
 		}
-		cap := execBackendStoreCap(cfg.ExecBackendCost)
-		if cfg.Provider == config.RemoteExecProviderMac {
-			cap = execBackendMacCap(cfg.ExecBackendCost)
-		}
-		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, cfg.Provider, fencingToken, db.BootID(), w.Stdout, cap)
-		if err != nil {
-			return nil, err
-		}
-		ledgeredBackend.setPerHourUSD(cfg.ExecBackendCost.PerHourUSD)
 		baseURL := strings.TrimSpace(cfg.E2BBaseURL)
 		if baseURL == "" {
 			baseURL = e2b.DefaultBaseURL
 		}
 		accountKey := sha256.Sum256([]byte(apiKey))
+		var capacity *sandboxdCapacitySource
+		cap := execBackendStoreCap(cfg.ExecBackendCost)
+		if cfg.Provider == config.RemoteExecProviderSandboxd {
+			// sandboxd's cap is read per provision from its capacity report;
+			// this zero policy is never used.
+			cap = db.ExecBackendCostCap{}
+			capacity = &sandboxdCapacitySource{
+				cache: sandboxdCapacityReports, key: fmt.Sprintf("%s|%x", baseURL, accountKey),
+				read: client.Capacity, ceiling: cfg.ExecBackendCost.MaxConcurrent, template: cfg.E2BTemplate,
+			}
+		}
+		ledgeredBackend, err := newLedgeredExecutionBackend(w.Store, remoteBackend, cfg.Provider, fencingToken, db.BootID(), w.Stdout, cap)
+		if err != nil {
+			return nil, err
+		}
+		ledgeredBackend.capacity = capacity
+		ledgeredBackend.setPerHourUSD(cfg.ExecBackendCost.PerHourUSD)
 		reapKey := fmt.Sprintf("%s|%s|%s|%x", backend, cfg.Provider, baseURL, accountKey)
 		home := w.workflowHome()
 		revokingBackend := &credentialRevokingExecutionBackend{inner: ledgeredBackend, home: home}
@@ -207,7 +215,7 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 			return nil, nil, nil, nil, errors.New("remote omp requires the model credential gateway; raw-key fallback is forbidden")
 		}
 		var err error
-		if cfg.Provider == config.RemoteExecProviderMac {
+		if cfg.Provider == config.RemoteExecProviderSandboxd {
 			ompARM64File, err = verifiedLinuxARM64Omp(cfg.OMPLinuxARM64File)
 			ompExecutable = cfg.OMPLinuxARM64File
 		} else {

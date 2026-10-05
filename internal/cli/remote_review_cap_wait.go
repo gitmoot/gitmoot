@@ -5,16 +5,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // A review its repository's checks_backend routed remote (#2316) has nowhere
-// else to run, so a full provider cap makes it WAIT instead of failing it the
-// way every other remote job fails. The wait reuses the scheduler: the job goes
+// else to run, and a sandboxd review is bounded by the gateway's finite
+// capacity (sandboxd #30), so for both a full provider cap makes the review
+// WAIT instead of failing it the way every other remote job fails. The wait reuses the scheduler: the job goes
 // back to queued with payload.blocker_retry_at set, which listPendingQueuedJobs
 // already skips until it passes, and the next tick after that retries the
 // reservation. Nothing polls in between.
@@ -34,17 +38,16 @@ const remoteReviewCapWaitDefaultBound = time.Hour
 var remoteReviewCapWaitNow = func() time.Time { return time.Now().UTC() }
 
 // waitForRemoteReviewCapacity is called when provisioning a remote review
-// failed. If the cause is a full provider cap and the review is checks-routed,
-// it returns the admitted (running) job to the queue held until the next retry
-// and reports requeued=true. The wait is bounded by bound, measured from the
+// failed. If the cause is a full provider cap (or, for sandboxd, no reported
+// capacity or a create refused with 409) and the review is checks-routed or
+// runs on sandboxd, it returns the admitted (running) job to the queue held
+// until the next retry and reports requeued=true. The wait is bounded by bound, measured from the
 // first refusal: past it, expired carries the failure the caller records
 // instead of cause. Any other cause, or a lost compare-and-set, returns
 // neither, and the caller fails the job as before.
 func (w jobWorker) waitForRemoteReviewCapacity(ctx context.Context, job db.Job, provider string, bound time.Duration, cause error) (requeued bool, expired error) {
-	var refusal *db.ExecBackendCapRefusal
-	if !errors.As(cause, &refusal) || refusal.Clause == "unconfigured" {
-		// An unconfigured cap never frees; waiting on it would only delay
-		// the operator's fix.
+	sandboxd := provider == config.RemoteExecProviderSandboxd
+	if !remoteReviewCapacityWaitCause(cause, sandboxd) {
 		return false, nil
 	}
 	latest, err := w.Store.GetJob(ctx, job.ID)
@@ -52,7 +55,9 @@ func (w jobWorker) waitForRemoteReviewCapacity(ctx context.Context, job db.Job, 
 		return false, nil
 	}
 	payload, err := daemonJobPayload(latest)
-	if err != nil || !payload.ReviewChecksRouted {
+	// Every sandboxd job is a review: --exec-provider and checks routing are
+	// its only writers, and both are review-only.
+	if err != nil || (!payload.ReviewChecksRouted && !sandboxd) {
 		return false, nil
 	}
 	if bound <= 0 {
@@ -90,6 +95,20 @@ func (w jobWorker) waitForRemoteReviewCapacity(ctx context.Context, job db.Job, 
 	}
 	writeLine(w.Stdout, "job %s: %s capacity full, review queued until %s: %v", job.ID, provider, retryAt.Format(time.RFC3339), cause)
 	return true, nil
+}
+
+// remoteReviewCapacityWaitCause reports whether cause can clear by waiting. A
+// cap refusal can, except "unconfigured", which never frees: waiting on it
+// would only delay the operator's fix. On sandboxd a create refused with 409
+// is its capacity answer (the report raced another client), and it allocated
+// nothing; cloud E2B's 409 keeps its existing handling.
+func remoteReviewCapacityWaitCause(cause error, sandboxd bool) bool {
+	var refusal *db.ExecBackendCapRefusal
+	if errors.As(cause, &refusal) {
+		return refusal.Clause != "unconfigured"
+	}
+	var refused *e2b.RequestRefusedError
+	return sandboxd && errors.As(cause, &refused) && refused.Operation == e2b.OperationCreate && refused.StatusCode == http.StatusConflict
 }
 
 // clearRemoteReviewCapWait ends a finished wait once the review provisioned:

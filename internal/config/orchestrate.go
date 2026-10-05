@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -593,6 +594,9 @@ type reviewPolicyOverride struct {
 	// kept per repository so dispatch refuses reviews of THAT repository
 	// instead of quietly running them locally, while other repositories load.
 	checksErr error
+	// checksDeprecation names a deprecated checks_* spelling this repository
+	// was loaded with; ReviewConfig.Deprecations reports it.
+	checksDeprecation string
 }
 
 // Review checks routing (#2316). checks_backend has one value: a repository
@@ -627,6 +631,19 @@ func (c ReviewConfig) ChecksRoute(repo string) (ReviewChecksRoute, error) {
 		return ReviewChecksRoute{}, override.checksErr
 	}
 	return override.checks, nil
+}
+
+// Deprecations lists the deprecated checks_* spellings repositories were
+// loaded with, one per repository, sorted, each naming its replacement.
+func (c ReviewConfig) Deprecations() []string {
+	var out []string
+	for repo, override := range c.repos {
+		if override.checksDeprecation != "" {
+			out = append(out, fmt.Sprintf("[repos.%q.review] %s", repo, override.checksDeprecation))
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // For resolves the effective policy for repo. Risk-tier settings remain global;
@@ -964,8 +981,12 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 	case "checks_backend", "checks_provider", "checks_template":
 		// Errors stay on the repository (see validateReviewChecksRoutes) and
 		// are deliberately not returned into the joined load error.
-		if err := applyReviewChecksField(&override.checks, key, value); err != nil && override.checksErr == nil {
+		deprecatedAlias, err := applyReviewChecksField(&override.checks, key, value)
+		if err != nil && override.checksErr == nil {
 			override.checksErr = fmt.Errorf("%s: %w", key, err)
+		}
+		if deprecatedAlias {
+			override.checksDeprecation = RemoteExecProviderMacDeprecation("checks_provider")
 		}
 		return nil
 	default:
@@ -973,30 +994,34 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 	}
 }
 
-func applyReviewChecksField(route *ReviewChecksRoute, key string, value string) error {
+// applyReviewChecksField sets one checks_* key. deprecatedAlias reports a
+// checks_provider written as the deprecated "mac", stored as "sandboxd".
+func applyReviewChecksField(route *ReviewChecksRoute, key string, value string) (deprecatedAlias bool, err error) {
 	parsed, err := parseConfigString(value)
 	if err != nil {
-		return err
+		return false, err
 	}
 	parsed = strings.TrimSpace(parsed)
 	switch key {
 	case "checks_backend":
 		if parsed != ReviewChecksBackendRemote {
-			return fmt.Errorf("unsupported checks_backend %q: the only value is %q", parsed, ReviewChecksBackendRemote)
+			return false, fmt.Errorf("unsupported checks_backend %q: the only value is %q", parsed, ReviewChecksBackendRemote)
 		}
 		route.Backend = parsed
 	case "checks_provider":
-		if parsed != RemoteExecProviderE2B && parsed != RemoteExecProviderMac {
-			return fmt.Errorf("unknown checks_provider %q: allowed providers are %q and %q", parsed, RemoteExecProviderE2B, RemoteExecProviderMac)
+		canonical, alias := NormalizeRemoteExecProvider(parsed)
+		if canonical != RemoteExecProviderE2B && canonical != RemoteExecProviderSandboxd {
+			return false, fmt.Errorf("unknown checks_provider %q: allowed providers are %q and %q", parsed, RemoteExecProviderE2B, RemoteExecProviderSandboxd)
 		}
-		route.Provider = parsed
+		route.Provider = canonical
+		return alias, nil
 	default:
 		if parsed == "" {
-			return errors.New("checks_template must name a template")
+			return false, errors.New("checks_template must name a template")
 		}
 		route.Template = parsed
 	}
-	return nil
+	return false, nil
 }
 
 // parseFindingsConsumption accepts only the two declarations and the empty

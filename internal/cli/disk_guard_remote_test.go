@@ -358,36 +358,37 @@ func TestUndoingADiskRouteKeepsTheStoredWorktreeAndPostsNoResult(t *testing.T) {
 	}
 }
 
-// A Mac review holds a Mac slot, not an E2B one: with the E2B cap at one
-// sandbox, a running opted-in Mac review and its Mac attempt must not stop the
-// disk guard from sending a waiting review to E2B. The routed review stays on
-// E2B (no exec_provider): nothing is routed to the Mac automatically.
-func TestLowDiskRoutingIgnoresMacReviewsInTheE2BCap(t *testing.T) {
+// A sandboxd review holds a sandboxd slot, not an E2B one: with the E2B cap at
+// one sandbox, a running opted-in sandboxd review and its sandboxd attempt must
+// not stop the disk guard from sending a waiting review to E2B. The routed
+// review stays on E2B (no exec_provider): nothing is routed to sandboxd
+// automatically.
+func TestLowDiskRoutingIgnoresSandboxdReviewsInTheE2BCap(t *testing.T) {
 	ctx, store, worker := diskGuardRemoteFixture(t, true, 1)
-	queueDiskGuardJob(t, ctx, store, "mac-review", "rev-omp", "review", `,"exec_backend":"remote","exec_provider":"mac"`)
-	if ok, err := store.TransitionJobState(ctx, "mac-review", string(workflow.JobQueued), string(workflow.JobRunning)); err != nil || !ok {
-		t.Fatalf("start mac-review: ok=%v err=%v", ok, err)
+	queueDiskGuardJob(t, ctx, store, "sandboxd-review", "rev-omp", "review", `,"exec_backend":"remote","exec_provider":"sandboxd"`)
+	if ok, err := store.TransitionJobState(ctx, "sandboxd-review", string(workflow.JobQueued), string(workflow.JobRunning)); err != nil || !ok {
+		t.Fatalf("start sandboxd-review: ok=%v err=%v", ok, err)
 	}
 	queueDiskGuardJob(t, ctx, store, "review-local", "rev-omp", "review", "")
 	if got := pendingIDs(t, ctx, worker); strings.Join(got, ",") != "review-local" {
-		t.Fatalf("pending while a Mac review is running = %v, want the review routed to E2B", got)
+		t.Fatalf("pending while a sandboxd review is running = %v, want the review routed to E2B", got)
 	}
 	if p := storedPayload(t, ctx, store, "review-local"); p.ExecBackend != "remote" || p.ExecProvider != "" {
 		t.Fatalf("routed review backend/provider = %q/%q, want remote on the default E2B", p.ExecBackend, p.ExecProvider)
 	}
 
-	// Once the Mac review holds a Mac attempt, that attempt still leaves E2B alone.
+	// Once the sandboxd review holds a sandboxd attempt, that attempt still leaves E2B alone.
 	if ok, err := store.TransitionJobState(ctx, "review-local", string(workflow.JobQueued), string(workflow.JobCancelled)); err != nil || !ok {
 		t.Fatalf("cancel review-local: ok=%v err=%v", ok, err)
 	}
 	if err := store.ReserveExecBackendAttempt(ctx, db.ExecBackendAttemptReservation{
-		ExecBackendAttemptKey: db.ExecBackendAttemptKey{JobID: "mac-review", Attempt: 1},
-		Provider:              "mac", DaemonFencingToken: "t", BootID: "b", TTLExpiresAt: time.Now().Add(time.Hour),
+		ExecBackendAttemptKey: db.ExecBackendAttemptKey{JobID: "sandboxd-review", Attempt: 1},
+		Provider:              "sandboxd", DaemonFencingToken: "t", BootID: "b", TTLExpiresAt: time.Now().Add(time.Hour),
 	}, db.ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: 1}); err != nil {
 		t.Fatalf("ReserveExecBackendAttempt: %v", err)
 	}
 	queueDiskGuardJob(t, ctx, store, "review-next", "rev-omp", "review", "")
 	if got := pendingIDs(t, ctx, worker); strings.Join(got, ",") != "review-next" {
-		t.Fatalf("pending while a Mac attempt is billing = %v, want the review routed to E2B", got)
+		t.Fatalf("pending while a sandboxd attempt is billing = %v, want the review routed to E2B", got)
 	}
 }

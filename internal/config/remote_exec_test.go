@@ -69,15 +69,15 @@ func TestLoadRemoteExecConfigExplicitImplementedBackend(t *testing.T) {
 	}
 }
 
-// The Mac provider is declared beside E2B and selected only per job: the
-// home's remote view stays E2B, the Mac view swaps in every provider-specific
-// value, and an unknown or undeclared provider is refused instead of quietly
-// running on E2B.
-func TestRemoteExecMacProviderIsAnOptInViewBesideE2B(t *testing.T) {
+// The sandboxd provider is declared beside E2B and selected only per job: the
+// home's remote view stays E2B, the sandboxd view swaps in every
+// provider-specific value, and an unknown or undeclared provider is refused
+// instead of quietly running on E2B.
+func TestRemoteExecSandboxdProviderIsAnOptInViewBesideE2B(t *testing.T) {
 	keyDir := t.TempDir()
 	e2bKey := filepath.Join(keyDir, "e2b-api-key")
-	macKey := filepath.Join(keyDir, "mac-api-key")
-	for _, file := range []string{e2bKey, macKey} {
+	sandboxdKey := filepath.Join(keyDir, "sandboxd-api-key")
+	for _, file := range []string{e2bKey, sandboxdKey} {
 		if err := os.WriteFile(file, []byte("private-"+filepath.Base(file)), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -93,68 +93,122 @@ cost_max_reserved_usd = 9
 cost_per_attempt_usd = 4.5
 cost_max_concurrent = 2
 `, e2bKey)
-	macSection := fmt.Sprintf(`
-[remote_exec.mac]
+	sandboxdSection := fmt.Sprintf(`
+[remote_exec.sandboxd]
 api_key_file = %q
 template = "review-arm64"
 omp_template = "review-arm64"
-base_url = "https://mac.example:8443"
-envd_base_url = "https://mac.example:8443"
+base_url = "https://sandboxd.example:8443"
+envd_base_url = "https://sandboxd.example:8443"
 omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
 credential_gateway_url = "https://192.168.128.1:43181"
 max_concurrent = 1
-`, macKey)
-	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+macSection))
+`, sandboxdKey)
+	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+sandboxdSection))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Provider != RemoteExecProviderE2B || cfg.E2BTemplate != "base" || cfg.E2BEnvdBaseURL != "" {
-		t.Fatalf("declaring the Mac changed the home's default remote view: %+v", cfg)
+		t.Fatalf("declaring sandboxd changed the home's default remote view: %+v", cfg)
 	}
 	defaultView, err := cfg.ForProvider("")
 	if err != nil || defaultView.Provider != RemoteExecProviderE2B || defaultView.E2BAPIKeyFile != e2bKey || defaultView.ExecBackendCost.PerAttemptUSD != 4.5 {
 		t.Fatalf("default provider view = %+v, %v; want E2B", defaultView, err)
 	}
-	mac, err := cfg.ForProvider(RemoteExecProviderMac)
+	sandboxd, err := cfg.ForProvider(RemoteExecProviderSandboxd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if mac.Provider != RemoteExecProviderMac || mac.E2BAPIKeyFile != macKey || mac.E2BBaseURL != "https://mac.example:8443" ||
-		mac.E2BEnvdBaseURL != "https://mac.example:8443" || mac.E2BTemplate != "review-arm64" || mac.E2BOMPTemplate != "review-arm64" ||
-		mac.OMPLinuxARM64File != "/opt/gitmoot/omp-linux-arm64" || mac.E2BDomain != "" ||
-		mac.ExecBackendCost != (ExecBackendCostConfig{MaxConcurrent: 1}) {
-		t.Fatalf("Mac view kept E2B values: %+v", mac)
+	if sandboxd.Provider != RemoteExecProviderSandboxd || sandboxd.E2BAPIKeyFile != sandboxdKey || sandboxd.E2BBaseURL != "https://sandboxd.example:8443" ||
+		sandboxd.E2BEnvdBaseURL != "https://sandboxd.example:8443" || sandboxd.E2BTemplate != "review-arm64" || sandboxd.E2BOMPTemplate != "review-arm64" ||
+		sandboxd.OMPLinuxARM64File != "/opt/gitmoot/omp-linux-arm64" || sandboxd.E2BDomain != "" ||
+		sandboxd.ExecBackendCost != (ExecBackendCostConfig{MaxConcurrent: 1}) {
+		t.Fatalf("sandboxd view kept E2B values: %+v", sandboxd)
 	}
-	if mac.ProviderCredentialGatewayURL() != "https://192.168.128.1:43181" || defaultView.ProviderCredentialGatewayURL() != "https://203.0.113.7:8443" {
-		t.Fatalf("gateway origins: mac %q e2b %q", mac.ProviderCredentialGatewayURL(), defaultView.ProviderCredentialGatewayURL())
+	if sandboxd.ProviderCredentialGatewayURL() != "https://192.168.128.1:43181" || defaultView.ProviderCredentialGatewayURL() != "https://203.0.113.7:8443" {
+		t.Fatalf("gateway origins: sandboxd %q e2b %q", sandboxd.ProviderCredentialGatewayURL(), defaultView.ProviderCredentialGatewayURL())
 	}
-	if err := cfg.ValidateProvider(RemoteExecProviderMac); err != nil {
-		t.Fatalf("configured Mac provider refused: %v", err)
+	if err := cfg.ValidateProvider(RemoteExecProviderSandboxd); err != nil {
+		t.Fatalf("configured sandboxd provider refused: %v", err)
 	}
-	if err := cfg.ValidateProvider("mac-studio"); err == nil || !strings.Contains(err.Error(), "unknown remote execution provider") {
-		t.Fatalf("unknown provider accepted: %v", err)
+	if len(cfg.Deprecations) != 0 {
+		t.Fatalf("[remote_exec.sandboxd] reported deprecations %q", cfg.Deprecations)
+	}
+	err = cfg.ValidateProvider("mac-studio")
+	if err == nil || !strings.Contains(err.Error(), "unknown remote execution provider") ||
+		!strings.Contains(err.Error(), `"sandboxd"`) || strings.Contains(err.Error(), `"mac"`) {
+		t.Fatalf("unknown provider = %v; want a refusal listing e2b and sandboxd, not mac", err)
 	}
 
 	e2bOnly, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e2bOnly.ValidateProvider(RemoteExecProviderMac); err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") {
-		t.Fatalf("undeclared Mac provider accepted: %v", err)
+	if err := e2bOnly.ValidateProvider(RemoteExecProviderSandboxd); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd]") {
+		t.Fatalf("undeclared sandboxd provider accepted: %v", err)
 	}
 
 	for name, broken := range map[string]string{
-		"zero capacity":          strings.Replace(macSection, "max_concurrent = 1", "max_concurrent = 0", 1),
-		"plain HTTP control":     strings.Replace(macSection, `base_url = "https://mac.example:8443"`, `base_url = "http://mac.example:8443"`, 1),
-		"envd with a path":       strings.Replace(macSection, `envd_base_url = "https://mac.example:8443"`, `envd_base_url = "https://mac.example:8443/envd"`, 1),
-		"relative ARM64 runtime": strings.Replace(macSection, `"/opt/gitmoot/omp-linux-arm64"`, `"omp-linux-arm64"`, 1),
+		"negative ceiling":       strings.Replace(sandboxdSection, "max_concurrent = 1", "max_concurrent = -1", 1),
+		"plain HTTP control":     strings.Replace(sandboxdSection, `base_url = "https://sandboxd.example:8443"`, `base_url = "http://sandboxd.example:8443"`, 1),
+		"envd with a path":       strings.Replace(sandboxdSection, `envd_base_url = "https://sandboxd.example:8443"`, `envd_base_url = "https://sandboxd.example:8443/envd"`, 1),
+		"relative ARM64 runtime": strings.Replace(sandboxdSection, `"/opt/gitmoot/omp-linux-arm64"`, `"omp-linux-arm64"`, 1),
 	} {
 		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+broken)); err == nil {
-			t.Errorf("%s: invalid [remote_exec.mac] accepted", name)
+			t.Errorf("%s: invalid [remote_exec.sandboxd] accepted", name)
 		}
 	}
-	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+"provider = \"mac\"\n")); err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") {
+	// max_concurrent is an optional ceiling: absent or 0 adds none.
+	for name, section := range map[string]string{
+		"absent ceiling": strings.Replace(sandboxdSection, "max_concurrent = 1\n", "", 1),
+		"zero ceiling":   strings.Replace(sandboxdSection, "max_concurrent = 1", "max_concurrent = 0", 1),
+	} {
+		loaded, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+section))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		view, err := loaded.ForProvider(RemoteExecProviderSandboxd)
+		if err != nil || view.ExecBackendCost.MaxConcurrent != 0 || view.ValidateProvider(RemoteExecProviderSandboxd) != nil {
+			t.Fatalf("%s: view ceiling %d, %v; want a valid sandboxd view without a ceiling", name, view.ExecBackendCost.MaxConcurrent, err)
+		}
+	}
+	if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+"provider = \"sandboxd\"\n")); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd]") {
 		t.Fatalf("home-wide provider selection accepted: %v", err)
+	}
+}
+
+// The provider was renamed from "mac". Production config still declares
+// [remote_exec.mac], so for one release it loads as [remote_exec.sandboxd]
+// with one deprecation naming the new section, and "mac" resolves to the
+// sandboxd view. Declaring both spellings is ambiguous and refused.
+func TestRemoteExecMacSectionIsADeprecatedSandboxdAlias(t *testing.T) {
+	key := filepath.Join(t.TempDir(), "sandboxd-api-key")
+	if err := os.WriteFile(key, []byte("private-sandboxd-api-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf("\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 2\n", key)
+	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.mac]"+body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Deprecations) != 1 || !strings.Contains(cfg.Deprecations[0], "[remote_exec.mac]") || !strings.Contains(cfg.Deprecations[0], "[remote_exec.sandboxd]") {
+		t.Fatalf("deprecations = %q; want one naming [remote_exec.sandboxd]", cfg.Deprecations)
+	}
+	for _, name := range []string{"mac", "sandboxd"} {
+		view, err := cfg.ForProvider(name)
+		if err != nil || view.Provider != RemoteExecProviderSandboxd || view.E2BTemplate != "review-arm64" || view.ExecBackendCost.MaxConcurrent != 2 {
+			t.Fatalf("ForProvider(%q) = %+v, %v; want the sandboxd view", name, view, err)
+		}
+	}
+	if canonical, alias := NormalizeRemoteExecProvider(" mac "); canonical != RemoteExecProviderSandboxd || !alias {
+		t.Fatalf("NormalizeRemoteExecProvider(mac) = %q, %v", canonical, alias)
+	}
+	if canonical, alias := NormalizeRemoteExecProvider("sandboxd"); canonical != RemoteExecProviderSandboxd || alias {
+		t.Fatalf("NormalizeRemoteExecProvider(sandboxd) = %q, %v", canonical, alias)
+	}
+	_, err = LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.sandboxd]"+body+"\n[remote_exec.mac]"+body))
+	if err == nil || !strings.Contains(err.Error(), "both") {
+		t.Fatalf("both sections loaded: %v", err)
 	}
 }
 

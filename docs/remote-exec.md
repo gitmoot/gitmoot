@@ -25,9 +25,10 @@ local_root = "/var/tmp/gitmoot-local"
 ```
 
 The default remote provider is cloud E2B, using its existing dollar caps.
-The Mac sandboxd provider is declared beside it in `[remote_exec.mac]` and is
-used only by a job that opts in with `--exec-provider mac` or by a repository
-whose `checks_provider = "mac"`; nothing else routes to it.
+The sandboxd provider (Linux ARM64 VMs on a Mac) is declared beside it in
+`[remote_exec.sandboxd]` and is used only by a job that opts in with
+`--exec-provider sandboxd` or by a repository whose
+`checks_provider = "sandboxd"`; nothing else routes to it.
 
 ## Versioned OMP review template
 
@@ -90,19 +91,30 @@ Remote OMP uploads the host OMP executable into the instance, requires
 allocation when that template or the credential gateway is missing.
 Unsupported job types and other model runtimes also refuse before allocation.
 
-### Opt-in Mac ARM64 provider
+### Opt-in sandboxd ARM64 provider
 
-The Mac sandboxd endpoint speaks the E2B control and envd protocols; Gitmoot
-does not run a second backend. The home keeps cloud E2B as its default remote
-provider and declares the Mac beside it. A review runs on the Mac only when it
-is requested with `--exec-provider mac`; the choice is stored in the job
-payload (`exec_provider`), survives retries and model fallbacks, and drives
-that job's admission, reservation, provisioning, envd routing, keepalive and
-teardown. The disk guard and `remote_routing_enabled` policy only ever route
-to E2B; a repository's `checks_provider` is the one policy that selects the
-provider (see Per-repository checks routing).
-A request for a provider that is unknown, or for `mac` on a home without
-`[remote_exec.mac]`, is refused before anything is enqueued.
+The sandboxd endpoint on the Mac speaks the E2B control and envd protocols;
+Gitmoot does not run a second backend. The home keeps cloud E2B as its default
+remote provider and declares sandboxd beside it. A review runs on sandboxd only
+when it is requested with `--exec-provider sandboxd`; the choice is stored in
+the job payload (`exec_provider`), survives retries and model fallbacks, and
+drives that job's admission, reservation, provisioning, envd routing, keepalive
+and teardown. The disk guard and `remote_routing_enabled` policy only ever
+route to E2B; a repository's `checks_provider` is the one policy that selects
+the provider (see Per-repository checks routing).
+A request for a provider that is unknown, or for `sandboxd` on a home without
+`[remote_exec.sandboxd]`, is refused before anything is enqueued.
+
+The provider was named `mac` before. For one release `[remote_exec.mac]`,
+`--exec-provider mac`, `checks_provider = "mac"` and queued jobs that stored
+`mac` are accepted as a deprecated alias of `sandboxd`; each prints a warning
+naming the replacement (`gitmoot daemon run` prints config deprecations once
+at start, on stderr). New jobs always store `sandboxd`, and existing ledger
+attempts are migrated to it. Declaring both `[remote_exec.sandboxd]` and
+`[remote_exec.mac]` is a load error. The alias is removed in the next minor
+release. Keep `max_concurrent` set while sandboxd may predate
+`GET /sandboxd/capacity`, and rename the section once that endpoint answers
+200 with the expected templates.
 
 The `sandboxd` host requires Apple `container` 1.4.1 and its Linux kernel
 (`container system start --enable-kernel-install`). Build the credential-free
@@ -116,7 +128,7 @@ network. Each guest uses a read-only root, a private 10 GiB volume at
 `/home/user`, and bounded `/tmp` mounts. Keep the SQLite ledger and 0600
 control-key file outside disposable paths; serve sandboxd's loopback listener
 only through an authenticated private HTTPS gateway. Neither building the
-image nor starting Apple's runtime activates Gitmoot's Mac provider.
+image nor starting Apple's runtime activates Gitmoot's sandboxd provider.
 
 Apple's `hostOnly` network blocks external egress but still reaches Mac
 services listening on all interfaces, so sandboxd v0.1.5 installs
@@ -138,43 +150,65 @@ file; it does not compare versions.
 credential_gateway_listen = "0.0.0.0:8443"
 credential_gateway_url = "https://203.0.113.7:8443"
 
-[remote_exec.mac]
-api_key_file = "/run/secrets/mac-sandboxd-key"
+[remote_exec.sandboxd]
+api_key_file = "/run/secrets/sandboxd-key"
 template = "review-arm64"
 omp_template = "review-arm64"
 base_url = "https://mac.example.ts.net:8443"
 envd_base_url = "https://mac.example.ts.net:8443"
 omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
 credential_gateway_url = "https://192.168.128.1:43181"
-max_concurrent = 1
+# max_concurrent = 4  # optional ceiling; required only for a sandboxd without GET /sandboxd/capacity
 ```
 
 `base_url` and `envd_base_url` must be HTTPS origins; `envd_base_url` sends
 `E2b-Sandbox-Id`, `E2b-Sandbox-Port: 49983`, and `X-Access-Token` to that one
-host on both upload and process streaming. `max_concurrent` is the Mac's
-sandbox capacity: Mac attempts reserve zero dollars and count only against
-it, while E2B attempts count only against the E2B dollar and concurrency caps,
-so neither provider can take the other's slot.
+host on both upload and process streaming.
+
+sandboxd's concurrency comes from its `GET /sandboxd/capacity` report
+(authenticated with `X-API-Key`), read immediately before each reservation and
+cached process-wide for 10 seconds; errors are not cached, and a create refused
+with 409 drops the cached report. The provider-wide cap is the reported
+cluster `totalSlots`, lowered to `max_concurrent` when that is set (absent or
+0 adds no ceiling; negative is a load error), and attempts of one template
+also count against that template's reported `totalSlots`. sandboxd attempts
+reserve zero dollars and count only against these caps, while E2B attempts
+count only against the E2B dollar and concurrency caps, so neither provider can
+take the other's slot. A shrinking report never cancels a running attempt.
+
+| Capacity report | Result |
+|---|---|
+| 200, template has slots | cap as above |
+| 200 with 0 total slots, or no online worker serves the template | `capacity` refusal; the review waits |
+| transport error, timeout, 5xx, 429, malformed JSON | `capacity` refusal; the review waits |
+| 404 (sandboxd predates the endpoint), `max_concurrent` > 0 | cap is `max_concurrent` (the old behaviour) |
+| 404 without `max_concurrent` | unconfigured; fails fast naming both fixes: upgrade sandboxd or set `max_concurrent` |
+| 401/403 | unconfigured; fails fast |
+
+Every sandboxd review that meets a full cap or a `capacity` refusal, or whose
+create sandboxd refuses with 409 (a race between the report and sandboxd's
+scheduler), waits in the queue as described under Per-repository checks
+routing, bounded by the job timeout. A cloud E2B 409 is handled as before.
 
 One credential gateway listener serves both providers. Its certificate names
-every advertised host (`credential_gateway_url` and the Mac's
-`credential_gateway_url`), and each job's lease is bound to its own provider's
-origin. Mac guests reach it through sandboxd's relay at
-`192.168.128.1:43181`, which forwards to the Mac's `127.0.0.1:43184`; a
+every advertised host (`credential_gateway_url` and
+`[remote_exec.sandboxd]`'s `credential_gateway_url`), and each job's lease is
+bound to its own provider's origin. sandboxd guests reach it through sandboxd's
+relay at `192.168.128.1:43181`, which forwards to the Mac's `127.0.0.1:43184`; a
 supervised `ssh -R 127.0.0.1:43184:127.0.0.1:8443` tunnel then carries it to
 the daemon's existing listener port (the port of `credential_gateway_listen`).
 No general-purpose proxy or secret is exposed to the VM.
 
 Reconciliation lists each provider's inventory separately and settles or
-orphans only that provider's attempts, so a Mac attempt is never settled
+orphans only that provider's attempts, so a sandboxd attempt is never settled
 because E2B does not list it, nor the reverse. sandboxd's list is complete for
 its worker (a failed inventory is a 503, never a short list) and sandboxd kills
-each sandbox at its persisted deadline, but Gitmoot still treats the Mac list
-as partial: it reads the list and its ledger in separate steps, so an attempt
-reserved in between would look absent. A `destroying` Mac attempt settles by
-the same provider-TTL grace rule as E2B.
+each sandbox at its persisted deadline, but Gitmoot still treats the sandboxd
+list as partial: it reads the list and its ledger in separate steps, so an
+attempt reserved in between would look absent. A `destroying` sandboxd attempt
+settles by the same provider-TTL grace rule as E2B.
 
-Mac OMP uploads only the configured absolute-path executable after verifying
+sandboxd OMP uploads only the configured absolute-path executable after verifying
 an executable Linux ARM64 ELF header and interpreter, before provider
 allocation. No x86 fallback or emulation is attempted. Supply a real Linux
 ARM64 build of OMP and a matching guest image and credential gateway. The
@@ -219,7 +253,7 @@ image (#2316):
 ```toml
 [repos."owner/repo".review]
 checks_backend = "remote"          # the only value
-checks_provider = "e2b"            # or "mac"; default "e2b"
+checks_provider = "e2b"            # or "sandboxd"; default "e2b"
 checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 ```
 
@@ -244,7 +278,7 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
   `shell` and `omp` can). There is no per-job override; to review the
   repository locally, remove `checks_backend`.
 - `checks_provider` is validated when the config loads: an unknown provider, or
-  one with no `[remote_exec]`/`[remote_exec.mac]` API key file or no template
+  one with no `[remote_exec]`/`[remote_exec.sandboxd]` API key file or no template
   at all, makes every review of that repository refuse with that reason. Other
   repositories keep loading. The `checks_*` keys are repository-scoped; in the
   global `[review]` section they are an error.
@@ -254,12 +288,15 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
   runtime; a review on the other is refused naming the missing key.
 - When the provider's cost or concurrency cap is full, the review returns to
   the queue instead of failing: a `remote_review_cap_waiting` job event names
-  the provider, the next retry time and the wait so far, and the scheduler
-  retries on its normal tick once `blocker_retry_at` passes (every 30 seconds).
-  When a slot frees, the review provisions and `remote_review_cap_admitted`
-  records how long it waited. The wait is bounded by the job timeout (one hour
-  when none is resolved); past it the job fails with the cap refusal as its
-  reason. An unconfigured cap fails immediately, because it never frees.
+  the provider and the reason, the next retry time and the wait so far, and
+  the scheduler retries on its normal tick once `blocker_retry_at` passes
+  (every 30 seconds). When a slot frees, the review provisions and
+  `remote_review_cap_admitted` records how long it waited. The wait is bounded
+  by the job timeout (one hour when none is resolved); past it the job fails
+  with the cap refusal as its reason. An unconfigured cap fails immediately,
+  because it never frees. Every sandboxd review, routed here or not, waits the
+  same way on a full cap, a `capacity` refusal or a sandboxd create 409; a
+  cloud E2B 409 is unchanged.
 - A remote review that declares `executed` evidence while its `tests_run`
   reports a missing toolchain (`command not found`, exit 127, "toolchain
   unavailable", "not installed") or names nothing that ran is recorded as
@@ -269,7 +306,7 @@ Actual cost: `[remote_exec].cost_per_hour_usd` is the provider's price for one
 sandbox-hour (for a 2 vCPU / 4 GiB E2B template, about `0.166`). When set, each
 destroyed attempt records `execbackend_attempts.cost_actual_usd` as its
 lifetime, from reservation to teardown, times that rate. The E2B API reports no
-per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The Mac
+per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The sandboxd
 provider has no dollar cost and records none. Attempts settled by
 reconciliation, whose teardown time is unknown, also stay NULL.
 

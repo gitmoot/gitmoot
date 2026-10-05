@@ -93,7 +93,7 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|mac] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
@@ -1019,6 +1019,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s: --exec-provider is only supported for agent review\n", label)
 		return agentRunOptions{}, false
 	}
+	warnDeprecatedExecProvider(stderr, options.execProvider)
 	if err := validateAgentRunActionOptions(command, options); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return agentRunOptions{}, false

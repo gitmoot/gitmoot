@@ -305,7 +305,7 @@ const (
 // backend is respected, and a review is switched at most once.
 func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
 	// Only the cloud E2B provider: a routed payload never gets exec_provider,
-	// and the cap below is the E2B dollar cap. The Mac provider is used only by
+	// and the cap below is the E2B dollar cap. The sandboxd provider is used only by
 	// a job that opted in at request time or whose repository's checks_provider
 	// names it (#2316); such a job carries exec_backend, or gets it from
 	// routeReviewChecks when it runs, and is passed through below without

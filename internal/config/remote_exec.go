@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -49,15 +50,19 @@ type RemoteExecConfig struct {
 	// itself always describes cloud E2B; ForProvider returns the view of an
 	// opted-in job, whose provider is chosen per job, never home-wide.
 	Provider string
-	// E2BEnvdBaseURL and OMPLinuxARM64File are set only in the Mac view from
-	// [remote_exec.mac]: one HTTPS envd origin with sandbox routing headers in
-	// place of wildcard hosts, and the host-side Linux ARM64 OMP executable.
+	// E2BEnvdBaseURL and OMPLinuxARM64File are set only in the sandboxd view
+	// from [remote_exec.sandboxd]: one HTTPS envd origin with sandbox routing
+	// headers in place of wildcard hosts, and the host-side Linux ARM64 OMP
+	// executable.
 	E2BEnvdBaseURL    string
 	OMPLinuxARM64File string
-	// Mac is the optional [remote_exec.mac] section. It declares the Mac
-	// Studio's sandboxd provider beside E2B; a job runs there only when its
-	// payload names it (exec_provider = "mac").
-	Mac *MacProviderConfig
+	// Sandboxd is the optional [remote_exec.sandboxd] section. It declares a
+	// local sandboxd provider beside E2B; a job runs there only when its
+	// payload names it (exec_provider = "sandboxd").
+	Sandboxd *SandboxdProviderConfig
+	// Deprecations lists deprecated spellings this config was loaded with,
+	// each naming its replacement. The daemon prints them once at start.
+	Deprecations []string
 	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
 	// origin reachable from a sandbox. They are configured together and are
 	// used only for opt-in broker material, never for the provider control key.
@@ -69,28 +74,55 @@ type RemoteExecConfig struct {
 	ExecBackendCost ExecBackendCostConfig
 }
 
-// Remote execution providers. E2B is the default for every remote job; the Mac
-// provider is used only by a job that opts in explicitly.
+// Remote execution providers. E2B is the default for every remote job; the
+// sandboxd provider is used only by a job that opts in explicitly.
 const (
-	RemoteExecProviderE2B = "e2b"
-	RemoteExecProviderMac = "mac"
+	RemoteExecProviderE2B      = "e2b"
+	RemoteExecProviderSandboxd = "sandboxd"
 )
 
-// MacProviderConfig is the [remote_exec.mac] section: the Mac Studio's sandboxd,
-// an E2B-compatible API, as an opt-in remote provider. It is capacity-limited
-// on-prem compute, so it has a concurrency cap and no dollar cost.
-type MacProviderConfig struct {
+// remoteExecProviderMacAlias is the provider's pre-rename name. Production
+// configs and queued payloads still carry it, so it is accepted for one
+// release, with a deprecation warning, and then removed.
+const remoteExecProviderMacAlias = "mac"
+
+// NormalizeRemoteExecProvider maps a provider name to its canonical spelling.
+// deprecatedAlias reports that name was the "mac" alias for "sandboxd". Every
+// other name, including unknown ones, is returned trimmed and unchanged.
+func NormalizeRemoteExecProvider(name string) (canonical string, deprecatedAlias bool) {
+	name = strings.TrimSpace(name)
+	if name == remoteExecProviderMacAlias {
+		return RemoteExecProviderSandboxd, true
+	}
+	return name, false
+}
+
+// RemoteExecProviderMacDeprecation is the one warning every "mac" entry point
+// prints, completed with where the alias appeared.
+func RemoteExecProviderMacDeprecation(where string) string {
+	return fmt.Sprintf("%s: remote execution provider %q is deprecated and will be removed in the next release; use %q", where, remoteExecProviderMacAlias, RemoteExecProviderSandboxd)
+}
+
+// SandboxdProviderConfig is the [remote_exec.sandboxd] section: a sandboxd
+// gateway, an E2B-compatible API, as an opt-in remote provider. It is
+// capacity-limited on-prem compute with no dollar cost: concurrency follows the
+// capacity the gateway reports at GET /sandboxd/capacity.
+type SandboxdProviderConfig struct {
 	APIKeyFile        string
 	Template          string
 	OMPTemplate       string
 	BaseURL           string
 	EnvdBaseURL       string
 	OMPLinuxARM64File string
-	// CredentialGatewayURL is the gateway origin Mac guests dial (the sandboxd
-	// relay). The daemon's one gateway listener also advertises it, beside
-	// [remote_exec].credential_gateway_url. Empty means Mac guests use that URL.
+	// CredentialGatewayURL is the gateway origin sandboxd guests dial (the
+	// sandboxd relay). The daemon's one gateway listener also advertises it,
+	// beside [remote_exec].credential_gateway_url. Empty means sandboxd guests
+	// use that URL.
 	CredentialGatewayURL string
-	MaxConcurrent        int
+	// MaxConcurrent is an optional operator ceiling on the reported capacity;
+	// 0 means no extra ceiling. Against a sandboxd without the capacity
+	// endpoint it is the whole cap.
+	MaxConcurrent int
 }
 
 // DefaultRemoteExecConfig preserves today's local backend and cloud identity.
@@ -109,7 +141,8 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		return RemoteExecConfig{}, err
 	}
 	cfg := DefaultRemoteExecConfig()
-	current, mac := false, false
+	current, provider := false, false
+	providerSection, sawSandboxd, sawMac := "", false, false
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -117,13 +150,24 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		if section, ok := sectionHeader(line); ok {
 			current = section == "remote_exec"
-			mac = section == "remote_exec.mac"
-			if mac && cfg.Mac == nil {
-				cfg.Mac = &MacProviderConfig{}
+			provider = section == "remote_exec.sandboxd" || section == "remote_exec.mac"
+			if provider {
+				providerSection = "[" + section + "]"
+				if section == "remote_exec.mac" {
+					sawMac = true
+				} else {
+					sawSandboxd = true
+				}
+				if sawMac && sawSandboxd {
+					return RemoteExecConfig{}, errors.New("config.toml declares both [remote_exec.sandboxd] and its deprecated alias [remote_exec.mac]: keep only [remote_exec.sandboxd]")
+				}
+				if cfg.Sandboxd == nil {
+					cfg.Sandboxd = &SandboxdProviderConfig{}
+				}
 			}
 			continue
 		}
-		if !current && !mac {
+		if !current && !provider {
 			continue
 		}
 		key, value, ok := strings.Cut(line, "=")
@@ -132,18 +176,18 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		}
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
-		if mac {
-			if err := parseMacProviderKey(cfg.Mac, key, value); err != nil {
+		if provider {
+			if err := parseSandboxdProviderKey(cfg.Sandboxd, providerSection, key, value); err != nil {
 				return RemoteExecConfig{}, err
 			}
 			continue
 		}
 		switch key {
 		case "provider", "e2b_envd_base_url", "omp_linux_arm64_file":
-			// These once selected the Mac provider for the whole home. The
+			// These once selected the sandboxd provider for the whole home. The
 			// provider is now chosen per job, so a home-wide value is refused
 			// rather than ignored.
-			return RemoteExecConfig{}, fmt.Errorf("[remote_exec].%s is not supported: declare the Mac provider in [remote_exec.mac] and opt a job in with --exec-provider mac", key)
+			return RemoteExecConfig{}, fmt.Errorf("[remote_exec].%s is not supported: declare the sandboxd provider in [remote_exec.sandboxd] and opt a job in with --exec-provider sandboxd", key)
 		case "backend":
 			parsed, err := parseConfigString(value)
 			if err != nil {
@@ -215,6 +259,9 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 	if err := validateRemoteExecConfig(cfg); err != nil {
 		return RemoteExecConfig{}, err
 	}
+	if sawMac {
+		cfg.Deprecations = append(cfg.Deprecations, "config.toml: section [remote_exec.mac] is deprecated and will be removed in the next release; rename it to [remote_exec.sandboxd] (same keys)")
+	}
 	return cfg, nil
 }
 
@@ -222,8 +269,8 @@ func validateRemoteExecConfig(cfg RemoteExecConfig) error {
 	if err := cfg.ExecBackendCost.Validate(); err != nil {
 		return err
 	}
-	if cfg.Mac != nil {
-		if err := cfg.Mac.validate(cfg); err != nil {
+	if cfg.Sandboxd != nil {
+		if err := cfg.Sandboxd.validate(cfg); err != nil {
 			return err
 		}
 	}
@@ -275,11 +322,11 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 	if err := validateE2BBaseURL(cfg.E2BBaseURL); err != nil {
 		return fmt.Errorf("invalid [remote_exec].e2b_base_url: %w", err)
 	}
-	if cfg.Provider == RemoteExecProviderMac {
-		if cfg.Mac == nil {
-			return fmt.Errorf("the mac remote provider is not configured: add a [remote_exec.mac] section")
+	if cfg.Provider == RemoteExecProviderSandboxd {
+		if cfg.Sandboxd == nil {
+			return fmt.Errorf("the sandboxd remote provider is not configured: add a [remote_exec.sandboxd] section")
 		}
-		if err := cfg.Mac.validate(cfg); err != nil {
+		if err := cfg.Sandboxd.validate(cfg); err != nil {
 			return err
 		}
 	}
@@ -290,32 +337,36 @@ func (cfg RemoteExecConfig) ValidateE2BProvider() error {
 }
 
 // ForProvider returns the configuration one remote job runs with. An empty
-// name is the default, cloud E2B. "mac" substitutes [remote_exec.mac] for the
-// E2B endpoint, credentials, templates and caps; the gateway listener and the
-// rest of the section are shared. Any other name, or "mac" without its section,
-// is refused rather than falling back to E2B.
+// name is the default, cloud E2B. "sandboxd" (or its deprecated alias "mac")
+// substitutes [remote_exec.sandboxd] for the E2B endpoint, credentials,
+// templates and caps; the gateway listener and the rest of the section are
+// shared. Any other name, or "sandboxd" without its section, is refused rather
+// than falling back to E2B.
 func (cfg RemoteExecConfig) ForProvider(name string) (RemoteExecConfig, error) {
-	switch strings.TrimSpace(name) {
+	canonical, _ := NormalizeRemoteExecProvider(name)
+	switch canonical {
 	case "", RemoteExecProviderE2B:
 		cfg.Provider = RemoteExecProviderE2B
 		return cfg, nil
-	case RemoteExecProviderMac:
-		if cfg.Mac == nil {
-			return RemoteExecConfig{}, fmt.Errorf("remote execution provider %q is not configured: add a [remote_exec.mac] section to config.toml", RemoteExecProviderMac)
+	case RemoteExecProviderSandboxd:
+		if cfg.Sandboxd == nil {
+			return RemoteExecConfig{}, fmt.Errorf("remote execution provider %q is not configured: add a [remote_exec.sandboxd] section to config.toml", RemoteExecProviderSandboxd)
 		}
-		mac := *cfg.Mac
-		cfg.Provider = RemoteExecProviderMac
-		cfg.E2BAPIKeyFile = mac.APIKeyFile
-		cfg.E2BTemplate = mac.Template
-		cfg.E2BOMPTemplate = mac.OMPTemplate
-		cfg.E2BBaseURL = mac.BaseURL
+		sandboxd := *cfg.Sandboxd
+		cfg.Provider = RemoteExecProviderSandboxd
+		cfg.E2BAPIKeyFile = sandboxd.APIKeyFile
+		cfg.E2BTemplate = sandboxd.Template
+		cfg.E2BOMPTemplate = sandboxd.OMPTemplate
+		cfg.E2BBaseURL = sandboxd.BaseURL
 		cfg.E2BDomain = ""
-		cfg.E2BEnvdBaseURL = mac.EnvdBaseURL
-		cfg.OMPLinuxARM64File = mac.OMPLinuxARM64File
-		cfg.ExecBackendCost = ExecBackendCostConfig{MaxConcurrent: mac.MaxConcurrent}
+		cfg.E2BEnvdBaseURL = sandboxd.EnvdBaseURL
+		cfg.OMPLinuxARM64File = sandboxd.OMPLinuxARM64File
+		// The ceiling only: the effective cap is read from the gateway's
+		// reported capacity at admission (#30).
+		cfg.ExecBackendCost = ExecBackendCostConfig{MaxConcurrent: sandboxd.MaxConcurrent}
 		return cfg, nil
 	default:
-		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %q and %q", name, RemoteExecProviderE2B, RemoteExecProviderMac)
+		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %q and %q", strings.TrimSpace(name), RemoteExecProviderE2B, RemoteExecProviderSandboxd)
 	}
 }
 
@@ -374,8 +425,8 @@ func (cfg RemoteExecConfig) ReviewChecksTemplateError(route ReviewChecksRoute, o
 }
 
 func (cfg RemoteExecConfig) reviewChecksSection() string {
-	if cfg.Provider == RemoteExecProviderMac {
-		return "[remote_exec.mac]"
+	if cfg.Provider == RemoteExecProviderSandboxd {
+		return "[remote_exec.sandboxd]"
 	}
 	return "[remote_exec]"
 }
@@ -383,8 +434,8 @@ func (cfg RemoteExecConfig) reviewChecksSection() string {
 // ProviderCredentialGatewayURL is the gateway origin guests of this view's
 // provider dial.
 func (cfg RemoteExecConfig) ProviderCredentialGatewayURL() string {
-	if cfg.Provider == RemoteExecProviderMac && cfg.Mac != nil && cfg.Mac.CredentialGatewayURL != "" {
-		return cfg.Mac.CredentialGatewayURL
+	if cfg.Provider == RemoteExecProviderSandboxd && cfg.Sandboxd != nil && cfg.Sandboxd.CredentialGatewayURL != "" {
+		return cfg.Sandboxd.CredentialGatewayURL
 	}
 	return cfg.CredentialGatewayURL
 }
@@ -394,25 +445,28 @@ func (cfg RemoteExecConfig) ProviderCredentialGatewayURL() string {
 // provider a job uses, so every job shares one listener.
 func (cfg RemoteExecConfig) CredentialGatewayURLs() []string {
 	urls := []string{cfg.CredentialGatewayURL}
-	if cfg.Mac != nil && cfg.Mac.CredentialGatewayURL != "" && cfg.Mac.CredentialGatewayURL != cfg.CredentialGatewayURL {
-		urls = append(urls, cfg.Mac.CredentialGatewayURL)
+	if cfg.Sandboxd != nil && cfg.Sandboxd.CredentialGatewayURL != "" && cfg.Sandboxd.CredentialGatewayURL != cfg.CredentialGatewayURL {
+		urls = append(urls, cfg.Sandboxd.CredentialGatewayURL)
 	}
 	return urls
 }
 
-func parseMacProviderKey(mac *MacProviderConfig, key, value string) error {
+// parseSandboxdProviderKey parses one key of the provider section, named in
+// errors as it was written ([remote_exec.sandboxd] or the deprecated
+// [remote_exec.mac]).
+func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, value string) error {
 	if key == "max_concurrent" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil {
-			return fmt.Errorf("parse [remote_exec.mac].max_concurrent: expected an integer: %w", err)
+			return fmt.Errorf("parse %s.max_concurrent: expected an integer: %w", section, err)
 		}
-		mac.MaxConcurrent = parsed
+		sandboxd.MaxConcurrent = parsed
 		return nil
 	}
 	fields := map[string]*string{
-		"api_key_file": &mac.APIKeyFile, "template": &mac.Template, "omp_template": &mac.OMPTemplate,
-		"base_url": &mac.BaseURL, "envd_base_url": &mac.EnvdBaseURL,
-		"omp_linux_arm64_file": &mac.OMPLinuxARM64File, "credential_gateway_url": &mac.CredentialGatewayURL,
+		"api_key_file": &sandboxd.APIKeyFile, "template": &sandboxd.Template, "omp_template": &sandboxd.OMPTemplate,
+		"base_url": &sandboxd.BaseURL, "envd_base_url": &sandboxd.EnvdBaseURL,
+		"omp_linux_arm64_file": &sandboxd.OMPLinuxARM64File, "credential_gateway_url": &sandboxd.CredentialGatewayURL,
 	}
 	field, ok := fields[key]
 	if !ok {
@@ -421,40 +475,42 @@ func parseMacProviderKey(mac *MacProviderConfig, key, value string) error {
 	}
 	parsed, err := parseConfigString(value)
 	if err != nil {
-		return fmt.Errorf("parse [remote_exec.mac].%s: %w", key, err)
+		return fmt.Errorf("parse %s.%s: %w", section, key, err)
 	}
 	*field = strings.TrimSpace(parsed)
 	return nil
 }
 
-// validate checks [remote_exec.mac] without reading its API key, so a declared
-// Mac provider cannot break a home that never uses it.
-func (mac MacProviderConfig) validate(cfg RemoteExecConfig) error {
-	if mac.APIKeyFile == "" || !filepath.IsAbs(mac.APIKeyFile) {
-		return fmt.Errorf("[remote_exec.mac].api_key_file must be an absolute path")
+// validate checks [remote_exec.sandboxd] without reading its API key, so a
+// declared sandboxd provider cannot break a home that never uses it.
+func (sandboxd SandboxdProviderConfig) validate(cfg RemoteExecConfig) error {
+	if sandboxd.APIKeyFile == "" || !filepath.IsAbs(sandboxd.APIKeyFile) {
+		return fmt.Errorf("[remote_exec.sandboxd].api_key_file must be an absolute path")
 	}
-	if mac.Template == "" {
-		return fmt.Errorf("[remote_exec.mac].template is required")
+	if sandboxd.Template == "" {
+		return fmt.Errorf("[remote_exec.sandboxd].template is required")
 	}
-	for key, value := range map[string]string{"base_url": mac.BaseURL, "envd_base_url": mac.EnvdBaseURL} {
+	for key, value := range map[string]string{"base_url": sandboxd.BaseURL, "envd_base_url": sandboxd.EnvdBaseURL} {
 		parsed, err := url.Parse(value)
 		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
 			parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return fmt.Errorf("[remote_exec.mac].%s must be an HTTPS origin without path, query, credentials, or fragment", key)
+			return fmt.Errorf("[remote_exec.sandboxd].%s must be an HTTPS origin without path, query, credentials, or fragment", key)
 		}
 	}
-	if mac.OMPLinuxARM64File != "" && !filepath.IsAbs(mac.OMPLinuxARM64File) {
-		return fmt.Errorf("[remote_exec.mac].omp_linux_arm64_file must be an absolute path")
+	if sandboxd.OMPLinuxARM64File != "" && !filepath.IsAbs(sandboxd.OMPLinuxARM64File) {
+		return fmt.Errorf("[remote_exec.sandboxd].omp_linux_arm64_file must be an absolute path")
 	}
-	if mac.MaxConcurrent <= 0 {
-		return fmt.Errorf("[remote_exec.mac].max_concurrent must be positive: it is the Mac's sandbox capacity")
+	// max_concurrent is an optional ceiling: the gateway reports the real
+	// capacity. Absent or 0 adds no ceiling; negative is a typo, not a policy.
+	if sandboxd.MaxConcurrent < 0 {
+		return fmt.Errorf("[remote_exec.sandboxd].max_concurrent must not be negative: it is an optional ceiling on the capacity sandboxd reports (0 or absent means no extra ceiling)")
 	}
-	if mac.CredentialGatewayURL != "" {
+	if sandboxd.CredentialGatewayURL != "" {
 		if strings.TrimSpace(cfg.CredentialGatewayListen) == "" {
-			return fmt.Errorf("[remote_exec.mac].credential_gateway_url requires [remote_exec].credential_gateway_listen and credential_gateway_url")
+			return fmt.Errorf("[remote_exec.sandboxd].credential_gateway_url requires [remote_exec].credential_gateway_listen and credential_gateway_url")
 		}
-		if err := (RemoteExecConfig{CredentialGatewayListen: cfg.CredentialGatewayListen, CredentialGatewayURL: mac.CredentialGatewayURL}).ValidateCredentialGateway(); err != nil {
-			return fmt.Errorf("[remote_exec.mac].credential_gateway_url: %w", err)
+		if err := (RemoteExecConfig{CredentialGatewayListen: cfg.CredentialGatewayListen, CredentialGatewayURL: sandboxd.CredentialGatewayURL}).ValidateCredentialGateway(); err != nil {
+			return fmt.Errorf("[remote_exec.sandboxd].credential_gateway_url: %w", err)
 		}
 	}
 	return nil
