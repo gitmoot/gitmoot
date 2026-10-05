@@ -46,7 +46,7 @@ var remoteReviewCapWaitNow = func() time.Time { return time.Now().UTC() }
 // instead of cause. Any other cause, or a lost compare-and-set, returns
 // neither, and the caller fails the job as before.
 func (w jobWorker) waitForRemoteReviewCapacity(ctx context.Context, job db.Job, provider string, bound time.Duration, cause error) (requeued bool, expired error) {
-	sandboxd := provider == config.RemoteExecProviderSandboxd
+	sandboxd := config.IsSandboxdProvider(provider)
 	if !remoteReviewCapacityWaitCause(cause, sandboxd) {
 		return false, nil
 	}

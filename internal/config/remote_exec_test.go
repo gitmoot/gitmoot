@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -82,6 +84,7 @@ func TestRemoteExecSandboxdProviderIsAnOptInViewBesideE2B(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	ompARM64 := writeTestLinuxELF(t, keyDir, "omp-linux-arm64", elfMachineAARCH64)
 	e2bSection := fmt.Sprintf(`[remote_exec]
 backend = "remote"
 e2b_api_key_file = %q
@@ -100,10 +103,10 @@ template = "review-arm64"
 omp_template = "review-arm64"
 base_url = "https://sandboxd.example:8443"
 envd_base_url = "https://sandboxd.example:8443"
-omp_linux_arm64_file = "/opt/gitmoot/omp-linux-arm64"
+omp_linux_arm64_file = %q
 credential_gateway_url = "https://192.168.128.1:43181"
 max_concurrent = 1
-`, sandboxdKey)
+`, sandboxdKey, ompARM64)
 	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+sandboxdSection))
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +124,7 @@ max_concurrent = 1
 	}
 	if sandboxd.Provider != RemoteExecProviderSandboxd || sandboxd.E2BAPIKeyFile != sandboxdKey || sandboxd.E2BBaseURL != "https://sandboxd.example:8443" ||
 		sandboxd.E2BEnvdBaseURL != "https://sandboxd.example:8443" || sandboxd.E2BTemplate != "review-arm64" || sandboxd.E2BOMPTemplate != "review-arm64" ||
-		sandboxd.OMPLinuxARM64File != "/opt/gitmoot/omp-linux-arm64" || sandboxd.E2BDomain != "" ||
+		sandboxd.OMPLinuxFile != ompARM64 || sandboxd.OMPGuestArch != "arm64" || sandboxd.E2BDomain != "" ||
 		sandboxd.ExecBackendCost != (ExecBackendCostConfig{MaxConcurrent: 1}) {
 		t.Fatalf("sandboxd view kept E2B values: %+v", sandboxd)
 	}
@@ -152,7 +155,7 @@ max_concurrent = 1
 		"negative ceiling":       strings.Replace(sandboxdSection, "max_concurrent = 1", "max_concurrent = -1", 1),
 		"plain HTTP control":     strings.Replace(sandboxdSection, `base_url = "https://sandboxd.example:8443"`, `base_url = "http://sandboxd.example:8443"`, 1),
 		"envd with a path":       strings.Replace(sandboxdSection, `envd_base_url = "https://sandboxd.example:8443"`, `envd_base_url = "https://sandboxd.example:8443/envd"`, 1),
-		"relative ARM64 runtime": strings.Replace(sandboxdSection, `"/opt/gitmoot/omp-linux-arm64"`, `"omp-linux-arm64"`, 1),
+		"relative ARM64 runtime": strings.Replace(sandboxdSection, fmt.Sprintf("%q", ompARM64), `"omp-linux-arm64"`, 1),
 	} {
 		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2bSection+broken)); err == nil {
 			t.Errorf("%s: invalid [remote_exec.sandboxd] accepted", name)
@@ -209,6 +212,169 @@ func TestRemoteExecMacSectionIsADeprecatedSandboxdAlias(t *testing.T) {
 	_, err = LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.sandboxd]"+body+"\n[remote_exec.mac]"+body))
 	if err == nil || !strings.Contains(err.Error(), "both") {
 		t.Fatalf("both sections loaded: %v", err)
+	}
+}
+
+const (
+	elfMachineAARCH64 = 183
+	elfMachineX86_64  = 62
+)
+
+// writeTestLinuxELF writes a minimal executable ELF64 header for machine; the
+// OMP verifier reads it and never runs it.
+func writeTestLinuxELF(t *testing.T, dir, name string, machine uint16) string {
+	t.Helper()
+	header := make([]byte, 64)
+	copy(header, "\x7fELF")
+	header[4], header[5], header[6], header[7] = 2, 1, 1, 3
+	binary.LittleEndian.PutUint16(header[16:], 2) // ET_EXEC
+	binary.LittleEndian.PutUint16(header[18:], machine)
+	binary.LittleEndian.PutUint32(header[20:], 1)
+	binary.LittleEndian.PutUint16(header[52:], 64)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, header, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// A home declares the Mac gateway and the Linux Firecracker gateway side by
+// side. Each provider is its own view: endpoint (plain HTTP on loopback for
+// the Linux gateway), key, templates, ceiling, gateway origin, and an OMP
+// upload whose key declares the guest architecture. The listener advertises
+// both gateway origins, and a binary for the wrong architecture is refused
+// before any review runs.
+func TestRemoteExecLoadsSandboxdAndSandboxdLinuxProviders(t *testing.T) {
+	dir := t.TempDir()
+	keys := map[string]string{}
+	for _, name := range []string{"e2b", "sandboxd", "sandboxd-linux"} {
+		keys[name] = filepath.Join(dir, name+"-api-key")
+		if err := os.WriteFile(keys[name], []byte("private-"+name+"-key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ompARM64 := writeTestLinuxELF(t, dir, "omp-linux-arm64", elfMachineAARCH64)
+	ompAMD64 := writeTestLinuxELF(t, dir, "omp-linux-amd64", elfMachineX86_64)
+	e2b := fmt.Sprintf(`[remote_exec]
+backend = "local"
+e2b_api_key_file = %q
+e2b_template = "base"
+credential_gateway_listen = "0.0.0.0:8443"
+credential_gateway_url = "https://203.0.113.7:8443"
+`, keys["e2b"])
+	mac := fmt.Sprintf(`
+[remote_exec.sandboxd]
+api_key_file = %q
+template = "review-arm64"
+omp_template = "review-arm64"
+base_url = "https://sandboxd.example:8443"
+envd_base_url = "https://sandboxd.example:8443"
+omp_linux_arm64_file = %q
+credential_gateway_url = "https://192.168.128.1:43181"
+max_concurrent = 1
+`, keys["sandboxd"], ompARM64)
+	linux := fmt.Sprintf(`
+[remote_exec."sandboxd-linux"]
+api_key_file = %q
+template = "review-amd64"
+omp_template = "review-amd64"
+base_url = "http://127.0.0.1:43190"
+envd_base_url = "http://127.0.0.1:43190"
+omp_linux_amd64_file = %q
+credential_gateway_url = "https://10.0.2.2:8443"
+max_concurrent = 2
+`, keys["sandboxd-linux"], ompAMD64)
+	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+mac+linux))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []struct {
+		provider, key, template, base, arch, omp, gateway string
+		ceiling                                           int
+	}{
+		{"sandboxd", keys["sandboxd"], "review-arm64", "https://sandboxd.example:8443", "arm64", ompARM64, "https://192.168.128.1:43181", 1},
+		{"sandboxd-linux", keys["sandboxd-linux"], "review-amd64", "http://127.0.0.1:43190", "amd64", ompAMD64, "https://10.0.2.2:8443", 2},
+	} {
+		view, err := cfg.ForProvider(want.provider)
+		if err != nil {
+			t.Fatalf("ForProvider(%q): %v", want.provider, err)
+		}
+		if view.Provider != want.provider || view.E2BAPIKeyFile != want.key || view.E2BTemplate != want.template || view.E2BOMPTemplate != want.template ||
+			view.E2BBaseURL != want.base || view.E2BEnvdBaseURL != want.base || view.OMPGuestArch != want.arch || view.OMPLinuxFile != want.omp ||
+			view.ProviderCredentialGatewayURL() != want.gateway || view.ExecBackendCost != (ExecBackendCostConfig{MaxConcurrent: want.ceiling}) {
+			t.Fatalf("ForProvider(%q) = %+v; want %+v", want.provider, view, want)
+		}
+		if err := cfg.ValidateProvider(want.provider); err != nil {
+			t.Fatalf("configured provider %q refused: %v", want.provider, err)
+		}
+	}
+	if got, want := cfg.CredentialGatewayURLs(), []string{"https://203.0.113.7:8443", "https://192.168.128.1:43181", "https://10.0.2.2:8443"}; !slices.Equal(got, want) {
+		t.Fatalf("CredentialGatewayURLs = %q, want %q", got, want)
+	}
+	if len(cfg.Deprecations) != 0 {
+		t.Fatalf("deprecations = %q", cfg.Deprecations)
+	}
+
+	// The unquoted section spelling declares the same provider.
+	unquoted, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+strings.Replace(linux, `[remote_exec."sandboxd-linux"]`, "[remote_exec.sandboxd-linux]", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view, err := unquoted.ForProvider("sandboxd-linux"); err != nil || view.E2BTemplate != "review-amd64" {
+		t.Fatalf("[remote_exec.sandboxd-linux] = %+v, %v", view, err)
+	}
+	// Declaring only the Mac gateway leaves sandboxd-linux undeclared.
+	macOnly, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+mac))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := macOnly.ValidateProvider("sandboxd-linux"); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd-linux]") {
+		t.Fatalf("undeclared sandboxd-linux accepted: %v", err)
+	}
+
+	// The key declares the architecture: an ARM64 binary under the AMD64 key,
+	// or a missing file, is refused for that provider alone.
+	for name, section := range map[string]string{
+		"arm64 binary for amd64 guests": strings.Replace(linux, fmt.Sprintf("%q", ompAMD64), fmt.Sprintf("%q", ompARM64), 1),
+		"missing amd64 binary":          strings.Replace(linux, fmt.Sprintf("%q", ompAMD64), fmt.Sprintf("%q", filepath.Join(dir, "absent")), 1),
+	} {
+		loaded, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+mac+section))
+		if err != nil {
+			t.Fatalf("%s: load: %v", name, err)
+		}
+		if err := loaded.ValidateProvider("sandboxd-linux"); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd-linux].omp_linux_amd64_file") {
+			t.Fatalf("%s: ValidateProvider = %v; want a refusal naming omp_linux_amd64_file", name, err)
+		}
+		if err := loaded.ValidateProvider("sandboxd"); err != nil {
+			t.Fatalf("%s: the Mac provider was refused too: %v", name, err)
+		}
+	}
+	for name, broken := range map[string]string{
+		"both architectures":     strings.Replace(linux, "omp_linux_amd64_file", fmt.Sprintf("omp_linux_arm64_file = %q\nomp_linux_amd64_file", ompARM64), 1),
+		"plain HTTP off-host":    strings.ReplaceAll(linux, "http://127.0.0.1:43190", "http://198.51.100.4:43190"),
+		"plain HTTP localhost":   strings.ReplaceAll(linux, "http://127.0.0.1:43190", "http://localhost:43190"),
+		"relative amd64 runtime": strings.Replace(linux, fmt.Sprintf("%q", ompAMD64), `"omp-linux-amd64"`, 1),
+	} {
+		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+broken)); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd-linux]") {
+			t.Errorf("%s: invalid [remote_exec.sandboxd-linux] = %v; want a refusal naming the section", name, err)
+		}
+	}
+}
+
+// TOML refuses a table defined twice. Both spellings of one provider, or the
+// same header repeated, must not merge silently with later keys winning.
+func TestRemoteExecRefusesASandboxdProviderDeclaredTwice(t *testing.T) {
+	section := func(header, template string) string {
+		return fmt.Sprintf("\n%s\ntemplate = %q\nbase_url = \"http://127.0.0.1:43190\"\n", header, template)
+	}
+	for name, content := range map[string]string{
+		"both spellings": section("[remote_exec.sandboxd-linux]", "first") + section(`[remote_exec."sandboxd-linux"]`, "second"),
+		"same header":    section("[remote_exec.sandboxd]", "first") + section("[remote_exec.sandboxd]", "second"),
+	} {
+		_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec]\nbackend = \"local\"\n"+content))
+		if err == nil || !strings.Contains(err.Error(), "twice") {
+			t.Errorf("%s: err = %v; want a refusal that the provider is declared twice", name, err)
+		}
 	}
 }
 

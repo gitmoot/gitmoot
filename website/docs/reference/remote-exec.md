@@ -89,7 +89,18 @@ job and survives retries (the disk guard and `remote_routing_enabled` policy
 use E2B only). An unknown provider, or `sandboxd` without its section, is
 refused at request time. sandboxd attempts reserve no dollars; E2B attempts
 count only against the E2B caps. Reconciliation lists and settles each provider
-separately. One credential gateway listener serves both providers' origins.
+separately. One credential gateway listener serves every provider's origin, and
+its certificate covers each advertised host.
+
+A second sandboxd gateway, `sandboxd-linux` (Linux AMD64 Firecracker VMs on the
+Gitmoot host), is declared in `[remote_exec."sandboxd-linux"]` with the same
+keys, and is selected with `--exec-provider sandboxd-linux` or
+`checks_provider = "sandboxd-linux"`. Its endpoint may be plain HTTP on
+loopback (`http://127.0.0.1:43190`), it sets `omp_linux_amd64_file` instead of
+`omp_linux_arm64_file` (the key declares the guest architecture; setting both is
+a load error), and its guests reach the credential gateway at
+`https://10.0.2.2:8443`. Its capacity, ceiling and ledger rows are its own.
+`gitmoot doctor` refuses a missing or wrong-architecture OMP file.
 
 sandboxd's concurrency follows its `GET /sandboxd/capacity` report, read before
 each reservation and cached for 10 seconds (errors are not cached; a sandboxd
@@ -149,7 +160,7 @@ image (#2316):
 ```toml
 [repos."owner/repo".review]
 checks_backend = "remote"          # the only value
-checks_provider = "e2b"            # or "sandboxd"; default "e2b"
+checks_provider = "e2b"            # or "sandboxd" / "sandboxd-linux"; default "e2b"
 checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 ```
 

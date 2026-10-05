@@ -99,9 +99,20 @@ type ExecBackendCapRefusal struct {
 	MaxConcurrentTemplate int
 }
 
-// ExecBackendProviderSandboxd is the only provider admitted by capacity rather
-// than dollars. It matches config.RemoteExecProviderSandboxd.
-const ExecBackendProviderSandboxd = "sandboxd"
+// ExecBackendProviderSandboxd and ExecBackendProviderSandboxdLinux are the
+// only providers admitted by capacity rather than dollars. They match
+// config.RemoteExecProviderSandboxd and RemoteExecProviderSandboxdLinux; each
+// keeps its own ledger rows, so one gateway's cap never counts the other's.
+const (
+	ExecBackendProviderSandboxd      = "sandboxd"
+	ExecBackendProviderSandboxdLinux = "sandboxd-linux"
+)
+
+// execBackendCapacityProvider reports whether provider is admitted by
+// reported capacity.
+func execBackendCapacityProvider(provider string) bool {
+	return provider == ExecBackendProviderSandboxd || provider == ExecBackendProviderSandboxdLinux
+}
 
 // ExecBackendCapClauseCapacity refuses before any row is written because the
 // provider reported no usable capacity, or its capacity could not be read. It

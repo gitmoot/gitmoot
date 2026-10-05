@@ -49,9 +49,10 @@ func execBackendStoreCap(cfg config.ExecBackendCostConfig) db.ExecBackendCostCap
 //
 // A non-nil refusal is returned before any row is written; otherwise the
 // returned policy goes to the store's guarded INSERT.
-func execBackendSandboxdCap(ceiling int, capacity e2b.Capacity, capErr error, template string) (db.ExecBackendCostCap, error) {
+func execBackendSandboxdCap(provider string, ceiling int, capacity e2b.Capacity, capErr error, template string) (db.ExecBackendCostCap, error) {
+	section := config.SandboxdProviderSection(provider)
 	if ceiling < 0 {
-		return db.ExecBackendCostCap{DenyReason: "[remote_exec.sandboxd].max_concurrent must not be negative"}, nil
+		return db.ExecBackendCostCap{DenyReason: section + ".max_concurrent must not be negative"}, nil
 	}
 	switch {
 	case capErr == nil:
@@ -59,9 +60,9 @@ func execBackendSandboxdCap(ceiling int, capacity e2b.Capacity, capErr error, te
 		if ceiling > 0 {
 			return db.ExecBackendCostCap{Configured: true, CapacityOnly: true, MaxConcurrent: ceiling}, nil
 		}
-		return db.ExecBackendCostCap{DenyReason: "sandboxd does not report capacity (GET /sandboxd/capacity answered 404) and no ceiling is configured: upgrade sandboxd to a release with the capacity endpoint, or set [remote_exec.sandboxd].max_concurrent"}, nil
+		return db.ExecBackendCostCap{DenyReason: "sandboxd does not report capacity (GET /sandboxd/capacity answered 404) and no ceiling is configured: upgrade sandboxd to a release with the capacity endpoint, or set " + section + ".max_concurrent"}, nil
 	case errors.Is(capErr, e2b.ErrCapacityAuth):
-		return db.ExecBackendCostCap{DenyReason: "sandboxd refused the configured API key for its capacity report: check [remote_exec.sandboxd].api_key_file: " + capErr.Error()}, nil
+		return db.ExecBackendCostCap{DenyReason: "sandboxd refused the configured API key for its capacity report: check " + section + ".api_key_file: " + capErr.Error()}, nil
 	default:
 		return db.ExecBackendCostCap{}, &db.ExecBackendCapRefusal{Clause: db.ExecBackendCapClauseCapacity,
 			DenyReason: "sandboxd capacity could not be read: " + capErr.Error()}
