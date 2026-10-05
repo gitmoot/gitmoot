@@ -19,7 +19,7 @@ import (
 
 // remoteProviderTestHome writes a home whose default remote provider is E2B
 // and, when section is set, declares the opt-in sandboxd provider beside it
-// under that section name ("sandboxd", or the deprecated "mac").
+// under that section name.
 func remoteProviderTestHome(t *testing.T, section string) string {
 	t.Helper()
 	home := t.TempDir()
@@ -131,43 +131,19 @@ func TestExecProviderRequestRefusesUnconfiguredAndUnknownProviders(t *testing.T)
 	}
 }
 
-// The provider was renamed from "mac" to "sandboxd". Production config and
-// queued payloads still say "mac", so for one release the old spelling is an
-// alias: --exec-provider mac warns and is stored as sandboxd, a home with only
-// [remote_exec.mac] serves it, and a queued "mac" payload resolves to the
-// sandboxd view. The new spelling works and does not warn.
-func TestSandboxdProviderAcceptsDeprecatedMacAlias(t *testing.T) {
-	provider, backend, err := requestExecProvider("mac", nil)
-	if err != nil || provider != "sandboxd" || backend == nil || *backend != "remote" {
-		t.Fatalf("--exec-provider mac = %q, %v, %v; want it stored as sandboxd on the remote backend", provider, backend, err)
+// The provider was renamed from "mac" to "sandboxd" (#2328) and the alias is
+// gone (#2329): --exec-provider mac and a queued "mac" payload are refused,
+// each naming "sandboxd", instead of running anywhere.
+func TestRemovedMacProviderIsRefusedNamingSandboxd(t *testing.T) {
+	if _, _, err := requestExecProvider("mac", nil); err == nil || !strings.Contains(err.Error(), `unknown --exec-provider "mac"`) || !strings.Contains(err.Error(), `renamed "sandboxd"`) {
+		t.Fatalf("--exec-provider mac = %v; want a refusal naming sandboxd", err)
 	}
-	if provider, _, err := requestExecProvider("sandboxd", nil); err != nil || provider != "sandboxd" {
-		t.Fatalf("--exec-provider sandboxd = %q, %v; want sandboxd", provider, err)
+	payload, err := daemonJobPayload(db.Job{ID: "queued-mac", Payload: `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		flag     string
-		warnings int
-	}{{"mac", 1}, {"sandboxd", 0}} {
-		var stderr strings.Builder
-		if _, ok := parseAgentRunOptions("review", []string{"reviewer", "review this", "--pr", "7", "--exec-provider", tc.flag}, &stderr); !ok {
-			t.Fatalf("--exec-provider %s refused: %s", tc.flag, stderr.String())
-		}
-		got := strings.Count(stderr.String(), `"mac" is deprecated`)
-		if got != tc.warnings || (tc.warnings > 0 && !strings.Contains(stderr.String(), `use "sandboxd"`)) {
-			t.Fatalf("--exec-provider %s stderr = %q; want %d deprecation warnings naming sandboxd", tc.flag, stderr.String(), tc.warnings)
-		}
-	}
-
-	legacyHome := remoteProviderTestHome(t, "mac")
-	for _, name := range []string{"mac", "sandboxd"} {
-		if err := validateRequestExecProvider(legacyHome, name); err != nil {
-			t.Fatalf("home with only [remote_exec.mac] refused provider %q: %v", name, err)
-		}
-	}
-	worker := jobWorker{Store: openExecBackendLedgerTestStore(t), ConfigHome: legacyHome, ConfigHomeExplicit: true}
-	// A payload queued before the upgrade still says "mac".
-	job := db.Job{ID: "queued-mac", Payload: `{"repo":"o/r","exec_backend":"remote","exec_provider":"mac"}`}
-	if cfg := providerSeenByProvision(t, worker, job); cfg.Provider != "sandboxd" || cfg.E2BBaseURL != "https://sandboxd.example:8443" || cfg.E2BTemplate != "review-arm64" {
-		t.Fatalf("queued mac payload provisioned with provider=%q base=%q template=%q; want the sandboxd view", cfg.Provider, cfg.E2BBaseURL, cfg.E2BTemplate)
+	worker := jobWorker{Store: openExecBackendLedgerTestStore(t), ConfigHome: remoteProviderTestHome(t, "sandboxd"), ConfigHomeExplicit: true}
+	if _, _, err := worker.resolveExecutionBackendForJob(db.Job{ID: "queued-mac"}, payload); err == nil || !strings.Contains(err.Error(), `"mac"`) || !strings.Contains(err.Error(), `renamed "sandboxd"`) {
+		t.Fatalf("queued mac payload resolved with err %v; want a refusal naming sandboxd", err)
 	}
 }

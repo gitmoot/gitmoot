@@ -184,7 +184,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
 	fs.StringVar(&opts.execBackend, "exec-backend", "", "execution backend for this review: local or remote (default local)")
-	fs.StringVar(&opts.execProvider, "exec-provider", "", "remote provider for this review: e2b (default), sandboxd or sandboxd-linux; a sandboxd provider implies --exec-backend remote and requires its [remote_exec.sandboxd] or [remote_exec.sandboxd-linux] section (\"mac\" is a deprecated alias for sandboxd)")
+	fs.StringVar(&opts.execProvider, "exec-provider", "", "remote provider for this review: e2b (default), sandboxd or sandboxd-linux; a sandboxd provider implies --exec-backend remote and requires its [remote_exec.sandboxd] or [remote_exec.sandboxd-linux] section")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
@@ -354,7 +354,6 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	// A review with no job-scoped selector is local regardless of process-wide
 	// configuration. This makes one remote review unable to reroute another.
-	warnDeprecatedExecProvider(stderr, opts.execProvider)
 	execProvider, selectedExecBackend, err := requestExecProvider(opts.execProvider, optionalStringPointer(opts.execBackend, opts.execBackendSet))
 	if err != nil {
 		return reviewRequestOutput{}, err

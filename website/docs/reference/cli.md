@@ -1376,10 +1376,8 @@ implies `--exec-backend remote`. `e2b`, the default, is cloud E2B; `sandboxd`
 runs the review on the Mac Studio's sandboxd and requires a
 `[remote_exec.sandboxd]` section; `sandboxd-linux` runs it on the Gitmoot
 host's Firecracker sandboxd and requires `[remote_exec."sandboxd-linux"]`; otherwise the request is refused before
-enqueue. `mac` is a deprecated alias for one release: it is accepted, prints
-`warning: --exec-provider: remote execution provider "mac" is deprecated and
-will be removed in the next release; use "sandboxd"` on stderr, and the job
-stores `sandboxd`. The choice is stored on the
+enqueue. The removed `mac` provider name is refused, naming `sandboxd`. The
+choice is stored on the
 job and kept across retries. A repository with `checks_backend = "remote"` in
 `[repos."owner/repo".review]` sends every review to its `checks_provider` and
 `checks_template`, whichever producer enqueued it (this command, PR fan-out,

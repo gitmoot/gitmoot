@@ -107,16 +107,12 @@ the provider (see Per-repository checks routing).
 A request for a provider that is unknown, or for `sandboxd` on a home without
 `[remote_exec.sandboxd]`, is refused before anything is enqueued.
 
-The provider was named `mac` before. For one release `[remote_exec.mac]`,
-`--exec-provider mac`, `checks_provider = "mac"` and queued jobs that stored
-`mac` are accepted as a deprecated alias of `sandboxd`; each prints a warning
-naming the replacement (`gitmoot daemon run` prints config deprecations once
-at start, on stderr). New jobs always store `sandboxd`, and existing ledger
-attempts are migrated to it. Declaring both `[remote_exec.sandboxd]` and
-`[remote_exec.mac]` is a load error. The alias is removed in the next minor
-release. Keep `max_concurrent` set while sandboxd may predate
-`GET /sandboxd/capacity`, and rename the section once that endpoint answers
-200 with the expected templates.
+The provider was named `mac` before #2328, and the alias is now removed:
+`[remote_exec.mac]` is a config load error naming `[remote_exec.sandboxd]`,
+and `--exec-provider mac`, `checks_provider = "mac"` and a queued job that
+stored `mac` are refused as an unknown provider, naming `sandboxd`. Existing
+ledger attempts were migrated to `sandboxd`. Keep `max_concurrent` set while
+sandboxd may predate `GET /sandboxd/capacity`.
 
 The `sandboxd` host requires Apple `container` 1.4.1 and its Linux kernel
 (`container system start --enable-kernel-install`). Build the credential-free

@@ -184,7 +184,7 @@ func sandboxdCapacityTestHome(t *testing.T, f *fakeSandboxd, section string, cei
 }
 
 // sandboxdTestBackend constructs the execution backend the daemon would use
-// for a job that opted into provider (the canonical name or its alias).
+// for a job that opted into provider.
 func sandboxdTestBackend(t *testing.T, f *fakeSandboxd, home, provider string) (execbackend.ExecutionBackend, *db.Store) {
 	t.Helper()
 	remote, err := config.LoadRemoteExecConfig(config.PathsForHome(home))
@@ -341,38 +341,4 @@ func TestSandboxdWithoutCapacityEndpointFallsBackToMaxConcurrent(t *testing.T) {
 			t.Fatalf("sandboxd saw %d creates; want none", posts)
 		}
 	})
-}
-
-// "mac" is the provider's old name. For one release a home that still
-// declares [remote_exec.mac] and a review requested with --exec-provider mac
-// keep working against the same gateway, capacity included, and the request
-// warns with the new name.
-func TestSandboxdMacAliasProvisionsOnTheGatewayAndWarns(t *testing.T) {
-	var stderr strings.Builder
-	if _, ok := parseAgentRunOptions("review", []string{"reviewer", "review this", "--pr", "7", "--exec-provider", "mac"}, &stderr); !ok {
-		t.Fatalf("--exec-provider mac refused: %s", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), `"mac" is deprecated`) || !strings.Contains(stderr.String(), `use "sandboxd"`) {
-		t.Fatalf("--exec-provider mac stderr = %q; want a deprecation naming sandboxd", stderr.String())
-	}
-
-	gateway := newFakeSandboxd(t)
-	gateway.reportCapacity(1, map[string]int{"review-arm64": 1})
-	home := sandboxdCapacityTestHome(t, gateway, "mac", 0)
-	if err := validateRequestExecProvider(home, "mac"); err != nil {
-		t.Fatalf("home with [remote_exec.mac] refused --exec-provider mac: %v", err)
-	}
-	backend, store := sandboxdTestBackend(t, gateway, home, "mac")
-	admitted, err := provisionUntilRefused(t, backend, 2)
-	if admitted != 1 {
-		t.Fatalf("admitted %d provisions through the alias (refusal %v); want the reported 1", admitted, err)
-	}
-	requireCapRefusal(t, err, "concurrency")
-	if gets, posts := gateway.counts(); gets == 0 || posts != 1 {
-		t.Fatalf("gateway saw %d capacity reads and %d creates; want at least 1 and 1", gets, posts)
-	}
-	rows, err := store.ListExecBackendAttemptsForJob(context.Background(), "job-1")
-	if err != nil || len(rows) != 1 || rows[0].Provider != "sandboxd" {
-		t.Fatalf("alias ledger rows = %+v, %v; want one stored under provider sandboxd", rows, err)
-	}
 }

@@ -160,25 +160,22 @@ func TestReviewChecksRoutingRefusesExplicitLocalBackend(t *testing.T) {
 
 // A review with no --exec-provider adopts checks_provider; before the fix the
 // absent flag compared as "" != "sandboxd" and every such review was refused,
-// attributed to an "--exec-provider e2b" nobody passed. The deprecated alias
-// checks_provider = "mac" routes the same way and is stored as sandboxd.
+// attributed to an "--exec-provider e2b" nobody passed.
 func TestReviewChecksRoutingSandboxdAdoptsProviderWithoutExecProvider(t *testing.T) {
-	for _, checksProvider := range []string{"sandboxd", "mac"} {
-		home, store, head := reviewChecksRoutingHomeWith(t, "e2b_template = \"base-tmpl\"\n",
-			"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \""+checksProvider+"\"\nchecks_template = \"swift-arm64\"\n")
-		output, failure := runReviewRequestJSON(t,
-			"--repo", "owner/repo", "--pr", "12", "--head", head,
-			"--branch", "feature/review", "--role", "joltra", "--home", home,
-			"--runtime", runtime.OmpRuntime, "--json",
-		)
-		if failure != "" {
-			t.Fatalf("checks_provider %s: %s", checksProvider, failure)
-		}
-		payload := reviewChecksPayload(t, store, output.JobID)
-		if payload["exec_backend"] != "remote" || payload["exec_provider"] != "sandboxd" || payload["exec_template"] != "swift-arm64" || payload["review_checks_routed"] != true {
-			t.Fatalf("checks_provider %s payload exec_backend=%v exec_provider=%v exec_template=%v review_checks_routed=%v; want remote, sandboxd, swift-arm64, true",
-				checksProvider, payload["exec_backend"], payload["exec_provider"], payload["exec_template"], payload["review_checks_routed"])
-		}
+	home, store, head := reviewChecksRoutingHomeWith(t, "e2b_template = \"base-tmpl\"\n",
+		"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"sandboxd\"\nchecks_template = \"swift-arm64\"\n")
+	output, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.OmpRuntime, "--json",
+	)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	payload := reviewChecksPayload(t, store, output.JobID)
+	if payload["exec_backend"] != "remote" || payload["exec_provider"] != "sandboxd" || payload["exec_template"] != "swift-arm64" || payload["review_checks_routed"] != true {
+		t.Fatalf("payload exec_backend=%v exec_provider=%v exec_template=%v review_checks_routed=%v; want remote, sandboxd, swift-arm64, true",
+			payload["exec_backend"], payload["exec_provider"], payload["exec_template"], payload["review_checks_routed"])
 	}
 }
 

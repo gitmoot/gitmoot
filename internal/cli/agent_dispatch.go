@@ -77,14 +77,14 @@ func reviewDispatchExecBackend(override *string) (execbackend.Backend, error) {
 // the remote backend when --exec-backend is omitted and contradicts an
 // explicit non-remote one. "e2b", the default, is stored as absent so payloads
 // carry exec_provider only for a sandboxd opt-in ("sandboxd" or
-// "sandboxd-linux"). The deprecated alias "mac" is stored as "sandboxd".
+// "sandboxd-linux").
 func requestExecProvider(provider string, backend *string) (string, *string, error) {
-	provider, _ = config.NormalizeRemoteExecProvider(provider)
+	provider = strings.TrimSpace(provider)
 	if provider == "" {
 		return "", backend, nil
 	}
 	if !config.IsRemoteExecProvider(provider) {
-		return "", nil, fmt.Errorf("unknown --exec-provider %q: allowed providers are %s", provider, config.RemoteExecProviderChoices())
+		return "", nil, config.UnknownRemoteExecProviderError("--exec-provider", provider)
 	}
 	if backend == nil {
 		remote := string(execbackend.Remote)
@@ -96,13 +96,6 @@ func requestExecProvider(provider string, backend *string) (string, *string, err
 		provider = ""
 	}
 	return provider, backend, nil
-}
-
-// warnDeprecatedExecProvider prints the deprecation for --exec-provider mac.
-func warnDeprecatedExecProvider(stderr io.Writer, provider string) {
-	if _, alias := config.NormalizeRemoteExecProvider(provider); alias && stderr != nil {
-		fmt.Fprintf(stderr, "warning: %s\n", config.RemoteExecProviderMacDeprecation("--exec-provider"))
-	}
 }
 
 // validateRequestExecProvider refuses an opted-in provider that this home does
