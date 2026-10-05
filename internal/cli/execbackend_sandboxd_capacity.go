@@ -50,12 +50,6 @@ func (c *sandboxdCapacityCache) get(ctx context.Context, key string, read func(c
 	return capacity, nil
 }
 
-// refresh reads the report now and caches it, bypassing the TTL.
-func (c *sandboxdCapacityCache) refresh(ctx context.Context, key string, read func(context.Context) (e2b.Capacity, error)) (e2b.Capacity, error) {
-	c.invalidate(key)
-	return c.get(ctx, key, read)
-}
-
 // invalidate drops key's report; sandboxd's create 409 proves it stale.
 func (c *sandboxdCapacityCache) invalidate(key string) {
 	c.mu.Lock()
