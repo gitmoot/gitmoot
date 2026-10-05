@@ -333,7 +333,7 @@ type localAgentDispatchRequest struct {
 	// pointer preserves explicit-local as distinct from absence.
 	ExecBackend *string
 	// ExecProvider is the remote provider an explicitly remote job runs on:
-	// empty for the default E2B, or "mac" for the opt-in Mac provider. It is
+	// empty for the default E2B, or "sandboxd" for the opt-in sandboxd gateway. It is
 	// refused at dispatch unless the job is remote and the provider is
 	// configured, so a typo can never quietly run on E2B instead.
 	ExecProvider string
