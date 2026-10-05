@@ -200,6 +200,10 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 	current := false
 	var provider *SandboxdProviderConfig
 	providerSection, sawSandboxd, sawMac := "", false, false
+	// declaredBy remembers the header that declared each sandboxd provider.
+	// TOML refuses a table defined twice; any two spellings of one provider
+	// would otherwise merge silently, later keys winning.
+	declaredBy := map[string]string{}
 	for _, raw := range strings.Split(string(content), "\n") {
 		line := strings.TrimSpace(stripConfigComment(raw))
 		if line == "" {
@@ -220,6 +224,10 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 				if sawMac && sawSandboxd {
 					return RemoteExecConfig{}, errors.New("config.toml declares both [remote_exec.sandboxd] and its deprecated alias [remote_exec.mac]: keep only [remote_exec.sandboxd]")
 				}
+				if previous, seen := declaredBy[name]; seen {
+					return RemoteExecConfig{}, fmt.Errorf("config.toml declares the %s provider twice, as %s and [%s]: keep one section", name, previous, section)
+				}
+				declaredBy[name] = "[" + section + "]"
 				if cfg.SandboxdProviders == nil {
 					cfg.SandboxdProviders = map[string]*SandboxdProviderConfig{}
 				}

@@ -361,6 +361,23 @@ max_concurrent = 2
 	}
 }
 
+// TOML refuses a table defined twice. Both spellings of one provider, or the
+// same header repeated, must not merge silently with later keys winning.
+func TestRemoteExecRefusesASandboxdProviderDeclaredTwice(t *testing.T) {
+	section := func(header, template string) string {
+		return fmt.Sprintf("\n%s\ntemplate = %q\nbase_url = \"http://127.0.0.1:43190\"\n", header, template)
+	}
+	for name, content := range map[string]string{
+		"both spellings": section("[remote_exec.sandboxd-linux]", "first") + section(`[remote_exec."sandboxd-linux"]`, "second"),
+		"same header":    section("[remote_exec.sandboxd]", "first") + section("[remote_exec.sandboxd]", "second"),
+	} {
+		_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec]\nbackend = \"local\"\n"+content))
+		if err == nil || !strings.Contains(err.Error(), "twice") {
+			t.Errorf("%s: err = %v; want a refusal that the provider is declared twice", name, err)
+		}
+	}
+}
+
 func TestLoadE2BAPIKeyAcceptsSecureSecretDelivery(t *testing.T) {
 	const secret = "api-key-GITMOOT-IMPL"
 	dir := t.TempDir()
