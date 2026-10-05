@@ -1083,6 +1083,93 @@ A review on the remote execution backend gets the same list at
 `GITMOOT_PRIOR_VERDICTS`; when it cannot be rendered the job records a
 `remote_review_evidence_unavailable` event with the reason.
 
+## Read-Only Seat Cannot Reach Docker Or Containerd
+
+This is intended. A read-only seat (`review` and `ask` jobs, launched with
+`sandbox-exec --read-only-workdir`) cannot connect to the host's local
+container-runtime endpoints. Landlock governs file access but not connecting to
+a Unix socket, so the seat launcher hides those endpoints itself. While still
+privileged, and before Landlock is applied, it:
+
+- creates a private mount namespace for the seat and makes the whole mount tree
+  private, so nothing it mounts reaches the host;
+- binds `/dev/null` over each existing runtime socket file: `/run/docker.sock`
+  and `/run/cri-dockerd.sock`, and the rootless Docker socket
+  `/run/user/*/docker.sock`;
+- mounts an empty read-only tmpfs over each existing runtime directory:
+  `/run/containerd`, `/run/docker`, `/run/podman`, `/run/buildkit`, `/run/crio`,
+  `/run/k3s/containerd`, `/run/k0s`, `/var/snap/microk8s/common/run`, the
+  rootless `docker`, `podman`, `buildkit`, `dockerd-rootless`, and
+  `containerd-rootless` directories under `/run/user/*`, and the per-user
+  `.colima`, `.config/colima`, `.lima`, `.rd`, `.docker/run`, and
+  `.docker/desktop` directories (Colima, Lima, Rancher Desktop, Docker Desktop)
+  under `/root`, each `/home/*`, and the daemon user's own home. Directories are
+  covered whole because they hold sockets that cannot be named in advance, such
+  as containerd's per-container shim sockets.
+
+Paths under `/run/user/*` and the homes belong to their users, so the daemon
+never follows a symlink there. A runtime path that is itself a symlink (such as
+`~/.colima` linked elsewhere) is covered where the link is, with `/dev/null`,
+and the link's target is never covered. A runtime path that runs through a
+symlink partway along (such as `~/.config/colima` under a dotfiles-managed
+`~/.config`, or `~/.docker/run` under a linked `~/.docker`) is not covered at
+all, so the rest of that directory stays visible in the seat; when something
+exists behind the link, the seat's stderr gets a
+`sandbox-exec: not covering container runtime path ...` line. A per-user path
+the daemon cannot inspect, such as a home it may not enter, is skipped with
+the same line; neither stops the seat. The `/run` and `/var/snap` paths are
+root's, and are resolved through symlinks.
+
+Each `/run` path is also checked under `/var/run`. Inside the seat,
+`docker version` reports `Cannot connect to the Docker daemon` and a connection
+to any covered path is refused. Reading the checkout, `git`, `go`, and the
+runtime itself work as before. The seat cannot remove the covers: Landlock
+denies mount changes to a sandboxed process, and denies access to the
+`/proc/<pid>/root` of processes outside the sandbox. Seats that write code
+(implementation and produce jobs) launch without this and keep their access to
+the runtime.
+
+### What is not covered
+
+The covers are a fixed list of local endpoints, not a general container
+boundary. A read-only seat can still reach:
+
+- **a runtime endpoint outside the list**, such as a socket at a custom
+  `--host`/`-H` path or a per-user runtime in a home directory not named above,
+  in one the daemon cannot inspect, or reached through a symlink partway along;
+- **a runtime listening on TCP** (for example `dockerd -H tcp://...`): the seat
+  keeps network access, which the model API needs, so a TCP listener on the
+  host or the network stays reachable;
+- **abstract-namespace Unix sockets**, which have no path to cover. Current
+  Docker, containerd, and Podman do not listen on them; containerd before 1.5
+  placed its shim sockets there;
+- **a socket created or recreated while the seat runs**, such as
+  `/run/docker.sock` after a runtime restart, until the next seat starts.
+  Sockets inside a covered directory stay hidden.
+
+The seat inherits no open runtime connection: the daemon passes a seat only its
+standard input, output, and error.
+
+### Read-only seat refuses to start
+
+When none of the listed paths exists there is nothing to hide, and the seat
+starts without a mount namespace. When any exists, the seat starts only if every
+cover is in place. No user namespace is used, so this needs `CAP_SYS_ADMIN`, and
+it fails inside an existing Landlock sandbox, which denies mount changes. In
+either case the seat refuses to start rather than run with the runtime
+reachable:
+
+```text
+sandbox-exec: read-only seat cannot hide the host container runtime: create a private mount namespace (requires CAP_SYS_ADMIN) to cover /run/docker, /run/containerd, /run/docker.sock: operation not permitted
+sandbox-exec: read-only seat cannot hide the host container runtime: make the seat mount tree private: operation not permitted
+```
+
+Run the daemon as root (or with `CAP_SYS_ADMIN`), outside any Landlock sandbox.
+The daemon launches every seat itself, so a seat is never started from inside
+another seat in normal operation. The second message appears when a read-only
+seat is launched from inside a sandbox, for example when gitmoot's own tests run
+inside a review seat; those tests skip with that reason.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

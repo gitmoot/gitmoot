@@ -178,6 +178,7 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 }
 
 func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	home, store, _ := runtimeOverrideE2EHome(t)
 	marker := filepath.Join(t.TempDir(), "shell-override-ran-daemon")

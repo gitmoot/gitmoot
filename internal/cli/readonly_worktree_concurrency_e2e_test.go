@@ -249,6 +249,7 @@ func drivePoolConcurrently(t *testing.T, ctx context.Context, worker jobWorker, 
 // rather than asserted. Reverting the dispatch-time allocation, so both asks
 // key repo:owner/repo, produces the same failure by the same route.
 func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
@@ -360,6 +361,7 @@ func TestReadOnlyWorktreeConcurrentAsksE2E(t *testing.T) {
 // case: a single, uncontended background ask on the stale-branch repo still gets a
 // dispatch-time worktree, runs to a terminal decision, and disposes its worktree.
 func TestLoneUncontendedBackgroundAskE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
@@ -408,6 +410,7 @@ func TestLoneUncontendedBackgroundAskE2E(t *testing.T) {
 // read-only seat blocks checkout writes even when the registered agent requests
 // workspace-write, then still removes the disposable worktree synchronously.
 func TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")
@@ -456,6 +459,7 @@ func TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E(t *testing.T) {
 // seat also protects linked git metadata without turning terminal cleanup into
 // a pre-cleanup capture failure.
 func TestBackgroundAskRejectsGitMetadataCorruptionBeforeCleanupE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := staleBranchGitCheckout(t, "owner/repo")

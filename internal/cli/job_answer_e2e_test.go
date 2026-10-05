@@ -38,6 +38,7 @@ func askGateQuestionCmd() string {
 // refusal below stops erroring; drop the ResolveEscalation call and both the
 // resolved-round and continuation assertions flip RED.
 func TestJobAnswerResumesAwaitingHumanE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")

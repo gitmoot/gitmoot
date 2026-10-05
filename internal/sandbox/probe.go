@@ -18,6 +18,12 @@ const (
 	probeExecutableEnv       = "GITMOOT_SANDBOX_PROBE_EXECUTABLE"
 )
 
+// ContainerRuntimeHidingRefusal prefixes every error with which a read-only
+// seat refuses to start because it cannot hide the host container runtime: the
+// mount namespace, the private mount tree, a cover mount, or runtime discovery
+// failed.
+const ContainerRuntimeHidingRefusal = "read-only seat cannot hide the host container runtime"
+
 // ProbeResult is the cached, definitive capability result used by operators and
 // produce dispatch. Supported is true only after the real shim allowed an
 // in-root write and denied an out-of-root write.

@@ -7,9 +7,14 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"testing"
+
+	"github.com/gitmoot/gitmoot/internal/sandbox"
 )
 
 // TestMain MUST stay in the default build (#1760 step 3). It is the package's
@@ -98,6 +103,15 @@ func makeTestTempRootUnder(parent string) (string, error) {
 		}
 		err := os.Mkdir(dir, 0o700)
 		if err == nil {
+			// Traversable but not listable by other uids, like the /tmp it
+			// stands in for: a root test that runs a command as a configured
+			// non-root identity (TestDefaultExecutionBackendUsesConfiguredIdentity)
+			// must reach its cwd below here, or exec fails with EACCES. Each
+			// t.TempDir below is still 0700.
+			if err := os.Chmod(dir, 0o711); err != nil {
+				_ = os.Remove(dir)
+				return "", err
+			}
 			return dir, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
@@ -120,4 +134,35 @@ func removeTestTempRoot(dir string) error {
 		return nil
 	})
 	return os.RemoveAll(dir)
+}
+
+var readOnlySeatLaunch struct {
+	once   sync.Once
+	reason string
+}
+
+// requireReadOnlySeatLaunchable skips a test that runs a read-only seat when
+// this host cannot start one at all: a host container runtime exists and
+// sandbox-exec cannot hide it here, so it refuses by design (#2318). That covers
+// every hiding failure: no CAP_SYS_ADMIN for the mount namespace, or mounts
+// denied because the test already runs inside a Landlock domain (a review
+// seat). The CI e2e lane runs as root; locally, run as root outside any sandbox.
+func requireReadOnlySeatLaunchable(t *testing.T) {
+	t.Helper()
+	readOnlySeatLaunch.once.Do(func() {
+		executable, err := os.Executable()
+		if err != nil {
+			return
+		}
+		command := exec.Command(executable, "sandbox-exec", "--read-only-workdir", "--", "/bin/true")
+		command.Dir = os.TempDir()
+		output, err := command.CombinedOutput()
+		if err != nil && strings.Contains(string(output), sandbox.ContainerRuntimeHidingRefusal) {
+			readOnlySeatLaunch.reason = strings.TrimSpace(string(output))
+		}
+	})
+	if readOnlySeatLaunch.reason != "" {
+		t.Logf("read-only seats cannot start on this host: %s", readOnlySeatLaunch.reason)
+		t.Skip("read-only seat refuses to start: a host container runtime exists and cannot be hidden here; run as root, outside any sandbox")
+	}
 }

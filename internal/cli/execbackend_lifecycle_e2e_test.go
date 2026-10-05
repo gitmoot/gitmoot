@@ -1030,6 +1030,7 @@ func TestExecutionBackendJobWorkerReportsAndRetriesRemoteStartupReapFailure(t *t
 // GITMOOT-IMPL: the remote-only job-type refusal must never reject ordinary
 // local work. A local ask reaches the shell runtime and succeeds.
 func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(""))
 	jobID := execBackendDispatchAsk(t, home)

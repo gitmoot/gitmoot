@@ -100,6 +100,7 @@ func TestPipelinePullReadsPreRemovalBundleV1Manifest(t *testing.T) {
 // shared by home A's publish and home B's list/pull, while the imported pipeline
 // still runs through the real #935 import and shell-worker paths.
 func TestPipelinePublishPullRoundTripThroughSharedBackend(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	backend := newFakeGitHubBackend()
 	usePipelineFakeGitHubBackend(t, backend)

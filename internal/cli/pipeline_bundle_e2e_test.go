@@ -23,6 +23,7 @@ import (
 // two independent Gitmoot homes and repositories. Both pipeline stages execute
 // through the real shell worker; no LLM, GitHub, or network service participates.
 func TestPipelineBundleRoundTripE2E(t *testing.T) {
+	requireReadOnlySeatLaunchable(t)
 	ctx := context.Background()
 	homeA, _, storeA := heartbeatLoopE2EHome(t)
 	checkoutA := pipelineBundleCheckout(t, "https://github.com/source/project.git")

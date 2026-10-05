@@ -489,6 +489,10 @@ func TestRuntimeCredentialCurationForegroundAndDaemonE2E(t *testing.T) {
 		for _, background := range []bool{false, true} {
 			name := fmt.Sprintf("curation-%t/background-%t", enabled, background)
 			t.Run(name, func(t *testing.T) {
+				if background {
+					// The daemon worker runs the ask job as a read-only seat.
+					requireReadOnlySeatLaunchable(t)
+				}
 				home, store, _ := runtimeOverrideE2EHome(t)
 				paths := config.PathsForHome(home)
 				body := "\n[credentials]\nenv_curation = false\n"
