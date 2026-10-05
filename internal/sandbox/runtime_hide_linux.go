@@ -10,8 +10,11 @@ import (
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // containerRuntimePaths are the local container-runtime endpoints a read-only
@@ -29,6 +32,9 @@ import (
 //
 // This is a fixed list of local endpoints. A runtime listening on TCP is not
 // covered: seats need the network.
+//
+// These are system paths: only root can create or replace them, so they are
+// symlink-resolved, and any error resolving one refuses the seat.
 var containerRuntimePaths = []string{
 	"/run/docker.sock",
 	"/run/docker",
@@ -40,12 +46,17 @@ var containerRuntimePaths = []string{
 	"/run/k3s/containerd",
 	"/run/k0s",
 	"/var/snap/microk8s/common/run",
-	"/run/user/*/docker.sock",
-	"/run/user/*/docker",
-	"/run/user/*/podman",
-	"/run/user/*/buildkit",
-	"/run/user/*/dockerd-rootless",
-	"/run/user/*/containerd-rootless",
+}
+
+// containerRuntimeUserRunPaths are rootless runtime endpoints, relative to each
+// user's runtime directory /run/user/<uid>.
+var containerRuntimeUserRunPaths = []string{
+	"docker.sock",
+	"docker",
+	"podman",
+	"buildkit",
+	"dockerd-rootless",
+	"containerd-rootless",
 }
 
 // containerRuntimeHomePaths are per-user runtime directories, relative to a
@@ -60,15 +71,37 @@ var containerRuntimeHomePaths = []string{
 	".docker/desktop",
 }
 
-// containerRuntimeCandidates expands the fixed lists into glob patterns: every
-// /run entry also under /var/run, and every home path under /root, each
-// /home/* directory, and the launching user's own home.
-func containerRuntimeCandidates() []string {
-	patterns := make([]string, 0, 2*len(containerRuntimePaths)+3*len(containerRuntimeHomePaths))
+// runtimeCandidates is where discovery looks for runtime endpoints.
+type runtimeCandidates struct {
+	// system holds glob patterns of root-owned paths.
+	system []string
+	// perUser holds paths below directories a user owns.
+	perUser []perUserRuntimePath
+}
+
+// perUserRuntimePath is a runtime path below each directory root matches (a
+// home or /run/user/<uid>). The user who owns that directory controls
+// everything below it, so the daemon never follows a symlink there: see
+// openUserRuntimePath.
+type perUserRuntimePath struct {
+	root string // glob pattern of the per-user directories
+	rel  string // slash-separated path below each
+}
+
+// containerRuntimeCandidates expands the fixed lists: every /run entry also
+// under /var/run, the rootless entries under each /run/user/*, and every home
+// path under /root, each /home/* directory, and the launching user's own home.
+func containerRuntimeCandidates() runtimeCandidates {
+	var candidates runtimeCandidates
 	for _, path := range containerRuntimePaths {
-		patterns = append(patterns, path)
+		candidates.system = append(candidates.system, path)
 		if rest, ok := strings.CutPrefix(path, "/run/"); ok {
-			patterns = append(patterns, "/var/run/"+rest)
+			candidates.system = append(candidates.system, "/var/run/"+rest)
+		}
+	}
+	for _, root := range []string{"/run/user/*", "/var/run/user/*"} {
+		for _, rel := range containerRuntimeUserRunPaths {
+			candidates.perUser = append(candidates.perUser, perUserRuntimePath{root: root, rel: rel})
 		}
 	}
 	homes := []string{"/root", "/home/*"}
@@ -76,11 +109,11 @@ func containerRuntimeCandidates() []string {
 		homes = append(homes, globEscape(account.HomeDir))
 	}
 	for _, home := range homes {
-		for _, path := range containerRuntimeHomePaths {
-			patterns = append(patterns, filepath.Join(home, path))
+		for _, rel := range containerRuntimeHomePaths {
+			candidates.perUser = append(candidates.perUser, perUserRuntimePath{root: home, rel: rel})
 		}
 	}
-	return patterns
+	return candidates
 }
 
 func globEscape(path string) string {
@@ -97,6 +130,10 @@ func globEscape(path string) string {
 type runtimePath struct {
 	path string
 	dir  bool
+	// userRoot is set for a path below a per-user directory: that directory,
+	// symlink-resolved. The path is reopened from it, without following any
+	// symlink, when it is covered.
+	userRoot string
 }
 
 // hideContainerRuntime moves the calling OS thread into a private mount
@@ -108,9 +145,10 @@ type runtimePath struct {
 // the host mount namespace. Otherwise it fails closed: when the namespace or
 // any cover cannot be set up (no CAP_SYS_ADMIN, since a user namespace is
 // deliberately not used, or mounts denied by an enclosing Landlock domain), the
-// seat must not start.
-func hideContainerRuntime() error {
-	paths, err := discoverContainerRuntime(containerRuntimeCandidates())
+// seat must not start. A per-user path the daemon cannot inspect is reported
+// through logf and left uncovered instead; see discoverContainerRuntime.
+func hideContainerRuntime(candidates runtimeCandidates, logf func(format string, args ...any)) error {
+	paths, err := discoverContainerRuntime(candidates, logf)
 	if err != nil {
 		return err
 	}
@@ -131,28 +169,128 @@ func hideContainerRuntime() error {
 		return fmt.Errorf("make the seat mount tree private: %w", err)
 	}
 	for _, p := range paths {
-		if p.dir {
-			flags := uintptr(syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
-			if err := syscall.Mount("tmpfs", p.path, "tmpfs", flags, "mode=0"); err != nil {
-				return fmt.Errorf("cover runtime directory %s: %w", p.path, err)
+		if p.userRoot != "" {
+			if err := coverUserRuntimePath(p, logf); err != nil {
+				return err
 			}
 			continue
 		}
-		if err := syscall.Mount("/dev/null", p.path, "", syscall.MS_BIND, ""); err != nil {
-			return fmt.Errorf("cover runtime socket %s: %w", p.path, err)
+		if err := coverRuntimePath(p.path, p.path, p.dir); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// discoverContainerRuntime resolves the runtime path patterns against the host.
-// Paths are symlink-resolved and deduplicated, so the /var/run -> /run alias is
-// covered once. Directories come first, and a path inside a covered directory
-// is dropped because that directory's mount already hides it.
-func discoverContainerRuntime(patterns []string) ([]runtimePath, error) {
+// coverRuntimePath mounts the cover for name at target: an empty read-only
+// tmpfs on a directory, /dev/null on anything else.
+func coverRuntimePath(target, name string, dir bool) error {
+	if dir {
+		flags := uintptr(syscall.MS_RDONLY | syscall.MS_NOSUID | syscall.MS_NODEV | syscall.MS_NOEXEC)
+		if err := syscall.Mount("tmpfs", target, "tmpfs", flags, "mode=0"); err != nil {
+			return fmt.Errorf("cover runtime directory %s: %w", name, err)
+		}
+		return nil
+	}
+	if err := syscall.Mount("/dev/null", target, "", syscall.MS_BIND, ""); err != nil {
+		return fmt.Errorf("cover runtime socket %s: %w", name, err)
+	}
+	return nil
+}
+
+// coverUserRuntimePath reopens a per-user path inside the seat's namespace (a
+// descriptor opened before unshare names the host's mounts, which cannot be
+// mounted over from here) and mounts the cover on that descriptor through
+// /proc/self/fd. mount(2) follows a symlink in the path it is given; the
+// descriptor pins the very inode inspected, so a link swapped in after
+// inspection cannot redirect the cover outside the user's directory.
+func coverUserRuntimePath(p runtimePath, logf func(format string, args ...any)) error {
+	rel, err := filepath.Rel(p.userRoot, p.path)
+	if err != nil {
+		return fmt.Errorf("cover runtime path %s: %w", p.path, err)
+	}
+	fd, path, dir, ok, err := openUserRuntimePath(p.userRoot, rel)
+	if err != nil {
+		logf("not covering container runtime path %s: %v", p.path, err)
+		return nil
+	}
+	if !ok {
+		return nil
+	}
+	defer unix.Close(fd)
+	return coverRuntimePath("/proc/self/fd/"+strconv.Itoa(fd), path, dir)
+}
+
+// openUserRuntimePath opens root/rel as an O_PATH descriptor without following
+// any symlink below root, one component at a time. It stops at the first
+// component that is a symlink and returns that link: the cover then lands on
+// the link itself, which makes every path through it unreachable, and never on
+// a target its owner chose. ok is false when the path does not exist. The
+// caller closes fd.
+func openUserRuntimePath(root, rel string) (fd int, path string, dir, ok bool, err error) {
+	fd, err = unix.Open(root, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
+			return -1, "", false, false, nil
+		}
+		return -1, "", false, false, fmt.Errorf("open %s: %w", root, err)
+	}
+	path = root
+	parts := strings.Split(rel, "/")
+	for i, name := range parts {
+		next, err := unix.Openat(fd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
+		path = filepath.Join(path, name)
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTDIR) {
+			return -1, "", false, false, nil
+		}
+		if err != nil {
+			return -1, "", false, false, fmt.Errorf("open %s: %w", path, err)
+		}
+		fd = next
+		var stat unix.Stat_t
+		if err := unix.Fstat(fd, &stat); err != nil {
+			unix.Close(fd)
+			return -1, "", false, false, fmt.Errorf("inspect %s: %w", path, err)
+		}
+		last := i == len(parts)-1
+		switch stat.Mode & unix.S_IFMT {
+		case unix.S_IFLNK:
+			return fd, path, false, true, nil
+		case unix.S_IFDIR:
+			if last {
+				return fd, path, true, true, nil
+			}
+		default:
+			if last {
+				return fd, path, false, true, nil
+			}
+			// A file in the middle of the path: the path cannot exist.
+			unix.Close(fd)
+			return -1, "", false, false, nil
+		}
+	}
+	unix.Close(fd)
+	return -1, "", false, false, fmt.Errorf("empty runtime path below %s", root)
+}
+
+// discoverContainerRuntime resolves the candidates against the host. Paths are
+// deduplicated, so the /var/run -> /run alias is covered once. Directories come
+// first, and a path inside a covered directory is dropped because that
+// directory's mount already hides it.
+//
+// System paths are symlink-resolved, and any error other than not-found
+// refuses: only root controls them. A per-user path is never resolved through a
+// symlink its owner made: a link is covered where it is, so no user can point
+// a cover at a directory of their choosing (/usr, the toolchain, a checkout).
+// An error inspecting a per-user path (a permission denied to the daemon, which
+// the seat as the same user meets too) is reported through logf and the path
+// left uncovered; it never refuses, so no user can stop every read-only seat on
+// the host from starting.
+func discoverContainerRuntime(candidates runtimeCandidates, logf func(format string, args ...any)) ([]runtimePath, error) {
 	var found []runtimePath
 	seen := make(map[string]bool)
-	for _, pattern := range patterns {
+	for _, pattern := range candidates.system {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, fmt.Errorf("container runtime path pattern %q: %w", pattern, err)
@@ -174,6 +312,47 @@ func discoverContainerRuntime(patterns []string) ([]runtimePath, error) {
 			}
 			seen[resolved] = true
 			found = append(found, runtimePath{path: resolved, dir: info.IsDir()})
+		}
+	}
+	reported := make(map[string]bool)
+	for _, candidate := range candidates.perUser {
+		roots, err := filepath.Glob(candidate.root)
+		if err != nil {
+			return nil, fmt.Errorf("container runtime path pattern %q: %w", candidate.root, err)
+		}
+		for _, root := range roots {
+			// The per-user directory itself, like /home/<user>, sits in a
+			// root-owned parent, so resolving it only follows root's links.
+			resolved, err := filepath.EvalSymlinks(root)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				if !reported[root] {
+					reported[root] = true
+					logf("not covering container runtime paths under %s: %v", root, err)
+				}
+				continue
+			}
+			fd, path, dir, ok, err := openUserRuntimePath(resolved, candidate.rel)
+			if err != nil {
+				// One line per directory: a daemon that may not enter another
+				// user's home would otherwise report every path below it.
+				if !reported[resolved] {
+					reported[resolved] = true
+					logf("not covering container runtime path %s: %v", filepath.Join(resolved, candidate.rel), err)
+				}
+				continue
+			}
+			if !ok {
+				continue
+			}
+			unix.Close(fd)
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			found = append(found, runtimePath{path: path, dir: dir, userRoot: resolved})
 		}
 	}
 	slices.SortStableFunc(found, func(a, b runtimePath) int {

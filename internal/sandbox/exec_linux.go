@@ -124,7 +124,10 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 		// thread until execve. Never unlock: the runtime must be exec'd from the
 		// thread that hides the host container runtime.
 		runtime.LockOSThread()
-		if err := hideContainerRuntime(); err != nil {
+		logf := func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, "sandbox-exec: "+format+"\n", args...)
+		}
+		if err := hideContainerRuntime(containerRuntimeCandidates(), logf); err != nil {
 			return fmt.Errorf("%s: %w", ContainerRuntimeHidingRefusal, err)
 		}
 	}

@@ -1107,6 +1107,16 @@ privileged, and before Landlock is applied, it:
   covered whole because they hold sockets that cannot be named in advance, such
   as containerd's per-container shim sockets.
 
+Paths under `/run/user/*` and the homes belong to their users, so the daemon
+never follows a symlink there. A runtime path that is itself a symlink, or that
+runs through one (such as `~/.docker` linked elsewhere), is covered where the
+link is, with `/dev/null`: every path through the link is then unreachable in
+the seat, and the link's target is never covered. A per-user path the daemon
+cannot inspect, such as a home it may not enter, is skipped with a
+`sandbox-exec: not covering container runtime path ...` line on the seat's
+stderr; it does not stop the seat. The `/run` and `/var/snap` paths are
+root's, and are resolved through symlinks.
+
 Each `/run` path is also checked under `/var/run`. Inside the seat,
 `docker version` reports `Cannot connect to the Docker daemon` and a connection
 to any covered path is refused. Reading the checkout, `git`, `go`, and the
@@ -1122,7 +1132,8 @@ The covers are a fixed list of local endpoints, not a general container
 boundary. A read-only seat can still reach:
 
 - **a runtime endpoint outside the list**, such as a socket at a custom
-  `--host`/`-H` path or a per-user runtime in a home directory not named above;
+  `--host`/`-H` path or a per-user runtime in a home directory not named above,
+  or in one the daemon cannot inspect;
 - **a runtime listening on TCP** (for example `dockerd -H tcp://...`): the seat
   keeps network access, which the model API needs, so a TCP listener on the
   host or the network stays reachable;

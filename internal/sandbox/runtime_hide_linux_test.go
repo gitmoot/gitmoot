@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -381,5 +382,197 @@ func TestSandboxExecReadOnlySeatRefusesHostContainerRuntimeE2E(t *testing.T) {
 	}
 	if !strings.Contains(string(dockerOutput), "Cannot connect to the Docker daemon") {
 		t.Fatalf("docker version failed inside a read-only seat, but not on the daemon connection: %v\n%s", err, dockerOutput)
+	}
+}
+
+const runtimeHideHomesEnv = "GITMOOT_TEST_RUNTIME_HIDE_HOMES"
+
+// userRuntimeFixture is a fake /home holding one hostile user, mallory, whose
+// home has every shape a runtime path can take: an ordinary runtime directory
+// (.rd), a symlink loop (.lima), a symlink to /etc (.colima), and a symlink
+// one component up the path (.docker, toward .docker/run and .docker/desktop)
+// to a directory outside the home. Paths are symlink-resolved.
+type userRuntimeFixture struct {
+	homes, home, outside string
+}
+
+func newUserRuntimeFixture(t *testing.T) userRuntimeFixture {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := userRuntimeFixture{
+		homes:   filepath.Join(base, "home"),
+		home:    filepath.Join(base, "home", "mallory"),
+		outside: filepath.Join(base, "outside"),
+	}
+	for _, dir := range []string{filepath.Join(f.home, ".rd"), f.outside} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{filepath.Join(f.home, ".rd", "docker.sock"), filepath.Join(f.outside, "run")} {
+		if err := os.WriteFile(file, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for link, target := range map[string]string{
+		".lima":   filepath.Join(f.home, ".lima"),
+		".colima": "/etc",
+		".docker": f.outside,
+	} {
+		if err := os.Symlink(target, filepath.Join(f.home, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return f
+}
+
+func (f userRuntimeFixture) candidates() runtimeCandidates {
+	var candidates runtimeCandidates
+	for _, rel := range containerRuntimeHomePaths {
+		candidates.perUser = append(candidates.perUser, perUserRuntimePath{root: filepath.Join(globEscape(f.homes), "*"), rel: rel})
+	}
+	return candidates
+}
+
+// TestDiscoverContainerRuntimeNeverFollowsUserSymlinks: a user's symlinks must
+// neither stop discovery (a loop used to refuse every read-only seat on the
+// host) nor send a cover to their target (a link to /etc used to cover /etc).
+// Each link is the endpoint itself, covered where it is; an ordinary runtime
+// directory is still found.
+func TestDiscoverContainerRuntimeNeverFollowsUserSymlinks(t *testing.T) {
+	f := newUserRuntimeFixture(t)
+	var logs []string
+	paths, err := discoverContainerRuntime(f.candidates(), func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	if err != nil {
+		t.Fatalf("user symlinks refused discovery: %v", err)
+	}
+	want := []runtimePath{
+		{path: filepath.Join(f.home, ".rd"), dir: true, userRoot: f.home},
+		{path: filepath.Join(f.home, ".colima"), userRoot: f.home},
+		{path: filepath.Join(f.home, ".lima"), userRoot: f.home},
+		{path: filepath.Join(f.home, ".docker"), userRoot: f.home},
+	}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("discovered %+v, want %+v", paths, want)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("discovery logged %q, want nothing: every path was inspectable", logs)
+	}
+}
+
+// TestDiscoverContainerRuntimeSkipsUserPathsItCannotInspect: a home the daemon
+// may not enter is reported once and left uncovered, never a refusal. The seat
+// runs as the daemon's user, so it cannot enter that home either.
+func TestDiscoverContainerRuntimeSkipsUserPathsItCannotInspect(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root is never denied a directory, so there is nothing to skip")
+	}
+	f := newUserRuntimeFixture(t)
+	if err := os.Chmod(f.home, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(f.home, 0o755) })
+	var logs []string
+	paths, err := discoverContainerRuntime(f.candidates(), func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	if err != nil {
+		t.Fatalf("an unreadable home refused discovery: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("discovered %+v inside a home the daemon cannot enter", paths)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], f.home) || !strings.Contains(logs[0], "permission denied") {
+		t.Fatalf("logs = %q, want one permission-denied line naming %s", logs, f.home)
+	}
+}
+
+// TestDiscoverContainerRuntimeRefusesUnresolvableSystemPath: a root-owned
+// system path that cannot be resolved still fails closed. Only root can make
+// one, so it is not a lever for other users.
+func TestDiscoverContainerRuntimeRefusesUnresolvableSystemPath(t *testing.T) {
+	run := t.TempDir()
+	loop := filepath.Join(run, "docker.sock")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	candidates := runtimeCandidates{system: []string{loop}}
+	paths, err := discoverContainerRuntime(candidates, t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "resolve container runtime path "+loop) {
+		t.Fatalf("discoverContainerRuntime = %+v, %v; want a resolve error for %s", paths, err, loop)
+	}
+	if err := hideContainerRuntime(candidates, t.Logf); err == nil {
+		t.Fatal("hideContainerRuntime accepted an unresolvable system runtime path")
+	}
+}
+
+// TestContainerRuntimeHideHelper is not a test.
+// TestHideContainerRuntimeCoversUserPathsInPlaceE2E runs this test binary as a
+// child that hides the fixture's runtime paths on its own OS thread and then,
+// from inside that mount namespace, reports what each path looks like.
+func TestContainerRuntimeHideHelper(t *testing.T) {
+	homes := os.Getenv(runtimeHideHomesEnv)
+	if homes == "" {
+		return
+	}
+	f := userRuntimeFixture{homes: homes, home: filepath.Join(homes, "mallory"), outside: filepath.Join(filepath.Dir(homes), "outside")}
+	runtime.LockOSThread()
+	err := hideContainerRuntime(f.candidates(), func(format string, args ...any) {
+		fmt.Printf("hide log: "+format+"\n", args...)
+	})
+	fmt.Printf("hide: %v\n", err)
+	report := func(name string, err error) {
+		fmt.Printf("%s: %v\n", name, err)
+	}
+	_, err = os.Stat("/etc/passwd")
+	report("stat /etc/passwd", err)
+	_, err = os.Stat(filepath.Join(f.outside, "run"))
+	report("stat outside/run", err)
+	for _, rel := range []string{".colima/passwd", ".lima/default", ".docker/run", ".rd/docker.sock"} {
+		_, err = os.Stat(filepath.Join(f.home, rel))
+		report("stat home/"+rel, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(f.home, ".rd"))
+	fmt.Printf("readdir home/.rd: %d %v\n", len(entries), err)
+}
+
+// TestHideContainerRuntimeCoversUserPathsInPlaceE2E proves the covers land on
+// the user's own paths, in a child's private mount namespace: a link loop no
+// longer refuses, a link to /etc or to another directory is covered where it
+// is while its target stays intact, and an ordinary runtime directory is
+// covered with an empty tmpfs.
+func TestHideContainerRuntimeCoversUserPathsInPlaceE2E(t *testing.T) {
+	requirePrivateMountNamespace(t)
+	f := newUserRuntimeFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, probeTestBinary(t), "-test.run", "^TestContainerRuntimeHideHelper$")
+	command.Env = append(os.Environ(), runtimeHideHomesEnv+"="+f.homes)
+	combined, err := command.CombinedOutput()
+	output := string(combined)
+	if err != nil {
+		t.Fatalf("hide helper failed: %v\n%s", err, output)
+	}
+	for _, want := range []string{
+		"hide: <nil>",
+		"stat /etc/passwd: <nil>",
+		"stat outside/run: <nil>",
+		"stat home/.colima/passwd: stat " + filepath.Join(f.home, ".colima/passwd") + ": not a directory",
+		"stat home/.lima/default: stat " + filepath.Join(f.home, ".lima/default") + ": not a directory",
+		"stat home/.docker/run: stat " + filepath.Join(f.home, ".docker/run") + ": not a directory",
+		"stat home/.rd/docker.sock: stat " + filepath.Join(f.home, ".rd/docker.sock") + ": no such file or directory",
+		"readdir home/.rd: 0 <nil>",
+	} {
+		if !strings.Contains(output, want+"\n") {
+			t.Errorf("hide helper output lacks %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "hide log:") {
+		t.Errorf("hide helper logged a skipped path:\n%s", output)
 	}
 }
