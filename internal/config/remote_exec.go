@@ -201,7 +201,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		if section, ok := sectionHeader(line); ok {
 			current = section == "remote_exec"
 			provider = nil
-			if section == "remote_exec."+removedMacProvider {
+			if remoteExecSubsection(section) == removedMacProvider {
 				return RemoteExecConfig{}, fmt.Errorf("config.toml section [remote_exec.%s] is no longer read: the provider was renamed %q, so rename the section to %s (same keys)", removedMacProvider, RemoteExecProviderSandboxd, SandboxdProviderSection(RemoteExecProviderSandboxd))
 			}
 			name, declared := sandboxdProviderSectionName(section)
@@ -567,13 +567,28 @@ func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, va
 // [remote_exec.sandboxd-linux] (TOML also allows the quoted spelling
 // [remote_exec."sandboxd-linux"]).
 func sandboxdProviderSectionName(section string) (string, bool) {
-	switch section {
-	case "remote_exec.sandboxd":
+	switch remoteExecSubsection(section) {
+	case RemoteExecProviderSandboxd:
 		return RemoteExecProviderSandboxd, true
-	case "remote_exec.sandboxd-linux", `remote_exec."sandboxd-linux"`:
+	case RemoteExecProviderSandboxdLinux:
 		return RemoteExecProviderSandboxdLinux, true
 	}
 	return "", false
+}
+
+// remoteExecSubsection returns the key under remote_exec in a section header,
+// with TOML basic or literal quotes removed, so [remote_exec.x],
+// [remote_exec."x"] and [remote_exec.'x'] all name x. Any other header yields "".
+func remoteExecSubsection(section string) string {
+	key, ok := strings.CutPrefix(section, "remote_exec.")
+	if !ok {
+		return ""
+	}
+	key = strings.TrimSpace(key)
+	if len(key) >= 2 && (key[0] == '"' && key[len(key)-1] == '"' || key[0] == '\'' && key[len(key)-1] == '\'') {
+		key = key[1 : len(key)-1]
+	}
+	return key
 }
 
 // GuestArch is the guest architecture this section's OMP upload targets and

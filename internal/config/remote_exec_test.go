@@ -186,9 +186,23 @@ func TestRemoteExecMacSectionIsRefusedNamingSandboxd(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := fmt.Sprintf("\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 2\n", key)
-	_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.mac]"+body))
-	if err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") || !strings.Contains(err.Error(), "rename the section to [remote_exec.sandboxd]") {
-		t.Fatalf("[remote_exec.mac] loaded with err %v; want a refusal naming [remote_exec.sandboxd]", err)
+	for _, header := range []string{`[remote_exec.mac]`, `[remote_exec."mac"]`, `[remote_exec.'mac']`} {
+		_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, header+body))
+		if err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") || !strings.Contains(err.Error(), "rename the section to [remote_exec.sandboxd]") {
+			t.Errorf("%s loaded with err %v; want a refusal naming [remote_exec.sandboxd]", header, err)
+		}
+	}
+}
+
+// Quoted TOML spellings name the same provider, so they load it rather than
+// being silently ignored.
+func TestRemoteExecQuotedSandboxdSectionIsTheSameProvider(t *testing.T) {
+	for _, header := range []string{`[remote_exec."sandboxd"]`, `[remote_exec.'sandboxd']`} {
+		content := "[remote_exec]\nbackend = \"local\"\n" + header + "\ntemplate = \"first\"\nbase_url = \"http://127.0.0.1:43190\"\n[remote_exec.sandboxd]\ntemplate = \"second\"\n"
+		_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, content))
+		if err == nil || !strings.Contains(err.Error(), "twice") {
+			t.Errorf("%s plus [remote_exec.sandboxd]: err = %v; want a refusal that the provider is declared twice", header, err)
+		}
 	}
 }
 
