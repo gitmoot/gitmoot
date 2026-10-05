@@ -147,6 +147,49 @@ func TestRemoteReviewDiffBaseHEADUsesForgeOnCacheMiss(t *testing.T) {
 	}
 }
 
+// Cached rows recorded without a base branch (seen for merged PRs) must fall
+// back to the forge exactly like a cache miss, instead of failing the review.
+func TestRemoteReviewDiffBaseHEADUsesForgeWhenCachedBaseIsEmpty(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	origin := createDaemonWorkerGitCheckout(t, "main")
+	runDaemonWorkerGit(t, origin, "remote", "remove", "origin")
+	base := gitOutputForTest(t, origin, "rev-parse", "HEAD")
+	runDaemonWorkerGit(t, origin, "switch", "-c", "review-head")
+	writeReviewBaseFile(t, origin, "under-review.txt", "review subject\n")
+	runDaemonWorkerGit(t, origin, "add", "-A")
+	runDaemonWorkerGit(t, origin, "commit", "-m", "review head")
+	head := gitOutputForTest(t, origin, "rev-parse", "HEAD")
+	runDaemonWorkerGit(t, origin, "switch", "main")
+
+	checkout := t.TempDir()
+	runDaemonWorkerGit(t, checkout, "clone", origin, checkout)
+	runDaemonWorkerGit(t, checkout, "fetch", "origin", "review-head")
+	const repo = "owner/repo"
+	seedDaemonWorkerRepo(t, store, repo, checkout)
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo, Number: 95, HeadBranch: "review-head", BaseBranch: "", HeadSHA: head, State: "merged",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	payload, err := json.Marshal(workflow.JobPayload{Repo: repo, Branch: "review-head", PullRequest: 95, HeadSHA: head})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := defaultJobWorker(store, io.Discard)
+	worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub {
+		return diffBaseForgeStub{pull: github.PullRequest{BaseRef: "main", HeadSHA: head}}
+	}
+	job := db.Job{ID: "review-empty-cached-base", Agent: "reviewer", Type: "review", Payload: string(payload)}
+	resolved, err := worker.remoteReviewDiffBaseHEAD(ctx, job, checkout)
+	if err != nil {
+		t.Fatalf("empty cached base: %v", err)
+	}
+	if resolved != base {
+		t.Fatalf("empty cached base diff base = %s, want %s", resolved, base)
+	}
+}
+
 // A re-review bounded to a prior head keeps that head, and never widens to the
 // base branch.
 func TestRemoteReviewDiffBaseHEADHonorsPriorReviewHead(t *testing.T) {

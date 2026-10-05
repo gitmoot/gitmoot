@@ -418,22 +418,26 @@ func (w jobWorker) remoteReviewDiffBaseHEAD(ctx context.Context, job db.Job, che
 		case err == nil:
 			baseBranch = strings.TrimSpace(pull.BaseBranch)
 		case errors.Is(err, sql.ErrNoRows):
+		default:
+			return "", fmt.Errorf("load PR #%d: %w", payload.PullRequest, err)
+		}
+		if baseBranch == "" {
+			// The watcher only caches PRs it has seen, and some cached rows
+			// (e.g. recorded at merge time) carry no base branch. A merged or
+			// older PR is still a valid exact-head review subject, so ask the
+			// forge rather than refuse.
 			repo, parseErr := github.ParseRepository(payload.Repo)
 			if parseErr != nil {
 				return "", fmt.Errorf("parse repo for PR #%d: %w", payload.PullRequest, parseErr)
 			}
-			// The watcher only caches PRs it has seen. A merged or older PR
-			// can still be a valid exact-head review subject without a row.
 			forgePull, fetchErr := w.remoteReviewAdmissionClient(checkout, hostJobSubprocessRunner{}).GetPullRequest(ctx, repo, int64(payload.PullRequest))
 			if fetchErr != nil {
-				return "", fmt.Errorf("load uncached PR #%d from forge: %w", payload.PullRequest, fetchErr)
+				return "", fmt.Errorf("load PR #%d base from forge: %w", payload.PullRequest, fetchErr)
 			}
 			if strings.TrimSpace(forgePull.HeadSHA) != head {
 				return "", fmt.Errorf("PR #%d head moved from %s to %s", payload.PullRequest, head, forgePull.HeadSHA)
 			}
 			baseBranch = strings.TrimSpace(forgePull.BaseRef)
-		default:
-			return "", fmt.Errorf("load PR #%d: %w", payload.PullRequest, err)
 		}
 		if baseBranch == "" {
 			return "", fmt.Errorf("PR #%d has no base branch", payload.PullRequest)
