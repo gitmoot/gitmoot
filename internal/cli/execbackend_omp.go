@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -149,20 +150,17 @@ if daemonize_and_wait(args.host, args.port):
 http.server.ThreadingHTTPServer((args.host, args.port), Proxy).serve_forever()
 `
 
-// Both fallback providers use OMP's native gateway transport. The model
-// credential is resolved on the host; the sandbox only knows this loopback
-// forwarder and an inert placeholder. Devin's swe-2 is not in a fresh OMP
-// catalog, so it needs an explicit entry; Codex is built in but needs a route.
-const remoteOmpModels = `providers:
-  openai-codex:
-    baseUrl: %s
-    apiKey: gitmoot-job-gateway
-    transport: pi-native
-  devin:
-    baseUrl: %s
-    apiKey: gitmoot-job-gateway
-    transport: pi-native
-    api: openai-completions
+// remoteOmpCatalogProviders are the providers the job's models.yml routes
+// through OMP's native gateway transport. The host OMP auth-gateway behind the
+// job's credential gateway resolves each request against its broker, which
+// holds the account and performs any OAuth refresh; the sandbox only knows this
+// loopback forwarder and an inert placeholder. Codex and xAI's subscription
+// (xai-oauth) are built into OMP's catalog and need only a route. Devin's swe-2
+// is not in a fresh OMP catalog, so it also needs an explicit model entry.
+var remoteOmpCatalogProviders = []struct{ name, models string }{
+	{name: "openai-codex"},
+	{name: "xai-oauth"},
+	{name: "devin", models: `    api: openai-completions
     models:
       - id: swe-2
         name: SWE-2
@@ -175,7 +173,43 @@ const remoteOmpModels = `providers:
           output: 3.75
           cacheRead: 0.075
           cacheWrite: 0.75
-`
+`},
+}
+
+// remoteOmpEnvironmentProvider authenticates through the ANTHROPIC_* variables
+// startRemoteOmpForwarder returns rather than through the catalog.
+const remoteOmpEnvironmentProvider = "anthropic"
+
+func remoteOmpModelCatalog(forwarderURL string) string {
+	var catalog strings.Builder
+	catalog.WriteString("providers:\n")
+	for _, provider := range remoteOmpCatalogProviders {
+		fmt.Fprintf(&catalog, "  %s:\n    baseUrl: %s\n    apiKey: gitmoot-job-gateway\n    transport: pi-native\n%s",
+			provider.name, forwarderURL, provider.models)
+	}
+	return catalog.String()
+}
+
+// remoteOmpAuthenticatedProviders lists every provider omp inside a remote
+// sandbox has a credential route for.
+func remoteOmpAuthenticatedProviders() []string {
+	providers := []string{remoteOmpEnvironmentProvider}
+	for _, routed := range remoteOmpCatalogProviders {
+		providers = append(providers, routed.name)
+	}
+	return providers
+}
+
+// remoteOmpModelAuthenticates reports whether omp inside a remote sandbox has a
+// credential route for a provider-qualified model. A provider with no route has
+// no credential there at all: omp stops with "No API key found for <provider>"
+// before any request, which Gitmoot classifies runtime_auth, so a sandbox spent
+// on it buys nothing (#2333). A bare model id names no provider and is left to
+// omp's own resolution.
+func remoteOmpModelAuthenticates(model string) bool {
+	provider, _, qualified := strings.Cut(strings.TrimSpace(model), "/")
+	return !qualified || slices.Contains(remoteOmpAuthenticatedProviders(), provider)
+}
 
 func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, gatewayURL string) ([]string, error) {
 	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
@@ -186,7 +220,7 @@ func startRemoteOmpForwarder(ctx context.Context, lifecycle execbackend.Executio
 		return nil, fmt.Errorf("install remote omp model gateway forwarder: %w", err)
 	}
 	if _, err := installer.InstallInstanceFile(ctx, instance, remoteOmpModelsPath,
-		strings.NewReader(fmt.Sprintf(remoteOmpModels, remoteOmpForwarderURL, remoteOmpForwarderURL)), 0o600); err != nil {
+		strings.NewReader(remoteOmpModelCatalog(remoteOmpForwarderURL)), 0o600); err != nil {
 		return nil, fmt.Errorf("install remote omp gateway model catalog: %w", err)
 	}
 	stream, err := lifecycle.Exec(ctx, instance, execbackend.Command{

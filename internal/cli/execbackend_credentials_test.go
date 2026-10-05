@@ -24,6 +24,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"gopkg.in/yaml.v3"
 )
 
 const remoteBrokerTestKey = "anthropic-key-never-enters-sandbox-GITMOOT-IMPL"
@@ -168,12 +169,30 @@ credential_gateway_url = %q
 			t.Fatalf("remote omp env missing %q: %v", want, ompEnv)
 		}
 	}
-	if catalog := ompInner.runtimeContents[remoteOmpModelsPath]; !bytes.Contains(catalog, []byte("devin:")) ||
-		!bytes.Contains(catalog, []byte("id: swe-2")) ||
-		!bytes.Contains(catalog, []byte("openai-codex:")) ||
-		!bytes.Contains(catalog, []byte("transport: pi-native")) ||
-		!bytes.Contains(catalog, []byte(remoteOmpForwarderURL)) {
-		t.Fatalf("remote omp fallback catalog is not routed through the job gateway: %s", catalog)
+	// Every provider a remote review can fall back to must be routed through the
+	// job gateway; a provider missing here has no credential in the sandbox and
+	// fails runtime_auth there (#2333: xai-oauth/grok-4.7, 15 remote failures).
+	var catalog struct {
+		Providers map[string]struct {
+			BaseURL   string `yaml:"baseUrl"`
+			APIKey    string `yaml:"apiKey"`
+			Transport string `yaml:"transport"`
+			Models    []struct {
+				ID string `yaml:"id"`
+			} `yaml:"models"`
+		} `yaml:"providers"`
+	}
+	if err := yaml.Unmarshal(ompInner.runtimeContents[remoteOmpModelsPath], &catalog); err != nil {
+		t.Fatalf("remote omp catalog is not YAML: %v", err)
+	}
+	for _, provider := range []string{"openai-codex", "xai-oauth", "devin"} {
+		entry, ok := catalog.Providers[provider]
+		if !ok || entry.BaseURL != remoteOmpForwarderURL || entry.APIKey != "gitmoot-job-gateway" || entry.Transport != "pi-native" {
+			t.Fatalf("remote omp catalog does not route %s through the job gateway: %+v (present=%v)", provider, entry, ok)
+		}
+	}
+	if models := catalog.Providers["devin"].Models; len(models) != 1 || models[0].ID != "swe-2" {
+		t.Fatalf("remote omp catalog devin models = %+v, want swe-2", models)
 	}
 	if bytes.Contains(bytes.Join([][]byte{
 		ompInner.material.CACertificate,

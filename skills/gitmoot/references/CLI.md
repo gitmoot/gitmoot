@@ -263,11 +263,12 @@ and allowlist failures are fail-closed. The option is off by default and does
 not enable standalone Codex, Claude, or Kimi runtimes on `remote`. Remote shells
 get `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` with a lease-bounded mTLS identity
 and capability. Remote OMP uses an instance-local forwarder and a job-scoped
-model catalog for `openai-codex/gpt-6-sol` and `devin/swe-2`; provider credentials
-remain host-side.
+model catalog for the `openai-codex`, `xai-oauth` and `devin` providers (for
+example `openai-codex/gpt-6-sol`, `xai-oauth/grok-4.7`, `devin/swe-2`); provider
+credentials remain host-side.
 
-Those two remote OMP models require `[credentials].model_gateway_key` to
-point to a proxied host key for the host OMP auth-gateway, with Codex and
+Those remote OMP models require `[credentials].model_gateway_key` to
+point to a proxied host key for the host OMP auth-gateway, with Codex, xAI and
 Devin credentials in its broker. The default Anthropic upstream does not
 serve `/v1/pi/stream`. Allowlist the upstream host; a loopback route also
 requires `model_gateway_allow_loopback_upstream = true`.
@@ -1115,6 +1116,10 @@ the next pool entry and re-queues it immediately (event
 pool exhausted the ordinary timed operational hold applies, and the shared
 attempt budget bounds the whole sequence. A verdict, a finding, or a product
 failure never changes the model: fallback exists for operational failure only.
+A remote review falls back only to models whose provider omp can authenticate
+inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `devin`); it
+skips any other entry with event `review_model_remote_skipped`, and the pool
+keeps that entry for local reviews.
 
 ## Review Policy
 

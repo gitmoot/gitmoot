@@ -406,15 +406,19 @@ malicious upstreams and transformed application payloads, including
 application-layer compression without `Content-Encoding`, are out of scope.
 Standalone Claude, Codex, and Kimi runtimes remain unsupported on `remote`
 until their clients can target this mTLS path. OMP uses an instance-local HTTP
-forwarder for Anthropic and a job-scoped `models.yml` for
-`openai-codex/gpt-6-sol` and `devin/swe-2`; the latter two use OMP's native
-gateway transport. The sandbox receives only an mTLS identity, capability,
+forwarder for Anthropic and a job-scoped `models.yml` that routes the
+`openai-codex`, `xai-oauth` and `devin` providers (for example
+`openai-codex/gpt-6-sol`, `xai-oauth/grok-4.7` and `devin/swe-2`) through OMP's
+native gateway transport. The sandbox receives only an mTLS identity, capability,
 loopback route, and inert placeholder. Provider credentials must exist in the
-host OMP broker; Gitmoot never supplies a raw provider key as a fallback.
+host OMP broker, which also performs any OAuth refresh; Gitmoot never supplies
+a raw provider key as a fallback. Any other provider has no credential in the
+sandbox, so a remote review's model fallback skips such pool entries (event
+`review_model_remote_skipped`) and leaves them to local reviews.
 
-For these two models, `[credentials].model_gateway_key` must name a proxied
+For these models, `[credentials].model_gateway_key` must name a proxied
 host key whose upstream is the host OMP auth-gateway, backed by broker
-credentials for Codex and Devin. Allow that upstream host in
+credentials for Codex, xAI and Devin. Allow that upstream host in
 `model_gateway_allow_hosts`; a loopback upstream also requires
 `model_gateway_allow_loopback_upstream = true`. The default
 `api.anthropic.com` upstream cannot serve OMP's `/v1/pi/stream` route.
