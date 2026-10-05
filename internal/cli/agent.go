@@ -1019,7 +1019,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		fmt.Fprintf(stderr, "%s: --exec-provider is only supported for agent review\n", label)
 		return agentRunOptions{}, false
 	}
-	warnDeprecatedExecProvider(stderr, options.execProvider)
 	if err := validateAgentRunActionOptions(command, options); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", label, err)
 		return agentRunOptions{}, false

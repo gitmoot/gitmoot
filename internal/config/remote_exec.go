@@ -64,9 +64,6 @@ type RemoteExecConfig struct {
 	// Each declares a sandboxd gateway beside E2B; a job runs there only when
 	// its payload names it (exec_provider = "sandboxd" or "sandboxd-linux").
 	SandboxdProviders map[string]*SandboxdProviderConfig
-	// Deprecations lists deprecated spellings this config was loaded with,
-	// each naming its replacement. The daemon prints them once at start.
-	Deprecations []string
 	// CredentialGatewayListen is the daemon bind address; URL is the HTTPS
 	// origin reachable from a sandbox. They are configured together and are
 	// used only for opt-in broker material, never for the provider control key.
@@ -124,26 +121,18 @@ func SandboxdProviderSection(provider string) string {
 	return "[remote_exec." + provider + "]"
 }
 
-// remoteExecProviderMacAlias is the provider's pre-rename name. Production
-// configs and queued payloads still carry it, so it is accepted for one
-// release, with a deprecation warning, and then removed.
-const remoteExecProviderMacAlias = "mac"
+// removedMacProvider is the sandboxd provider's name before #2328 renamed it.
+// It is no longer accepted anywhere; every refusal names the replacement.
+const removedMacProvider = "mac"
 
-// NormalizeRemoteExecProvider maps a provider name to its canonical spelling.
-// deprecatedAlias reports that name was the "mac" alias for "sandboxd". Every
-// other name, including unknown ones, is returned trimmed and unchanged.
-func NormalizeRemoteExecProvider(name string) (canonical string, deprecatedAlias bool) {
-	name = strings.TrimSpace(name)
-	if name == remoteExecProviderMacAlias {
-		return RemoteExecProviderSandboxd, true
+// UnknownRemoteExecProviderError refuses name given as field (for example
+// "--exec-provider" or "checks_provider"), listing the allowed providers and,
+// for the removed "mac", the provider it was renamed to.
+func UnknownRemoteExecProviderError(field, name string) error {
+	if name == removedMacProvider {
+		return fmt.Errorf("unknown %s %q: the provider was renamed %q; allowed providers are %s", field, name, RemoteExecProviderSandboxd, RemoteExecProviderChoices())
 	}
-	return name, false
-}
-
-// RemoteExecProviderMacDeprecation is the one warning every "mac" entry point
-// prints, completed with where the alias appeared.
-func RemoteExecProviderMacDeprecation(where string) string {
-	return fmt.Sprintf("%s: remote execution provider %q is deprecated and will be removed in the next release; use %q", where, remoteExecProviderMacAlias, RemoteExecProviderSandboxd)
+	return fmt.Errorf("unknown %s %q: allowed providers are %s", field, name, RemoteExecProviderChoices())
 }
 
 // OMPLinuxFileKey is the provider-section key naming the OMP executable for a
@@ -199,7 +188,7 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 	cfg := DefaultRemoteExecConfig()
 	current := false
 	var provider *SandboxdProviderConfig
-	providerSection, sawSandboxd, sawMac := "", false, false
+	providerSection := ""
 	// declaredBy remembers the header that declared each sandboxd provider.
 	// TOML refuses a table defined twice; any two spellings of one provider
 	// would otherwise merge silently, later keys winning.
@@ -212,18 +201,12 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 		if section, ok := sectionHeader(line); ok {
 			current = section == "remote_exec"
 			provider = nil
+			if section == "remote_exec."+removedMacProvider {
+				return RemoteExecConfig{}, fmt.Errorf("config.toml section [remote_exec.%s] is no longer read: the provider was renamed %q, so rename the section to %s (same keys)", removedMacProvider, RemoteExecProviderSandboxd, SandboxdProviderSection(RemoteExecProviderSandboxd))
+			}
 			name, declared := sandboxdProviderSectionName(section)
 			if declared {
 				providerSection = "[" + section + "]"
-				switch section {
-				case "remote_exec.mac":
-					sawMac = true
-				case "remote_exec.sandboxd":
-					sawSandboxd = true
-				}
-				if sawMac && sawSandboxd {
-					return RemoteExecConfig{}, errors.New("config.toml declares both [remote_exec.sandboxd] and its deprecated alias [remote_exec.mac]: keep only [remote_exec.sandboxd]")
-				}
 				if previous, seen := declaredBy[name]; seen {
 					return RemoteExecConfig{}, fmt.Errorf("config.toml declares the %s provider twice, as %s and [%s]: keep one section", name, previous, section)
 				}
@@ -330,9 +313,6 @@ func LoadRemoteExecConfig(paths Paths) (RemoteExecConfig, error) {
 	if err := validateRemoteExecConfig(cfg); err != nil {
 		return RemoteExecConfig{}, err
 	}
-	if sawMac {
-		cfg.Deprecations = append(cfg.Deprecations, "config.toml: section [remote_exec.mac] is deprecated and will be removed in the next release; rename it to [remote_exec.sandboxd] (same keys)")
-	}
 	return cfg, nil
 }
 
@@ -428,13 +408,13 @@ func (cfg RemoteExecConfig) ValidateOMPExecutable() error {
 }
 
 // ForProvider returns the configuration one remote job runs with. An empty
-// name is the default, cloud E2B. "sandboxd" (or its deprecated alias "mac")
-// and "sandboxd-linux" substitute their own section for the E2B endpoint,
-// credentials, templates and caps; the gateway listener and the rest of the
-// section are shared. Any other name, or a sandboxd provider without its
-// section, is refused rather than falling back to E2B.
+// name is the default, cloud E2B. "sandboxd" and "sandboxd-linux" substitute
+// their own section for the E2B endpoint, credentials, templates and caps;
+// the gateway listener and the rest of the section are shared. Any other
+// name, or a sandboxd provider without its section, is refused rather than
+// falling back to E2B.
 func (cfg RemoteExecConfig) ForProvider(name string) (RemoteExecConfig, error) {
-	canonical, _ := NormalizeRemoteExecProvider(name)
+	canonical := strings.TrimSpace(name)
 	switch {
 	case canonical == "" || canonical == RemoteExecProviderE2B:
 		cfg.Provider = RemoteExecProviderE2B
@@ -458,7 +438,7 @@ func (cfg RemoteExecConfig) ForProvider(name string) (RemoteExecConfig, error) {
 		cfg.ExecBackendCost = ExecBackendCostConfig{MaxConcurrent: sandboxd.MaxConcurrent}
 		return cfg, nil
 	default:
-		return RemoteExecConfig{}, fmt.Errorf("unknown remote execution provider %q: allowed providers are %s", strings.TrimSpace(name), RemoteExecProviderChoices())
+		return RemoteExecConfig{}, UnknownRemoteExecProviderError("remote execution provider", canonical)
 	}
 }
 
@@ -553,8 +533,7 @@ func (cfg RemoteExecConfig) CredentialGatewayURLs() []string {
 }
 
 // parseSandboxdProviderKey parses one key of the provider section, named in
-// errors as it was written ([remote_exec.sandboxd] or the deprecated
-// [remote_exec.mac]).
+// errors as it was written.
 func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, value string) error {
 	if key == "max_concurrent" {
 		parsed, err := strconv.Atoi(value)
@@ -584,12 +563,12 @@ func parseSandboxdProviderKey(sandboxd *SandboxdProviderConfig, section, key, va
 }
 
 // sandboxdProviderSectionName maps a config.toml section to the sandboxd
-// provider it declares: [remote_exec.sandboxd], its deprecated alias
-// [remote_exec.mac], and [remote_exec.sandboxd-linux] (TOML also allows the
-// quoted spelling [remote_exec."sandboxd-linux"]).
+// provider it declares: [remote_exec.sandboxd] and
+// [remote_exec.sandboxd-linux] (TOML also allows the quoted spelling
+// [remote_exec."sandboxd-linux"]).
 func sandboxdProviderSectionName(section string) (string, bool) {
 	switch section {
-	case "remote_exec.sandboxd", "remote_exec.mac":
+	case "remote_exec.sandboxd":
 		return RemoteExecProviderSandboxd, true
 	case "remote_exec.sandboxd-linux", `remote_exec."sandboxd-linux"`:
 		return RemoteExecProviderSandboxdLinux, true

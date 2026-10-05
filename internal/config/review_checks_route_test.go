@@ -57,7 +57,7 @@ checks_template = "x"
 	for repo, want := range map[string]string{
 		"o/unknown":   "unknown checks_provider",
 		"o/sandboxd":  "[remote_exec.sandboxd]",
-		"o/mac":       "[remote_exec.sandboxd]",
+		"o/mac":       `unknown checks_provider "mac": the provider was renamed "sandboxd"`,
 		"o/nobackend": "require checks_backend",
 	} {
 		if _, err := cfg.ChecksRoute(repo); err == nil || !strings.Contains(err.Error(), want) {
@@ -66,11 +66,6 @@ checks_template = "x"
 	}
 	if route, err := cfg.ChecksRoute("o/unconfigured"); err != nil || route.Enabled() {
 		t.Fatalf("unconfigured repo route = %+v, %v", route, err)
-	}
-	// checks_provider = "mac" is the deprecated alias: one warning, for that
-	// repository only, naming the replacement.
-	if got := cfg.Deprecations(); len(got) != 1 || !strings.Contains(got[0], `"o/mac"`) || !strings.Contains(got[0], `use "sandboxd"`) {
-		t.Fatalf("deprecations = %q; want one for o/mac naming sandboxd", got)
 	}
 }
 

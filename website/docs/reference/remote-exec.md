@@ -114,14 +114,12 @@ back to `max_concurrent`, or fails fast naming both fixes (upgrade sandboxd or
 set `max_concurrent`) when it is unset; 401/403 fail fast. Running attempts are
 never cancelled when capacity drops.
 
-The provider was named `mac` before: for one release `[remote_exec.mac]`,
-`--exec-provider mac`, `checks_provider = "mac"` and queued `mac` jobs are
-accepted as a deprecated alias with a warning naming the replacement, new
-jobs store `sandboxd`, and declaring both `[remote_exec.sandboxd]` and
-`[remote_exec.mac]` is a load error. The alias is removed in the next minor
-release; keep `max_concurrent` set until `GET /sandboxd/capacity` answers 200
-with the expected templates, then rename the section. See
-`docs/remote-exec.md` for the sandboxd configuration and operator runbook.
+The provider was named `mac` before: `[remote_exec.mac]` is now a load error
+naming `[remote_exec.sandboxd]`, and `--exec-provider mac`,
+`checks_provider = "mac"` and queued `mac` jobs are refused, naming
+`sandboxd`. Keep `max_concurrent` set until `GET /sandboxd/capacity` answers
+200 with the expected templates. See `docs/remote-exec.md` for the sandboxd
+configuration and operator runbook.
 
 Automatic review routing is opt-in and job-scoped. With no policy, even a
 process-wide remote backend setting does not reroute reviews. For example:

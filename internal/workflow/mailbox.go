@@ -287,8 +287,7 @@ type JobRequest struct {
 	ExecBackend *string
 	// ExecProvider names the remote provider an explicitly remote job runs on.
 	// Empty is the default, cloud E2B; "sandboxd" and "sandboxd-linux" are the
-	// opt-in sandboxd providers (older payloads may carry "mac", the deprecated
-	// alias of "sandboxd").
+	// opt-in sandboxd providers.
 	ExecProvider string
 	// ExecTemplate replaces the provider's configured template for this job
 	// only. It is set by a repository's checks_template (#2316).

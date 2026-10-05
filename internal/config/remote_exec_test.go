@@ -134,9 +134,6 @@ max_concurrent = 1
 	if err := cfg.ValidateProvider(RemoteExecProviderSandboxd); err != nil {
 		t.Fatalf("configured sandboxd provider refused: %v", err)
 	}
-	if len(cfg.Deprecations) != 0 {
-		t.Fatalf("[remote_exec.sandboxd] reported deprecations %q", cfg.Deprecations)
-	}
 	err = cfg.ValidateProvider("mac-studio")
 	if err == nil || !strings.Contains(err.Error(), "unknown remote execution provider") ||
 		!strings.Contains(err.Error(), `"sandboxd"`) || strings.Contains(err.Error(), `"mac"`) {
@@ -180,38 +177,18 @@ max_concurrent = 1
 	}
 }
 
-// The provider was renamed from "mac". Production config still declares
-// [remote_exec.mac], so for one release it loads as [remote_exec.sandboxd]
-// with one deprecation naming the new section, and "mac" resolves to the
-// sandboxd view. Declaring both spellings is ambiguous and refused.
-func TestRemoteExecMacSectionIsADeprecatedSandboxdAlias(t *testing.T) {
+// The provider was renamed from "mac" (#2328) and the alias is gone (#2329): a
+// config that still declares [remote_exec.mac] fails to load, naming the
+// section to rename it to, instead of silently losing the provider.
+func TestRemoteExecMacSectionIsRefusedNamingSandboxd(t *testing.T) {
 	key := filepath.Join(t.TempDir(), "sandboxd-api-key")
 	if err := os.WriteFile(key, []byte("private-sandboxd-api-key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	body := fmt.Sprintf("\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 2\n", key)
-	cfg, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.mac]"+body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Deprecations) != 1 || !strings.Contains(cfg.Deprecations[0], "[remote_exec.mac]") || !strings.Contains(cfg.Deprecations[0], "[remote_exec.sandboxd]") {
-		t.Fatalf("deprecations = %q; want one naming [remote_exec.sandboxd]", cfg.Deprecations)
-	}
-	for _, name := range []string{"mac", "sandboxd"} {
-		view, err := cfg.ForProvider(name)
-		if err != nil || view.Provider != RemoteExecProviderSandboxd || view.E2BTemplate != "review-arm64" || view.ExecBackendCost.MaxConcurrent != 2 {
-			t.Fatalf("ForProvider(%q) = %+v, %v; want the sandboxd view", name, view, err)
-		}
-	}
-	if canonical, alias := NormalizeRemoteExecProvider(" mac "); canonical != RemoteExecProviderSandboxd || !alias {
-		t.Fatalf("NormalizeRemoteExecProvider(mac) = %q, %v", canonical, alias)
-	}
-	if canonical, alias := NormalizeRemoteExecProvider("sandboxd"); canonical != RemoteExecProviderSandboxd || alias {
-		t.Fatalf("NormalizeRemoteExecProvider(sandboxd) = %q, %v", canonical, alias)
-	}
-	_, err = LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.sandboxd]"+body+"\n[remote_exec.mac]"+body))
-	if err == nil || !strings.Contains(err.Error(), "both") {
-		t.Fatalf("both sections loaded: %v", err)
+	_, err := LoadRemoteExecConfig(remoteExecTestPaths(t, "[remote_exec.mac]"+body))
+	if err == nil || !strings.Contains(err.Error(), "[remote_exec.mac]") || !strings.Contains(err.Error(), "rename the section to [remote_exec.sandboxd]") {
+		t.Fatalf("[remote_exec.mac] loaded with err %v; want a refusal naming [remote_exec.sandboxd]", err)
 	}
 }
 
@@ -310,9 +287,6 @@ max_concurrent = 2
 	}
 	if got, want := cfg.CredentialGatewayURLs(), []string{"https://203.0.113.7:8443", "https://192.168.128.1:43181", "https://10.0.2.2:8443"}; !slices.Equal(got, want) {
 		t.Fatalf("CredentialGatewayURLs = %q, want %q", got, want)
-	}
-	if len(cfg.Deprecations) != 0 {
-		t.Fatalf("deprecations = %q", cfg.Deprecations)
 	}
 
 	// The unquoted section spelling declares the same provider.
