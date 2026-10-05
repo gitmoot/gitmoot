@@ -898,6 +898,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// delivery and is destroyed synchronously on every return path. Host checkout,
 	// git, observation, and finalization remain on checkout/jobRunner; only runtime
 	// delivery executes in the distinct backend workspace.
+	provisionStartedAt := time.Now()
 	lifecycle, instance, credentialLease, credentialEnv, lifecycleErr := w.provisionExecutionBackend(runCtx, execBackend, execConfig, agent.Runtime, job, jobTimeout+runtimeLeaseTeardownGrace, checkout)
 	if instance != nil {
 		defer w.destroyExecutionBackend(job.ID, lifecycle, instance)
@@ -925,9 +926,15 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	if remoteReviewAdmitted && payload.RemoteCapWaitSince != "" {
 		w.clearRemoteReviewCapWait(ctx, job, execConfig.Provider)
 	}
+	var sandboxRunDeadline time.Time
 	if lifecycle != nil && instance != nil {
 		deliveryCheckout = instance.Workspace
-		w.executionRunner = execbackend.InstanceRunner{Backend: lifecycle, Instance: instance}
+		// A cloud E2B sandbox has a fixed lifetime, so the run deadline has to
+		// end inside it: a review that outlives its sandbox dies mid-stream with
+		// no verdict instead of timing out cleanly (#2331).
+		sandboxLifetime := remoteSandboxLifetime(execBackend, execConfig)
+		sandboxRunDeadline = remoteSandboxRunDeadline(sandboxLifetime, provisionStartedAt)
+		w.executionRunner = execbackend.InstanceRunner{Backend: lifecycle, Instance: instance, Lifetime: sandboxLifetime, Started: provisionStartedAt}
 		if len(credentialEnv) > 0 {
 			w.executionRunner = subprocess.EnvInjectingRunner{Inner: w.executionRunner, Env: credentialEnv}
 		}
@@ -1180,7 +1187,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	}
 	runStartedAt := time.Now().UTC()
 	var cancel context.CancelFunc
-	runCtx, cancel = context.WithTimeout(runCtx, jobTimeout)
+	runCtx, cancel = context.WithDeadline(runCtx, w.runDeadline(ctx, job.ID, jobTimeout, sandboxRunDeadline))
 	defer cancel()
 	runDeadline, hasRunDeadline := runCtx.Deadline()
 	stopKillPending := func() {}
@@ -1265,6 +1272,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			if latestErr == nil && latest.State == string(workflow.JobBlocked) {
 				commentErr = errors.New(agentPermissionBlockedMessage)
 			}
+		}
+		// A sandbox retired at the end of its fixed lifetime leaves only the
+		// runtime's "stream ended" symptom in err; lead with the cause instead,
+		// on the job's events and in its PR comment.
+		var lifetimeErr *execbackend.SandboxLifetimeExceededError
+		if errors.As(err, &lifetimeErr) {
+			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: sandboxTTLExceededEventKind, Message: lifetimeErr.Error()}); eventErr != nil {
+				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, sandboxTTLExceededEventKind, eventErr)
+			}
+			commentErr = lifetimeErr
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, commentErr)
 		// Record the SAME err the journal line below prints, so the job row can

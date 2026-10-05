@@ -215,6 +215,19 @@ per-sandbox cost, so without the key `cost_actual_usd` stays NULL. The sandboxd
 provider has no dollar cost and records none. Attempts settled by
 reconciliation, whose teardown time is unknown, also stay NULL.
 
+Sandbox lifetime: cloud E2B retires a sandbox one hour after it is created.
+Creation refuses a longer timeout ("Timeout cannot be greater than 1 hours"),
+and a later extension is silently capped at that hour, so the TTL keepalive
+cannot carry a cloud sandbox past it. A job whose timeout is longer (the
+default is four hours) therefore has its run deadline clamped to end five
+minutes before its sandbox does, recorded as a `job_timeout_clamped` job
+event, and it times out cleanly instead of losing its stream. A run that still
+fails once its sandbox's hour is up fails with a `sandbox_ttl_exceeded` job
+event and the same reason in its PR comment, and is never retried
+automatically: a fresh sandbox has the same limit. sandboxd sandboxes have no
+fixed lifetime (each extension is bounded by the worker's `-max-ttl` from the
+time of the request), so neither applies to them.
+
 Before reserving cost or calling E2B, remote review admission re-reads the pull
 request head and refuses stale jobs, duplicate repo/PR/head/purpose subjects,
 unsupported runtime/backend pairs, and unapproved repeat attempts. One accepted

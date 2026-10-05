@@ -34,6 +34,69 @@ const executionBackendDestroyTimeout = 30 * time.Second
 
 const executionBackendReapTimeout = 30 * time.Second
 
+// sandboxTTLExceededEventKind is recorded when a run fails because its cloud
+// sandbox reached the provider's fixed lifetime. The run is never retried: a
+// fresh sandbox has the same lifetime, so the same run would die the same way.
+const sandboxTTLExceededEventKind = "sandbox_ttl_exceeded"
+
+// remoteSandboxLifetimeMargin is how long before a fixed-lifetime sandbox ends
+// the run deadline is placed. It leaves the runtime its own shutdown and the
+// mailbox's finalization a live sandbox, so the run times out cleanly instead
+// of being cut off mid-stream by the provider.
+const remoteSandboxLifetimeMargin = 5 * time.Minute
+
+// remoteSandboxLifetime is the fixed lifetime the job's provider gives every
+// sandbox it creates, or zero when the TTL keepalive can extend it.
+//
+// Cloud E2B caps a sandbox at its team's max instance length counted from the
+// sandbox's start, and a set-timeout request past that cap succeeds with the
+// end time silently clamped to it (e2b-dev/infra
+// packages/api/internal/orchestrator/keep_alive.go, getMaxAllowedTTL). Create
+// accepts at most remoteexec.ProviderMaxTTL here, so that is the lifetime: the
+// keepalive cannot carry a cloud sandbox past it. Measured: both stream-loss
+// review failures in production died 60m02s after their sandbox was created.
+// sandboxd caps each extension at now + -max-ttl instead, so the keepalive does
+// extend its sandboxes and they have no fixed lifetime.
+func remoteSandboxLifetime(backend execbackend.Backend, cfg config.RemoteExecConfig) time.Duration {
+	if backend != execbackend.Remote || config.IsSandboxdProvider(cfg.Provider) {
+		return 0
+	}
+	return remoteexec.ProviderMaxTTL
+}
+
+// remoteSandboxRunDeadline is the latest instant a run on a sandbox with a
+// fixed lifetime may end: remoteSandboxLifetimeMargin before the provider
+// retires a sandbox whose create call started no earlier than
+// provisionStarted. Zero means the sandbox has no fixed lifetime.
+//
+// It is an INSTANT, not a duration, because the run context is armed only
+// after the rest of the worker's setup. A duration measured here and started
+// there would move the run's end past the sandbox's by however long that setup
+// took (#2338 review).
+func remoteSandboxRunDeadline(lifetime time.Duration, provisionStarted time.Time) time.Time {
+	if lifetime <= 0 {
+		return time.Time{}
+	}
+	return provisionStarted.Add(lifetime - remoteSandboxLifetimeMargin)
+}
+
+// runDeadline is the instant the run context is armed at: jobTimeout from now,
+// or sandboxDeadline when that comes first. A deadline the sandbox shortens is
+// recorded as job_timeout_clamped, the event that already reports every other
+// clamp of a job's deadline.
+func (w jobWorker) runDeadline(ctx context.Context, jobID string, jobTimeout time.Duration, sandboxDeadline time.Time) time.Time {
+	deadline := time.Now().Add(jobTimeout)
+	if sandboxDeadline.IsZero() || !sandboxDeadline.Before(deadline) {
+		return deadline
+	}
+	message := fmt.Sprintf("job_timeout %s does not fit in the remote sandbox: the provider retires it %s after creation and does not extend it, so the run deadline is clamped to %s (%s from now), %s before the sandbox ends",
+		jobTimeout, remoteexec.ProviderMaxTTL, sandboxDeadline.UTC().Format(time.RFC3339), time.Until(sandboxDeadline).Truncate(time.Second), remoteSandboxLifetimeMargin)
+	if _, err := w.Store.ClaimJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "job_timeout_clamped", Message: message}); err != nil {
+		writeLine(w.Stdout, "job %s job_timeout_clamped event failed: %v", jobID, err)
+	}
+	return sandboxDeadline
+}
+
 var reapedExecutionBackendRoots sync.Map
 
 var executionBackendFencingToken = sync.OnceValues(newRuntimeLockOwnerToken)

@@ -347,6 +347,13 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 		errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
 		return blockerClassification{}, false
 	}
+	// A sandbox retired at the end of its fixed lifetime is not an outage: a
+	// re-run gets a sandbox with the same lifetime and dies the same way (#2331).
+	// Its wrapped transport text must not reach the network arm below.
+	var lifetime *execbackend.SandboxLifetimeExceededError
+	if errors.As(cause, &lifetime) {
+		return blockerClassification{}, false
+	}
 	text := cause.Error()
 	detail := firstLineTrimmed(text)
 	if errors.Is(cause, runtime.ErrClaudeAuthFailed) {

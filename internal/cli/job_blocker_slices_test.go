@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -157,6 +159,17 @@ func TestClassifyOperationalBlockerNetworkOutage(t *testing.T) {
 		got, ok := classifyOperationalBlocker(cause, now)
 		if !ok || got.Class != blockerClassRuntimeQuota {
 			t.Fatalf("classify = (%+v, %v), want runtime_quota (more specific than network)", got, ok)
+		}
+	})
+	t.Run("a sandbox retired at its fixed lifetime is never an outage", func(t *testing.T) {
+		// A killed sandbox drops the stream mid-read, which Go renders as an
+		// outage signature; re-running would die at the same limit (#2331).
+		cause := workflow.DeliveryError{Err: fmt.Errorf("omp stream ended without an agent_end event: %w", &execbackend.SandboxLifetimeExceededError{
+			InstanceID: "sandbox-1", Lifetime: time.Hour, Ran: time.Hour + 2*time.Second,
+			Err: errors.New("decode envd Start event: unexpected EOF"),
+		})}
+		if got, ok := classifyOperationalBlocker(cause, now); ok {
+			t.Fatalf("classify = %+v, want no retryable class for sandbox lifetime expiry", got)
 		}
 	})
 }

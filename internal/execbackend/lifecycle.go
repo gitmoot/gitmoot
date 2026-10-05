@@ -885,6 +885,46 @@ type InstanceRunner struct {
 	BaseEnv        []string
 	ScratchDirs    []string
 	MaxOutputBytes int
+	// Lifetime, when positive, is the provider's fixed lifetime for Instance,
+	// counted from Started, which must not be later than the provider's create
+	// call. A command that fails once that lifetime has run out is reported as a
+	// SandboxLifetimeExceededError. Zero means the instance has no fixed
+	// lifetime.
+	Lifetime time.Duration
+	Started  time.Time
+}
+
+// sandboxLifetimeSlack is how far before the end of a fixed sandbox lifetime a
+// failure already counts as the provider retiring the sandbox. Started is taken
+// before the provider's create call, so the measured run time is never shorter
+// than the sandbox's real age; the slack only absorbs a provider that reaps a
+// little before the exact second.
+const sandboxLifetimeSlack = time.Minute
+
+// SandboxLifetimeExceededError reports a command that failed because the
+// provider retired its sandbox at the end of a fixed lifetime the run did not
+// fit in. It is not a transport fault: a fresh sandbox has the same lifetime,
+// so the same run would die the same way.
+type SandboxLifetimeExceededError struct {
+	InstanceID string
+	Lifetime   time.Duration
+	Ran        time.Duration
+	Err        error
+}
+
+func (e *SandboxLifetimeExceededError) Error() string {
+	return fmt.Sprintf("sandbox_ttl_exceeded: the run exceeded the provider's %s sandbox limit: sandbox %s was retired %s after it was requested, and a retry would hit the same limit: %v",
+		formatSandboxLifetime(e.Lifetime), e.InstanceID, e.Ran.Round(time.Second), e.Err)
+}
+
+func (e *SandboxLifetimeExceededError) Unwrap() error { return e.Err }
+
+// formatSandboxLifetime renders whole hours as "1h" rather than Go's "1h0m0s".
+func formatSandboxLifetime(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
+	}
+	return d.String()
 }
 
 func (r InstanceRunner) run(ctx context.Context, dir string, env []string, out io.Writer, onPID subprocess.PIDCallback, command string, args ...string) (subprocess.Result, error) {
@@ -903,10 +943,29 @@ func (r InstanceRunner) run(ctx context.Context, dir string, env []string, out i
 		OnStart:        onPID,
 	})
 	if err != nil {
-		return subprocess.Result{}, err
+		return subprocess.Result{}, r.lifetimeError(ctx, err)
 	}
 	result, err := stream.Wait()
-	return subprocess.Result{Command: result.Command, Args: result.Args, Stdout: result.Stdout, Stderr: result.Stderr}, err
+	return subprocess.Result{Command: result.Command, Args: result.Args, Stdout: result.Stdout, Stderr: result.Stderr}, r.lifetimeError(ctx, err)
+}
+
+// lifetimeError reclassifies a failure that happened once the instance's fixed
+// lifetime had run out. A process that reported its own exit status was not
+// cut off, and a cancelled or expired caller context explains the failure on
+// its own, so neither is reclassified.
+func (r InstanceRunner) lifetimeError(ctx context.Context, err error) error {
+	if err == nil || r.Lifetime <= 0 || r.Started.IsZero() || ctx.Err() != nil {
+		return err
+	}
+	var exited interface{ ExitCode() int }
+	if errors.As(err, &exited) {
+		return err
+	}
+	ran := time.Since(r.Started)
+	if ran < r.Lifetime-sandboxLifetimeSlack {
+		return err
+	}
+	return &SandboxLifetimeExceededError{InstanceID: r.Instance.ID, Lifetime: r.Lifetime, Ran: ran, Err: err}
 }
 
 func (r InstanceRunner) Run(ctx context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
