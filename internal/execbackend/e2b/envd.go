@@ -161,6 +161,10 @@ func (e *ExitError) Error() string {
 	return fmt.Sprintf("remote command exited with code %d: %s", e.Code, detail)
 }
 
+// ExitCode matches os/exec's ExitError, so a caller can tell a process that
+// reported its own exit from a sandbox that went away under it.
+func (e *ExitError) ExitCode() int { return e.Code }
+
 type streamResult struct {
 	result execbackend.ExecResult
 	err    error

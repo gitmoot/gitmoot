@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -929,10 +930,24 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 	// #1753 deleted the cockpit pane wrapper, so the remote backend no longer
 	// emits cockpit_unavailable. Pin its absence rather than dropping the check:
 	// a resurrected emitter on the remote path would otherwise go unnoticed.
+	var sandboxClamp string
 	for _, event := range events {
 		if event.Kind == "cockpit_unavailable" {
 			t.Fatalf("cockpit_unavailable survived the pane-wrapper deletion: %+v", event)
 		}
+		if event.Kind == "job_timeout_clamped" && strings.Contains(event.Message, "remote sandbox") {
+			sandboxClamp = event.Message
+		}
+	}
+	// #2331: cloud E2B retires a sandbox one hour after creation and silently
+	// refuses to extend it, so the default 4h run deadline must be clamped to
+	// end inside that hour, or a long run dies mid-stream with no verdict.
+	match := regexp.MustCompile(`clamped to (\S+),`).FindStringSubmatch(sandboxClamp)
+	if match == nil {
+		t.Fatalf("no job_timeout_clamped event fits the run into the 1h sandbox: events=%+v", events)
+	}
+	if clamped, err := time.ParseDuration(match[1]); err != nil || clamped <= 50*time.Minute || clamped > 55*time.Minute {
+		t.Fatalf("run deadline clamped to %q (%v), want just under 55m: %s", match[1], err, sandboxClamp)
 	}
 }
 
