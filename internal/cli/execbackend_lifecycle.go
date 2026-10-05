@@ -503,34 +503,53 @@ func mergedPullRequestDiffBase(ctx context.Context, git gitutil.Client, pull git
 }
 
 // remoteReviewOriginRefreshLocks serialises the diff-base origin refresh per
-// checkout. Concurrent `git fetch origin` runs on one repository race on its
-// remote-tracking refs and fail with `cannot lock ref` (#2330).
+// repository. Concurrent `git fetch origin` runs on one repository race on its
+// remote-tracking refs and fail with `cannot lock ref` (#2330). Reviews run in
+// separate linked worktrees that share those refs, so the key is the git
+// common directory, not the checkout path.
 var remoteReviewOriginRefreshLocks repoCheckoutLocks
 
-// remoteReviewOriginRefreshRetryDelay lets a fetch outside this process (for
-// example another daemon's job runner) release the ref lock before the single
-// retry.
-const remoteReviewOriginRefreshRetryDelay = 250 * time.Millisecond
+// remoteReviewOriginRefreshRetryDelays bounds the retries of a ref-lock race
+// with a fetch outside this process (for example another daemon's job
+// runner), waiting a little longer before each one.
+var remoteReviewOriginRefreshRetryDelays = [...]time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
 
 // refreshRemoteReviewOrigin fetches origin for checkout. Refreshes in this
-// process are serialised per checkout; a ref-lock race with another process
-// is retried once.
+// process are serialised per repository; a ref-lock race with another process
+// is retried with a bounded backoff.
 func refreshRemoteReviewOrigin(ctx context.Context, git gitutil.Client, checkout string) error {
-	lock := remoteReviewOriginRefreshLocks.For(filepath.Clean(checkout))
+	lock := remoteReviewOriginRefreshLocks.For(remoteReviewOriginRefreshKey(ctx, git, checkout))
 	lock.Lock()
 	defer lock.Unlock()
 	err := git.FetchRemote(ctx, "origin")
-	if err == nil || !gitRefLockRace(err) {
-		return err
+	for _, delay := range remoteReviewOriginRefreshRetryDelays {
+		if err == nil || !gitRefLockRace(err) {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		case <-timer.C:
+		}
+		err = git.FetchRemote(ctx, "origin")
 	}
-	timer := time.NewTimer(remoteReviewOriginRefreshRetryDelay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return err
-	case <-timer.C:
+	return err
+}
+
+// remoteReviewOriginRefreshKey names the repository whose remote-tracking refs
+// a refresh of checkout updates: its resolved git common directory, or the
+// checkout path when git cannot report one.
+func remoteReviewOriginRefreshKey(ctx context.Context, git gitutil.Client, checkout string) string {
+	common, err := git.CommonDir(ctx)
+	if err != nil {
+		return filepath.Clean(checkout)
 	}
-	return git.FetchRemote(ctx, "origin")
+	if resolved, err := filepath.EvalSymlinks(common); err == nil {
+		return resolved
+	}
+	return common
 }
 
 // gitRefLockRace reports whether a git failure is a lost race for a ref lock:

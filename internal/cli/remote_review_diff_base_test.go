@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -329,40 +330,62 @@ func TestRemoteReviewDiffBaseHEADScopesMergedPullRequest(t *testing.T) {
 	}
 }
 
-// Two reviews can refresh one checkout's origin at the same moment, possibly
+// Two reviews can refresh one repository's origin at the same moment, possibly
 // from different daemon job runners, and git fails the loser with `cannot
-// lock ref` (#2330). A lost ref-lock race is retried once instead of failing
-// the review.
+// lock ref` (#2330). A lost ref-lock race is retried with a bounded backoff:
+// a lock released within the budget lets the review through, and one held
+// past it fails the review rather than retrying forever.
 func TestRemoteReviewDiffBaseHEADRetriesOriginRefreshRefLockRace(t *testing.T) {
-	worker, job, checkout, base := diffBaseRefreshFixture(t)
-	state := installGitFetchShim(t, `
+	for _, tc := range []struct {
+		name    string
+		races   int
+		wantErr bool
+	}{
+		{name: "lock released within the retry budget", races: 3},
+		{name: "lock held past the retry budget", races: 100, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			worker, job, checkout, base := diffBaseRefreshFixture(t)
+			state := installGitFetchShim(t, `
 	echo fetch >> "$STATE/fetches"
-	if [ ! -e "$STATE/raced" ]; then
-		: > "$STATE/raced"
+	if [ "$(wc -l < "$STATE/fetches")" -le `+strconv.Itoa(tc.races)+` ]; then
 		echo "error: cannot lock ref 'refs/remotes/origin/main': is at 1111111 but expected 2222222" >&2
 		exit 1
 	fi`)
 
-	resolved, err := worker.remoteReviewDiffBaseHEAD(context.Background(), job, checkout)
-	if err != nil {
-		t.Fatalf("diff base after a ref-lock race: %v", err)
-	}
-	if resolved != base {
-		t.Fatalf("diff base = %s, want %s", resolved, base)
-	}
-	fetches, err := os.ReadFile(filepath.Join(state, "fetches"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(string(fetches), "fetch"); got != 2 {
-		t.Fatalf("origin fetched %d times, want the race and one retry", got)
+			resolved, err := worker.remoteReviewDiffBaseHEAD(context.Background(), job, checkout)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "cannot lock ref") {
+					t.Fatalf("diff base with a held ref lock = %q, %v; want the ref-lock failure", resolved, err)
+				}
+			} else if err != nil {
+				t.Fatalf("diff base after ref-lock races: %v", err)
+			} else if resolved != base {
+				t.Fatalf("diff base = %s, want %s", resolved, base)
+			}
+			fetches, err := os.ReadFile(filepath.Join(state, "fetches"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Count(string(fetches), "fetch"); got != 4 {
+				t.Fatalf("origin fetched %d times, want the first fetch and three retries", got)
+			}
+		})
 	}
 }
 
-// Concurrent reviews of one checkout must not run their origin refreshes at
+// Concurrent reviews of one repository must not run their origin refreshes at
 // the same time, so they never race each other for the ref locks (#2330).
+// Reviews run in separate linked worktrees of the registered checkout, which
+// all share its refs/remotes/origin/*.
 func TestRemoteReviewDiffBaseHEADSerializesConcurrentOriginRefreshes(t *testing.T) {
 	worker, job, checkout, base := diffBaseRefreshFixture(t)
+	worktrees := []string{checkout}
+	for i := range 2 {
+		worktree := filepath.Join(t.TempDir(), "review-"+strconv.Itoa(i))
+		runDaemonWorkerGit(t, checkout, "worktree", "add", "--detach", worktree, "HEAD")
+		worktrees = append(worktrees, worktree)
+	}
 	// A fetch that starts while another is in flight records the overlap and
 	// fails the way git does when it loses the ref lock.
 	state := installGitFetchShim(t, `
@@ -377,25 +400,25 @@ func TestRemoteReviewDiffBaseHEADSerializesConcurrentOriginRefreshes(t *testing.
 	rmdir "$STATE/inflight"
 	exit $status`)
 
-	const reviews = 4
-	bases := make([]string, reviews)
-	errs := make([]error, reviews)
+	reviews := append(worktrees, worktrees[1:]...)
+	bases := make([]string, len(reviews))
+	errs := make([]error, len(reviews))
 	var wg sync.WaitGroup
-	for i := range reviews {
+	for i, dir := range reviews {
 		wg.Go(func() {
-			bases[i], errs[i] = worker.remoteReviewDiffBaseHEAD(context.Background(), job, checkout)
+			bases[i], errs[i] = worker.remoteReviewDiffBaseHEAD(context.Background(), job, dir)
 		})
 	}
 	wg.Wait()
 	for i := range reviews {
 		if errs[i] != nil {
-			t.Errorf("review %d: %v", i, errs[i])
+			t.Errorf("review %d in %s: %v", i, reviews[i], errs[i])
 		} else if bases[i] != base {
 			t.Errorf("review %d diff base = %s, want %s", i, bases[i], base)
 		}
 	}
 	if overlaps, err := os.ReadFile(filepath.Join(state, "overlaps")); err == nil {
-		t.Fatalf("%d origin refreshes overlapped another on the same checkout", strings.Count(string(overlaps), "overlap"))
+		t.Fatalf("%d origin refreshes overlapped another on the same repository", strings.Count(string(overlaps), "overlap"))
 	}
 }
 
