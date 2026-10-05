@@ -43,6 +43,7 @@ import (
 // observed in its result summary, so a failure names the check that broke.
 func TestReadOnlySeatRunsSocketTestsAndOfflineModuleBuildsE2E(t *testing.T) {
 	skipUnlessSeatTempParentWritable(t)
+	requireReadOnlySeatLaunchable(t)
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")
 	t.Setenv("HERDR_SOCKET_PATH", filepath.Join(t.TempDir(), "absent-herdr.sock"))

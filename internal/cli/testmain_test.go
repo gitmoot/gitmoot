@@ -103,6 +103,15 @@ func makeTestTempRootUnder(parent string) (string, error) {
 		}
 		err := os.Mkdir(dir, 0o700)
 		if err == nil {
+			// Traversable but not listable by other uids, like the /tmp it
+			// stands in for: a root test that runs a command as a configured
+			// non-root identity (TestDefaultExecutionBackendUsesConfiguredIdentity)
+			// must reach its cwd below here, or exec fails with EACCES. Each
+			// t.TempDir below is still 0700.
+			if err := os.Chmod(dir, 0o711); err != nil {
+				_ = os.Remove(dir)
+				return "", err
+			}
 			return dir, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
