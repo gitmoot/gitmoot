@@ -352,6 +352,7 @@ max_concurrent = 2
 	for name, broken := range map[string]string{
 		"both architectures":     strings.Replace(linux, "omp_linux_amd64_file", fmt.Sprintf("omp_linux_arm64_file = %q\nomp_linux_amd64_file", ompARM64), 1),
 		"plain HTTP off-host":    strings.ReplaceAll(linux, "http://127.0.0.1:43190", "http://198.51.100.4:43190"),
+		"plain HTTP localhost":   strings.ReplaceAll(linux, "http://127.0.0.1:43190", "http://localhost:43190"),
 		"relative amd64 runtime": strings.Replace(linux, fmt.Sprintf("%q", ompAMD64), `"omp-linux-amd64"`, 1),
 	} {
 		if _, err := LoadRemoteExecConfig(remoteExecTestPaths(t, e2b+broken)); err == nil || !strings.Contains(err.Error(), "[remote_exec.sandboxd-linux]") {
