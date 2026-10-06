@@ -1331,6 +1331,13 @@ checkout. A review round and a reviewers list are not required for that
 replacement. A task-bearing review without a PR number or recorded head keeps
 its original path instead; it is not eligible for exact-head reallocation.
 
+Retry also advances the job's lifecycle generation. The global queue reader
+preserves that generation when handing the job to the worker, so review routing
+and remote admission compare against the current attempt rather than a
+zero-valued token. A stale worker still cannot claim a newer attempt. This does
+not bypass active role holds, admission limits, or other scheduling conditions;
+`retry_queued` alone is not proof that the worker has started.
+
 A seat that still exists is kept, including a dangling symlink. Retry does not
 delete it or allocate a second copy on top of it. If the path cannot be
 inspected, retry fails closed and does not change the job. A later race, where

@@ -281,7 +281,14 @@ func TestRemoteReviewAdmissionAllowsValidExactHeadToProvider(t *testing.T) {
 	if _, won, err := f.store.ClaimReviewRequest(f.ctx, key, f.job.ID, db.DefaultReviewPurpose, "routed-review", reviewRequestOwner()); err != nil || !won {
 		t.Fatalf("seed same-job subject claim: won=%v err=%v", won, err)
 	}
-	f.run(t)
+	tracker := newInflightJobTracker(f.ctx)
+	if err := dispatchQueuedJobsTracked(f.ctx, f.worker, 1, 1, "owner/repo", "", tracker); err != nil {
+		t.Fatal(err)
+	}
+	tracker.drain(io.Discard, 5*time.Second)
+	if err := tracker.takeErr("owner/repo"); err != nil {
+		t.Fatal(err)
+	}
 	if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
 		t.Fatalf("backend factory/provider calls = %d/%d, want 1/1", f.factoryCalls, f.backend.provisionCalls)
 	}
@@ -294,6 +301,23 @@ func TestRemoteReviewAdmissionAllowsExplicitOperatorRetry(t *testing.T) {
 		Provider:              "e2b", DaemonFencingToken: "test-fence", BootID: "test-boot",
 		TTLExpiresAt: time.Now().UTC().Add(time.Minute), CostReservedUSD: 0.5,
 	}, db.ExecBackendCostCap{Configured: true, MaxReservedUSD: 25, PerAttemptUSD: 0.5}); err != nil {
+		t.Fatal(err)
+	}
+	// The old readonly seat has been reclaimed. Retry must clear its path, and
+	// the global dispatcher must carry the new generation into admission.
+	payload, err := workflow.ParseJobPayload(f.job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.WorktreePath = t.TempDir() + "/removed-seat"
+	payload.ReadOnlyWorktree = true
+	payload.ReadOnlySeat = true
+	payload.DelegationID = "review-1"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.UpdateJobPayload(f.ctx, f.job.ID, string(encoded)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.TransitionJobStateWithEventAtGeneration(
@@ -309,8 +333,31 @@ func TestRemoteReviewAdmissionAllowsExplicitOperatorRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.job = retried
-	f.run(t)
+	retriedPayload, err := workflow.ParseJobPayload(retried.Payload)
+	if err != nil || retried.LifecycleGeneration != 1 || retriedPayload.WorktreePath != "" {
+		t.Fatalf("retry did not advance generation and clear the reclaimed seat: job=%+v payload=%+v err=%v", retried, retriedPayload, err)
+	}
+	tracker := newInflightJobTracker(f.ctx)
+	if err := dispatchQueuedJobsTracked(f.ctx, f.worker, 1, 1, "owner/repo", "", tracker); err != nil {
+		t.Fatal(err)
+	}
+	tracker.drain(io.Discard, 5*time.Second)
+	if err := tracker.takeErr("owner/repo"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := f.store.ListJobEvents(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := false
+	for _, event := range events {
+		if event.Kind == "running" && event.Message == "remote review admitted before execution-backend reservation" {
+			admitted = true
+		}
+	}
+	if !admitted {
+		t.Fatalf("retried review did not reach running admission through the global queue: events=%+v", events)
+	}
 	if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
 		t.Fatalf("backend factory/provider calls = %d/%d, want 1/1 after explicit retry", f.factoryCalls, f.backend.provisionCalls)
 	}
