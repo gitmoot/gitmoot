@@ -140,18 +140,31 @@ func reviewAdvanceUsesRegisteredCheckout(job db.Job) bool {
 // callers are the configurations where no engine allocation happens at all: an
 // engine with no read-only worktree manager or no Home/DelegationCheckout (the
 // routine leg and the high-risk lens child both arrive path-less there). A leg
-// born with a WorktreePath fails the last gate conjunct below and returns
-// untouched, so no configuration has two live allocation paths. It runs after
-// scheduler admission, including the disk guard, and before checkout validation.
-// The persisted marker lets the existing terminal cleanup reclaim the detached
+// born with a WorktreePath is not eligible and returns untouched, so no
+// configuration has two live allocation paths. A pathless owned read-only PR
+// review (ReadOnlyWorktree set, path cleared by retry) is eligible even when
+// review round and reviewers were never set (#2286). A pathless review without
+// that marker still needs both. ReadOnlySeat alone is not ownership. The
+// persisted marker lets the existing terminal cleanup reclaim the detached
 // worktree.
-func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
+// nativeReviewWorktreeEligible is the single gate for the existing exact-head
+// allocator. The registered checkout is only the git source of the detached
+// seat; this never treats that checkout as the review worktree.
+func nativeReviewWorktreeEligible(job db.Job, payload workflow.JobPayload) bool {
 	if job.Type != "review" ||
 		payload.PullRequest <= 0 ||
 		strings.TrimSpace(payload.HeadSHA) == "" ||
-		strings.TrimSpace(payload.ReviewRound) == "" ||
-		len(payload.Reviewers) == 0 ||
 		strings.TrimSpace(payload.WorktreePath) != "" {
+		return false
+	}
+	if strings.TrimSpace(payload.ReviewRound) != "" && len(payload.Reviewers) > 0 {
+		return true
+	}
+	return payload.ReadOnlyWorktree
+}
+
+func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, error) {
+	if !nativeReviewWorktreeEligible(job, payload) {
 		return payload, nil
 	}
 	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)

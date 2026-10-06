@@ -115,9 +115,25 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	payload.BlockerRetryAt = ""
 	payload.BlockerSuggestedAction = ""
 	payload.BlockerPreDelivery = false
-	if manualRetryShouldClearReadOnlyWorktree(job, payload) {
+	clearSeat, seatErr := manualRetryShouldClearReadOnlyWorktree(job, payload)
+	if seatErr != nil {
+		// Named refusal before the queued transition. A seat that cannot be
+		// classified as absent or present must not bump lifecycle generation.
+		return db.Job{}, seatErr
+	}
+	if clearSeat {
+		// Drop the dead path only. ReadOnlyWorktree stays set so the existing
+		// exact-head allocator can recognize an owned seat and replace it.
+		// Clearing the marker would make a pathless retry look like a routine
+		// review that never had a seat.
 		payload.WorktreePath = ""
-		payload.HeadSHA = ""
+		// A PR review's HeadSHA is the exact head under review, not a property
+		// of the disposable seat. The allocator uses it as the detached ref
+		// (#2286). Ask/produce seats still drop a stale head so the replacement
+		// is checked at its own tip.
+		if !prReviewHeadSurvivesRetry(job, payload) {
+			payload.HeadSHA = ""
+		}
 	}
 	encoded, err := marshalPayload(payload)
 	if err != nil {
@@ -296,19 +312,45 @@ func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (
 	return false, nil
 }
 
-func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) bool {
+// manualRetryShouldClearReadOnlyWorktree reports whether a retry must drop
+// payload.WorktreePath. The no-task ask/review/produce clear is unchanged.
+// The only new exception is a review whose TaskID is set and whose path is an
+// explicitly owned dispatch seat (ReadOnlyWorktree). A review task id does not
+// own that seat. Ask/produce with a task id, an implement job, and a review
+// whose checkout is the unmarked task worktree all keep their path. ReadOnlySeat
+// alone is not ownership.
+func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) (bool, error) {
 	if strings.TrimSpace(payload.WorktreePath) == "" {
-		return false
-	}
-	if strings.TrimSpace(payload.TaskID) != "" {
-		return false
+		return false, nil
 	}
 	switch strings.TrimSpace(job.Type) {
 	case "ask", "review", "produce":
-		return true
 	default:
-		return false
+		return false, nil
 	}
+	if strings.TrimSpace(payload.TaskID) == "" {
+		return true, nil
+	}
+	if !prReviewHeadSurvivesRetry(job, payload) || !payload.ReadOnlyWorktree {
+		return false, nil
+	}
+	// Only the new review-task seat branch inspects the path. A present seat,
+	// including a dangling symlink, is the checkout the retry must keep.
+	// Anything other than a definite absence fails closed before the
+	// generation write. pathPresent uses Lstat, so NotExist is the only absence.
+	present, err := pathPresent(payload.WorktreePath)
+	if err != nil {
+		return false, fmt.Errorf("inspect read-only review seat %s: %w", payload.WorktreePath, err)
+	}
+	return !present, nil
+}
+
+// prReviewHeadSurvivesRetry keeps the exact review head across a retry. The
+// disposable seat may be gone; the head the review was bound to must not be.
+func prReviewHeadSurvivesRetry(job db.Job, payload JobPayload) bool {
+	return strings.EqualFold(strings.TrimSpace(job.Type), "review") &&
+		payload.PullRequest > 0 &&
+		strings.TrimSpace(payload.HeadSHA) != ""
 }
 
 func latestCancellationWasFromRunning(ctx context.Context, store *db.Store, jobID string) (bool, error) {

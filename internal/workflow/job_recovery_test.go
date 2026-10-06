@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -140,6 +143,231 @@ func TestRetryJobPreservesTaskWorktreePath(t *testing.T) {
 	if storedPayload.HeadSHA != "abc123" {
 		t.Fatalf("task retry HeadSHA = %q, want preserved", storedPayload.HeadSHA)
 	}
+}
+
+func TestRetryJobClearsOwnedReviewSeatDespiteTaskID(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	const (
+		seat = "/tmp/gitmoot/worktrees/owner--repo/delegations/review-1/readonly-seat"
+		head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+		task = "/tmp/gitmoot/worktrees/owner--repo/task-1"
+	)
+	// Incident shape: review task id, owned seat, exact head, no review round
+	// and no reviewers. The task id must not keep the removed seat path.
+	disposable := `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"review-pr-1101","read_only_worktree":true,"read_only_seat":true,"worktree_path":"` + seat + `","head_sha":"` + head + `","result":{"decision":"blocked","summary":"stale"}}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-1", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: disposable}, db.JobEvent{
+		Kind:    string(JobBlocked),
+		Message: "blocked",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	job, err := RetryJob(ctx, store, "review-1")
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if stored.WorktreePath != "" {
+		t.Fatalf("review retry kept removed seat WorktreePath = %q", stored.WorktreePath)
+	}
+	if !stored.ReadOnlyWorktree || !stored.ReadOnlySeat {
+		t.Fatalf("review retry dropped seat ownership flags: %+v", stored)
+	}
+	if stored.HeadSHA != head {
+		t.Fatalf("review retry HeadSHA = %q, want exact head %s", stored.HeadSHA, head)
+	}
+	if stored.TaskID != "review-pr-1101" || stored.ReviewRound != "" || len(stored.Reviewers) != 0 {
+		t.Fatalf("review retry changed task/round/reviewers: %+v", stored)
+	}
+
+	// Same task id, no disposable marker: the task checkout stays.
+	owned := `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"task-1","worktree_path":"` + task + `","head_sha":"` + head + `"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-owned", Agent: "reviewer", Type: "review", State: string(JobFailed), Payload: owned}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent owned returned error: %v", err)
+	}
+	ownedJob, err := RetryJob(ctx, store, "review-owned")
+	if err != nil {
+		t.Fatalf("RetryJob owned returned error: %v", err)
+	}
+	ownedPayload, err := unmarshalPayload(ownedJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload owned returned error: %v", err)
+	}
+	if ownedPayload.WorktreePath != task || ownedPayload.HeadSHA != head {
+		t.Fatalf("task-owned review = %+v, want path %s head %s", ownedPayload, task, head)
+	}
+
+	// A stale marker on an implement job must not clear the task checkout.
+	implement := `{"repo":"owner/repo","branch":"feature","task_id":"task-1","read_only_worktree":true,"worktree_path":"` + task + `","head_sha":"abc123"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "implement-marked", Agent: "builder", Type: "implement", State: string(JobFailed), Payload: implement}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent implement returned error: %v", err)
+	}
+	implementJob, err := RetryJob(ctx, store, "implement-marked")
+	if err != nil {
+		t.Fatalf("RetryJob implement returned error: %v", err)
+	}
+	implementPayload, err := unmarshalPayload(implementJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload implement returned error: %v", err)
+	}
+	if implementPayload.WorktreePath != task {
+		t.Fatalf("implement retry WorktreePath = %q, want preserved task checkout", implementPayload.WorktreePath)
+	}
+
+	// Ask with a task id keeps its path even if a seat marker is set. The new
+	// TaskID exception is review-only.
+	ask := `{"repo":"owner/repo","task_id":"task-1","read_only_worktree":true,"worktree_path":"` + task + `","head_sha":"abc123"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "ask-marked", Agent: "asker", Type: "ask", State: string(JobFailed), Payload: ask}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent ask returned error: %v", err)
+	}
+	askJob, err := RetryJob(ctx, store, "ask-marked")
+	if err != nil {
+		t.Fatalf("RetryJob ask returned error: %v", err)
+	}
+	askPayload, err := unmarshalPayload(askJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload ask returned error: %v", err)
+	}
+	if askPayload.WorktreePath != task {
+		t.Fatalf("ask-with-task retry WorktreePath = %q, want preserved", askPayload.WorktreePath)
+	}
+}
+
+func TestRetryJobPreservesOwnedTaskReviewWithoutExactPRHead(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		pr   int
+		head string
+	}{
+		{name: "no pull request", head: "abc123"},
+		{name: "no head", pr: 121},
+		{name: "blank head", pr: 121, head: " "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			seat := filepath.Join(t.TempDir(), "missing-seat")
+			payload := JobPayload{
+				Repo: "owner/repo", TaskID: "review-task", PullRequest: test.pr,
+				HeadSHA: test.head, WorktreePath: seat, ReadOnlyWorktree: true,
+			}
+			encoded, err := marshalPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "review", Agent: "reviewer", Type: "review",
+				State: string(JobFailed), Payload: encoded,
+			}, db.JobEvent{Kind: string(JobFailed), Message: "failed"}); err != nil {
+				t.Fatal(err)
+			}
+			job, err := RetryJob(ctx, store, "review")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := unmarshalPayload(job.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WorktreePath != seat || got.HeadSHA != test.head {
+				t.Fatalf("review without allocator identity lost its checkout: %+v", got)
+			}
+		})
+	}
+}
+
+func TestRetryJobPreservesPresentOwnedReviewSeat(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seat := t.TempDir()
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	payload := ownedReviewSeatPayload(seat, head)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-present", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: payload}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := RetryJob(ctx, store, "review-present")
+	if err != nil {
+		t.Fatalf("RetryJob: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WorktreePath != seat || stored.HeadSHA != head || !stored.ReadOnlyWorktree {
+		t.Fatalf("present seat retry = %+v, want path %s head %s marker kept", stored, seat, head)
+	}
+}
+
+func TestRetryJobPreservesDanglingOwnedReviewSeatSymlink(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	seat := filepath.Join(dir, "readonly-seat")
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), seat); err != nil {
+		t.Fatal(err)
+	}
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-link", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: ownedReviewSeatPayload(seat, head)}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := RetryJob(ctx, store, "review-link")
+	if err != nil {
+		t.Fatalf("RetryJob: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WorktreePath != seat || stored.HeadSHA != head {
+		t.Fatalf("dangling symlink retry = %+v, want path %s head %s", stored, seat, head)
+	}
+}
+
+func TestRetryJobInspectErrorDoesNotTransitionOwnedReviewSeat(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seat := filepath.Join(blocker, "readonly-seat")
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	payload := ownedReviewSeatPayload(seat, head)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-inspect", Agent: "reviewer", Type: "review", State: string(JobBlocked), LifecycleGeneration: 4, Payload: payload}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetJob(ctx, "review-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RetryJob(ctx, store, "review-inspect")
+	if err == nil || !errors.Is(err, syscall.ENOTDIR) || !strings.Contains(err.Error(), "inspect read-only review seat "+seat) {
+		t.Fatalf("RetryJob err = %v, want inspect error wrapping ENOTDIR for %s", err, seat)
+	}
+	after, err := store.GetJob(ctx, "review-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.LifecycleGeneration != before.LifecycleGeneration || after.Payload != before.Payload {
+		t.Fatalf("inspect error mutated job: before=%+v after=%+v", before, after)
+	}
+}
+
+func ownedReviewSeatPayload(seat, head string) string {
+	return `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"review-pr-1101","read_only_worktree":true,"read_only_seat":true,"worktree_path":"` + seat + `","head_sha":"` + head + `"}`
 }
 
 func TestRetryJobRecoversDismissedTaskAtomically(t *testing.T) {
