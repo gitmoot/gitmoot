@@ -5,8 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -240,6 +243,88 @@ func TestRetryJobClearsOwnedReviewSeatDespiteTaskID(t *testing.T) {
 	if askPayload.WorktreePath != task {
 		t.Fatalf("ask-with-task retry WorktreePath = %q, want preserved", askPayload.WorktreePath)
 	}
+}
+
+func TestRetryJobPreservesPresentOwnedReviewSeat(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seat := t.TempDir()
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	payload := ownedReviewSeatPayload(seat, head)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-present", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: payload}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := RetryJob(ctx, store, "review-present")
+	if err != nil {
+		t.Fatalf("RetryJob: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WorktreePath != seat || stored.HeadSHA != head || !stored.ReadOnlyWorktree {
+		t.Fatalf("present seat retry = %+v, want path %s head %s marker kept", stored, seat, head)
+	}
+}
+
+func TestRetryJobPreservesDanglingOwnedReviewSeatSymlink(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	seat := filepath.Join(dir, "readonly-seat")
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), seat); err != nil {
+		t.Fatal(err)
+	}
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-link", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: ownedReviewSeatPayload(seat, head)}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := RetryJob(ctx, store, "review-link")
+	if err != nil {
+		t.Fatalf("RetryJob: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.WorktreePath != seat || stored.HeadSHA != head {
+		t.Fatalf("dangling symlink retry = %+v, want path %s head %s", stored, seat, head)
+	}
+}
+
+func TestRetryJobInspectErrorDoesNotTransitionOwnedReviewSeat(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	dir := t.TempDir()
+	blocker := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seat := filepath.Join(blocker, "readonly-seat")
+	const head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+	payload := ownedReviewSeatPayload(seat, head)
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-inspect", Agent: "reviewer", Type: "review", State: string(JobBlocked), LifecycleGeneration: 4, Payload: payload}, db.JobEvent{Kind: string(JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.GetJob(ctx, "review-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RetryJob(ctx, store, "review-inspect")
+	if err == nil || !errors.Is(err, syscall.ENOTDIR) || !strings.Contains(err.Error(), "inspect read-only review seat "+seat) {
+		t.Fatalf("RetryJob err = %v, want inspect error wrapping ENOTDIR for %s", err, seat)
+	}
+	after, err := store.GetJob(ctx, "review-inspect")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != before.State || after.LifecycleGeneration != before.LifecycleGeneration || after.Payload != before.Payload {
+		t.Fatalf("inspect error mutated job: before=%+v after=%+v", before, after)
+	}
+}
+
+func ownedReviewSeatPayload(seat, head string) string {
+	return `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"review-pr-1101","read_only_worktree":true,"read_only_seat":true,"worktree_path":"` + seat + `","head_sha":"` + head + `"}`
 }
 
 func TestRetryJobRecoversDismissedTaskAtomically(t *testing.T) {

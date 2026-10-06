@@ -3,15 +3,15 @@ package cli
 import (
 	"bytes"
 	"context"
-	"io"
-	"os"
-	"testing"
-
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
 )
 
 // TestRetryRemovedReadonlySeatReallocatesExactHead is the #2286 lifecycle:
@@ -96,5 +96,64 @@ func TestRetryRemovedReadonlySeatReallocatesExactHead(t *testing.T) {
 	}
 	if checkout != seat {
 		t.Fatalf("checkoutForJob = %q, want replacement seat %q", checkout, seat)
+	}
+}
+
+// TestRetryPresentReadonlySeatIsConsumed keeps a still-present owned review
+// seat and runs checkout against that path. Recreating it would fail with
+// "already exists". No review round or reviewers, matching the incident shape.
+func TestRetryPresentReadonlySeatIsConsumed(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	shared, head, _ := readonlyReviewWorktreeGitCheckout(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", shared)
+	paths := config.PathsForHome(home)
+	const jobID = "local-review-present-seat"
+	seat, err := workflow.DelegationWorktreePath(paths.Home, "owner/repo", jobID, "readonly-seat", 0)
+	if err != nil {
+		t.Fatalf("DelegationWorktreePath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(seat), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, shared, "worktree", "add", "--detach", seat, head)
+	payload := `{"repo":"owner/repo","branch":"feature/review","pull_request":1101,"task_id":"review-pr-1101","read_only_worktree":true,"read_only_seat":true,"exec_backend":"remote","worktree_path":"` + seat + `","head_sha":"` + head + `"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: jobID, Agent: "reviewer", Type: "review", State: string(workflow.JobBlocked), Payload: payload,
+	}, db.JobEvent{Kind: string(workflow.JobBlocked), Message: "blocked"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runJobRetry([]string{jobID, "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("job retry exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.WorktreePath != seat || parsed.HeadSHA != head || !parsed.ReadOnlyWorktree {
+		t.Fatalf("present seat after retry = %+v, want path %s head %s", parsed, seat, head)
+	}
+	worker := defaultJobWorker(store, io.Discard, home)
+	prepared, err := worker.prepareNativeReviewWorktreeForRunner(ctx, job, parsed, subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("prepare must not recreate a present seat: %v", err)
+	}
+	if prepared.WorktreePath != seat {
+		t.Fatalf("prepare path = %q, want existing seat %q", prepared.WorktreePath, seat)
+	}
+	checkout, err := worker.checkoutForJob(ctx, job, prepared, runtime.Agent{}, subprocess.ExecRunner{})
+	if err != nil {
+		t.Fatalf("checkoutForJob: %v", err)
+	}
+	if checkout != seat {
+		t.Fatalf("checkoutForJob = %q, want existing seat %q", checkout, seat)
+	}
+	if got := readonlyWorktreeHead(t, checkout); got != head {
+		t.Fatalf("consumed seat HEAD = %s, want %s", got, head)
 	}
 }

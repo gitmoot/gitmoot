@@ -115,7 +115,13 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	payload.BlockerRetryAt = ""
 	payload.BlockerSuggestedAction = ""
 	payload.BlockerPreDelivery = false
-	if manualRetryShouldClearReadOnlyWorktree(job, payload) {
+	clearSeat, seatErr := manualRetryShouldClearReadOnlyWorktree(job, payload)
+	if seatErr != nil {
+		// Named refusal before the queued transition. A seat that cannot be
+		// classified as absent or present must not bump lifecycle generation.
+		return db.Job{}, seatErr
+	}
+	if clearSeat {
 		// Drop the dead path only. ReadOnlyWorktree stays set so the existing
 		// exact-head allocator can recognize an owned seat and replace it.
 		// Clearing the marker would make a pathless retry look like a routine
@@ -313,19 +319,30 @@ func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (
 // own that seat. Ask/produce with a task id, an implement job, and a review
 // whose checkout is the unmarked task worktree all keep their path. ReadOnlySeat
 // alone is not ownership.
-func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) bool {
+func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) (bool, error) {
 	if strings.TrimSpace(payload.WorktreePath) == "" {
-		return false
+		return false, nil
 	}
 	switch strings.TrimSpace(job.Type) {
 	case "ask", "review", "produce":
 	default:
-		return false
+		return false, nil
 	}
 	if strings.TrimSpace(payload.TaskID) == "" {
-		return true
+		return true, nil
 	}
-	return strings.TrimSpace(job.Type) == "review" && payload.ReadOnlyWorktree
+	if strings.TrimSpace(job.Type) != "review" || !payload.ReadOnlyWorktree {
+		return false, nil
+	}
+	// Only the new review-task seat branch inspects the path. A present seat,
+	// including a dangling symlink, is the checkout the retry must keep.
+	// Anything other than a definite absence fails closed before the
+	// generation write. pathPresent uses Lstat, so NotExist is the only absence.
+	present, err := pathPresent(payload.WorktreePath)
+	if err != nil {
+		return false, fmt.Errorf("inspect read-only review seat %s: %w", payload.WorktreePath, err)
+	}
+	return !present, nil
 }
 
 // prReviewHeadSurvivesRetry keeps the exact review head across a retry. The

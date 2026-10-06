@@ -1330,6 +1330,14 @@ exact-head allocator then recreates the `readonly-seat` from the registered
 checkout. A review round and a reviewers list are not required for that
 replacement.
 
+A seat that still exists is kept, including a dangling symlink. Retry does not
+delete it or allocate a second copy on top of it. If the path cannot be
+inspected, retry fails closed and does not change the job. A later race, where
+the seat was absent at retry and reappears before allocation, fails at that
+allocation. The error is returned before checkout resolution. Gitmoot does not
+delete the seat to reconcile it, and does not fall back to the registered
+checkout or the repository root.
+
 A task-owned checkout is different. A review or implement job whose path is
 not marked `read_only_worktree` keeps that path. An ask or produce job that
 already has a task id also keeps its path. Do not delete the registered
