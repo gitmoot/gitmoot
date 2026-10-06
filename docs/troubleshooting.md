@@ -1328,7 +1328,8 @@ that cleanup already removed, retry drops that path even when the review has a
 task id. The task id names the review task, not the seat. The existing
 exact-head allocator then recreates the `readonly-seat` from the registered
 checkout. A review round and a reviewers list are not required for that
-replacement.
+replacement. A task-bearing review without a PR number or recorded head keeps
+its original path instead; it is not eligible for exact-head reallocation.
 
 A seat that still exists is kept, including a dangling symlink. Retry does not
 delete it or allocate a second copy on top of it. If the path cannot be

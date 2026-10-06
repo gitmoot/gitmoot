@@ -245,6 +245,49 @@ func TestRetryJobClearsOwnedReviewSeatDespiteTaskID(t *testing.T) {
 	}
 }
 
+func TestRetryJobPreservesOwnedTaskReviewWithoutExactPRHead(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		pr   int
+		head string
+	}{
+		{name: "no pull request", head: "abc123"},
+		{name: "no head", pr: 121},
+		{name: "blank head", pr: 121, head: " "},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			seat := filepath.Join(t.TempDir(), "missing-seat")
+			payload := JobPayload{
+				Repo: "owner/repo", TaskID: "review-task", PullRequest: test.pr,
+				HeadSHA: test.head, WorktreePath: seat, ReadOnlyWorktree: true,
+			}
+			encoded, err := marshalPayload(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "review", Agent: "reviewer", Type: "review",
+				State: string(JobFailed), Payload: encoded,
+			}, db.JobEvent{Kind: string(JobFailed), Message: "failed"}); err != nil {
+				t.Fatal(err)
+			}
+			job, err := RetryJob(ctx, store, "review")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := unmarshalPayload(job.Payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WorktreePath != seat || got.HeadSHA != test.head {
+				t.Fatalf("review without allocator identity lost its checkout: %+v", got)
+			}
+		})
+	}
+}
+
 func TestRetryJobPreservesPresentOwnedReviewSeat(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)

@@ -331,7 +331,7 @@ func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) (boo
 	if strings.TrimSpace(payload.TaskID) == "" {
 		return true, nil
 	}
-	if strings.TrimSpace(job.Type) != "review" || !payload.ReadOnlyWorktree {
+	if !prReviewHeadSurvivesRetry(job, payload) || !payload.ReadOnlyWorktree {
 		return false, nil
 	}
 	// Only the new review-task seat branch inspects the path. A present seat,
