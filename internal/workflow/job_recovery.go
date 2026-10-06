@@ -116,8 +116,18 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	payload.BlockerSuggestedAction = ""
 	payload.BlockerPreDelivery = false
 	if manualRetryShouldClearReadOnlyWorktree(job, payload) {
+		// Drop the dead path only. ReadOnlyWorktree stays set so the existing
+		// exact-head allocator can recognize an owned seat and replace it.
+		// Clearing the marker would make a pathless retry look like a routine
+		// review that never had a seat.
 		payload.WorktreePath = ""
-		payload.HeadSHA = ""
+		// A PR review's HeadSHA is the exact head under review, not a property
+		// of the disposable seat. The allocator uses it as the detached ref
+		// (#2286). Ask/produce seats still drop a stale head so the replacement
+		// is checked at its own tip.
+		if !prReviewHeadSurvivesRetry(job, payload) {
+			payload.HeadSHA = ""
+		}
 	}
 	encoded, err := marshalPayload(payload)
 	if err != nil {
@@ -296,19 +306,34 @@ func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (
 	return false, nil
 }
 
+// manualRetryShouldClearReadOnlyWorktree reports whether a retry must drop
+// payload.WorktreePath. The no-task ask/review/produce clear is unchanged.
+// The only new exception is a review whose TaskID is set and whose path is an
+// explicitly owned dispatch seat (ReadOnlyWorktree). A review task id does not
+// own that seat. Ask/produce with a task id, an implement job, and a review
+// whose checkout is the unmarked task worktree all keep their path. ReadOnlySeat
+// alone is not ownership.
 func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) bool {
 	if strings.TrimSpace(payload.WorktreePath) == "" {
 		return false
 	}
-	if strings.TrimSpace(payload.TaskID) != "" {
-		return false
-	}
 	switch strings.TrimSpace(job.Type) {
 	case "ask", "review", "produce":
-		return true
 	default:
 		return false
 	}
+	if strings.TrimSpace(payload.TaskID) == "" {
+		return true
+	}
+	return strings.TrimSpace(job.Type) == "review" && payload.ReadOnlyWorktree
+}
+
+// prReviewHeadSurvivesRetry keeps the exact review head across a retry. The
+// disposable seat may be gone; the head the review was bound to must not be.
+func prReviewHeadSurvivesRetry(job db.Job, payload JobPayload) bool {
+	return strings.EqualFold(strings.TrimSpace(job.Type), "review") &&
+		payload.PullRequest > 0 &&
+		strings.TrimSpace(payload.HeadSHA) != ""
 }
 
 func latestCancellationWasFromRunning(ctx context.Context, store *db.Store, jobID string) (bool, error) {

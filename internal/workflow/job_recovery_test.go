@@ -142,6 +142,106 @@ func TestRetryJobPreservesTaskWorktreePath(t *testing.T) {
 	}
 }
 
+func TestRetryJobClearsOwnedReviewSeatDespiteTaskID(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	const (
+		seat = "/tmp/gitmoot/worktrees/owner--repo/delegations/review-1/readonly-seat"
+		head = "b8e9a16518f9b684d63dabc19d26e8e0f36202b1"
+		task = "/tmp/gitmoot/worktrees/owner--repo/task-1"
+	)
+	// Incident shape: review task id, owned seat, exact head, no review round
+	// and no reviewers. The task id must not keep the removed seat path.
+	disposable := `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"review-pr-1101","read_only_worktree":true,"read_only_seat":true,"worktree_path":"` + seat + `","head_sha":"` + head + `","result":{"decision":"blocked","summary":"stale"}}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-1", Agent: "reviewer", Type: "review", State: string(JobBlocked), Payload: disposable}, db.JobEvent{
+		Kind:    string(JobBlocked),
+		Message: "blocked",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent returned error: %v", err)
+	}
+	job, err := RetryJob(ctx, store, "review-1")
+	if err != nil {
+		t.Fatalf("RetryJob returned error: %v", err)
+	}
+	stored, err := unmarshalPayload(job.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload returned error: %v", err)
+	}
+	if stored.WorktreePath != "" {
+		t.Fatalf("review retry kept removed seat WorktreePath = %q", stored.WorktreePath)
+	}
+	if !stored.ReadOnlyWorktree || !stored.ReadOnlySeat {
+		t.Fatalf("review retry dropped seat ownership flags: %+v", stored)
+	}
+	if stored.HeadSHA != head {
+		t.Fatalf("review retry HeadSHA = %q, want exact head %s", stored.HeadSHA, head)
+	}
+	if stored.TaskID != "review-pr-1101" || stored.ReviewRound != "" || len(stored.Reviewers) != 0 {
+		t.Fatalf("review retry changed task/round/reviewers: %+v", stored)
+	}
+
+	// Same task id, no disposable marker: the task checkout stays.
+	owned := `{"repo":"owner/repo","branch":"feature","pull_request":1101,"task_id":"task-1","worktree_path":"` + task + `","head_sha":"` + head + `"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "review-owned", Agent: "reviewer", Type: "review", State: string(JobFailed), Payload: owned}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent owned returned error: %v", err)
+	}
+	ownedJob, err := RetryJob(ctx, store, "review-owned")
+	if err != nil {
+		t.Fatalf("RetryJob owned returned error: %v", err)
+	}
+	ownedPayload, err := unmarshalPayload(ownedJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload owned returned error: %v", err)
+	}
+	if ownedPayload.WorktreePath != task || ownedPayload.HeadSHA != head {
+		t.Fatalf("task-owned review = %+v, want path %s head %s", ownedPayload, task, head)
+	}
+
+	// A stale marker on an implement job must not clear the task checkout.
+	implement := `{"repo":"owner/repo","branch":"feature","task_id":"task-1","read_only_worktree":true,"worktree_path":"` + task + `","head_sha":"abc123"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "implement-marked", Agent: "builder", Type: "implement", State: string(JobFailed), Payload: implement}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent implement returned error: %v", err)
+	}
+	implementJob, err := RetryJob(ctx, store, "implement-marked")
+	if err != nil {
+		t.Fatalf("RetryJob implement returned error: %v", err)
+	}
+	implementPayload, err := unmarshalPayload(implementJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload implement returned error: %v", err)
+	}
+	if implementPayload.WorktreePath != task {
+		t.Fatalf("implement retry WorktreePath = %q, want preserved task checkout", implementPayload.WorktreePath)
+	}
+
+	// Ask with a task id keeps its path even if a seat marker is set. The new
+	// TaskID exception is review-only.
+	ask := `{"repo":"owner/repo","task_id":"task-1","read_only_worktree":true,"worktree_path":"` + task + `","head_sha":"abc123"}`
+	if err := store.CreateJobWithEvent(ctx, db.Job{ID: "ask-marked", Agent: "asker", Type: "ask", State: string(JobFailed), Payload: ask}, db.JobEvent{
+		Kind:    string(JobFailed),
+		Message: "failed",
+	}); err != nil {
+		t.Fatalf("CreateJobWithEvent ask returned error: %v", err)
+	}
+	askJob, err := RetryJob(ctx, store, "ask-marked")
+	if err != nil {
+		t.Fatalf("RetryJob ask returned error: %v", err)
+	}
+	askPayload, err := unmarshalPayload(askJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload ask returned error: %v", err)
+	}
+	if askPayload.WorktreePath != task {
+		t.Fatalf("ask-with-task retry WorktreePath = %q, want preserved", askPayload.WorktreePath)
+	}
+}
+
 func TestRetryJobRecoversDismissedTaskAtomically(t *testing.T) {
 	tests := []struct {
 		name      string

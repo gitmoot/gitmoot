@@ -1320,6 +1320,22 @@ containing `=` is kept rather than dropped.
 In GATEWAY mode no runtime stages a credential file, and the policy the seat
 computes says so rather than naming files it then withholds.
 
+## Retry of a removed read-only review seat
+
+`gitmoot job retry` on a blocked or failed review keeps the exact PR head. If
+the job's path is a dispatch-allocated read-only seat (`read_only_worktree`)
+that cleanup already removed, retry drops that path even when the review has a
+task id. The task id names the review task, not the seat. The existing
+exact-head allocator then recreates the `readonly-seat` from the registered
+checkout. A review round and a reviewers list are not required for that
+replacement.
+
+A task-owned checkout is different. A review or implement job whose path is
+not marked `read_only_worktree` keeps that path. An ask or produce job that
+already has a task id also keeps its path. Do not delete the registered
+checkout or the task worktree to force a retry; request a fresh review only
+when the exact head itself is gone.
+
 ## Worktrees consume too much disk
 
 The daemon checks task-owned worktrees every five minutes. A task is eligible
