@@ -372,6 +372,16 @@ FROM wake_outbox`
 	return out, rows.Err()
 }
 
+// LatestWakeOutboxID returns the highest outbox row id, or 0 for an empty
+// outbox. Row ids only grow, so a changed value means a new row was inserted;
+// the daemon's drain loop polls it to deliver new rows without re-running the
+// full drain every few seconds.
+func (s *Store) LatestWakeOutboxID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM wake_outbox`).Scan(&id)
+	return id, err
+}
+
 // ListWakeOutboxObligations projects undelivered work. Failed and uncertain
 // attempts remain visible, but are never returned as automatically retryable.
 func (s *Store) ListWakeOutboxObligations(

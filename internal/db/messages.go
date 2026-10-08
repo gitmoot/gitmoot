@@ -32,8 +32,8 @@ type Message struct {
 	HeadSHA            string `json:"head_sha,omitempty"`
 	ReviewPurpose      string `json:"review_purpose,omitempty"`
 	SourceJobID        string `json:"source_job_id,omitempty"`
-	SourceState string `json:"source_state,omitempty"`
-	ReviewDecision string `json:"review_decision,omitempty"`
+	SourceState        string `json:"source_state,omitempty"`
+	ReviewDecision     string `json:"review_decision,omitempty"`
 }
 
 const messageSelect = `SELECT m.id,m.thread_id,COALESCE(m.reply_to,0),m.sender,m.recipient,m.body,

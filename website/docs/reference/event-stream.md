@@ -230,6 +230,10 @@ wake names carries the delivery outcome; every row it collapses is recorded
 `superseded` with `coalesced into wake outbox row <id>`, so the suppressed
 wakes stay readable and countable rather than each reporting a delivery of its
 own.
+A review result (an awaited-fact wake for a review verdict, in any state)
+skips the hold and is delivered at the next drain; the daemon drains the
+outbox on its own loop, checking for new rows every five seconds and
+re-draining at least every thirty seconds, independent of repository sweeps.
 Pending, attempted, delivered, superseded, stalled, failed, and
 `delivery_unknown` remain queryable per outbox row, and outstanding obligations
 contribute to daemon tick health. A deliverable row still inside its hold is

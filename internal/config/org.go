@@ -15,6 +15,14 @@ import (
 // interrupt reduction on this fleet's own arrival history, which is 21.8% at
 // 120s and 32.1% at 300s against 7.1% at the previous 5s (#1978). It stays
 // configurable through [org].wake_coalesce_hold.
+//
+// REVIEW RESULTS ARE EXEMPT by OWNER DECISION on 2026-10-08: an awaited-fact
+// wake whose fact is a review verdict (subject_kind review_verdict, in every
+// lifecycle state, including a failed, blocked, or cancelled review) skips
+// this hold and is delivered at the next drain. Every other wake kind (notes,
+// replies, directives, blocked/escalation events, other fact kinds) keeps the
+// hold unchanged. The exemption lives in wakeOutboxRowHold
+// (internal/cli/reply_wake_outbox.go).
 const DefaultWakeCoalesceHold = 5 * time.Minute
 
 // DefaultNotificationStaleAfter is how long a notification may stay pending
