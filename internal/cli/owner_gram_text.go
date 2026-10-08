@@ -46,7 +46,7 @@ type ownerAlert struct {
 // request: the head named in a gate escalation, and the repository a note was
 // written about.
 type ownerAlertLookup interface {
-	PullRequestForHead(ctx context.Context, head string) (repo string, number int, found bool, err error)
+	PullRequestForHead(ctx context.Context, repo, head string) (number int, found bool, err error)
 	GetWorkflowNote(ctx context.Context, id int64) (db.WorkflowNote, error)
 }
 
@@ -94,10 +94,12 @@ func ownerAlertFor(ctx context.Context, lookup ownerAlertLookup, row db.WakeOutb
 		alert.original = row.MessageBody
 	}
 	alert.original = ownerGramPlainText(alert.original)
-	if number == 0 && lookup != nil {
+	// The head names a pull request only within the alert's own repository:
+	// the same commit can head pull requests in other repositories.
+	if number == 0 && repo != "" && lookup != nil {
 		if match := ownerGramHeadPattern.FindStringSubmatch(alert.original); match != nil {
-			if r, n, found, err := lookup.PullRequestForHead(ctx, match[1]); err == nil && found {
-				repo, number = r, n
+			if n, found, err := lookup.PullRequestForHead(ctx, repo, match[1]); err == nil && found {
+				number = n
 			}
 		}
 	}
@@ -120,7 +122,8 @@ func explainOwnerAlert(alert *ownerAlert, row db.WakeOutboxObligation, event eve
 	leftOpen := strings.Contains(text, workflow.LowRiskAutoMergeLeaveOpenPrefix)
 	mergeQueue := strings.Contains(text, "requires GitHub's merge queue")
 	awaitingMerge := strings.Contains(text, "awaiting_human_merge")
-	attributionWhy := fmt.Sprintf("Gitmoot can't confirm who wrote this change, so it won't merge it automatically. Fix: the seat that wrote it records its work (gitmoot job record --acting-role %s …).", alert.seatName())
+	// Plain words only above the separator: the procedure stays in the original.
+	attributionWhy := fmt.Sprintf("Gitmoot can't confirm who wrote this change, so it won't merge it automatically. Fix: %s, the seat that wrote it, records its work in Gitmoot.", alert.seatName())
 	mergeTodo := "If you want this change, merge it on GitHub. If not, close it."
 	switch {
 	case leftOpen:
@@ -139,7 +142,7 @@ func explainOwnerAlert(alert *ownerAlert, row db.WakeOutboxObligation, event eve
 		alert.todo = "Add it to the merge queue on GitHub."
 	case attribution:
 		alert.headline = "Gitmoot can't confirm who wrote this change, so it won't merge it automatically."
-		alert.why = fmt.Sprintf("Fix: the seat that wrote it records its work (gitmoot job record --acting-role %s …).", alert.seatName())
+		alert.why = fmt.Sprintf("Fix: %s, the seat that wrote it, records its work in Gitmoot.", alert.seatName())
 		alert.todo = "Nothing is needed from you unless you want to merge it by hand on GitHub."
 	case awaitingMerge:
 		alert.headline = "it's approved and waiting for someone to merge it."
@@ -157,11 +160,11 @@ func explainOwnerAlert(alert *ownerAlert, row db.WakeOutboxObligation, event eve
 	}
 }
 
-// seatName is the role named in a record-your-work hint: the seat when the
-// alert came from one, otherwise a placeholder.
+// seatName names the seat in a record-your-work hint: the seat when the alert
+// came from one, otherwise a plain description.
 func (a ownerAlert) seatName() string {
 	if a.who == "Gitmoot" || a.who == "A review" || a.who == "" {
-		return "<role>"
+		return "the repo's seat"
 	}
 	return a.who
 }

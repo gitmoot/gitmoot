@@ -62,13 +62,17 @@ func TestOwnerGramRendersMessage283687Plainly(t *testing.T) {
 	want := "life-crm needs you: jerryfane/estel#6 — it's approved, but Gitmoot won't merge it by itself.\n" +
 		"This repo has no automated checks (CI), so automatic merging is off for it. " +
 		"Gitmoot can't confirm who wrote this change, so it won't merge it automatically. " +
-		"Fix: the seat that wrote it records its work (gitmoot job record --acting-role life-crm …).\n" +
+		"Fix: life-crm, the seat that wrote it, records its work in Gitmoot.\n" +
 		"What to do: If you want this change, merge it on GitHub. If not, close it.\n" +
 		"https://github.com/jerryfane/estel/pull/6\n\n" +
 		ownerGramSeparator + "\n" +
 		"Original message from life-crm about jerryfane/estel#6, unedited:\n" + original
 	if message.Text != want || message.Attachment != "" {
 		t.Fatalf("rendered gram:\n%s\n\nwant:\n%s", message.Text, want)
+	}
+	summary, _, _ := strings.Cut(message.Text, ownerGramSeparator)
+	if strings.Contains(summary, "gitmoot ") {
+		t.Fatalf("owner-facing summary carries a CLI command:\n%s", summary)
 	}
 	t.Logf("rendered gram for message 283687:\n%s", message.Text)
 }
@@ -133,4 +137,24 @@ func TestOwnerGramRendersEstel6AfterSeatRouting(t *testing.T) {
 		t.Fatalf("rendered gram:\n%s\n\nwant:\n%s", message.Text, want)
 	}
 	t.Logf("rendered gram for estel#6 after seat routing:\n%s", message.Text)
+}
+
+// The same head can head pull requests in different repositories; the Gram
+// must link only the alert's own repository's pull request.
+func TestOwnerGramLinksOnlyThePullRequestOfItsOwnRepository(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	const head = "6ad9eed75402ee3d75b021d2e79ceef6e113ac44"
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "someone/fork", Number: 99, URL: "https://github.com/someone/fork/pull/99",
+		HeadBranch: "engine-claude", BaseBranch: "main", HeadSHA: head, State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original := "CI gate: low-risk auto-merge left the pull request open for a human merge: head 6ad9eed reports no external CI; " +
+		"low-risk auto-merge requires real green CI for head " + head
+	message := renderOwnerGramFromNote(t, store, sink, "[org:escalate to=owner from=life-crm wf=adhoc/estel-review-codex-2026-10-08] "+original)
+	if strings.Contains(message.Text, "someone/fork") || !strings.HasPrefix(message.Text, "life-crm needs you: jerryfane/estel — ") {
+		t.Fatalf("rendered gram linked another repository's pull request:\n%s", message.Text)
+	}
 }

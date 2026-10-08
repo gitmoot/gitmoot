@@ -231,23 +231,23 @@ WHERE target_role = ? AND state IN ('failed', 'delivery_unknown', 'stalled')`,
 	return health, err
 }
 
-// PullRequestForHead finds the pull request whose recorded head is head. The
-// owner Gram uses it to link a gate escalation, which names only the head.
-func (s *Store) PullRequestForHead(ctx context.Context, head string) (string, int, bool, error) {
-	head = strings.TrimSpace(head)
-	if head == "" {
-		return "", 0, false, nil
+// PullRequestForHead finds the pull request of repo whose recorded head is
+// head. The owner Gram uses it to link a gate escalation, which names only the
+// head; it never looks outside the alert's own repository.
+func (s *Store) PullRequestForHead(ctx context.Context, repo, head string) (int, bool, error) {
+	repo, head = strings.TrimSpace(repo), strings.TrimSpace(head)
+	if repo == "" || head == "" {
+		return 0, false, nil
 	}
-	var repo string
 	var number int
 	err := s.db.QueryRowContext(ctx, `
-SELECT repo_full_name, number FROM pull_requests
-WHERE head_sha = ? ORDER BY updated_at DESC, id DESC LIMIT 1`, head).Scan(&repo, &number)
+SELECT number FROM pull_requests
+WHERE repo_full_name = ? AND head_sha = ? ORDER BY updated_at DESC, id DESC LIMIT 1`, repo, head).Scan(&number)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", 0, false, nil
+		return 0, false, nil
 	}
 	if err != nil {
-		return "", 0, false, err
+		return 0, false, err
 	}
-	return repo, number, true, nil
+	return number, true, nil
 }
