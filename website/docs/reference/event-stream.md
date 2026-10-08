@@ -234,6 +234,19 @@ A review result (an awaited-fact wake for a review verdict, in any state)
 skips the hold and is delivered at the next drain; the daemon drains the
 outbox on its own loop, checking for new rows every five seconds and
 re-draining at least every thirty seconds, independent of repository sweeps.
+
+The owner role has no pane or seat. The daemon's drain therefore delivers every
+due wake addressed to `owner` (needs-attention escalations, blocked events,
+notes, directives and review results) as one plain-text Herdr Gram
+(`herdr gram send --from gitmoot`), with no event rule needed. Owner Grams are
+at least two minutes apart; alerts due together share one Gram (up to ten
+items). Rows are claimed before the send and each gets a receipt in
+`owner_gram_receipts` with the gram id. An accepted Gram marks the row
+`delivered` (accepted by Herdr, not proof the owner read it). A refused send
+marks it `failed` with `owner gram refused: ...`, and `gitmoot org wake retry`
+can resend it. An unknown outcome marks it `delivery_unknown` and is never
+resent. `gitmoot org status` flags the owner row while any owner alert is
+failed, `delivery_unknown` or stalled and not yet retried or superseded.
 Pending, attempted, delivered, superseded, stalled, failed, and
 `delivery_unknown` remain queryable per outbox row, and outstanding obligations
 contribute to daemon tick health. A deliverable row still inside its hold is

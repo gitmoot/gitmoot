@@ -147,6 +147,11 @@ type jobWorker struct {
 	// It is consulted only for a claimed not-applied observation; nil selects the
 	// checkout-bound production client.
 	PermissionPolicyEffectGit func(string) permissionpolicy.EffectGit
+	// OwnerGram delivers wakes addressed to the owner role as Herdr Grams. Only
+	// the daemon supervisors set it, on the worker they hand the wake drain loop
+	// (sendOwnerGramViaHerdr); nil keeps owner wakes on the ordinary rule/pane
+	// path, so tests never send a real Gram.
+	OwnerGram ownerGramSender
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
@@ -176,12 +181,13 @@ func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, er
 		return replyWakeDelivery{}, fmt.Errorf("list event rules: %w", err)
 	}
 	if w.EventSinkOverride != nil {
-		return replyWakeDelivery{sink: w.EventSinkOverride, rules: rules}, nil
+		return replyWakeDelivery{sink: w.EventSinkOverride, rules: rules, ownerGram: w.OwnerGram}, nil
 	}
 	return replyWakeDelivery{
-		sink:  resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
-		rules: rules,
-		ready: messageRecipientReadiness(w.workflowHome()),
+		sink:      resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
+		rules:     rules,
+		ready:     messageRecipientReadiness(w.workflowHome()),
+		ownerGram: w.OwnerGram,
 	}, nil
 }
 

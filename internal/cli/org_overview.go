@@ -40,6 +40,8 @@ type orgSharedState struct {
 	awaitedFactsErr error
 	awaitedLoaded   bool
 	unavailable     map[string]db.OrgRoleUnavailable
+	// ownerAlerts counts undelivered owner wakes; nil when unreadable.
+	ownerAlerts *db.OwnerAlertHealth
 }
 
 type orgLiveSourceError struct {
@@ -79,6 +81,13 @@ func loadOrgSharedState(ctx context.Context, paths config.Paths, store *db.Store
 	}
 	for _, row := range unavailable {
 		state.unavailable[row.Role] = row
+	}
+	// Best effort, like missed-wake flagging: an unreadable count is a warning,
+	// never a failed status.
+	if alerts, err := store.OwnerAlertHealth(ctx, orgChartRootRole); err != nil {
+		state.Warnings = append(state.Warnings, fmt.Sprintf("owner alert delivery health unavailable: %v", err))
+	} else {
+		state.ownerAlerts = &alerts
 	}
 
 	// Missed-wake flagging is a best-effort add-on. Keep its existing
@@ -339,6 +348,7 @@ func buildOrgStatusRows(ctx context.Context, shared *orgSharedState, src orgLive
 			RecycleStatus: recycleStatus, RecycleAfter: recycleAfterText,
 			MissedWakes: consecutive, Flagged: flagged, FlagReason: flagReason,
 			UnavailableReason: unavailableReason, UnavailableUntil: unavailableUntil,
+			UndeliveredAlerts: orgOwnerAlerts(role.Name, shared.ownerAlerts),
 		})
 	}
 	if command == "chart" {
@@ -448,4 +458,11 @@ func orgTurnAgeBasis(live org.RoleLiveState, age string) string {
 	default:
 		return "last_completed"
 	}
+}
+
+func orgOwnerAlerts(role string, alerts *db.OwnerAlertHealth) *db.OwnerAlertHealth {
+	if role != orgChartRootRole || alerts == nil || alerts.Total() == 0 {
+		return nil
+	}
+	return alerts
 }

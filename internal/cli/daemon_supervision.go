@@ -104,7 +104,11 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			// The wake outbox is store-global and drains on its own short loop,
 			// not at the head of the repository sweep, so a review result is
 			// not delayed by the whole fleet sweep.
-			stopReplyWakeDrain := startReplyWakeDrainLoop(ctx, store, worker, tracker, stdout)
+			// Owner-addressed wakes go to Herdr Gram (owner decision 2026-10-08).
+			// Only the daemon drainer is wired to send; tests inject a fake.
+			drainWorker := worker
+			drainWorker.OwnerGram = sendOwnerGramViaHerdr
+			stopReplyWakeDrain := startReplyWakeDrainLoop(ctx, store, drainWorker, tracker, stdout)
 			defer stopReplyWakeDrain()
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
@@ -233,7 +237,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// The deferred drain cancels + waits (bounded) for in-flight jobs on exit.
 	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
 	startBlockedRoleWakeLoop(ctx, store, home, stdout)
-	stopReplyWakeDrain := startReplyWakeDrainLoop(ctx, store, worker, tracker, stdout)
+	drainWorker := worker
+	drainWorker.OwnerGram = sendOwnerGramViaHerdr
+	stopReplyWakeDrain := startReplyWakeDrainLoop(ctx, store, drainWorker, tracker, stdout)
 	defer stopReplyWakeDrain()
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
 	// single-repo daemon would silently never run them. Off-by-default: with no

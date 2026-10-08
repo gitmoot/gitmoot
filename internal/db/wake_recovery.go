@@ -25,6 +25,9 @@ func WakeProvenUnsent(row WakeOutboxEntry) bool {
 	if row.LastError == "role pane binding unresolved" || row.LastError == "herdr unavailable" {
 		return true
 	}
+	if row.State == WakeOutboxStateFailed && strings.HasPrefix(row.LastError, OwnerGramRefusedPrefix) {
+		return true
+	}
 	for _, code := range []string{"agent_not_found", "agent_blocked", "agent_input_pending"} {
 		if strings.HasPrefix(row.LastError, "agent prompt "+code+":") {
 			return true

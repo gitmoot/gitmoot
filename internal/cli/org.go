@@ -1237,6 +1237,10 @@ type orgStatusOutput struct {
 	FlagReason        string             `json:"flag_reason,omitempty"`
 	UnavailableReason string             `json:"unavailable_reason,omitempty"`
 	UnavailableUntil  string             `json:"unavailable_until,omitempty"`
+	// UndeliveredAlerts is set on the owner row only: owner wakes whose Gram
+	// failed or whose outcome is unknown, plus stalled ones, that no operator
+	// has resolved. A failed owner alert must not die silently again.
+	UndeliveredAlerts *db.OwnerAlertHealth `json:"undelivered_alerts,omitempty"`
 }
 
 func runOrgBrief(args []string, stdout, stderr io.Writer) int {
@@ -1399,10 +1403,17 @@ func orgUnavailableFlag(row orgStatusOutput) string {
 }
 
 func orgMissedWakeFlag(row orgStatusOutput) string {
-	if !row.Flagged {
-		return ""
+	flag := ""
+	if row.Flagged {
+		flag = fmt.Sprintf(" ⚠ flagged (%d missed wakes)", row.MissedWakes)
 	}
-	return fmt.Sprintf(" ⚠ flagged (%d missed wakes)", row.MissedWakes)
+	if alerts := row.UndeliveredAlerts; alerts != nil && alerts.Total() > 0 {
+		flag += fmt.Sprintf(
+			" ⚠ %d owner alerts not delivered (failed=%d unknown=%d stalled=%d; gitmoot org wake list --state failed|delivery_unknown|stalled)",
+			alerts.Total(), alerts.Failed, alerts.Unknown, alerts.Stalled,
+		)
+	}
+	return flag
 }
 
 func printOrgBrief(w io.Writer, brief orgBriefOutput) {

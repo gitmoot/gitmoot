@@ -2201,6 +2201,9 @@ with `coalesced into wake outbox row <id>`. Different event kinds never share a
 coalescing key, and a later tick flushes a quiet tail without another event.
 A review result (an awaited-fact wake for a review verdict, in any state) skips
 the hold and is delivered at the next drain.
+Wakes addressed to the `owner` role go to the owner as one Herdr Gram per drain
+(at least two minutes apart) and need no event rule; `gitmoot org status`
+flags owner alerts that failed or whose delivery is unknown.
 Rules default to `--scope addressed`: an addressed rule is eligible only when
 the event names a target role and that role matches `--wake`.
 `--scope observer` exempts a rule from the addressee gate, so observers receive

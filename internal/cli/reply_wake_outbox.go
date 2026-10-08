@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -42,6 +43,9 @@ type replyWakeDelivery struct {
 	sink  events.Sink
 	rules []db.EventRule
 	ready func(context.Context, string) (string, error)
+	// ownerGram, when set, delivers wakes addressed to the owner role as Herdr
+	// Grams instead of through rules and panes (owner_gram.go).
+	ownerGram ownerGramSender
 }
 
 type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
@@ -186,8 +190,37 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 		}
 	}
 
+	pending := obligations.Pending
+	if resolve != nil && slices.ContainsFunc(pending, isOwnerWake) {
+		// Owner wakes go to Herdr Gram when the daemon wired it; otherwise they
+		// stay on the ordinary path below.
+		delivery, err := resolve(ctx)
+		if err != nil {
+			return replyWakeOutboxHealth{}, fmt.Errorf("resolve wake outbox delivery: %w", err)
+		}
+		if delivery.ownerGram != nil {
+			var ownerRows []db.WakeOutboxObligation
+			rest := make([]db.WakeOutboxObligation, 0, len(pending))
+			for _, entry := range pending {
+				if isOwnerWake(entry) {
+					ownerRows = append(ownerRows, entry)
+				} else {
+					rest = append(rest, entry)
+				}
+			}
+			claimed, err := deliverOwnerGram(ctx, store, delivery, ownerRows, now, hold)
+			if claimed {
+				mutated = true
+			}
+			if err != nil {
+				return replyWakeOutboxHealth{}, err
+			}
+			pending = rest
+		}
+	}
+
 	groups := make(map[string][]db.WakeOutboxObligation)
-	for _, entry := range obligations.Pending {
+	for _, entry := range pending {
 		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
 		if entry.SourceKind == db.WakeOutboxSourceWorkflowNote &&
 			strings.HasPrefix(strings.ToLower(entry.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
@@ -383,12 +416,20 @@ func classifyWakeOutboxObligations(
 		createdAt  time.Time
 	}
 	unmatched := make([]unmatchedWakeObligation, 0, len(obligations.Pending))
+	var ownerSpacedUntil time.Time
+	ownerSpacingLoaded := false
 	routes := make([]db.EventRuleRoute, 0, len(obligations.Pending))
 	seenRoutes := make(map[string]struct{})
 	for _, obligation := range obligations.Pending {
 		route, event, err := classifyPendingWakeRoute(delivery.rules, obligation, attemptedBefore)
 		if err != nil {
 			return replyWakeOutboxHealth{}, err
+		}
+		if delivery.ownerGram != nil && isOwnerWake(obligation) && route == pendingWakeUnroutable {
+			// The owner Gram path needs no event rule, so an owner wake no rule
+			// routes is deliverable rather than inert. An explicitly muted
+			// route still counts as suppressed.
+			route = pendingWakeDeliverable
 		}
 		if route == pendingWakeDeliverable {
 			createdAt, err := time.Parse(time.RFC3339Nano, obligation.CreatedAt)
@@ -402,6 +443,22 @@ func classifyWakeOutboxObligations(
 			if rowHold := wakeOutboxRowHold(obligation, hold); rowHold > 0 && now.UTC().Before(createdAt.Add(rowHold)) {
 				health.held++
 				continue
+			}
+			if delivery.ownerGram != nil && isOwnerWake(obligation) {
+				// A due owner wake waiting out the Gram spacing interval is held
+				// by design, like a row inside its coalescing hold.
+				if !ownerSpacingLoaded {
+					ownerSpacingLoaded = true
+					if recorder, ok := store.(ownerGramStore); ok {
+						if last, err := recorder.LatestOwnerGramSentAt(ctx); err == nil && !last.IsZero() {
+							ownerSpacedUntil = last.Add(ownerGramMinInterval)
+						}
+					}
+				}
+				if now.UTC().Before(ownerSpacedUntil) {
+					health.held++
+					continue
+				}
 			}
 			health.pending++
 			continue
