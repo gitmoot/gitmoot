@@ -22,7 +22,8 @@ type fakeOwnerGram struct {
 	texts  []string
 	result ownerGramResult
 	// started, when set, receives once per send; release, when set, blocks the
-	// send until closed; delay simulates a slow Herdr.
+	// FIRST send until closed (later sends return at once, so a defect shows as
+	// an extra send rather than a hung test); delay simulates a slow Herdr.
 	started chan struct{}
 	release chan struct{}
 	delay   time.Duration
@@ -31,12 +32,16 @@ type fakeOwnerGram struct {
 func (f *fakeOwnerGram) send(_ context.Context, text string) ownerGramResult {
 	f.mu.Lock()
 	f.texts = append(f.texts, text)
+	first := len(f.texts) == 1
 	started, release, delay, result := f.started, f.release, f.delay, f.result
 	f.mu.Unlock()
 	if started != nil {
-		started <- struct{}{}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 	}
-	if release != nil {
+	if release != nil && first {
 		<-release
 	}
 	time.Sleep(delay)
