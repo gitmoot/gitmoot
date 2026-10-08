@@ -65,6 +65,28 @@ is an explicit authorized merge request. Turning `auto_merge` back on re-arms
 only tasks parked for this exact kill-switch reason.
 Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
 
+A repository can instead opt into low-risk auto-merge while the global switch
+stays off:
+
+```toml
+[repos."owner/repo".merge_gate]
+auto_merge = "low_risk"
+```
+
+The gate then merges without a human only when the exact head has a clean
+exact-head approval, real green external CI (no CI keeps it manual; the
+synthetic `gitmoot/ci` success is not used), no `hold`/`do-not-merge` label, is
+not a draft, and the review-level classifier puts that exact head at level 1 or
+2. The level is the newest `~/.gitmoot/review-levels.jsonl` entry for that head,
+or the daemon classifies the head like `gitmoot review level` and records it; a
+classifier failure is reused for an hour before a retry. Level 3, a classifier
+error or a head that moved keeps the pull request open with a reason starting
+`low-risk auto-merge left the pull request open for a human merge:` that names
+the failed condition. After a level 2 auto-merge the daemon requests the
+post-merge review once for the acting role of the exact-head review job, or
+records a `low_risk_post_merge_review_owed` task event when it cannot.
+`gitmoot/gitmoot` always requires review and is refused as a config error.
+
 When review independence cannot be verified, the merge gate names the evidence
 it observed: no implement job for the task, implement jobs that do not match the
 task identity, a matching implement job with no agent, or a malformed implement

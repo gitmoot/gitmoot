@@ -7,6 +7,7 @@ import (
 
 func applyResolvedMergeGatePolicy(gate *workflow.PolicyMergeGate, policy config.MergeGatePolicy) {
 	gate.AutoMerge = policy.AutoMerge
+	gate.LowRiskOnly = policy.LowRiskOnly
 	gate.RequireExternalCI = policy.RequireExternalCI
 	gate.MinCIWait = policy.MinCIWait
 	gate.MaxCIWait = policy.MaxCIWait

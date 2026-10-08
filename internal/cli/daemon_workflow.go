@@ -708,8 +708,12 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	if err != nil {
 		return workflow.MergeDecision{}, err
 	}
-	gate := newDaemonPolicyMergeGateForRunner(g.Store, g.githubClient(checkout), checkout, g.Runner)
+	gh := g.githubClient(checkout)
+	gate := newDaemonPolicyMergeGateForRunner(g.Store, gh, checkout, g.Runner)
 	applyResolvedMergeGatePolicy(&gate, policy)
+	if gate.LowRiskOnly {
+		gate.ReviewLevel = daemonLowRiskReviewLevel(g.Home, gh)
+	}
 	if g.Git != nil {
 		gate.Git = g.Git
 	}
@@ -731,6 +735,9 @@ func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeReq
 	// never sees the driver. Keep it that way: never call the gate from within a
 	// still-running job's own execution.
 	decision, err := gate.Evaluate(ctx, request)
+	if err == nil && decision.Merged {
+		g.requestLowRiskPostMergeReview(ctx, request, decision)
+	}
 	if err != nil || !decision.Reason.IsGateMiss() {
 		return decision, err
 	}

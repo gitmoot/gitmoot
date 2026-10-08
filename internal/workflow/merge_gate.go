@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"github.com/gitmoot/gitmoot/internal/reviewlevel"
 )
 
 const (
@@ -96,6 +97,14 @@ type PolicyMergeGate struct {
 	// PipelineAutoMerger does not call Evaluate and remains governed only by its
 	// independent pipeline allow_auto_merge mechanism.
 	AutoMerge bool
+	// LowRiskOnly narrows AutoMerge (per-repo auto_merge = "low_risk"): a
+	// merge without an explicit human request also needs the exact head to be
+	// classified level 1 or 2 by ReviewLevel, and no hold label. Every other
+	// outcome leaves the pull request open for a human.
+	LowRiskOnly bool
+	// ReviewLevel returns the review-level decision for repo/pr at headSHA.
+	// Required when LowRiskOnly is set; nil fails closed.
+	ReviewLevel func(ctx context.Context, repo string, pullRequest int, headSHA string) (reviewlevel.Decision, error)
 	// RequireExternalCI hard-blocks a merge whose head reports zero external CI
 	// instead of ever stamping the synthetic gitmoot/ci success (#596, layer 3 —
 	// the [merge_gate] require_external_ci knob). Default false.
@@ -123,6 +132,9 @@ type PolicyMergeGate struct {
 	taskClaimRenewalTicks      func(context.Context, time.Duration) <-chan time.Time
 	afterTaskClaimRenewal      func()
 	outcomeConfirmationTimeout time.Duration
+	// lowRiskRequiresCI is set by Evaluate for a LowRiskOnly automatic merge:
+	// a head with no external CI stays manual (no synthetic gitmoot/ci).
+	lowRiskRequiresCI bool
 }
 
 // defaultMinCIWait is the built-in grace window used when MinCIWait is unset. It
@@ -292,6 +304,11 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if !g.AutoMerge && !request.HumanMergeRequested && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason(MergeLeaveOpenAutoMergeKillSwitchReason)}, nil
 	}
+	if g.LowRiskOnly && !request.HumanMergeRequested {
+		// A low-risk auto-merge needs real CI on the head: a no-CI head stays
+		// manual instead of receiving the synthetic gitmoot/ci success.
+		g.lowRiskRequiresCI = true
+	}
 	if request.PullRequestDraftUnknown && !request.TerminalRecoveryOnly {
 		return MergeDecision{LeaveOpen: true, Reason: PlainReason("pull request draft state is unknown")}, nil
 	}
@@ -354,6 +371,14 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		if !reason.IsZero() {
 			return g.gateMiss(reason), nil
 		}
+	}
+	lowRiskLevel := ""
+	if g.LowRiskOnly && !request.HumanMergeRequested && !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
+		level, reason := g.lowRiskAutoMergeLevel(ctx, request, pr, headSHA)
+		if reason != "" {
+			return MergeDecision{LeaveOpen: true, Reason: PlainReason(LowRiskAutoMergeLeaveOpenPrefix + reason)}, nil
+		}
+		lowRiskLevel = level
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
 		if queueAware, ok := g.GitHub.(mergeQueueAwareGitHub); ok {
@@ -482,7 +507,60 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		Context:     GitmootMergeGateContext,
 		Description: "Gitmoot merge gate passed",
 	})
-	return g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
+	decision, err := g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
+	if err == nil && decision.Merged {
+		decision.ReviewLevel = lowRiskLevel
+		if lowRiskLevel != "" {
+			decision.MergedHeadSHA = headSHA
+		}
+	}
+	return decision, err
+}
+
+// LowRiskAutoMergeLeaveOpenPrefix starts every leave-open reason of the
+// per-repo auto_merge = "low_risk" policy, so seats can tell which condition
+// kept the pull request open.
+const LowRiskAutoMergeLeaveOpenPrefix = "low-risk auto-merge left the pull request open for a human merge: "
+
+// lowRiskHoldLabels are pull request labels an owner or seat sets to keep a
+// low-risk head from merging automatically.
+var lowRiskHoldLabels = []string{"hold", "do-not-merge", "do not merge"}
+
+// lowRiskAutoMergeLevel returns the exact-head level that permits a low-risk
+// auto-merge, or a non-empty reason naming the failed condition. It runs only
+// after the exact-head review and real external CI gate passed.
+func (g PolicyMergeGate) lowRiskAutoMergeLevel(ctx context.Context, request MergeRequest, pr github.PullRequest, headSHA string) (string, string) {
+	if reviewlevel.AlwaysReviewRepo(request.Repo) {
+		return "", fmt.Sprintf("%s always requires review before merge and cannot opt in", strings.TrimSpace(request.Repo))
+	}
+	if pr.Draft {
+		return "", "pull request is draft"
+	}
+	for _, label := range pr.Labels {
+		for _, hold := range lowRiskHoldLabels {
+			if strings.EqualFold(strings.TrimSpace(label.Name), hold) {
+				return "", fmt.Sprintf("hold label %q is set", label.Name)
+			}
+		}
+	}
+	if g.ReviewLevel == nil {
+		return "", "review-level classifier is not configured"
+	}
+	decision, err := g.ReviewLevel(ctx, request.Repo, request.PullRequest, headSHA)
+	if err != nil {
+		return "", fmt.Sprintf("review level unavailable at head %s: %v", headSHA, err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(decision.HeadSHA), headSHA) {
+		return "", fmt.Sprintf("review level was classified at head %s, not the current head %s", strings.TrimSpace(decision.HeadSHA), headSHA)
+	}
+	switch decision.Level {
+	case reviewlevel.LevelNoReview, reviewlevel.LevelBackground:
+		return decision.Level, ""
+	case reviewlevel.LevelRequired:
+		return "", fmt.Sprintf("head %s is level 3 (%s: %s)", headSHA, decision.Source, decision.Reason)
+	default:
+		return "", fmt.Sprintf("head %s has unknown review level %q", headSHA, decision.Level)
+	}
 }
 
 func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
@@ -2593,6 +2671,12 @@ func (g PolicyMergeGate) concludeNoExternalCI(ctx context.Context, repo github.R
 	// a repo-config/operator-policy condition, not a template defect, so it blocks
 	// as MergeBlockTransient (unharvested), and only here — never during the
 	// creation-lag race handled above.
+	if g.lowRiskRequiresCI {
+		return mergeBlocked{
+			reason: fmt.Sprintf("%shead %s reports no external CI; low-risk auto-merge requires real green CI", LowRiskAutoMergeLeaveOpenPrefix, shortHead),
+			class:  MergeBlockTransient,
+		}
+	}
 	if g.RequireExternalCI {
 		return mergeBlocked{
 			reason: fmt.Sprintf("merge gate requires external CI but head %s still reports none after waiting for CI to appear; set [merge_gate] require_external_ci = false to allow no-CI merges, or ensure the CI workflow runs on this pull request", shortHead),
