@@ -193,12 +193,11 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 	pending := obligations.Pending
 	if resolve != nil && slices.ContainsFunc(pending, isOwnerWake) {
 		// Owner wakes go to Herdr Gram when the daemon wired it; otherwise they
-		// stay on the ordinary path below.
+		// stay on the ordinary path below. An unreadable delivery snapshot also
+		// leaves them there: the ordinary path resolves again and reports the
+		// cause, so this pre-step cannot mask or reword it.
 		delivery, err := resolve(ctx)
-		if err != nil {
-			return replyWakeOutboxHealth{}, fmt.Errorf("resolve wake outbox delivery: %w", err)
-		}
-		if delivery.ownerGram != nil {
+		if err == nil && delivery.ownerGram != nil {
 			var ownerRows []db.WakeOutboxObligation
 			rest := make([]db.WakeOutboxObligation, 0, len(pending))
 			for _, entry := range pending {
