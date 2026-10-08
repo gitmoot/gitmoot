@@ -85,6 +85,12 @@ func loadStaleNotificationReport(ctx context.Context, store *db.Store, threshold
 			// purpose: keep it in the warning rather than hide the whole report.
 			route = pendingWakeDeliverable
 		}
+		if route == pendingWakeUnroutable && isOwnerWake(row) {
+			// The daemon delivers owner wakes as Herdr Grams without any rule
+			// (owner_gram.go), so an old rule-less owner wake is overdue, not
+			// pending on purpose.
+			route = pendingWakeDeliverable
+		}
 		created, err := time.Parse(time.RFC3339Nano, row.CreatedAt)
 		if err != nil {
 			return staleNotificationReport{}, fmt.Errorf("parse stale notification created_at for row %d: %w", row.ID, err)
