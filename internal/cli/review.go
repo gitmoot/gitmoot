@@ -1503,7 +1503,11 @@ func reviewGateState(home, repo string) string {
 	if err != nil {
 		return "unknown: " + err.Error()
 	}
-	if gate.For(repo).AutoMerge {
+	policy := gate.For(repo)
+	if policy.AutoMerge && policy.LowRiskOnly {
+		return "native low-risk auto-merge enabled: an exact-head approval plus real green CI can merge a level 1 or 2 head without a human; level 3, unknown level, no CI and holds stay manual"
+	}
+	if policy.AutoMerge {
 		return "native auto-merge enabled: an exact-head approval plus green CI can merge without a human"
 	}
 	return "native auto-merge disabled by operator kill switch: the gate publishes status but merges nothing, and a merge is a human decision"

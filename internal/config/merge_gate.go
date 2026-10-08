@@ -6,7 +6,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/reviewlevel"
 )
+
+// MergeGateAutoMergeLowRisk is the per-repo auto_merge value that opts a repo
+// into native auto-merge only for heads the review-level classifier puts at
+// level 1 or 2, with real external CI (gitmoot/gitmoot#2265 follow-up).
+const MergeGateAutoMergeLowRisk = "low_risk"
 
 // DefaultMinCIWait is retained for compatibility with existing merge_gate
 // configuration. The mandatory native merge gate never treats zero external CI
@@ -24,6 +31,10 @@ type MergeGatePolicy struct {
 	// an exact-head approval and green SHA-scoped CI. It defaults true; false is
 	// an explicit operator kill-switch.
 	AutoMerge bool
+	// LowRiskOnly narrows AutoMerge to heads classified level 1 or 2 at the
+	// exact head with real external CI. It is set only by a per-repo
+	// `auto_merge = "low_risk"`; the global default stays a plain boolean.
+	LowRiskOnly bool
 	// RequireExternalCI is retained for config compatibility. Exact-head external
 	// CI is mandatory for native auto-merge regardless of this legacy value.
 	RequireExternalCI bool
@@ -53,6 +64,7 @@ type MergeGateConfig struct {
 // global value rather than resetting it to a zero value).
 type mergeGateOverride struct {
 	autoMerge         *bool
+	lowRisk           bool
 	requireExternalCI *bool
 	minCIWait         *time.Duration
 	maxCIWait         *time.Duration
@@ -75,9 +87,14 @@ func (c MergeGateConfig) For(repo string) MergeGatePolicy {
 	}
 	if override.autoMerge != nil {
 		policy.AutoMerge = *override.autoMerge
+		policy.LowRiskOnly = false
 	}
 	if override.requireExternalCI != nil {
 		policy.RequireExternalCI = *override.requireExternalCI
+	}
+	if override.lowRisk {
+		policy.AutoMerge = true
+		policy.LowRiskOnly = true
 	}
 	if override.minCIWait != nil {
 		policy.MinCIWait = *override.minCIWait
@@ -153,6 +170,9 @@ func LoadMergeGatePolicy(paths Paths) (MergeGateConfig, error) {
 		if err := validateMergeGatePolicy(fmt.Sprintf("[repos.%q.merge_gate]", name), cfg.For(name)); err != nil {
 			return MergeGateConfig{}, err
 		}
+		if cfg.repos[name].lowRisk && reviewlevel.AlwaysReviewRepo(name) {
+			return MergeGateConfig{}, fmt.Errorf("[repos.%q.merge_gate].auto_merge: %q is refused for %s, which always requires review before merge", name, MergeGateAutoMergeLowRisk, name)
+		}
 	}
 	return cfg, nil
 }
@@ -221,11 +241,20 @@ func applyMergeGateGlobalField(policy *MergeGatePolicy, key string, value string
 func applyMergeGateOverrideField(override *mergeGateOverride, key string, value string) error {
 	switch key {
 	case "auto_merge":
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			if strings.TrimSpace(unquoted) != MergeGateAutoMergeLowRisk {
+				return fmt.Errorf("auto_merge must be true, false or %q", MergeGateAutoMergeLowRisk)
+			}
+			override.autoMerge = nil
+			override.lowRisk = true
+			return nil
+		}
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
 			return err
 		}
 		override.autoMerge = &parsed
+		override.lowRisk = false
 		return nil
 	case "require_external_ci":
 		parsed, err := strconv.ParseBool(value)

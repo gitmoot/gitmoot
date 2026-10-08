@@ -40,6 +40,16 @@ const (
 // AlwaysReviewRepos are reviewed before every merge regardless of the diff.
 var AlwaysReviewRepos = []string{"gitmoot/gitmoot"}
 
+// AlwaysReviewRepo reports whether repo is one of AlwaysReviewRepos.
+func AlwaysReviewRepo(repo string) bool {
+	for _, candidate := range AlwaysReviewRepos {
+		if strings.EqualFold(strings.TrimSpace(repo), candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 // FixedPathPattern names paths whose change always needs review before merge.
 var FixedPathPattern = regexp.MustCompile(`(^|/)(AGENTS|CLAUDE)\.md$|^\.agents/|^skills/.*SKILL\.md$|^\.github/workflows/|(^|/)(fly|render|vercel|netlify)\.(toml|json|ya?ml)$|^deploy/|(^|/)go\.(mod|sum)$|(^|/)package(-lock)?\.json$|(^|/)(pnpm-lock\.yaml|yarn\.lock|Podfile\.lock|Package\.resolved|Cargo\.lock|poetry\.lock|uv\.lock)$|(^|/)migrations?/|^internal/workflow/merge_gate|^internal/credgw/|^internal/config/org\.go$`)
 
@@ -110,10 +120,8 @@ func Decide(ctx context.Context, judge Judge, model string, in Input) Decision {
 		return decision
 	}
 
-	for _, repo := range AlwaysReviewRepos {
-		if strings.EqualFold(strings.TrimSpace(in.Repo), repo) {
-			return required("repo", repo+" always requires review before merge")
-		}
+	if AlwaysReviewRepo(in.Repo) {
+		return required("repo", strings.TrimSpace(in.Repo)+" always requires review before merge")
 	}
 	var fixed []string
 	for _, file := range in.Files {

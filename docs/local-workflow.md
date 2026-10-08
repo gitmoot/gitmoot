@@ -546,7 +546,10 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    reports missing wake routes and pane bindings. Set
    `[merge_gate] auto_merge = false` globally or per
    repository as
-   an explicit kill-switch. The merge gate also checks local worktree cleanliness,
+   an explicit kill-switch, or set a repository's
+   `[repos."owner/repo".merge_gate] auto_merge = "low_risk"` to merge only
+   exact-head-approved level 1 or 2 heads with real green CI (see the gitmoot
+   skill's SAFETY reference). The merge gate also checks local worktree cleanliness,
    branch freshness, and mergeability. Final merge work
    is serialized per repository base branch. Before the policy gate can issue
    its squash-merge-and-delete request, the daemon checks the PR branch for any
