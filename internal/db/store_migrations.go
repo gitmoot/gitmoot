@@ -2924,7 +2924,8 @@ UPDATE execbackend_attempts SET provider = 'sandboxd' WHERE provider = 'mac';
 	`,
 	// Owner alerts via Herdr Gram (owner decision 2026-10-08). One receipt per
 	// wake row per claim: the attempt number comes from wake_outbox, so the
-	// primary key refuses a second outcome for the same claim. Append-only.
+	// primary key refuses a second outcome for the same claim. Receipts are
+	// append-only; owner_gram_spacing spaces the sends.
 	`
 CREATE TABLE owner_gram_receipts (
 	wake_outbox_id INTEGER NOT NULL REFERENCES wake_outbox(id),
@@ -2936,5 +2937,12 @@ CREATE TABLE owner_gram_receipts (
 	PRIMARY KEY(wake_outbox_id, attempt)
 );
 CREATE INDEX idx_owner_gram_receipts_sent_at ON owner_gram_receipts(sent_at);
+-- One row: the latest owner Gram send. Reserved in the claim transaction and
+-- advanced to the outcome time, so owner Grams stay minInterval apart even
+-- across concurrent drainers and slow sends.
+CREATE TABLE owner_gram_spacing (
+	id INTEGER PRIMARY KEY CHECK(id = 1),
+	last_send_at TEXT NOT NULL
+);
 	`,
 }

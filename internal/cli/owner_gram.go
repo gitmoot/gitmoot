@@ -57,8 +57,9 @@ type ownerGramSender func(ctx context.Context, text string) ownerGramResult
 // ownerGramStore is the store surface the owner path needs beyond
 // wakeOutboxStore. A store without it keeps the previous behavior.
 type ownerGramStore interface {
+	ClaimOwnerGramWakeOutbox(ctx context.Context, ids []int64, at time.Time, minInterval time.Duration) (bool, error)
 	FinishOwnerGramWakeOutbox(ctx context.Context, ids []int64, outcome, gramID, detail string, at time.Time) error
-	LatestOwnerGramSentAt(ctx context.Context) (time.Time, error)
+	OwnerGramLastSendAt(ctx context.Context) (time.Time, error)
 }
 
 func isOwnerWake(row db.WakeOutboxObligation) bool {
@@ -92,7 +93,8 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	if len(due) == 0 {
 		return false, nil
 	}
-	last, err := recorder.LatestOwnerGramSentAt(ctx)
+	// Cheap pre-check; the claim below re-checks the slot atomically.
+	last, err := recorder.OwnerGramLastSendAt(ctx)
 	if err != nil {
 		return false, fmt.Errorf("read latest owner gram: %w", err)
 	}
@@ -107,17 +109,23 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 		items = append(items, ownerGramItemFor(entry.row, entry.event))
 	}
 	text := ownerGramText(items, len(due)-len(batch))
-	claimed, err := store.ClaimWakeOutbox(ctx, ids[0], ids[1:], now)
+	// The claim reserves the owner Gram slot in the same transaction, so a
+	// concurrent drainer with a disjoint batch cannot send inside the interval.
+	claimed, err := recorder.ClaimOwnerGramWakeOutbox(ctx, ids, now, ownerGramMinInterval)
 	if err != nil {
 		return false, err
 	}
 	if !claimed {
-		// Another drainer owns these rows now; it records their outcome.
+		// Another drainer owns these rows or the slot; it records its outcome.
 		return false, nil
 	}
+	sendStarted := time.Now()
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownerGramSendTimeout)
 	result := delivery.ownerGram(sendCtx, text)
 	cancel()
+	// The outcome is stamped when the send finished, on the drain's clock, so
+	// the spacing interval runs from the real send (#2345 review).
+	finishedAt := now.Add(time.Since(sendStarted))
 	if result.Outcome == db.OwnerGramAccepted && strings.TrimSpace(result.GramID) == "" {
 		result = ownerGramResult{Outcome: db.OwnerGramUnknown, Detail: "send reported success without a gram id"}
 	}
@@ -130,7 +138,7 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	if result.Outcome == db.OwnerGramAccepted {
 		detail = "owner gram " + result.GramID + " accepted by herdr (not proof of reading)"
 	}
-	if err := recorder.FinishOwnerGramWakeOutbox(context.WithoutCancel(ctx), ids, result.Outcome, result.GramID, detail, now); err != nil {
+	if err := recorder.FinishOwnerGramWakeOutbox(context.WithoutCancel(ctx), ids, result.Outcome, result.GramID, detail, finishedAt); err != nil {
 		return true, fmt.Errorf("record owner gram outcome for wakes %v: %w", ids, err)
 	}
 	return true, nil

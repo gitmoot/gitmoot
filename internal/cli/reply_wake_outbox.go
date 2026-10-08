@@ -449,7 +449,7 @@ func classifyWakeOutboxObligations(
 				if !ownerSpacingLoaded {
 					ownerSpacingLoaded = true
 					if recorder, ok := store.(ownerGramStore); ok {
-						if last, err := recorder.LatestOwnerGramSentAt(ctx); err == nil && !last.IsZero() {
+						if last, err := recorder.OwnerGramLastSendAt(ctx); err == nil && !last.IsZero() {
 							ownerSpacedUntil = last.Add(ownerGramMinInterval)
 						}
 					}

@@ -53,8 +53,8 @@ type OwnerAlertHealth struct {
 func (h OwnerAlertHealth) Total() int { return h.Failed + h.Unknown + h.Stalled }
 
 // FinishOwnerGramWakeOutbox records the outcome of one owner Gram for every
-// claimed (attempted) row it covered, in one transaction: a receipt per row and
-// the row's terminal state (accepted -> delivered, refused -> failed,
+// claimed (attempted) row it covered, in one transaction: a receipt per row
+// stamped with `at`, the time the send finished, and the row's terminal state (accepted -> delivered, refused -> failed,
 // unknown -> delivery_unknown). A refused or unknown send also writes the same
 // wake_delivery_failed job event pane deliveries write.
 func (s *Store) FinishOwnerGramWakeOutbox(ctx context.Context, ids []int64, outcome, gramID, detail string, at time.Time) error {
@@ -101,6 +101,13 @@ SELECT id, attempt_count, ?, ?, ?, ? FROM wake_outbox WHERE id = ? AND state = '
 	if err := finishWakeOutboxRowsTx(writeCtx, tx, ids, state, detail, at); err != nil {
 		return err
 	}
+	// The spacing interval runs from when the send actually finished, not from
+	// when the drain reserved the slot, so a slow send cannot shorten it.
+	if _, err := tx.ExecContext(writeCtx,
+		`UPDATE owner_gram_spacing SET last_send_at = ? WHERE id = 1 AND last_send_at < ?`, stamp, stamp,
+	); err != nil {
+		return err
+	}
 	if outcome != OwnerGramAccepted {
 		message := fmt.Sprintf("wake delivery failed for owner: owner gram %s: %s", outcome, detail)
 		for _, id := range ids {
@@ -115,17 +122,76 @@ SELECT id, attempt_count, ?, ?, ?, ? FROM wake_outbox WHERE id = ? AND state = '
 	return tx.Commit()
 }
 
-// LatestOwnerGramSentAt is when the most recent owner Gram attempt was made, or
-// the zero time when none was. The drain spaces owner Grams from it.
-func (s *Store) LatestOwnerGramSentAt(ctx context.Context) (time.Time, error) {
-	var stamp sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(sent_at) FROM owner_gram_receipts`).Scan(&stamp); err != nil {
-		return time.Time{}, err
+// ClaimOwnerGramWakeOutbox claims the rows of one owner Gram AND reserves the
+// owner Gram slot, in one transaction. The slot (owner_gram_spacing) holds the
+// time of the latest owner Gram send, so two drainers with disjoint batches
+// cannot both send inside minInterval: the second one finds the slot taken and
+// claims nothing. It returns false, with nothing changed, when the slot is not
+// free or any row is no longer pending.
+func (s *Store) ClaimOwnerGramWakeOutbox(ctx context.Context, ids []int64, at time.Time, minInterval time.Duration) (bool, error) {
+	if len(ids) == 0 {
+		return false, errors.New("owner gram claim requires at least one wake id")
 	}
-	if !stamp.Valid || stamp.String == "" {
+	query, args, err := wakeOutboxIDUpdate(`
+UPDATE wake_outbox
+SET state = 'attempted', attempt_count = attempt_count + 1,
+	attempted_at = ?, finished_at = NULL, last_error = '', updated_at = ?
+WHERE state = 'pending' AND id IN (`, ids, at)
+	if err != nil {
+		return false, err
+	}
+	stamp := at.UTC().Format(BlockedEpisodeTimeLayout)
+	freeBy := at.UTC().Add(-minInterval).Format(BlockedEpisodeTimeLayout)
+	// #1911: contended waits are the first write and the COMMIT.
+	writeCtx, cancel := s.durableWriteContext(ctx, 2)
+	defer cancel()
+	tx, err := s.db.BeginTx(writeCtx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The layout is fixed-width, so the stamps compare correctly as text.
+	result, err := tx.ExecContext(writeCtx, `
+INSERT INTO owner_gram_spacing(id, last_send_at) VALUES (1, ?)
+ON CONFLICT(id) DO UPDATE SET last_send_at = excluded.last_send_at
+WHERE owner_gram_spacing.last_send_at <= ?`, stamp, freeBy)
+	if err != nil {
+		return false, fmt.Errorf("reserve owner gram slot: %w", err)
+	}
+	if reserved, err := result.RowsAffected(); err != nil {
+		return false, err
+	} else if reserved != 1 {
+		return false, tx.Rollback()
+	}
+	result, err = tx.ExecContext(writeCtx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected != int64(len(ids)) {
+		return false, tx.Rollback()
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// OwnerGramLastSendAt is the latest owner Gram send time (its reservation, or
+// its recorded outcome once known), or the zero time when none was sent.
+func (s *Store) OwnerGramLastSendAt(ctx context.Context) (time.Time, error) {
+	var stamp string
+	err := s.db.QueryRowContext(ctx, `SELECT last_send_at FROM owner_gram_spacing WHERE id = 1`).Scan(&stamp)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && stamp == "") {
 		return time.Time{}, nil
 	}
-	return time.Parse(BlockedEpisodeTimeLayout, stamp.String)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Parse(BlockedEpisodeTimeLayout, stamp)
 }
 
 // ListOwnerGramReceipts returns every owner Gram receipt, oldest first.

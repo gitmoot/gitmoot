@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -20,13 +21,26 @@ type fakeOwnerGram struct {
 	mu     sync.Mutex
 	texts  []string
 	result ownerGramResult
+	// started, when set, receives once per send; release, when set, blocks the
+	// send until closed; delay simulates a slow Herdr.
+	started chan struct{}
+	release chan struct{}
+	delay   time.Duration
 }
 
 func (f *fakeOwnerGram) send(_ context.Context, text string) ownerGramResult {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.texts = append(f.texts, text)
-	return f.result
+	started, release, delay, result := f.started, f.release, f.delay, f.result
+	f.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	time.Sleep(delay)
+	return result
 }
 
 func (f *fakeOwnerGram) calls() []string {
@@ -301,5 +315,85 @@ func TestOwnerWakeWithoutGramSenderKeepsOrdinaryPath(t *testing.T) {
 	receipts, err := store.ListOwnerGramReceipts(ctx)
 	if err != nil || len(receipts) != 0 {
 		t.Fatalf("receipts = %+v err=%v, want none", receipts, err)
+	}
+}
+
+// Two drainers with DISJOINT batches (more than ownerGramMaxItems due rows)
+// must not both send: the first claim reserves the owner Gram slot durably
+// before its send starts.
+func TestOverlappingDrainsWithDisjointOwnerBatchesSendOneGram(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	for index := range ownerGramMaxItems + 5 {
+		insertOwnerEscalation(t, store, fmt.Sprintf("review-pr-%d-ovl", index+1), "acme/widget")
+	}
+	gram := &fakeOwnerGram{
+		result:  ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-first"},
+		started: make(chan struct{}, 4), release: make(chan struct{}),
+	}
+	resolve := ownerGramResolver(store, sink, gram)
+	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		_, _ = drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve)
+	}()
+	select {
+	case <-gram.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first drain never started its send")
+	}
+	// The first send is still in flight and has written no receipt yet.
+	_, _ = drainReplyWakeOutboxWithHealth(ctx, store, due.Add(time.Second), replyWakeCoalescingWindow, resolve)
+	if got := len(gram.calls()); got != 1 {
+		close(gram.release)
+		t.Fatalf("gram sends while the first send was in flight = %d, want 1", got)
+	}
+	close(gram.release)
+	<-firstDone
+	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
+	if err != nil || len(pending) != 5 {
+		t.Fatalf("pending owner rows = %d err=%v, want the 5 rows beyond the first gram", len(pending), err)
+	}
+}
+
+// The spacing interval runs from when a send finished, not from when the drain
+// started it, so a slow Herdr cannot shorten the gap between owner Grams.
+func TestOwnerGramSpacingRunsFromSendCompletion(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	for index := range ownerGramMaxItems + 1 {
+		insertOwnerEscalation(t, store, fmt.Sprintf("review-pr-%d-slow", index+1), "acme/widget")
+	}
+	const sendTook = 1500 * time.Millisecond
+	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-slow"}, delay: sendTook}
+	resolve := ownerGramResolver(store, sink, gram)
+	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve); err != nil {
+		t.Fatal(err)
+	}
+	receipts, err := store.ListOwnerGramReceipts(ctx)
+	if err != nil || len(receipts) != ownerGramMaxItems {
+		t.Fatalf("receipts = %d err=%v", len(receipts), err)
+	}
+	sentAt, err := time.Parse(db.BlockedEpisodeTimeLayout, receipts[0].SentAt)
+	if err != nil || sentAt.Sub(due) < sendTook {
+		t.Fatalf("receipt sent_at = %s, drain started %s: want the send completion time", receipts[0].SentAt, due)
+	}
+	gram.mu.Lock()
+	gram.delay = 0
+	gram.mu.Unlock()
+	// Two minutes after the drain STARTED, but not after the send finished.
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due.Add(ownerGramMinInterval+sendTook/2), replyWakeCoalescingWindow, resolve); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(gram.calls()); got != 1 {
+		t.Fatalf("gram sends before two minutes after completion = %d, want 1", got)
+	}
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, sentAt.Add(ownerGramMinInterval), replyWakeCoalescingWindow, resolve); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(gram.calls()); got != 2 {
+		t.Fatalf("gram sends two minutes after completion = %d, want 2", got)
 	}
 }
