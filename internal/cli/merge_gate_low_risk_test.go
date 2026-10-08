@@ -137,3 +137,34 @@ func TestLowRiskPostMergeReviewRequestedOnce(t *testing.T) {
 		t.Fatalf("post-merge review jobs = %d, request events = %d; want exactly one of each", postMerge, requested)
 	}
 }
+
+// The per-repo low_risk value reaches the daemon's gate as LowRiskOnly, and a
+// plain repo keeps the global kill switch.
+func TestResolvedMergeGatePolicyCarriesLowRisk(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(config.DefaultConfig(paths)+`
+[merge_gate]
+auto_merge = false
+
+[repos."gitmoot/test-check".merge_gate]
+auto_merge = "low_risk"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy, ok := resolvedMergeGatePolicy(home, "gitmoot/test-check")
+	var gate workflow.PolicyMergeGate
+	applyResolvedMergeGatePolicy(&gate, policy)
+	if !ok || !gate.AutoMerge || !gate.LowRiskOnly {
+		t.Fatalf("gate = %+v ok = %v, want low-risk auto-merge", gate, ok)
+	}
+	if plain, ok := resolvedMergeGatePolicy(home, "jerryfane/noted"); !ok || plain.AutoMerge || plain.LowRiskOnly {
+		t.Fatalf("plain repo policy = %+v, want the global kill switch", plain)
+	}
+	if !autoMergeEnabledResolver(home)("gitmoot/test-check") || autoMergeEnabledResolver(home)("jerryfane/noted") {
+		t.Fatal("auto-merge resolver does not follow the per-repo low_risk opt-in")
+	}
+}
