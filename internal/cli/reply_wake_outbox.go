@@ -93,6 +93,42 @@ type wakeOutboxStore interface {
 	AddJobEventIfAbsent(ctx context.Context, event db.JobEvent) error
 }
 
+// wakeOutboxRowHold is the coalescing hold that applies to one pending row.
+//
+// REVIEW RESULTS SKIP THE HOLD (owner decision 2026-10-08). An awaited-fact row
+// whose fact is a review verdict is the answer a seat is blocked on, so holding
+// it for [org].wake_coalesce_hold only added up to five minutes to every
+// review round trip. Every other kind keeps the configured hold unchanged.
+//
+// The exemption covers every lifecycle state of the fact, including a failed,
+// blocked, or cancelled review, because the waiter must act on those too. One
+// consequence is deliberate: a failed-attempt wake is no longer held back in
+// case a later success of the same fact arrives within the hold. Such a pair
+// still reduces to one wake whenever both rows are pending at the same drain
+// (for example while the recipient is not ready), and a fact that becomes
+// satisfied still supersedes its still-pending failure rows in the store.
+// Measured on the live store before this change, the hold had absorbed a
+// failure wake within five minutes at most 4 times in two months of
+// review-fact traffic.
+func wakeOutboxRowHold(row db.WakeOutboxObligation, hold time.Duration) time.Duration {
+	if isReviewResultWake(row) {
+		return 0
+	}
+	return hold
+}
+
+func isReviewResultWake(row db.WakeOutboxObligation) bool {
+	if row.SourceKind != db.WakeOutboxSourceAwaitedFact {
+		return false
+	}
+	var payload db.AwaitedFactWakePayload
+	if err := json.Unmarshal([]byte(row.SourceID), &payload); err != nil {
+		// An undecodable row keeps the hold; the drain reports the decode error.
+		return false
+	}
+	return payload.SubjectKind == db.AwaitedFactSubjectReviewVerdict
+}
+
 // drainReplyWakeOutboxWithHealth is a store-global daemon operation. It
 // deliberately reads durable work before resolving delivery: unreadable outbox
 // state and an empty outbox therefore cannot collapse into the same result.
@@ -188,7 +224,11 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
 			}
-			deadline := startedAt.Add(hold)
+			// Review results skip the hold (owner decision 2026-10-08; see
+			// wakeOutboxRowHold). A group never mixes exempt and held rows:
+			// awaited-fact groups are keyed per fact, so every row in one shares
+			// the anchor's subject kind.
+			deadline := startedAt.Add(wakeOutboxRowHold(items[start], hold))
 			if now.UTC().Before(deadline) {
 				// Later rows for the same group cannot be due before its oldest
 				// row, so leave the whole tail pending for a future tick.
@@ -357,8 +397,9 @@ func classifyWakeOutboxObligations(
 			}
 			// A deliverable row inside its hold is WAITING, not outstanding: the
 			// next due tick delivers it, and with a 300s hold this is the normal
-			// state of the outbox rather than a fault (#1978).
-			if hold > 0 && now.UTC().Before(createdAt.Add(hold)) {
+			// state of the outbox rather than a fault (#1978). A hold-exempt
+			// review result is never waiting: it is due the moment it exists.
+			if rowHold := wakeOutboxRowHold(obligation, hold); rowHold > 0 && now.UTC().Before(createdAt.Add(rowHold)) {
 				health.held++
 				continue
 			}

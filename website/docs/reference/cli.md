@@ -2199,6 +2199,8 @@ escalation events retain their redacted event detail. The row the wake names
 records the delivery outcome and each row it collapses is recorded `superseded`
 with `coalesced into wake outbox row <id>`. Different event kinds never share a
 coalescing key, and a later tick flushes a quiet tail without another event.
+A review result (an awaited-fact wake for a review verdict, in any state) skips
+the hold and is delivered at the next drain.
 Rules default to `--scope addressed`: an addressed rule is eligible only when
 the event names a target role and that role matches `--wake`.
 `--scope observer` exempts a rule from the addressee gate, so observers receive

@@ -40,9 +40,7 @@ func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testi
 			var diagnostic bytes.Buffer
 			tick := func(now time.Time) {
 				t.Helper()
-				if err := runEnabledRepoWorkerTicksTracked(ctx, store, worker, 0, "", &diagnostic, now, nil, nil); err != nil {
-					t.Fatal(err)
-				}
+				runReplyWakeOutboxDrainOnce(ctx, store, worker, &diagnostic, now, nil)
 			}
 			now := time.Now().UTC().Add(time.Hour)
 			for _, held := range []struct {

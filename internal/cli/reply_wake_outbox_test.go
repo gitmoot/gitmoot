@@ -12,8 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,7 +21,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -317,102 +314,6 @@ func TestReplyWakeOutboxMalformedRowDoesNotBlockOtherRoleDelivery(t *testing.T) 
 	}
 }
 
-func TestReplyWakeOutboxDrainFailureDoesNotAbortRepoWork(t *testing.T) {
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "job-after-unhealthy-wake", Agent: "audit", Action: "ask",
-		Repo: "owner/repo", Branch: "main", PullRequest: 1,
-	})
-	if err := store.InsertWakeOutbox(
-		context.Background(), db.WakeOutboxSourceBlocked, "not-json",
-		db.WakeOutboxKindBlocked, []string{"owner"},
-	); err != nil {
-		t.Fatal(err)
-	}
-	var stdout bytes.Buffer
-	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
-	if err := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 1, "", &stdout, time.Now().UTC(), nil, nil,
-	); err != nil {
-		t.Fatalf("fleet tick aborted on reply wake drain failure: %v", err)
-	}
-	job, err := store.GetJob(context.Background(), "job-after-unhealthy-wake")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("repo job state = %q, want succeeded after unhealthy wake drain", job.State)
-	}
-	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
-		t.Fatalf("fleet tick log = %q, want unhealthy wake drain", stdout.String())
-	}
-}
-
-// A persistently inert wake outbox must (a) never escalate the supervisor and
-// (b) since #1758, print its health line exactly ONCE however long it persists —
-// inert is a permanent state, so the repeat carries no information and used to
-// cost ~12.8k journal lines/day.
-//
-// Ticks are counted through the newTickCandidates seam rather than through the
-// health line itself: with log-on-change the line no longer marks a tick, so
-// counting it would silently stop measuring what the test claims to measure.
-func TestReplyWakeOutboxInertHealthDoesNotEscalateSingleRepoLoop(t *testing.T) {
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	insertOptionalBlockedWake(t, store, "owner")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	worker := defaultJobWorker(store, io.Discard, t.TempDir())
-	live := newDaemonReloadableConfig(30*time.Second, 1, false)
-	tracker := newInflightJobTracker(ctx)
-	var checkoutLock sync.Mutex
-	stdout := &syncBuffer{}
-
-	// Cancel only once the loop has run strictly more ticks than the escalation
-	// ladder tolerates, so surviving the ladder is what ends the test.
-	wantTicks := maxConsecutiveWorkerTickFailures + 2
-	var ticks atomic.Int32
-	var cancelOnce sync.Once
-	realNewTickCandidates := newTickCandidates
-	newTickCandidates = func(store tickCandidateStore) *tickCandidates {
-		if ticks.Add(1) >= int32(wantTicks) {
-			cancelOnce.Do(cancel)
-		}
-		return realNewTickCandidates(store)
-	}
-	defer func() { newTickCandidates = realNewTickCandidates }()
-
-	errCh := startSingleRepoWorkerLoop(
-		ctx, 100*time.Microsecond, store, worker, live, &checkoutLock, tracker,
-		"owner/repo", "", stdout,
-	)
-
-	select {
-	case err, ok := <-errCh:
-		if ok && err != nil {
-			t.Fatalf("single-repo loop escalated persistent inert wake health: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatalf("single-repo loop ran %d ticks in 5s, want %d; log=%q", ticks.Load(), wantTicks, stdout.String())
-	}
-	if got := ticks.Load(); got < int32(wantTicks) {
-		t.Fatalf("ticks = %d, want at least %d (the escalation ladder must be outlived)", got, wantTicks)
-	}
-	if got := strings.Count(stdout.String(), "reply wake outbox drain health:"); got != 1 {
-		t.Fatalf("inert health lines = %d over %d ticks, want exactly 1; log=%q", got, ticks.Load(), stdout.String())
-	}
-	if strings.Contains(stdout.String(), "consecutive failures, escalating") {
-		t.Fatalf("inert reply wake health reached escalation ladder: %q", stdout.String())
-	}
-	if strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
-		!strings.Contains(stdout.String(), "pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") {
-		t.Fatalf("inert reply wake health log = %q", stdout.String())
-	}
-}
-
 // Leaving the inert state and returning to it must re-log: log-on-change may
 // suppress a repeat, never a transition.
 func TestReplyWakeOutboxHealthRelogsAfterTransition(t *testing.T) {
@@ -636,50 +537,6 @@ func TestReplyWakeOutboxHonorsConfiguredHold(t *testing.T) {
 	}
 }
 
-func TestReplyWakeOutboxFleetDrainRunsWithZeroEnabledRepos(t *testing.T) {
-	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
-	ctx := context.Background()
-	for index := 0; index < 4; index++ {
-		if _, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: "release/tail", Author: "worker", Body: fmt.Sprint(index),
-			AddressedTarget: "owner",
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	pending, err := store.ListWakeOutbox(ctx, db.WakeOutboxStatePending)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldestAt, err := time.Parse(time.RFC3339Nano, pending[0].CreatedAt)
-	if err != nil {
-		t.Fatal(err)
-	}
-	health, err := drainReplyWakeOutboxWithHealth(ctx, store, oldestAt.Add(replyWakeCoalescingWindow-time.Millisecond), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
-	// A row inside its hold is waiting, not outstanding, so the tick is healthy.
-	if err != nil || health.held != 4 || health.pending != 0 {
-		t.Fatalf("pre-hold drain health = %s err = %v, want four held rows", health, err)
-	}
-	if wake.promptCalls != 0 {
-		t.Fatalf("tail woke before window closed: %v", wake.prompts)
-	}
-	worker := defaultJobWorker(store, io.Discard, home)
-	installReplyWakeProductionSink(t, worker, sink.sink)
-	repos, err := store.ListRepos(ctx)
-	if err != nil || len(repos) != 0 {
-		t.Fatalf("repos = %+v, err=%v; test requires a zero-repo fleet", repos, err)
-	}
-	if err := runEnabledRepoWorkerTicksTracked(
-		ctx, store, worker, 0, "", io.Discard,
-		oldestAt.Add(replyWakeCoalescingWindow), nil, nil,
-	); err != nil {
-		t.Fatalf("fleet daemon tick: %v", err)
-	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("tail wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
-	}
-}
-
 func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -764,13 +621,7 @@ func TestReplyWakeOutboxReadFailureLogsUnhealthyWithoutAbortingFleetTick(t *test
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	var stdout bytes.Buffer
-	err = runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		time.Now().UTC(), nil, nil,
-	)
-	if err != nil {
-		t.Fatalf("daemon tick aborted after the wake outbox became unreadable: %v", err)
-	}
+	runReplyWakeOutboxDrainOnce(context.Background(), store, worker, &stdout, time.Now().UTC(), nil)
 	if !strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") ||
 		!strings.Contains(stdout.String(), "no such table: wake_outbox") {
 		t.Fatalf("daemon tick log = %q, want explicit unreadable wake outbox cause", stdout.String())
@@ -936,16 +787,13 @@ func TestReplyWakeOutboxHealthFailsClosedWhenEventRulesAreUnreadable(t *testing.
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		createdAt.Add(replyWakeCoalescingWindow-time.Millisecond), nil, nil,
+	runReplyWakeOutboxDrainOnce(
+		context.Background(), store, worker, &stdout,
+		createdAt.Add(replyWakeCoalescingWindow-time.Millisecond), nil,
 	)
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending rows after event_rules read failure = %+v, err=%v", pending, err)
-	}
-	if tickErr != nil {
-		t.Fatalf("daemon tick aborted after sink resolution skipped a pending wake: %v", tickErr)
 	}
 	if !strings.Contains(stdout.String(), "classify wake outbox obligations") ||
 		!strings.Contains(stdout.String(), "no such table: event_rules") ||
@@ -969,13 +817,7 @@ func TestReplyWakeOutboxZeroRulesReportsInertWithoutUnhealthy(t *testing.T) {
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		time.Now().UTC(), nil, nil,
-	)
-	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
-	}
+	runReplyWakeOutboxDrainOnce(context.Background(), store, worker, &stdout, time.Now().UTC(), nil)
 	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
@@ -1017,13 +859,10 @@ func TestReplyWakeOutboxUnrelatedEnabledRuleReportsPendingObligationInert(t *tes
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+	runReplyWakeOutboxDrainOnce(
+		context.Background(), store, worker, &stdout,
+		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil,
 	)
-	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on inert pending-obligation health: %v", tickErr)
-	}
 	if !strings.Contains(stdout.String(), "reply wake outbox drain health: pending=0 held=0 inert=1 route_removed=0 aged_attempted=0") ||
 		strings.Contains(stdout.String(), "reply wake outbox drain unhealthy:") {
 		t.Fatalf("fleet tick log = %q, want visible inert-only health", stdout.String())
@@ -1056,13 +895,7 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 	installReplyWakeProductionSink(t, worker, sink.sink)
 	recoveryAt := attemptedAt.Add(replyWakeAttemptedUnknownAfter)
 	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		recoveryAt, nil, nil,
-	)
-	if tickErr != nil {
-		t.Fatalf("crash-recovery tick aborted on delivery-unknown health failure: %v", tickErr)
-	}
+	runReplyWakeOutboxDrainOnce(context.Background(), store, worker, &stdout, recoveryAt, nil)
 	if !strings.Contains(stdout.String(), "delivery unknown") {
 		t.Fatalf("crash-recovery tick log = %q, want delivery-unknown health failure", stdout.String())
 	}
@@ -1078,12 +911,7 @@ func TestReplyWakeOutboxAgedAttemptedExpiresDeliveryUnknownWithoutDuplicateWake(
 		t.Fatalf("delivery unknown events = %+v, err=%v", events, err)
 	}
 
-	if err := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", io.Discard,
-		recoveryAt.Add(time.Second), nil, nil,
-	); err != nil {
-		t.Fatalf("post-resolution fleet tick = %v", err)
-	}
+	runReplyWakeOutboxDrainOnce(context.Background(), store, worker, io.Discard, recoveryAt.Add(time.Second), nil)
 	if wake.promptCalls != 0 {
 		t.Fatalf("resolved delivery-unknown row emitted on later tick: calls=%d", wake.promptCalls)
 	}
@@ -1144,12 +972,10 @@ func TestReplyWakeOutboxProvenAgedDeliveryDoesNotReportUnknown(t *testing.T) {
 	worker := defaultJobWorker(store, io.Discard, home)
 	installReplyWakeProductionSink(t, worker, sink.sink)
 	var stdout bytes.Buffer
-	if err := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		attemptedAt.Add(replyWakeAttemptedUnknownAfter), nil, nil,
-	); err != nil {
-		t.Fatalf("tick aborted: %v", err)
-	}
+	runReplyWakeOutboxDrainOnce(
+		context.Background(), store, worker, &stdout,
+		attemptedAt.Add(replyWakeAttemptedUnknownAfter), nil,
+	)
 	if strings.Contains(stdout.String(), "delivery unknown") {
 		t.Fatalf("a PROVEN delivery was reported as unknown: %q", stdout.String())
 	}
@@ -1232,13 +1058,10 @@ END`); err != nil {
 	worker := defaultJobWorker(store, io.Discard, home)
 	installReplyWakeProductionSink(t, worker, sink.sink)
 	var stdout bytes.Buffer
-	tickErr := runEnabledRepoWorkerTicksTracked(
-		context.Background(), store, worker, 0, "", &stdout,
-		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+	runReplyWakeOutboxDrainOnce(
+		context.Background(), store, worker, &stdout,
+		createdAt.Add(replyWakeCoalescingWindow+time.Second), nil,
 	)
-	if tickErr != nil {
-		t.Fatalf("fleet tick aborted on post-claim finish failure: %v", tickErr)
-	}
 	if !strings.Contains(stdout.String(), "finish wake outbox as delivered") ||
 		!strings.Contains(stdout.String(), "forced wake outbox finish failure") {
 		t.Fatalf("fleet tick log = %q, want surfaced post-claim finish failure", stdout.String())
@@ -1306,11 +1129,12 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 	wake := &blockingReplyWake{started: make(chan struct{}), release: make(chan struct{})}
 	worker := defaultJobWorker(store, io.Discard, home)
 	installReplyWakeProductionSink(t, worker, &eventRuleSink{wake: wake})
-	tickDone := make(chan error, 1)
+	tickDone := make(chan struct{})
 	go func() {
-		tickDone <- runEnabledRepoWorkerTicksTracked(
-			context.Background(), store, worker, 0, "", io.Discard,
-			createdAt.Add(replyWakeCoalescingWindow+time.Second), nil, nil,
+		defer close(tickDone)
+		runReplyWakeOutboxDrainOnce(
+			context.Background(), store, worker, io.Discard,
+			createdAt.Add(replyWakeCoalescingWindow+time.Second), nil,
 		)
 	}()
 
@@ -1320,18 +1144,15 @@ func TestReplyWakeOutboxSurvivesProducerProcessExitAndDrainsOnLaterDaemonTick(t 
 		t.Fatal("later daemon tick did not begin durable wake delivery")
 	}
 	select {
-	case err := <-tickDone:
-		t.Fatalf("daemon tick returned before durable delivery completed: %v", err)
+	case <-tickDone:
+		t.Fatal("daemon drain returned before durable delivery completed")
 	case <-time.After(2 * time.Second):
 	}
 	close(wake.release)
 	select {
-	case err := <-tickDone:
-		if err != nil {
-			t.Fatalf("later daemon tick: %v", err)
-		}
+	case <-tickDone:
 	case <-time.After(10 * time.Second):
-		t.Fatal("later daemon tick did not finish after delivery")
+		t.Fatal("later daemon drain did not finish after delivery")
 	}
 
 	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)

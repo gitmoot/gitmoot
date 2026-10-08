@@ -1765,29 +1765,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 }
 
 func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
-	// #1200/#1201 durable addressed-note wakes belong to the shared store, not
-	// any repository. Drain before listing repos so zero enabled repos cannot
-	// suppress delivery or hide an unreadable outbox behind a healthy fleet tick.
-	health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
-	switch {
-	case err != nil:
-		if health.blocked > 0 {
-			if !tracker.replyWakeOutboxHealthChanged(health) {
-				break
-			}
-		} else {
-			tracker.forgetReplyWakeOutboxHealth()
-		}
-		writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-	case health.inert > 0:
-		// Log on CHANGE only (#1758): inert obligations persist until an
-		// operator adds a matching rule, so the unchanged line is pure noise.
-		if tracker.replyWakeOutboxHealthChanged(health) {
-			writeLine(stdout, "reply wake outbox drain health: %s", health)
-		}
-	default:
-		tracker.forgetReplyWakeOutboxHealth()
-	}
 	if tracker.staleTaskLaneLockReclaimDue(now) {
 		if err := reclaimStaleTaskLaneLocks(ctx, store, "", stdout, now); err != nil {
 			writeLine(stdout, "task lane lock reclaim failed: %v", err)

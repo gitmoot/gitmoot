@@ -101,6 +101,10 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				return runEnabledRepoWorkerTicksTracked(ctx, store, w, workers, rootFilter, stdout, now, checkoutLocks, tracker)
 			})
 			startBlockedRoleWakeLoop(ctx, store, paths.Home, stdout)
+			// The wake outbox is store-global and drains on its own short loop,
+			// not at the head of the repository sweep, so a review result is
+			// not delayed by the whole fleet sweep.
+			startReplyWakeDrainLoop(ctx, store, worker, tracker, stdout)
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
 		}
 		// Heartbeat schedules (#533) reuse the normal job queue. Off-by-default: with
@@ -228,6 +232,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// The deferred drain cancels + waits (bounded) for in-flight jobs on exit.
 	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
 	startBlockedRoleWakeLoop(ctx, store, home, stdout)
+	startReplyWakeDrainLoop(ctx, store, worker, tracker, stdout)
 	// Heartbeat schedules (#533) must also fire in the single-repo daemon, or a
 	// single-repo daemon would silently never run them. Off-by-default: with no
 	// heartbeat sections the scan returns before any store touch. A failure to
@@ -589,28 +594,6 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 // never drift from the deployed one.
 func startSingleRepoWorkerLoop(ctx context.Context, interval time.Duration, store *db.Store, worker jobWorker, live *daemonReloadableConfig, checkoutLock *sync.Mutex, tracker *inflightJobTracker, repo string, rootFilter string, stdout io.Writer) <-chan error {
 	return startSupervisorWorkerLoopRecovering(ctx, interval, stdout, func(now time.Time) error {
-		// The durable reply outbox is store-global maintenance. Run it once at
-		// the supervisor boundary, outside the repository tick, matching the
-		// multi-repo fleet loop.
-		health, err := drainFleetReplyWakeOutbox(ctx, store, worker, now)
-		switch {
-		case err != nil:
-			if health.blocked > 0 {
-				if !tracker.replyWakeOutboxHealthChanged(health) {
-					break
-				}
-			} else {
-				tracker.forgetReplyWakeOutboxHealth()
-			}
-			writeLine(stdout, "reply wake outbox drain unhealthy: %v", err)
-		case health.inert > 0:
-			// Log on CHANGE only (#1758); see the fleet loop for the rationale.
-			if tracker.replyWakeOutboxHealthChanged(health) {
-				writeLine(stdout, "reply wake outbox drain health: %s", health)
-			}
-		default:
-			tracker.forgetReplyWakeOutboxHealth()
-		}
 		// The checkout lock now guards the TICK (maintenance + claim/dispatch),
 		// not whole job runs: dispatched jobs execute on their own goroutines
 		// after this returns, tracked by the in-flight tracker (#562). Holding it
