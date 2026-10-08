@@ -83,6 +83,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 1,
 		reason:      "daemon org lane reads host-local herdr archive state (#1635); never job work — an injectable dependency tests override, wired to the real binary only in production deps",
 	},
+	"internal/cli/owner_gram.go:runHerdrGramSend": {
+		rawCommands: 1,
+		reason:      "daemon wake drain sends owner alerts as a host-local Herdr Gram (owner decision 2026-10-08); never job work — jobWorker.OwnerGram is an injectable sender tests replace, wired to the real binary only by the daemon supervisors",
+	},
 	"internal/cli/plugin.go:<package>": {
 		execRunners: 2,
 		reason:      "operator plugin install and doctor commands use replaceable host runner seams",
