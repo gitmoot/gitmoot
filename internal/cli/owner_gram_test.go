@@ -402,3 +402,35 @@ func TestOwnerGramSpacingRunsFromSendCompletion(t *testing.T) {
 		t.Fatalf("gram sends two minutes after completion = %d, want 2", got)
 	}
 }
+
+// Work the drain does before the send (reading the slot, preparing the batch,
+// waiting on the claim transaction) also counts: the outcome is stamped no
+// earlier than the wall clock at send completion.
+func TestOwnerGramSpacingCountsPreSendDrainWork(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	insertOwnerEscalation(t, store, "review-pr-1-pre", "acme/widget")
+	// The drain read its clock 30s ago and only reaches the send now.
+	drainNow := time.Now().UTC().Add(-30 * time.Second)
+	execRaw(t, store.DatabasePath(), `UPDATE wake_outbox SET created_at = ? WHERE target_role = 'owner'`,
+		drainNow.Add(-replyWakeCoalescingWindow-time.Second).Format(db.BlockedEpisodeTimeLayout))
+	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-pre"}}
+	sendFloor := time.Now().UTC()
+	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, drainNow, replyWakeCoalescingWindow, ownerGramResolver(store, sink, gram)); err != nil {
+		t.Fatal(err)
+	}
+	if len(gram.calls()) != 1 {
+		t.Fatalf("gram sends = %d, want 1", len(gram.calls()))
+	}
+	last, err := store.OwnerGramLastSendAt(ctx)
+	if err != nil || last.Before(sendFloor) {
+		t.Fatalf("owner gram slot = %s err=%v, want no earlier than the send's wall-clock completion %s", last, err, sendFloor)
+	}
+	receipts, err := store.ListOwnerGramReceipts(ctx)
+	if err != nil || len(receipts) != 1 {
+		t.Fatalf("receipts = %+v err=%v", receipts, err)
+	}
+	if sentAt, err := time.Parse(db.BlockedEpisodeTimeLayout, receipts[0].SentAt); err != nil || sentAt.Before(sendFloor) {
+		t.Fatalf("receipt sent_at = %s, want no earlier than %s", receipts[0].SentAt, sendFloor)
+	}
+}

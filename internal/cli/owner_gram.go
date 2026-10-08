@@ -123,9 +123,15 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownerGramSendTimeout)
 	result := delivery.ownerGram(sendCtx, text)
 	cancel()
-	// The outcome is stamped when the send finished, on the drain's clock, so
-	// the spacing interval runs from the real send (#2345 review).
+	// The outcome is stamped when the send finished, so the spacing interval
+	// runs from the real send (#2345 review). The wall clock covers every bit of
+	// work since the drain read `now` (slot read, batch preparation, the claim
+	// transaction); the drain-clock form keeps the send's own duration when a
+	// caller's `now` runs ahead of the wall clock, as tests' does.
 	finishedAt := now.Add(time.Since(sendStarted))
+	if wall := time.Now().UTC(); wall.After(finishedAt) {
+		finishedAt = wall
+	}
 	if result.Outcome == db.OwnerGramAccepted && strings.TrimSpace(result.GramID) == "" {
 		result = ownerGramResult{Outcome: db.OwnerGramUnknown, Detail: "send reported success without a gram id"}
 	}
