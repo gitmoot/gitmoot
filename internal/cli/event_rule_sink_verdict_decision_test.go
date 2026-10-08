@@ -103,7 +103,6 @@ func TestReviewVerdictWakeStaysExcludedForFanOut(t *testing.T) {
 	}
 }
 
-
 // THE VOCABULARY INVARIANT the fix relies on instead of a defensive branch.
 //
 // engine_types.go admits a wake only when the THRESHOLD-ADJUSTED decision is
