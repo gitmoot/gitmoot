@@ -158,3 +158,24 @@ func TestOwnerGramLinksOnlyThePullRequestOfItsOwnRepository(t *testing.T) {
 		t.Fatalf("rendered gram linked another repository's pull request:\n%s", message.Text)
 	}
 }
+
+// GitHub repository names are case-insensitive: a PR stored as Jerryfane/Estel
+// still links an alert about jerryfane/estel.
+func TestOwnerGramLinksPullRequestAcrossRepositoryNameCase(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	const head = "6ad9eed75402ee3d75b021d2e79ceef6e113ac44"
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: "Jerryfane/Estel", Number: 6, URL: "https://github.com/Jerryfane/Estel/pull/6",
+		HeadBranch: "engine-claude", BaseBranch: "main", HeadSHA: head, State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original := "CI gate: low-risk auto-merge left the pull request open for a human merge: head 6ad9eed reports no external CI; " +
+		"low-risk auto-merge requires real green CI for head " + head
+	message := renderOwnerGramFromNote(t, store, sink, "[org:escalate to=owner from=life-crm wf=adhoc/estel-review-codex-2026-10-08] "+original)
+	if !strings.HasPrefix(message.Text, "life-crm needs you: jerryfane/estel#6 — ") ||
+		!strings.Contains(message.Text, "https://github.com/jerryfane/estel/pull/6") {
+		t.Fatalf("rendered gram missed the PR stored with different case:\n%s", message.Text)
+	}
+}
