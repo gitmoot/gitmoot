@@ -113,3 +113,39 @@ func TestReplyWakeDrainLoopDeliversNewReviewResultOnNextTick(t *testing.T) {
 		t.Fatalf("review result wake = calls=%d prompt=%q, want delivery on the next tick", wake.promptCalls, wake.prompt)
 	}
 }
+
+// Stopping the drain loop waits for an in-flight delivery to record its
+// outcome, so a supervisor cannot close the store under a claimed batch.
+func TestReplyWakeDrainLoopStopWaitsForInFlightDelivery(t *testing.T) {
+	store, _, _, home := reviewResultWakeHarness(t)
+	insertReviewResultWake(t, store)
+	wake := &blockingReplyWake{started: make(chan struct{}), release: make(chan struct{})}
+	worker := defaultJobWorker(store, io.Discard, home)
+	installReplyWakeProductionSink(t, worker, &eventRuleSink{wake: wake})
+	stop := startReplyWakeDrainLoop(context.Background(), store, worker, nil, io.Discard)
+	select {
+	case <-wake.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("drain loop did not start delivering the review result")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		stop()
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while a claimed delivery was still in flight")
+	case <-time.After(500 * time.Millisecond):
+	}
+	close(wake.release)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stop did not return after the delivery finished")
+	}
+	delivered, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStateDelivered)
+	if err != nil || len(delivered) != 1 {
+		t.Fatalf("delivered = %+v err=%v, want the in-flight wake recorded before stop returned", delivered, err)
+	}
+}

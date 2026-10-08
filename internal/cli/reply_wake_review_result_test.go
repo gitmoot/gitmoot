@@ -10,8 +10,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
-	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // Owner decision 2026-10-08: a review result skips [org].wake_coalesce_hold,
@@ -154,15 +152,12 @@ func TestConcurrentDrainsClaimReviewResultWakeOnce(t *testing.T) {
 
 // The wake outbox drains on its own loop, never inside the repository sweep:
 // a slow fleet sweep must not delay a wake, and an unhealthy outbox must not
-// touch repository work.
+// touch repository work. The assertion is on the outbox itself, not on job
+// dispatch, so a host disk guard refusing dispatch cannot change the verdict.
 func TestReplyWakeOutboxDrainRunsOutsideRepoSweep(t *testing.T) {
-	store := daemonWorkerStore(t)
+	store, sink, wake, _ := reviewResultWakeHarness(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "job-after-unhealthy-wake", Agent: "audit", Action: "ask",
-		Repo: "owner/repo", Branch: "main", PullRequest: 1,
-	})
+	insertReviewResultWake(t, store)
 	if err := store.InsertWakeOutbox(
 		context.Background(), db.WakeOutboxSourceBlocked, "not-json",
 		db.WakeOutboxKindBlocked, []string{"owner"},
@@ -171,22 +166,22 @@ func TestReplyWakeOutboxDrainRunsOutsideRepoSweep(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
+	worker.EventSinkOverride = sink
 	if err := runEnabledRepoWorkerTicksTracked(
 		context.Background(), store, worker, 1, "", &stdout, time.Now().UTC(), nil, nil,
 	); err != nil {
 		t.Fatalf("fleet tick: %v", err)
 	}
-	job, err := store.GetJob(context.Background(), "job-after-unhealthy-wake")
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(stdout.String(), "reply wake outbox") || wake.promptCalls != 0 {
+		t.Fatalf("repo sweep log = %q prompts=%d, want no wake outbox drain inside the sweep", stdout.String(), wake.promptCalls)
 	}
-	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("repo job state = %q, want succeeded beside an unhealthy wake outbox", job.State)
-	}
-	if strings.Contains(stdout.String(), "reply wake outbox") {
-		t.Fatalf("repo sweep log = %q, want no wake outbox drain inside the sweep", stdout.String())
+	if pending := wakeOutboxRowsBySource(t, store, db.WakeOutboxStatePending); pending[db.WakeOutboxSourceAwaitedFact] != 1 {
+		t.Fatalf("pending rows by source after the sweep = %v, want the review result untouched", pending)
 	}
 	if _, err := drainFleetReplyWakeOutbox(context.Background(), store, worker, time.Now().UTC()); err == nil {
 		t.Fatal("standalone drain reported a malformed outbox row as healthy")
+	}
+	if delivered := wakeOutboxRowsBySource(t, store, db.WakeOutboxStateDelivered); delivered[db.WakeOutboxSourceAwaitedFact] != 1 {
+		t.Fatalf("delivered rows by source after the standalone drain = %v, want the review result", delivered)
 	}
 }

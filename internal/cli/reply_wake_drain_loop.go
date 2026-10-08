@@ -68,21 +68,40 @@ func (l *replyWakeDrainLoop) tick(ctx context.Context, now time.Time) bool {
 
 // startReplyWakeDrainLoop starts the single drain goroutine. It drains once
 // immediately so startup does not wait an interval.
-func startReplyWakeDrainLoop(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer) {
+//
+// The returned stop function is the supervisor's shutdown: it cancels the loop
+// and waits for an in-flight drain to record its outcome, so the supervisor
+// cannot close the store under a claimed batch (post-claim delivery runs
+// without cancellation). The wait is bounded by daemonShutdownDrainTimeout,
+// the same bound the in-flight job tracker uses.
+func startReplyWakeDrainLoop(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer) (stop func()) {
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
 	loop := newReplyWakeDrainLoop(store, worker, tracker, stdout)
 	go func() {
-		loop.tick(ctx, time.Now().UTC())
+		defer close(done)
+		loop.tick(loopCtx, time.Now().UTC())
 		ticker := time.NewTicker(replyWakeDrainInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-loopCtx.Done():
 				return
 			case <-ticker.C:
-				loop.tick(ctx, time.Now().UTC())
+				loop.tick(loopCtx, time.Now().UTC())
 			}
 		}
 	}()
+	return func() {
+		cancel()
+		timer := time.NewTimer(daemonShutdownDrainTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+			writeLine(stdout, "reply wake outbox drain did not stop within %s", daemonShutdownDrainTimeout)
+		}
+	}
 }
 
 // runReplyWakeOutboxDrainOnce drains the store-global wake outbox and logs its
