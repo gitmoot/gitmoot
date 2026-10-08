@@ -814,10 +814,33 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	roster := loadOrgRoster(ctx, g.Store, cfg)
 	from, fromDeclared := mergeGateEscalationFrom(roster, cfg, request.Repo)
+	// A miss the seat itself must fix goes back to that seat, not up the chart
+	// (owner decision 2026-10-08): the owner cannot record another seat's work,
+	// and escalating it only parked the PR in the owner's inbox. The escalation
+	// is authored by Gitmoot because the seat is its recipient.
+	if seat, rest := reason.SplitSeatActionable(); !seat.IsZero() && fromDeclared && orgRosterHasMember(roster, from) {
+		if err := g.journalMergeGateEscalation(ctx, request, label, mergeGateSeatEscalationAuthor, from, seat); err != nil {
+			return err
+		}
+		if rest.IsZero() {
+			return nil
+		}
+		reason = rest
+	}
 	to := mergeGateEscalationTo(roster, cfg, from, fromDeclared)
 	if to == "" {
 		return errors.New("resolve merge-gate escalation recipient: no live org role is available on the upward route")
 	}
+	return g.journalMergeGateEscalation(ctx, request, label, from, to, reason)
+}
+
+// mergeGateSeatEscalationAuthor authors an escalation sent back to the seat
+// that owns the repository, so it is a message to the seat, not a note to itself.
+const mergeGateSeatEscalationAuthor = "gitmoot"
+
+// journalMergeGateEscalation writes one escalation note unless the same open
+// question is already journaled for the same recipient and workflow.
+func (g daemonMergeGate) journalMergeGateEscalation(ctx context.Context, request workflow.MergeRequest, label, from, to string, reason workflow.MergeReason) error {
 	body := workflow.FormatOrgEscalateNote(from, to, label, reason.Render())
 	if body == "" {
 		return errors.New("format merge-gate escalation note")

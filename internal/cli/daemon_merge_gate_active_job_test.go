@@ -1246,3 +1246,54 @@ func (n *terminalPollNextTasks) EnqueueNextTask(_ context.Context, taskID string
 	n.taskIDs = append(n.taskIDs, taskID)
 	return nil
 }
+
+// An implementer-attribution gap is fixed by the seat that wrote the change,
+// so it goes back to that seat, not up to the owner (owner decision
+// 2026-10-08). A miss in the same decision that needs a human still goes up.
+func TestMergeGateAttributionGapEscalatesToTheSeatNotTheOwner(t *testing.T) {
+	store := daemonWorkerStore(t)
+	gate := daemonMergeGate{Store: store, Home: daemonMergeGateLiveOrgHome(t)}
+	const head = "6ad9eed75402ee3d75b021d2e79ceef6e113ac44"
+	seatOnly, err := workflow.GateMissReason("review gate", workflow.ImplementerAttributionGapReason, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := gate.escalateMergeGateMiss(ctx, workflow.MergeRequest{Repo: "owner/repo", WorkflowID: "wf-seat"}, seatOnly); err != nil {
+		t.Fatal(err)
+	}
+	notes, err := store.ListWorkflowNotes(ctx, "wf-seat", 0)
+	if err != nil || len(notes) != 1 {
+		t.Fatalf("notes = %+v err=%v, want one escalation", notes, err)
+	}
+	from, to, _, _, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
+	if !ok || to != "coordinator" || from != mergeGateSeatEscalationAuthor {
+		t.Fatalf("escalation from=%q to=%q, want gitmoot -> coordinator (the seat), not the owner", from, to)
+	}
+
+	mixed, err := seatOnly.WithGateMiss("CI gate", workflow.LowRiskAutoMergeLeaveOpenPrefix+"head 6ad9eed reports no external CI", head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.escalateMergeGateMiss(ctx, workflow.MergeRequest{Repo: "owner/repo", WorkflowID: "wf-mixed"}, mixed); err != nil {
+		t.Fatal(err)
+	}
+	notes, err = store.ListWorkflowNotes(ctx, "wf-mixed", 0)
+	if err != nil || len(notes) != 2 {
+		t.Fatalf("notes = %+v err=%v, want one seat and one owner escalation", notes, err)
+	}
+	byTo := map[string]string{}
+	for _, note := range notes {
+		_, to, _, question, ok := workflow.ParseOrgEscalateNote(note.Body)
+		if !ok {
+			t.Fatalf("unparseable note %q", note.Body)
+		}
+		byTo[to] = question
+	}
+	if !workflow.IsImplementerAttributionGap(byTo["coordinator"]) || strings.Contains(byTo["coordinator"], "no external CI") {
+		t.Fatalf("seat escalation = %q, want only the attribution gap", byTo["coordinator"])
+	}
+	if workflow.IsImplementerAttributionGap(byTo["owner"]) || !strings.Contains(byTo["owner"], "no external CI") {
+		t.Fatalf("owner escalation = %q, want only the human-merge miss", byTo["owner"])
+	}
+}

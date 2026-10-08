@@ -230,3 +230,25 @@ WHERE target_role = ? AND state IN ('failed', 'delivery_unknown', 'stalled')`,
 	).Scan(&health.Failed, &health.Unknown, &health.Stalled)
 	return health, err
 }
+
+// PullRequestForHead finds the pull request of repo whose recorded head is
+// head. The owner Gram uses it to link a gate escalation, which names only the
+// head; it never looks outside the alert's own repository. GitHub repository
+// names are case-insensitive, so the repository match is too.
+func (s *Store) PullRequestForHead(ctx context.Context, repo, head string) (int, bool, error) {
+	repo, head = strings.TrimSpace(repo), strings.TrimSpace(head)
+	if repo == "" || head == "" {
+		return 0, false, nil
+	}
+	var number int
+	err := s.db.QueryRowContext(ctx, `
+SELECT number FROM pull_requests
+WHERE repo_full_name = ? COLLATE NOCASE AND head_sha = ? ORDER BY updated_at DESC, id DESC LIMIT 1`, repo, head).Scan(&number)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return number, true, nil
+}

@@ -29,9 +29,9 @@ type fakeOwnerGram struct {
 	delay   time.Duration
 }
 
-func (f *fakeOwnerGram) send(_ context.Context, text string) ownerGramResult {
+func (f *fakeOwnerGram) send(_ context.Context, message ownerGramMessage) ownerGramResult {
 	f.mu.Lock()
-	f.texts = append(f.texts, text)
+	f.texts = append(f.texts, message.Text)
 	first := len(f.texts) == 1
 	started, release, delay, result := f.started, f.release, f.delay, f.result
 	f.mu.Unlock()
@@ -116,7 +116,7 @@ func TestOwnerEscalationIsSentAsOneGramWithReceiptAndNeverResent(t *testing.T) {
 	if len(sent) != 1 {
 		t.Fatalf("gram sends = %d, want 1: %q", len(sent), sent)
 	}
-	for _, want := range []string{"Gitmoot: 1 item needs you", "acme/widget", "stranded", "gitmoot job show review-pr-46-abc"} {
+	for _, want := range []string{"Gitmoot needs you: acme/widget#46", "What to do: Merge it on GitHub", "https://github.com/acme/widget/pull/46", "stranded"} {
 		if !strings.Contains(sent[0], want) {
 			t.Fatalf("gram text = %q, want it to contain %q", sent[0], want)
 		}
@@ -223,7 +223,7 @@ func TestOwnerGramsAreSpacedAndBatched(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent := gram.calls()
-	if len(sent) != 1 || !strings.Contains(sent[0], "Gitmoot: 2 items need you") ||
+	if len(sent) != 1 || !strings.Contains(sent[0], "Gitmoot: 2 things need you.") ||
 		!strings.Contains(sent[0], "acme/one") || !strings.Contains(sent[0], "acme/two") {
 		t.Fatalf("gram sends = %q, want both alerts in one gram", sent)
 	}
