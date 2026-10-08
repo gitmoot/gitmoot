@@ -510,6 +510,9 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	decision, err := g.finishMerged(ctx, request, pr, strings.TrimSpace(result.SHA))
 	if err == nil && decision.Merged {
 		decision.ReviewLevel = lowRiskLevel
+		if lowRiskLevel != "" {
+			decision.MergedHeadSHA = headSHA
+		}
 	}
 	return decision, err
 }

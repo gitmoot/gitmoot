@@ -78,7 +78,7 @@ func TestLowRiskAutoMergeMergesLevelOneHead(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Evaluate: %v", err)
 			}
-			if !decision.Merged || decision.ReviewLevel != level || len(gh.merges) != 1 || gh.merges[0].MatchHeadCommit != "head123" {
+			if !decision.Merged || decision.ReviewLevel != level || decision.MergedHeadSHA != "head123" || len(gh.merges) != 1 || gh.merges[0].MatchHeadCommit != "head123" {
 				t.Fatalf("decision = %+v merges = %+v; want an exact-head merge at %s", decision, gh.merges, level)
 			}
 		})

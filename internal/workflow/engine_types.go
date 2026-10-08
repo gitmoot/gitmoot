@@ -419,6 +419,8 @@ type MergeDecision struct {
 	// ReviewLevel is the exact-head review level that permitted a low-risk
 	// auto-merge (per-repo auto_merge = "low_risk"); empty otherwise.
 	ReviewLevel string
+	// MergedHeadSHA is the exact head a low-risk auto-merge merged.
+	MergedHeadSHA string
 	// Deferred marks a transient, retry-later hold (for example, a job is in
 	// flight on the pull-request branch). Unlike a block, runMergeGate parks the
 	// task in ready_to_merge so the daemon re-evaluates it on a later tick; a

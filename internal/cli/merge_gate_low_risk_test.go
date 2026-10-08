@@ -105,10 +105,12 @@ func TestLowRiskPostMergeReviewRequestedOnce(t *testing.T) {
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return &reviewRoutingFixtureClient{head: head} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
-	gate := daemonMergeGate{Store: store, Home: home}
-	request := workflow.MergeRequest{Repo: "owner/repo", PullRequest: 12, HeadSHA: head, TaskID: "task-12"}
+	// The daemon gate carries the RESOLVED <home>/.gitmoot root (#459), and the
+	// task payload head may be stale: the merged head decides.
+	gate := daemonMergeGate{Store: store, Home: config.PathsForHome(home).Home}
+	request := workflow.MergeRequest{Repo: "owner/repo", PullRequest: 12, HeadSHA: "stalestalestalestalestalestalestalestale", TaskID: "task-12"}
 	for range 2 {
-		gate.requestLowRiskPostMergeReview(ctx, request, workflow.MergeDecision{Merged: true, ReviewLevel: reviewlevel.LevelBackground})
+		gate.requestLowRiskPostMergeReview(ctx, request, workflow.MergeDecision{Merged: true, ReviewLevel: reviewlevel.LevelBackground, MergedHeadSHA: head})
 	}
 	jobs, err := store.ListReviewJobsForPullRequest(ctx, "owner/repo", 12)
 	if err != nil {
@@ -166,5 +168,20 @@ auto_merge = "low_risk"
 	}
 	if !autoMergeEnabledResolver(home)("gitmoot/test-check") || autoMergeEnabledResolver(home)("jerryfane/noted") {
 		t.Fatal("auto-merge resolver does not follow the per-repo low_risk opt-in")
+	}
+}
+
+// The daemon passes its resolved <home>/.gitmoot root; the hook must read the
+// review-levels.jsonl that `gitmoot review level --home <home>` writes.
+func TestDaemonLowRiskReviewLevelReadsTheRealHome(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now().UTC()
+	if err := appendReviewLevelLog(home, "gitmoot/test-check", 7, reviewlevel.Decision{HeadSHA: lowRiskCLIHead, Level: reviewlevel.LevelNoReview, Source: "jev"}, now); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(reviewLevelAPIKeyName, "")
+	decision, err := daemonLowRiskReviewLevel(config.PathsForHome(home).Home, &reviewLevelFakeGitHub{})(context.Background(), "gitmoot/test-check", 7, lowRiskCLIHead)
+	if err != nil || decision.Level != reviewlevel.LevelNoReview {
+		t.Fatalf("decision = %+v err = %v; want the recorded level 1 from the real home", decision, err)
 	}
 }

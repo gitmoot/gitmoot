@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/jev"
@@ -35,11 +36,24 @@ const lowRiskPostMergeReviewOwedEventKind = "low_risk_post_merge_review_owed"
 
 // daemonLowRiskReviewLevel binds lowRiskReviewLevel to the daemon's GitHub
 // client, the configured JEV key and the wall clock.
-func daemonLowRiskReviewLevel(home string, gh reviewLevelGitHubClient) func(ctx context.Context, repo string, pr int, headSHA string) (reviewlevel.Decision, error) {
+func daemonLowRiskReviewLevel(resolvedHome string, gh reviewLevelGitHubClient) func(ctx context.Context, repo string, pr int, headSHA string) (reviewlevel.Decision, error) {
+	home := rawHomeFromResolved(resolvedHome)
 	return func(ctx context.Context, repo string, pr int, headSHA string) (reviewlevel.Decision, error) {
 		judge := func() reviewlevel.Judge { return newReviewLevelJudge(reviewLevelAPIKey(ctx, home)) }
 		return lowRiskReviewLevel(home, gh, judge, time.Now)(ctx, repo, pr, headSHA)
 	}
+}
+
+// rawHomeFromResolved turns the daemon gate's RESOLVED <home>/.gitmoot root
+// (the #459 convention for daemonMergeGate.Home) back into the --home value
+// that pathsFromFlag, withStore and requestReview expect, so the low-risk paths
+// read and write the real review-levels.jsonl, keychain and org config.
+func rawHomeFromResolved(home string) string {
+	home = strings.TrimSpace(home)
+	if home != "" && filepath.Base(filepath.Clean(home)) == config.DirName {
+		return filepath.Dir(filepath.Clean(home))
+	}
+	return home
 }
 
 // lowRiskReviewLevel is the PolicyMergeGate.ReviewLevel hook for repos with
@@ -161,7 +175,11 @@ func (g daemonMergeGate) requestLowRiskPostMergeReview(ctx context.Context, requ
 	if decision.ReviewLevel != reviewlevel.LevelBackground || g.Store == nil {
 		return
 	}
-	head := strings.ToLower(strings.TrimSpace(request.HeadSHA))
+	// The head that actually merged, not the task payload's recorded head.
+	head := strings.ToLower(strings.TrimSpace(decision.MergedHeadSHA))
+	if head == "" {
+		head = strings.ToLower(strings.TrimSpace(request.HeadSHA))
+	}
 	taskID := strings.TrimSpace(request.TaskID)
 	if taskID != "" {
 		events, err := g.Store.ListTaskEvents(ctx, taskID)
@@ -181,7 +199,7 @@ func (g daemonMergeGate) requestLowRiskPostMergeReview(ctx context.Context, requ
 	}
 	if err == nil {
 		_, err = requestReview(ctx, g.Store, reviewRequestOptions{
-			home: g.Home, repo: request.Repo, pr: request.PullRequest, head: head,
+			home: rawHomeFromResolved(g.Home), repo: request.Repo, pr: request.PullRequest, head: head,
 			purpose: "code", role: role, ttl: defaultReviewRequestTTL, postMerge: true,
 		}, io.Discard)
 	}
