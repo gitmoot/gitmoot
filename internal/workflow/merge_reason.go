@@ -115,3 +115,38 @@ func (r MergeReason) Render() string {
 	}
 	return strings.Join(parts, "; ")
 }
+
+// SplitSeatActionable separates the misses the implementing seat can fix itself
+// (IsSeatActionableGateCause) from the rest. Seat-actionable misses go back to
+// that seat instead of up the chart to the owner (owner decision 2026-10-08):
+// the owner cannot record another seat's work. A status reason stays with rest.
+func (r MergeReason) SplitSeatActionable() (seat, rest MergeReason) {
+	rest.plain = r.plain
+	for _, miss := range r.misses {
+		if IsSeatActionableGateCause(miss.cause) {
+			seat.misses = append(seat.misses, miss)
+		} else {
+			rest.misses = append(rest.misses, miss)
+		}
+	}
+	return seat, rest
+}
+
+// ImplementerAttributionGapReason is the review-gate cause recorded when no
+// implement work is attributed to the task.
+const ImplementerAttributionGapReason = noImplementJobAttributionReason
+
+// IsSeatActionableGateCause reports a gate-miss cause whose remedy is an action
+// by the seat that wrote the change, not a decision for anyone above it. Today
+// that is the implementer-attribution gap: the remedy is `gitmoot job record`
+// by the implementing seat.
+func IsSeatActionableGateCause(cause string) bool {
+	return strings.HasPrefix(strings.TrimSpace(cause), noImplementJobAttributionReason)
+}
+
+// IsImplementerAttributionGap reports whether operator text carries the
+// implementer-attribution gap, wherever it appears in the text. Owner-facing
+// renderers use it to replace the procedure with a plain explanation.
+func IsImplementerAttributionGap(text string) bool {
+	return strings.Contains(text, noImplementJobAttributionReason)
+}

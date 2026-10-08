@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // OWNER ALERTS GO TO HERDR GRAM (owner decision 2026-10-08).
@@ -38,9 +38,8 @@ const (
 	ownerGramMaxItems = 10
 	// ownerGramSendTimeout stays well inside replyWakeAttemptedUnknownAfter, so
 	// the aged-attempt sweep never races a send that is still running.
-	ownerGramSendTimeout   = 15 * time.Second
-	ownerGramItemDetailMax = 240
-	ownerGramSenderLabel   = "gitmoot"
+	ownerGramSendTimeout = 15 * time.Second
+	ownerGramSenderLabel = "gitmoot"
 )
 
 // ownerGramResult is what one send attempt proved.
@@ -50,9 +49,16 @@ type ownerGramResult struct {
 	Detail  string
 }
 
+// ownerGramMessage is one Gram: its text and, when the full text would exceed
+// Herdr's limit, the unedited originals as an attached file.
+type ownerGramMessage struct {
+	Text       string
+	Attachment string
+}
+
 // ownerGramSender sends one Gram to the owner. Production uses
 // sendOwnerGramViaHerdr; tests inject a fake so no real Gram is ever sent.
-type ownerGramSender func(ctx context.Context, text string) ownerGramResult
+type ownerGramSender func(ctx context.Context, message ownerGramMessage) ownerGramResult
 
 // ownerGramStore is the store surface the owner path needs beyond
 // wakeOutboxStore. A store without it keeps the previous behavior.
@@ -103,12 +109,13 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	}
 	batch := due[:min(len(due), ownerGramMaxItems)]
 	ids := make([]int64, 0, len(batch))
-	items := make([]ownerGramItem, 0, len(batch))
+	items := make([]ownerAlert, 0, len(batch))
+	lookup, _ := store.(ownerAlertLookup)
 	for _, entry := range batch {
 		ids = append(ids, entry.row.ID)
-		items = append(items, ownerGramItemFor(entry.row, entry.event))
+		items = append(items, ownerAlertFor(ctx, lookup, entry.row, entry.event))
 	}
-	text := ownerGramText(items, len(due)-len(batch))
+	message := renderOwnerGram(items, len(due)-len(batch))
 	// The claim reserves the owner Gram slot in the same transaction, so a
 	// concurrent drainer with a disjoint batch cannot send inside the interval.
 	claimed, err := recorder.ClaimOwnerGramWakeOutbox(ctx, ids, now, ownerGramMinInterval)
@@ -121,7 +128,7 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	}
 	sendStarted := time.Now()
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ownerGramSendTimeout)
-	result := delivery.ownerGram(sendCtx, text)
+	result := delivery.ownerGram(sendCtx, message)
 	cancel()
 	// The outcome is stamped when the send finished, so the spacing interval
 	// runs from the real send (#2345 review). The wall clock covers every bit of
@@ -150,96 +157,6 @@ func deliverOwnerGram(ctx context.Context, store wakeOutboxStore, delivery reply
 	return true, nil
 }
 
-type ownerGramItem struct {
-	kind    string
-	subject string
-	why     string
-	command string
-}
-
-func ownerGramItemFor(row db.WakeOutboxObligation, event events.Event) ownerGramItem {
-	item := ownerGramItem{
-		kind:    ownerGramKindLabel(row, event),
-		subject: strings.TrimSpace(event.Repo),
-		why:     strings.TrimSpace(event.Detail),
-		command: fmt.Sprintf("gitmoot org wake show %d", row.ID),
-	}
-	switch row.SourceKind {
-	case db.WakeOutboxSourceEscalation, db.WakeOutboxSourceBlocked:
-		if job := strings.TrimSpace(event.JobID); job != "" {
-			item.command = "gitmoot job show " + job
-		}
-	case db.WakeOutboxSourceWorkflowNote:
-		item.command = "gitmoot workflow show-note " + row.SourceID
-	case db.WakeOutboxSourceAwaitedFact:
-		var payload db.AwaitedFactWakePayload
-		if json.Unmarshal([]byte(row.SourceID), &payload) == nil && payload.SubjectKey != "" {
-			item.subject = payload.SubjectKey
-		}
-	}
-	// A job command names the work itself; otherwise the shared-inbox message is
-	// the most complete view of a note or notice.
-	if row.MessageID != 0 && !strings.HasPrefix(item.command, "gitmoot job show ") {
-		item.command = fmt.Sprintf("gitmoot message show %d", row.MessageID)
-		if item.why == "" || row.SourceKind == db.WakeOutboxSourceWorkflowNote {
-			item.why = fmt.Sprintf("%s from %s: %s", row.MessageKind, row.MessageSender, row.MessageBody)
-		}
-	}
-	item.why = truncateForWake(terminalSafeWorkflowText(workflow.RedactCommentText(item.why)), ownerGramItemDetailMax)
-	return item
-}
-
-func ownerGramKindLabel(row db.WakeOutboxObligation, event events.Event) string {
-	switch row.SourceKind {
-	case db.WakeOutboxSourceEscalation:
-		return "needs you"
-	case db.WakeOutboxSourceBlocked:
-		return "blocked"
-	case db.WakeOutboxSourceAwaitedFact:
-		return "review result"
-	case db.WakeOutboxSourceWorkflowNote:
-		if event.Type == events.EventOrgDirective {
-			return "directive"
-		}
-		return "message"
-	default:
-		return "notice"
-	}
-}
-
-// ownerGramText is the plain message the owner reads on the phone: what, where,
-// why, and the command that shows the rest. Identical lines are listed once.
-func ownerGramText(items []ownerGramItem, more int) string {
-	var body strings.Builder
-	seen := make(map[string]struct{}, len(items))
-	for _, item := range items {
-		line := "- " + item.kind
-		if item.subject != "" {
-			line += " " + item.subject
-		}
-		if item.why != "" {
-			line += ": " + item.why
-		}
-		line += "\n  " + item.command
-		if _, dup := seen[line]; dup {
-			continue
-		}
-		seen[line] = struct{}{}
-		body.WriteString(line)
-		body.WriteString("\n")
-	}
-	noun := "items need"
-	if len(items) == 1 {
-		noun = "item needs"
-	}
-	header := fmt.Sprintf("Gitmoot: %d %s you\n", len(items), noun)
-	text := header + body.String()
-	if more > 0 {
-		text += fmt.Sprintf("%d more will follow in the next message.\n", more)
-	}
-	return strings.TrimSpace(text)
-}
-
 // herdrGramResponse is the JSON `herdr gram send` prints: a success on stdout
 // (exit 0) or an error on stderr (exit 1).
 type herdrGramResponse struct {
@@ -260,8 +177,8 @@ type herdrGramResponse struct {
 // error: the request was refused before anything was stored), an argument
 // refusal (exit 2) or a binary that cannot start: refused. Anything else,
 // including a timeout or exit 0 without a readable id: unknown.
-func sendOwnerGramViaHerdr(ctx context.Context, text string) ownerGramResult {
-	return classifyHerdrGramSend(runHerdrGramSend(ctx, text))
+func sendOwnerGramViaHerdr(ctx context.Context, message ownerGramMessage) ownerGramResult {
+	return classifyHerdrGramSend(runHerdrGramSend(ctx, message))
 }
 
 type herdrGramRun struct {
@@ -273,8 +190,23 @@ type herdrGramRun struct {
 	stderr   []byte
 }
 
-func runHerdrGramSend(ctx context.Context, text string) herdrGramRun {
-	cmd := exec.CommandContext(ctx, "herdr", "gram", "send", "--from", ownerGramSenderLabel, text)
+func runHerdrGramSend(ctx context.Context, message ownerGramMessage) herdrGramRun {
+	args := []string{"gram", "send", "--from", ownerGramSenderLabel}
+	if message.Attachment != "" {
+		file, err := os.CreateTemp("", "gitmoot-owner-alert-*.txt")
+		if err != nil {
+			return herdrGramRun{startErr: fmt.Errorf("write gram attachment: %w", err)}
+		}
+		defer os.Remove(file.Name())
+		_, writeErr := file.WriteString(message.Attachment)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return herdrGramRun{startErr: fmt.Errorf("write gram attachment: %w", err)}
+		}
+		args = append(args, "--file", file.Name())
+	}
+	args = append(args, message.Text)
+	cmd := exec.CommandContext(ctx, "herdr", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Start(); err != nil {

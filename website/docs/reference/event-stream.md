@@ -247,6 +247,14 @@ marks it `failed` with `owner gram refused: ...`, and `gitmoot org wake retry`
 can resend it. An unknown outcome marks it `delivery_unknown` and is never
 resent. `gitmoot org status` flags the owner row while any owner alert is
 failed, `delivery_unknown` or stalled and not yet retried or superseded.
+Each owner Gram is written for a phone: per item, a plain line naming who
+needs the owner, the pull request and why, then `What to do:` and the pull
+request link. Known gate reasons get a plain explanation. The unedited
+original text follows below a separator and is never shortened; past Herdr's
+8 KiB text limit it is attached as a file and the Gram says so. A merge-gate
+miss only the repository's seat can fix (no implement work recorded for the
+task) is escalated to that seat, not to the owner; other misses in the same
+decision still go up the chart.
 Pending, attempted, delivered, superseded, stalled, failed, and
 `delivery_unknown` remain queryable per outbox row, and outstanding obligations
 contribute to daemon tick health. A deliverable row still inside its hold is
