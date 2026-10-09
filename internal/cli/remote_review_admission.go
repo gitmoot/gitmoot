@@ -28,7 +28,7 @@ const (
 	// red_ci, but it can still turn green, so the disk guard retries it
 	// (undoDiskGuardRoute) instead of declining the remote route for good.
 	remoteReviewAvoidedCIPending = "ci_pending"
-	remoteReviewAvoidedRetry       = "retry"
+	remoteReviewAvoidedRetry     = "retry"
 )
 
 var errRemoteReviewAdmissionCancelled = errors.New("remote review admission was cancelled")
