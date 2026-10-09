@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -295,6 +296,12 @@ const (
 	diskGuardRouteUndoneEventKind  = "disk_guard_route_undone"
 )
 
+// diskGuardCIPendingRetryInterval is how long a disk-routed review whose
+// remote run was refused only because current-head CI is still pending waits
+// before the guard switches it to remote again. A fresh pull request is routed
+// moments after its push, when CI has almost never finished.
+var diskGuardCIPendingRetryInterval = 2 * time.Minute
+
 // diskGuardRemoteReviews picks, while the guard pauses local dispatch, the
 // queued reviews that may run on the remote backend instead: reviews already
 // set to remote, and reviews with no backend of their own that this pass
@@ -302,7 +309,9 @@ const (
 // review also requires green current-head CI at remote admission
 // (PolicyRoutedReview), and any refusal of its remote run puts it back to
 // waiting locally (undoDiskGuardRoute) instead of failing it. An explicit local
-// backend is respected, and a review is switched at most once.
+// backend is respected, and a review is switched at most once - except that a
+// refusal for still-pending CI only holds it until blocker_retry_at, after
+// which a later pass switches it again.
 func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job, reason string) []db.Job {
 	// Only the cloud E2B provider: a routed payload never gets exec_provider,
 	// and the cap below is the E2B dollar cap. The sandboxd provider is used only by
@@ -334,12 +343,14 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 			allowed = append(allowed, job)
 			continue
 		}
-		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || !diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || queuedJobBlockerHeld(job, time.Now().UTC()) ||
+			!diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
 			continue
 		}
 		payload.ExecBackend = string(execbackend.Remote)
 		payload.PolicyRoutedReview = true
 		payload.DiskGuardRouted = true
+		payload.BlockerRetryAt = ""
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			continue
@@ -386,8 +397,12 @@ func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, p
 // disk guard switched to remote it instead puts the stored job back to waiting
 // locally and marks it declined, so the opt-in never turns a review that would
 // have waited into a failed one; if the cause is not about the remote run, the
-// review meets it again locally. running is true once remote admission has
-// claimed the job. It reports whether it took ownership of the job's outcome.
+// review meets it again locally. A refusal only because current-head CI is
+// still pending (remoteReviewAvoidedCIPending) is not a decline: CI can still
+// turn green, so the review is held for diskGuardCIPendingRetryInterval and
+// diskGuardRemoteReviews switches it again after that. running is true once
+// remote admission has claimed the job. It reports whether it took ownership
+// of the job's outcome.
 func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state workflow.JobState, running bool, cause error) bool {
 	if state != workflow.JobFailed && state != workflow.JobBlocked {
 		return false
@@ -405,13 +420,21 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 	payload.ClearExecBackendOverride()
 	payload.PolicyRoutedReview = false
 	payload.DiskGuardRouted = false
-	payload.DiskGuardRouteDeclined = true
+	waitFor := "waits for local disk again"
+	var refusal *remoteReviewAdmissionRefusal
+	if errors.As(cause, &refusal) && refusal.reason == remoteReviewAvoidedCIPending {
+		retryAt := time.Now().UTC().Add(diskGuardCIPendingRetryInterval)
+		payload.BlockerRetryAt = retryAt.Format(time.RFC3339Nano)
+		waitFor = "retries the remote route at " + retryAt.Format(time.RFC3339) + " or waits for local disk"
+	} else {
+		payload.DiskGuardRouteDeclined = true
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return false
 	}
 	event := db.JobEvent{JobID: job.ID, Kind: diskGuardRouteUndoneEventKind,
-		Message: "remote run did not start, so this review waits for local disk again: " + cause.Error()}
+		Message: "remote run did not start, so this review " + waitFor + ": " + cause.Error()}
 	var undone bool
 	if running {
 		undone, err = w.Store.TransitionJobStatePayloadWithEventAtGeneration(ctx, job.ID, string(workflow.JobRunning),

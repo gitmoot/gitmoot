@@ -543,7 +543,12 @@ write as the switch, so concurrent passes cannot overshoot). A switched review
 needs green current-head CI at remote admission. If it would fail or block for
 any reason before its remote run starts (red CI, a moved head, a duplicate, the
 worktree or checkout, the cost cap, the provider), it goes back to waiting
-locally (event `disk_guard_route_undone`) instead, and is not switched again. A
+locally (event `disk_guard_route_undone`) instead, and is not switched again.
+The one exception is CI that has not finished: when at least one current-head
+check is still pending and none has failed (refusal reason `ci_pending`), the
+review is held for two minutes (`blocker_retry_at`) instead of declined, and a
+later pass switches it to remote again, so it runs once CI turns green. Failing
+checks or no reported checks still decline the route. A
 review pinned to `--exec-backend local` keeps waiting, and nothing is switched
 while the daemon is draining. It spends money, so it needs a configured
 `[remote_exec]` cost cap and is off unless set.

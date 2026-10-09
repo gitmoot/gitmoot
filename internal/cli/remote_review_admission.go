@@ -23,7 +23,12 @@ const (
 	remoteReviewAvoidedDuplicate   = "duplicate"
 	remoteReviewAvoidedUnsupported = "unsupported"
 	remoteReviewAvoidedRedCI       = "red_ci"
-	remoteReviewAvoidedRetry       = "retry"
+	// remoteReviewAvoidedCIPending is CI that has not finished yet: at least
+	// one current-head check still pending and none failed. It is refused like
+	// red_ci, but it can still turn green, so the disk guard retries it
+	// (undoDiskGuardRoute) instead of declining the remote route for good.
+	remoteReviewAvoidedCIPending = "ci_pending"
+	remoteReviewAvoidedRetry     = "retry"
 )
 
 var errRemoteReviewAdmissionCancelled = errors.New("remote review admission was cancelled")
@@ -105,7 +110,11 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 				return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, fmt.Sprintf("remote review CI policy could not read current-head checks: %v", err))
 			}
 			if ok, detail := remoteReviewChecksGreen(checks); !ok {
-				return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, detail)
+				reason := remoteReviewAvoidedRedCI
+				if remoteReviewChecksOnlyPending(checks) {
+					reason = remoteReviewAvoidedCIPending
+				}
+				return false, newRemoteReviewRefusal(reason, detail)
 			}
 		}
 	}
@@ -179,6 +188,30 @@ func remoteReviewChecksGreen(checks []github.PullRequestCheck) (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+// remoteReviewChecksOnlyPending reports whether checks that are not green are
+// only waiting to finish: at least one check is pending and none has failed.
+// No checks at all is not pending - there is nothing that could turn green.
+func remoteReviewChecksOnlyPending(checks []github.PullRequestCheck) bool {
+	pending := false
+	for _, check := range checks {
+		bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
+		state := strings.ToLower(strings.TrimSpace(check.State))
+		switch {
+		case bucket == "pass" || bucket == "skipping":
+		case bucket == "pending":
+			pending = true
+		case bucket != "":
+			return false
+		case state == "success" || state == "skipped" || state == "neutral":
+		case state == "pending" || state == "queued" || state == "in_progress" || state == "expected" || state == "waiting" || state == "requested":
+			pending = true
+		default:
+			return false
+		}
+	}
+	return pending
 }
 
 func firstNonEmptyRemoteReview(values ...string) string {
