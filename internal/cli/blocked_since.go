@@ -438,6 +438,13 @@ func snapshotForOrgRoles(snapshot org.Snapshot, roles []config.OrgRole) org.Snap
 	return snapshot
 }
 
+// evaluateAwaitedFactTTLs ends every due wait. A review wait the pull request
+// has moved past ends superseded and wakes nobody (see db.ExpireAwaitedFact).
+// A wait that still matters wakes its waiter: the role that asked is the one
+// that can re-request, chase, or drop it. Addressing the chart parent instead
+// sent every expired seat wait to the owner as a "needs you" Gram. Only a
+// waiter that is archived goes up the existing escalation route, to its
+// nearest live ancestor.
 func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig config.OrgConfig, stdout io.Writer, now time.Time, deps awaitedFactTTLDependencies) error {
 	if store == nil {
 		return nil
@@ -446,30 +453,41 @@ func evaluateAwaitedFactTTLs(ctx context.Context, store *db.Store, orgConfig con
 	if err != nil {
 		return err
 	}
+	var roster orgRoster
+	rosterLoaded := false
 	for _, item := range items {
-		role, ok := orgConfig.Role(item.WaiterRole)
 		target := item.WaiterRole
-		if ok {
-			target = strings.TrimSpace(role.Parent)
-		} else {
+		if _, ok := orgConfig.Role(item.WaiterRole); !ok {
 			// Seat removal cannot remove the wait's termination bound. Preserve the
 			// exact removed-role address so delivery failure remains separately
 			// observable while the subscription itself becomes terminal/queryable.
 			writeLine(stdout, "awaited fact %d waiter role %q is no longer configured; expiring with wake still addressed to that role", item.ID, item.WaiterRole)
+		} else {
+			// Loaded only when a configured waiter is due, which is rare.
+			if !rosterLoaded {
+				roster, rosterLoaded = loadOrgRoster(ctx, store, orgConfig), true
+			}
+			// With no live ancestor the archived waiter keeps the address rather
+			// than turning expiry into silence.
+			if !orgRosterHasMember(roster, item.WaiterRole) {
+				if up := mergeGateEscalationTo(roster, orgConfig, item.WaiterRole, true); up != "" {
+					target = up
+				}
+			}
 		}
-		if target == "" {
-			// A root wait still terminates visibly. With no parent available, wake
-			// the root itself rather than turning expiry into silence.
-			target = item.WaiterRole
-		}
-		expired, err := deps.markExpired(ctx, store, item.ID, target, now.UTC())
+		changed, err := deps.markExpired(ctx, store, item.ID, target, now.UTC())
 		if err != nil {
 			writeLine(stdout, "awaited fact %d expiry failed: %v", item.ID, err)
 			continue
 		}
-		if expired {
-			writeLine(stdout, "awaited fact %d expired; escalation addressed to %s", item.ID, target)
+		if !changed {
+			continue
 		}
+		if fact, err := store.GetAwaitedFact(ctx, item.ID); err == nil && fact.State == db.AwaitedFactStateSuperseded {
+			writeLine(stdout, "awaited fact %d %s; no wake", item.ID, fact.ResolutionDetail)
+			continue
+		}
+		writeLine(stdout, "awaited fact %d expired; wake addressed to %s", item.ID, target)
 	}
 	return nil
 }

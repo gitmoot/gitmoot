@@ -2945,4 +2945,47 @@ CREATE TABLE owner_gram_spacing (
 	last_send_at TEXT NOT NULL
 );
 	`,
+	// Superseded awaited facts. A review wait whose question the pull request
+	// has moved past (the waiter asked again at another head, or the PR merged,
+	// closed or moved on) ends 'superseded' with its reason instead of expiring
+	// into an alert nobody can act on. SQLite cannot widen a CHECK in place, so
+	// the table is rebuilt; every row keeps its id, state and deadline, and the
+	// indexes are recreated after the old table (and its same-named indexes) is
+	// dropped. Append-only tail; migrations are positional.
+	`
+ALTER TABLE awaited_facts RENAME TO awaited_facts_before_superseded;
+
+CREATE TABLE awaited_facts (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	waiter_role TEXT NOT NULL,
+	subject_kind TEXT NOT NULL,
+	subject_key TEXT NOT NULL,
+	deadline TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'waiting'
+		CHECK(state IN ('waiting', 'satisfied', 'expired', 'superseded')),
+	resolution_detail TEXT NOT NULL DEFAULT '',
+	satisfied_at TEXT NOT NULL DEFAULT '',
+	expired_at TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO awaited_facts(
+	id, waiter_role, subject_kind, subject_key, deadline, state,
+	resolution_detail, satisfied_at, expired_at, created_at, updated_at
+)
+SELECT
+	id, waiter_role, subject_kind, subject_key, deadline, state,
+	resolution_detail, satisfied_at, expired_at, created_at, updated_at
+FROM awaited_facts_before_superseded;
+
+DROP TABLE awaited_facts_before_superseded;
+
+CREATE UNIQUE INDEX idx_awaited_facts_live_subject
+	ON awaited_facts(waiter_role, subject_kind, subject_key)
+	WHERE state = 'waiting';
+CREATE INDEX idx_awaited_facts_waiting_deadline
+	ON awaited_facts(deadline, id)
+	WHERE state = 'waiting';
+	`,
 }

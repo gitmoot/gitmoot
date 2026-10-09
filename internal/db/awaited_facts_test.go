@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -275,6 +276,113 @@ func TestFailedReviewWakeIsRetiredWhenFactExpiresToParent(t *testing.T) {
 	}
 	if state := awaitedFactState(t, store, fact.ID); state != AwaitedFactStateExpired {
 		t.Fatalf("awaited fact state = %q, want expired", state)
+	}
+}
+
+// TestExpireAwaitedFactSupersedesReviewWaitThePullRequestMovedPast pins which
+// due review waits end superseded (reason, no wake) instead of expiring into an
+// alert, and the guards that keep a live question expiring visibly.
+func TestExpireAwaitedFactSupersedesReviewWaitThePullRequestMovedPast(t *testing.T) {
+	const repo, pr = "acme/widget", 45
+	mirror := func(head, state string, observedBeforeWait bool) func(t *testing.T, store *Store) {
+		return func(t *testing.T, store *Store) {
+			if err := store.UpsertPullRequest(context.Background(), PullRequest{
+				RepoFullName: repo, Number: pr, HeadSHA: head, State: state,
+			}); err != nil {
+				t.Fatalf("UpsertPullRequest: %v", err)
+			}
+			if observedBeforeWait {
+				if _, err := store.db.Exec(`UPDATE pull_requests SET updated_at = datetime('now', '-1 hour') WHERE repo_full_name = ? AND number = ?`, repo, pr); err != nil {
+					t.Fatalf("backdate mirror: %v", err)
+				}
+			}
+		}
+	}
+	cases := []struct {
+		name       string
+		head       string
+		purpose    string
+		setup      func(t *testing.T, store *Store)
+		wantState  string
+		wantDetail string
+	}{
+		{name: "no newer wait and no PR record expires", head: "abc1234", wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "PR still at the waited head expires", head: "abc1234", setup: mirror("abc1234", "open", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{
+			name: "same waiter later awaited another head", head: "abc1234",
+			setup: func(t *testing.T, store *Store) {
+				subscribeReviewFact(t, store, "lane", repo, pr, "def5678")
+			},
+			wantState: "superseded", wantDetail: "superseded: lane later awaited acme/widget#45 at head def5678 (awaited fact 2)",
+		},
+		{
+			name: "another role's later wait does not speak for this waiter", head: "abc1234",
+			setup: func(t *testing.T, store *Store) {
+				subscribeReviewFact(t, store, "other", repo, pr, "def5678")
+			},
+			wantState: AwaitedFactStateExpired, wantDetail: "deadline expired",
+		},
+		{
+			name: "later wait on a longer spelling of the same commit is no move", head: "abc1234",
+			setup: func(t *testing.T, store *Store) {
+				subscribeReviewFact(t, store, "lane", repo, pr, "abc1234def")
+			},
+			wantState: AwaitedFactStateExpired, wantDetail: "deadline expired",
+		},
+		{name: "merged PR", head: "abc1234", setup: mirror("abc1234", "merged", true), wantState: "superseded", wantDetail: "superseded: acme/widget#45 is merged"},
+		{name: "closed PR observed after the wait", head: "abc1234", setup: mirror("abc1234", "closed", false), wantState: "superseded", wantDetail: "superseded: acme/widget#45 is closed"},
+		{name: "head moved after the wait", head: "abc1234", setup: mirror("def5678", "open", false), wantState: "superseded", wantDetail: "superseded: acme/widget#45 moved from head abc1234 to def5678"},
+		{name: "mirror older than the wait is not trusted", head: "abc1234", setup: mirror("def5678", "open", true), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "abbreviated waited head matches the full PR head", head: "abc1234", setup: mirror("abc1234def", "open", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "post-merge wait on a merged PR still expires", head: "abc1234", purpose: ReviewRequestPurpose("code", true), setup: mirror("abc1234", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "post-merge wait on a merge commit is not a head move", head: "abc1234", purpose: ReviewRequestPurpose("code", true), setup: mirror("def5678", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openAwaitedFactTestStore(t)
+			ctx := context.Background()
+			key, err := ReviewVerdictSubjectKey(repo, pr, tc.head)
+			if tc.purpose != "" {
+				key, err = ReviewRequestSubjectKey(repo, pr, tc.head, tc.purpose)
+			}
+			if err != nil {
+				t.Fatalf("subject key: %v", err)
+			}
+			fact, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
+				WaiterRole: "lane", SubjectKind: AwaitedFactSubjectReviewVerdict,
+				SubjectKey: key, Deadline: time.Now().UTC().Add(time.Hour),
+			})
+			if err != nil {
+				t.Fatalf("SubscribeAwaitedFact: %v", err)
+			}
+			if tc.setup != nil {
+				tc.setup(t, store)
+			}
+			changed, err := store.ExpireAwaitedFact(ctx, fact.ID, "lane", time.Now().UTC())
+			if err != nil || !changed {
+				t.Fatalf("ExpireAwaitedFact changed=%t err=%v", changed, err)
+			}
+			got, err := store.GetAwaitedFact(ctx, fact.ID)
+			if err != nil || got.State != tc.wantState || got.ResolutionDetail != tc.wantDetail {
+				t.Fatalf("stored fact = %+v err=%v, want state %q detail %q", got, err, tc.wantState, tc.wantDetail)
+			}
+			pending, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wakes := 0
+			for _, row := range pending {
+				if strings.Contains(row.SourceID, fmt.Sprintf(`"id":%d,`, fact.ID)) {
+					wakes++
+				}
+			}
+			if want := map[bool]int{true: 1, false: 0}[tc.wantState == AwaitedFactStateExpired]; wakes != want {
+				t.Fatalf("wakes for fact %d = %d, want %d (%+v)", fact.ID, wakes, want, pending)
+			}
+			if again, err := store.ExpireAwaitedFact(ctx, fact.ID, "lane", time.Now().UTC()); err != nil || again {
+				t.Fatalf("second expiry changed=%t err=%v, want no-op", again, err)
+			}
+		})
 	}
 }
 
