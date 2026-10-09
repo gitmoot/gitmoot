@@ -251,7 +251,8 @@ When enabled, admission requires at least one reported check and every check mus
 be passing, skipped, or neutral. Policy-routed remote reviews always require
 this, regardless of `remote_require_ci_green`.
 Refusals record durable `remote_review_admission_avoided_<reason>` job events,
-where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`, or `retry`.
+where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`,
+`ci_pending` (current-head checks still running, none failed), or `retry`.
 
 For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
 checkout into a distinct detached Git worktree, streams runtime commands there,
