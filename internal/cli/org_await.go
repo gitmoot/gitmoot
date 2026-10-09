@@ -37,8 +37,8 @@ func runOrgAwait(args []string, stdout, stderr io.Writer) int {
 func printOrgAwaitUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--json] [--home DIR]")
-	fmt.Fprintln(w, "Every awaited fact has a required deadline. A matching exact-head review verdict satisfies it; expiry remains queryable and wakes the waiter's parent.")
+	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]")
+	fmt.Fprintln(w, "Every awaited fact has a required deadline. A matching exact-head review verdict satisfies it. At the deadline a review wait the PR has moved past (a later wait on another head, merged, closed, or a new head) ends superseded with its reason and wakes nobody; any other wait expires, remains queryable, and wakes the waiter (an archived waiter's nearest live ancestor).")
 }
 
 func runOrgAwaitReview(args []string, stdout, stderr io.Writer) int {
@@ -126,7 +126,7 @@ func runOrgAwaitList(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	roleFlag := fs.String("role", "", "filter by waiter role")
-	state := fs.String("state", "", "filter by waiting, satisfied, or expired")
+	state := fs.String("state", "", "filter by waiting, satisfied, expired, or superseded")
 	jsonOutput := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

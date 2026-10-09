@@ -31,59 +31,136 @@ func insertAwaitedFactWakeForTest(t *testing.T, store *db.Store, payload db.Awai
 	}
 }
 
-func TestAwaitedFactExpiryRemainsQueryableAndAddressesParent(t *testing.T) {
-	root := t.TempDir()
-	paths := config.PathsForHome(root)
-	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+// TestAwaitedFactExpiryWakesWaiterAndSupersedesStaleReviewWaits pins the
+// 2026-10-09 owner Gram (macserve#2/#3): phobos's review waits on heads that
+// were replaced and then merged expired into "needs you" wakes for the owner.
+// A wait the PR has moved past now ends superseded with no wake at all, and a
+// wait that still matters wakes the waiter rather than its chart parent; only
+// an archived waiter's expiry climbs to the nearest live ancestor.
+func TestAwaitedFactExpiryWakesWaiterAndSupersedesStaleReviewWaits(t *testing.T) {
+	cases := []struct {
+		name      string
+		archived  bool
+		setup     func(t *testing.T, store *db.Store, deadline time.Time)
+		wantState string
+		wantWake  string
+	}{
+		{
+			name:      "current head wakes the waiter",
+			wantState: db.AwaitedFactStateExpired,
+			wantWake:  "lane",
+		},
+		{
+			name: "newer review wait on the same PR supersedes",
+			setup: func(t *testing.T, store *db.Store, deadline time.Time) {
+				awaitReviewForTest(t, store, "lane", 45, "head-new", deadline.Add(time.Hour))
+			},
+			wantState: "superseded",
+		},
+		{
+			name: "merged PR supersedes",
+			setup: func(t *testing.T, store *db.Store, _ time.Time) {
+				if err := store.UpsertPullRequest(context.Background(), db.PullRequest{
+					RepoFullName: "acme/widget", Number: 45, HeadSHA: "head-new", State: "merged",
+				}); err != nil {
+					t.Fatalf("UpsertPullRequest: %v", err)
+				}
+			},
+			wantState: "superseded",
+		},
+		{
+			name:      "archived waiter escalates to nearest live ancestor",
+			archived:  true,
+			wantState: db.AwaitedFactStateExpired,
+			wantWake:  "owner",
+		},
 	}
-	if err := os.WriteFile(paths.ConfigFile, []byte(`[org.roles."owner"]
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			paths := config.PathsForHome(root)
+			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.WriteFile(paths.ConfigFile, []byte(`[org.roles."owner"]
 scope=["*"]
 [org.roles."lane"]
 parent="owner"
 scope=["*"]
 `), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+				t.Fatalf("WriteFile: %v", err)
+			}
+			cfg, err := config.LoadOrg(paths)
+			if err != nil {
+				t.Fatalf("LoadOrg: %v", err)
+			}
+			store, err := dbtest.Open(t, paths.Database)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer store.Close()
+			if tc.archived {
+				stamp := time.Now().UTC().Format(time.RFC3339Nano)
+				if err := store.UpsertOrgRoleArchived(context.Background(), db.OrgRoleArchived{
+					Role: "lane", ArchivedAt: stamp, ArchivedBy: "test", ObservedAt: stamp,
+				}); err != nil {
+					t.Fatalf("UpsertOrgRoleArchived: %v", err)
+				}
+			}
+			deadline := time.Now().UTC().Add(time.Minute)
+			fact := awaitReviewForTest(t, store, "lane", 45, "head-old", deadline)
+			if tc.setup != nil {
+				tc.setup(t, store, deadline)
+			}
+			var log bytes.Buffer
+			if err := evaluateAwaitedFactTTLs(context.Background(), store, cfg, &log, deadline.Add(time.Second), awaitedFactTTLDependencies{}); err != nil {
+				t.Fatalf("evaluateAwaitedFactTTLs: %v", err)
+			}
+			got, err := store.GetAwaitedFact(context.Background(), fact.ID)
+			if err != nil {
+				t.Fatalf("GetAwaitedFact: %v", err)
+			}
+			if got.State != tc.wantState {
+				t.Fatalf("fact %d state = %q (%s), want %q; log=%q", fact.ID, got.State, got.ResolutionDetail, tc.wantState, log.String())
+			}
+			if tc.wantState == "superseded" && !strings.HasPrefix(got.ResolutionDetail, "superseded: ") {
+				t.Fatalf("superseded detail = %q, want the reason", got.ResolutionDetail)
+			}
+			outbox, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
+			if err != nil {
+				t.Fatalf("ListWakeOutbox: %v", err)
+			}
+			var wakes []string
+			for _, row := range outbox {
+				if strings.Contains(row.SourceID, fmt.Sprintf(`"id":%d,`, fact.ID)) {
+					wakes = append(wakes, row.TargetRole+"|"+row.CoalesceKey)
+				}
+			}
+			var want []string
+			if tc.wantWake != "" {
+				want = []string{tc.wantWake + "|fact:" + tc.wantWake}
+			}
+			if strings.Join(wakes, ",") != strings.Join(want, ",") {
+				t.Fatalf("wakes for fact %d = %v, want %v; log=%q", fact.ID, wakes, want, log.String())
+			}
+		})
 	}
-	cfg, err := config.LoadOrg(paths)
-	if err != nil {
-		t.Fatalf("LoadOrg: %v", err)
-	}
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer store.Close()
-	key, err := db.ReviewVerdictSubjectKey("acme/widget", 45, "head-expire")
+}
+
+func awaitReviewForTest(t *testing.T, store *db.Store, role string, pr int, head string, deadline time.Time) db.AwaitedFact {
+	t.Helper()
+	key, err := db.ReviewVerdictSubjectKey("acme/widget", pr, head)
 	if err != nil {
 		t.Fatalf("ReviewVerdictSubjectKey: %v", err)
 	}
-	deadline := time.Now().UTC().Add(time.Minute)
 	fact, _, err := store.SubscribeAwaitedFact(context.Background(), db.AwaitedFactSubscription{
-		WaiterRole: "lane", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		WaiterRole: role, SubjectKind: db.AwaitedFactSubjectReviewVerdict,
 		SubjectKey: key, Deadline: deadline,
 	})
 	if err != nil {
 		t.Fatalf("SubscribeAwaitedFact: %v", err)
 	}
-	var log bytes.Buffer
-	if err := evaluateAwaitedFactTTLs(context.Background(), store, cfg, &log, deadline.Add(time.Second), awaitedFactTTLDependencies{}); err != nil {
-		t.Fatalf("evaluateAwaitedFactTTLs: %v", err)
-	}
-	expired, err := store.ListAwaitedFacts(context.Background(), "lane", db.AwaitedFactStateExpired)
-	if err != nil {
-		t.Fatalf("ListAwaitedFacts: %v", err)
-	}
-	if len(expired) != 1 || expired[0].ID != fact.ID || expired[0].ExpiredAt == "" {
-		t.Fatalf("queryable expired facts = %+v, want terminal row %d", expired, fact.ID)
-	}
-	outbox, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
-	if err != nil {
-		t.Fatalf("ListWakeOutbox: %v", err)
-	}
-	if len(outbox) != 1 || outbox[0].TargetRole != "owner" || outbox[0].CoalesceKey != "fact:owner" || !strings.Contains(outbox[0].SourceID, `"waiter_role":"lane"`) {
-		t.Fatalf("expiry outbox = %+v, want exact parent delivery", outbox)
-	}
+	return fact
 }
 
 func TestAwaitedFactOutboxIsAddressedDeliveryWithoutReceiptCeremony(t *testing.T) {

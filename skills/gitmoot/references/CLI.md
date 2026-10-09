@@ -1090,7 +1090,8 @@ What one request does, in order:
    request by the same role keeps its original wait; two concurrent requests for
    the same role and subject both ATTACH to the single live wait rather than one
    failing. When the wait's `--ttl`
-   elapses it expires to the role's parent, as every awaited fact does.
+   elapses it ends like every awaited fact: superseded when the PR has moved
+   past that head, otherwise expired to the waiting role itself.
 
 The request prints every hold it can see rather than leaving a requester to
 infer one: the daemon not running, the disk guard pausing dispatch, and any
@@ -2488,15 +2489,21 @@ registration is starting is not missed. A later terminal review-job commit
 satisfies only the matching repository, PR, and head, then writes an addressed
 `fact:<role>` wake obligation.
 
-`gitmoot org await list [--role <role>] [--state waiting|satisfied|expired]
-[--json] [--home <dir>]` shows live and terminal subscriptions. The existing
-one-minute org supervision lane expires overdue waits, retains the row as a
-queryable `expired` terminal state, and addresses the expiry to the waiter's
-current parent (or the waiter itself for a root role). If the waiter role was
-removed from the chart, expiry still becomes terminal and the wake retains the
-removed role as its exact address, leaving delivery failure observable instead
-of making the wait immortal. Fact wakes are delivery only: they require a `fact`
-event rule but create no acknowledgment or completion ceremony.
+`gitmoot org await list [--role <role>] [--state
+waiting|satisfied|expired|superseded] [--json] [--home <dir>]` shows live and
+terminal subscriptions. The existing one-minute org supervision lane ends
+overdue waits. A review wait the pull request has moved past ends in the
+queryable `superseded` state, with the reason in `resolution_detail`, and wakes
+nobody. A wait has been moved past when the same role later awaited that PR at
+another head, when the PR is merged, or when the local PR record, observed after
+the wait began, shows it closed or at another head. The local PR record never
+supersedes a post-merge wait. Any other overdue wait is retained as `expired` and
+wakes the waiter itself. An archived waiter's expiry goes to its nearest live
+ancestor instead; with none, it stays addressed to the waiter. If the waiter
+role was removed from the chart, expiry still becomes terminal and the wake
+retains the removed role as its exact address. Delivery failure stays observable
+and the wait never becomes immortal. Fact wakes are delivery only: they require
+a `fact` event rule but create no acknowledgment or completion ceremony.
 
 `gitmoot org interrupts [--window 24h|7d|0] [--json] [--home <dir>]` reports
 **how often each seat is interrupted** (#1983). Per seat, over the window:

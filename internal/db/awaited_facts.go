@@ -17,9 +17,10 @@ import (
 const (
 	AwaitedFactSubjectReviewVerdict = "review_verdict"
 
-	AwaitedFactStateWaiting   = "waiting"
-	AwaitedFactStateSatisfied = "satisfied"
-	AwaitedFactStateExpired   = "expired"
+	AwaitedFactStateWaiting    = "waiting"
+	AwaitedFactStateSatisfied  = "satisfied"
+	AwaitedFactStateExpired    = "expired"
+	AwaitedFactStateSuperseded = "superseded"
 )
 
 // AwaitedFact is one bounded durable interest. Terminal rows remain queryable;
@@ -898,7 +899,7 @@ FROM awaited_facts WHERE id = ?`, id).Scan(
 func (s *Store) ListAwaitedFacts(ctx context.Context, waiterRole, state string) ([]AwaitedFact, error) {
 	waiterRole = strings.ToLower(strings.TrimSpace(waiterRole))
 	state = strings.ToLower(strings.TrimSpace(state))
-	if state != "" && state != AwaitedFactStateWaiting && state != AwaitedFactStateSatisfied && state != AwaitedFactStateExpired {
+	if state != "" && state != AwaitedFactStateWaiting && state != AwaitedFactStateSatisfied && state != AwaitedFactStateExpired && state != AwaitedFactStateSuperseded {
 		return nil, fmt.Errorf("invalid awaited fact state %q", state)
 	}
 	rows, err := s.db.QueryContext(ctx, `
@@ -944,9 +945,13 @@ ORDER BY deadline ASC, id ASC`, now.UTC().Format(time.RFC3339Nano))
 	return facts, rows.Err()
 }
 
-// ExpireAwaitedFact stamps a queryable terminal state and durably addresses
-// the escalation target in one transaction. A concurrent producer wins or
-// loses the same state CAS; it can never emit both satisfaction and expiry.
+// ExpireAwaitedFact ends a due wait in one transaction and reports whether it
+// changed. A review wait the pull request has moved past ends superseded, with
+// the reason as its resolution detail, and wakes nobody: expiring it alerted a
+// role about a question nobody was still asking (macserve#2/#3, 2026-10-09).
+// Any other due wait gets a queryable expired state and durably addresses
+// escalationRole. A concurrent producer wins or loses the same state CAS; it
+// can never emit both satisfaction and expiry.
 func (s *Store) ExpireAwaitedFact(ctx context.Context, id int64, escalationRole string, now time.Time) (bool, error) {
 	escalationRole = strings.ToLower(strings.TrimSpace(escalationRole))
 	if escalationRole == "" {
@@ -957,15 +962,30 @@ func (s *Store) ExpireAwaitedFact(ctx context.Context, id int64, escalationRole 
 		return false, err
 	}
 	defer tx.Rollback()
-	var fact AwaitedFact
-	if err := tx.QueryRowContext(ctx, `SELECT waiter_role, subject_kind, subject_key FROM awaited_facts WHERE id = ?`, id).Scan(&fact.WaiterRole, &fact.SubjectKind, &fact.SubjectKey); err != nil {
+	fact := AwaitedFact{ID: id}
+	if err := tx.QueryRowContext(ctx, `SELECT waiter_role, subject_kind, subject_key, created_at FROM awaited_facts WHERE id = ?`, id).Scan(&fact.WaiterRole, &fact.SubjectKind, &fact.SubjectKey, &fact.CreatedAt); err != nil {
+		return false, err
+	}
+	reason, err := awaitedFactSupersededTx(ctx, tx, fact)
+	if err != nil {
 		return false, err
 	}
 	stamp := now.UTC().Format(time.RFC3339Nano)
-	result, err := tx.ExecContext(ctx, `
+	state := AwaitedFactStateExpired
+	update := `
 UPDATE awaited_facts
 SET state = 'expired', resolution_detail = 'deadline expired', expired_at = ?, updated_at = ?
-WHERE id = ? AND state = 'waiting'`, stamp, stamp, id)
+WHERE id = ? AND state = 'waiting'`
+	args := []any{stamp, stamp, id}
+	if reason != "" {
+		state = AwaitedFactStateSuperseded
+		update = `
+UPDATE awaited_facts
+SET state = 'superseded', resolution_detail = ?, updated_at = ?
+WHERE id = ? AND state = 'waiting'`
+		args = []any{reason, stamp, id}
+	}
+	result, err := tx.ExecContext(ctx, update, args...)
 	if err != nil {
 		return false, err
 	}
@@ -973,13 +993,100 @@ WHERE id = ? AND state = 'waiting'`, stamp, stamp, id)
 	if err != nil || affected == 0 {
 		return false, err
 	}
-	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateExpired, now); err != nil {
+	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, state, now); err != nil {
 		return false, err
 	}
-	if err := insertAwaitedFactWakeTx(ctx, tx, id, fact.WaiterRole, escalationRole, fact.SubjectKind, fact.SubjectKey, AwaitedFactStateExpired); err != nil {
-		return false, err
+	if state == AwaitedFactStateExpired {
+		if err := insertAwaitedFactWakeTx(ctx, tx, id, fact.WaiterRole, escalationRole, fact.SubjectKind, fact.SubjectKey, AwaitedFactStateExpired); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
+}
+
+// awaitedFactSupersededTx names why a review wait no longer asks a live
+// question, or returns "" when it still does. Nothing else retires a wait
+// whose head was replaced: a blocked review leaves it waiting, and the
+// daemon's stale-head and closed-PR sweeps retire review JOBS only.
+//
+// A wait is superseded when its waiter later awaited the same pull request at
+// another head (the waiter's own statement that this head is no longer the one
+// under review), when the pull request is merged, or when the PR mirror,
+// observed after the wait began, shows it closed or at another head. The
+// recency guard keeps a lagging mirror from retiring a wait on a head it has
+// not seen yet; merged needs none because it is irreversible. A post-merge
+// wait asks about a merged PR by definition, so the mirror never retires it.
+// Heads compare by prefix because `org await review` accepts an abbreviated
+// SHA, and an abbreviation of the same commit is not a move.
+func awaitedFactSupersededTx(ctx context.Context, tx *sql.Tx, fact AwaitedFact) (string, error) {
+	if fact.SubjectKind != AwaitedFactSubjectReviewVerdict {
+		return "", nil
+	}
+	repo, pullRequest, head, err := parseReviewVerdictSubjectKey(fact.SubjectKey)
+	if err != nil {
+		return "", nil
+	}
+	prefix := fmt.Sprintf("%s#%d@", repo, pullRequest)
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, subject_key
+FROM awaited_facts
+WHERE waiter_role = ? AND subject_kind = ? AND id > ? AND substr(subject_key, 1, ?) = ?
+ORDER BY id`, fact.WaiterRole, fact.SubjectKind, fact.ID, len(prefix), prefix)
+	if err != nil {
+		return "", err
+	}
+	reason := ""
+	for rows.Next() {
+		var laterID int64
+		var laterKey string
+		if err := rows.Scan(&laterID, &laterKey); err != nil {
+			rows.Close()
+			return "", err
+		}
+		_, _, laterHead, parseErr := parseReviewVerdictSubjectKey(laterKey)
+		if parseErr == nil && !sameCommitHead(head, laterHead) {
+			reason = fmt.Sprintf("superseded: %s later awaited %s#%d at head %s (awaited fact %d)",
+				fact.WaiterRole, repo, pullRequest, laterHead, laterID)
+			break
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return "", err
+	}
+	if reason != "" || strings.HasSuffix(reviewVerdictKeyPurpose(fact.SubjectKey), postMergePurposeSuffix) {
+		return reason, nil
+	}
+	var prState, prHead string
+	var observedAfterWait bool
+	err = tx.QueryRowContext(ctx, `
+SELECT state, head_sha, COALESCE(julianday(updated_at) >= julianday(?), 0)
+FROM pull_requests
+WHERE lower(repo_full_name) = ? AND number = ?`, fact.CreatedAt, repo, pullRequest).Scan(&prState, &prHead, &observedAfterWait)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	prState = strings.ToLower(strings.TrimSpace(prState))
+	prHead = strings.ToLower(strings.TrimSpace(prHead))
+	switch {
+	case prState == "merged":
+		return fmt.Sprintf("superseded: %s#%d is merged", repo, pullRequest), nil
+	case !observedAfterWait:
+		return "", nil
+	case prState == "closed":
+		return fmt.Sprintf("superseded: %s#%d is closed", repo, pullRequest), nil
+	case prHead != "" && !sameCommitHead(head, prHead):
+		return fmt.Sprintf("superseded: %s#%d moved from head %s to %s", repo, pullRequest, head, prHead), nil
+	}
+	return "", nil
+}
+
+// sameCommitHead reports whether two recorded heads can name the same commit:
+// equal, or one an abbreviation of the other.
+func sameCommitHead(a, b string) bool {
+	return a != "" && b != "" && (strings.HasPrefix(a, b) || strings.HasPrefix(b, a))
 }
 
 // firstNonEmptyString returns the first value that is not blank after trimming,
