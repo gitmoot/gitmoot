@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gitmoot/gitmoot/internal/workflow"
+
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
@@ -117,8 +119,17 @@ func TestCLIReviewDispatchLeavesThePromptUntouchedWithNoObligations(t *testing.T
 	if err != nil {
 		t.Fatalf("daemonJobPayload: %v", err)
 	}
-	if payload.Instructions != request.Instructions {
-		t.Fatalf("prompt changed with an empty ledger:\n got %q\nwant %q", payload.Instructions, request.Instructions)
+	// #2230 NARROWED THIS, and the narrowing is the point rather than a
+	// convenience. The invariant protects against OBLIGATION noise: a review with
+	// no ledger history must not be told to discharge findings that do not exist.
+	// The findings-log contract is a different, deliberately unconditional
+	// instruction - every review can die mid-run, so every review is asked to
+	// append as it works. Re-pinning byte-identity would have forced a choice
+	// between that contract and this guard, when only one of the two properties
+	// is actually at stake here.
+	withoutFindingsLog := strings.TrimSuffix(payload.Instructions, workflow.ReviewFindingsLogBrief())
+	if withoutFindingsLog != request.Instructions {
+		t.Fatalf("prompt gained obligation text with an empty ledger:\n got %q\nwant %q", withoutFindingsLog, request.Instructions)
 	}
 }
 
