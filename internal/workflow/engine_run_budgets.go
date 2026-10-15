@@ -298,7 +298,7 @@ func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, paylo
 	return e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 		JobID: job.ID,
 		Kind:  ReviewApprovedWithNotesEventKind,
-		Message: fmt.Sprintf("review severity %s is below repository blocking severity %s; findings remain recorded and no fix is dispatched",
+		Message: reviewFoldMessage(reviewFoldReason(payload.Result, blockingSeverity),
 			payload.Result.Severity, blockingSeverity),
 	})
 }
