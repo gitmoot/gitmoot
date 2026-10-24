@@ -411,7 +411,7 @@ func classifyWakeOutboxObligations(
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
 			}
-			rowHold := ownerGramCoalescingWindow
+			rowHold := wakeOutboxRowHold(obligation, ownerGramCoalescingWindow)
 			if !isOwnerWake(obligation) || delivery.ownerGram == nil {
 				key, err := wakeOutboxGroupKey(obligation)
 				if err != nil {

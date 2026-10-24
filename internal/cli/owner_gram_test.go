@@ -96,6 +96,31 @@ func wakeRowsByRole(t *testing.T, store *db.Store) map[string]db.WakeOutboxEntry
 	return byRole
 }
 
+func TestOwnerReviewResultHealthMatchesImmediateDelivery(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	insertOwnerEscalation(t, store, "ordinary-alert", "acme/widget")
+	insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+		ID: 46, WaiterRole: "owner", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: "acme/widget#46@head", State: db.AwaitedFactStateSatisfied, JobID: "review-46",
+	})
+	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-review-46"}}
+	resolve := ownerGramResolver(store, sink, gram)
+	now := time.Now().UTC()
+	health, err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptTimeout), now, replyWakeCoalescingWindow, resolve)
+	if err == nil || health.pending != 1 || health.held != 1 {
+		t.Fatalf("urgent review must be pending while ordinary alert is held: health=%+v err=%v", health, err)
+	}
+	health, err = drainReplyWakeOutboxWithHealth(ctx, store, now, replyWakeCoalescingWindow, resolve)
+	if err != nil || health.pending != 0 || health.held != 1 {
+		t.Fatalf("review must deliver immediately without releasing ordinary alert: health=%+v err=%v", health, err)
+	}
+	receipts, err := store.ListOwnerGramReceipts(ctx)
+	if err != nil || len(receipts) != 1 || receipts[0].GramID != "gram-review-46" || receipts[0].Outcome != db.OwnerGramAccepted {
+		t.Fatalf("immediate review delivery receipt=%+v err=%v", receipts, err)
+	}
+}
+
 func TestOwnerEscalationIsSentAsOneGramWithReceiptAndNeverResent(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})
 	ctx := context.Background()
