@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -69,9 +71,22 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 			s.updated.Format("2006-01-02 15:04:05"), s.id); err != nil {
 			t.Fatalf("set updated_at(%s): %v", s.id, err)
 		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE cleanup_obligations SET terminal_at=? WHERE owner_job_id=?`,
+			s.updated.Format(time.RFC3339Nano), s.id); err != nil {
+			t.Fatalf("set terminal_at(%s): %v", s.id, err)
+		}
 		for _, k := range s.events {
 			if err := store.AddJobEvent(ctx, JobEvent{JobID: s.id, Kind: k, Message: "m"}); err != nil {
 				t.Fatalf("AddJobEvent(%s,%s): %v", s.id, k, err)
+			}
+			var payload struct {
+				WorktreePath string `json:"worktree_path"`
+			}
+			if err := json.Unmarshal([]byte(s.payload), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.MarkCleanupObligationRemoved(ctx, s.id, payload.WorktreePath, now); err != nil {
+				t.Fatalf("record completed cleanup(%s): %v", s.id, err)
 			}
 		}
 		if s.want {
@@ -167,5 +182,48 @@ func TestAgedDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T) {
 	}
 	if len(second) != 1 || firstSet[second[0]] {
 		t.Fatalf("second batch = %v, want the one candidate outside the first batch", second)
+	}
+}
+
+func TestAgedCleanupSelectorRefusesNewerObligationGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := openLifecycleGenerationStore(t)
+	const jobID, path = "generation-mismatch", "/managed/generation-mismatch"
+	now := time.Now().UTC()
+	old := now.Add(-73 * time.Hour).Format(time.RFC3339Nano)
+	if err := store.CreateJob(ctx, Job{
+		ID: jobID, Agent: "reader", Type: "review", State: "succeeded",
+		Payload: `{"worktree_path":"/managed/generation-mismatch","read_only_worktree":true}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obligation, err := store.EnsureCleanupObligation(ctx, jobID, path, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET updated_at=? WHERE id=?`, old, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx,
+		`UPDATE cleanup_obligations SET lifecycle_generation=?, terminal_at=? WHERE resource_id=?`,
+		job.LifecycleGeneration+1, old, obligation.ResourceID); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, now.Add(-72*time.Hour))
+	if err != nil || slices.Contains(ids, jobID) {
+		t.Fatalf("newer obligation was treated as disposable older evidence: ids=%v err=%v", ids, err)
+	}
+	if _, err := store.db.ExecContext(ctx,
+		`UPDATE cleanup_obligations SET lifecycle_generation=? WHERE resource_id=?`,
+		job.LifecycleGeneration, obligation.ResourceID); err != nil {
+		t.Fatal(err)
+	}
+	ids, err = store.JobIDsWithAgedTerminalDelegationWorktree(ctx, now.Add(-72*time.Hour))
+	if err != nil || !slices.Contains(ids, jobID) {
+		t.Fatalf("matching aged generation was not selected: ids=%v err=%v", ids, err)
 	}
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -112,6 +113,13 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	}
 
 	worker := defaultJobWorker(store, io.Discard, home)
+	worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engine := worker.defaultWorkflowForRunner(checkout, subprocess.ExecRunner{})
+		// These fixture stages run synchronous shell commands and create no
+		// background workspace users. Foreign host /proc access is unrelated.
+		engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+		return engine
+	}
 	enqueue := newPipelineStageEnqueuer(store, home)
 	now := time.Now().UTC()
 	for i := 0; i < 8; i++ {

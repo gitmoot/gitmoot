@@ -281,6 +281,14 @@ func backdateJobUpdatedAt(t *testing.T, dbPath, jobID string, when time.Time) {
 	if _, err := raw.ExecContext(context.Background(), `UPDATE jobs SET updated_at = ? WHERE id = ?`, when.UTC().Format("2006-01-02 15:04:05"), jobID); err != nil {
 		t.Fatalf("backdate updated_at returned error: %v", err)
 	}
+	// Terminal fixtures must age the immutable cleanup clock too; updating only
+	// the mutable job timestamp no longer makes a newly terminal resource old.
+	if _, err := raw.ExecContext(context.Background(), `UPDATE cleanup_obligations
+		SET terminal_at = ? WHERE owner_job_id = ? AND terminal_at != ''
+		AND lifecycle_generation = (SELECT lifecycle_generation FROM jobs WHERE id = ?)`,
+		when.UTC().Format(time.RFC3339Nano), jobID, jobID); err != nil {
+		t.Fatalf("backdate cleanup terminal time returned error: %v", err)
+	}
 }
 
 // fakeReclaimWorktreeManager is a worktree manager used by the

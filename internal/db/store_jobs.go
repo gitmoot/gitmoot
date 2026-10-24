@@ -2267,9 +2267,9 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 	return s.jobIDsByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL, delegationWorktreeReclaimCandidateLimit)
 }
 
-// JobIDsWithAgedTerminalDelegationWorktree returns final jobs whose recorded
-// delegation/read-only/fix worktree has outlived cutoff and has no successful
-// cleanup event. Unlike the pending-marker query above, this deliberately finds
+// JobIDsWithAgedTerminalDelegationWorktree returns due final jobs whose recorded
+// delegation/read-only/fix worktree has outlived cutoff without completed cleanup
+// for its current generation. Unlike the pending-marker query, this finds
 // crash-window leftovers that never got far enough to emit a cleanup-skipped
 // marker. Blocked is excluded: it is resumable and therefore still owns its
 // worktree. The payload predicates exclude ordinary task worktrees.
@@ -2293,11 +2293,14 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 // rows have no worktree_path, so they can never be a candidate or an owner: the
 // guard is a no-op on the result set and matches the sibling json_valid guards
 // (store_jobs.go json*Reclaim queries).
+// Current-generation obligations supply the terminal clock and completion state.
+// Publication may refresh jobs.updated_at; old removal events belong to old
+// generations and cannot suppress a replacement generation's obligation.
 func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
 	cutoffStr := cutoff.UTC().Format("2006-01-02 15:04:05")
 	rows, err := s.db.QueryContext(ctx, `
 		WITH job_wt AS MATERIALIZED (
-			SELECT id, state,
+			SELECT id, state, lifecycle_generation,
 			       unixepoch(COALESCE(NULLIF(updated_at, ''), created_at)) AS ts,
 			       json_extract(payload, '$.worktree_path') AS worktree_path,
 			       COALESCE(json_extract(payload, '$.delegation_id'), '') AS delegation_id,
@@ -2305,34 +2308,45 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			       COALESCE(json_extract(payload, '$.fix_worktree'), 0) AS fix_worktree
 			FROM jobs
 			WHERE json_valid(payload)
+		), cleanup_wt AS MATERIALIZED (
+			SELECT j.*, obligation.resource_id,
+			       obligation.lifecycle_generation AS cleanup_generation,
+			       obligation.state AS cleanup_state, obligation.next_attempt_at,
+			       CASE WHEN obligation.resource_id IS NULL
+			                  OR obligation.lifecycle_generation < j.lifecycle_generation THEN j.ts
+			            WHEN obligation.lifecycle_generation = j.lifecycle_generation
+			                  THEN unixepoch(obligation.terminal_at) END AS terminal_ts
+			FROM job_wt j
+			LEFT JOIN cleanup_obligations obligation
+			  ON obligation.owner_job_id = j.id
+			 AND obligation.expected_path = j.worktree_path
 		)
 		SELECT j.id
-		FROM job_wt j
-		LEFT JOIN cleanup_obligations obligation
-		  ON obligation.owner_job_id = j.id
-		 AND obligation.expected_path = j.worktree_path
+		FROM cleanup_wt j
 		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
-		  AND j.ts <= unixepoch(?)
+		  AND j.terminal_ts <= unixepoch(?)
 		  AND COALESCE(j.worktree_path, '') <> ''
 		  AND (j.delegation_id <> '' OR j.read_only_worktree = 1 OR j.fix_worktree = 1)
 		  AND NOT EXISTS (
-			SELECT 1 FROM job_wt owner
+			SELECT 1 FROM cleanup_wt owner
 			WHERE owner.id <> j.id
 			  AND owner.worktree_path = j.worktree_path
 			  AND (owner.state NOT IN ('succeeded', 'failed', 'cancelled')
-			       OR owner.ts IS NULL
-			       OR owner.ts > unixepoch(?))
+			       OR owner.terminal_ts IS NULL
+			       OR owner.terminal_ts > unixepoch(?))
 		  )
-		  AND NOT EXISTS (
+		  AND (j.resource_id IS NOT NULL OR NOT EXISTS (
 			SELECT 1 FROM job_events e
 			WHERE e.job_id = j.id
 			  AND e.kind IN ('delegation_worktree_removed', 'delegation_worktree_reclaimed_ttl')
-		  )
-		  AND (obligation.resource_id IS NULL OR (
-			obligation.state IN ('pending', 'retryable')
-			AND unixepoch(obligation.next_attempt_at) <= unixepoch('now')
 		  ))
-		ORDER BY COALESCE(unixepoch(obligation.next_attempt_at), j.ts), j.id
+		  AND (j.resource_id IS NULL OR j.cleanup_generation < j.lifecycle_generation OR (
+			j.cleanup_state IN ('pending', 'retryable')
+			AND unixepoch(j.next_attempt_at) <= unixepoch('now')
+		  ))
+		ORDER BY CASE WHEN j.cleanup_generation = j.lifecycle_generation
+		              THEN COALESCE(unixepoch(j.next_attempt_at), j.terminal_ts)
+		              ELSE j.terminal_ts END, j.id
 		LIMIT ?`, cutoffStr, cutoffStr, delegationWorktreeReclaimCandidateLimit)
 	if err != nil {
 		return nil, err

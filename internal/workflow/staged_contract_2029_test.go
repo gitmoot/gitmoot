@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -508,66 +509,41 @@ func TestUnmarkedReviewIsUntouchedByTheStagedChokepoint(t *testing.T) {
 	}
 }
 
-// #2029 round four, P2. A contract refusal used to return from AdvanceJob BEFORE
-// the read-only cleanup defer was installed, so the refusal leaked its
-// dispatch-allocated worktree and emitted no reclaim marker. Moving the guard
-// earlier moved the leak with it, which is why the defer now leads the refusal
-// rather than trailing it.
-//
-// The harness mirrors TestCleanupReadOnlyDelegationWorktreeForceRemoves: cleanup
-// no-ops without a DelegationCheckout and a worktree manager, so a fixture
-// lacking them measures the harness rather than the behaviour.
+// A staged contract refusal must still preserve the terminal output and dispose
+// of its otherwise eligible workspace, without dispatching an unauthorized verdict.
 func TestStagedContractRefusalStillReclaimsItsReadOnlyWorktree(t *testing.T) {
 	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "preflight", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	manager := &fakeWorktreeManager{}
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	wt := managedEngineWorktree(t, &engine, "staged-refusal-delegation-d1")
-	payload := JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-refuse", PullRequest: 4243,
-		TaskID: "task-refuse", HeadSHA: strings.Repeat("a", 40),
-		StagedReviewVerdictAgent: "verdict-agent",
-		DelegationID:             "d1",
-		WorktreePath:             wt,
-		ReadOnlyWorktree:         true,
-		Result: &AgentResult{
-			// Verdict-shaped with zero delegations: the contract refuses it.
-			Decision: "approved", Summary: "preflight", Evidence: EvidenceExecuted,
-			TestsRun: []string{"go test ./internal/workflow/ -> ok"},
-		},
+	world := newProducerCleanupFixture(t, true)
+	seedAgent(t, world.store, "producer", []string{"review"}, "owner/repo")
+	payload := world.payload
+	payload.Branch, payload.TaskID = "task-refuse", "task-refuse"
+	payload.StagedReviewVerdictAgent = "verdict-agent"
+	payload.Result = &AgentResult{
+		Decision: "approved", Summary: "preflight", Evidence: EvidenceExecuted,
+		TestsRun: []string{"go test ./internal/workflow/ -> ok"},
 	}
-	insertCompletedJob(t, store, db.Job{ID: "staged-refusal", Agent: "preflight", Type: "review"}, payload)
-
-	err := engine.AdvanceJob(ctx, "staged-refusal")
-	if err == nil {
-		t.Fatalf("AdvanceJob returned nil; the marked preflight should have been refused")
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	// THE REFUSAL MUST NOT COST THE WORKTREE. Force-remove is what the manager
-	// records; without the defer above the refusal this list is empty.
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
-		t.Fatalf("refusal did not reclaim its read-only worktree: removedForce = %+v, want one force-remove of %q", manager.removedForce, wt)
+	if err := world.store.UpdateJobPayload(ctx, world.jobID, encoded); err != nil {
+		t.Fatal(err)
 	}
-
-	// THE EVENT SIDE, because the force-remove call alone is the manager's word.
-	// A reclaimed worktree records delegation_worktree_removed; a leaked one that
-	// the daemon must pick up later records delegation_worktree_cleanup_skipped.
-	// Both are asserted, so this fails whether the refusal leaks silently or
-	// leaks loudly.
-	//
-	// ON-DISK ABSENCE IS DELIBERATELY NOT ASSERTED: fakeWorktreeManager RECORDS a
-	// force-remove and does not delete anything, so a directory check here would
-	// fail against a correct fix and pass only if the fake grew real filesystem
-	// behaviour. The events are the observable this harness can honestly read.
-	if got := countJobEvents(t, store, "staged-refusal", "delegation_worktree_removed"); got != 1 {
-		t.Fatalf("delegation_worktree_removed count = %d, want 1: the reclaim was not recorded", got)
+	if err := world.engine.AdvanceJob(ctx, world.jobID); err == nil {
+		t.Fatal("marked preflight accepted a verdict without its required delegation")
 	}
-	if got := countJobEvents(t, store, "staged-refusal", "delegation_worktree_cleanup_skipped"); got != 0 {
-		t.Fatalf("delegation_worktree_cleanup_skipped count = %d, want 0: the refusal deferred its cleanup instead of performing it", got)
+	world.assertRemoved(t)
+	if data, err := os.ReadFile(world.preserved); err != nil || string(data) != "producer result\n" {
+		t.Fatalf("contract refusal lost terminal output: %q %v", data, err)
+	}
+	jobs, err := world.store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		if job.ID != world.jobID {
+			t.Fatalf("refused preflight dispatched an unexpected job: %+v", job)
+		}
 	}
 }
 

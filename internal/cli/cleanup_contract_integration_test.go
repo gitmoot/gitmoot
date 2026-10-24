@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -172,6 +173,38 @@ func TestCleanupCLIHistoricalReplayPreservesRecreatedGeneration(t *testing.T) {
 	current, err := world.store.GetJob(ctx, world.job.ID)
 	if err != nil || current.State != "queued" || current.LifecycleGeneration != retried.LifecycleGeneration {
 		t.Fatalf("replay changed active lifecycle: %+v %v", current, err)
+	}
+	// Old completion events must not hide a later terminal generation from the
+	// aged scheduler. Its own receipt, not the replayed token, authorizes removal.
+	payload.Result = &workflow.AgentResult{Decision: "approved", Summary: "replacement generation completed"}
+	encoded, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobPayload(ctx, world.job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobState(ctx, world.job.ID, "succeeded"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	backdateJobUpdatedAt(t, world.paths.Database, world.job.ID, now.Add(-73*time.Hour))
+	worker := defaultJobWorker(world.store, io.Discard, world.home)
+	worker.WorkflowFactory = func(string) workflow.Engine { return engine }
+	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(world.store), now, 72*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(world.path); !os.IsNotExist(err) {
+		obligation, _ := world.store.GetCleanupObligation(ctx, resource)
+		events, _ := world.store.ListJobEvents(ctx, world.job.ID)
+		t.Fatalf("terminal replacement generation was not reclaimed: %v obligation=%+v events=%+v", err, obligation, events)
+	}
+	completed := world.cleanup(t, "inspect", world.job.ID)
+	replacement := completed["receipt"].(map[string]any)
+	if completed["lifecycle_generation"] != float64(retried.LifecycleGeneration) ||
+		replacement["lifecycle_generation"] != float64(retried.LifecycleGeneration) ||
+		replacement["receipt_id"] == originalReceipt["receipt_id"] || replacement["removed_at"] == "" {
+		t.Fatalf("replacement cleanup did not receive its own durable receipt: %+v", completed)
 	}
 }
 

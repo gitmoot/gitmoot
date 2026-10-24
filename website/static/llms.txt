@@ -25,6 +25,9 @@ Generation receipts survive deletion and historical replay never touches a
 replacement tree. Publication stays independent of deletion. A null
 `approved_size_budget` means unknown, not unlimited, and cannot authorize
 budget-dependent external cleanup.
+Aged cleanup uses the current generation's terminal clock, not later artifact
+publication. Older completion events cannot hide a replacement generation.
+Checkout contention defers cleanup without spending its failure budget.
 
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:

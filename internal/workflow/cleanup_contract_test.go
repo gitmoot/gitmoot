@@ -95,3 +95,119 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 		})
 	}
 }
+
+// producerCleanupFixture uses production ownership validation and real Git
+// resources. Each test owns every workspace user; runtime tests vary that proof.
+type producerCleanupFixture struct {
+	store     *db.Store
+	engine    Engine
+	manager   gitutil.Client
+	jobID     string
+	path      string
+	branch    string
+	preserved string
+	payload   JobPayload
+}
+
+func newProducerCleanupFixture(t *testing.T, readOnly bool) producerCleanupFixture {
+	t.Helper()
+	ctx := context.Background()
+	store := openEngineStore(t)
+	checkout := t.TempDir()
+	runWorktreeGit(t, checkout, "init", "--initial-branch=main")
+	runWorktreeGit(t, checkout, "config", "user.email", "test@example.com")
+	runWorktreeGit(t, checkout, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(checkout, "result.txt"), []byte("producer result\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runWorktreeGit(t, checkout, "add", "result.txt")
+	runWorktreeGit(t, checkout, "commit", "-m", "producer result")
+	manager := gitutil.NewHostClient(checkout)
+	engine := testEngine(store)
+	engine.Home = t.TempDir()
+	engine.DelegationCheckout, engine.DelegationWorktrees = checkout, manager
+	engine.cleanupTargetValidator = nil
+	engine.WorktreeHasLiveProcess = nil
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+	world := producerCleanupFixture{store: store, engine: engine, manager: manager,
+		jobID: "cleanup-parent/delegation/produce", branch: "gitmoot-delegation-cleanup-produce",
+		preserved: filepath.Join(t.TempDir(), "preserved-result.txt")}
+	action, owner, segment := "implement", "cleanup-parent", "produce"
+	world.payload = JobPayload{Repo: "owner/repo", ParentJobID: owner, DelegationID: segment,
+		Branch: world.branch, Result: &AgentResult{Decision: "implemented", Summary: "producer result"}}
+	if readOnly {
+		action, owner, segment = "review", "cleanup-review", "readonly-seat"
+		world.jobID, world.branch = owner, ""
+		world.payload = JobPayload{Repo: "owner/repo", PullRequest: 7,
+			ReadOnlyWorktree: true, ReadOnlySeat: true,
+			Result: &AgentResult{Decision: "approved", Summary: "producer result"}}
+		head, err := manager.RevParse(ctx, "HEAD")
+		if err != nil {
+			t.Fatal(err)
+		}
+		world.payload.HeadSHA = head
+	} else {
+		insertCompletedJob(t, store, db.Job{ID: owner, Agent: "coordinator", Type: "ask"},
+			JobPayload{Repo: "owner/repo", Result: &AgentResult{Decision: "approved"}})
+	}
+	path, err := DelegationWorktreePath(engine.Home, "owner/repo", owner, segment, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	world.path, world.payload.WorktreePath = path, path
+	if readOnly {
+		runWorktreeGit(t, checkout, "worktree", "add", "--detach", path, "HEAD")
+	} else {
+		runWorktreeGit(t, checkout, "worktree", "add", "-b", world.branch, path, "HEAD")
+	}
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: checkout}); err != nil {
+		t.Fatal(err)
+	}
+	insertCompletedJob(t, store, db.Job{ID: world.jobID, Agent: "producer", Type: action,
+		ParentJobID: world.payload.ParentJobID, DelegationID: world.payload.DelegationID}, world.payload)
+	if readOnly {
+		preserved := world.preserved
+		world.engine.BeforeReadOnlyWorktreeCleanup = func(_ context.Context, _, _ string, payload JobPayload) error {
+			content, err := os.ReadFile(filepath.Join(payload.WorktreePath, "result.txt"))
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(preserved, content, 0600)
+		}
+	}
+	return world
+}
+
+func (world producerCleanupFixture) assertPreserved(t *testing.T) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(world.path, "result.txt"))
+	if err != nil || string(content) != "producer result\n" {
+		t.Fatalf("producer contents changed: %q %v", content, err)
+	}
+	if world.branch != "" {
+		if exists, err := world.manager.BranchExists(context.Background(), world.branch); err != nil || !exists {
+			t.Fatalf("producer branch lost: exists=%t err=%v", exists, err)
+		}
+	}
+}
+
+func (world producerCleanupFixture) assertRemoved(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat(world.path); !os.IsNotExist(err) {
+		t.Fatalf("producer tree still exists: %v", err)
+	}
+	if world.branch != "" {
+		if exists, err := world.manager.BranchExists(context.Background(), world.branch); err != nil || exists {
+			t.Fatalf("producer branch remains: exists=%t err=%v", exists, err)
+		}
+	} else {
+		content, err := os.ReadFile(world.preserved)
+		if err != nil || string(content) != "producer result\n" {
+			t.Fatalf("preserved output unavailable after disposal: %q %v", content, err)
+		}
+	}
+	obligation, err := world.store.GetCleanupObligation(context.Background(), db.CleanupObligationResourceID(world.jobID, world.path))
+	if err != nil || obligation.State != db.CleanupObligationRemoved {
+		t.Fatalf("cleanup outcome not durable: %+v %v", obligation, err)
+	}
+}

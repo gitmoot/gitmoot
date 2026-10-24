@@ -48,8 +48,9 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		}
 		persistCtx := context.WithoutCancel(ctx)
 		if countFailure {
+			cause := errors.New(RedactCommentText(err.Error()))
 			_, persistErr := e.Store.RecordCleanupObligationFailure(persistCtx, jobID, result.Decision.ExpectedPath,
-				db.ClassifyCleanupObligationFailure("reclaim", err), err, e.now(), e.now().Add(CleanupRetryDelay), CleanupRetryBudget)
+				db.ClassifyCleanupObligationFailure("reclaim", err), cause, e.now(), e.now().Add(CleanupRetryDelay), CleanupRetryBudget)
 			err = errors.Join(err, persistErr)
 		} else {
 			err = errors.Join(err, e.deferDelegationCleanupFailure(persistCtx, jobID, result.Decision.ExpectedPath, "reclaim", err))

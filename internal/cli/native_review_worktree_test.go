@@ -72,6 +72,9 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
 		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
+		// This fixture owns every workspace user; unrelated host /proc permissions
+		// are not evidence of a writer in this synthetic review.
+		engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
 		return engine
 	}
 

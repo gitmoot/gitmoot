@@ -672,6 +672,11 @@ cannot hot-loop. Cleanup obligations retry once per minute and stop in
 `quarantined` after the third failure. Inspect them with `gitmoot job cleanup
 list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.
+Checkout contention defers both ordinary and aged cleanup without spending the
+failure budget. Persisted error text uses the existing credential-redaction
+policy. Aged selection uses the current generation's recorded terminal time;
+artifact publication does not restart retention, and an older generation's
+completion cannot suppress cleanup of its replacement.
 
 Repeated terminal-task failures log three times per path before identical
 messages are suppressed. The terminal-task pass proves at most eight candidates

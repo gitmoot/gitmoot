@@ -2997,6 +2997,11 @@ Apply exits `0` for `removed`/`already_removed`, `3` for another completed
 decision, `1` for an operational error and `2` for invalid arguments. A prepared
 receipt is not a removal receipt until `removed_at` is set. Historical replay
 never reopens quarantine or grants deletion of the current generation.
+The generation field is `lifecycle_generation` in both the decision and receipt.
+Aged selection uses that generation's terminal time, so artifact publication
+does not restart retention and old completion events cannot hide a replacement.
+Checkout contention defers automatic cleanup without consuming its retry budget.
+Persisted cleanup diagnostics use the existing credential-redaction policy.
 
 `approved_size_budget: null` explicitly means unknown. It does not authorize
 zero-byte or unlimited cleanup; consumers requiring a positive byte cap must

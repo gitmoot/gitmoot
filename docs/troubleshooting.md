@@ -1457,6 +1457,11 @@ Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
+Checkout contention defers cleanup without spending that failure budget.
+Persisted error text uses the existing credential-redaction policy. Aged
+selection uses the current generation's recorded terminal time, not a later
+artifact-publication timestamp. An older generation's completion does not
+suppress cleanup of a replacement generation.
 The five-minute worktree cadence advances after every attempted pass, including
 passes with candidate failures, so a failed cleanup cannot hot-loop.
 
