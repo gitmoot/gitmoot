@@ -135,7 +135,8 @@ elif mode == 'proofs':
     package = env['PROOF_PACKAGE']
     assert package in ('cli', 'db', 'workflow')
     base = {'original': '574d0705976d280fb5ad6fcacbfef6b5ddb27514',
-            'corrections': '999c965ff914592aca4dd02f82c53127a7070b9f'}[env['PROOF_BASE']]
+            'corrections': '999c965ff914592aca4dd02f82c53127a7070b9f',
+            'review': '6c18b98c7469eddd7729ca2c8e4df0b4bba9ba2d'}[env['PROOF_BASE']]
     tool_revision = 'd5f169ab623e8ba0896b727a09f36738612a79e2'
     tools = evidence / 'tools'
     tools.mkdir()
@@ -169,6 +170,57 @@ elif mode == 'proofs':
         assert re.search(r'^--- PASS: ' + re.escape(row['name']) + r'\b',
                          row.get('new_output', ''), re.MULTILINE), row
     shutil.rmtree(tools)
+elif mode == 'mutations':
+    cases = [
+        ('undispatched', 'workflow', 'TestCleanupPreservesResumableConsumerUntilSucceeded',
+         'internal/workflow/cleanup_contract.go',
+         'return "consumer_undispatched", nil',
+         '/* mutation: accept undispatched consumers */',
+         'undispatched consumer lost producer contents'),
+        ('runtime-query', 'workflow', 'TestCleanupRefusesUnreadableRuntimeOwner',
+         'internal/workflow/cleanup_preservation.go',
+         '\tif err != nil {\n\t\treturn "runtime_owner_unknown"\n\t}\n\tif liveness != nil',
+         '\tif err != nil {\n\t\treturn ""\n\t}\n\tif liveness != nil',
+         'unreadable runtime owner was not refused'),
+        ('collector', 'cli', 'TestCleanupPublishesForBlockedPipelineAndRefusesLostArtifacts',
+         'internal/cli/ask_diff_precleanup.go',
+         'errs = append(errs, err)', 'return err',
+         'artifact failure prevented durable diff collection'),
+        ('legacy-event', 'db', 'TestJobIDsWithAgedTerminalDelegationWorktree',
+         'internal/db/store_jobs.go',
+         'AND (j.resource_id IS NOT NULL OR NOT EXISTS (',
+         'AND (1 = 1 OR NOT EXISTS (',
+         'legacy-cleanup'),
+    ]
+    results = []
+    for label, package, test, relative, before, after, expected_failure in cases:
+        command = ['go', 'test', '-tags', 'e2e', '-count=1', '-p', '1',
+                   './internal/' + package, '-v', '-timeout', '10m', '-run', '^' + test + '$']
+        baseline = run(label + '-baseline', command, timeout=900).read_text()
+        assert re.search(r'^--- PASS: ' + re.escape(test) + r'\b', baseline, re.MULTILINE), baseline
+        path = source / relative
+        original = path.read_bytes()
+        content = original.decode()
+        assert content.count(before) == 1, (relative, before, content.count(before))
+        mutant = content.replace(before, after).encode()
+        record = {'test': test, 'file': relative, 'source_head': head,
+                  'original_sha256': hashlib.sha256(original).hexdigest(),
+                  'mutant_sha256': hashlib.sha256(mutant).hexdigest(),
+                  'before': before, 'after': after, 'expected_failure': expected_failure}
+        (evidence / (label + '-mutation.json')).write_text(json.dumps(record, indent=2) + '\n')
+        try:
+            path.write_bytes(mutant)
+            output = run(label + '-mutant', command, allowed=(1,), timeout=900).read_text()
+            assert re.search(r'^--- FAIL: ' + re.escape(test) + r'\b', output, re.MULTILINE), output
+            assert expected_failure in output and '[build failed]' not in output, output
+            record['outcome'] = 'baseline_passed_compiling_mutant_failed_expected_behavior'
+        finally:
+            path.write_bytes(original)
+            assert path.read_bytes() == original
+            record['source_restored'] = True
+            (evidence / (label + '-mutation.json')).write_text(json.dumps(record, indent=2) + '\n')
+        results.append(record)
+    (evidence / 'mutation-results.json').write_text(json.dumps(results, indent=2) + '\n')
 elif mode == 'website':
     provenance.update(node=text(['node', '--version']), npm=text(['npm', '--version']))
     (evidence / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')

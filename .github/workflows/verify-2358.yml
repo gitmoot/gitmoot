@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: 6c18b98c7469eddd7729ca2c8e4df0b4bba9ba2d
+  TARGET_SHA: 53806f217de1bd6c25cd4ec2ca1466c61ed64b80
   GOTOOLCHAIN: local
   GOMAXPROCS: '2'
 
@@ -61,7 +61,7 @@ jobs:
       fail-fast: false
       matrix:
         package: [cli, db, workflow]
-        base_name: [original, corrections]
+        base_name: [original, corrections, review]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -91,6 +91,41 @@ jobs:
         if: always()
         with:
           name: cleanup-proofs-${{ matrix.package }}-${{ matrix.base_name }}-${{ env.TARGET_SHA }}
+          path: exported
+          if-no-files-found: error
+          retention-days: 30
+
+  mutations:
+    name: Review guard regression mutations
+    if: ${{ !contains(github.event.head_commit.message, '[smoke-only]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: instruments
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: source/go.sum
+      - name: Prove guard regressions from passing baselines
+        run: >-
+          sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
+          python3 instruments/verify.py source evidence mutations
+      - name: Export redacted portable receipts
+        if: always()
+        run: sudo -E python3 instruments/export.py evidence exported
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-review-mutations-${{ env.TARGET_SHA }}
           path: exported
           if-no-files-found: error
           retention-days: 30
