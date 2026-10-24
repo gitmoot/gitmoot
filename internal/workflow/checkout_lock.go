@@ -46,6 +46,16 @@ func acquireCheckoutMutationLock(ctx context.Context, store *db.Store, checkoutP
 	if ownerID == "" {
 		return nil, key, errors.New("checkout mutation lock owner is required")
 	}
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return nil, key, err
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			releaseLifecycle()
+		}
+	}()
 	token, err := newCheckoutMutationOwnerToken()
 	if err != nil {
 		return nil, key, err
@@ -62,7 +72,9 @@ func acquireCheckoutMutationLock(ctx context.Context, store *db.Store, checkoutP
 	if !acquired {
 		return nil, key, BlockedError{Reason: checkoutMutationBusyMessage}
 	}
+	transferred = true
 	return func(releaseCtx context.Context) error {
+		defer releaseLifecycle()
 		_, err := store.ReleaseResourceLock(releaseCtx, key, ownerID, token)
 		return err
 	}, key, nil

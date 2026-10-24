@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -54,29 +53,27 @@ func askReviewDiffPrecleanupHookForRunner(store *db.Store, runner subprocess.Run
 			return nil
 		}
 
-		snapshot, truncated, captureErr := captureReadOnlyWorktreeDiffForRunner(ctx, payload.WorktreePath, runner)
 		job, loadErr := store.GetJob(ctx, jobID)
 		if loadErr != nil {
-			return errors.Join(captureErr, fmt.Errorf("load job before persisting read-only worktree diff: %w", loadErr))
+			return fmt.Errorf("load job before capturing read-only worktree diff: %w", loadErr)
 		}
-		latest, loadErr := daemonJobPayload(job)
+		current, loadErr := daemonJobPayload(job)
 		if loadErr != nil {
-			return errors.Join(captureErr, loadErr)
+			return loadErr
 		}
-		latest.ReadOnlyWorktreeDiff = snapshot
-		latest.ReadOnlyWorktreeDiffTruncated = truncated
-		latest.ReadOnlyWorktreeDiffError = ""
+		if !workflow.IsFinalJobState(job.State) || current.WorktreePath != payload.WorktreePath {
+			return db.ErrCleanupEvidenceChanged
+		}
+		snapshot, truncated, captureErr := captureReadOnlyWorktreeDiffForRunner(ctx, payload.WorktreePath, runner)
+		captureError := ""
 		if captureErr != nil {
-			latest.ReadOnlyWorktreeDiff = ""
-			latest.ReadOnlyWorktreeDiffTruncated = false
-			latest.ReadOnlyWorktreeDiffError = workflow.RedactCommentText(captureErr.Error())
+			snapshot, truncated = "", false
+			captureError = workflow.RedactCommentText(captureErr.Error())
 		}
-
-		encoded, marshalErr := json.Marshal(latest)
-		if marshalErr != nil {
-			return errors.Join(captureErr, fmt.Errorf("marshal read-only worktree diff metadata: %w", marshalErr))
+		written, persistErr := store.RecordReadOnlyCleanupDiff(ctx, job, snapshot, truncated, captureError)
+		if persistErr == nil && !written {
+			persistErr = db.ErrCleanupEvidenceChanged
 		}
-		persistErr := store.UpdateJobPayload(ctx, jobID, string(encoded))
 		if persistErr != nil {
 			persistErr = fmt.Errorf("persist read-only worktree diff metadata: %w", persistErr)
 		}

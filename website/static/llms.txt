@@ -17,6 +17,15 @@ Findings ledger obligations follow commit ancestry, not pull request number alon
 Quoted-only diagnostics from a failed review remain job failures rather than code
 findings; locator-backed or executed findings still enter the ledger.
 
+Owned delegation/read-only cleanup uses producer-scoped `job cleanup inspect`
+and `apply --resource … --token …` with a positional job ID. Ordinary and aged
+cleanup share consumer, lifecycle, identity and preservation checks. Terminal
+state alone is insufficient; blocked/resumable consumers retain their inputs.
+Generation receipts survive deletion and historical replay never touches a
+replacement tree. Publication stays independent of deletion. A null
+`approved_size_budget` means unknown, not unlimited, and cannot authorize
+budget-dependent external cleanup.
+
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:
 `[workload-mode-reconciliation repo=<owner/repo> pr=<n> head=<40-char reviewed head> mode=<THROUGHPUT|STEADY|DRAIN> decision_note=<note id|none>]`.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func runJobCleanup(args []string, stdout, stderr io.Writer) int {
@@ -23,6 +24,8 @@ func runJobCleanup(args []string, stdout, stderr io.Writer) int {
 		return runJobCleanupList(args[1:], stdout, stderr)
 	case "reopen":
 		return runJobCleanupReopen(args[1:], stdout, stderr)
+	case "inspect", "apply":
+		return runJobCleanupResource(args[0], args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown job cleanup command %q\n\n", args[0])
 		printJobCleanupUsage(stderr)
@@ -34,6 +37,8 @@ func printJobCleanupUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]")
 	fmt.Fprintln(w, "  gitmoot job cleanup reopen <resource-id>")
+	fmt.Fprintln(w, "  gitmoot job cleanup inspect [--json] <job-id>")
+	fmt.Fprintln(w, "  gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> [--json] <job-id>")
 }
 
 func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
@@ -111,5 +116,95 @@ func runJobCleanupReopen(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "reopened cleanup obligation %s for job %s\n", obligation.ResourceID, obligation.OwnerJobID)
+	return 0
+}
+
+func runJobCleanupResource(operation string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("job cleanup "+operation, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	jsonOutput := fs.Bool("json", false, "print the versioned producer cleanup decision")
+	resourceID := fs.String("resource", "", "producer-derived resource identity from inspect")
+	token := fs.String("token", "", "eligibility token from inspect")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fmt.Fprintln(stderr, "job cleanup "+operation+" requires exactly one job id")
+		return 2
+	}
+	if operation == "apply" && (strings.TrimSpace(*resourceID) == "" || strings.TrimSpace(*token) == "") {
+		fmt.Fprintln(stderr, "job cleanup apply requires --resource and --token from inspect")
+		return 2
+	}
+	if operation == "inspect" && (*resourceID != "" || *token != "") {
+		fmt.Fprintln(stderr, "job cleanup inspect derives the resource; --resource and --token are apply-only")
+		return 2
+	}
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "job cleanup %s: %v\n", operation, err)
+		return 1
+	}
+	ctx := context.Background()
+	var decision workflow.CleanupInspection
+	var result workflow.CleanupApplyResult
+	withCleanupStore := withReadOnlyStore
+	if operation == "apply" {
+		withCleanupStore = withStore
+	}
+	err = withCleanupStore(*home, func(store *db.Store) error {
+		job, err := store.GetJob(ctx, fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		payload, err := workflow.ParseJobPayload(job.Payload)
+		if err != nil {
+			return err
+		}
+		repo, err := store.GetRepo(ctx, payload.Repo)
+		if err != nil {
+			return err
+		}
+		engine := daemonWorkflowEngine(store, nil, repo.CheckoutPath, paths.Home)
+		if operation == "inspect" {
+			decision, err = engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{})
+			return err
+		}
+		result, err = engine.ApplyProducerCleanup(ctx, job.ID, *resourceID, *token, workflow.CleanupPolicy{})
+		decision = result.Decision
+		return err
+	})
+	if *jsonOutput {
+		var value any = decision
+		if operation == "apply" {
+			value = result
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if encodeErr := encoder.Encode(value); encodeErr != nil {
+			err = errors.Join(err, encodeErr)
+		}
+	} else if operation == "inspect" {
+		fmt.Fprintf(stdout, "resource=%s job=%s generation=%d eligible=%t reasons=%s token=%s\n",
+			decision.ResourceID, decision.OwnerJobID, decision.LifecycleGeneration,
+			decision.Eligible, strings.Join(decision.ReasonCodes, ","), decision.EligibilityToken)
+	} else {
+		fmt.Fprintf(stdout, "state=%s resource=%s reasons=%s\n", result.State, *resourceID, strings.Join(decision.ReasonCodes, ","))
+		if result.Receipt != nil {
+			fmt.Fprintf(stdout, "receipt=%s generation=%d removed_at=%s\n",
+				result.Receipt.ReceiptID, result.Receipt.LifecycleGeneration, result.Receipt.RemovedAt)
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "job cleanup %s: %v\n", operation, err)
+		return 1
+	}
+	if operation == "apply" && result.State != "removed" && result.State != "already_removed" {
+		return 3
+	}
 	return 0
 }

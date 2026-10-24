@@ -326,6 +326,11 @@ func (e Engine) AdvanceParentDAGForTerminalChild(ctx context.Context, jobID stri
 	if err := e.validate(); err != nil {
 		return err
 	}
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	job, payload, err := e.jobPayload(ctx, jobID)
 	if err != nil {
 		return err
@@ -468,6 +473,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	if err := e.validate(); err != nil {
 		return err
 	}
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	releasedLifecycle := false
+	releaseForCleanup := func() {
+		if !releasedLifecycle {
+			releaseLifecycle()
+			releasedLifecycle = true
+		}
+	}
+	defer releaseForCleanup()
 	job, payload, err := e.jobPayload(ctx, jobID)
 	if err != nil {
 		return err
@@ -513,6 +530,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// force-removes; above it, exactly one. Moving the guard earlier moved that
 	// leak with it, so the defer has to lead every refusal.
 	defer func() {
+		releaseForCleanup()
 		retErr = errors.Join(retErr, e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload))
 	}()
 	if err := e.enforceStagedVerdictContract(ctx, job, payload); err != nil {
@@ -557,6 +575,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// No-op for non-implement / non-delegation jobs and (idempotently) for already
 	// cleaned ones. Skips succeeded legs still feeding a pending integration (#332).
 	defer func() {
+		releaseForCleanup()
 		retErr = errors.Join(retErr, e.cleanupImplementDelegationWorktree(ctx, jobID, job.Type, payload))
 	}()
 
@@ -567,6 +586,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// (the merge gate cleans only the task worktree), so they would otherwise
 	// accumulate forever (#478). No-op for a job with no parent/deps.
 	defer func() {
+		releaseForCleanup()
 		retErr = errors.Join(retErr, e.cleanupConsumedImplementLegWorktrees(ctx, payload))
 	}()
 

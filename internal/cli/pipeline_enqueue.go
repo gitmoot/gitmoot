@@ -39,6 +39,11 @@ func newPipelineStageEnqueuer(store *db.Store, home string) pipelineStageEnqueue
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(home)
 	mailbox.OrgPolicy = orgPolicyResolver(home)
 	return func(ctx context.Context, request workflow.JobRequest) (db.Job, error) {
+		ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+		if err != nil {
+			return db.Job{}, err
+		}
+		defer releaseLifecycle()
 		backend, err := localAgentDispatchExecBackendFor(home)
 		if err != nil {
 			return db.Job{}, err

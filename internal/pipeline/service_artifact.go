@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -37,11 +38,9 @@ func containedRelativePath(path string) bool {
 	return path != "" && path != "." && !filepath.IsAbs(path) && path != ".." && !strings.HasPrefix(path, ".."+string(filepath.Separator))
 }
 
-// PipelineServiceArtifactPrecleanupHook is wired into workflow.Engine's
-// terminal read-only cleanup. AdvanceJob invokes it while the service shell
-// worktree still exists and cleanup removes the worktree immediately after it
-// returns. Pipeline stage settlement happens on a later daemon scan, so this is
-// the last reliable collection point that preserves normal disposal.
+// PipelineServiceArtifactPrecleanupHook publishes terminal service outputs while
+// their worktree exists. Publication is independent of deletion eligibility:
+// blocked downstream stages need these outputs before cleanup can become safe.
 func PipelineServiceArtifactPrecleanupHook(store *db.Store, paths config.Paths) func(context.Context, string, string, workflow.JobPayload) error {
 	return func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
 		if payload.Sender != workflow.PipelineJobSender || payload.RuntimeOverride != runtime.ShellRuntime ||
@@ -83,7 +82,25 @@ func collectPipelineServiceStageArtifacts(ctx context.Context, store *db.Store, 
 	if payload.Result == nil || !serviceContainsString(spec.EffectiveSuccessDecisions(stage), payload.Result.Decision) {
 		return nil // a terminal job can still be a pipeline-level non-success decision
 	}
-	return copyPipelineServiceStageOut(paths, runID, stage.ID, payload.WorktreePath)
+	if err := copyPipelineServiceStageOut(paths, runID, stage.ID, payload.WorktreePath); err != nil {
+		return err
+	}
+	snapshot, err := preservePipelineCleanupArtifacts(paths, runID, stage.ID, job, payload.WorktreePath)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+	written, err := store.RecordCleanupArtifactSnapshot(ctx, job, string(encoded))
+	if err != nil {
+		return err
+	}
+	if !written {
+		return db.ErrCleanupEvidenceChanged
+	}
+	return nil
 }
 
 func servicePipelineStageForJob(ctx context.Context, store *db.Store, paths config.Paths, runID, jobID string) (Stage, Spec, error) {
@@ -167,6 +184,11 @@ func copyPipelineServiceStageOut(paths config.Paths, runID, stageID, worktree st
 	if err != nil {
 		return err
 	}
+	replacing, err := pipelineServiceArtifactsCommittedBytes(filepath.Join(artifactsRoot, stageID))
+	if err != nil {
+		return err
+	}
+	committed -= replacing
 	temp, err := os.MkdirTemp(artifactsRoot, "."+stageID+"-")
 	if err != nil {
 		return err

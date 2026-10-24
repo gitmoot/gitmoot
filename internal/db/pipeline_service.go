@@ -458,6 +458,11 @@ func (s *Store) CheckServiceRunAdmission(ctx context.Context, check ServiceRunAd
 // admissions from both observing spare capacity. Rate-limit denials persist only
 // elapsed refill; all other denials roll the whole transaction back.
 func (s *Store) AdmitServiceRun(ctx context.Context, admission ServiceRunAdmission) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	admission.Run.ID = strings.TrimSpace(admission.Run.ID)
 	admission.Run.Pipeline = strings.TrimSpace(admission.Run.Pipeline)
 	admission.ServiceRun.RunID = strings.TrimSpace(admission.ServiceRun.RunID)
@@ -575,6 +580,7 @@ func (s *Store) AdmitServiceRun(ctx context.Context, admission ServiceRunAdmissi
 		return err
 	}
 	return tx.Commit()
+
 }
 
 // FinalizeServiceRun records a completed, verified archive exactly once. A

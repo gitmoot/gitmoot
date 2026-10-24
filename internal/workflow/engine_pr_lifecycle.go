@@ -15,6 +15,11 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if err := e.validate(); err != nil {
 		return err
 	}
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	if err := validatePullRequestEvent(event); err != nil {
 		return err
 	}

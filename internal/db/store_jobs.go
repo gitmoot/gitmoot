@@ -66,6 +66,11 @@ func jobResultHashFromPayload(payload string) string {
 }
 
 func (s *Store) CreateJob(ctx context.Context, job Job) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	// root_id is a denormalized index of the engine's rootJobID() rule (#420):
 	// bind the SAME COALESCE(NULLIF(?,''), ?) to (payload.RootJobID, job.ID) so
 	// the invariant — payload root when set, else self-root — holds regardless of
@@ -79,9 +84,15 @@ func (s *Store) CreateJob(ctx context.Context, job Job) error {
 		rootIDFromPayload(job.Payload), job.ID, projection.WorkflowID, projection.Repo, projection.PullRequest,
 		projection.BlockerRetryAt, projection.BlockerSuggestedAction)
 	return annotateJobInsertConflict(job.ID, err)
+
 }
 
 func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent, additionalEvents ...JobEvent) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -92,6 +103,7 @@ func (s *Store) CreateJobWithEvent(ctx context.Context, job Job, event JobEvent,
 		return err
 	}
 	return tx.Commit()
+
 }
 
 // createJobWithEventTx is the shared insert body, so the ownership-bound variant
@@ -144,6 +156,11 @@ var ErrAdvanceOwnershipLost = errors.New("supersede advance no longer owns this 
 // carries the insert means either both the ownership predicate held and the job
 // exists, or neither.
 func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, own AdvanceOwnership, now time.Time, event JobEvent, additionalEvents ...JobEvent) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -161,6 +178,7 @@ func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, o
 		return err
 	}
 	return tx.Commit()
+
 }
 
 // AddJobEventIfAdvanceOwned appends a job event only while the advance that asked
@@ -197,6 +215,11 @@ func (s *Store) AddJobEventIfAdvanceOwned(ctx context.Context, event JobEvent, o
 // sets externally_driven — every other job insert leaves it at its DEFAULT 0, so
 // the normal dispatch path is byte-identical.
 func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job, event JobEvent, extraEvents ...JobEvent) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -228,6 +251,7 @@ func (s *Store) CreateExternallyDrivenJobWithEvent(ctx context.Context, job Job,
 		}
 	}
 	return tx.Commit()
+
 }
 
 // JobCreatedAt returns a job's created_at timestamp string (SQLite UTC format,
@@ -488,7 +512,7 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 // id for a stable tree. It selects updated_at like ListJobs so callers can show
 // child age; the idx_jobs_parent_job_id index backs the filter.
 func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, type, state, payload, model, parent_job_id, delegation_id, delegation_depth, delegated_by, root_killed, input_tokens, output_tokens, updated_at, lifecycle_generation
 		FROM jobs WHERE parent_job_id = ? ORDER BY delegation_id, id`, parentJobID)
 	if err != nil {
 		return nil, err
@@ -498,7 +522,7 @@ func (s *Store) ListJobsByParent(ctx context.Context, parentJobID string) ([]Job
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt); err != nil {
+		if err := rows.Scan(&job.ID, &job.Agent, &job.Type, &job.State, &job.Payload, &job.Model, &job.ParentJobID, &job.DelegationID, &job.DelegationDepth, &job.DelegatedBy, &job.RootKilled, &job.InputTokens, &job.OutputTokens, &job.UpdatedAt, &job.LifecycleGeneration); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -798,14 +822,25 @@ func (s *Store) ListRunningJobsUpdatedBefore(ctx context.Context, before time.Ti
 const bumpLifecycleGenerationSQL = `lifecycle_generation = lifecycle_generation + (CASE WHEN ? = 'queued' AND state <> 'queued' THEN 1 ELSE 0 END)`
 
 func (s *Store) UpdateJobState(ctx context.Context, id string, state string) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, state, state, id)
 	if err != nil {
 		return err
 	}
 	return requireAffected(result, "job", id)
+
 }
 
 func (s *Store) TransitionJobState(ctx context.Context, id string, from string, to string) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ?`, to, to, id, from)
 	if err != nil {
 		return false, err
@@ -815,6 +850,7 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 		return false, err
 	}
 	return affected == 1, nil
+
 }
 
 // TransitionJobStateAtGeneration is TransitionJobState with the LIFECYCLE
@@ -828,6 +864,11 @@ func (s *Store) TransitionJobState(ctx context.Context, id string, from string, 
 // as a fault persists, which is the unbounded job_events growth the advance-retry
 // markers were reshaped to avoid (#598).
 func (s *Store) TransitionJobStateAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	result, err := s.db.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ?`, to, to, id, from, fromGeneration)
 	if err != nil {
 		return false, err
@@ -837,9 +878,15 @@ func (s *Store) TransitionJobStateAtGeneration(ctx context.Context, id string, f
 		return false, err
 	}
 	return affected == 1, nil
+
 }
 
 func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from string, to string, event JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -867,6 +914,7 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // TransitionJobStateWithEventAtGeneration is TransitionJobStateWithEvent whose
@@ -888,6 +936,11 @@ func (s *Store) TransitionJobStateWithEvent(ctx context.Context, id string, from
 // transition and the follow-up leaves a marker a later sweep can rediscover
 // rather than a silently half-finished settlement.
 func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -923,6 +976,7 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // TransitionJobStatePayloadWithEventAtGeneration atomically settles one
@@ -931,6 +985,11 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 // TransitionJobStateWithEventAtGeneration, a stale run loses the compare-and-swap
 // instead of rewriting the result of a newer lifecycle.
 func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, payload string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -972,6 +1031,7 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // ClaimRunningJob is TransitionJobStateWithEvent specialized for the queued->
@@ -994,6 +1054,11 @@ func (s *Store) ClaimRunningJobAtGeneration(ctx context.Context, id string, from
 }
 
 func (s *Store) claimRunningJob(ctx context.Context, id string, from string, to string, event JobEvent, runnerPID int, runnerBootID string, generation *int64) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1024,6 +1089,7 @@ func (s *Store) claimRunningJob(ctx context.Context, id string, from string, to 
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // ListRunningJobIDsFromForeignBoot returns running jobs whose recorded runner
@@ -1063,6 +1129,11 @@ var ErrSupersedeAdvanceOwned = errors.New("supersession parent-advance owns this
 // transition commit together; a separate pre-check loses to a recovery pass that
 // acquires ownership in between.
 func (s *Store) TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1109,9 +1180,15 @@ func (s *Store) TransitionJobStatePayloadWithEventUnlessAdvanceOwned(ctx context
 		}
 	}
 	return true, tx.Commit()
+
 }
 
 func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id string, from string, to string, payload string, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1153,6 +1230,7 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // TransitionJobStatePayloadUsageWithEvent atomically closes externally driven
@@ -1161,6 +1239,11 @@ func (s *Store) TransitionJobStatePayloadWithEvent(ctx context.Context, id strin
 // the usage write in the same transaction. Negative token values are clamped to
 // zero defensively; the CLI rejects them before reaching this layer.
 func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id string, from string, to string, payload string, model string, inputTokens int, outputTokens int, event JobEvent, extraEvents ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	if inputTokens < 0 {
 		inputTokens = 0
 	}
@@ -1208,6 +1291,7 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 // TransitionJobStatePayloadWithEventAndTaskTransition is the retry path's
@@ -1218,6 +1302,11 @@ func (s *Store) TransitionJobStatePayloadUsageWithEvent(ctx context.Context, id 
 // so it must refuse for the same reason (#1673) rather than being the hole the
 // other arm's guard leaves open.
 func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.Context, id string, from string, to string, payload string, now time.Time, event JobEvent, taskID string, taskFrom string, taskTo string, taskKind string, taskReason string) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1277,9 +1366,15 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent string, toAgent string, payload string, event JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1315,9 +1410,15 @@ func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent stri
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1341,6 +1442,7 @@ func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string)
 		return requireAffected(result, "job", id)
 	}
 	return tx.Commit()
+
 }
 
 // UpdateJobPayloadAtGeneration is UpdateJobPayload with the job's LIFECYCLE
@@ -1412,6 +1514,11 @@ func (s *Store) RouteQueuedJobRemote(ctx context.Context, id string, payload str
 }
 
 func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string, atGeneration int64, event JobEvent, clause string, clauseArgs []any) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1440,9 +1547,15 @@ func (s *Store) rerouteQueuedJob(ctx context.Context, id string, payload string,
 		return false, err
 	}
 	return true, tx.Commit()
+
 }
 
 func (s *Store) UpdateJobPayloadAtGeneration(ctx context.Context, id string, payload string, atGeneration int64) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -1466,9 +1579,15 @@ func (s *Store) UpdateJobPayloadAtGeneration(ctx context.Context, id string, pay
 		return false, tx.Commit()
 	}
 	return true, tx.Commit()
+
 }
 
 func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string, payload string, state string, event JobEvent) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1501,6 +1620,7 @@ func (s *Store) UpdateJobPayloadAndStateWithEvent(ctx context.Context, id string
 		return err
 	}
 	return tx.Commit()
+
 }
 
 type queryRower interface {
@@ -2578,6 +2698,11 @@ func (s *Store) TransitionJobStateWithEvents(ctx context.Context, id string, fro
 // A nil payload leaves the stored payload untouched, so the events-only wrapper above
 // is byte-equivalent to the original single-event primitive.
 func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id string, from string, to string, payload []byte, events ...JobEvent) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -2618,6 +2743,7 @@ func (s *Store) TransitionJobStateWithPayloadAndEvents(ctx context.Context, id s
 		}
 	}
 	return true, tx.Commit()
+
 }
 
 // maxJobEventIDSQL is the change cursor for the candidate queries whose result is

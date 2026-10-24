@@ -56,7 +56,13 @@ type pipelineRunExecer interface {
 // deterministic manual/schedule run id); a duplicate id is an error so a
 // double-create is caught rather than silently overwriting an in-flight run.
 func (s *Store) CreatePipelineRun(ctx context.Context, run PipelineRun) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	return insertPipelineRun(ctx, s.db, run)
+
 }
 
 func insertPipelineRun(ctx context.Context, execer pipelineRunExecer, run PipelineRun) error {
@@ -164,6 +170,11 @@ func (s *Store) ListActivePipelineRuns(ctx context.Context) ([]PipelineRun, erro
 // pipeline, trigger, spec_hash, started_at — is never changed. It returns an error
 // if no run matched the id so a lost row surfaces rather than silently no-op'ing.
 func (s *Store) UpdatePipelineRun(ctx context.Context, run PipelineRun) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	run.ID = strings.TrimSpace(run.ID)
 	if run.ID == "" {
 		return errors.New("pipeline run id is required")
@@ -184,13 +195,20 @@ func (s *Store) UpdatePipelineRun(ctx context.Context, run PipelineRun) error {
 		return errors.New("pipeline run " + run.ID + " not found")
 	}
 	return nil
+
 }
 
 // CreatePipelineRunStage inserts one stage row for a run. The (run_id, stage_id)
 // pair is the primary key, so a duplicate is an error (the run-creation path
 // inserts each stage exactly once).
 func (s *Store) CreatePipelineRunStage(ctx context.Context, stage PipelineRunStage) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	return insertPipelineRunStage(ctx, s.db, stage)
+
 }
 
 func insertPipelineRunStage(ctx context.Context, execer pipelineRunExecer, stage PipelineRunStage) error {
@@ -258,6 +276,11 @@ func (s *Store) GetPipelineRunStage(ctx context.Context, runID, stageID string) 
 // needs, summary, started/finished) in place, keyed by (run_id, stage_id). It
 // returns an error if no stage row matched so a lost row surfaces.
 func (s *Store) UpdatePipelineRunStage(ctx context.Context, stage PipelineRunStage) error {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return fenceErr
+	}
+	defer releaseLifecycle()
 	stage.RunID = strings.TrimSpace(stage.RunID)
 	stage.StageID = strings.TrimSpace(stage.StageID)
 	if stage.RunID == "" || stage.StageID == "" {
@@ -279,6 +302,7 @@ func (s *Store) UpdatePipelineRunStage(ctx context.Context, stage PipelineRunSta
 		return errors.New("pipeline run stage " + stage.RunID + "/" + stage.StageID + " not found")
 	}
 	return nil
+
 }
 
 // UpdatePipelineLastRun records a pipeline's most recent run bookkeeping

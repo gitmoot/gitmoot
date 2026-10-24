@@ -33,6 +33,15 @@ func (w jobWorker) resumeSelfDirtyWorktreeForRunner(ctx context.Context, job db.
 	if strings.TrimSpace(payload.WorktreePath) != "" || strings.TrimSpace(payload.TaskID) == "" || w.Store == nil {
 		return "", payload, false
 	}
+	ctx, releaseLifecycle, err := w.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return "", payload, false
+	}
+	defer releaseLifecycle()
+	current, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil || current.LifecycleGeneration != job.LifecycleGeneration || current.State != job.State || current.Payload != job.Payload {
+		return "", payload, false
+	}
 
 	task, err := w.Store.GetTask(ctx, payload.TaskID)
 	if err != nil || strings.TrimSpace(task.WorktreePath) == "" {

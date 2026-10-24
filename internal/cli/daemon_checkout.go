@@ -167,6 +167,18 @@ func (w jobWorker) prepareNativeReviewWorktreeForRunner(ctx context.Context, job
 	if !nativeReviewWorktreeEligible(job, payload) {
 		return payload, nil
 	}
+	ctx, releaseLifecycle, err := w.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return payload, err
+	}
+	defer releaseLifecycle()
+	current, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		return payload, err
+	}
+	if current.LifecycleGeneration != job.LifecycleGeneration || current.State != job.State || current.Payload != job.Payload {
+		return payload, errors.New("native review lifecycle changed before worktree preparation")
+	}
 	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
 	if err != nil {
 		return payload, err

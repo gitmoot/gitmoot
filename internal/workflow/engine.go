@@ -84,13 +84,13 @@ type Engine struct {
 	DelegationWorktrees    WorktreeManager
 	DelegationCheckout     string
 	cleanupTargetValidator func(home, jobID, jobType string, payload JobPayload) error
-	// BeforeReadOnlyWorktreeCleanup is an optional terminal hook invoked after a
-	// read-only job has settled but before its detached worktree is force-removed.
-	// It lets the CLI durably collect service-stage outputs and worktree diffs
-	// without teaching the workflow package about those artifacts. An error is
-	// recorded as a job event but never suppresses cleanup; the hook owns any
-	// durable failure marker.
+	// BeforeReadOnlyWorktreeCleanup publishes terminal artifacts independently of
+	// deletion eligibility, so blocked consumers can still receive their inputs.
+	// Missing collectors or preservation failures refuse read-only deletion.
 	BeforeReadOnlyWorktreeCleanup func(context.Context, string, string, JobPayload) error
+	// CleanupRetention reloads producer retention policy during each inspection
+	// and immediately before deletion. Nil is reserved for explicit engine policy.
+	CleanupRetention func() (time.Duration, error)
 	// OwnerPIDLive reports whether a recorded owner PID is a live process on this
 	// host. It gates the DESTRUCTIVE implement-delegation worktree/branch cleanup so
 	// a worktree still owned by a live runtime worker is never force-removed out from

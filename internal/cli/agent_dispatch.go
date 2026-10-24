@@ -898,6 +898,16 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// Falling back to the shared checkout would silently drop that boundary, so
 	// allocation failure refuses both exact-head reviews and taskless background
 	// asks. Foreground and task-bearing asks keep their existing checkout policy.
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	lifecycleReleased := false
+	defer func() {
+		if !lifecycleReleased {
+			releaseLifecycle()
+		}
+	}()
 	jobID := firstNonEmpty(strings.TrimSpace(request.JobID), localAgentJobID(request.Action, agent.Name))
 	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
 	if dispatchReadOnlyWorktreeEligible(request) {
@@ -1125,6 +1135,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		return localAgentJobOutput{}, err
 	}
+	releaseLifecycle()
+	lifecycleReleased = true
 	if foregroundContract != nil && foregroundContract.State == runtime.RuntimeContractUnknown {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_contract_unknown", Message: runtime.RuntimeContractEventMessage(job.ID, effectiveAgent, *foregroundContract)})
 	}

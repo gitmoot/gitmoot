@@ -42,31 +42,6 @@ func (f floodingExactEnvRunner) RunExactEnv(_ context.Context, _ string, _ []str
 	return nil
 }
 
-func TestComposeBeforeReadOnlyWorktreeCleanupHooksRunsEveryHook(t *testing.T) {
-	firstErr := errors.New("first collector failed")
-	secondErr := errors.New("second collector failed")
-	var calls []string
-	hook := composeBeforeReadOnlyWorktreeCleanupHooks(
-		func(context.Context, string, string, workflow.JobPayload) error {
-			calls = append(calls, "first")
-			return firstErr
-		},
-		nil,
-		func(context.Context, string, string, workflow.JobPayload) error {
-			calls = append(calls, "second")
-			return secondErr
-		},
-	)
-
-	err := hook(context.Background(), "job-1", "ask", workflow.JobPayload{})
-	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {
-		t.Fatalf("composed error = %v, want both collector errors", err)
-	}
-	if got := strings.Join(calls, ","); got != "first,second" {
-		t.Fatalf("collector calls = %q, want first,second", got)
-	}
-}
-
 func TestReadOnlyWorktreeDiffRunnerBoundsOutputWhileRunning(t *testing.T) {
 	const total = readOnlyWorktreeDiffMaxBytes * 3
 	sandbox := readOnlyWorktreeGitSandbox{

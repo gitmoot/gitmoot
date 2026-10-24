@@ -2884,6 +2884,18 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	if strings.TrimSpace(w.ConfigHome) == "" {
 		return poolIsolatedDispatch{}, false, nil
 	}
+	ctx, releaseLifecycle, err := w.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return poolIsolatedDispatch{}, false, err
+	}
+	defer releaseLifecycle()
+	current, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		return poolIsolatedDispatch{}, false, err
+	}
+	if current.LifecycleGeneration != job.LifecycleGeneration || current.State != job.State || current.Payload != job.Payload {
+		return poolIsolatedDispatch{}, false, errors.New("pool isolation lifecycle changed before worktree preparation")
+	}
 	repoRecord, err := w.Store.GetRepo(ctx, payload.Repo)
 	if err != nil || strings.TrimSpace(repoRecord.CheckoutPath) == "" {
 		return poolIsolatedDispatch{}, false, err

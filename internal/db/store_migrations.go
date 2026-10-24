@@ -36,6 +36,11 @@ func SchemaMigrationCount() int {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	ctx, releaseLifecycle, err := s.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	MigrateObserver()
 	for version, migration := range migrations {
 		if err := s.applyMigration(ctx, version+1, migration); err != nil {
@@ -3015,5 +3020,35 @@ WITH RECURSIVE links(start_id, id) AS (
 )
 UPDATE wake_outbox SET coalesced_into = NULL
 WHERE id IN (SELECT start_id FROM links WHERE start_id = id);
+	`,
+	// #2358: retain terminal evidence outside disposable workspaces and scope
+	// cleanup accounting to the lifecycle that actually owns the resource.
+	`
+ALTER TABLE cleanup_obligations ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE cleanup_obligations ADD COLUMN terminal_at TEXT NOT NULL DEFAULT '';
+UPDATE cleanup_obligations SET lifecycle_generation = COALESCE(
+	(SELECT lifecycle_generation FROM jobs WHERE jobs.id = cleanup_obligations.owner_job_id), 0);
+UPDATE cleanup_obligations SET terminal_at = COALESCE(
+	(SELECT updated_at FROM jobs WHERE jobs.id = cleanup_obligations.owner_job_id
+	 AND jobs.state IN ('succeeded', 'failed', 'cancelled')), '');
+CREATE INDEX idx_pipeline_run_stages_job_id ON pipeline_run_stages(job_id);
+
+CREATE TABLE cleanup_receipts (
+	resource_id TEXT NOT NULL,
+	lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation >= 0),
+	owner_job_id TEXT NOT NULL,
+	expected_path TEXT NOT NULL,
+	terminal_state TEXT NOT NULL CHECK(terminal_state IN ('succeeded', 'failed', 'cancelled')),
+	owner_payload TEXT NOT NULL,
+	evidence TEXT NOT NULL,
+	eligibility_token TEXT NOT NULL UNIQUE,
+	receipt_id TEXT NOT NULL UNIQUE,
+	created_at TEXT NOT NULL,
+	removed_at TEXT NOT NULL DEFAULT '',
+	superseded_at TEXT NOT NULL DEFAULT '',
+	superseded_by_generation INTEGER NOT NULL DEFAULT 0,
+	CHECK(removed_at='' OR superseded_at=''),
+	PRIMARY KEY(resource_id, lifecycle_generation)
+);
 	`,
 }

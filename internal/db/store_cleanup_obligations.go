@@ -20,17 +20,19 @@ const (
 )
 
 type CleanupObligation struct {
-	ResourceID    string                  `json:"resource_id"`
-	ResourceKind  string                  `json:"resource_kind"`
-	OwnerJobID    string                  `json:"owner_job_id"`
-	ExpectedPath  string                  `json:"expected_path"`
-	State         string                  `json:"state"`
-	Reason        CleanupObligationReason `json:"reason"`
-	AttemptCount  int                     `json:"attempt_count"`
-	NextAttemptAt string                  `json:"next_attempt_at"`
-	LastError     string                  `json:"last_error"`
-	CreatedAt     string                  `json:"created_at"`
-	UpdatedAt     string                  `json:"updated_at"`
+	ResourceID          string                  `json:"resource_id"`
+	ResourceKind        string                  `json:"resource_kind"`
+	OwnerJobID          string                  `json:"owner_job_id"`
+	ExpectedPath        string                  `json:"expected_path"`
+	State               string                  `json:"state"`
+	Reason              CleanupObligationReason `json:"reason"`
+	LifecycleGeneration int64                   `json:"lifecycle_generation"`
+	TerminalAt          string                  `json:"terminal_at"`
+	AttemptCount        int                     `json:"attempt_count"`
+	NextAttemptAt       string                  `json:"next_attempt_at"`
+	LastError           string                  `json:"last_error"`
+	CreatedAt           string                  `json:"created_at"`
+	UpdatedAt           string                  `json:"updated_at"`
 }
 
 type CleanupObligationReason string
@@ -82,6 +84,11 @@ func cleanupObligationTime(value time.Time) string {
 }
 
 func (s *Store) EnsureCleanupObligation(ctx context.Context, ownerJobID, expectedPath string, now time.Time) (CleanupObligation, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return CleanupObligation{}, fenceErr
+	}
+	defer releaseLifecycle()
 	ownerJobID = strings.TrimSpace(ownerJobID)
 	expectedPath = filepath.Clean(strings.TrimSpace(expectedPath))
 	if ownerJobID == "" || expectedPath == "." || expectedPath == "" {
@@ -92,21 +99,37 @@ func (s *Store) EnsureCleanupObligation(ctx context.Context, ownerJobID, expecte
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO cleanup_obligations (
 			resource_id, resource_kind, owner_job_id, expected_path, state,
-			reason, attempt_count, next_attempt_at, created_at, updated_at
-		) VALUES (?, 'delegation_worktree', ?, ?, 'pending', 'pending', 0, ?, ?, ?)
+			reason, attempt_count, next_attempt_at, created_at, updated_at, lifecycle_generation, terminal_at
+		) VALUES (?, 'delegation_worktree', ?, ?, 'pending', 'pending', 0, ?, ?, ?,
+			COALESCE((SELECT lifecycle_generation FROM jobs WHERE id=?), 0),
+			COALESCE((SELECT updated_at FROM jobs WHERE id=? AND state IN ('succeeded', 'failed', 'cancelled')), ''))
 		ON CONFLICT(resource_id) DO UPDATE SET
 			owner_job_id=excluded.owner_job_id,
 			expected_path=excluded.expected_path,
+			state=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation THEN 'pending' ELSE cleanup_obligations.state END,
+			reason=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation THEN 'pending' ELSE cleanup_obligations.reason END,
+			attempt_count=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation THEN 0 ELSE cleanup_obligations.attempt_count END,
+			next_attempt_at=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation THEN excluded.next_attempt_at ELSE cleanup_obligations.next_attempt_at END,
+			last_error=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation THEN '' ELSE cleanup_obligations.last_error END,
+			terminal_at=CASE WHEN cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation OR cleanup_obligations.terminal_at='' THEN excluded.terminal_at ELSE cleanup_obligations.terminal_at END,
+			lifecycle_generation=excluded.lifecycle_generation,
 			updated_at=excluded.updated_at
-		WHERE cleanup_obligations.state IN ('pending', 'retryable')`,
-		resourceID, ownerJobID, expectedPath, stamp, stamp, stamp)
+		WHERE cleanup_obligations.state IN ('pending', 'retryable')
+			OR cleanup_obligations.lifecycle_generation <> excluded.lifecycle_generation`,
+		resourceID, ownerJobID, expectedPath, stamp, stamp, stamp, ownerJobID, ownerJobID)
 	if err != nil {
 		return CleanupObligation{}, err
 	}
 	return s.GetCleanupObligation(ctx, resourceID)
+
 }
 
 func (s *Store) RecordCleanupObligationFailure(ctx context.Context, ownerJobID, expectedPath string, reason CleanupObligationReason, cause error, now time.Time, nextAttempt time.Time, budget int) (CleanupObligation, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return CleanupObligation{}, fenceErr
+	}
+	defer releaseLifecycle()
 	if budget <= 0 {
 		return CleanupObligation{}, fmt.Errorf("cleanup retry budget must be positive")
 	}
@@ -131,6 +154,7 @@ func (s *Store) RecordCleanupObligationFailure(ctx context.Context, ownerJobID, 
 		return CleanupObligation{}, err
 	}
 	return s.GetCleanupObligation(ctx, obligation.ResourceID)
+
 }
 
 // DeferCleanupObligation reschedules an obligation. The GENERIC terminal
@@ -140,6 +164,11 @@ func (s *Store) RecordCleanupObligationFailure(ctx context.Context, ownerJobID, 
 // would make any "announce on the transition" caller re-announce every pass. A
 // specific reason always wins, including over another specific reason.
 func (s *Store) DeferCleanupObligation(ctx context.Context, ownerJobID, expectedPath string, reason CleanupObligationReason, now, nextAttempt time.Time) (CleanupObligation, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return CleanupObligation{}, fenceErr
+	}
+	defer releaseLifecycle()
 	obligation, err := s.EnsureCleanupObligation(ctx, ownerJobID, expectedPath, now)
 	if err != nil {
 		return CleanupObligation{}, err
@@ -161,9 +190,15 @@ func (s *Store) DeferCleanupObligation(ctx context.Context, ownerJobID, expected
 		return CleanupObligation{}, err
 	}
 	return s.GetCleanupObligation(ctx, obligation.ResourceID)
+
 }
 
 func (s *Store) MarkCleanupObligationRemoved(ctx context.Context, ownerJobID, expectedPath string, now time.Time) (CleanupObligation, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return CleanupObligation{}, fenceErr
+	}
+	defer releaseLifecycle()
 	obligation, err := s.EnsureCleanupObligation(ctx, ownerJobID, expectedPath, now)
 	if err != nil {
 		return CleanupObligation{}, err
@@ -177,24 +212,25 @@ func (s *Store) MarkCleanupObligationRemoved(ctx context.Context, ownerJobID, ex
 		return CleanupObligation{}, err
 	}
 	return s.GetCleanupObligation(ctx, obligation.ResourceID)
+
 }
 
 func (s *Store) GetCleanupObligation(ctx context.Context, resourceID string) (CleanupObligation, error) {
 	var obligation CleanupObligation
 	err := s.db.QueryRowContext(ctx, `
 		SELECT resource_id, resource_kind, owner_job_id, expected_path, state,
-		       reason, attempt_count, next_attempt_at, last_error, created_at, updated_at
+		       reason, attempt_count, next_attempt_at, last_error, created_at, updated_at, lifecycle_generation, terminal_at
 		FROM cleanup_obligations WHERE resource_id=?`, strings.TrimSpace(resourceID)).Scan(
 		&obligation.ResourceID, &obligation.ResourceKind, &obligation.OwnerJobID,
 		&obligation.ExpectedPath, &obligation.State, &obligation.Reason,
 		&obligation.AttemptCount, &obligation.NextAttemptAt, &obligation.LastError,
-		&obligation.CreatedAt, &obligation.UpdatedAt)
+		&obligation.CreatedAt, &obligation.UpdatedAt, &obligation.LifecycleGeneration, &obligation.TerminalAt)
 	return obligation, err
 }
 
 func (s *Store) ListCleanupObligations(ctx context.Context, state string) ([]CleanupObligation, error) {
 	query := `SELECT resource_id, resource_kind, owner_job_id, expected_path, state,
-	                 reason, attempt_count, next_attempt_at, last_error, created_at, updated_at
+	                 reason, attempt_count, next_attempt_at, last_error, created_at, updated_at, lifecycle_generation, terminal_at
 	          FROM cleanup_obligations`
 	args := []any{}
 	if state = strings.TrimSpace(state); state != "" {
@@ -213,7 +249,7 @@ func (s *Store) ListCleanupObligations(ctx context.Context, state string) ([]Cle
 		if err := rows.Scan(&obligation.ResourceID, &obligation.ResourceKind, &obligation.OwnerJobID,
 			&obligation.ExpectedPath, &obligation.State, &obligation.Reason,
 			&obligation.AttemptCount, &obligation.NextAttemptAt, &obligation.LastError,
-			&obligation.CreatedAt, &obligation.UpdatedAt); err != nil {
+			&obligation.CreatedAt, &obligation.UpdatedAt, &obligation.LifecycleGeneration, &obligation.TerminalAt); err != nil {
 			return nil, err
 		}
 		obligations = append(obligations, obligation)
@@ -222,6 +258,11 @@ func (s *Store) ListCleanupObligations(ctx context.Context, state string) ([]Cle
 }
 
 func (s *Store) ReopenCleanupObligation(ctx context.Context, resourceID string, now time.Time) (CleanupObligation, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return CleanupObligation{}, fenceErr
+	}
+	defer releaseLifecycle()
 	stamp := cleanupObligationTime(now)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE cleanup_obligations
@@ -239,6 +280,7 @@ func (s *Store) ReopenCleanupObligation(ctx context.Context, resourceID string, 
 		return CleanupObligation{}, sql.ErrNoRows
 	}
 	return s.GetCleanupObligation(ctx, resourceID)
+
 }
 
 func (s *Store) CountQuarantinedCleanupObligations(ctx context.Context) (int, error) {
