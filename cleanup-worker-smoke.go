@@ -81,8 +81,8 @@ func main() {
 		return output
 	}
 	shell := `printf 'real worker completed\n' > worker-proof.txt; printf '{"gitmoot_result":{"decision":"approved","summary":"worker pid %s exited","findings":[],"changes_made":[],"tests_run":["native shell execution"],"needs":[],"delegations":[]}}\n' "$$"`
-	cli("agent", "subscribe", "--home", home, "--runtime", "shell", "--session", shell,
-		"--role", "agent", "--repo", "owner/repo", "--capability", "ask", "--policy", "auto", "cleanup-smoke-shell")
+	cli("agent", "subscribe", "cleanup-smoke-shell", "--home", home, "--runtime", "shell", "--session", shell,
+		"--role", "agent", "--repo", "owner/repo", "--capability", "ask", "--policy", "auto")
 	const jobID = "smoke-worker"
 	path, err := workflow.DelegationWorktreePath(paths.Home, "owner/repo", jobID, "readonly-seat", 0)
 	must(err)
