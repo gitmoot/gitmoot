@@ -165,6 +165,14 @@ func TestPipelineServiceAcceptanceE2E(t *testing.T) {
 	if !strings.Contains(payload.ReadOnlyWorktreeDiff, "?? out/kit.txt") {
 		t.Fatalf("composed pre-cleanup hooks did not capture the service worktree status: %q", payload.ReadOnlyWorktreeDiff)
 	}
+	// Stage completion publishes its artifacts, but the unfinished pipeline
+	// retains its workspace. Reclaim only after the successful run is folded.
+	engine := worker.WorkflowFactory(checkout)
+	cleanupNow := time.Now().UTC().Add(2 * time.Minute)
+	engine.Now = func() time.Time { return cleanupNow }
+	if removed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, stage.JobID); err != nil || !removed {
+		t.Fatalf("completed service pipeline did not release its stage workspace: removed=%v err=%v", removed, err)
+	}
 	if _, err := os.Stat(payload.WorktreePath); !os.IsNotExist(err) {
 		t.Fatalf("service stage worktree was not disposed after pre-cleanup artifact collection: %v", err)
 	}

@@ -4371,34 +4371,36 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 	branch := "gitmoot-delegation-x-d1"
 	wt := managedDelegationReclaimTestPath(t, home, "parent", "d1")
 	pendingID := "parent/delegation/d1"
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	manager := &selectiveReclaimManager{Client: gitutil.NewHostClient(checkout)}
+	if err := manager.AddWorktree(ctx, branch, wt, "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{
+		ID: "parent", Agent: "coordinator", Type: "ask", State: string(workflow.JobSucceeded),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Result: &workflow.AgentResult{Decision: "approved"}}),
+	}, "completed producer ancestor")
 	payload := workflow.JobPayload{
 		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "d1", WorktreePath: wt, Branch: branch,
-		Result: &workflow.AgentResult{Decision: "failed"},
+		Result: &workflow.AgentResult{Decision: "implemented"},
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("Marshal payload returned error: %v", err)
 	}
 	if err := store.CreateJobWithEvent(ctx, db.Job{
-		ID: pendingID, Agent: "producer", Type: "implement", State: string(workflow.JobFailed),
+		ID: pendingID, Agent: "producer", Type: "implement", State: string(workflow.JobSucceeded),
 		ParentJobID: "parent", DelegationID: "d1", Payload: string(encoded),
-	}, db.JobEvent{Kind: string(workflow.JobFailed), Message: "seed"}); err != nil {
+	}, db.JobEvent{Kind: string(workflow.JobSucceeded), Message: "seed"}); err != nil {
 		t.Fatalf("CreateJobWithEvent(pending) returned error: %v", err)
 	}
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: pendingID, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
 		t.Fatalf("AddJobEvent returned error: %v", err)
 	}
 
-	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{branch: true}}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{
-			Store:               store,
-			Home:                worker.workflowHome(),
-			DelegationCheckout:  t.TempDir(),
-			DelegationWorktrees: manager,
-			OwnerPIDLive:        func(int64) bool { return false },
-		}
+		return reclaimFixtureEngine(worker, checkout, manager)
 	}
 
 	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(worker.Store), time.Now().UTC()); err != nil {
@@ -4407,6 +4409,12 @@ func TestReclaimSkippedDelegationWorktreesBoundedToMarkedJobs(t *testing.T) {
 
 	if len(manager.removed) != 1 || manager.removed[0] != wt {
 		t.Fatalf("only the marked pending worktree must be reclaimed: removed=%+v", manager.removed)
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("marked worktree was not physically reclaimed: %v", err)
+	}
+	if exists, err := manager.BranchExists(ctx, branch); err != nil || exists {
+		t.Fatalf("marked producer branch remains: exists=%v err=%v", exists, err)
 	}
 	pending, err := delegationWorktreeCleanupPendingForTest(ctx, worker.Store, pendingID)
 	if err != nil {
