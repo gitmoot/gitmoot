@@ -30,7 +30,7 @@ func renderOwnerGramFromNote(t *testing.T, store *db.Store, sink synchronousEven
 		rules, err := store.ListEventRules(ctx)
 		return replyWakeDelivery{sink: sink, rules: rules, ownerGram: gram}, err
 	}
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve); err != nil {
 		t.Fatalf("drain: %v", err)
 	}

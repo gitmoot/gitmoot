@@ -96,6 +96,31 @@ func wakeRowsByRole(t *testing.T, store *db.Store) map[string]db.WakeOutboxEntry
 	return byRole
 }
 
+func TestOwnerReviewResultHealthMatchesImmediateDelivery(t *testing.T) {
+	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
+	ctx := context.Background()
+	insertOwnerEscalation(t, store, "ordinary-alert", "acme/widget")
+	insertAwaitedFactWakeForTest(t, store, db.AwaitedFactWakePayload{
+		ID: 46, WaiterRole: "owner", SubjectKind: db.AwaitedFactSubjectReviewVerdict,
+		SubjectKey: "acme/widget#46@head", State: db.AwaitedFactStateSatisfied, JobID: "review-46",
+	})
+	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-review-46"}}
+	resolve := ownerGramResolver(store, sink, gram)
+	now := time.Now().UTC()
+	health, err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptedUnknownAfter), now, replyWakeCoalescingWindow, resolve)
+	if err == nil || health.pending != 1 || health.held != 1 {
+		t.Fatalf("urgent review must be pending while ordinary alert is held: health=%+v err=%v", health, err)
+	}
+	health, err = drainReplyWakeOutboxWithHealth(ctx, store, now, replyWakeCoalescingWindow, resolve)
+	if err != nil || health.pending != 0 || health.held != 1 {
+		t.Fatalf("review must deliver immediately without releasing ordinary alert: health=%+v err=%v", health, err)
+	}
+	receipts, err := store.ListOwnerGramReceipts(ctx)
+	if err != nil || len(receipts) != 1 || receipts[0].GramID != "gram-review-46" || receipts[0].Outcome != db.OwnerGramAccepted {
+		t.Fatalf("immediate review delivery receipt=%+v err=%v", receipts, err)
+	}
+}
+
 func TestOwnerEscalationIsSentAsOneGramWithReceiptAndNeverResent(t *testing.T) {
 	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})
 	ctx := context.Background()
@@ -107,7 +132,7 @@ func TestOwnerEscalationIsSentAsOneGramWithReceiptAndNeverResent(t *testing.T) {
 	}
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-test-1"}}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve); err != nil {
 		t.Fatalf("drain: %v", err)
@@ -152,7 +177,7 @@ func TestOwnerGramUnknownOutcomeIsNotResentAndShowsInOrgHealth(t *testing.T) {
 	insertOwnerEscalation(t, store, "review-pr-7-def", "acme/widget")
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramUnknown, Detail: "herdr gram send timed out; it may have been sent"}}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 
 	health, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve)
 	if err == nil || health.blocked != 1 || health.unknown != 1 {
@@ -199,7 +224,7 @@ func TestOwnerGramRefusalFailsRowAsProvenUnsent(t *testing.T) {
 	ctx := context.Background()
 	insertOwnerEscalation(t, store, "review-pr-8-aaa", "acme/widget")
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramRefused, Detail: "herdr server_not_running: no herdr server"}}
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	_, _ = drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, ownerGramResolver(store, sink, gram))
 	row := wakeRowsByRole(t, store)["owner"]
 	if row.State != db.WakeOutboxStateFailed || !db.WakeProvenUnsent(row) {
@@ -218,7 +243,7 @@ func TestOwnerGramsAreSpacedAndBatched(t *testing.T) {
 	insertOwnerEscalation(t, store, "review-pr-2-bbb", "acme/two")
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-batch"}}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve); err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +256,7 @@ func TestOwnerGramsAreSpacedAndBatched(t *testing.T) {
 	insertOwnerEscalation(t, store, "review-pr-3-ccc", "acme/three")
 	// The receipt was stamped at real time; a third alert due shortly after is
 	// held back by the spacing interval, then sent once it elapses.
-	soon := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	soon := time.Now().UTC().Add(5*time.Minute + time.Second)
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, soon, replyWakeCoalescingWindow, resolve); err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +278,7 @@ func TestConcurrentDrainsSendOwnerGramOnce(t *testing.T) {
 	insertOwnerEscalation(t, store, "review-pr-9-ddd", "acme/widget")
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-once"}}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	var group sync.WaitGroup
 	for range 4 {
 		group.Go(func() {
@@ -312,7 +337,7 @@ func TestOwnerWakeWithoutGramSenderKeepsOrdinaryPath(t *testing.T) {
 	store, sink, _, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}})
 	ctx := context.Background()
 	insertOwnerEscalation(t, store, "review-pr-6-fff", "acme/widget")
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	health, _ := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
 	if health.inert != 1 {
 		t.Fatalf("health = %s, want the rule-less owner escalation inert without a gram sender", health)
@@ -337,7 +362,7 @@ func TestOverlappingDrainsWithDisjointOwnerBatchesSendOneGram(t *testing.T) {
 		started: make(chan struct{}, 4), release: make(chan struct{}),
 	}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	firstDone := make(chan struct{})
 	go func() {
 		defer close(firstDone)
@@ -373,7 +398,7 @@ func TestOwnerGramSpacingRunsFromSendCompletion(t *testing.T) {
 	const sendTook = 1500 * time.Millisecond
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-slow"}, delay: sendTook}
 	resolve := ownerGramResolver(store, sink, gram)
-	due := time.Now().UTC().Add(replyWakeCoalescingWindow + time.Second)
+	due := time.Now().UTC().Add(5*time.Minute + time.Second)
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, due, replyWakeCoalescingWindow, resolve); err != nil {
 		t.Fatal(err)
 	}
@@ -413,7 +438,7 @@ func TestOwnerGramSpacingCountsPreSendDrainWork(t *testing.T) {
 	// The drain read its clock 30s ago and only reaches the send now.
 	drainNow := time.Now().UTC().Add(-30 * time.Second)
 	execRaw(t, store.DatabasePath(), `UPDATE wake_outbox SET created_at = ? WHERE target_role = 'owner'`,
-		drainNow.Add(-replyWakeCoalescingWindow-time.Second).Format(db.BlockedEpisodeTimeLayout))
+		drainNow.Add(-5*time.Minute-time.Second).Format(db.BlockedEpisodeTimeLayout))
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-pre"}}
 	sendFloor := time.Now().UTC()
 	if _, err := drainReplyWakeOutboxWithHealth(ctx, store, drainNow, replyWakeCoalescingWindow, ownerGramResolver(store, sink, gram)); err != nil {

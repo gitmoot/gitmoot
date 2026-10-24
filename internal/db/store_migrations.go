@@ -2988,4 +2988,32 @@ CREATE INDEX idx_awaited_facts_waiting_deadline
 	ON awaited_facts(deadline, id)
 	WHERE state = 'waiting';
 	`,
+	`
+-- Batch membership is a durable relationship, not a successful-delivery claim.
+ALTER TABLE wake_outbox ADD COLUMN coalesced_into INTEGER;
+
+UPDATE wake_outbox AS member
+SET coalesced_into = (
+	SELECT survivor.id FROM wake_outbox AS survivor
+	WHERE survivor.id = CAST(substr(member.last_error, length('coalesced into wake outbox row ') + 1) AS INTEGER)
+	  AND member.last_error = 'coalesced into wake outbox row ' || survivor.id
+	  AND survivor.id != member.id
+	  AND survivor.target_role = member.target_role
+	  AND survivor.coalesce_key = member.coalesce_key
+)
+WHERE member.state = 'superseded'
+  AND member.last_error LIKE 'coalesced into wake outbox row %';
+
+-- Discard cyclic historical claims. Their legacy marker remains visible as an
+-- unresolved relationship; no state, attempt, timestamp or message is changed.
+WITH RECURSIVE links(start_id, id) AS (
+	SELECT id, coalesced_into FROM wake_outbox WHERE coalesced_into IS NOT NULL
+	UNION
+	SELECT links.start_id, parent.coalesced_into
+	FROM links JOIN wake_outbox parent ON parent.id = links.id
+	WHERE parent.coalesced_into IS NOT NULL
+)
+UPDATE wake_outbox SET coalesced_into = NULL
+WHERE id IN (SELECT start_id FROM links WHERE start_id = id);
+	`,
 }

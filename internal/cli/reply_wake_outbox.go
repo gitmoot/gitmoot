@@ -11,27 +11,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
+	"github.com/gitmoot/gitmoot/internal/org"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const (
-	// replyWakeCoalescingWindow is the DEFAULT hold, overridable by
-	// [org].wake_coalesce_hold. It absorbs a burst of separate short-lived
-	// `message escalate` processes and, since the owner decision of 2026-09-07,
-	// deliberately trades up to five minutes of wake latency for a measured
-	// 32.1% fewer interrupts on this fleet's own arrival history.
-	//
-	// IT IS A HOLD ON THE OLDEST PENDING ROW, NOT A LIMIT ON BATCH MEMBERSHIP
-	// (#1978). It used to be both: a row created more than one window after
-	// the batch anchor started a SECOND rolling window and therefore a second
-	// wake, even though both rows were pending at the same drain and shared one
-	// coalesce_key. Measured on this box's live store, 8,464 attempted rows were
-	// delivered as 8,091 wakes, so 92.8% of delivery attempts carried exactly
-	// one row while same-key arrivals were 5 seconds to 5 minutes apart.
-	replyWakeCoalescingWindow  = config.DefaultWakeCoalesceHold
+	// Working recipients batch from the oldest queued item; idle recipients
+	// have no batching delay. This is not a limit on batch membership.
+	replyWakeCoalescingWindow  = 2 * time.Minute
+	ownerGramCoalescingWindow  = 5 * time.Minute
 	replyWakeMaxCoalescedItems = 10
 	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
 	// its terminal store write. Thirty seconds leaves margin for a live owner;
@@ -42,7 +32,7 @@ const (
 type replyWakeDelivery struct {
 	sink  events.Sink
 	rules []db.EventRule
-	ready func(context.Context, string) (string, error)
+	ready func(context.Context, string) (messageRecipientStatus, error)
 	// ownerGram, when set, delivers wakes addressed to the owner role as Herdr
 	// Grams instead of through rules and panes (owner_gram.go).
 	ownerGram ownerGramSender
@@ -52,11 +42,8 @@ type replyWakeDeliveryResolver func(context.Context) (replyWakeDelivery, error)
 
 type replyWakeOutboxHealth struct {
 	pending int
-	// held counts deliverable rows still inside their coalescing hold. They are
-	// SEPARATE from pending because they are waiting BY DESIGN, and with a
-	// 300s default hold nearly every tick observes one (#1978/#1979). Counting
-	// them as an outstanding obligation turned "drain unhealthy" from a real
-	// diagnostic into a line the daemon prints most minutes.
+	// held counts deliverable rows waiting for a working recipient's deadline.
+	// Unsafe or unavailable recipients remain pending, not deliberately held.
 	held  int
 	inert int
 	// routeRemoved means a durable tombstone proves that a matching rule was
@@ -97,23 +84,8 @@ type wakeOutboxStore interface {
 	AddJobEventIfAbsent(ctx context.Context, event db.JobEvent) error
 }
 
-// wakeOutboxRowHold is the coalescing hold that applies to one pending row.
-//
-// REVIEW RESULTS SKIP THE HOLD (owner decision 2026-10-08). An awaited-fact row
-// whose fact is a review verdict is the answer a seat is blocked on, so holding
-// it for [org].wake_coalesce_hold only added up to five minutes to every
-// review round trip. Every other kind keeps the configured hold unchanged.
-//
-// The exemption covers every lifecycle state of the fact, including a failed,
-// blocked, or cancelled review, because the waiter must act on those too. One
-// consequence is deliberate: a failed-attempt wake is no longer held back in
-// case a later success of the same fact arrives within the hold. Such a pair
-// still reduces to one wake whenever both rows are pending at the same drain
-// (for example while the recipient is not ready), and a fact that becomes
-// satisfied still supersedes its still-pending failure rows in the store.
-// Measured on the live store before this change, the hold had absorbed a
-// failure wake within five minutes at most 4 times in two months of
-// review-fact traffic.
+// Owner Gram batching retains its separate policy, including immediate review
+// results. Seat notifications instead use recipient activity for every source.
 func wakeOutboxRowHold(row db.WakeOutboxObligation, hold time.Duration) time.Duration {
 	if isReviewResultWake(row) {
 		return 0
@@ -131,6 +103,22 @@ func isReviewResultWake(row db.WakeOutboxObligation) bool {
 		return false
 	}
 	return payload.SubjectKind == db.AwaitedFactSubjectReviewVerdict
+}
+
+func wakeOutboxGroupKey(entry db.WakeOutboxObligation) (string, error) {
+	key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
+	if entry.SourceKind == db.WakeOutboxSourceWorkflowNote &&
+		strings.HasPrefix(strings.ToLower(entry.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
+		key += "\x00" + entry.SourceID + "\x00" + entry.DirectivePhase
+	}
+	if entry.SourceKind == db.WakeOutboxSourceAwaitedFact {
+		var payload db.AwaitedFactWakePayload
+		if err := json.Unmarshal([]byte(entry.SourceID), &payload); err != nil {
+			return "", fmt.Errorf("decode awaited fact wake outbox group for row %d: %w", entry.ID, err)
+		}
+		key += fmt.Sprintf("\x00fact:%d", payload.ID)
+	}
+	return key, nil
 }
 
 // drainReplyWakeOutboxWithHealth is a store-global daemon operation. It
@@ -207,7 +195,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 					rest = append(rest, entry)
 				}
 			}
-			claimed, err := deliverOwnerGram(ctx, store, delivery, ownerRows, now, hold)
+			claimed, err := deliverOwnerGram(ctx, store, delivery, ownerRows, now, ownerGramCoalescingWindow)
 			if claimed {
 				mutated = true
 			}
@@ -220,23 +208,9 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 
 	groups := make(map[string][]db.WakeOutboxObligation)
 	for _, entry := range pending {
-		key := strings.ToLower(strings.TrimSpace(entry.TargetRole)) + "\x00" + entry.CoalesceKey
-		if entry.SourceKind == db.WakeOutboxSourceWorkflowNote &&
-			strings.HasPrefix(strings.ToLower(entry.CoalesceKey), db.WakeOutboxDirectiveCoalescePrefix) {
-			// A directive prompt names exactly one obligation and command. Never
-			// let role-level coalescing mark another directive delivered unseen.
-			key += "\x00" + entry.SourceID + "\x00" + entry.DirectivePhase
-		}
-		if entry.SourceKind == db.WakeOutboxSourceAwaitedFact {
-			var payload db.AwaitedFactWakePayload
-			if err := json.Unmarshal([]byte(entry.SourceID), &payload); err != nil {
-				return replyWakeOutboxHealth{}, fmt.Errorf("decode awaited fact wake outbox group for row %d: %w", entry.ID, err)
-			}
-			// Each awaited fact is its own obligation stream. Mixing distinct
-			// facts can truncate one action from the only prompt that carries it;
-			// keeping every lifecycle of one fact together also lets a later
-			// success suppress its earlier failed-attempt wake before delivery.
-			key += fmt.Sprintf("\x00fact:%d", payload.ID)
+		key, err := wakeOutboxGroupKey(entry)
+		if err != nil {
+			return replyWakeOutboxHealth{}, err
 		}
 		groups[key] = append(groups[key], entry)
 	}
@@ -251,20 +225,11 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 	sort.Strings(keys)
 	for _, key := range keys {
 		items := groups[key]
+		groupClaimed := false
 		for start := 0; start < len(items); {
-			startedAt, err := time.Parse(time.RFC3339Nano, items[start].CreatedAt)
+			startedAt, err := time.Parse(time.RFC3339Nano, items[0].CreatedAt)
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", items[start].ID, err)
-			}
-			// Review results skip the hold (owner decision 2026-10-08; see
-			// wakeOutboxRowHold). A group never mixes exempt and held rows:
-			// awaited-fact groups are keyed per fact, so every row in one shares
-			// the anchor's subject kind.
-			deadline := startedAt.Add(wakeOutboxRowHold(items[start], hold))
-			if now.UTC().Before(deadline) {
-				// Later rows for the same group cannot be due before its oldest
-				// row, so leave the whole tail pending for a future tick.
-				break
 			}
 			// EVERY DUE PENDING ROW FOR THIS KEY JOINS THE BATCH, capped only by
 			// replyWakeMaxCoalescedItems (#1978). The anchor's hold above has
@@ -293,9 +258,20 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			if delivery.sink == nil {
 				break
 			}
+			status := messageRecipientStatus{state: org.StateWorking}
+			if delivery.ready != nil {
+				status, err = delivery.ready(ctx, wakeRecipient(event))
+				if err != nil {
+					return replyWakeOutboxHealth{}, err
+				}
+			}
+			recipientHold := hold
+			if status.state == org.StateIdle || groupClaimed || status.reason != "" {
+				recipientHold = 0
+			}
 			matchingRules := matchingWakeRules(delivery.rules, event)
 			if batch[0].SourceKind == db.WakeOutboxSourceEvent {
-				batch, event, matchingRules, err = authorizedMessageEventBatch(delivery.rules, batch, event, now, hold)
+				batch, event, matchingRules, err = authorizedMessageEventBatch(delivery.rules, batch, event, now, recipientHold)
 				if err != nil {
 					return replyWakeOutboxHealth{}, err
 				}
@@ -318,22 +294,19 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 					ids = append(ids, entry.ID)
 				}
 			}
-			if delivery.ready != nil {
-				reason, err := delivery.ready(ctx, wakeRecipient(event))
-				if err != nil {
-					return replyWakeOutboxHealth{}, err
-				}
-				if reason != "" {
-					if recorder, ok := store.(interface {
-						DeferMessageNotifications(context.Context, []int64, string) error
-					}); ok {
-						if err := recorder.DeferMessageNotifications(ctx, ids, reason); err != nil {
-							return replyWakeOutboxHealth{}, err
-						}
+			if status.reason != "" {
+				if recorder, ok := store.(interface {
+					DeferMessageNotifications(context.Context, []int64, string) error
+				}); ok {
+					if err := recorder.DeferMessageNotifications(ctx, ids, status.reason); err != nil {
+						return replyWakeOutboxHealth{}, err
 					}
-					start = end
-					continue
 				}
+				start = end
+				continue
+			}
+			if now.UTC().Before(startedAt.Add(recipientHold)) {
+				break
 			}
 			// Generic batches keep their oldest row as the delivered survivor.
 			// A single-fact batch instead survives on its newest lifecycle row,
@@ -347,6 +320,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			}
 			if claimed {
 				mutated = true
+				groupClaimed = true
 				event.WakeOutboxIDs = ids
 				if err := emitReplyWakeOutboxEvent(ctx, delivery.sink, event, matchingRules); err != nil {
 					return replyWakeOutboxHealth{}, fmt.Errorf("emit claimed %s wake: %w", event.WakeKind, err)
@@ -419,6 +393,8 @@ func classifyWakeOutboxObligations(
 	ownerSpacingLoaded := false
 	routes := make([]db.EventRuleRoute, 0, len(obligations.Pending))
 	seenRoutes := make(map[string]struct{})
+	groupCreated := make(map[string]time.Time)
+	recipientStates := make(map[string]messageRecipientStatus)
 	for _, obligation := range obligations.Pending {
 		route, event, err := classifyPendingWakeRoute(delivery.rules, obligation, attemptedBefore)
 		if err != nil {
@@ -435,11 +411,34 @@ func classifyWakeOutboxObligations(
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
 			}
-			// A deliverable row inside its hold is WAITING, not outstanding: the
-			// next due tick delivers it, and with a 300s hold this is the normal
-			// state of the outbox rather than a fault (#1978). A hold-exempt
-			// review result is never waiting: it is due the moment it exists.
-			if rowHold := wakeOutboxRowHold(obligation, hold); rowHold > 0 && now.UTC().Before(createdAt.Add(rowHold)) {
+			rowHold := wakeOutboxRowHold(obligation, ownerGramCoalescingWindow)
+			if !isOwnerWake(obligation) || delivery.ownerGram == nil {
+				key, err := wakeOutboxGroupKey(obligation)
+				if err != nil {
+					return replyWakeOutboxHealth{}, err
+				}
+				if anchor, ok := groupCreated[key]; ok {
+					createdAt = anchor
+				} else {
+					groupCreated[key] = createdAt
+				}
+				rowHold = hold
+				if delivery.ready != nil {
+					recipient := wakeRecipient(event)
+					status, seen := recipientStates[recipient]
+					if !seen {
+						status, err = delivery.ready(ctx, recipient)
+						if err != nil {
+							return replyWakeOutboxHealth{}, err
+						}
+						recipientStates[recipient] = status
+					}
+					if status.state == org.StateIdle || status.reason != "" {
+						rowHold = 0
+					}
+				}
+			}
+			if rowHold > 0 && now.UTC().Before(createdAt.Add(rowHold)) {
 				health.held++
 				continue
 			}

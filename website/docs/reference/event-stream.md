@@ -220,20 +220,32 @@ legacy review wakes for the same recipient.
 Resolving it records an answer and receipt in its thread and notifies the actual
 requester. Historical requests without an identifiable requester use system
 provenance, not an invented target. Historical import creates no new wakes and
-preserves uncertain delivery evidence. The daemon holds each pending group
-for `[org].wake_coalesce_hold` (default `5m`) after its OLDEST row, then
-delivers every due pending row for
-that event kind and role as ONE wake, bounded at ten rows per wake, so a
-blocked event and a reply for the same role remain separate but two notes for
-the same role are one interrupt however far apart they arrived. The one row the
-wake names carries the delivery outcome; every row it collapses is recorded
-`superseded` with `coalesced into wake outbox row <id>`, so the suppressed
-wakes stay readable and countable rather than each reporting a delivery of its
-own.
-A review result (an awaited-fact wake for a review verdict, in any state)
-skips the hold and is delivered at the next drain; the daemon drains the
-outbox on its own loop, checking for new rows every five seconds and
-re-draining at least every thirty seconds, independent of repository sweeps.
+preserves uncertain delivery evidence. Working recipients batch notifications
+for 120 seconds from the oldest compatible queued item. Idle recipients have no
+batching delay; becoming idle releases a held batch on the next five-second
+drain tick. New arrivals do not restart the deadline. Review-result notifications
+use the same policy; `org.wake_coalesce_hold` is no longer supported.
+
+Compatible notifications share one wake, bounded at ten rows per wake.
+Different event kinds, directives and awaited facts retain their grouping
+boundaries. Collapsed rows carry an explicit `coalesced_into` relationship.
+Inbox, CLI and dashboard status follows the survivor's actual state, not an
+unconditional resolved status. Missing, invalid or cyclic historical links
+remain uncertain. Interrupt accounting still counts physical wakes only.
+
+Activity is checked every five seconds, independent of repository sweeps.
+Offline, unknown, unbound or unsafe recipients remain pending; runtime admission
+still protects drafts, dialogs and operator input. Manual inbox reads are
+immediate. Claude/Codex tool-return hooks use the working deadline; prompt-submit
+and Stop hooks release mail at idle boundaries. Owner Grams retain their separate
+five-minute batching policy and immediate review-result handling.
+
+Writable and read-only database handles initialize connection-local SQLite
+settings on every physical connection, including replacements after cancellation.
+Replies reserve the writer before reading their parent, so brief contention
+waits instead of failing a read-to-write upgrade. Known notification outcomes
+use bounded bookkeeping retries without resending transport. An uncertain
+message insertion is not automatically replayed.
 
 The owner role has no pane or seat. The daemon's drain therefore delivers every
 due wake addressed to `owner` (needs-attention escalations, blocked events,

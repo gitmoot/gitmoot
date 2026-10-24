@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -132,8 +133,12 @@ func TestMessagePendingClaimShowsOwnMailOnceAndLeavesOtherRoles(t *testing.T) {
 		}
 	}
 
-	// Mail that arrives mid-turn is claimed by the next tool boundary, alone.
+	// Mid-turn mail waits for its deadline before a tool boundary claims it.
 	third := sendTestMessage(t, home, "jarvis", "deimos", "One more thing.")
+	originalNow := turnHookNow
+	due := time.Now().UTC().Add(2*time.Minute + time.Second)
+	turnHookNow = func() time.Time { return due }
+	t.Cleanup(func() { turnHookNow = originalNow })
 	stdout, _ = runTurnHook(t, home, "deimos", "claude", "PostToolUse",
 		`{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Bash"}`)
 	output = decodeTurnHookOutput(t, stdout)
@@ -269,7 +274,7 @@ func TestMessagePendingBoundsOneInjectionAndKeepsTheRestPending(t *testing.T) {
 	if !strings.Contains(text, "More mail is waiting") || strings.Contains(text, fmt.Sprintf("message %d ", ids[turnHookMaxItems])) {
 		t.Fatalf("first injection not bounded:\n%s", text)
 	}
-	stdout, _ = runTurnHook(t, home, "deimos", "claude", "PostToolUse", `{"hook_event_name":"PostToolUse"}`)
+	stdout, _ = runTurnHook(t, home, "deimos", "claude", "UserPromptSubmit", `{"hook_event_name":"UserPromptSubmit"}`)
 	text = decodeTurnHookOutput(t, stdout).HookSpecificOutput.AdditionalContext
 	for _, id := range ids[turnHookMaxItems:] {
 		if !strings.Contains(text, fmt.Sprintf("message %d ", id)) {

@@ -31,6 +31,12 @@ func (s *Store) DeferAttemptedWakeOutbox(ctx context.Context, ids []int64, reaso
 	}
 	writeCtx, cancel := s.durableWriteContext(ctx, 2)
 	defer cancel()
+	return retryNotificationWrite(writeCtx, func() error {
+		return s.deferAttemptedWakeOutboxOnce(writeCtx, ids, reason, at)
+	})
+}
+
+func (s *Store) deferAttemptedWakeOutboxOnce(writeCtx context.Context, ids []int64, reason string, at time.Time) error {
 	tx, err := s.db.BeginTx(writeCtx, nil)
 	if err != nil {
 		return err
@@ -38,7 +44,7 @@ func (s *Store) DeferAttemptedWakeOutbox(ctx context.Context, ids []int64, reaso
 	defer tx.Rollback()
 	query, args, err := wakeOutboxIDUpdateStamps(`
 UPDATE wake_outbox
-SET state = 'pending', last_error = ?, attempted_at = NULL, finished_at = NULL,
+SET state = 'pending', coalesced_into = NULL, last_error = ?, attempted_at = NULL, finished_at = NULL,
 	attempt_count = attempt_count - 1, updated_at = ?
 WHERE state = 'attempted' AND attempt_count > 0 AND id IN (`, ids, at, 1, strings.TrimSpace(reason))
 	if err != nil {
@@ -48,4 +54,31 @@ WHERE state = 'attempted' AND attempt_count > 0 AND id IN (`, ids, at, 1, string
 		return err
 	}
 	return tx.Commit()
+}
+
+// Retry only SQLite BUSY outcomes: the statement/transaction did not commit.
+// The caller owns one absolute durability budget for all attempts. No transport
+// operation belongs inside this callback, and ambiguous I/O/commit errors are
+// deliberately not replayed.
+func retryNotificationWrite(ctx context.Context, write func() error) error {
+	for attempt := 0; ; {
+		err := write()
+		if err == nil {
+			return nil
+		}
+		var sqliteErr interface{ Code() int }
+		if !errors.As(err, &sqliteErr) || sqliteErr.Code()&0xff != 5 {
+			return err
+		}
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), err)
+		}
+		seqConflictBackoff(attempt)
+		if attempt < 6 {
+			attempt++
+		}
+		if ctx.Err() != nil {
+			return errors.Join(ctx.Err(), err)
+		}
+	}
 }

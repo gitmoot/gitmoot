@@ -191,7 +191,7 @@ func insertWorkflowNoteWakeOutboxTx(ctx context.Context, tx *sql.Tx, noteID int6
 func supersedeDirectiveWakeOutboxTx(ctx context.Context, tx *sql.Tx, directiveID int64, receiptKind string) error {
 	_, err := tx.ExecContext(ctx, `
 UPDATE wake_outbox
-SET state = 'superseded',
+SET state = 'superseded', coalesced_into = NULL,
 	last_error = ?,
 	finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
 	updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -300,6 +300,7 @@ INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(source_kind, source_id, target_role) DO UPDATE SET
 	state = 'pending',
+	coalesced_into = NULL,
 	coalesce_key = excluded.coalesce_key,
 	attempt_count = 0,
 	last_error = '',
@@ -690,9 +691,9 @@ WHERE state = 'attempted' AND attempted_at IS NOT NULL AND attempted_at <= ?
 		}
 		result, err := tx.ExecContext(writeCtx, `
 UPDATE wake_outbox
-SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+SET state = ?, last_error = ?, coalesced_into = NULLIF(?, 0), finished_at = ?, updated_at = ?
 WHERE id = ? AND state = 'attempted' AND attempted_at <= ?`,
-			state, rowDetail, stamp, stamp, entry.ID,
+			state, rowDetail, survivor, stamp, stamp, entry.ID,
 			attemptedBefore.UTC().Format(BlockedEpisodeTimeLayout))
 		if err != nil {
 			return nil, err
@@ -763,7 +764,7 @@ func (s *Store) ClaimWakeOutbox(ctx context.Context, surviving int64, coalesced 
 	ids = append(ids, coalesced...)
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
-SET state = 'attempted', attempt_count = attempt_count + 1,
+SET state = 'attempted', coalesced_into = NULL, attempt_count = attempt_count + 1,
 	attempted_at = ?, finished_at = NULL, last_error = '', updated_at = ?
 WHERE state = 'pending' AND id IN (`, ids, at)
 	if err != nil {
@@ -850,7 +851,7 @@ RETURNING attempt_count, target_role`,
 	if attempts < retryBudget {
 		query, args, err := wakeOutboxIDUpdateStamps(`
 UPDATE wake_outbox
-SET state = 'pending', last_error = ?, attempted_at = NULL, finished_at = NULL,
+SET state = 'pending', coalesced_into = NULL, last_error = ?, attempted_at = NULL, finished_at = NULL,
 	updated_at = ?
 WHERE state = 'attempted' AND id IN (`, ids, at, 1, strings.TrimSpace(cause))
 		if err != nil {
@@ -866,7 +867,7 @@ WHERE state = 'attempted' AND id IN (`, ids, at, 1, strings.TrimSpace(cause))
 	}
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
-SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+SET state = ?, coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
 WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(cause))
 	if err != nil {
 		return false, attempts, err
@@ -933,6 +934,18 @@ func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail
 	if !ok || interpretation == wakeOutboxStatePendingObligation || interpretation == wakeOutboxStateAgedAttemptObligation {
 		return fmt.Errorf("invalid terminal wake outbox state %q", state)
 	}
+	acquisitions := 1
+	if state == WakeOutboxStateDelivered && len(ids) > 1 {
+		acquisitions = 2
+	}
+	writeCtx, cancel := s.durableWriteContext(ctx, acquisitions)
+	defer cancel()
+	return retryNotificationWrite(writeCtx, func() error {
+		return s.finishWakeOutboxOnce(writeCtx, ids, state, detail, at)
+	})
+}
+
+func (s *Store) finishWakeOutboxOnce(writeCtx context.Context, ids []int64, state, detail string, at time.Time) error {
 	if state == WakeOutboxStateDelivered && len(ids) > 1 {
 		// ONE TRANSACTION, for two independent reasons that happen to share a
 		// remedy (#1911).
@@ -946,14 +959,12 @@ func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail
 		// DurableWriteBudget covers one. A transaction takes the lock at its
 		// first write and holds it to COMMIT, so the contended waits are the
 		// first statement and the commit rather than one per statement.
-		writeCtx, cancel := s.durableWriteContext(ctx, 2)
-		defer cancel()
 		tx, err := s.db.BeginTx(writeCtx, nil)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		if err := finishWakeOutboxRowsTx(writeCtx, tx, ids[1:], WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(ids[0]), at); err != nil {
+		if err := finishWakeOutboxRowsExec(writeCtx, tx, ids[1:], WakeOutboxStateSuperseded, WakeOutboxCoalescedDetail(ids[0]), at, ids[0]); err != nil {
 			return err
 		}
 		if err := finishWakeOutboxRowsTx(writeCtx, tx, ids[:1], state, detail, at); err != nil {
@@ -961,17 +972,11 @@ func (s *Store) FinishWakeOutbox(ctx context.Context, ids []int64, state, detail
 		}
 		return tx.Commit()
 	}
-	return s.finishWakeOutboxRows(ctx, ids, state, detail, at)
-}
-
-func (s *Store) finishWakeOutboxRows(ctx context.Context, ids []int64, state, detail string, at time.Time) error {
-	writeCtx, cancel := s.durableWriteContext(ctx, 1)
-	defer cancel()
-	return finishWakeOutboxRowsExec(writeCtx, s.db, ids, state, detail, at)
+	return finishWakeOutboxRowsExec(writeCtx, s.db, ids, state, detail, at, 0)
 }
 
 func finishWakeOutboxRowsTx(ctx context.Context, tx *sql.Tx, ids []int64, state, detail string, at time.Time) error {
-	return finishWakeOutboxRowsExec(ctx, tx, ids, state, detail, at)
+	return finishWakeOutboxRowsExec(ctx, tx, ids, state, detail, at, 0)
 }
 
 // wakeOutboxExecer is the shared shape of *sql.DB and *sql.Tx, so the finish
@@ -980,11 +985,11 @@ type wakeOutboxExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func finishWakeOutboxRowsExec(ctx context.Context, execer wakeOutboxExecer, ids []int64, state, detail string, at time.Time) error {
+func finishWakeOutboxRowsExec(ctx context.Context, execer wakeOutboxExecer, ids []int64, state, detail string, at time.Time, coalescedInto int64) error {
 	query, args, err := wakeOutboxIDUpdate(`
 UPDATE wake_outbox
-SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
-WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(detail))
+SET state = ?, last_error = ?, coalesced_into = NULLIF(CAST(? AS INTEGER), 0), finished_at = ?, updated_at = ?
+WHERE state = 'attempted' AND id IN (`, ids, at, state, strings.TrimSpace(detail), strconv.FormatInt(coalescedInto, 10))
 	if err != nil {
 		return err
 	}

@@ -130,3 +130,22 @@ func (c *Cockpit) ResolveNotificationTarget(ctx context.Context, binding string)
 	}
 	return NotificationTarget{Selector: selector, PaneID: agent.PaneID, Kind: agent.Agent}, true
 }
+
+// StableAgentBinding returns the unique local identity currently occupying a
+// verified pane. Neither a pane label nor a nameless registration is an identity.
+func (c *Cockpit) StableAgentBinding(ctx context.Context, paneID string) (string, error) {
+	agents, err := c.client.registeredAgents(ctx)
+	if err != nil {
+		return "", err
+	}
+	agent, ok := registeredAgentForBinding(agents, paneID)
+	if !ok || agent.Name == "" {
+		return "", fmt.Errorf("pane %q has no unique named local agent; register the agent before binding", paneID)
+	}
+	binding := "agent:" + agent.Name
+	named, ok := registeredAgentForBinding(agents, binding)
+	if !ok || named.PaneID != paneID {
+		return "", fmt.Errorf("agent name %q is ambiguous; binding unchanged", agent.Name)
+	}
+	return binding, nil
+}

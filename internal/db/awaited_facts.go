@@ -857,7 +857,7 @@ WHERE source_kind = ? AND state = ?`,
 	for _, id := range stale {
 		if _, err := tx.ExecContext(ctx, `
 UPDATE wake_outbox
-SET state = ?, last_error = ?, finished_at = ?, updated_at = ?
+SET state = ?, coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
 WHERE id = ? AND state = ?`,
 			WakeOutboxStateSuperseded, reason, stamp, stamp, id, WakeOutboxStatePending,
 		); err != nil {

@@ -8,19 +8,9 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-const (
-	// replyWakeDrainInterval is how often the dedicated drain loop checks the
-	// outbox for a new row. A review result skips the coalescing hold (owner
-	// decision 2026-10-08), so this interval, not the fleet sweep, bounds how
-	// long a seat waits for its verdict wake.
-	replyWakeDrainInterval = 5 * time.Second
-	// replyWakeDrainRecheckInterval bounds how long the loop goes without a full
-	// drain when no new row arrived. Held rows become due, deferred recipients
-	// become ready and attempted rows age without any insert, so they are picked
-	// up on this cadence. The cheap new-row check keeps the loop from repeating
-	// readiness probes (one Herdr snapshot per due group) every five seconds.
-	replyWakeDrainRecheckInterval = 30 * time.Second
-)
+// Recheck pending work even without inserts: a recipient becoming idle releases
+// its held batch. Empty outboxes return before any runtime probes.
+const replyWakeDrainInterval = 5 * time.Second
 
 // replyWakeDrainLoop is the daemon's ONLY wake outbox drainer. The drain used to
 // run at the head of every repository sweep, so a wake waited for the whole
@@ -32,10 +22,6 @@ type replyWakeDrainLoop struct {
 	worker  jobWorker
 	tracker *inflightJobTracker
 	stdout  io.Writer
-	recheck time.Duration
-
-	lastRowID int64
-	lastDrain time.Time
 }
 
 func newReplyWakeDrainLoop(store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer) *replyWakeDrainLoop {
@@ -44,26 +30,12 @@ func newReplyWakeDrainLoop(store *db.Store, worker jobWorker, tracker *inflightJ
 		worker:  worker,
 		tracker: tracker,
 		stdout:  stdout,
-		recheck: replyWakeDrainRecheckInterval,
 	}
 }
 
-// tick runs a full drain when a row was inserted since the last drain or the
-// recheck interval elapsed, and reports whether it drained. An unreadable
-// watermark always drains, so the drain's own health line reports the fault.
-func (l *replyWakeDrainLoop) tick(ctx context.Context, now time.Time) bool {
-	latest, err := l.store.LatestWakeOutboxID(ctx)
-	if err == nil && !l.lastDrain.IsZero() && latest == l.lastRowID && now.Sub(l.lastDrain) < l.recheck {
-		return false
-	}
+// tick observes recipient activity on every tick, not just after a new row.
+func (l *replyWakeDrainLoop) tick(ctx context.Context, now time.Time) {
 	runReplyWakeOutboxDrainOnce(ctx, l.store, l.worker, l.stdout, now, l.tracker)
-	l.lastDrain = now
-	// The watermark was read BEFORE the drain, so a row inserted while it ran
-	// still differs from lastRowID on the next tick.
-	if err == nil {
-		l.lastRowID = latest
-	}
-	return true
 }
 
 // startReplyWakeDrainLoop starts the single drain goroutine. It drains once

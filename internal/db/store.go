@@ -149,8 +149,48 @@ func OpenAlreadyMigrated(path string) (*Store, error) {
 	return openWritable(path)
 }
 
+// SQLite's busy handler and synchronous mode belong to a physical connection.
+// database/sql can replace that connection after cancellation even with a
+// one-connection pool; the driver must initialize every replacement.
+func sqliteConnectionDSN(path string, readOnly bool) (string, error) {
+	u := &url.URL{Scheme: "file", OmitHost: true, Path: path}
+	if strings.HasPrefix(path, "file:") {
+		var err error
+		u, err = url.Parse(path)
+		if err != nil {
+			return "", fmt.Errorf("parse sqlite URI: %w", err)
+		}
+	}
+	q := u.Query()
+	pragmas := q["_pragma"]
+	kept := pragmas[:0]
+	for _, pragma := range pragmas {
+		name := strings.TrimSpace(pragma)
+		if i := strings.IndexAny(name, "(= \t"); i >= 0 {
+			name = name[:i]
+		}
+		if strings.EqualFold(name, "busy_timeout") || (!readOnly && strings.EqualFold(name, "synchronous")) {
+			continue
+		}
+		kept = append(kept, pragma)
+	}
+	q["_pragma"] = append(kept, fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
+	if readOnly {
+		q.Set("mode", "ro")
+	} else {
+		// Preserve the existing NORMAL durability policy on every connection.
+		q.Add("_pragma", "synchronous(NORMAL)")
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
+}
+
 func openWritable(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn, err := sqliteConnectionDSN(path, false)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -165,17 +205,16 @@ func openWritable(path string) (*Store, error) {
 }
 
 func OpenReadOnly(path string) (*Store, error) {
-	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
+	dsn, err := sqliteConnectionDSN(path, true)
+	if err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if err := configureReadOnlySQLite(context.Background(), db); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -194,9 +233,6 @@ func (s *Store) DatabasePath() string {
 }
 
 func configureWritableSQLite(ctx context.Context, db *sql.DB) error {
-	if err := configureReadOnlySQLite(ctx, db); err != nil {
-		return err
-	}
 	// auto_vacuum must be selected before the first table is created. Fresh
 	// homes therefore start with the page metadata needed for bounded
 	// incremental reclaim. On an existing database created with NONE, SQLite
@@ -215,25 +251,6 @@ func configureWritableSQLite(ctx context.Context, db *sql.DB) error {
 	}
 	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL`); err != nil {
 		return fmt.Errorf("configure sqlite WAL: %w", err)
-	}
-	// synchronous=NORMAL is the WAL-recommended setting: it fsyncs only at WAL
-	// checkpoints instead of on every commit (the FULL default), making the
-	// per-item generation commits cheap. The bounded tradeoff is that an OS
-	// crash or power loss can lose transactions committed since the last WAL
-	// checkpoint (not merely the last commit); WAL still guarantees the database
-	// is never corrupted. This is safe for generation because resume regenerates
-	// any item whose commit did not survive. The wal_autocheckpoint default
-	// (1000 pages) is left in place so long-lived read connections do not let the
-	// WAL grow unbounded.
-	if _, err := db.ExecContext(ctx, `PRAGMA synchronous=NORMAL`); err != nil {
-		return fmt.Errorf("configure sqlite synchronous: %w", err)
-	}
-	return nil
-}
-
-func configureReadOnlySQLite(ctx context.Context, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout=%d`, sqliteBusyTimeoutMillis)); err != nil {
-		return fmt.Errorf("configure sqlite busy timeout: %w", err)
 	}
 	return nil
 }

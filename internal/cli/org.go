@@ -306,6 +306,16 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "org seat add: %v\n", err)
 		return 2
 	}
+	if pane.PaneID != "" {
+		bindingCtx, cancelBinding := context.WithTimeout(ctx, orgSeatExternalTimeout)
+		binding, err := cockpit.New(cockpit.Options{HerdrBin: "herdr"}).StableAgentBinding(bindingCtx, pane.PaneID)
+		cancelBinding()
+		if err != nil {
+			fmt.Fprintf(stderr, "org seat add: %v; leave the role unbound until registration is valid\n", err)
+			return 1
+		}
+		desired.Pane = binding
+	}
 	store, err := db.Open(paths.Database)
 	if err != nil {
 		fmt.Fprintf(stderr, "org seat add: open store: %v\n", err)
@@ -1179,6 +1189,7 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 type orgBriefOutput struct {
 	Role            string             `json:"role"`
 	Parent          string             `json:"parent,omitempty"`
+	PeerMessaging   string             `json:"peer_messaging"`
 	Pane            string             `json:"pane,omitempty"`
 	Children        []string           `json:"children"`
 	Path            []string           `json:"path"`
@@ -1296,6 +1307,8 @@ func runOrgBrief(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+const orgPeerMessaging = "Use gitmoot message send <role> \"text\" for peer conversation, message inbox on startup/resume, message show <id> to read, and message reply <id> \"text\" to reply. Include saved Gitmoot message IDs in handoffs. Queued is not submitted; submitted is not read or completed. Herdr prompts are for seat control, not replacement peer mail."
+
 func buildOrgBriefOutput(cfg config.OrgConfig, presence map[string]db.OrgRolePresence, role config.OrgRole, snapshot org.Snapshot, snapshotErr error) orgBriefOutput {
 	live := org.RoleLiveState{State: org.StateUnknown}
 	if snapshotErr != nil {
@@ -1313,7 +1326,8 @@ func buildOrgBriefOutput(cfg config.OrgConfig, presence map[string]db.OrgRolePre
 	row := presence[role.Name]
 	return orgBriefOutput{
 		Role: role.Name, Parent: role.Parent, Pane: role.Pane, Children: childNames, Path: cfg.Path(role.Name), Scope: role.Scope,
-		MergeRule: role.MergeRule, Model: role.Model, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
+		PeerMessaging: orgPeerMessaging,
+		MergeRule:     role.MergeRule, Model: role.Model, LastSeenAt: row.LastSeenAt, LastCommand: row.LastCommand,
 		ProviderState: live.State, ProviderDetail: live.Detail, ObservedAt: snapshot.ObservedAt, ProviderVersion: snapshot.ProviderVersion,
 	}
 }
@@ -1419,6 +1433,7 @@ func orgMissedWakeFlag(row orgStatusOutput) string {
 func printOrgBrief(w io.Writer, brief orgBriefOutput) {
 	fmt.Fprintf(w, "role: %s\n", brief.Role)
 	fmt.Fprintf(w, "parent: %s\n", dash(brief.Parent))
+	fmt.Fprintf(w, "peer_messaging: %s\n", brief.PeerMessaging)
 	fmt.Fprintf(w, "children: %s\n", dash(strings.Join(brief.Children, ", ")))
 	fmt.Fprintf(w, "path: %s\n", dash(strings.Join(brief.Path, " > ")))
 	fmt.Fprintf(w, "scope: %s\n", dash(strings.Join(brief.Scope, ", ")))

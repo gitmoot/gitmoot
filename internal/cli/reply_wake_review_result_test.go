@@ -12,9 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 )
 
-// Owner decision 2026-10-08: a review result skips [org].wake_coalesce_hold,
-// every other wake kind keeps it.
-
+// Review results share the recipient's working hold and idle release policy.
 func reviewResultWakeHarness(t *testing.T) (*db.Store, synchronousEventRuleTestSink, *fakeEventWake, string) {
 	t.Helper()
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})
@@ -57,45 +55,18 @@ func wakeOutboxRowsBySource(t *testing.T, store *db.Store, state string) map[str
 	return counts
 }
 
-func TestReviewResultWakeIsClaimedOnFirstDrainWhileNoteStaysHeld(t *testing.T) {
+func TestReviewResultUsesSameWorkingHoldAsMessages(t *testing.T) {
 	store, sink, wake, _ := reviewResultWakeHarness(t)
 	insertHeldNoteWake(t, store)
 	insertReviewResultWake(t, store)
-
-	health, err := drainReplyWakeOutboxWithHealth(
-		context.Background(), store, time.Now().UTC(), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink),
-	)
-	if err != nil {
-		t.Fatalf("drain: %v (health %s)", err, health)
-	}
-	if wake.promptCalls != 1 || !strings.Contains(wake.prompt, "acme/widget#46@head") {
-		t.Fatalf("review result wake = calls=%d prompt=%q, want one immediate wake for the verdict", wake.promptCalls, wake.prompt)
-	}
-	if delivered := wakeOutboxRowsBySource(t, store, db.WakeOutboxStateDelivered); delivered[db.WakeOutboxSourceAwaitedFact] != 1 || delivered[db.WakeOutboxSourceWorkflowNote] != 0 {
-		t.Fatalf("delivered rows by source = %v, want only the review result", delivered)
-	}
-	if pending := wakeOutboxRowsBySource(t, store, db.WakeOutboxStatePending); pending[db.WakeOutboxSourceWorkflowNote] != 1 {
-		t.Fatalf("pending rows by source = %v, want the workflow note still held", pending)
-	}
-	if health.held != 1 || health.pending != 0 {
-		t.Fatalf("health = %s, want only the note held", health)
-	}
-}
-
-func TestReviewResultWakeIsNotCountedHeld(t *testing.T) {
-	store, sink, _, _ := reviewResultWakeHarness(t)
-	insertHeldNoteWake(t, store)
-	insertReviewResultWake(t, store)
-
 	now := time.Now().UTC()
-	health, _ := wakeOutboxObligationHealth(
-		context.Background(), store, now.Add(-replyWakeAttemptedUnknownAfter), now,
-		replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink),
-	)
-	// The due review result is an outstanding obligation, not a row waiting by
-	// design; the note inside its hold is the only held row.
-	if health.held != 1 || health.pending != 1 {
-		t.Fatalf("health = %s, want held=1 (note) pending=1 (review result)", health)
+	health, err := drainReplyWakeOutboxWithHealth(context.Background(), store, now, replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
+	if err != nil || health.held != 2 || wake.promptCalls != 0 {
+		t.Fatalf("working recipient: health=%s prompts=%d err=%v", health, wake.promptCalls, err)
+	}
+	_, err = drainReplyWakeOutboxWithHealth(context.Background(), store, now.Add(2*time.Minute), replyWakeCoalescingWindow, replyWakeTestDeliveryResolver(sink))
+	if err != nil || wake.promptCalls != 2 {
+		t.Fatalf("due recipient: prompts=%d err=%v", wake.promptCalls, err)
 	}
 }
 
@@ -129,7 +100,7 @@ func TestConcurrentDrainsClaimReviewResultWakeOnce(t *testing.T) {
 		}
 		return replyWakeDelivery{sink: locked, rules: rules}, nil
 	}
-	now := time.Now().UTC()
+	now := time.Now().UTC().Add(2 * time.Minute)
 	var group sync.WaitGroup
 	for range 4 {
 		group.Add(1)
@@ -178,7 +149,7 @@ func TestReplyWakeOutboxDrainRunsOutsideRepoSweep(t *testing.T) {
 	if pending := wakeOutboxRowsBySource(t, store, db.WakeOutboxStatePending); pending[db.WakeOutboxSourceAwaitedFact] != 1 {
 		t.Fatalf("pending rows by source after the sweep = %v, want the review result untouched", pending)
 	}
-	if _, err := drainFleetReplyWakeOutbox(context.Background(), store, worker, time.Now().UTC()); err == nil {
+	if _, err := drainFleetReplyWakeOutbox(context.Background(), store, worker, time.Now().UTC().Add(2*time.Minute)); err == nil {
 		t.Fatal("standalone drain reported a malformed outbox row as healthy")
 	}
 	if delivered := wakeOutboxRowsBySource(t, store, db.WakeOutboxStateDelivered); delivered[db.WakeOutboxSourceAwaitedFact] != 1 {

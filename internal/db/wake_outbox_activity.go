@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"strings"
 	"time"
 )
 
@@ -27,7 +26,7 @@ type WakeOutboxActivity struct {
 // oldest first. An empty `since` window returns the whole table.
 func (s *Store) ListWakeOutboxActivity(ctx context.Context, since time.Time) ([]WakeOutboxActivity, error) {
 	query := `
-SELECT id, target_role, source_kind, coalesce_key, state, created_at, last_error
+SELECT id, target_role, source_kind, coalesce_key, state, created_at, coalesced_into IS NOT NULL
 FROM wake_outbox`
 	var args []any
 	if !since.IsZero() {
@@ -43,14 +42,12 @@ FROM wake_outbox`
 	activity := []WakeOutboxActivity{}
 	for rows.Next() {
 		var entry WakeOutboxActivity
-		var lastError string
 		if err := rows.Scan(
 			&entry.ID, &entry.TargetRole, &entry.SourceKind,
-			&entry.CoalesceKey, &entry.State, &entry.CreatedAt, &lastError,
+			&entry.CoalesceKey, &entry.State, &entry.CreatedAt, &entry.Collapsed,
 		); err != nil {
 			return nil, err
 		}
-		entry.Collapsed = strings.HasPrefix(lastError, wakeOutboxCoalescedPrefix)
 		activity = append(activity, entry)
 	}
 	return activity, rows.Err()
