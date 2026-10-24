@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -489,14 +490,40 @@ func TestCleanupReconcilesRemovedResourceAfterRetentionDisabled(t *testing.T) {
 	}
 	now = now.Add(2 * time.Minute)
 	engine.DelegationWorktrees = gitutil.NewHostClient(world.checkout)
+	raw, err := sql.Open("sqlite", world.paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(ctx, `
+CREATE TRIGGER fail_reconcile_lock_release
+BEFORE DELETE ON resource_locks
+WHEN OLD.owner_job_id LIKE 'cleanup-reconcile:%'
+BEGIN
+  SELECT RAISE(ABORT, 'injected checkout release failure');
+END;`); err != nil {
+		t.Fatal(err)
+	}
 	removed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, world.job.ID, now.Add(-72*time.Hour))
-	if err != nil || !removed {
-		t.Fatalf("accounting-only reconciliation was stranded by changed policy: removed=%t err=%v", removed, err)
+	if err == nil || !strings.Contains(err.Error(), "injected checkout release failure") {
+		t.Fatalf("accounting recovery hid checkout-lock release failure: removed=%t err=%v", removed, err)
 	}
 	resource := db.CleanupObligationResourceID(world.job.ID, world.path)
 	obligation, err := world.store.GetCleanupObligation(ctx, resource)
 	if err != nil || obligation.State != db.CleanupObligationRemoved {
 		t.Fatalf("unfinished ledger: %+v %v", obligation, err)
+	}
+	var lock db.ResourceLock
+	if err := raw.QueryRowContext(ctx, `SELECT resource_key, owner_job_id, owner_token
+FROM resource_locks WHERE owner_job_id = ?`, "cleanup-reconcile:"+world.job.ID).
+		Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken); err != nil {
+		t.Fatalf("failed release did not retain the checkout lock: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `DROP TRIGGER fail_reconcile_lock_release`); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := world.store.ReleaseResourceLock(ctx, lock.ResourceKey, lock.OwnerJobID, lock.OwnerToken); err != nil || !released {
+		t.Fatalf("release after fault cleared: released=%t err=%v", released, err)
 	}
 	if removed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, world.job.ID, now.Add(-72*time.Hour)); err != nil || removed {
 		t.Fatalf("completed episode counted twice: removed=%t err=%v", removed, err)

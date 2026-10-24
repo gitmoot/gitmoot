@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -93,11 +94,22 @@ func TestCleanupPublishesForBlockedPipelineAndRefusesLostArtifacts(t *testing.T)
 				if err := os.Remove(artifact); err != nil {
 					t.Fatal(err)
 				}
+				if err := os.WriteFile(filepath.Join(world.path, "result.txt"), []byte("diagnostic after artifact loss\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
 				if removed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, world.job.ID); err == nil || removed {
 					t.Fatalf("missing immutable artifact did not refuse cleanup: removed=%t err=%v", removed, err)
 				}
 				if _, err := os.Stat(world.path); err != nil {
 					t.Fatalf("preservation failure removed producer: %v", err)
+				}
+				job, err := world.store.GetJob(ctx, world.job.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				preserved, err := workflow.ParseJobPayload(job.Payload)
+				if err != nil || !strings.Contains(preserved.ReadOnlyWorktreeDiff, "+diagnostic after artifact loss\n") {
+					t.Fatalf("artifact failure prevented durable diff collection: %+v %v", preserved, err)
 				}
 				return
 			}

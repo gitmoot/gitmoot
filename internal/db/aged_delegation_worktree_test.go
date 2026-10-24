@@ -41,6 +41,7 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 		payload string
 		updated time.Time
 		events  []string
+		legacy  bool
 		want    bool
 	}{
 		{id: "aged-delegation", state: "succeeded", payload: wt("/wt/a", `"delegation_id":"d1"`), updated: old, want: true},
@@ -51,13 +52,14 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 		{id: "active-owner", state: "running", payload: wt("/wt/b", `"delegation_id":"d2b"`), updated: recent, want: false},
 		// has-cleanup already emitted a removal event -> excluded.
 		{id: "has-cleanup", state: "succeeded", payload: wt("/wt/d", `"delegation_id":"d3"`), updated: old, events: []string{"delegation_worktree_removed"}, want: false},
+		{id: "legacy-cleanup", state: "succeeded", payload: wt("/wt/legacy", `"delegation_id":"legacy"`), updated: old, events: []string{"delegation_worktree_removed"}, legacy: true, want: false},
 		{id: "no-worktree", state: "succeeded", payload: `{"delegation_id":"d4"}`, updated: old, want: false},
 		{id: "not-aged", state: "succeeded", payload: wt("/wt/g", `"delegation_id":"d5"`), updated: recent, want: false},
 		{id: "blocked-resumable", state: "blocked", payload: wt("/wt/h", `"delegation_id":"d6"`), updated: old, want: false},
 		// ordinary task worktree: no delegation_id and not read-only -> excluded.
 		{id: "ordinary-task", state: "succeeded", payload: wt("/wt/i", ""), updated: old, want: false},
-		// two aged terminal jobs sharing one worktree: neither owner is active or
-		// newer than cutoff, so BOTH are reclaim candidates (matches the old query).
+		// Selection discovers both aged terminal co-owners. The producer admission
+		// gate still refuses their overlapping paths; selection is not authorization.
 		{id: "shared-both-aged-1", state: "succeeded", payload: wt("/wt/s", `"delegation_id":"s1"`), updated: old, want: true},
 		{id: "shared-both-aged-2", state: "failed", payload: wt("/wt/s", `"delegation_id":"s2"`), updated: old, want: true},
 	}
@@ -87,6 +89,11 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 			}
 			if _, err := store.MarkCleanupObligationRemoved(ctx, s.id, payload.WorktreePath, now); err != nil {
 				t.Fatalf("record completed cleanup(%s): %v", s.id, err)
+			}
+		}
+		if s.legacy {
+			if _, err := store.db.ExecContext(ctx, `DELETE FROM cleanup_obligations WHERE owner_job_id = ?`, s.id); err != nil {
+				t.Fatalf("restore pre-obligation cleanup history(%s): %v", s.id, err)
 			}
 		}
 		if s.want {

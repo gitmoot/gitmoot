@@ -28,6 +28,10 @@ budget-dependent external cleanup.
 Aged cleanup uses the current generation's terminal clock, not later artifact
 publication. Older completion events cannot hide a replacement generation.
 Checkout contention defers cleanup without spending its failure budget.
+Inspection holds the exclusive lifecycle fence and needs a writable fence
+sidecar, even with a read-only database connection. Any other job naming the same
+workspace causes `path_referenced`, including aged terminal co-owners.
+Accounting recovery returns checkout-lock release errors rather than hiding them.
 
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:

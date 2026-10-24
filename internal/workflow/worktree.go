@@ -635,34 +635,6 @@ func isReadOnlyDelegationWorktree(jobType string, payload JobPayload) bool {
 		readOnlyDelegationAction(jobType)
 }
 
-func (e Engine) prepareDelegationCleanupObligation(ctx context.Context, jobID, jobType string, payload JobPayload) (bool, error) {
-	path := filepath.Clean(strings.TrimSpace(payload.WorktreePath))
-	home := filepath.Clean(strings.TrimSpace(e.Home))
-	if path == "." || path == "" {
-		return false, errors.New("cleanup path is unavailable")
-	}
-	obligation, err := e.Store.EnsureCleanupObligation(context.WithoutCancel(ctx), jobID, path, time.Now().UTC())
-	if err != nil {
-		return false, err
-	}
-	switch obligation.State {
-	case db.CleanupObligationQuarantined, db.CleanupObligationRemoved:
-		return false, nil
-	case db.CleanupObligationPending, db.CleanupObligationRetryable:
-		// Actuation is permitted only for these two non-terminal states.
-	default:
-		return false, fmt.Errorf("cleanup obligation %s has unsupported state %q", obligation.ResourceID, obligation.State)
-	}
-	validator := ValidateDelegationCleanupTarget
-	if e.cleanupTargetValidator != nil {
-		validator = e.cleanupTargetValidator
-	}
-	if err := validator(home, jobID, jobType, payload); err != nil {
-		return false, errors.Join(err, e.deferDelegationCleanupFailure(ctx, jobID, path, "identity", err))
-	}
-	return true, nil
-}
-
 // ValidateDelegationCleanupTarget independently derives the managed path for a
 // cleanup owner and resolves symlinks before accepting filesystem containment.
 func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPayload) error {
@@ -793,11 +765,6 @@ func (e Engine) deferDelegationCleanupFailure(ctx context.Context, jobID, path, 
 	return e.deferDelegationCleanupObligation(ctx, jobID, path, db.ClassifyCleanupObligationFailure(phase, err))
 }
 
-func (e Engine) markDelegationCleanupRemoved(ctx context.Context, jobID, path string) error {
-	_, err := e.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, time.Now().UTC())
-	return err
-}
-
 // cleanupReadOnlyDelegationWorktree disposes the detached worktree allocated for
 // a read-only delegation child once the child job is terminal. It is best-effort
 // and idempotent: a missing worktree (already removed on a prior advance, or
@@ -866,21 +833,6 @@ func (e Engine) cleanupImplementDelegationWorktree(ctx context.Context, jobID st
 	return err
 }
 
-// cleanupBlockedByLiveOwner reports whether the destructive implement-delegation
-// cleanup for jobID must be REFUSED because a live runtime worker could still be
-// writing to the worktree, and a short reason. It composes the two never-clobber
-// signals (#536): an active FOREIGN runtime-session lock (unexpired lease), and a
-// live process whose cwd is inside the worktree (the post-lease-expiry backstop).
-func (e Engine) cleanupBlockedByLiveOwner(ctx context.Context, jobID string, payload JobPayload) (bool, string) {
-	if active, reason := e.runtimeOwnerActive(ctx, jobID); active {
-		return true, fmt.Sprintf("runtime owner still active (%s)", reason)
-	}
-	if path := strings.TrimSpace(payload.WorktreePath); path != "" && e.worktreeHasLiveProcess(path) {
-		return true, fmt.Sprintf("a live process still has its cwd in worktree %s", path)
-	}
-	return false, ""
-}
-
 // recordCleanupSkippedOnce emits a delegation_worktree_cleanup_skipped event, but
 // at most once per preserve window (#536 finding 3): reclaimSkippedDelegationWorktrees
 // re-fires the cleanup every 1s tick for the whole lease duration while the owner
@@ -896,26 +848,6 @@ func (e Engine) recordCleanupSkippedOnce(ctx context.Context, jobID string, payl
 		JobID:   jobID,
 		Kind:    "delegation_worktree_cleanup_skipped",
 		Message: fmt.Sprintf("implement worktree %s cleanup skipped: %s", strings.TrimSpace(payload.WorktreePath), reason),
-	})
-}
-
-// recordReadOnlyCleanupSkippedOnce emits the reclaim-eligible
-// delegation_worktree_cleanup_skipped marker for a read-only worktree whose
-// terminal disposal FAILED transiently (lock contention / force-remove error). It
-// is the read-only twin of recordCleanupSkippedOnce: without it a bare
-// delegation_worktree_cleanup_failed is never re-selected (the reclaim SQL keys on
-// _skipped, and the advance-retry pass keys on advance markers), so the worktree
-// would leak. Deduped by lastCleanupOutcomeIsSkip so a persistently-failing removal
-// does not grow the event log without bound; a later delegation_worktree_removed
-// closes the window.
-func (e Engine) recordReadOnlyCleanupSkippedOnce(ctx context.Context, jobID string, path string, reason string) {
-	if e.lastCleanupOutcomeIsSkip(ctx, jobID) {
-		return
-	}
-	_ = e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{
-		JobID:   jobID,
-		Kind:    "delegation_worktree_cleanup_skipped",
-		Message: fmt.Sprintf("read-only worktree %s cleanup skipped: %s", strings.TrimSpace(path), reason),
 	})
 }
 
@@ -1404,67 +1336,10 @@ func parseStoredJobTime(value string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// implementLegBranchMayBeMerged reports whether a succeeded implement leg's
-// branch must be PRESERVED because a dependent integration step (#332) may still
-// merge it. A sibling delegation that lists this leg in its Deps consumes the
-// leg's branch after that leg succeeds, but only
-// until that consumer reaches a terminal state: once every consumer is terminal
-// the merge has already run (or failed terminally) and the branch can be torn
-// down (#478). cleanupConsumedImplementLegWorktrees re-fires this leg's cleanup
-// from the consumer's terminal advance so an integration-fed leg is reclaimed
-// rather than accumulating forever.
-//
-// Cleanup is DESTRUCTIVE (git branch -D + force worktree removal), so on any
-// uncertainty it fails safe by returning true (preserve): a missing/unreadable
-// parent result, a not-yet-dispatched consumer, or an inability to read consumer
-// job states all mean "cannot prove the branch is unneeded". It returns false
-// (safe to clean) only when the parent result was read AND either no sibling
-// lists this leg in its Deps or every such consumer is terminal.
-func (e Engine) implementLegBranchMayBeMerged(ctx context.Context, payload JobPayload) bool {
-	parentID := strings.TrimSpace(payload.ParentJobID)
-	if parentID == "" {
-		return false
-	}
-	_, parentPayload, err := e.jobPayload(ctx, parentID)
-	if err != nil || parentPayload.Result == nil {
-		return true // cannot determine -> preserve (destructive op fails safe)
-	}
-	legID := strings.TrimSpace(payload.DelegationID)
-	var consumerIDs []string
-	for _, sib := range parentPayload.Result.Delegations {
-		for _, dep := range sib.Deps {
-			if strings.TrimSpace(dep) == legID {
-				consumerIDs = append(consumerIDs, strings.TrimSpace(sib.ID))
-				break
-			}
-		}
-	}
-	if len(consumerIDs) == 0 {
-		return false // no integration consumer -> always safe to clean
-	}
-	children, err := e.childDelegationJobs(ctx, parentID)
-	if err != nil {
-		return true // cannot read consumer job states -> preserve
-	}
-	for _, consumerID := range consumerIDs {
-		consumer, ok := children[consumerID]
-		if !ok || !IsSettledJobState(consumer.State) {
-			return true // consumer not yet dispatched or still running -> preserve
-		}
-	}
-	return false // every consumer is terminal: the merge is done -> clean the leg
-}
-
-// cleanupConsumedImplementLegWorktrees tears down the per-delegation worktrees
-// and branches of the implement legs that THIS now-terminal integration step
-// consumed via its Deps (#332/#478). A leg's own terminal advance preserves its
-// branch while a consumer is still pending/running (implementLegBranchMayBeMerged),
-// and the merge gate only cleans the task worktree, so without this nothing would
-// ever reclaim an integration-fed leg and its gitmoot-delegation-* branch and
-// worktree would accumulate forever after the tree finished. It re-runs each
-// leg's cleanup, whose #332 guard now observes this consumer terminal and (absent
-// another live consumer) proceeds. It is idempotent for already-cleaned legs and
-// fails closed when durable cleanup accounting cannot be persisted.
+// cleanupConsumedImplementLegWorktrees rechecks producers after an integration
+// step advances. The shared cleanup gate retains their worktrees and branches
+// until all declared consumers succeed, including consumers not yet dispatched.
+// Already-cleaned resources are idempotent; accounting failures remain errors.
 func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payload JobPayload) error {
 	parentID := strings.TrimSpace(payload.ParentJobID)
 	deps := compactStrings(payload.Deps)

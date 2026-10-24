@@ -2,8 +2,11 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -53,10 +56,6 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 			payload := JobPayload{Repo: "owner/repo", ParentJobID: parent, DelegationID: "produce",
 				WorktreePath: path, Branch: branch, Result: &AgentResult{Decision: "implemented", Summary: "producer result"}}
 			insertCompletedJob(t, store, db.Job{ID: producer, Agent: "producer", Type: "implement", ParentJobID: parent, DelegationID: "produce"}, payload)
-			insertCompletedJob(t, store, db.Job{ID: consumer, Agent: "consumer", Type: "review", ParentJobID: parent, DelegationID: "integrate"}, JobPayload{
-				Repo: "owner/repo", ParentJobID: parent, DelegationID: "integrate", Deps: []string{"produce"},
-				Result: &AgentResult{Decision: "approved"},
-			})
 			cleanup := func() {
 				t.Helper()
 				var err error
@@ -69,11 +68,8 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			for _, state := range []JobState{JobBlocked, JobQueued} {
-				if err := store.UpdateJobState(ctx, consumer, string(state)); err != nil {
-					t.Fatal(err)
-				}
-				cleanup()
+			assertRetained := func(state string) {
+				t.Helper()
 				data, err := os.ReadFile(filepath.Join(path, "result.txt"))
 				if err != nil || string(data) != "producer result\n" {
 					t.Fatalf("%s consumer lost producer contents: %q, %v", state, data, err)
@@ -81,6 +77,22 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 				if exists, err := manager.BranchExists(ctx, branch); err != nil || !exists {
 					t.Fatalf("%s consumer lost producer branch: exists=%v err=%v", state, exists, err)
 				}
+			}
+			cleanup()
+			assertRetained("undispatched")
+			if _, err := store.GetJob(ctx, consumer); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("cleanup changed the undispatched consumer: %v", err)
+			}
+			insertCompletedJob(t, store, db.Job{ID: consumer, Agent: "consumer", Type: "review", ParentJobID: parent, DelegationID: "integrate"}, JobPayload{
+				Repo: "owner/repo", ParentJobID: parent, DelegationID: "integrate", Deps: []string{"produce"},
+				Result: &AgentResult{Decision: "approved"},
+			})
+			for _, state := range []JobState{JobBlocked, JobQueued} {
+				if err := store.UpdateJobState(ctx, consumer, string(state)); err != nil {
+					t.Fatal(err)
+				}
+				cleanup()
+				assertRetained(string(state))
 			}
 			if err := store.UpdateJobState(ctx, consumer, string(JobSucceeded)); err != nil {
 				t.Fatal(err)
@@ -92,6 +104,70 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 			if exists, err := manager.BranchExists(ctx, branch); err != nil || exists {
 				t.Fatalf("completed consumer should release producer branch: exists=%v err=%v", exists, err)
 			}
+		})
+	}
+}
+
+func TestCleanupRefusesUnreadableRuntimeOwner(t *testing.T) {
+	for _, aged := range []bool{false, true} {
+		name := "ordinary"
+		if aged {
+			name = "aged"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			world := newProducerCleanupFixture(t, false)
+			policy := CleanupPolicy{}
+			if aged {
+				policy = CleanupPolicy{Mode: "aged", cutoff: time.Now().Add(time.Hour)}
+			}
+			decision, err := world.engine.InspectProducerCleanup(ctx, world.jobID, policy)
+			if err != nil || !decision.Eligible {
+				t.Fatalf("healthy owner is not eligible: %+v %v", decision, err)
+			}
+			raw, err := sql.Open("sqlite", world.store.DatabasePath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = raw.Close() })
+			key, token := db.RuntimeSessionLockKeyPrefix+"cleanup-query-fault", "owner-token"
+			acquired, err := world.store.AcquireResourceLock(ctx, db.ResourceLock{
+				ResourceKey: key, OwnerJobID: world.jobID, OwnerToken: token,
+				ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+			}, time.Now().UTC())
+			if err != nil || !acquired {
+				t.Fatalf("runtime lock fixture: acquired=%t err=%v", acquired, err)
+			}
+			// SQLite accepts a text value in this INTEGER column, but the runtime
+			// liveness query cannot scan it into the PID. Other store paths work.
+			if _, err := raw.ExecContext(ctx, `UPDATE resource_locks SET owner_pid = 'unreadable' WHERE resource_key = ?`, key); err != nil {
+				t.Fatal(err)
+			}
+			decision, err = world.engine.InspectProducerCleanup(ctx, world.jobID, policy)
+			if err != nil || decision.Eligible || !slices.Contains(decision.ReasonCodes, "runtime_owner_unknown") {
+				t.Fatalf("unreadable runtime owner was not refused: %+v %v", decision, err)
+			}
+			cleanup := func() {
+				t.Helper()
+				var err error
+				if aged {
+					_, err = world.engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, world.jobID, policy.cutoff)
+				} else {
+					err = world.engine.cleanupImplementDelegationWorktree(ctx, world.jobID, "implement", world.payload)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			cleanup()
+			world.assertPreserved(t)
+			if released, err := world.store.ReleaseResourceLock(ctx, key, world.jobID, token); err != nil || !released {
+				t.Fatalf("clear runtime fault: released=%t err=%v", released, err)
+			}
+			now := time.Now().Add(2 * time.Minute)
+			world.engine.Now = func() time.Time { return now }
+			cleanup()
+			world.assertRemoved(t)
 		})
 	}
 }

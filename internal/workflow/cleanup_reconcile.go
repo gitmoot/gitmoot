@@ -16,11 +16,10 @@ import (
 // recovery before consulting current deletion policy. It never deletes a path
 // or branch. A replacement lifecycle owns its remaining resources; an old token
 // can close that old episode only as superseded, not as a successful removal.
-func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, token string) (CleanupApplyResult, bool, error) {
-	result := CleanupApplyResult{SchemaVersion: 1, State: "refused"}
+func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, token string) (result CleanupApplyResult, handled bool, err error) {
+	result = CleanupApplyResult{SchemaVersion: 1, State: "refused"}
 	var receipt db.CleanupReceipt
 	var owner db.Job
-	var err error
 	if token != "" {
 		receipt, err = e.Store.CleanupReceiptForToken(ctx, token)
 	} else {
@@ -116,7 +115,9 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 	if err != nil {
 		return result, true, err
 	}
-	defer release(context.WithoutCancel(ctx))
+	defer func() {
+		err = errors.Join(err, release(context.WithoutCancel(ctx)))
+	}()
 	inspector, ok := e.DelegationWorktrees.(cleanupWorktreeInspector)
 	if !ok {
 		return result, false, nil

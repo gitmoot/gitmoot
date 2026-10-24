@@ -57,7 +57,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		}
 	}()
 	reconciled, handled, reconcileErr := e.reconcileCleanupReceipt(ctx, jobID, resourceID, token)
-	if handled {
+	if handled || reconcileErr != nil {
 		return reconciled, reconcileErr
 	}
 	decision, payload, err := e.inspectProducerCleanup(ctx, jobID, policy, nil)

@@ -2557,6 +2557,16 @@ retention deadline where applicable, reason codes and an eligibility token.
 `eligible: false` is a normal inspection result; inspect exits zero unless the
 operation itself fails. Both owned implement and read-only worktrees use
 `resource_kind: "delegation_worktree"`. No arbitrary path argument is accepted.
+Inspection holds the database's exclusive lifecycle fence while reading Git and
+process state, so job lifecycle mutations wait for that snapshot. It creates no
+obligation or receipt, but requires write access to the fence sidecar beside the
+database, even with a read-only database connection. A read-only-mounted home is
+not supported.
+
+`path_referenced` refuses removal whenever another job names the same workspace,
+even if both owners are old and terminal. Aged selection only discovers
+candidates; it does not prove unique ownership. Investigate overlapping ownership
+instead of bypassing this refusal.
 
 Apply requires the same job, resource and token. It revalidates the shared
 ordinary/aged safety predicate under the lifecycle fence before removal and
@@ -2578,6 +2588,8 @@ Apply exits `0` for `removed`/`already_removed`, `3` for another completed
 decision, `1` for an operational error and `2` for invalid arguments. A prepared
 receipt is not a removal receipt until `removed_at` is set. Historical replay
 never reopens quarantine or grants deletion of the current generation.
+Checkout-lock release failures are operational errors, including during
+accounting-only recovery. Inspect the durable receipt before retrying.
 
 `approved_size_budget: null` explicitly means unknown. It does not authorize
 zero-byte or unlimited cleanup; consumers requiring a positive byte cap must

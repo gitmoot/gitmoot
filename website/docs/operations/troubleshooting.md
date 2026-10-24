@@ -636,6 +636,14 @@ Inspection is advisory. Apply derives the path from metadata and revalidates
 consumers, generation, policy, physical identity and liveness under the
 lifecycle fence, then the checkout lock. Retry/resume and enqueue use the same
 fence. No arbitrary path, orphan or shared-checkout deletion is supported.
+Inspect itself holds the same database's exclusive lifecycle fence while reading
+Git and process state; concurrent lifecycle mutations wait. It does not create
+obligations or receipts, but its fence sidecar must be writable. A read-only
+database connection does not make a read-only-mounted home supported.
+
+`path_referenced` retains a workspace named by any other job, including an old
+terminal owner. The aged selector can discover both owners without authorizing
+either removal. Investigate the ownership overlap; do not bypass the shared gate.
 
 Publication does not wait for deletion eligibility. Blocked downstream stages
 can receive their inputs while the producer workspace remains; required service
@@ -649,6 +657,9 @@ the same path. An unfinished historical episode replaced by retry becomes
 retention changes; remaining destructive effects still require fresh admission.
 Apply exits `0` for removed/already-removed, `3` for another completed decision,
 `1` for operational errors and `2` for invalid arguments.
+Accounting recovery also reports checkout-lock release failures as operational
+errors. Inspect the durable receipt to distinguish completed removal from
+unfinished accounting before retrying.
 
 `approved_size_budget: null` means unknown, never zero or unlimited. A consumer
 requiring a positive cap must remain ineligible. Do not substitute direct path

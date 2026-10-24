@@ -1478,6 +1478,14 @@ identity and liveness under a lifecycle fence shared with retry/resume and
 enqueue, before taking the checkout lock. No arbitrary path, shared-checkout
 or orphan deletion is supported. Existing `list` and operator-only `reopen`
 behavior is unchanged.
+Inspect itself holds the same database's exclusive lifecycle fence while reading
+Git and process state; concurrent lifecycle mutations wait. It does not create
+obligations or receipts, but its fence sidecar must be writable. A read-only
+database connection does not make a read-only-mounted home supported.
+
+`path_referenced` retains a workspace named by any other job, including an old
+terminal owner. The aged selector can discover both owners without authorizing
+either removal. Investigate the ownership overlap; do not bypass the shared gate.
 
 Terminal publication is independent of deletion: blocked downstream stages
 can receive their inputs while the workspace stays intact. Required service
@@ -1491,6 +1499,9 @@ returns `superseded`, not successful removal. Accounting-only reconciliation
 can finish after retention changes; any remaining destructive effects still
 need current admission. Apply exits `0` for removed/already-removed, `3` for
 another completed decision, `1` for operational errors and `2` for bad arguments.
+Accounting recovery also reports checkout-lock release failures as operational
+errors. Inspect the durable receipt to distinguish completed removal from
+unfinished accounting before retrying.
 
 `approved_size_budget: null` means unknown, not zero or unlimited. A
 budget-dependent external caller must remain ineligible until an enforced
