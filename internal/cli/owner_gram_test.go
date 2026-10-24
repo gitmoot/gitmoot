@@ -107,7 +107,7 @@ func TestOwnerReviewResultHealthMatchesImmediateDelivery(t *testing.T) {
 	gram := &fakeOwnerGram{result: ownerGramResult{Outcome: db.OwnerGramAccepted, GramID: "gram-review-46"}}
 	resolve := ownerGramResolver(store, sink, gram)
 	now := time.Now().UTC()
-	health, err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptTimeout), now, replyWakeCoalescingWindow, resolve)
+	health, err := wakeOutboxObligationHealth(ctx, store, now.Add(-replyWakeAttemptedUnknownAfter), now, replyWakeCoalescingWindow, resolve)
 	if err == nil || health.pending != 1 || health.held != 1 {
 		t.Fatalf("urgent review must be pending while ordinary alert is held: health=%+v err=%v", health, err)
 	}
