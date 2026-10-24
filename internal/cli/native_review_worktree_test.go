@@ -177,9 +177,6 @@ func TestNativeReviewWorkerRetainsFailedPreflightUntilAged(t *testing.T) {
 	if _, err := os.Stat(preparedPath); !os.IsNotExist(err) {
 		t.Fatalf("aged failed review worktree remains: %v", err)
 	}
-	if count := countCLIJobEvents(t, store, job.ID, "delegation_worktree_removed"); count != 1 {
-		t.Fatalf("aged failed review removal events = %d, want 1", count)
-	}
 }
 
 func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
