@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: 51649917eba3007f84ebcaeec27193019fe2ccc6
+  TARGET_SHA: 6c18b98c7469eddd7729ca2c8e4df0b4bba9ba2d
   GOTOOLCHAIN: local
   GOMAXPROCS: '2'
 

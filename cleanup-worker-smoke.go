@@ -62,6 +62,7 @@ func main() {
 	must(os.WriteFile(filepath.Join(checkout, "input.txt"), []byte("isolated producer input\n"), 0600))
 	git("add", "input.txt")
 	git("commit", "-m", "isolated fixture")
+	git("remote", "add", "origin", "https://github.com/owner/repo.git")
 	paths := config.PathsForHome(home)
 	must(config.Initialize(paths))
 	must(os.Setenv("GITMOOT_HOME", paths.Home))
