@@ -1,0 +1,126 @@
+name: Producer cleanup verification
+
+on:
+  push:
+    branches: [verify/2358-hosted]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: producer-cleanup-verification
+  cancel-in-progress: true
+
+env:
+  TARGET_SHA: 0ead5dd47a53546eec9ea37d8c8a9bdc1ae45c07
+  GOTOOLCHAIN: local
+  GOMAXPROCS: '2'
+
+jobs:
+  smoke:
+    name: Exact-head native CLI and daemon smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: instruments
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: source/go.sum
+      - name: Run real isolated processes as root
+        run: >-
+          sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
+          python3 instruments/verify.py source evidence smoke
+      - name: Export redacted portable receipts
+        if: always()
+        run: sudo -E python3 instruments/export.py evidence exported
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-native-smoke-${{ env.TARGET_SHA }}
+          path: exported
+          if-no-files-found: error
+          retention-days: 30
+
+  proofs:
+    name: Regression proofs (${{ matrix.package }}, ${{ matrix.base_name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [cli, db, workflow]
+        base_name: [original, corrections]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: instruments
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: source/go.sum
+      - name: Prove every changed test in this package
+        env:
+          PROOF_PACKAGE: ${{ matrix.package }}
+          PROOF_BASE: ${{ matrix.base_name }}
+        run: >-
+          sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
+          python3 instruments/verify.py source evidence proofs
+      - name: Export redacted portable receipts
+        if: always()
+        run: sudo -E python3 instruments/export.py evidence exported
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-proofs-${{ matrix.package }}-${{ matrix.base_name }}-${{ env.TARGET_SHA }}
+          path: exported
+          if-no-files-found: error
+          retention-days: 30
+
+  website:
+    name: Exact-head website build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: instruments
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/website/package-lock.json
+      - name: Build documentation without publishing
+        run: python3 instruments/verify.py source evidence website
+      - name: Export redacted portable receipts
+        if: always()
+        run: sudo -E python3 instruments/export.py evidence exported
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-website-${{ env.TARGET_SHA }}
+          path: exported
+          if-no-files-found: error
+          retention-days: 30
