@@ -37,8 +37,17 @@ type Message struct {
 }
 
 const messageSelect = `SELECT m.id,m.thread_id,COALESCE(m.reply_to,0),m.sender,m.recipient,m.body,
- n.workflow_id,n.created_at,COALESCE(w.state,CASE WHEN m.recipient='@system' THEN 'not_required' ELSE 'not_notified' END),
- m.kind,m.source_kind,m.source_id,m.historical,COALESCE(w.last_error,''),
+ n.workflow_id,n.created_at,
+ CASE WHEN w.id IS NULL THEN CASE WHEN m.recipient='@system' THEN 'not_required' ELSE 'not_notified' END
+ WHEN effective.id IS NULL OR (effective.state='superseded' AND effective.last_error LIKE 'coalesced into wake outbox row %')
+ THEN 'delivery_unknown' ELSE effective.state END,
+ m.kind,m.source_kind,m.source_id,m.historical,
+ CASE WHEN w.id IS NULL THEN ''
+ WHEN effective.id IS NULL OR (effective.state='superseded' AND effective.last_error LIKE 'coalesced into wake outbox row %')
+ THEN 'coalesced notification has an invalid or missing survivor; delivery uncertain'
+ WHEN w.state='superseded' AND w.coalesced_into IS NOT NULL
+ THEN 'coalesced into wake outbox row '||w.coalesced_into||CASE WHEN effective.last_error!='' THEN ': '||effective.last_error ELSE '' END
+ ELSE effective.last_error END,
  CASE root.kind
  WHEN 'directive' THEN CASE
  WHEN EXISTS(SELECT 1 FROM messages receipt JOIN workflow_notes r ON r.id=receipt.id WHERE receipt.thread_id=root.id AND receipt.kind='directive_receipt' AND r.body LIKE '[org:directive-done id='||root.id||' %') THEN 'completed'
@@ -49,7 +58,18 @@ const messageSelect = `SELECT m.id,m.thread_id,COALESCE(m.reply_to,0),m.sender,m
  ELSE '' END, m.source_payload
  FROM messages m JOIN messages root ON root.id=m.thread_id
  JOIN workflow_notes n ON n.id=m.id
- LEFT JOIN wake_outbox w ON w.source_kind=m.source_kind AND w.source_id=m.source_id AND w.target_role=m.recipient`
+ LEFT JOIN wake_outbox w ON w.source_kind=m.source_kind AND w.source_id=m.source_id AND w.target_role=m.recipient
+ LEFT JOIN wake_outbox effective ON effective.id = (
+ WITH RECURSIVE batch(id, state, coalesced_into) AS (
+   SELECT w.id, w.state, w.coalesced_into WHERE w.id IS NOT NULL
+   UNION
+   SELECT parent.id, parent.state, parent.coalesced_into
+   FROM batch JOIN wake_outbox parent ON parent.id=batch.coalesced_into
+   WHERE batch.state='superseded'
+     AND parent.target_role=w.target_role AND parent.coalesce_key=w.coalesce_key
+ )
+ SELECT id FROM batch WHERE state!='superseded' OR coalesced_into IS NULL LIMIT 1
+ )`
 
 func scanMessage(row interface{ Scan(...any) error }) (Message, error) {
 	var m Message
@@ -90,6 +110,12 @@ func (s *Store) CreateMessage(ctx context.Context, input Message) (Message, erro
 	}
 	defer tx.Rollback()
 	if input.ReplyTo > 0 {
+		// Reserve the writer before reading the parent. A read-first reply
+		// cannot wait safely when upgrading its SQLite snapshot to write.
+		// This changes no message content and never retries an insertion.
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET id=id WHERE id=?`, input.ReplyTo); err != nil {
+			return Message{}, fmt.Errorf("reserve message reply writer: %w", err)
+		}
 		parent, err := scanMessage(tx.QueryRowContext(ctx, messageSelect+` WHERE m.id=? AND (m.sender=? OR m.recipient=?)`, input.ReplyTo, input.Sender, input.Sender))
 		if err != nil {
 			return Message{}, fmt.Errorf("reply parent unavailable to this role: %w", err)

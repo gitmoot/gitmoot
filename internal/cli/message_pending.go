@@ -254,6 +254,10 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 	}
 	eligible := make([]db.WakeOutboxObligation, 0, len(obligations.Pending))
 	more := false
+	// A tool-return hook is inside a working turn. Prompt-submit and Stop
+	// hooks are idle boundaries, so they release mail without a batching wait.
+	working := request.event == turnHookPostToolUse
+	dueGroups := make(map[string]bool)
 	for _, row := range obligations.Pending {
 		if row.MessageID == 0 {
 			// Only mail the agent can open is shown; anything else stays with
@@ -267,6 +271,24 @@ func claimTurnHookRows(ctx context.Context, store *db.Store, role string, reques
 		}
 		if len(matchingWakeRules(rules, event)) == 0 {
 			continue
+		}
+		if working {
+			key, err := wakeOutboxGroupKey(row)
+			if err != nil {
+				return nil, false, err
+			}
+			due, seen := dueGroups[key]
+			if !seen {
+				createdAt, err := time.Parse(time.RFC3339Nano, row.CreatedAt)
+				if err != nil {
+					return nil, false, fmt.Errorf("parse notification %d creation time: %w", row.ID, err)
+				}
+				due = !now.Before(createdAt.Add(replyWakeCoalescingWindow))
+				dueGroups[key] = due
+			}
+			if !due {
+				continue
+			}
 		}
 		if len(eligible) == turnHookMaxItems {
 			more = true

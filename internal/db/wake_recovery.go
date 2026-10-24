@@ -67,7 +67,7 @@ func (s *Store) RecoverWakeOutbox(ctx context.Context, expected WakeOutboxEntry,
 		kind = "wake_recovery_retry"
 	}
 	now := time.Now().UTC().Format(BlockedEpisodeTimeLayout)
-	result, err := tx.ExecContext(ctx, `UPDATE wake_outbox SET state = ?, last_error = ?,
+	result, err := tx.ExecContext(ctx, `UPDATE wake_outbox SET state = ?, coalesced_into = NULL, last_error = ?,
  attempted_at = NULL, finished_at = CASE WHEN ? = 'pending' THEN NULL ELSE ? END, updated_at = ?
  WHERE id = ? AND state = ? AND last_error = ? AND updated_at = ?`,
 		state, "operator recovery: "+reason, state, now, now, expected.ID, expected.State, expected.LastError, expected.UpdatedAt)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMessageFailureRollsBackJournalAndNotification(t *testing.T) {
@@ -64,5 +65,34 @@ func TestMessageBodyCannotBecomeDirectiveAndReplyCannotRedirect(t *testing.T) {
 	}
 	if reply.Recipient != "one" || reply.ThreadID != message.ID || reply.ReplyTo != message.ID {
 		t.Fatalf("reply=%+v", reply)
+	}
+}
+
+func TestMessageReplyWaitsForConcurrentWriter(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	parent, err := store.CreateMessage(ctx, Message{Sender: "sender", Recipient: "worker", Body: "request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := holdWriteLock(t, store.DatabasePath(), 150*time.Millisecond)
+	defer released()
+	reply, err := store.CreateMessage(ctx, Message{Sender: "worker", ReplyTo: parent.ID, Body: "durable reply"})
+	if err != nil {
+		t.Fatalf("reply must wait for the competing writer without replay: %v", err)
+	}
+	got, err := store.GetMessage(ctx, reply.ID, "sender")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body != "durable reply" || got.Recipient != "sender" || got.ReplyTo != parent.ID || got.ThreadID != parent.ID || got.Status != "queued" {
+		t.Fatalf("reply lost its content, routing or queued notification: %+v", got)
+	}
+	var count int
+	if err := store.db.QueryRow(`SELECT count(*) FROM messages WHERE thread_id=?`, parent.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("thread has %d messages, want exactly one request and one reply", count)
 	}
 }

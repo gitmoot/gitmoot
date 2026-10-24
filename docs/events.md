@@ -226,20 +226,33 @@ requester. Historical requests without an identifiable requester use system
 provenance, not an invented target. Historical import creates no new wakes and
 preserves uncertain delivery evidence. Legacy self-addressed journal notes remain
 system notifications with their original body, not self-conversations; their
-existing delivery evidence is unchanged. The daemon holds each pending group
-for `[org].wake_coalesce_hold` (default `5m`) after its OLDEST row, then
-delivers every due pending row for
-that event kind and role as ONE wake, bounded at ten rows per wake, so a
-blocked event and a reply for the same role remain separate but two notes for
-the same role are one interrupt however far apart they arrived. The one row the
-wake names carries the delivery outcome; every row it collapses is recorded
-`superseded` with `coalesced into wake outbox row <id>`, so the suppressed
-wakes stay readable and countable rather than each reporting a delivery of its
-own.
-A review result (an awaited-fact wake for a review verdict, in any state)
-skips the hold and is delivered at the next drain; the daemon drains the
-outbox on its own loop, checking for new rows every five seconds and
-re-draining at least every thirty seconds, independent of repository sweeps.
+existing delivery evidence is unchanged. Working recipients batch notifications
+for 120 seconds from the oldest compatible queued item. Idle recipients have no
+batching delay; becoming idle releases a held batch on the next five-second
+drain tick. New arrivals do not restart the deadline. This policy includes
+review-result notifications and replaces `org.wake_coalesce_hold`.
+
+Compatible notifications share one wake, bounded at ten rows per wake.
+Different event kinds, directives and awaited facts retain their grouping
+boundaries. Each collapsed row records an explicit `coalesced_into` relationship.
+Inbox, CLI and dashboard status follows the survivor: submitted, uncertain or
+queued, never unconditional success merely because a row was collapsed.
+Missing, invalid or cyclic historical relationships remain uncertain.
+Physical interrupt accounting still counts one wake, not one per message.
+
+The daemon rechecks activity every five seconds, independent of repository
+sweeps. Offline, unknown, unbound or unsafe recipients stay pending. Runtime
+admission still protects drafts, dialogs and operator input. Manual inbox reads
+are immediate. Claude/Codex tool-return hooks use the working deadline;
+prompt-submit and Stop hooks release mail at idle boundaries. Owner Grams retain
+their separate five-minute batching policy and immediate review-result handling.
+
+Writable and read-only database handles initialize connection-local SQLite
+settings on every physical connection, including replacements after cancellation.
+Replies reserve the writer before reading their parent, so brief contention
+waits instead of failing a read-to-write upgrade. Known notification outcomes
+use bounded bookkeeping retries without resending transport. An uncertain
+message insertion is not automatically replayed.
 
 The owner role has no pane or seat. The daemon's drain therefore delivers every
 due wake addressed to `owner` (needs-attention escalations, blocked events,
@@ -354,6 +367,9 @@ does not change subscriptions or replay old notices. Missing, archived, remote
 or ambiguous names fail closed. Literal pane IDs and exact labels still work,
 but only when the resolved pane contains a registered agent; an abandoned
 shell is not a delivery target. The agent binding also drives org presence.
+`org seat add --pane ID_OR_LABEL` also validates the unique named local agent
+and persists its `agent:NAME` binding. Register the agent before adopting its
+pane; unregistered shells and duplicate agent names cannot capture delivery.
 
 Uncertain delivery does not increment missed-wake counters.
 

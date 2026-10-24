@@ -3,6 +3,8 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -308,4 +310,117 @@ VALUES ('workflow_note', ?, 'worker', 'reply:worker', ?, 1, ?, ?, `+attempted+`)
 		ids = append(ids, id)
 	}
 	return ids
+}
+
+func TestNotificationOutcomeSurvivesConnectionReplacement(t *testing.T) {
+	for _, outcome := range []string{"deferred", "delivered"} {
+		t.Run(outcome, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "notifications.db")
+			store, err := openCachedTestStore(t, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
+			ids := seedWakeOutboxRows(t, store, WakeOutboxStateAttempted, 2)
+			conn, err := store.db.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+				t.Fatalf("retire physical connection: %v", err)
+			}
+			_ = conn.Close()
+			wait := holdWriteLock(t, path, 150*time.Millisecond)
+			defer wait()
+			now := time.Now().UTC()
+			if outcome == "deferred" {
+				err = store.DeferAttemptedWakeOutbox(context.Background(), ids, "draft", now)
+			} else {
+				err = store.FinishWakeOutbox(context.Background(), ids, WakeOutboxStateDelivered, "", now)
+			}
+			if err != nil {
+				t.Fatalf("persist %s after connection replacement: %v", outcome, err)
+			}
+			for i, id := range ids {
+				var state, detail string
+				var attempts int
+				var attempted sql.NullString
+				if err := store.db.QueryRow(`SELECT state,last_error,attempt_count,attempted_at FROM wake_outbox WHERE id=?`, id).Scan(&state, &detail, &attempts, &attempted); err != nil {
+					t.Fatal(err)
+				}
+				if outcome == "deferred" {
+					if state != WakeOutboxStatePending || detail != "draft" || attempts != 0 || attempted.Valid {
+						t.Fatalf("refused row: state=%s reason=%q attempts=%d attempted=%v", state, detail, attempts, attempted)
+					}
+				} else {
+					want := WakeOutboxStateDelivered
+					if i > 0 {
+						want = WakeOutboxStateSuperseded
+					}
+					if state != want || attempts != 1 {
+						t.Fatalf("submitted row: state=%s want=%s attempts=%d", state, want, attempts)
+					}
+				}
+			}
+			if outcome == "deferred" {
+				if err := store.DeferAttemptedWakeOutbox(context.Background(), ids, "draft", now); err == nil {
+					t.Fatal("a second refusal must not consume the same attempt twice")
+				}
+			}
+		})
+	}
+}
+
+func TestReadOnlyMessageLookupWaitsAfterConnectionReplacement(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	saved, err := store.CreateMessage(ctx, Message{Sender: "sender", Recipient: "worker", Body: "durable request"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := store.DatabasePath()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	holder.SetMaxOpenConns(1)
+	// Readers can encounter contention on a database opened read-only before
+	// a writer has established WAL. Exercise that supported opening path.
+	if _, err := holder.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	conn, err := reader.db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("retire physical connection: %v", err)
+	}
+	_ = conn.Close()
+	if _, err := holder.Exec(`BEGIN EXCLUSIVE`); err != nil {
+		t.Fatal(err)
+	}
+	released := make(chan error, 1)
+	time.AfterFunc(150*time.Millisecond, func() {
+		_, err := holder.Exec(`COMMIT`)
+		released <- err
+	})
+	defer func() {
+		if err := <-released; err != nil {
+			t.Error(err)
+		}
+	}()
+	got, err := reader.GetMessage(ctx, saved.ID, "worker")
+	if err != nil || got.Body != "durable request" || got.Status != "queued" {
+		t.Fatalf("read-only replacement lost the request under contention: %+v %v", got, err)
+	}
 }

@@ -10,21 +10,6 @@ import (
 	"unicode"
 )
 
-// DefaultWakeCoalesceHold is 300s by OWNER DECISION on 2026-09-07, relayed by
-// phobos: up to five minutes of added wake latency in exchange for the measured
-// interrupt reduction on this fleet's own arrival history, which is 21.8% at
-// 120s and 32.1% at 300s against 7.1% at the previous 5s (#1978). It stays
-// configurable through [org].wake_coalesce_hold.
-//
-// REVIEW RESULTS ARE EXEMPT by OWNER DECISION on 2026-10-08: an awaited-fact
-// wake whose fact is a review verdict (subject_kind review_verdict, in every
-// lifecycle state, including a failed, blocked, or cancelled review) skips
-// this hold and is delivered at the next drain. Every other wake kind (notes,
-// replies, directives, blocked/escalation events, other fact kinds) keeps the
-// hold unchanged. The exemption lives in wakeOutboxRowHold
-// (internal/cli/reply_wake_outbox.go).
-const DefaultWakeCoalesceHold = 5 * time.Minute
-
 // DefaultNotificationStaleAfter is how long a notification may stay pending
 // before the dashboard, `gitmoot doctor` and `gitmoot daemon status` flag it
 // as waiting too long. Configurable through [org].notification_stale_after.
@@ -54,7 +39,6 @@ type OrgConfig struct {
 	directiveAckTTL        time.Duration
 	directiveDoneTTL       time.Duration
 	directiveMaxNudges     int
-	wakeCoalesceHold       time.Duration
 	notificationStaleAfter time.Duration
 	roles                  map[string]OrgRole
 }
@@ -103,18 +87,6 @@ func (c OrgConfig) DirectiveMaxNudges() int {
 		return 3
 	}
 	return c.directiveMaxNudges
-}
-
-// WakeCoalesceHold is how long the daemon holds a pending wake group after its
-// OLDEST row before delivering every due row for that role and kind as one
-// wake. Raising it trades wake latency for fewer interrupts: measured on this
-// fleet's own arrival history, 5s collapses 7.1% of wakes, 120s collapses
-// 21.8% and 300s collapses 32.1% (#1978).
-func (c OrgConfig) WakeCoalesceHold() time.Duration {
-	if c.wakeCoalesceHold <= 0 {
-		return DefaultWakeCoalesceHold
-	}
-	return c.wakeCoalesceHold
 }
 
 // NotificationStaleAfter is how long a notification may stay pending before it
@@ -230,7 +202,6 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 	seenDirectiveAckTTL := false
 	seenDirectiveDoneTTL := false
 	seenDirectiveMaxNudges := false
-	seenWakeCoalesceHold := false
 	seenNotificationStaleAfter := false
 	current := ""
 	inOrg := false
@@ -290,7 +261,7 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 			// fail closed on a config that uses either field.
 			if key != "enforce" && key != "recycle_after" && key != "recycle_enforce" &&
 				key != "directive_ack_ttl" && key != "directive_done_ttl" &&
-				key != "directive_max_nudges" && key != "wake_coalesce_hold" &&
+				key != "directive_max_nudges" &&
 				key != "notification_stale_after" {
 				return OrgConfig{}, fmt.Errorf("unknown [org] field %q", key)
 			}
@@ -361,19 +332,6 @@ func parseOrgContent(content []byte) (OrgConfig, error) {
 					return OrgConfig{}, fmt.Errorf("message directive_max_nudges must be positive")
 				}
 				cfg.directiveMaxNudges = v
-			case "wake_coalesce_hold":
-				if seenWakeCoalesceHold {
-					return OrgConfig{}, fmt.Errorf("duplicate [org].wake_coalesce_hold")
-				}
-				seenWakeCoalesceHold = true
-				v, err := parseOrgDuration(value)
-				if err != nil {
-					return OrgConfig{}, fmt.Errorf("parse [org].wake_coalesce_hold: %w", err)
-				}
-				if v <= 0 {
-					return OrgConfig{}, fmt.Errorf("org wake_coalesce_hold must be positive")
-				}
-				cfg.wakeCoalesceHold = v
 			case "notification_stale_after":
 				if seenNotificationStaleAfter {
 					return OrgConfig{}, fmt.Errorf("duplicate [org].notification_stale_after")
@@ -578,9 +536,6 @@ func ValidateOrg(cfg OrgConfig) error {
 	}
 	if cfg.directiveMaxNudges < 0 {
 		return fmt.Errorf("message directive_max_nudges must not be negative")
-	}
-	if cfg.wakeCoalesceHold < 0 {
-		return fmt.Errorf("org wake_coalesce_hold must not be negative")
 	}
 	if cfg.notificationStaleAfter < 0 {
 		return fmt.Errorf("org notification_stale_after must not be negative")

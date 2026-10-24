@@ -1832,12 +1832,11 @@ repairs a role and installs addressed `reply`, `review-verdict`, `blocked`,
 `org-seat-<name>-<kind>`.
 
 With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
-exact live label, and stores the resolved pane id. Existing label-based commands
-therefore keep working; re-running one for the same resolved pane canonicalizes
-that existing binding to the pane id. Later cosmetic label changes do not
-retarget or break bindings written by this command. Duplicate labels, unknown
-references, and a supplied but empty `--pane` hard-fail before any role or route
-is written.
+exact live label, validates its unique named local Herdr agent, and stores
+`agent:NAME`. The binding follows that registered identity across pane replacement;
+cosmetic label changes do not retarget it. Register the agent before adopting
+its pane. Duplicate labels or agent names, unregistered/remote/archived agents,
+unknown references, and an empty `--pane` fail before role or route writes.
 Omit `--pane` to create an unbound role and the same routes; re-run the command
 with `--pane ID_OR_LABEL` to bind that role later. If a configured binding stops
 resolving, for example after Herdr recreates a pane with a new id, the same
@@ -1971,6 +1970,12 @@ input is not blindly resent. This replaces the old `org message`, `org escalate`
 and `org directive` sending surfaces, without aliases. Historical addressed
 notes retain their IDs and source links. Import creates inbox projections,
 never new wake obligations; unknown delivery stays unknown.
+Batched messages follow the survivor's actual notification status. Coalescing
+does not mean success: uncertain survivors and invalid historical links remain
+uncertain. Status projection does not resend mail.
+Replies reserve SQLite's writer before reading the parent, allowing brief
+contention to clear without retrying the insertion. If an insertion's outcome
+is unknown, inspect saved history before considering a manual retry.
 
 Claude Code and Codex seats receive mail at turn boundaries through the
 Gitmoot plugin's hooks, which run
@@ -2202,17 +2207,22 @@ over the pane's last `idle` or `working` activity status.
 rows commit atomically with their source note.
 Blocked and escalation rows are persisted synchronously by the event sink after
 the source transition; an insert failure is logged but cannot roll back the
-emitting job. The daemon holds each pending group for `[org].wake_coalesce_hold`
-(default `5m`) after its
-oldest row, then delivers every due pending row for that event kind and role as
-one wake, bounded at ten rows per wake. Reply prompts carry `N new items,
-oldest id X` and a retrieval command for each collapsed row; blocked and
-escalation events retain their redacted event detail. The row the wake names
-records the delivery outcome and each row it collapses is recorded `superseded`
-with `coalesced into wake outbox row <id>`. Different event kinds never share a
-coalescing key, and a later tick flushes a quiet tail without another event.
-A review result (an awaited-fact wake for a review verdict, in any state) skips
-the hold and is delivered at the next drain.
+emitting job. A working recipient's group waits 120 seconds from its oldest
+compatible queued item; an idle recipient has no batching delay. Becoming idle
+releases held mail on the next five-second drain tick, and newer arrivals do not
+restart the deadline. Review results use this same policy. The old
+`org.wake_coalesce_hold` setting is removed. Offline, unknown and unsafe recipients
+remain pending; draft/dialog/operator safeguards still apply. Manual inbox reads
+remain immediate.
+
+Each wake carries at most ten compatible items. Reply prompts include retrieval
+commands; blocked and escalation events retain redacted details. Collapsed rows
+record `coalesced_into`, and message status follows the survivor rather than
+claiming success. Invalid historical links remain uncertain. Different event
+kinds, directives and awaited facts retain separate grouping boundaries.
+Claude/Codex tool-return hooks observe the working deadline; prompt-submit and
+Stop hooks release mail at idle boundaries.
+Owner Grams retain their separate five-minute hold and immediate review results.
 Wakes addressed to the `owner` role go to the owner as one Herdr Gram per drain
 (at least two minutes apart) and need no event rule; `gitmoot org status`
 flags owner alerts that failed or whose delivery is unknown.

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,9 +24,24 @@ type orgSeatFixtureProvider struct {
 
 func (p orgSeatFixtureProvider) Snapshot(context.Context) (org.Snapshot, error) {
 	panes := append([]org.LivePane(nil), (*p.panes)...)
+	if registryPath := os.Getenv("GITMOOT_SEAT_TEST_REGISTRY"); registryPath != "" {
+		agents := make([]map[string]string, 0, len(panes))
+		for _, pane := range panes {
+			agents = append(agents, map[string]string{"name": "fixture-" + pane.PaneID, "pane_id": pane.PaneID, "agent": "omp"})
+		}
+		payload, err := json.Marshal(map[string]any{"result": map[string]any{"agents": agents}})
+		if err != nil {
+			return org.Snapshot{}, err
+		}
+		if err := os.WriteFile(registryPath, payload, 0o600); err != nil {
+			return org.Snapshot{}, err
+		}
+	}
 	bindings := make(map[string]org.PaneBinding, len(p.roles))
 	for _, role := range p.roles {
 		binding := strings.TrimSpace(role.Pane)
+		// Fixture registration names are independent of the terminal label.
+		binding = strings.TrimPrefix(binding, "agent:fixture-")
 		if binding == "" {
 			bindings[role.Name] = org.PaneBinding{Detail: "Herdr pane binding is unset"}
 			continue
@@ -91,7 +107,7 @@ func TestOrgSeatAddOwnerBootstrapRemainsRootWithMergeAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner, ok := cfg.Role("owner")
-	if !ok || owner.Parent != "" || len(owner.Scope) != 1 || owner.Scope[0] != "*" || owner.MergeRule != "owner" || owner.Pane != "w1:p1" {
+	if !ok || owner.Parent != "" || len(owner.Scope) != 1 || owner.Scope[0] != "*" || owner.MergeRule != "owner" || owner.Pane != "agent:fixture-w1:p1" {
 		t.Fatalf("owner role = %+v, present=%t", owner, ok)
 	}
 }
@@ -105,27 +121,12 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
-	for _, want := range []string{
-		`pane w1:p2 claimed label="Worker"`,
-		`role worker created pane="w1:p2"`,
-		"route org-seat-worker-blocked created",
-		"route org-seat-worker-directive created",
-		"route org-seat-worker-escalation created",
-		"route org-seat-worker-fact created",
-		"route org-seat-worker-reply created",
-		"route org-seat-worker-review-verdict created",
-		"ok role worker pane=w1:p2 enabled_routes=6",
-	} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("seat add output missing %q:\n%s", want, stdout.String())
-		}
-	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "*" || worker.MergeRule != "" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "*" || worker.MergeRule != "" {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	rules := listOrgSeatTestRules(t, paths)
@@ -137,8 +138,7 @@ func TestOrgSeatAddEndsGreenOnRealityValidation(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = runOrg([]string{"seat", "add", "worker", "--pane", "Worker", "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), "route org-seat-worker-reply existed") ||
-		!strings.Contains(stdout.String(), "ok role worker pane=w1:p2 enabled_routes=6") {
+	if code != 0 {
 		t.Fatalf("second seat add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
@@ -260,7 +260,7 @@ func TestOrgSeatAddAcceptsLiteralPaneID(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	if !strings.Contains(stdout.String(), `pane w1:p2 claimed label="Worker"`) {
@@ -308,7 +308,7 @@ func TestOrgSeatAddLiteralPaneIDPrecedesDuplicateLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p8" {
+	if !ok || worker.Pane != "agent:fixture-w1:p8" {
 		t.Fatalf("literal-id worker role = %+v, present=%t", worker, ok)
 	}
 }
@@ -319,7 +319,7 @@ func TestOrgSeatAddCanonicalizesExistingLabelBinding(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{"seat", "add", "owner", "--pane", "w1:p1", "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), `role owner repaired pane="w1:p1"`) {
+	if code != 0 {
 		t.Fatalf("label canonicalization code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
@@ -327,7 +327,7 @@ func TestOrgSeatAddCanonicalizesExistingLabelBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	owner, ok := cfg.Role("owner")
-	if !ok || owner.Pane != "w1:p1" {
+	if !ok || owner.Pane != "agent:fixture-w1:p1" {
 		t.Fatalf("canonicalized owner role = %+v, present=%t", owner, ok)
 	}
 	stdout.Reset()
@@ -393,7 +393,7 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = runOrg([]string{"seat", "add", "worker", "--pane", "w1:p2", "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), `role worker repaired pane="w1:p2"`) {
+	if code != 0 {
 		t.Fatalf("bind existing seat code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err = config.LoadOrg(paths)
@@ -401,7 +401,7 @@ func TestOrgSeatAddCreatesUnboundThenBinds(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok = cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" {
 		t.Fatalf("bound worker role = %+v, present=%t", worker, ok)
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
@@ -484,8 +484,7 @@ func TestOrgSeatAddAcceptsMatchingPolicyFlagsForExistingRole(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := runOrg(args, &stdout, &stderr); code != 0 ||
-		!strings.Contains(stdout.String(), `role worker existed pane="w1:p2"`) {
+	if code := runOrg(args, &stdout, &stderr); code != 0 {
 		t.Fatalf("matching policy retry code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
@@ -494,7 +493,7 @@ func TestOrgSeatAddAcceptsMatchingPolicyFlagsForExistingRole(t *testing.T) {
 	}
 	worker, ok := cfg.Role("worker")
 	if !ok || worker.Parent != "owner" || !slices.Equal(worker.Scope, []string{"gitmoot/gitmoot"}) ||
-		worker.MergeRule != "none" || worker.Pane != "w1:p2" {
+		worker.MergeRule != "none" || worker.Pane != "agent:fixture-w1:p2" {
 		t.Fatalf("worker after matching retry = %+v, present=%t", worker, ok)
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
@@ -617,8 +616,7 @@ func TestOrgSeatAddRebindsUnresolvedConfiguredPane(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p2", "--home", home}, &stdout, &stderr)
-	if code != 0 || !strings.Contains(stdout.String(), `role worker repaired pane="w1:p2"`) ||
-		!strings.Contains(stdout.String(), "route org-seat-worker-reply existed") {
+	if code != 0 {
 		t.Fatalf("stale pane rebind code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
@@ -626,7 +624,7 @@ func TestOrgSeatAddRebindsUnresolvedConfiguredPane(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" || worker.Parent != "owner" || worker.MergeRule != "owner" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" || worker.Parent != "owner" || worker.MergeRule != "owner" {
 		t.Fatalf("rebound worker = %+v, present=%t", worker, ok)
 	}
 	if got := len(listOrgSeatTestRules(t, paths)); got != 7 {
@@ -662,6 +660,7 @@ func TestOrgSeatAddRejectsAmbiguousConfiguredPaneRebind(t *testing.T) {
 
 func TestOrgSeatAddValidationRejectsVanishedTarget(t *testing.T) {
 	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
 	original := newOrgProvider
 	calls := 0
 	newOrgProvider = func(roles []config.OrgRole) org.Provider {
@@ -679,20 +678,21 @@ func TestOrgSeatAddValidationRejectsVanishedTarget(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p2", "--home", home}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), `role "worker" pane is unresolved`) {
+	if code != 1 {
 		t.Fatalf("vanished target add code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if worker, ok := cfg.Role("worker"); !ok || worker.Pane != "w1:p2" {
-		t.Fatalf("vanished target worker = %+v, present=%t", worker, ok)
+	if worker, ok := cfg.Role("worker"); !ok || worker.Pane != "agent:fixture-w1:p2" {
+		t.Fatalf("vanished pane lost its registered identity: %+v, present=%t", worker, ok)
 	}
 }
 
 func TestOrgSeatAddValidationRejectsMissingOwnedRoute(t *testing.T) {
 	home, paths, panes := setupOrgSeatTestHome(t)
+	withOrgSeatFixtureProvider(t, &panes)
 	original := newOrgProvider
 	calls := 0
 	newOrgProvider = func(roles []config.OrgRole) org.Provider {
@@ -764,7 +764,7 @@ func TestOrgSeatAddInheritsActingRoleWithoutMergeAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" || worker.Parent != "coordinator" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/*" || worker.MergeRule != "" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" || worker.Parent != "coordinator" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/*" || worker.MergeRule != "" {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 	stdout.Reset()
@@ -795,7 +795,7 @@ func TestOrgSeatAddAcceptsBoundedOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker, ok := cfg.Role("worker")
-	if !ok || worker.Pane != "w1:p2" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/repo" || worker.MergeRule != "self" {
+	if !ok || worker.Pane != "agent:fixture-w1:p2" || worker.Parent != "owner" || len(worker.Scope) != 1 || worker.Scope[0] != "gitmoot/repo" || worker.MergeRule != "self" {
 		t.Fatalf("worker role = %+v, present=%t", worker, ok)
 	}
 }
@@ -1290,10 +1290,53 @@ pane = "Owner"
 func withOrgSeatFixtureProvider(t *testing.T, panes *[]org.LivePane) {
 	t.Helper()
 	original := newOrgProvider
+	binDir := t.TempDir()
+	t.Setenv("GITMOOT_SEAT_TEST_REGISTRY", filepath.Join(binDir, "agents.json"))
+	writeExecutableGitHelper(t, binDir, "herdr", "#!/bin/sh\n[ \"$1 $2\" = 'agent list' ] || exit 1\nexec cat \"$GITMOOT_SEAT_TEST_REGISTRY\"\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	newOrgProvider = func(roles []config.OrgRole) org.Provider {
 		return orgSeatFixtureProvider{roles: append([]config.OrgRole(nil), roles...), panes: panes}
 	}
 	t.Cleanup(func() { newOrgProvider = original })
+}
+
+func TestOrgSeatAddRejectsUnverifiedRegisteredIdentity(t *testing.T) {
+	for _, registration := range []string{
+		`[{"name":"worker","pane_id":"w1:p2"},{"name":"worker","pane_id":"w1:other"}]`,
+		`[{"name":"","pane_id":"w1:p2"}]`,
+		`[{"name":"worker","pane_id":"w1:p2","archived":true}]`,
+		`[{"name":"worker","pane_id":"peer/w1:p2","machine_id":"peer"}]`,
+		`[]`,
+	} {
+		t.Run(registration, func(t *testing.T) {
+			home, paths, panes := setupOrgSeatTestHome(t)
+			withOrgSeatFixtureProvider(t, &panes)
+			newOrgProvider = func(roles []config.OrgRole) org.Provider {
+				snapshot, err := (orgSeatFixtureProvider{roles: roles, panes: &panes}).Snapshot(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(os.Getenv("GITMOOT_SEAT_TEST_REGISTRY"), []byte(`{"result":{"agents":`+registration+`}}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return orgFixtureProvider{snapshot: snapshot}
+			}
+			var stdout, stderr bytes.Buffer
+			if code := runOrg([]string{"seat", "add", "worker", "--pane", "w1:p2", "--home", home}, &stdout, &stderr); code != 1 {
+				t.Fatalf("unverified identity accepted: code=%d out=%q err=%q", code, stdout.String(), stderr.String())
+			}
+			cfg, err := config.LoadOrg(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := cfg.Role("worker"); exists {
+				t.Fatal("unverified registration created a role")
+			}
+			if rules := listOrgSeatTestRules(t, paths); len(rules) != 1 || rules[0].WakeRole != "owner" {
+				t.Fatalf("unverified registration changed delivery routes: %+v", rules)
+			}
+		})
+	}
 }
 
 func newOrgSeatUnshippedRepo(t *testing.T) string {

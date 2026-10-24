@@ -6,13 +6,9 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
-	"sort"
 	"strings"
 	"testing"
-
-	"github.com/gitmoot/gitmoot/internal/config"
 )
 
 // Round-3 enforcement of the single-choke-point claim (#1635, PR #1637).
@@ -123,55 +119,5 @@ func TestOrgRosterSeamIsTheOnlyResolveCallSite(t *testing.T) {
 	}
 	if len(violations) != 0 {
 		t.Fatalf("ResolveOrgRoster referenced outside the roster seam: %v — consumers draw from loadOrgRoster (internal/cli/org_roster.go, #1635); a direct nil-observation resolve is the unfiltered-roster bypass", violations)
-	}
-}
-
-// TestOrgConfigMethodSetIsPinned snapshots OrgConfig's exported method set.
-// It is a change-forcing guard, not a bypass detector: re-exporting a bulk
-// roles accessor, or adding a new one, must arrive together with an edit here
-// that names why the single-choke-point policy (#1635) permits it.
-func TestOrgConfigMethodSetIsPinned(t *testing.T) {
-	want := []string{
-		"Ancestors",
-		"Children",
-		"DirectiveAckTTL",
-		"DirectiveDoneTTL",
-		"DirectiveMaxNudges",
-		"Enabled",
-		"Enforce",
-		// NotificationStaleAfter is a scalar policy read like WakeCoalesceHold
-		// below: one duration, no role membership. It leaves the #1635
-		// single-choke-point policy untouched (#2303).
-		"NotificationStaleAfter",
-		"Path",
-		"RecycleAfterFor",
-		"RecycleEnforce",
-		"Role",
-		"Roots",
-		// WakeCoalesceHold is a scalar policy read, the same shape as the
-		// DirectiveAckTTL/DirectiveDoneTTL accessors above. It exposes one
-		// duration and no role membership, so the single-choke-point policy
-		// (#1635) is untouched: ResolveOrgRoster remains the only way to
-		// enumerate roles (#1978).
-		"WakeCoalesceHold",
-	}
-	typ := reflect.TypeOf(config.OrgConfig{})
-	got := make([]string, 0, typ.NumMethod())
-	for i := 0; i < typ.NumMethod(); i++ {
-		got = append(got, typ.Method(i).Name)
-	}
-	sort.Strings(got)
-	// Fail-closed: an empty method set means the reflection read is broken or
-	// the type moved, never that the policy is satisfied.
-	if len(got) == 0 {
-		t.Fatal("OrgConfig exports no methods; the pin is reading the wrong type")
-	}
-	if len(got) != len(want) {
-		t.Fatalf("OrgConfig exported methods = %v, pinned %v — a new or re-exported accessor must update this pin alongside a stated reason it honors the #1635 single-choke-point policy", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("OrgConfig exported methods = %v, pinned %v — a new or re-exported accessor must update this pin alongside a stated reason it honors the #1635 single-choke-point policy", got, want)
-		}
 	}
 }

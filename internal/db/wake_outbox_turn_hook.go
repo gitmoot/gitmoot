@@ -61,7 +61,7 @@ func (s *Store) ClaimWakeOutboxForTurnHook(ctx context.Context, role string, ids
 	}
 	rows, err := tx.QueryContext(ctx, `
 UPDATE wake_outbox
-SET state = 'delivered', last_error = ?, finished_at = ?, updated_at = ?
+SET state = 'delivered', coalesced_into = NULL, last_error = ?, finished_at = ?, updated_at = ?
 WHERE state = ? AND target_role = ? AND id IN (`+placeholders+`)
 RETURNING id`, args...)
 	if err != nil {

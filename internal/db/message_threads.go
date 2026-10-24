@@ -124,7 +124,7 @@ func (s *Store) ResolveMessageEscalation(ctx context.Context, id int64, by, answ
 	}
 	// A pending question is obsolete after its resolution; uncertain input is
 	// reconciled, never retried. Keep both immutable notes as the audit trail.
-	if _, err := tx.ExecContext(ctx, `UPDATE wake_outbox SET state='superseded',last_error='escalation resolved before notification',finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE source_kind='workflow_note' AND source_id=CAST(? AS TEXT) AND state IN ('pending','failed','stalled','delivery_unknown')`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE wake_outbox SET state='superseded',coalesced_into=NULL,last_error='escalation resolved before notification',finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE source_kind='workflow_note' AND source_id=CAST(? AS TEXT) AND state IN ('pending','failed','stalled','delivery_unknown')`, id); err != nil {
 		return WorkflowNote{}, err
 	}
 	if err := tx.Commit(); err != nil {

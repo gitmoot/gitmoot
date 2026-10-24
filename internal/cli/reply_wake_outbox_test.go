@@ -500,42 +500,6 @@ func TestReplyWakeOutboxCollapsesDuePendingRowsBeyondTheWindow(t *testing.T) {
 // not the constant: with a two-minute hold, a group whose oldest row is 90s old
 // is not delivered, and the same group is delivered as one wake at 121s. A
 // drain that ignored the configured value would wake the seat at 90s.
-func TestReplyWakeOutboxHonorsConfiguredHold(t *testing.T) {
-	store, sink, wake, _ := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p1"}})
-	ctx := context.Background()
-	const hold = 2 * time.Minute
-	base := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
-	for index := range 2 {
-		note, err := store.InsertWorkflowNote(ctx, db.WorkflowNote{
-			WorkflowID: "release/hold", Author: "worker",
-			Body: fmt.Sprint(index), AddressedTarget: "owner",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		setWakeOutboxCreatedAt(
-			t, store.DatabasePath(), fmt.Sprint(note.ID),
-			base.Add(time.Duration(index)*30*time.Second),
-		)
-	}
-	health, err := drainReplyWakeOutboxWithHealth(
-		ctx, store, base.Add(90*time.Second), hold, replyWakeTestDeliveryResolver(sink),
-	)
-	if err != nil || health.held != 2 || health.pending != 0 {
-		t.Fatalf("held drain health = %s err = %v, want two rows held inside the hold and no fault", health, err)
-	}
-	if wake.promptCalls != 0 {
-		t.Fatalf("configured hold ignored: woke at 90s with a %s hold; prompts=%v", hold, wake.prompts)
-	}
-	if _, err := drainReplyWakeOutboxWithHealth(
-		ctx, store, base.Add(hold+time.Second), hold, replyWakeTestDeliveryResolver(sink),
-	); err != nil {
-		t.Fatal(err)
-	}
-	if wake.promptCalls != 1 {
-		t.Fatalf("post-hold wake = calls=%d prompt=%q", wake.promptCalls, wake.prompt)
-	}
-}
 
 func TestReplyWakeOutboxRecordsExistingDeliveryOutcomeStates(t *testing.T) {
 	tests := []struct {
@@ -786,19 +750,20 @@ func TestReplyWakeOutboxHealthFailsClosedWhenEventRulesAreUnreadable(t *testing.
 	}
 
 	worker := defaultJobWorker(store, io.Discard, home)
-	var stdout bytes.Buffer
-	runReplyWakeOutboxDrainOnce(
-		context.Background(), store, worker, &stdout,
-		createdAt.Add(replyWakeCoalescingWindow-time.Millisecond), nil,
+	_, drainErr := drainReplyWakeOutboxWithHealth(
+		context.Background(), store,
+		createdAt.Add(replyWakeCoalescingWindow-time.Millisecond),
+		replyWakeCoalescingWindow, worker.replyWakeDelivery,
 	)
+	if drainErr == nil {
+		t.Fatal("unreadable event rules must fail the drain")
+	}
 	pending, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending rows after event_rules read failure = %+v, err=%v", pending, err)
 	}
-	if !strings.Contains(stdout.String(), "classify wake outbox obligations") ||
-		!strings.Contains(stdout.String(), "no such table: event_rules") ||
-		strings.Contains(stdout.String(), "inert=") {
-		t.Fatalf("daemon tick log = %q, want explicit event_rules read cause", stdout.String())
+	if pending[0].AttemptCount != 0 {
+		t.Fatalf("unreadable routing spent an attempt: %+v", pending[0])
 	}
 }
 
