@@ -1680,8 +1680,9 @@ cosmetic `display_name`, an optional `model` runtime pin, an optional per-role
 `recycle_after` duration override, and an optional `pane` Herdr binding. For
 backward compatibility, a configured binding resolves as a literal pane id or a
 unique exact live label. A literal id tracks one pane; a label tracks whichever
-current pane uniquely carries that cosmetic value. `org seat add` canonicalizes
-new bindings to ids. Roles without a binding report unknown live presence, and
+current pane uniquely carries that cosmetic value. `org seat add` validates the
+registered local agent and stores `agent:NAME`. Roles without a binding report
+unknown live presence, and
 event wakes for them are skipped with an observable log and increment the
 role's missed-wake counter rather than being inferred from a pane label. There
 is exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and
@@ -1702,6 +1703,10 @@ queued-plus-running job count attributed to the role through `ActingOrgRole`
 (#1057); it is distinct from daily or historical job counts. Escalations are
 recorded with `gitmoot message escalate` and resolved with
 `gitmoot message resolve`, using an answer or a linked journal note.
+
+`brief` also includes `peer_messaging` guidance in text and JSON: use Gitmoot
+messages for peer conversation, check the inbox on startup/resume, retain
+message IDs in handoffs, and distinguish queueing from reading or completion.
 
 For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
 weekly-quota rejection marks that role `unavailable` until the provider's

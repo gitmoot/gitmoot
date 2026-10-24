@@ -21,6 +21,7 @@ const (
 	// Working recipients batch from the oldest queued item; idle recipients
 	// have no batching delay. This is not a limit on batch membership.
 	replyWakeCoalescingWindow  = 2 * time.Minute
+	ownerGramCoalescingWindow  = 5 * time.Minute
 	replyWakeMaxCoalescedItems = 10
 	// A synchronous reply wake gets one 12s Herdr call plus bounded probes and
 	// its terminal store write. Thirty seconds leaves margin for a live owner;
@@ -194,7 +195,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 					rest = append(rest, entry)
 				}
 			}
-			claimed, err := deliverOwnerGram(ctx, store, delivery, ownerRows, now, 5*time.Minute)
+			claimed, err := deliverOwnerGram(ctx, store, delivery, ownerRows, now, ownerGramCoalescingWindow)
 			if claimed {
 				mutated = true
 			}
@@ -410,7 +411,7 @@ func classifyWakeOutboxObligations(
 			if err != nil {
 				return replyWakeOutboxHealth{}, fmt.Errorf("parse wake outbox created_at for row %d: %w", obligation.ID, err)
 			}
-			rowHold := wakeOutboxRowHold(obligation, 5*time.Minute)
+			rowHold := ownerGramCoalescingWindow
 			if !isOwnerWake(obligation) || delivery.ownerGram == nil {
 				key, err := wakeOutboxGroupKey(obligation)
 				if err != nil {

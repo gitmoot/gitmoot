@@ -12,9 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 )
 
-// Owner decision 2026-10-08: a review result skips [org].wake_coalesce_hold,
-// every other wake kind keeps it.
-
+// Review results share the recipient's working hold and idle release policy.
 func reviewResultWakeHarness(t *testing.T) (*db.Store, synchronousEventRuleTestSink, *fakeEventWake, string) {
 	t.Helper()
 	store, sink, wake, home := replyWakeTestHarness(t, []replyWakeTestRole{{"owner", "w1:p0"}, {"lane", "w1:p1"}})

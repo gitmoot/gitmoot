@@ -307,7 +307,9 @@ func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if pane.PaneID != "" {
-		binding, err := cockpit.New(cockpit.Options{HerdrBin: "herdr"}).StableAgentBinding(ctx, pane.PaneID)
+		bindingCtx, cancelBinding := context.WithTimeout(ctx, orgSeatExternalTimeout)
+		binding, err := cockpit.New(cockpit.Options{HerdrBin: "herdr"}).StableAgentBinding(bindingCtx, pane.PaneID)
+		cancelBinding()
 		if err != nil {
 			fmt.Fprintf(stderr, "org seat add: %v; leave the role unbound until registration is valid\n", err)
 			return 1

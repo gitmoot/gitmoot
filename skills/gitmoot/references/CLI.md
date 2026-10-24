@@ -2170,6 +2170,10 @@ queued-plus-running job count attributed to the role through `ActingOrgRole`
 (#1057); it is distinct from daily or historical job counts. Escalations can be
 resolved with `gitmoot message resolve`, using an answer or a linked journal note.
 
+`brief` includes `peer_messaging` guidance in text and JSON: use Gitmoot messages
+for peer conversation, check the inbox on startup/resume, retain message IDs in
+handoffs, and distinguish queueing from reading or completion.
+
 For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
 weekly-quota rejection marks that role `unavailable` until the provider's
 stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
