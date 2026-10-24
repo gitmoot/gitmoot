@@ -81,7 +81,7 @@ func main() {
 		}
 		return output
 	}
-	shell := `printf 'real worker completed\n' > worker-proof.txt; printf '{"gitmoot_result":{"decision":"approved","summary":"worker pid %s exited","findings":[],"changes_made":[],"tests_run":["native shell execution"],"needs":[],"delegations":[]}}\n' "$$"`
+	shell := `test "$(cat input.txt)" = 'isolated producer input' || exit 91; printf '{"gitmoot_result":{"decision":"approved","summary":"worker pid %s exited","findings":[],"changes_made":[],"tests_run":["native shell read isolated input"],"needs":[],"delegations":[]}}\n' "$$"`
 	cli("agent", "subscribe", "cleanup-smoke-shell", "--home", home, "--runtime", "shell", "--session", shell,
 		"--role", "agent", "--repo", "owner/repo", "--capability", "ask", "--policy", "auto")
 	const jobID = "smoke-worker"
@@ -132,7 +132,7 @@ func main() {
 	must(err)
 	completed, err := workflow.ParseJobPayload(job.Payload)
 	must(err)
-	if job.State != "succeeded" || completed.Result == nil || !strings.Contains(completed.ReadOnlyWorktreeDiff, "worker-proof.txt") {
+	if job.State != "succeeded" || completed.Result == nil || completed.Result.Decision != "approved" {
 		panic(fmt.Sprintf("real worker output was not durably published: %+v", completed))
 	}
 	var pid int
@@ -151,6 +151,12 @@ func main() {
 	must(err)
 	if receipt.RemovedAt == "" {
 		panic("physical removal has no completed generation receipt")
+	}
+	preserved, err := workflow.ParseJobPayload(receipt.OwnerPayload)
+	must(err)
+	if receipt.TerminalState != "succeeded" || preserved.Result == nil ||
+		preserved.Result.Decision != "approved" || preserved.Result.Summary != completed.Result.Summary {
+		panic("immutable receipt did not preserve the real worker result")
 	}
 	fmt.Printf("worker_pid=%d reaped=true state=%s workspace_removed=true liveness_override=false\n", pid, job.State)
 	encoded, err = json.Marshal(receipt)

@@ -53,6 +53,8 @@ jobs:
 
   proofs:
     name: Regression proofs (${{ matrix.package }}, ${{ matrix.base_name }})
+    # An instrument-only retry reuses the completed proofs at the same TARGET_SHA.
+    if: ${{ !contains(github.event.head_commit.message, '[smoke-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 95
     strategy:
@@ -95,6 +97,7 @@ jobs:
 
   website:
     name: Exact-head website build
+    if: ${{ !contains(github.event.head_commit.message, '[smoke-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
