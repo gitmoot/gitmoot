@@ -19,6 +19,7 @@ env:
 jobs:
   smoke:
     name: Exact-head native CLI and daemon smoke
+    if: ${{ !contains(github.event.head_commit.message, '[capacity-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -168,6 +169,38 @@ jobs:
         if: always()
         with:
           name: cleanup-website-${{ env.TARGET_SHA }}
+          path: exported
+          if-no-files-found: error
+          retention-days: 30
+
+  focused-capacity:
+    name: Cold focused package capacity measurement
+    if: ${{ contains(github.event.head_commit.message, '[capacity-only]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: instruments
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: source/go.sum
+      - name: Measure offline build with empty private caches
+        run: python3 instruments/measure-focused-build.py source evidence
+      - name: Export redacted portable receipts
+        if: always()
+        run: python3 instruments/export.py evidence exported
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cleanup-focused-capacity-${{ env.TARGET_SHA }}
           path: exported
           if-no-files-found: error
           retention-days: 30
