@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -168,6 +169,47 @@ func TestCleanupRefusesUnreadableRuntimeOwner(t *testing.T) {
 			world.engine.Now = func() time.Time { return now }
 			cleanup()
 			world.assertRemoved(t)
+		})
+	}
+}
+
+func TestCleanupRetainsServiceProducerWithoutConsumerEvidence(t *testing.T) {
+	for _, aged := range []bool{false, true} {
+		name := "ordinary"
+		if aged {
+			name = "aged"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			world := newProducerCleanupFixture(t, false)
+			// Service stage jobs need not carry PipelineName; their canonical
+			// sender still requires durable pipeline consumer evidence.
+			world.payload.Sender = PipelineJobSender
+			world.payload.RootJobID = "psr-0123456789abcdef0123456789abcdef"
+			encoded, err := json.Marshal(world.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := world.store.UpdateJobPayload(ctx, world.jobID, string(encoded)); err != nil {
+				t.Fatal(err)
+			}
+			policy := CleanupPolicy{}
+			if aged {
+				policy = CleanupPolicy{Mode: "aged", cutoff: time.Now().Add(time.Hour)}
+			}
+			inspection, err := world.engine.InspectProducerCleanup(ctx, world.jobID, policy)
+			if err != nil || inspection.Eligible || !slices.Contains(inspection.ReasonCodes, "pipeline_consumers_unknown") {
+				t.Fatalf("missing service consumer evidence was not refused: %+v %v", inspection, err)
+			}
+			if aged {
+				_, err = world.engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, world.jobID, policy.cutoff)
+			} else {
+				err = world.engine.cleanupImplementDelegationWorktree(ctx, world.jobID, "implement", world.payload)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			world.assertPreserved(t)
 		})
 	}
 }

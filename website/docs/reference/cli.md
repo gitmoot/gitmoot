@@ -2576,6 +2576,12 @@ blocked owners and unresolved consumers are never made terminal by cleanup.
 Artifact publication remains independent so blocked consumers can receive
 their inputs without authorizing deletion.
 
+Without reconstruction proof, failed/cancelled implement, produce and shell
+owners retain their workspaces and owned branches indefinitely. TTL is not a
+maximum retention or disk bound. `retry_disposition_unknown` has no force or
+`reopen` override; inspect the job and escalate capacity to its owner. Retry only
+to resume real work, not to bypass retention. Direct deletion remains unsupported.
+
 | Apply state | Meaning |
 |---|---|
 | `removed` | This generation's worktree and required cleanup side effects completed. |

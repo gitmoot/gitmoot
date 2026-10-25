@@ -645,6 +645,17 @@ database connection does not make a read-only-mounted home supported.
 terminal owner. The aged selector can discover both owners without authorizing
 either removal. Investigate the ownership overlap; do not bypass the shared gate.
 
+`retry_disposition_unknown` means the failed/cancelled owner has no proven
+reconstruction path. Only exact-head native read-only PR reviews currently have
+that proof. Failed/cancelled implement legs, produce stages and shell stages
+retain their workspaces and owned branches indefinitely, even after TTL expiry.
+This is intentional: TTL is not a maximum retention or disk-cap guarantee.
+Repeated aged scans may continue to discover these retained jobs; a skip event
+does not imply future removal. Neither `apply` nor `reopen` overrides the refusal,
+and no force-disposal command is provided. Inspect the job and escalate disk
+capacity to its owner; retry only when the work should genuinely resume. Do not
+retry just to discard evidence or bypass the gate with direct deletion.
+
 Publication does not wait for deletion eligibility. Blocked downstream stages
 can receive their inputs while the producer workspace remains; required service
 outputs have immutable generation snapshots under

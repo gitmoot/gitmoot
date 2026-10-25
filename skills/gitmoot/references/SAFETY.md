@@ -612,6 +612,14 @@ pipeline stages, unknown ownership or process state, and preservation failures
 all retain the resource. Succeeded owners require a stored result. Failed or
 cancelled owners additionally require a proven reconstruction path; currently
 this is a native read-only PR review pinned to an exact head.
+Failed/cancelled implement legs, produce stages and shell stages therefore remain
+retained indefinitely while they lack that proof, including their owned branches.
+TTL is a minimum age for eligible cleanup, not a maximum retention or disk bound.
+`retry_disposition_unknown` cannot be overridden by `apply` or `reopen`; there is
+no force-disposal command. This intentional safety tradeoff can accumulate disk
+usage. Inspect the job and escalate capacity to its owner; retry only when the
+work itself should resume. Do not retry merely to discard evidence or bypass the
+gate with direct deletion.
 
 Aged cleanup also requires the generation's terminal time to precede
 `[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).

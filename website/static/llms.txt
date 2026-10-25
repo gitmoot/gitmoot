@@ -32,6 +32,11 @@ Inspection holds the exclusive lifecycle fence and needs a writable fence
 sidecar, even with a read-only database connection. Any other job naming the same
 workspace causes `path_referenced`, including aged terminal co-owners.
 Accounting recovery returns checkout-lock release errors rather than hiding them.
+Failed/cancelled implement, produce and shell owners without reconstruction proof
+remain retained indefinitely, including owned branches. TTL is not a disk bound;
+`retry_disposition_unknown` has no force or reopen override. Escalate capacity to
+the owner rather than bypassing retention. Pipeline senders require consumer
+evidence even for service stages without PipelineName or a prun- root ID.
 
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:

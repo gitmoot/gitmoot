@@ -357,7 +357,7 @@ func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload,
 	}
 	d.PipelineConsumers = pipelineConsumers
 	d.evidence.PipelineConsumers = pipelineConsumers
-	if len(pipelineConsumers) == 0 && (payload.PipelineName != "" || strings.HasPrefix(payload.RootJobID, "prun-")) {
+	if len(pipelineConsumers) == 0 && (payload.Sender == PipelineJobSender || payload.PipelineName != "" || strings.HasPrefix(payload.RootJobID, "prun-")) {
 		return "pipeline_consumers_unknown", nil
 	}
 	for _, consumer := range pipelineConsumers {
