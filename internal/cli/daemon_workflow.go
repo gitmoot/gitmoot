@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -119,6 +121,9 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// rather than inside the repo checkout, so generated briefs stay out of
 		// the tracked tree and are never committed.
 		engine.ArtifactRoot = home
+		engine.CleanupRetention = func() (time.Duration, error) {
+			return config.LoadDelegationWorktreeTTL(config.Paths{ConfigFile: filepath.Join(home, "config.toml")})
+		}
 		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
 			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
 			askReviewDiffPrecleanupHookForRunner(store, runner),

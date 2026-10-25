@@ -467,6 +467,8 @@ type JobPayload struct {
 	// security must consume ReadOnlySeat instead. Additive/omitempty preserves
 	// legacy payloads.
 	ReadOnlyWorktree bool `json:"read_only_worktree,omitempty"`
+	// CleanupArtifacts identifies immutable, generation-bound required outputs.
+	CleanupArtifacts *CleanupArtifactSnapshot `json:"cleanup_artifacts,omitempty"`
 	// ReadOnlySeat selects the hard runtime sandbox and isolated provider state
 	// for untrusted ask/review delivery. It is deliberately separate from the
 	// disposable-worktree cleanup marker above: produce and service-shell jobs
@@ -968,6 +970,14 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 }
 
 func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error) {
+	if m.store == nil {
+		return db.Job{}, errors.New("mailbox store is required")
+	}
+	ctx, releaseLifecycle, fenceErr := m.store.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return db.Job{}, fenceErr
+	}
+	defer releaseLifecycle()
 	job, advisory, err := m.prepareEnqueue(ctx, request)
 	if err != nil {
 		return db.Job{}, err

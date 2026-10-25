@@ -65,6 +65,11 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	if store == nil {
 		return db.Job{}, fmt.Errorf("store is required")
 	}
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return db.Job{}, err
+	}
+	defer releaseLifecycle()
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		return db.Job{}, err
@@ -105,6 +110,7 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		return db.Job{}, err
 	}
 	payload.Result = nil
+	payload.CleanupArtifacts = nil
 	// A human-requested retry is a fresh lifecycle for the operational-blocker
 	// machinery (#532): drop any deferral hold so the retried job dispatches now
 	// (a stale blocker_retry_at would silently park a cancel→retried job behind
@@ -237,6 +243,11 @@ func MaybeResumeOnGatesCleared(ctx context.Context, store *db.Store, jobID strin
 	if store == nil {
 		return GateResumeOutcome{}, fmt.Errorf("store is required")
 	}
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return GateResumeOutcome{}, err
+	}
+	defer releaseLifecycle()
 	total, open, err := store.CountJobGates(ctx, jobID)
 	if err != nil {
 		return GateResumeOutcome{}, err

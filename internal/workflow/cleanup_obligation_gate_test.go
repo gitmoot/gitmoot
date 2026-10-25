@@ -21,9 +21,7 @@ func quarantineCleanupObligation(t *testing.T, store *db.Store, jobID, path stri
 	}
 }
 
-// TestQuarantinedCleanupObligationBlocksEveryDirectActuator kills mutants that
-// discard prepareDelegationCleanupObligation's actuation decision in any direct
-// fix, read-only, or implement cleanup path.
+// Repeated advancement must not reopen quarantined cleanup or remove its tree.
 func TestAdvanceRetryDoesNotActuateQuarantinedCleanup(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +73,9 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
 		engine := daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
 		engine.MergeGate = gate
+		// This fixture owns every workspace user; unrelated host /proc permissions
+		// are not evidence of a writer in this synthetic review.
+		engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
 		return engine
 	}
 
@@ -103,7 +107,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	}
 }
 
-func TestNativeReviewWorkerCleansOwnedWorktreeWhenAdapterPreflightFails(t *testing.T) {
+func TestNativeReviewWorkerRetainsFailedPreflightUntilAged(t *testing.T) {
 	ctx := context.Background()
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
@@ -149,21 +153,29 @@ func TestNativeReviewWorkerCleansOwnedWorktreeWhenAdapterPreflightFails(t *testi
 	if preparedPath == "" || payload.WorktreePath != preparedPath || !payload.ReadOnlyWorktree {
 		t.Fatalf("prepared worktree = %q payload=%+v", preparedPath, payload)
 	}
+	if _, err := os.Stat(preparedPath); err != nil {
+		t.Fatalf("failed review snapshot was removed before retention elapsed: %v", err)
+	}
+	engine := worker.WorkflowFactory(sharedCheckout)
+	cleanupNow := time.Now().UTC().Add(2 * time.Minute)
+	engine.Now = func() time.Time { return cleanupNow }
+	// Adapter construction failed, so this controlled fixture never launched a runtime.
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+	ordinary, err := engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{Mode: "ordinary"})
+	if err != nil || ordinary.Eligible || !slices.Contains(ordinary.ReasonCodes, "retry_disposition_unknown") {
+		t.Fatalf("ordinary cleanup admitted failed review: %+v %v", ordinary, err)
+	}
+	aged, err := engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{Mode: "aged", Retention: 72 * time.Hour})
+	if err != nil || aged.Eligible || !slices.Contains(aged.ReasonCodes, "retention_pending") {
+		t.Fatalf("failed review bypassed retention: %+v %v", aged, err)
+	}
+	cleanupNow = cleanupNow.Add(73 * time.Hour)
+	removed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, job.ID, cleanupNow.Add(-72*time.Hour))
+	if err != nil || !removed {
+		t.Fatalf("aged exact-head failed review was not reclaimed: removed=%v err=%v", removed, err)
+	}
 	if _, err := os.Stat(preparedPath); !os.IsNotExist(err) {
-		t.Fatalf("failed native review worktree still exists: path=%q err=%v", preparedPath, err)
-	}
-	events, err := store.ListJobEvents(ctx, job.ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents: %v", err)
-	}
-	removed := false
-	for _, event := range events {
-		if event.Kind == "delegation_worktree_removed" {
-			removed = true
-		}
-	}
-	if !removed {
-		t.Fatalf("native review cleanup events = %+v, want delegation_worktree_removed", events)
+		t.Fatalf("aged failed review worktree remains: %v", err)
 	}
 }
 

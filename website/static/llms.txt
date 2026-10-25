@@ -17,6 +17,27 @@ Findings ledger obligations follow commit ancestry, not pull request number alon
 Quoted-only diagnostics from a failed review remain job failures rather than code
 findings; locator-backed or executed findings still enter the ledger.
 
+Owned delegation/read-only cleanup uses producer-scoped `job cleanup inspect`
+and `apply --resource … --token …` with a positional job ID. Ordinary and aged
+cleanup share consumer, lifecycle, identity and preservation checks. Terminal
+state alone is insufficient; blocked/resumable consumers retain their inputs.
+Generation receipts survive deletion and historical replay never touches a
+replacement tree. Publication stays independent of deletion. A null
+`approved_size_budget` means unknown, not unlimited, and cannot authorize
+budget-dependent external cleanup.
+Aged cleanup uses the current generation's terminal clock, not later artifact
+publication. Older completion events cannot hide a replacement generation.
+Checkout contention defers cleanup without spending its failure budget.
+Inspection holds the exclusive lifecycle fence and needs a writable fence
+sidecar, even with a read-only database connection. Any other job naming the same
+workspace causes `path_referenced`, including aged terminal co-owners.
+Accounting recovery returns checkout-lock release errors rather than hiding them.
+Failed/cancelled implement, produce and shell owners without reconstruction proof
+remain retained indefinitely, including owned branches. TTL is not a disk bound;
+`retry_disposition_unknown` has no force or reopen override. Escalate capacity to
+the owner rather than bypassing retention. Pipeline senders require consumer
+evidence even for service stages without PipelineName or a prun- root ID.
+
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:
 `[workload-mode-reconciliation repo=<owner/repo> pr=<n> head=<40-char reviewed head> mode=<THROUGHPUT|STEADY|DRAIN> decision_note=<note id|none>]`.

@@ -605,12 +605,34 @@ releasing its branch lock. Allocation recovery and enqueue failures atomically
 rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries can proceed
 without destroying data.
 
-The daemon force-reclaims a recorded delegation/read-only worktree only when its
-owning job is final (`succeeded`, `failed`, or `cancelled`) and its terminal
-`updated_at` is older than `[workflow].delegation_worktree_ttl` (default `72h`;
-`"0"` disables). `blocked` is resumable and is never a TTL candidate. A
-successful linked-worktree force-remove and metadata prune records
+Ordinary and aged cleanup of recognized owned delegation/read-only worktrees use
+the same producer-owned admission gate. A terminal owner alone is not enough:
+blocked/resumable consumers, declared but undispatched dependencies, unfinished
+pipeline stages, unknown ownership or process state, and preservation failures
+all retain the resource. Succeeded owners require a stored result. Failed or
+cancelled owners additionally require a proven reconstruction path; currently
+this is a native read-only PR review pinned to an exact head.
+Failed/cancelled implement legs, produce stages and shell stages therefore remain
+retained indefinitely while they lack that proof, including their owned branches.
+TTL is a minimum age for eligible cleanup, not a maximum retention or disk bound.
+`retry_disposition_unknown` cannot be overridden by `apply` or `reopen`; there is
+no force-disposal command. This intentional safety tradeoff can accumulate disk
+usage. Inspect the job and escalate capacity to its owner; retry only when the
+work itself should resume. Do not retry merely to discard evidence or bypass the
+gate with direct deletion.
+
+Aged cleanup also requires the generation's terminal time to precede
+`[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).
+Ordinary succeeded-owner cleanup keeps its existing retention policy. Neither
+path overrides quarantine, checkout/branch locks or live-process protection.
+Successful aged removal and metadata reconciliation record
 `delegation_worktree_reclaimed_ttl`.
+
+Terminal artifact publication does not wait for deletion eligibility. Blocked
+downstream stages can receive their inputs while the producer worktree remains.
+Required service outputs have generation-bound snapshots under
+`$GITMOOT_HOME/cleanup-artifacts/`, outside disposable workspaces; a missing or
+changed required snapshot refuses deletion.
 
 No NEW fix clone is ever created: #2203 removed the fix-worktree lifecycle
 along with the auto-fix leg that allocated one. The clones already on disk are
@@ -652,18 +674,31 @@ size, split into reclaimable final owners, pinned non-final owners, and unproven
 directories, plus the quarantined cleanup count. Pinned, unproven, and
 quarantined worktrees are observation-only.
 
-For manual relief, list
-`$GITMOOT_HOME/worktrees/*/delegations/*/*`, map each path to its job's
-`payload.worktree_path`, and run `gitmoot job show <job-id> --json`. Proceed only
-when the current state is `succeeded`, `failed`, or `cancelled` and the exact
-path matches; then run `git -C <registered-checkout> worktree remove --force
-<path>` followed by `git -C <registered-checkout> worktree prune`. Never remove
-a worktree owned by a blocked, queued, or running job.
+For an explicitly authorized manual cleanup, use the producer contract:
 
-Fix-round clones live under `$GITMOOT_HOME/worktrees/*/fixes/*` and have their
-own `.git` directory. After proving the exact `payload.worktree_path` belongs to
-a final job, remove that directory directly; do not run registered-checkout
-`git worktree remove`, and do not delete the task branch.
+```sh
+gitmoot job cleanup inspect --json <job-id>
+gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> --json <job-id>
+```
+
+Inspection is advisory, not a lock or deletion grant. Apply derives the path
+from producer metadata and rechecks consumers, lifecycle generation, policy,
+physical identity and liveness under the lifecycle fence, then the checkout
+lock. Retry/resume and dependent enqueue share that fence; no SQLite write
+transaction remains open during filesystem removal. Never substitute direct
+`rm`, `git worktree remove`, or a Janitor path scan for this admission.
+
+Immutable per-generation receipts survive removal in the producer database.
+Replaying a completed token returns its historical receipt without touching a
+new tree at the same path. An interrupted old episode superseded by retry is
+reported as `superseded`, not as a successful removal. Accounting-only recovery
+can complete after retention changes; remaining destructive effects still need
+current admission. No replay automatically reopens quarantine.
+
+`approved_size_budget: null` means unknown, not zero or unlimited. A
+budget-dependent external consumer must remain ineligible until the producer
+supplies an enforced positive-cap contract. Shared checkouts, orphan paths and
+standalone fix clones remain outside this cleanup API.
 
 ## Shared Tool Cache (isolated worktrees)
 

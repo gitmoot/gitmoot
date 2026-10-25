@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/reviewseverity"
@@ -16,8 +17,11 @@ import (
 )
 
 type Store struct {
-	db   *sql.DB
-	path string
+	db                  *sql.DB
+	path                string
+	lifecycleIdentityMu sync.Mutex
+	lifecycleFencePath  string
+	lifecycleMemory     bool
 	// reviewBlockingSeverity resolves the repository [review] blocking-severity
 	// policy. It exists only so awaited review-verdict facts wake their waiter
 	// with the SAME effective decision the engine acted on and the job.finished

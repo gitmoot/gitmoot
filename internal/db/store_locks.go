@@ -64,6 +64,11 @@ func (s *Store) ResourceLockOwnerBootID(ctx context.Context, resourceKey string)
 }
 
 func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now time.Time) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	resourceKey := strings.TrimSpace(lock.ResourceKey)
 	ownerJobID := strings.TrimSpace(lock.OwnerJobID)
 	ownerToken := strings.TrimSpace(lock.OwnerToken)
@@ -116,6 +121,7 @@ func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now 
 		return true, tx.Commit()
 	}
 	return false, tx.Commit()
+
 }
 
 func (s *Store) GetResourceLock(ctx context.Context, resourceKey string) (ResourceLock, error) {
@@ -565,6 +571,11 @@ func (s *Store) AcquireLock(ctx context.Context, lock BranchLock) (bool, error) 
 }
 
 func (s *Store) CreateLock(ctx context.Context, lock BranchLock) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	// #1250: the acting org role is written HERE and only here — one writer, two
 	// readers. Attribution belongs to the branch's ownership event, so it is
 	// captured when the branch is taken and never rewritten afterwards.
@@ -593,6 +604,7 @@ func (s *Store) CreateLock(ctx context.Context, lock BranchLock) (bool, error) {
 		return false, err
 	}
 	return affected == 1, nil
+
 }
 
 func (s *Store) GetBranchLock(ctx context.Context, repoFullName string, branch string) (BranchLock, error) {

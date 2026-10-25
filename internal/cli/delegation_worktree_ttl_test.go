@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"strings"
+	"os"
 	"testing"
 	"time"
 
@@ -28,36 +28,43 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 		{id: "terminal-fresh", state: workflow.JobSucceeded, age: time.Hour, path: managedReclaimTestPath(t, home, "terminal-fresh")},
 		{id: "blocked-old", state: workflow.JobBlocked, age: 30 * 24 * time.Hour, path: managedReclaimTestPath(t, home, "blocked-old")},
 	}
-	sharedPath := managedReclaimTestPath(t, home, "shared")
+	sharedPath := managedReclaimTestPath(t, home, "shared-old")
 	rows = append(rows,
 		seeded{id: "shared-old", state: workflow.JobFailed, age: 10 * 24 * time.Hour, path: sharedPath},
 		seeded{id: "shared-fresh", state: workflow.JobSucceeded, age: time.Hour, path: sharedPath},
 	)
+	manager, checkout := newSelectiveReclaimManager(t, rows[0].path, rows[1].path, rows[2].path, sharedPath)
+	head, err := manager.RevParse(ctx, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, row := range rows {
-		payload, err := json.Marshal(workflow.JobPayload{Repo: "owner/repo", WorktreePath: row.path, ReadOnlyWorktree: true})
+		decision := "approved"
+		if row.state == workflow.JobFailed {
+			decision = "failed"
+		}
+		payload, err := json.Marshal(workflow.JobPayload{
+			Repo: "owner/repo", WorktreePath: row.path, ReadOnlyWorktree: true, ReadOnlySeat: true,
+			PullRequest: 7, HeadSHA: head,
+			Result: &workflow.AgentResult{Decision: decision, Summary: "terminal fixture evidence"},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := store.CreateJobWithEvent(ctx, db.Job{
-			ID: row.id, Agent: "reader", Type: "ask", State: string(row.state),
-			ParentJobID: "parent", DelegationID: row.id, Payload: string(payload),
+			ID: row.id, Agent: "reader", Type: "review", State: string(row.state), Payload: string(payload),
 		}, db.JobEvent{Kind: string(row.state), Message: "seed"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	store.Close()
-	const layout = "2006-01-02 15:04:05"
 	for _, row := range rows {
-		at := now.Add(-row.age).Format(layout)
-		setJobTimes(t, home, row.id, at, at)
+		backdateJobUpdatedAt(t, store.DatabasePath(), row.id, now.Add(-row.age))
 	}
-	store = openCLIJobStore(t, home)
 	defer store.Close()
 
-	manager := &fakeReclaimWorktreeManager{branches: map[string]bool{}}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+		return reclaimFixtureEngine(worker, checkout, manager)
 	}
 	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
 		t.Fatalf("reclaimAgedTerminalDelegationWorktrees: %v", err)
@@ -65,8 +72,18 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 	if len(manager.removed) != 1 || manager.removed[0] != rows[0].path {
 		t.Fatalf("removed = %v, want only aged final worktree %s", manager.removed, rows[0].path)
 	}
-	if manager.pruned != 1 {
-		t.Fatalf("prune calls = %d, want 1", manager.pruned)
+	for i, row := range rows {
+		_, err := os.Stat(row.path)
+		if i == 0 && !os.IsNotExist(err) {
+			t.Fatalf("eligible terminal resource remains: %v", err)
+		}
+		if i != 0 && err != nil {
+			t.Fatalf("protected resource %s changed: %v", row.id, err)
+		}
+	}
+	outcome, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(rows[0].id, rows[0].path))
+	if err != nil || outcome.State != db.CleanupObligationRemoved {
+		t.Fatalf("terminal disposal was not recorded durably: %+v %v", outcome, err)
 	}
 	events, err := store.ListJobEvents(ctx, "terminal-old")
 	if err != nil {
@@ -83,8 +100,8 @@ func TestReclaimAgedTerminalDelegationWorktreesTTLAndStateGate(t *testing.T) {
 	}
 
 	engine := worker.WorkflowFactory("")
-	if _, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, "blocked-old", now.Add(-72*time.Hour)); err == nil || !strings.Contains(err.Error(), "non-final") {
-		t.Fatalf("blocked force reclaim error = %v, want non-final refusal", err)
+	if removed, err := engine.ReclaimAgedTerminalDelegationWorktreeOutcome(ctx, "blocked-old", now.Add(-72*time.Hour)); err == nil || removed {
+		t.Fatalf("blocked owner was not refused: removed=%v err=%v", removed, err)
 	}
 }
 

@@ -2,16 +2,17 @@ package workflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"database/sql"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
 func TestReadOnlyFanoutNeedsWorktree(t *testing.T) {
@@ -84,132 +85,67 @@ func TestIsReadOnlyDelegationWorktree(t *testing.T) {
 	}
 }
 
-// TestCleanupDisposesTopLevelReadOnlyWorktree proves the #739 terminal disposal: a
-// TOP-LEVEL read-only (ask) worktree — allocated at dispatch, carrying the explicit
-// ReadOnlyWorktree marker and NO DelegationID — is force-removed by the existing
-// cleanupReadOnlyDelegationWorktree once its job is terminal, and an implement
-// worktree in the same call is left untouched.
 func TestCleanupDisposesTopLevelReadOnlyWorktree(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	manager := &fakeWorktreeManager{}
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	wt := managedEngineWorktree(t, &engine, "local-ask-seat")
-	hookCalled := false
-	engine.BeforeReadOnlyWorktreeCleanup = func(_ context.Context, jobID, jobType string, payload JobPayload) error {
-		hookCalled = true
-		if jobID != "local-ask-seat" || jobType != "ask" || payload.WorktreePath != wt {
-			t.Fatalf("pre-cleanup hook args: job=%q type=%q payload=%+v", jobID, jobType, payload)
-		}
-		if _, err := os.Stat(wt); err != nil {
-			t.Fatalf("worktree was absent before pre-cleanup hook: %v", err)
-		}
-		return nil
+	world := newProducerCleanupFixture(t, true)
+	if err := world.engine.cleanupReadOnlyDelegationWorktree(context.Background(), world.jobID, "ask", world.payload); err != nil {
+		t.Fatal(err)
 	}
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", JobPayload{WorktreePath: wt, ReadOnlyWorktree: true})
-	if !hookCalled {
-		t.Fatal("pre-cleanup hook was not called")
-	}
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
-		t.Fatalf("removedForce = %+v, want one force-remove of the top-level worktree %q", manager.removedForce, wt)
-	}
-	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_removed"); got != 1 {
-		t.Fatalf("delegation_worktree_removed count = %d, want 1", got)
-	}
-
-	// An implement worktree (marker false, Branch set) is NOT a read-only worktree.
-	manager.removedForce = nil
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "impl", "implement", JobPayload{DelegationID: "d1", WorktreePath: t.TempDir(), Branch: "b"})
-	if len(manager.removedForce) != 0 {
-		t.Fatalf("implement worktree must not be disposed by the read-only cleanup: %+v", manager.removedForce)
+	world.assertRemoved(t)
+	if data, err := os.ReadFile(world.preserved); err != nil || string(data) != "producer result\n" {
+		t.Fatalf("published result did not survive disposal: %q %v", data, err)
 	}
 }
 
-func TestReadOnlyPrecleanupFailureEventRedactsHookError(t *testing.T) {
+func TestReadOnlyPrecleanupFailureRedactsDurableError(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
 	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	manager := &fakeWorktreeManager{}
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
 	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	wt := managedEngineWorktree(t, &engine, "secret-capture-error")
-	engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
 		return errors.New("hostile helper failed with token=" + secret)
 	}
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "secret-capture-error", "ask", JobPayload{
-		WorktreePath: wt, ReadOnlyWorktree: true,
-	})
+	decision, err := world.engine.InspectProducerCleanup(ctx, world.jobID, CleanupPolicy{Mode: "ordinary"})
+	if err != nil || !decision.Eligible {
+		t.Fatalf("valid resource did not reach preservation: %+v %v", decision, err)
+	}
+	result, err := world.engine.ApplyProducerCleanup(ctx, world.jobID, decision.ResourceID, decision.EligibilityToken, CleanupPolicy{Mode: "ordinary"})
+	if err == nil || result.State != "retryable" {
+		t.Fatalf("failed preservation was not retryable: %+v %v", result, err)
+	}
+	world.assertPreserved(t)
+	obligation, err := world.store.GetCleanupObligation(ctx, decision.ResourceID)
+	if err != nil || obligation.State != db.CleanupObligationRetryable || obligation.AttemptCount != 1 {
+		t.Fatalf("failed preservation was not retained durably: %+v %v", obligation, err)
+	}
+	if strings.Contains(obligation.LastError, secret) || !strings.Contains(obligation.LastError, "[REDACTED]") {
+		t.Fatalf("durable preservation diagnostic exposed a credential: %q", obligation.LastError)
+	}
+}
 
-	events, err := store.ListJobEvents(ctx, "secret-capture-error")
+func TestReclaimReadOnlyWorktreeRejectsUnownedPath(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	unowned := t.TempDir()
+	sentinel := filepath.Join(unowned, "keep.txt")
+	if err := os.WriteFile(sentinel, []byte("not a producer resource"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	payload := world.payload
+	payload.WorktreePath = unowned
+	encoded, err := marshalPayload(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var message string
-	for _, event := range events {
-		if event.Kind == "readonly_worktree_precleanup_failed" {
-			message = event.Message
-		}
+	if err := world.store.UpdateJobPayload(ctx, world.jobID, encoded); err != nil {
+		t.Fatal(err)
 	}
-	if message == "" {
-		t.Fatal("readonly_worktree_precleanup_failed event was not recorded")
+	removed, err := world.engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, world.jobID)
+	if err == nil || removed {
+		t.Fatalf("unowned path was admitted: removed=%v err=%v", removed, err)
 	}
-	if strings.Contains(message, secret) || !strings.Contains(message, "token=[REDACTED]") {
-		t.Fatalf("pre-cleanup failure event did not redact hostile content: %q", message)
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "not a producer resource" {
+		t.Fatalf("unowned contents changed: %q %v", data, err)
 	}
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
-		t.Fatalf("redacted hook error blocked worktree cleanup: removed=%v", manager.removedForce)
-	}
-}
-
-// TestReclaimReadOnlyWorktree proves ReclaimTerminalDelegationWorktree (the daemon's
-// restart/lock-expiry reclaim path) now also reclaims an orphaned TOP-LEVEL
-// read-only worktree (#739) whose deferred cleanup never ran (crash between terminal
-// advance and the defer), while still reclaiming an implement worktree.
-func TestReclaimReadOnlyWorktree(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	manager := &fakeWorktreeManager{}
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	// A terminal top-level read-only ask job whose worktree still exists on disk.
-	roWT := managedEngineWorktree(t, &engine, "local-ask-seat")
-	roPayload, err := json.Marshal(JobPayload{WorktreePath: roWT, ReadOnlyWorktree: true})
-	if err != nil {
-		t.Fatalf("marshal read-only payload: %v", err)
-	}
-	if err := store.CreateJob(ctx, db.Job{ID: "local-ask-seat", Agent: "responder", Type: "ask", State: string(JobSucceeded), Payload: string(roPayload)}); err != nil {
-		t.Fatalf("CreateJob read-only: %v", err)
-	}
-	if err := engine.ReclaimTerminalDelegationWorktree(ctx, "local-ask-seat"); err != nil {
-		t.Fatalf("ReclaimTerminalDelegationWorktree (read-only) returned error: %v", err)
-	}
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != roWT {
-		t.Fatalf("removedForce = %+v, want the orphaned read-only worktree %q reclaimed", manager.removedForce, roWT)
-	}
-
-	// An implement delegation worktree is still reclaimed by the same path.
-	manager.removedForce = nil
-	implWT := managedEngineWorktree(t, &engine, "parent-delegation-d1")
-	implPayload, err := json.Marshal(JobPayload{DelegationID: "d1", WorktreePath: implWT, Branch: "gitmoot-delegation-d1"})
-	if err != nil {
-		t.Fatalf("marshal implement payload: %v", err)
-	}
-	if err := store.CreateJob(ctx, db.Job{ID: "parent/delegation/d1", Agent: "impl", Type: "implement", State: string(JobFailed), Payload: string(implPayload)}); err != nil {
-		t.Fatalf("CreateJob implement: %v", err)
-	}
-	if err := engine.ReclaimTerminalDelegationWorktree(ctx, "parent/delegation/d1"); err != nil {
-		t.Fatalf("ReclaimTerminalDelegationWorktree (implement) returned error: %v", err)
-	}
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != implWT {
-		t.Fatalf("removedForce = %+v, want the implement worktree %q reclaimed", manager.removedForce, implWT)
-	}
+	world.assertPreserved(t)
 }
 
 func TestAllocateReadOnlyDelegationWorktreeDetachedNoBranchLock(t *testing.T) {
@@ -293,98 +229,46 @@ func TestAllocateReadOnlyDelegationWorktreeDefaultsRefToHEAD(t *testing.T) {
 	}
 }
 
-func TestCleanupReadOnlyDelegationWorktreeForceRemoves(t *testing.T) {
+func TestReadOnlyCleanupFailureIsReclaimable(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
 	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	manager := &fakeWorktreeManager{}
-	engine.DelegationCheckout = t.TempDir()
-	engine.DelegationWorktrees = manager
-
-	// The worktree path must exist on disk; cleanup skips an already-gone path.
-	wt := managedEngineWorktree(t, &engine, "job-1-delegation-d1")
-	payload := JobPayload{DelegationID: "d1", WorktreePath: wt}
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-1/delegation/d1", "ask", payload)
-	if len(manager.removedForce) != 1 || manager.removedForce[0] != wt {
-		t.Fatalf("removedForce = %+v, want one force-remove of %q", manager.removedForce, wt)
+	manager := &failingReadOnlyCleanupManager{Client: world.manager, failure: errors.New("transient removal failure")}
+	world.engine.DelegationWorktrees = manager
+	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "ask", world.payload); err == nil {
+		t.Fatal("removal failure was lost")
 	}
-
-	// Idempotent: a second cleanup for an already-removed (non-existent) worktree
-	// is a silent no-op (no re-lock, no spurious cleanup-failed event).
-	gone := filepath.Join(t.TempDir(), "already-removed")
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-1/delegation/d1", "ask", JobPayload{DelegationID: "d1", WorktreePath: gone})
-	if len(manager.removedForce) != 1 {
-		t.Fatalf("cleanup of a missing worktree must be a no-op: %+v", manager.removedForce)
+	world.assertPreserved(t)
+	resource := db.CleanupObligationResourceID(world.jobID, world.path)
+	obligation, err := world.store.GetCleanupObligation(ctx, resource)
+	if err != nil || obligation.State != db.CleanupObligationRetryable {
+		t.Fatalf("failed removal is not reclaimable: %+v %v", obligation, err)
 	}
-	if got := countJobEvents(t, store, "job-1/delegation/d1", "delegation_worktree_cleanup_failed"); got != 0 {
-		t.Fatalf("missing-worktree cleanup must not emit cleanup_failed events, got %d", got)
+	manager.failure = nil
+	next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := countJobEvents(t, store, "job-1/delegation/d1", "delegation_worktree_removed"); got != 1 {
-		t.Fatalf("delegation_worktree_removed event count = %d, want 1", got)
+	world.engine.Now = func() time.Time { return next.Add(time.Second) }
+	removed, err := world.engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, world.jobID)
+	if err != nil || !removed {
+		t.Fatalf("retry did not reclaim the resource: removed=%v err=%v", removed, err)
 	}
-
-	// No-op for an implement child (cleaned via the merge gate, not here).
-	manager.removedForce = nil
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-2", "implement", payload)
-	// No-op for a non-delegation job and for a child without a worktree path.
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-3", "ask", JobPayload{WorktreePath: "/wt/x"})
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "job-4", "ask", JobPayload{DelegationID: "d2"})
-	if len(manager.removedForce) != 0 {
-		t.Fatalf("cleanup must be a no-op for non read-only worktree children: %+v", manager.removedForce)
+	world.assertRemoved(t)
+	if data, err := os.ReadFile(world.preserved); err != nil || string(data) != "producer result\n" {
+		t.Fatalf("retry lost the preserved result: %q %v", data, err)
 	}
 }
 
-// TestReadOnlyCleanupFailureIsReclaimable pins the #739-review fix: when a
-// read-only worktree's terminal disposal FAILS transiently (force-remove error),
-// cleanup must emit the reclaim-eligible delegation_worktree_cleanup_skipped marker
-// — NOT a dead-end delegation_worktree_cleanup_failed that no pass ever re-selects —
-// so ReclaimTerminalDelegationWorktree re-fires the cleanup on a later daemon tick
-// instead of leaking the worktree permanently.
-func TestReadOnlyCleanupFailureIsReclaimable(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	engine := testEngine(store)
-	engine.DelegationCheckout = t.TempDir()
-	manager := &fakeWorktreeManager{removeErr: errors.New("worktree busy")}
-	engine.DelegationWorktrees = manager
+type failingReadOnlyCleanupManager struct {
+	gitutil.Client
+	failure error
+}
 
-	wt := managedEngineWorktree(t, &engine, "local-ask-seat")
-	payload := JobPayload{WorktreePath: wt, ReadOnlyWorktree: true}
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
-
-	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_failed"); got != 0 {
-		t.Fatalf("a transient read-only cleanup failure must not emit a dead-end cleanup_failed, got %d", got)
+func (m *failingReadOnlyCleanupManager) RemoveWorktreeForce(ctx context.Context, path string) error {
+	if m.failure != nil {
+		return m.failure
 	}
-	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_skipped"); got != 1 {
-		t.Fatalf("a transient read-only cleanup failure must emit a reclaimable _skipped marker, got %d", got)
-	}
-	if !engine.lastCleanupOutcomeIsSkip(ctx, "local-ask-seat") {
-		t.Fatal("latest cleanup outcome must be a skip so reclaimSkippedDelegationWorktrees re-fires it")
-	}
-	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("local-ask-seat", wt))
-	if err != nil {
-		t.Fatalf("GetCleanupObligation: %v", err)
-	}
-	if obligation.State != db.CleanupObligationRetryable || obligation.Reason != db.CleanupReasonUnknown || obligation.AttemptCount != 0 {
-		t.Fatalf("initial cleanup failure obligation = %+v", obligation)
-	}
-
-	// Deduped: a second failing pass must not grow the event log without bound.
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
-	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_cleanup_skipped"); got != 1 {
-		t.Fatalf("skip marker must be emitted at most once per preserve window, got %d", got)
-	}
-
-	// Once the removal succeeds, a re-fired cleanup disposes the worktree and closes
-	// the window (delegation_worktree_removed), so it drops out of the reclaim set.
-	manager.removeErr = nil
-	engine.cleanupReadOnlyDelegationWorktree(ctx, "local-ask-seat", "ask", payload)
-	if got := countJobEvents(t, store, "local-ask-seat", "delegation_worktree_removed"); got != 1 {
-		t.Fatalf("a later successful cleanup must emit delegation_worktree_removed, got %d", got)
-	}
-	if engine.lastCleanupOutcomeIsSkip(ctx, "local-ask-seat") {
-		t.Fatal("a successful removal must close the reclaim window")
-	}
+	return m.Client.RemoveWorktreeForce(ctx, path)
 }
 
 // TestRecordReadOnlyWorktreeReclaimOnAbort pins the #739-review leak fix: a

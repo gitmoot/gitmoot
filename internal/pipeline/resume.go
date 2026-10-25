@@ -35,6 +35,11 @@ func ResumePipelineRun(ctx context.Context, store *db.Store, runID, fromStage st
 	if runID == "" {
 		return db.PipelineRun{}, errors.New("run id is required")
 	}
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return db.PipelineRun{}, err
+	}
+	defer releaseLifecycle()
 	run, ok, err := store.GetPipelineRun(ctx, runID)
 	if err != nil {
 		return db.PipelineRun{}, err

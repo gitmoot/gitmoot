@@ -2539,6 +2539,8 @@ gitmoot job run <job-id>
 gitmoot job retry <job-id>
 gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]
 gitmoot job cleanup reopen <resource-id>
+gitmoot job cleanup inspect [--home DIR] [--json] <job-id>
+gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> [--home DIR] [--json] <job-id>
 gitmoot job gates <job-id>                                         # list resumable gates; add --json
 gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
@@ -2548,6 +2550,57 @@ gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a jo
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 ```
+
+`job cleanup inspect` returns the versioned producer decision (`schema_version:
+1`), stable resource identity, owner generation, consumer evidence, policy/hash,
+retention deadline where applicable, reason codes and an eligibility token.
+`eligible: false` is a normal inspection result; inspect exits zero unless the
+operation itself fails. Both owned implement and read-only worktrees use
+`resource_kind: "delegation_worktree"`. No arbitrary path argument is accepted.
+Inspection holds the database's exclusive lifecycle fence while reading Git and
+process state, so job lifecycle mutations wait for that snapshot. It creates no
+obligation or receipt, but requires write access to the fence sidecar beside the
+database, even with a read-only database connection. A read-only-mounted home is
+not supported.
+
+`path_referenced` refuses removal whenever another job names the same workspace,
+even if both owners are old and terminal. Aged selection only discovers
+candidates; it does not prove unique ownership. Investigate overlapping ownership
+instead of bypassing this refusal.
+
+Apply requires the same job, resource and token. It revalidates the shared
+ordinary/aged safety predicate under the lifecycle fence before removal and
+preserves immutable terminal evidence outside the workspace. Failed/cancelled
+owners use the aged policy and need a producer-proven reconstruction path;
+blocked owners and unresolved consumers are never made terminal by cleanup.
+Artifact publication remains independent so blocked consumers can receive
+their inputs without authorizing deletion.
+
+Without reconstruction proof, failed/cancelled implement, produce and shell
+owners retain their workspaces and owned branches indefinitely. TTL is not a
+maximum retention or disk bound. `retry_disposition_unknown` has no force or
+`reopen` override; inspect the job and escalate capacity to its owner. Retry only
+to resume real work, not to bypass retention. Direct deletion remains unsupported.
+
+| Apply state | Meaning |
+|---|---|
+| `removed` | This generation's worktree and required cleanup side effects completed. |
+| `already_removed` | Historical successful receipt; a recreated generation was not touched. |
+| `superseded` | An unfinished historical episode was closed by a newer lifecycle, not reported as removed. |
+| `refused` | Current admission failed; inspect `decision.reason_codes`. |
+| `retryable` | An operation failed after admission; the durable retry/quarantine budget applies. |
+
+Apply exits `0` for `removed`/`already_removed`, `3` for another completed
+decision, `1` for an operational error and `2` for invalid arguments. A prepared
+receipt is not a removal receipt until `removed_at` is set. Historical replay
+never reopens quarantine or grants deletion of the current generation.
+Checkout-lock release failures are operational errors, including during
+accounting-only recovery. Inspect the durable receipt before retrying.
+
+`approved_size_budget: null` explicitly means unknown. It does not authorize
+zero-byte or unlimited cleanup; consumers requiring a positive byte cap must
+remain ineligible. The existing `list` and operator-only `reopen` commands keep
+their contracts.
 
 A delivery killed by a signal records a `delivery_signal_killed` event naming
 the signal and which evidence identified it. Both renderings count: a
@@ -2574,9 +2627,10 @@ snapshot ends with an explicit omitted-byte marker instead of being silently
 cut. Git subprocesses and the wait for each index-file copy share a 10-second
 context: on expiry Gitmoot kills the subprocess or stops waiting for the copy.
 The operating system still owns cancellation of an in-progress filesystem
-syscall, so this is a bounded-wait guarantee rather than a promise that kernel
-I/O itself is cancelled. Failures are recorded and never prevent worktree
-removal.
+syscall, so this bounds the wait rather than promising kernel I/O cancellation.
+Capture failures are recorded and retain the worktree. Publication is
+generation-bound: a concurrent retry or changed owner snapshot refuses the
+stale metadata write rather than attaching old evidence to the new lifecycle.
 
 When standard output is an interactive terminal (and `NO_COLOR` is unset),
 the transcript renders styled: agent turns get blank-line spacing and keep

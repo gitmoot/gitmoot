@@ -55,7 +55,7 @@ type ResourceLockLiveness struct {
 // The never-clobber protection for a worker that is genuinely STILL RUNNING past
 // lease expiry is provided separately and correctly by the physical
 // worktree-process probe the cleanup gate consults
-// (workflow.Engine.worktreeHasLiveProcess), which is PID-reuse- and
+// (workflow.Engine.worktreeLiveness), which is PID-reuse- and
 // hostname-rename-immune. So past lease expiry this lock-based gate steps aside and
 // the physical probe decides.
 func (l ResourceLockLiveness) Active() bool {

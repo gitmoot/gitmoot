@@ -1391,11 +1391,14 @@ for those paths. Doctor detail separates aged final delegation owners that are
 whose owner is **unproven**. Pinned includes `blocked`, `queued`, and `running`;
 Gitmoot never force-removes those.
 
-`[workflow].delegation_worktree_ttl = "72h"` is default-on because a final
-delegation owner cannot resume, while the grace period preserves short-term
-debugging access. Set it to `"0"` to disable the TTL pass. Aged read-only and
-delegation worktrees are force-removed even when dirty. An independent fix
-clone is different: removing it deletes its standalone object database.
+`[workflow].delegation_worktree_ttl = "72h"` supplies the default aged-cleanup
+grace period; `"0"` disables aged cleanup. Ordinary and aged cleanup now share
+the same producer safety gate. A terminal owner alone is insufficient:
+blocked/resumable or undispatched consumers, unfinished pipelines, unknown
+process/ownership state and failed preservation all retain the worktree.
+Succeeded owners need a stored result; failed/cancelled owners additionally
+need a proven reconstruction path (currently a pinned native read-only PR
+review). Cleanup never cancels a consumer to make a resource eligible.
 
 ### Fix clones are never deleted automatically
 
@@ -1454,31 +1457,65 @@ Each failure advances a durable, restart-safe cleanup obligation. Retries wait
 one minute and stop after the third failure in `quarantined`; quarantined paths
 are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
+Checkout contention defers cleanup without spending that failure budget.
+Persisted error text uses the existing credential-redaction policy. Aged
+selection uses the current generation's recorded terminal time, not a later
+artifact-publication timestamp. An older generation's completion does not
+suppress cleanup of a replacement generation.
 The five-minute worktree cadence advances after every attempted pass, including
 passes with candidate failures, so a failed cleanup cannot hot-loop.
 
-For immediate manual relief, list paths and then prove the owner is final. Do
-not infer safety from directory age alone:
+For an explicitly authorized manual cleanup, inspect the producer-owned
+resource rather than deleting a path:
 
 ```sh
-find "$HOME/.gitmoot/worktrees" -type d -path '*/delegations/*/*' -prune -print
-
-# sqlite3 is an optional operator aid, not a Gitmoot runtime dependency.
-sqlite3 "$HOME/.gitmoot/gitmoot.db" -header -column '
-SELECT id, state, updated_at, json_extract(payload, "$.worktree_path") AS path
-FROM jobs
-WHERE state IN ("succeeded", "failed", "cancelled")
-  AND datetime(updated_at) <= datetime("now", "-72 hours")
-  AND json_extract(payload, "$.worktree_path") <> ""
-  AND (json_extract(payload, "$.delegation_id") <> ""
-       OR json_extract(payload, "$.read_only_worktree") = 1);
-'
-
-gitmoot job show <job-id> --json
-git -C <registered-checkout> worktree remove --force <verified-worktree-path>
-git -C <registered-checkout> worktree prune
+gitmoot job cleanup inspect --json <job-id>
+gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> --json <job-id>
 ```
 
-Before removal, verify that `job show` still reports `succeeded`, `failed`, or
-`cancelled` and the exact same `payload.worktree_path`. Never manually remove a
-worktree owned by a blocked, queued, or running job; settle that job first.
+Inspection is advisory. Apply rechecks generation, consumers, policy, path
+identity and liveness under a lifecycle fence shared with retry/resume and
+enqueue, before taking the checkout lock. No arbitrary path, shared-checkout
+or orphan deletion is supported. Existing `list` and operator-only `reopen`
+behavior is unchanged.
+Inspect itself holds the same database's exclusive lifecycle fence while reading
+Git and process state; concurrent lifecycle mutations wait. It does not create
+obligations or receipts, but its fence sidecar must be writable. A read-only
+database connection does not make a read-only-mounted home supported.
+
+`path_referenced` retains a workspace named by any other job, including an old
+terminal owner. The aged selector can discover both owners without authorizing
+either removal. Investigate the ownership overlap; do not bypass the shared gate.
+
+`retry_disposition_unknown` means the failed/cancelled owner has no proven
+reconstruction path. Only exact-head native read-only PR reviews currently have
+that proof. Failed/cancelled implement legs, produce stages and shell stages
+retain their workspaces and owned branches indefinitely, even after TTL expiry.
+This is intentional: TTL is not a maximum retention or disk-cap guarantee.
+Repeated aged scans may continue to discover these retained jobs; a skip event
+does not imply future removal. Neither `apply` nor `reopen` overrides the refusal,
+and no force-disposal command is provided. Inspect the job and escalate disk
+capacity to its owner; retry only when the work should genuinely resume. Do not
+retry just to discard evidence or bypass the gate with direct deletion.
+
+Terminal publication is independent of deletion: blocked downstream stages
+can receive their inputs while the workspace stays intact. Required service
+outputs have immutable generation snapshots under
+`$GITMOOT_HOME/cleanup-artifacts/`; missing or changed evidence refuses removal.
+Cleanup receipts remain in the producer database after workspace disposal.
+
+Replaying a completed token returns `already_removed` and the old receipt,
+without touching a recreated tree. An interrupted episode replaced by retry
+returns `superseded`, not successful removal. Accounting-only reconciliation
+can finish after retention changes; any remaining destructive effects still
+need current admission. Apply exits `0` for removed/already-removed, `3` for
+another completed decision, `1` for operational errors and `2` for bad arguments.
+Accounting recovery also reports checkout-lock release failures as operational
+errors. Inspect the durable receipt to distinguish completed removal from
+unfinished accounting before retrying.
+
+`approved_size_budget: null` means unknown, not zero or unlimited. A
+budget-dependent external caller must remain ineligible until an enforced
+positive-cap contract exists. Do not replace this gate with direct `rm`,
+`git worktree remove` or a consumer-side path/size scan.
+

@@ -922,6 +922,22 @@ func AdvancePipelineRunWithAutoMerge(ctx context.Context, store *db.Store, enque
 	if run.State != RunRunning {
 		return run, nil
 	}
+	ctx, releaseLifecycle, err := store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return run, err
+	}
+	defer releaseLifecycle()
+	current, exists, err := store.GetPipelineRun(ctx, run.ID)
+	if err != nil {
+		return run, err
+	}
+	if !exists {
+		return run, fmt.Errorf("pipeline run %s disappeared before advancement", run.ID)
+	}
+	run = current
+	if run.State != RunRunning {
+		return run, nil
+	}
 	specByID := make(map[string]Stage, len(spec.Stages))
 	for _, stage := range spec.Stages {
 		specByID[stage.ID] = stage

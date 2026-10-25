@@ -157,6 +157,11 @@ func (s *Store) NextSucceededPipelineTriggerRun(ctx context.Context, state Pipel
 // downstream is disabled, already active, or the cursor changed since selection,
 // it returns fired=false without advancing the cursor.
 func (s *Store) FirePipelineTrigger(ctx context.Context, expected PipelineTriggerState, upstreamRun, downstreamRun PipelineRun, stages []PipelineRunStage) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	expected.Downstream = strings.TrimSpace(expected.Downstream)
 	expected.Upstream = strings.TrimSpace(expected.Upstream)
 	expected.Cursor = strings.TrimSpace(expected.Cursor)
@@ -259,4 +264,5 @@ func (s *Store) FirePipelineTrigger(ctx context.Context, expected PipelineTrigge
 		return false, err
 	}
 	return true, nil
+
 }

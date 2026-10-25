@@ -599,12 +599,17 @@ Doctor separates reclaimable final delegation owners, pinned non-final owners,
 and unproven directories. `/api/health` exposes the same delegation metric and
 quarantined cleanup count in its top-level `worktrees` field.
 
-`[workflow].delegation_worktree_ttl = "72h"` is default-on. After that grace
-period the daemon force-removes dirty terminal-owned read-only and delegation
-worktrees. Set the TTL to `"0"` to disable this pass. Blocked, queued, and
-running owners remain pinned.
+`[workflow].delegation_worktree_ttl = "72h"` supplies the default aged-cleanup
+grace period; `"0"` disables aged cleanup. Ordinary and aged cleanup share the
+same producer safety gate. Terminal state alone is insufficient: blocked,
+resumable or undispatched consumers, unfinished pipelines, unknown liveness or
+ownership, and preservation failures retain the resource. Succeeded owners need
+a stored result; failed/cancelled owners additionally need a proven
+reconstruction path (currently a pinned native read-only PR review). Cleanup
+never cancels consumers or treats an operational failure as permission to
+delete.
 
-No NEW fix clone is created — #2203 removed the fix-worktree lifecycle and the
+No new fix clone is created — #2203 removed the
 auto-fix leg that allocated one — and no gitmoot path deletes one that already
 exists. It is a standalone object
 database, and Linux has no inode-conditional unlink that can make deletion match
@@ -618,6 +623,58 @@ enqueue failures rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries
 can allocate without destroying bytes. Cleanup obligations remain open.
 Managed-path absence is not treated as removal, even when no sibling is found,
 and dangling symlinks remain visible through `lstat`.
+
+For an explicitly authorized manual cleanup, use producer-owned inspection
+and a generation-bound token:
+
+```sh
+gitmoot job cleanup inspect --json <job-id>
+gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> --json <job-id>
+```
+
+Inspection is advisory. Apply derives the path from metadata and revalidates
+consumers, generation, policy, physical identity and liveness under the
+lifecycle fence, then the checkout lock. Retry/resume and enqueue use the same
+fence. No arbitrary path, orphan or shared-checkout deletion is supported.
+Inspect itself holds the same database's exclusive lifecycle fence while reading
+Git and process state; concurrent lifecycle mutations wait. It does not create
+obligations or receipts, but its fence sidecar must be writable. A read-only
+database connection does not make a read-only-mounted home supported.
+
+`path_referenced` retains a workspace named by any other job, including an old
+terminal owner. The aged selector can discover both owners without authorizing
+either removal. Investigate the ownership overlap; do not bypass the shared gate.
+
+`retry_disposition_unknown` means the failed/cancelled owner has no proven
+reconstruction path. Only exact-head native read-only PR reviews currently have
+that proof. Failed/cancelled implement legs, produce stages and shell stages
+retain their workspaces and owned branches indefinitely, even after TTL expiry.
+This is intentional: TTL is not a maximum retention or disk-cap guarantee.
+Repeated aged scans may continue to discover these retained jobs; a skip event
+does not imply future removal. Neither `apply` nor `reopen` overrides the refusal,
+and no force-disposal command is provided. Inspect the job and escalate disk
+capacity to its owner; retry only when the work should genuinely resume. Do not
+retry just to discard evidence or bypass the gate with direct deletion.
+
+Publication does not wait for deletion eligibility. Blocked downstream stages
+can receive their inputs while the producer workspace remains; required service
+outputs have immutable generation snapshots under
+`$GITMOOT_HOME/cleanup-artifacts/`. Missing or changed required evidence refuses
+deletion. Receipts remain in the producer database outside disposable paths.
+
+A completed token replays as `already_removed` without touching a new tree at
+the same path. An unfinished historical episode replaced by retry becomes
+`superseded`, not successful removal. Accounting-only recovery can finish after
+retention changes; remaining destructive effects still require fresh admission.
+Apply exits `0` for removed/already-removed, `3` for another completed decision,
+`1` for operational errors and `2` for invalid arguments.
+Accounting recovery also reports checkout-lock release failures as operational
+errors. Inspect the durable receipt to distinguish completed removal from
+unfinished accounting before retrying.
+
+`approved_size_budget: null` means unknown, never zero or unlimited. A consumer
+requiring a positive cap must remain ineligible. Do not substitute direct path
+deletion or a consumer-side size scan for the producer contract.
 
 `gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory
 structurally, including set-asides created before a job row exists. Directory
@@ -637,6 +694,11 @@ cannot hot-loop. Cleanup obligations retry once per minute and stop in
 `quarantined` after the third failure. Inspect them with `gitmoot job cleanup
 list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.
+Checkout contention defers both ordinary and aged cleanup without spending the
+failure budget. Persisted error text uses the existing credential-redaction
+policy. Aged selection uses the current generation's recorded terminal time;
+artifact publication does not restart retention, and an older generation's
+completion cannot suppress cleanup of its replacement.
 
 Repeated terminal-task failures log three times per path before identical
 messages are suppressed. The terminal-task pass proves at most eight candidates

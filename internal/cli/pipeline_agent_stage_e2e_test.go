@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -368,7 +370,8 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 
 	// Phase 2: drive both reviews concurrently on the pool worker. Both must be live
 	// simultaneously to clear the 2-of-2 rendezvous.
-	bothRunning := drivePoolConcurrently(t, ctx, readonlyPoolWorker(store, home), store, []string{reva.JobID, revb.JobID})
+	worker := readonlyPoolWorker(store, home)
+	bothRunning := drivePoolConcurrently(t, ctx, worker, store, []string{reva.JobID, revb.JobID})
 	if !bothRunning {
 		t.Fatal("state sampler never observed both review stages in `running` at once (serialized)")
 	}
@@ -382,7 +385,10 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 		}
 	}
 
-	// Each detached worktree is DISPOSED on terminal (dir gone + removal event).
+	// Completed stages remain available until their pipeline has consumed them.
+	engine := worker.defaultWorkflowForRunner(checkout, subprocess.ExecRunner{})
+	cleanupNow := time.Now().UTC().Add(2 * time.Minute)
+	engine.Now = func() time.Time { return cleanupNow }
 	for name, id := range map[string]string{"reva": reva.JobID, "revb": revb.JobID} {
 		job, err := store.GetJob(ctx, id)
 		if err != nil {
@@ -392,11 +398,12 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 		if err != nil {
 			t.Fatalf("payload %s: %v", id, err)
 		}
-		if _, statErr := os.Stat(p.WorktreePath); !os.IsNotExist(statErr) {
-			t.Fatalf("review stage %s worktree %s not disposed on terminal (stat err=%v)", name, p.WorktreePath, statErr)
+		if _, statErr := os.Stat(p.WorktreePath); statErr != nil {
+			t.Fatalf("review stage %s lost its workspace before pipeline completion: %v", name, statErr)
 		}
-		if n := countCLIJobEvents(t, store, id, "delegation_worktree_removed"); n != 1 {
-			t.Fatalf("review stage %s delegation_worktree_removed events = %d, want 1", name, n)
+		decision, err := engine.InspectProducerCleanup(ctx, id, workflow.CleanupPolicy{Mode: "ordinary"})
+		if err != nil || decision.Eligible || !slices.Contains(decision.ReasonCodes, "pipeline_consumer_resumable") {
+			t.Fatalf("unfinished pipeline did not retain stage %s: %+v %v", name, decision, err)
 		}
 	}
 
@@ -410,6 +417,26 @@ func TestPipelineReviewStagesConcurrentWorktreesE2E(t *testing.T) {
 	}
 	if run.State != pipeline.RunSucceeded {
 		t.Fatalf("run state = %s, want succeeded", run.State)
+	}
+	for _, id := range []string{reva.JobID, revb.JobID} {
+		removed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, id)
+		if err != nil || !removed {
+			t.Fatalf("completed pipeline did not release stage %s: removed=%v err=%v", id, removed, err)
+		}
+		job, err := store.GetJob(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := workflow.ParseJobPayload(job.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(payload.WorktreePath); !os.IsNotExist(err) {
+			t.Fatalf("completed pipeline stage %s workspace remains: %v", id, err)
+		}
+		if count := countCLIJobEvents(t, store, id, "delegation_worktree_removed"); count != 1 {
+			t.Fatalf("completed pipeline stage %s removal events = %d, want 1", id, count)
+		}
 	}
 }
 

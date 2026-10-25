@@ -557,6 +557,11 @@ func (e Engine) ResolveEscalation(ctx context.Context, coordinatorJobID string, 
 		return fmt.Errorf("invalid resume decision %q; want retry|continue|abort|answer", decision)
 	}
 
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	rec, exists, err := e.loadEscalation(ctx, coordinatorJobID)
 	if err != nil {
 		return err
@@ -1127,6 +1132,11 @@ func (e Engine) recoverEscalationRound(ctx context.Context, round db.EscalationR
 	// THE FENCE FIRST. Recovery must own the round through EFFECT COMMIT, and the
 	// order is load-bearing: taking it before the pre-effects is what stops two
 	// recoverers from both allocating a worktree or both taking a branch lock (#1673).
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer releaseLifecycle()
 	owner := newEscalationRoundID()
 	fenceNow := time.Now().UTC()
 	held, err := e.Store.AcquireEscalationRecoveryLease(ctx, round.JobID, round.RoundID, owner,
@@ -1546,6 +1556,11 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 	if ttl <= 0 {
 		return 0, nil
 	}
+	ctx, releaseLifecycle, err := e.Store.AcquireJobLifecycle(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseLifecycle()
 	// BOUNDED (#598): iterate ONLY the coordinators with an open escalation round
 	// (requested > resolved) instead of listing EVERY job and re-reading each one's
 	// full event history twice. Zero candidates => the loop body never runs, so this

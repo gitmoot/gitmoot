@@ -57,6 +57,7 @@ func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id str
 	t.Helper()
 	payload := workflow.JobPayload{
 		Repo: repo, WorktreePath: path, ReadOnlyWorktree: true,
+		Result: &workflow.AgentResult{Decision: "approved", Summary: "retained terminal result"},
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -74,8 +75,8 @@ func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id str
 		}
 	}
 	seedCLIJob(t, store, db.Job{
-		ID: id, Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
-		Repo: repo, ParentJobID: "parent", DelegationID: id, Payload: string(encoded),
+		ID: id, Agent: "reader", Type: "ask", State: string(workflow.JobSucceeded),
+		Repo: repo, Payload: string(encoded),
 	}, "seed reclaim resilience candidate")
 	backdateJobUpdatedAt(t, store.DatabasePath(), id, now.Add(-73*time.Hour))
 	if pendingMarker {
@@ -88,19 +89,44 @@ func seedReclaimResilienceCandidateForRepo(t *testing.T, store *db.Store, id str
 }
 
 type selectiveReclaimManager struct {
-	fakeReclaimWorktreeManager
+	gitutil.Client
+	removed  []string
 	failPath string
 	err      error
 	calls    int
 }
 
-func (m *selectiveReclaimManager) RemoveWorktreeForce(_ context.Context, path string) error {
+func (m *selectiveReclaimManager) RemoveWorktreeForce(ctx context.Context, path string) error {
 	m.calls++
 	if filepath.Clean(path) == filepath.Clean(m.failPath) {
 		return m.err
 	}
+	if err := m.Client.RemoveWorktreeForce(ctx, path); err != nil {
+		return err
+	}
 	m.removed = append(m.removed, path)
 	return nil
+}
+
+func newSelectiveReclaimManager(t *testing.T, paths ...string) (*selectiveReclaimManager, string) {
+	t.Helper()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	manager := &selectiveReclaimManager{Client: gitutil.NewHostClient(checkout)}
+	for _, path := range paths {
+		if err := manager.AddDetachedWorktree(context.Background(), path, "HEAD"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return manager, checkout
+}
+
+func reclaimFixtureEngine(worker jobWorker, checkout string, manager workflow.WorktreeManager) workflow.Engine {
+	return workflow.Engine{
+		Store: worker.Store, Home: worker.workflowHome(),
+		DelegationCheckout: checkout, DelegationWorktrees: manager,
+		WorktreeLiveness:              func(string) (bool, bool) { return false, true },
+		BeforeReadOnlyWorktreeCleanup: askReviewDiffPrecleanupHookForRunner(worker.Store, subprocess.ExecRunner{}),
+	}
 }
 
 func seedReclaimResilienceCandidate(t *testing.T, store *db.Store, id string, path string, now time.Time, pendingMarker bool, badRunner bool) {
@@ -138,9 +164,7 @@ func TestDelegationReclaimPoisonPillContinues(t *testing.T) {
 				seedReclaimResilienceCandidate(t, store, "a-poison", poisonPath, now, mode == "skipped", phase == "runner")
 				seedReclaimResilienceCandidate(t, store, "b-good", goodPath, now, mode == "skipped", false)
 
-				manager := &selectiveReclaimManager{
-					fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
-				}
+				manager, checkout := newSelectiveReclaimManager(t, poisonPath, goodPath)
 				if mode == "aged" && phase == "reclaim" {
 					manager.failPath = poisonPath
 					manager.err = errors.New("poison reclaim failure")
@@ -161,7 +185,7 @@ func TestDelegationReclaimPoisonPillContinues(t *testing.T) {
 					if mode == "skipped" && phase == "reclaim" && factoryCalls == 1 {
 						mutateReclaimCandidateColumn(t, store, `UPDATE jobs SET payload = '{' WHERE id = ?`, "a-poison")
 					}
-					return workflow.Engine{Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+					return reclaimFixtureEngine(worker, checkout, manager)
 				}
 
 				cand := newTickCandidates(store)
@@ -176,6 +200,17 @@ func TestDelegationReclaimPoisonPillContinues(t *testing.T) {
 				}
 				if len(manager.removed) != 1 || filepath.Clean(manager.removed[0]) != filepath.Clean(goodPath) {
 					t.Fatalf("second candidate was not reclaimed after %s failure: removed=%v", phase, manager.removed)
+				}
+				if _, err := os.Stat(goodPath); !os.IsNotExist(err) {
+					t.Fatalf("second resource was not physically removed: %v", err)
+				}
+				outcome, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("b-good", goodPath))
+				if err != nil || outcome.State != db.CleanupObligationRemoved {
+					t.Fatalf("second resource completion was not durable: %+v %v", outcome, err)
+				}
+				failure, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("a-poison", poisonPath))
+				if err != nil || failure.AttemptCount != 1 {
+					t.Fatalf("poison failure was not accounted: %+v %v", failure, err)
 				}
 			})
 		}
@@ -257,27 +292,6 @@ func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	}
 }
 
-type destinationReclaimManager struct {
-	client   gitutil.Client
-	failPath string
-}
-
-func (m destinationReclaimManager) AddWorktree(ctx context.Context, branch string, path string, base string) error {
-	return m.client.AddWorktree(ctx, branch, path, base)
-}
-func (m destinationReclaimManager) AddDetachedWorktree(ctx context.Context, path string, ref string) error {
-	return m.client.AddDetachedWorktree(ctx, path, ref)
-}
-func (m destinationReclaimManager) RemoveWorktreeForce(ctx context.Context, path string) error {
-	if filepath.Clean(path) == filepath.Clean(m.failPath) {
-		return errors.New("injected unreclaimable first destination")
-	}
-	return m.client.RemoveWorktreeForce(ctx, path)
-}
-func (m destinationReclaimManager) PruneWorktrees(ctx context.Context) error {
-	return m.client.PruneWorktrees(ctx)
-}
-
 func TestAgedDelegationReclaimDestinationRemovesSecondDirectory(t *testing.T) {
 	resetDelegationReclaimAccountingForTest(t)
 	ctx := context.Background()
@@ -298,10 +312,9 @@ func TestAgedDelegationReclaimDestinationRemovesSecondDirectory(t *testing.T) {
 	seedReclaimResilienceCandidate(t, store, "b-good", secondPath, now, false, false)
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{
-			Store: store, Home: worker.workflowHome(), DelegationCheckout: checkout,
-			DelegationWorktrees: destinationReclaimManager{client: client, failPath: firstPath},
-		}
+		return reclaimFixtureEngine(worker, checkout, &selectiveReclaimManager{
+			Client: client, failPath: firstPath, err: errors.New("injected unreclaimable first destination"),
+		})
 	}
 	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
 		t.Fatal(err)
@@ -328,20 +341,19 @@ func TestDelegationCleanupUnknownFailureQuarantinesAndSurvivesRestart(t *testing
 	path := managedReclaimTestPath(t, home, "unknown-poison")
 	realNow := time.Now().UTC()
 	seedReclaimResilienceCandidate(t, store, "unknown-poison", path, realNow, false, false)
-	manager := &selectiveReclaimManager{
-		fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
-		failPath:                   path,
-		err:                        errors.New("unclassified git worktree refusal"),
-	}
+	manager, checkout := newSelectiveReclaimManager(t, path)
+	manager.failPath = path
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	manager.err = errors.New("unclassified git worktree refusal: " + secret)
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: worker.Store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+		return reclaimFixtureEngine(worker, checkout, manager)
 	}
 
 	// Keep each persisted next_attempt_at behind wall clock time while advancing
 	// the logical attempt time. This exercises the production due-query without a
 	// sleep or a test-only selector.
-	for attempt := 0; attempt < wantBudget; attempt++ {
+	for attempt := range wantBudget {
 		now := realNow.Add(-10*time.Minute + time.Duration(attempt)*2*time.Minute)
 		if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
 			t.Fatalf("attempt %d: %v", attempt+1, err)
@@ -355,6 +367,9 @@ func TestDelegationCleanupUnknownFailureQuarantinesAndSurvivesRestart(t *testing
 	}
 	if obligation.State != db.CleanupObligationQuarantined || obligation.Reason != "unknown" || obligation.AttemptCount != wantBudget {
 		t.Fatalf("obligation = %+v, want unknown quarantine at budget %d", obligation, wantBudget)
+	}
+	if strings.Contains(obligation.LastError, secret) || !strings.Contains(obligation.LastError, "[REDACTED]") {
+		t.Fatalf("quarantined diagnostic exposed a credential: %q", obligation.LastError)
 	}
 	if ids, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, realNow.Add(-72*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -399,16 +414,13 @@ func TestDelegationCleanupSkippedFailureConsumesBudget(t *testing.T) {
 	path := managedReclaimTestPath(t, home, "skipped-poison")
 	realNow := time.Now().UTC()
 	seedReclaimResilienceCandidate(t, store, "skipped-poison", path, realNow, true, false)
-	manager := &selectiveReclaimManager{
-		fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
-		failPath:                   path,
-		err:                        errors.New("unclassified skipped cleanup refusal"),
-	}
+	manager, checkout := newSelectiveReclaimManager(t, path)
+	manager.failPath, manager.err = path, errors.New("unclassified skipped cleanup refusal")
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+		return reclaimFixtureEngine(worker, checkout, manager)
 	}
-	for attempt := 0; attempt < wantBudget; attempt++ {
+	for attempt := range wantBudget {
 		now := realNow.Add(-10*time.Minute + time.Duration(attempt)*2*time.Minute)
 		if err := reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now); err != nil {
 			t.Fatal(err)
@@ -432,12 +444,12 @@ func TestDelegationCleanupRefusesUncontainedTarget(t *testing.T) {
 	path := t.TempDir()
 	realNow := time.Now().UTC()
 	seedReclaimResilienceCandidate(t, store, "unsafe-target", path, realNow, false, false)
-	manager := &selectiveReclaimManager{fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}}}
+	manager, checkout := newSelectiveReclaimManager(t, path)
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store, Home: worker.workflowHome(), DelegationCheckout: t.TempDir(), DelegationWorktrees: manager}
+		return reclaimFixtureEngine(worker, checkout, manager)
 	}
-	for attempt := 0; attempt < delegationCleanupRetryBudget; attempt++ {
+	for attempt := range delegationCleanupRetryBudget {
 		now := realNow.Add(-10*time.Minute + time.Duration(attempt)*2*time.Minute)
 		if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
 			t.Fatal(err)
@@ -513,32 +525,27 @@ func TestDelegationCleanupSkipsDegeneratePathBeforeObligation(t *testing.T) {
 	}
 }
 
-type failingAgedReclaimManager struct {
-	fakeReclaimWorktreeManager
-	err error
-}
-
-func (m *failingAgedReclaimManager) RemoveWorktreeForce(_ context.Context, path string) error {
-	m.removed = append(m.removed, path)
-	return m.err
-}
-
 func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 
-	checkout := t.TempDir()
+	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	worktreePath := managedReclaimTestPath(t, home, "aged-terminal")
+	client := gitutil.NewHostClient(checkout)
+	if err := client.AddDetachedWorktree(ctx, worktreePath, "HEAD"); err != nil {
+		t.Fatal(err)
+	}
 	seedCLIJob(t, store, db.Job{
-		ID: "aged-terminal", Agent: "reader", Type: "ask", State: string(workflow.JobFailed),
+		ID: "aged-terminal", Agent: "reader", Type: "ask", State: string(workflow.JobSucceeded),
 		Repo: "owner/repo",
 		Payload: mustJobPayload(t, workflow.JobPayload{
 			Repo: "owner/repo", WorktreePath: worktreePath, ReadOnlyWorktree: true,
+			Result: &workflow.AgentResult{Decision: "approved", Summary: "retained terminal result"},
 		}),
 	}, "seed aged terminal delegation")
 	backdateJobUpdatedAt(t, store.DatabasePath(), "aged-terminal", now.Add(-73*time.Hour))
@@ -558,15 +565,13 @@ func TestAgedWorktreeReclaimFailureDoesNotBlockDispatch(t *testing.T) {
 		return adapter, nil
 	}
 	reclaimErr := errors.New("injected aged worktree reclaim failure")
-	manager := &failingAgedReclaimManager{
-		fakeReclaimWorktreeManager: fakeReclaimWorktreeManager{branches: map[string]bool{}},
-		err:                        reclaimErr,
-	}
+	manager := &selectiveReclaimManager{Client: client, failPath: worktreePath, err: reclaimErr}
 	baseWorkflowFactory := worker.defaultWorkflow
 	worker.WorkflowFactory = func(parentCheckout string) workflow.Engine {
 		engine := baseWorkflowFactory(parentCheckout)
 		engine.DelegationCheckout = checkout
 		engine.DelegationWorktrees = manager
+		engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
 		return engine
 	}
 
@@ -799,43 +804,75 @@ func TestSkippedReclaimPersistsFairnessPastFilteredHostWindow(t *testing.T) {
 // budget and quarantines an obligation that would have succeeded once the lock
 // cleared, so a contended pass must DEFER instead of recording a failure.
 func TestDeferDelegationCleanupContentionKeepsRetryBudget(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	t.Cleanup(func() {
-		if err := store.Close(); err != nil {
-			t.Fatalf("close store: %v", err)
-		}
-	})
-	worker := defaultJobWorker(store, io.Discard, home)
-	now := time.Now().UTC()
-	path := filepath.Join(home, "worktrees", "owner--repo", "fixes", "job-contended")
-	contended := fmt.Errorf("lock checkout for TTL fix clone reclaim: %w",
-		workflow.BlockedError{Reason: "This checkout is already being mutated by another Gitmoot task."})
-	if !delegationCleanupContended(contended) {
-		t.Fatal("wrapped BlockedError was not classified as contention")
-	}
-	if delegationCleanupContended(errors.New("remove failed")) {
-		t.Fatal("an ordinary failure was classified as contention")
-	}
-
-	for attempt := 0; attempt < delegationCleanupRetryBudget+1; attempt++ {
-		if err := deferDelegationCleanupContention(ctx, worker, "aged", "job-contended", path, contended, now); err != nil {
-			t.Fatalf("deferDelegationCleanupContention: %v", err)
-		}
-	}
-	obligation, err := store.GetCleanupObligation(ctx, db.CleanupObligationResourceID("job-contended", path))
-	if err != nil {
-		t.Fatalf("GetCleanupObligation: %v", err)
-	}
-	if obligation.State != db.CleanupObligationRetryable {
-		t.Fatalf("obligation state = %q, want retryable after repeated contention", obligation.State)
-	}
-	if obligation.AttemptCount != 0 {
-		t.Fatalf("attempt count = %d, want 0: contention must not spend the retry budget", obligation.AttemptCount)
-	}
-	if obligation.Reason != db.CleanupReasonCheckoutLock {
-		t.Fatalf("reason = %q, want %q", obligation.Reason, db.CleanupReasonCheckoutLock)
+	for _, mode := range []string{"aged", "skipped"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			home := t.TempDir()
+			store := openCLIJobStore(t, home)
+			t.Cleanup(func() { _ = store.Close() })
+			const jobID = "job-contended"
+			path := managedReclaimTestPath(t, home, jobID)
+			realNow := time.Now().UTC()
+			logicalNow := realNow.Add(-10 * time.Minute)
+			seedReclaimResilienceCandidate(t, store, jobID, path, realNow, mode == "skipped", false)
+			manager, checkout := newSelectiveReclaimManager(t, path)
+			worker := defaultJobWorker(store, io.Discard, home)
+			worker.WorkflowFactory = func(string) workflow.Engine {
+				engine := reclaimFixtureEngine(worker, checkout, manager)
+				// Keep retry scheduling deterministic without sleeping for backoff.
+				// The production checkout lock still uses its real bounded wait.
+				engine.Now = func() time.Time { return logicalNow }
+				return engine
+			}
+			resourceID := db.CleanupObligationResourceID(jobID, path)
+			mutateReclaimCandidateColumn(t, store,
+				`UPDATE cleanup_obligations SET next_attempt_at = ? WHERE resource_id = ?`,
+				logicalNow.Format(time.RFC3339Nano), resourceID)
+			lock := db.ResourceLock{
+				ResourceKey: "checkout-mutation:" + filepath.Clean(checkout),
+				OwnerJobID:  "other-mutator", OwnerToken: "held-checkout",
+				ExpiresAt: realNow.Add(30 * time.Minute).Format(time.RFC3339Nano),
+			}
+			acquired, err := store.AcquireResourceLock(ctx, lock, realNow)
+			if err != nil || !acquired {
+				t.Fatalf("could not establish real checkout contention: acquired=%v err=%v", acquired, err)
+			}
+			reclaim := func() error {
+				if mode == "aged" {
+					return reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), logicalNow, 72*time.Hour)
+				}
+				return reclaimSkippedDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), logicalNow)
+			}
+			if err := reclaim(); err != nil {
+				t.Fatal(err)
+			}
+			obligation, err := store.GetCleanupObligation(ctx, resourceID)
+			if err != nil || obligation.State != db.CleanupObligationRetryable ||
+				obligation.AttemptCount != 0 || obligation.Reason != db.CleanupReasonCheckoutLock {
+				t.Fatalf("contended scheduler spent the failure budget: %+v %v", obligation, err)
+			}
+			if manager.calls != 0 {
+				t.Fatal("contended scheduler reached physical removal")
+			}
+			if _, err := os.Stat(path); err != nil {
+				t.Fatalf("contended resource changed: %v", err)
+			}
+			released, err := store.ReleaseResourceLock(ctx, lock.ResourceKey, lock.OwnerJobID, lock.OwnerToken)
+			if err != nil || !released {
+				t.Fatalf("release checkout contention: released=%v err=%v", released, err)
+			}
+			logicalNow = realNow
+			if err := reclaim(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("eligible resource was not reclaimed after the lock cleared: %v", err)
+			}
+			obligation, err = store.GetCleanupObligation(ctx, resourceID)
+			if err != nil || obligation.State != db.CleanupObligationRemoved || obligation.AttemptCount != 0 {
+				t.Fatalf("post-contention cleanup did not complete durably: %+v %v", obligation, err)
+			}
+		})
 	}
 }
 

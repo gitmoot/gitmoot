@@ -15,7 +15,7 @@ import (
 // run that is CURRENTLY executing this job in-process (set by the daemon worker
 // after it acquires the lock). It lets the destructive worktree-cleanup gate tell
 // its OWN about-to-be-released lock from a foreign live owner — see
-// runtimeOwnerActive.
+// cleanupRuntimeRefusal.
 type runtimeSelfOwnerTokenKey struct{}
 
 // WithRuntimeSelfOwnerToken tags ctx with the owner token of the runtime-session
@@ -37,32 +37,6 @@ func runtimeSelfOwnerToken(ctx context.Context) string {
 	}
 	token, _ := ctx.Value(runtimeSelfOwnerTokenKey{}).(string)
 	return token
-}
-
-// runtimeOwnerActive reports whether jobID's runtime-session lock is still held by
-// an active FOREIGN owner — an unexpired lease, a live same-host owner PID, or an
-// unverifiable cross-host owner. It is the conservative gate the DESTRUCTIVE
-// implement-worktree cleanup consults so a worktree owned by a still-running
-// runtime worker is never force-removed (#536).
-//
-// The run that is finishing normally still holds its OWN runtime-session lock at
-// cleanup time, because the daemon releases that lock only AFTER engine.RunJob
-// (hence AdvanceJob's deferred cleanup) returns. Counting that own lock as
-// "active" would refuse cleanup on EVERY healthy completion and leak the worktree
-// + gitmoot-delegation-* branch (the #478 regression). So the run's own lock —
-// identified by the owner token threaded through ctx — is excluded; only a foreign
-// owner gates the destructive removal. A job that holds no (other) runtime lock is
-// never active, so cleanup behavior is unchanged.
-func (e Engine) runtimeOwnerActive(ctx context.Context, jobID string) (bool, string) {
-	if e.Store == nil {
-		return false, ""
-	}
-	thisHost, _ := os.Hostname()
-	liveness, err := e.Store.JobRuntimeLockLiveness(ctx, jobID, e.now().UTC(), thisHost, e.ownerPIDLive(), runtimeSelfOwnerToken(ctx))
-	if err != nil || liveness == nil {
-		return false, ""
-	}
-	return liveness.Active(), liveness.Reason
 }
 
 func (e Engine) ownerPIDLive() func(int64) bool {
@@ -89,17 +63,6 @@ func (e Engine) worktreeLiveness(path string) (live bool, known bool) {
 		return e.WorktreeHasLiveProcess(path), true
 	}
 	return strictWorktreeLiveness(path)
-}
-
-// worktreeHasLiveProcess reports whether a live process on this host still has its
-// working directory inside the worktree at path. It is the lock-independent,
-// PID-reuse- and hostname-rename-immune never-clobber gate the destructive cleanup
-// consults so a worktree a daemon-crash-reparented worker is STILL writing is not
-// force-removed even after its runtime-session lease has expired and its lock been
-// reaped (#536 finding 1).
-func (e Engine) worktreeHasLiveProcess(path string) bool {
-	live, _ := e.worktreeLiveness(path)
-	return live
 }
 
 // WorktreeLiveness reports whether a live process on this host has its cwd in

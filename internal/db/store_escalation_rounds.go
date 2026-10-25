@@ -483,6 +483,11 @@ type PreparedJob struct {
 // Every write goes through tx-scoped statements taking this transaction handle; no
 // effect opens its own transaction or connection.
 func (s *Store) CommitResolutionEffects(ctx context.Context, commit ResolutionCommit, now time.Time) (bool, error) {
+	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
+	if fenceErr != nil {
+		return false, fenceErr
+	}
+	defer releaseLifecycle()
 	jobID := strings.TrimSpace(commit.JobID)
 	roundID := strings.TrimSpace(commit.RoundID)
 	owner := strings.TrimSpace(commit.Owner)
@@ -583,6 +588,7 @@ func (s *Store) CommitResolutionEffects(ctx context.Context, commit ResolutionCo
 		}
 	}
 	return true, tx.Commit()
+
 }
 
 // MarkEscalationRoundNeedsRepairAsOwner parks a round only for its FENCE HOLDER. That

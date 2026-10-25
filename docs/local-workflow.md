@@ -131,12 +131,16 @@ not itself dispose the task.
 `task list` and `task events` are the whole surviving task verb set;
 `gitmoot task --help` prints exactly those two.
 
-Delegation worktrees have a separate default-on retention bound:
-`[workflow].delegation_worktree_ttl = "72h"`. Only worktrees owned by final jobs
-(`succeeded`, `failed`, or `cancelled`) older than the TTL are force-removed;
-`"0"` disables the pass. Blocked, queued, and running owners stay pinned. Run
-`gitmoot doctor` to see stale count, logical size, and the
-reclaimable/pinned/unproven breakdown; dashboard `/api/health` mirrors it.
+Delegation worktrees use a separate default-on aged cleanup policy:
+`[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only
+eligible terminal (`succeeded`, `failed`, or `cancelled`) resources may be removed
+after the TTL. Terminal state and age alone do not authorize removal: blocked
+or resumable consumers, preservation failures, and unknown process liveness
+retain the workspace. The current generation's obligation supplies its terminal
+clock, so artifact publication does not restart retention and an older
+generation's completion cannot hide a replacement. Run `gitmoot doctor` to see
+stale count, logical size, and the reclaimable/pinned/unproven breakdown;
+dashboard `/api/health` mirrors it.
 Candidate-local lookup, runner, and removal failures skip only that worktree;
 later candidates continue. Repeated failures are logged three times per path,
 then suppressed. Each failed cleanup also advances a durable obligation with a
@@ -145,6 +149,9 @@ automatic selection. Doctor and `/api/health` report quarantined obligations;
 inspect them with `gitmoot job cleanup list --state quarantined` and explicitly
 reopen one with `gitmoot job cleanup reopen <resource-id>`. Candidate-query and
 store-wide lookup failures remain fatal.
+Checkout contention defers both ordinary and aged cleanup without spending the
+failure budget. Persisted cleanup errors use the existing credential-redaction
+policy.
 
 Never-started plans have a separate destructive opt-in:
 `[workflow].planned_ttl = "720h"`. It is disabled by default; unset, empty,
