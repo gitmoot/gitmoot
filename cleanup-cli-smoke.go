@@ -39,6 +39,23 @@ func main() {
  cli:=func(want int, args ...string) []byte { full:=append([]string{"job","cleanup",args[0],"--home",home,"--json"},args[1:]...); c:=exec.CommandContext(ctx,os.Args[1],full...); out,err:=c.Output(); code:=0; if err!=nil {if ee,ok:=err.(*exec.ExitError);ok {code=ee.ExitCode(); if code!=want {panic(fmt.Sprintf("CLI %v: exit %d stderr=%s stdout=%s",full,code,ee.Stderr,out))}} else {panic(err)}}; if code!=want {panic(fmt.Sprintf("CLI exit %d want %d: %s",code,want,out))}; return out }
  var inspection workflow.CleanupInspection
  must(json.Unmarshal(cli(0,"inspect",id),&inspection)); if !inspection.Eligible {panic(fmt.Sprintf("inspection refused: %+v",inspection))}
+ // Missing service-stage metadata must invalidate an otherwise eligible token.
+ service := payload
+ service.Sender = workflow.PipelineJobSender
+ service.RootJobID = "psr-0123456789abcdef0123456789abcdef"
+ serviceBytes,err := json.Marshal(service); must(err)
+ must(store.UpdateJobPayload(ctx,id,string(serviceBytes)))
+ var unknown workflow.CleanupInspection
+ must(json.Unmarshal(cli(0,"inspect",id),&unknown))
+ if unknown.Eligible || strings.Join(unknown.ReasonCodes,",")!="pipeline_consumers_unknown" {panic(fmt.Sprintf("missing pipeline evidence admitted: %+v",unknown))}
+ var refused workflow.CleanupApplyResult
+ must(json.Unmarshal(cli(3,"apply","--resource",inspection.ResourceID,"--token",inspection.EligibilityToken,id),&refused))
+ if refused.State!="refused" {panic(fmt.Sprintf("missing pipeline evidence applied: %+v",refused))}
+ retained,err:=os.ReadFile(filepath.Join(path,"result.txt")); must(err)
+ if string(retained)!="producer input\n" {panic("missing pipeline evidence lost producer input")}
+ fmt.Println("service_metadata_missing=refused workspace_preserved=true")
+ must(store.UpdateJobPayload(ctx,id,string(encoded)))
+ must(json.Unmarshal(cli(0,"inspect",id),&inspection)); if !inspection.Eligible {panic("restored standalone producer not eligible")}
  var applied workflow.CleanupApplyResult
  must(json.Unmarshal(cli(0,"apply","--resource",inspection.ResourceID,"--token",inspection.EligibilityToken,id),&applied))
  if applied.State!="removed" || applied.Receipt==nil {panic(fmt.Sprintf("apply: %+v",applied))}

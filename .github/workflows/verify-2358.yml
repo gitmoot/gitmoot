@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: 53806f217de1bd6c25cd4ec2ca1466c61ed64b80
+  TARGET_SHA: c2a8340e578e053881e495cb24be830ed66a94c6
   GOTOOLCHAIN: local
   GOMAXPROCS: '2'
 
@@ -62,6 +62,9 @@ jobs:
       matrix:
         package: [cli, db, workflow]
         base_name: [original, corrections, review]
+        include:
+          - package: workflow
+            base_name: review2
     steps:
       - uses: actions/checkout@v4
         with:

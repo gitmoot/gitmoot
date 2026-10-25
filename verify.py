@@ -136,7 +136,8 @@ elif mode == 'proofs':
     assert package in ('cli', 'db', 'workflow')
     base = {'original': '574d0705976d280fb5ad6fcacbfef6b5ddb27514',
             'corrections': '999c965ff914592aca4dd02f82c53127a7070b9f',
-            'review': '6c18b98c7469eddd7729ca2c8e4df0b4bba9ba2d'}[env['PROOF_BASE']]
+            'review': '6c18b98c7469eddd7729ca2c8e4df0b4bba9ba2d',
+            'review2': '53806f217de1bd6c25cd4ec2ca1466c61ed64b80'}[env['PROOF_BASE']]
     tool_revision = 'd5f169ab623e8ba0896b727a09f36738612a79e2'
     tools = evidence / 'tools'
     tools.mkdir()
