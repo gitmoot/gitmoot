@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tarfile
 
 source = Path(sys.argv[1]).resolve()
 evidence = Path(sys.argv[2]).resolve()
@@ -104,6 +105,8 @@ def run(name, command, cwd=source, allowed=(0,), timeout=1800):
 
 if mode == 'smoke':
     assert os.geteuid() == 0, 'real process and mount-namespace visibility requires root'
+    kit = evidence.parent / 'review-kit'
+    kit.mkdir()
     binary = evidence / 'gitmoot'
     package = 'github.com/gitmoot/gitmoot/internal/buildinfo'
     stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -112,6 +115,7 @@ if mode == 'smoke':
                          '-o', str(binary), './cmd/gitmoot'], timeout=900)
     run('native-version', [str(binary), 'version'], timeout=30)
     binary_hashes = {'gitmoot': hashlib.sha256(binary.read_bytes()).hexdigest()}
+    shutil.copy2(binary, kit / 'gitmoot')
     for kind in ('cli', 'worker'):
         directory = source / f'.cleanup-{kind}-smoke'
         assert not directory.exists()
@@ -126,11 +130,28 @@ if mode == 'smoke':
                                          f'./.cleanup-{kind}-smoke'], timeout=900)
             binary_hashes[kind] = hashlib.sha256(driver.read_bytes()).hexdigest()
             run(f'native-{kind}-smoke', [str(driver), str(binary)], timeout=180)
+            shutil.copy2(driver, kit / f'{kind}-smoke')
         finally:
             shutil.rmtree(directory)
             driver.unlink(missing_ok=True)
     (evidence / 'binary-hashes.json').write_text(json.dumps(binary_hashes, indent=2) + '\n')
     binary.unlink()
+    for package in ('workflow', 'cli', 'db'):
+        target = kit / f'{package}.test'
+        run(f'build-review-{package}', ['go', 'test', '-c', '-tags', 'e2e',
+            '-p', '1', '-o', str(target), './internal/' + package], timeout=900)
+        run(f'review-{package}-buildinfo', ['go', 'version', '-m', str(target)], timeout=30)
+    manifest = {'provenance': provenance,
+                'files': [{'name': p.name, 'bytes': p.stat().st_size,
+                           'sha256': hashlib.sha256(p.read_bytes()).hexdigest()}
+                          for p in sorted(kit.iterdir())]}
+    (kit / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    (evidence / 'review-kit-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    with tarfile.open(evidence.parent / 'review-kit.tar.gz', 'w:gz') as archive:
+        archive.add(kit, arcname='review-kit')
+    (evidence / 'review-kit-archive.json').write_text(json.dumps({
+        'sha256': hashlib.sha256((evidence.parent / 'review-kit.tar.gz').read_bytes()).hexdigest(),
+        'source_head': head, 'source_tree': provenance['source_tree']}, indent=2) + '\n')
 elif mode == 'proofs':
     package = env['PROOF_PACKAGE']
     assert package in ('cli', 'db', 'workflow')

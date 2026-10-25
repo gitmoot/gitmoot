@@ -50,6 +50,12 @@ jobs:
           path: exported
           if-no-files-found: error
           retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-review-kit-${{ env.TARGET_SHA }}
+          path: review-kit.tar.gz
+          if-no-files-found: error
+          retention-days: 30
 
   proofs:
     name: Regression proofs (${{ matrix.package }}, ${{ matrix.base_name }})
