@@ -176,3 +176,23 @@ func TestUndoneRemoteRouteRestoresTheReviewsOwnRuntimeAndModel(t *testing.T) {
 		t.Fatalf("undo alerts = %d, want exactly 1", undo)
 	}
 }
+
+// TestBandHeldReviewIsNeverSilent (#2373 review, P3): a review in the review
+// band that will not move remotely (here it was requested --exec-backend
+// local) is held with a durable event and exactly one alert naming why.
+func TestBandHeldReviewIsNeverSilent(t *testing.T) {
+	ctx, store, worker := fallbackFixture(t, 20)
+	queueDiskGuardJob(t, ctx, store, "local-review", "rev-omp", "review", `,"model":"anthropic/claude-sonnet-5-5","exec_backend":"local","review_requester":"usmle-app"`)
+	for pass := 0; pass < 2; pass++ {
+		if got := pendingIDs(t, ctx, worker); len(got) != 0 {
+			t.Fatalf("pending = %v, want the review held in the band", got)
+		}
+	}
+	if !slices.Contains(eventKinds(t, ctx, store, "local-review"), diskGuardReviewHeldEventKind) {
+		t.Fatalf("no %s event for the held review", diskGuardReviewHeldEventKind)
+	}
+	msgs := messagesTo(t, ctx, store, "usmle-app")
+	if len(msgs) != 1 || !strings.Contains(msgs[0].Body, "--exec-backend local") {
+		t.Fatalf("messages = %+v, want one alert naming --exec-backend local", msgs)
+	}
+}

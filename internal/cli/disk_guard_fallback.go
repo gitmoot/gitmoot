@@ -2,8 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -160,9 +163,17 @@ func diskGuardReviewBandDispatch(ctx context.Context, worker jobWorker, jobs, ma
 		routed[job.ID] = true
 	}
 	held := make(map[string]bool)
+	remoteAvailable := diskGuardRemoteAvailable(worker)
 	for _, job := range matching {
 		if strings.EqualFold(strings.TrimSpace(job.Type), "review") && !routed[job.ID] {
 			held[job.ID] = true
+			// No silent starvation (#2373 review, P3): every held review gets a
+			// durable event and one alert naming why. A review whose route plan
+			// already failed has been alerted with that cause; the atomic
+			// once-per-kind claim makes this call a no-op for it.
+			if payload, err := daemonJobPayload(job); err == nil {
+				diskGuardHoldReview(ctx, worker, job, payload, reason, diskGuardBandHoldCause(job, payload, remoteAvailable))
+			}
 		}
 	}
 	out := make([]db.Job, 0, len(jobs))
@@ -212,4 +223,30 @@ func foregroundReviewDiskWarning(home string) string {
 		return ""
 	}
 	return "disk is low on this host (" + evaluation.detail() + "); this foreground review still runs here. Re-run it with --background to let the daemon run it on the remote backend."
+}
+
+// diskGuardRemoteAvailable reports whether the remote (E2B) backend is
+// configured for disk-guard routing at all.
+func diskGuardRemoteAvailable(worker jobWorker) bool {
+	backend, _, err := daemonJobExecBackendFor(worker, string(execbackend.Remote), true)
+	return err == nil && backend == execbackend.Remote
+}
+
+// diskGuardBandHoldCause names why a review in the review band is held
+// instead of moved to the remote backend.
+func diskGuardBandHoldCause(job db.Job, payload workflow.JobPayload, remoteAvailable bool) error {
+	switch {
+	case !remoteAvailable:
+		return errors.New("the remote (E2B) backend is not configured or not available on this daemon")
+	case payload.DiskGuardRouteDeclined:
+		return errors.New("an earlier remote run of this review was refused, so it is not moved again")
+	case payload.PolicyRoutedReview:
+		return errors.New("its review policy route is still being decided")
+	case queuedJobBlockerHeld(job, time.Now().UTC()):
+		return errors.New("it is waiting for its blocker retry time")
+	}
+	if name, present := payload.ExecBackendOverride(); present {
+		return fmt.Errorf("it was requested with --exec-backend %s", name)
+	}
+	return errors.New("it is not eligible for the remote route")
 }

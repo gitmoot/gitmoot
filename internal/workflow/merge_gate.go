@@ -1125,7 +1125,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if !reviewRowCanRetireAnObjection(candidate.job, candidate.payload, headSHA) {
 				continue
 			}
+			// A later verdict replaces only the SAME part of a split review
+			// (#2372): part B's approval says nothing about part A's objection.
 			if effectiveReviewerIdentityName(candidate.job, candidate.payload) == reviewer &&
+				reviewPartOf(candidate.payload) == reviewPartOf(review.payload) &&
 				isReviewReplacementDecision(candidate.payload.Result.Decision) &&
 				reviewJobSupersedes(candidate.job, candidate.payload, review.job, review.payload) {
 				supersededReviewIDs[review.job.ID] = struct{}{}
@@ -1395,6 +1398,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	if len(activeAtHead) > 0 {
 		var authorship reviewAuthorshipAssessment
 		var undispatchedFanOuts []string
+		var partApprovals []string
 		satisfied := false
 		var acceptedApprovals []delegatedReviewApproval
 		for _, review := range activeAtHead {
@@ -1428,6 +1432,14 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				// never was an answer, whichever way it pointed.
 				decision = "approved"
 			}
+			if decision == "approved" && !fanOut && reviewPartOf(review.payload) != "" {
+				// A part of a split review (#2372) reviewed a slice of this head,
+				// not the head: it can never approve the merge. Its objections
+				// still block (the case below), so it can only make the gate
+				// stricter. The whole head needs an approval without a part.
+				partApprovals = append(partApprovals, fmt.Sprintf("%s (part %s, job %s)", reviewer, reviewPartOf(review.payload), review.job.ID))
+				continue
+			}
 			switch decision {
 			case "approved":
 				approvals, err := ensureDelegatedReviewEvidence(
@@ -1438,6 +1450,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				}
 				if !fanOut {
 					approvals = []delegatedReviewApproval{{job: review.job, payload: review.payload}}
+				}
+				approvals = withoutPartApprovals(approvals)
+				if len(approvals) == 0 {
+					partApprovals = append(partApprovals, fmt.Sprintf("%s (fan-out of part reviews, job %s)", reviewer, review.job.ID))
+					continue
 				}
 				satisfied = true
 				acceptedApprovals = append(acceptedApprovals, approvals...)
@@ -1456,6 +1473,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		if reason := authorship.failureReason(); reason != "" {
 			return errors.New(reason)
+		}
+		if !satisfied && len(partApprovals) > 0 {
+			return fmt.Errorf(
+				"no whole-head review approval at evaluated head: only parts of a split review approved (%s); a part covers a slice of the head, so dispatch a review without --part to approve the merge",
+				strings.Join(partApprovals, ", "))
 		}
 		if !satisfied {
 			// Every reviewer slot at this head was an undispatched fan-out. Returning
@@ -1494,6 +1516,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	var acceptedApprovals []delegatedReviewApproval
 	var authorship reviewAuthorshipAssessment
 	var undispatchedFanOuts []string
+	var roundPartApprovals []string
 	type eligibleReview struct {
 		job     db.Job
 		payload JobPayload
@@ -1568,6 +1591,12 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				// Direct approvals were assessed while eligibility was built above.
 				approvals = []delegatedReviewApproval{{job: job, payload: payload}}
 			}
+			// A part of a split review (#2372) can never approve the head.
+			approvals = withoutPartApprovals(approvals)
+			if len(approvals) == 0 {
+				roundPartApprovals = append(roundPartApprovals, fmt.Sprintf("%s (part %s, job %s)", effectiveReviewerIdentityName(job, payload), reviewPartOf(payload), job.ID))
+				continue
+			}
 			approved = true
 			acceptedApprovals = append(acceptedApprovals, approvals...)
 		case "changes_requested", "blocked", "failed":
@@ -1582,6 +1611,11 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New(reason)
 	}
 	if !approved {
+		if len(roundPartApprovals) > 0 {
+			return fmt.Errorf(
+				"no whole-head review approval in the latest round: only parts of a split review approved (%s); a part covers a slice of the head, so dispatch a review without --part to approve the merge",
+				strings.Join(roundPartApprovals, ", "))
+		}
 		if len(undispatchedFanOuts) > 0 {
 			return fmt.Errorf(
 				"no review verdict in the latest round: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
@@ -1629,6 +1663,24 @@ func ResultIsFanOut(result *AgentResult) bool {
 type delegatedReviewApproval struct {
 	job     db.Job
 	payload JobPayload
+}
+
+// reviewPartOf is the normalized part of a split review (#2372), "" for a
+// review of the whole head.
+func reviewPartOf(payload JobPayload) string {
+	return db.NormalizeReviewPart(payload.ReviewPart)
+}
+
+// withoutPartApprovals drops approvals that review only a part of the head.
+// A part approval never authorizes a merge; part objections still block.
+func withoutPartApprovals(approvals []delegatedReviewApproval) []delegatedReviewApproval {
+	kept := approvals[:0:0]
+	for _, approval := range approvals {
+		if reviewPartOf(approval.payload) == "" {
+			kept = append(kept, approval)
+		}
+	}
+	return kept
 }
 
 // ensureDelegatedReviewEvidence decides a delegation tree on its LEAF verdicts,

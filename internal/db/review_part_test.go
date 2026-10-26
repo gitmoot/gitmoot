@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 )
 
 // TestReviewPartScopesTheReviewClaim (#2372): the parts of one split review at
@@ -78,5 +79,49 @@ func TestReviewPartLabelsThatCouldForgeAnotherKeyAreRejected(t *testing.T) {
 		if !ValidReviewPart(part) {
 			t.Errorf("part %q rejected", part)
 		}
+	}
+}
+
+// TestAPartVerdictDoesNotSatisfyAWholeHeadWaiter (#2373 review, P2): a verdict
+// on one part of a split review answers its part-scoped waiter only. A
+// whole-head waiter keeps waiting, whether it subscribed before or after.
+func TestAPartVerdictDoesNotSatisfyAWholeHeadWaiter(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	partPayload := func(decision string) string {
+		raw := awaitedReviewPayload(t, "acme/widget", 72, "head-split", decision, "review-part")
+		return raw[:len(raw)-1] + `,"review_purpose":"code","review_part":"mm-1-mm-3"}`
+	}
+	if err := store.CreateJobWithEvent(ctx, Job{ID: "review-part", Agent: "reviewer", Type: "review", State: "running", Payload: partPayload("")}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+		t.Fatalf("CreateJobWithEvent: %v", err)
+	}
+	whole := subscribeReviewFact(t, store, "lane", "acme/widget", 72, "head-split")
+	partKey := mustKey(t, "acme/widget", 72, "head-split", ReviewRequestPurpose("code", false, "mm-1-mm-3"))
+	part, _, err := store.SubscribeAwaitedFact(ctx, AwaitedFactSubscription{
+		WaiterRole: "usmle-app", SubjectKind: AwaitedFactSubjectReviewVerdict, SubjectKey: partKey, Deadline: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("subscribe part: %v", err)
+	}
+	if changed, err := store.TransitionJobStatePayloadWithEvent(ctx, "review-part", "running", "succeeded", partPayload("approved"), JobEvent{Kind: "succeeded", Message: "approved"}); err != nil || !changed {
+		t.Fatalf("transition changed=%v err=%v", changed, err)
+	}
+	for _, tc := range []struct {
+		id   int64
+		want string
+	}{{whole.ID, AwaitedFactStateWaiting}, {part.ID, AwaitedFactStateSatisfied}} {
+		got, err := store.GetAwaitedFact(ctx, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State != tc.want {
+			t.Fatalf("fact %d (%s) state = %q, want %q", tc.id, got.SubjectKey, got.State, tc.want)
+		}
+	}
+	// A whole-head waiter that subscribes AFTER the part verdict must not be
+	// answered by it either.
+	late := subscribeReviewFact(t, store, "late-lane", "acme/widget", 72, "head-split")
+	if late.State != AwaitedFactStateWaiting {
+		t.Fatalf("late whole-head subscription state = %q, want waiting", late.State)
 	}
 }

@@ -164,7 +164,9 @@ func reviewVerdictKeyPurpose(key string) string {
 // pre-router verdicts still meet.
 func reviewPayloadServesPurpose(payload reviewVerdictPayload, want string) bool {
 	if want == "" {
-		return true
+		// A whole-head wait is never answered by one part of a split review
+		// (#2372).
+		return NormalizeReviewPart(payload.ReviewPart) == ""
 	}
 	return ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart) == want
 }
@@ -762,10 +764,20 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	// key belongs to the #2171 review router, which asks "is this head reviewed
 	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
 	// waiter, because the router deliberately runs those as separate reviews.
-	keys := []any{key}
+	//
+	// A PART of a split review (#2372) answers only its own purpose-scoped key:
+	// it reviewed a slice of the head, so it must not tell a whole-head waiter
+	// that the head is reviewed.
+	var keys []any
+	if NormalizeReviewPart(decoded.ReviewPart) == "" {
+		keys = append(keys, key)
+	}
 	purpose := ReviewRequestPurpose(decoded.ReviewPurpose, decoded.PostMergeReview, decoded.ReviewPart)
 	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, purpose); purposeErr == nil {
 		keys = append(keys, purposed)
+	}
+	if len(keys) == 0 {
+		return nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
 	rows, err := tx.QueryContext(ctx, `
