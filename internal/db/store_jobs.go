@@ -1748,6 +1748,22 @@ func (s *Store) AddJobEventIfAbsent(ctx context.Context, event JobEvent) error {
 	return err
 }
 
+// ClaimJobEventKind is AddJobEventIfAbsent that also reports whether this call
+// inserted the event, so a caller can attach a one-time side effect (such as an
+// agent alert, #2372) to the first occurrence of a job/kind pair only.
+func (s *Store) ClaimJobEventKind(ctx context.Context, event JobEvent) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider)
+		SELECT ?, ?, ?, ?, ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM job_events WHERE job_id = ? AND kind = ?
+		)`, event.JobID, event.Kind, event.Message, event.Runtime, event.Provider, event.JobID, event.Kind)
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	return inserted == 1, err
+}
+
 // ClaimJobEvent atomically inserts an exact job/kind/message event and reports
 // whether this caller won. The NOT EXISTS guard and insert share one SQLite
 // statement, so concurrent pipeline scans cannot both claim the same external

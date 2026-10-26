@@ -109,7 +109,14 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 			if err != nil {
 				return false, newRemoteReviewRefusal(remoteReviewAvoidedRedCI, fmt.Sprintf("remote review CI policy could not read current-head checks: %v", err))
 			}
-			if ok, detail := remoteReviewChecksGreen(checks); !ok {
+			// A review moved here for capacity (#2372, owner decision): a
+			// repository with no CI at all is allowed, because it can never
+			// turn green and the review would otherwise wait forever. Red or
+			// still-pending checks keep blocking, so money is not spent
+			// reviewing a head that fails CI. A repository that requires
+			// green CI by its own policy keeps requiring it.
+			zeroChecksAllowed := payload.DiskGuardRouted && len(checks) == 0 && !reviewConfig.For(repo.FullName()).RemoteRequireCIGreen
+			if ok, detail := remoteReviewChecksGreen(checks); !ok && !zeroChecksAllowed {
 				reason := remoteReviewAvoidedRedCI
 				if remoteReviewChecksOnlyPending(checks) {
 					reason = remoteReviewAvoidedCIPending
@@ -122,7 +129,7 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 		return false, err
 	}
 
-	purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
+	purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart)
 	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), payload.PullRequest, head, purpose)
 	if err != nil {
 		return false, err

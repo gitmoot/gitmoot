@@ -334,8 +334,8 @@ func TestExpireAwaitedFactSupersedesReviewWaitThePullRequestMovedPast(t *testing
 		{name: "head moved after the wait", head: "abc1234", setup: mirror("def5678", "open", false), wantState: "superseded", wantDetail: "superseded: acme/widget#45 moved from head abc1234 to def5678"},
 		{name: "mirror older than the wait is not trusted", head: "abc1234", setup: mirror("def5678", "open", true), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
 		{name: "abbreviated waited head matches the full PR head", head: "abc1234", setup: mirror("abc1234def", "open", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
-		{name: "post-merge wait on a merged PR still expires", head: "abc1234", purpose: ReviewRequestPurpose("code", true), setup: mirror("abc1234", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
-		{name: "post-merge wait on a merge commit is not a head move", head: "abc1234", purpose: ReviewRequestPurpose("code", true), setup: mirror("def5678", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "post-merge wait on a merged PR still expires", head: "abc1234", purpose: ReviewRequestPurpose("code", true, ""), setup: mirror("abc1234", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
+		{name: "post-merge wait on a merge commit is not a head move", head: "abc1234", purpose: ReviewRequestPurpose("code", true, ""), setup: mirror("def5678", "merged", false), wantState: AwaitedFactStateExpired, wantDetail: "deadline expired"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

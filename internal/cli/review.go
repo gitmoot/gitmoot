@@ -103,7 +103,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -130,6 +130,11 @@ type reviewRequestOptions struct {
 	// the mode on: a repository declaring execution = "none" is a
 	// no-execution review whether or not the flag is passed.
 	noExecution bool
+	// part names one part of a split review (#2372): several reviews of the
+	// same head and purpose, each covering a different slice of the change.
+	// It scopes the claim, verdict and awaited fact; the same part twice is
+	// still one review.
+	part string
 	// model, effort, workflowID and session are carried so delegation from
 	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
 	// is load-bearing: every dispatch on this campaign passes
@@ -191,6 +196,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.execProvider, "exec-provider", "", "remote provider for this review: e2b (default), sandboxd or sandboxd-linux; a sandboxd provider implies --exec-backend remote and requires its [remote_exec.sandboxd] or [remote_exec.sandboxd-linux] section")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
+	fs.StringVar(&opts.part, "part", "", "one part of a split review of the same head: a slug of letters, digits and dashes (e.g. mm-12-mm-15)")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	// Spellings `agent review` uses for the same inputs (#2314), so a caller
@@ -247,6 +253,11 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		}
 		*alias.value = aliasValue
 	}
+	if part := strings.TrimSpace(opts.part); part != "" && !db.ValidReviewPart(part) {
+		fmt.Fprintf(stderr, "review request: --part %q must be 1-64 letters, digits or dashes, starting and ending with a letter or digit\n", part)
+		return 2
+	}
+	opts.part = db.NormalizeReviewPart(opts.part)
 	if opts.ttl <= 0 {
 		fmt.Fprintln(stderr, "review request: --ttl must be positive")
 		return 2
@@ -403,7 +414,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	// claimPurpose is the purpose component for everything keyed on the review
 	// question: claim, subscription, verdict history, loop guard, baseline.
-	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge)
+	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge, opts.part)
 	subjectKey, err := db.ReviewRequestSubjectKey(repo.FullName(), opts.pr, head, claimPurpose)
 	if err != nil {
 		return reviewRequestOutput{}, err
@@ -528,6 +539,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
 		PostMergeReview:      opts.postMerge,
 		ReviewNoExecution:    noExecution,
+		ReviewPart:           opts.part,
 		SelectedAction:       "review",
 		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:        reviewRequestExecutionPath,
@@ -630,7 +642,7 @@ func (s reviewClaimSubject) answers(payload workflow.JobPayload) bool {
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), s.headSHA) {
 		return false
 	}
-	got := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
+	got := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart)
 	want := s.purpose
 	if want == "" {
 		want = db.DefaultReviewPurpose
@@ -973,7 +985,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 // later wakes it from the job's own state transition — never from gate
 // advancement and never from a process that has to still be alive.
 func subscribeReviewRequester(ctx context.Context, store *db.Store, output *reviewRequestOutput, opts reviewRequestOptions) error {
-	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, db.ReviewRequestPurpose(output.Purpose, opts.postMerge), opts.ttl)
+	factID, holds, err := subscribeRoleToReviewVerdict(ctx, store, opts.role, output.Repo, output.PullRequest, output.HeadSHA, db.ReviewRequestPurpose(output.Purpose, opts.postMerge, opts.part), opts.ttl)
 	if err != nil {
 		return err
 	}

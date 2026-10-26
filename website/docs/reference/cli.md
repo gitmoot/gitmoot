@@ -548,10 +548,39 @@ The one exception is CI that has not finished: when at least one current-head
 check is still pending and none has failed (refusal reason `ci_pending`), the
 review is held for two minutes (`blocker_retry_at`) instead of declined, and a
 later pass switches it to remote again, so it runs once CI turns green. Failing
-checks or no reported checks still decline the route. A
+checks still decline the route; no reported checks at all is admitted (#2372). A
 review pinned to `--exec-backend local` keeps waiting, and nothing is switched
 while the daemon is draining. It spends money, so it needs a configured
 `[remote_exec]` cost cap and is off unless set.
+
+**Review-only threshold and alerts (#2372).** `remote_reviews_below_bytes`
+(default `0`, off; requires `remote_reviews = true`; must be above
+`min_free_bytes`) moves queued **reviews** to the remote backend once free
+space is below it, while every other job keeps running locally until the
+dispatch floor above. Below the dispatch floor reviews move as before.
+
+- **Runtime:** a review whose runtime cannot run remotely (codex) runs as omp
+  with the **same model** (event `disk_guard_runtime_changed`). If omp cannot
+  reach that model in the sandbox, the review is not moved and keeps waiting.
+  A different model is never substituted. If the remote run then does not
+  start, the review goes back to its own runtime and model.
+- **CI:** a moved review is admitted when the repository reports **no checks at
+  all**. Failing or still-running checks keep blocking it, and a repository
+  with `remote_require_ci_green = true` keeps requiring green CI.
+- **Alerts:** the requesting role (`review_requester`, else the acting org role)
+  gets one gitmoot message per job when its review moves to the remote backend,
+  one when a review is held because it cannot run remotely (with the reason),
+  and one when a moved review's remote run does not start and it goes back to
+  waiting locally.
+- **Split reviews:** `review request --part NAME` (also `agent review --part`
+  through the router) names one part of a review split at one head, such as
+  `mm-12-mm-15` or `cross`. Each part has its own claim, verdict and awaited
+  fact, so all parts can run, each in its own sandbox within the cost cap; the
+  same part requested twice is still one review. A part is 1-64 letters,
+  digits or dashes and cannot start or end with a dash.
+- **Not covered yet:** coordinator or Janitor pressure holds are not visible to
+  gitmoot until #2359 lands; until then only the disk measurement triggers the
+  move.
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
@@ -1338,7 +1367,7 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
-    [--full] [--post-merge] [--no-execution] [--allow-prompt-head-mismatch] [--background] [--json] \
+    [--full] [--post-merge] [--no-execution] [--part NAME] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]

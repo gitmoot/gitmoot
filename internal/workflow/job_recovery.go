@@ -610,7 +610,7 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 		return
 	}
 	if cause == abortCauseCancel && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
-		purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
+		purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart)
 		if subjectKey, keyErr := db.ReviewRequestSubjectKey(payload.Repo, payload.PullRequest, payload.HeadSHA, purpose); keyErr == nil {
 			_ = store.ReleaseReviewRequest(ctx, subjectKey, job.ID)
 		}

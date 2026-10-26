@@ -30,7 +30,7 @@ func TestMessageReviewNotificationUsesRequesterAndExactPurpose(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "post-merge subscriber":
-				key, err := db.ReviewRequestSubjectKey("acme/widget", 42, head, db.ReviewRequestPurpose("code", true))
+				key, err := db.ReviewRequestSubjectKey("acme/widget", 42, head, db.ReviewRequestPurpose("code", true, ""))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -69,7 +69,7 @@ func TestMessageReviewNotificationUsesRequesterAndExactPurpose(t *testing.T) {
 			if err := json.Unmarshal(wire, &notice); err != nil {
 				t.Fatal(err)
 			}
-			if notice.Sender != "@system" || notice.Kind != "review" || notice.Repo != "acme/widget" || notice.PullRequest != 42 || notice.HeadSHA != head || notice.ReviewPurpose != db.ReviewRequestPurpose("code", true) {
+			if notice.Sender != "@system" || notice.Kind != "review" || notice.Repo != "acme/widget" || notice.PullRequest != 42 || notice.HeadSHA != head || notice.ReviewPurpose != db.ReviewRequestPurpose("code", true, "") {
 				t.Fatalf("incorrect trusted provenance: %+v", notice)
 			}
 			if policy == "post-merge subscriber" && notice.SourceKind != db.WakeOutboxSourceAwaitedFact {

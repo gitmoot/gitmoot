@@ -27,6 +27,12 @@ type DiskGuardPolicy struct {
 	// reviews run on the remote execution backend while the guard pauses local
 	// dispatch, within the [remote_exec] cost cap. Everything else still waits.
 	RemoteReviews bool
+	// RemoteReviewsBelowBytes ([disk_guard] remote_reviews_below_bytes, default
+	// 0 = off) moves queued REVIEWS to the remote backend once free space is
+	// below this many bytes, before the dispatch floor above pauses anything
+	// (#2372). Other jobs keep dispatching locally until MinFreeBytes /
+	// MinFreePercent. It requires RemoteReviews and must be above MinFreeBytes.
+	RemoteReviewsBelowBytes uint64
 }
 
 func DefaultDiskGuardPolicy() DiskGuardPolicy {
@@ -91,6 +97,12 @@ func LoadDiskGuardPolicy(paths Paths) (DiskGuardPolicy, error) {
 				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].remote_reviews: %w", err)
 			}
 			policy.RemoteReviews = parsed
+		case "remote_reviews_below_bytes":
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].remote_reviews_below_bytes: %w", err)
+			}
+			policy.RemoteReviewsBelowBytes = parsed
 		case "min_free_percent":
 			parsed, err := strconv.ParseFloat(value, 64)
 			if err != nil {
@@ -112,6 +124,14 @@ func validateDiskGuardPolicy(policy DiskGuardPolicy) error {
 	}
 	if policy.Enabled && policy.MinFreeBytes == 0 && policy.MinFreePercent == 0 {
 		return fmt.Errorf("disk_guard requires min_free_bytes or min_free_percent when enabled")
+	}
+	if policy.RemoteReviewsBelowBytes > 0 {
+		if !policy.RemoteReviews {
+			return fmt.Errorf("disk_guard.remote_reviews_below_bytes requires remote_reviews = true")
+		}
+		if policy.RemoteReviewsBelowBytes <= policy.MinFreeBytes {
+			return fmt.Errorf("disk_guard.remote_reviews_below_bytes (%d) must be above min_free_bytes (%d): below the dispatch floor reviews already move", policy.RemoteReviewsBelowBytes, policy.MinFreeBytes)
+		}
 	}
 	return nil
 }

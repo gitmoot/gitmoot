@@ -49,6 +49,7 @@ func (s *eventRuleSink) persistMessageEvent(ctx context.Context, event events.Ev
 			HeadSHA         string `json:"head_sha"`
 			ReviewPurpose   string `json:"review_purpose"`
 			PostMergeReview bool   `json:"post_merge_review"`
+			ReviewPart      string `json:"review_part"`
 		}
 		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
 			return fmt.Errorf("decode notification source job: %w", err)
@@ -56,7 +57,7 @@ func (s *eventRuleSink) persistMessageEvent(ctx context.Context, event events.Ev
 		message.WorkflowID = payload.WorkflowID
 		source.HeadSHA = payload.HeadSHA
 		if message.Kind == "review" {
-			source.ReviewPurpose = db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview)
+			source.ReviewPurpose = db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart)
 		}
 		if source.Repo == "" {
 			source.Repo = payload.Repo
