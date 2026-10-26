@@ -1,285 +1,31 @@
 name: CI
 
-# Runs the build/vet/test gate on every push to main and every pull request, so
-# "the tests pass" is enforced on a clean checkout rather than trusted from a
-# local run. Does NOT run the live multi-runtime (codex/claude/kimi) E2E — that
-# needs runtime auth and stays a manual step.
-#
-# Stage 2 lane map (#906; expected wall time ~8m), all rigor-preserving:
-#   - DEP-ONLY FAST LANE: a PR touching only go.mod/go.sum (the dashboard-module
-#     pin bumps — embedded assets, zero Go changes) skips the -race lanes. The
-#     full build + generated-contract check + vet + non-race `go test ./...`
-#     still run, and the bumped module passed its own CI. Pushes to main always
-#     run everything.
-#   - BUILD / VET / TEST: build, generated-contract check, vet, and plain
-#     `go test ./...` stay together with the partition-script self-test as the
-#     non-race gate. Since #1760 step 3 this lane runs the UNTAGGED tests only:
-#     36 e2e/live files carry `//go:build e2e` and are invisible without it.
-#   - E2E: the same `go test ./...` WITH `-tags e2e`, which is the only lane that
-#     compiles those 36 files. Tagging them without this job would have stopped
-#     them running forever, silently, and a green suite is exactly what that
-#     failure looks like. It runs AS ROOT, because read-only seat tests skip
-#     unprivileged on a runner with Docker (#2318).
-#   - RACE BUILD: five package jobs compile one -race test binary each. Every
-#     package's full current test list is partitioned and asserted to appear
-#     exactly once before its binary + shard plan are uploaded.
-#   - RACE RUN: internal/cli is split 8 ways, internal/pipeline 4 ways,
-#     internal/db 2 ways, internal/workflow 4 ways, and internal/daemon 1 way. Each runner downloads
-#     the package bundle and executes from the package directory, preserving Go
-#     test-binary working-directory semantics without recompiling.
-
+# THROWAWAY (#2364): hosted, verbose, named run of the no-execution sandbox
+# kernel tests only. This branch is never merged.
 on:
-  push:
-    branches: [main]
   pull_request:
-  merge_group:
 
 permissions:
   contents: read
-  actions: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
-  changes:
-    # Classifies the diff so the -race lanes can skip dep-only PRs (#754).
-    # code=true means "something beyond go.mod/go.sum changed" (or this is a
-    # push to main, which always runs the full gate).
-    name: classify diff
+  noexec-kernel:
+    name: no-execution kernel tests (verbose)
     runs-on: ubuntu-latest
-    outputs:
-      code: ${{ steps.diff.outputs.code }}
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Classify
-        id: diff
-        run: |
-          # A merge_group entry takes this branch DELIBERATELY (queue tests the merged result, so no lane may skip); no merge_group case is missing below.
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "push to main — full gate"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
-          echo "changed files:"; echo "$CHANGED"
-          if echo "$CHANGED" | grep -qvE '^(go\.mod|go\.sum)$'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "dep-only diff — race lanes will be skipped"
-          fi
-
-  build-test:
-    name: build / vet / test
-    needs: changes
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Build
-        run: go build ./...
-
-      - name: Generated contract is current
-        # The gitmoot_result reply contract is single-sourced from the workflow
-        # result structs and regenerated into internal/prompts/contract_generated.go
-        # by `go generate ./...`. Fail if the checked-in artifact is stale so a
-        # struct change can never silently drift the prompt agents are given.
+      - name: Kernel facts
         run: |
-          go generate ./...
-          git diff --exit-code
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Race partition script
-        run: scripts/partition-race-tests_test.sh
-
-      # An explicit timeout, not Go's implicit 10m-per-package default (#1549).
-      # internal/cli already burns 482.8s on a green main, so a normal PR that adds
-      # tests there crosses the ceiling and CI reports `panic: test timed out` under
-      # the name of whichever test happened to be running — an innocent one.
-      # This is #573's fix ("give the race-detector test step an explicit 20m
-      # timeout") applied to the non-race lane, which was still relying on the
-      # language default.
-      - name: Test
-        run: go test -timeout 25m ./...
-
-  e2e:
-    name: e2e (tagged)
-    needs: changes
-    # Skipped on dep-only PRs for the same reason as the race lanes (#754).
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      # THE ONLY LANE THAT COMPILES THE TAGGED FILES. `./...` rather than the
-      # three packages that hold them today, because a package list would silently
-      # stop covering a tagged file added to a fourth package later — the same
-      # silent-stop this job exists to prevent, one level up. The cost is that the
-      # untagged tests run here a second time; that is the price of a lane that
-      # cannot drift, and it runs concurrently with build-test rather than after.
-      #
-      # AS ROOT (#2318). A read-only seat hides the host container runtime in a
-      # private mount namespace, which needs CAP_SYS_ADMIN, and refuses to start
-      # without it while a runtime exists. The runner has Docker, so in the
-      # unprivileged build-test lane every test that runs a read-only seat skips
-      # with that reason. This lane runs them all as root, so the hiding path and
-      # every read-only seat E2E stay covered. -E plus the explicit PATH, GOCACHE,
-      # and GOMODCACHE keep setup-go's toolchain and restored caches, because sudo
-      # resets PATH and may reset HOME.
-      - name: Test (e2e tag, as root)
+          uname -a
+          cat /sys/kernel/security/lsm || true
+          git log -1 --format='%H %s'
+      - name: No-execution sandbox kernel tests (as root, verbose)
+        shell: bash
         run: >-
           sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
-          go test -tags e2e -timeout 30m ./...
-
-  race-build:
-    name: race build (internal/${{ matrix.package }})
-    needs: changes
-    # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - package: cli
-            shards: 8
-          - package: pipeline
-            shards: 4
-          - package: db
-            shards: 2
-          - package: workflow
-            shards: 4
-          - package: daemon
-            shards: 1
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Compile once and partition
-        env:
-          PACKAGE: ${{ matrix.package }}
-          SHARDS: ${{ matrix.shards }}
-        run: |
-          set -o pipefail
-          bundle="$RUNNER_TEMP/race-$PACKAGE"
-          mkdir -p "$bundle/partitions"
-
-          # -tags e2e is REQUIRED here, not optional: without it this compile
-          # silently drops the 33 tagged internal/cli files (plus 2 in workflow
-          # and 1 in daemon) from the race binary, and the shard plan derived
-          # from `-test.list` would shrink to match with nothing failing. That is
-          # the same silent-stop as tagging with no runner, one layer down. Race
-          # coverage is therefore byte-for-byte what it was before the tag.
-          go test -c -race -tags e2e -o "$bundle/$PACKAGE.test" "./internal/$PACKAGE/"
-          # `go tool -n` resolves the matching test2json executable even when
-          # the Go distribution materializes it in the build cache on demand.
-          cp "$(go tool -n test2json)" "$bundle/test2json"
-          (
-            cd "internal/$PACKAGE"
-            "$bundle/$PACKAGE.test" -test.list '.*'
-          ) > "$bundle/tests.list"
-
-          scripts/partition-race-tests.sh \
-            --tests "$bundle/tests.list" \
-            --shards "$SHARDS" \
-            --out-dir "$bundle/partitions"
-
-      - name: Upload race binary and shard plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: race-${{ matrix.package }}-bundle
-          path: ${{ runner.temp }}/race-${{ matrix.package }}
-          if-no-files-found: error
-          retention-days: 7
-
-  race:
-    name: race (internal/${{ matrix.package }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
-    needs: [changes, race-build]
-    # Skipped on dep-only PRs (#754); see the fast-lane note at the top.
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - {package: cli, shard: 0, shards: 8}
-          - {package: cli, shard: 1, shards: 8}
-          - {package: cli, shard: 2, shards: 8}
-          - {package: cli, shard: 3, shards: 8}
-          - {package: cli, shard: 4, shards: 8}
-          - {package: cli, shard: 5, shards: 8}
-          - {package: cli, shard: 6, shards: 8}
-          - {package: cli, shard: 7, shards: 8}
-          - {package: pipeline, shard: 0, shards: 4}
-          - {package: pipeline, shard: 1, shards: 4}
-          - {package: pipeline, shard: 2, shards: 4}
-          - {package: pipeline, shard: 3, shards: 4}
-          - {package: db, shard: 0, shards: 2}
-          - {package: db, shard: 1, shards: 2}
-          - {package: workflow, shard: 0, shards: 4}
-          - {package: workflow, shard: 1, shards: 4}
-          - {package: workflow, shard: 2, shards: 4}
-          - {package: workflow, shard: 3, shards: 4}
-          - {package: daemon, shard: 0, shards: 1}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download compiled race binary and shard plan
-        uses: actions/download-artifact@v4
-        with:
-          name: race-${{ matrix.package }}-bundle
-          path: ${{ runner.temp }}/race-${{ matrix.package }}
-
-      - name: Run compiled race shard
-        env:
-          PACKAGE: ${{ matrix.package }}
-          SHARD: ${{ matrix.shard }}
-        run: |
-          set -o pipefail
-          bundle="$RUNNER_TEMP/race-$PACKAGE"
-          binary="$bundle/$PACKAGE.test"
-          test2json="$bundle/test2json"
-          chmod +x "$binary" "$test2json"
-
-          run_regex=$(cat "$bundle/partitions/shard-$SHARD.regex")
-          count=$(wc -l < "$bundle/partitions/shard-$SHARD.tests" | tr -d ' ')
-          total=$(wc -l < "$bundle/tests.list" | tr -d ' ')
-          echo "running internal/$PACKAGE shard $SHARD: $count of $total tests"
-
-          (
-            cd "internal/$PACKAGE"
-            "$binary" \
-              -test.v=test2json \
-              -test.run="$run_regex" \
-              -test.timeout=20m 2>&1 \
-              | "$test2json" -p "internal/$PACKAGE" -t
-          )
+          go test -tags e2e -count=1 -v -timeout 10m -run 'TestNoExecutionSandbox' ./internal/sandbox/
