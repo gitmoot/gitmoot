@@ -1166,8 +1166,9 @@ What the worker does:
   runtime or any child with `EACCES`. Landlock removes the Execute right from
   every granted path except the runtime and its ELF loader. If the supervisor
   dies, the kernel kills the runtime. Children cannot leave the seat's process
-  group, and the supervisor kills and reaps any that remain when the runtime
-  exits.
+  group. When the runtime exits, the supervisor kills every remaining member of
+  that group, all generations at once; if any survive, the seat reports failure
+  even when omp itself succeeded.
 - Refuses a result that claims `evidence: executed`, lists `tests_run` entries,
   or delegates work. This check runs whatever `result_checks` mode is set. The
   job records `review_no_execution: true`.

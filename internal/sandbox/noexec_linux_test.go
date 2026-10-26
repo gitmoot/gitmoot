@@ -182,12 +182,14 @@ func TestNoExecutionSandboxReapsDescendantsOnExitE2E(t *testing.T) {
 }
 
 // TestNoExecutionSandboxReapsMultiGenerationDescendantsE2E: the runtime
-// leaves a live child A that has its own live child B. B reaches the
-// supervisor only after A is killed, so cleanup must keep rescanning; a
-// cleanup that blocks waiting after one generation hangs on B (Jarvis 362037).
+// leaves a live child A that has its own live child B, and exits only after B
+// has reported its pid (so the run really has two generations). The
+// supervisor must kill both and exit; a cleanup that blocks waiting after one
+// generation hangs on B (Jarvis 362037).
 func TestNoExecutionSandboxReapsMultiGenerationDescendantsE2E(t *testing.T) {
 	h := newNoExecHarness(t)
-	cmd := h.command(h.probe, "orphan-chain")
+	pidFile := filepath.Join(h.write, "chain.pids")
+	cmd := h.command(h.probe, "orphan-chain", pidFile)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {
@@ -201,10 +203,25 @@ func TestNoExecutionSandboxReapsMultiGenerationDescendantsE2E(t *testing.T) {
 		if err != nil {
 			t.Fatalf("orphan-chain run: %v (%s)", err, strings.TrimSpace(out.String()))
 		}
-	case <-time.After(3 * descendantReapBound):
+	case <-time.After(3 * groupCleanupBound):
 		remaining := killGroup(pgid)
 		<-done
-		t.Fatalf("supervisor did not finish cleanup of a two-generation tree within %v (%d processes in the group)", 3*descendantReapBound, remaining)
+		t.Fatalf("supervisor did not finish cleanup of a two-generation tree within %v (%d processes in the group; %s)", 3*groupCleanupBound, remaining, strings.TrimSpace(out.String()))
+	}
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("runtime never proved both generations started: %v (%s)", err, strings.TrimSpace(out.String()))
+	}
+	pids := strings.Fields(string(data))
+	if len(pids) != 2 {
+		t.Fatalf("pid file %q, want two pids", data)
+	}
+	for _, field := range pids {
+		pid, _ := strconv.Atoi(field)
+		if pid <= 0 || processAlive(pid) {
+			killGroup(pgid)
+			t.Fatalf("descendant %d (of A,B = %v) outlived the runtime and supervisor", pid, pids)
+		}
 	}
 	if members := groupMembers(pgid); len(members) != 0 {
 		killGroup(pgid)

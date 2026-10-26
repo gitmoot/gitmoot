@@ -87,19 +87,42 @@ func main() {
 		fmt.Println("OK orphan", pid)
 	case "orphan-chain":
 		// Two generations that outlive the runtime: A stays alive and has its
-		// own child B, so B is reparented to the supervisor only after A is
-		// killed. A forks with a raw syscall: ForkLock is held in the child.
-		pid := rawFork(func() {
-			if inner, _, _ := unix.RawSyscall(unix.SYS_FORK, 0, 0, 0); inner == 0 {
-				for {
-					unix.RawSyscall(unix.SYS_PAUSE, 0, 0, 0)
-				}
+		// own live child B. B sends its pid back through a pipe before the
+		// runtime exits, so the run proves B exists; a failed inner fork is
+		// reported instead of silently testing one generation.
+		var p [2]int
+		if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
+			report("orphan-chain", err, "")
+			return
+		}
+		var pidBytes [4]byte
+		pidA := rawFork(func() {
+			inner, _, errno := unix.RawSyscall(unix.SYS_FORK, 0, 0, 0)
+			if errno != 0 {
+				pidBytes = [4]byte{0xff, 0xff, 0xff, 0xff}
+				unix.RawSyscall(unix.SYS_WRITE, uintptr(p[1]), uintptr(unsafe.Pointer(&pidBytes[0])), 4)
+			} else if inner == 0 {
+				self, _, _ := unix.RawSyscall(unix.SYS_GETPID, 0, 0, 0)
+				pidBytes = [4]byte{byte(self), byte(self >> 8), byte(self >> 16), byte(self >> 24)}
+				unix.RawSyscall(unix.SYS_WRITE, uintptr(p[1]), uintptr(unsafe.Pointer(&pidBytes[0])), 4)
 			}
 			for {
 				unix.RawSyscall(unix.SYS_PAUSE, 0, 0, 0)
 			}
 		})
-		fmt.Println("OK orphan-chain", pid)
+		_ = unix.Close(p[1])
+		var got [4]byte
+		if n, err := unix.Read(p[0], got[:]); err != nil || n != 4 {
+			fmt.Println("FAIL orphan-chain no readiness from B", n, err)
+			os.Exit(1)
+		}
+		if got == [4]byte{0xff, 0xff, 0xff, 0xff} {
+			fmt.Println("FAIL orphan-chain inner fork failed")
+			os.Exit(1)
+		}
+		pidB := int(got[0]) | int(got[1])<<8 | int(got[2])<<16 | int(got[3])<<24
+		writeFile(args[0], fmt.Sprintf("%d %d", pidA, pidB))
+		fmt.Println("OK orphan-chain", pidA, pidB)
 	case "hold":
 		// Writes its pid, forks a descendant that tries to exec /bin/true
 		// after a delay (so after the supervisor may be gone), and waits.

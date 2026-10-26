@@ -161,11 +161,23 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	// Orphaned descendants of the runtime reparent here, so they can be
-	// killed and reaped when the runtime exits instead of outliving the seat.
+	// reaped when the runtime exits instead of outliving the seat.
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		parentEnd.Close()
 		childEnd.Close()
 		return 1, fmt.Errorf("no-execution supervisor subreaper: %w", err)
+	}
+	// The supervisor leads its own process group, and the runtime and every
+	// descendant stay in it (the seccomp filter refuses setsid and setpgid).
+	// Cleanup kills that group, so it reaches every generation at once, and a
+	// worker that SIGKILLs the group reaches them even if the supervisor is
+	// gone. A supervisor launched by the worker already leads its group.
+	if unix.Getpgrp() != os.Getpid() {
+		if err := unix.Setpgid(0, 0); err != nil {
+			parentEnd.Close()
+			childEnd.Close()
+			return 1, fmt.Errorf("no-execution supervisor process group: %w", err)
+		}
 	}
 	cmd := exec.Command(self, childArgs...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
@@ -176,7 +188,6 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 		return 1, fmt.Errorf("start no-execution child: %w", err)
 	}
 	childEnd.Close()
-	defer killAndReapDescendants()
 
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
@@ -197,6 +208,12 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 		_ = cmd.Process.Kill()
 	}
 	waitErr := cmd.Wait()
+	// FAIL CLOSED: a seat whose descendants could not all be killed reports
+	// failure whatever the runtime's own exit status was, because the worker
+	// sweeps the group only on cancellation, not after a normal exit.
+	if cleanupErr := killAndReapGroup(); cleanupErr != nil {
+		return 1, cleanupErr
+	}
 	code := cmd.ProcessState.ExitCode()
 	if status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
 		code = 128 + int(status.Signal())
@@ -208,56 +225,78 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 	return code, nil
 }
 
-// descendantReapBound caps how long killAndReapDescendants keeps killing new
-// generations. It is a backstop, not the normal path: a tree drains one
-// generation per round. The worker's process-group kill still reaches any
-// survivor, because descendants cannot leave the group (setsid/setpgid EPERM).
-const descendantReapBound = 5 * time.Second
+// groupCleanupBound caps how long killAndReapGroup waits for killed group
+// members to die and be reaped. SIGKILL cannot be caught, so this is only
+// reached when something is stuck in the kernel; it then fails closed.
+const groupCleanupBound = 5 * time.Second
 
-// killAndReapDescendants SIGKILLs every remaining child of the supervisor and
-// reaps it, generation by generation, until the supervisor has no children.
-// Run after the runtime exits on every path.
+// killAndReapGroup SIGKILLs every other member of the supervisor's process
+// group, which is every descendant of the runtime in every generation
+// (none can leave the group), then reaps until the supervisor has no child
+// and no member is left. Run after the runtime exits.
 //
-// The supervisor is a subreaper, so a grandchild reparents HERE only when its
-// own parent dies. Reaping therefore never blocks: a blocking wait after
-// killing one generation would reap that generation and then wait forever on
-// the next one, which is alive and was never signalled (Jarvis 362037). Each
-// round kills every current child, reaps whatever has exited with WNOHANG,
-// and rescans; ECHILD means the tree is empty.
-func killAndReapDescendants() {
-	self := strconv.Itoa(os.Getpid())
-	deadline := time.Now().Add(descendantReapBound)
+// It never blocks in wait: a blocking wait after one round could reap one
+// generation and then wait forever on a live one (Jarvis 362037). It kills
+// by GROUP rather than by parent, so a grandchild is killed in the same round
+// as its parent instead of only after reparenting here. It returns an error
+// if any member is still alive at the bound, so the seat reports failure
+// rather than leaving a process behind after a successful exit.
+func killAndReapGroup() error {
+	self := os.Getpid()
+	deadline := time.Now().Add(groupCleanupBound)
 	for {
-		entries, _ := os.ReadDir("/proc")
-		for _, entry := range entries {
-			pid, err := strconv.Atoi(entry.Name())
-			if err != nil || entry.Name() == self {
-				continue
-			}
-			stat, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
-			if err != nil {
-				continue
-			}
-			// ppid is the 2nd field after the parenthesised command name.
-			fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
-			if len(fields) > 1 && fields[1] == self {
-				_ = unix.Kill(pid, unix.SIGKILL)
-			}
+		members := otherGroupMembers(self)
+		for _, pid := range members {
+			_ = unix.Kill(pid, unix.SIGKILL)
 		}
+		noChildren := false
 		for {
 			pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
 			if errors.Is(err, unix.ECHILD) {
-				return // no child left at all
+				noChildren = true
+				break
 			}
 			if err != nil || pid <= 0 {
 				break // children remain but none has exited yet
 			}
 		}
+		if noChildren && len(members) == 0 {
+			return nil
+		}
 		if time.Now().After(deadline) {
-			return
+			if left := otherGroupMembers(self); len(left) > 0 {
+				return fmt.Errorf("no-execution supervisor: %d descendant processes %v survived SIGKILL for %v", len(left), left, groupCleanupBound)
+			}
+			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// otherGroupMembers lists the live processes, other than the supervisor, in
+// the process group the supervisor leads. Zombies are left out: they are dead
+// and are reaped by whoever is their parent (this supervisor, as subreaper,
+// once their own parent is gone).
+func otherGroupMembers(self int) []int {
+	var members []int
+	selfName := strconv.Itoa(self)
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || entry.Name() == selfName {
+			continue
+		}
+		stat, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// After the parenthesised command name: state, ppid, pgrp, ...
+		fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+		if len(fields) > 2 && fields[2] == selfName && fields[0] != "Z" && fields[0] != "X" {
+			members = append(members, pid)
+		}
+	}
+	return members
 }
 
 // superviseExecs answers seccomp exec notifications until no confined process
