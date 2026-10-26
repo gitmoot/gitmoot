@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -681,6 +682,18 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 				request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
 				if err != nil {
 					return localAgentJobOutput{}, err
+				}
+			}
+		}
+		if !request.Background && execBackend == execbackend.Local {
+			// #2372, owner decision: a foreground review stays on this host
+			// even when disk is low, and the caller is told so it can re-run it
+			// in the background to get the remote route.
+			if warning := foregroundReviewDiskWarning(request.Home); warning != "" {
+				if request.DispatchWarning != nil {
+					request.DispatchWarning(warning)
+				} else {
+					fmt.Fprintln(os.Stderr, "warning: "+warning)
 				}
 			}
 		}

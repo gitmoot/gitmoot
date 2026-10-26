@@ -198,3 +198,18 @@ func diskGuardRoutedAlertText(reason string, plan diskGuardRoutePlan) string {
 	}
 	return text
 }
+
+// foregroundReviewDiskWarning returns the alert for a foreground review that
+// runs on this host while the disk is below the review threshold or the
+// dispatch floor (#2372: foreground reviews stay local, with an alert), or "".
+func foregroundReviewDiskWarning(home string) string {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return ""
+	}
+	evaluation := evaluateConfiguredDiskGuard(paths)
+	if evaluation.allowsDispatch() && !evaluation.reviewsBelowThreshold() {
+		return ""
+	}
+	return "disk is low on this host (" + evaluation.detail() + "); this foreground review still runs here. Re-run it with --background to let the daemon run it on the remote backend."
+}

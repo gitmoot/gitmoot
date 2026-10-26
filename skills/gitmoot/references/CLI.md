@@ -775,6 +775,9 @@ dispatch floor above. Below the dispatch floor reviews move as before.
   fact, so all parts can run, each in its own sandbox within the cost cap; the
   same part requested twice is still one review. A part is 1-64 letters,
   digits or dashes and cannot start or end with a dash.
+- **Foreground reviews** (`--foreground`) stay on this host even when disk is
+  low (owner decision); the command prints a warning telling the caller to
+  re-run with `--background` to get the remote route.
 - **Not covered yet:** coordinator or Janitor pressure holds are not visible to
   gitmoot until #2359 lands; until then only the disk measurement triggers the
   move.
