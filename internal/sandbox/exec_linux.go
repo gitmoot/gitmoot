@@ -207,10 +207,6 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 	if noExecution {
 		return execNoExecutionChild(executable, argv, noExecutionEnv(os.Environ()))
 	}
-	// #2360: nothing but the checked stdio crosses the exec.
-	if err := sealDescriptors(-1); err != nil {
-		return err
-	}
 	return syscall.Exec(executable, argv, os.Environ())
 }
 
