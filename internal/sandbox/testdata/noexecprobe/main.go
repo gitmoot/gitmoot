@@ -85,6 +85,21 @@ func main() {
 		})
 		writeFile(args[0], strconv.Itoa(pid))
 		fmt.Println("OK orphan", pid)
+	case "orphan-chain":
+		// Two generations that outlive the runtime: A stays alive and has its
+		// own child B, so B is reparented to the supervisor only after A is
+		// killed. A forks with a raw syscall: ForkLock is held in the child.
+		pid := rawFork(func() {
+			if inner, _, _ := unix.RawSyscall(unix.SYS_FORK, 0, 0, 0); inner == 0 {
+				for {
+					unix.RawSyscall(unix.SYS_PAUSE, 0, 0, 0)
+				}
+			}
+			for {
+				unix.RawSyscall(unix.SYS_PAUSE, 0, 0, 0)
+			}
+		})
+		fmt.Println("OK orphan-chain", pid)
 	case "hold":
 		// Writes its pid, forks a descendant that tries to exec /bin/true
 		// after a delay (so after the supervisor may be gone), and waits.

@@ -181,6 +181,37 @@ func TestNoExecutionSandboxReapsDescendantsOnExitE2E(t *testing.T) {
 	}
 }
 
+// TestNoExecutionSandboxReapsMultiGenerationDescendantsE2E: the runtime
+// leaves a live child A that has its own live child B. B reaches the
+// supervisor only after A is killed, so cleanup must keep rescanning; a
+// cleanup that blocks waiting after one generation hangs on B (Jarvis 362037).
+func TestNoExecutionSandboxReapsMultiGenerationDescendantsE2E(t *testing.T) {
+	h := newNoExecHarness(t)
+	cmd := h.command(h.probe, "orphan-chain")
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := cmd.Process.Pid
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("orphan-chain run: %v (%s)", err, strings.TrimSpace(out.String()))
+		}
+	case <-time.After(3 * descendantReapBound):
+		remaining := killGroup(pgid)
+		<-done
+		t.Fatalf("supervisor did not finish cleanup of a two-generation tree within %v (%d processes in the group)", 3*descendantReapBound, remaining)
+	}
+	if members := groupMembers(pgid); len(members) != 0 {
+		killGroup(pgid)
+		t.Fatalf("descendants %v outlived the runtime and supervisor", members)
+	}
+}
+
 // TestNoExecutionSandboxCancellationFailsClosedE2E covers cancellation after
 // bootstrap: SIGTERM is forwarded to the runtime, and a SIGKILLed supervisor
 // takes the runtime with it, leaves no descendant outside the seat's process
@@ -313,20 +344,26 @@ func killGroup(pgid int) int {
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		alive := 0
-		entries, _ := os.ReadDir("/proc")
-		for _, entry := range entries {
-			pid, err := strconv.Atoi(entry.Name())
-			if err != nil {
-				continue
-			}
-			if got, err := syscall.Getpgid(pid); err == nil && got == pgid && processAlive(pid) {
-				alive++
-			}
-		}
+		alive := len(groupMembers(pgid))
 		if alive == 0 || time.Now().After(deadline) {
 			return alive
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// groupMembers returns the live (non-zombie) processes in process group pgid.
+func groupMembers(pgid int) []int {
+	var alive []int
+	entries, _ := os.ReadDir("/proc")
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if got, err := syscall.Getpgid(pid); err == nil && got == pgid && processAlive(pid) {
+			alive = append(alive, pid)
+		}
+	}
+	return alive
 }

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -207,17 +208,30 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 	return code, nil
 }
 
-// killAndReapDescendants SIGKILLs every remaining child of the supervisor
-// (orphans of the runtime reparent here as subreaper) and reaps them, until
-// none is left. Run after the runtime exits on every path.
+// descendantReapBound caps how long killAndReapDescendants keeps killing new
+// generations. It is a backstop, not the normal path: a tree drains one
+// generation per round. The worker's process-group kill still reaches any
+// survivor, because descendants cannot leave the group (setsid/setpgid EPERM).
+const descendantReapBound = 5 * time.Second
+
+// killAndReapDescendants SIGKILLs every remaining child of the supervisor and
+// reaps it, generation by generation, until the supervisor has no children.
+// Run after the runtime exits on every path.
+//
+// The supervisor is a subreaper, so a grandchild reparents HERE only when its
+// own parent dies. Reaping therefore never blocks: a blocking wait after
+// killing one generation would reap that generation and then wait forever on
+// the next one, which is alive and was never signalled (Jarvis 362037). Each
+// round kills every current child, reaps whatever has exited with WNOHANG,
+// and rescans; ECHILD means the tree is empty.
 func killAndReapDescendants() {
-	self := os.Getpid()
+	self := strconv.Itoa(os.Getpid())
+	deadline := time.Now().Add(descendantReapBound)
 	for {
-		killed := 0
 		entries, _ := os.ReadDir("/proc")
 		for _, entry := range entries {
 			pid, err := strconv.Atoi(entry.Name())
-			if err != nil || pid == self {
+			if err != nil || entry.Name() == self {
 				continue
 			}
 			stat, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
@@ -226,19 +240,23 @@ func killAndReapDescendants() {
 			}
 			// ppid is the 2nd field after the parenthesised command name.
 			fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
-			if len(fields) > 1 && fields[1] == strconv.Itoa(self) {
+			if len(fields) > 1 && fields[1] == self {
 				_ = unix.Kill(pid, unix.SIGKILL)
-				killed++
 			}
 		}
 		for {
-			if _, err := unix.Wait4(-1, nil, 0, nil); err != nil {
-				break // ECHILD: nothing left to reap
+			pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+			if errors.Is(err, unix.ECHILD) {
+				return // no child left at all
+			}
+			if err != nil || pid <= 0 {
+				break // children remain but none has exited yet
 			}
 		}
-		if killed == 0 {
+		if time.Now().After(deadline) {
 			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
