@@ -163,10 +163,12 @@ func TestADiskRoutedReviewRefusedForPendingCIIsRoutedAgainOnceGreen(t *testing.T
 }
 
 // Failing CI and no reported checks are not pending: the route stays declined.
-func TestADiskRoutedReviewRefusedForRedOrMissingCIStaysDeclined(t *testing.T) {
+// A repository with no checks at all is now admitted for a disk-routed review
+// (#2372, owner decision); see TestCapacityRoutedReviewIsAdmittedWithZeroChecks
+// ButNotWithRedOrPending. Red CI still declines it.
+func TestADiskRoutedReviewRefusedForRedCIStaysDeclined(t *testing.T) {
 	for name, checks := range map[string][]github.PullRequestCheck{
 		"failing beside pending": {{Name: "build", Bucket: "fail"}, {Name: "lint", Bucket: "pending"}},
-		"none reported":          nil,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := diskRoutedAdmissionFixture(t)
@@ -217,4 +219,32 @@ func diskGuardBlockerRetryAtColumn(t *testing.T, f *remoteReviewAdmissionFixture
 		t.Fatal(err)
 	}
 	return column
+}
+
+// TestCapacityRoutedReviewIsAdmittedWithZeroChecksButNotWithRedOrPending:
+// owner decision for #2372. A repo with no CI can run remotely when moved for
+// capacity; failing or pending CI still blocks.
+func TestCapacityRoutedReviewIsAdmittedWithZeroChecksButNotWithRedOrPending(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		checks []github.PullRequestCheck
+		refuse string
+	}{
+		{name: "zero checks", checks: nil},
+		{name: "red", checks: []github.PullRequestCheck{{Name: "build", Bucket: "fail"}}, refuse: remoteReviewAvoidedRedCI},
+		{name: "pending", checks: []github.PullRequestCheck{{Name: "build", Bucket: "pending"}}, refuse: remoteReviewAvoidedCIPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := diskRoutedAdmissionFixture(t)
+			f.github.checks = tc.checks
+			f.run(t)
+			if tc.refuse != "" {
+				f.assertRefusedBeforeProvision(t, tc.refuse, 0)
+				return
+			}
+			if f.factoryCalls == 0 {
+				t.Fatal("zero-check repo was not admitted to the remote backend")
+			}
+		})
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -385,7 +386,9 @@ type localAgentDispatchRequest struct {
 	// ReviewNoExecution asks for a no-execution review (#2364); the worker
 	// also applies it to every review of a repository declaring
 	// execution = "none".
-	ReviewNoExecution      bool
+	ReviewNoExecution bool
+	// ReviewPart names one part of a split review (#2372).
+	ReviewPart             string
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -679,6 +682,18 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 				request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
 				if err != nil {
 					return localAgentJobOutput{}, err
+				}
+			}
+		}
+		if !request.Background && execBackend == execbackend.Local {
+			// #2372, owner decision: a foreground review stays on this host
+			// even when disk is low, and the caller is told so it can re-run it
+			// in the background to get the remote route.
+			if warning := foregroundReviewDiskWarning(request.Home); warning != "" {
+				if request.DispatchWarning != nil {
+					request.DispatchWarning(warning)
+				} else {
+					fmt.Fprintln(os.Stderr, "warning: "+warning)
 				}
 			}
 		}
@@ -1119,6 +1134,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		NoFixTarget:              request.NoFixTarget,
 		PostMergeReview:          request.PostMergeReview,
 		ReviewNoExecution:        request.ReviewNoExecution,
+		ReviewPart:               request.ReviewPart,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
@@ -1720,7 +1736,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, db.ReviewRequestPurpose(request.ReviewPurpose, request.PostMergeReview)); err != nil {
+	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, db.ReviewRequestPurpose(request.ReviewPurpose, request.PostMergeReview, request.ReviewPart)); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())

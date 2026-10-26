@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -163,9 +164,11 @@ func reviewVerdictKeyPurpose(key string) string {
 // pre-router verdicts still meet.
 func reviewPayloadServesPurpose(payload reviewVerdictPayload, want string) bool {
 	if want == "" {
-		return true
+		// A whole-head wait is never answered by one part of a split review
+		// (#2372).
+		return NormalizeReviewPart(payload.ReviewPart) == ""
 	}
-	return ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview) == want
+	return ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart) == want
 }
 
 // postMergePurposeSuffix scopes a post-merge review (#2265) apart from the
@@ -177,15 +180,40 @@ const postMergePurposeSuffix = "-post-merge"
 // purpose-scoped verdict key. Every site that builds that key from a request or
 // a stored review payload must go through it, so claim, subscription, verdict
 // resolution and release always agree.
-func ReviewRequestPurpose(purpose string, postMerge bool) string {
+func ReviewRequestPurpose(purpose string, postMerge bool, part string) string {
 	purpose = strings.ToLower(strings.TrimSpace(purpose))
 	if purpose == "" {
 		purpose = DefaultReviewPurpose
 	}
 	if postMerge {
-		return purpose + postMergePurposeSuffix
+		purpose += postMergePurposeSuffix
+	}
+	if part = NormalizeReviewPart(part); part != "" {
+		purpose += reviewPartSeparator + part
 	}
 	return purpose
+}
+
+// reviewPartSeparator scopes one part of a split review (#2372) apart from the
+// other parts of the same head and purpose. Without it every part after the
+// first attaches to the first part's claim and is refused as a duplicate by
+// remote admission. The same part twice is still one subject.
+const reviewPartSeparator = "~"
+
+// reviewPartPattern is the accepted part label after lowercasing: a short slug
+// of letters, digits and dashes (for example "mm-12-mm-15" or "cross"). It can
+// never contain a key separator ("|", "#", "@", "~") or whitespace.
+var reviewPartPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`)
+
+// NormalizeReviewPart lowercases and trims a part label. It returns "" for no
+// part. Callers validate with ValidReviewPart before storing one.
+func NormalizeReviewPart(part string) string {
+	return strings.ToLower(strings.TrimSpace(part))
+}
+
+// ValidReviewPart reports whether a non-empty part label is acceptable.
+func ValidReviewPart(part string) bool {
+	return reviewPartPattern.MatchString(NormalizeReviewPart(part))
 }
 
 // verdictHistoryPurpose is the purpose a stored verdict is indexed under in
@@ -193,9 +221,9 @@ func ReviewRequestPurpose(purpose string, postMerge bool) string {
 // post-merge verdict gets the scoped purpose, so it neither blocks nor answers
 // a pre-merge request at the same head, and vice versa. An unrecorded purpose
 // on a pre-merge verdict stays "" so legacy consumers keep defaulting it.
-func verdictHistoryPurpose(purpose string, postMerge bool) string {
-	if postMerge {
-		return ReviewRequestPurpose(purpose, true)
+func verdictHistoryPurpose(purpose string, postMerge bool, part string) string {
+	if postMerge || NormalizeReviewPart(part) != "" {
+		return ReviewRequestPurpose(purpose, postMerge, part)
 	}
 	return strings.ToLower(strings.TrimSpace(purpose))
 }
@@ -439,6 +467,7 @@ type reviewVerdictPayload struct {
 	// ReviewPurpose scopes a #2171 router verdict to the question it answers, so
 	// a code review cannot satisfy a security waiter at the same head.
 	ReviewPurpose string `json:"review_purpose"`
+	ReviewPart    string `json:"review_part"`
 	// PostMergeReview marks a review of an already-merged head (#2265); it
 	// answers only post-merge waiters for its purpose.
 	PostMergeReview bool `json:"post_merge_review"`
@@ -560,12 +589,13 @@ WHERE type = 'review' AND state = 'succeeded' AND lower(repo) = ? AND pull_reque
 			HeadSHA         string `json:"head_sha"`
 			ReviewPurpose   string `json:"review_purpose"`
 			PostMergeReview bool   `json:"post_merge_review"`
+			ReviewPart      string `json:"review_part"`
 		}
 		readable := json.Unmarshal([]byte(payload), &lenient) == nil
 		undecodable = append(undecodable, UndecodableReviewVerdict{
 			JobID:         jobID,
 			HeadSHA:       strings.ToLower(strings.TrimSpace(lenient.HeadSHA)),
-			ReviewPurpose: verdictHistoryPurpose(lenient.ReviewPurpose, lenient.PostMergeReview),
+			ReviewPurpose: verdictHistoryPurpose(lenient.ReviewPurpose, lenient.PostMergeReview, lenient.ReviewPart),
 			UpdatedAt:     updatedAt,
 			Readable:      readable,
 		})
@@ -615,7 +645,7 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		verdicts = append(verdicts, SucceededReviewVerdict{
 			JobID:            strings.TrimSpace(jobID),
 			Agent:            strings.TrimSpace(agent),
-			ReviewPurpose:    verdictHistoryPurpose(decoded.ReviewPurpose, decoded.PostMergeReview),
+			ReviewPurpose:    verdictHistoryPurpose(decoded.ReviewPurpose, decoded.PostMergeReview, decoded.ReviewPart),
 			HeadSHA:          strings.ToLower(strings.TrimSpace(decoded.HeadSHA)),
 			Decision:         decision,
 			Severity:         strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)),
@@ -734,10 +764,20 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	// key belongs to the #2171 review router, which asks "is this head reviewed
 	// FOR THIS PURPOSE": a code verdict must never terminally satisfy a security
 	// waiter, because the router deliberately runs those as separate reviews.
-	keys := []any{key}
-	purpose := ReviewRequestPurpose(decoded.ReviewPurpose, decoded.PostMergeReview)
+	//
+	// A PART of a split review (#2372) answers only its own purpose-scoped key:
+	// it reviewed a slice of the head, so it must not tell a whole-head waiter
+	// that the head is reviewed.
+	var keys []any
+	if NormalizeReviewPart(decoded.ReviewPart) == "" {
+		keys = append(keys, key)
+	}
+	purpose := ReviewRequestPurpose(decoded.ReviewPurpose, decoded.PostMergeReview, decoded.ReviewPart)
 	if purposed, purposeErr := ReviewRequestSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA, purpose); purposeErr == nil {
 		keys = append(keys, purposed)
+	}
+	if len(keys) == 0 {
+		return nil
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
 	rows, err := tx.QueryContext(ctx, `

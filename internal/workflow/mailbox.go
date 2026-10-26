@@ -372,7 +372,9 @@ type JobRequest struct {
 	RiskTier string
 	// ReviewPurpose, ReviewModelPool and ReviewRequester are the #2171 router's
 	// selection record; see JobPayload for semantics.
-	ReviewPurpose   string
+	ReviewPurpose string
+	// ReviewPart names one part of a split review (#2372); empty for a whole-head review.
+	ReviewPart      string
 	ReviewModelPool []string
 	ReviewRequester string
 	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
@@ -551,8 +553,16 @@ type JobPayload struct {
 	// failing it, and sets DiskGuardRouteDeclined so it is not switched again.
 	DiskGuardRouted        bool `json:"disk_guard_routed,omitempty"`
 	DiskGuardRouteDeclined bool `json:"disk_guard_route_declined,omitempty"`
-	execBackendPresent     bool
-	unknownJSONFields      map[string]json.RawMessage
+	// DiskGuardSwitchedRuntime and DiskGuardSwitchedModel hold the review's own
+	// runtime override and model while the disk guard runs it as omp remotely
+	// (#2372, codex -> omp with the same model). Undoing the route restores them,
+	// so a review that goes back to waiting locally runs exactly as requested.
+	// DiskGuardRuntimeSwitched is true while that switch is in effect.
+	DiskGuardRuntimeSwitched bool   `json:"disk_guard_runtime_switched,omitempty"`
+	DiskGuardSwitchedRuntime string `json:"disk_guard_switched_runtime,omitempty"`
+	DiskGuardSwitchedModel   string `json:"disk_guard_switched_model,omitempty"`
+	execBackendPresent       bool
+	unknownJSONFields        map[string]json.RawMessage
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
@@ -674,7 +684,10 @@ type JobPayload struct {
 	// this purpose; Model holds the entry currently in use. An operational
 	// blocker (quota/auth) advances Model to the next untried entry before the
 	// generic timed hold applies, so a verdict is never the trigger for fallback.
-	ReviewPurpose   string   `json:"review_purpose,omitempty"`
+	ReviewPurpose string `json:"review_purpose,omitempty"`
+	// ReviewPart is the durable form of JobRequest.ReviewPart. It scopes the
+	// review claim, verdict and awaited fact to one part of a split review.
+	ReviewPart      string   `json:"review_part,omitempty"`
 	ReviewModelPool []string `json:"review_model_pool,omitempty"`
 	// ReviewRequester names the org role that asked for this review and is
 	// notified when the verdict is saved. Attribution only; never authorization.
@@ -933,6 +946,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Check:                    strings.TrimSpace(request.Check),
 		CheckRetries:             request.CheckRetries,
 		ReviewPurpose:            reviewPurpose,
+		ReviewPart:               strings.ToLower(strings.TrimSpace(request.ReviewPart)),
 		ReviewModelPool:          reviewPool,
 		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
 	})

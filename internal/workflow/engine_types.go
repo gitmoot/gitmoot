@@ -273,7 +273,7 @@ func (e Engine) mailbox() Mailbox {
 					targets := event.WakeTargetRoles[:0]
 					for _, role := range event.WakeTargetRoles {
 						subscribed, err := e.Store.HasReviewSubscription(ctx, role, payload.Repo, payload.PullRequest,
-							payload.HeadSHA, db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview))
+							payload.HeadSHA, db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart))
 						if err != nil {
 							slog.Warn("review notification subscription lookup failed", "job_id", jobID, "role", role, "error", err)
 						}

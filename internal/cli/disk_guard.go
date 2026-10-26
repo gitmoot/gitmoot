@@ -49,6 +49,14 @@ func (e diskGuardEvaluation) allowsDispatch() bool {
 		e.FreePercent >= e.Policy.MinFreePercent
 }
 
+// reviewsBelowThreshold reports the review-only band (#2372): local dispatch
+// is still allowed, but free space is below remote_reviews_below_bytes, so
+// reviews should run remotely.
+func (e diskGuardEvaluation) reviewsBelowThreshold() bool {
+	return e.Policy.Enabled && e.Err == nil && e.Policy.RemoteReviews &&
+		e.Policy.RemoteReviewsBelowBytes > 0 && e.Usage.FreeBytes < e.Policy.RemoteReviewsBelowBytes
+}
+
 func (e diskGuardEvaluation) detail() string {
 	if !e.Policy.Enabled {
 		return fmt.Sprintf("path=%s disabled", e.Path)
@@ -243,6 +251,9 @@ func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Jo
 	}
 	if evaluation.allowsDispatch() {
 		clearDiskGuardRefusal(evaluation.Path)
+		if evaluation.reviewsBelowThreshold() {
+			return diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
+		}
 		return jobs
 	}
 
@@ -343,9 +354,20 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 			allowed = append(allowed, job)
 			continue
 		}
-		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || queuedJobBlockerHeld(job, time.Now().UTC()) ||
-			!diskGuardCanRouteRemote(ctx, worker.Store, job, payload) {
+		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || queuedJobBlockerHeld(job, time.Now().UTC()) {
 			continue
+		}
+		plan, err := diskGuardRemoteRoutePlan(ctx, worker.Store, job, payload)
+		if err != nil {
+			diskGuardHoldReview(ctx, worker, job, payload, reason, err)
+			continue
+		}
+		if plan.runtimeOverride != "" {
+			payload.DiskGuardRuntimeSwitched = true
+			payload.DiskGuardSwitchedRuntime = payload.RuntimeOverride
+			payload.DiskGuardSwitchedModel = payload.Model
+			payload.RuntimeOverride = plan.runtimeOverride
+			payload.Model = plan.model
 		}
 		payload.ExecBackend = string(execbackend.Remote)
 		payload.PolicyRoutedReview = true
@@ -363,33 +385,15 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 		if err != nil || !routed {
 			continue
 		}
+		if plan.runtimeOverride != "" {
+			_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: diskGuardRuntimeChangedEventKind,
+				Message: fmt.Sprintf("runtime %s cannot run remotely; this review runs as %s with the same model %s", plan.fromRuntime, plan.runtimeOverride, plan.model)})
+		}
+		diskGuardAlert(ctx, worker, job, payload, diskGuardRoutedAlertEventKind, diskGuardRoutedAlertText(reason, plan))
 		job.Payload = string(encoded)
 		allowed = append(allowed, job)
 	}
 	return allowed
-}
-
-// diskGuardCanRouteRemote reports whether a local review can run remotely at
-// all: an exact pull-request head, a registered agent whose runtime runs
-// remotely, and no earlier cloud attempt (remote admission allows one).
-func diskGuardCanRouteRemote(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) bool {
-	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
-	if payload.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil || payload.Ephemeral != nil {
-		return false
-	}
-	runtimeName := strings.TrimSpace(payload.RuntimeOverride)
-	if runtimeName == "" {
-		agent, err := store.GetAgent(ctx, job.Agent)
-		if err != nil {
-			return false
-		}
-		runtimeName = agent.Runtime
-	}
-	if !remoteCapableRuntime(runtimeName) {
-		return false
-	}
-	attempts, err := store.ListExecBackendAttemptsForJob(ctx, job.ID)
-	return err == nil && len(attempts) == 0
 }
 
 // undoDiskGuardRoute is called by every path that would fail or block a job
@@ -420,6 +424,15 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 	payload.ClearExecBackendOverride()
 	payload.PolicyRoutedReview = false
 	payload.DiskGuardRouted = false
+	if payload.DiskGuardRuntimeSwitched {
+		// Back to the review's own runtime and model: the omp switch was only
+		// for the remote run (#2372).
+		payload.RuntimeOverride = payload.DiskGuardSwitchedRuntime
+		payload.Model = payload.DiskGuardSwitchedModel
+		payload.DiskGuardRuntimeSwitched = false
+		payload.DiskGuardSwitchedRuntime = ""
+		payload.DiskGuardSwitchedModel = ""
+	}
 	waitFor := "waits for local disk again"
 	var refusal *remoteReviewAdmissionRefusal
 	if errors.As(cause, &refusal) && refusal.reason == remoteReviewAvoidedCIPending {
@@ -446,6 +459,9 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 		return false
 	}
 	writeLine(w.Stdout, "job %s: disk-guard remote route undone, waiting locally: %v", job.ID, cause)
+	// One alert per job for the undo, separate from the routed alert (#2372).
+	diskGuardAlert(ctx, w, latest, payload, diskGuardRouteUndoneAlertEventKind,
+		fmt.Sprintf("The remote run of this review did not start, so it %s. Cause: %s", waitFor, cause.Error()))
 	return true
 }
 
