@@ -28,4 +28,4 @@ jobs:
         shell: bash
         run: >-
           sudo -E env "PATH=$PATH" "GOCACHE=$(go env GOCACHE)" "GOMODCACHE=$(go env GOMODCACHE)"
-          go test -tags e2e -count=1 -v -timeout 10m -run 'TestNoExecutionSandbox' ./internal/sandbox/
+          go test -tags e2e -count=3 -v -timeout 15m -run 'TestNoExecutionSandbox' ./internal/sandbox/
