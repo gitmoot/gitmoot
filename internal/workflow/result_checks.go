@@ -395,6 +395,36 @@ func actionableEntries(values []string) []string {
 	return filtered
 }
 
+// NoExecutionReviewResultChecks returns the failed checks for the result of a
+// no-execution review (#2364), or nil. Such a seat cannot start any program,
+// so a result claiming executed evidence, naming commands in tests_run, or
+// delegating work to other jobs (which would run without the restriction) is
+// not a truthful record of that review. Unlike RunResultChecks it is not
+// subject to the result_checks mode: the mailbox always refuses a failure, so
+// a stored no-execution verdict can never carry an execution claim.
+func NoExecutionReviewResultChecks(r AgentResult) []ResultCheck {
+	var failed []ResultCheck
+	if EvidenceWasExecuted(r) || hasActionableEntries(r.TestsRun) {
+		failed = append(failed, ResultCheck{
+			ID:       "review-no-execution-claims-nothing-ran",
+			Action:   "review",
+			Question: "Does a no-execution review claim no executed evidence?",
+			Explanation: fmt.Sprintf(
+				"the review ran on a no-execution seat that cannot start any program, but declared evidence %q with %d tests_run entries; it must report evidence %q with an empty tests_run",
+				strings.TrimSpace(r.Evidence), len(actionableEntries(r.TestsRun)), EvidenceStaticOnly),
+		})
+	}
+	if len(r.Delegations) > 0 {
+		failed = append(failed, ResultCheck{
+			ID:          "review-no-execution-delegates-nothing",
+			Action:      "review",
+			Question:    "Does a no-execution review delegate no work?",
+			Explanation: fmt.Sprintf("the review ran on a no-execution seat but declared %d delegations; delegated jobs would run outside the no-execution restriction", len(r.Delegations)),
+		})
+	}
+	return failed
+}
+
 // hasActionableEntries reports whether a string slice contains at least one
 // entry that carries information, so an all-empty list - including one whose
 // only entries are content-free containers - counts as no entries.

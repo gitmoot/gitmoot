@@ -103,7 +103,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -126,6 +126,10 @@ type reviewRequestOptions struct {
 	// `agent review --no-fix-target` routes here unchanged (#2314). It exists to
 	// refuse --lead alongside it, as the direct path does.
 	noFixTarget bool
+	// noExecution asks for a no-execution review (#2364). It can only turn
+	// the mode on: a repository declaring execution = "none" is a
+	// no-execution review whether or not the flag is passed.
+	noExecution bool
 	// model, effort, workflowID and session are carried so delegation from
 	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
 	// is load-bearing: every dispatch on this campaign passes
@@ -187,6 +191,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.execProvider, "exec-provider", "", "remote provider for this review: e2b (default), sandboxd or sandboxd-linux; a sandboxd provider implies --exec-backend remote and requires its [remote_exec.sandboxd] or [remote_exec.sandboxd-linux] section")
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
+	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	// Spellings `agent review` uses for the same inputs (#2314), so a caller
 	// can move to this command by changing only the verb.
@@ -305,8 +310,8 @@ func reviewRequestModel(opts reviewRequestOptions, runtimeName string, pool []st
 	return reviewModelForRuntime(runtimeName, pool)
 }
 
-func reviewRequestInstructions(opts reviewRequestOptions, repo string, head string, scope *workflow.ReviewScope) string {
-	brief := reviewRouterInstructions(opts.purpose, repo, opts.pr, head, scope)
+func reviewRequestInstructions(opts reviewRequestOptions, repo string, head string, scope *workflow.ReviewScope, noExecution bool) string {
+	brief := reviewRouterInstructions(opts.purpose, repo, opts.pr, head, scope, noExecution)
 	message := strings.TrimSpace(opts.message)
 	if message == "" {
 		return brief
@@ -374,6 +379,12 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		return reviewRequestOutput{}, err
 	}
 	head := strings.ToLower(strings.TrimSpace(opts.head))
+	// Resolved before any claim is taken, so a repository whose policy cannot
+	// be read refuses without leaving a claim behind (#2364).
+	noExecution, err := reviewRequiresNoExecution(paths, repo.FullName(), opts.noExecution)
+	if err != nil {
+		return reviewRequestOutput{}, err
+	}
 	branch := strings.TrimSpace(opts.branch)
 	if head == "" || branch == "" {
 		pr, err := jobGitHubClient(record.CheckoutPath, newAgentDispatchGitHubClient(record.CheckoutPath), runner).GetPullRequest(ctx, repo, int64(opts.pr))
@@ -473,11 +484,19 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
 		return reviewRequestOutput{}, err
 	}
+	if noExecution {
+		// Refused here, before a job exists, for what the worker would refuse
+		// anyway: the worker re-checks all of it on the job it claims.
+		if err := noExecutionReviewDispatchError(effectiveRuntime, execBackend); err != nil {
+			releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+			return reviewRequestOutput{}, err
+		}
+	}
 	request := localAgentDispatchRequest{
 		RepoFlag:     repo.FullName(),
 		Agent:        reviewer.Name,
 		Action:       "review",
-		Instructions: reviewRequestInstructions(opts, repo.FullName(), head, scope),
+		Instructions: reviewRequestInstructions(opts, repo.FullName(), head, scope, noExecution),
 		Background:   true,
 		// Gated on the EFFECTIVE runtime, not on whether an override was
 		// emitted: a review running on the agent's own non-omp runtime must not
@@ -508,6 +527,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// that names an implementer gets the routing it asked for (#2196).
 		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
 		PostMergeReview:      opts.postMerge,
+		ReviewNoExecution:    noExecution,
 		SelectedAction:       "review",
 		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:        reviewRequestExecutionPath,
@@ -1425,7 +1445,7 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 	return nil, "not a direct follow-up: " + lastUnavailable
 }
 
-func reviewRouterInstructions(purpose, repo string, pullRequest int, head string, scope *workflow.ReviewScope) string {
+func reviewRouterInstructions(purpose, repo string, pullRequest int, head string, scope *workflow.ReviewScope, noExecution bool) string {
 	var focus string
 	switch purpose {
 	case "security":
@@ -1444,9 +1464,17 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	if scope != nil {
 		diffScope = workflow.ReviewScopeInstructions(head, scope)
 	}
+	// A NO-EXECUTION REVIEW (#2364) replaces ONLY the evidence obligation: its
+	// seat cannot run anything, so asking it to execute checks would be an
+	// instruction it can only fail or fabricate. The worker appends the
+	// exact-head CI evidence it fetched.
+	evidence := "Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths); do not approve on static reading alone. Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding."
+	if noExecution {
+		evidence = "This is a no-execution review: read the diff and the code, and use the exact-head CI evidence appended below as the record of what ran. Return evidence=static_only with an empty tests_run, and an evidence locator (file:line, or check name and log line) for every finding."
+	}
 	return fmt.Sprintf(`Independent review-only assessment of %s pull request #%d at exact head %s.
 %s
-%s Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths); do not approve on static reading alone. Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding. Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.`, repo, pullRequest, head, focus, diffScope)
+%s %s Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.`, repo, pullRequest, head, focus, diffScope, evidence)
 }
 
 func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {

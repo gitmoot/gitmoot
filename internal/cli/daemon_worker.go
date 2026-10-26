@@ -106,6 +106,10 @@ type jobWorker struct {
 	// ReviewAdmissionGitHubFactory is the current-head/check reader at the one
 	// remote-review pre-provision boundary. Production leaves it nil.
 	ReviewAdmissionGitHubFactory func(string) remoteReviewAdmissionGitHub
+	// StaticReviewCIGitHubFactory reads exact-head check runs and job logs for
+	// a no-execution review's staged CI evidence (#2364). Production leaves it
+	// nil.
+	StaticReviewCIGitHubFactory func(string) staticReviewCIGitHub
 	// UsePool selects the opt-in continuous worker-pool scheduler (#394,
 	// --scheduler=pool) over the default per-tick wg.Wait() barrier.
 	UsePool bool
@@ -490,6 +494,36 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
+	noExecution := false
+	if job.Type == "review" || payload.ReviewNoExecution {
+		// #2364: a no-execution review is requested on the job or declared by
+		// the repository. The repository declaration is read HERE, on every
+		// review whatever path queued it, so no dispatch route can skip it.
+		// Applied before any adapter or sandbox runner is built from this
+		// agent, and refused outright for a non-seat, an unsupported runtime,
+		// backend or host rather than run with a weaker contract.
+		var err error
+		if paths, pathsErr := w.configPaths(); pathsErr != nil {
+			err = pathsErr
+		} else {
+			noExecution, err = reviewRequiresNoExecution(paths, payload.Repo, payload.ReviewNoExecution)
+		}
+		if err == nil && noExecution {
+			err = applyNoExecution(w.ConfigHome, readOnlySeat, &agent)
+		}
+		if err == nil && noExecution && execBackend != execbackend.Local {
+			// The no-execution sandbox is the local Landlock wrapper; a remote
+			// instance runs the runtime outside it.
+			err = fmt.Errorf("no-execution review is not supported on the %s execution backend; it runs only on the local backend", execBackend)
+		}
+		if err != nil {
+			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+			return nil
+		}
+	}
 	var absentBinaryRefusal error
 	preflightRequest := runtime.RuntimeContractRequest{Plan: payload.Plan}
 	if result, checked, preflightErr := w.runtimeContractPreflight(ctx, execBackend, execConfig, agent, preflightRequest); preflightErr != nil {
@@ -519,6 +553,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		// where it required the permission one. A policy refusal is true whether or
 		// not the binary exists, so it must win the diagnosis.
 		absentBinaryRefusal = runtime.RuntimeContractAbsentBinaryError(agent, result)
+		if noExecution && absentBinaryRefusal == nil {
+			if err := runtime.OmpNoExecutionVersionError(result.Version); err != nil {
+				if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+					return finishErr
+				}
+				_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+				return nil
+			}
+		}
+	} else if noExecution {
+		// #2364: the omp build a no-execution seat runs must be a verified one,
+		// and nothing else can say which build that is.
+		err := errors.New("no-execution review refused: the runtime contract probe did not run, so the omp version cannot be verified")
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
 	}
 	if err := w.produceDispatchError(job.Type, agent); err != nil {
 		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
@@ -1078,6 +1130,31 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
+	}
+	if noExecution {
+		// #2364: the seat must be the no-execution read-only wrapper; anything
+		// else would run the runtime without the exec supervisor.
+		stateAdapter, ok := adapter.(readOnlyRuntimeAdapter)
+		var briefErr error
+		if !ok {
+			briefErr = fmt.Errorf("no-execution review requires the local read-only seat, got %T", adapter)
+		} else {
+			var client staticReviewCIGitHub
+			client, briefErr = w.staticReviewCIClient(checkout, jobRunner)
+			if briefErr == nil {
+				evidenceCtx, cancelEvidence := context.WithTimeout(ctx, 60*time.Second)
+				stateAdapter.staticReviewBrief = staticReviewBrief(staticReviewEvidence(evidenceCtx, client, payload.Repo, payload.HeadSHA))
+				cancelEvidence()
+				adapter = stateAdapter
+			}
+		}
+		if briefErr != nil {
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, briefErr); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, briefErr)
+			return nil
+		}
 	}
 	// #1817: THE SEAT'S OWN RUNTIME IS PUBLISHED UNAVAILABLE, SO REFUSE HERE -
 	// after the adapter exists, so the real-adapter discriminator can be asked,
@@ -1721,6 +1798,10 @@ type readOnlyRuntimeAdapter struct {
 	cleanupRoot string
 	cleanupTemp seatTempDir
 	ompSession  *readOnlyOmpBrokerSession
+	// staticReviewBrief is appended to the prompt of a no-execution review
+	// (#2364): the statement that this seat cannot run anything, and the
+	// exact-head CI evidence the host fetched for it.
+	staticReviewBrief string
 }
 
 func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
@@ -1746,6 +1827,9 @@ func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent
 		if _, err := a.ompSession.prepare(model); err != nil {
 			return runtime.Result{}, err
 		}
+	}
+	if a.staticReviewBrief != "" {
+		job.Prompt = strings.TrimRight(job.Prompt, "\n") + "\n\n" + a.staticReviewBrief
 	}
 	// Mailbox repair turns reuse this adapter. Keep its isolated credentials and
 	// session state until RunJob returns; the worker owns job-boundary cleanup.
@@ -1789,6 +1873,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	var (
 		seatAuthEnv []string
 		ompConfig   *readOnlyOmpBrokerConfig
+		launchDir   string
 	)
 	var err error
 	if agent.Runtime == runtime.OmpRuntime {
@@ -1806,6 +1891,36 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
 	if err != nil {
 		return nil, readOnlySeatSetup{}, err
+	}
+	if agent.NoExecution {
+		// The omp no-execution overlay is read by the runtime at startup; it is
+		// data, never executable under the no-execution ruleset. It is ALSO
+		// named in PI_CONFIG_FILES so no other source can claim that variable.
+		// The launch dir is an empty job-private directory the runtime starts
+		// in, so it never reads the checkout's .env (the checkout is passed
+		// to omp with --cwd instead).
+		//
+		// The cache root is keyed by worktree path and is WRITABLE by every
+		// seat that used it, including earlier seats that could run commands.
+		// omp reads .env and user settings from HOME, the XDG roots and its
+		// start directory at startup, so each of those is recreated empty
+		// rather than trusted.
+		if strings.TrimSpace(agent.NoExecutionConfig) == "" {
+			cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
+			return nil, readOnlySeatSetup{}, errors.Join(errors.New("no-execution seat has no runtime settings overlay"), cleanupErr)
+		}
+		grants.readFiles = append(grants.readFiles, agent.NoExecutionConfig)
+		grants.env = append(grants.env, "PI_CONFIG_FILES="+agent.NoExecutionConfig)
+		launchDir = filepath.Join(grants.cacheRoot, "launch")
+		for _, dir := range []string{launchDir, "home", "xdg-config", "xdg-data", "xdg-state", "xdg-cache"} {
+			if !filepath.IsAbs(dir) {
+				dir = filepath.Join(grants.cacheRoot, dir)
+			}
+			if err := errors.Join(os.RemoveAll(dir), os.MkdirAll(dir, 0o700)); err != nil {
+				cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
+				return nil, readOnlySeatSetup{}, errors.Join(fmt.Errorf("reset no-execution seat dir %q: %w", dir, err), cleanupErr)
+			}
+		}
 	}
 	setup := readOnlySeatSetup{dropped: grants.dropped, runtimeUnavailable: grants.runtimeUnavailable, toolchainUnavailable: grants.toolchainUnavailable}
 	var ompSession *readOnlyOmpBrokerSession
@@ -1834,9 +1949,15 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// above is a no-op and BaseEnv is dropped: a wiring test proved the child
 		// then saw only the grant env. #1810's review called this shape-dependence
 		// out; routing through grants.env is what makes the fix shape-independent.
+		if agent.NoExecution {
+			return landlockNoExecutionRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
+		}
 		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
 	}
 	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
+	if err == nil && agent.NoExecution {
+		wrapped, err = withOmpNoExecutionLaunchDir(wrapped, launchDir)
+	}
 	if err != nil {
 		// Staging and narrowing are already done at this point, so the
 		// withheld list is reported even though the wrap failed.
@@ -1915,6 +2036,35 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 	}
 }
 
+// withOmpNoExecutionLaunchDir points an omp adapter at the neutral directory a
+// no-execution seat starts in. Any other adapter is refused: only omp is a
+// supported no-execution runtime, and a seat that cannot be given its launch
+// dir must not run from the checkout instead.
+func withOmpNoExecutionLaunchDir(adapter workflow.DeliveryAdapter, launchDir string) (workflow.DeliveryAdapter, error) {
+	switch a := adapter.(type) {
+	case modelGatewayRuntimeAdapter:
+		inner, err := withOmpNoExecutionLaunchDir(a.Adapter, launchDir)
+		if err != nil {
+			return nil, err
+		}
+		runtimeAdapter, ok := inner.(runtime.Adapter)
+		if !ok {
+			return nil, fmt.Errorf("no-execution seat returned incompatible %T adapter", inner)
+		}
+		a.Adapter = runtimeAdapter
+		return a, nil
+	case runtime.OmpAdapter:
+		a.LaunchDir = launchDir
+		return a, nil
+	case *runtime.OmpAdapter:
+		copied := *a
+		copied.LaunchDir = launchDir
+		return &copied, nil
+	default:
+		return nil, fmt.Errorf("no-execution seat cannot run on adapter %T; only omp is supported", adapter)
+	}
+}
+
 // applyReadOnlySeat rewrites an agent for hard runtime isolation.
 //
 // SESSION SAFETY: prepareReadOnlyRuntimeState builds the seat's runtime state
@@ -1957,6 +2107,66 @@ func applyReadOnlySeat(readOnlySeat bool, configDir string, jobID string, agent 
 	}
 	agent.RuntimeRef = ref
 	return nil
+}
+
+// noExecutionRuntimes are the runtimes whose adapter applies a verified
+// read-only tool allowlist for a no-execution seat (#2364). Any other runtime
+// would still offer the model a shell or code tool, so it is refused.
+var noExecutionRuntimes = map[string]bool{runtime.OmpRuntime: true}
+
+// applyNoExecution narrows a read-only seat to one that runs nothing. It fails
+// closed: a job recorded as no-execution never runs with a weaker contract.
+func applyNoExecution(home string, readOnlySeat bool, agent *runtime.Agent) error {
+	if !readOnlySeat || agent == nil || !agent.ReadOnlySeat {
+		return errors.New("no-execution review requires a read-only review seat")
+	}
+	if !noExecutionRuntimes[agent.Runtime] {
+		return fmt.Errorf("no-execution review is not supported on runtime %q; use an omp reviewer", agent.Runtime)
+	}
+	if err := sandbox.NoExecutionSupported(); err != nil {
+		return fmt.Errorf("no-execution review refused on this host: %w", err)
+	}
+	overlay, err := ensureOmpNoExecutionOverlay(home)
+	if err != nil {
+		return err
+	}
+	agent.NoExecution = true
+	agent.NoExecutionConfig = overlay
+	return nil
+}
+
+// ensureOmpNoExecutionOverlay writes the fixed omp no-execution settings
+// overlay once under the Gitmoot home and returns its path. Its content is a
+// constant, so every no-execution job shares one read-only file; a file whose
+// content differs is rewritten atomically rather than trusted.
+func ensureOmpNoExecutionOverlay(home string) (string, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve gitmoot home for no-execution overlay: %w", err)
+	}
+	dir := filepath.Join(filepath.Dir(paths.Database), "runtimes")
+	path := filepath.Join(dir, "omp-no-execution-v1.yml")
+	if current, readErr := os.ReadFile(path); readErr == nil && string(current) == runtime.OmpNoExecutionOverlay {
+		return path, nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create no-execution overlay dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".omp-no-execution-*.yml")
+	if err != nil {
+		return "", fmt.Errorf("write no-execution overlay: %w", err)
+	}
+	_, writeErr := tmp.WriteString(runtime.OmpNoExecutionOverlay)
+	closeErr := tmp.Close()
+	if err := errors.Join(writeErr, closeErr, os.Chmod(tmp.Name(), 0o400)); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("write no-execution overlay: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("install no-execution overlay: %w", err)
+	}
+	return path, nil
 }
 
 // resumableSessionRuntime reports whether a runtime's RuntimeRef names a
@@ -3284,20 +3494,26 @@ func compactCleanPaths(paths []string) []string {
 }
 
 func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
-	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false)
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false, false)
 }
 
 func landlockReadOnlyRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
-	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, true)
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, true, false)
 }
 
-func landlockRuntimeRunner(runner subprocess.Runner, reads, readFiles, writes, env []string, readOnlyWorkdir bool) subprocess.Runner {
+// landlockNoExecutionRunner is landlockReadOnlyRunner for a review seat that
+// must run nothing (#2364).
+func landlockNoExecutionRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
+	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, true, true)
+}
+
+func landlockRuntimeRunner(runner subprocess.Runner, reads, readFiles, writes, env []string, readOnlyWorkdir, noExecution bool) subprocess.Runner {
 	readable := append([]string(nil), reads...)
 	files := append([]string(nil), readFiles...)
 	writable := append([]string(nil), writes...)
 	runtimeEnv := append([]string(nil), env...)
 	wrap := func(inner subprocess.Runner) subprocess.WrappingRunner {
-		return subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, ReadOnlyWorkdir: readOnlyWorkdir, Env: runtimeEnv}
+		return subprocess.WrappingRunner{Inner: inner, ReadablePaths: readable, ReadableFiles: files, WritablePaths: writable, ReadOnlyWorkdir: readOnlyWorkdir, NoExecution: noExecution, Env: runtimeEnv}
 	}
 	if tee, ok := runner.(subprocess.TeeRunner); ok {
 		inner := tee.Inner

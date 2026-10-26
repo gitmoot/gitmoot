@@ -254,6 +254,11 @@ type JobRequest struct {
 	// filesystem sandbox and isolated runtime profile. It is independent of
 	// ReadOnlyWorktree, which owns only disposable-worktree lifecycle.
 	ReadOnlySeat bool
+	// ReviewNoExecution marks a review seat that must run nothing (#2364): the
+	// runtime gets a read-only tool allowlist and the sandbox denies executing
+	// any program but the runtime itself. It is only meaningful with
+	// ReadOnlySeat.
+	ReviewNoExecution bool
 	// IsolateShellStage is an enqueue-only marker for a non-service pipeline shell
 	// stage that opted into a detached read-only worktree. It is consumed before
 	// payload persistence; false preserves the legacy shared-checkout request.
@@ -474,6 +479,10 @@ type JobPayload struct {
 	// disposable-worktree cleanup marker above: produce and service-shell jobs
 	// may own throwaway writable worktrees without being read-only runtime seats.
 	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
+	// ReviewNoExecution is the durable form of JobRequest.ReviewNoExecution. The
+	// worker reads it to apply the no-execution sandbox and runtime tool
+	// allowlist, and result checks read it to reject an executed-evidence claim.
+	ReviewNoExecution bool `json:"review_no_execution,omitempty"`
 	// ReadOnlyWorktreeDiff durably preserves the bounded `git status --short` +
 	// `git diff HEAD` snapshot collected immediately before a terminal ask/review
 	// worktree is removed. Truncated is explicit when the snapshot exceeded the
@@ -870,6 +879,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		WorktreePath:           request.WorktreePath,
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
 		ReadOnlySeat:           request.ReadOnlySeat,
+		ReviewNoExecution:      request.ReviewNoExecution,
 		TemplateID:             snapshot.ID,
 		TemplateResolvedCommit: snapshot.ResolvedCommit,
 		TemplateContent:        snapshot.Content,
@@ -1724,6 +1734,27 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			payload.ResultObservation = excludedResultObservation(deliveryWorktree.ExcludedSource, result)
 		} else {
 			payload.ResultObservation = observeResultChanges(ctx, deliveryWorktree.Path, result, execBackend)
+		}
+	}
+	// #2364: a no-execution review's result is checked whatever the
+	// result_checks mode, because the mode is an audit dial and this is the
+	// review's own contract. A failure takes the block path. The agent flag
+	// covers a review made no-execution by its repository's policy, which the
+	// worker applies on the agent; it is recorded on the payload here so the
+	// stored job says which contract its verdict was produced under.
+	if (payload.ReviewNoExecution || agent.NoExecution) && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		payload.ReviewNoExecution = true
+		if failed := NoExecutionReviewResultChecks(result); len(failed) > 0 {
+			payload.ResultChecks = failed
+			summary := SummarizeResultChecks(failed)
+			_ = m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary)
+			if err := m.savePayload(ctx, job.ID, payload); err != nil {
+				return AgentResult{}, err
+			}
+			if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
+				return AgentResult{}, err
+			}
+			return AgentResult{}, &ResultChecksError{Failed: failed}
 		}
 	}
 	// #526 deterministic binary-checklist audit of the parsed result. The worktree

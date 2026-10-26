@@ -1133,6 +1133,16 @@ func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref
 	return checks, nil
 }
 
+// ActionsJobLog reads the plain-text log of one GitHub Actions job. It is a
+// read-only call; callers bound how much of it they keep.
+func (c *GhClient) ActionsJobLog(ctx context.Context, repo Repository, jobID int64) (string, error) {
+	result, err := c.run(ctx, false, "api", endpoint(repo, "actions", "jobs", strconv.FormatInt(jobID, 10), "logs"))
+	if err != nil {
+		return "", err
+	}
+	return result.Stdout, nil
+}
+
 // WorkflowsExistAtRef reports whether the repository has a `.github/workflows`
 // directory at the given ref (#596). The merge gate uses it as a cheap, one-read
 // workflow-awareness signal: if the head tree demonstrably carries workflow

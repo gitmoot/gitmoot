@@ -593,6 +593,81 @@ type reviewPolicyOverride struct {
 	// kept per repository so dispatch refuses reviews of THAT repository
 	// instead of quietly running them locally, while other repositories load.
 	checksErr error
+	// execution is the repository's declared review execution policy (#2364),
+	// empty when undeclared. executionErr is why the declaration could not be
+	// read; ReviewExecution then refuses rather than allow execution.
+	execution    string
+	executionErr error
+}
+
+// Review execution policy (#2364). "allowed" is the default: a reviewer may
+// build and run tests. "none" makes every review of the repository a
+// no-execution review: the reviewer reads code and the host-staged exact-head
+// CI evidence, and the seat cannot start any program but its runtime.
+const (
+	ReviewExecutionAllowed = "allowed"
+	ReviewExecutionNone    = "none"
+)
+
+// ReviewExecution returns repo's review execution policy: ReviewExecutionNone
+// or ReviewExecutionAllowed. A declaration that could not be read is an error;
+// callers must refuse that repository's reviews, never treat it as allowed.
+func (c ReviewConfig) ReviewExecution(repo string) (string, error) {
+	repo = strings.TrimSpace(repo)
+	override, ok := c.repos[repo]
+	if !ok {
+		return ReviewExecutionAllowed, nil
+	}
+	if override.executionErr != nil {
+		return "", fmt.Errorf("[repos.%q.review] %w", repo, override.executionErr)
+	}
+	if override.execution == "" {
+		return ReviewExecutionAllowed, nil
+	}
+	return override.execution, nil
+}
+
+// LoadReviewExecution reads repo's review execution policy from the config
+// file. A config file that cannot be read is an error, because its repository
+// sections may declare "none", and so is an `execution` key misplaced in the
+// global [review] section: whoever wrote it meant to restrict reviews, and
+// silently allowing execution would be the wrong way to fail. A field error in
+// an unrelated key does not affect this answer and is ignored here.
+func LoadReviewExecution(paths Paths, repo string) (string, error) {
+	cfg, err := LoadReviewConfig(paths)
+	if err != nil && cfg.repos == nil {
+		return "", fmt.Errorf("load review execution policy: %w", err)
+	}
+	if misplaced := findReviewConfigFieldError(err, "execution"); misplaced != nil {
+		return "", misplaced
+	}
+	return cfg.ReviewExecution(repo)
+}
+
+// findReviewConfigFieldError returns the first field error for field in a
+// (possibly joined) review config load error.
+func findReviewConfigFieldError(err error, field string) *reviewConfigFieldError {
+	if err == nil {
+		return nil
+	}
+	if fieldErr, ok := err.(*reviewConfigFieldError); ok {
+		if fieldErr.field == field {
+			return fieldErr
+		}
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if found := findReviewConfigFieldError(child, field); found != nil {
+				return found
+			}
+		}
+		return nil
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return findReviewConfigFieldError(wrapped.Unwrap(), field)
+	}
+	return nil
 }
 
 // Review checks routing (#2316). checks_backend has one value: a repository
@@ -893,7 +968,7 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 		}
 		policy.FindingsConsumption = parsed
 		return nil
-	case "checks_backend", "checks_provider", "checks_template":
+	case "checks_backend", "checks_provider", "checks_template", "execution":
 		return fmt.Errorf("%s is repository-scoped: set it in [repos.\"owner/repo\".review]", key)
 	default:
 		return nil
@@ -967,6 +1042,21 @@ func applyReviewPolicyOverrideField(override *reviewPolicyOverride, key string, 
 		if err := applyReviewChecksField(&override.checks, key, value); err != nil && override.checksErr == nil {
 			override.checksErr = fmt.Errorf("%s: %w", key, err)
 		}
+		return nil
+	case "execution":
+		// Fail CLOSED, and on the repository only like checks_*: an
+		// unreadable declaration makes ReviewExecution refuse that
+		// repository's reviews rather than run them with execution allowed.
+		parsed, err := parseConfigString(value)
+		parsed = strings.TrimSpace(parsed)
+		if err == nil && parsed != ReviewExecutionAllowed && parsed != ReviewExecutionNone {
+			err = fmt.Errorf("unsupported execution %q: use %q or %q", parsed, ReviewExecutionAllowed, ReviewExecutionNone)
+		}
+		if err != nil {
+			override.executionErr = fmt.Errorf("execution: %w", err)
+			return nil
+		}
+		override.execution = parsed
 		return nil
 	default:
 		return nil
