@@ -242,34 +242,35 @@ const groupCleanupBound = 5 * time.Second
 // if any member is still alive at the bound, so the seat reports failure
 // rather than leaving a process behind after a successful exit.
 func killAndReapGroup() error {
+	// THROWAWAY red-on-old: the 838e3dd4 cleanup verbatim (kill direct
+	// children, then BLOCKING wait until ECHILD, then rescan).
 	self := os.Getpid()
-	deadline := time.Now().Add(groupCleanupBound)
 	for {
-		members := otherGroupMembers(self)
-		for _, pid := range members {
-			_ = unix.Kill(pid, unix.SIGKILL)
+		killed := 0
+		entries, _ := os.ReadDir("/proc")
+		for _, entry := range entries {
+			pid, err := strconv.Atoi(entry.Name())
+			if err != nil || pid == self {
+				continue
+			}
+			stat, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
+			if err != nil {
+				continue
+			}
+			fields := strings.Fields(string(stat[strings.LastIndexByte(string(stat), ')')+1:]))
+			if len(fields) > 1 && fields[1] == strconv.Itoa(self) {
+				_ = unix.Kill(pid, unix.SIGKILL)
+				killed++
+			}
 		}
-		noChildren := false
 		for {
-			pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
-			if errors.Is(err, unix.ECHILD) {
-				noChildren = true
+			if _, err := unix.Wait4(-1, nil, 0, nil); err != nil {
 				break
 			}
-			if err != nil || pid <= 0 {
-				break // children remain but none has exited yet
-			}
 		}
-		if noChildren && len(members) == 0 {
+		if killed == 0 {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			if left := otherGroupMembers(self); len(left) > 0 {
-				return fmt.Errorf("no-execution supervisor: %d descendant processes %v survived SIGKILL for %v", len(left), left, groupCleanupBound)
-			}
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
