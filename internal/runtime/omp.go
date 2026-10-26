@@ -101,6 +101,12 @@ var ompThinkingLevels = map[string]struct{}{
 type OmpAdapter struct {
 	Runner subprocess.Runner
 	Dir    string
+	// LaunchDir is the process working directory of a no-execution seat
+	// (#2364). Dir stays the project omp works on (passed as --cwd), while
+	// the process starts in this empty job-private directory so omp never
+	// loads the checkout's .env into its environment. Required when the
+	// agent is NoExecution; unused otherwise.
+	LaunchDir string
 }
 
 func (a OmpAdapter) Name() string { return OmpRuntime }
@@ -303,6 +309,16 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 		return Result{}, err
 	}
 	defer cleanup()
+	runDir := a.Dir
+	if agent.NoExecution {
+		// Fail closed: a no-execution seat never starts in the checkout,
+		// where omp would load the repository's .env into its environment.
+		if strings.TrimSpace(a.LaunchDir) == "" || strings.TrimSpace(a.Dir) == "" {
+			return Result{}, errors.New("omp no-execution seat requires both a project dir and a neutral launch dir")
+		}
+		agent.noExecutionProjectDir = a.Dir
+		runDir = a.LaunchDir
+	}
 	// The requested model selects argv and PlanMode describes the requested
 	// execution target. Upstream-provider evidence does not trust either field;
 	// it comes from the final successful runtime message parsed below.
@@ -318,7 +334,7 @@ func (a OmpAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, 
 	// would otherwise block before the model is ever called, get SIGKILLed on the ctx
 	// deadline, and this parser would diagnose the empty stream as "ended without an
 	// agent_end event" — the wrong cause for a wiring bug.
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "omp", args...)
+	result, err := runAgentCommand(ctx, a.runner(), runDir, job.AgentEnv, job.OnPID, "omp", args...)
 	// Parse before branching on err: the header id and runtime-reported provider
 	// are worth capturing. Only the complete-success path below publishes the
 	// provider as execution evidence.
@@ -548,6 +564,7 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bo
 	approval, _ := ompApprovalArgs(agent)
 	args := []string{"-p", "--mode=json", approval, "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)
+	args = append(args, ompNoExecutionArgs(agent)...)
 	if model != "" {
 		args = append(args, "--model", model)
 	}
@@ -604,6 +621,85 @@ func ompWorkspaceArgs(agent Agent) []string {
 		if path = strings.TrimSpace(path); path != "" {
 			args = append(args, "--add-dir", path)
 		}
+	}
+	return args
+}
+
+// ompNoExecutionTools is the complete tool allowlist for a no-execution review
+// seat (#2364): read files, search them, list them, and keep a todo list. Every
+// tool that runs code (bash, python, notebook, browser, computer, lsp, task) or
+// changes files (edit, write) is absent, and web_search is absent because the
+// CI evidence the review needs is staged into the prompt by the host.
+const ompNoExecutionTools = "read,grep,glob,todo"
+
+// ompNoExecutionVerifiedVersions are the omp builds whose no-execution
+// behaviour was measured (#2364: tool allowlist, provider and MCP gating,
+// --cwd, settings overlay precedence). Another version may move a discovery
+// path or a flag, so a no-execution seat refuses it until it is measured and
+// added here.
+var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true}
+
+// OmpNoExecutionVersionError refuses a no-execution seat on an omp build
+// whose behaviour has not been verified. version is the runtime contract
+// probe's reported `omp --version` line.
+func OmpNoExecutionVersionError(version string) error {
+	version = strings.TrimSpace(version)
+	if ompNoExecutionVerifiedVersions[version] {
+		return nil
+	}
+	if version == "" {
+		version = "unknown"
+	}
+	return fmt.Errorf("no-execution review refused: installed omp version %q has not been verified for no-execution seats (verified: omp/18.10.4)", version)
+}
+
+// ompDiscoveryProviders is every config-discovery provider omp 18.10.4 ships
+// (the ids registered with its capability registry). A no-execution seat
+// disables ALL of them, because each one can contribute MCP servers, custom
+// tools, hooks, extensions or rules from user or project files. Measured on
+// omp 18.10.4 (#2364): with --no-extensions alone, project and user
+// `tools/*.js` still load in-process and project and user MCP servers are
+// still contacted; with every provider disabled nothing is loaded or
+// contacted and read/grep/glob still work.
+var ompDiscoveryProviders = []string{
+	"agent-plugins", "agents", "agents-md", "builtin-defaults", "claude", "claude-md",
+	"claude-plugins", "cline", "codex", "cursor", "custom-context", "gemini", "github",
+	"mcp-json", "native", "omp-managed", "omp-plugins", "opencode", "skillshare",
+	"ssh-json", "vscode", "windsurf",
+}
+
+// OmpNoExecutionOverlay is the omp settings overlay a no-execution seat runs
+// with. It is passed with --config, which omp applies above every user,
+// project and PI_CONFIG_FILES layer: a planted project config.yml or an
+// environment overlay that re-enables providers, MCP or extensions was
+// overridden in every measured case.
+var OmpNoExecutionOverlay = func() string {
+	var b strings.Builder
+	b.WriteString("mcp:\n  enableProjectConfig: false\nextensions: []\nskills:\n  enabled: false\ndisabledProviders:\n")
+	for _, provider := range ompDiscoveryProviders {
+		b.WriteString("  - " + provider + "\n")
+	}
+	return b.String()
+}()
+
+// ompNoExecutionArgs is the runtime half of the no-execution contract. The
+// allowlist removes code-running tools from what the model can call, the
+// --no-* flags and the overlay stop user and repo-supplied extensions, tools,
+// hooks, skills, rules and MCP servers from being discovered, loaded into the
+// omp process or contacted, and --cwd names the checkout as the project while
+// the process itself starts in a neutral directory, so omp never reads the
+// checkout's .env into its environment. The sandbox denies executing any
+// other program.
+func ompNoExecutionArgs(agent Agent) []string {
+	if !agent.NoExecution {
+		return nil
+	}
+	args := []string{"--tools=" + ompNoExecutionTools, "--no-extensions", "--no-skills", "--no-rules", "--no-lsp", "--no-pty"}
+	if overlay := strings.TrimSpace(agent.NoExecutionConfig); overlay != "" {
+		args = append(args, "--config="+overlay)
+	}
+	if agent.noExecutionProjectDir != "" {
+		args = append(args, "--cwd="+agent.noExecutionProjectDir)
 	}
 	return args
 }

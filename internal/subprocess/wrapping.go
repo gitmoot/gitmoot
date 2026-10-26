@@ -18,6 +18,10 @@ type WrappingRunner struct {
 	ReadableFiles   []string
 	WritablePaths   []string
 	ReadOnlyWorkdir bool
+	// NoExecution launches the command under sandbox-exec --no-execution
+	// (#2364): nothing but the command itself may be executed. It implies a
+	// read-only working directory.
+	NoExecution bool
 	// Env is appended to the sandbox-exec process environment and inherited by
 	// the exec'd runtime. It is empty for every existing wrapper except Claude
 	// produce, which points CLAUDE_CONFIG_DIR and XDG_CACHE_HOME at the
@@ -43,7 +47,9 @@ func (r WrappingRunner) command(command string, args []string) (string, []string
 		}
 	}
 	wrapped := []string{"sandbox-exec"}
-	if r.ReadOnlyWorkdir {
+	if r.NoExecution {
+		wrapped = append(wrapped, "--no-execution")
+	} else if r.ReadOnlyWorkdir {
 		wrapped = append(wrapped, "--read-only-workdir")
 	}
 	for _, path := range r.ReadablePaths {

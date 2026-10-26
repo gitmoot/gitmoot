@@ -381,7 +381,11 @@ type localAgentDispatchRequest struct {
 	NoFixTarget bool
 	// PostMergeReview reviews an already-merged head (#2265 level 2); its
 	// findings become follow-ups instead of blocking a merge.
-	PostMergeReview        bool
+	PostMergeReview bool
+	// ReviewNoExecution asks for a no-execution review (#2364); the worker
+	// also applies it to every review of a repository declaring
+	// execution = "none".
+	ReviewNoExecution      bool
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -1114,6 +1118,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		SkipNativeReviewFanout:   request.SkipNativeReviewFanout,
 		NoFixTarget:              request.NoFixTarget,
 		PostMergeReview:          request.PostMergeReview,
+		ReviewNoExecution:        request.ReviewNoExecution,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",

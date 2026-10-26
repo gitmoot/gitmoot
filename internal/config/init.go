@@ -305,6 +305,11 @@ path = ""
 # blocking_severity = "P1"
 # remote_require_ci_green = true
 # findings_consumption = "advisory"
+# execution = "none" makes every review of the repository a no-execution
+# review: the reviewer reads code and the exact-head CI evidence and its seat
+# cannot start any program (omp 18.10.4, local backend, linux/amd64 only;
+# anything else refuses). An invalid value refuses the repository's reviews.
+# execution = "none"
 
 # [merge_gate] controls native task merges. Native auto-merge is enabled by
 # default, but only when an approved review verdict matches the exact current

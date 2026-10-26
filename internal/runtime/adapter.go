@@ -60,6 +60,20 @@ type Agent struct {
 	// receive the widened command and network permissions below.
 	// In-memory only; never persisted on the agents table.
 	ReadOnlySeat bool
+	// NoExecution narrows a ReadOnlySeat to a seat that may run nothing (#2364).
+	// Adapters that support it restrict the runtime to read-only tools; the
+	// daemon also launches the runtime under a sandbox that denies executing any
+	// other program. In-memory only.
+	NoExecution bool
+	// NoExecutionConfig is the omp settings overlay a no-execution seat runs
+	// with (it disables every config-discovery provider, MCP and extensions).
+	// Set with NoExecution; the daemon grants the sandbox read access to it.
+	// In-memory only.
+	NoExecutionConfig string
+	// noExecutionProjectDir is the checkout a no-execution omp run works on,
+	// passed as --cwd while the process starts elsewhere. Set by OmpAdapter
+	// on its own copy of the agent at delivery; never set by callers.
+	noExecutionProjectDir string
 	// RuntimeConfigDir is the source profile selected by the dispatching process.
 	// Read-only seats copy only the provider authentication needed by that
 	// runtime into per-job state; the source directory is never sandbox-visible.

@@ -39,6 +39,11 @@ Omitting the field records `static_only`. Silence never becomes an execution
 claim, so a producer that does not know about this field cannot be read as
 having run anything. An unrecognised value is rejected outright.
 
+A no-execution review (#2364) MUST return `"static_only"` with an empty
+`tests_run` and no `delegations`. Its seat cannot run anything; a result that
+claims otherwise is refused and the job fails, whatever `result_checks` mode is
+set.
+
 **The engine now records WHETHER YOU DECLARED IT**, alongside the value, in an
 engine-owned `evidence_declared` flag. Do not send that flag: it is assigned
 during normalization and a supplied value is overwritten, because provenance

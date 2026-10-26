@@ -913,7 +913,7 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
-    [--full] [--post-merge] [--allow-prompt-head-mismatch] [--background] [--json] \
+    [--full] [--post-merge] [--no-execution] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]
@@ -1127,6 +1127,58 @@ A remote review falls back only to models whose provider omp can authenticate
 inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `devin`); it
 skips any other entry with event `review_model_remote_skipped`, and the pool
 keeps that entry for local reviews.
+
+### No-execution reviews (#2364)
+
+A no-execution review reads the code and the exact-head CI results instead of
+running anything. Use it when a reviewer must not execute the pull request's
+code.
+
+```sh
+gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target --no-execution
+```
+
+A repository can require it for every review:
+
+```toml
+[repos."owner/repo".review]
+execution = "none"     # "allowed" is the default
+```
+
+The repository setting applies to every review job of that repository, however
+it was queued. A dispatch flag cannot turn it off. An invalid value, or
+`execution` in the global `[review]` section, refuses the review instead of
+allowing execution.
+
+What the worker does:
+
+- Replaces the "execute checks" brief with a static brief and adds the CI
+  evidence it fetched from GitHub: every check run at the exact head, and the
+  log tail of up to three failing Actions jobs. CI logs are marked as untrusted
+  output.
+- Runs omp with only `read`, `grep`, `glob` and `todo`, with every
+  config-discovery provider, MCP, extensions, skills, rules, LSP and PTY turned
+  off through `--config`. omp starts in an empty job directory and gets the
+  checkout through `--cwd`, so the checkout's `.env` is never loaded. The seat's
+  HOME, XDG directories and launch directory are recreated empty for each job.
+- Starts omp under `sandbox-exec --no-execution`. A supervisor allows exactly one
+  exec, the runtime itself, and refuses every later `execve`/`execveat` from the
+  runtime or any child with `EACCES`. Landlock removes the Execute right from
+  every granted path except the runtime and its ELF loader. If the supervisor
+  dies, the kernel kills the runtime. Children cannot leave the seat's process
+  group. When the runtime exits, the supervisor kills every remaining member of
+  that group, all generations at once; if any survive, the seat reports failure
+  even when omp itself succeeded.
+- Refuses a result that claims `evidence: executed`, lists `tests_run` entries,
+  or delegates work. This check runs whatever `result_checks` mode is set. The
+  job records `review_no_execution: true`.
+
+Supported scope: Linux amd64, the local execution backend, the omp runtime, and
+omp 18.10.4 (the only version measured). Any other architecture, backend,
+runtime or omp version refuses the review before omp starts.
+
+Trust boundary: the sandbox stops omp from starting programs. It cannot stop a
+bug inside omp itself that runs model-written code inside the omp process.
 
 ## Review Policy
 
