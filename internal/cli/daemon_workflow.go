@@ -935,23 +935,51 @@ func mergeGateEscalationTo(roster orgRoster, cfg config.OrgConfig, from string, 
 // orgChartRootRole is the single root name ValidateOrg admits.
 const orgChartRootRole = "owner"
 
-// repoOrgOwner returns the most-specific live role whose scope matches repo.
-// Exact repo scope outranks owner-wide scope, which outranks global scope.
-// Chart depth and then the roster's stable name order break equal-specificity
-// ties without allowing a deeper wildcard branch to defeat an exact owner.
-func repoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
-	best, bestSpecificity, bestDepth := "", -1, -1
+// repoOwnerResolution is the outcome of choosing one live role for a repo.
+// Owner is set only when exactly one role wins. Tied lists the roles that
+// matched with equal best specificity and equal chart depth; it is non-empty
+// only when the choice is ambiguous (#2363). An empty Owner with empty Tied
+// means no live role's scope matches the repo at all.
+type repoOwnerResolution struct {
+	Owner string
+	Tied  []string
+}
+
+// resolveRepoOrgOwner picks the most-specific live role whose scope matches
+// repo. Exact repo scope outranks owner-wide scope, which outranks global
+// scope, and a deeper chart position breaks an equal-specificity tie so a
+// child seat outranks its parent. It does NOT guess among roles that are still
+// tied after that: roster name order is not evidence of ownership, and choosing
+// the alphabetically first role routed Docus work to an unrelated seat (#2363).
+// An ambiguous repo resolves to no owner and reports the tied roles instead.
+func resolveRepoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) repoOwnerResolution {
+	var tied []string
+	bestSpecificity, bestDepth := -1, -1
 	for _, role := range roster.Members() {
 		specificity := repoScopeSpecificity(role.Scope, repo)
 		if specificity < 0 {
 			continue
 		}
 		depth := len(cfg.Path(role.Name))
-		if specificity > bestSpecificity || (specificity == bestSpecificity && depth > bestDepth) {
-			best, bestSpecificity, bestDepth = role.Name, specificity, depth
+		switch {
+		case specificity > bestSpecificity || (specificity == bestSpecificity && depth > bestDepth):
+			tied = []string{role.Name}
+			bestSpecificity, bestDepth = specificity, depth
+		case specificity == bestSpecificity && depth == bestDepth:
+			tied = append(tied, role.Name)
 		}
 	}
-	return best, best != ""
+	if len(tied) == 1 {
+		return repoOwnerResolution{Owner: tied[0]}
+	}
+	return repoOwnerResolution{Tied: tied}
+}
+
+// repoOrgOwner returns the single live role that owns repo, or false when no
+// role matches or the best matches are tied. See resolveRepoOrgOwner.
+func repoOrgOwner(roster orgRoster, cfg config.OrgConfig, repo string) (string, bool) {
+	resolution := resolveRepoOrgOwner(roster, cfg, repo)
+	return resolution.Owner, resolution.Owner != ""
 }
 
 func repoScopeSpecificity(scope []string, repo string) int {

@@ -612,7 +612,9 @@ func TestOrgPreflightEnqueueParity(t *testing.T) {
 		{name: "block unknown", enforce: "block", role: "unknown", repo: "owner/repo", wantErr: true},
 		{name: "block out-of-scope", enforce: "block", role: "owner", repo: "other/repo", wantErr: true},
 		{name: "block in-scope", enforce: "block", role: "OWNER", repo: "owner/repo"},
-		{name: "warn role-less", enforce: "warn", repo: "owner/repo", wantViolation: true},
+		// #2363: a role-less dispatch is refused in warn mode too; warn audits a
+		// known role outside its scope, not a dispatch with no one to report to.
+		{name: "warn role-less", enforce: "warn", repo: "owner/repo", wantErr: true},
 		{name: "warn unknown", enforce: "warn", role: "unknown", repo: "owner/repo", wantViolation: true},
 		{name: "warn out-of-scope", enforce: "warn", role: "owner", repo: "other/repo", wantViolation: true},
 		{name: "warn in-scope", enforce: "warn", role: "owner", repo: "owner/repo"},

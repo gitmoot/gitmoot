@@ -61,6 +61,7 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 		return
 	}
 	event = s.addressBlockedEvent(ctx, event)
+	event = s.addressUnownedVerdictEvent(ctx, event)
 	events.EmitEvent(ctx, s.inner, event)
 	if s.store == nil {
 		return
@@ -341,10 +342,85 @@ func (s *eventRuleSink) addressBlockedEvent(ctx context.Context, event events.Ev
 		targetRole = persistedRole
 	}
 	if targetRole == "" && cfgOK {
-		targetRole, _ = repoOrgOwner(roster, cfg, event.Repo)
+		resolution := resolveRepoOrgOwner(roster, cfg, event.Repo)
+		targetRole = resolution.Owner
+		if targetRole == "" {
+			s.recordUnownedBlockedEvent(ctx, event, resolution)
+		}
 	}
 	event.WakeTargetRole = targetRole
 	return event
+}
+
+// addressUnownedVerdictEvent gives a review verdict that has no addressee to the
+// repo's single org owner. The engine addresses a verdict to the requesting
+// role, the PR owner, or the lead agent; a review dispatched from an
+// unregistered seat without --org-role on a PR with no implement job has none
+// of those, so its changes_requested verdict reached nobody (#2363). The repo
+// owner is the seat accountable for that work. A tied or absent owner is not
+// guessed, matching blocked routing. This never sets a lead or a fix target.
+//
+// An empty target is not enough evidence on its own: the engine also empties
+// it when the real requester or owner already holds a durable review
+// subscription. So the job's own attribution is re-read, and the fallback runs
+// only when the job has no requester, no lead, and no resolvable PR owner.
+func (s *eventRuleSink) addressUnownedVerdictEvent(ctx context.Context, event events.Event) events.Event {
+	if event.Cause != events.EventCauseReviewVerdict || s.store == nil ||
+		strings.TrimSpace(event.WakeTargetRole) != "" || len(event.WakeTargetRoles) > 0 {
+		return event
+	}
+	job, err := s.store.GetJob(ctx, event.JobID)
+	if err != nil {
+		return event
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil || workflow.NormalizeActingOrgRole(payload.ActingOrgRole) != "" ||
+		workflow.NormalizeActingOrgRole(payload.LeadAgent) != "" {
+		return event
+	}
+	prOwner, err := s.store.ResolvePullRequestOwner(ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID)
+	if err != nil || workflow.NormalizeActingOrgRole(prOwner) != "" {
+		return event
+	}
+	cfg, ok := s.loadOrgConfig()
+	if !ok {
+		return event
+	}
+	owner := resolveRepoOrgOwner(loadOrgRoster(ctx, s.store, cfg), cfg, event.Repo).Owner
+	if owner == "" {
+		return event
+	}
+	event.WakeTargetRole = owner
+	event.WakeTargetRoles = []string{owner}
+	return event
+}
+
+// blockedEventUnownedKind marks a blocked job whose wake had no single owner to
+// address. It is recorded once per job so repeated blocked-since reminders do
+// not grow the job's history, and it is how an unowned or ambiguously owned
+// repo becomes visible instead of being silently routed to a guessed seat
+// (#2363). Recording it never assigns ownership.
+const blockedEventUnownedKind = "wake_target_unowned"
+
+func (s *eventRuleSink) recordUnownedBlockedEvent(ctx context.Context, event events.Event, resolution repoOwnerResolution) {
+	jobID := strings.TrimSpace(event.JobID)
+	if s.store == nil || jobID == "" {
+		return
+	}
+	if _, err := s.store.GetJob(ctx, jobID); err != nil {
+		// Blocked-since digests can carry a task id rather than a job id; there is
+		// no job history to annotate then.
+		return
+	}
+	repo := strings.TrimSpace(event.Repo)
+	message := fmt.Sprintf("no org role scopes %s; blocked notice reached observers only. Add the repo to its owning seat's scope.", repo)
+	if len(resolution.Tied) > 1 {
+		message = fmt.Sprintf("no single org owner for %s: roles %s tie on scope and chart depth; blocked notice reached observers only. Give one seat an explicit scope for the repo.",
+			repo, strings.Join(resolution.Tied, ", "))
+	}
+	if err := s.store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: jobID, Kind: blockedEventUnownedKind, Message: message}); err != nil {
+		slog.Warn("unowned blocked event record failed", "job_id", jobID, "repo", repo, "error", err)
+	}
 }
 
 func recordUnresolvedRoleWake(ctx context.Context, store *db.Store, role string) error {

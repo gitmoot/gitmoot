@@ -1372,6 +1372,11 @@ func runOrgOverview(command string, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "org %s: %v\n", command, err)
 		return 1
 	}
+	if command == "status" {
+		if warning := unownedReposWarning(ctx, store, shared.Config, time.Now().UTC()); warning != "" {
+			shared.Warnings = append(shared.Warnings, warning)
+		}
+	}
 	for _, warning := range shared.Warnings {
 		fmt.Fprintf(stderr, "org %s: %s\n", command, warning)
 	}

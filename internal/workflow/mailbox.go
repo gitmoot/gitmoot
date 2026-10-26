@@ -1057,7 +1057,11 @@ func OrgScopeDecision(policy OrgEnforcement, actingRole, repo string) (string, e
 		return "", nil
 	}
 	if roleName == "" {
-		return violation(fmt.Sprintf("org enforcement on for %s: pass --org-role <role>", repo))
+		// A missing requester is refused even in warn mode. Warn mode exists to
+		// audit a KNOWN role acting outside its scope; with no role there is
+		// nobody to return the result to, so the job ran and its verdicts and
+		// blocked notices went to a guessed or empty recipient (#2363).
+		return "", fmt.Errorf("no org role for this dispatch to %s: pass --org-role <role>, set GITMOOT_ORG_ROLE, or run it from a seat registered with `gitmoot org seat add`", repo)
 	}
 	if policy.Role == nil {
 		return violation("org policy is missing role lookup")

@@ -66,21 +66,11 @@ func messageActingRole(ctx context.Context, cfg config.OrgConfig, explicit strin
 		role = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
 	}
 	if role == "" {
-		pane := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
-		if pane != "" {
-			snapshot, err := orgProviderSnapshot(ctx, cfg)
-			if err != nil {
-				return "", fmt.Errorf("cannot resolve current sender: %w", err)
-			}
-			for name, binding := range snapshot.PaneBindings {
-				if binding.PaneID == pane {
-					if role != "" {
-						return "", errors.New("current pane maps to multiple roles; use --role")
-					}
-					role = name
-				}
-			}
+		paneRole, err := callerPaneOrgRole(ctx, cfg)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve current sender: %w", err)
 		}
+		role = paneRole
 	}
 	if role == "" {
 		return "", errors.New("sender role unavailable; set GITMOOT_ORG_ROLE or use --role")
@@ -89,6 +79,74 @@ func messageActingRole(ctx context.Context, cfg config.OrgConfig, explicit strin
 		return "", fmt.Errorf("unknown role %q", role)
 	}
 	return role, nil
+}
+
+// callerPaneOrgRole returns the org role registered for the calling Herdr pane
+// (HERDR_PANE_ID), or "" when the process is not in a pane or the pane is not
+// a registered seat. A pane bound to more than one role is an error rather than
+// a choice. Dispatch and messaging share this so a seat that runs work from its
+// own pane is attributed without having to remember --org-role (#2363).
+// errPaneMapsToMultipleRoles is returned when the calling pane is bound to more
+// than one org role.
+var errPaneMapsToMultipleRoles = errors.New("current pane maps to multiple roles; use --role")
+
+func callerPaneOrgRole(ctx context.Context, cfg config.OrgConfig) (string, error) {
+	pane := strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	if pane == "" {
+		return "", nil
+	}
+	snapshot, err := orgProviderSnapshot(ctx, cfg)
+	if err != nil {
+		return "", err
+	}
+	role := ""
+	for name, binding := range snapshot.PaneBindings {
+		if binding.PaneID == pane {
+			if role != "" {
+				return "", errPaneMapsToMultipleRoles
+			}
+			role = name
+		}
+	}
+	return role, nil
+}
+
+// resolveDispatchOrgRole fills an empty requester role for an operator
+// dispatch: explicit flag, then GITMOOT_ORG_ROLE, then the calling pane's
+// registered seat. It runs before any routing choice that depends on the role.
+// It only fills; an unresolved role stays empty so the org gate refuses it with
+// one consistent message. A pane lookup failure is not fatal here for the same
+// reason, but an ambiguous pane is: guessing between two roles is the defect
+// this fixes.
+func resolveDispatchOrgRole(ctx context.Context, home, explicit string) (string, error) {
+	role := strings.ToLower(strings.TrimSpace(explicit))
+	if role == "" {
+		role = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
+	}
+	if role != "" {
+		return role, nil
+	}
+	cfg, ok := loadMergeGateOrgConfig(home)
+	if !ok || !cfg.Enabled() {
+		return "", nil
+	}
+	paneRole, err := callerPaneOrgRole(ctx, cfg)
+	if errors.Is(err, errPaneMapsToMultipleRoles) {
+		return "", err
+	}
+	return paneRole, nil
+}
+
+// resolveAgentOrgRole applies resolveDispatchOrgRole to a parsed command's role
+// and reports a usage failure for an ambiguous pane.
+func resolveAgentOrgRole(role *string, home, label string, stderr io.Writer) bool {
+	resolved, err := resolveDispatchOrgRole(context.Background(), home, *role)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: %v\n", label, err)
+		return false
+	}
+	*role = resolved
+	return true
 }
 
 func runMessage(args []string, stdout, stderr io.Writer) int {

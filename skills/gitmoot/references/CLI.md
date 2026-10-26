@@ -2256,12 +2256,23 @@ binary before adding the fail-closed field to config. Brief and chart surface
 the configured pin, but live-vs-pinned drift detection awaits a running-model
 signal from Herdr.
 
-Fresh local `agent ask`, `agent run`, `agent review`, and `orchestrate`
-dispatches accept `--org-role <name>` (or the
-narrow `GITMOOT_ORG_ROLE` fallback). The role is validated and touched before
-dispatch, stored as `acting_org_role` in the job payload for provenance, and
-its scope is enforced at enqueue. `[org] enforce = "block"` rejects violations;
-`"warn"` queues and records an `org_scope_violation` event.
+Fresh local `agent ask`, `agent run`, `agent review`, `orchestrate`, and
+`review request` dispatches resolve the requesting role from `--org-role
+<name>`, else `GITMOOT_ORG_ROLE`, else the role registered for the calling Herdr
+pane (`HERDR_PANE_ID`); a pane bound to two roles is an error. The role is
+validated and touched before dispatch, stored as `acting_org_role` in the job
+payload, and its scope is enforced at enqueue. With an org registry, a dispatch
+with no resolvable role is refused in every mode. `[org] enforce = "block"`
+rejects out-of-scope repos; `"warn"` queues a known role outside its scope and
+records an `org_scope_violation` event.
+
+A role-less blocked notice, and a review verdict with no requester, lead, or PR
+owner, go to the repo's single owner: the live role with the most specific
+scope match (exact repo, then `owner/*`, then `*`), deeper chart position
+breaking an equal match. Roles still tied are never chosen between: observers
+only, plus a `wake_target_unowned` job event naming them. `org status` and
+`doctor` (`org repo ownership`) list repos with jobs in the last 7 days and no
+single owner.
 
 `gitmoot message escalate [--to ROLE] [--workflow LABEL] [--role ROLE]
 "QUESTION"` records a tracked decision request in the shared inbox. The default
@@ -3746,8 +3757,8 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
 task as `awaiting_human_merge` and records an org escalation. It selects the
-most-specific live role whose scope matches the repo and addresses that role's
-nearest live chart ancestor. With no live scope match it addresses a live
+repo's single owner and addresses that role's nearest live chart ancestor. With
+no single owner, including roles tied on scope and depth, it addresses a live
 `owner`; a root match addresses itself. With no live upward recipient, the gate
 fails closed without journaling an addressed note. Archive filtering does not
 predict delivery; `org validate` reports missing wake routes and pane bindings.

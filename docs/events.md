@@ -165,6 +165,12 @@ Rules default to `--scope addressed`: when an event carries a target role, only
 the matching addressed rule receives it. During rule evaluation,
 `--scope observer` exempts a rule from that addressee gate.
 Events without a target role match observer rules only.
+A role-less blocked event is addressed to the repo's single owner (most
+specific live scope match, deeper chart position breaking a tie). When roles
+remain tied, or none matches, the event carries no target role, so only
+observer rules receive it, and the blocked job records one
+`wake_target_unowned` event naming the tied roles (#2363). A review verdict with
+no requester, lead, or PR owner uses the same single-owner rule.
 Durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching rules for the event's own kind, wake-role equality with the
 addressed target is the only routing condition. An observer-scoped rule is

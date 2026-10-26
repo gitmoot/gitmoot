@@ -269,6 +269,9 @@ scope = ["owner/repo"]
 		t.Fatalf("first evaluation wrote %d notes, want 1: %+v", len(got), got)
 	}
 
+	// Author churn: the single exact owner is renamed but stays under the same
+	// accountable parent. No two roles tie on scope and depth, because a tie is
+	// now ambiguous rather than broken by name order (#2363).
 	writeChart(`
 [org.roles."owner"]
 scope = ["*"]
@@ -281,9 +284,6 @@ scope = ["owner/*"]
 [org.roles."alpha"]
 parent = "coordinator"
 scope = ["owner/repo"]
-[org.roles."worker"]
-parent = "coordinator"
-scope = ["owner/repo"]
 `)
 	if got := evaluate(); got != renderedReason {
 		t.Fatalf("rendered reason changed after author churn: first=%q second=%q", renderedReason, got)
@@ -292,6 +292,8 @@ scope = ["owner/repo"]
 		t.Fatalf("same-recipient author churn wrote %d notes, want 1: %+v", len(got), got)
 	}
 
+	// Recipient change: the exact owner now sits under a new accountable parent,
+	// so a second note is owed. The stage-one coordinator<-worker note remains.
 	writeChart(`
 [org.roles."owner"]
 scope = ["*"]
@@ -306,9 +308,6 @@ parent = "owner"
 scope = ["owner/*"]
 [org.roles."alpha"]
 parent = "coordinator-b"
-scope = ["owner/repo"]
-[org.roles."worker"]
-parent = "coordinator"
 scope = ["owner/repo"]
 `)
 	if got := evaluate(); got != renderedReason {
@@ -568,6 +567,53 @@ scope = ["*"]
 	from, declared := mergeGateEscalationFrom(roster, cfg, "owner/repo")
 	if from != "exact" || !declared {
 		t.Fatalf("mergeGateEscalationFrom = (%q, %t), want exact repo scope over deeper wildcard", from, declared)
+	}
+}
+
+// TestRepoOrgOwnerRefusesToGuessAmongTiedRoles pins #2363: when several live
+// roles match a repo with equal specificity and equal chart depth, no owner is
+// chosen. The pre-fix resolver picked the alphabetically first role, which sent
+// Docus notifications to an unrelated global seat.
+func TestRepoOrgOwnerRefusesToGuessAmongTiedRoles(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."deimos"]
+parent = "owner"
+scope = ["*"]
+[org.roles."jarvis"]
+parent = "owner"
+scope = ["*"]
+[org.roles."apps"]
+parent = "jarvis"
+scope = ["acme/app"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadOrg(paths)
+	if err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	roster := loadOrgRoster(context.Background(), daemonWorkerStore(t), cfg)
+
+	// Asserted through repoOrgOwner and mergeGateEscalationFrom, which old code
+	// also has: the pre-fix resolver returned ("deimos", true) here.
+	if owner, ok := repoOrgOwner(roster, cfg, "acme/docus"); ok || owner != "" {
+		t.Fatalf("repoOrgOwner on a tied repo = (%q, %v), want no owner", owner, ok)
+	}
+	if from, declared := mergeGateEscalationFrom(roster, cfg, "acme/docus"); declared {
+		t.Fatalf("mergeGateEscalationFrom on a tied repo = (%q, declared), want undeclared", from)
+	}
+	if owner, ok := repoOrgOwner(roster, cfg, "acme/app"); !ok || owner != "apps" {
+		t.Fatalf("exact-scope repoOrgOwner = (%q, %v), want apps", owner, ok)
+	}
+	if tied := resolveRepoOrgOwner(roster, cfg, "acme/docus").Tied; !reflect.DeepEqual(tied, []string{"deimos", "jarvis"}) {
+		t.Fatalf("tied roles = %v, want [deimos jarvis]", tied)
 	}
 }
 
