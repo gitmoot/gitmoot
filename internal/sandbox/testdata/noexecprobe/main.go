@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -71,6 +72,25 @@ func main() {
 			}
 		}
 		report("fds", err, strings.Join(targets, " "))
+	case "fdwrite":
+		// Writes through a raw descriptor number the runtime was never meant to
+		// have (#2360 inherited-authority-descriptor case) and reports its
+		// identity first, so a pass names exactly what was reachable.
+		fd, _ := strconv.Atoi(args[0])
+		var st unix.Stat_t
+		if err := unix.Fstat(fd, &st); err != nil {
+			report("fdwrite", err, "")
+			return
+		}
+		_, err := unix.Write(fd, []byte("WRITTEN-THROUGH-INHERITED-FD\n"))
+		report("fdwrite", err, fmt.Sprintf("fd=%d dev=%d ino=%d uid=%d euid=%d", fd, st.Dev, st.Ino, os.Getuid(), os.Geteuid()))
+	case "stdio":
+		// Ordinary I/O must keep working: read stdin, write stdout and stderr.
+		data, err := io.ReadAll(os.Stdin)
+		if err == nil {
+			_, err = fmt.Fprintf(os.Stderr, "stderr-ok\n")
+		}
+		report("stdio", err, strings.TrimSpace(string(data)))
 	case "exitcode":
 		code, _ := strconv.Atoi(args[0])
 		fmt.Println("EXIT", code)
