@@ -93,7 +93,9 @@ func TestOrgScopeDecisionEnqueueParity(t *testing.T) {
 		{name: "block unknown role", enforce: "block", role: "unknown", repo: "owner/repo", wantErr: true},
 		{name: "block out of scope", enforce: "block", role: "owner", repo: "other/repo", wantErr: true},
 		{name: "block in scope", enforce: "block", role: "owner", repo: "owner/repo"},
-		{name: "warn missing role", enforce: "warn", repo: "owner/repo", wantViolation: true},
+		// #2363: warn mode audits a known role outside its scope; a dispatch with
+		// no role has no one to return its result to and is refused in every mode.
+		{name: "warn missing role", enforce: "warn", repo: "owner/repo", wantErr: true},
 		{name: "warn unknown role", enforce: "warn", role: "unknown", repo: "owner/repo", wantViolation: true},
 		{name: "warn out of scope", enforce: "warn", role: "owner", repo: "other/repo", wantViolation: true},
 		{name: "warn in scope", enforce: "warn", role: "owner", repo: "owner/repo"},

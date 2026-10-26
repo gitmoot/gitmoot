@@ -141,6 +141,9 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 2
 	}
+	if !resolveAgentOrgRole(&options.orgRole, options.home, "agent ask", stderr) {
+		return 2
+	}
 	if !options.force && looksLikeWorkflowOrchestration(options.message) {
 		fmt.Fprintln(stderr, "note: this reads like implementation workflow orchestration, but `agent ask` is read-only and will only answer/analyze.")
 		fmt.Fprintln(stderr, "Gitmoot does not dispatch implementation (#2203): implement in your own session and record it with `gitmoot job record --type implement`.")
@@ -406,6 +409,9 @@ func runAgentRun(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 2
 	}
+	if !resolveAgentOrgRole(&options.orgRole, options.home, "agent run", stderr) {
+		return 2
+	}
 	selected, reason := selectAgentRunAction(options)
 	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
 		fmt.Fprintf(stderr, "agent run: %v\n", err)
@@ -445,6 +451,9 @@ func runOrchestrate(args []string, stdout, stderr io.Writer) int {
 	}
 	options, ok := parseAgentRunOptions("orchestrate", args, stderr)
 	if !ok {
+		return 2
+	}
+	if !resolveAgentOrgRole(&options.orgRole, options.home, "orchestrate", stderr) {
 		return 2
 	}
 	// Force the background run path: orchestrate always fans out delegations.
@@ -499,6 +508,9 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	}
 	options, ok := parseAgentRunOptions("review", args, stderr)
 	if !ok {
+		return 2
+	}
+	if !resolveAgentOrgRole(&options.orgRole, options.home, "agent review", stderr) {
 		return 2
 	}
 	if strings.TrimSpace(options.repo) == "" {

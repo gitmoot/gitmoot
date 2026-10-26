@@ -214,6 +214,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := orgRoleActivityDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	if check, ok := orgUnownedReposDoctorCheck(paths); ok {
+		checks = append(checks, check)
+	}
 	if check, ok := staleNotificationsDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}

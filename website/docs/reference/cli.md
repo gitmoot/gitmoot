@@ -1823,12 +1823,25 @@ snapshot and event-rule store. It fails when a role has no live pane, has no
 enabled wake route, or a labeled live pane is not claimed by any role; each
 failure includes category counts and a reason. Use `gitmoot org show` to view
 the configured roles. When enabled, fresh local `agent ask`, `agent run`, `agent
-review`, and `orchestrate` dispatches require
-`--org-role <role>` (or `GITMOOT_ORG_ROLE`) and reject out-of-scope repositories
-at enqueue.
-`enforce = "block"` is the default; `"warn"` allows the job and records an
+review`, `orchestrate`, and `review request` dispatches need a requesting role:
+`--org-role <role>`, else `GITMOOT_ORG_ROLE`, else the role registered for the
+calling Herdr pane (`HERDR_PANE_ID`). A pane bound to two roles is an error. A
+dispatch with no resolvable role is refused in every enforcement mode, because
+its verdicts and blocked notices would have no one to return to.
+`enforce = "block"` is the default and rejects out-of-scope repositories at
+enqueue; `"warn"` allows a known role outside its scope and records an
 `org_scope_violation` event. Merge rules are enforced for explicit
 `/gitmoot merge` commands and advisory on other paths.
+
+A role-less blocked notice, and a review verdict with no requester, lead, or PR
+owner, go to the repo's single owner: the live role with the most specific
+scope match (exact repo, then `owner/*`, then `*`), with a deeper chart position
+breaking an equal match. Roles still tied after that are not chosen between:
+the notice reaches observer rules only, and a blocked job records a
+`wake_target_unowned` event naming the tied roles. `gitmoot org status` and
+`gitmoot doctor` (check `org repo ownership`) list repos with jobs in the last
+seven days that have no single owner. Listing never assigns ownership; add the
+repo to its owning seat's scope.
 
 `gitmoot org seat add <name> [--pane ID_OR_LABEL] [--parent ROLE]
 [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]` creates or
@@ -3225,12 +3238,13 @@ auto-finalizes a whole paused delegation *tree* and is on by default (24h);
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A miss parks the task as
-`awaiting_human_merge` and records an org escalation. It selects the
-most-specific live role whose scope matches the repo and addresses that role's
-nearest live chart ancestor. With no live scope match it addresses a live
-`owner`; a root match addresses itself. With no live upward recipient, the gate
-fails closed without journaling an addressed note. Archive filtering does not
-predict delivery; `org validate` reports missing wake routes and pane bindings.
+`awaiting_human_merge` and records an org escalation. It selects the repo's
+single owner (as above) and addresses that role's nearest live chart ancestor.
+With no single owner, including roles tied on scope and depth, it addresses a
+live `owner`; a root match addresses itself. With no live upward recipient, the
+gate fails closed without journaling an addressed note. Archive filtering does
+not predict delivery; `org validate` reports missing wake routes and pane
+bindings.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit kill-switch;
 that deliberate hold does not escalate. Pipeline `allow_auto_merge` is independent.
 

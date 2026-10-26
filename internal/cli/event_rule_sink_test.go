@@ -279,6 +279,98 @@ pane="w1:p4"
 	}
 }
 
+// TestBlockedWakeOnTiedRepoIsNotGuessedAndIsRecorded reproduces #2363: a
+// role-less blocked job on a repo that no seat scopes explicitly. Two global
+// roles tie; the pre-fix resolver woke the alphabetically first one. Now the
+// notice reaches observers only, and the job records once why no owner was
+// addressed.
+func TestBlockedWakeOnTiedRepoIsNotGuessedAndIsRecorded(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const orgConfig = `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p1"
+[org.roles."deimos"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+[org.roles."jarvis"]
+parent="owner"
+scope=["*"]
+pane="w1:p3"
+[org.roles."audit"]
+parent="owner"
+scope=["oversight/*"]
+pane="w1:p4"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for _, rule := range []db.EventRule{
+		{ID: "addressed-deimos", OnKind: "blocked", WakeRole: "deimos", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "addressed-jarvis", OnKind: "blocked", WakeRole: "jarvis", Scope: db.EventRuleScopeAddressed, Enabled: true},
+		{ID: "observer-audit", OnKind: "blocked", WakeRole: "audit", Scope: db.EventRuleScopeObserver, Enabled: true},
+	} {
+		if err := store.AddEventRule(ctx, rule); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CreateJob(ctx, db.Job{
+		ID: "docus-review", Agent: "reviewer", Type: "review", State: string(workflow.JobBlocked),
+		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "acme/docus"}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recorded := &recordingSink{}
+	sink := &eventRuleSink{inner: recorded, store: store, home: home}
+	for range 2 {
+		emitDaemonTerminalEvent(ctx, sink, store, "docus-review", daemonTerminalBlocked, string(workflow.JobBlocked), "blocked")
+	}
+
+	for _, row := range mustListWakeOutbox(t, store) {
+		if row.TargetRole == "deimos" || row.TargetRole == "jarvis" {
+			t.Fatalf("tied global role %q was woken for an unowned repo", row.TargetRole)
+		}
+	}
+	for _, event := range recorded.byType(events.EventJobBlocked) {
+		if event.WakeTargetRole != "" {
+			t.Fatalf("blocked event addressed %q, want no guessed owner", event.WakeTargetRole)
+		}
+	}
+	jobEvents, err := store.ListJobEvents(ctx, "docus-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unowned []string
+	for _, event := range jobEvents {
+		if event.Kind == "wake_target_unowned" {
+			unowned = append(unowned, event.Message)
+		}
+	}
+	if len(unowned) != 1 || !strings.Contains(unowned[0], "deimos, jarvis") || !strings.Contains(unowned[0], "acme/docus") {
+		t.Fatalf("unowned records = %q, want exactly one naming the tied roles and repo", unowned)
+	}
+}
+
+func mustListWakeOutbox(t *testing.T, store *db.Store) []db.WakeOutboxEntry {
+	t.Helper()
+	rows, err := store.ListWakeOutbox(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
 func pendingWakeTargetRoles(t *testing.T, store *db.Store) []string {
 	t.Helper()
 	rows, err := store.ListWakeOutbox(context.Background(), db.WakeOutboxStatePending)
@@ -623,6 +715,91 @@ pane="w1:p3"
 	}
 	if !hasVerdictPrompt || !hasGenericPrompt {
 		t.Fatalf("requester prompts = %q, want generic and verdict-specific prompts", requesterPrompts)
+	}
+}
+
+// TestUnaddressedReviewVerdictWakesSingleRepoOwner reproduces #2363's verdict
+// gap: a review dispatched without --org-role, no lead, and no implement job
+// emitted a changes_requested verdict addressed to nobody. The repo's single
+// owner now receives it; a job that carries its own requester keeps the
+// engine's addressing, and a repo with tied owners still gets no guess.
+func TestUnaddressedReviewVerdictWakesSingleRepoOwner(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const orgConfig = `
+[org.roles."owner"]
+scope=["*"]
+pane="w1:p0"
+[org.roles."deimos"]
+parent="owner"
+scope=["*"]
+pane="w1:p1"
+[org.roles."jarvis"]
+parent="owner"
+scope=["*"]
+pane="w1:p2"
+[org.roles."app"]
+parent="jarvis"
+scope=["acme/docus"]
+pane="w1:p3"
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(orgConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for _, role := range []string{"app", "deimos", "jarvis"} {
+		if err := store.AddEventRule(ctx, db.EventRule{ID: "verdict-" + role, OnKind: eventRuleKindReviewVerdict, WakeRole: role, Scope: db.EventRuleScopeAddressed, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addJob := func(id, repo, actingRole string) {
+		t.Helper()
+		if err := store.CreateJob(ctx, db.Job{
+			ID: id, Agent: "reviewer", Type: "review", State: string(workflow.JobSucceeded),
+			Payload: mustJobPayload(t, workflow.JobPayload{Repo: repo, PullRequest: 72, ActingOrgRole: actingRole}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addJob("unattributed", "acme/docus", "")
+	addJob("attributed", "acme/docus", "deimos")
+	addJob("tied", "acme/other", "")
+	verdict := func(jobID, repo string) events.Event {
+		return events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict, JobID: jobID, Repo: repo, PullRequest: 72, ReviewDecision: "changes_requested"}
+	}
+	// Driven through Emit, which old code also has, and checked on what was
+	// forwarded: the pre-fix sink passed the unattributed verdict on unaddressed.
+	recorded := &recordingSink{}
+	sink := &eventRuleSink{inner: recorded, store: store, home: home}
+	emitted := func(jobID, repo string) events.Event {
+		t.Helper()
+		before := len(recorded.byType(events.EventJobFinished))
+		sink.Emit(ctx, verdict(jobID, repo))
+		all := recorded.byType(events.EventJobFinished)
+		if len(all) != before+1 {
+			t.Fatalf("verdict for %s was not forwarded", jobID)
+		}
+		return all[len(all)-1]
+	}
+
+	if got := emitted("unattributed", "acme/docus"); got.WakeTargetRole != "app" || !reflect.DeepEqual(got.WakeTargetRoles, []string{"app"}) {
+		t.Fatalf("unattributed verdict addressed %q %v, want the repo owner app", got.WakeTargetRole, got.WakeTargetRoles)
+	}
+	// The engine emptied this target because the real requester holds a durable
+	// subscription; the repo owner must not be woken in its place.
+	if got := emitted("attributed", "acme/docus"); got.WakeTargetRole != "" || len(got.WakeTargetRoles) != 0 {
+		t.Fatalf("attributed verdict re-addressed to %q %v, want engine addressing kept", got.WakeTargetRole, got.WakeTargetRoles)
+	}
+	if got := emitted("tied", "acme/other"); got.WakeTargetRole != "" || len(got.WakeTargetRoles) != 0 {
+		t.Fatalf("tied repo verdict addressed %q %v, want no guess", got.WakeTargetRole, got.WakeTargetRoles)
 	}
 }
 

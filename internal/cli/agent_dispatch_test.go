@@ -1818,11 +1818,14 @@ func TestDelegatedMessageMayStartWithADash(t *testing.T) {
 func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
 	for _, testCase := range []struct {
 		name  string
+		org   bool
 		extra []string
 		want  string
 	}{
-		{"no acting role", nil, "no --org-role"},
-		{"an inexpressible flag", []string{"--org-role", "joltra", "--skip-native-review-fanout"}, "--skip-native-review-fanout"},
+		// With an org registry a role-less dispatch is now refused (#2363), so the
+		// no-role bypass is only reachable without one.
+		{"no acting role", false, nil, "no --org-role"},
+		{"an inexpressible flag", true, []string{"--org-role", "joltra", "--skip-native-review-fanout"}, "--skip-native-review-fanout"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -1830,15 +1833,17 @@ func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
 			if err := config.Initialize(paths); err != nil {
 				t.Fatal(err)
 			}
-			file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+			if testCase.org {
+				file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
+					file.Close()
+					t.Fatal(err)
+				}
 				file.Close()
-				t.Fatal(err)
 			}
-			file.Close()
 			store := openCLIJobStore(t, home)
 			defer store.Close()
 			checkout, _, head := readonlyReviewWorktreeGitCheckout(t)

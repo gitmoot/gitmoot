@@ -544,10 +544,12 @@ If a job is not eligible, Gitmoot keeps the old queue/wait behavior.
    Native task auto-merge is enabled by default, but only with an approved review
    verdict for the exact current head SHA and green SHA-scoped commit statuses
    and check-runs. A miss leaves the PR open, records an org escalation, and
-   enqueues an addressed workflow-note wake. The sender is the most-specific live
-   org role whose scope matches the repo, and the recipient is its nearest live
-   chart ancestor. With no live scope match, the recipient is the live `owner`
-   root; when the match is already the root, the note addresses that root itself.
+   enqueues an addressed workflow-note wake. The sender is the repo's single
+   owner: the live org role with the most specific scope match, a deeper chart
+   position breaking an equal match. Roles still tied after that are never
+   chosen between by name. The recipient is the owner's nearest live chart
+   ancestor. With no single owner, the recipient is the live `owner` root; when
+   the match is already the root, the note addresses that root itself.
    If no live upward recipient exists, the gate fails closed without journaling
    an addressed note. Archive filtering does not predict delivery; `org validate`
    reports missing wake routes and pane bindings. Set

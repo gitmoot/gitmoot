@@ -745,6 +745,29 @@ func (s *Store) CountJobsByOrgRoleSince(ctx context.Context, since time.Time) (m
 	return counts, rows.Err()
 }
 
+// ListJobReposSince returns each distinct non-empty job repo, lowercased and
+// sorted, with a job created at or after since. It feeds the unowned-repo
+// diagnostic (#2363).
+func (s *Store) ListJobReposSince(ctx context.Context, since time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT lower(trim(repo)) AS r
+		FROM jobs
+		WHERE trim(repo) <> '' AND created_at >= ?
+		ORDER BY r`, since.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var repos []string
+	for rows.Next() {
+		var repo string
+		if err := rows.Scan(&repo); err != nil {
+			return nil, err
+		}
+		repos = append(repos, repo)
+	}
+	return repos, rows.Err()
+}
+
 // listRunningJobsUpdatedBeforeSQL is ListRunningJobsUpdatedBefore's exact query,
 // exported as a package-level const so the plan test (TestListRunningJobsUpdatedBeforeOrder)
 // EXPLAINs the PRODUCTION text (binding the threshold as its `?` parameter) instead of
