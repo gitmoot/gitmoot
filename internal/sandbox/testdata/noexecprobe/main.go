@@ -127,7 +127,9 @@ func main() {
 		// Writes its pid, forks a descendant that tries to exec /bin/true
 		// after a delay (so after the supervisor may be gone), and waits.
 		writeFile(args[0], strconv.Itoa(os.Getpid()))
-		result, err := os.OpenFile(args[1], os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		// A raw descriptor, not an *os.File: an os.File's finalizer may
+		// close the descriptor the forked descendant later writes to.
+		resultFD, err := unix.Open(args[1], unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, 0o600)
 		if err != nil {
 			report("hold", err, "")
 			return
@@ -136,15 +138,25 @@ func main() {
 		argv, _ := slicePtr([]string{"/bin/true"})
 		envv, _ := slicePtr(nil)
 		delay := unix.Timespec{Sec: 1, Nsec: 500_000_000}
-		var message [32]byte
-		resultFD := result.Fd()
+		message := [16]byte{'D', 'E', 'N', 'I', 'E', 'D', ' ', 'e', 'r', 'r', 'n', 'o', '='}
 		childPid := rawFork(func() {
+			// Raw syscalls and no allocation only: this is a fork of a
+			// multithreaded Go process.
 			unix.RawSyscall(unix.SYS_NANOSLEEP, uintptr(unsafe.Pointer(&delay)), 0, 0)
 			_, _, errno := unix.RawSyscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)),
 				uintptr(unsafe.Pointer(&argv[0])), uintptr(unsafe.Pointer(&envv[0])))
-			n := copy(message[:], "DENIED errno=")
-			n += copy(message[n:], strconv.Itoa(int(errno)))
-			unix.RawSyscall(unix.SYS_WRITE, resultFD, uintptr(unsafe.Pointer(&message[0])), uintptr(n))
+			n := 13
+			if errno >= 100 {
+				message[n] = byte('0' + errno/100%10)
+				n++
+			}
+			if errno >= 10 {
+				message[n] = byte('0' + errno/10%10)
+				n++
+			}
+			message[n] = byte('0' + errno%10)
+			n++
+			unix.RawSyscall(unix.SYS_WRITE, uintptr(resultFD), uintptr(unsafe.Pointer(&message[0])), uintptr(n))
 			unix.RawSyscall(unix.SYS_EXIT_GROUP, 0, 0, 0)
 		})
 		fmt.Println("OK hold child", childPid)
