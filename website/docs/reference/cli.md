@@ -146,7 +146,13 @@ the resolved registry:
 ```sh
 gitmoot runtime list
 gitmoot runtime list --json
+gitmoot runtime prune --dry-run
+gitmoot runtime prune
 ```
+
+`runtime prune` removes staged runtime copies under `<home>/runtimes` that no job
+has staged for 7 days (`--min-idle`) and no live process uses. The daemon runs it
+once a day; `--dry-run` only lists what it would remove.
 
 The values come from the compiled built-in defaults, overlaid with any
 `[runtimes.<name>]` overrides in `config.toml`. Override a built-in runtime's

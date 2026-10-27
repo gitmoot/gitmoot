@@ -157,6 +157,8 @@ func runRuntime(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "list":
 		return runRuntimeList(args[1:], stdout, stderr)
+	case "prune":
+		return runRuntimePrune(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown runtime command %q\n\n", args[0])
 		printRuntimeUsage(stderr)
@@ -167,10 +169,15 @@ func runRuntime(args []string, stdout, stderr io.Writer) int {
 func printRuntimeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot runtime list [--json]")
+	fmt.Fprintln(w, "  gitmoot runtime prune [--dry-run] [--min-idle 168h] [--json]")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Shows the resolved metadata for each built-in runtime: capabilities, default")
+	fmt.Fprintln(w, "list shows the resolved metadata for each built-in runtime: capabilities, default")
 	fmt.Fprintln(w, "model/effort, known models, and where token usage is read from. Values come from the")
 	fmt.Fprintln(w, "compiled built-in defaults, overlaid with any [runtimes.<name>] config overrides.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "prune removes staged runtime copies under <home>/runtimes that no job staged for")
+	fmt.Fprintln(w, "--min-idle and no live process uses. The daemon runs it daily with the default.")
+	fmt.Fprintln(w, "A removed copy is staged again the next time a job needs it.")
 }
 
 // runtimeListEntry is the JSON shape for `gitmoot runtime list --json`.
