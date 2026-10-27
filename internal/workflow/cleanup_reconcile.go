@@ -17,7 +17,7 @@ import (
 // or branch. A replacement lifecycle owns its remaining resources; an old token
 // can close that old episode only as superseded, not as a successful removal.
 func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, token string) (result CleanupApplyResult, handled bool, err error) {
-	result = CleanupApplyResult{SchemaVersion: 1, State: "refused"}
+	result = CleanupApplyResult{SchemaVersion: CleanupSchemaVersion, State: "refused"}
 	var receipt db.CleanupReceipt
 	var owner db.Job
 	if token != "" {
@@ -90,7 +90,7 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 	if err != nil {
 		return result, true, err
 	}
-	result.Decision = CleanupInspection{SchemaVersion: 1, Producer: "gitmoot", DecisionOwner: "gitmoot",
+	result.Decision = CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
 		ResourceID: receipt.ResourceID, ResourceKind: "delegation_worktree", OwnerJobID: jobID,
 		OwnerState: owner.State, LifecycleGeneration: receipt.LifecycleGeneration,
 		ExpectedPath: receipt.ExpectedPath, Receipt: &receipt, Obligation: &obligation}

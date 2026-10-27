@@ -124,6 +124,22 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		engine.CleanupRetention = func() (time.Duration, error) {
 			return config.LoadDelegationWorktreeTTL(config.Paths{ConfigFile: filepath.Join(home, "config.toml")})
 		}
+		engine.CleanupBudget = func(repo string) (*workflow.ApprovedCleanupSizeBudget, *workflow.CleanupSizeLimits, error) {
+			cfg, err := config.LoadCleanupBudget(config.Paths{ConfigFile: filepath.Join(home, "config.toml")})
+			if err != nil {
+				return nil, nil, err
+			}
+			budget := cfg.For(repo)
+			if budget == nil {
+				return nil, nil, nil
+			}
+			return &workflow.ApprovedCleanupSizeBudget{
+					Unit: workflow.CleanupSizeUnitAllocatedBytes, LimitBytes: budget.LimitBytes,
+					Owner: budget.Owner, Approval: budget.Approval,
+				}, &workflow.CleanupSizeLimits{
+					MaxEntries: budget.MaxEntries, MaxDepth: budget.MaxDepth, TimeoutMS: budget.TimeoutMS,
+				}, nil
+		}
 		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
 			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
 			askReviewDiffPrecleanupHookForRunner(store, runner),

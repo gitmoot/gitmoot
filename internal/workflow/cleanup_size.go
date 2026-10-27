@@ -1,5 +1,12 @@
 package workflow
 
+import (
+	"context"
+	"encoding/json"
+
+	"github.com/gitmoot/gitmoot/internal/db"
+)
+
 // Producer cleanup byte budgets, schema v2 (#2360; wire agreement 356319 with workspace-janitor#69).
 // Concrete caps and limits in tests are fixtures, never live defaults: a resource class with no
 // configured positive cap has a nil ApprovedCleanupSizeBudget, which means UNKNOWN.
@@ -73,4 +80,47 @@ func cleanupBudgetRefusal(budget *ApprovedCleanupSizeBudget, measured *CleanupSi
 		return CleanupRefusalSizeOverBudget
 	}
 	return ""
+}
+
+// measureForCleanup runs the budget gate on the enforced path: it measures the resource (when it
+// exists) with the policy's sizing bounds and records the measurement on the decision. It returns
+// "" to admit or a refusal code. A missing resource (an episode being reconciled) is not measured:
+// nothing remains to destroy, and its policy was already bound by the receipt check.
+func (e Engine) measureForCleanup(d *CleanupInspection, policy CleanupPolicy, exists bool) string {
+	if policy.Budget == nil || policy.SizeLimits == nil {
+		return CleanupRefusalSizeBudgetUnknown
+	}
+	if !exists {
+		return ""
+	}
+	m := measureCleanupTree(d.ExpectedPath, *policy.SizeLimits, e.now)
+	d.SizeMeasurement = &m
+	return cleanupBudgetRefusal(policy.Budget, &m)
+}
+
+// recordCleanupRefusal persists a refused consumer decision with its budget and measurement
+// evidence (#2360 v2). The submitted token is kept even though a refused decision carries none.
+func (e Engine) recordCleanupRefusal(ctx context.Context, jobID, submittedToken string, d CleanupInspection) (db.CleanupRefusal, error) {
+	budget, err := json.Marshal(d.ApprovedSizeBudget)
+	if err != nil {
+		return db.CleanupRefusal{}, err
+	}
+	measurement, err := json.Marshal(d.SizeMeasurement)
+	if err != nil {
+		return db.CleanupRefusal{}, err
+	}
+	gate := d.BudgetGate
+	if gate == "" {
+		gate = CleanupBudgetGateEnforced
+	}
+	reasons := d.ReasonCodes
+	if len(reasons) == 0 {
+		reasons = []string{"refused"}
+	}
+	return e.Store.RecordCleanupRefusal(ctx, db.CleanupRefusal{
+		SchemaVersion: CleanupSchemaVersion, ResourceID: d.ResourceID, OwnerJobID: jobID,
+		LifecycleGeneration: d.LifecycleGeneration, SubmittedToken: submittedToken, PolicyHash: d.PolicyHash,
+		BudgetGate: gate, ApprovedSizeBudget: string(budget), SizeMeasurement: string(measurement),
+		ReasonCodes: reasons, ObservedAt: d.ObservedAt,
+	}, e.now())
 }

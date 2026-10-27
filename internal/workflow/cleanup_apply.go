@@ -21,19 +21,26 @@ type CleanupApplyResult struct {
 	State         string             `json:"state"`
 	Decision      CleanupInspection  `json:"decision"`
 	Receipt       *db.CleanupReceipt `json:"receipt,omitempty"`
+	// RefusalReceipt is the durable record of a refused consumer apply (#2360 v2).
+	RefusalReceipt *db.CleanupRefusal `json:"refusal_receipt,omitempty"`
 }
 
 // ApplyProducerCleanup accepts only a producer-derived resource and a prior
 // eligibility token. It never accepts a path, reopens quarantine or changes TTL.
+// It is the consumer path, so it is always budget-gated (#2360 v2): the caller cannot opt out.
 func (e Engine) ApplyProducerCleanup(ctx context.Context, jobID, resourceID, token string, policy CleanupPolicy) (CleanupApplyResult, error) {
 	if strings.TrimSpace(resourceID) == "" || strings.TrimSpace(token) == "" {
 		return CleanupApplyResult{}, errors.New("cleanup apply requires resource identity and eligibility token")
 	}
+	policy.BudgetGate = CleanupBudgetGateEnforced
 	return e.applyProducerCleanup(ctx, jobID, resourceID, token, policy, true)
 }
 
 func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, token string, policy CleanupPolicy, countFailure bool) (result CleanupApplyResult, err error) {
-	result = CleanupApplyResult{SchemaVersion: 1, State: "refused"}
+	result = CleanupApplyResult{SchemaVersion: CleanupSchemaVersion, State: "refused"}
+	if policy.BudgetGate != CleanupBudgetGateEnforced {
+		policy.BudgetGate = CleanupBudgetGateNotApplicable
+	}
 	if err := e.validate(); err != nil {
 		return result, err
 	}
@@ -42,6 +49,19 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		return result, err
 	}
 	defer releaseLifecycle()
+	// Every refused consumer apply leaves a durable refusal receipt (#2360 v2), written in its own
+	// short transaction after all filesystem work, while the lifecycle fence is still held.
+	defer func() {
+		if policy.BudgetGate != CleanupBudgetGateEnforced || result.State != "refused" || result.Decision.ResourceID == "" {
+			return
+		}
+		recorded, recErr := e.recordCleanupRefusal(context.WithoutCancel(ctx), jobID, token, result.Decision)
+		if recErr != nil {
+			err = errors.Join(err, fmt.Errorf("record cleanup refusal: %w", recErr))
+			return
+		}
+		result.RefusalReceipt = &recorded
+	}()
 	defer func() {
 		if err == nil || result.State != "retryable" || result.Decision.ResourceID == "" {
 			return
@@ -147,6 +167,15 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		if live, known := e.worktreeLiveness(current.ResolvedPath); live || !known {
 			result.State, result.Decision = "refused", current.refuse("process_active_or_unknown")
 			return result, nil
+		}
+		// Final destructive gate (#2360 v2): a FRESH complete measurement within the approved cap,
+		// under the lifecycle fence and checkout lock, immediately before removal.
+		if current.Policy.BudgetGate == CleanupBudgetGateEnforced {
+			if reason := e.measureForCleanup(&current, current.Policy, true); reason != "" {
+				result.State, result.Decision = "refused", current.refuse(reason)
+				return result, nil
+			}
+			result.Decision = current
 		}
 		if err := e.DelegationWorktrees.(ReadOnlyWorktreeManager).RemoveWorktreeForce(ctx, current.ExpectedPath); err != nil {
 			return result, fmt.Errorf("remove producer worktree: %w", err)

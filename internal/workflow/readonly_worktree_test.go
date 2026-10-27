@@ -103,7 +103,7 @@ func TestReadOnlyPrecleanupFailureRedactsDurableError(t *testing.T) {
 	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
 		return errors.New("hostile helper failed with token=" + secret)
 	}
-	decision, err := world.engine.InspectProducerCleanup(ctx, world.jobID, CleanupPolicy{Mode: "ordinary"})
+	decision, err := world.engine.InspectProducerCleanup(ctx, world.jobID, CleanupPolicy{Mode: "ordinary", BudgetGate: CleanupBudgetGateEnforced})
 	if err != nil || !decision.Eligible {
 		t.Fatalf("valid resource did not reach preservation: %+v %v", decision, err)
 	}

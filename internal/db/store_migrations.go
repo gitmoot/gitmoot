@@ -3051,4 +3051,27 @@ CREATE TABLE cleanup_receipts (
 	PRIMARY KEY(resource_id, lifecycle_generation)
 );
 	`,
+	// #2360 v2: durable, append-only cleanup refusal receipts. A refusal is not a destructive
+	// episode, so it never shares cleanup_receipts' one-row-per-generation and unique-token keys:
+	// repeated refusals of one resource (including inspections that issued no token) all persist,
+	// and no refusal can overwrite a prepared or completed episode's evidence.
+	`
+CREATE TABLE cleanup_refusals (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	refusal_id TEXT NOT NULL UNIQUE,
+	schema_version INTEGER NOT NULL,
+	resource_id TEXT NOT NULL,
+	owner_job_id TEXT NOT NULL,
+	lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation >= 0),
+	submitted_token TEXT NOT NULL DEFAULT '',
+	policy_hash TEXT NOT NULL DEFAULT '',
+	budget_gate TEXT NOT NULL,
+	approved_size_budget TEXT NOT NULL DEFAULT 'null',
+	size_measurement TEXT NOT NULL DEFAULT 'null',
+	reason_codes TEXT NOT NULL,
+	observed_at TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
+CREATE INDEX idx_cleanup_refusals_resource ON cleanup_refusals(resource_id, lifecycle_generation);
+	`,
 }

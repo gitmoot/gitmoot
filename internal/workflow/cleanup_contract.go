@@ -21,10 +21,17 @@ import (
 
 // CleanupPolicy is supplied by the producer, never by a deletion target. Empty
 // Mode selects ordinary cleanup for success and retention-bound cleanup otherwise.
+//
+// BudgetGate, Budget and SizeLimits (#2360 v2) are part of the hashed policy, so an eligibility
+// token binds the approved cap, its provenance and the sizing bounds: any change to them invalidates
+// a token. They are set by the engine from producer configuration, never by a caller.
 type CleanupPolicy struct {
-	Mode      string        `json:"mode"`
-	Retention time.Duration `json:"retention_ns"`
-	cutoff    time.Time
+	Mode       string                     `json:"mode"`
+	Retention  time.Duration              `json:"retention_ns"`
+	BudgetGate string                     `json:"budget_gate"`
+	Budget     *ApprovedCleanupSizeBudget `json:"approved_size_budget"`
+	SizeLimits *CleanupSizeLimits         `json:"size_limits,omitempty"`
+	cutoff     time.Time
 }
 
 type CleanupConsumer struct {
@@ -58,7 +65,9 @@ type CleanupInspection struct {
 	PolicyHash          string                       `json:"policy_hash"`
 	RetentionDeadline   string                       `json:"retention_deadline,omitempty"`
 	Rebuildable         bool                         `json:"rebuildable"`
-	ApprovedSizeBudget  *int64                       `json:"approved_size_budget"`
+	BudgetGate          string                       `json:"budget_gate"`
+	ApprovedSizeBudget  *ApprovedCleanupSizeBudget   `json:"approved_size_budget"`
+	SizeMeasurement     *CleanupSizeMeasurement      `json:"size_measurement"`
 	Receipt             *db.CleanupReceipt           `json:"receipt,omitempty"`
 	Obligation          *db.CleanupObligation        `json:"obligation,omitempty"`
 	evidence            cleanupEvidence
@@ -102,7 +111,9 @@ func cleanupConsumer(job db.Job) CleanupConsumer {
 }
 
 // InspectProducerCleanup is advisory and does not create obligations or receipts.
-// ApplyProducerCleanup repeats these checks under the same exclusive fence.
+// ApplyProducerCleanup repeats these checks under the same exclusive fence. A consumer must
+// inspect with BudgetGate enforced (as `job cleanup inspect` does): ApplyProducerCleanup always
+// enforces it, so a token from an ungated inspection never matches.
 func (e Engine) InspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy) (CleanupInspection, error) {
 	if err := e.validate(); err != nil {
 		return CleanupInspection{}, err
@@ -117,7 +128,7 @@ func (e Engine) InspectProducerCleanup(ctx context.Context, jobID string, policy
 }
 
 func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy, collected *cleanupEvidence) (CleanupInspection, JobPayload, error) {
-	d := CleanupInspection{SchemaVersion: 1, Producer: "gitmoot", DecisionOwner: "gitmoot",
+	d := CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
 		OwnerJobID: jobID, ResourceKind: "delegation_worktree", ObservedAt: e.now().UTC().Format(time.RFC3339Nano),
 		ReasonCodes: []string{}, Consumers: []CleanupConsumer{}}
 	job, payload, err := e.jobPayload(ctx, jobID)
@@ -197,7 +208,21 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 	if policy.Mode == "ordinary" {
 		policy.Retention = 0
 	}
-	d.Policy = policy
+	// v2 budget gate (#2360): the consumer path is enforced; automatic reclaim is not budget-gated
+	// and says so (workspace-janitor 366497). The budget comes only from producer configuration.
+	if policy.BudgetGate == "" {
+		policy.BudgetGate = CleanupBudgetGateNotApplicable
+	}
+	policy.Budget, policy.SizeLimits = nil, nil
+	if policy.BudgetGate == CleanupBudgetGateEnforced && e.CleanupBudget != nil {
+		budget, limits, err := e.CleanupBudget(payload.Repo)
+		if err != nil {
+			d.Policy, d.BudgetGate = policy, policy.BudgetGate
+			return d.refuse(CleanupRefusalSizeBudgetUnknown), payload, nil
+		}
+		policy.Budget, policy.SizeLimits = budget, limits
+	}
+	d.Policy, d.BudgetGate, d.ApprovedSizeBudget = policy, policy.BudgetGate, policy.Budget
 	encodedPolicy, _ := json.Marshal(policy)
 	d.PolicyHash = cleanupHash(string(encodedPolicy))
 	d.evidence = cleanupEvidence{ResourceID: d.ResourceID, OwnerState: job.State,
@@ -211,6 +236,15 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		if json.Unmarshal([]byte(receipt.Evidence), &saved) != nil || receipt.OwnerPayload != job.Payload ||
 			saved.OwnerState != job.State || saved.Generation != job.LifecycleGeneration || saved.ResourceID != d.ResourceID {
 			return d.refuse("terminal_evidence_changed"), payload, nil
+		}
+		// An unfinished budget-gated episode is replayed only under the exact policy it was prepared
+		// with: a changed cap, provenance, sizing bound, gate or retention invalidates it (#2360). A
+		// consumer cannot finish an automatic (not budget-gated) episode, nor the reverse. Episodes
+		// prepared by automatic reclaim alone keep their existing recovery (completed episodes were
+		// returned above as already_removed).
+		if (saved.Policy.BudgetGate == CleanupBudgetGateEnforced || policy.BudgetGate == CleanupBudgetGateEnforced) &&
+			saved.PolicyHash != d.PolicyHash {
+			return d.refuse(CleanupRefusalBudgetPolicyChanged), payload, nil
 		}
 		collected = &saved
 	} else if !errors.Is(rerr, sql.ErrNoRows) {
@@ -314,6 +348,11 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		}
 		if collected != nil && (collected.PathIdentity != d.evidence.PathIdentity || collected.Git != d.evidence.Git) {
 			return d.refuse("resource_replaced"), payload, nil
+		}
+	}
+	if policy.BudgetGate == CleanupBudgetGateEnforced {
+		if reason := e.measureForCleanup(&d, policy, statErr == nil); reason != "" {
+			return d.refuse(reason), payload, nil
 		}
 	}
 	if implement {

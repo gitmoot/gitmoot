@@ -171,7 +171,7 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		}
 		engine := daemonWorkflowEngine(store, nil, repo.CheckoutPath, paths.Home)
 		if operation == "inspect" {
-			decision, err = engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{})
+			decision, err = engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{BudgetGate: workflow.CleanupBudgetGateEnforced})
 			return err
 		}
 		result, err = engine.ApplyProducerCleanup(ctx, job.ID, *resourceID, *token, workflow.CleanupPolicy{})
