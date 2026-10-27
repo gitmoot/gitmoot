@@ -149,6 +149,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				if err := runSQLiteIncrementalVacuumOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
 					writeLine(stdout, "incremental sqlite vacuum error: %s", err)
 				}
+				if err := runSQLiteWALCheckpointOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
+					writeLine(stdout, "sqlite WAL checkpoint error: %s", err)
+				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
 				}
@@ -324,6 +327,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if err := runSQLiteIncrementalVacuumOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
 			writeLine(stdout, "incremental sqlite vacuum error: %s", err)
+		}
+		if err := runSQLiteWALCheckpointOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
+			writeLine(stdout, "sqlite WAL checkpoint error: %s", err)
 		}
 		if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 			writeLine(stdout, "pipeline scan error: %s", err)
