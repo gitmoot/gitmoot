@@ -22,9 +22,11 @@ and `apply --resource … --token …` with a positional job ID. Ordinary and ag
 cleanup share consumer, lifecycle, identity and preservation checks. Terminal
 state alone is insufficient; blocked/resumable consumers retain their inputs.
 Generation receipts survive deletion and historical replay never touches a
-replacement tree. Publication stays independent of deletion. A null
-`approved_size_budget` means unknown, not unlimited, and cannot authorize
-budget-dependent external cleanup.
+replacement tree. Publication stays independent of deletion. Since schema v2 the
+consumer path is budget-gated: a producer-owned `[cleanup_budget]` cap plus a
+fresh, complete allocated-bytes measurement within it (re-measured before
+removal); a null `approved_size_budget` means unknown and refuses, and refused
+applies leave durable refusal receipts. Automatic reclaim is not budget-gated.
 Aged cleanup uses the current generation's terminal clock, not later artifact
 publication. Older completion events cannot hide a replacement generation.
 Checkout contention defers cleanup without spending its failure budget.

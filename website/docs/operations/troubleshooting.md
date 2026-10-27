@@ -672,8 +672,13 @@ Accounting recovery also reports checkout-lock release failures as operational
 errors. Inspect the durable receipt to distinguish completed removal from
 unfinished accounting before retrying.
 
-`approved_size_budget: null` means unknown, never zero or unlimited. A consumer
-requiring a positive cap must remain ineligible. Do not substitute direct path
+`approved_size_budget: null` means unknown, never zero or unlimited, and the
+budget-gated consumer path refuses with `size_budget_unknown` (schema v2, #2360).
+To allow consumer cleanup, an owner adds a complete `[cleanup_budget]` section
+(see the CLI reference). `size_measurement_incomplete` means the allocated-bytes
+walk crossed a mount, met an external hardlink or an unreadable/changing entry, or
+hit a sizing bound; `size_over_budget` means the tree is larger than the cap.
+Refused applies are recorded as durable refusal receipts. Do not substitute direct path
 deletion or a consumer-side size scan for the producer contract.
 
 `gitmoot doctor` and `/api/health` discover the canonical `fixes/` directory

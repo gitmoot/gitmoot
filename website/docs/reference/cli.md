@@ -2676,7 +2676,7 @@ gitmoot lock show owner/repo <branch>
 ```
 
 `job cleanup inspect` returns the versioned producer decision (`schema_version:
-1`), stable resource identity, owner generation, consumer evidence, policy/hash,
+2`), stable resource identity, owner generation, consumer evidence, policy/hash,
 retention deadline where applicable, reason codes and an eligibility token.
 `eligible: false` is a normal inspection result; inspect exits zero unless the
 operation itself fails. Both owned implement and read-only worktrees use
@@ -2721,10 +2721,45 @@ never reopens quarantine or grants deletion of the current generation.
 Checkout-lock release failures are operational errors, including during
 accounting-only recovery. Inspect the durable receipt before retrying.
 
-`approved_size_budget: null` explicitly means unknown. It does not authorize
-zero-byte or unlimited cleanup; consumers requiring a positive byte cap must
-remain ineligible. The existing `list` and operator-only `reopen` commands keep
-their contracts.
+**Byte budget (schema v2, #2360).** `job cleanup inspect` and `apply` are the
+consumer path and are **budget-gated** (`budget_gate: "enforced"`). The budget is
+a producer-owned positive cap from the Gitmoot config, never from the caller:
+
+```toml
+[cleanup_budget]                     # every repository
+# [repos."owner/repo".cleanup_budget] replaces it for one repository
+limit_bytes = 1073741824             # allocated bytes, > 0
+owner       = "who approved it"
+approval    = "decision id"
+max_entries = 200000                 # sizing bounds, all > 0
+max_depth   = 64
+timeout_ms  = 30000
+```
+
+A section must have all six keys; an incomplete or invalid section is an error,
+not a partial cap. With no section, `approved_size_budget` is `null`, which means
+**unknown**: it does not authorize zero-byte or unlimited cleanup, and the
+decision refuses with `size_budget_unknown`.
+
+`size_measurement` is the resource's **allocated** bytes (`st_blocks*512` over the
+root, every directory, file and symlink inode; symlinks are never followed; each
+inode once). It is `complete: false` with `bytes: null` if it crosses a mount,
+finds a hardlink shared with something outside the tree, hits an unreadable or
+changing entry, or exhausts `max_entries`, `max_depth` or `timeout_ms`. That
+refuses with `size_measurement_incomplete`. A complete measurement above the cap
+refuses with `size_over_budget`; exactly at the cap is allowed. The cap, its
+owner/approval and the sizing bounds are part of the policy hash, so changing
+any of them invalidates an issued token. `apply` measures again immediately
+before removal, so a tree that grew past the cap after inspection is refused
+and kept. An unfinished episode prepared under a different budget refuses with
+`budget_policy_changed`.
+
+Every refused `apply` writes a durable **refusal receipt** (`refusal_receipt` in
+the JSON: refusal id, schema version, resource, job, generation, submitted token,
+policy hash, budget gate, budget, measurement, reason codes, timestamps). It never
+replaces an episode's receipt. Automatic ordinary and aged reclaim is **not**
+budget-gated; its receipts record `budget_gate: "not_applicable"` and no budget.
+The existing `list` and operator-only `reopen` commands keep their contracts.
 
 A delivery killed by a signal records a `delivery_signal_killed` event naming
 the signal and which evidence identified it. Both renderings count: a

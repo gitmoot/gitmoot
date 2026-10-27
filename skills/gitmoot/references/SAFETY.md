@@ -695,9 +695,13 @@ reported as `superseded`, not as a successful removal. Accounting-only recovery
 can complete after retention changes; remaining destructive effects still need
 current admission. No replay automatically reopens quarantine.
 
-`approved_size_budget: null` means unknown, not zero or unlimited. A
-budget-dependent external consumer must remain ineligible until the producer
-supplies an enforced positive-cap contract. Shared checkouts, orphan paths and
+`approved_size_budget: null` means unknown, not zero or unlimited. Since schema
+v2 (#2360) the consumer path (`job cleanup inspect`/`apply`) is budget-gated: it
+refuses unless a producer-owned `[cleanup_budget]` cap exists and a fresh, complete
+allocated-bytes measurement is within it, measured again right before removal.
+Unknown or incomplete measurements refuse; every refused apply leaves a durable
+refusal receipt. Automatic ordinary/aged reclaim is not budget-gated and records
+`budget_gate: "not_applicable"`. Shared checkouts, orphan paths and
 standalone fix clones remain outside this cleanup API.
 
 ## Shared Tool Cache (isolated worktrees)
