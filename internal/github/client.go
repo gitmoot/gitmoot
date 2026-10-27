@@ -1092,17 +1092,23 @@ func (c *GhClient) GetCombinedStatus(ctx context.Context, repo Repository, ref s
 	return status, err
 }
 
-// ListCheckRunsForRef returns ONE check run per (app, name) at ref: the latest one (#2413).
+// ListCheckRunsForRef returns the check runs at ref, minus superseded CANCELLED duplicates (#2413).
 //
-// The check-runs endpoint returns every run at the commit. A workflow that ran twice for the
-// same head (a superseded duplicate run cancelled by concurrency, or a rerun) leaves an older
-// cancelled or failed run beside the newer one, and a consumer that blocks on ANY non-passing
-// run then blocks on a result that GitHub itself no longer considers current. Only the latest
-// run per (app id, name) is kept: latest started_at, ties broken by the larger run id. A
-// cancelled or failed run that IS the latest still comes back, so nothing is silently passed.
+// The check-runs endpoint returns every run at the commit. A workflow that ran twice for the same
+// head, the earlier run cancelled by concurrency as superseded, leaves a cancelled run beside the
+// newer one, and a consumer that blocks on any non-passing run then blocks on a result GitHub
+// itself treats as replaced. The check-run payload carries no workflow identity, so (app id, name)
+// cannot tell a superseded duplicate from a distinct same-named check (two workflows with a job
+// "test"). The filter is therefore FAIL-CLOSED, never worse than returning every run:
+//   - only a run whose conclusion is "cancelled" can be dropped;
+//   - and only when another run with the same non-zero app id and the same name has a parsed
+//     started_at strictly LATER than the cancelled run's own parsed started_at.
+//
+// A failed, timed-out or action-required run is never dropped, so a failing same-named check is
+// never hidden. A run with a missing started_at (a queued rerun) is always kept and can supersede
+// nothing. App-less runs (app id 0) are never deduplicated.
 func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref string) ([]PullRequestCheck, error) {
 	type checkRun struct {
-		ID          int64  `json:"id"`
 		AppID       int64  `json:"app_id"`
 		Name        string `json:"name"`
 		Status      string `json:"status"`
@@ -1113,18 +1119,18 @@ func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref
 	}
 	result, err := c.run(ctx, false,
 		"api", "--paginate", "--jq",
-		".check_runs[] | {id, app_id: .app.id, name, status, conclusion, html_url, started_at, completed_at}",
+		".check_runs[] | {app_id: .app.id, name, status, conclusion, html_url, started_at, completed_at}",
 		endpoint(repo, "commits", ref, "check-runs")+"?per_page=100",
 	)
 	if err != nil {
 		return nil, err
 	}
+	var runs []checkRun
 	type key struct {
 		app  int64
 		name string
 	}
-	latest := map[key]checkRun{}
-	var order []key
+	latestStart := map[key]time.Time{}
 	scanner := bufio.NewScanner(strings.NewReader(result.Stdout))
 	for line := 1; scanner.Scan(); line++ {
 		raw := strings.TrimSpace(scanner.Text())
@@ -1135,23 +1141,24 @@ func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref
 		if err := json.Unmarshal([]byte(raw), &run); err != nil {
 			return nil, fmt.Errorf("decode gh check-run line %d: %w", line, err)
 		}
-		k := key{app: run.AppID, name: run.Name}
-		previous, seen := latest[k]
-		if !seen {
-			order = append(order, k)
-			latest[k] = run
-			continue
-		}
-		if checkRunIsNewer(run.StartedAt, run.ID, previous.StartedAt, previous.ID) {
-			latest[k] = run
+		runs = append(runs, run)
+		if started, ok := parseCheckRunStart(run.StartedAt); ok && run.AppID != 0 {
+			k := key{app: run.AppID, name: run.Name}
+			if started.After(latestStart[k]) {
+				latestStart[k] = started
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scan gh check-runs response: %w", err)
 	}
-	checks := make([]PullRequestCheck, 0, len(order))
-	for _, k := range order {
-		run := latest[k]
+	checks := make([]PullRequestCheck, 0, len(runs))
+	for _, run := range runs {
+		if run.AppID != 0 && strings.EqualFold(strings.TrimSpace(run.Conclusion), "cancelled") {
+			if started, ok := parseCheckRunStart(run.StartedAt); ok && latestStart[key{app: run.AppID, name: run.Name}].After(started) {
+				continue // superseded by a later-started run of the same check
+			}
+		}
 		state := strings.TrimSpace(run.Conclusion)
 		if state == "" {
 			state = strings.TrimSpace(run.Status)
@@ -1163,21 +1170,9 @@ func (c *GhClient) ListCheckRunsForRef(ctx context.Context, repo Repository, ref
 	return checks, nil
 }
 
-// checkRunIsNewer orders two runs of one check: the later started_at wins; an unparsable or
-// missing start time is older than any parsed one; equal (or both unknown) start times fall
-// back to the larger run id, which GitHub assigns increasingly.
-func checkRunIsNewer(startedA string, idA int64, startedB string, idB int64) bool {
-	a, errA := time.Parse(time.RFC3339, strings.TrimSpace(startedA))
-	b, errB := time.Parse(time.RFC3339, strings.TrimSpace(startedB))
-	switch {
-	case errA == nil && errB != nil:
-		return true
-	case errA != nil && errB == nil:
-		return false
-	case errA == nil && errB == nil && !a.Equal(b):
-		return a.After(b)
-	}
-	return idA > idB
+func parseCheckRunStart(value string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value))
+	return parsed, err == nil
 }
 
 // ActionsJobLog reads the plain-text log of one GitHub Actions job. It is a

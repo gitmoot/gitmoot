@@ -823,24 +823,32 @@ func TestListCheckRunsForRefUsesExactCommitSHAAndPaginates(t *testing.T) {
 	}
 	runner.wantArgs(t, 0,
 		"api", "--paginate", "--jq",
-		".check_runs[] | {id, app_id: .app.id, name, status, conclusion, html_url, started_at, completed_at}",
+		".check_runs[] | {app_id: .app.id, name, status, conclusion, html_url, started_at, completed_at}",
 		"repos/gitmoot/gitmoot/commits/head123/check-runs?per_page=100",
 	)
 }
 
-// #2413: a superseded run of the same check at the same head must not decide the result; the
-// latest run per (app, name) does, and a latest run that is cancelled still comes back.
-func TestListCheckRunsForRefKeepsOnlyTheLatestRunPerCheck(t *testing.T) {
+// #2413: a cancelled run superseded by a LATER-started run of the same check at the same head
+// must not decide the result, and nothing else may be dropped (fail-closed, review of
+// local-review-review-router-18e2806d13ce54a5-1): failures are always kept, a queued rerun
+// (started_at null) is always kept and supersedes nothing, and app-less runs are never merged.
+func TestListCheckRunsForRefDropsOnlySupersededCancelledRuns(t *testing.T) {
 	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `
-{"id":101,"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"cancelled","html_url":"u/101","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:00:30Z"}
-{"id":102,"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"success","html_url":"u/102","started_at":"2026-10-27T19:00:10Z","completed_at":"2026-10-27T19:05:00Z"}
-{"id":201,"app_id":15368,"name":"lint","status":"completed","conclusion":"success","html_url":"u/201","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:01:00Z"}
-{"id":202,"app_id":15368,"name":"lint","status":"completed","conclusion":"cancelled","html_url":"u/202","started_at":"2026-10-27T19:02:00Z","completed_at":"2026-10-27T19:02:05Z"}
-{"id":301,"app_id":15368,"name":"race","status":"completed","conclusion":"failure","html_url":"u/301","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:03:00Z"}
-{"id":302,"app_id":15368,"name":"race","status":"in_progress","conclusion":null,"html_url":"u/302","started_at":"2026-10-27T19:04:00Z","completed_at":null}
-{"id":401,"app_id":15368,"name":"same-start","status":"completed","conclusion":"failure","html_url":"u/401","started_at":"2026-10-27T19:00:00Z"}
-{"id":402,"app_id":15368,"name":"same-start","status":"completed","conclusion":"success","html_url":"u/402","started_at":"2026-10-27T19:00:00Z"}
-{"id":501,"app_id":999,"name":"test (linux)","status":"completed","conclusion":"failure","html_url":"u/501","started_at":"2026-10-27T18:00:00Z"}
+{"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"cancelled","html_url":"u/dup-cancelled","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"success","html_url":"u/dup-success","started_at":"2026-10-27T19:00:10Z"}
+{"app_id":15368,"name":"lint","status":"completed","conclusion":"success","html_url":"u/lint-old","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"lint","status":"completed","conclusion":"cancelled","html_url":"u/lint-latest-cancelled","started_at":"2026-10-27T19:02:00Z"}
+{"app_id":15368,"name":"test","status":"completed","conclusion":"failure","html_url":"u/other-workflow-failure","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"test","status":"completed","conclusion":"success","html_url":"u/other-workflow-success","started_at":"2026-10-27T19:05:00Z"}
+{"app_id":15368,"name":"build","status":"completed","conclusion":"success","html_url":"u/build-old-pass","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"build","status":"queued","conclusion":null,"html_url":"u/build-queued-rerun","started_at":null}
+{"app_id":15368,"name":"race","status":"completed","conclusion":"cancelled","html_url":"u/race-cancelled","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"race","status":"queued","conclusion":null,"html_url":"u/race-queued","started_at":null}
+{"app_id":15368,"name":"same-start","status":"completed","conclusion":"cancelled","html_url":"u/same-cancelled","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":15368,"name":"same-start","status":"completed","conclusion":"success","html_url":"u/same-success","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":null,"name":"legacy","status":"completed","conclusion":"cancelled","html_url":"u/appless-cancelled","started_at":"2026-10-27T19:00:00Z"}
+{"app_id":null,"name":"legacy","status":"completed","conclusion":"success","html_url":"u/appless-success","started_at":"2026-10-27T19:05:00Z"}
+{"app_id":999,"name":"test (linux)","status":"completed","conclusion":"cancelled","html_url":"u/other-app-cancelled","started_at":"2026-10-27T18:00:00Z"}
 `}}}
 	client := GhClient{Runner: runner}
 	checks, err := client.ListCheckRunsForRef(context.Background(), Repository{Owner: "o", Name: "r"}, "head")
@@ -849,17 +857,26 @@ func TestListCheckRunsForRefKeepsOnlyTheLatestRunPerCheck(t *testing.T) {
 	}
 	got := map[string]string{}
 	for _, check := range checks {
-		got[check.Link] = check.Name + "=" + check.State
+		got[check.Link] = check.State
 	}
 	want := map[string]string{
-		"u/102": "test (linux)=success", // superseded cancelled 101 dropped
-		"u/202": "lint=cancelled",       // the latest run cancelled: still reported
-		"u/302": "race=in_progress",     // a newer pending run stays pending
-		"u/402": "same-start=success",   // equal start: larger id wins
-		"u/501": "test (linux)=failure", // same name, different app: kept separately
+		"u/dup-success":            "success",   // the superseded cancelled duplicate is dropped
+		"u/lint-old":               "success",   // kept: only cancelled runs can be dropped
+		"u/lint-latest-cancelled":  "cancelled", // the latest run cancelled: still reported
+		"u/other-workflow-failure": "failure",   // a failure is never hidden by a same-named success
+		"u/other-workflow-success": "success",
+		"u/build-old-pass":         "success",
+		"u/build-queued-rerun":     "queued",    // a queued rerun is kept (the gate sees it pending)
+		"u/race-cancelled":         "cancelled", // a run with no start time supersedes nothing
+		"u/race-queued":            "queued",
+		"u/same-cancelled":         "cancelled", // equal start: not strictly later, nothing dropped
+		"u/same-success":           "success",
+		"u/appless-cancelled":      "cancelled", // app-less runs are never deduplicated
+		"u/appless-success":        "success",
+		"u/other-app-cancelled":    "cancelled", // same name, different app: independent
 	}
 	if len(checks) != len(want) {
-		t.Fatalf("checks = %+v, want exactly %d (one per app and name)", checks, len(want))
+		t.Fatalf("checks = %+v, want exactly %d", checks, len(want))
 	}
 	for link, w := range want {
 		if got[link] != w {
