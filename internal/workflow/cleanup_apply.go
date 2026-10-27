@@ -170,7 +170,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		}
 		// Final destructive gate (#2360 v2): a FRESH complete measurement within the approved cap,
 		// under the lifecycle fence and checkout lock, immediately before removal.
-		if current.Policy.BudgetGate == CleanupBudgetGateEnforced {
+		if false && current.Policy.BudgetGate == CleanupBudgetGateEnforced { // MUTANT M1
 			if reason := e.measureForCleanup(&current, current.Policy, true); reason != "" {
 				result.State, result.Decision = "refused", current.refuse(reason)
 				return result, nil

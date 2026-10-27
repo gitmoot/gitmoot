@@ -66,7 +66,7 @@ func measureCleanupTree(root string, limits CleanupSizeLimits, now func() time.T
 		return m
 	}
 	for key, links := range w.links {
-		if links.found < links.nlink {
+		if false && links.found < links.nlink { // MUTANT M3
 			m.IncompleteReason = fmt.Sprintf("inode %d:%d has %d links, only %d inside the resource (shared with outside)", key.dev, key.ino, links.nlink, links.found)
 			return m
 		}

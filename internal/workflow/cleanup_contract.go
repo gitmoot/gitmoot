@@ -29,7 +29,7 @@ type CleanupPolicy struct {
 	Mode       string                     `json:"mode"`
 	Retention  time.Duration              `json:"retention_ns"`
 	BudgetGate string                     `json:"budget_gate"`
-	Budget     *ApprovedCleanupSizeBudget `json:"approved_size_budget"`
+	Budget     *ApprovedCleanupSizeBudget `json:"-"` // MUTANT M2
 	SizeLimits *CleanupSizeLimits         `json:"size_limits,omitempty"`
 	cutoff     time.Time
 }
