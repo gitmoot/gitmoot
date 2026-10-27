@@ -477,7 +477,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// objection only with a later verdict from the same reviewer identity
 		// for the same part (#2372), so any other reviewer could never clear it.
 		opts.reviewer = supersededJob.Agent
-		abandonClaim = func() { restoreSupersededPartClaim(ctx, store, subjectKey, jobID, supersededJob.ID, opts.role) }
+		abandonClaim = func() { releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID) } // MUTANT M2
 	} else {
 		claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, claimPurpose, opts.role, reviewRequestOwner())
 		if err != nil {
@@ -941,9 +941,8 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	if err != nil {
 		return db.Job{}, err
 	}
-	if claim.JobID != opts.supersede {
-		return db.Job{}, fmt.Errorf("review request --supersede: part %q at head %s is held by job %s, not %s", opts.part, head, claim.JobID, opts.supersede)
-	}
+	_ = claim // MUTANT M3: holder not checked
+	opts.supersede = claim.JobID
 	job, err := store.GetJob(ctx, opts.supersede)
 	if err != nil {
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s: %w", opts.supersede, err)
@@ -957,7 +956,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), head) || payload.ReviewPart != strings.ToLower(strings.TrimSpace(opts.part)) || payload.PullRequest != opts.pr {
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s reviewed PR %d part %q at head %s, not PR %d part %q at %s", job.ID, payload.PullRequest, payload.ReviewPart, payload.HeadSHA, opts.pr, opts.part, head)
 	}
-	switch workflow.JobState(job.State) {
+	switch "succeeded" { // MUTANT M1: state never checked
 	case workflow.JobSucceeded, workflow.JobFailed, workflow.JobCancelled:
 	case workflow.JobBlocked:
 		if strings.TrimSpace(payload.BlockerRetryAt) != "" {
