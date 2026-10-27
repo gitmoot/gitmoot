@@ -193,7 +193,6 @@ func sqliteConnectionDSN(path string, readOnly bool) (string, error) {
 	} else {
 		// Preserve the existing NORMAL durability policy on every connection.
 		q.Add("_pragma", "synchronous(NORMAL)")
-		q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", SQLiteJournalSizeLimitBytes))
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil

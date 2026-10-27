@@ -64,7 +64,7 @@ func (s *Store) CheckpointWALTruncate(ctx context.Context) (WALCheckpoint, error
 		return WALCheckpoint{}, fmt.Errorf("sqlite WAL checkpoint: acquire connection: %w", err)
 	}
 	defer conn.Close()
-	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
+	if _, err := conn.ExecContext(ctx, `SELECT 1`); err != nil { // MUTANT: busy wait kept
 		return WALCheckpoint{}, fmt.Errorf("sqlite WAL checkpoint: disable busy wait: %w", err)
 	}
 	var result WALCheckpoint
