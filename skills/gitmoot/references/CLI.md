@@ -788,6 +788,20 @@ dispatch floor above. Below the dispatch floor reviews move as before.
   fact, so all parts can run, each in its own sandbox within the cost cap; the
   same part requested twice is still one review. A part is 1-64 letters,
   digits or dashes and cannot start or end with a dash.
+- **Re-reviewing a part at the same head:** a part that ended with a blocking
+  verdict (`changes_requested`, `blocked` or `failed`) can be re-reviewed
+  without a new head:
+  `review request --part NAME --supersede JOB --reason TEXT`. The named job must
+  hold that part's claim at that exact head and be settled; a live job, an
+  approved part, another part's job and another reviewer are refused. The
+  re-review runs on the same reviewer, because the merge gate retires a part's
+  objection only with a later verdict from that reviewer for that part. The
+  claim moves with a compare-and-set, so of two competing re-reviews only one
+  is dispatched. The old verdict keeps blocking until the new job lands a
+  verdict of its own: a queued, failed or cancelled re-review clears nothing,
+  and a re-review that fails before its job exists gives the claim back. The
+  new job records `review_supersedes` and the reason; the old job gets a
+  `review_part_superseded` event.
 - **Foreground reviews** (`--foreground`) stay on this host even when disk is
   low (owner decision); the command prints a warning telling the caller to
   re-run with `--background` to get the remote route.
@@ -958,7 +972,7 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
-    [--full] [--post-merge] [--no-execution] [--part NAME] [--allow-prompt-head-mismatch] [--background] [--json] \
+    [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]

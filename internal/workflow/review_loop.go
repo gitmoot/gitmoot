@@ -61,14 +61,27 @@ func (m ReviewLoopMatch) Reason() string {
 // On a match, the event is claimed against the matched succeeded job. No new
 // review job is created, and no prior result is returned to the caller.
 func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose string) (ReviewLoopMatch, bool, error) {
+	return DetectReviewLoopSuperseding(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose, "")
+}
+
+// DetectReviewLoopSuperseding is DetectReviewLoop for a `review request
+// --supersede` re-review (#2405): the verdict of the ONE named superseded job is
+// the reason for the request, not loop evidence, so it alone is exempt. Any
+// other repeated verdict still refuses, and an empty supersededJobID is exactly
+// DetectReviewLoop.
+func DetectReviewLoopSuperseding(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose, supersededJobID string) (ReviewLoopMatch, bool, error) {
 	matches, err := FindRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose)
 	if err != nil {
 		return ReviewLoopMatch{}, false, err
 	}
-	if len(matches) == 0 {
-		return ReviewLoopMatch{}, false, nil
+	supersededJobID = strings.TrimSpace(supersededJobID)
+	for _, match := range matches {
+		if supersededJobID != "" && match.JobID == supersededJobID {
+			continue
+		}
+		return match, true, nil
 	}
-	return matches[0], true, nil
+	return ReviewLoopMatch{}, false, nil
 }
 
 // FindRepeatedReviewers returns exact-head verdict evidence for each requesting

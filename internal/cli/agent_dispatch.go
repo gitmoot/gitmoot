@@ -388,7 +388,11 @@ type localAgentDispatchRequest struct {
 	// execution = "none".
 	ReviewNoExecution bool
 	// ReviewPart names one part of a split review (#2372).
-	ReviewPart             string
+	ReviewPart string
+	// ReviewSupersedes/ReviewSupersedeReason carry `review request --supersede`
+	// audit linkage into the job payload (#2405).
+	ReviewSupersedes       string
+	ReviewSupersedeReason  string
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -1135,6 +1139,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		PostMergeReview:          request.PostMergeReview,
 		ReviewNoExecution:        request.ReviewNoExecution,
 		ReviewPart:               request.ReviewPart,
+		ReviewSupersedes:         request.ReviewSupersedes,
+		ReviewSupersedeReason:    request.ReviewSupersedeReason,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
@@ -1736,7 +1742,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 			request.HeadSHA = pr.HeadSHA
 		}
 	}
-	if match, detected, err := workflow.DetectReviewLoop(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, db.ReviewRequestPurpose(request.ReviewPurpose, request.PostMergeReview, request.ReviewPart)); err != nil {
+	if match, detected, err := workflow.DetectReviewLoopSuperseding(ctx, store, repo.FullName(), request.PullRequest, request.HeadSHA, []string{request.Agent}, db.ReviewRequestPurpose(request.ReviewPurpose, request.PostMergeReview, request.ReviewPart), request.ReviewSupersedes); err != nil {
 		return localAgentDispatchRequest{}, err
 	} else if detected {
 		return localAgentDispatchRequest{}, errors.New(match.Reason())
