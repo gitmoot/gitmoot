@@ -67,6 +67,14 @@ type sqlExecer interface {
 // daemon its own home via GITMOOT_HOME_DIR so they do not share a DB at all.)
 const sqliteBusyTimeoutMillis = 15000
 
+// SQLiteJournalSizeLimitBytes bounds the write-ahead log a writable connection
+// leaves on disk once a checkpoint has reset it (#2384). Without it SQLite keeps
+// the WAL at its historical peak forever: the production home carried a 503 MB
+// gitmoot.db-wal with journal_size_limit=-1. It does NOT bound peak growth while
+// a long-lived reader pins an old snapshot; the daemon's non-blocking
+// TRUNCATE checkpoint (CheckpointWALTruncate) reclaims that once readers move on.
+const SQLiteJournalSizeLimitBytes = 64 << 20
+
 // DurableWriteBudget is the MINIMUM context deadline a caller must allow a
 // durability write against this store, and it is DERIVED from
 // sqliteBusyTimeoutMillis rather than hand-set beside it.
@@ -153,9 +161,10 @@ func OpenAlreadyMigrated(path string) (*Store, error) {
 	return openWritable(path)
 }
 
-// SQLite's busy handler and synchronous mode belong to a physical connection.
-// database/sql can replace that connection after cancellation even with a
-// one-connection pool; the driver must initialize every replacement.
+// SQLite's busy handler, synchronous mode and journal size limit belong to a
+// physical connection. database/sql can replace that connection after
+// cancellation even with a one-connection pool; the driver must initialize
+// every replacement.
 func sqliteConnectionDSN(path string, readOnly bool) (string, error) {
 	u := &url.URL{Scheme: "file", OmitHost: true, Path: path}
 	if strings.HasPrefix(path, "file:") {
@@ -173,7 +182,7 @@ func sqliteConnectionDSN(path string, readOnly bool) (string, error) {
 		if i := strings.IndexAny(name, "(= \t"); i >= 0 {
 			name = name[:i]
 		}
-		if strings.EqualFold(name, "busy_timeout") || (!readOnly && strings.EqualFold(name, "synchronous")) {
+		if strings.EqualFold(name, "busy_timeout") || (!readOnly && (strings.EqualFold(name, "synchronous") || strings.EqualFold(name, "journal_size_limit"))) {
 			continue
 		}
 		kept = append(kept, pragma)
@@ -184,6 +193,7 @@ func sqliteConnectionDSN(path string, readOnly bool) (string, error) {
 	} else {
 		// Preserve the existing NORMAL durability policy on every connection.
 		q.Add("_pragma", "synchronous(NORMAL)")
+		q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", SQLiteJournalSizeLimitBytes))
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil

@@ -80,6 +80,13 @@ The one-time command fully rewrites the database; the daemon never runs a full
 runtime dependency. For a non-default home, use the exact path printed by
 `gitmoot doctor`.
 
+The write-ahead log (`gitmoot.db-wal`) is bounded too. Every writable connection
+sets `journal_size_limit` to 64 MiB, so a burst of writes no longer leaves the
+WAL file at its peak size. The daemon also runs a non-blocking
+`wal_checkpoint(TRUNCATE)` every 15 minutes, which empties the file. If a reader
+still holds an older snapshot, the checkpoint does not wait; it retries a minute
+later.
+
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
 command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
 --session <ref> [--role <role>] [--path .] [--start-daemon]`). `--repo`,
