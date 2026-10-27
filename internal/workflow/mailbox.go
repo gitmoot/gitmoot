@@ -374,9 +374,13 @@ type JobRequest struct {
 	// selection record; see JobPayload for semantics.
 	ReviewPurpose string
 	// ReviewPart names one part of a split review (#2372); empty for a whole-head review.
-	ReviewPart      string
-	ReviewModelPool []string
-	ReviewRequester string
+	ReviewPart string
+	// ReviewSupersedes/ReviewSupersedeReason link a part re-review to the
+	// settled part verdict it is dispatched to replace (#2405).
+	ReviewSupersedes      string
+	ReviewSupersedeReason string
+	ReviewModelPool       []string
+	ReviewRequester       string
 	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
 	// review and names the agent its verdict delegation must go to (#1821).
 	//
@@ -687,8 +691,15 @@ type JobPayload struct {
 	ReviewPurpose string `json:"review_purpose,omitempty"`
 	// ReviewPart is the durable form of JobRequest.ReviewPart. It scopes the
 	// review claim, verdict and awaited fact to one part of a split review.
-	ReviewPart      string   `json:"review_part,omitempty"`
-	ReviewModelPool []string `json:"review_model_pool,omitempty"`
+	ReviewPart string `json:"review_part,omitempty"`
+	// ReviewSupersedes names the settled part-review job this job was
+	// dispatched to replace via `review request --supersede` (#2405), and
+	// ReviewSupersedeReason is the requester's stated reason. They are audit
+	// linkage only: the old verdict keeps blocking at the merge gate until this
+	// job lands its own verdict; nothing here retires it.
+	ReviewSupersedes      string   `json:"review_supersedes,omitempty"`
+	ReviewSupersedeReason string   `json:"review_supersede_reason,omitempty"`
+	ReviewModelPool       []string `json:"review_model_pool,omitempty"`
 	// ReviewRequester names the org role that asked for this review and is
 	// notified when the verdict is saved. Attribution only; never authorization.
 	ReviewRequester string `json:"review_requester,omitempty"`
@@ -947,6 +958,8 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		CheckRetries:             request.CheckRetries,
 		ReviewPurpose:            reviewPurpose,
 		ReviewPart:               strings.ToLower(strings.TrimSpace(request.ReviewPart)),
+		ReviewSupersedes:         strings.TrimSpace(request.ReviewSupersedes),
+		ReviewSupersedeReason:    strings.TrimSpace(request.ReviewSupersedeReason),
 		ReviewModelPool:          reviewPool,
 		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
 	})

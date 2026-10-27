@@ -61,13 +61,16 @@ type reviewRequestOutput struct {
 	// Baseline is the prior head a delta review was bounded to; BaselineSkipped
 	// names why a full review was dispatched instead (#2177). Exactly one is set
 	// on a dispatch, and neither on an attach or a reused verdict.
-	Runtime         string   `json:"runtime,omitempty"`
-	Baseline        string   `json:"baseline,omitempty"`
-	BaselineSkipped string   `json:"baseline_skipped,omitempty"`
-	AwaitedFactID   int64    `json:"awaited_fact_id"`
-	NotifyBy        string   `json:"notify_by"`
-	Holds           []string `json:"holds,omitempty"`
-	WatchCommand    string   `json:"watch_command,omitempty"`
+	Runtime         string `json:"runtime,omitempty"`
+	Baseline        string `json:"baseline,omitempty"`
+	BaselineSkipped string `json:"baseline_skipped,omitempty"`
+	// Supersedes names the settled part-review job this dispatch replaces
+	// (#2405); its verdict keeps blocking until this job lands its own.
+	Supersedes    string   `json:"supersedes,omitempty"`
+	AwaitedFactID int64    `json:"awaited_fact_id"`
+	NotifyBy      string   `json:"notify_by"`
+	Holds         []string `json:"holds,omitempty"`
+	WatchCommand  string   `json:"watch_command,omitempty"`
 	// The fields below repeat the names `agent review --json` prints, so a
 	// caller that parsed that object reads the same keys here (#2314). `state`
 	// above keeps its router meaning (dispatched, attached, verdict_exists);
@@ -103,7 +106,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -135,6 +138,11 @@ type reviewRequestOptions struct {
 	// It scopes the claim, verdict and awaited fact; the same part twice is
 	// still one review.
 	part string
+	// supersede names a settled part-review job whose verdict this request
+	// re-reviews at the same head (#2405), and supersedeReason says why. See
+	// takeSupersededPartClaim for the contract.
+	supersede       string
+	supersedeReason string
 	// model, effort, workflowID and session are carried so delegation from
 	// `agent review` drops NOTHING the caller supplied (#2196 review). --model
 	// is load-bearing: every dispatch on this campaign passes
@@ -197,6 +205,8 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.StringVar(&opts.part, "part", "", "one part of a split review of the same head: a slug of letters, digits and dashes (e.g. mm-12-mm-15)")
+	fs.StringVar(&opts.supersede, "supersede", "", "re-review a part at the same head: the settled review job of that part whose verdict this request replaces once it lands; requires --part and --reason")
+	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both jobs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	// Spellings `agent review` uses for the same inputs (#2314), so a caller
@@ -229,6 +239,16 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
 		fmt.Fprintln(stderr, "review request: --post-merge and --lead are mutually exclusive")
+		return 2
+	}
+	opts.supersede = strings.TrimSpace(opts.supersede)
+	opts.supersedeReason = strings.TrimSpace(opts.supersedeReason)
+	if opts.supersede != "" && (strings.TrimSpace(opts.part) == "" || opts.supersedeReason == "") {
+		fmt.Fprintln(stderr, "review request: --supersede re-reviews one part at the same head and requires --part and --reason")
+		return 2
+	}
+	if opts.supersede == "" && opts.supersedeReason != "" {
+		fmt.Fprintln(stderr, "review request: --reason is only meaningful with --supersede")
 		return 2
 	}
 	if opts.noFixTarget && strings.TrimSpace(opts.lead) != "" {
@@ -442,42 +462,68 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	// absent" as "claim is dead" steals the claim and both requesters dispatch,
 	// which is the duplicate this table exists to prevent.
 	jobID := localAgentJobID("review", "review-router")
-	claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, claimPurpose, opts.role, reviewRequestOwner())
-	if err != nil {
-		return reviewRequestOutput{}, err
-	}
-	if !won {
-		attach, takeover, err := resolveLostReviewClaim(ctx, store, claim, time.Now().UTC())
+	// abandonClaim undoes this request's claim when dispatch fails before a job
+	// exists. A normal request releases it; a superseding request moves it back
+	// to the job it took it from, so a failed re-review never leaves the part
+	// unclaimed (#2405). Either way the old verdict was never touched.
+	abandonClaim := func() { releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID) }
+	var supersededJob db.Job
+	if opts.supersede != "" {
+		supersededJob, err = takeSupersededPartClaim(ctx, store, subjectKey, head, opts, jobID)
 		if err != nil {
 			return reviewRequestOutput{}, err
 		}
-		if !takeover {
-			return finishReviewAttach(ctx, store, output, attach, claim, opts)
-		}
-		// The holder is provably gone: its job ended without a verdict, or it
-		// never enqueued one and its claim has aged past the dispatch window.
-		// Move the claim; a concurrent requester that wins this CAS instead is
-		// the one that dispatches, and this caller attaches to its job.
-		moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, claim.JobID, jobID, opts.role, reviewRequestOwner())
+		// The re-review runs on the SAME reviewer: the merge gate retires a part
+		// objection only with a later verdict from the same reviewer identity
+		// for the same part (#2372), so any other reviewer could never clear it.
+		opts.reviewer = supersededJob.Agent
+		abandonClaim = func() { restoreSupersededPartClaim(ctx, store, subjectKey, jobID, supersededJob.ID, opts.role) }
+	} else {
+		claim, won, err := store.ClaimReviewRequest(ctx, subjectKey, jobID, claimPurpose, opts.role, reviewRequestOwner())
 		if err != nil {
 			return reviewRequestOutput{}, err
 		}
-		if !moved {
-			current, err := store.GetReviewRequest(ctx, subjectKey)
+		if !won {
+			attach, takeover, err := resolveLostReviewClaim(ctx, store, claim, time.Now().UTC())
 			if err != nil {
 				return reviewRequestOutput{}, err
 			}
-			attach, takeover, err := resolveLostReviewClaim(ctx, store, current, time.Now().UTC())
-			if err != nil || takeover {
-				return reviewRequestOutput{}, fmt.Errorf("review request for %s is contended: the claim moved to job %s while this request was resolving; re-run it", subjectKey, current.JobID)
+			if !takeover {
+				return finishReviewAttach(ctx, store, output, attach, claim, opts)
 			}
-			return finishReviewAttach(ctx, store, output, attach, current, opts)
+			// The holder is provably gone: its job ended without a verdict, or it
+			// never enqueued one and its claim has aged past the dispatch window.
+			// Move the claim; a concurrent requester that wins this CAS instead is
+			// the one that dispatches, and this caller attaches to its job.
+			moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, claim.JobID, jobID, opts.role, reviewRequestOwner())
+			if err != nil {
+				return reviewRequestOutput{}, err
+			}
+			if !moved {
+				current, err := store.GetReviewRequest(ctx, subjectKey)
+				if err != nil {
+					return reviewRequestOutput{}, err
+				}
+				attach, takeover, err := resolveLostReviewClaim(ctx, store, current, time.Now().UTC())
+				if err != nil || takeover {
+					return reviewRequestOutput{}, fmt.Errorf("review request for %s is contended: the claim moved to job %s while this request was resolving; re-run it", subjectKey, current.JobID)
+				}
+				return finishReviewAttach(ctx, store, output, attach, current, opts)
+			}
 		}
 	}
 	reviewer, selectedRuntime, err := selectReviewRouterAgent(ctx, store, repo.FullName(), opts.pr, head, claimPurpose, opts.reviewer, opts.role)
 	if err != nil {
-		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+		abandonClaim()
 		return reviewRequestOutput{}, err
+	}
+	if opts.supersede != "" {
+		newIdentity, _ := workflow.ReviewerIdentity(reviewer.Name, opts.role)
+		oldIdentity, _ := workflow.ReviewerIdentity(supersededJob.Agent, supersededPayloadRole(supersededJob))
+		if newIdentity == "" || newIdentity != oldIdentity {
+			abandonClaim()
+			return reviewRequestOutput{}, fmt.Errorf("review request --supersede: reviewer identity %q differs from the superseded job's %q; the merge gate would never let it replace that verdict", newIdentity, oldIdentity)
+		}
 	}
 	// Resolved only once the claim is won and a reviewer exists, so a losing or
 	// attaching request never pays for git calls whose answer it will discard.
@@ -492,14 +538,14 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	effectiveRuntime := effectiveReviewRuntime(opts.runtime, selectedRuntime)
 	if err := validateRuntimeExecutionBackend(effectiveRuntime, execBackend); err != nil {
-		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+		abandonClaim()
 		return reviewRequestOutput{}, err
 	}
 	if noExecution {
 		// Refused here, before a job exists, for what the worker would refuse
 		// anyway: the worker re-checks all of it on the job it claims.
 		if err := noExecutionReviewDispatchError(effectiveRuntime, execBackend); err != nil {
-			releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+			abandonClaim()
 			return reviewRequestOutput{}, err
 		}
 	}
@@ -536,18 +582,20 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// A NAMED LEAD IS A FIX TARGET. The router's own requests carry none, so
 		// a changes-requested verdict has nowhere to route and says so; a caller
 		// that names an implementer gets the routing it asked for (#2196).
-		NoFixTarget:          strings.TrimSpace(opts.lead) == "",
-		PostMergeReview:      opts.postMerge,
-		ReviewNoExecution:    noExecution,
-		ReviewPart:           opts.part,
-		SelectedAction:       "review",
-		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
-		ExecutionPath:        reviewRequestExecutionPath,
-		JobID:                jobID,
-		ReviewPurpose:        opts.purpose,
-		ReviewModelPool:      pool,
-		ReviewRequester:      opts.role,
-		ReviewScope:          scope,
+		NoFixTarget:           strings.TrimSpace(opts.lead) == "",
+		PostMergeReview:       opts.postMerge,
+		ReviewNoExecution:     noExecution,
+		ReviewPart:            opts.part,
+		ReviewSupersedes:      opts.supersede,
+		ReviewSupersedeReason: opts.supersedeReason,
+		SelectedAction:        "review",
+		SelectedActionReason:  reviewRequestSelectedActionReason(opts.purpose),
+		ExecutionPath:         reviewRequestExecutionPath,
+		JobID:                 jobID,
+		ReviewPurpose:         opts.purpose,
+		ReviewModelPool:       pool,
+		ReviewRequester:       opts.role,
+		ReviewScope:           scope,
 		// A carried finding may legitimately cite a commit outside this PR
 		// (#2178 round 1): the citation classifier scans the delta brief, and
 		// the refusal it prints names this flag, so the flag must exist here.
@@ -558,8 +606,17 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	dispatched, err := dispatchLocalAgentJobFromCLI(ctx, store, request)
 	if err != nil {
-		releaseUnenqueuedReviewClaim(ctx, store, subjectKey, jobID)
+		abandonClaim()
 		return reviewRequestOutput{}, err
+	}
+	if opts.supersede != "" {
+		// The new job carries the linkage in its payload from the moment it
+		// exists; this event makes it visible from the old job too.
+		output.Supersedes = supersededJob.ID
+		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: supersededJob.ID, Kind: reviewPartSupersededEventKind,
+			Message: fmt.Sprintf("part %s re-review %s dispatched by %s at head %s: %s; this verdict stays effective until that job lands its own", opts.part, dispatched.JobID, opts.role, head, opts.supersedeReason)}); err != nil {
+			fmt.Fprintf(stderr, "review request: warning: re-review %s dispatched, but recording it on %s failed: %v\n", dispatched.JobID, supersededJob.ID, err)
+		}
 	}
 	output.State = reviewRequestDispatched
 	output.JobID = dispatched.JobID
@@ -848,6 +905,120 @@ func releaseUnenqueuedReviewClaim(ctx context.Context, store *db.Store, subjectK
 		return
 	}
 	_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
+}
+
+// reviewPartSupersededEventKind is recorded on a settled part-review job when
+// `review request --supersede` dispatches its re-review (#2405).
+const reviewPartSupersededEventKind = "review_part_superseded"
+
+// takeSupersededPartClaim moves the claim of one part of a split review at one
+// exact head from a SETTLED part-review job to newJobID (#2405).
+//
+// WHY THIS EXISTS. The merge gate retires a part's objection only with a later
+// verdict from the same reviewer identity for the same part at the evaluated
+// head (#2372). But the claim outlives its job and a settled verdict counts as
+// an answer, so a second request for that part attached to the old verdict
+// (local) or was refused as a duplicate (remote): an objection that came from
+// a mis-scoped prompt could only be cleared by a new head, which resets every
+// other part. --supersede is the audited exit.
+//
+// CONTRACT (Jarvis 365409):
+//   - the named job must hold the claim for EXACTLY this repo, PR, full head,
+//     purpose and normalized part (the claim key is all of those);
+//   - it must be settled: not queued, running or scheduled for an automatic
+//     retry, with no live child, and carry a BLOCKING verdict (an approved part
+//     blocks nothing, so there is nothing to supersede);
+//   - the claim moves by compare-and-set from that exact job, so of two
+//     competing superseders exactly one wins;
+//   - NOTHING here touches the old job, its result or findings. Its objection
+//     stays effective at the gate until the new job lands a verdict of its
+//     own; a queued, failed, cancelled or crashed re-review clears nothing.
+func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, head string, opts reviewRequestOptions, newJobID string) (db.Job, error) {
+	claim, err := store.GetReviewRequest(ctx, subjectKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return db.Job{}, fmt.Errorf("review request --supersede: no review holds part %q at head %s; request it without --supersede", opts.part, head)
+	}
+	if err != nil {
+		return db.Job{}, err
+	}
+	if claim.JobID != opts.supersede {
+		return db.Job{}, fmt.Errorf("review request --supersede: part %q at head %s is held by job %s, not %s", opts.part, head, claim.JobID, opts.supersede)
+	}
+	job, err := store.GetJob(ctx, opts.supersede)
+	if err != nil {
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s: %w", opts.supersede, err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s payload: %w", job.ID, err)
+	}
+	// The claim key already binds repo, PR, head, purpose and part; checking the
+	// job's own fields as well refuses a claim row that does not match its job.
+	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), head) || payload.ReviewPart != strings.ToLower(strings.TrimSpace(opts.part)) || payload.PullRequest != opts.pr {
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s reviewed PR %d part %q at head %s, not PR %d part %q at %s", job.ID, payload.PullRequest, payload.ReviewPart, payload.HeadSHA, opts.pr, opts.part, head)
+	}
+	switch workflow.JobState(job.State) {
+	case workflow.JobSucceeded, workflow.JobFailed, workflow.JobCancelled:
+	case workflow.JobBlocked:
+		if strings.TrimSpace(payload.BlockerRetryAt) != "" {
+			return db.Job{}, fmt.Errorf("review request --supersede: job %s is blocked with an automatic retry scheduled at %s; it is not settled", job.ID, payload.BlockerRetryAt)
+		}
+	default:
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s is %s; only a settled review can be superseded", job.ID, job.State)
+	}
+	decision := ""
+	if payload.Result != nil {
+		decision = strings.TrimSpace(payload.Result.Decision)
+	}
+	switch decision {
+	case "changes_requested", "blocked", "failed":
+	case "approved":
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s approved part %q; an approval blocks nothing, so there is nothing to supersede", job.ID, opts.part)
+	default:
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s carries no blocking verdict (decision %q); request the part without --supersede", job.ID, decision)
+	}
+	children, err := store.ListJobsByParent(ctx, job.ID)
+	if err != nil {
+		return db.Job{}, err
+	}
+	for _, child := range children {
+		switch workflow.JobState(child.State) {
+		case workflow.JobQueued, workflow.JobRunning, workflow.JobBlocked:
+			return db.Job{}, fmt.Errorf("review request --supersede: job %s still has live child %s (%s); it is not settled", job.ID, child.ID, child.State)
+		}
+	}
+	if explicit := strings.TrimSpace(opts.reviewer); explicit != "" && explicit != job.Agent {
+		return db.Job{}, fmt.Errorf("review request --supersede: --reviewer %s differs from %s, who reviewed this part; the merge gate retires a part objection only with the same reviewer's later verdict", explicit, job.Agent)
+	}
+	moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, job.ID, newJobID, opts.role, reviewRequestOwner())
+	if err != nil {
+		return db.Job{}, err
+	}
+	if !moved {
+		return db.Job{}, fmt.Errorf("review request --supersede: the claim for part %q moved away from job %s while this request ran (another re-review won); nothing was dispatched", opts.part, job.ID)
+	}
+	return job, nil
+}
+
+// restoreSupersededPartClaim gives the claim back to the superseded job when a
+// re-review fails before its job exists, so the part is never left unclaimed.
+// Like releaseUnenqueuedReviewClaim it acts only when the new job row is
+// provably absent; a job that did enqueue keeps the claim it runs under.
+func restoreSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, newJobID, supersededJobID, role string) {
+	if _, err := store.GetJob(ctx, newJobID); !errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	_, _ = store.ReplaceReviewRequestJob(ctx, subjectKey, newJobID, supersededJobID, role, reviewRequestOwner())
+}
+
+// supersededPayloadRole is the acting org role stored on a review job, the
+// second input of its reviewer identity.
+func supersededPayloadRole(job db.Job) string {
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		return ""
+	}
+	return payload.ActingOrgRole
 }
 
 // reviewRequestOwner identifies this process as the claim holder.
