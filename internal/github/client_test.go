@@ -823,9 +823,49 @@ func TestListCheckRunsForRefUsesExactCommitSHAAndPaginates(t *testing.T) {
 	}
 	runner.wantArgs(t, 0,
 		"api", "--paginate", "--jq",
-		".check_runs[] | {name, status, conclusion, html_url, completed_at}",
+		".check_runs[] | {id, app_id: .app.id, name, status, conclusion, html_url, started_at, completed_at}",
 		"repos/gitmoot/gitmoot/commits/head123/check-runs?per_page=100",
 	)
+}
+
+// #2413: a superseded run of the same check at the same head must not decide the result; the
+// latest run per (app, name) does, and a latest run that is cancelled still comes back.
+func TestListCheckRunsForRefKeepsOnlyTheLatestRunPerCheck(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{Stdout: `
+{"id":101,"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"cancelled","html_url":"u/101","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:00:30Z"}
+{"id":102,"app_id":15368,"name":"test (linux)","status":"completed","conclusion":"success","html_url":"u/102","started_at":"2026-10-27T19:00:10Z","completed_at":"2026-10-27T19:05:00Z"}
+{"id":201,"app_id":15368,"name":"lint","status":"completed","conclusion":"success","html_url":"u/201","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:01:00Z"}
+{"id":202,"app_id":15368,"name":"lint","status":"completed","conclusion":"cancelled","html_url":"u/202","started_at":"2026-10-27T19:02:00Z","completed_at":"2026-10-27T19:02:05Z"}
+{"id":301,"app_id":15368,"name":"race","status":"completed","conclusion":"failure","html_url":"u/301","started_at":"2026-10-27T19:00:00Z","completed_at":"2026-10-27T19:03:00Z"}
+{"id":302,"app_id":15368,"name":"race","status":"in_progress","conclusion":null,"html_url":"u/302","started_at":"2026-10-27T19:04:00Z","completed_at":null}
+{"id":401,"app_id":15368,"name":"same-start","status":"completed","conclusion":"failure","html_url":"u/401","started_at":"2026-10-27T19:00:00Z"}
+{"id":402,"app_id":15368,"name":"same-start","status":"completed","conclusion":"success","html_url":"u/402","started_at":"2026-10-27T19:00:00Z"}
+{"id":501,"app_id":999,"name":"test (linux)","status":"completed","conclusion":"failure","html_url":"u/501","started_at":"2026-10-27T18:00:00Z"}
+`}}}
+	client := GhClient{Runner: runner}
+	checks, err := client.ListCheckRunsForRef(context.Background(), Repository{Owner: "o", Name: "r"}, "head")
+	if err != nil {
+		t.Fatalf("ListCheckRunsForRef: %v", err)
+	}
+	got := map[string]string{}
+	for _, check := range checks {
+		got[check.Link] = check.Name + "=" + check.State
+	}
+	want := map[string]string{
+		"u/102": "test (linux)=success", // superseded cancelled 101 dropped
+		"u/202": "lint=cancelled",       // the latest run cancelled: still reported
+		"u/302": "race=in_progress",     // a newer pending run stays pending
+		"u/402": "same-start=success",   // equal start: larger id wins
+		"u/501": "test (linux)=failure", // same name, different app: kept separately
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("checks = %+v, want exactly %d (one per app and name)", checks, len(want))
+	}
+	for link, w := range want {
+		if got[link] != w {
+			t.Fatalf("check %s = %q, want %q (all: %+v)", link, got[link], w, checks)
+		}
+	}
 }
 
 func TestListCheckRunsForRefRejectsMalformedNDJSON(t *testing.T) {
