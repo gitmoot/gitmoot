@@ -171,6 +171,11 @@ func CollectRuntimes(gitmootHome string, options RuntimeCollectOptions) (Runtime
 		idle = append(idle, copy)
 	}
 	if len(idle) == 0 {
+		// A dry run changes nothing on disk, including leftover .trash- entries
+		// from an earlier interrupted pass (#2404).
+		if options.DryRun {
+			return report, nil
+		}
 		return report, removeRuntimeTrash(root)
 	}
 
