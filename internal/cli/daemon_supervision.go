@@ -111,6 +111,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			stopReplyWakeDrain := startReplyWakeDrainLoop(ctx, store, drainWorker, tracker, stdout)
 			defer stopReplyWakeDrain()
 			startTranscriptRetentionLoop(ctx, paths, store, stdout)
+			startRuntimeCollectionLoop(ctx, paths, stdout)
 		}
 		// Heartbeat schedules (#533) reuse the normal job queue. Off-by-default: with
 		// no heartbeat sections the scan returns before any store touch. Skip it under
@@ -255,6 +256,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
 	if heartbeatPathsErr == nil {
 		startTranscriptRetentionLoop(ctx, heartbeatPaths, store, stdout)
+		startRuntimeCollectionLoop(ctx, heartbeatPaths, stdout)
 	}
 	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
 	// daemon would silently never advance/schedule pipelines. Off-by-default: with no

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // RuntimeDirName holds staged runtime copies beside the staged Go toolchains.
@@ -165,6 +166,17 @@ func stageRuntimeBounded(gitmootHome string, name string, executable string, cha
 	lock := entry.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
+	// Shared root lock, then the last-used stamp, BEFORE looking at the copy:
+	// the runtime collector (#2382) takes this lock exclusively and re-reads the
+	// stamp, so it can never retire a copy this pass is about to hand out.
+	unlockRoot, err := lockRuntimeRoot(root, false)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
+	}
+	defer unlockRoot()
+	if err := markRuntimeUsed(root, publishedName, time.Now()); err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
+	}
 
 	if _, err := os.Lstat(published); err == nil {
 		if err := validatePublished(published, name, relative, fingerprint); err != nil {

@@ -941,11 +941,18 @@ This preserves ordinary system commands through the inherited `PATH` without
 permitting a runtime name to fall through to its host copy. Failures also appear
 as `gitmoot: read-only seat runtime:` on daemon stderr.
 
-**One limit, stated rather than implied:** published runtime copies are not
-reclaimed. Each distinct content fingerprint publishes a new directory and
-nothing removes it, because safe reclamation needs to know which trees live
-seats are executing. `toolchain.Collect` has no production caller either, so the
-same is true of staged Go toolchains.
+**Reclaiming old copies.** Each distinct content fingerprint publishes a new
+directory, so every provider upgrade leaves one behind. The daemon removes a copy
+once a day when two things are both true: no job has staged it for 7 days, and
+no live process uses it. "Uses" means running from it, having it as the working
+directory, naming it on the command line, or mapping a file from it. Staging
+refreshes a last-used stamp under a lock that the collector takes exclusively,
+so a copy being handed to a job is never removed. A removed copy is staged again
+the next time a job needs it. Run `gitmoot runtime prune --dry-run` to see what
+would be removed, and `gitmoot runtime prune` to do it now (`--min-idle` changes
+the 7 days). If the process scan cannot finish, nothing is removed.
+Unavailable-runtime commands are never removed. `toolchain.Collect` still has no
+production caller, so staged Go toolchains are not reclaimed.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 
