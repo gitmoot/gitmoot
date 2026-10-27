@@ -1,6 +1,8 @@
 package toolchain
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -282,5 +284,37 @@ func TestCollectRuntimesWaitsForStagingLock(t *testing.T) {
 	}
 	if _, err := os.Stat(published); err != nil {
 		t.Fatalf("copy staged during collection is gone: %v", err)
+	}
+}
+
+// #2404 (Jarvis 366005): with every copy recently staged there is nothing idle,
+// and a dry run must still leave a leftover .trash- entry from an earlier
+// interrupted pass on disk. Only a real pass removes it.
+func TestCollectRuntimesDryRunLeavesTrashWhenNothingIsIdle(t *testing.T) {
+	home := t.TempDir()
+	if _, _, err := StageRuntime(home, "recent", writeRuntimeTool(t, "recent")); err != nil {
+		t.Fatal(err)
+	}
+	trash := filepath.Join(RuntimeRoot(home), runtimeTrashPrefix+"old-copy-abc")
+	if err := os.MkdirAll(filepath.Join(trash, ".bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	options := RuntimeCollectOptions{MinIdle: 7 * 24 * time.Hour, ProcRoot: emptyProc(t), DryRun: true}
+	report, err := CollectRuntimes(home, options)
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(report.Removed) != 0 {
+		t.Fatalf("dry run reported removals with nothing idle: %s", names(report.Removed))
+	}
+	if _, err := os.Stat(trash); err != nil {
+		t.Fatalf("dry run deleted the leftover trash entry: %v", err)
+	}
+	options.DryRun = false
+	if _, err := CollectRuntimes(home, options); err != nil {
+		t.Fatalf("real pass: %v", err)
+	}
+	if _, err := os.Stat(trash); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("real pass left the trash entry: %v", err)
 	}
 }
