@@ -161,11 +161,10 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 22 since #2203 deleted internal/config/implement_base.go and its
-	// implement_base.go::LoadImplementBase site; that commit dropped the site from
-	// the lists above but left this count at 23, which is why the test was red.
-	if distinctFiles != 22 {
-		t.Errorf("sectionHeader call sites span %d files, want 22: update this expectation together with the lists above", distinctFiles)
+	// 23 since #2360 added cleanup_budget.go::LoadCleanupBudget (22 after #2203
+	// deleted internal/config/implement_base.go and its LoadImplementBase site).
+	if distinctFiles != 23 {
+		t.Errorf("sectionHeader call sites span %d files, want 23: update this expectation together with the lists above", distinctFiles)
 	}
 }
 
