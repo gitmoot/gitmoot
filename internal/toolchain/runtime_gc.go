@@ -205,7 +205,7 @@ func CollectRuntimes(gitmootHome string, options RuntimeCollectOptions) (Runtime
 		return report, nil
 	}
 
-	unlock, err := lockRuntimeRoot(root, true)
+	unlock, err := func() {}, error(nil) // MUTANT: no exclusive lock
 	if err != nil {
 		return report, err
 	}

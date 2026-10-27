@@ -174,7 +174,9 @@ func stageRuntimeBounded(gitmootHome string, name string, executable string, cha
 		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
 	}
 	defer unlockRoot()
-	if err := markRuntimeUsed(root, publishedName, time.Now()); err != nil {
+	if _, statErr := os.Lstat(published); statErr == nil {
+		// MUTANT: reuse does not refresh the stamp
+	} else if err := markRuntimeUsed(root, publishedName, time.Now()); err != nil {
 		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
 	}
 
