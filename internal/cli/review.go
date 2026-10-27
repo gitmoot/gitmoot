@@ -956,7 +956,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), head) || payload.ReviewPart != strings.ToLower(strings.TrimSpace(opts.part)) || payload.PullRequest != opts.pr {
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s reviewed PR %d part %q at head %s, not PR %d part %q at %s", job.ID, payload.PullRequest, payload.ReviewPart, payload.HeadSHA, opts.pr, opts.part, head)
 	}
-	switch "succeeded" { // MUTANT M1: state never checked
+	switch workflow.JobSucceeded { // MUTANT M1: state never checked
 	case workflow.JobSucceeded, workflow.JobFailed, workflow.JobCancelled:
 	case workflow.JobBlocked:
 		if strings.TrimSpace(payload.BlockerRetryAt) != "" {
