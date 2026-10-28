@@ -694,9 +694,10 @@ The same capture also feeds the `$`-denominated
 The accepted-field roster is derived from the contract struct, so a
 `gitmoot_result` carrying a field that no longer exists fails validation with
 `unsupported gitmoot_result field "<name>"`. The agent then gets a repair turn
-naming the field and carrying its complete previous response (up to 128 KiB;
-longer responses are visibly cut and the agent is told to reproduce its previous
-turn in full), and must return the same result without it. If no repair attempt
+naming the field and carrying its complete previous response (up to 96 KiB, so
+the whole prompt fits in one command-line argument; a longer response is visibly
+cut and the agent is told to return one complete result that keeps every item,
+shortening wording if needed), and must return the same result without it. If no repair attempt
 validates, the job fails. This is deliberate: the roster is what catches a typo
 or an invented field before it becomes a silent no-op.
 

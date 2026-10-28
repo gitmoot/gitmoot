@@ -699,7 +699,7 @@ Fixes:
 - Keep `summary` non-empty.
 - Use only contract fields; an extra top-level key such as `head_sha` is
   rejected and sent back for repair. The repair turn carries the whole previous
-  response (up to 128 KiB), so the agent can return it unchanged except for the
+  response (up to 96 KiB), so the agent can return it unchanged except for the
   key.
 
 Gitmoot already retries this for you: output missing the `gitmoot_result`
