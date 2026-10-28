@@ -157,3 +157,31 @@ func TestChecksRoutedReviewCapWaitIsBounded(t *testing.T) {
 		t.Fatalf("expired wait has no clear failure reason: %+v", events)
 	}
 }
+
+// #2439: a remote review that was NOT checks-routed (an agent or dispatch that
+// runs reviews remotely, e.g. a repository whose reviews must not run on the
+// host) also waits on a full cap instead of failing with a PR comment for a
+// review that never ran.
+func TestExplicitRemoteReviewWaitsForFullCap(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	f.backend.provisionErr = &db.ExecBackendCapRefusal{Clause: "concurrency", LiveCount: 4, MaxConcurrent: 4}
+	f.run(t)
+	waiting, err := f.store.GetJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waiting.State != string(workflow.JobQueued) || !queuedJobBlockerHeld(waiting, time.Now()) {
+		t.Fatalf("cap-full remote review state = %s (held=%v); want queued and held", waiting.State, queuedJobBlockerHeld(waiting, time.Now()))
+	}
+	// An unconfigured cap never frees, so it still fails at once.
+	g := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	g.backend.provisionErr = &db.ExecBackendCapRefusal{Clause: "unconfigured"}
+	g.run(t)
+	failed, err := g.store.GetJob(g.ctx, g.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.State != string(workflow.JobFailed) {
+		t.Fatalf("unconfigured-cap review state = %s; want failed", failed.State)
+	}
+}

@@ -15,10 +15,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// A review its repository's checks_backend routed remote (#2316) has nowhere
-// else to run, and a sandboxd review is bounded by the gateway's finite
-// capacity (sandboxd #30), so for both a full provider cap makes the review
-// WAIT instead of failing it the way every other remote job fails. The wait reuses the scheduler: the job goes
+// A full provider cap is a transient capacity condition, not a verdict on the
+// review: a remote review that hits it WAITS instead of failing (#2316 for
+// checks-routed reviews, sandboxd #30, and #2439 for every other admitted remote
+// review, e.g. a repository whose reviews must not run on the host). Failing it
+// posted a PR comment for a review that never ran and left the requester to
+// re-dispatch by hand. The wait reuses the scheduler: the job goes
 // back to queued with payload.blocker_retry_at set, which listPendingQueuedJobs
 // already skips until it passes, and the next tick after that retries the
 // reservation. Nothing polls in between.
@@ -37,11 +39,11 @@ const remoteReviewCapWaitDefaultBound = time.Hour
 
 var remoteReviewCapWaitNow = func() time.Time { return time.Now().UTC() }
 
-// waitForRemoteReviewCapacity is called when provisioning a remote review
-// failed. If the cause is a full provider cap (or, for sandboxd, no reported
-// capacity or a create refused with 409) and the review is checks-routed or
-// runs on sandboxd, it returns the admitted (running) job to the queue held
-// until the next retry and reports requeued=true. The wait is bounded by bound, measured from the
+// waitForRemoteReviewCapacity is called when provisioning an admitted remote
+// review failed. If the cause is a full provider cap (or, for sandboxd, no
+// reported capacity or a create refused with 409), it returns the admitted
+// (running) job to the queue held until the next retry and reports
+// requeued=true. The wait is bounded by bound, measured from the
 // first refusal: past it, expired carries the failure the caller records
 // instead of cause. Any other cause, or a lost compare-and-set, returns
 // neither, and the caller fails the job as before.
@@ -55,9 +57,7 @@ func (w jobWorker) waitForRemoteReviewCapacity(ctx context.Context, job db.Job, 
 		return false, nil
 	}
 	payload, err := daemonJobPayload(latest)
-	// Every sandboxd job is a review: --exec-provider and checks routing are
-	// its only writers, and both are review-only.
-	if err != nil || (!payload.ReviewChecksRouted && !sandboxd) {
+	if err != nil {
 		return false, nil
 	}
 	if bound <= 0 {

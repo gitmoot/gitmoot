@@ -199,7 +199,9 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
   `remote_review_cap_admitted` records how long it waited. The wait is bounded
   by the job timeout (one hour when none is resolved); past it the job fails
   with the cap refusal as its reason. An unconfigured cap fails immediately,
-  because it never frees. Every sandboxd review, routed here or not, waits the
+  because it never frees. Since #2439 this holds for every admitted remote
+  review, checks-routed or not (for example an E2B review dispatched with
+  `--exec-backend remote`). Every sandboxd review, routed here or not, waits the
   same way on a full cap, a `capacity` refusal or a sandboxd create 409; a
   cloud E2B 409 is unchanged.
 - A remote review that declares `executed` evidence while its `tests_run`
