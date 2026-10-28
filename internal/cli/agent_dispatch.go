@@ -1162,6 +1162,30 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		return localAgentJobOutput{}, err
 	}
+	// #2409: once the row exists, a FOREGROUND caller owns its delivery. Any error
+	// before RunJob takes the job out of queued (event bookkeeping, managed config,
+	// session lock, tool cache, adapter or read-only seat preflight such as the omp
+	// auth broker) must not leave a claimable job: the daemon would run it in the
+	// background, outside the foreground contract and resource scope the caller
+	// chose. The transition is from queued only, so a job RunJob already claimed,
+	// or the busy-ask path that cancels its own job, is untouched; a busy REVIEW
+	// returns no error and stays queued on purpose. It is deferred twice: here, so
+	// every return after enqueue is covered, and again once the runtime session
+	// lock is held, so (defers run last-in first-out) the job is settled BEFORE
+	// the lock is released and can never sit unlocked and queued for a daemon pass.
+	foregroundSettled := false
+	settleForegroundPreDeliveryFailure := func() {
+		if request.Background || err == nil || foregroundSettled {
+			return
+		}
+		foregroundSettled = true
+		_, _ = store.TransitionJobStateWithEvent(context.WithoutCancel(ctx), job.ID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "foreground_predelivery_failed",
+			Message: "foreground dispatch failed before delivery; the job is settled so the daemon will not run it: " + err.Error(),
+		})
+	}
+	defer settleForegroundPreDeliveryFailure()
 	releaseLifecycle()
 	lifecycleReleased = true
 	if foregroundContract != nil && foregroundContract.State == runtime.RuntimeContractUnknown {
@@ -1269,6 +1293,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}()
 	stopRuntimeLockHeartbeat := startRuntimeSessionLockHeartbeat(ctx, store, lockKey, ownerToken, lockTTL)
 	defer stopRuntimeLockHeartbeat()
+	defer settleForegroundPreDeliveryFailure()
 	// Thread the owner token so a foreground run's terminal cleanup (RunJob ->
 	// AdvanceJob, which fires while this lock is still held) recognizes its own lock
 	// and does not refuse the healthy-path cleanup as a foreign live owner (#536).
