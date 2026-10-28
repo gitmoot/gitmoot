@@ -51,10 +51,11 @@ type eventRuleSink struct {
 	released atomic.Bool
 }
 
-// storeReleased prevents a cached sink from using a closed producer store.
 // wakeTargetUnresolvedKind records that a review verdict's owner could not be
 // resolved because the lookup failed (#2367); distinct from wake_target_unowned.
 const wakeTargetUnresolvedKind = "wake_target_unresolved"
+
+// storeReleased prevents a cached sink from using a closed producer store.
 
 func (s *eventRuleSink) storeReleased() bool {
 	return s != nil && s.released.Load()
