@@ -336,7 +336,10 @@ sandbox, so the attempt settles to `destroyed` with an
 `execbackend_destroy_confirmed` job event and frees its cap slot. A per-ID 404
 never settles it (E2B returns that for an inaccessible live sandbox too), and a
 failed inventory keeps the slot. A provider with a complete inventory settles
-on absence alone. A partially-created non-empty directory that Git never registered remains the
+on absence alone. The same timeout rule settles a `provisioning`, `running` or
+`collecting` attempt whose teardown never started (#2365), with an
+`execbackend_expired_attempt_settled` event, but only when its job is already
+final; a running job or a missing job row keeps the slot. A partially-created non-empty directory that Git never registered remains the
 known orphaned-but-present cleanup limitation tracked in #1572.
 
 ## Proving a Parallel Local Wave

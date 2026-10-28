@@ -349,7 +349,11 @@ E2B inventory entries never prove deletion or release cost reservations on their
 own; a `destroying` attempt absent from a successful inventory settles to
 `destroyed` (event `execbackend_destroy_confirmed`, cap slot freed) only once it
 is past `ttl_expires_at` plus a 15-minute grace, when E2B's own timeout has
-killed the sandbox. A per-ID 404 never settles it.
+killed the sandbox. A per-ID 404 never settles it. The same timeout rule
+settles a `provisioning`, `running` or `collecting` attempt whose teardown never
+started (event `execbackend_expired_attempt_settled`), but only when its job is
+already final (`succeeded`, `failed`, `cancelled`, ...); a running job or a
+missing job row keeps the reservation.
 
 Remote review admission runs after exact-head checkout binding and before cost
 reservation or provider calls. It re-reads the PR head; deduplicates
