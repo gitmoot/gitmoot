@@ -30,19 +30,29 @@ func startRuntimeCollectionLoop(ctx context.Context, paths config.Paths, stdout 
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
-				report, err := toolchain.CollectRuntimes(paths.Home, toolchain.RuntimeCollectOptions{MinIdle: toolchain.DefaultRuntimeMinIdle, Now: now})
-				if err != nil {
-					writeLine(stdout, "runtime collection failed: %v", err)
-				}
-				if report.Incomplete != "" {
-					writeLine(stdout, "runtime collection kept every copy: %s", report.Incomplete)
-				}
-				if len(report.Removed) > 0 {
-					writeLine(stdout, "runtime collection removed %d idle copies (%d bytes)", len(report.Removed), report.RemovedBytes)
-				}
+				runRuntimeCollectionPass(paths, now, stdout)
 			}
 		}
 	}()
+}
+
+// runtimeCollectionProcRoot is the procfs root both collection paths scan; empty
+// means /proc. Tests point it at a synthetic process table.
+var runtimeCollectionProcRoot = ""
+
+// runRuntimeCollectionPass is one daemon collection pass: errors and an
+// incomplete process scan are logged, never fatal.
+func runRuntimeCollectionPass(paths config.Paths, now time.Time, stdout io.Writer) {
+	report, err := toolchain.CollectRuntimes(paths.Home, toolchain.RuntimeCollectOptions{MinIdle: toolchain.DefaultRuntimeMinIdle, Now: now, ProcRoot: runtimeCollectionProcRoot})
+	if err != nil {
+		writeLine(stdout, "runtime collection failed: %v", err)
+	}
+	if report.Incomplete != "" {
+		writeLine(stdout, "runtime collection kept every copy: %s", report.Incomplete)
+	}
+	if len(report.Removed) > 0 {
+		writeLine(stdout, "runtime collection removed %d idle copies (%d bytes)", len(report.Removed), report.RemovedBytes)
+	}
 }
 
 func runRuntimePrune(args []string, stdout, stderr io.Writer) int {
@@ -71,7 +81,7 @@ func runRuntimePrune(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "runtime prune: %v\n", err)
 		return 1
 	}
-	report, err := toolchain.CollectRuntimes(paths.Home, toolchain.RuntimeCollectOptions{MinIdle: *minIdle, DryRun: *dryRun})
+	report, err := toolchain.CollectRuntimes(paths.Home, toolchain.RuntimeCollectOptions{MinIdle: *minIdle, DryRun: *dryRun, ProcRoot: runtimeCollectionProcRoot})
 	if *jsonOutput {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")

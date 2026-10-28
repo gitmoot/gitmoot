@@ -59,6 +59,9 @@ func fakeProcess(t *testing.T, procRoot, pid, exe string) {
 	if err := os.WriteFile(filepath.Join(dir, "maps"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "environ"), []byte("PATH=/usr/bin:/bin\x00"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func names(copies []RuntimeCopy) string {
@@ -316,5 +319,106 @@ func TestCollectRuntimesDryRunLeavesTrashWhenNothingIsIdle(t *testing.T) {
 	}
 	if _, err := os.Stat(trash); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("real pass left the trash entry: %v", err)
+	}
+}
+
+// #2404: a long-lived shell whose ONLY reference to a copy is a PATH entry keeps
+// that copy; the same process without the entry does not.
+func TestCollectRuntimesKeepsACopyThatOnlyAShellPATHReferences(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	launcher, _, err := StageRuntime(home, "pathonly", writeRuntimeTool(t, "pathonly"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := publishedRoot(t, launcher)
+	ageRuntimeStamp(t, home, published, now.Add(-10*24*time.Hour))
+	options := RuntimeCollectOptions{MinIdle: 7 * 24 * time.Hour, Now: now, DryRun: true}
+
+	options.ProcRoot = emptyProc(t)
+	fakeProcess(t, options.ProcRoot, "77", "/bin/sh")
+	control, err := CollectRuntimes(home, options)
+	if err != nil || names(control.Removed) != filepath.Base(published) {
+		t.Fatalf("control (no PATH entry) = %+v %v, want the idle copy removable", control, err)
+	}
+
+	options.ProcRoot = emptyProc(t)
+	fakeProcess(t, options.ProcRoot, "77", "/bin/sh")
+	environ := "HOME=/root\x00PATH=/usr/bin:" + filepath.Dir(launcher) + "/:/bin\x00"
+	if err := os.WriteFile(filepath.Join(options.ProcRoot, "77", "environ"), []byte(environ), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := CollectRuntimes(home, options)
+	if err != nil || len(report.Removed) != 0 {
+		t.Fatalf("PATH-referenced copy = %+v %v, want kept", report, err)
+	}
+}
+
+// #2404: an unreadable environ (as for another user's process when not root) is an
+// incomplete scan, so every copy is kept.
+func TestCollectRuntimesKeepsAllWhenEnvironIsUnreadable(t *testing.T) {
+	home := t.TempDir()
+	now := time.Now()
+	launcher, _, err := StageRuntime(home, "noenv", writeRuntimeTool(t, "noenv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ageRuntimeStamp(t, home, publishedRoot(t, launcher), now.Add(-10*24*time.Hour))
+	proc := emptyProc(t)
+	fakeProcess(t, proc, "78", "/bin/sh")
+	environ := filepath.Join(proc, "78", "environ")
+	if err := os.Remove(environ); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(environ, 0o700); err != nil { // reading a directory fails with EISDIR
+		t.Fatal(err)
+	}
+	report, err := CollectRuntimes(home, RuntimeCollectOptions{MinIdle: 7 * 24 * time.Hour, Now: now, ProcRoot: proc})
+	if err != nil || report.Incomplete == "" || len(report.Removed) != 0 {
+		t.Fatalf("report = %+v %v, want Incomplete and nothing removed", report, err)
+	}
+}
+
+// #2404: a copy that fails validation is not re-stamped, so it still ages out.
+func TestStageRuntimeDoesNotRefreshTheStampOfACorruptCopy(t *testing.T) {
+	home := t.TempDir()
+	source := writeRuntimeTool(t, "corrupt")
+	launcher, _, err := StageRuntime(home, "corrupt", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := publishedRoot(t, launcher)
+	aged := time.Now().Add(-10 * 24 * time.Hour).Truncate(time.Second)
+	ageRuntimeStamp(t, home, published, aged)
+	if err := os.Remove(launcher); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := StageRuntime(home, "corrupt", source); !errors.Is(err, ErrRuntimeNotStageable) {
+		t.Fatalf("restage of a corrupt copy = %v, want ErrRuntimeNotStageable", err)
+	}
+	info, err := os.Stat(filepath.Join(RuntimeRoot(home), runtimeLastUsedDir, filepath.Base(published)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(aged) {
+		t.Fatalf("corrupt copy was re-stamped: %v, want %v", info.ModTime(), aged)
+	}
+}
+
+// #2404: the collector skips any ".staging-" directory as an in-flight publish, so
+// a runtime with such a name could never age out; staging refuses it.
+func TestStageRuntimeRefusesNamesTheCollectorWouldSkip(t *testing.T) {
+	home := t.TempDir()
+	source := writeRuntimeTool(t, "staged")
+	for _, name := range []string{"tool.staging-1", ".hidden"} {
+		if _, _, err := StageRuntime(home, name, source); !errors.Is(err, ErrRuntimeNotStageable) {
+			t.Fatalf("StageRuntime(%q) = %v, want ErrRuntimeNotStageable", name, err)
+		}
+		if _, err := StageUnavailableRuntime(home, name); !errors.Is(err, ErrRuntimeNotStageable) {
+			t.Fatalf("StageUnavailableRuntime(%q) = %v, want ErrRuntimeNotStageable", name, err)
+		}
+	}
+	if _, _, err := StageRuntime(home, "tool.v2", source); err != nil {
+		t.Fatalf("an ordinary dotted name was refused: %v", err)
 	}
 }

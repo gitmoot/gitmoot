@@ -325,7 +325,10 @@ func treeBytes(path string) int64 {
 }
 
 // runtimeCopiesReferencedByProcesses reports which of copies a live process
-// references through /proc/<pid>/{exe,cwd,cmdline,maps}. A process that exits
+// references through /proc/<pid>/{exe,cwd,cmdline,environ,maps}. environ
+// matters for a long-lived shell whose only reference is a PATH entry such as
+// <copy>/.bin (#2404): every absolute element of every colon-separated value
+// counts. A process that exits
 // mid-scan is skipped; any other read failure makes the whole scan fail, so
 // the caller keeps every copy rather than guessing.
 func runtimeCopiesReferencedByProcesses(procRoot string, copies []string) (map[string]bool, error) {
@@ -371,6 +374,24 @@ func runtimeCopiesReferencedByProcesses(procRoot string, copies []string) (map[s
 		for _, arg := range strings.Split(string(cmdline), "\x00") {
 			if filepath.IsAbs(arg) {
 				match(arg)
+			}
+		}
+		environ, err := os.ReadFile(filepath.Join(dir, "environ"))
+		if err != nil {
+			if gone(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read %s/environ: %w", dir, err)
+		}
+		for _, variable := range strings.Split(string(environ), "\x00") {
+			_, value, ok := strings.Cut(variable, "=")
+			if !ok {
+				continue
+			}
+			for _, element := range strings.Split(value, ":") {
+				if filepath.IsAbs(element) {
+					match(filepath.Clean(element))
+				}
 			}
 		}
 		maps, err := os.ReadFile(filepath.Join(dir, "maps"))
