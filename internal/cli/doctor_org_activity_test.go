@@ -178,3 +178,22 @@ func appendOrgActivityTestConfig(t *testing.T, paths config.Paths) {
 		t.Fatal(err)
 	}
 }
+
+// #2367: an org registry that cannot be loaded must not make the unowned-repos
+// check vanish as if there were no org; it reports ownership as unverified.
+func TestOrgUnownedReposDoctorCheckReportsAnUnreadableRegistry(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org]\nenforce = maybe\n[org.roles.\"owner\"]\nscope = [\"*\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadOrg(paths); err == nil {
+		t.Fatal("fixture must be an unloadable org registry")
+	}
+	check, ok := orgUnownedReposDoctorCheck(paths)
+	if !ok || check.Name != orgUnownedReposDoctorCheckName || !strings.Contains(check.Detail, "repo ownership unverified") {
+		t.Fatalf("check = %+v ok=%v, want an unverified warning", check, ok)
+	}
+}

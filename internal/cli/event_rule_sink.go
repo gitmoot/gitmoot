@@ -379,7 +379,16 @@ func (s *eventRuleSink) addressUnownedVerdictEvent(ctx context.Context, event ev
 		return event
 	}
 	prOwner, err := s.store.ResolvePullRequestOwner(ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID)
-	if err != nil || workflow.NormalizeActingOrgRole(prOwner) != "" {
+	if err != nil {
+		// Not guessed and not silent (#2367): a transient lookup failure leaves
+		// the verdict unaddressed, so the job says so, as a blocked notice does.
+		if recordErr := s.store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: blockedEventUnownedKind,
+			Message: fmt.Sprintf("review verdict not addressed: resolving the pull request owner failed: %v", err)}); recordErr != nil {
+			slog.Warn("unaddressed verdict record failed", "job_id", job.ID, "error", recordErr)
+		}
+		return event
+	}
+	if workflow.NormalizeActingOrgRole(prOwner) != "" {
 		return event
 	}
 	cfg, ok := s.loadOrgConfig()

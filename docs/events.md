@@ -169,8 +169,12 @@ A role-less blocked event is addressed to the repo's single owner (most
 specific live scope match, deeper chart position breaking a tie). When roles
 remain tied, or none matches, the event carries no target role, so only
 observer rules receive it, and the blocked job records one
-`wake_target_unowned` event naming the tied roles (#2363). A review verdict with
-no requester, lead, or PR owner uses the same single-owner rule.
+`wake_target_unowned` event (#2363): with a tie it names the tied roles; with no
+match it names the repo and says no role scopes it. The event is recorded once
+per job, so its text describes the first such notice. A review verdict with no
+requester, lead, or PR owner uses the same single-owner rule; if resolving the
+PR owner fails, the job records `wake_target_unowned` saying the verdict was not
+addressed, instead of guessing (#2367).
 Durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching rules for the event's own kind, wake-role equality with the
 addressed target is the only routing condition. An observer-scoped rule is
