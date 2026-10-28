@@ -2915,10 +2915,19 @@ sum(bucket_ms)           == covered_ms + overlap_ms
 - `attempt` — the job's lifecycle generation, because `job retry` re-delivers
   the same job id.
 - `coverage` — **read this before the buckets.** `decomposed` means the runtime
-  emits per-tool events (Codex, Kimi). `opaque_runtime` means it does not:
+  emits per-tool events (Codex, Kimi, omp). `opaque_runtime` means it does not:
   Claude reports one final envelope and no tool events, so an opaque row has
   zero commands however long the job took. That is a blind spot, not a
   measurement that the job spent its time outside commands.
+- `trace` — `traced` once the runtime's tool stream was actually read, so
+  `commands` 0 then means no command ran; `not_traced` otherwise (#2371).
+
+A review that ran shell commands also records one `review_command_trace` event:
+each command (redacted, at most 300 bytes), its exit code, status, start/end
+time and a redacted output tail of at most 400 bytes, for at most 120 commands
+(later ones are counted in `omitted`), plus `sandboxes`: the execution-backend
+attempts (provider, sandbox id) of that job generation, so a remote review's
+commands are tied to the sandbox they ran in.
 
 **The grammar is an ACCEPTOR with per-character provenance.** A command is
 classified only if every token positively matches the declared shapes:

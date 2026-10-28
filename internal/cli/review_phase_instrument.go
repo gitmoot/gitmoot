@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -57,7 +58,7 @@ const (
 // events at all. Anything else is opaque and is reported as such.
 func runtimeEmitsToolEvents(runtimeName string) bool {
 	switch strings.ToLower(strings.TrimSpace(runtimeName)) {
-	case "codex", "kimi":
+	case "codex", "kimi", "omp":
 		return true
 	default:
 		return false
@@ -1185,7 +1186,12 @@ func classifyCommandSegment(segment string, depth int) string {
 // silently absorbed 24ms of a measured 76ms run and made the documented
 // partition false exactly when overlap occurred.
 type phaseProfile struct {
-	Coverage   string `json:"coverage"`
+	Coverage string `json:"coverage"`
+	// Trace says whether the runtime's stream was actually read (#2371):
+	// "traced" once a decoding translator recognised at least one stream event,
+	// so commands=0 means no command ran; "not_traced" otherwise, so commands=0
+	// means nothing is known, never "nothing ran".
+	Trace      string `json:"trace"`
 	Runtime    string `json:"runtime"`
 	Attempt    int64  `json:"attempt"`
 	WallMS     int64  `json:"wall_ms"`
@@ -1219,6 +1225,49 @@ type pendingCommand struct {
 	command string
 	tool    string
 	started time.Time
+}
+
+// reviewCommandTraceEventKind carries the bounded per-command trace of a review
+// attempt (#2371): which shell commands ran, their exit codes, and the sandbox
+// they ran in.
+const reviewCommandTraceEventKind = "review_command_trace"
+
+// Bounds on the trace so a long run cannot fill the store: at most
+// commandTraceMaxEntries commands are listed (later ones are only counted), and
+// each keeps a capped command text and a redacted, capped output tail.
+const (
+	commandTraceMaxEntries      = 120
+	commandTraceMaxCommandBytes = 300
+	commandTraceMaxTailBytes    = 400
+)
+
+type commandTraceEntry struct {
+	Tool       string `json:"tool"`
+	Command    string `json:"command"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	Status     string `json:"status"`
+	StartedAt  string `json:"started_at"`
+	EndedAt    string `json:"ended_at,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+	OutputTail string `json:"output_tail,omitempty"`
+}
+
+type commandTraceSandbox struct {
+	Provider  string `json:"provider"`
+	SandboxID string `json:"sandbox_id"`
+	Attempt   int    `json:"attempt"`
+	State     string `json:"state"`
+}
+
+type commandTrace struct {
+	Runtime string `json:"runtime"`
+	// LifecycleGeneration is the job generation this trace belongs to (the
+	// phase profile's "attempt"); Sandboxes are the execution-backend attempts
+	// of that generation, empty for a local run.
+	LifecycleGeneration int64                 `json:"lifecycle_generation"`
+	Sandboxes           []commandTraceSandbox `json:"sandboxes"`
+	Commands            []commandTraceEntry   `json:"commands"`
+	Omitted             int                   `json:"omitted"`
 }
 
 type commandInterval struct {
@@ -1259,6 +1308,9 @@ type retainedTranscript struct {
 	bucketNS     map[string]int64
 	bucketCount  map[string]int
 	commands     int
+	recognized   int
+	trace        []commandTraceEntry
+	traceOmitted int
 	unpaired     int
 	toolEvents   int
 	inFlight     int
@@ -1386,6 +1438,9 @@ func (r *retainedTranscript) observe(p []byte) {
 
 func (r *retainedTranscript) consume(events []transcript.Event) {
 	for _, event := range events {
+		if event.Kind != transcript.KindRaw {
+			r.recognized++
+		}
 		switch event.Kind {
 		case transcript.KindToolCall:
 			if !isShellToolName(event.Name) {
@@ -1449,8 +1504,55 @@ func (r *retainedTranscript) consume(events []transcript.Event) {
 			r.bucketCount[bucket]++
 			r.intervals = append(r.intervals, commandInterval{start: call.started, end: end})
 			r.commands++
+			r.recordTrace(call, &end, event.Status, event.ExitCode, event.OutputDigest)
 		}
 	}
+}
+
+// recordTrace appends one bounded trace entry; past commandTraceMaxEntries the
+// command is only counted, so a long run's trace event stays bounded.
+func (r *retainedTranscript) recordTrace(call pendingCommand, end *time.Time, status string, exitCode *int, output string) {
+	if len(r.trace) >= commandTraceMaxEntries {
+		r.traceOmitted++
+		return
+	}
+	entry := commandTraceEntry{
+		Tool:      call.tool,
+		Command:   truncateUTF8(workflow.RedactCommentText(call.command), commandTraceMaxCommandBytes),
+		ExitCode:  exitCode,
+		Status:    status,
+		StartedAt: call.started.UTC().Format(time.RFC3339Nano),
+	}
+	if end != nil {
+		entry.EndedAt = end.UTC().Format(time.RFC3339Nano)
+		entry.DurationMS = end.Sub(call.started).Milliseconds()
+	}
+	if tail := workflow.RedactedStderrTail(output); tail != "" {
+		entry.OutputTail = tailUTF8(tail, commandTraceMaxTailBytes)
+	}
+	r.trace = append(r.trace, entry)
+}
+
+func truncateUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
+func tailUTF8(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	start := len(s) - limit
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
+	}
+	return "…" + s[start:]
 }
 
 // Close flushes the translator, emits one bounded profile row, and closes the
@@ -1516,6 +1618,7 @@ func (r *retainedTranscript) closeInFlight(now time.Time) {
 		r.intervals = append(r.intervals, commandInterval{start: call.started, end: now})
 		r.commands++
 		r.inFlight++
+		r.recordTrace(call, nil, "in_flight", nil, "")
 	}
 }
 
@@ -1545,8 +1648,13 @@ func (r *retainedTranscript) emit() {
 	if !runtimeEmitsToolEvents(r.runtime) {
 		coverage = phaseCoverageOpaque
 	}
+	trace := "not_traced"
+	if coverage == phaseCoverageDecomposed && r.recognized > 0 {
+		trace = "traced"
+	}
 	profile := phaseProfile{
 		Coverage:     coverage,
+		Trace:        trace,
 		Runtime:      strings.TrimSpace(r.runtime),
 		Attempt:      r.attempt,
 		WallMS:       wall,
@@ -1573,6 +1681,31 @@ func (r *retainedTranscript) emit() {
 		Kind:    phaseProfileEventKind,
 		Message: string(encoded),
 	})
+	r.emitCommandTrace()
+}
+
+// emitCommandTrace records the bounded per-command trace (#2371), tied to the
+// execution-backend attempts (sandboxes) of this job generation. Written only
+// when at least one command was seen, so runs without a tool stream add no row.
+func (r *retainedTranscript) emitCommandTrace() {
+	if len(r.trace) == 0 && r.traceOmitted == 0 {
+		return
+	}
+	ctx := context.Background()
+	trace := commandTrace{Runtime: strings.TrimSpace(r.runtime), LifecycleGeneration: r.attempt, Sandboxes: []commandTraceSandbox{}, Commands: r.trace, Omitted: r.traceOmitted}
+	if attempts, err := r.store.ListExecBackendAttemptsForJob(ctx, r.jobID); err == nil {
+		for _, attempt := range attempts {
+			if attempt.LifecycleGeneration != r.attempt || attempt.SandboxID == nil {
+				continue
+			}
+			trace.Sandboxes = append(trace.Sandboxes, commandTraceSandbox{Provider: attempt.Provider, SandboxID: *attempt.SandboxID, Attempt: attempt.Attempt, State: attempt.State})
+		}
+	}
+	encoded, err := json.Marshal(trace)
+	if err != nil {
+		return
+	}
+	_ = r.store.AddJobEvent(ctx, db.JobEvent{JobID: r.jobID, Kind: reviewCommandTraceEventKind, Message: string(encoded)})
 }
 
 // phaseProfileMilliseconds converts the nanosecond accounting into the emitted
