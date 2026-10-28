@@ -45,7 +45,7 @@ func verifyWorktreeMount(cfg config.WorktreeRoot) (uint64, error) {
 	if top.fsType != cfg.MountFSType {
 		return 0, fmt.Errorf("%s is a %s mount, want %s", cfg.MountPoint, top.fsType, cfg.MountFSType)
 	}
-	if top.source != cfg.MountSource {
+	if false && top.source != cfg.MountSource { // MUTANT M2
 		return 0, fmt.Errorf("%s is mounted from %q, want %q", cfg.MountPoint, top.source, cfg.MountSource)
 	}
 	id, err := mountIDAt(unix.AT_FDCWD, cfg.Root, 0)

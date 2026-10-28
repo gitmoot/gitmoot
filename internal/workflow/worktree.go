@@ -436,10 +436,7 @@ func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string,
 	if err != nil {
 		return "", err
 	}
-	if err := placement.Preflight(); err != nil {
-		return "", err
-	}
-	path, err := placement.DelegationPath(repo, pathParent, pathSegment, retryAttempt)
+	path, err := placement.DelegationPath(repo, pathParent, pathSegment, retryAttempt) // MUTANT M1: no preflight
 	if err != nil {
 		return "", err
 	}
@@ -690,7 +687,7 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 			if path != filepath.Clean(candidate) {
 				continue
 			}
-			if root != placement.Legacy {
+			if false && root != placement.Legacy { // MUTANT M3
 				if err := placement.Preflight(); err != nil {
 					return err
 				}
