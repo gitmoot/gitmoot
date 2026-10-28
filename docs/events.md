@@ -173,8 +173,9 @@ observer rules receive it, and the blocked job records one
 match it names the repo and says no role scopes it. The event is recorded once
 per job, so its text describes the first such notice. A review verdict with no
 requester, lead, or PR owner uses the same single-owner rule; if resolving the
-PR owner fails, the job records `wake_target_unowned` saying the verdict was not
-addressed, instead of guessing (#2367).
+PR owner fails, the job records `wake_target_unresolved` saying the verdict was
+not addressed, instead of guessing (#2367); it is a separate kind so it never
+hides a later `wake_target_unowned`.
 Durable-outbox claim authorization is scope-blind: among enabled,
 filter-matching rules for the event's own kind, wake-role equality with the
 addressed target is the only routing condition. An observer-scoped rule is

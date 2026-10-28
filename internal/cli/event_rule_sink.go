@@ -52,6 +52,10 @@ type eventRuleSink struct {
 }
 
 // storeReleased prevents a cached sink from using a closed producer store.
+// wakeTargetUnresolvedKind records that a review verdict's owner could not be
+// resolved because the lookup failed (#2367); distinct from wake_target_unowned.
+const wakeTargetUnresolvedKind = "wake_target_unresolved"
+
 func (s *eventRuleSink) storeReleased() bool {
 	return s != nil && s.released.Load()
 }
@@ -381,8 +385,10 @@ func (s *eventRuleSink) addressUnownedVerdictEvent(ctx context.Context, event ev
 	prOwner, err := s.store.ResolvePullRequestOwner(ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID)
 	if err != nil {
 		// Not guessed and not silent (#2367): a transient lookup failure leaves
-		// the verdict unaddressed, so the job says so, as a blocked notice does.
-		if recordErr := s.store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: blockedEventUnownedKind,
+		// the verdict unaddressed, so the job says so. It has its OWN kind:
+		// sharing wake_target_unowned would let this first, transient record
+		// suppress (once-per-job dedup) a later genuine unowned notice.
+		if recordErr := s.store.AddJobEventIfAbsent(ctx, db.JobEvent{JobID: job.ID, Kind: wakeTargetUnresolvedKind,
 			Message: fmt.Sprintf("review verdict not addressed: resolving the pull request owner failed: %v", err)}); recordErr != nil {
 			slog.Warn("unaddressed verdict record failed", "job_id", job.ID, "error", recordErr)
 		}
