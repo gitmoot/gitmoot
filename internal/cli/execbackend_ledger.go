@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/execbackend/e2b"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 const e2bAttemptProvider = "e2b"
@@ -408,6 +410,12 @@ func (b *ledgeredExecutionBackend) reconcileInventory(ctx context.Context, repor
 				}
 				continue
 			}
+			if !report.InventoryComplete && execBackendAttemptStateLive(attempt.State) {
+				if settleErr := b.settleExpiredAbandonedAttempt(persistCtx, attempt, id); settleErr != nil {
+					reconcileErrs = append(reconcileErrs, settleErr)
+				}
+				continue
+			}
 			if report.InventoryComplete {
 				if changed, markErr := b.store.MarkExecBackendAttemptOrphaned(persistCtx, key); markErr != nil || !changed {
 					reconcileErrs = append(reconcileErrs, errors.Join(fmt.Errorf("mark execution backend attempt %+v orphaned", key), markErr))
@@ -464,6 +472,70 @@ func (b *ledgeredExecutionBackend) settleUnobservedTeardown(ctx context.Context,
 	writeLine(b.stdout, "execution backend recovery: %s", message)
 	if err := b.store.AddJobEvent(ctx, db.JobEvent{JobID: key.JobID, Kind: "execbackend_destroy_confirmed", Message: message}); err != nil {
 		return fmt.Errorf("record confirmed teardown of execution backend attempt %+v: %w", key, err)
+	}
+	return nil
+}
+
+func execBackendAttemptStateLive(state string) bool {
+	switch state {
+	case db.ExecBackendAttemptStateProvisioning, db.ExecBackendAttemptStateRunning, db.ExecBackendAttemptStateCollecting:
+		return true
+	}
+	return false
+}
+
+// settleExpiredAbandonedAttempt releases a provisioning/running/collecting
+// attempt whose teardown never started (#2365): e.g. a daemon restart or a
+// failure path that settled the JOB but never reached Destroy, so the row
+// stayed `running` - a billing state - and held a cost/concurrency cap slot
+// forever. E2B's list is never complete, so the only proof of absence is the
+// provider's own timeout, exactly as for an unobserved teardown (#2282).
+//
+// Three conditions, all required: the sandbox is absent from the provider list
+// (checked by the caller); the attempt is past ttl_expires_at plus the
+// provider's enforcement grace, so the provider has killed it; and the owning
+// job exists and is final, so nothing will use or tear down this sandbox. A
+// running job, a missing job row or an unparseable TTL keeps the reservation.
+// The write is keyed to the exact (job, generation, attempt), so a live
+// re-provision of the same job is never touched. A per-ID 404 is not consulted.
+func (b *ledgeredExecutionBackend) settleExpiredAbandonedAttempt(ctx context.Context, attempt *db.ExecBackendAttempt, sandboxID string) error {
+	key := attempt.ExecBackendAttemptKey
+	enforcer, ok := b.inner.(execbackend.ProviderTTLEnforcer)
+	if !ok {
+		return nil
+	}
+	ttlExpiresAt, err := time.Parse(time.RFC3339Nano, attempt.TTLExpiresAt)
+	if err != nil {
+		return fmt.Errorf("parse ttl_expires_at of execution backend attempt %+v: %w", key, err)
+	}
+	killedBy := ttlExpiresAt.Add(enforcer.ProviderTTLGrace())
+	if !b.now().After(killedBy) {
+		return nil
+	}
+	job, err := b.store.GetJob(ctx, key.JobID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("read owner of execution backend attempt %+v: %w", key, err)
+	}
+	if !workflow.IsFinalJobState(job.State) {
+		return nil
+	}
+	changed, err := b.store.MarkExecBackendAttemptReconciledDestroyed(ctx, key, nil)
+	if err != nil || !changed {
+		return errors.Join(fmt.Errorf("settle expired execution backend attempt %+v", key), err)
+	}
+	b.mu.Lock()
+	if b.attempt[sandboxID] == key {
+		delete(b.attempt, sandboxID)
+	}
+	b.mu.Unlock()
+	message := fmt.Sprintf("execution backend sandbox %s (generation %d, attempt %d) settled destroyed: attempt was %s with job %s %s, absent from provider inventory and past its provider-enforced timeout (ttl_expires_at %s + %s grace); its cost reservation is released",
+		sandboxID, key.LifecycleGeneration, key.Attempt, attempt.State, key.JobID, job.State, ttlExpiresAt.UTC().Format(time.RFC3339), enforcer.ProviderTTLGrace())
+	writeLine(b.stdout, "execution backend recovery: %s", message)
+	if err := b.store.AddJobEvent(ctx, db.JobEvent{JobID: key.JobID, Kind: "execbackend_expired_attempt_settled", Message: message}); err != nil {
+		return fmt.Errorf("record settled expired execution backend attempt %+v: %w", key, err)
 	}
 	return nil
 }
