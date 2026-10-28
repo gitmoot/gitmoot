@@ -37,8 +37,11 @@ type Event struct {
 	// translators already key their pending-tool maps by this id; surfacing it
 	// lets a consumer pair the two events instead of guessing from arrival
 	// order, which is wrong the moment two tools overlap (#1824 review F1).
-	ToolID  string
-	RawLine string
+	ToolID string
+	// ExitCode is a shell tool's exit status when the runtime reports it (omp,
+	// #2371); nil when the runtime does not expose one.
+	ExitCode *int
+	RawLine  string
 }
 
 // PreviewMode tells the styled renderer which end of a long tool result is

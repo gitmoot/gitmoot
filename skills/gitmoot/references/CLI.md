@@ -3279,11 +3279,23 @@ run CONCURRENTLY, so their durations do not partition anything:
   events and re-delivers the same job id, so one job id can hold several
   profiles; this field is the attempt boundary.
 - `coverage` — **read this before the buckets.** `decomposed` means the runtime
-  emits per-tool events (codex, kimi). `opaque_runtime` means it does not:
+  emits per-tool events (codex, kimi, omp). `opaque_runtime` means it does not:
   Claude reports a single final envelope and no tool events, so an opaque row
   has zero commands however long the job took. An opaque profile is a blind
   spot, NOT a measurement that the job spent all its time outside commands -
   exclude those rows from any decomposition rather than averaging them in.
+- `trace` — `traced` once the runtime's tool stream was actually read (at least
+  one decoded event), so `commands` 0 then means no command ran; `not_traced`
+  otherwise, so `commands` 0 means nothing is known (#2371).
+
+Alongside the profile, a review that ran shell commands records one
+`review_command_trace` event: each command (redacted, at most 300 bytes), its
+exit code (omp reports one; a command without one is `null`), status
+(`ok`, `error`, `in_flight`), start/end time and a redacted output tail of at
+most 400 bytes. At most 120 commands are listed; later ones are counted in
+`omitted`. `sandboxes` lists the execution-backend attempts (provider,
+sandbox id) of that job generation, so a remote (E2B) review's commands are tied
+to the sandbox they ran in; it is empty for a local run.
 
 **`unknown` is a REFUSAL, not a leftover.** The classifier is a cheap lexer, not
 a shell parser, and its supported grammar is declared in
