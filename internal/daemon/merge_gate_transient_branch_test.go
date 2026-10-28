@@ -9,7 +9,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// TestPollOnceReleasesTransientlyBlockedBranchTaskInsteadOfDemotingIt is #2374
+// TestTransientlyBlockedBranchTaskIsReleasedNotDemoted is #2374
 // (appkit#7). An approved implement task owns the PR's head branch; the merge
 // gate blocked it TRANSIENTLY (dirty worktree). reconcilePROpenTasks used to
 // promote every blocked task on an open same-repo PR to pr_open before the
@@ -17,14 +17,18 @@ import (
 // (ready_to_merge / awaiting_human_merge only) both ignored it and nothing could
 // recover it. The transient block must instead be retried back to
 // ready_to_merge; a QUALITY block keeps the old pr_open promotion.
-func TestPollOnceReleasesTransientlyBlockedBranchTaskInsteadOfDemotingIt(t *testing.T) {
+func TestTransientlyBlockedBranchTaskIsReleasedNotDemoted(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		class workflow.MergeBlockClass
-		want  workflow.TaskState
+		name         string
+		class        workflow.MergeBlockClass
+		otherBlocker bool
+		want         workflow.TaskState
 	}{
-		{"transient block is retried, not demoted", workflow.MergeBlockTransient, workflow.TaskReadyToMerge},
-		{"quality block still promotes to pr_open", workflow.MergeBlockQuality, workflow.TaskPullRequestOpen},
+		{"transient block is retried, not demoted", workflow.MergeBlockTransient, false, workflow.TaskReadyToMerge},
+		{"quality block still promotes to pr_open", workflow.MergeBlockQuality, false, workflow.TaskPullRequestOpen},
+		// The gate row is transient, but a LATER blocker owns the task's block; the
+		// retry would never release it, so holding it would wedge it forever.
+		{"task blocked by another blocker still promotes", workflow.MergeBlockTransient, true, workflow.TaskPullRequestOpen},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -46,6 +50,11 @@ func TestPollOnceReleasesTransientlyBlockedBranchTaskInsteadOfDemotingIt(t *test
 				HeadBranch: pull.HeadRef, BaseBranch: pull.BaseRef, HeadSHA: pull.HeadSHA, State: "open",
 			}); err != nil {
 				t.Fatal(err)
+			}
+			if tc.otherBlocker {
+				if err := store.AddTaskEvent(ctx, db.TaskEvent{TaskID: task.ID, Kind: "quorum_unmet", ToState: string(workflow.TaskBlocked), Reason: "2 of 3 delegation children failed"}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			daemon, _ := blockedReviewTaskDaemon(t, store, repo, pull)
 			if err := daemon.reconcilePROpenTasks(ctx, []github.PullRequest{pull}); err != nil {

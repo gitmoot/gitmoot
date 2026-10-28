@@ -480,20 +480,41 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 		// reconcileTransientlyBlockedMergeGates to return it to ready_to_merge.
 		// Promoting it to pr_open here would strand an approved task: neither
 		// that retry (blocked only) nor `/gitmoot merge` (ready_to_merge /
-		// awaiting_human_merge only) acts on pr_open. A quality block, or a gate
-		// row that is missing, still promotes exactly as before. A lookup ERROR
-		// holds only blocked tasks this tick (implementing tasks and the journal
-		// breadcrumb below proceed).
-		transientGateBlock, gateErr := d.mergeGateBlockedTransiently(ctx, pull.Number)
-		if gateErr != nil {
-			if firstErr == nil {
-				firstErr = gateErr
+		// awaiting_human_merge only) acts on pr_open. Only a task the retry
+		// would release is held: the gate's block must be transient AND own the
+		// task's current block (mergeGateOwnsCurrentBlock). A task blocked by
+		// another blocker, a quality block, or a missing gate row promotes
+		// exactly as before. A lookup error holds the task for this tick only.
+		tasks := byBranch[strings.TrimSpace(pull.HeadRef)]
+		var transientGate *db.MergeGate
+		if len(tasks) > 0 {
+			gate, transient, gateErr := d.transientMergeGate(ctx, pull.Number)
+			switch {
+			case gateErr != nil:
+				if firstErr == nil {
+					firstErr = gateErr
+				}
+				transientGate = &db.MergeGate{}
+			case transient:
+				transientGate = &gate
 			}
-			transientGateBlock = true
 		}
-		for _, task := range byBranch[strings.TrimSpace(pull.HeadRef)] {
-			if transientGateBlock && task.State == string(workflow.TaskBlocked) {
-				continue
+		for _, task := range tasks {
+			if transientGate != nil && task.State == string(workflow.TaskBlocked) {
+				held := true
+				if transientGate.State != "" {
+					attributed, unattributed, _, attrErr := d.mergeGateOwnsCurrentBlock(ctx, task.ID, transientGate.Reason)
+					if attrErr != nil {
+						if firstErr == nil {
+							firstErr = attrErr
+						}
+					} else {
+						held = attributed || unattributed
+					}
+				}
+				if held {
+					continue
+				}
 			}
 			changed, _, err := d.Store.TransitionTaskStateWithEvent(ctx, task.ID,
 				[]string{string(workflow.TaskImplementing), string(workflow.TaskBlocked)},
@@ -550,19 +571,19 @@ func (d Daemon) reconcilePROpenTasks(ctx context.Context, pulls []github.PullReq
 // is the wrong seam for this exit.
 const transientMergeGateRetryInterval = time.Minute
 
-// mergeGateBlockedTransiently reports whether this repo's merge gate for the PR
+// transientMergeGate returns this repo's merge gate for the PR and whether it
 // currently holds a TRANSIENT block (#2374): the same test
 // reconcileTransientlyBlockedMergeGates uses to select a row for re-evaluation.
 // No gate row is not a block.
-func (d Daemon) mergeGateBlockedTransiently(ctx context.Context, number int64) (bool, error) {
+func (d Daemon) transientMergeGate(ctx context.Context, number int64) (db.MergeGate, bool, error) {
 	gate, err := d.Store.GetMergeGate(ctx, d.Repo.FullName(), number)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return db.MergeGate{}, false, nil
 		}
-		return false, err
+		return db.MergeGate{}, false, err
 	}
-	return gate.State == "blocked" && gate.BlockClass == int(workflow.MergeBlockTransient), nil
+	return gate, gate.State == "blocked" && gate.BlockClass == int(workflow.MergeBlockTransient), nil
 }
 
 func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openPullNumbers map[int64]struct{}) error {
