@@ -377,7 +377,11 @@ func (e Engine) prepareNativeReviewWorktree(ctx context.Context, request JobRequ
 	// (home, repo, job id) and AllocateReadOnlyWorktree recomputes exactly this
 	// value; resolving it here lets the idempotence check below compare the SAME
 	// payload the enqueue will store.
-	path, err := DelegationWorktreePath(e.Home, request.Repo, request.ID, "readonly-seat", 0)
+	placement, err := ResolveWorktreePlacement(e.Home)
+	if err != nil {
+		return request, false, err
+	}
+	path, err := placement.DelegationPath(request.Repo, request.ID, "readonly-seat", 0)
 	if err != nil {
 		return request, false, err
 	}

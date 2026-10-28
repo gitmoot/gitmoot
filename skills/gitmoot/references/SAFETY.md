@@ -621,6 +621,13 @@ usage. Inspect the job and escalate capacity to its owner; retry only when the
 work itself should resume. Do not retry merely to discard evidence or bypass the
 gate with direct deletion.
 
+A configured `[worktrees]` root (another filesystem, e.g. an SSHFS mount) is
+used only after a mount preflight: mount point, source and filesystem type must
+match `/proc/self/mountinfo` and the root must sit on that mount. A failed
+preflight refuses allocation, reopen and cleanup under that root
+(`worktree root unavailable`); nothing falls back to `<home>/worktrees`, and an
+absent mount is never treated as an already-removed worktree.
+
 Aged cleanup also requires the generation's terminal time to precede
 `[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).
 Ordinary succeeded-owner cleanup keeps its existing retention policy. Neither

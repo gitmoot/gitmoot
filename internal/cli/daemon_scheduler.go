@@ -2925,7 +2925,9 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	// per-repo dispatch loop, so it passes the short ReadOnlyWorktreeDispatchLockWaitBudget
 	// (not the 2-minute default) to fail open fast under merge-gate lock contention
 	// rather than freezing this repo's dispatch+reap loop.
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.ConfigHome, payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
+	// The RESOLVED home (#2375): it is where config.toml, and so [worktrees], lives, and it is
+	// the home the cleanup validator derives this path from (workflowHome).
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.workflowHome(), payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
 	if err != nil {
 		return poolIsolatedDispatch{}, false, err
 	}

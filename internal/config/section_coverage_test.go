@@ -38,6 +38,7 @@ var (
 	// and review_router.go by TestReviewRouterMalformedHeaderEndsSection.
 	pinnedSectionHeaderSites = []string{
 		"cleanup_budget.go::LoadCleanupBudget", // TestCleanupBudgetMalformedHeaderRefuses (#2360)
+		"worktrees.go::LoadWorktreeRoot",       // TestWorktreeRootMalformedHeaderRefuses (#2375)
 		"admission.go::LoadAdmissionPolicy",
 		"credentials.go::LoadCredentialsConfig",
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",
@@ -161,10 +162,10 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 23 since #2360 added cleanup_budget.go::LoadCleanupBudget (22 after #2203
-	// deleted internal/config/implement_base.go and its LoadImplementBase site).
-	if distinctFiles != 23 {
-		t.Errorf("sectionHeader call sites span %d files, want 23: update this expectation together with the lists above", distinctFiles)
+	// 24 since #2375 added worktrees.go::LoadWorktreeRoot (23 after #2360 added
+	// cleanup_budget.go; 22 after #2203 deleted internal/config/implement_base.go).
+	if distinctFiles != 24 {
+		t.Errorf("sectionHeader call sites span %d files, want 24: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

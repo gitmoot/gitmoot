@@ -38,7 +38,13 @@ type delegationWorktreeUsage struct {
 	Quarantined    int    `json:"quarantined"`
 	Truncated      bool   `json:"truncated"`
 	Root           string `json:"root"`
-	Summary        string `json:"summary"`
+	// Roots lists every scanned root: <home>/worktrees, plus the [worktrees] root (#2375)
+	// while it is proven to be on its mount.
+	Roots []string `json:"roots"`
+	// UnavailableRoot is a configured [worktrees] root that failed its mount preflight; it is
+	// not scanned, so nothing under it is counted, reclaimed or reported as gone.
+	UnavailableRoot string `json:"unavailableRoot,omitempty"`
+	Summary         string `json:"summary"`
 }
 
 type delegationWorktreeClass int
@@ -58,7 +64,18 @@ const (
 // unproven, never reclaimed.
 func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, store *db.Store, now time.Time, ttl time.Duration) (delegationWorktreeUsage, error) {
 	root := filepath.Join(paths.Home, "worktrees")
-	usage := delegationWorktreeUsage{Root: root}
+	usage := delegationWorktreeUsage{Root: root, Roots: []string{root}}
+	placement, err := workflow.ResolveWorktreePlacement(paths.Home)
+	if err != nil {
+		return usage, err
+	}
+	if placement.External() {
+		if err := placement.Preflight(); err != nil {
+			usage.UnavailableRoot = placement.Root
+		} else {
+			usage.Roots = append(usage.Roots, placement.Root)
+		}
+	}
 	jobs, err := store.ListJobs(ctx)
 	if err != nil {
 		return usage, err
@@ -77,7 +94,7 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		if strings.TrimSpace(payload.DelegationID) == "" && !payload.ReadOnlyWorktree {
 			continue // ordinary task/shared-checkout payload
 		}
-		path, ok := worktreePathUnderRoot(root, payload.WorktreePath)
+		path, ok := worktreePathUnderAnyRoot(usage.Roots, payload.WorktreePath)
 		if !ok {
 			continue
 		}
@@ -131,39 +148,41 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	// allocation has no job row by definition. A single global entry budget bounds
 	// doctor and /api/health even when the host tree is attacker-controlled.
 	discoveryEntriesRemaining := delegationWorktreeDiscoveryEntryLimit
-	scanTruncated, scanErr := walkWorktreeDirectoriesBatched(ctx, root, &discoveryEntriesRemaining, func(path string, entry fs.DirEntry) (descend, stop bool) {
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			usage.Truncated = true
-			return false, false
-		}
-		parts := strings.Split(rel, string(filepath.Separator))
-		switch {
-		case len(parts) == 1:
-			return entry.IsDir(), false
-		case len(parts) == 2 && (parts[1] == "delegations" || parts[1] == "fixes"):
-			return entry.IsDir(), false
-		case len(parts) == 3 && parts[1] == "delegations":
-			return entry.IsDir(), false
-		case len(parts) == 4 && parts[1] == "delegations", len(parts) == 3 && parts[1] == "fixes":
-			if entry.IsDir() {
-				if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
-					usage.Truncated = true
-					return false, true
-				}
-				pathsOnDisk[path] = struct{}{}
-			} else {
-				unprovenEntries[path] = struct{}{}
+	for _, root := range usage.Roots {
+		scanTruncated, scanErr := walkWorktreeDirectoriesBatched(ctx, root, &discoveryEntriesRemaining, func(path string, entry fs.DirEntry) (descend, stop bool) {
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				usage.Truncated = true
+				return false, false
 			}
+			parts := strings.Split(rel, string(filepath.Separator))
+			switch {
+			case len(parts) == 1:
+				return entry.IsDir(), false
+			case len(parts) == 2 && (parts[1] == "delegations" || parts[1] == "fixes"):
+				return entry.IsDir(), false
+			case len(parts) == 3 && parts[1] == "delegations":
+				return entry.IsDir(), false
+			case len(parts) == 4 && parts[1] == "delegations", len(parts) == 3 && parts[1] == "fixes":
+				if entry.IsDir() {
+					if len(pathsOnDisk) >= delegationWorktreeTrackedPathLimit {
+						usage.Truncated = true
+						return false, true
+					}
+					pathsOnDisk[path] = struct{}{}
+				} else {
+					unprovenEntries[path] = struct{}{}
+				}
+			}
+			return false, false
+		})
+		usage.Truncated = usage.Truncated || scanTruncated
+		if scanErr != nil {
+			return usage, scanErr
 		}
-		return false, false
-	})
-	usage.Truncated = usage.Truncated || scanTruncated
-	if scanErr != nil {
-		return usage, scanErr
-	}
-	if ctx.Err() != nil {
-		return usage, ctx.Err()
+		if ctx.Err() != nil {
+			return usage, ctx.Err()
+		}
 	}
 	usage.Stale += len(unprovenEntries)
 	usage.Unproven += len(unprovenEntries)
@@ -197,7 +216,10 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 		usage.Truncated = usage.Truncated || truncated
 	}
 	usage.Size = formatWorktreeBytes(usage.SizeBytes)
-	usage.Summary = fmt.Sprintf("%d stale worktree%s / %s under %s", usage.Stale, pluralSuffix(usage.Stale), usage.Size, usage.Root)
+	usage.Summary = fmt.Sprintf("%d stale worktree%s / %s under %s", usage.Stale, pluralSuffix(usage.Stale), usage.Size, strings.Join(usage.Roots, " and "))
+	if usage.UnavailableRoot != "" {
+		usage.Summary += fmt.Sprintf("; configured worktree root %s is unavailable (mount preflight failed) and was not scanned", usage.UnavailableRoot)
+	}
 	if usage.Truncated {
 		usage.Summary += " (bounded scan truncated; counts and bytes are lower bounds)"
 	}
@@ -217,6 +239,15 @@ func worktreeClassPriority(class delegationWorktreeClass) int {
 	default:
 		return 0
 	}
+}
+
+func worktreePathUnderAnyRoot(roots []string, candidate string) (string, bool) {
+	for _, root := range roots {
+		if path, ok := worktreePathUnderRoot(root, candidate); ok {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func worktreePathUnderRoot(root, candidate string) (string, bool) {
@@ -384,6 +415,6 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
 	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
-	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0
+	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0 || usage.UnavailableRoot != ""
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

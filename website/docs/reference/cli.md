@@ -2549,6 +2549,31 @@ branches, branches still present on `origin`, and remote-check uncertainty all
 prevent automatic dismissal; successful transitions record
 `task_dismissed_auto`.
 
+Where new worktrees go: by default under `<home>/worktrees`. A `[worktrees]`
+section moves NEW gitmoot-created worktrees (read-only review seats, pipeline
+stages, pool isolation, delegation and integration worktrees) to another root,
+for example a network mount; the database, WAL, caches, artifacts and cleanup
+receipts stay in the home:
+
+```toml
+[worktrees]
+root = "/mnt/storagebox-workspaces/worktrees"   # absolute; must already exist
+mount_point = "/mnt/storagebox-workspaces"      # optional: all three mount keys or none
+mount_source = "u666042@u666042.your-storagebox.de:fleet-workspaces"
+mount_fstype = "fuse.sshfs"
+```
+
+Gitmoot never creates `root`. With the mount keys, every allocation, every
+reopen of a recorded worktree under `root` and every cleanup there first checks
+`/proc/self/mountinfo` for that mount point, source and type, and checks that
+`root` is on that very mount. If the check fails, the job or cleanup is refused
+with `worktree root unavailable: ...`; there is no fallback to `<home>/worktrees`.
+Parent directories are created through handles on the verified mount. Existing
+worktrees are not moved: those under `<home>/worktrees` keep their cleanup
+identity. `gitmoot doctor` reports both roots and warns when the configured root
+is unavailable. An invalid `[worktrees]` section is a config error; `gitmoot
+config set` refuses to write one.
+
 Delegation worktrees use the separate default-on
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables that pass. Only
 final job owners older than the TTL are force-reclaimed. Blocked, queued, and
