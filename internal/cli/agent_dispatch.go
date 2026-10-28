@@ -1213,6 +1213,24 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			RawOutputCount:       0,
 		}, nil
 	}
+	// #2409: from here the CALLER owns delivery. An error before RunJob takes the
+	// job out of queued (managed config, session lock, tool cache, adapter or
+	// read-only seat preflight such as the omp auth broker) must not leave a
+	// claimable job: the daemon would run it in the background, outside the
+	// foreground contract and resource scope the caller chose. The transition is
+	// from queued only, so a job RunJob already claimed, or the busy-ask path that
+	// cancels its own job, is untouched; a busy REVIEW returns no error and stays
+	// queued on purpose.
+	defer func() {
+		if err == nil {
+			return
+		}
+		_, _ = store.TransitionJobStateWithEvent(context.WithoutCancel(ctx), job.ID, string(workflow.JobQueued), string(workflow.JobFailed), db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "foreground_predelivery_failed",
+			Message: "foreground dispatch failed before delivery; the job is settled so the daemon will not run it: " + err.Error(),
+		})
+	}()
 	managed, err := localManagedAgentDispatchConfigForAgent(ctx, store, request.Home, agent.Name)
 	if err != nil {
 		return localAgentJobOutput{}, err

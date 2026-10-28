@@ -1490,7 +1490,7 @@ if a follow-up could not be filed. `--post-merge` refuses `--lead`. Through
 `agent review` it needs the router path: `--org-role` and `--no-fix-target`,
 without `--foreground`.
 
-Two things `agent review` reports that are easy to miss:
+Three things `agent review` reports that are easy to miss:
 
 - **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
   router requires a verdict recipient), `--foreground`, or any flag the router
@@ -1508,6 +1508,13 @@ Two things `agent review` reports that are easy to miss:
   `agent run --action review` and `orchestrate --pr` never reach that gate and
   record their reason in `route_selected` instead. The complete query is
   `route_selected NOT LIKE '%review_request%'`.
+- **A foreground dispatch that fails before delivery leaves no job to run.** If
+  `--foreground` (or a foreground `agent ask`) fails after the job is created but
+  before it starts, for example on the read-only omp seat's auth-broker check,
+  the command exits non-zero and the job is set to `failed` with a
+  `foreground_predelivery_failed` event, so the daemon never picks it up and runs
+  it in the background (#2409). A busy runtime session still leaves a foreground
+  REVIEW queued on purpose.
 - **An ATTACHING request is told what it lost.** A second request at a head that
   already holds a claim attaches to the running review rather than spending a
   second reviewer — and prints which of your `--reviewer`, instructions,
