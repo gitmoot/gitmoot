@@ -410,7 +410,7 @@ func TestStageRuntimeDoesNotRefreshTheStampOfACorruptCopy(t *testing.T) {
 func TestStageRuntimeRefusesNamesTheCollectorWouldSkip(t *testing.T) {
 	home := t.TempDir()
 	source := writeRuntimeTool(t, "staged")
-	for _, name := range []string{"tool.staging-1", ".hidden"} {
+	for _, name := range []string{"tool.staging-1", ".hidden", "my python", "nöde", "a:b"} {
 		if _, _, err := StageRuntime(home, name, source); !errors.Is(err, ErrRuntimeNotStageable) {
 			t.Fatalf("StageRuntime(%q) = %v, want ErrRuntimeNotStageable", name, err)
 		}

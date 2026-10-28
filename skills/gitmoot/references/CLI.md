@@ -141,7 +141,8 @@ gitmoot runtime prune
 `runtime prune` removes staged runtime copies under `<home>/runtimes` that no job
 has staged for 7 days (`--min-idle`) and no live process uses. A process "uses" a
 copy through its executable, working directory, command line, memory maps or any
-absolute entry of an environment value such as `PATH`; if any of these cannot be
+absolute entry of an environment value such as `PATH` (as set when the process
+started; a later `export` is not visible in `/proc`); if any of these cannot be
 read, the pass keeps every copy. The daemon runs it once a day; `--dry-run` only
 lists what it would remove and changes nothing on disk.
 

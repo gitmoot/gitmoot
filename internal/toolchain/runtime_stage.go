@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -431,11 +432,13 @@ func hasPathElement(path string, name string) bool {
 	return false
 }
 
-// stageableRuntimeName reports whether name can be one published path component. A
-// ".staging-" fragment is refused because the runtime collector skips any such
-// directory as an in-flight publish, so a copy with that name would never age out
-// (#2404); a leading dot is refused for the same reason.
+// stageableRuntimeName reports whether name can be one published path component
+// the runtime collector will later see (#2404): only the collectable alphabet
+// [A-Za-z0-9._-], no leading dot, and no ".staging-" fragment (the collector
+// skips such directories as in-flight publishes). Anything else would publish
+// a copy that is never a collection candidate and so never ages out.
 func stageableRuntimeName(name string) bool {
-	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`) &&
-		!strings.HasPrefix(name, ".") && !strings.Contains(name, ".staging-")
+	return stageableRuntimeNamePattern.MatchString(name) && !strings.Contains(name, ".staging-")
 }
+
+var stageableRuntimeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*$`)
