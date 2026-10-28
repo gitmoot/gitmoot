@@ -470,6 +470,71 @@ func TestDelegationCleanupRefusesUncontainedTarget(t *testing.T) {
 	}
 }
 
+// #2375: an outage of the configured [worktrees] mount defers cleanup of worktrees under it
+// instead of spending the identity budget, so a mount blip never quarantines them; once the
+// root is usable again the same worktree is reclaimed.
+func TestDelegationCleanupDefersWhileWorktreeRootUnavailable(t *testing.T) {
+	resetDelegationReclaimAccountingForTest(t)
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	paths := config.PathsForHome(home)
+	box := t.TempDir()
+	root := filepath.Join(box, "worktrees")
+	path := filepath.Join(root, "owner--repo", "delegations", "outage", "pool-isolation")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setWorktrees := func(section string) {
+		t.Helper()
+		if err := os.WriteFile(paths.ConfigFile, append(append([]byte{}, base...), []byte("\n[worktrees]\n"+section)...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// box is not a mount point, so the mount preflight fails exactly as for a stopped mount.
+	setWorktrees(fmt.Sprintf("root = %q\nmount_point = %q\nmount_source = \"user@host:share\"\nmount_fstype = \"fuse.sshfs\"\n", root, box))
+	realNow := time.Now().UTC()
+	seedReclaimResilienceCandidate(t, store, "outage", path, realNow, false, false)
+	manager, checkout := newSelectiveReclaimManager(t, path)
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.WorkflowFactory = func(string) workflow.Engine {
+		return reclaimFixtureEngine(worker, checkout, manager)
+	}
+	resourceID := db.CleanupObligationResourceID("outage", path)
+	for attempt := 0; attempt <= delegationCleanupRetryBudget; attempt++ {
+		now := realNow.Add(-20*time.Minute + time.Duration(attempt)*2*time.Minute)
+		if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), now, 72*time.Hour); err != nil {
+			t.Fatal(err)
+		}
+	}
+	obligation, err := store.GetCleanupObligation(ctx, resourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.calls != 0 || obligation.State == db.CleanupObligationQuarantined || obligation.AttemptCount != 0 {
+		t.Fatalf("mount outage spent the cleanup budget: calls=%d obligation=%+v", manager.calls, obligation)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("worktree changed during the outage: %v", err)
+	}
+	// The root is usable again (here: no mount keys); the deferred obligation is reclaimed.
+	setWorktrees(fmt.Sprintf("root = %q\n", root))
+	if err := reclaimAgedTerminalDelegationWorktrees(ctx, worker, "", "", nil, newTickCandidates(store), realNow.Add(2*time.Minute), 72*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.removed) != 1 || filepath.Clean(manager.removed[0]) != filepath.Clean(path) {
+		t.Fatalf("worktree not reclaimed after the root came back: removed=%v", manager.removed)
+	}
+	if outcome, err := store.GetCleanupObligation(ctx, resourceID); err != nil || outcome.State != db.CleanupObligationRemoved {
+		t.Fatalf("obligation after recovery = %+v %v", outcome, err)
+	}
+}
+
 // TestDelegationCleanupAccountingFailureFailsClosed kills the mutant that logs
 // a cleanup-obligation persistence failure and reports a candidate-local skip.
 func TestDelegationCleanupAccountingFailureFailsClosed(t *testing.T) {
