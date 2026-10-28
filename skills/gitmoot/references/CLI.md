@@ -3290,12 +3290,15 @@ run CONCURRENTLY, so their durations do not partition anything:
 
 Alongside the profile, a review that ran shell commands records one
 `review_command_trace` event: each command (redacted, cut to 300 bytes plus a
-`…` marker), its exit code (omp reports one; a command without one is `null`),
+`…` marker), its exit code (omp reports one; the `exit_code` key is absent
+when none is known, e.g. a command still `in_flight`),
 status (omp: `ok`, `error`, `in_flight`; codex and kimi report their own status
 text, e.g. `completed (exit 0)`), start/end time and a redacted output tail cut
 to 400 bytes plus a `…` marker. At most 120 commands are listed; later ones are
-counted in `omitted`. An omp end event whose `result` is not a JSON object is
-kept raw, so its shell call shows as `in_flight`. `sandboxes` lists the
+counted in `omitted`. An omp end event whose `result` is a non-object JSON value
+(a string, number or array) cannot be decoded and is kept raw, so its shell call
+shows as `in_flight`; a `null` or missing `result` decodes as an empty result.
+`sandboxes` lists the
 execution-backend attempts (provider, sandbox id) of that job generation, so a
 remote (E2B) review's commands are tied to the sandbox they ran in; it is empty
 for a local run.
