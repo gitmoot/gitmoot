@@ -1177,6 +1177,16 @@ another seat in normal operation. The second message appears when a read-only
 seat is launched from inside a sandbox, for example when gitmoot's own tests run
 inside a review seat; those tests skip with that reason.
 
+## Jobs refused with `worktree root unavailable`
+
+A `[worktrees]` root is configured (#2375) and its preflight failed: the root
+directory is missing, the mount point is not mounted, or it is mounted from a
+different source or with a different filesystem type. Gitmoot refuses rather
+than place worktrees on the local disk. Check `findmnt <mount_point>` against
+`mount_source` / `mount_fstype` in `config.toml`, remount, and retry the job.
+Worktrees already under `<home>/worktrees` are unaffected. `gitmoot doctor`
+shows the unavailable root in the `worktrees` check.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so

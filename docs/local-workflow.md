@@ -131,6 +131,39 @@ not itself dispose the task.
 `task list` and `task events` are the whole surviving task verb set;
 `gitmoot task --help` prints exactly those two.
 
+Where new worktrees go: by default under `<home>/worktrees`. A `[worktrees]`
+section moves NEW gitmoot-created worktrees (read-only review seats, pipeline
+stages, pool isolation, delegation and integration worktrees) to another root,
+for example a network mount; the database, WAL, caches, artifacts and cleanup
+receipts stay in the home:
+
+```toml
+[worktrees]
+root = "/mnt/storagebox-workspaces/worktrees"   # absolute; must already exist
+mount_point = "/mnt/storagebox-workspaces"      # optional: all three mount keys or none
+mount_source = "u666042@u666042.your-storagebox.de:fleet-workspaces"
+mount_fstype = "fuse.sshfs"
+```
+
+Gitmoot never creates `root`. With the mount keys, every allocation, every
+reopen of a recorded worktree under `root` and every cleanup there first checks
+`/proc/self/mountinfo` for that mount point, source and type, and checks that
+`root` is on that very mount. If the check fails, the job or cleanup is refused
+with `worktree root unavailable: ...`; there is no fallback to `<home>/worktrees`.
+Parent directories are created through handles on the verified mount. Existing
+worktrees are not moved: those under `<home>/worktrees` keep their cleanup
+identity. `gitmoot doctor` reports both roots and warns when the configured root
+is unavailable or the section cannot be loaded. An invalid `[worktrees]` section
+is a config error; `gitmoot config set` refuses to write one. While the mount is
+down, cleanup of worktrees under `root` is deferred (refusal code
+`worktree_root_unavailable`) and retried; it does not count toward quarantine.
+
+Only the CURRENT `root` and `<home>/worktrees` are managed. Before changing
+`root`, let worktrees under the old root finish and be cleaned (or remove them
+by hand); afterwards gitmoot neither reopens nor cleans paths under the old root.
+The mount checks need Linux 5.6 or newer (`statx` mount IDs); on older kernels
+or other systems a section with mount keys refuses every allocation.
+
 Delegation worktrees use a separate default-on aged cleanup policy:
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only
 eligible terminal (`succeeded`, `failed`, or `cancelled`) resources may be removed

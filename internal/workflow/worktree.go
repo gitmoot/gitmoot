@@ -430,7 +430,16 @@ func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string,
 	if strings.TrimSpace(pathSegment) == "" {
 		return "", errors.New("read-only worktree path segment is required")
 	}
-	path, err := DelegationWorktreePath(home, repo, pathParent, pathSegment, retryAttempt)
+	// #2375: new worktrees go to the [worktrees] root when one is configured, and only after
+	// proving it is present on its configured mount; there is no fallback to <home>/worktrees.
+	placement, err := ResolveWorktreePlacement(home)
+	if err != nil {
+		return "", err
+	}
+	if err := placement.Preflight(); err != nil {
+		return "", err
+	}
+	path, err := placement.DelegationPath(repo, pathParent, pathSegment, retryAttempt)
 	if err != nil {
 		return "", err
 	}
@@ -452,7 +461,7 @@ func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string,
 	}()
 	// Ensure the parent chain exists before `git worktree add` (matches the reactive
 	// pool-isolation path); the leaf is created by git itself.
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := placement.PrepareParent(path); err != nil {
 		return "", err
 	}
 	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
@@ -513,7 +522,14 @@ func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request Delegat
 		return "", errors.New("integration worktree requires at least one leg branch")
 	}
 	integrationID := "integration-" + request.DelegationID
-	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, integrationID, request.RetryAttempt)
+	placement, err := ResolveWorktreePlacement(request.Home)
+	if err != nil {
+		return "", err
+	}
+	if err := placement.Preflight(); err != nil {
+		return "", err
+	}
+	path, err := placement.DelegationPath(request.Repo, request.ParentJobID, integrationID, request.RetryAttempt)
 	if err != nil {
 		return "", err
 	}
@@ -533,6 +549,13 @@ func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request Delegat
 	// A delegation is dispatched once (advanceDelegations skips already-enqueued
 	// dependents; retries use a retry-suffixed path), so allocate a fresh detached
 	// worktree like the implement and read-only paths rather than reusing one.
+	// Under a configured root the parents are created on the verified mount first, so
+	// git's own leading-directory creation can never land on the local disk (#2375).
+	if placement.External() {
+		if err := placement.PrepareParent(path); err != nil {
+			return "", err
+		}
+	}
 	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
 		return "", err
 	}
@@ -646,28 +669,40 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 	if home == "." || home == "" {
 		return errors.New("cleanup worktree home is unavailable")
 	}
-	expected, err := expectedDelegationCleanupPaths(home, jobID, jobType, payload)
+	// #2375: a worktree keeps the identity of the root it was created under. The legacy
+	// <home>/worktrees layout is always recognised (existing worktrees are never moved); the
+	// configured root is recognised too, but only while it is proven to be on its mount, so an
+	// absent mount can never look like an already-removed worktree.
+	placement, err := ResolveWorktreePlacement(home)
 	if err != nil {
 		return err
 	}
-	matched := false
-	for _, candidate := range expected {
-		if path == filepath.Clean(candidate) {
-			matched = true
-			break
+	roots := []string{placement.Legacy}
+	if placement.External() {
+		roots = append(roots, placement.Root)
+	}
+	for _, root := range roots {
+		expected, err := expectedDelegationCleanupPaths(root, jobID, jobType, payload)
+		if err != nil {
+			return err
+		}
+		for _, candidate := range expected {
+			if path != filepath.Clean(candidate) {
+				continue
+			}
+			if root != placement.Legacy {
+				if err := placement.Preflight(); err != nil {
+					return err
+				}
+			}
+			return cleanupPathContained(root, path)
 		}
 	}
-	if !matched {
-		return fmt.Errorf("cleanup path %q does not match the job's derived managed path", path)
-	}
-	root := filepath.Join(home, "worktrees")
-	if err := cleanupPathContained(root, path); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("cleanup path %q does not match the job's derived managed path", path)
 }
 
-func expectedDelegationCleanupPaths(home, jobID, jobType string, payload JobPayload) ([]string, error) {
+// expectedDelegationCleanupPaths derives every managed path a cleanup owner may hold below root.
+func expectedDelegationCleanupPaths(root, jobID, jobType string, payload JobPayload) ([]string, error) {
 	// Match isReadOnlyDelegationWorktree's precedence: the explicit marker is a
 	// top-level dispatch/pipeline/pool allocation even if legacy payload metadata
 	// also carries a DelegationID.
@@ -675,7 +710,7 @@ func expectedDelegationCleanupPaths(home, jobID, jobType string, payload JobPayl
 		segments := []string{"readonly-seat", "pipeline-service-stage", "pipeline-stage", "pool-isolation"}
 		paths := make([]string, 0, len(segments))
 		for _, segment := range segments {
-			path, err := DelegationWorktreePath(home, payload.Repo, jobID, segment, 0)
+			path, err := delegationWorktreePathUnder(root, payload.Repo, jobID, segment, 0)
 			if err != nil {
 				return nil, err
 			}
@@ -696,13 +731,13 @@ func expectedDelegationCleanupPaths(home, jobID, jobType string, payload JobPayl
 		if strings.TrimSpace(jobID) != expectedJobID {
 			return nil, fmt.Errorf("cleanup owner job %q does not match parent %q and delegation %q", jobID, parentID, delegationID)
 		}
-		path, err := DelegationWorktreePath(home, payload.Repo, parentID, delegationID, payload.RetryCount)
+		path, err := delegationWorktreePathUnder(root, payload.Repo, parentID, delegationID, payload.RetryCount)
 		if err != nil {
 			return nil, err
 		}
 		paths := []string{path}
 		if readOnlyDelegationAction(jobType) {
-			integration, err := DelegationWorktreePath(home, payload.Repo, parentID, "integration-"+delegationID, payload.RetryCount)
+			integration, err := delegationWorktreePathUnder(root, payload.Repo, parentID, "integration-"+delegationID, payload.RetryCount)
 			if err != nil {
 				return nil, err
 			}
@@ -1395,6 +1430,14 @@ func DelegationWorktreePath(home string, repo string, parentJobID string, delega
 	if home == "" {
 		return "", errors.New("delegation worktree home is required")
 	}
+	return delegationWorktreePathUnder(filepath.Join(home, "worktrees"), repo, parentJobID, delegationID, retryAttempt)
+}
+
+// delegationWorktreePathUnder lays out a delegation worktree below an already-chosen root.
+func delegationWorktreePathUnder(root string, repo string, parentJobID string, delegationID string, retryAttempt int) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return "", errors.New("delegation worktree root is required")
+	}
 	repoSegment, err := taskWorktreeRepoSegment(repo)
 	if err != nil {
 		return "", err
@@ -1407,7 +1450,7 @@ func DelegationWorktreePath(home string, repo string, parentJobID string, delega
 	if err != nil {
 		return "", err
 	}
-	base := filepath.Join(home, "worktrees", repoSegment, "delegations", parentSegment, delegationSegment)
+	base := filepath.Join(root, repoSegment, "delegations", parentSegment, delegationSegment)
 	if retryAttempt > 0 {
 		base = filepath.Join(base, "retry", strconv.Itoa(retryAttempt))
 	}

@@ -326,6 +326,12 @@ func (w jobWorker) taskWorktreeCheckout(ctx context.Context, payload workflow.Jo
 		if err != nil {
 			return "", false, err
 		}
+		// #2375: a recorded worktree under the configured root is reopened only while that root
+		// is proven to be on its mount; an absent mount refuses the job instead of letting it
+		// run against an empty mount-point directory.
+		if err := workflow.PreflightWorktreePath(w.workflowHome(), checkout); err != nil {
+			return "", false, err
+		}
 		return checkout, checkout != "", nil
 	}
 	if strings.TrimSpace(payload.TaskID) == "" {

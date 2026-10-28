@@ -314,6 +314,16 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 		return obligation, false, fmt.Errorf("cleanup obligation %s has unsupported state %q", obligation.ResourceID, obligation.State)
 	}
 	if err := delegationCleanupTargetContained(worker, job, obligation); err != nil {
+		// #2375: an unavailable [worktrees] mount is an availability condition, not an
+		// identity or containment violation. Defer like checkout contention, without
+		// spending the failure budget, so a mount outage can never quarantine cleanup.
+		if errors.Is(err, workflow.ErrWorktreeRootUnavailable) {
+			logDelegationReclaimFailure(worker.Stdout, mode, "worktree_root", job.ID, path, err)
+			if deferErr := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); deferErr != nil {
+				return obligation, false, deferErr
+			}
+			return obligation, false, nil
+		}
 		if _, persistErr := recordDelegationCleanupFailure(ctx, worker, mode, "identity", job.ID, path, err, now); persistErr != nil {
 			return obligation, false, persistErr
 		}
@@ -2925,7 +2935,9 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 	// per-repo dispatch loop, so it passes the short ReadOnlyWorktreeDispatchLockWaitBudget
 	// (not the 2-minute default) to fail open fast under merge-gate lock contention
 	// rather than freezing this repo's dispatch+reap loop.
-	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.ConfigHome, payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
+	// The RESOLVED home (#2375): it is where config.toml, and so [worktrees], lives, and it is
+	// the home the cleanup validator derives this path from (workflowHome).
+	path, err := workflow.AllocateReadOnlyWorktree(ctx, w.Store, w.workflowHome(), payload.Repo, repoRecord.CheckoutPath, job.ID, "pool-isolation", 0, "", workflow.ReadOnlyWorktreeDispatchLockWaitBudget, client)
 	if err != nil {
 		return poolIsolatedDispatch{}, false, err
 	}

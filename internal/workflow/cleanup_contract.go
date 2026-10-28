@@ -157,6 +157,11 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		validator = e.cleanupTargetValidator
 	}
 	if err := validator(e.Home, jobID, job.Type, payload); err != nil {
+		if errors.Is(err, ErrWorktreeRootUnavailable) {
+			// #2375: the configured worktree mount is not proven; nothing is known about the
+			// tree, so this is an availability refusal, never an identity verdict.
+			return d.refuse(CleanupRefusalWorktreeRootUnavailable), payload, nil
+		}
 		return d.refuse("identity_or_containment"), payload, nil
 	}
 	d.ResolvedPath, err = evalPathWithMissingTail(d.ExpectedPath)

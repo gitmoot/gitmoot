@@ -133,6 +133,9 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadCleanupBudget(paths); err != nil {
 		return err
 	}
+	if _, err := LoadWorktreeRoot(paths); err != nil {
+		return err
+	}
 	if _, err := LoadOrg(paths); err != nil {
 		return err
 	}
