@@ -47,7 +47,7 @@ type delegationWorktreeUsage struct {
 	// ConfigError is a [worktrees] section that cannot be loaded: allocation refuses, and only
 	// the legacy root is scanned.
 	ConfigError string `json:"configError,omitempty"`
-	Summary         string `json:"summary"`
+	Summary     string `json:"summary"`
 }
 
 type delegationWorktreeClass int
