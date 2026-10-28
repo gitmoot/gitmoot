@@ -110,9 +110,25 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	builder.WriteString(resultDecisionHelp)
 	builder.WriteString(delegationSchemaHelp)
 	builder.WriteString("\nPrevious raw output:\n")
-	builder.WriteString(trimRawOutput(rawOutput, 12000))
+	builder.WriteString(repairRawOutputExcerpt(rawOutput))
 	builder.WriteByte('\n')
 	return builder.String()
+}
+
+// repairRawOutputLimit bounds the copy of the previous output in a repair prompt.
+// Large enough for a full review result with many findings (#2418: a 12 KB cap
+// cut a valid review mid-findings, so the repair turn could not reproduce it).
+const repairRawOutputLimit = 128 * 1024
+
+// repairRawOutputExcerpt returns the previous output whole when it fits. A longer
+// output is cut AND says so, pointing the agent at its own previous turn instead
+// of asking it to rebuild a result from a fragment.
+func repairRawOutputExcerpt(output string) string {
+	output = strings.TrimSpace(output)
+	if len(output) <= repairRawOutputLimit {
+		return output
+	}
+	return fmt.Sprintf("[only the first %d of %d bytes are shown; your complete previous response is the previous turn of this conversation - reproduce its content in full, do not shorten it]\n%s\n[truncated]", repairRawOutputLimit, len(output), output[:repairRawOutputLimit])
 }
 
 func writeField(builder *strings.Builder, label string, value string) {
@@ -124,12 +140,4 @@ func writeField(builder *strings.Builder, label string, value string) {
 	builder.WriteString(": ")
 	builder.WriteString(value)
 	builder.WriteByte('\n')
-}
-
-func trimRawOutput(output string, limit int) string {
-	output = strings.TrimSpace(output)
-	if len(output) <= limit {
-		return output
-	}
-	return output[:limit] + "\n[truncated]"
 }

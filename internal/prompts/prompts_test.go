@@ -120,6 +120,21 @@ func TestRenderRepairPromptIncludesErrorAndRawOutput(t *testing.T) {
 	}
 }
 
+// #2418: an output beyond the excerpt limit is cut visibly and the agent is
+// pointed at its own previous turn, never handed a silent fragment to rebuild.
+func TestRenderRepairPromptLabelsAnOversizedExcerpt(t *testing.T) {
+	huge := strings.Repeat("x", repairRawOutputLimit+100)
+	prompt := RenderRepairPrompt(huge, errors.New("missing gitmoot_result"))
+	if strings.Contains(prompt, huge) {
+		t.Fatal("an output beyond the limit was embedded whole")
+	}
+	for _, want := range []string{"only the first", "your complete previous response is the previous turn", "[truncated]"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("oversized repair prompt missing %q", want)
+		}
+	}
+}
+
 func TestRenderRepairPromptSurfacesJoinedFieldErrors(t *testing.T) {
 	// Simulate an errors.Join'd validation failure against the frozen contract:
 	// each per-field error renders as one line, joined with newlines.
