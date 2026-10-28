@@ -66,10 +66,10 @@ func TestInheritedAuthorityDescriptorIsWritableWithoutTheLauncher(t *testing.T) 
 	// probe is broken rather than that the launcher sealed the descriptor.
 	h := newNoExecHarness(t)
 	path, f := protectedFile(t)
-	cmd := exec.Command(h.probe, "fdwrite", "3")
-	cmd.ExtraFiles = []*os.File{f}
+	cmd := exec.Command(h.probe, "fdwrite", "4")
+	cmd.ExtraFiles = []*os.File{f, f}
 	out, err := cmd.CombinedOutput()
-	if err != nil || !strings.HasPrefix(string(out), "OK fdwrite fd=3") {
+	if err != nil || !strings.HasPrefix(string(out), "OK fdwrite fd=4") {
 		t.Fatalf("control run: %v %q", err, out)
 	}
 	data, _ := os.ReadFile(path)
@@ -81,17 +81,23 @@ func TestInheritedAuthorityDescriptorIsWritableWithoutTheLauncher(t *testing.T) 
 func TestManagedLaunchDoesNotPassAnInheritedAuthorityDescriptorE2E(t *testing.T) {
 	h := newNoExecHarness(t)
 	for _, mode := range sealModes {
-		t.Run(mode.name, func(t *testing.T) {
-			path, f := protectedFile(t)
-			cmd := h.modeCommand(mode.flag, "fdwrite", "3")
-			cmd.ExtraFiles = []*os.File{f} // fd 3 in the launcher, as an accidental leak
-			out, _ := cmd.CombinedOutput()
-			got := strings.TrimSpace(string(out))
-			if !strings.Contains(got, "DENIED fdwrite errno=9") { // EBADF: the runtime has no fd 3
-				t.Fatalf("runtime reached the inherited descriptor: %q", got)
-			}
-			assertUnchanged(t, path)
-		})
+		// fd 3 alone is not enough: the no-execution supervisor dup2s its handoff
+		// socket onto the child's fd 3 and closes it before exec, so EBADF there
+		// would not prove the seal ran. fd 4 survives into the child unless the
+		// seal marks it close-on-exec.
+		for _, fd := range []string{"3", "4"} {
+			t.Run(mode.name+"/fd"+fd, func(t *testing.T) {
+				path, f := protectedFile(t)
+				cmd := h.modeCommand(mode.flag, "fdwrite", fd)
+				cmd.ExtraFiles = []*os.File{f, f} // fds 3 and 4 in the launcher, as an accidental leak
+				out, _ := cmd.CombinedOutput()
+				got := strings.TrimSpace(string(out))
+				if !strings.Contains(got, "DENIED fdwrite errno=9") { // EBADF: the runtime has no such fd
+					t.Fatalf("runtime reached the inherited descriptor: %q", got)
+				}
+				assertUnchanged(t, path)
+			})
+		}
 	}
 }
 

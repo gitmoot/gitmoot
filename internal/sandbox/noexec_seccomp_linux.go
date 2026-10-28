@@ -346,9 +346,7 @@ func execNoExecutionChild(executable string, argv, env []string) error {
 	// #2360: nothing but the checked stdio crosses the exec. The handoff
 	// socket stays open until it is closed explicitly below; the seccomp
 	// listener is created close-on-exec by the kernel.
-	if err := sealDescriptors(NoExecutionChildFD); err != nil {
-		return err
-	}
+	// MUTANT: seal removed from the no-execution child
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("set no_new_privs: %w", err)
 	}
