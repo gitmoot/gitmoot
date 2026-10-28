@@ -56,7 +56,6 @@ type eventRuleSink struct {
 const wakeTargetUnresolvedKind = "wake_target_unresolved"
 
 // storeReleased prevents a cached sink from using a closed producer store.
-
 func (s *eventRuleSink) storeReleased() bool {
 	return s != nil && s.released.Load()
 }

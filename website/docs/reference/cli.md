@@ -2923,8 +2923,10 @@ sum(bucket_ms)           == covered_ms + overlap_ms
   `commands` 0 then means no command ran; `not_traced` otherwise (#2371).
 
 A review that ran shell commands also records one `review_command_trace` event:
-each command (redacted, at most 300 bytes), its exit code, status, start/end
-time and a redacted output tail of at most 400 bytes, for at most 120 commands
+each command (redacted, cut to 300 bytes plus a `…` marker), its exit code,
+status (omp: `ok`/`error`/`in_flight`; codex and kimi report their own status
+text), start/end time and a redacted output tail cut to 400 bytes plus a `…`
+marker, for at most 120 commands
 (later ones are counted in `omitted`), plus `sandboxes`: the execution-backend
 attempts (provider, sandbox id) of that job generation, so a remote review's
 commands are tied to the sandbox they ran in.

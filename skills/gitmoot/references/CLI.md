@@ -352,7 +352,7 @@ is past `ttl_expires_at` plus a 15-minute grace, when E2B's own timeout has
 killed the sandbox. A per-ID 404 never settles it. The same timeout rule
 settles a `provisioning`, `running` or `collecting` attempt whose teardown never
 started (event `execbackend_expired_attempt_settled`), but only when its job is
-already final (`succeeded`, `failed`, `cancelled`, ...); a running job or a
+already final (`succeeded`, `failed` or `cancelled`); a running job or a
 missing job row keeps the reservation.
 
 Remote review admission runs after exact-head checkout binding and before cost
@@ -3289,13 +3289,16 @@ run CONCURRENTLY, so their durations do not partition anything:
   otherwise, so `commands` 0 means nothing is known (#2371).
 
 Alongside the profile, a review that ran shell commands records one
-`review_command_trace` event: each command (redacted, at most 300 bytes), its
-exit code (omp reports one; a command without one is `null`), status
-(`ok`, `error`, `in_flight`), start/end time and a redacted output tail of at
-most 400 bytes. At most 120 commands are listed; later ones are counted in
-`omitted`. `sandboxes` lists the execution-backend attempts (provider,
-sandbox id) of that job generation, so a remote (E2B) review's commands are tied
-to the sandbox they ran in; it is empty for a local run.
+`review_command_trace` event: each command (redacted, cut to 300 bytes plus a
+`…` marker), its exit code (omp reports one; a command without one is `null`),
+status (omp: `ok`, `error`, `in_flight`; codex and kimi report their own status
+text, e.g. `completed (exit 0)`), start/end time and a redacted output tail cut
+to 400 bytes plus a `…` marker. At most 120 commands are listed; later ones are
+counted in `omitted`. An omp end event whose `result` is not a JSON object is
+kept raw, so its shell call shows as `in_flight`. `sandboxes` lists the
+execution-backend attempts (provider, sandbox id) of that job generation, so a
+remote (E2B) review's commands are tied to the sandbox they ran in; it is empty
+for a local run.
 
 **`unknown` is a REFUSAL, not a leftover.** The classifier is a cheap lexer, not
 a shell parser, and its supported grammar is declared in

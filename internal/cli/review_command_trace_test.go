@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -106,5 +107,63 @@ func TestOmpReviewWithoutAStreamIsNotTraced(t *testing.T) {
 				t.Fatalf("profile = %+v, want trace %q and 0 commands", profile, want)
 			}
 		})
+	}
+}
+
+// #2437 (P3 from #2435): the trace stays bounded and tied to the right generation.
+// More than commandTraceMaxEntries commands are counted in omitted; a long output
+// keeps only a bounded tail; a failure without a reported exit code is -1; and a
+// sandbox from another lifecycle generation of the same job is not listed.
+func TestCommandTraceBoundsAndGenerationFilter(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	store := seedInstrumentJob(t, paths, "omp-bounds", "omp-reviewer", "omp")
+	seedExecBackendAttemptAt(t, store, db.ExecBackendAttemptKey{JobID: "omp-bounds", Attempt: 1, LifecycleGeneration: 0}, "sbx-this-generation", time.Now().Add(time.Hour))
+	seedExecBackendAttemptAt(t, store, db.ExecBackendAttemptKey{JobID: "omp-bounds", Attempt: 1, LifecycleGeneration: 7}, "sbx-other-generation", time.Now().Add(time.Hour))
+
+	handle := openInstrumentedTranscript(t, home, "omp-bounds", "omp", store)
+	write := func(line string) {
+		t.Helper()
+		if _, err := handle.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	long := strings.Repeat("x", 5000) + "TAIL-END"
+	write(`{"type":"tool_execution_start","toolCallId":"first","toolName":"bash","args":{"command":"long-output"}}`)
+	write(`{"type":"tool_execution_end","toolCallId":"first","toolName":"bash","result":{"content":[{"type":"text","text":"` + long + `"}]},"isError":true}`)
+	total := commandTraceMaxEntries + 5
+	for i := 1; i < total; i++ {
+		id := "c" + strconv.Itoa(i)
+		write(`{"type":"tool_execution_start","toolCallId":"` + id + `","toolName":"bash","args":{"command":"true"}}`)
+		write(`{"type":"tool_execution_end","toolCallId":"` + id + `","toolName":"bash","result":{"content":[]},"isError":false}`)
+	}
+	if err := handle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := store.ListJobEvents(t.Context(), "omp-bounds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var trace commandTrace
+	for _, event := range events {
+		if event.Kind == reviewCommandTraceEventKind {
+			if err := json.Unmarshal([]byte(event.Message), &trace); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(trace.Commands) != commandTraceMaxEntries || trace.Omitted != total-commandTraceMaxEntries {
+		t.Fatalf("commands=%d omitted=%d, want %d and %d", len(trace.Commands), trace.Omitted, commandTraceMaxEntries, total-commandTraceMaxEntries)
+	}
+	first := trace.Commands[0]
+	if first.ExitCode == nil || *first.ExitCode != -1 {
+		t.Fatalf("failed without a code = %v, want -1", first.ExitCode)
+	}
+	if !strings.HasSuffix(first.OutputTail, "TAIL-END") || len(first.OutputTail) > commandTraceMaxTailBytes+len("…") {
+		t.Fatalf("output tail is %d bytes (%q...), want the last %d bytes", len(first.OutputTail), first.OutputTail[:20], commandTraceMaxTailBytes)
+	}
+	if len(trace.Sandboxes) != 1 || trace.Sandboxes[0].SandboxID != "sbx-this-generation" {
+		t.Fatalf("sandboxes = %+v, want only this generation's", trace.Sandboxes)
 	}
 }
