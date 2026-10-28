@@ -247,6 +247,8 @@ func newProducerCleanupFixture(t *testing.T, readOnly bool) producerCleanupFixtu
 	engine.cleanupTargetValidator = nil
 	engine.WorktreeHasLiveProcess = nil
 	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+	// A FIXTURE cap for the budget-gated consumer path (#2360 v2); never a live default.
+	engine.CleanupBudget = fixtureCleanupBudget(1 << 30)
 	world := producerCleanupFixture{store: store, engine: engine, manager: manager,
 		jobID: "cleanup-parent/delegation/produce", branch: "gitmoot-delegation-cleanup-produce",
 		preserved: filepath.Join(t.TempDir(), "preserved-result.txt")}
@@ -327,5 +329,13 @@ func (world producerCleanupFixture) assertRemoved(t *testing.T) {
 	obligation, err := world.store.GetCleanupObligation(context.Background(), db.CleanupObligationResourceID(world.jobID, world.path))
 	if err != nil || obligation.State != db.CleanupObligationRemoved {
 		t.Fatalf("cleanup outcome not durable: %+v %v", obligation, err)
+	}
+}
+
+// fixtureCleanupBudget is a test-only approved cap with explicit sizing bounds (#2360 v2).
+func fixtureCleanupBudget(limit int64) func(string) (*ApprovedCleanupSizeBudget, *CleanupSizeLimits, error) {
+	return func(string) (*ApprovedCleanupSizeBudget, *CleanupSizeLimits, error) {
+		return &ApprovedCleanupSizeBudget{Unit: CleanupSizeUnitAllocatedBytes, LimitBytes: limit, Owner: "fixture-owner", Approval: "fixture-only"},
+			&CleanupSizeLimits{MaxEntries: 100_000, MaxDepth: 64, TimeoutMS: 30_000}, nil
 	}
 }

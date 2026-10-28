@@ -91,6 +91,11 @@ type Engine struct {
 	// CleanupRetention reloads producer retention policy during each inspection
 	// and immediately before deletion. Nil is reserved for explicit engine policy.
 	CleanupRetention func() (time.Duration, error)
+	// CleanupBudget reloads the producer-approved byte cap and sizing bounds for a repository
+	// during each budget-gated inspection (#2360 v2). It returns (nil, nil, nil) when no cap is
+	// configured (UNKNOWN) and an error when the configuration cannot be read or is invalid; both
+	// refuse with size_budget_unknown. Nil means no cap is ever known.
+	CleanupBudget func(repo string) (*ApprovedCleanupSizeBudget, *CleanupSizeLimits, error)
 	// OwnerPIDLive reports whether a recorded owner PID is a live process on this
 	// host. It gates the DESTRUCTIVE implement-delegation worktree/branch cleanup so
 	// a worktree still owned by a live runtime worker is never force-removed out from

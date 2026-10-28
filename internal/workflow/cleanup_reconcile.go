@@ -16,8 +16,8 @@ import (
 // recovery before consulting current deletion policy. It never deletes a path
 // or branch. A replacement lifecycle owns its remaining resources; an old token
 // can close that old episode only as superseded, not as a successful removal.
-func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, token string) (result CleanupApplyResult, handled bool, err error) {
-	result = CleanupApplyResult{SchemaVersion: 1, State: "refused"}
+func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, token, budgetGate string) (result CleanupApplyResult, handled bool, err error) {
+	result = CleanupApplyResult{SchemaVersion: CleanupSchemaVersion, State: "refused"}
 	var receipt db.CleanupReceipt
 	var owner db.Job
 	if token != "" {
@@ -90,7 +90,10 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 	if err != nil {
 		return result, true, err
 	}
-	result.Decision = CleanupInspection{SchemaVersion: 1, Producer: "gitmoot", DecisionOwner: "gitmoot",
+	// Accounting-only recovery never measures or deletes, so it carries the caller's gate and no
+	// budget or measurement; the decision is still a complete schema-v2 shape.
+	result.Decision = CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
+		ObservedAt: e.now().UTC().Format(time.RFC3339Nano), BudgetGate: budgetGate,
 		ResourceID: receipt.ResourceID, ResourceKind: "delegation_worktree", OwnerJobID: jobID,
 		OwnerState: owner.State, LifecycleGeneration: receipt.LifecycleGeneration,
 		ExpectedPath: receipt.ExpectedPath, Receipt: &receipt, Obligation: &obligation}

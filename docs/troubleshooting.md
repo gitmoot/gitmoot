@@ -1203,6 +1203,14 @@ Symptoms:
   not readable` - the file has a section header that never closes, so Gitmoot
   cannot locate the credentials it must strip. It refuses rather than stage a
   file it cannot classify. Fix the TOML or remove it from the host state dir.
+- `refuse launch: fd <n> is a <type> ...; a managed runtime's stdin/stdout/stderr
+  must be a pipe, /dev/null or a terminal` - since #2360 a managed launch
+  (`sandbox-exec`, read-only and no-execution seats) passes only checked stdio to
+  the runtime and marks every other inherited descriptor close-on-exec. A stdio
+  that is a regular file, directory or socket could hand the runtime write access
+  it was not granted, so the launch refuses. Daemon-run jobs always use pipes; for
+  a hand-run command, pipe the output (`... | tee log`) instead of redirecting it
+  to a file.
 
 What the seat stages, per runtime:
 
@@ -1521,8 +1529,12 @@ Accounting recovery also reports checkout-lock release failures as operational
 errors. Inspect the durable receipt to distinguish completed removal from
 unfinished accounting before retrying.
 
-`approved_size_budget: null` means unknown, not zero or unlimited. A
-budget-dependent external caller must remain ineligible until an enforced
-positive-cap contract exists. Do not replace this gate with direct `rm`,
+`approved_size_budget: null` means unknown, not zero or unlimited, and the
+budget-gated consumer path refuses with `size_budget_unknown` (schema v2, #2360).
+To allow consumer cleanup, an owner adds a complete `[cleanup_budget]` section
+(see the CLI reference). `size_measurement_incomplete` means the allocated-bytes
+walk crossed a mount, met an external hardlink or an unreadable/changing entry, or
+hit a sizing bound; `size_over_budget` means the tree is larger than the cap.
+Refused applies are recorded as durable refusal receipts. Do not replace this gate with direct `rm`,
 `git worktree remove` or a consumer-side path/size scan.
 

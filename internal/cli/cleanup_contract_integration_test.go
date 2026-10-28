@@ -42,6 +42,8 @@ func newCleanupCLIWorld(t *testing.T, state, action string) cleanupCLIWorld {
 	if err := config.Initialize(world.paths); err != nil {
 		t.Fatal(err)
 	}
+	// A FIXTURE cap for the budget-gated consumer path (#2360 v2); never a live default.
+	appendCleanupFixtureBudget(t, world.paths.ConfigFile, 1<<30)
 	var err error
 	world.store, err = db.Open(world.paths.Database)
 	if err != nil {
@@ -535,7 +537,7 @@ func TestCleanupRevalidatesConsumerEnqueueAfterLifecycleFence(t *testing.T) {
 	ctx := context.Background()
 	engine := daemonWorkflowEngine(world.store, nil, world.checkout, world.paths.Home)
 	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
-	inspection, err := engine.InspectProducerCleanup(ctx, world.job.ID, workflow.CleanupPolicy{})
+	inspection, err := engine.InspectProducerCleanup(ctx, world.job.ID, workflow.CleanupPolicy{BudgetGate: workflow.CleanupBudgetGateEnforced})
 	if err != nil || !inspection.Eligible {
 		t.Fatalf("initial admission: %+v %v", inspection, err)
 	}
@@ -572,5 +574,17 @@ func TestCleanupRevalidatesConsumerEnqueueAfterLifecycleFence(t *testing.T) {
 	consumer, err := world.store.GetJob(ctx, "late-consumer")
 	if err != nil || consumer.State != "queued" {
 		t.Fatalf("cleanup changed consumer state: %+v %v", consumer, err)
+	}
+}
+
+func appendCleanupFixtureBudget(t *testing.T, configFile string, limit int64) {
+	t.Helper()
+	f, err := os.OpenFile(configFile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := fmt.Fprintf(f, "\n[cleanup_budget]\nlimit_bytes = %d\nowner = \"fixture-owner\"\napproval = \"fixture-only\"\nmax_entries = 100000\nmax_depth = 64\ntimeout_ms = 30000\n", limit); err != nil {
+		t.Fatal(err)
 	}
 }
