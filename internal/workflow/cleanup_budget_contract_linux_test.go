@@ -125,7 +125,9 @@ func TestBudgetGatedCleanupRefusesUnknownAndOverBudget(t *testing.T) {
 }
 
 // #2360 v2: the measurement is not part of the token, so the FINAL gate re-measures immediately
-// before removal: a tree that grew past the cap after admission is refused and kept.
+// before removal: a tree that grew past the cap after admission is refused and kept. The growth
+// happens only after apply has prepared its receipt, i.e. after apply's own inspection measured
+// the tree, so only the final gate can see it.
 func TestBudgetGatedCleanupFinalGateRemeasures(t *testing.T) {
 	world := newProducerCleanupFixture(t, false)
 	probe := enforcedInspect(t, world)
@@ -134,12 +136,19 @@ func TestBudgetGatedCleanupFinalGateRemeasures(t *testing.T) {
 	if !d.Eligible {
 		t.Fatalf("admission = %+v", d)
 	}
-	if err := os.WriteFile(filepath.Join(world.path, "grew.bin"), []byte(strings.Repeat("g", 512*1024)), 0o600); err != nil {
-		t.Fatal(err)
+	grew := false
+	world.engine.WorktreeLiveness = func(string) (bool, bool) {
+		if _, err := world.store.CleanupReceiptForToken(context.Background(), d.EligibilityToken); err == nil && !grew {
+			grew = true
+			if err := os.WriteFile(filepath.Join(world.path, "grew.bin"), []byte(strings.Repeat("g", 512*1024)), 0o600); err != nil {
+				t.Error(err)
+			}
+		}
+		return false, true
 	}
 	result, err := world.engine.ApplyProducerCleanup(context.Background(), world.jobID, d.ResourceID, d.EligibilityToken, CleanupPolicy{Mode: "ordinary"})
-	if err != nil || result.State != "refused" || !hasReason(result.Decision, CleanupRefusalSizeOverBudget) {
-		t.Fatalf("apply after growth = %+v %v", result, err)
+	if err != nil || !grew || result.State != "refused" || !hasReason(result.Decision, CleanupRefusalSizeOverBudget) {
+		t.Fatalf("apply after growth (grew=%v) = %+v %v", grew, result, err)
 	}
 	world.assertPreserved(t)
 	if _, err := os.Stat(filepath.Join(world.path, "grew.bin")); err != nil {
