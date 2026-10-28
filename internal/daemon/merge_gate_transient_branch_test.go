@@ -64,4 +64,3 @@ func TestPollOnceReleasesTransientlyBlockedBranchTaskInsteadOfDemotingIt(t *test
 		})
 	}
 }
-
