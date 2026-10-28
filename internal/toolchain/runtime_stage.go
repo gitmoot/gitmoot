@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -105,7 +106,7 @@ const maxInterpreterChain = 8
 // that is exactly the self-loop case.
 func stageRuntimeBounded(gitmootHome string, name string, executable string, chain []string) (string, []string, error) {
 	name = strings.TrimSpace(name)
-	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+	if !stageableRuntimeName(name) {
 		return "", nil, fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
 	}
 	executable = strings.TrimSpace(executable)
@@ -166,26 +167,26 @@ func stageRuntimeBounded(gitmootHome string, name string, executable string, cha
 	lock := entry.(*sync.Mutex)
 	lock.Lock()
 	defer lock.Unlock()
-	// Shared root lock, then the last-used stamp, BEFORE looking at the copy:
-	// the runtime collector (#2382) takes this lock exclusively and re-reads the
-	// stamp, so it can never retire a copy this pass is about to hand out.
+	// The shared root lock is held from before the copy is looked at until after
+	// the last-used stamp is written: the runtime collector (#2382) takes this
+	// lock exclusively, so it can never retire a copy this pass hands out. The
+	// stamp is written only for a copy that validated or was just published
+	// (#2404): a permanently corrupt tree is never refreshed, so it ages out.
 	unlockRoot, err := lockRuntimeRoot(root, false)
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
 	}
 	defer unlockRoot()
-	if err := markRuntimeUsed(root, publishedName, time.Now()); err != nil {
-		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
-	}
 
 	if _, err := os.Lstat(published); err == nil {
 		if err := validatePublished(published, name, relative, fingerprint); err != nil {
 			return "", nil, err
 		}
-		return launcher, closure, nil
-	}
-	if err := source.publish(root, publishedName, name, relative, interpreter, fingerprint); err != nil {
+	} else if err := source.publish(root, publishedName, name, relative, interpreter, fingerprint); err != nil {
 		return "", nil, err
+	}
+	if err := markRuntimeUsed(root, publishedName, time.Now()); err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrRuntimeNotStageable, err)
 	}
 	return launcher, closure, nil
 }
@@ -305,7 +306,7 @@ const UnavailableRuntimeSuffix = "-unavailable-v1"
 // route the seat back through an ungranted operator installation.
 func StageUnavailableRuntime(gitmootHome string, name string) (string, error) {
 	name = strings.TrimSpace(name)
-	if name == "" || strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+	if !stageableRuntimeName(name) {
 		return "", fmt.Errorf("%w: %q is not usable as one path component", ErrRuntimeNotStageable, name)
 	}
 	root := RuntimeRoot(gitmootHome)
@@ -430,3 +431,14 @@ func hasPathElement(path string, name string) bool {
 	}
 	return false
 }
+
+// stageableRuntimeName reports whether name can be one published path component
+// the runtime collector will later see (#2404): only the collectable alphabet
+// [A-Za-z0-9._-], no leading dot, and no ".staging-" fragment (the collector
+// skips such directories as in-flight publishes). Anything else would publish
+// a copy that is never a collection candidate and so never ages out.
+func stageableRuntimeName(name string) bool {
+	return stageableRuntimeNamePattern.MatchString(name) && !strings.Contains(name, ".staging-")
+}
+
+var stageableRuntimeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*$`)
