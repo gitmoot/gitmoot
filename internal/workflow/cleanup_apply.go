@@ -76,7 +76,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 			err = errors.Join(err, e.deferDelegationCleanupFailure(persistCtx, jobID, result.Decision.ExpectedPath, "reclaim", err))
 		}
 	}()
-	reconciled, handled, reconcileErr := e.reconcileCleanupReceipt(ctx, jobID, resourceID, token)
+	reconciled, handled, reconcileErr := e.reconcileCleanupReceipt(ctx, jobID, resourceID, token, policy.BudgetGate)
 	if handled || reconcileErr != nil {
 		return reconciled, reconcileErr
 	}

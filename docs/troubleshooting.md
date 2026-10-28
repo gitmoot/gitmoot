@@ -1203,6 +1203,14 @@ Symptoms:
   not readable` - the file has a section header that never closes, so Gitmoot
   cannot locate the credentials it must strip. It refuses rather than stage a
   file it cannot classify. Fix the TOML or remove it from the host state dir.
+- `refuse launch: fd <n> is a <type> ...; a managed runtime's stdin/stdout/stderr
+  must be a pipe, /dev/null or a terminal` - since #2360 a managed launch
+  (`sandbox-exec`, read-only and no-execution seats) passes only checked stdio to
+  the runtime and marks every other inherited descriptor close-on-exec. A stdio
+  that is a regular file, directory or socket could hand the runtime write access
+  it was not granted, so the launch refuses. Daemon-run jobs always use pipes; for
+  a hand-run command, pipe the output (`... | tee log`) instead of redirecting it
+  to a file.
 
 What the seat stages, per runtime:
 

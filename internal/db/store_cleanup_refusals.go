@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,9 +55,13 @@ func (s *Store) RecordCleanupRefusal(ctx context.Context, refusal CleanupRefusal
 		return CleanupRefusal{}, err
 	}
 	refusal.CreatedAt = now.UTC().Format(time.RFC3339Nano)
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d|%s|%s|%s|%s", refusal.ResourceID, refusal.LifecycleGeneration,
-		refusal.SubmittedToken, string(reasons), refusal.ObservedAt, refusal.CreatedAt)))
-	refusal.RefusalID = "cleanup-refusal-" + hex.EncodeToString(sum[:])[:24]
+	// Random, not derived: two identical refusals in one clock tick are two events, and each must
+	// get its own append-only row rather than a UNIQUE failure.
+	var id [12]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return CleanupRefusal{}, err
+	}
+	refusal.RefusalID = "cleanup-refusal-" + hex.EncodeToString(id[:])
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO cleanup_refusals(refusal_id, schema_version, resource_id, owner_job_id, lifecycle_generation,
 	submitted_token, policy_hash, budget_gate, approved_size_budget, size_measurement, reason_codes, observed_at, created_at)

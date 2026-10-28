@@ -108,6 +108,23 @@ func TestSetConfigScalarRevertsOnInvalidResult(t *testing.T) {
 	}
 }
 
+// #2360: a config edit that breaks the cleanup budget is refused at write time, instead of
+// silently turning every consumer cleanup into size_budget_unknown later.
+func TestSetConfigScalarRejectsInvalidCleanupBudget(t *testing.T) {
+	paths := editTestPaths(t, "[cleanup_budget]\nlimit_bytes = 1073741824\nowner = \"ops\"\napproval = \"decision-1\"\nmax_entries = 100000\nmax_depth = 64\ntimeout_ms = 30000\n")
+	original, _ := os.ReadFile(paths.ConfigFile)
+	if err := SetConfigScalar(paths, []string{"cleanup_budget", "limit_bytes"}, IntScalar(0)); err == nil {
+		t.Fatal("a zero cap was accepted")
+	}
+	after, _ := os.ReadFile(paths.ConfigFile)
+	if string(after) != string(original) {
+		t.Fatalf("file not reverted after an invalid budget edit:\n%s", after)
+	}
+	if err := SetConfigScalar(paths, []string{"cleanup_budget", "limit_bytes"}, IntScalar(2147483648)); err != nil {
+		t.Fatalf("a valid cap was refused: %v", err)
+	}
+}
+
 func TestSetConfigScalarPreservesTrailingComment(t *testing.T) {
 	fixture := "[agents.planner]\nmax_background = 4 # ops cap, do not exceed\n"
 	paths := editTestPaths(t, fixture)
