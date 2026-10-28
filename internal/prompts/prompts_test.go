@@ -120,6 +120,27 @@ func TestRenderRepairPromptIncludesErrorAndRawOutput(t *testing.T) {
 	}
 }
 
+// #2418: an output beyond the excerpt limit is cut visibly, and the WHOLE repair
+// prompt still fits in one argv entry (Linux MAX_ARG_STRLEN = 32 pages = 131072
+// bytes): claude, codex and shell receive the prompt as a single argument, so a
+// larger prompt would fail exec with E2BIG instead of reaching the agent.
+func TestRenderRepairPromptLabelsAnOversizedExcerpt(t *testing.T) {
+	const maxArgStrlen = 131072
+	huge := strings.Repeat("x", 4*repairRawOutputLimit)
+	prompt := RenderRepairPrompt(huge, errors.New("missing gitmoot_result"))
+	if strings.Contains(prompt, huge[:repairRawOutputLimit+1]) {
+		t.Fatal("an output beyond the limit was embedded whole")
+	}
+	if len(prompt) >= maxArgStrlen {
+		t.Fatalf("repair prompt is %d bytes; it must stay below one argv entry (%d)", len(prompt), maxArgStrlen)
+	}
+	for _, want := range []string{"only the first", "keeps every decision, finding and check", "[truncated]"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("oversized repair prompt missing %q", want)
+		}
+	}
+}
+
 func TestRenderRepairPromptSurfacesJoinedFieldErrors(t *testing.T) {
 	// Simulate an errors.Join'd validation failure against the frozen contract:
 	// each per-field error renders as one line, joined with newlines.

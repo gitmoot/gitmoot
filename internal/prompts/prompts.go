@@ -110,9 +110,30 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	builder.WriteString(resultDecisionHelp)
 	builder.WriteString(delegationSchemaHelp)
 	builder.WriteString("\nPrevious raw output:\n")
-	builder.WriteString(trimRawOutput(rawOutput, 12000))
+	builder.WriteString(repairRawOutputExcerpt(rawOutput))
 	builder.WriteByte('\n')
 	return builder.String()
+}
+
+// repairRawOutputLimit bounds the copy of the previous output in a repair prompt.
+// Large enough for a full review result with many findings (#2418: a 12 KB cap
+// cut a valid review mid-findings, so the repair turn could not reproduce it),
+// and small enough that the WHOLE repair prompt (this excerpt plus the fixed
+// contract help) stays below the kernel's 128 KiB single-argument limit
+// (MAX_ARG_STRLEN): claude, codex and shell receive the prompt as one argv entry,
+// and a larger one fails exec with E2BIG. RenderRepairPrompt's test pins that.
+const repairRawOutputLimit = 96 * 1024
+
+// repairRawOutputExcerpt returns the previous output whole when it fits. A longer
+// output is cut visibly, and the agent is told what to return without assuming
+// it can see its previous turn: several runtimes start a fresh session per
+// delivery.
+func repairRawOutputExcerpt(output string) string {
+	output = strings.TrimSpace(output)
+	if len(output) <= repairRawOutputLimit {
+		return output
+	}
+	return fmt.Sprintf("[your previous response was %d bytes; only the first %d are shown. Return ONE complete, corrected gitmoot_result that keeps every decision, finding and check you reported; if it does not fit in %d bytes, shorten the wording of each item rather than dropping items]\n%s\n[truncated]", len(output), repairRawOutputLimit, repairRawOutputLimit, output[:repairRawOutputLimit])
 }
 
 func writeField(builder *strings.Builder, label string, value string) {
@@ -124,12 +145,4 @@ func writeField(builder *strings.Builder, label string, value string) {
 	builder.WriteString(": ")
 	builder.WriteString(value)
 	builder.WriteByte('\n')
-}
-
-func trimRawOutput(output string, limit int) string {
-	output = strings.TrimSpace(output)
-	if len(output) <= limit {
-		return output
-	}
-	return output[:limit] + "\n[truncated]"
 }
