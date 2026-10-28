@@ -80,7 +80,12 @@ func unownedReposWarning(ctx context.Context, store *db.Store, cfg config.OrgCon
 // owner. It is a warning, never a required failure.
 func orgUnownedReposDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	cfg, err := config.LoadOrg(paths)
-	if err != nil || !cfg.Enabled() {
+	if err != nil {
+		// A config that cannot be read must not look like "no org": the check
+		// stays visible as an unverified warning (#2367), like org role activity.
+		return doctor.Check{Name: orgUnownedReposDoctorCheckName, Detail: fmt.Sprintf("repo ownership unverified: load org registry: %v", err)}, true
+	}
+	if !cfg.Enabled() {
 		return doctor.Check{}, false
 	}
 	if strings.TrimSpace(paths.Database) == "" {

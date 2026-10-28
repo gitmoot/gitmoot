@@ -553,7 +553,10 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	case options.foreground:
 		options.routerBypassReason = "--foreground (the router always dispatches a daemon-owned job)"
 	case strings.TrimSpace(options.orgRole) == "":
-		options.routerBypassReason = "no --org-role (the router requires a role to deliver the verdict to)"
+		// Reachable only WITHOUT an org registry: with one, a dispatch whose role
+		// resolves from none of --org-role, GITMOOT_ORG_ROLE or the calling pane
+		// is refused by the org gate before it is enqueued (#2363).
+		options.routerBypassReason = "no --org-role and no org registry (the router requires a role to deliver the verdict to)"
 	}
 	if !options.foreground && strings.TrimSpace(options.orgRole) != "" {
 		if unexpressible := agentReviewInputsTheRouterCannotCarry(options); len(unexpressible) > 0 {
@@ -592,10 +595,10 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
 	// REQUIRES --role because the role is who the verdict is delivered to, and a
-	// review nobody receives is the defect #2194 exists to fix. Failing the
-	// dispatch instead would break every caller that reviews without a role
-	// (TestReviewDispatchRoutesChangesRequestedFixToTaskImplementer is one), so
-	// the direct path stays and the #2194 hold below states the consequence.
+	// review nobody receives is the defect #2194 exists to fix. Since #2363 this
+	// arm is reached only on a home with no org registry (with one, the org gate
+	// refuses a role-less dispatch outright); there the direct path stays and the
+	// #2194 hold below states the consequence.
 	//
 	// FOREGROUND IS NOT DELEGATED AND THAT IS A STATED LIMIT, not an oversight.
 	// `review request` always dispatches a daemon-owned job; a foreground review

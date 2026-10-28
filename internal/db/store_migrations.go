@@ -3074,4 +3074,10 @@ CREATE TABLE cleanup_refusals (
 );
 CREATE INDEX idx_cleanup_refusals_resource ON cleanup_refusals(resource_id, lifecycle_generation);
 	`,
+	// #2367: org status and doctor list the repos with jobs in the last 7 days
+	// (ListJobReposSince). Without this covering index that is a full jobs scan on
+	// every call; with it the created_at range is read from the index alone.
+	`
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at_repo ON jobs(created_at, repo);
+	`,
 }
