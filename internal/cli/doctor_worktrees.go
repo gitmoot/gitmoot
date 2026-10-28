@@ -44,6 +44,9 @@ type delegationWorktreeUsage struct {
 	// UnavailableRoot is a configured [worktrees] root that failed its mount preflight; it is
 	// not scanned, so nothing under it is counted, reclaimed or reported as gone.
 	UnavailableRoot string `json:"unavailableRoot,omitempty"`
+	// ConfigError is a [worktrees] section that cannot be loaded: allocation refuses, and only
+	// the legacy root is scanned.
+	ConfigError string `json:"configError,omitempty"`
 	Summary         string `json:"summary"`
 }
 
@@ -67,9 +70,8 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	usage := delegationWorktreeUsage{Root: root, Roots: []string{root}}
 	placement, err := workflow.ResolveWorktreePlacement(paths.Home)
 	if err != nil {
-		return usage, err
-	}
-	if placement.External() {
+		usage.ConfigError = err.Error()
+	} else if placement.External() {
 		if err := placement.Preflight(); err != nil {
 			usage.UnavailableRoot = placement.Root
 		} else {
@@ -217,6 +219,9 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 	}
 	usage.Size = formatWorktreeBytes(usage.SizeBytes)
 	usage.Summary = fmt.Sprintf("%d stale worktree%s / %s under %s", usage.Stale, pluralSuffix(usage.Stale), usage.Size, strings.Join(usage.Roots, " and "))
+	if usage.ConfigError != "" {
+		usage.Summary += fmt.Sprintf("; [worktrees] config cannot be loaded, so new worktrees are refused: %s", usage.ConfigError)
+	}
 	if usage.UnavailableRoot != "" {
 		usage.Summary += fmt.Sprintf("; configured worktree root %s is unavailable (mount preflight failed) and was not scanned", usage.UnavailableRoot)
 	}
@@ -415,6 +420,6 @@ func delegationWorktreeDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 
 func buildDelegationWorktreeDoctorCheck(usage delegationWorktreeUsage) doctor.Check {
 	detail := fmt.Sprintf("%s (%d reclaimable, %d pinned by non-terminal owners, %d unproven; %d recent terminal within TTL; %d cleanup quarantined)", usage.Summary, usage.Reclaimable, usage.Pinned, usage.Unproven, usage.RecentTerminal, usage.Quarantined)
-	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0 || usage.UnavailableRoot != ""
+	warn := usage.Truncated || usage.Stale >= delegationWorktreeWarnCount || usage.SizeBytes >= delegationWorktreeWarnBytes || usage.Quarantined > 0 || usage.UnavailableRoot != "" || usage.ConfigError != ""
 	return doctor.Check{Name: "worktrees", OK: !warn, Required: false, Detail: detail}
 }

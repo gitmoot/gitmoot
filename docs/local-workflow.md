@@ -153,8 +153,16 @@ with `worktree root unavailable: ...`; there is no fallback to `<home>/worktrees
 Parent directories are created through handles on the verified mount. Existing
 worktrees are not moved: those under `<home>/worktrees` keep their cleanup
 identity. `gitmoot doctor` reports both roots and warns when the configured root
-is unavailable. An invalid `[worktrees]` section is a config error; `gitmoot
-config set` refuses to write one.
+is unavailable or the section cannot be loaded. An invalid `[worktrees]` section
+is a config error; `gitmoot config set` refuses to write one. While the mount is
+down, cleanup of worktrees under `root` is deferred (refusal code
+`worktree_root_unavailable`) and retried; it does not count toward quarantine.
+
+Only the CURRENT `root` and `<home>/worktrees` are managed. Before changing
+`root`, let worktrees under the old root finish and be cleaned (or remove them
+by hand); afterwards gitmoot neither reopens nor cleans paths under the old root.
+The mount checks need Linux 5.6 or newer (`statx` mount IDs); on older kernels
+or other systems a section with mount keys refuses every allocation.
 
 Delegation worktrees use a separate default-on aged cleanup policy:
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only

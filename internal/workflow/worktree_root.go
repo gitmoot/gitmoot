@@ -15,6 +15,10 @@ import (
 // that would create, reopen or clean a worktree there is refused; it never falls back to the home.
 var ErrWorktreeRootUnavailable = errors.New("worktree root unavailable")
 
+// CleanupRefusalWorktreeRootUnavailable is the cleanup refusal code for a resource under a
+// configured [worktrees] root whose mount preflight failed. It is retryable once the mount is back.
+const CleanupRefusalWorktreeRootUnavailable = "worktree_root_unavailable"
+
 // WorktreePlacement resolves where gitmoot-created worktrees live for one resolved home.
 // Legacy (<home>/worktrees) is always recognised so existing worktrees keep their cleanup
 // identity; Root is where NEW worktrees are allocated (Legacy unless [worktrees] is configured).

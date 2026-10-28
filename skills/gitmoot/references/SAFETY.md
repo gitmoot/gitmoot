@@ -626,7 +626,10 @@ used only after a mount preflight: mount point, source and filesystem type must
 match `/proc/self/mountinfo` and the root must sit on that mount. A failed
 preflight refuses allocation, reopen and cleanup under that root
 (`worktree root unavailable`); nothing falls back to `<home>/worktrees`, and an
-absent mount is never treated as an already-removed worktree.
+absent mount is never treated as an already-removed worktree. Cleanup there is
+deferred with refusal code `worktree_root_unavailable` and never quarantined for
+an outage. Mount checks need Linux 5.6+; otherwise a section with mount keys
+refuses every allocation.
 
 Aged cleanup also requires the generation's terminal time to precede
 `[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).
