@@ -612,9 +612,10 @@ dispatch floor above. Below the dispatch floor reviews move as before.
 - **Foreground reviews** (`--foreground`) stay on this host even when disk is
   low (owner decision); the command prints a warning telling the caller to
   re-run with `--background` to get the remote route.
-- **Not covered yet:** coordinator or Janitor pressure holds are not visible to
-  gitmoot until #2359 lands; until then only the disk measurement triggers the
-  move.
+- **Janitor pressure:** with `[disk_guard] remote_reviews = true`, Janitor-held
+  queued reviews use the same capped E2B route and requester notifications.
+  Explicit-local reviews and ineligible work still wait. Manual coordinator
+  holds without a machine-readable Janitor signal do not trigger routing.
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
@@ -2620,6 +2621,13 @@ reason and starts by itself once janitor reports recovery; a foreground dispatch
 or `job run` exits with `janitor pressure holds new heavy work: ...` before it
 creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
 keeps no state of its own. The `[disk_guard]` floors still apply on their own.
+
+With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
+try the existing E2B route, within its dollar/concurrency cap and exact-head
+eligibility checks. The requesting role receives the same move/hold/refusal
+messages as disk-floor routing. Explicit-local reviews, other job types, and
+reviews that cannot run remotely stay queued. A remote refusal restores local
+waiting; foreground dispatch and `job run` still refuse rather than reroute.
 
 Delegation worktrees use the separate default-on
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables that pass. Only
