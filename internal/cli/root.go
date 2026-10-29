@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -205,6 +206,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if check, ok := delegationWorktreeDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
+	checks = append(checks, runtimeCollectionDoctorCheck(paths, time.Now().UTC()))
 	if check, ok := sqliteAutoVacuumDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
