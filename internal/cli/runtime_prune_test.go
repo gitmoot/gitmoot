@@ -99,10 +99,55 @@ func TestRuntimeCollectionPassRemovesAndReportsIncompleteScans(t *testing.T) {
 	runtimeCollectionProcRoot = t.TempDir()
 	out.Reset()
 	runRuntimeCollectionPass(paths, time.Now(), &out)
-	if !strings.Contains(out.String(), "runtime collection removed 1 idle copies") {
-		t.Fatalf("pass log = %q", out.String())
-	}
 	if _, err := os.Stat(published); !os.IsNotExist(err) {
 		t.Fatalf("idle copy still present: %v", err)
+	}
+}
+
+func TestRuntimeCollectionPassRecordsNoRemovalAndIncompleteScan(t *testing.T) {
+	_, paths, published := idleRuntimeHome(t)
+	now := time.Now().UTC()
+	stamp := filepath.Join(toolchain.RuntimeRoot(paths.Home), ".last-used", filepath.Base(published))
+	if err := os.Chtimes(stamp, now, now); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	runRuntimeCollectionPass(paths, now, &out)
+	data, err := os.ReadFile(filepath.Join(paths.Home, "runtime-collection.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Decode the on-disk contract without depending on a new production type,
+	// so this check also compiles on the old code.
+	var state struct {
+		LastPassAt time.Time `json:"last_pass_at"`
+		Kept       int       `json:"kept"`
+		Removed    int       `json:"removed"`
+		Incomplete string    `json:"incomplete"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.LastPassAt.Equal(now) || state.Kept != 1 || state.Removed != 0 || state.Incomplete != "" {
+		t.Fatalf("no-removal pass record: %+v", state)
+	}
+	old := now.Add(-2 * toolchain.DefaultRuntimeMinIdle)
+	if err := os.Chtimes(stamp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	runtimeCollectionProcRoot = filepath.Join(t.TempDir(), "missing")
+	runRuntimeCollectionPass(paths, now.Add(time.Minute), &out)
+	data, err = os.ReadFile(filepath.Join(paths.Home, "runtime-collection.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if !state.LastPassAt.Equal(now.Add(time.Minute)) || state.Incomplete == "" || state.Removed != 0 {
+		t.Fatalf("incomplete pass did not replace prior success: %+v", state)
+	}
+	if _, err := os.Stat(published); err != nil {
+		t.Fatalf("collector removed a protected copy: %v", err)
 	}
 }

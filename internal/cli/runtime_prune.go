@@ -7,9 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/doctor"
 	"github.com/gitmoot/gitmoot/internal/toolchain"
 )
 
@@ -44,15 +47,80 @@ var runtimeCollectionProcRoot = ""
 // incomplete process scan are logged, never fatal.
 func runRuntimeCollectionPass(paths config.Paths, now time.Time, stdout io.Writer) {
 	report, err := toolchain.CollectRuntimes(paths.Home, toolchain.RuntimeCollectOptions{MinIdle: toolchain.DefaultRuntimeMinIdle, Now: now, ProcRoot: runtimeCollectionProcRoot})
+	state := runtimeCollectionState{
+		LastPassAt: now.UTC(), Kept: len(report.Kept), Removed: len(report.Removed),
+		RemovedBytes: report.RemovedBytes, Incomplete: report.Incomplete,
+	}
 	if err != nil {
-		writeLine(stdout, "runtime collection failed: %v", err)
+		state.Error = err.Error()
 	}
-	if report.Incomplete != "" {
-		writeLine(stdout, "runtime collection kept every copy: %s", report.Incomplete)
+	writeLine(stdout, "runtime collection: kept %d, removed %d (%d bytes); error=%q incomplete=%q",
+		state.Kept, state.Removed, state.RemovedBytes, state.Error, state.Incomplete)
+	if err := saveRuntimeCollectionState(paths, state); err != nil {
+		writeLine(stdout, "runtime collection: cannot record pass: %v", err)
 	}
-	if len(report.Removed) > 0 {
-		writeLine(stdout, "runtime collection removed %d idle copies (%d bytes)", len(report.Removed), report.RemovedBytes)
+}
+
+// Keep the last daemon pass outside runtimes/: collection must not remove its
+// own record. Manual prune runs do not stand in for a daemon pass.
+type runtimeCollectionState struct {
+	LastPassAt   time.Time `json:"last_pass_at"`
+	Kept         int       `json:"kept"`
+	Removed      int       `json:"removed"`
+	RemovedBytes int64     `json:"removed_bytes"`
+	Incomplete   string    `json:"incomplete,omitempty"`
+	Error        string    `json:"error,omitempty"`
+}
+
+func saveRuntimeCollectionState(paths config.Paths, state runtimeCollectionState) error {
+	file, err := os.CreateTemp(paths.Home, ".runtime-collection-*")
+	if err != nil {
+		return err
 	}
+	defer os.Remove(file.Name())
+	err = json.NewEncoder(file).Encode(state)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), filepath.Join(paths.Home, "runtime-collection.json"))
+}
+
+func runtimeCollectionDoctorCheck(paths config.Paths, now time.Time) doctor.Check {
+	check := doctor.Check{Name: "runtime collector", Required: false}
+	data, err := os.ReadFile(filepath.Join(paths.Home, "runtime-collection.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		check.Detail = "no daemon pass recorded; first pass runs 24h after daemon start"
+		return check
+	}
+	var state runtimeCollectionState
+	if err == nil {
+		err = json.Unmarshal(data, &state)
+	}
+	if err != nil {
+		check.Detail = fmt.Sprintf("cannot read last daemon pass: %v", err)
+		return check
+	}
+	if state.LastPassAt.IsZero() || state.LastPassAt.After(now) {
+		check.Detail = "invalid last daemon pass time"
+		return check
+	}
+	age := now.Sub(state.LastPassAt)
+	check.OK = age <= runtimeCollectionInterval+time.Hour && state.Error == "" && state.Incomplete == ""
+	check.Detail = fmt.Sprintf("last pass %s (%s ago); kept %d, removed %d (%d bytes)",
+		state.LastPassAt.Format(time.RFC3339), age.Round(time.Second), state.Kept, state.Removed, state.RemovedBytes)
+	if age > runtimeCollectionInterval+time.Hour {
+		check.Detail += "; overdue (24h interval, 1h grace)"
+	}
+	if state.Error != "" {
+		check.Detail += "; failed: " + state.Error
+	}
+	if state.Incomplete != "" {
+		check.Detail += "; incomplete: " + state.Incomplete
+	}
+	return check
 }
 
 func runRuntimePrune(args []string, stdout, stderr io.Writer) int {
