@@ -641,7 +641,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if pathsErr != nil {
 			return localAgentJobOutput{}, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
 		}
-		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName()); err != nil {
+		// record is the RESOLVED checkout, also for a repo this dispatch is about to
+		// register, so it is measured even before it has a database row.
+		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName(), record.CheckoutPath, record.PrimaryCheckoutPath); err != nil {
 			return localAgentJobOutput{}, err
 		}
 	}
@@ -2102,7 +2104,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 	// background dispatch too, so it is heavy work janitor pressure must hold.
 	if paths, pathsErr := pathsFromFlag(home); pathsErr != nil {
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
-	} else if err := janitorPressureRefusal(ctx, store, paths, repo); err != nil {
+	} else if err := janitorPressureRefusal(ctx, store, paths, repo, record.CheckoutPath, record.PrimaryCheckoutPath); err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	execBackend, err := localAgentDispatchExecBackendFor(home)

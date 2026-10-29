@@ -210,8 +210,13 @@ func janitorDeviceOf(path string) (uint64, error) {
 // metadata and objects), and a configured [worktrees] root that is local. A
 // [worktrees] root on a verified network mount is not host disk; its own mount
 // preflight governs it.
-func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string) ([]string, error) {
+func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) ([]string, error) {
 	out := []string{paths.Home, seatTempParent()}
+	// Checkouts the caller already resolved (a first dispatch to an unregistered
+	// repo has no database row yet) count as much as registered ones.
+	for _, checkout := range knownCheckouts {
+		out = appendJanitorCheckout(out, checkout)
+	}
 	if strings.TrimSpace(repo) != "" && store != nil {
 		// An unregistered repo has no checkout for new work to write to (the
 		// job fails on its own); any other lookup error holds.
@@ -224,10 +229,7 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 			// The worker may self-heal to the primary checkout, so both count, and
 			// so does each one's git storage (a linked worktree's .git lives elsewhere).
 			for _, checkout := range []string{record.CheckoutPath, record.PrimaryCheckoutPath} {
-				if checkout = strings.TrimSpace(checkout); checkout != "" {
-					out = append(out, checkout)
-					out = append(out, janitorGitStorage(checkout)...)
-				}
+				out = appendJanitorCheckout(out, checkout)
 			}
 		}
 	}
@@ -241,13 +243,24 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 	return out, nil
 }
 
+// appendJanitorCheckout adds a checkout, its .git (stat follows a symlinked or
+// separately mounted .git to the device it really lives on), and a linked
+// worktree's git dir and common dir.
+func appendJanitorCheckout(out []string, checkout string) []string {
+	if checkout = strings.TrimSpace(checkout); checkout == "" {
+		return out
+	}
+	out = append(out, checkout, filepath.Join(checkout, ".git"))
+	return append(out, janitorGitStorage(checkout)...)
+}
+
 // janitorGitStorage returns the git directory and common directory a checkout
 // writes objects and worktree metadata to, when they differ from the checkout
 // (a linked worktree's "gitdir:" file). A plain checkout returns nothing extra.
 func janitorGitStorage(checkout string) []string {
 	raw, err := os.ReadFile(filepath.Join(checkout, ".git"))
 	if err != nil {
-		return nil // a directory .git (or none) lives on the checkout's own device
+		return nil // a directory .git is measured directly by appendJanitorCheckout
 	}
 	gitDir, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), "gitdir:")
 	if !ok {
@@ -305,7 +318,7 @@ func loadJanitorAdmission(ctx context.Context, paths config.Paths) janitorAdmiss
 
 func (a janitorAdmission) enabled() bool { return a.cfgErr != nil || a.cfg.Enabled }
 
-func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths config.Paths, repo string) string {
+func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) string {
 	switch {
 	case a.cfgErr != nil:
 		return fmt.Sprintf("[janitor_capacity] cannot be loaded: %v", a.cfgErr)
@@ -313,11 +326,8 @@ func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths confi
 		return ""
 	case a.readErr != nil:
 		return a.readErr.Error()
-	case !janitorNow().Before(a.snapshot.validUntil):
-		// The sample expired while devices were resolved (or across a long pass).
-		return fmt.Sprintf("janitor capacity sample is stale (valid until %s)", a.snapshot.validUntil.UTC().Format(time.RFC3339))
 	}
-	hostPaths, err := janitorHostPaths(ctx, store, paths, repo)
+	hostPaths, err := janitorHostPaths(ctx, store, paths, repo, knownCheckouts...)
 	if err != nil {
 		return err.Error()
 	}
@@ -325,7 +335,19 @@ func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths confi
 	if err != nil {
 		return err.Error()
 	}
-	return a.snapshot.decide(devices)
+	if reason := a.snapshot.decide(devices); reason != "" {
+		return reason
+	}
+	return a.expired()
+}
+
+// expired is the LAST check before an admission: a sample that was fresh when
+// it arrived may expire while devices are resolved or later in a long pass.
+func (a janitorAdmission) expired() string {
+	if !janitorNow().Before(a.snapshot.validUntil) {
+		return fmt.Sprintf("janitor capacity sample is stale (valid until %s)", a.snapshot.validUntil.UTC().Format(time.RFC3339))
+	}
+	return ""
 }
 
 // janitorPressureQueuedDispatch drops the queued jobs janitor pressure holds
@@ -359,6 +381,8 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		if !cached {
 			reason = admission.hold(ctx, worker.Store, paths, repo)
 			reasons[repo] = reason
+		} else if reason == "" {
+			reason = admission.expired() // a cached admission must still be fresh
 		}
 		if reason == "" {
 			allowed = append(allowed, job)
@@ -378,12 +402,12 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 
 // janitorPressureRefusal is the foreground check: it returns an error naming
 // the hold, or nil when the consumer is off or the devices are cleared.
-func janitorPressureRefusal(ctx context.Context, store *db.Store, paths config.Paths, repo string) error {
+func janitorPressureRefusal(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) error {
 	admission := loadJanitorAdmission(ctx, paths)
 	if !admission.enabled() {
 		return nil
 	}
-	if reason := admission.hold(ctx, store, paths, repo); reason != "" {
+	if reason := admission.hold(ctx, store, paths, repo, knownCheckouts...); reason != "" {
 		return fmt.Errorf("janitor pressure holds new heavy work: %s", reason)
 	}
 	return nil

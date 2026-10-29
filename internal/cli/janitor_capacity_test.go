@@ -306,3 +306,66 @@ func TestJanitorPressureDoesNotStartAColdManagedInstance(t *testing.T) {
 		t.Fatalf("instances created under pressure: %+v", instances)
 	}
 }
+
+// Review round 2 (#2444): the expiry check is the LAST step of an admission.
+// A sample that arrives fresh but expires while devices are resolved holds, and
+// a cached admission later in the same pass is re-checked too.
+func TestJanitorCapacityExpiryIsCheckedAtTheAdmissionBoundary(t *testing.T) {
+	ctx, _, paths, _ := diskGuardDispatchFixture(t)
+	start := time.Now()
+	clock := start
+	previousNow := janitorNow
+	janitorNow = func() time.Time { return clock }
+	t.Cleanup(func() { janitorNow = previousNow })
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumes := []string{}
+	for d := range devices {
+		volumes = append(volumes, janitorVolumeJSON(d, "target_recovered", false))
+	}
+	snapshot, err := parseJanitorCapacity([]byte(janitorStatusJSON(start.Add(-50*time.Second), time.Minute, janitorTestPolicyHash, volumes...)), janitorTestPolicyHash, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := janitorAdmission{cfg: config.JanitorCapacity{Enabled: true}, snapshot: snapshot}
+	if reason := a.hold(ctx, nil, paths, ""); reason != "" {
+		t.Fatalf("fresh sample held: %q", reason)
+	}
+	clock = start.Add(11 * time.Second) // past valid_until (start+10s)
+	if reason := a.hold(ctx, nil, paths, ""); !strings.Contains(reason, "stale") {
+		t.Fatalf("expired sample admitted: %q", reason)
+	}
+	if reason := a.expired(); !strings.Contains(reason, "stale") {
+		t.Fatalf("cached admission not re-checked: %q", reason)
+	}
+}
+
+// Review round 2 (#2444): a checkout's .git is always measured (stat follows a
+// symlinked .git to its real device), and a checkout the CLI resolved before
+// the repo has a database row is measured too.
+func TestJanitorHostPathsMeasureDotGitAndUnregisteredCheckouts(t *testing.T) {
+	ctx, store, paths, _ := diskGuardDispatchFixture(t)
+	checkout := t.TempDir()
+	elsewhere := t.TempDir()
+	if err := os.Symlink(elsewhere, checkout+"/.git"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := janitorHostPaths(ctx, store, paths, "owner/not-yet-registered", checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, checkout+"\n") && !strings.HasSuffix(joined, checkout) || !strings.Contains(joined, checkout+"/.git") {
+		t.Fatalf("host paths %v miss the unregistered checkout or its .git", got)
+	}
+	dev, err := janitorDeviceOf(checkout + "/.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := janitorDeviceOf(elsewhere)
+	if err != nil || dev != want {
+		t.Fatalf("symlinked .git measured on device %d, want %d (%v)", dev, want, err)
+	}
+}
