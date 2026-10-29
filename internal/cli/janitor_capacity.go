@@ -376,6 +376,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	if !admission.enabled() {
 		return jobs
 	}
+	remotePolicy, remotePolicyErr := config.LoadDiskGuardPolicy(paths)
 	reasons := map[string]string{}
 	allowed := make([]db.Job, 0, len(jobs))
 	now := time.Now()
@@ -398,6 +399,23 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		if reason == "" {
 			allowed = append(allowed, job)
 			continue
+		}
+		if remotePolicyErr == nil && remotePolicy.RemoteReviews {
+			// Reuse the disk-pressure route, including its cap, eligibility,
+			// notifications and refusal-to-local transition. Only an explicit
+			// remote result can pass this hold; checks-policy passthrough may
+			// still select local execution and must remain held.
+			for _, routed := range diskGuardRemoteReviews(ctx, worker, []db.Job{job}, "janitor capacity: "+reason) {
+				payload, err := daemonJobPayload(routed)
+				if err == nil {
+					if backend, present := payload.ExecBackendOverride(); present && backend == "remote" {
+						allowed = append(allowed, routed)
+					}
+				}
+			}
+			if len(allowed) > 0 && allowed[len(allowed)-1].ID == job.ID {
+				continue
+			}
 		}
 		if shouldLogDiskGuard("janitor_capacity", repo, reason, now) {
 			writeLine(worker.Stdout, "JANITOR PRESSURE HOLDS NEW WORK (%s): %s", repo, reason)

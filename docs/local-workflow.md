@@ -198,6 +198,13 @@ or `job run` exits with `janitor pressure holds new heavy work: ...` before it
 creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
 keeps no state of its own. The `[disk_guard]` floors still apply on their own.
 
+With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
+try the existing E2B route, within its dollar/concurrency cap and exact-head
+eligibility checks. The requesting role receives the same move/hold/refusal
+messages as disk-floor routing. Explicit-local reviews, other job types, and
+reviews that cannot run remotely stay queued. A remote refusal restores local
+waiting; foreground dispatch and `job run` still refuse rather than reroute.
+
 Delegation worktrees use a separate default-on aged cleanup policy:
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only
 eligible terminal (`succeeded`, `failed`, or `cancelled`) resources may be removed

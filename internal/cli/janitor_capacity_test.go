@@ -430,3 +430,59 @@ func TestJanitorAdmissionDoesNotExemptVerifiedLocalMount(t *testing.T) {
 		t.Fatalf("uncovered local storage admitted: %q", reason)
 	}
 }
+
+func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 1)
+	paths, err := diskGuardPaths(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enableJanitorCapacity(t, paths)
+	// The existing disk guard is healthy; only Janitor holds this work.
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 80 << 30}, nil
+	})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var volumes []string
+	for dev := range devices {
+		volumes = append(volumes, janitorVolumeJSON(dev, "critical", true))
+	}
+	replaceJanitorStatus(t, janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...), nil)
+	queueDiskGuardJob(t, ctx, store, "a-review", "rev-omp", "review", `,"review_requester":"requester"`)
+	queueDiskGuardJob(t, ctx, store, "b-review", "rev-omp", "review", "")
+	queueDiskGuardJob(t, ctx, store, "implementation", "rev-omp", "implement", "")
+	queueDiskGuardJob(t, ctx, store, "pinned-local", "rev-omp", "review", `,"exec_backend":"local"`)
+	for pass := 0; pass < 2; pass++ {
+		if got := pendingIDs(t, ctx, worker); !slices.Equal(got, []string{"a-review"}) {
+			t.Fatalf("Janitor held dispatch = %v, want one remote review within cap", got)
+		}
+	}
+	if p := storedPayload(t, ctx, store, "a-review"); !p.DiskGuardRouted || !p.PolicyRoutedReview || storedBackend(t, ctx, store, "a-review") != "remote" {
+		t.Fatalf("review bypassed capped remote admission: %+v", p)
+	}
+	for _, id := range []string{"b-review", "implementation", "pinned-local"} {
+		if storedBackend(t, ctx, store, id) == "remote" {
+			t.Fatalf("%s escaped the pressure hold", id)
+		}
+	}
+	messages := messagesTo(t, ctx, store, "requester")
+	if len(messages) != 1 || !strings.Contains(messages[0].Body, "janitor capacity") || !strings.Contains(messages[0].Body, "E2B") {
+		t.Fatalf("missing or duplicate pressure-route alert: %+v", messages)
+	}
+	job, err := store.GetJob(ctx, "a-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !worker.undoDiskGuardRoute(ctx, job, workflow.JobFailed, false, errors.New("remote provider refused")) {
+		t.Fatal("remote refusal did not restore local waiting")
+	}
+	if storedBackend(t, ctx, store, job.ID) == "remote" || !storedPayload(t, ctx, store, job.ID).DiskGuardRouteDeclined {
+		t.Fatal("refused review remained remote or may reroute")
+	}
+	if messages := messagesTo(t, ctx, store, "requester"); len(messages) != 2 {
+		t.Fatalf("remote refusal did not notify requesting role: %+v", messages)
+	}
+}

@@ -813,9 +813,10 @@ dispatch floor above. Below the dispatch floor reviews move as before.
 - **Foreground reviews** (`--foreground`) stay on this host even when disk is
   low (owner decision); the command prints a warning telling the caller to
   re-run with `--background` to get the remote route.
-- **Not covered yet:** coordinator or Janitor pressure holds are not visible to
-  gitmoot until #2359 lands; until then only the disk measurement triggers the
-  move.
+- **Janitor pressure:** with `[disk_guard] remote_reviews = true`, Janitor-held
+  queued reviews use the same capped E2B route and requester notifications.
+  Explicit-local reviews and ineligible work still wait. Manual coordinator
+  holds without a machine-readable Janitor signal do not trigger routing.
 
 Janitor capacity admission treats configured Storage Box paths as off-host only
 on Linux when each path's pinned descriptor matches the configured `fuse.sshfs`
