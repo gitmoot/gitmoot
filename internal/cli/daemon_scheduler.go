@@ -2036,7 +2036,17 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	if err != nil {
 		return err
 	}
+	listed := true
 	for len(pending) > 0 {
+		// #2359: this loop keeps the list it started with while earlier batches
+		// run, which can take a long time; re-ask janitor before each later batch
+		// so a hold that began meanwhile stops new preparation.
+		if !listed {
+			if pending = janitorPressureQueuedDispatch(ctx, worker, pending, repoFilter, rootFilter); len(pending) == 0 {
+				return nil
+			}
+		}
+		listed = false
 		policy, err := worker.parallelSessionPolicy()
 		if err != nil {
 			policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
@@ -2258,6 +2268,12 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		// the drain check, because switching a review is a durable change that
 		// must not happen while dispatch is off.
 		jobs = diskGuardQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
+		if len(jobs) == 0 {
+			return nil, nil
+		}
+		// #2359: default-off janitor pressure admission, after the disk guard so
+		// its own floors still decide first. Off = no janitor process at all.
+		jobs = janitorPressureQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
 		if len(jobs) == 0 {
 			return nil, nil
 		}

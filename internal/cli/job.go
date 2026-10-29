@@ -1173,6 +1173,12 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		worker := defaultJobWorker(store, stdout, *home)
+		// #2359: running a queued job by hand is new heavy work like any dispatch.
+		if paths, pathsErr := diskGuardPaths(worker); pathsErr != nil {
+			return fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
+		} else if err := janitorPressureRefusal(context.Background(), store, paths, payload.Repo); err != nil {
+			return err
+		}
 		worker.CommenterFactory = worker.defaultCommenter
 		if err := worker.run(context.Background(), job); err != nil {
 			return err

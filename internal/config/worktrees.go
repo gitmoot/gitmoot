@@ -40,12 +40,24 @@ var worktreeRootKeys = []string{"root", "mount_point", "mount_source", "mount_fs
 
 // LoadWorktreeRoot parses [worktrees]. A missing config file or section is the default layout.
 func LoadWorktreeRoot(paths Paths) (WorktreeRoot, error) {
+	values, err := loadSingleSectionValues(paths, "worktrees")
+	if err != nil || values == nil {
+		return WorktreeRoot{}, err
+	}
+	return buildWorktreeRoot(values)
+}
+
+// loadSingleSectionValues returns the raw key = value pairs of a top-level
+// [name] section that may appear at most once, or nil when the file or the
+// section is absent. Duplicate sections or keys and malformed headers that
+// target name are errors; values are returned unparsed.
+func loadSingleSectionValues(paths Paths, name string) (map[string]string, error) {
 	content, err := os.ReadFile(paths.ConfigFile)
 	if os.IsNotExist(err) {
-		return WorktreeRoot{}, nil
+		return nil, nil
 	}
 	if err != nil {
-		return WorktreeRoot{}, err
+		return nil, err
 	}
 	var values map[string]string
 	inSection := false
@@ -55,13 +67,13 @@ func LoadWorktreeRoot(paths Paths) (WorktreeRoot, error) {
 			continue
 		}
 		if section, ok := sectionHeader(line); ok {
-			if section == "" && malformedHeaderTargets(line, "worktrees") {
-				return WorktreeRoot{}, fmt.Errorf("parse worktrees section: missing closing ]")
+			if section == "" && malformedHeaderTargets(line, name) {
+				return nil, fmt.Errorf("parse %s section: missing closing ]", name)
 			}
-			inSection = strings.TrimSpace(section) == "worktrees"
+			inSection = strings.TrimSpace(section) == name
 			if inSection {
 				if values != nil {
-					return WorktreeRoot{}, fmt.Errorf("parse worktrees: [worktrees] appears twice")
+					return nil, fmt.Errorf("parse %s: [%s] appears twice", name, name)
 				}
 				values = map[string]string{}
 			}
@@ -72,18 +84,15 @@ func LoadWorktreeRoot(paths Paths) (WorktreeRoot, error) {
 		}
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
-			return WorktreeRoot{}, fmt.Errorf("parse worktrees: line %q is not key = value", line)
+			return nil, fmt.Errorf("parse %s: line %q is not key = value", name, line)
 		}
 		key = strings.TrimSpace(key)
 		if _, dup := values[key]; dup {
-			return WorktreeRoot{}, fmt.Errorf("parse worktrees: %s set twice", key)
+			return nil, fmt.Errorf("parse %s: %s set twice", name, key)
 		}
 		values[key] = strings.TrimSpace(value)
 	}
-	if values == nil {
-		return WorktreeRoot{}, nil
-	}
-	return buildWorktreeRoot(values)
+	return values, nil
 }
 
 func buildWorktreeRoot(values map[string]string) (WorktreeRoot, error) {

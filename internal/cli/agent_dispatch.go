@@ -837,6 +837,20 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			stagedVerdictAgent = verdictAgent
 		}
 	}
+	// #2359: default-off janitor pressure admission, before any durable state.
+	// A foreground dispatch starts heavy work right now, and a dispatch that
+	// allocates a read-only worktree writes one before the job is even queued,
+	// so both are refused while janitor holds. A plain background enqueue writes
+	// nothing heavy; the daemon's dispatch listing holds it in the queue instead.
+	if !request.Background || dispatchReadOnlyWorktreeEligible(request) {
+		paths, pathsErr := pathsFromFlag(request.Home)
+		if pathsErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
+		}
+		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName()); err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	switch request.Action {
 	case "review":
 		if err := reviewReadOnlyWorktreeCapacity(request.Home); err != nil {

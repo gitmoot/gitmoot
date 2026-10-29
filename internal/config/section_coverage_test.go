@@ -37,8 +37,8 @@ var (
 	// staged_review.go pinned by TestStagedReviewMalformedHeaderClearsSection,
 	// and review_router.go by TestReviewRouterMalformedHeaderEndsSection.
 	pinnedSectionHeaderSites = []string{
-		"cleanup_budget.go::LoadCleanupBudget", // TestCleanupBudgetMalformedHeaderRefuses (#2360)
-		"worktrees.go::LoadWorktreeRoot",       // TestWorktreeRootMalformedHeaderRefuses (#2375)
+		"cleanup_budget.go::LoadCleanupBudget",  // TestCleanupBudgetMalformedHeaderRefuses (#2360)
+		"worktrees.go::loadSingleSectionValues", // TestWorktreeRootMalformedHeaderRefuses (#2375), TestLoadJanitorCapacityRefusesInvalidSections (#2359)
 		"admission.go::LoadAdmissionPolicy",
 		"credentials.go::LoadCredentialsConfig",
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",
