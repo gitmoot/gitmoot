@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 type JobPrompt struct {
@@ -94,15 +95,7 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	builder.WriteString("Your previous response did not contain a valid gitmoot_result JSON object.\n")
 	if parseError != nil {
 		builder.WriteString("Validation errors (fix every line):\n")
-		for _, line := range strings.Split(parseError.Error(), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			builder.WriteString("- ")
-			builder.WriteString(line)
-			builder.WriteByte('\n')
-		}
+		builder.WriteString(repairValidationErrors(parseError.Error()))
 	}
 	builder.WriteString("\nReturn only one JSON object in this exact shape:\n")
 	builder.WriteString(resultContractShape)
@@ -134,6 +127,47 @@ func repairRawOutputExcerpt(output string) string {
 		return output
 	}
 	return fmt.Sprintf("[your previous response was %d bytes; only the first %d are shown. Return ONE complete, corrected gitmoot_result that keeps every decision, finding and check you reported; if it does not fit in %d bytes, shorten the wording of each item rather than dropping items]\n%s\n[truncated]", len(output), repairRawOutputLimit, repairRawOutputLimit, output[:repairRawOutputLimit])
+}
+
+// repairValidationErrorsLimit bounds the validation-error list in a repair
+// prompt (#2431). The error can echo agent-authored text, such as an unknown
+// field name, so without a cap it could push the whole prompt past one argv
+// entry (MAX_ARG_STRLEN), which repairRawOutputLimit's headroom assumes it never does.
+const repairValidationErrorsLimit = 4 * 1024
+
+// repairValidationErrors renders one "- " line per non-empty error line,
+// stopping at repairValidationErrorsLimit bytes on a UTF-8 boundary and saying
+// how much was left out.
+func repairValidationErrors(text string) string {
+	var builder strings.Builder
+	omitted := 0
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if omitted > 0 {
+			omitted += len(line)
+			continue
+		}
+		room := repairValidationErrorsLimit - builder.Len() - len("- \n")
+		if len(line) > room {
+			cut := max(room, 0)
+			for cut > 0 && !utf8.RuneStart(line[cut]) {
+				cut--
+			}
+			if cut > 0 {
+				builder.WriteString("- " + line[:cut] + "\n")
+			}
+			omitted = len(line) - cut
+			continue
+		}
+		builder.WriteString("- " + line + "\n")
+	}
+	if omitted > 0 {
+		fmt.Fprintf(&builder, "- [%d more bytes of validation errors omitted]\n", omitted)
+	}
+	return builder.String()
 }
 
 func writeField(builder *strings.Builder, label string, value string) {
