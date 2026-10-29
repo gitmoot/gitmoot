@@ -1072,6 +1072,16 @@ func pollRegisteredReposWithPoller(ctx context.Context, poller registeredRepoPol
 		}
 		polled++
 		result, err := poller.pollRepo(ctx, repoRecord, now)
+		if errors.Is(err, db.ErrRepoNotFound) {
+			// #2449: `repo remove` ran after this pass listed the repo. That is an
+			// operator action, not a daemon failure: forget its schedule and keep
+			// polling the rest instead of ending the daemon run.
+			writeLine(poller.Stdout, "%s: removed during this poll pass; skipped", fullName)
+			delete(schedule.NextPoll, fullName)
+			delete(schedule.IdleStreak, fullName)
+			delete(schedule.ErrorStreak, fullName)
+			continue
+		}
 		if err != nil {
 			return wait, err
 		}

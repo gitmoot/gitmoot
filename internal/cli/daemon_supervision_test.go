@@ -931,3 +931,59 @@ func TestRunSingleRepoSupervisorReconcilesDefaultBranchAtStartup(t *testing.T) {
 		t.Fatalf("startup output = %q, want reconciliation message", output.buffer.String())
 	}
 }
+
+// #2449: `repo remove` during a poll pass (the pass listed the repo first) made
+// the poll-result write return "repo not found", which ended the whole daemon
+// run. The removed repo is now skipped and the rest of the pass still polls.
+func TestPollRegisteredReposSkipsARepoRemovedDuringThePass(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	store, err := dbtest.Open(t, paths.Database)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	removedCheckout, keptCheckout := t.TempDir(), t.TempDir()
+	for _, repo := range []db.Repo{
+		{Owner: "owner", Name: "a-removed", CheckoutPath: removedCheckout, PollInterval: "30s"},
+		{Owner: "owner", Name: "b-kept", CheckoutPath: keptCheckout, PollInterval: "30s"},
+	} {
+		if err := store.UpsertRepo(ctx, repo); err != nil {
+			t.Fatalf("UpsertRepo(%s) returned error: %v", repo.FullName(), err)
+		}
+	}
+	var stdout bytes.Buffer
+	poller := defaultRegisteredRepoPoller(store, 1, false, &stdout, "", "")
+	poller.GitHubClient = func(checkout string) github.Client {
+		if checkout == removedCheckout {
+			// The operator removes the repo while its poll is in flight.
+			if _, err := store.RemoveRepo(ctx, "owner/a-removed"); err != nil {
+				t.Fatalf("RemoveRepo: %v", err)
+			}
+		}
+		return &cliPollFakeGitHub{}
+	}
+	poller.WorkflowFactory = func(*db.Store, github.Client, string) *workflow.Engine { return nil }
+	schedule := registeredRepoSchedule{NextPoll: map[string]time.Time{}, IdleStreak: map[string]int{}, ErrorStreak: map[string]int{}}
+
+	if _, err := pollRegisteredReposWithPoller(ctx, poller, schedule, time.Date(2026, 10, 29, 16, 48, 0, 0, time.UTC), 30*time.Second); err != nil {
+		t.Fatalf("a repo removed mid-pass ended the poll pass: %v", err)
+	}
+	kept, err := store.GetRepo(ctx, "owner/b-kept")
+	if err != nil {
+		t.Fatalf("GetRepo kept: %v", err)
+	}
+	if kept.LastPollAt == "" {
+		t.Fatal("the repo after the removed one was not polled")
+	}
+	if _, scheduled := schedule.NextPoll["owner/a-removed"]; scheduled {
+		t.Fatal("the removed repo kept a poll schedule")
+	}
+	if !strings.Contains(stdout.String(), "owner/a-removed: removed during this poll pass; skipped") {
+		t.Fatalf("no skip line in output: %q", stdout.String())
+	}
+}
