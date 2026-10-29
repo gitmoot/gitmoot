@@ -75,6 +75,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 2,
 		reason:      "dashboard probes the deployed gitmoot binary version on the host",
 	},
+	"internal/cli/janitor_capacity.go:<package>": {
+		rawCommands: 1,
+		reason:      "default-off pressure admission (#2359) reads the host's own workspace-janitor status with a fixed argv; never job work - runJanitorStatus is the injectable seam tests replace",
+	},
 	"internal/cli/org.go:<package>": {
 		execRunners: 2,
 		reason:      "operator org doctor and seat-management commands use replaceable host runner seams",
