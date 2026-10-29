@@ -2,8 +2,10 @@ package prompts
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestRenderJobIncludesContextAndContract(t *testing.T) {
@@ -177,5 +179,27 @@ func TestRenderJobIncludesDelegationValidationHint(t *testing.T) {
 	want := `delegations[<index>] (id "<id>")`
 	if !strings.Contains(prompt, want) {
 		t.Fatalf("job prompt missing delegation validation hint %q:\n%s", want, prompt)
+	}
+}
+
+// #2431: an error echoing agent-authored text (here, a huge unknown field name)
+// is bounded, says how much was omitted, and the WHOLE prompt still fits in one
+// argv entry even with a maximal raw-output excerpt.
+func TestRenderRepairPromptBoundsAHugeValidationError(t *testing.T) {
+	const maxArgStrlen = 131072
+	field := strings.Repeat("é", 60*1024) // multi-byte, to exercise the UTF-8 cut
+	parseErr := fmt.Errorf("unsupported gitmoot_result field %q\nsecond line stays out", field)
+	prompt := RenderRepairPrompt(strings.Repeat("x", 4*repairRawOutputLimit), parseErr)
+	if len(prompt) >= maxArgStrlen {
+		t.Fatalf("repair prompt is %d bytes; it must stay below one argv entry (%d)", len(prompt), maxArgStrlen)
+	}
+	if !utf8.ValidString(prompt) {
+		t.Fatal("repair prompt was cut inside a UTF-8 sequence")
+	}
+	if !strings.Contains(prompt, "more bytes of validation errors omitted]") || strings.Contains(prompt, "second line stays out") {
+		t.Fatal("an oversized validation error was not visibly bounded")
+	}
+	if !strings.Contains(prompt, "- unsupported gitmoot_result field") {
+		t.Fatal("the start of the error must still reach the agent")
 	}
 }
