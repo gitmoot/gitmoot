@@ -180,7 +180,9 @@ Heavy work is every queued or foreground agent or shell job; messaging, inbox,
 status and other bounded commands are never held, and running jobs are never
 stopped or cancelled. For each job, gitmoot checks the devices of the home, the
 seat scratch parent, the repository's checkout and a local `[worktrees]` root
-against `data.capacity.volumes[]` (matched by device number). Work is admitted
+against `data.capacity.volumes[]` (matched by device number). A checkout on
+the `[worktrees]` network mount (for example the Storage Box) is left out while
+that mount passes its preflight, like the worktree root; janitor never covers it. Work is admitted
 only when every device is `target_recovered` or `cleanup_needed` with
 `admission_hold: false` in a fresh sample (before `valid_until`) under the
 approved `policy_hash`. Anything else holds: `critical`, `no_safe_reclaim`,

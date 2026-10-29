@@ -19,6 +19,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // #2359: default-off pressure admission. workspace-janitor owns pressure and its
@@ -295,6 +296,26 @@ func janitorHostDevices(hostPaths []string) (map[uint64]string, error) {
 	return devices, nil
 }
 
+// janitorVerifiedMountDevice returns the device of the [worktrees] network
+// mount, but only while it passes the same preflight that new worktrees on it
+// require (mounted, configured source and type, root on that mount). It is a
+// variable so tests can stand in for a mount.
+var janitorVerifiedMountDevice = func(paths config.Paths) (uint64, bool) {
+	root, err := config.LoadWorktreeRoot(paths)
+	if err != nil || !root.Configured() || !root.HasMount() {
+		return 0, false
+	}
+	placement, err := workflow.ResolveWorktreePlacement(filepath.Dir(paths.ConfigFile))
+	if err != nil || placement.Preflight() != nil {
+		return 0, false
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(root.Root, &st); err != nil {
+		return 0, false
+	}
+	return uint64(st.Dev), true
+}
+
 // janitorAdmission is one consumer read: the loaded config and, when enabled,
 // one producer snapshot. A config error counts as enabled, so it holds.
 type janitorAdmission struct {
@@ -334,6 +355,12 @@ func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths confi
 	devices, err := janitorHostDevices(hostPaths)
 	if err != nil {
 		return err.Error()
+	}
+	// #2452: a checkout on the verified [worktrees] network mount writes to that
+	// mount, not to host disk, and janitor never covers it. Leave its device out,
+	// exactly as the worktree root itself is left out. Unverified or down: keep it.
+	if dev, ok := janitorVerifiedMountDevice(paths); ok {
+		delete(devices, dev)
 	}
 	if reason := a.snapshot.decide(devices); reason != "" {
 		return reason

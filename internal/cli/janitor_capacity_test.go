@@ -370,3 +370,48 @@ func TestJanitorHostPathsMeasureDotGitAndUnregisteredCheckouts(t *testing.T) {
 		t.Fatalf("symlinked .git measured on device %d, want %d (%v)", dev, want, err)
 	}
 }
+
+// #2452: a checkout on the verified [worktrees] network mount (the Storage Box)
+// is on a device janitor never covers. It must not hold work while that mount
+// is verified, and must still hold when it is not. /dev/shm stands in for the
+// mount: it is a real, separate device.
+func TestJanitorAdmissionLeavesOutTheVerifiedNetworkMount(t *testing.T) {
+	ctx, _, paths, _ := diskGuardDispatchFixture(t)
+	checkout, err := os.MkdirTemp("/dev/shm", "gm-2452-")
+	if err != nil {
+		t.Skipf("no /dev/shm: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(checkout) })
+	mountDev, err := janitorDeviceOf(checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, same := local[mountDev]; same {
+		t.Skip("/dev/shm shares a device with the test home")
+	}
+	volumes := []string{}
+	for d := range local {
+		volumes = append(volumes, janitorVolumeJSON(d, "target_recovered", false))
+	}
+	now := time.Now()
+	snapshot, err := parseJanitorCapacity([]byte(janitorStatusJSON(now.Add(-time.Second), time.Minute, janitorTestPolicyHash, volumes...)), janitorTestPolicyHash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := janitorAdmission{cfg: config.JanitorCapacity{Enabled: true}, snapshot: snapshot}
+
+	previous := janitorVerifiedMountDevice
+	t.Cleanup(func() { janitorVerifiedMountDevice = previous })
+	janitorVerifiedMountDevice = func(config.Paths) (uint64, bool) { return 0, false }
+	if reason := a.hold(ctx, nil, paths, "", checkout); !strings.Contains(reason, "not covered") {
+		t.Fatalf("an unverified uncovered device must hold, got %q", reason)
+	}
+	janitorVerifiedMountDevice = func(config.Paths) (uint64, bool) { return mountDev, true }
+	if reason := a.hold(ctx, nil, paths, "", checkout); reason != "" {
+		t.Fatalf("a checkout on the verified network mount held work: %q", reason)
+	}
+}
