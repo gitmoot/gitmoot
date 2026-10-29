@@ -133,12 +133,28 @@ func (s *Store) SetRepoPollInterval(ctx context.Context, fullName string, interv
 	return requireAffected(result, "repo", fullName)
 }
 
+// ErrRepoNotFound marks a write to a repo that is not, or no longer, registered
+// (for example removed by `repo remove` while a daemon poll pass held it).
+var ErrRepoNotFound = errors.New("repo not found")
+
+type repoNotFoundError string
+
+func (e repoNotFoundError) Error() string      { return fmt.Sprintf("repo %q not found", string(e)) }
+func (repoNotFoundError) Is(target error) bool { return target == ErrRepoNotFound }
+
 func (s *Store) UpdateRepoPollResult(ctx context.Context, fullName string, lastPollAt string, lastError string) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE repos SET last_poll_at = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE full_name = ?`, lastPollAt, lastError, fullName)
 	if err != nil {
 		return err
 	}
-	return requireAffected(result, "repo", fullName)
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return repoNotFoundError(fullName)
+	}
+	return nil
 }
 
 // UpdateRepoDefaultBranch corrects the cached default branch, reporting whether
