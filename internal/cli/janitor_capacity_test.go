@@ -138,7 +138,7 @@ func TestJanitorCapacityDisabledStartsNoProcess(t *testing.T) {
 func TestJanitorPressureHoldsQueuedWorkUntilRecovery(t *testing.T) {
 	ctx, store, paths, worker := diskGuardDispatchFixture(t)
 	enableJanitorCapacity(t, paths)
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestJanitorCapacityExpiresDuringASlowCall(t *testing.T) {
 	previousNow := janitorNow
 	janitorNow = func() time.Time { return clock }
 	t.Cleanup(func() { janitorNow = previousNow })
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestJanitorHostPathsIncludeEveryResolvableCheckout(t *testing.T) {
 	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "healed", CheckoutPath: linked, PrimaryCheckoutPath: primary}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := janitorHostPaths(ctx, store, paths, "owner/healed")
+	got, _, err := janitorHostPaths(ctx, store, paths, "owner/healed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestJanitorCapacityExpiryIsCheckedAtTheAdmissionBoundary(t *testing.T) {
 	previousNow := janitorNow
 	janitorNow = func() time.Time { return clock }
 	t.Cleanup(func() { janitorNow = previousNow })
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +354,7 @@ func TestJanitorHostPathsMeasureDotGitAndUnregisteredCheckouts(t *testing.T) {
 	if err := os.Symlink(elsewhere, checkout+"/.git"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := janitorHostPaths(ctx, store, paths, "owner/not-yet-registered", checkout)
+	got, _, err := janitorHostPaths(ctx, store, paths, "owner/not-yet-registered", checkout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,6 +371,66 @@ func TestJanitorHostPathsMeasureDotGitAndUnregisteredCheckouts(t *testing.T) {
 	}
 }
 
+func TestJanitorAdmissionDoesNotExemptVerifiedLocalMount(t *testing.T) {
+	ctx, _, paths, _ := diskGuardDispatchFixture(t)
+	checkout, err := os.MkdirTemp("/dev/shm", "gm-local-mount-")
+	if err != nil {
+		t.Skipf("no separate tmpfs: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(checkout) })
+	table, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		t.Skipf("mount table unavailable: %v", err)
+	}
+	var source string
+	for _, line := range strings.Split(string(table), "\n") {
+		fields := strings.Fields(line)
+		separator := slices.Index(fields, "-")
+		if len(fields) > 4 && fields[4] == "/dev/shm" && separator >= 0 && len(fields) > separator+2 && fields[separator+1] == "tmpfs" {
+			source = fields[separator+2]
+		}
+	}
+	if source == "" {
+		t.Skip("/dev/shm is not a tmpfs mount")
+	}
+	appendConfig(t, paths, fmt.Sprintf("\n[worktrees]\nroot = %q\nmount_point = \"/dev/shm\"\nmount_source = %q\nmount_fstype = \"tmpfs\"\n", checkout, source))
+	placement, err := workflow.ResolveWorktreePlacement(paths.Home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := placement.Preflight(); err != nil {
+		t.Fatalf("local mount positive control failed: %v", err)
+	}
+	localDev, err := janitorDeviceOf(checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	homeDev, err := janitorDeviceOf(paths.Home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if localDev == homeDev {
+		t.Skip("tmpfs is not separate")
+	}
+	now := time.Now()
+	snapshot, err := parseJanitorCapacity([]byte(janitorStatusJSON(now, time.Minute, janitorTestPolicyHash,
+		janitorVolumeJSON(homeDev, "target_recovered", false),
+		janitorVolumeJSON(localDev, "critical", true))), janitorTestPolicyHash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := janitorAdmission{cfg: config.JanitorCapacity{Enabled: true}, snapshot: snapshot}
+	if reason := a.hold(ctx, nil, paths, "", checkout); !strings.Contains(reason, "critical") {
+		t.Fatalf("verified LOCAL mount lost pressure coverage: %q", reason)
+	}
+	// A local device with no producer coverage must also stay held.
+	snapshot.volumes = nil
+	a.snapshot = snapshot
+	if reason := a.hold(ctx, nil, paths, "", checkout); !strings.Contains(reason, "not covered") {
+		t.Fatalf("uncovered local storage admitted: %q", reason)
+	}
+}
+
 func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 	ctx, store, worker := diskGuardRemoteFixture(t, true, 1)
 	paths, err := diskGuardPaths(worker)
@@ -382,7 +442,7 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 80 << 30}, nil
 	})
-	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
 	if err != nil {
 		t.Fatal(err)
 	}

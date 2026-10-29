@@ -2615,7 +2615,13 @@ Heavy work is every queued or foreground agent or shell job; messaging, inbox,
 status and other bounded commands are never held, and running jobs are never
 stopped or cancelled. For each job, gitmoot checks the devices of the home, the
 seat scratch parent, the repository's checkout and a local `[worktrees]` root
-against `data.capacity.volumes[]` (matched by device number). Work is admitted
+against `data.capacity.volumes[]` (matched by device number). On Linux, each path
+on the configured `fuse.sshfs` worktree mount is omitted only when a retained
+descriptor's mount ID matches that mount's source/type/point in the local kernel
+mount table. Local mounts and other paths retain coverage; no whole device is
+exempted. Config is read once, and admission never probes the remote worktree
+root for an unrelated local path. Worktree creation still runs its own preflight.
+Unknown identity or unavailable mount data keeps the path covered. Work is admitted
 only when every device is `target_recovered` or `cleanup_needed` with
 `admission_hold: false` in a fresh sample (before `valid_until`) under the
 approved `policy_hash`. Anything else holds: `critical`, `no_safe_reclaim`,

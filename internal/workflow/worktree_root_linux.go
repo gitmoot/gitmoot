@@ -25,6 +25,53 @@ type mountEntry struct {
 	source     string
 }
 
+// WorktreeStorageDevice measures a path (or its nearest existing ancestor)
+// through a pinned descriptor. network is true only for the configured sshfs
+// mount, never for a local mount. No pathname lookup of cfg.Root is performed.
+// The caller must omit this path, not delete its device from other paths.
+func WorktreeStorageDevice(path string, cfg config.WorktreeRoot) (device uint64, network bool, err error) {
+	var fd int
+	for p := filepath.Clean(path); ; p = filepath.Dir(p) {
+		fd, err = unix.Open(p, unix.O_PATH|unix.O_CLOEXEC, 0)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.ENOENT) || p == filepath.Dir(p) {
+			return 0, false, fmt.Errorf("resolve device for %s: %w", path, err)
+		}
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return 0, false, err
+	}
+	return uint64(st.Dev), worktreeNetworkFD(fd, cfg), nil
+}
+
+// The descriptor pins both the inode and mount while the local mount table is
+// read. Unmount/replacement cannot retarget it to the directory underneath or
+// recycle its mount ID. Config is a caller-owned snapshot, not reloaded here.
+func worktreeNetworkFD(fd int, cfg config.WorktreeRoot) bool {
+	if !cfg.Configured() || !cfg.HasMount() || cfg.MountFSType != "fuse.sshfs" {
+		return false
+	}
+	id, err := mountIDAt(fd, "", unix.AT_EMPTY_PATH|unix.AT_STATX_DONT_SYNC)
+	if err != nil {
+		return false
+	}
+	entries, err := readMountInfo(mountInfoPath)
+	if err != nil {
+		return false
+	}
+	var top *mountEntry
+	for i := range entries {
+		if entries[i].mountPoint == cfg.MountPoint {
+			top = &entries[i]
+		}
+	}
+	return top != nil && top.id == id && top.fsType == "fuse.sshfs" && top.source == cfg.MountSource
+}
+
 // verifyWorktreeMount proves cfg.MountPoint is currently mounted with the configured source and
 // filesystem type, and that cfg.Root lives on that very mount (same mount ID). It returns the
 // mount ID. The topmost mount at the mount point wins, as it is the one path lookups reach.

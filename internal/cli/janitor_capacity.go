@@ -19,6 +19,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // #2359: default-off pressure admission. workspace-janitor owns pressure and its
@@ -210,7 +211,7 @@ func janitorDeviceOf(path string) (uint64, error) {
 // metadata and objects), and a configured [worktrees] root that is local. A
 // [worktrees] root on a verified network mount is not host disk; its own mount
 // preflight governs it.
-func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) ([]string, error) {
+func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) ([]string, config.WorktreeRoot, error) {
 	out := []string{paths.Home, seatTempParent()}
 	// Checkouts the caller already resolved (a first dispatch to an unregistered
 	// repo has no database row yet) count as much as registered ones.
@@ -224,7 +225,7 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 		case err != nil:
-			return nil, fmt.Errorf("resolve checkout of %s: %w", repo, err)
+			return nil, config.WorktreeRoot{}, fmt.Errorf("resolve checkout of %s: %w", repo, err)
 		default:
 			// The worker may self-heal to the primary checkout, so both count, and
 			// so does each one's git storage (a linked worktree's .git lives elsewhere).
@@ -235,12 +236,12 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 	}
 	root, err := config.LoadWorktreeRoot(paths)
 	if err != nil {
-		return nil, err
+		return nil, root, err
 	}
-	if root.Configured() && !root.HasMount() {
+	if root.Configured() && (!root.HasMount() || root.MountFSType != "fuse.sshfs") {
 		out = append(out, root.Root)
 	}
-	return out, nil
+	return out, root, nil
 }
 
 // appendJanitorCheckout adds a checkout, its .git (stat follows a symlinked or
@@ -281,12 +282,22 @@ func janitorGitStorage(checkout string) []string {
 	return out
 }
 
-func janitorHostDevices(hostPaths []string) (map[uint64]string, error) {
+func janitorHostDevices(hostPaths []string, root config.WorktreeRoot) (map[uint64]string, error) {
 	devices := make(map[uint64]string, len(hostPaths))
 	for _, path := range hostPaths {
-		dev, err := janitorDeviceOf(path)
+		var dev uint64
+		var network bool
+		var err error
+		if root.Configured() && root.HasMount() && root.MountFSType == "fuse.sshfs" {
+			dev, network, err = workflow.WorktreeStorageDevice(path, root)
+		} else {
+			dev, err = janitorDeviceOf(path)
+		}
 		if err != nil {
 			return nil, err
+		}
+		if network {
+			continue
 		}
 		if _, seen := devices[dev]; !seen {
 			devices[dev] = path
@@ -327,11 +338,11 @@ func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths confi
 	case a.readErr != nil:
 		return a.readErr.Error()
 	}
-	hostPaths, err := janitorHostPaths(ctx, store, paths, repo, knownCheckouts...)
+	hostPaths, root, err := janitorHostPaths(ctx, store, paths, repo, knownCheckouts...)
 	if err != nil {
 		return err.Error()
 	}
-	devices, err := janitorHostDevices(hostPaths)
+	devices, err := janitorHostDevices(hostPaths, root)
 	if err != nil {
 		return err.Error()
 	}
