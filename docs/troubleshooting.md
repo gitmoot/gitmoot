@@ -1032,6 +1032,11 @@ would be removed, and `gitmoot runtime prune` to do it now (`--min-idle` changes
 the 7 days). If the process scan cannot finish, nothing is removed.
 Unavailable-runtime commands are never removed. `toolchain.Collect` still has no
 production caller, so staged Go toolchains are not reclaimed.
+Every daemon pass logs kept/removed counts and saves its timestamp and result to
+`<home>/runtime-collection.json`, including no-op, failed and incomplete passes.
+`gitmoot doctor` shows this record and warns when it is missing, failed,
+incomplete or older than 25 hours (24h interval plus 1h grace). Restarting the
+daemon resets its first-pass timer; manual prune does not update the daemon record.
 
 ### Codex reviews report zero executed checks (`bwrap: setting up uid map`)
 

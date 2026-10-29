@@ -17,6 +17,11 @@ Findings ledger obligations follow commit ancestry, not pull request number alon
 Quoted-only diagnostics from a failed review remain job failures rather than code
 findings; locator-backed or executed findings still enter the ledger.
 
+Daemon runtime collection records every pass in `<home>/runtime-collection.json`,
+including no-op and incomplete passes. `doctor` reports counts and last-pass age;
+missing, failed, incomplete or older-than-25h records warn. Manual prune does not
+replace the daemon record, and daemon restart resets the 24h first-pass timer.
+
 Owned delegation/read-only cleanup uses producer-scoped `job cleanup inspect`
 and `apply --resource … --token …` with a positional job ID. Ordinary and aged
 cleanup share consumer, lifecycle, identity and preservation checks. Terminal

@@ -164,6 +164,11 @@ absolute entry of an environment value such as `PATH` (as set when the process
 started; a later `export` is not visible in `/proc`); if any of these cannot be
 read, the pass keeps every copy. The daemon runs it once a day; `--dry-run` only
 lists what it would remove and changes nothing on disk.
+Each daemon pass logs its counts, even when nothing is removed, and atomically
+records `<home>/runtime-collection.json`. `doctor` reports the last pass and warns
+on failure, incomplete scanning, or age over 25h (24h interval plus 1h grace).
+No recorded pass is reported as unknown, not success. Daemon restart resets the
+first-pass timer; manual `runtime prune` does not update this daemon record.
 
 The values come from the compiled built-in defaults, overlaid with any
 `[runtimes.<name>]` overrides in `config.toml`. Override a built-in runtime's
