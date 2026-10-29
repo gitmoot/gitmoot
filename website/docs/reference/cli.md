@@ -2593,6 +2593,34 @@ by hand); afterwards gitmoot neither reopens nor cleans paths under the old root
 The mount checks need Linux 5.6 or newer (`statx` mount IDs); on older kernels
 or other systems a section with mount keys refuses every allocation.
 
+Janitor pressure admission (#2359, off by default): with a `[janitor_capacity]`
+section, gitmoot holds NEW heavy work while workspace-janitor reports that a host
+disk it would write to is not cleared:
+
+```toml
+[janitor_capacity]
+enabled = true                              # absent or false: no janitor process is ever started
+executable = "/root/.local/bin/janitor"     # run as: <executable> --format json status
+policy_hash = "<64 hex from janitor status>" # only this approved janitor policy is trusted
+timeout_ms = 5000                           # optional, 100..60000
+```
+
+Heavy work is every queued or foreground agent or shell job; messaging, inbox,
+status and other bounded commands are never held, and running jobs are never
+stopped or cancelled. For each job, gitmoot checks the devices of the home, the
+seat scratch parent, the repository's checkout and a local `[worktrees]` root
+against `data.capacity.volumes[]` (matched by device number). Work is admitted
+only when every device is `target_recovered` or `cleanup_needed` with
+`admission_hold: false` in a fresh sample (before `valid_until`) under the
+approved `policy_hash`. Anything else holds: `critical`, `no_safe_reclaim`,
+`measurement_unknown`, an uncovered device, a stale, future or missing sample,
+another policy hash, a failing or slow janitor, or an invalid section. A held
+queued job stays `queued` with one `janitor_pressure_held` event naming the
+reason and starts by itself once janitor reports recovery; a foreground dispatch
+or `job run` exits with `janitor pressure holds new heavy work: ...` before it
+creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
+keeps no state of its own. The `[disk_guard]` floors still apply on their own.
+
 Delegation worktrees use the separate default-on
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables that pass. Only
 final job owners older than the TTL are force-reclaimed. Blocked, queued, and

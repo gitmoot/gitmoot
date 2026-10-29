@@ -631,6 +631,13 @@ deferred with refusal code `worktree_root_unavailable` and never quarantined for
 an outage. Mount checks need Linux 5.6+; otherwise a section with mount keys
 refuses every allocation.
 
+Janitor pressure admission (`[janitor_capacity]`, #2359) is off by default. When
+enabled it only HOLDS new heavy work (queued jobs stay queued, foreground
+dispatch refuses before it writes); it never cancels running work, never
+deletes anything and never overrides `[disk_guard]`. Any doubt about janitor's
+answer (stale, unknown, uncovered device, other policy hash, janitor failing)
+holds.
+
 Aged cleanup also requires the generation's terminal time to precede
 `[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).
 Ordinary succeeded-owner cleanup keeps its existing retention policy. Neither

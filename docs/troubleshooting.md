@@ -1191,6 +1191,17 @@ than place worktrees on the local disk. Check `findmnt <mount_point>` against
 Worktrees already under `<home>/worktrees` are unaffected. `gitmoot doctor`
 shows the unavailable root in the `worktrees` check.
 
+## Jobs Stay Queued With `janitor_pressure_held`
+
+`[janitor_capacity]` is enabled and workspace-janitor does not clear a host disk
+the job would write to. The event names the device and janitor's state or the
+reason the answer could not be trusted (stale sample, uncovered device, other
+policy hash, janitor failing). Check `janitor --format json status` under
+`data.capacity`. The job starts by itself on the first dispatch pass after
+janitor reports `target_recovered` (or `cleanup_needed` with
+`admission_hold: false`); nothing needs retrying. To turn the consumer off,
+set `enabled = false` or delete the section; it is read on every pass.
+
 ## Read-Only Reviewer Seat Refuses To Start
 
 A read-only seat runs the runtime against an ISOLATED home rather than yours, so
