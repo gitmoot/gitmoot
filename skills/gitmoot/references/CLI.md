@@ -818,9 +818,10 @@ dispatch floor above. Below the dispatch floor reviews move as before.
 - **Foreground reviews** (`--foreground`) stay on this host even when disk is
   low (owner decision); the command prints a warning telling the caller to
   re-run with `--background` to get the remote route.
-- **Not covered yet:** coordinator or Janitor pressure holds are not visible to
-  gitmoot until #2359 lands; until then only the disk measurement triggers the
-  move.
+- **Janitor pressure:** with `[disk_guard] remote_reviews = true`, Janitor-held
+  queued reviews use the same capped E2B route and requester notifications.
+  Explicit-local reviews and ineligible work still wait. Manual coordinator
+  holds without a machine-readable Janitor signal do not trigger routing.
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
