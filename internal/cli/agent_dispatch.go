@@ -630,6 +630,21 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
+	// #2359: default-off janitor pressure admission, before any durable state or
+	// agent start. A foreground dispatch starts heavy work right now, and a
+	// dispatch that allocates a read-only worktree writes one before the job is
+	// even queued, so both are refused while janitor holds. A plain background
+	// enqueue writes nothing heavy (a cold managed-instance start is gated in
+	// ensureManagedAgentInstance); the daemon's dispatch listing holds the job.
+	if !request.Background || dispatchReadOnlyWorktreeEligible(request) {
+		paths, pathsErr := pathsFromFlag(request.Home)
+		if pathsErr != nil {
+			return localAgentJobOutput{}, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
+		}
+		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName()); err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	// Resolve once per human dispatch. The snapshot is shared by the mutation
 	// preflight and the enqueue chokepoint so both see precisely one registry.
 	orgPolicy := orgPolicyResolver(request.Home)
@@ -835,20 +850,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		if staged {
 			stagedVerdictAgent = verdictAgent
-		}
-	}
-	// #2359: default-off janitor pressure admission, before any durable state.
-	// A foreground dispatch starts heavy work right now, and a dispatch that
-	// allocates a read-only worktree writes one before the job is even queued,
-	// so both are refused while janitor holds. A plain background enqueue writes
-	// nothing heavy; the daemon's dispatch listing holds it in the queue instead.
-	if !request.Background || dispatchReadOnlyWorktreeEligible(request) {
-		paths, pathsErr := pathsFromFlag(request.Home)
-		if pathsErr != nil {
-			return localAgentJobOutput{}, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
-		}
-		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName()); err != nil {
-			return localAgentJobOutput{}, err
 		}
 	}
 	switch request.Action {
@@ -2096,6 +2097,13 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		if err != nil {
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
+	}
+	// #2359: starting a cold managed instance runs the agent runtime now, for a
+	// background dispatch too, so it is heavy work janitor pressure must hold.
+	if paths, pathsErr := pathsFromFlag(home); pathsErr != nil {
+		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
+	} else if err := janitorPressureRefusal(ctx, store, paths, repo); err != nil {
+		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	execBackend, err := localAgentDispatchExecBackendFor(home)
 	if err != nil {

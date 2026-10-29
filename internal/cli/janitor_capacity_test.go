@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -86,6 +89,8 @@ func TestJanitorCapacityDecision(t *testing.T) {
 		{"no capacity target configured", `{"schema_version":1,"kind":"status","data":{"inventory_report":{}}}`, false},
 		{"unsupported schema", strings.Replace(ok, `"schema_version":1`, `"schema_version":2`, 1), false},
 		{"not JSON", "janitor: database is locked", false},
+		{"trailing garbage after a healthy document", ok + " garbage", false},
+		{"a second, contradicting document", ok + "\n" + janitorStatusJSON(now.Add(-30*time.Second), 2*time.Minute, janitorTestPolicyHash, janitorVolumeJSON(dev, "critical", true)), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot, err := parseJanitorCapacity([]byte(tc.out), janitorTestPolicyHash, now)
@@ -198,5 +203,106 @@ func TestJanitorPressureRefusesForegroundDispatchBeforeEnqueue(t *testing.T) {
 	}
 	if len(jobs) != 0 {
 		t.Fatalf("a refused dispatch created jobs: %+v", jobs)
+	}
+}
+
+// Review P2 (#2444): freshness is judged when janitor's answer ARRIVES. A sample
+// that was fresh when the call started but expired during a slow call holds.
+func TestJanitorCapacityExpiresDuringASlowCall(t *testing.T) {
+	ctx, _, paths, _ := diskGuardDispatchFixture(t)
+	enableJanitorCapacity(t, paths)
+	start := time.Now()
+	clock := start
+	previousNow := janitorNow
+	janitorNow = func() time.Time { return clock }
+	t.Cleanup(func() { janitorNow = previousNow })
+	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volumes := []string{}
+	for d := range devices {
+		volumes = append(volumes, janitorVolumeJSON(d, "target_recovered", false))
+	}
+	out := janitorStatusJSON(start.Add(-50*time.Second), time.Minute, janitorTestPolicyHash, volumes...) // valid until start+10s
+	previousRun := runJanitorStatus
+	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+		clock = start.Add(15 * time.Second) // the producer took 15s to answer
+		return []byte(out), nil
+	}
+	t.Cleanup(func() { runJanitorStatus = previousRun })
+	if err := janitorPressureRefusal(ctx, nil, paths, ""); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("refusal = %v, want a stale-sample hold", err)
+	}
+}
+
+// Review P2 (#2444): the worker may self-heal to the repo's primary checkout,
+// and a linked worktree's objects live in another .git, so the admission set
+// includes both and each one's git storage.
+func TestJanitorHostPathsIncludeEveryResolvableCheckout(t *testing.T) {
+	ctx, store, paths, _ := diskGuardDispatchFixture(t)
+	primary := t.TempDir()
+	runGit(t, primary, "init", "-q")
+	seedGitHead(t, primary)
+	linked := t.TempDir() + "/linked"
+	runGit(t, primary, "worktree", "add", "-q", "--detach", linked)
+	if err := store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "healed", CheckoutPath: linked, PrimaryCheckoutPath: primary}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := janitorHostPaths(ctx, store, paths, "owner/healed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{linked, primary, primary + "/.git/worktrees/linked"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("host paths %v miss %s", got, want)
+		}
+	}
+}
+
+// Review P1 (#2444): a dispatch to a managed agent TYPE with no live instance
+// starts the runtime while it resolves the agent. Under janitor pressure that
+// start must not happen: no runtime call, no instance.
+func TestJanitorPressureDoesNotStartAColdManagedInstance(t *testing.T) {
+	declareNoRealAdapterExec(t)
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "branch", "-m", "main")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	seedGitHead(t, repoDir)
+	t.Chdir(repoDir)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"agent", "type", "set", "planner", "--home", home, "--runtime", "codex", "--role", "planner",
+		"--policy", "workspace-write", "--max-background", "1", "--idle-timeout", "20m", "--job-timeout", "5m", "--capability", "ask"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agent type set = %d: %s", code, stderr.String())
+	}
+	enableJanitorCapacity(t, config.PathsForHome(home))
+	replaceJanitorStatus(t, `{"schema_version":1,"kind":"status","data":{"inventory_report":{}}}`, nil)
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440111"}` + "\n"}}}
+	defer replaceRuntimeFactory(runtime.Factory{Runner: runner})()
+
+	for _, args := range [][]string{
+		{"agent", "ask", "planner", "plan", "--home", home, "--repo", "owner/repo", "--background"},
+		{"agent", "ask", "planner", "plan", "--home", home, "--repo", "owner/repo"},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := Run(args, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "janitor pressure holds new heavy work") {
+			t.Fatalf("%v = %d (stderr %q), want the janitor hold", args, code, stderr.String())
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime started under janitor pressure: %+v", runner.calls)
+	}
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	instances, err := store.ListAgentInstances(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(instances) != 0 {
+		t.Fatalf("instances created under pressure: %+v", instances)
 	}
 }

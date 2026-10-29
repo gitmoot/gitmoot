@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,13 +68,18 @@ type janitorCapacitySnapshot struct {
 
 // readJanitorCapacity runs the producer and validates its decision. Any error
 // means the decision is unknown, which holds heavy work.
-func readJanitorCapacity(ctx context.Context, cfg config.JanitorCapacity, now time.Time) (janitorCapacitySnapshot, error) {
+func readJanitorCapacity(ctx context.Context, cfg config.JanitorCapacity) (janitorCapacitySnapshot, error) {
 	out, err := runJanitorStatus(ctx, cfg.Executable, cfg.Timeout)
 	if err != nil {
 		return janitorCapacitySnapshot{}, err
 	}
-	return parseJanitorCapacity(out, cfg.PolicyHash, now)
+	// Freshness is judged when the answer ARRIVES, not when the call started:
+	// a slow producer must not turn an expired sample into an admission.
+	return parseJanitorCapacity(out, cfg.PolicyHash, janitorNow())
 }
+
+// janitorNow is the consumer clock; tests replace it.
+var janitorNow = time.Now
 
 func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitorCapacitySnapshot, error) {
 	var envelope struct {
@@ -98,6 +104,12 @@ func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitor
 	decoder.UseNumber()
 	if err := decoder.Decode(&envelope); err != nil {
 		return janitorCapacitySnapshot{}, fmt.Errorf("janitor status is not valid JSON: %v", err)
+	}
+	// Exactly ONE document: trailing garbage or a second envelope could
+	// contradict the first, so it is not trusted.
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return janitorCapacitySnapshot{}, errors.New("janitor status has data after its JSON document")
 	}
 	if envelope.SchemaVersion.String() != "1" || envelope.Kind != "status" {
 		return janitorCapacitySnapshot{}, fmt.Errorf("janitor status envelope schema_version=%q kind=%q is not supported (want 1, status)", envelope.SchemaVersion, envelope.Kind)
@@ -209,8 +221,13 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 		case err != nil:
 			return nil, fmt.Errorf("resolve checkout of %s: %w", repo, err)
 		default:
-			if checkout := strings.TrimSpace(record.CheckoutPath); checkout != "" {
-				out = append(out, checkout)
+			// The worker may self-heal to the primary checkout, so both count, and
+			// so does each one's git storage (a linked worktree's .git lives elsewhere).
+			for _, checkout := range []string{record.CheckoutPath, record.PrimaryCheckoutPath} {
+				if checkout = strings.TrimSpace(checkout); checkout != "" {
+					out = append(out, checkout)
+					out = append(out, janitorGitStorage(checkout)...)
+				}
 			}
 		}
 	}
@@ -222,6 +239,33 @@ func janitorHostPaths(ctx context.Context, store *db.Store, paths config.Paths, 
 		out = append(out, root.Root)
 	}
 	return out, nil
+}
+
+// janitorGitStorage returns the git directory and common directory a checkout
+// writes objects and worktree metadata to, when they differ from the checkout
+// (a linked worktree's "gitdir:" file). A plain checkout returns nothing extra.
+func janitorGitStorage(checkout string) []string {
+	raw, err := os.ReadFile(filepath.Join(checkout, ".git"))
+	if err != nil {
+		return nil // a directory .git (or none) lives on the checkout's own device
+	}
+	gitDir, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), "gitdir:")
+	if !ok {
+		return nil
+	}
+	gitDir = strings.TrimSpace(gitDir)
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(checkout, gitDir)
+	}
+	out := []string{gitDir}
+	if common, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		dir := strings.TrimSpace(string(common))
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(gitDir, dir)
+		}
+		out = append(out, filepath.Clean(dir))
+	}
+	return out
 }
 
 func janitorHostDevices(hostPaths []string) (map[uint64]string, error) {
@@ -247,14 +291,14 @@ type janitorAdmission struct {
 	readErr  error
 }
 
-func loadJanitorAdmission(ctx context.Context, paths config.Paths, now time.Time) janitorAdmission {
+func loadJanitorAdmission(ctx context.Context, paths config.Paths) janitorAdmission {
 	cfg, err := config.LoadJanitorCapacity(paths)
 	if err != nil {
 		return janitorAdmission{cfgErr: err}
 	}
 	a := janitorAdmission{cfg: cfg}
 	if cfg.Enabled {
-		a.snapshot, a.readErr = readJanitorCapacity(ctx, cfg, now)
+		a.snapshot, a.readErr = readJanitorCapacity(ctx, cfg)
 	}
 	return a
 }
@@ -269,6 +313,9 @@ func (a janitorAdmission) hold(ctx context.Context, store *db.Store, paths confi
 		return ""
 	case a.readErr != nil:
 		return a.readErr.Error()
+	case !janitorNow().Before(a.snapshot.validUntil):
+		// The sample expired while devices were resolved (or across a long pass).
+		return fmt.Sprintf("janitor capacity sample is stale (valid until %s)", a.snapshot.validUntil.UTC().Format(time.RFC3339))
 	}
 	hostPaths, err := janitorHostPaths(ctx, store, paths, repo)
 	if err != nil {
@@ -291,7 +338,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	paths, err := diskGuardPaths(worker)
 	admission := janitorAdmission{cfgErr: fmt.Errorf("resolve Gitmoot home: %w", err)}
 	if err == nil {
-		admission = loadJanitorAdmission(ctx, paths, time.Now())
+		admission = loadJanitorAdmission(ctx, paths)
 	}
 	if !admission.enabled() {
 		return jobs
@@ -332,7 +379,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 // janitorPressureRefusal is the foreground check: it returns an error naming
 // the hold, or nil when the consumer is off or the devices are cleared.
 func janitorPressureRefusal(ctx context.Context, store *db.Store, paths config.Paths, repo string) error {
-	admission := loadJanitorAdmission(ctx, paths, time.Now())
+	admission := loadJanitorAdmission(ctx, paths)
 	if !admission.enabled() {
 		return nil
 	}
