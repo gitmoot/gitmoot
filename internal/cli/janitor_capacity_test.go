@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -356,8 +358,7 @@ func TestJanitorHostPathsMeasureDotGitAndUnregisteredCheckouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.Join(got, "\n")
-	if !strings.Contains(joined, checkout+"\n") && !strings.HasSuffix(joined, checkout) || !strings.Contains(joined, checkout+"/.git") {
+	if !slices.Contains(got, checkout) || !slices.Contains(got, filepath.Join(checkout, ".git")) {
 		t.Fatalf("host paths %v miss the unregistered checkout or its .git", got)
 	}
 	dev, err := janitorDeviceOf(checkout + "/.git")
