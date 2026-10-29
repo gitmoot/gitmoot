@@ -191,3 +191,98 @@ func TestReadMountInfoDecodesEscapes(t *testing.T) {
 		t.Fatal("a line without the optional-field separator was accepted")
 	}
 }
+
+func TestWorktreeStorageDeviceKeepsUnverifiedAndLocalMounts(t *testing.T) {
+	w := newWorktreeRootWorld(t)
+	placement, err := ResolveWorktreePlacement(w.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := placement.config
+	for _, tc := range []struct {
+		name, point, fstype, source string
+		delta                       uint64
+		wantNetwork                 bool
+	}{
+		{"verified", w.mount, "fuse.sshfs", cfg.MountSource, 0, true},
+		{"missing", w.mount + "-absent", "fuse.sshfs", cfg.MountSource, 0, false},
+		{"replaced", w.mount, "fuse.sshfs", cfg.MountSource, 1, false},
+		{"wrong-source", w.mount, "fuse.sshfs", "other:share", 0, false},
+		{"local-mount", w.mount, "ext4", "/dev/root", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w.setMountTable(t, tc.point, tc.fstype, tc.source, tc.delta)
+			_, network, err := WorktreeStorageDevice(filepath.Join(w.root, "not-created"), cfg)
+			if err != nil || network != tc.wantNetwork {
+				t.Fatalf("network=%v err=%v, want %v", network, err, tc.wantNetwork)
+			}
+		})
+	}
+	cfg.MountFSType = "ext4"
+	cfg.MountSource = "/dev/root"
+	w.setMountTable(t, w.mount, "ext4", "/dev/root", 0)
+	if _, network, err := WorktreeStorageDevice(w.root, cfg); err != nil || network {
+		t.Fatalf("configured and verified local mount exempted: network=%v err=%v", network, err)
+	}
+}
+
+func TestWorktreeStoragePinsIdentityAcrossPathAndConfigReplacement(t *testing.T) {
+	w := newWorktreeRootWorld(t)
+	placement, err := ResolveWorktreePlacement(w.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := placement.config
+	local, err := os.MkdirTemp("/dev/shm", "gm-device-")
+	if err != nil {
+		t.Skipf("separate local mount unavailable: %v", err)
+	}
+	defer os.RemoveAll(local)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(local, alias); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := unix.Open(alias, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	var original unix.Stat_t
+	if err := unix.Fstat(fd, &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(w.root, alias); err != nil {
+		t.Fatal(err)
+	}
+	networkDev, network, err := WorktreeStorageDevice(alias, cfg)
+	if err != nil || !network {
+		t.Fatalf("positive control: network=%v err=%v", network, err)
+	}
+	if networkDev == uint64(original.Dev) {
+		t.Skip("fixture requires distinct devices")
+	}
+	if worktreeNetworkFD(fd, cfg) {
+		t.Fatal("path replacement retargeted a pinned LOCAL descriptor")
+	}
+	// Reloading the on-disk config cannot alter the snapshot used by this
+	// admission, nor make the local descriptor match the network mount.
+	w.writeConfig(t, w.root, "different:share", "fuse.sshfs")
+	if worktreeNetworkFD(fd, cfg) {
+		t.Fatal("config replacement exempted a pinned local path")
+	}
+	updated, err := ResolveWorktreePlacement(w.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, network, err := WorktreeStorageDevice(alias, updated.config); err != nil || network {
+		t.Fatalf("new mismatched config did not fail closed: network=%v err=%v", network, err)
+	}
+	// An unrelated local path does not require cfg.Root to be accessible.
+	cfg.Root = filepath.Join(alias, "unavailable-root")
+	if dev, network, err := WorktreeStorageDevice(local, cfg); err != nil || network || dev != uint64(original.Dev) {
+		t.Fatalf("local measurement depends on remote root: dev=%d network=%v err=%v", dev, network, err)
+	}
+}

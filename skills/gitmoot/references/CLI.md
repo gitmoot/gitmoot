@@ -817,6 +817,12 @@ dispatch floor above. Below the dispatch floor reviews move as before.
   gitmoot until #2359 lands; until then only the disk measurement triggers the
   move.
 
+Janitor capacity admission treats configured Storage Box paths as off-host only
+on Linux when each path's pinned descriptor matches the configured `fuse.sshfs`
+mount ID/source/type/point in the local kernel mount table. Local mounts and
+unverified paths remain covered. It does not exempt a whole device or probe the
+remote worktree root for local-only admissions; creation still runs mount preflight.
+
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
 (including the never-fit case, which names the cap), a checkout key held by an
