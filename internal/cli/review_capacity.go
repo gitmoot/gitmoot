@@ -128,6 +128,11 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	if !cfg.Enabled || (!sourceOnly && !cfg.ReviewFreshSpace) {
 		return ctx, func() error { return nil }, nil
 	}
+	ownsGeneration := generation != nil
+	var ownedGeneration int64
+	if ownsGeneration {
+		ownedGeneration = *generation
+	}
 	check := func() (map[uint64]string, []reviewCapacityMeasurement, error) {
 		current, err := config.LoadJanitorCapacity(paths)
 		if err != nil {
@@ -174,8 +179,8 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 				}
 				// A dispatch owns only its context. A worker also owns the captured
 				// lifecycle, never a retry that reused this job ID during cleanup.
-				if generation != nil {
-					err = errors.Join(err, cancelMonitoredReview(store, jobID, *generation, func() { cancel(err) }))
+				if ownsGeneration {
+					err = errors.Join(err, cancelMonitoredReview(store, jobID, ownedGeneration, func() { cancel(err) }))
 				} else {
 					cancel(err)
 				}
