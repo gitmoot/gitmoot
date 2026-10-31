@@ -115,13 +115,14 @@ func (w jobWorker) admitRemoteReview(ctx context.Context, job db.Job, payload wo
 			// still-pending checks keep blocking, so money is not spent
 			// reviewing a head that fails CI. A repository that requires
 			// green CI by its own policy keeps requiring it.
-			zeroChecksAllowed := payload.DiskGuardRouted && len(checks) == 0 && !reviewConfig.For(repo.FullName()).RemoteRequireCIGreen
-			if ok, detail := remoteReviewChecksGreen(checks); !ok && !zeroChecksAllowed {
+			ci := classifyRemoteReviewChecks(checks)
+			zeroChecksAllowed := payload.DiskGuardRouted && !ci.present && !reviewConfig.For(repo.FullName()).RemoteRequireCIGreen
+			if !ci.green && !zeroChecksAllowed {
 				reason := remoteReviewAvoidedRedCI
-				if remoteReviewChecksOnlyPending(checks) {
+				if ci.pendingOnly {
 					reason = remoteReviewAvoidedCIPending
 				}
-				return false, newRemoteReviewRefusal(reason, detail)
+				return false, newRemoteReviewRefusal(reason, ci.detail)
 			}
 		}
 	}
@@ -177,48 +178,47 @@ func newRemoteReviewRefusal(reason, message string) error {
 	return &remoteReviewAdmissionRefusal{reason: reason, message: message}
 }
 
-func remoteReviewChecksGreen(checks []github.PullRequestCheck) (bool, string) {
-	if len(checks) == 0 {
-		return false, "remote review CI policy requires at least one current-head check, but none were reported"
-	}
-	for _, check := range checks {
-		bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
-		state := strings.ToLower(strings.TrimSpace(check.State))
-		passed := false
-		if bucket != "" {
-			passed = bucket == "pass" || bucket == "skipping"
-		} else {
-			passed = state == "success" || state == "skipped" || state == "neutral"
-		}
-		if !passed {
-			return false, fmt.Sprintf("remote review CI policy requires green current-head checks; %q is %s", check.Name, firstNonEmptyRemoteReview(bucket, state, "unknown"))
-		}
-	}
-	return true, ""
+type remoteReviewCheckState struct {
+	present     bool
+	green       bool
+	pendingOnly bool
+	detail      string
 }
 
-// remoteReviewChecksOnlyPending reports whether checks that are not green are
-// only waiting to finish: at least one check is pending and none has failed.
-// No checks at all is not pending - there is nothing that could turn green.
-func remoteReviewChecksOnlyPending(checks []github.PullRequestCheck) bool {
-	pending := false
+// The merge gate consumes review results, so it cannot be a prerequisite for
+// obtaining them. Match the native gate's canonical self-check exclusion; other
+// gitmoot statuses, including security checks, remain prerequisites.
+func classifyRemoteReviewChecks(checks []github.PullRequestCheck) remoteReviewCheckState {
+	result := remoteReviewCheckState{green: true}
 	for _, check := range checks {
+		if strings.TrimSpace(check.Name) == workflow.GitmootMergeGateContext {
+			continue
+		}
+		result.present = true
 		bucket := strings.ToLower(strings.TrimSpace(check.Bucket))
-		state := strings.ToLower(strings.TrimSpace(check.State))
-		switch {
-		case bucket == "pass" || bucket == "skipping":
-		case bucket == "pending":
-			pending = true
-		case bucket != "":
-			return false
-		case state == "success" || state == "skipped" || state == "neutral":
-		case state == "pending" || state == "queued" || state == "in_progress" || state == "expected" || state == "waiting" || state == "requested":
-			pending = true
-		default:
-			return false
+		state := ""
+		if bucket == "" {
+			state = strings.ToLower(strings.TrimSpace(check.State))
+		}
+		if bucket == "pass" || bucket == "skipping" ||
+			(bucket == "" && (state == "success" || state == "skipped" || state == "neutral")) {
+			continue
+		}
+		result.green = false
+		if result.detail == "" {
+			result.detail = fmt.Sprintf("remote review CI policy requires green current-head checks; %q is %s", check.Name, firstNonEmptyRemoteReview(bucket, state, "unknown"))
+		}
+		result.pendingOnly = bucket == "pending" || (bucket == "" &&
+			(state == "pending" || state == "queued" || state == "in_progress" || state == "expected" || state == "waiting" || state == "requested"))
+		if !result.pendingOnly {
+			return result
 		}
 	}
-	return pending
+	if !result.present {
+		result.green = false
+		result.detail = "remote review CI policy requires at least one current-head prerequisite check, but none were reported"
+	}
+	return result
 }
 
 func firstNonEmptyRemoteReview(values ...string) string {

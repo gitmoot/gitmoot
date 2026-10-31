@@ -188,8 +188,8 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	if err != nil {
 		return execbackend.Local, true, "current-head CI unavailable: " + err.Error()
 	}
-	if green, reason := remoteReviewChecksGreen(checks); !green {
-		return execbackend.Local, true, reason
+	if ci := classifyRemoteReviewChecks(checks); !ci.green {
+		return execbackend.Local, true, ci.detail
 	}
 	labels := make([]string, 0, len(pr.Labels))
 	for _, label := range pr.Labels {

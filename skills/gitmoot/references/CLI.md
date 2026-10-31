@@ -371,9 +371,11 @@ generation. Cancellation releases the review claim. Refusals emit durable
 failed), and `retry`.
 
 Set `[review] remote_require_ci_green = true` to require at least one successful
-current-head check and no pending or failed checks before remote provisioning.
-The default is `false`. A `[repos."owner/repo".review]` value overrides the
-global policy for that repository.
+current-head prerequisite check and no pending or failed prerequisite checks.
+Only `gitmoot/merge-gate` is excluded because it depends on the review itself;
+other checks, including `gitmoot/security`, still block. A gate-only head counts
+as no prerequisite CI, not green CI. The default is `false`; a
+`[repos."owner/repo".review]` value overrides the global policy.
 
 Automatic background review routing is separately opt-in. Configure
 `[review] remote_routing_enabled = true` globally or in
@@ -771,7 +773,9 @@ The one exception is CI that has not finished: when at least one current-head
 check is still pending and none has failed (refusal reason `ci_pending`), the
 review is held for two minutes (`blocker_retry_at`) instead of declined, and a
 later pass switches it to remote again, so it runs once CI turns green. Failing
-checks still decline the route; no reported checks at all is admitted (#2372). A
+checks still decline the route. No prerequisite checks is admitted unless the
+repository requires `remote_require_ci_green`; the exact `gitmoot/merge-gate`
+context is excluded, but other Gitmoot/security checks are not. A
 review pinned to `--exec-backend local` keeps waiting, and nothing is switched
 while the daemon is draining. It spends money, so it needs a configured
 `[remote_exec]` cost cap and is off unless set.
