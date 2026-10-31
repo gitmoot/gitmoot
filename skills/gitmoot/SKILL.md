@@ -163,6 +163,15 @@ agent with `implement` capability and a write-granting policy so requested
 changes can route to it. With `--org-role` it still goes through the router and
 keeps the reviewer you named.
 
+E2B reviews prepare their exact source and review base inside E2B, without a host
+checkout or bulk source staging. They require the configured mTLS credential
+gateway for a temporary, repository-scoped Git-read lease; the host token is
+never exported. When Janitor is enabled, remaining local control-state writes
+use fresh-space monitoring rather than the cleanup-target latch. Local reviews
+can opt in with `[janitor_capacity] review_admission = "fresh_space"`; see CLI.md
+for its best-effort limits and cancellation behavior. This changes neither
+ordinary non-review admission nor provider spending/concurrency limits.
+
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
 `--action implement`, `task run`, `repo auto-fix`, and the implement heartbeat
 are all gone; an `implement` delegation leg and a `/gitmoot <agent> implement`

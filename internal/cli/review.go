@@ -405,7 +405,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
-	repo, record, _, _, err := resolveLocalAgentRepo(ctx, store, opts.repo, runner)
+	repo, record, _, _, err := resolveDispatchRepoIdentity(ctx, store, localAgentDispatchRequest{Action: "review", RepoFlag: opts.repo, jobRunner: runner})
 	if err != nil {
 		return reviewRequestOutput{}, err
 	}
@@ -418,7 +418,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	branch := strings.TrimSpace(opts.branch)
 	if head == "" || branch == "" {
-		pr, err := jobGitHubClient(record.CheckoutPath, newAgentDispatchGitHubClient(record.CheckoutPath), runner).GetPullRequest(ctx, repo, int64(opts.pr))
+		pr, err := jobGitHubClient("", newAgentDispatchGitHubClient(""), runner).GetPullRequest(ctx, repo, int64(opts.pr))
 		if err != nil {
 			return reviewRequestOutput{}, fmt.Errorf("resolve pull request #%d: %w", opts.pr, err)
 		}
@@ -525,17 +525,6 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return reviewRequestOutput{}, fmt.Errorf("review request --supersede: reviewer identity %q differs from the superseded job's %q; the merge gate would never let it replace that verdict", newIdentity, oldIdentity)
 		}
 	}
-	// Resolved only once the claim is won and a reviewer exists, so a losing or
-	// attaching request never pays for git calls whose answer it will discard.
-	var scope *workflow.ReviewScope
-	if opts.full {
-		output.BaselineSkipped = "flag --full"
-	} else {
-		scope, output.BaselineSkipped = resolveDeltaReviewScope(ctx, store, jobGitClient(record.CheckoutPath, runner), repo.FullName(), opts.pr, head, claimPurpose)
-		if scope != nil {
-			output.Baseline = scope.PreviousHeadSHA
-		}
-	}
 	effectiveRuntime := effectiveReviewRuntime(opts.runtime, selectedRuntime)
 	if err := validateRuntimeExecutionBackend(effectiveRuntime, execBackend); err != nil {
 		abandonClaim()
@@ -550,11 +539,10 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		}
 	}
 	request := localAgentDispatchRequest{
-		RepoFlag:     repo.FullName(),
-		Agent:        reviewer.Name,
-		Action:       "review",
-		Instructions: reviewRequestInstructions(opts, repo.FullName(), head, scope, noExecution),
-		Background:   true,
+		RepoFlag:   repo.FullName(),
+		Agent:      reviewer.Name,
+		Action:     "review",
+		Background: true,
 		// Gated on the EFFECTIVE runtime, not on whether an override was
 		// emitted: a review running on the agent's own non-omp runtime must not
 		// carry an omp pool model either.
@@ -595,7 +583,6 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		ReviewPurpose:         opts.purpose,
 		ReviewModelPool:       pool,
 		ReviewRequester:       opts.role,
-		ReviewScope:           scope,
 		// A carried finding may legitimately cite a commit outside this PR
 		// (#2178 round 1): the citation classifier scans the delta brief, and
 		// the refusal it prints names this flag, so the flag must exist here.
@@ -604,6 +591,21 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			fmt.Fprintf(stderr, "review request: warning: %s\n", warning)
 		},
 	}
+	var scope *workflow.ReviewScope
+	if opts.full {
+		output.BaselineSkipped = "flag --full"
+	} else {
+		scope, output.BaselineSkipped, err = resolveDispatchReviewScope(ctx, store, record, repo, request, effectiveRuntime, claimPurpose)
+		if err != nil {
+			abandonClaim()
+			return reviewRequestOutput{}, err
+		}
+		if scope != nil {
+			output.Baseline = scope.PreviousHeadSHA
+		}
+	}
+	request.ReviewScope = scope
+	request.Instructions = reviewRequestInstructions(opts, repo.FullName(), head, scope, noExecution)
 	dispatched, err := dispatchLocalAgentJobFromCLI(ctx, store, request)
 	if err != nil {
 		abandonClaim()
@@ -1509,7 +1511,7 @@ func reviewRequestSelectedActionReason(purpose string) string {
 //   - another purpose: a different question;
 //   - not newer than the baseline: selection had already passed it;
 //   - not an ancestor of the dispatch head: off this line of history.
-func undecodableBlocks(ctx context.Context, git gitutil.Client, undecodable []db.UndecodableReviewVerdict, baseline, baselineUpdatedAt, baselineJobID, head, wantPurpose string) string {
+func undecodableBlocks(ctx context.Context, git reviewAncestry, undecodable []db.UndecodableReviewVerdict, baseline, baselineUpdatedAt, baselineJobID, head, wantPurpose string) string {
 	for _, invisible := range undecodable {
 		if !invisible.Readable {
 			return "verdict history has an unreadable row; its position cannot be established, so the baseline cannot be trusted"
@@ -1542,7 +1544,17 @@ func undecodableBlocks(ctx context.Context, git gitutil.Client, undecodable []db
 	return ""
 }
 
+type reviewAncestry interface {
+	IsAncestor(context.Context, string, string) (bool, error)
+}
+
 func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.Client, repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
+	return resolveDeltaReviewScopeUsing(ctx, store, git, func(ctx context.Context, number int, base, head string) ([]string, error) {
+		return localReviewChangedFiles(ctx, git, number, base, head)
+	}, repo, pullRequest, head, purpose)
+}
+
+func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git reviewAncestry, changedFiles func(context.Context, int, string, string) ([]string, error), repo string, pullRequest int, head, purpose string) (*workflow.ReviewScope, string) {
 	// AN UNDECODABLE VERDICT IS NOT AN ABSENCE (#2179, #2178 round 1). A row
 	// SucceededReviewVerdicts cannot decode is dropped silently, so the loop
 	// below would walk straight past a real terminal verdict to an OLDER
@@ -1583,7 +1595,7 @@ func resolveDeltaReviewScope(ctx context.Context, store *db.Store, git gitutil.C
 			continue
 		}
 		candidates++
-		files, err := localReviewChangedFiles(ctx, git, pullRequest, baseline, head)
+		files, err := changedFiles(ctx, pullRequest, baseline, head)
 		if err != nil {
 			var unavailable workflow.ReviewScopeUnavailableError
 			if errors.As(err, &unavailable) {

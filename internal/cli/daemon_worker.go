@@ -355,7 +355,34 @@ func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.Jo
 	return backend, cfg, nil
 }
 
-func (w jobWorker) run(ctx context.Context, job db.Job) error {
+// Refresh before preparation and again before admission. Runtime persistence
+// changes payload JSON during preparation, so compare delivery identity instead.
+func (w jobWorker) currentRemoteReviewDelivery(ctx context.Context, job db.Job, payload workflow.JobPayload) (db.Job, workflow.JobPayload, bool, error) {
+	current, err := w.Store.GetJob(ctx, job.ID)
+	if err != nil {
+		return job, payload, false, err
+	}
+	if current.State != string(workflow.JobQueued) {
+		return job, payload, false, nil
+	}
+	fresh, err := daemonJobPayload(current)
+	if err != nil {
+		return job, payload, false, err
+	}
+	backend, overridden := payload.ExecBackendOverride()
+	freshBackend, freshOverridden := fresh.ExecBackendOverride()
+	if current.Agent != job.Agent || fresh.Model != payload.Model ||
+		fresh.RuntimeOverride != payload.RuntimeOverride ||
+		fresh.RuntimeOverrideRef != payload.RuntimeOverrideRef ||
+		fresh.HeadSHA != payload.HeadSHA ||
+		freshBackend != backend || freshOverridden != overridden ||
+		fresh.ExecProvider != payload.ExecProvider || fresh.ExecTemplate != payload.ExecTemplate {
+		return job, payload, false, nil
+	}
+	return current, fresh, true, nil
+}
+
+func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
@@ -398,6 +425,49 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
 		return nil
+	}
+	sourceOnly := job.Type == "review" && execBackend == execbackend.Remote && !config.IsSandboxdProvider(execConfig.Provider)
+	if job.Type == "review" && execBackend == execbackend.Remote {
+		current, fresh, owned, refreshErr := w.currentRemoteReviewDelivery(ctx, job, payload)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if !owned {
+			return nil
+		}
+		job, payload = current, fresh
+	}
+	if job.Type == "review" {
+		paths, pathsErr := diskGuardPaths(w)
+		if pathsErr != nil {
+			return pathsErr
+		}
+		runCtx, stop, admissionErr := startReviewCapacityMonitor(ctx, w.Store, paths, payload.Repo, payload.HeadSHA, job.ID, sourceOnly, &job.LifecycleGeneration, payload.WorktreePath)
+		if admissionErr != nil {
+			return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+				JobID: job.ID, Kind: janitorPressureHeldEventKind,
+				Message: "held queued before worker preparation: " + admissionErr.Error(),
+			})
+		}
+		ctx = runCtx
+		// Registered before preparation's cleanup defers, so monitoring covers
+		// the whole delivery and its provider/worktree cleanup.
+		defer func() { returnErr = errors.Join(returnErr, stop()) }()
+	}
+	if sourceOnly && !payload.ReadOnlySeat {
+		payload.ReadOnlySeat = true
+		encoded, encodeErr := json.Marshal(payload)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		updated, updateErr := w.Store.UpdateJobPayloadAtGeneration(ctx, job.ID, string(encoded), job.LifecycleGeneration)
+		if updateErr != nil {
+			return updateErr
+		}
+		if !updated {
+			return nil
+		}
+		job.Payload = string(encoded)
 	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
@@ -642,7 +712,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	nativeReviewDeliveryStarted := false
-	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if !sourceOnly {
+		payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	}
 	if err != nil {
 		// An exact-head allocation that spent its checkout-mutation-lock budget is
 		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
@@ -683,7 +755,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
 		}()
 	}
-	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
+	var checkout string
+	if !sourceOnly {
+		checkout, err = w.checkoutForJob(ctx, job, payload, agent, jobRunner)
+	}
 	if err != nil {
 		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
 			checkout, payload, err = resumedCheckout, resumedPayload, nil
@@ -910,27 +985,13 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 	// an operator cancelled it an hour later. Re-reading here makes admission and
 	// its refusal agree on one generation.
 	if execBackend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
-		current, err := w.Store.GetJob(ctx, job.ID)
+		current, freshPayload, owned, err := w.currentRemoteReviewDelivery(ctx, job, payload)
 		if err != nil {
 			return err
 		}
-		if current.State != string(workflow.JobQueued) {
-			// Someone else moved it (cancel, another worker). Nothing to admit.
-			return nil
-		}
-		// Runtime persistence above updates this job's payload even on a healthy
-		// first run, so compare delivery identity rather than raw JSON.
-		// A fallback may replace the model/runtime while this worker prepares
-		// the old snapshot: let the next poll rebuild its adapter and session
-		// lock instead of spending the cloud attempt with the old runtime.
-		freshPayload, err := daemonJobPayload(current)
-		if err != nil {
-			return err
-		}
-		if current.Agent != job.Agent || freshPayload.Model != payload.Model ||
-			freshPayload.RuntimeOverride != payload.RuntimeOverride ||
-			freshPayload.RuntimeOverrideRef != payload.RuntimeOverrideRef ||
-			freshPayload.HeadSHA != payload.HeadSHA {
+		if !owned || current.LifecycleGeneration != job.LifecycleGeneration {
+			// A requeue during preparation belongs to a fresh worker, not the
+			// generation whose preparation and cancellation we currently own.
 			return nil
 		}
 		payload = freshPayload

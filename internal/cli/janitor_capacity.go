@@ -19,6 +19,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -54,12 +55,14 @@ var runJanitorStatus = func(ctx context.Context, executable string, timeout time
 }
 
 type janitorVolume struct {
-	key           string
-	device        uint64
-	hasDevice     bool
-	state         string
-	admissionHold bool
-	reason        string
+	key                string
+	device             uint64
+	hasDevice          bool
+	state              string
+	admissionHold      bool
+	reason             string
+	available, reserve uint64
+	hasByteLimits      bool
 }
 
 type janitorCapacitySnapshot struct {
@@ -97,6 +100,8 @@ func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitor
 					State         string       `json:"state"`
 					AdmissionHold *bool        `json:"admission_hold"`
 					Reason        string       `json:"reason"`
+					Available     *json.Number `json:"available_bytes"`
+					Reserve       *json.Number `json:"reserve_bytes"`
 				} `json:"volumes"`
 			} `json:"capacity"`
 		} `json:"data"`
@@ -145,6 +150,13 @@ func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitor
 		if raw.Device != nil {
 			if n, err := strconv.ParseUint(raw.Device.String(), 10, 64); err == nil && raw.FilesystemKey == "device:"+raw.Device.String() {
 				v.device, v.hasDevice = n, true
+			}
+		}
+		if raw.Available != nil && raw.Reserve != nil {
+			available, availableErr := strconv.ParseUint(raw.Available.String(), 10, 64)
+			reserve, reserveErr := strconv.ParseUint(raw.Reserve.String(), 10, 64)
+			if availableErr == nil && reserveErr == nil && reserve > 0 {
+				v.available, v.reserve, v.hasByteLimits = available, reserve, true
 			}
 		}
 		s.volumes = append(s.volumes, v)
@@ -386,8 +398,27 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 			continue
 		}
 		repo := ""
+		sourceOnly := false
 		if payload, perr := daemonJobPayload(job); perr == nil {
 			repo = payload.Repo
+			if job.Type == "review" {
+				backend, remoteConfig, resolveErr := worker.resolveExecutionBackendForJob(job, payload)
+				if resolveErr == nil {
+					sourceOnly = backend == execbackend.Remote && !config.IsSandboxdProvider(remoteConfig.Provider)
+				}
+			}
+		}
+		if job.Type == "review" && (sourceOnly || admission.cfg.ReviewFreshSpace) {
+			_, _, reviewErr := admission.reviewMeasurements(ctx, worker.Store, paths, repo, sourceOnly)
+			if reviewErr == nil {
+				allowed = append(allowed, job)
+			} else {
+				_ = worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+					JobID: job.ID, Kind: janitorPressureHeldEventKind,
+					Message: "held queued by review fresh-space admission: " + reviewErr.Error(),
+				})
+			}
+			continue
 		}
 		reason, cached := reasons[repo]
 		if !cached {

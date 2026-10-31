@@ -287,12 +287,22 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		}
 	}
 	materials := execbackend.Materials{SourceWorktree: checkout}
+	var sourcePlan *remoteReviewSourcePlan
 	if backend == execbackend.Remote && strings.EqualFold(job.Type, "review") {
-		diffBase, err := w.remoteReviewDiffBaseHEAD(ctx, job, checkout)
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("resolve review diff base for job %s: %w", job.ID, err)
+		if !config.IsSandboxdProvider(cfg.Provider) {
+			var err error
+			sourcePlan, err = w.prepareRemoteReviewSource(ctx, job, cfg, ttl)
+			if err != nil {
+				return nil, nil, nil, nil, fmt.Errorf("prepare E2B review source: %w", err)
+			}
+			materials.SourceWorktree = ""
+		} else {
+			diffBase, err := w.remoteReviewDiffBaseHEAD(ctx, job, checkout)
+			if err != nil {
+				return nil, nil, nil, nil, fmt.Errorf("resolve review diff base for job %s: %w", job.ID, err)
+			}
+			materials.DiffBaseHEAD = diffBase
 		}
-		materials.DiffBaseHEAD = diffBase
 	}
 	lifecycle, err := w.ExecutionBackendFactory(backend, cfg)
 	if err != nil {
@@ -319,6 +329,14 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 		return lifecycle, instance, nil, nil, fmt.Errorf("provision %s execution backend for job %s: %w", backend, job.ID, err)
 	}
 
+	if sourcePlan != nil {
+		sourceLease, source, err := sourcePlan.register(job.ID, instance.ID)
+		if err != nil {
+			return lifecycle, instance, nil, nil, fmt.Errorf("register remote review source: %w", err)
+		}
+		defer sourceLease.Revoke()
+		materials.RemoteReview = source
+	}
 	if err := lifecycle.SyncIn(ctx, instance, materials); err != nil {
 		return lifecycle, instance, nil, nil, fmt.Errorf("sync job %s into %s execution backend: %w", job.ID, backend, err)
 	}

@@ -25,17 +25,18 @@ import (
 // process is started and nothing is read. A present but invalid section is a
 // load ERROR, never a silent "disabled".
 type JanitorCapacity struct {
-	Enabled    bool
-	Executable string
-	PolicyHash string
-	Timeout    time.Duration
+	Enabled          bool
+	Executable       string
+	PolicyHash       string
+	Timeout          time.Duration
+	ReviewFreshSpace bool
 }
 
 // DefaultJanitorCapacityTimeout bounds one status call when timeout_ms is unset.
 const DefaultJanitorCapacityTimeout = 5 * time.Second
 
 var (
-	janitorCapacityKeys    = []string{"enabled", "executable", "policy_hash", "timeout_ms"}
+	janitorCapacityKeys    = []string{"enabled", "executable", "policy_hash", "timeout_ms", "review_admission"}
 	janitorPolicyHashShape = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -67,6 +68,13 @@ func buildJanitorCapacity(values map[string]string) (JanitorCapacity, error) {
 		default:
 			return JanitorCapacity{}, fmt.Errorf("[janitor_capacity]: enabled must be true or false")
 		}
+	}
+	if raw, ok := values["review_admission"]; ok {
+		mode, err := strconv.Unquote(raw)
+		if err != nil || (mode != "cleanup_target" && mode != "fresh_space") {
+			return JanitorCapacity{}, fmt.Errorf("[janitor_capacity]: review_admission must be \"cleanup_target\" or \"fresh_space\"")
+		}
+		c.ReviewFreshSpace = mode == "fresh_space"
 	}
 	for _, key := range []string{"executable", "policy_hash"} {
 		raw, ok := values[key]

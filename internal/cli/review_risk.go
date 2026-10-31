@@ -173,33 +173,37 @@ func wireReviewChangedFiles(engine *workflow.Engine, gh github.Client, checkout 
 				Reason: "review scope has no local checkout and no GitHub client",
 			}
 		}
-		compare, err := gh.CompareCommits(ctx, github.Repository{Owner: owner, Name: name}, base, head)
-		if err != nil {
-			return nil, err
-		}
-		switch strings.TrimSpace(compare.Status) {
-		case "ahead", "identical":
-		default:
-			return nil, workflow.ReviewScopeUnavailableError{
-				Reason: fmt.Sprintf("review scope compare is %q, not a direct follow-up", compare.Status),
-			}
-		}
-		// A capped page is not a complete list and nothing in the response can
-		// make it one, so a range at or past the cap is unscopable from the API
-		// alone however large the returned array looks.
-		if compare.Truncated {
-			return nil, workflow.ReviewScopeUnavailableError{
-				Reason: fmt.Sprintf(
-					"review scope compare file list is capped at %d files and no local checkout could prove the range complete",
-					len(compare.Files)),
-			}
-		}
-		paths := make([]string, 0, len(compare.Files))
-		for _, file := range compare.Files {
-			paths = append(paths, file.Filename)
-		}
-		return sortedUniqueReviewPaths(paths), nil
+		return forgeReviewChangedFiles(ctx, gh, github.Repository{Owner: owner, Name: name}, base, head)
 	}
+}
+
+func forgeReviewChangedFiles(ctx context.Context, gh github.Client, repo github.Repository, base, head string) ([]string, error) {
+	compare, err := gh.CompareCommits(ctx, repo, base, head)
+	if err != nil {
+		return nil, err
+	}
+	switch strings.TrimSpace(compare.Status) {
+	case "ahead", "identical":
+	default:
+		return nil, workflow.ReviewScopeUnavailableError{
+			Reason: fmt.Sprintf("review scope compare is %q, not a direct follow-up", compare.Status),
+		}
+	}
+	// A capped page is not a complete list and nothing in the response can
+	// make it one, so a range at or past the cap is unscopable from the API
+	// alone however large the returned array looks.
+	if compare.Truncated {
+		return nil, workflow.ReviewScopeUnavailableError{
+			Reason: fmt.Sprintf(
+				"review scope compare file list is capped at %d files and no local checkout could prove the range complete",
+				len(compare.Files)),
+		}
+	}
+	paths := make([]string, 0, len(compare.Files))
+	for _, file := range compare.Files {
+		paths = append(paths, file.Filename)
+	}
+	return sortedUniqueReviewPaths(paths), nil
 }
 
 // localReviewChangedFiles enumerates base...head from the daemon's own checkout.

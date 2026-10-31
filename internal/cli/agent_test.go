@@ -1713,7 +1713,7 @@ func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testi
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
-	agent, release, err := ensureManagedAgentInstance(context.Background(), store, home, "planner", "owner/repo", record)
+	agent, release, err := resolveLocalDispatchAgent(context.Background(), store, localAgentDispatchRequest{Home: home, Type: "planner", Background: true}, "owner/repo", record)
 	if err != nil {
 		t.Fatalf("ensureManagedAgentInstance returned error: %v", err)
 	}

@@ -227,7 +227,7 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 // only by the normal queued-job dispatch listing. Daemon maintenance and
 // reconciliation do not pass through this function, so future in-process
 // reclaim remains able to free disk while agent dispatch is paused.
-func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
+func diskGuardLocalQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
 	matching := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {

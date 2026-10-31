@@ -85,6 +85,7 @@ func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteRe
 	remoteBackend := string(execbackend.Remote)
 	home, paths, store := heartbeatLoopE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, "")
+	enableReviewSourceGatewayFixture(t, paths)
 	checkout := createDaemonWorkerGitCheckout(t, "remote-review-admission")
 	head := daemonWorkerHeadSHA(t, checkout)
 	makeReviewFixOriginFetchable(t, checkout, "remote-review-admission")
@@ -105,7 +106,7 @@ func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteRe
 	if err != nil {
 		t.Fatal(err)
 	}
-	stub := &remoteReviewAdmissionGitHubStub{pull: github.PullRequest{Number: 2238, HeadSHA: head}}
+	stub := &remoteReviewAdmissionGitHubStub{pull: github.PullRequest{Number: 2238, HeadSHA: head, BaseRef: "remote-review-admission"}}
 	probe := &remoteReviewProbeBackend{provisionErr: errors.New("provider probe stops after Provision")}
 	fixture := &remoteReviewAdmissionFixture{ctx: ctx, home: home, paths: paths, store: store, job: job, head: head, github: stub, backend: probe}
 	fixture.worker = defaultJobWorker(store, io.Discard, home)

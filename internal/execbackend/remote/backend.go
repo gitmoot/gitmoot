@@ -424,6 +424,12 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 	if err != nil {
 		return err
 	}
+	if materials.RemoteReview != nil {
+		if materials.SourceWorktree != "" {
+			return errors.New("remote review source cannot also name a host worktree")
+		}
+		return b.syncRemoteReview(ctx, instance, state, materials.RemoteReview)
+	}
 	hostWorktree := strings.TrimSpace(materials.SourceWorktree)
 	if hostWorktree == "" {
 		return errors.New("remote execution backend source worktree is required")
@@ -450,7 +456,11 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 	if err != nil {
 		return fmt.Errorf("capture remote execution sync input: %w", err)
 	}
-	historyRoot, err := os.MkdirTemp("", "gitmoot-remote-sync-")
+	// Keep bulk history on the source workspace filesystem, not the host's
+	// default /tmp. Review workspaces use the verified configured worktree
+	// mount. Capture input first so this disposable directory is never synced
+	// as an untracked input; never fall back if its parent is unavailable.
+	historyRoot, err := os.MkdirTemp(hostWorktree, ".gitmoot-remote-sync-")
 	if err != nil {
 		return fmt.Errorf("create remote sync history directory: %w", err)
 	}

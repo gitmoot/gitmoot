@@ -53,6 +53,9 @@ type ProxyAuthKind string
 const (
 	ProxyAuthBearer ProxyAuthKind = "bearer"
 	ProxyAuthHeader ProxyAuthKind = "header"
+	// ProxyAuthGitRead grants only smart-HTTP upload-pack on one repository.
+	// The upstream token stays on the host; the sandbox uses its mTLS lease.
+	ProxyAuthGitRead ProxyAuthKind = "git_read"
 	// ProxyAuthResolved defers bearer-versus-header placement until the host
 	// resolver loads the current credential. It is valid only for a
 	// sandbox-bound mTLS lease, after every sandbox-side credential has already
@@ -506,6 +509,11 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 			return
 		}
 	}
+	if registered.policy.AuthKind == ProxyAuthGitRead && !gitReadRequestAllowed(r, suffix) {
+		http.Error(w, "source operation refused", http.StatusForbidden)
+		g.writeLog(r.Method, registered.upstream.Hostname(), http.StatusForbidden, registered.jobID)
+		return
+	}
 	resolved, err := registered.resolver(r.Context())
 	if err != nil || strings.TrimSpace(resolved.Value) == "" || !resolvedMatchesProxyPolicy(resolved, registered.policy) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -534,6 +542,8 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		outbound.Header.Set("Authorization", "Bearer "+resolved.Value)
 	case ProxyAuthHeader:
 		outbound.Header.Set(resolved.Header, resolved.Value)
+	case ProxyAuthGitRead:
+		outbound.SetBasicAuth("x-access-token", resolved.Value)
 	}
 
 	response, err := g.client.Do(outbound)
@@ -557,9 +567,13 @@ func (g *Gateway) serveProxyRequest(w http.ResponseWriter, r *http.Request, acce
 		return
 	}
 	removeHopHeaders(response.Header)
-	copyRedactedHeader(w.Header(), response.Header, resolved.Value)
+	var extraSecrets []string
+	if registered.policy.AuthKind == ProxyAuthGitRead {
+		extraSecrets = []string{base64.StdEncoding.EncodeToString([]byte("x-access-token:" + resolved.Value))}
+	}
+	copyRedactedHeader(w.Header(), response.Header, resolved.Value, extraSecrets...)
 	w.WriteHeader(response.StatusCode)
-	_ = streamRedactedResponse(w, response.Body, resolved.Value)
+	_ = streamRedactedResponse(w, response.Body, resolved.Value, extraSecrets...)
 	g.writeLog(r.Method, registered.upstream.Hostname(), response.StatusCode, registered.jobID)
 }
 
@@ -641,6 +655,17 @@ func ValidateProxyPolicy(policy ProxyPolicy) (ProxyPolicy, *url.URL, error) {
 		if strings.TrimSpace(policy.Header) != "" {
 			return ProxyPolicy{}, nil, errors.New("bearer proxy auth cannot set a header name")
 		}
+	case ProxyAuthGitRead:
+		if strings.TrimSpace(policy.Header) != "" {
+			return ProxyPolicy{}, nil, errors.New("read-only Git proxy cannot set a header name")
+		}
+		parts := strings.Split(strings.Trim(upstream.Path, "/"), "/")
+		if len(parts) != 2 || parts[0] == "" || parts[1] == ".git" || !strings.HasSuffix(parts[1], ".git") {
+			return ProxyPolicy{}, nil, errors.New("read-only Git proxy requires one owner/repository.git path")
+		}
+		if !policy.AllowLoopbackHTTP && upstream.Host != "github.com" {
+			return ProxyPolicy{}, nil, errors.New("read-only Git proxy requires github.com")
+		}
 	case ProxyAuthHeader:
 		header := http.CanonicalHeaderKey(strings.TrimSpace(policy.Header))
 		if !validHTTPToken(header) {
@@ -708,8 +733,8 @@ func sortedHostSet(hosts map[string]struct{}) []string {
 // and transformed application payloads are out of scope. The finite reversible
 // forms below are defense in depth, not an application-layer DLP guarantee;
 // that exclusion includes application/gzip data without Content-Encoding.
-func copyRedactedHeader(destination, source http.Header, secret string) {
-	patterns := credentialRedactionPatterns(secret)
+func copyRedactedHeader(destination, source http.Header, secret string, extraSecrets ...string) {
+	patterns := responseCredentialPatterns(secret, extraSecrets)
 	destination.Del("Content-Length")
 	for name, values := range source {
 		if strings.EqualFold(name, "Content-Length") || redactCredentialText(name, patterns) != name {
@@ -721,8 +746,8 @@ func copyRedactedHeader(destination, source http.Header, secret string) {
 	}
 }
 
-func streamRedactedResponse(destination http.ResponseWriter, source io.Reader, secret string) error {
-	patterns := credentialRedactionPatterns(secret)
+func streamRedactedResponse(destination http.ResponseWriter, source io.Reader, secret string, extraSecrets ...string) error {
+	patterns := responseCredentialPatterns(secret, extraSecrets)
 	buffered := bufio.NewWriter(destination)
 	redactor := &credentialRedactingWriter{destination: buffered, patterns: patterns}
 	controller := http.NewResponseController(destination)
@@ -768,6 +793,18 @@ type credentialRedactionPattern struct {
 // the host credential. The proxy applies this one set to headers and streaming
 // bodies so an upstream cannot evade the boundary merely by changing transport
 // encoding or ASCII case.
+func responseCredentialPatterns(secret string, extra []string) []credentialRedactionPattern {
+	patterns := credentialRedactionPatterns(secret)
+	if len(extra) == 0 {
+		return patterns
+	}
+	for _, value := range extra {
+		patterns = append(patterns, credentialRedactionPatterns(value)...)
+	}
+	sort.Slice(patterns, func(i, j int) bool { return len(patterns[i].value) > len(patterns[j].value) })
+	return patterns
+}
+
 func credentialRedactionPatterns(secret string) []credentialRedactionPattern {
 	if secret == "" {
 		return nil

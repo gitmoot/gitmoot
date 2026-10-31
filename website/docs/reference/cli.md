@@ -2611,11 +2611,13 @@ enabled = true                              # absent or false: no janitor proces
 executable = "/root/.local/bin/janitor"     # run as: <executable> --format json status
 policy_hash = "<64 hex from janitor status>" # only this approved janitor policy is trusted
 timeout_ms = 5000                           # optional, 100..60000
+review_admission = "cleanup_target"         # optional: "fresh_space" enables monitored local reviews
 ```
 
 Heavy work is every queued or foreground agent or shell job; messaging, inbox,
-status and other bounded commands are never held, and running jobs are never
-stopped or cancelled. For each job, gitmoot checks the devices of the home, the
+status and other bounded commands are never held. Ordinary admission does not
+cancel running jobs; monitored reviews are the exception described below.
+For ordinary work, gitmoot checks the devices of the home, the
 seat scratch parent, the repository's checkout and a local `[worktrees]` root
 against `data.capacity.volumes[]` (matched by device number). On Linux, each path
 on the configured `fuse.sshfs` worktree mount is omitted only when a retained
@@ -2633,7 +2635,26 @@ queued job stays `queued` with one `janitor_pressure_held` event naming the
 reason and starts by itself once janitor reports recovery; a foreground dispatch
 or `job run` exits with `janitor pressure holds new heavy work: ...` before it
 creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
-keeps no state of its own. The `[disk_guard]` floors still apply on their own.
+keeps no competing pressure latch. Ordinary `[disk_guard]` floors still apply.
+
+Actual E2B reviews resolve routing before local preparation and fetch their
+exact source and history inside E2B. They need no host checkout or staging
+archive. With Janitor enabled, their remaining local control-state footprint
+requires fresh matching policy/device evidence and immediate available bytes
+above the canonical reserve; the cleanup-target latch alone does not block
+them. The existing provider concurrency and spending controls remain in force.
+
+`review_admission = "fresh_space"` also enables this best-effort policy for
+local reviews; `"cleanup_target"` retains ordinary local review admission. Local
+preparation paths remain covered, and configured Storage Box allocation still
+requires mount preflight without a root fallback. Every two seconds, a monitor
+checks capacity through preparation, runtime delivery and owned cleanup.
+Stale/changed policy or device evidence, low reserve, and monitor errors close
+admission and request cancellation of only the owned review generation.
+Measurements and cancellation requests go to `.gitmoot/review-capacity.jsonl`.
+Cancelled reviews are not automatically retried. This is not a physical-byte
+quota: shared writers can cross the reserve between checks. Ordinary non-review
+gates and the canonical reserve/latch do not change.
 
 With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
 try the existing E2B route, within its dollar/concurrency cap and exact-head

@@ -431,8 +431,9 @@ type localAgentDispatchRequest struct {
 	// ReviewScope bounds a router delta review to baseline..head (#2177). Nil
 	// means a full review against the pull request base, which is what every
 	// router request did before delta review existed.
-	ReviewScope *workflow.ReviewScope
-	jobRunner   subprocess.Runner
+	ReviewScope  *workflow.ReviewScope
+	remoteSource bool
+	jobRunner    subprocess.Runner
 	// checksRoute is the repository's checks routing applyReviewChecksRoute
 	// applied; set only when ReviewChecksRouted.
 	checksRoute reviewChecksRoute
@@ -626,26 +627,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := validateAndTouchActingOrgRole(ctx, store, request.Home, request.ActingOrgRole, request.ExecutionPath); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	repo, record, dispatchBranch, persistDefaultBranch, err := resolveLocalAgentRepo(ctx, store, request.RepoFlag, localDispatchJobRunner(request))
+	repo, record, dispatchBranch, persistDefaultBranch, err := resolveDispatchRepoIdentity(ctx, store, request)
 	if err != nil {
 		return localAgentJobOutput{}, err
-	}
-	// #2359: default-off janitor pressure admission, before any durable state or
-	// agent start. A foreground dispatch starts heavy work right now, and a
-	// dispatch that allocates a read-only worktree writes one before the job is
-	// even queued, so both are refused while janitor holds. A plain background
-	// enqueue writes nothing heavy (a cold managed-instance start is gated in
-	// ensureManagedAgentInstance); the daemon's dispatch listing holds the job.
-	if !request.Background || dispatchReadOnlyWorktreeEligible(request) {
-		paths, pathsErr := pathsFromFlag(request.Home)
-		if pathsErr != nil {
-			return localAgentJobOutput{}, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
-		}
-		// record is the RESOLVED checkout, also for a repo this dispatch is about to
-		// register, so it is measured even before it has a database row.
-		if err := janitorPressureRefusal(ctx, store, paths, repo.FullName(), record.CheckoutPath, record.PrimaryCheckoutPath); err != nil {
-			return localAgentJobOutput{}, err
-		}
 	}
 	// Resolve once per human dispatch. The snapshot is shared by the mutation
 	// preflight and the enqueue chokepoint so both see precisely one registry.
@@ -686,7 +670,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 				return localAgentJobOutput{}, err
 			}
 		} else {
-			route, policyEvaluated, reason := reviewPolicyBackend(ctx, request, repo, record.CheckoutPath)
+			route, policyEvaluated, reason := reviewPolicyBackend(ctx, request, repo, "")
 			source := "default"
 			if request.ExecBackend != nil {
 				source = "explicit"
@@ -719,11 +703,27 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			}
 		}
 	}
+	request.remoteSource = request.Action == "review" && execBackend == execbackend.Remote && !config.IsSandboxdProvider(request.ExecProvider)
+	var stopCapacity func() error
+	ctx, stopCapacity, err = admitDispatchPreparation(ctx, store, &request, repo, record)
+	if err != nil {
+		return localAgentJobOutput{}, err
+	}
+	defer func() { err = errors.Join(err, stopCapacity()) }()
+	if request.Action == "review" && !request.remoteSource {
+		repo, record, dispatchBranch, persistDefaultBranch, err = resolveLocalAgentRepo(ctx, store, request.RepoFlag, localDispatchJobRunner(request))
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+	}
 	if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	var checkoutPath string
 	checkoutPath = record.CheckoutPath
+	if request.remoteSource {
+		checkoutPath = ""
+	}
 	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
 	if err != nil {
 		return localAgentJobOutput{}, err
@@ -774,6 +774,21 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		request.ReviewRouteReason = "backend=local source=policy reason=selected runtime is not remote-capable"
 		request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
 		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		request.remoteSource = false
+		var stopLocalCapacity func() error
+		ctx, stopLocalCapacity, err = admitDispatchPreparation(ctx, store, &request, repo, record)
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		defer func() { err = errors.Join(err, stopLocalCapacity()) }()
+		repo, record, dispatchBranch, persistDefaultBranch, err = resolveLocalAgentRepo(ctx, store, request.RepoFlag, localDispatchJobRunner(request))
+		if err != nil {
+			return localAgentJobOutput{}, err
+		}
+		checkoutPath = record.CheckoutPath
+		if err := upsertLocalAgentRepo(ctx, store, record, persistDefaultBranch); err != nil {
 			return localAgentJobOutput{}, err
 		}
 	}
@@ -856,8 +871,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	switch request.Action {
 	case "review":
-		if err := reviewReadOnlyWorktreeCapacity(request.Home); err != nil {
-			return localAgentJobOutput{}, err
+		if !request.remoteSource {
+			if err := reviewReadOnlyWorktreeCapacity(request.Home); err != nil {
+				return localAgentJobOutput{}, err
+			}
 		}
 		var err error
 		request, err = prepareLocalReviewDispatchRequest(ctx, store, record, repo, request)
@@ -915,8 +932,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// worktree is created at that commit from it), and scanning before allocation
 	// is what keeps the refusal from having to unwind a worktree it created. The
 	// warning scan below is left exactly as it was, on the allocated worktree.
+	var reviewGraph promptCommitGraph = jobGitClient(record.CheckoutPath, localDispatchJobRunner(request))
+	if request.remoteSource {
+		reviewGraph = &remoteReviewGraph{client: jobGitHubClient("", newAgentDispatchGitHubClient(""), localDispatchJobRunner(request)), repo: repo, head: strings.ToLower(request.HeadSHA)}
+	}
 	if request.Action == "review" && !request.AllowPromptHeadMismatch {
-		citations := classifyPromptCommitCitations(ctx, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
+		citations := classifyPromptCommitCitations(ctx, reviewGraph,
 			store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest)
 		if err := reviewPromptTargetMismatchError(citations, request.HeadSHA); err != nil {
 			return localAgentJobOutput{}, err
@@ -949,8 +970,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 	}()
 	jobID := firstNonEmpty(strings.TrimSpace(request.JobID), localAgentJobID(request.Action, agent.Name))
-	readOnlyWorktreePath, readOnlyWorktreeErr := maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
-	if dispatchReadOnlyWorktreeEligible(request) {
+	var readOnlyWorktreePath string
+	var readOnlyWorktreeErr error
+	if !request.remoteSource {
+		readOnlyWorktreePath, readOnlyWorktreeErr = maybeAllocateDispatchReadOnlyWorktree(ctx, store, request, repo.FullName(), record.CheckoutPath, jobID)
+	}
+	if !request.remoteSource && dispatchReadOnlyWorktreeEligible(request) {
 		kind := "read-only ask"
 		if request.Action == "review" {
 			kind = "exact-head review"
@@ -981,15 +1006,17 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		//
 		// Only UNRESOLVABLE survives as worth saying: the classifier could not
 		// establish the relationship, so nobody has judged that citation.
-		promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
-		promptHeadWarnings = retainUnjudgedPromptHeadWarnings(ctx, jobGitClient(record.CheckoutPath, localDispatchJobRunner(request)),
-			store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest, promptHeadWarnings)
+		if !request.remoteSource {
+			promptHeadWarnings = dispatchPromptHeadContradictionWarnings(ctx, jobGitClient(checkoutPath, localDispatchJobRunner(request)), request.Instructions, request.HeadSHA)
+			promptHeadWarnings = retainUnjudgedPromptHeadWarnings(ctx, reviewGraph,
+				store, request.Instructions, request.HeadSHA, repo.FullName(), request.PullRequest, promptHeadWarnings)
+		}
 	}
 	// Locking stays on the agent's REGISTERED session (see the same split in
 	// jobWorker.run): a read-only seat isolates DELIVERY, not serialization, so
 	// #684's "busy reviewer session leaves the review queued" is unchanged.
 	sessionLockAgent := effectiveAgent
-	if readOnlyWorktreePath != "" {
+	if readOnlyWorktreePath != "" || request.remoteSource {
 		if err := applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), jobID, &effectiveAgent); err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("isolate read-only seat session: %w", err)
 		}
@@ -1161,7 +1188,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
-		ReadOnlySeat:             readOnlyWorktreePath != "",
+		ReadOnlySeat:             readOnlyWorktreePath != "" || request.remoteSource,
 		ReviewPurpose:            request.ReviewPurpose,
 		ReviewModelPool:          request.ReviewModelPool,
 		ReviewRequester:          request.ReviewRequester,
@@ -1769,9 +1796,13 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 		return localAgentDispatchRequest{}, errors.New("agent review requires --pr number")
 	}
 	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
+		checkout := record.CheckoutPath
+		if request.remoteSource {
+			checkout = ""
+		}
 		pr, err := jobGitHubClient(
-			record.CheckoutPath,
-			newAgentDispatchGitHubClient(record.CheckoutPath),
+			checkout,
+			newAgentDispatchGitHubClient(checkout),
 			localDispatchJobRunner(request),
 		).GetPullRequest(ctx, repo, int64(request.PullRequest))
 		if err != nil {
@@ -1812,7 +1843,7 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 					return localAgentDispatchRequest{}, err
 				}
 			}
-			if strings.TrimSpace(task.WorktreePath) != "" {
+			if !request.remoteSource && strings.TrimSpace(task.WorktreePath) != "" {
 				head, headErr := jobGitClient(task.WorktreePath, localDispatchJobRunner(request)).HeadSHA(ctx)
 				if headErr != nil {
 					return localAgentDispatchRequest{}, headErr
@@ -1962,7 +1993,7 @@ func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request loc
 			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
 		}
 	}
-	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record)
+	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record, request.Action == "review")
 }
 
 func forcedManagedAgentTypeNotFoundError(typeName string) error {
@@ -2024,7 +2055,7 @@ func localManagedAgentDispatchConfigForAgent(ctx context.Context, store *db.Stor
 	return localManagedAgentDispatchConfig{OK: true, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
 }
 
-func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home string, typeName string, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
+func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home string, typeName string, repo string, record db.Repo, deferRuntimeStart bool) (db.Agent, func(context.Context) error, error) {
 	types, err := loadAgentTypeConfig(home)
 	if err != nil {
 		return db.Agent{}, noopAgentReservationRelease, err
@@ -2099,6 +2130,31 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		if err != nil {
 			return db.Agent{}, noopAgentReservationRelease, err
 		}
+	}
+	if deferRuntimeStart {
+		if !resumableSessionRuntime(instanceAgent.Runtime) {
+			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed reviewer requires a resumable runtime")
+		}
+		instanceAgent.RuntimeRef = runtime.FreshRefForJob(instanceAgent.Name)
+		instance := db.AgentInstance{
+			Name: instanceAgent.Name, Type: agentType.Name, Runtime: instanceAgent.Runtime,
+			RuntimeRef: instanceAgent.RuntimeRef, RepoFullName: repo, Role: instanceAgent.Role,
+			TemplateID: instanceAgent.TemplateID, Model: instanceAgent.Model, Effort: instanceAgent.Effort,
+			Capabilities: instanceAgent.Capabilities, AutonomyPolicy: instanceAgent.AutonomyPolicy,
+			State: "idle", CreatedAt: formatManagedAgentTime(now), LastUsedAt: formatManagedAgentTime(now),
+			ExpiresAt: formatManagedAgentTime(now.Add(jobTimeout)),
+		}
+		// Reviews always receive a fresh isolated session at delivery. Reserve
+		// their managed-type slot without starting a throwaway host session.
+		if err := store.UpsertAgentInstance(ctx, instance); err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+		agent, err := store.GetAgent(ctx, instance.Name)
+		if err != nil {
+			return db.Agent{}, noopAgentReservationRelease, err
+		}
+		releaseOnError = false
+		return agent, releaseTypeLock, nil
 	}
 	// #2359: starting a cold managed instance runs the agent runtime now, for a
 	// background dispatch too, so it is heavy work janitor pressure must hold.

@@ -562,6 +562,8 @@ func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T)
 // once belonged to are gone (#1757); the names stay forbidden so reintroducing
 // one would be caught here rather than silently substituting an ExecRunner and
 // bypassing the resolved backend.
+// Raw host commands are classified by TestJobPathsDoNotHardcodeHostRunners and
+// its single, function-scoped allowlist, including host credential resolution.
 func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
 	forbidden := map[string]struct{}{
 		"defaultCheckout":             {},
@@ -598,16 +600,6 @@ func TestJobSubprocessProductionRoutesDoNotCallHostWrappers(t *testing.T) {
 			}
 			if _, blocked := forbidden[selector.Sel.Name]; blocked {
 				violations = append(violations, fset.Position(selector.Sel.Pos()).String())
-			}
-			if pkg, ok := selector.X.(*ast.Ident); ok && pkg.Name == "exec" &&
-				(selector.Sel.Name == "Command" || selector.Sel.Name == "CommandContext") && len(call.Args) != 0 {
-				commandArg := call.Args[0]
-				if selector.Sel.Name == "CommandContext" && len(call.Args) > 1 {
-					commandArg = call.Args[1]
-				}
-				if literal, ok := commandArg.(*ast.BasicLit); ok && (literal.Value == `"git"` || literal.Value == `"gh"`) {
-					violations = append(violations, fset.Position(selector.Sel.Pos()).String())
-				}
 			}
 			return true
 		})

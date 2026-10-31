@@ -317,6 +317,10 @@ func TestRemoteSyncInShipsExactHeadAndReviewBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Host scratch can be unavailable while the review worktree's mounted
+	// filesystem is healthy. Exact-history transport must use that workspace
+	// rather than requiring another local-disk copy.
+	t.Setenv("TMPDIR", filepath.Join(source, "unavailable-host-tmp"))
 	if err := backend.SyncIn(context.Background(), instance, execbackend.Materials{
 		SourceWorktree: source,
 		DiffBaseHEAD:   base,

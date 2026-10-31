@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
 // #1819. A review dispatch whose PROMPT names a commit other than --head-sha
@@ -78,6 +76,10 @@ type promptCommitCitation struct {
 	// refusal can say "that is #1810's head" instead of "unknown commit".
 	ownedBy []int
 }
+type promptCommitGraph interface {
+	RevParse(context.Context, string) (string, error)
+	IsAncestor(context.Context, string, string) (bool, error)
+}
 
 // classifyPromptCommitCitations resolves every commit-shaped token in a prompt
 // against the dispatch head and the store's recorded heads.
@@ -85,7 +87,7 @@ type promptCommitCitation struct {
 // It returns nothing when the dispatch head cannot be resolved: with no head
 // there is no relationship to establish, and this is the existing
 // promptHeadContradictionWarnings behaviour rather than a new fail-open.
-func classifyPromptCommitCitations(ctx context.Context, git gitutil.Client, heads recordedPullRequestHeadSource, prompt string, dispatchHead string, repo string, pullRequest int) []promptCommitCitation {
+func classifyPromptCommitCitations(ctx context.Context, git promptCommitGraph, heads recordedPullRequestHeadSource, prompt string, dispatchHead string, repo string, pullRequest int) []promptCommitCitation {
 	if strings.TrimSpace(prompt) == "" {
 		return nil
 	}
@@ -182,7 +184,7 @@ func classifyPromptCommitCitations(ctx context.Context, git gitutil.Client, head
 // The second return exists so the caller can distinguish that from a real false:
 // collapsing them lets an instrument failure refuse a dispatch, which is the one
 // direction this guard must never take.
-func promptCitationAncestry(ctx context.Context, git gitutil.Client, ancestor string, descendant string) (reachable bool, known bool) {
+func promptCitationAncestry(ctx context.Context, git promptCommitGraph, ancestor string, descendant string) (reachable bool, known bool) {
 	reachable, err := git.IsAncestor(ctx, ancestor, descendant)
 	if err != nil {
 		return false, false
@@ -259,7 +261,7 @@ func reviewPromptTargetMismatchError(citations []promptCommitCitation, dispatchH
 // routine case teaches its reader to ignore it.
 func retainUnjudgedPromptHeadWarnings(
 	ctx context.Context,
-	git gitutil.Client,
+	git promptCommitGraph,
 	heads recordedPullRequestHeadSource,
 	prompt string,
 	dispatchHead string,

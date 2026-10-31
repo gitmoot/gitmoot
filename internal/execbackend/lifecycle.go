@@ -109,7 +109,8 @@ type JobScope struct {
 	TTL                 time.Duration
 }
 
-// Materials are non-secret inputs staged into one execution instance.
+// Materials stage source into an execution instance. RemoteReview carries only
+// an ephemeral repository-read broker identity, never an upstream credential.
 type Materials struct {
 	SourceWorktree string
 	// DiffBaseHEAD optionally names the ancestor of SourceWorktree's HEAD that
@@ -118,7 +119,22 @@ type Materials struct {
 	// reviewed commit and the base is a local commit, without copying the host
 	// repository's .git directory.
 	DiffBaseHEAD string
+	RemoteReview *RemoteReviewSource
 }
+
+// RemoteReviewSource replaces host checkout/history preparation for E2B reviews.
+// BaseRef is the authenticated PR target branch; its current tip and merge base
+// are resolved inside the instance. DiffBase, when set, is a frozen review base
+// or previously reviewed head. MergedSHA is supplied only for a merged PR.
+type RemoteReviewSource struct {
+	Head      string
+	BaseRef   string
+	MergedSHA string
+	DiffBase  string
+	Access    CredentialMaterial
+}
+
+const ReviewSourceMaterialDir = "/home/user/.gitmoot-source"
 
 const (
 	CredentialMaterialDir           = "/home/user/.gitmoot/credential-gateway"

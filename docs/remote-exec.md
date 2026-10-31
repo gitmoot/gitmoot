@@ -402,25 +402,36 @@ Refusals record durable `remote_review_admission_avoided_<reason>` job events,
 where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`,
 `ci_pending` (current-head checks still running, none failed), or `retry`.
 
-For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
-checkout into a distinct detached Git worktree, streams runtime commands there,
-collects changes, and destroys the instance after the job. The same instance
-survives Mailbox repair deliveries. Only an implement job imports changes, and none can be dispatched; a review
-returns its FINDINGS in the result envelope and needs no change set. An
-implement job's changes would return through
+For an engine-driven daemon job, Gitmoot provisions one job-scoped instance,
+prepares its workspace, streams runtime commands there, and destroys the
+instance after the job. E2B reviews fetch source directly inside that instance;
+other paths synchronize a host worktree. The same instance survives Mailbox
+repair deliveries. Reviews return findings in the result envelope and never
+import changes. Implementation dispatch is disabled; legacy implement jobs use
 the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
 result observation; host Git commands and the finalizer still run against the
 host worktree, and backend-created commits are refused.
 
-On the remote backend the instance workspace is a Git repository whose `HEAD`
-is the exact host commit, not a copy re-committed under a new SHA. Gitmoot
-fetches that commit and its history back to the review diff base into a
-throwaway host repository and uploads only its object store and shallow
-boundary, plus a patch of any uncommitted host changes. No host `.git`
-directory, config, remote, credential helper or GitHub token is uploaded, and
-the instance has no `origin`. For a pull-request review the diff base is the
-merge base with the refreshed `origin/<base>` (or the prior reviewed head for a
-bounded re-review); the instance gets it as the local branch
+An E2B review does not require a registered host checkout, detached local
+worktree, host Git-history copy, or source archive. Repository and PR metadata
+are resolved before local preparation. Git fetches the exact requested head
+inside E2B and verifies it before runtime delivery. The current target branch
+and its merge base are resolved there too; merged PRs retain the first-parent
+base handling, and a follow-up review verifies its previous reviewed head is
+an ancestor.
+
+Source access uses the existing `credential_gateway_listen` /
+`credential_gateway_url` mTLS listener, including for shell reviews without a
+model gateway. The host resolves its GitHub credential through
+`gh auth token --hostname github.com`; the instance receives only an expiring,
+job-scoped identity. The broker pins `github.com/<owner>/<repo>.git` and allows
+only smart-HTTP discovery and `git-upload-pack`, never pushes or another
+repository. Source identity files are removed after preparation and the lease
+is revoked before runtime delivery. No host GitHub token is uploaded.
+
+The worktree-copying remote paths still prepare and upload isolated history
+without copying the host Git configuration or credentials. Neither source path
+installs an `origin`. A review's resolved base becomes the local branch
 `gitmoot-review-base`, which the checked-out `gitmoot-head` branch tracks, so
 `git status`, `git log @{upstream}..` and `git diff @{upstream}` show the
 review scope. A remote review also receives the same rendered, repo-scoped
@@ -469,7 +480,7 @@ process identity. When `local_uid` is absent, daemon jobs do the same.
 
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
-history hydration; the remote backend ships exact history as described above. Cancel
+history hydration; remote source preparation follows the paths above. Cancel
 kills active command groups and destroys the instance. On daemon restart, the
 remote reaper positively observes provider inventory and matches the complete
 sandbox identity (job, attempt, generation, fencing token, boot ID, and sandbox
