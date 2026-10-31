@@ -391,9 +391,13 @@ remote_require_ci_green = true
 remote_require_ci_green = false
 ```
 
-When enabled, admission requires at least one reported check and every check must
-be passing, skipped, or neutral. Policy-routed remote reviews always require
-this, regardless of `remote_require_ci_green`.
+When enabled, admission requires at least one prerequisite check, and every
+prerequisite must be passing, skipped, or neutral. The exact
+`gitmoot/merge-gate` context is excluded: its result depends on the review.
+Other checks, including `gitmoot/security`, retain their normal blocking semantics.
+A gate-only head is treated as having no prerequisite CI, not as green CI.
+Policy-routed reviews require green prerequisite CI, except that a capacity-routed
+review may have none when the repository does not require `remote_require_ci_green`.
 Refusals record durable `remote_review_admission_avoided_<reason>` job events,
 where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`,
 `ci_pending` (current-head checks still running, none failed), or `retry`.
