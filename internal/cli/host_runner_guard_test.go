@@ -95,6 +95,10 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		execRunners: 2,
 		reason:      "operator plugin install and doctor commands use replaceable host runner seams",
 	},
+	"internal/cli/remote_review_source.go:resolveReviewSourceCredential": {
+		rawCommands: 1,
+		reason:      "credential gateway resolves host GitHub auth locally; only the scoped Git-read lease reaches the review instance, never the host credential or its lookup command",
+	},
 	"internal/cli/repo.go:resolveRegisteredRepoRecord": {
 		execRunners: 1,
 		reason:      "operator repo registration inspects and repairs the selected host checkout",

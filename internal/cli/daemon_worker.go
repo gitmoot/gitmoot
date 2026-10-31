@@ -355,7 +355,7 @@ func (w jobWorker) resolveExecutionBackendForJob(job db.Job, payload workflow.Jo
 	return backend, cfg, nil
 }
 
-func (w jobWorker) run(ctx context.Context, job db.Job) error {
+func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
@@ -398,6 +398,39 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		}
 		_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
 		return nil
+	}
+	sourceOnly := job.Type == "review" && execBackend == execbackend.Remote && !config.IsSandboxdProvider(execConfig.Provider)
+	if job.Type == "review" {
+		paths, pathsErr := diskGuardPaths(w)
+		if pathsErr != nil {
+			return pathsErr
+		}
+		runCtx, stop, admissionErr := startReviewCapacityMonitor(ctx, w.Store, paths, payload.Repo, payload.HeadSHA, job.ID, sourceOnly, &job.LifecycleGeneration, payload.WorktreePath)
+		if admissionErr != nil {
+			return w.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
+				JobID: job.ID, Kind: janitorPressureHeldEventKind,
+				Message: "held queued before worker preparation: " + admissionErr.Error(),
+			})
+		}
+		ctx = runCtx
+		// Registered before preparation's cleanup defers, so monitoring covers
+		// the whole delivery and its provider/worktree cleanup.
+		defer func() { returnErr = errors.Join(returnErr, stop()) }()
+	}
+	if sourceOnly && !payload.ReadOnlySeat {
+		payload.ReadOnlySeat = true
+		encoded, encodeErr := json.Marshal(payload)
+		if encodeErr != nil {
+			return encodeErr
+		}
+		updated, updateErr := w.Store.UpdateJobPayloadAtGeneration(ctx, job.ID, string(encoded), job.LifecycleGeneration)
+		if updateErr != nil {
+			return updateErr
+		}
+		if !updated {
+			return nil
+		}
+		job.Payload = string(encoded)
 	}
 	// An ephemeral child carries an inline worker spec instead of a
 	// pre-registered agent. Materialize a throwaway agent + runtime session
@@ -642,7 +675,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	nativeReviewDeliveryStarted := false
-	payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	if !sourceOnly {
+		payload, err = w.prepareNativeReviewWorktreeForRunner(ctx, job, payload, jobRunner)
+	}
 	if err != nil {
 		// An exact-head allocation that spent its checkout-mutation-lock budget is
 		// TRANSIENT: the holder is another worker's short shared-.git op. Terminally
@@ -683,7 +718,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 			w.cleanupUndeliveredNativeReviewWorktree(context.WithoutCancel(ctx), job.ID, payload, jobRunner)
 		}()
 	}
-	checkout, err := w.checkoutForJob(ctx, job, payload, agent, jobRunner)
+	var checkout string
+	if !sourceOnly {
+		checkout, err = w.checkoutForJob(ctx, job, payload, agent, jobRunner)
+	}
 	if err != nil {
 		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
 			checkout, payload, err = resumedCheckout, resumedPayload, nil

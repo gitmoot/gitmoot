@@ -343,10 +343,13 @@ type CombinedStatus struct {
 }
 
 type CompareResult struct {
-	Status   string            `json:"status"`
-	AheadBy  int               `json:"ahead_by"`
-	BehindBy int               `json:"behind_by"`
-	Files    []PullRequestFile `json:"files"`
+	Status     string `json:"status"`
+	AheadBy    int    `json:"ahead_by"`
+	BehindBy   int    `json:"behind_by"`
+	BaseCommit struct {
+		SHA string `json:"sha"`
+	} `json:"base_commit"`
+	Files []PullRequestFile `json:"files"`
 	// Truncated reports that Files is demonstrably INCOMPLETE for this range:
 	// the compare endpoint returned its 300-file maximum and CompareCommits
 	// could not recover the remainder. It is computed by CompareCommits and

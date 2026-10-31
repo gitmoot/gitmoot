@@ -474,9 +474,13 @@ func (h *remoteLifecycleHarness) serveEnvd(w http.ResponseWriter, r *http.Reques
 		}
 		// Land the upload where the instance would see it, so the REAL guest
 		// scripts run against it rather than a Go re-implementation.
+		landed := data
+		if remotePath == "/home/user/.gitmoot-source/gitconfig" {
+			landed = bytes.ReplaceAll(data, []byte("/home/user/"), []byte(filepath.Dir(h.workspace)+"/"))
+		}
 		if err := os.MkdirAll(filepath.Dir(local), 0o700); err != nil {
 			h.t.Errorf("stage upload: %v", err)
-		} else if err := os.WriteFile(local, data, 0o600); err != nil {
+		} else if err := os.WriteFile(local, landed, 0o600); err != nil {
 			h.t.Errorf("stage upload: %v", err)
 		}
 		h.mu.Lock()

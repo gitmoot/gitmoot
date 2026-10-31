@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -51,9 +53,21 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	runDaemonWorkerGit(t, checkout, "commit", "-m", "review subject")
 	head := daemonWorkerHeadSHA(t, checkout)
 	runDaemonWorkerGit(t, checkout, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic "+secret)
+	serveReviewSourceFixture(t, paths, checkout, secret)
+	enableJanitorCapacity(t, paths)
+	device, err := janitorDeviceOf(paths.Home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousStatus := runJanitorStatus
+	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+		volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":2147483648,"reserve_bytes":1048576,"reason":"cleanup target not reached"}`, device, device)
+		return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volume)), nil
+	}
+	t.Cleanup(func() { runJanitorStatus = previousStatus })
 
 	const repo = "owner/repo"
-	seedDaemonWorkerRepo(t, store, repo, checkout)
+	seedDaemonWorkerRepo(t, store, repo, filepath.Join(home, "unavailable-host-checkout"))
 	seedDaemonWorkerAgent(t, store, "remote-review-agent", runtime.ShellRuntime, remoteReviewWorkspaceProbe, []string{"review"}, repo)
 	// The summary deliberately does not enumerate the finding: only the
 	// individual finding carries its title and detail, as on PR #1202 where a
@@ -134,14 +148,8 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 		uploads[name] = data
 	}
 	harness.mu.Unlock()
-	archive := uploads["/home/user/.gitmoot-sync.tar.gz"]
-	if len(archive) == 0 {
-		t.Fatal("workspace archive was not uploaded")
-	}
-	for name, content := range remoteLifecycleArchiveEntries(t, archive) {
-		if bytes.Contains(content, []byte(secret)) {
-			t.Fatalf("workspace archive entry %q carries the host credential", name)
-		}
+	if _, exists := uploads["/home/user/.gitmoot-sync.tar.gz"]; exists {
+		t.Fatal("remote source review uploaded a host workspace archive")
 	}
 	for name, content := range uploads {
 		if bytes.Contains(content, []byte(secret)) {

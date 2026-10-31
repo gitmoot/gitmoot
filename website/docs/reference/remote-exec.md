@@ -256,25 +256,34 @@ Refusals record durable `remote_review_admission_avoided_<reason>` job events,
 where `reason` is `stale`, `duplicate`, `unsupported`, `red_ci`,
 `ci_pending` (current-head checks still running, none failed), or `retry`.
 
-For an engine-driven daemon job, Gitmoot provisions one job-scoped instance, syncs the selected host
-checkout into a distinct detached Git worktree, streams runtime commands there,
-collects changes, and destroys the instance after the job. The same instance
-survives Mailbox repair deliveries. Only an implement job imports changes, and none can be dispatched; a review
+For an engine-driven daemon job, Gitmoot provisions one job-scoped instance,
+prepares its workspace, streams runtime commands there, and destroys the
+instance after the job. E2B reviews fetch source directly inside that instance;
+other paths synchronize a host worktree. The same instance survives Mailbox
+repair deliveries. Only an implement job imports changes, and none can be dispatched; a review
 returns its FINDINGS in the result envelope and needs no change set. An
 implement job's changes would return through
 the bounded transactional `BuildChangeSet` / `ImportChangeSet` transport before
 result observation; host Git commands and the finalizer still run against the
 host worktree, and backend-created commits are refused.
 
-On the remote backend the instance workspace is a Git repository whose `HEAD`
-is the exact host commit, not a copy re-committed under a new SHA. Gitmoot
-fetches that commit and its history back to the review diff base into a
-throwaway host repository and uploads only its object store and shallow
-boundary, plus a patch of any uncommitted host changes. No host `.git`
-directory, config, remote, credential helper or GitHub token is uploaded, and
-the instance has no `origin`. For a pull-request review the diff base is the
-merge base with the refreshed `origin/<base>` (or the prior reviewed head for a
-bounded re-review); the instance gets it as the local branch
+E2B reviews resolve repository identity and routing before local preparation.
+They need no registered host checkout, local review worktree, Git-history copy,
+or source archive. Git fetches and verifies the exact head inside E2B, refreshes
+the target branch, and derives the review base there. Merged-PR base handling
+and ancestor verification for follow-up reviews are preserved.
+
+Repository reads use the existing `credential_gateway_listen` /
+`credential_gateway_url` mTLS listener, even for shell reviews without a model
+gateway. The host resolves `gh auth token --hostname github.com`; the instance
+gets only an expiring job-scoped identity. The broker pins one GitHub repository
+and allows smart-HTTP discovery and `git-upload-pack`, not pushes or other
+repositories. Preparation removes the identity files and revokes the lease
+before runtime delivery. The host token never enters the instance.
+
+Other worktree-copying remote paths still upload isolated Git history without
+host configuration or credentials. Neither path installs an `origin`.
+The resolved review base is the local branch
 `gitmoot-review-base`, which the checked-out `gitmoot-head` branch tracks, so
 `git status`, `git log @{upstream}..` and `git diff @{upstream}` show the
 review scope. A remote review also receives the same rendered, repo-scoped
@@ -323,7 +332,7 @@ process identity. When `local_uid` is absent, daemon jobs do the same.
 
 The local worktree's `.git` file points at an absolute gitdir in the source
 repository. That pointer resolves on the same filesystem, so `local` needs no
-history hydration; the remote backend ships exact history as described above. Cancel
+history hydration; remote source preparation follows the paths above. Cancel
 kills active command groups and destroys the instance. On daemon restart, the
 remote reaper positively observes provider inventory and matches the complete
 sandbox identity (job, attempt, generation, fencing token, boot ID, and sandbox

@@ -45,6 +45,18 @@ remain retained indefinitely, including owned branches. TTL is not a disk bound;
 the owner rather than bypassing retention. Pipeline senders require consumer
 evidence even for service stages without PipelineName or a prun- root ID.
 
+E2B reviews resolve routing before local source preparation and fetch the exact
+head/base inside E2B through a repository-scoped mTLS Git-read broker. The host
+token is not uploaded; no local checkout, source archive or Git-history staging
+is required. Existing provider concurrency and spending controls remain.
+With Janitor enabled, fresh matching evidence and immediate space above the
+canonical reserve govern remaining local control-state writes, not the cleanup
+target latch. `[janitor_capacity] review_admission = "fresh_space"` opts local
+reviews into the same best-effort policy; its default is `"closed"`. Two-second
+monitoring requests cancellation only of the owned review generation on failed
+checks, through owned cleanup. It is not a quota or protection from all shared
+writers. Ordinary non-review gates and Janitor's reserve/latch are unchanged.
+
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:
 `[workload-mode-reconciliation repo=<owner/repo> pr=<n> head=<40-char reviewed head> mode=<THROUGHPUT|STEADY|DRAIN> decision_note=<note id|none>]`.

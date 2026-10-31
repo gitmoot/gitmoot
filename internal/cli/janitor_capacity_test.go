@@ -448,7 +448,7 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 	}
 	var volumes []string
 	for dev := range devices {
-		volumes = append(volumes, janitorVolumeJSON(dev, "critical", true))
+		volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":2147483648,"reserve_bytes":1048576,"reason":"cleanup target not reached"}`, dev, dev))
 	}
 	replaceJanitorStatus(t, janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...), nil)
 	queueDiskGuardJob(t, ctx, store, "a-review", "rev-omp", "review", `,"review_requester":"requester"`)

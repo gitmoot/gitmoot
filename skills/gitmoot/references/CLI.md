@@ -820,14 +820,35 @@ dispatch floor above. Below the dispatch floor reviews move as before.
   re-run with `--background` to get the remote route.
 - **Janitor pressure:** with `[disk_guard] remote_reviews = true`, Janitor-held
   queued reviews use the same capped E2B route and requester notifications.
-  Explicit-local reviews and ineligible work still wait. Manual coordinator
-  holds without a machine-readable Janitor signal do not trigger routing.
+  Explicit-local reviews use ordinary admission unless fresh-space review
+  admission is enabled below. Manual coordinator holds without a machine-readable
+  Janitor signal do not trigger routing.
 
 Janitor capacity admission treats configured Storage Box paths as off-host only
 on Linux when each path's pinned descriptor matches the configured `fuse.sshfs`
 mount ID/source/type/point in the local kernel mount table. Local mounts and
 unverified paths remain covered. It does not exempt a whole device or probe the
 remote worktree root for local-only admissions; creation still runs mount preflight.
+
+E2B reviews resolve routing before host source preparation. They fetch the
+exact head and review base inside E2B through a temporary, repository-scoped
+mTLS Git-read lease; no host checkout, source archive or Git-history copy is
+required. Configure `credential_gateway_listen` and `credential_gateway_url`
+even for shell reviews. The host GitHub token stays in the broker.
+
+With Janitor enabled, E2B reviews check and monitor only their remaining local
+control-state footprint. A cleanup-target hold is not enough to block them:
+fresh matching policy/device evidence and immediate available bytes must both
+remain above the canonical reserve. Local reviews can opt into this
+best-effort policy with `[janitor_capacity] review_admission = "fresh_space"`
+(default `"closed"`). The two-second monitor spans preparation, execution and
+owned cleanup; failed checks cancel only the owned lifecycle generation.
+`.gitmoot/review-capacity.jsonl` records measurements and cancellation requests.
+Cancellation is not proof that remote destruction completed, and does not
+automatically retry a cancelled review. Shared writers can still cross the
+reserve between checks. Existing concurrency, provider budgets, ordinary
+non-review gates and Janitor's reserve/latch are unchanged.
+
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal

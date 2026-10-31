@@ -177,8 +177,9 @@ timeout_ms = 5000                           # optional, 100..60000
 ```
 
 Heavy work is every queued or foreground agent or shell job; messaging, inbox,
-status and other bounded commands are never held, and running jobs are never
-stopped or cancelled. For each job, gitmoot checks the devices of the home, the
+status and other bounded commands are never held. Ordinary admission does not
+cancel running jobs; monitored reviews are the exception described below.
+For ordinary work, gitmoot checks the devices of the home, the
 seat scratch parent, the repository's checkout and a local `[worktrees]` root
 against `data.capacity.volumes[]` (matched by device number). On Linux, each path
 on the configured `fuse.sshfs` worktree mount is omitted only when a retained
@@ -196,7 +197,7 @@ queued job stays `queued` with one `janitor_pressure_held` event naming the
 reason and starts by itself once janitor reports recovery; a foreground dispatch
 or `job run` exits with `janitor pressure holds new heavy work: ...` before it
 creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
-keeps no state of its own. The `[disk_guard]` floors still apply on their own.
+keeps no competing pressure latch. Ordinary `[disk_guard]` floors still apply.
 
 With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
 try the existing E2B route, within its dollar/concurrency cap and exact-head
@@ -204,6 +205,25 @@ eligibility checks. The requesting role receives the same move/hold/refusal
 messages as disk-floor routing. Explicit-local reviews, other job types, and
 reviews that cannot run remotely stay queued. A remote refusal restores local
 waiting; foreground dispatch and `job run` still refuse rather than reroute.
+
+Actual E2B reviews now bypass local checkout/build admission: source and Git
+history are prepared inside E2B, not staged on the host. With Janitor enabled,
+their remaining local control-state writes still require fresh matching
+policy/device evidence and immediate free space above the canonical reserve.
+The cleanup-target latch alone does not block them. Existing provider spending
+and concurrency limits still apply; no single-review slot is added.
+
+Local reviews can opt into the same best-effort fresh-space policy with
+`[janitor_capacity] review_admission = "fresh_space"` (default `"closed"`).
+This checks all covered local preparation paths; configured Storage Box
+allocation still requires verified mount identity, without root fallback.
+Monitoring runs every two seconds through preparation, delivery and owned
+cleanup. Low reserve, stale/changed policy or backing-device evidence, and
+monitor errors close admission and request cancellation of only the owned
+review generation. Records are appended to `.gitmoot/review-capacity.jsonl`.
+Shared writers can cross the reserve between checks: this is not a byte quota
+or a disk-space guarantee. Ordinary non-review admission and the canonical
+Janitor reserve/latch remain unchanged.
 
 Delegation worktrees use a separate default-on aged cleanup policy:
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only
