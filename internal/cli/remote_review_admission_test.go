@@ -449,6 +449,72 @@ func TestPolicyRoutedReviewRechecksCIImmediatelyBeforeProvision(t *testing.T) {
 	f.assertRefusedBeforeProvision(t, remoteReviewAvoidedRedCI, 0)
 }
 
+func TestPolicyRoutedReviewUsesOnlyPrerequisiteCI(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		gateBucket string
+		external   *github.PullRequestCheck
+		diskGuard  bool
+		requireCI  bool
+		refusal    string
+	}{
+		{name: "green CI does not wait for review gate", gateBucket: "pending", external: &github.PullRequestCheck{Name: "build", Bucket: "pass"}},
+		{name: "capacity route with no external CI", gateBucket: "pending", diskGuard: true},
+		{name: "successful gate is not required CI", gateBucket: "pass", diskGuard: true, requireCI: true, refusal: remoteReviewAvoidedRedCI},
+		{name: "normal policy still requires real CI", gateBucket: "pending", refusal: remoteReviewAvoidedRedCI},
+		{name: "pending security still waits", gateBucket: "pending", external: &github.PullRequestCheck{Name: "gitmoot/security", Bucket: "pending"}, refusal: remoteReviewAvoidedCIPending},
+		{name: "failed security still blocks", gateBucket: "pending", external: &github.PullRequestCheck{Name: "gitmoot/security", Bucket: "fail"}, refusal: remoteReviewAvoidedRedCI},
+		{name: "unknown external result still blocks", gateBucket: "pending", external: &github.PullRequestCheck{Name: "build"}, refusal: remoteReviewAvoidedRedCI},
+		{name: "pending bucket overrides successful state", gateBucket: "pending", external: &github.PullRequestCheck{Name: "build", Bucket: "pending", State: "SUCCESS"}, refusal: remoteReviewAvoidedCIPending},
+		{name: "bare pending state still waits", gateBucket: "pending", external: &github.PullRequestCheck{Name: "build", State: "IN_PROGRESS"}, refusal: remoteReviewAvoidedCIPending},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+			payload, err := daemonJobPayload(f.job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload.PolicyRoutedReview = true
+			payload.DiskGuardRouted = test.diskGuard
+			payload.PostMergeReview = true
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.UpdateJobPayload(f.ctx, f.job.ID, string(encoded)); err != nil {
+				t.Fatal(err)
+			}
+			f.job.Payload = string(encoded)
+			f.github.pull.Merged = true
+			f.github.pull.State = "closed"
+			if test.requireCI {
+				file, err := os.OpenFile(f.paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, writeErr := io.WriteString(file, "\n[review]\nremote_require_ci_green = true\n")
+				if err := errors.Join(writeErr, file.Close()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.github.checks = []github.PullRequestCheck{
+				{Name: workflow.GitmootMergeGateContext, Bucket: test.gateBucket},
+			}
+			if test.external != nil {
+				f.github.checks = append(f.github.checks, *test.external)
+			}
+			f.run(t)
+			if test.refusal != "" {
+				f.assertRefusedBeforeProvision(t, test.refusal, 0)
+				return
+			}
+			if f.factoryCalls != 1 || f.backend.provisionCalls != 1 {
+				t.Fatalf("admitted review provider calls = %d/%d, want 1/1", f.factoryCalls, f.backend.provisionCalls)
+			}
+		})
+	}
+}
+
 func TestRemoteReviewCancellationAfterAdmissionStopsBeforeProvider(t *testing.T) {
 	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
 	f.beforeBackendFactoryReturn = func() {
