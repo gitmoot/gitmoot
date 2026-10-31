@@ -214,7 +214,7 @@ The cleanup-target latch alone does not block them. Existing provider spending
 and concurrency limits still apply; no single-review slot is added.
 
 Local reviews can opt into the same best-effort fresh-space policy with
-`[janitor_capacity] review_admission = "fresh_space"` (default `"closed"`).
+`[janitor_capacity] review_admission = "fresh_space"` (default `"cleanup_target"`).
 This checks all covered local preparation paths; configured Storage Box
 allocation still requires verified mount identity, without root fallback.
 Monitoring runs every two seconds through preparation, delivery and owned

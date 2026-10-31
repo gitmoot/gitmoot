@@ -2611,7 +2611,7 @@ enabled = true                              # absent or false: no janitor proces
 executable = "/root/.local/bin/janitor"     # run as: <executable> --format json status
 policy_hash = "<64 hex from janitor status>" # only this approved janitor policy is trusted
 timeout_ms = 5000                           # optional, 100..60000
-review_admission = "closed"                 # optional: "fresh_space" enables monitored local reviews
+review_admission = "cleanup_target"         # optional: "fresh_space" enables monitored local reviews
 ```
 
 Heavy work is every queued or foreground agent or shell job; messaging, inbox,
@@ -2645,7 +2645,7 @@ above the canonical reserve; the cleanup-target latch alone does not block
 them. The existing provider concurrency and spending controls remain in force.
 
 `review_admission = "fresh_space"` also enables this best-effort policy for
-local reviews; `"closed"` retains ordinary local review admission. Local
+local reviews; `"cleanup_target"` retains ordinary local review admission. Local
 preparation paths remain covered, and configured Storage Box allocation still
 requires mount preflight without a root fallback. Every two seconds, a monitor
 checks capacity through preparation, runtime delivery and owned cleanup.

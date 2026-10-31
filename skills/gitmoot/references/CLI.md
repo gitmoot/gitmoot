@@ -845,7 +845,7 @@ control-state footprint. A cleanup-target hold is not enough to block them:
 fresh matching policy/device evidence and immediate available bytes must both
 remain above the canonical reserve. Local reviews can opt into this
 best-effort policy with `[janitor_capacity] review_admission = "fresh_space"`
-(default `"closed"`). The two-second monitor spans preparation, execution and
+(default `"cleanup_target"`). The two-second monitor spans preparation, execution and
 owned cleanup; failed checks cancel only the owned lifecycle generation.
 `.gitmoot/review-capacity.jsonl` records measurements and cancellation requests.
 Cancellation is not proof that remote destruction completed, and does not
