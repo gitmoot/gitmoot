@@ -1670,6 +1670,9 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 			tracker.markStaleTaskLaneLockReclaimSuccessful(now)
 		}
 	}
+	if ownsCandidates {
+		refreshRemoteLaneCap(worker, tracker)
+	}
 	inflightIDs := tracker.inflightIDs()
 	paths, pathsErr := worker.configPaths()
 	if pathsErr != nil {
@@ -1823,6 +1826,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// collected during the sweep and served after it, so a blocking acquisition
 	// never sits in front of a repo that could have dispatched immediately.
 	var forced []db.Repo
+	refreshRemoteLaneCap(worker, tracker)
 	for _, repo := range repos {
 		if !repo.Enabled {
 			continue
@@ -2424,10 +2428,7 @@ var poolIsolationAttemptObserver func(jobID string)
 // nil tracker total() is 0 and hostCap == limit, so the clamp is inert and the
 // result is exactly the historical limit − running.
 func poolDispatchSlots(limit, running, hostCap int, tracker *inflightJobTracker) int {
-	slots := limit - running
-	if hostSlots := hostCap - tracker.total(); hostSlots < slots {
-		slots = hostSlots
-	}
+	slots, _, _, _ := laneDispatchSlots(limit-running, hostCap, tracker)
 	return slots
 }
 
@@ -2659,7 +2660,8 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
 					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
 				}
-				queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, seedCheckouts, seedRuntimes)
+				localHeadroom, remoteHeadroom, laneOn := tracker.laneHeadroom(hostCap)
+				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, limit-running, localHeadroom, remoteHeadroom, laneOn, policy, seedCheckouts, seedRuntimes)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -2678,7 +2680,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					// beginWithin re-checks the host-global cap atomically with
 					// registration: a concurrent pass for another repo may have consumed
 					// the headroom this pass's slot computation saw.
-					if !tracker.beginWithin(hostCap, job.ID, repoFilter, checkoutKey, runtimeKey) {
+					if !tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, repoFilter, checkoutKey, runtimeKey) {
 						worker.Admission.Release(job.ID)
 						continue
 					}
