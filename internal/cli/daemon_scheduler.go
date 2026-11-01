@@ -1670,6 +1670,9 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 			tracker.markStaleTaskLaneLockReclaimSuccessful(now)
 		}
 	}
+	if ownsCandidates {
+		refreshRemoteLaneCap(worker, tracker)
+	}
 	inflightIDs := tracker.inflightIDs()
 	paths, pathsErr := worker.configPaths()
 	if pathsErr != nil {
@@ -1823,6 +1826,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// collected during the sweep and served after it, so a blocking acquisition
 	// never sits in front of a repo that could have dispatched immediately.
 	var forced []db.Repo
+	refreshRemoteLaneCap(worker, tracker)
 	for _, repo := range repos {
 		if !repo.Enabled {
 			continue
@@ -2418,17 +2422,11 @@ var poolRequeryObserver func()
 // once" from "retried every re-query" — the two behaviours the backoff separates.
 var poolIsolationAttemptObserver func(jobID string)
 
-// poolDispatchSlots is a pool pass's dispatch budget: the repo's free slots,
-// clamped by the host-global remainder (hostCap − tracked in-flight across ALL
-// repos) so concurrent per-repo passes never exceed the daemon-wide cap. With a
-// nil tracker total() is 0 and hostCap == limit, so the clamp is inert and the
-// result is exactly the historical limit − running.
-func poolDispatchSlots(limit, running, hostCap int, tracker *inflightJobTracker) int {
-	slots := limit - running
-	if hostSlots := hostCap - tracker.total(); hostSlots < slots {
-		slots = hostSlots
-	}
-	return slots
+// poolIsolationCandidate is poolIsolationEligible restricted to the host lane
+// (#2470): isolation allocates a HOST worktree and takes a host slot, so a job
+// pinned to the E2B lane is never isolated; it waits for remote headroom.
+func poolIsolationCandidate(job db.Job, payload workflow.JobPayload) bool {
+	return poolIsolationEligible(job, payload) && !queuedJobUsesRemoteLane(job)
 }
 
 // runQueuedJobsForRepoPoolTracked is the pool pass with the supervisor's
@@ -2470,10 +2468,20 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		// for isolation-dispatched jobs.
 		payloadBeforeIsolation string
 		err                    error
+		// remote is true for a job admitted on the remote lane (#2470): it never
+		// counted toward this pass's per-repo `running` (host work only).
+		remote bool
 	}
 	inflightCheckouts := map[string]bool{}
 	inflightRuntimes := map[string]bool{}
+	// running is this pass's per-repo HOST count, the budget input (#2470).
+	// inflight is every job this pass admitted on either lane and has not yet
+	// reaped: it alone decides when the pass may return, because reap is the
+	// only place tracker.end runs. Exiting with a remote job still in flight
+	// would leak its tracker registration and wedge the repo (tryBeginPool
+	// refuses while perRepo > 0).
 	running := 0
+	inflight := 0
 	// bouncedBusy / bouncedBusyRuntimes track jobs (and their runtime-session keys)
 	// that returned errRuntimeSessionBusy earlier in THIS pool invocation (#598).
 	// A busy job re-queues immediately once reaped, so without this it was
@@ -2539,7 +2547,10 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		// budget is a no-op, so this is safe on every reap path incl. panic
 		// recovery and shutdown (mirrors the worktree cleanup discipline).
 		worker.Admission.Release(f.jobID)
-		running--
+		if !f.remote {
+			running--
+		}
+		inflight--
 		// Dispose an auto-created isolation worktree (#394 part 2). Best-effort and
 		// on a non-cancellable context so it still runs during daemon shutdown; both
 		// the add (in allocatePoolIsolationWorktree) and this remove run on the
@@ -2590,7 +2601,8 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 			// every poolRequeryInterval only to discard the result at the `slots > 0`
 			// test. The wake still happens — the pass must stay alive to reap — it
 			// just no longer re-scans a queue it is not allowed to draw from.
-			slots := poolDispatchSlots(limit, running, hostCap, tracker)
+			localBudget, remoteBudget, laneOn := laneBudgets(limit-running, hostCap, tracker)
+			slots := localBudget + remoteBudget
 			pending := []db.Job(nil)
 			if slots > 0 {
 				scanned, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter, true)
@@ -2659,7 +2671,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
 					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
 				}
-				queued, remaining := selectRunnableQueuedJobsSeeded(ctx, worker.Store, pending, slots, policy, seedCheckouts, seedRuntimes)
+				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, policy, seedCheckouts, seedRuntimes)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -2678,7 +2690,8 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					// beginWithin re-checks the host-global cap atomically with
 					// registration: a concurrent pass for another repo may have consumed
 					// the headroom this pass's slot computation saw.
-					if !tracker.beginWithin(hostCap, job.ID, repoFilter, checkoutKey, runtimeKey) {
+					admitted, onRemote := tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, repoFilter, checkoutKey, runtimeKey)
+					if !admitted {
 						worker.Admission.Release(job.ID)
 						continue
 					}
@@ -2687,10 +2700,15 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					if runtimeKey != "" {
 						inflightRuntimes[runtimeKey] = true
 					}
-					running++
+					// `running` is this pass's per-repo HOST count (#2470): a remote
+					// job is bounded by the remote lane instead.
+					if !onRemote {
+						running++
+					}
+					inflight++
 					dispatched++
 					go func() {
-						done <- finished{jobID: job.ID, checkoutKey: checkoutKey, runtimeKey: runtimeKey, err: runPoolJobRecovered(deliveryCtx, worker, job)}
+						done <- finished{jobID: job.ID, checkoutKey: checkoutKey, runtimeKey: runtimeKey, remote: onRemote, err: poolJobRunner(deliveryCtx, worker, job)}
 					}()
 				}
 				// #394 part 2: a read-only job left blocked ONLY by a contended same-repo
@@ -2714,7 +2732,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 						break
 					}
 					payload, perr := daemonJobPayload(job)
-					if perr != nil || !poolIsolationEligible(job, payload) {
+					if perr != nil || !poolIsolationCandidate(job, payload) {
 						continue
 					}
 					// Backoff gate FIRST, before anything that reads the store or
@@ -2822,15 +2840,16 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					// not serialized behind it.
 					_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: iso.job.ID, Kind: "pool_isolation_worktree_allocated", Message: fmt.Sprintf("read-only pool-isolation worktree %s allocated (#739); job keyed %s to run beside the same-repo checkout holder", iso.worktreePath, iso.checkoutKey)})
 					running++
+					inflight++
 					dispatched++
 					go func() {
-						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, runner: iso.runner, payloadBeforeIsolation: payloadBeforeIsolation, err: runPoolJobRecovered(deliveryCtx, worker, iso.job)}
+						done <- finished{jobID: iso.job.ID, checkoutKey: iso.checkoutKey, runtimeKey: iso.runtimeKey, worktreePath: iso.worktreePath, repoCheckout: iso.repoCheckout, runner: iso.runner, payloadBeforeIsolation: payloadBeforeIsolation, err: poolJobRunner(deliveryCtx, worker, iso.job)}
 					}()
 				}
 			}
 		}
 
-		if running == 0 {
+		if inflight == 0 {
 			// Nothing running: if we also dispatched nothing this pass the queue is
 			// drained (or everything left is un-runnable for now) — return, surfacing
 			// any worker error. On firstErr we reach here once inflight has drained.
@@ -2873,6 +2892,11 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 		}
 	}
 }
+
+// poolJobRunner runs one job the pool pass admitted. A variable only so a
+// test can observe the pass's own accounting without provisioning a real
+// execution backend; production never reassigns it.
+var poolJobRunner = runPoolJobRecovered
 
 // runPoolJobRecovered runs a pool job and converts a panic into an error so the
 // worker goroutine ALWAYS sends its result to the done channel. This keeps the
