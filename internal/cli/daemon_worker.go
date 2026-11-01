@@ -1317,6 +1317,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	if warningRecorded {
 		adapter = w.observePermissionPolicyEffects(adapter, job.ID, deliveryCheckout)
 	}
+	if execBackend == execbackend.Remote {
+		adapter = w.guardRemoteReviewEvidence(adapter, lifecycle, instance, job.ID, payload)
+	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	engine.CollectChangeSet = executionChangeSetCollector(lifecycle, instance, execBackend, job.ID)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE

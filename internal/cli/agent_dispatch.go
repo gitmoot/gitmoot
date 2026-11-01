@@ -260,6 +260,12 @@ func applyReviewChecksRoute(request *localAgentDispatchRequest, repo string) (bo
 	if err := validateRequestExecProvider(request.Home, route.provider); err != nil {
 		return true, fmt.Errorf("review of %s refused: %s: %w", repo, route.setting(), err)
 	}
+	// Private review evidence is delivered only on E2B (#2476). A checks route
+	// that would move the review to a sandboxd provider is refused here, before
+	// enqueue, rather than shipping the files somewhere they were not pinned for.
+	if request.ReviewEvidence != nil && !reviewEvidenceProviderAllowed(route.provider) {
+		return true, fmt.Errorf("review of %s refused: %s routes it to provider %q, but --evidence-manifest is delivered only to E2B reviews", repo, route.setting(), route.provider)
+	}
 	remote := string(execbackend.Remote)
 	request.ExecBackend = &remote
 	request.ExecProvider = route.provider
@@ -390,8 +396,10 @@ type localAgentDispatchRequest struct {
 	ReviewPart string
 	// ReviewSupersedes/ReviewSupersedeReason carry `review request --supersede`
 	// audit linkage into the job payload (#2405).
-	ReviewSupersedes       string
-	ReviewSupersedeReason  string
+	ReviewSupersedes      string
+	ReviewSupersedeReason string
+	// ReviewEvidence is the pinned private evidence of a remote review (#2476).
+	ReviewEvidence         *workflow.ReviewEvidence
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -1172,6 +1180,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReviewPart:               request.ReviewPart,
 		ReviewSupersedes:         request.ReviewSupersedes,
 		ReviewSupersedeReason:    request.ReviewSupersedeReason,
+		ReviewEvidence:           request.ReviewEvidence,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",
