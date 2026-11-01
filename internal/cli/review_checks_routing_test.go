@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -176,6 +178,40 @@ func TestReviewChecksRoutingSandboxdAdoptsProviderWithoutExecProvider(t *testing
 	if payload["exec_backend"] != "remote" || payload["exec_provider"] != "sandboxd" || payload["exec_template"] != "swift-arm64" || payload["review_checks_routed"] != true {
 		t.Fatalf("payload exec_backend=%v exec_provider=%v exec_template=%v review_checks_routed=%v; want remote, sandboxd, swift-arm64, true",
 			payload["exec_backend"], payload["exec_provider"], payload["exec_template"], payload["review_checks_routed"])
+	}
+}
+
+// #2477 review: checks routing rewrites the provider after the request checked
+// it. Private evidence pinned for E2B must not ride that rewrite to sandboxd;
+// the request is refused before anything is enqueued.
+func TestReviewEvidenceRefusedWhenChecksRouteTargetsSandboxd(t *testing.T) {
+	home, store, head := reviewChecksRoutingHomeWith(t, "e2b_template = \"base-tmpl\"\n",
+		"\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"sandboxd\"\nchecks_template = \"swift-arm64\"\n")
+	evidence := filepath.Join(t.TempDir(), "native.log")
+	if err := os.WriteFile(evidence, []byte("log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("log\n"))
+	manifest, _ := json.Marshal(map[string]any{"schema_version": 1, "head_sha": head, "files": []map[string]any{{"path": evidence, "bytes": 4, "sha256": hex.EncodeToString(sum[:])}}})
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, failure := runReviewRequestJSON(t,
+		"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.OmpRuntime, "--exec-backend", "remote",
+		"--evidence-manifest", manifestPath, "--json",
+	)
+	if failure == "" || !strings.Contains(failure, "delivered only to E2B") {
+		t.Fatalf("evidence review routed to sandboxd: failure=%q, want refusal", failure)
+	}
+	jobs, err := store.ListJobsByType(context.Background(), "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("refused request still enqueued %d review jobs", len(jobs))
 	}
 }
 

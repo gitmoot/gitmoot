@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +63,10 @@ func (w jobWorker) installRemoteReviewEvidence(ctx context.Context, lifecycle ex
 	if !strings.EqualFold(evidence.HeadSHA, strings.TrimSpace(payload.HeadSHA)) {
 		return nil, fmt.Errorf("review evidence is pinned to head %s, but the job reviews %s", evidence.HeadSHA, payload.HeadSHA)
 	}
+	// Second gate after every dispatch-time rewrite: evidence goes only to E2B.
+	if !reviewEvidenceProviderAllowed(payload.ExecProvider) {
+		return nil, fmt.Errorf("review evidence is delivered only to E2B reviews; this job targets provider %q", payload.ExecProvider)
+	}
 	installer, ok := lifecycle.(execbackend.InstanceFileInstaller)
 	if !ok {
 		return nil, fmt.Errorf("execution backend %q cannot install review evidence", lifecycle.Name())
@@ -101,22 +103,27 @@ func remoteReviewEvidencePaths(evidence *workflow.ReviewEvidence) []string {
 }
 
 // verifyRemoteReviewEvidence measures every evidence file inside the sandbox
-// and compares it with the pin. It always records a receipt event; any missing,
-// resized or rehashed file is an error.
+// and compares it with the pin. Size and hash come from ONE read of each file
+// (`wc -c` and `sha256sum` over the same bytes via a single shell pass per
+// file), so a receipt never pairs a size and a hash from two different
+// snapshots. It always records a receipt event; any missing, resized or
+// rehashed file is an error.
 func (w jobWorker) verifyRemoteReviewEvidence(ctx context.Context, runner execbackend.InstanceRunner, instance *execbackend.Instance, jobID string, evidence *workflow.ReviewEvidence, phase string) error {
 	paths := remoteReviewEvidencePaths(evidence)
-	sums, sumErr := runner.Run(ctx, instance.Workspace, "sha256sum", append([]string{"--"}, paths...)...)
-	sizes, sizeErr := runner.Run(ctx, instance.Workspace, "stat", append([]string{"-c", "%s %n", "--"}, paths...)...)
-	measuredSums := parseReviewEvidenceColumns(sums.Stdout)
-	measuredSizes := parseReviewEvidenceColumns(sizes.Stdout)
+	// For each file: copy it once to a private temp file, then measure that
+	// copy. Later writes to the evidence file cannot change what was measured.
+	const measure = `set -e; t=$(mktemp); trap 'rm -f "$t"' EXIT
+for f in "$@"; do cat -- "$f" > "$t"; printf '%s %s %s\n' "$(wc -c < "$t" | tr -d ' ')" "$(sha256sum < "$t" | cut -d' ' -f1)" "${f##*/}"; done`
+	result, measureErr := runner.Run(ctx, instance.Workspace, "sh", append([]string{"-c", measure, "measure"}, paths...)...)
+	measured := parseReviewEvidenceMeasurements(result.Stdout)
 	receipt := reviewEvidenceReceipt{
 		Phase: phase, JobID: jobID, LifecycleGeneration: instance.LifecycleGeneration, InstanceID: instance.ID,
 		HeadSHA: evidence.HeadSHA, ManifestSHA256: evidence.ManifestSHA256,
 	}
 	var mismatched []string
 	for _, file := range evidence.Files {
-		readback := reviewEvidenceReadback{Name: file.SandboxName, SHA256: measuredSums[file.SandboxName]}
-		readback.Bytes, _ = strconv.ParseInt(measuredSizes[file.SandboxName], 10, 64)
+		readback := measured[file.SandboxName]
+		readback.Name = file.SandboxName
 		readback.Match = readback.SHA256 == file.SHA256 && readback.Bytes == file.Bytes
 		if !readback.Match {
 			mismatched = append(mismatched, file.SandboxName)
@@ -126,15 +133,22 @@ func (w jobWorker) verifyRemoteReviewEvidence(ctx context.Context, runner execba
 	kind := reviewEvidenceVerifiedEventKind
 	var failure error
 	switch {
-	case sumErr != nil || sizeErr != nil:
+	case measureErr != nil:
 		kind = reviewEvidenceAlteredEventKind
-		failure = fmt.Errorf("review evidence could not be read back in the sandbox (%s): %w", phase, errors.Join(sumErr, sizeErr))
+		failure = fmt.Errorf("review evidence could not be read back in the sandbox (%s): %w", phase, measureErr)
 	case len(mismatched) > 0:
 		kind = reviewEvidenceAlteredEventKind
 		failure = fmt.Errorf("review evidence differs from its pin in the sandbox (%s): %s", phase, strings.Join(mismatched, ", "))
 	}
 	w.recordReviewEvidenceReceipt(ctx, jobID, kind, receipt)
 	return failure
+}
+
+// reviewEvidenceProviderAllowed reports whether a review's execution provider
+// may receive private evidence: E2B only ("" is the E2B default).
+func reviewEvidenceProviderAllowed(provider string) bool {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	return provider == "" || provider == "e2b"
 }
 
 func (w jobWorker) recordReviewEvidenceReceipt(ctx context.Context, jobID, kind string, receipt reviewEvidenceReceipt) {
@@ -152,18 +166,22 @@ func (w jobWorker) recordReviewEvidenceReceipt(ctx context.Context, jobID, kind 
 	}
 }
 
-// parseReviewEvidenceColumns maps the base name of the last field (a path) of
-// each "<value> <path>" line to its first field. sha256sum separates with two
-// spaces; stat -c '%s %n' with one. Sandbox names are unique and contain no
-// spaces, so the base name identifies the file whatever directory prefix the
-// provider reports.
-func parseReviewEvidenceColumns(output string) map[string]string {
-	values := map[string]string{}
+// parseReviewEvidenceMeasurements reads "<bytes> <sha256> <name>" lines from
+// the single-snapshot measure script. Sandbox names are unique and contain no
+// spaces. A missing or malformed line leaves a zero measurement, which can
+// never equal a pin, so verification fails closed.
+func parseReviewEvidenceMeasurements(output string) map[string]reviewEvidenceReadback {
+	values := map[string]reviewEvidenceReadback{}
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 2 {
-			values[path.Base(fields[1])] = strings.ToLower(fields[0])
+		if len(fields) != 3 {
+			continue
 		}
+		size, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		values[fields[2]] = reviewEvidenceReadback{Bytes: size, SHA256: strings.ToLower(fields[1])}
 	}
 	return values
 }

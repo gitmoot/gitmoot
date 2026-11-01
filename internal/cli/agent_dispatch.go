@@ -260,6 +260,12 @@ func applyReviewChecksRoute(request *localAgentDispatchRequest, repo string) (bo
 	if err := validateRequestExecProvider(request.Home, route.provider); err != nil {
 		return true, fmt.Errorf("review of %s refused: %s: %w", repo, route.setting(), err)
 	}
+	// Private review evidence is delivered only on E2B (#2476). A checks route
+	// that would move the review to a sandboxd provider is refused here, before
+	// enqueue, rather than shipping the files somewhere they were not pinned for.
+	if request.ReviewEvidence != nil && !reviewEvidenceProviderAllowed(route.provider) {
+		return true, fmt.Errorf("review of %s refused: %s routes it to provider %q, but --evidence-manifest is delivered only to E2B reviews", repo, route.setting(), route.provider)
+	}
 	remote := string(execbackend.Remote)
 	request.ExecBackend = &remote
 	request.ExecProvider = route.provider

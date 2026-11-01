@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -102,10 +103,12 @@ func LoadReviewEvidence(manifestPath, head string) (*ReviewEvidence, error) {
 		if decoded, err := hex.DecodeString(file.SHA256); err != nil || len(decoded) != sha256.Size {
 			return nil, fmt.Errorf("evidence file %s: sha256 %q is not 64 hex characters", file.Path, entry.SHA256)
 		}
-		if _, err := file.VerifiedBytes(); err != nil {
-			return nil, err
-		}
 		file.SandboxName = reviewEvidenceSandboxName(index, file.Path)
+		if _, err := file.VerifiedBytes(); err != nil {
+			// Request time: the error reaches only the caller's terminal, so
+			// naming the host path here helps and leaks nothing.
+			return nil, fmt.Errorf("%s: %w", file.Path, err)
+		}
 		evidence.Files = append(evidence.Files, file)
 	}
 	return evidence, nil
@@ -113,13 +116,22 @@ func LoadReviewEvidence(manifestPath, head string) (*ReviewEvidence, error) {
 
 // VerifiedBytes re-reads the file and returns its bytes only if size and sha256
 // still match the pin. Drift is an error, never a silent substitution.
+//
+// Its errors name the file only by SandboxName, never the host path: at
+// provisioning they become the job's failure event, PR comment and dashboard
+// text (#2477 review). The request-time caller adds the host path for its own
+// stderr.
 func (f ReviewEvidenceFile) VerifiedBytes() ([]byte, error) {
 	body, sum, err := readPinnedRegularFile(f.Path, ReviewEvidenceMaxFileBytes)
 	if err != nil {
-		return nil, fmt.Errorf("evidence file %s: %w", f.Path, err)
+		var pathErr *fs.PathError
+		if errors.As(err, &pathErr) {
+			err = fmt.Errorf("%s: %w", pathErr.Op, pathErr.Err)
+		}
+		return nil, fmt.Errorf("evidence file %s: %w", f.SandboxName, err)
 	}
 	if int64(len(body)) != f.Bytes || sum != f.SHA256 {
-		return nil, fmt.Errorf("evidence file %s changed: now %d bytes sha256 %s, pinned %d bytes sha256 %s", f.Path, len(body), sum, f.Bytes, f.SHA256)
+		return nil, fmt.Errorf("evidence file %s changed: now %d bytes sha256 %s, pinned %d bytes sha256 %s", f.SandboxName, len(body), sum, f.Bytes, f.SHA256)
 	}
 	return body, nil
 }

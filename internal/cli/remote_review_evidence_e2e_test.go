@@ -138,8 +138,15 @@ func TestRemoteReviewEvidenceIsVerifiedInsideTheSandbox(t *testing.T) {
 				if finished.State == string(workflow.JobSucceeded) || payload.Result != nil || len(kinds[reviewEvidenceVerifiedEventKind]) != 0 {
 					t.Fatalf("host drift: state=%s result=%v verified=%v; want refusal before the reviewer ran", finished.State, payload.Result, kinds[reviewEvidenceVerifiedEventKind])
 				}
-				if failure := strings.Join(kinds[string(workflow.JobFailed)], " "); !strings.Contains(failure, "changed") {
-					t.Fatalf("host drift failure = %q, want it to name the changed file", failure)
+				failure := strings.Join(kinds[string(workflow.JobFailed)], " ")
+				if !strings.Contains(failure, "01-native.log changed") {
+					t.Fatalf("host drift failure = %q, want it to name the changed sandbox file", failure)
+				}
+				// The failure becomes the job event, PR comment and dashboard text.
+				for _, event := range events {
+					if strings.Contains(event.Message, evidenceDir) {
+						t.Fatalf("event %s publishes the host evidence path: %q", event.Kind, event.Message)
+					}
 				}
 				return
 			}
