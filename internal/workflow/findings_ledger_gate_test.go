@@ -50,11 +50,12 @@ func TestPolicyMergeGateRefusesWhenAPriorFindingIsUnobservedAtThisHead(t *testin
 	}
 }
 
-// #2488 (herdrup#595): a review at the head declared f1 answered with quoted
-// evidence only, so the ledger recorded it open AT THIS HEAD. The refusal said
-// the finding "carries no observation", which sent the requester looking for a
-// missing review. It must instead say the finding is not discharged, that it
-// was observed at this head with quoted evidence only, and what discharges it.
+// #2488 (herdrup#595): a review at the head declared f1 answered, listed the
+// checks it ran, but declared evidence static_only and gave no finding file, so
+// the ledger recorded f1 open AT THIS HEAD. The refusal said the finding
+// "carries no observation", which sent the requester looking for a missing
+// review. It must say the finding is not discharged, that this head's review
+// listed checks under static_only, and what discharges it.
 func TestLedgerRefusalNamesQuotedAnswerAtThisHead(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -63,6 +64,7 @@ func TestLedgerRefusalNamesQuotedAnswerAtThisHead(t *testing.T) {
 		Repo: "mobile/app", PullRequest: 595, HeadSHA: head, ObserverJob: "review-at-head",
 		State: db.FindingOpen, Severity: "P2", Title: "settled width", Detail: "final leg can pass without dragging",
 		EvidenceKind: db.EvidenceQuoted, SourceJob: "review-earlier",
+		ExecutedCommands: []string{"npm test (48/48)", "wrangler deploy --dry-run"},
 	}); err != nil {
 		t.Fatalf("seed observation: %v", err)
 	}
@@ -73,7 +75,7 @@ func TestLedgerRefusalNamesQuotedAnswerAtThisHead(t *testing.T) {
 	if err == nil {
 		t.Fatal("an open P2 at this head no longer holds the merge")
 	}
-	for _, want := range []string{"not discharged at head", "observed at this head by review-at-head with quoted evidence only", "file evidence_locator or executed checks"} {
+	for _, want := range []string{"not discharged at head", "review-at-head answered it at this head and listed checks, but declared evidence static_only", "only with evidence=executed, or with a finding file plus rationale"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal %q does not say %q", err, want)
 		}

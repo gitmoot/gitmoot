@@ -350,15 +350,20 @@ func LedgerObligationsAtHead(ctx context.Context, observations []db.ReviewFindin
 
 // openObligationReason says why an open finding still holds, and when it was
 // last observed at THIS head with only quoted evidence, what discharges it
-// (#2488): an answer is recorded open unless it cites a file evidence_locator
-// (STATIC) or executed checks (EXECUTED) - see the reviewer job's
-// findings_ledger_downgraded event.
+// (#2488). The writer (ledgerObservationWithDeclaredState) records an answer
+// as EXECUTED only when the verdict declares evidence=executed AND lists
+// checks, and as STATIC only with a finding `file` plus a rationale; anything
+// else is QUOTED and open. A review that listed checks under static_only is
+// the common miss (herdrup#595), so that case is named.
 func openObligationReason(obs db.ReviewFindingObservation, head string) string {
-	if strings.EqualFold(strings.TrimSpace(obs.HeadSHA), strings.TrimSpace(head)) && obs.EvidenceKind == db.EvidenceQuoted {
-		return fmt.Sprintf("still open: observed at this head by %s with quoted evidence only; an answer discharges it only with a file evidence_locator or executed checks",
-			firstNonEmptyString(obs.ObserverJob, "a review"))
+	if !strings.EqualFold(strings.TrimSpace(obs.HeadSHA), strings.TrimSpace(head)) || obs.EvidenceKind != db.EvidenceQuoted {
+		return "still open"
 	}
-	return "still open"
+	observer := firstNonEmptyString(obs.ObserverJob, "a review")
+	if len(obs.ExecutedCommands) > 0 {
+		return fmt.Sprintf("still open: %s answered it at this head and listed checks, but declared evidence static_only; an answer discharges it only with evidence=executed, or with a finding file plus rationale", observer)
+	}
+	return fmt.Sprintf("still open: %s observed it at this head with quoted evidence only; an answer discharges it only with evidence=executed and listed checks, or with a finding file plus rationale", observer)
 }
 
 // answeredIsMandatory decides whether an answered finding is mandatory again.
