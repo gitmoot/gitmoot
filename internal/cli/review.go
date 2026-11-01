@@ -1133,6 +1133,13 @@ func attachDiscardedInputs(output reviewRequestOutput, opts reviewRequestOptions
 }
 
 func finishReviewAttach(ctx context.Context, store *db.Store, output reviewRequestOutput, job db.Job, claim db.ReviewRequest, opts reviewRequestOptions) (reviewRequestOutput, error) {
+	// Private evidence is pinned into the job a request CREATES (#2476). An
+	// existing review cannot receive it, so attaching would report a review
+	// the caller believes has the files when no file reaches any sandbox.
+	// Refuse, naming the holder, before subscribing to its verdict.
+	if strings.TrimSpace(opts.evidenceManifest) != "" {
+		return reviewRequestOutput{}, fmt.Errorf("--evidence-manifest cannot attach to existing review %s (%s) for this head: evidence is pinned only into a newly dispatched review; settle or cancel that review first", firstNonEmpty(job.ID, claim.JobID), firstNonEmpty(job.State, "dispatching"))
+	}
 	output.State = reviewRequestAttached
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
