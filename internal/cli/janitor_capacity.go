@@ -399,7 +399,9 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	}
 	// Canonical warning bytes apply before fresh-space admission, even when a
 	// newer statfs reading has recovered above the configured review threshold.
-	// Invalid evidence is left to the admission checks below; never route on it.
+	// The E2B route stays an operator opt-in ([disk_guard] remote_reviews): with
+	// it off the canonical band adds no routing, and local reviews keep the
+	// ordinary Janitor admission below. Invalid evidence never routes.
 	if admission.cfgErr == nil && admission.readErr == nil && admission.expired() == "" {
 		device, deviceErr := janitorDeviceOf(paths.Home)
 		evaluation := evaluateConfiguredDiskGuard(paths)
@@ -415,7 +417,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 				}
 			}
 		}
-		if deviceErr == nil && !duplicate && volume != nil && volume.hasTarget && janitorClearedStates[volume.state] && evaluation.allowsDispatch() {
+		if evaluation.Policy.RemoteReviews && deviceErr == nil && !duplicate && volume != nil && volume.hasTarget && janitorClearedStates[volume.state] && evaluation.allowsDispatch() {
 			evaluation.Usage.FreeBytes = min(evaluation.Usage.FreeBytes, volume.available)
 			evaluation.Policy.RemoteReviewsBelowBytes = max(evaluation.Policy.RemoteReviewsBelowBytes, volume.target)
 			if evaluation.Usage.FreeBytes >= volume.reserve && evaluation.Usage.FreeBytes < evaluation.Policy.RemoteReviewsBelowBytes {

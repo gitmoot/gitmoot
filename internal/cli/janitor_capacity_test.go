@@ -469,8 +469,8 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 		}
 	}
 	messages := messagesTo(t, ctx, store, "requester")
-	if len(messages) != 1 {
-		t.Fatalf("missing or duplicate pressure-route alert: %+v", messages)
+	if len(messages) != 1 || !strings.Contains(messages[0].Body, "E2B") || !strings.Contains(messages[0].Body, "free space") {
+		t.Fatalf("missing, duplicate or empty pressure-route alert: %+v", messages)
 	}
 	job, err := store.GetJob(ctx, "a-review")
 	if err != nil {

@@ -61,19 +61,23 @@ func TestReviewThresholdsApplyBeforeFreshSpaceAdmission(t *testing.T) {
 		target uint64
 		want   string
 		remote bool
+		// optOut runs with [disk_guard] remote_reviews = false: the canonical
+		// warning band must not spend the E2B cap without the operator's opt-in.
+		optOut bool
 	}{
-		{"below_floor", 9_999_999_999, 9_999_999_999, 20_000_000_000, "", false},
-		{"floor_equal", 10_000_000_000, 10_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true},
-		{"floor_plus_one", 10_000_000_001, 10_000_000_001, 20_000_000_000, "auto-review,e2b-review,ordinary", true},
-		{"below_warning", 19_999_999_999, 19_999_999_999, 20_000_000_000, "auto-review,e2b-review,ordinary", true},
-		{"warning_equal", 20_000_000_000, 20_000_000_000, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false},
-		{"above_warning", 20_000_000_001, 20_000_000_001, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false},
-		{"canonical_warning_with_recovered_statfs", 19_999_999_999, 30_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true},
-		{"canonical_floor_with_recovered_statfs", 9_999_999_999, 30_000_000_000, 20_000_000_000, "", false},
-		{"unknown_warning_target", 30_000_000_000, 30_000_000_000, 0, "ordinary", false},
+		{"below_floor", 9_999_999_999, 9_999_999_999, 20_000_000_000, "", false, false},
+		{"floor_equal", 10_000_000_000, 10_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"floor_plus_one", 10_000_000_001, 10_000_000_001, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"below_warning", 19_999_999_999, 19_999_999_999, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"warning_equal", 20_000_000_000, 20_000_000_000, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false, false},
+		{"above_warning", 20_000_000_001, 20_000_000_001, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false, false},
+		{"canonical_warning_with_recovered_statfs", 19_999_999_999, 30_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"canonical_floor_with_recovered_statfs", 9_999_999_999, 30_000_000_000, 20_000_000_000, "", false, false},
+		{"unknown_warning_target", 30_000_000_000, 30_000_000_000, 0, "ordinary", false, false},
+		{"canonical_warning_without_remote_opt_in", 19_999_999_999, 30_000_000_000, 20_000_000_000, "e2b-review,ordinary", false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+			ctx, store, worker := diskGuardRemoteFixture(t, !tc.optOut, 4)
 			paths, err := diskGuardPaths(worker)
 			if err != nil {
 				t.Fatal(err)
