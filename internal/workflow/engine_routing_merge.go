@@ -328,7 +328,9 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 }
 
 func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (string, error) {
-	jobs, err := e.Store.ListJobs(ctx)
+	// Scoped read (#2470): the task's candidate review rows only, not every job
+	// in the store; sameTask below still decides membership exactly.
+	jobs, err := e.Store.ListReviewJobsInTaskScope(ctx, current.Repo, current.PullRequest)
 	if err != nil {
 		return "", err
 	}
