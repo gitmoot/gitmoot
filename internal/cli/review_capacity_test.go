@@ -20,6 +20,36 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func TestForegroundReviewCannotPrepareLocallyInWarningBand(t *testing.T) {
+	declareNoRealAdapterExec(t)
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	paths := config.PathsForHome(home)
+	appendConfig(t, paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: 15_000_000_000}, nil
+	})
+	before, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		Home: home, RepoFlag: "owner/repo", Agent: "reviewer", Action: "review",
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review", Instructions: "review this",
+		ActingOrgRole: "joltra", NoFixTarget: true,
+	})
+	if err == nil {
+		t.Fatal("foreground local review bypassed the E2B-only warning band")
+	}
+	after, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("refused local review created a delivery: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 	for _, requeued := range []bool{false, true} {
 		t.Run(fmt.Sprintf("successor_generation=%t", requeued), func(t *testing.T) {
@@ -47,6 +77,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			}
 			paths := config.PathsForHome(home)
 			appendConfig(t, paths, fmt.Sprintf("\n[janitor_capacity]\nenabled = true\nreview_admission = \"fresh_space\"\nexecutable = \"/usr/local/bin/janitor\"\npolicy_hash = %q\n", janitorTestPolicyHash))
+			appendConfig(t, paths, "\n[disk_guard]\nmin_free_percent = 0\n")
 			hostPaths, root, err := janitorHostPaths(ctx, store, paths, "owner/repo", payload.WorktreePath)
 			if err != nil {
 				t.Fatal(err)
@@ -60,11 +91,11 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
 				available := uint64(2 << 30)
 				if low.Load() {
-					available = 1 << 20
+					available = 1 << 19
 				}
 				volumes := make([]string, 0, len(devices))
 				for device := range devices {
-					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"reason":"cleanup target held"}`, device, device, available))
+					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"target_bytes":1048576,"reason":"cleanup target held"}`, device, device, available))
 				}
 				return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
 			}

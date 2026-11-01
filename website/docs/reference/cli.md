@@ -554,18 +554,22 @@ cannot be established or a floor is breached. The guard applies only to normal
 agent-job dispatch; daemon maintenance/reconciliation remains runnable so an
 internal reclaim pass can free space.
 
-While the disk is low, `remote_reviews = true` (default `false`) lets queued
-reviews run on the remote execution backend instead of waiting; every other job
-still waits. A review already set to `--exec-backend remote` runs; a review with
-no backend of its own is switched to remote (event `disk_guard_routed_remote`)
+Below the hard dispatch floor, every new job waits, including E2B reviews:
+remote preparation still writes controller state on this host. Neither
+fresh-space review admission nor remote routing bypasses this floor.
+In the warning band, `remote_reviews = true` (default `false`) lets queued
+reviews use E2B while ordinary jobs remain eligible. A review already set to
+E2B keeps that route; a review with no backend of its own is switched to E2B
+(event `disk_guard_routed_remote`)
 when it has an exact pull-request head, its agent's runtime runs remotely, it
 has not used its one cloud attempt, and the `[remote_exec]` cost cap has room
 for one more attempt in dollars and in number (checked in the same database
 write as the switch, so concurrent passes cannot overshoot). A switched review
 needs green current-head CI at remote admission. If it would fail or block for
 any reason before its remote run starts (red CI, a moved head, a duplicate, the
-worktree or checkout, the cost cap, the provider), it goes back to waiting
-locally (event `disk_guard_route_undone`) instead, and is not switched again.
+worktree or checkout, the cost cap, the provider), it returns to the queue
+(event `disk_guard_route_undone`), with no local fallback in the warning band
+and no further automatic switch for a declined route.
 The one exception is CI that has not finished: when at least one current-head
 check is still pending and none has failed (refusal reason `ci_pending`), the
 review is held for two minutes (`blocker_retry_at`) instead of declined, and a
@@ -577,11 +581,25 @@ review pinned to `--exec-backend local` keeps waiting, and nothing is switched
 while the daemon is draining. It spends money, so it needs a configured
 `[remote_exec]` cost cap and is off unless set.
 
-**Review-only threshold and alerts (#2372).** `remote_reviews_below_bytes`
+**Review-only threshold and alerts (#2372, #2466).** `remote_reviews_below_bytes`
 (default `0`, off; requires `remote_reviews = true`; must be above
-`min_free_bytes`) moves queued **reviews** to the remote backend once free
-space is below it, while every other job keeps running locally until the
-dispatch floor above. Below the dispatch floor reviews move as before.
+`min_free_bytes`) requires **E2B** for queued reviews below the threshold.
+Ordinary jobs remain eligible at or above the hard floor. Explicit-local and
+non-E2B reviews wait; running job identities are never rewritten.
+
+For a decimal 10GB hard floor and 20GB review warning threshold:
+
+```toml
+[disk_guard]
+min_free_bytes = 10000000000
+min_free_percent = 0
+remote_reviews = true
+remote_reviews_below_bytes = 20000000000
+```
+
+10GB equality admits work, with reviews restricted to E2B; 20GB equality
+restores normal routing. Setting `min_free_percent = 0` removes the separate
+percentage floor. Unknown or invalid measurements still fail closed.
 
 - **Runtime:** a review whose runtime cannot run remotely (codex) runs as omp
   with the **same model** (event `disk_guard_runtime_changed`). If omp cannot
@@ -616,13 +634,14 @@ dispatch floor above. Below the dispatch floor reviews move as before.
   and a re-review that fails before its job exists gives the claim back. The
   new job records `review_supersedes` and the reason; the old job gets a
   `review_part_superseded` event.
-- **Foreground reviews** (`--foreground`) stay on this host even when disk is
-  low (owner decision); the command prints a warning telling the caller to
-  re-run with `--background` to get the remote route.
-- **Janitor pressure:** with `[disk_guard] remote_reviews = true`, Janitor-held
-  queued reviews use the same capped E2B route and requester notifications.
-  Explicit-local reviews and ineligible work still wait. Manual coordinator
-  holds without a machine-readable Janitor signal do not trigger routing.
+- **Foreground reviews:** local preparation refuses before creating a job when
+  the warning threshold requires E2B. Use an explicit E2B route or background
+  dispatch; foreground execution is not a capacity exception.
+- **Janitor pressure:** fresh canonical `target_bytes` is the review warning
+  threshold, not a state-name heuristic. `reserve_bytes` remains the hard
+  floor. Canonical warning routing happens before fresh-space local admission;
+  a newer, higher statfs reading cannot erase a lower canonical sample.
+  Unknown, stale or mismatched evidence cannot trigger a remote bypass.
 
 A queued job that the dispatcher examined and could not claim records a
 `dispatch_held_back` job event naming the reason: an admission-budget refusal
@@ -2641,27 +2660,31 @@ Actual E2B reviews resolve routing before local preparation and fetch their
 exact source and history inside E2B. They need no host checkout or staging
 archive. With Janitor enabled, their remaining local control-state footprint
 requires fresh matching policy/device evidence and immediate available bytes
-above the canonical reserve; the cleanup-target latch alone does not block
-them. The existing provider concurrency and spending controls remain in force.
+at or above the canonical reserve and independent disk-guard floor. A
+cleanup-target hold alone does not block them. Provider concurrency and spending
+controls remain in force.
 
 `review_admission = "fresh_space"` also enables this best-effort policy for
-local reviews; `"cleanup_target"` retains ordinary local review admission. Local
-preparation paths remain covered, and configured Storage Box allocation still
-requires mount preflight without a root fallback. Every two seconds, a monitor
-checks capacity through preparation, runtime delivery and owned cleanup.
-Stale/changed policy or device evidence, low reserve, and monitor errors close
-admission and request cancellation of only the owned review generation.
-Measurements and cancellation requests go to `.gitmoot/review-capacity.jsonl`.
-Cancelled reviews are not automatically retried. This is not a physical-byte
-quota: shared writers can cross the reserve between checks. Ordinary non-review
-gates and the canonical reserve/latch do not change.
+local reviews; `"cleanup_target"` retains ordinary local review admission.
+Local reviews must additionally meet canonical `target_bytes`; missing or
+invalid byte limits fail closed. No recovery margin or per-review byte
+reservation is added. Preparation paths remain covered, and Storage Box
+allocation still requires mount preflight without a root fallback.
 
-With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
-try the existing E2B route, within its dollar/concurrency cap and exact-head
-eligibility checks. The requesting role receives the same move/hold/refusal
-messages as disk-floor routing. Explicit-local reviews, other job types, and
-reviews that cannot run remotely stay queued. A remote refusal restores local
-waiting; foreground dispatch and `job run` still refuse rather than reroute.
+Every two seconds, a monitor checks capacity through preparation, runtime
+delivery and owned cleanup. Failed checks request cancellation of only the
+owned review generation, never reroute a running job. Measurements and
+cancellation requests go to `.gitmoot/review-capacity.jsonl`. Cancellation
+does not prove remote destruction completed or automatically retry the review.
+Shared writers can cross thresholds between checks. Ordinary non-review
+admission and the producer's hold remain independent.
+
+With `[disk_guard] remote_reviews = true`, queued reviews below the configured
+or canonical warning threshold use the capped E2B route before local
+fresh-space admission is considered. Explicit-local and non-E2B reviews wait;
+remote refusal never falls back locally while the warning applies. Below the
+hard floor, remote controller writes are refused too. Foreground dispatch and
+manual `job run` do not silently reroute work.
 
 Delegation worktrees use the separate default-on
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables that pass. Only

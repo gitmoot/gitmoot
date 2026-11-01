@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +45,14 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	harness := newRemoteLifecycleHarness(t)
 	home, paths, store := heartbeatLoopE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
+	contents, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), `backend = "remote"`, `backend = "local"`, 1))
+	if err := os.WriteFile(paths.ConfigFile, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	base := daemonWorkerHeadSHA(t, checkout)
@@ -54,14 +64,18 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	head := daemonWorkerHeadSHA(t, checkout)
 	runDaemonWorkerGit(t, checkout, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic "+secret)
 	serveReviewSourceFixture(t, paths, checkout, secret)
+	appendConfig(t, paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
 	enableJanitorCapacity(t, paths)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: 19_999_999_999}, nil
+	})
 	device, err := janitorDeviceOf(paths.Home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	previousStatus := runJanitorStatus
 	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
-		volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":2147483648,"reserve_bytes":1048576,"reason":"cleanup target not reached"}`, device, device)
+		volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":false,"available_bytes":19999999999,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"warning band"}`, device, device)
 		return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volume)), nil
 	}
 	t.Cleanup(func() { runJanitorStatus = previousStatus })
@@ -98,12 +112,10 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	remoteBackend := string(execbackend.Remote)
 	job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("worker owns checkout")).Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-review-exact-head", Agent: "remote-review-agent", Action: "review",
 		Repo: repo, PullRequest: 2281, HeadSHA: head, Branch: "feature",
 		ReviewPurpose: db.DefaultReviewPurpose, Instructions: "review the exact head",
-		ExecBackend: &remoteBackend,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -113,9 +125,26 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	worker.RemoteEnvdEndpointResolver = func(string, int) string { return harness.envd.URL }
 	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
 	worker.ReviewAdmissionGitHubFactory = func(string) remoteReviewAdmissionGitHub {
-		return remoteReviewAdmissionGitHubStub{pull: github.PullRequest{Number: 2281, HeadSHA: head, BaseRef: "main"}}
+		return remoteReviewAdmissionGitHubStub{
+			pull:   github.PullRequest{Number: 2281, HeadSHA: head, BaseRef: "main"},
+			checks: []github.PullRequestCheck{{Name: "build", Bucket: "pass"}},
+		}
 	}
 	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
+	if pending := pendingIDs(t, ctx, worker); strings.Join(pending, ",") != job.ID {
+		t.Fatalf("warning-band dispatch = %v, want only %s", pending, job.ID)
+	}
+	job, err = store.GetJob(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routed.ExecBackend != string(execbackend.Remote) || !routed.DiskGuardRouted || routed.WorktreePath != "" {
+		t.Fatalf("warning-band review did not route to E2B before local preparation: %+v", routed)
+	}
 	if err := worker.run(ctx, job); err != nil {
 		t.Fatalf("worker.run: %v", err)
 	}

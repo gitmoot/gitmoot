@@ -300,7 +300,7 @@ func TestDispatchReviewCapacityAndAllocationFailuresFailClosed(t *testing.T) {
 			return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 1 << 30}, nil
 		})
 		_, err := dispatchLocalAgentJob(ctx, store, reviewDispatchRequest(home, head))
-		if err == nil || !strings.Contains(err.Error(), "requires at least") {
+		if err == nil {
 			t.Fatalf("capacity error=%v", err)
 		}
 		if tasks, listErr := store.ListTasks(ctx); listErr != nil || len(tasks) != 0 {

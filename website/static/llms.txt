@@ -54,13 +54,19 @@ E2B reviews resolve routing before local source preparation and fetch the exact
 head/base inside E2B through a repository-scoped mTLS Git-read broker. The host
 token is not uploaded; no local checkout, source archive or Git-history staging
 is required. Existing provider concurrency and spending controls remain.
-With Janitor enabled, fresh matching evidence and immediate space above the
-canonical reserve govern remaining local control-state writes, not the cleanup
-target latch. `[janitor_capacity] review_admission = "fresh_space"` opts local
-reviews into the same best-effort policy; its default is `"cleanup_target"`. Two-second
-monitoring requests cancellation only of the owned review generation on failed
-checks, through owned cleanup. It is not a quota or protection from all shared
-writers. Ordinary non-review gates and Janitor's reserve/latch are unchanged.
+With Janitor enabled, fresh matching evidence and immediate space at or above
+the canonical reserve and independent disk-guard floor govern local controller
+writes; a cleanup-target hold alone does not block E2B reviews. Local reviews
+can opt into `review_admission = "fresh_space"` but must also meet canonical
+`target_bytes`. The warning band requires E2B before local fresh-space admission,
+with no local fallback; below the hard floor remote preparation also waits.
+For decimal 10GB/20GB policy, set disk_guard min_free_bytes=10000000000,
+min_free_percent=0, remote_reviews=true, remote_reviews_below_bytes=20000000000
+and pin the approved matching producer policy. Equality at 10GB admits ordinary
+work and E2B reviews; equality at 20GB restores normal routing. Unknown/stale
+evidence fails closed. Two-second monitoring cancels only the owned review
+generation through cleanup; it does not reroute running work or guarantee
+remote destruction. Provider budgets and ordinary admission remain independent.
 
 A pull request that changes the `**Current mode:` marker in `AGENTS.md` is held
 until an exact-head reconciliation row exists:
@@ -125,4 +131,4 @@ retryable and bounded by the gate `timeout` or 24h from the episode's start.
 - [No-execution reviews](https://gitmoot.io/docs/reference/cli#no-execution-reviews-2364): `gitmoot review request --no-execution`, or `execution = "none"` in `[repos."owner/repo".review]` for every review of a repository, reviews from code plus host-fetched exact-head CI evidence; the omp seat runs only read/grep/glob/todo and a one-time exec supervisor refuses every program start after the runtime (omp 18.10.4, local backend, linux/amd64 only); results claiming executed evidence are refused.
 - [Low-disk review fallback](https://gitmoot.io/docs/reference/cli#reconfigure-without-restarting): `[disk_guard] remote_reviews_below_bytes` moves queued reviews to the remote backend before the dispatch floor; codex reviews run as omp with the same model (never a different one), no-CI repos are admitted, the requesting role gets one gitmoot message per move, hold or undo, and `review request --part NAME` splits one head into separately claimed parts; `--supersede JOB --reason TEXT` re-reviews one blocking part at the same head on the same reviewer, and the old verdict keeps blocking until the new one lands.
 - [Janitor Storage Box coverage](https://gitmoot.io/docs/reference/cli#reconfigure-without-restarting): Linux admission omits only individual paths whose pinned descriptor matches the configured `fuse.sshfs` mount in the kernel table. Local mounts retain coverage; unknown identity fails closed. No remote-root probe is added for unrelated local work.
-- [Janitor pressure review fallback](https://gitmoot.io/docs/reference/cli#reconfigure-without-restarting): `[disk_guard] remote_reviews = true` also routes Janitor-held queued reviews to E2B, using the existing cost/concurrency cap, eligibility checks and requester messages. Explicit-local and ineligible jobs wait; remote refusal restores local waiting. Foreground and manual `job run` are not rerouted.
+- [Canonical review capacity](https://gitmoot.io/docs/reference/cli#reconfigure-without-restarting): Fresh `target_bytes` supplies the canonical warning threshold and `reserve_bytes` the hard floor. A lower canonical sample cannot be erased by recovered statfs. Queued reviews require E2B in the warning band, with existing cost/concurrency checks and requester messages; explicit-local and non-E2B jobs wait, and remote refusal cannot fall back locally. Foreground and manual `job run` do not silently reroute.

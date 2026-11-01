@@ -30,16 +30,19 @@ func TestRemoteReviewsQueueWithoutLocalSourceUnderCleanupHold(t *testing.T) {
 	}
 	appendConfig(t, paths, "\n[remote_exec]\nbackend = \"local\"\ncost_max_reserved_usd = 100\ncost_per_attempt_usd = 1\ncost_max_concurrent = 2\n")
 	enableJanitorCapacity(t, paths)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: 30_000_000_000}, nil
+	})
 	device, err := janitorDeviceOf(paths.Home)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var sample atomic.Value
 	setSample := func(available uint64) {
-		volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"reason":"recovery target not reached"}`, device, device, available)
+		volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"cleanup target held"}`, device, device, available)
 		sample.Store(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volume))
 	}
-	setSample(2 << 30)
+	setSample(30_000_000_000)
 	previous := runJanitorStatus
 	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
 		return []byte(sample.Load().(string)), nil
@@ -82,15 +85,14 @@ func TestRemoteReviewsQueueWithoutLocalSourceUnderCleanupHold(t *testing.T) {
 	if slices.Contains(allowed, "held-local-work") {
 		t.Fatal("ordinary local work bypassed the unchanged pressure gate")
 	}
-	// The reserve is still load-bearing, independently of the cleanup latch.
-	setSample(1 << 20)
+	setSample(9_999_999_999)
 	allowed = pendingIDs(t, ctx, worker)
 	for _, id := range ids {
 		if slices.Contains(allowed, id) {
-			t.Fatalf("review %s admitted at the reserve", id)
+			t.Fatalf("review %s admitted below the reserve", id)
 		}
 	}
-	setSample(2 << 30)
+	setSample(30_000_000_000)
 	allowed = pendingIDs(t, ctx, worker)
 	for _, id := range ids {
 		if !slices.Contains(allowed, id) {

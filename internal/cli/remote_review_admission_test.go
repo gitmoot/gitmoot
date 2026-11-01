@@ -160,6 +160,36 @@ func (f *remoteReviewAdmissionFixture) assertRefusedBeforeProvision(t *testing.T
 	t.Fatalf("events = %+v, want durable counter %q", events, wantKind)
 }
 
+func TestRemoteReviewCapacityRefusesBeforeControllerPreparation(t *testing.T) {
+	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	appendConfig(t, f.paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: 9_999_999_999}, nil
+	})
+	f.run(t)
+	if f.factoryCalls != 0 || f.backend.provisionCalls != 0 {
+		t.Fatalf("below-floor review reached backend factory/provider: %d/%d", f.factoryCalls, f.backend.provisionCalls)
+	}
+	attempts, err := f.store.ListExecBackendAttemptsForJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Fatalf("below-floor review wrote remote attempt reservations: %+v", attempts)
+	}
+	job, err := f.store.GetJob(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := workflow.ParseJobPayload(job.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != string(workflow.JobQueued) || payload.WorktreePath != "" {
+		t.Fatalf("below-floor review executed or materialized a controller worktree: %+v", job)
+	}
+}
+
 func TestRemoteReviewUncachedPRReachesProvider(t *testing.T) {
 	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
 	if err := f.store.ExecForTest(f.ctx, `DELETE FROM pull_requests WHERE repo_full_name = ? AND number = ?`, "owner/repo", 2238); err != nil {

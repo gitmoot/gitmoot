@@ -199,31 +199,39 @@ or `job run` exits with `janitor pressure holds new heavy work: ...` before it
 creates anything. Janitor owns the pressure state and its hysteresis; gitmoot
 keeps no competing pressure latch. Ordinary `[disk_guard]` floors still apply.
 
-With `[disk_guard] remote_reviews = true`, Janitor-held queued reviews instead
-try the existing E2B route, within its dollar/concurrency cap and exact-head
-eligibility checks. The requesting role receives the same move/hold/refusal
-messages as disk-floor routing. Explicit-local reviews, other job types, and
-reviews that cannot run remotely stay queued. A remote refusal restores local
-waiting; foreground dispatch and `job run` still refuse rather than reroute.
+With `[disk_guard] remote_reviews = true`, queued reviews below the configured
+or canonical `target_bytes` warning threshold use the capped E2B route before
+local fresh-space admission is considered. Explicit-local and non-E2B reviews
+wait; remote refusal never falls back locally while the warning applies.
+Below the hard floor, remote controller writes are refused too. Foreground
+dispatch and manual `job run` do not silently reroute work.
 
 Actual E2B reviews now bypass local checkout/build admission: source and Git
 history are prepared inside E2B, not staged on the host. With Janitor enabled,
 their remaining local control-state writes still require fresh matching
-policy/device evidence and immediate free space above the canonical reserve.
-The cleanup-target latch alone does not block them. Existing provider spending
-and concurrency limits still apply; no single-review slot is added.
+policy/device evidence and immediate free space at or above the canonical
+reserve and independent disk-guard floor. A cleanup-target hold alone does not
+block them. Provider spending and concurrency limits still apply.
 
 Local reviews can opt into the same best-effort fresh-space policy with
 `[janitor_capacity] review_admission = "fresh_space"` (default `"cleanup_target"`).
-This checks all covered local preparation paths; configured Storage Box
-allocation still requires verified mount identity, without root fallback.
+Local reviews must additionally meet canonical `target_bytes`; missing or
+invalid byte limits fail closed. No recovery margin or per-review byte
+reservation is added. This checks local preparation paths; configured Storage
+Box allocation still requires verified mount identity without root fallback.
 Monitoring runs every two seconds through preparation, delivery and owned
-cleanup. Low reserve, stale/changed policy or backing-device evidence, and
-monitor errors close admission and request cancellation of only the owned
-review generation. Records are appended to `.gitmoot/review-capacity.jsonl`.
-Shared writers can cross the reserve between checks: this is not a byte quota
-or a disk-space guarantee. Ordinary non-review admission and the canonical
-Janitor reserve/latch remain unchanged.
+cleanup. Failed checks request cancellation of only the owned review generation,
+never reroute a running job. Records go to `.gitmoot/review-capacity.jsonl`.
+Cancellation does not prove remote destruction completed or automatically retry
+the review. Shared writers can cross thresholds between checks. Ordinary
+non-review admission and the producer's hold remain independent.
+
+For decimal 10GB/20GB operation, configure `min_free_bytes = 10000000000`,
+`min_free_percent = 0`, `remote_reviews = true` and
+`remote_reviews_below_bytes = 20000000000` in `[disk_guard]`, with a matching
+approved Janitor policy. Below 10GB all source-host-writing work waits; 10GB
+equality admits ordinary work and E2B reviews. Below 20GB reviews require E2B;
+20GB equality restores normal routing. Stale or unknown evidence still holds.
 
 Delegation worktrees use a separate default-on aged cleanup policy:
 `[workflow].delegation_worktree_ttl = "72h"`; `"0"` disables the pass. Only

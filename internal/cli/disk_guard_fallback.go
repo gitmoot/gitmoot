@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -159,7 +160,28 @@ func diskGuardReviewBandDispatch(ctx context.Context, worker jobWorker, jobs, ma
 	reason := fmt.Sprintf("free space %d bytes is below the review threshold [disk_guard] remote_reviews_below_bytes=%d", evaluation.Usage.FreeBytes, evaluation.Policy.RemoteReviewsBelowBytes)
 	remote := diskGuardRemoteReviews(ctx, worker, matching, reason)
 	routed := make(map[string]bool, len(remote))
+	paths, pathsErr := diskGuardPaths(worker)
 	for _, job := range remote {
+		payload, err := daemonJobPayload(job)
+		if err != nil || pathsErr != nil {
+			continue
+		}
+		route, checksRouted, err := loadReviewChecksRoute(paths, payload.Repo)
+		if err != nil {
+			diskGuardHoldReview(ctx, worker, job, payload, reason, err)
+			continue
+		}
+		e2b := false
+		if checksRouted {
+			e2b = route.Provider == config.RemoteExecProviderE2B
+		} else {
+			backend, cfg, err := worker.resolveExecutionBackendForJob(job, payload)
+			e2b = err == nil && backend == execbackend.Remote && !config.IsSandboxdProvider(cfg.Provider)
+		}
+		if !e2b {
+			diskGuardHoldReview(ctx, worker, job, payload, reason, fmt.Errorf("warning-band reviews require E2B; the frozen or repository checks route selects another backend"))
+			continue
+		}
 		routed[job.ID] = true
 	}
 	held := make(map[string]bool)
@@ -208,21 +230,6 @@ func diskGuardRoutedAlertText(reason string, plan diskGuardRoutePlan) string {
 		text += fmt.Sprintf(" Runtime changed %s -> %s with the same model %s.", plan.fromRuntime, plan.runtimeOverride, plan.model)
 	}
 	return text
-}
-
-// foregroundReviewDiskWarning returns the alert for a foreground review that
-// runs on this host while the disk is below the review threshold or the
-// dispatch floor (#2372: foreground reviews stay local, with an alert), or "".
-func foregroundReviewDiskWarning(home string) string {
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return ""
-	}
-	evaluation := evaluateConfiguredDiskGuard(paths)
-	if evaluation.allowsDispatch() && !evaluation.reviewsBelowThreshold() {
-		return ""
-	}
-	return "disk is low on this host (" + evaluation.detail() + "); this foreground review still runs here. Re-run it with --background to let the daemon run it on the remote backend."
 }
 
 // diskGuardRemoteAvailable reports whether the remote (E2B) backend is

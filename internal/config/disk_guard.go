@@ -24,8 +24,8 @@ type DiskGuardPolicy struct {
 	MinFreeBytes   uint64
 	MinFreePercent float64
 	// RemoteReviews ([disk_guard] remote_reviews, default false) lets queued
-	// reviews run on the remote execution backend while the guard pauses local
-	// dispatch, within the [remote_exec] cost cap. Everything else still waits.
+	// reviews move to E2B in the warning band, within the [remote_exec] cost cap.
+	// The hard dispatch floor still blocks remote controller writes.
 	RemoteReviews bool
 	// RemoteReviewsBelowBytes ([disk_guard] remote_reviews_below_bytes, default
 	// 0 = off) moves queued REVIEWS to the remote backend once free space is
@@ -130,7 +130,7 @@ func validateDiskGuardPolicy(policy DiskGuardPolicy) error {
 			return fmt.Errorf("disk_guard.remote_reviews_below_bytes requires remote_reviews = true")
 		}
 		if policy.RemoteReviewsBelowBytes <= policy.MinFreeBytes {
-			return fmt.Errorf("disk_guard.remote_reviews_below_bytes (%d) must be above min_free_bytes (%d): below the dispatch floor reviews already move", policy.RemoteReviewsBelowBytes, policy.MinFreeBytes)
+			return fmt.Errorf("disk_guard.remote_reviews_below_bytes (%d) must be above min_free_bytes (%d)", policy.RemoteReviewsBelowBytes, policy.MinFreeBytes)
 		}
 	}
 	return nil

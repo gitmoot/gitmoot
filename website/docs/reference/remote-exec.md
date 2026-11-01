@@ -144,8 +144,11 @@ If no purpose, label, final-review rule, or known high-risk path qualifies,
 the review stays local. With
 `remote_final_reviews = true`, any ready exact-head review with green CI is
 eligible. Drafts, stale heads, missing/red CI, unsupported runtimes, and
-foreground reviews stay local. An explicit per-job `--exec-backend` always
-wins. Each dispatch persists a `review_backend_route_selected` event with its
+foreground reviews do not gain an automatic route from this policy.
+An explicit per-job `--exec-backend` selects the route but cannot bypass capacity:
+local/non-E2B work waits in the review warning band, and all remote controller
+preparation waits below the hard floor. Each dispatch persists a
+`review_backend_route_selected` event with its
 reason and the chosen backend. The remote worker rechecks current head and CI
 immediately before reserving capacity; a later red result refuses the cloud job.
 
