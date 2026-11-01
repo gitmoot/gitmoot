@@ -143,7 +143,8 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
 
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org await withdraw [--role ROLE] --reason TEXT [--home DIR] ID")
 	fmt.Fprintln(w, "  gitmoot org wake list [--state STATE] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org wake show ID [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org wake retry|supersede ID --reason TEXT [--home DIR]")

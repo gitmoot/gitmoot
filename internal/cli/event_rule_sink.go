@@ -744,10 +744,16 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
 		if strings.HasPrefix(event.Cause, "awaited_fact_review_") {
 			// A deliberate cancel is not a failure to recover from (#2484): the
-			// waiter that no longer needs the verdict ends the wait instead.
+			// waiter that no longer needs the verdict ends the wait instead. The
+			// command carries the real fact ID (RootID is awaited-fact:N) in the
+			// template itself, after the 320-byte detail cut, so it always arrives.
+			withdraw := "gitmoot org await list --role " + event.WakeTargetRole + " --state waiting, then gitmoot org await withdraw <id> --role " + event.WakeTargetRole + " --reason TEXT"
+			if id := strings.TrimPrefix(event.RootID, "awaited-fact:"); id != event.RootID && id != "" {
+				withdraw = "gitmoot org await withdraw " + id + " --role " + event.WakeTargetRole + " --reason TEXT"
+			}
 			return fmt.Sprintf(
-				"gitmoot awaited fact for %s: %s. Inspect current waits with: gitmoot org await list --role %s --state waiting. Retry the exact-head review; if no reviewer runtime works, record a blocker naming its owner and next trigger before idling. If the review was cancelled on purpose or the verdict is no longer needed, end the wait with: gitmoot org await withdraw <id> --role %s --reason TEXT",
-				event.WakeTargetRole, detail, event.WakeTargetRole, event.WakeTargetRole,
+				"gitmoot awaited fact for %s: %s. Inspect current waits with: gitmoot org await list --role %s --state waiting. Retry the exact-head review; if no reviewer runtime works, record a blocker naming its owner and next trigger before idling. If the review was cancelled on purpose or the verdict is no longer needed, end the wait with: %s",
+				event.WakeTargetRole, detail, event.WakeTargetRole, withdraw,
 			)
 		}
 		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)

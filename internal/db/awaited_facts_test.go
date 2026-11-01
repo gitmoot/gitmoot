@@ -303,9 +303,8 @@ func TestWithdrawAwaitedFactEndsTheWaitWithoutWaking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("gitmoot org await withdraw %d --role lane", fact.ID)
-	if len(pending) != 1 || !strings.Contains(pending[0].SourceID, want) {
-		t.Fatalf("cancel notice = %+v, want one naming %q", pending, want)
+	if len(pending) != 1 {
+		t.Fatalf("cancel notices = %+v, want one", pending)
 	}
 
 	if _, err := store.WithdrawAwaitedFact(ctx, fact.ID, "intruder", "not mine", time.Now().UTC()); !errors.Is(err, ErrAwaitedFactNotWithdrawable) {

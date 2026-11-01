@@ -206,6 +206,24 @@ func TestFailedReviewFactWakeRequiresRetryOrExplicitBlocker(t *testing.T) {
 	}
 }
 
+// #2484 review: the withdraw command a seat runs must carry the real fact ID
+// even when the failure detail is longer than the 320-byte detail cut.
+func TestReviewFactWakeNamesWithdrawCommandWithFactIDPastTheDetailCut(t *testing.T) {
+	long := "review job review-9 cancelled carrying verdict approved at head " + strings.Repeat("f", 40) + "; " + strings.Repeat("x", 400)
+	payload := `{"id":3846,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_cancelled","job_id":"review-9","detail":"` + long + `"}`
+	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
+		ID: 3, SourceKind: db.WakeOutboxSourceAwaitedFact, SourceID: payload,
+		TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := eventRuleWakePrompt("fact", event)
+	if !strings.Contains(prompt, "gitmoot org await withdraw 3846 --role lane --reason TEXT") || strings.Contains(prompt, "withdraw <id>") {
+		t.Fatalf("cancelled-review prompt = %q, want the withdraw command with fact ID 3846", prompt)
+	}
+}
+
 func TestFactWakeBatchPrioritizesReviewFailureOverOlderCompletion(t *testing.T) {
 	now := time.Now().UTC()
 	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{

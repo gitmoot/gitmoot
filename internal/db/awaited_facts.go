@@ -834,12 +834,9 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 		}
 	}
 	for _, target := range targets {
-		// The wait stays open after a cancel; a waiter that cancelled on purpose
-		// needs the one command that ends it (#2484), not just "unresolved".
-		withdraw := fmt.Sprintf("; if it is no longer needed, end it with gitmoot org await withdraw %d --role %s --reason TEXT", target.id, target.role)
 		if err := insertAwaitedFactNoticeWakeTx(
 			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, target.key,
-			noticeState, jobID, lifecycleGeneration, detail+withdraw,
+			noticeState, jobID, lifecycleGeneration, detail,
 		); err != nil {
 			return err
 		}
