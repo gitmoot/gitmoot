@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -46,6 +48,7 @@ func TestRemoteLaneAdmitsE2BJobsWhileHostIsFull(t *testing.T) {
 	}
 
 	const hostCap = 1
+	const repoLimit = 1
 	tracker := newInflightJobTracker(ctx)
 	defer tracker.drain(io.Discard, 5*time.Second)
 	tracker.setRemoteCap(2)
@@ -55,11 +58,13 @@ func TestRemoteLaneAdmitsE2BJobsWhileHostIsFull(t *testing.T) {
 	}
 	defer tracker.end("busy-local")
 
-	local, remoteRoom, laneOn := tracker.laneHeadroom(hostCap)
+	// Budgets come from the same helper the pool and barrier passes use, with
+	// the repo's LOCAL remainder.
+	local, remoteRoom, laneOn := laneBudgets(repoLimit-tracker.inflightLocal("owner/repo"), hostCap, tracker)
 	if local != 0 || remoteRoom != 2 || !laneOn {
-		t.Fatalf("headroom local=%d remote=%d laneOn=%v, want 0/2/true", local, remoteRoom, laneOn)
+		t.Fatalf("budgets local=%d remote=%d laneOn=%v, want 0/2/true", local, remoteRoom, laneOn)
 	}
-	queued, _ := selectRunnableByLane(ctx, store, pending, 10, local, remoteRoom, laneOn, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, nil, nil)
+	queued, _ := selectRunnableByLane(ctx, store, pending, local, remoteRoom, laneOn, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, nil, nil)
 	var ids []string
 	for _, job := range queued {
 		ids = append(ids, job.ID)
@@ -68,24 +73,83 @@ func TestRemoteLaneAdmitsE2BJobsWhileHostIsFull(t *testing.T) {
 		t.Fatalf("selected %v with the host full, want the first two E2B jobs %v (sandboxd stays on the host lane)", ids, want)
 	}
 	for _, job := range queued {
-		if !tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, "owner/repo", "", "") {
-			t.Fatalf("remote lane refused %s below its cap", job.ID)
+		admitted, onRemote := tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, "owner/repo", "", "")
+		if !admitted || !onRemote {
+			t.Fatalf("remote lane refused %s below its cap (admitted=%v onRemote=%v)", job.ID, admitted, onRemote)
 		}
 		defer tracker.end(job.ID)
 	}
-	if tracker.beginWithinLane(hostCap, true, "remote-3", "owner/repo", "", "") {
+	if admitted, _ := tracker.beginWithinLane(hostCap, true, "remote-3", "owner/repo", "", ""); admitted {
 		t.Fatal("remote lane admitted a job past cost_max_concurrent")
 	}
-	if tracker.beginWithinLane(hostCap, false, "local-1", "owner/repo", "", "") {
+	if admitted, _ := tracker.beginWithinLane(hostCap, false, "local-1", "owner/repo", "", ""); admitted {
 		t.Fatal("a local job was admitted past --workers because remote jobs were in flight")
 	}
 	if got := tracker.total(); got != 1 {
 		t.Fatalf("host in-flight total = %d, want 1: E2B jobs must not consume host slots", got)
 	}
+	// Two remote jobs of owner/repo are in flight, yet the per-repo limit (1)
+	// bounds host work only: the repo's local budget is still its full limit.
+	if got := tracker.inflightLocal("owner/repo"); got != 0 {
+		t.Fatalf("inflightLocal(owner/repo) = %d, want 0 with only remote jobs in flight", got)
+	}
+	tracker.end("busy-local")
+	if local, _, _ := laneBudgets(repoLimit-tracker.inflightLocal("owner/repo"), hostCap, tracker); local != 1 {
+		t.Fatalf("local budget = %d with an idle host and only remote jobs in flight, want the repo limit 1", local)
+	}
+
+	// An E2B job is never isolation-dispatched onto the host lane.
+	for _, job := range pending {
+		payload, err := daemonJobPayload(job)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if queuedJobUsesRemoteLane(job) && poolIsolationCandidate(job, payload) {
+			t.Fatalf("E2B job %s is an isolation candidate; isolation takes a host slot", job.ID)
+		}
+	}
 
 	// With the lane off (no cost_max_concurrent), E2B jobs share --workers as before.
 	tracker.setRemoteCap(0)
-	if tracker.beginWithinLane(hostCap, true, "remote-3", "owner/repo", "", "") {
+	if !tracker.beginWithin(hostCap, "busy-local-2", "owner/other", "repo:owner/other", "") {
+		t.Fatal("could not refill the host")
+	}
+	defer tracker.end("busy-local-2")
+	if admitted, _ := tracker.beginWithinLane(hostCap, true, "remote-3", "owner/repo", "", ""); admitted {
 		t.Fatal("with the remote lane off an E2B job bypassed the full host cap")
+	}
+}
+
+// #2470. The lane cap follows live [remote_exec] cost_max_concurrent and turns
+// the lane off when the config cannot be read.
+func TestRefreshRemoteLaneCapFollowsConfig(t *testing.T) {
+	home := t.TempDir()
+	store := daemonWorkerStore(t)
+	worker := defaultJobWorker(store, io.Discard, home)
+	paths, err := worker.configPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker := newInflightJobTracker(context.Background())
+	defer tracker.drain(io.Discard, time.Second)
+	write := func(body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	capNow := func() int { tracker.mu.Lock(); defer tracker.mu.Unlock(); return tracker.remoteCap }
+	write("[remote_exec]\ncost_max_reserved_usd = 90.0\ncost_per_attempt_usd = 4.5\ncost_max_concurrent = 20\n")
+	refreshRemoteLaneCap(worker, tracker)
+	if got := capNow(); got != 20 {
+		t.Fatalf("remote cap = %d, want 20 from config", got)
+	}
+	write("[remote_exec]\ncost_max_concurrent = \"not a number\"\n")
+	refreshRemoteLaneCap(worker, tracker)
+	if got := capNow(); got != 0 {
+		t.Fatalf("remote cap = %d after an unreadable config, want 0 (lane off)", got)
 	}
 }

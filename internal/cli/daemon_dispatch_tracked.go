@@ -193,35 +193,38 @@ func (t *inflightJobTracker) trackedJobContext(jobID string, fallback context.Co
 // host headroom and both dispatch past the cap if the check were external.
 // hostCap <= 0 means unbounded (plain begin).
 func (t *inflightJobTracker) beginWithin(hostCap int, jobID, repo, checkoutKey, runtimeKey string) bool {
-	return t.beginWithinLane(hostCap, false, jobID, repo, checkoutKey, runtimeKey)
+	admitted, _ := t.beginWithinLane(hostCap, false, jobID, repo, checkoutKey, runtimeKey)
+	return admitted
 }
 
 // beginWithinLane is beginWithin for a job that may run on the remote lane
 // (#2470). With the lane enabled a remote job is admitted against remoteCap and
 // never consumes a host slot; a local job is admitted against hostCap and never
-// consumes a remote slot. With the lane disabled every job is local.
-func (t *inflightJobTracker) beginWithinLane(hostCap int, remote bool, jobID, repo, checkoutKey, runtimeKey string) bool {
+// consumes a remote slot. With the lane disabled every job is local. onRemote
+// reports the lane the job was registered on, so a caller keeping its own
+// per-lane counters charges the right one.
+func (t *inflightJobTracker) beginWithinLane(hostCap int, remote bool, jobID, repo, checkoutKey, runtimeKey string) (admitted, onRemote bool) {
 	if t == nil {
-		return true
+		return true, false
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.draining {
-		return false
+		return false, false
 	}
 	if _, exists := t.jobs[jobID]; exists {
-		return false
+		return false, false
 	}
 	remote = remote && t.remoteCap > 0
 	local, remoteInFlight := t.laneTotalsLocked()
 	switch {
 	case remote:
 		if remoteInFlight >= t.remoteCap {
-			return false
+			return false, false
 		}
 	case hostCap > 0:
 		if local >= hostCap {
-			return false
+			return false, false
 		}
 	}
 	jobCtx, cancelJob := context.WithCancel(t.runCtx)
@@ -234,7 +237,7 @@ func (t *inflightJobTracker) beginWithinLane(hostCap int, remote bool, jobID, re
 	}
 	t.perRepo[repo]++
 	t.wg.Add(1)
-	return true
+	return true, remote
 }
 
 // laneTotalsLocked counts in-flight jobs per lane. Caller holds t.mu.
@@ -389,6 +392,9 @@ func (t *inflightJobTracker) inflightIDs() map[string]bool {
 	return ids
 }
 
+// inflight counts this repo's in-flight jobs on both lanes. busy/tryBeginPool
+// keep using every job (single-selector invariants); dispatch BUDGETS use
+// inflightLocal, because the per-repo limit bounds host work only (#2470).
 func (t *inflightJobTracker) inflight(repo string) int {
 	if t == nil {
 		return 0
@@ -396,6 +402,22 @@ func (t *inflightJobTracker) inflight(repo string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.perRepo[repo]
+}
+
+// inflightLocal counts this repo's in-flight jobs on the host lane only.
+func (t *inflightJobTracker) inflightLocal(repo string) int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, dispatch := range t.jobs {
+		if dispatch.repo == repo && !dispatch.remote {
+			n++
+		}
+	}
+	return n
 }
 
 // total reports the in-flight LOCAL dispatched jobs across ALL repos — the
@@ -453,24 +475,26 @@ func queuedJobUsesRemoteLane(job db.Job) bool {
 	return provider == "" || provider == "e2b"
 }
 
-// laneDispatchSlots is a pass's dispatch budget with the remote lane (#2470):
-// the repo's own remainder, clamped by the combined host and remote headroom.
-func laneDispatchSlots(repoSlots, hostCap int, tracker *inflightJobTracker) (slots, local, remote int, laneOn bool) {
-	local, remote, laneOn = tracker.laneHeadroom(hostCap)
-	slots = min(repoSlots, local+remote)
-	return slots, local, remote, laneOn
+// laneBudgets is a pass's dispatch budget per lane (#2470). The per-repo limit
+// bounds host work only, so the local budget is the repo's LOCAL remainder
+// clamped by host headroom, and the remote budget is remote headroom alone:
+// remote jobs neither consume nor are bounded by per-repo slots. With the lane
+// off every job is local and remote is 0, exactly the pre-#2470 budget.
+func laneBudgets(repoLocalSlots, hostCap int, tracker *inflightJobTracker) (local, remote int, laneOn bool) {
+	hostLocal, remote, laneOn := tracker.laneHeadroom(hostCap)
+	return max(min(repoLocalSlots, hostLocal), 0), remote, laneOn
 }
 
 // selectRunnableByLane is selectRunnableQueuedJobsSeeded with the remote lane
-// (#2470): local jobs are selected against the host headroom and remote jobs
-// against the remote headroom, each in FIFO order, so a long local backlog on a
-// full host never consumes the slots a remote job could use, and vice versa.
-// The remote pass is seeded with the keys the local pass just selected so the
-// two never pick jobs that share a checkout or runtime session. With the lane
-// off this is exactly the single selection used before #2470.
-func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, repoSlots, local, remote int, laneOn bool, policy config.ParallelSessionPolicy, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+// (#2470): local jobs are selected against the local budget and remote jobs
+// against the remote budget, each in FIFO order, so a local backlog on a full
+// host never consumes slots a remote job could use, and vice versa. The remote
+// pass is seeded with the keys the local pass just selected so the two never
+// pick jobs that share a checkout or runtime session. With the lane off this is
+// exactly the single selection used before #2470.
+func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, policy config.ParallelSessionPolicy, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if !laneOn {
-		return selectRunnableQueuedJobsSeeded(ctx, store, pending, min(repoSlots, local), policy, seedCheckouts, seedRuntimes)
+		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, policy, seedCheckouts, seedRuntimes)
 	}
 	var localJobs, remoteJobs []db.Job
 	for _, job := range pending {
@@ -480,7 +504,7 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			localJobs = append(localJobs, job)
 		}
 	}
-	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, min(repoSlots, local), policy, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, policy, seedCheckouts, seedRuntimes)
 	if len(remoteJobs) == 0 {
 		return queued, remaining
 	}
@@ -494,7 +518,7 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			runtimes[key] = true
 		}
 	}
-	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, min(repoSlots-len(queued), remote), policy, checkouts, runtimes)
+	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, policy, checkouts, runtimes)
 	return append(queued, remoteQueued...), append(remaining, remoteRemaining...)
 }
 
@@ -1015,8 +1039,10 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	// Host-global clamp: never dispatch past the daemon-wide in-flight budget,
 	// whatever this repo's own remainder is (see the function comment). Remote
 	// jobs draw on their own lane (#2470) instead of the host budget.
-	slots, localHeadroom, remoteHeadroom, laneOn := laneDispatchSlots(limit-tracker.inflight(repoFilter), hostCap, tracker)
-	if slots <= 0 || len(eligible) == 0 {
+	// One budget read per pass: the selection below uses exactly these values,
+	// and beginWithinLane re-checks the host/remote caps under the tracker lock.
+	localBudget, remoteBudget, laneOn := laneBudgets(limit-tracker.inflightLocal(repoFilter), hostCap, tracker)
+	if localBudget+remoteBudget <= 0 || len(eligible) == 0 {
 		return tracker.takeErr(repoFilter)
 	}
 	policy, err := worker.parallelSessionPolicy()
@@ -1024,7 +1050,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
 	}
 	seedCheckouts, seedRuntimes := tracker.seeds()
-	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, limit-tracker.inflight(repoFilter), localHeadroom, remoteHeadroom, laneOn, policy, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, localBudget, remoteBudget, laneOn, policy, seedCheckouts, seedRuntimes)
 	explainHeldBackJobs(ctx, worker, tracker, remaining)
 	for _, job := range queued {
 		job := job
@@ -1037,7 +1063,7 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		// beginWithin re-checks the host-global cap atomically with registration:
 		// a concurrent pool pass for another repo may have consumed the headroom
 		// this pass's slot computation saw.
-		if !tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, repoFilter, checkoutKey, runtimeKey) {
+		if admitted, _ := tracker.beginWithinLane(hostCap, queuedJobUsesRemoteLane(job), job.ID, repoFilter, checkoutKey, runtimeKey); !admitted {
 			worker.Admission.Release(job.ID)
 			continue
 		}
