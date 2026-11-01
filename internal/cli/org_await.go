@@ -27,6 +27,8 @@ func runOrgAwait(args []string, stdout, stderr io.Writer) int {
 		return runOrgAwaitReview(args[1:], stdout, stderr)
 	case "list":
 		return runOrgAwaitList(args[1:], stdout, stderr)
+	case "withdraw":
+		return runOrgAwaitWithdraw(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown org await command %q\n", args[0])
 		printOrgAwaitUsage(stderr)
@@ -38,7 +40,8 @@ func printOrgAwaitUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]")
-	fmt.Fprintln(w, "Every awaited fact has a required deadline. A matching exact-head review verdict satisfies it. At the deadline a review wait the PR has moved past (a later wait on another head, merged, closed, or a new head) ends superseded with its reason and wakes nobody; any other wait expires, remains queryable, and wakes the waiter (an archived waiter's nearest live ancestor).")
+	fmt.Fprintln(w, "  gitmoot org await withdraw [--role ROLE] --reason TEXT [--home DIR] ID")
+	fmt.Fprintln(w, "Every awaited fact has a required deadline. A matching exact-head review verdict satisfies it. At the deadline a review wait the PR has moved past (a later wait on another head, merged, closed, or a new head) ends superseded with its reason and wakes nobody; any other wait expires, remains queryable, and wakes the waiter (an archived waiter's nearest live ancestor). The waiter may withdraw a waiting fact it no longer needs (for example after cancelling the review on purpose): it ends superseded as \"withdrawn by ROLE: REASON\" and wakes nobody.")
 }
 
 func runOrgAwaitReview(args []string, stdout, stderr io.Writer) int {
@@ -118,6 +121,55 @@ func runOrgAwaitReview(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "awaited fact %d state=%s subject=%s deadline=%s\n", fact.ID, fact.State, fact.SubjectKey, fact.Deadline)
+	return 0
+}
+
+// runOrgAwaitWithdraw lets the waiter end a wait it no longer needs (#2484).
+// Without it a deliberate review cancel left the wait open until its deadline,
+// and every review_cancelled notice told the waiter to retry the review.
+func runOrgAwaitWithdraw(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("org await withdraw", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	roleFlag := fs.String("role", "", "organization role that is waiting (defaults to GITMOOT_ORG_ROLE)")
+	reason := fs.String("reason", "", "why the wait is no longer needed (required, recorded on the fact)")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 || strings.TrimSpace(*reason) == "" {
+		fmt.Fprintln(stderr, "org await withdraw requires one awaited fact ID and --reason")
+		return 2
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(fs.Arg(0)), 10, 64)
+	if err != nil || id <= 0 {
+		fmt.Fprintf(stderr, "org await withdraw: invalid awaited fact ID %q\n", fs.Arg(0))
+		return 2
+	}
+	role := strings.ToLower(strings.TrimSpace(*roleFlag))
+	if role == "" {
+		role = strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE")))
+	}
+	if role == "" {
+		fmt.Fprintln(stderr, "org await withdraw: --role or GITMOOT_ORG_ROLE is required")
+		return 2
+	}
+	var fact db.AwaitedFact
+	err = withStore(*home, func(store *db.Store) error {
+		var withdrawErr error
+		fact, withdrawErr = store.WithdrawAwaitedFact(context.Background(), id, role, *reason, time.Now().UTC())
+		return withdrawErr
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "org await withdraw: %v\n", err)
+		if errors.Is(err, db.ErrAwaitedFactNotWithdrawable) {
+			return 2
+		}
+		return 1
+	}
+	fmt.Fprintf(stdout, "awaited fact %d state=%s subject=%s detail=%s\n", fact.ID, fact.State, fact.SubjectKey, fact.ResolutionDetail)
 	return 0
 }
 

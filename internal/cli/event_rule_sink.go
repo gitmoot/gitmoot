@@ -743,9 +743,11 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 	if strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindFact) {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
 		if strings.HasPrefix(event.Cause, "awaited_fact_review_") {
+			// A deliberate cancel is not a failure to recover from (#2484): the
+			// waiter that no longer needs the verdict ends the wait instead.
 			return fmt.Sprintf(
-				"gitmoot awaited fact for %s: %s. Inspect current waits with: gitmoot org await list --role %s --state waiting. Retry the exact-head review; if no reviewer runtime works, record a blocker naming its owner and next trigger before idling",
-				event.WakeTargetRole, detail, event.WakeTargetRole,
+				"gitmoot awaited fact for %s: %s. Inspect current waits with: gitmoot org await list --role %s --state waiting. Retry the exact-head review; if no reviewer runtime works, record a blocker naming its owner and next trigger before idling. If the review was cancelled on purpose or the verdict is no longer needed, end the wait with: gitmoot org await withdraw <id> --role %s --reason TEXT",
+				event.WakeTargetRole, detail, event.WakeTargetRole, event.WakeTargetRole,
 			)
 		}
 		return fmt.Sprintf("gitmoot awaited fact for %s: %s", event.WakeTargetRole, detail)
