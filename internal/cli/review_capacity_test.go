@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -86,16 +87,17 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var low atomic.Bool
+			// Low space no longer stops a running review (#2479); failed or
+			// unknown capacity evidence still does, and is what this test uses.
+			var broken atomic.Bool
 			previous := runJanitorStatus
 			runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
-				available := uint64(2 << 30)
-				if low.Load() {
-					available = 1 << 19
+				if broken.Load() {
+					return nil, errors.New("janitor status unavailable")
 				}
 				volumes := make([]string, 0, len(devices))
 				for device := range devices {
-					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"target_bytes":1048576,"reason":"cleanup target held"}`, device, device, available))
+					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"target_bytes":1048576,"reason":"cleanup target held"}`, device, device, uint64(2<<30)))
 				}
 				return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
 			}
@@ -128,14 +130,14 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 					t.Fatalf("queue successor generation: changed=%t error=%v", changed, err)
 				}
 			}
-			low.Store(true)
+			broken.Store(true)
 			select {
 			case <-finished:
 			case <-time.After(8 * time.Second):
-				t.Fatal("review kept running after fresh available bytes reached the reserve")
+				t.Fatal("review kept running after its capacity evidence failed")
 			}
-			if runErr == nil || !strings.Contains(runErr.Error(), "reserve") {
-				t.Fatalf("monitor outcome = %v, want reserve cancellation", runErr)
+			if runErr == nil || !strings.Contains(runErr.Error(), "janitor status unavailable") {
+				t.Fatalf("monitor outcome = %v, want fail-closed cancellation", runErr)
 			}
 			ended, err := store.GetJob(ctx, job.ID)
 			wantState := string(workflow.JobCancelled)
@@ -159,11 +161,12 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 	}
 }
 
-// Jarvis 380078: a local review admitted above the 20GB warning threshold must
-// keep running when free space dips into the 10-20GB band; the band decides
-// only where NEW reviews start. Crossing the 10GB hard floor still cancels it,
-// and the cancel names its reason on the job.
-func TestLocalReviewMonitorKeepsRunningInWarningBandButStopsAtFloor(t *testing.T) {
+// Jarvis 380078/380099, owner disk policy: low space decides only where NEW
+// reviews start. A local review admitted above 20GB keeps running when free
+// space falls into the 10-20GB band and even below the 10GB floor ("do not
+// blindly terminate running work"). Failed capacity evidence still stops it
+// fail-closed, and the cancel names its reason on the job.
+func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 	declareNoRealAdapterExec(t)
 	home, store, head := reviewRouterHome(t)
 	ctx := context.Background()
@@ -196,7 +199,11 @@ func TestLocalReviewMonitorKeepsRunningInWarningBandButStopsAtFloor(t *testing.T
 	}
 	var free atomic.Uint64
 	free.Store(25_000_000_000)
+	var broken atomic.Bool
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		if broken.Load() {
+			return diskFilesystemUsage{}, errors.New("statfs failed")
+		}
 		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: free.Load()}, nil
 	})
 	previous := runJanitorStatus
@@ -227,25 +234,27 @@ func TestLocalReviewMonitorKeepsRunningInWarningBandButStopsAtFloor(t *testing.T
 	case <-time.After(30 * time.Second):
 		t.Fatal("review never reached delivery")
 	}
-	// Into the warning band: at least two monitor intervals must pass with the
-	// review still running.
-	free.Store(15_000_000_000)
-	select {
-	case <-finished:
-		events, _ := store.ListJobEvents(ctx, job.ID)
-		t.Fatalf("running local review was stopped in the warning band: %v events=%+v", runErr, events)
-	case <-time.After(2*reviewCapacityInterval + time.Second):
+	// Into the warning band, then below the hard floor: each for at least two
+	// monitor intervals, the review still running.
+	for _, bytes := range []uint64{15_000_000_000, 5_000_000_000} {
+		free.Store(bytes)
+		select {
+		case <-finished:
+			events, _ := store.ListJobEvents(ctx, job.ID)
+			t.Fatalf("running local review was stopped at %d free bytes: %v events=%+v", bytes, runErr, events)
+		case <-time.After(2*reviewCapacityInterval + time.Second):
+		}
 	}
-	// Below the hard floor the monitor still stops it, and says why.
-	free.Store(5_000_000_000)
+	// A failed measurement is unknown evidence: fail closed, and say why.
+	broken.Store(true)
 	select {
 	case <-finished:
 	case <-time.After(8 * time.Second):
-		t.Fatal("review kept running below the hard floor")
+		t.Fatal("review kept running after its disk measurement failed")
 	}
 	ended, err := store.GetJob(ctx, job.ID)
 	if err != nil || ended.State != string(workflow.JobCancelled) {
-		t.Fatalf("review below floor = %+v, %v; want cancelled", ended, err)
+		t.Fatalf("review after failed measurement = %+v, %v; want cancelled", ended, err)
 	}
 	events, err := store.ListJobEvents(ctx, job.ID)
 	if err != nil {
@@ -257,7 +266,7 @@ func TestLocalReviewMonitorKeepsRunningInWarningBandButStopsAtFloor(t *testing.T
 			reason = event.Message
 		}
 	}
-	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") {
+	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") || !strings.Contains(reason, "statfs failed") {
 		t.Fatalf("cancel has no recorded reason: %+v", events)
 	}
 }

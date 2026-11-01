@@ -221,10 +221,11 @@ reservation is added. This checks local preparation paths; configured Storage
 Box allocation still requires verified mount identity without root fallback.
 Monitoring runs every two seconds through preparation, delivery and owned
 cleanup. Failed checks request cancellation of only the owned review generation,
-never reroute a running job. The 20GB warning band is checked only at
-admission; a running local review that dips into the band keeps running, and
-only the hard floor, canonical reserve, device or policy changes stop it
-(#2479). Each monitor cancel records `review_capacity_cancelled` with its
+never reroute a running job. Free-space thresholds (10GB floor, canonical
+reserve, 20GB warning band) apply only at admission; a running review is never
+stopped for low space. Failed, unknown, stale or mismatched evidence and device
+or policy changes still stop it (#2479). Each monitor cancel records
+`review_capacity_cancelled` with its
 reason. Records go to `.gitmoot/review-capacity.jsonl`.
 Cancellation does not prove remote destruction completed or automatically retry
 the review. Shared writers can cross thresholds between checks. Ordinary

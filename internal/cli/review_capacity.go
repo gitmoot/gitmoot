@@ -41,10 +41,11 @@ func reviewDiskGuardRefusal(evaluation diskGuardEvaluation, sourceOnly bool) err
 // This is best-effort monitoring, not a quota or a promise about other writers.
 //
 // admitting distinguishes starting a review from monitoring one already
-// running. The 20GB warning band (local reviews must use E2B) governs only
-// where NEW work starts; a running local review that sees free space dip into
-// the band keeps running (owner policy: do not terminate running work). The
-// hard floor and the canonical reserve still apply while running.
+// running. Space thresholds (the 10GB floor, the canonical reserve, the 20GB
+// warning band and Janitor's low-space states) decide only whether NEW work
+// may start. Owner policy (#2466/#2479): do not terminate running work for low
+// space. While running, only failed, unknown, stale or mismatched evidence
+// (and, in the monitor, device or policy changes) stops a review.
 func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly, admitting bool, checkouts ...string) (map[uint64]string, []reviewCapacityMeasurement, error) {
 	if a.cfgErr != nil {
 		return nil, nil, a.cfgErr
@@ -55,11 +56,13 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 	if a.readErr != nil {
 		return nil, nil, a.readErr
 	}
-	// skipWarning is reviewDiskGuardRefusal's "no warning-band check" switch.
-	skipWarning := sourceOnly || !admitting
 	evaluation := evaluateConfiguredDiskGuard(paths)
-	if err := reviewDiskGuardRefusal(evaluation, skipWarning); err != nil {
-		return nil, nil, err
+	if admitting {
+		if err := reviewDiskGuardRefusal(evaluation, sourceOnly); err != nil {
+			return nil, nil, err
+		}
+	} else if evaluation.Policy.Enabled && evaluation.Err != nil {
+		return nil, nil, fmt.Errorf("disk guard measurement failed during review: %s", evaluation.detail())
 	}
 	// Remote source preparation writes control state and logs, not local Git.
 	hostPaths := []string{paths.Home}
@@ -91,7 +94,7 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 				volume = v
 			}
 		}
-		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || !janitorClearedStates[volume.state] {
+		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || (admitting && !janitorClearedStates[volume.state]) {
 			return nil, nil, fmt.Errorf("review device %d (%s) has unknown or unsafe canonical capacity", device, path)
 		}
 		usage, err := measureDiskGuardFilesystem(path)
@@ -104,10 +107,13 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 		}
 		available := min(volume.available, usage.FreeBytes)
 		measurements = append(measurements, reviewCapacityMeasurement{device, path, available, volume.reserve})
+		if !admitting {
+			continue
+		}
 		if available < volume.reserve {
 			return nil, measurements, fmt.Errorf("review device %d (%s) has %d available bytes, requires at least canonical reserve %d", device, path, available, volume.reserve)
 		}
-		if !skipWarning && available < volume.target {
+		if !sourceOnly && available < volume.target {
 			return nil, measurements, fmt.Errorf("review device %d (%s) has %d available bytes; E2B required below canonical target %d", device, path, available, volume.target)
 		}
 		if device == homeDevice {
@@ -116,7 +122,7 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 			if current.Usage.TotalBytes > 0 {
 				current.FreePercent = float64(available) / float64(current.Usage.TotalBytes) * 100
 			}
-			if err := reviewDiskGuardRefusal(current, skipWarning); err != nil {
+			if err := reviewDiskGuardRefusal(current, sourceOnly); err != nil {
 				return nil, measurements, err
 			}
 		}
