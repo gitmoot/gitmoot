@@ -70,6 +70,102 @@ func TestListWakeOutboxObligationsScopesDirectiveReceiptsToWorkflow(t *testing.T
 	}
 }
 
+// #2470. The indexed marker lookup must match exactly the original prefix test:
+// an id that merely starts with the directive's id is not its marker, the
+// `delivered` spelling counts, and a marker note longer than the 64-character
+// indexed prefix is still found.
+func TestListWakeOutboxObligationsMatchesMarkerBoundariesExactly(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	addNote := func(author, body string) WorkflowNote {
+		t.Helper()
+		note, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: "phase/markers", Author: author, Body: body})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+	addDirective := func() WorkflowNote {
+		t.Helper()
+		note, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+			WorkflowID: "phase/markers", Author: "owner",
+			Body:            "[org:directive to=worker from=owner wf=phase/markers]\nact",
+			AddressedTarget: "worker", AddressedWakeKind: WakeOutboxKindDirective,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return note
+	}
+	idPrefixOnly := addDirective()
+	delivered := addDirective()
+	longDone := addDirective()
+	addNote("worker", fmt.Sprintf("[org:directive-ack id=%d0 by=worker]", idPrefixOnly.ID))
+	addNote("worker", fmt.Sprintf("[org:directive-done id=%d9 by=worker]", idPrefixOnly.ID))
+	addNote("worker", fmt.Sprintf("[org:directive-ack id=%d] no space after the id", idPrefixOnly.ID))
+	addNote("daemon", fmt.Sprintf("[org:directive-delivered id=%d by=daemon]", delivered.ID))
+	addNote("worker", fmt.Sprintf("[org:directive-done id=%d by=worker %s]", longDone.ID, strings.Repeat("x", 200)))
+
+	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[int64]string{}
+	for _, obligation := range obligations.Pending {
+		sourceID, err := strconv.ParseInt(obligation.SourceID, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[sourceID] = obligation.DirectivePhase
+	}
+	want := map[int64]string{
+		idPrefixOnly.ID: WakeOutboxDirectivePhaseAcknowledgment,
+		delivered.ID:    WakeOutboxDirectivePhaseCompletion,
+		longDone.ID:     WakeOutboxDirectivePhaseTerminal,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("directive phases = %v, want %v", got, want)
+	}
+}
+
+// #2478 review: source_id is free text. A marker prefix longer than the
+// 64-character indexed range must still match exactly as before; the range
+// alone would compare it greater than every indexed value and miss it.
+func TestListWakeOutboxObligationsMatchesMarkersLongerThanTheIndexedPrefix(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "phase/long", Author: "owner",
+		Body: "[org:directive to=worker from=owner wf=phase/long]\nact",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CAST(source_id AS INTEGER) still resolves the directive; the trailing
+	// text makes `[org:directive-done id=<source_id> ` 70+ characters long.
+	sourceID := fmt.Sprintf("%d%s", directive.ID, strings.Repeat("x", 50))
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "phase/long", Author: "worker",
+		Body: "[org:directive-done id=" + sourceID + " by=worker]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Format(BlockedEpisodeTimeLayout)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, created_at, updated_at)
+VALUES ('workflow_note', ?, 'worker', 'directive:worker', 'pending', 0, ?, ?)`, sourceID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obligations.Pending) != 1 || obligations.Pending[0].DirectivePhase != WakeOutboxDirectivePhaseTerminal {
+		t.Fatalf("pending obligations = %+v, want one terminal directive", obligations.Pending)
+	}
+}
+
 func TestWakeOutboxEntryStateRemainsSerializable(t *testing.T) {
 	encoded, err := json.Marshal(WakeOutboxEntry{State: WakeOutboxStatePending})
 	if err != nil {

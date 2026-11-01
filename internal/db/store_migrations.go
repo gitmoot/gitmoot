@@ -3080,4 +3080,14 @@ CREATE INDEX idx_cleanup_refusals_resource ON cleanup_refusals(resource_id, life
 	`
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at_repo ON jobs(created_at, repo);
 	`,
+	// #2470: the daemon's wake-outbox drain (every 5s) asks, per directive row,
+	// whether its workflow holds an `[org:directive-<kind> id=N ` marker note.
+	// Without this index each check read every note body in the workflow
+	// (6.8s per drain on the live store); wakeOutboxDirectiveMarkerExists
+	// range-scans the indexed prefix instead.
+	`
+CREATE INDEX IF NOT EXISTS idx_workflow_notes_directive_markers
+	ON workflow_notes(workflow_id, substr(body, 1, 64))
+	WHERE substr(body, 1, length('[org:directive-')) = '[org:directive-';
+	`,
 }
