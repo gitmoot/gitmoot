@@ -76,7 +76,7 @@ func TestAdvisoryDeclarationRelaxesTheLedgerGateAndRecordsWhatItPassed(t *testin
 			if refusal == nil {
 				t.Fatal("premise broken: the obligation gate did not refuse, so neither arm tests anything")
 			}
-			if !strings.Contains(refusal.Error(), "carry no observation at head") {
+			if !strings.Contains(refusal.Error(), "not discharged at head") {
 				t.Fatalf("unexpected refusal shape %q", refusal)
 			}
 
@@ -87,7 +87,7 @@ func TestAdvisoryDeclarationRelaxesTheLedgerGateAndRecordsWhatItPassed(t *testin
 			// entirely left it green. That is the same green-test-exercising-no-path
 			// shape this campaign keeps finding in other people's work.
 			err := gate.ensureFinalReviewCaptured(ctx, request, head)
-			ledgerRefused := err != nil && strings.Contains(err.Error(), "carry no observation at head")
+			ledgerRefused := err != nil && strings.Contains(err.Error(), "not discharged at head")
 			if tc.wantRefusal && !ledgerRefused {
 				t.Fatalf("an undeclared repository did not refuse on its unobserved obligations; err = %v", err)
 			}
