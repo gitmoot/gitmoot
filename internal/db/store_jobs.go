@@ -494,6 +494,32 @@ func (s *Store) ListReviewJobsForPullRequest(ctx context.Context, repo string, p
 	return scanJobs(rows)
 }
 
+// ListReviewJobsInTaskScope returns every review job that could belong to the
+// same task as a job on repo/pullRequest, for workflow.sameTask to decide
+// exactly (#2470). It replaces a full ListJobs scan in review-round lookups,
+// which decoded every job payload on each advancement. The scope is a SUPERSET
+// of sameTask's matches: the repo projection must equal repo (sameTask rejects
+// differing non-empty repos), and when pullRequest > 0 the row's pull_request
+// projection is either that number or unset (0/NULL), because older rows carry
+// the PR only inside their payload. An empty repo cannot be narrowed, so it
+// returns every review job.
+func (s *Store) ListReviewJobsInTaskScope(ctx context.Context, repo string, pullRequest int) ([]Job, error) {
+	if strings.TrimSpace(repo) == "" {
+		return s.ListJobsByType(ctx, "review")
+	}
+	query := `SELECT ` + jobColumns + ` FROM jobs WHERE type = 'review' AND repo = ?`
+	args := []any{repo}
+	if pullRequest > 0 {
+		query += ` AND (pull_request = ? OR pull_request = 0 OR pull_request IS NULL)`
+		args = append(args, pullRequest)
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 // ListJobsByParent returns the direct children of parentJobID (delegation
 // children and the coordinator continuation job), ordered by delegation_id then
 // id for a stable tree. It selects updated_at like ListJobs so callers can show
