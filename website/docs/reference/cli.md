@@ -2335,6 +2335,14 @@ registration is starting is not missed. A later terminal review-job commit
 satisfies only the matching repository, PR, and head, then writes an addressed
 `fact:<role>` wake obligation.
 
+`gitmoot org await withdraw [--role <role>] --reason <text> [--home <dir>] <id>`
+ends a waiting fact its waiter no longer needs, for example after cancelling the
+review on purpose (#2484). Only the waiter role (`--role` or `GITMOOT_ORG_ROLE`)
+may withdraw, and only while the fact is `waiting`. It ends `superseded` with
+`withdrawn by <role>: <reason>` in `resolution_detail`, retires any undelivered
+wake for it, and wakes nobody, also at its deadline. A cancelled or failed
+review's notice names this command with the fact's ID.
+
 `gitmoot org await list [--role <role>] [--state
 waiting|satisfied|expired|superseded] [--json] [--home <dir>]` shows live and
 terminal subscriptions. The existing one-minute org supervision lane ends

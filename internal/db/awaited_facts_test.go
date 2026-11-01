@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -276,6 +277,57 @@ func TestFailedReviewWakeIsRetiredWhenFactExpiresToParent(t *testing.T) {
 	}
 	if state := awaitedFactState(t, store, fact.ID); state != AwaitedFactStateExpired {
 		t.Fatalf("awaited fact state = %q, want expired", state)
+	}
+}
+
+// #2484. A waiter that cancelled its review on purpose withdraws the wait: it
+// ends superseded with the reason, the pending cancel notice is retired, and
+// the deadline later wakes nobody. Another role cannot withdraw it, and a wait
+// that already ended cannot be withdrawn.
+func TestWithdrawAwaitedFactEndsTheWaitWithoutWaking(t *testing.T) {
+	store := openAwaitedFactTestStore(t)
+	ctx := context.Background()
+	fact := subscribeReviewFact(t, store, "lane", "acme/widget", 46, "head-withdrawn")
+	payload := `{"repo":"acme/widget","pull_request":46,"head_sha":"head-withdrawn"}`
+	if err := store.CreateJobWithEvent(ctx, Job{
+		ID: "review-cancelled", Agent: "reviewer", Type: "review", State: "running",
+		Repo: "acme/widget", PullRequest: 46, Payload: payload,
+	}, JobEvent{Kind: "running", Message: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.TransitionJobStatePayloadWithEvent(ctx, "review-cancelled", "running", "cancelled", payload,
+		JobEvent{Kind: "cancelled", Message: "cancel requested from running"}); err != nil || !changed {
+		t.Fatalf("cancel transition changed=%t err=%v", changed, err)
+	}
+	pending, err := store.ListWakeOutbox(ctx, WakeOutboxStatePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("cancel notices = %+v, want one", pending)
+	}
+
+	if _, err := store.WithdrawAwaitedFact(ctx, fact.ID, "intruder", "not mine", time.Now().UTC()); !errors.Is(err, ErrAwaitedFactNotWithdrawable) {
+		t.Fatalf("withdraw by another role err = %v, want refusal", err)
+	}
+	withdrawn, err := store.WithdrawAwaitedFact(ctx, fact.ID, "Lane", "cancelled on purpose: level 1", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("withdraw by waiter: %v", err)
+	}
+	if withdrawn.State != AwaitedFactStateSuperseded || withdrawn.ResolutionDetail != "withdrawn by lane: cancelled on purpose: level 1" {
+		t.Fatalf("withdrawn fact = %+v", withdrawn)
+	}
+	if pending, _ := store.ListWakeOutbox(ctx, WakeOutboxStatePending); len(pending) != 0 {
+		t.Fatalf("pending wakes after withdraw = %+v, want none", pending)
+	}
+	if _, err := store.WithdrawAwaitedFact(ctx, fact.ID, "lane", "again", time.Now().UTC()); !errors.Is(err, ErrAwaitedFactNotWithdrawable) {
+		t.Fatalf("second withdraw err = %v, want refusal", err)
+	}
+	if expired, err := store.ExpireAwaitedFact(ctx, fact.ID, "owner", time.Now().UTC().Add(2*time.Hour)); err != nil || expired {
+		t.Fatalf("deadline after withdraw changed=%t err=%v, want no change", expired, err)
+	}
+	if pending, _ := store.ListWakeOutbox(ctx, WakeOutboxStatePending); len(pending) != 0 {
+		t.Fatalf("deadline after withdraw woke %+v", pending)
 	}
 }
 

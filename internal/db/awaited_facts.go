@@ -1044,6 +1044,64 @@ WHERE id = ? AND state = 'waiting'`
 	return true, tx.Commit()
 }
 
+// ErrAwaitedFactNotWithdrawable reports a withdraw of a wait that is not the
+// caller's or is no longer waiting.
+var ErrAwaitedFactNotWithdrawable = errors.New("awaited fact cannot be withdrawn")
+
+// WithdrawAwaitedFact ends a waiting fact on its waiter's request (#2484), for
+// example after the waiter cancelled the review on purpose. It ends as
+// superseded with "withdrawn by <role>: <reason>" as its resolution detail,
+// supersedes any undelivered wake for it, and wakes nobody: the waiter is the
+// one who stopped asking. Only the waiter role may withdraw, and only while
+// the fact is waiting; the state CAS keeps a concurrent verdict or expiry from
+// being overwritten.
+func (s *Store) WithdrawAwaitedFact(ctx context.Context, id int64, role, reason string, now time.Time) (AwaitedFact, error) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	reason = strings.TrimSpace(reason)
+	if role == "" || reason == "" {
+		return AwaitedFact{}, errors.New("withdrawing an awaited fact requires the waiter role and a reason")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return AwaitedFact{}, err
+	}
+	defer tx.Rollback()
+	var waiter, state string
+	if err := tx.QueryRowContext(ctx, `SELECT waiter_role, state FROM awaited_facts WHERE id = ?`, id).Scan(&waiter, &state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AwaitedFact{}, fmt.Errorf("%w: awaited fact %d does not exist", ErrAwaitedFactNotWithdrawable, id)
+		}
+		return AwaitedFact{}, err
+	}
+	if waiter != role {
+		return AwaitedFact{}, fmt.Errorf("%w: awaited fact %d is waited on by %s, not %s", ErrAwaitedFactNotWithdrawable, id, waiter, role)
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `
+UPDATE awaited_facts
+SET state = 'superseded', resolution_detail = ?, updated_at = ?
+WHERE id = ? AND state = 'waiting'`, "withdrawn by "+role+": "+reason, stamp, id)
+	if err != nil {
+		return AwaitedFact{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AwaitedFact{}, err
+	}
+	if affected == 0 {
+		var current string
+		_ = tx.QueryRowContext(ctx, `SELECT state FROM awaited_facts WHERE id = ?`, id).Scan(&current)
+		return AwaitedFact{}, fmt.Errorf("%w: awaited fact %d is already %s", ErrAwaitedFactNotWithdrawable, id, firstNonEmptyString(current, state))
+	}
+	if err := supersedePendingAwaitedFactWakesTx(ctx, tx, id, AwaitedFactStateSuperseded, now); err != nil {
+		return AwaitedFact{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AwaitedFact{}, err
+	}
+	return s.GetAwaitedFact(ctx, id)
+}
+
 // awaitedFactSupersededTx names why a review wait no longer asks a live
 // question, or returns "" when it still does. Nothing else retires a wait
 // whose head was replaced: a blocked review leaves it waiting, and the
