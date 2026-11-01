@@ -26,6 +26,10 @@ func ProbeDaemonProcess(pid int, metaFile string) (state string, err error) {
 	if state != DaemonRunning {
 		return state, nil
 	}
+	// A live non-leader thread ID is not the recorded daemon process (#2463).
+	if leader, known := processIsThreadGroupLeader(pid); known && !leader {
+		return DaemonStopped, nil
+	}
 	if processLooksLikeDaemon(pid, metaFile) {
 		return DaemonRunning, nil
 	}

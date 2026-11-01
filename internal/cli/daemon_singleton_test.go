@@ -50,6 +50,43 @@ func spawnFakeDaemon(t *testing.T, state daemonState) (pid int) {
 	return pid
 }
 
+// recordOwnThreadAsDaemon reproduces #2463 with a real kernel identity: after a
+// VM restart, a persisted daemon PID can be reused as a non-leader thread of the
+// starting daemon. kill(0) and /proc/<tid>/cmdline both accept that thread ID,
+// and the cmdline is exactly the recorded daemon argv.
+func recordOwnThreadAsDaemon(t *testing.T, state daemonState) {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Skipf("Linux thread IDs unavailable: %v", err)
+	}
+	tid := 0
+	for _, entry := range entries {
+		if id, err := strconv.Atoi(entry.Name()); err == nil && id != os.Getpid() {
+			tid = id
+			break
+		}
+	}
+	if tid == 0 {
+		t.Skip("test process has no non-leader thread")
+	}
+	cmdline, err := os.ReadFile("/proc/self/cmdline")
+	if err != nil {
+		t.Fatalf("read own cmdline: %v", err)
+	}
+	argv := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
+	meta := daemonMeta{
+		PID:        tid,
+		StartedAt:  time.Now().UTC().Format(time.RFC3339),
+		Args:       argv[1:],
+		LogFile:    state.LogFile,
+		Executable: argv[0],
+	}
+	if err := writeDaemonState(state, meta); err != nil {
+		t.Fatalf("writeDaemonState: %v", err)
+	}
+}
+
 // TestGuardDaemonRunSingleton is the #550 regression: `daemon run` must refuse to
 // start a SECOND daemon on a home that already has a LIVE registered daemon, while
 // a stale pidfile from a dead daemon (and a clean home) must NOT block a fresh
@@ -86,6 +123,13 @@ func TestGuardDaemonRunSingleton(t *testing.T) {
 			wantCode: 0,
 		},
 		{
+			name: "persisted pid reused as own thread allows start",
+			setup: func(t *testing.T, state daemonState) {
+				recordOwnThreadAsDaemon(t, state)
+			},
+			wantCode: 0,
+		},
+		{
 			name: "live registered daemon refuses start",
 			setup: func(t *testing.T, state daemonState) {
 				spawnFakeDaemon(t, state)
@@ -118,7 +162,7 @@ func TestGuardDaemonRunSingleton(t *testing.T) {
 
 			// The stale-pidfile case must also have been cleared, so a fresh start
 			// is unobstructed (currentDaemonPID reports not-running).
-			if tt.name == "stale pidfile from dead daemon allows start" {
+			if tt.name == "stale pidfile from dead daemon allows start" || tt.name == "persisted pid reused as own thread allows start" {
 				if pid, _, err := currentDaemonPID(state); err != nil || pid != 0 {
 					t.Fatalf("stale pidfile not cleared: pid=%d err=%v", pid, err)
 				}
