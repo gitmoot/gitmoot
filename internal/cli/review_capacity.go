@@ -94,7 +94,13 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 				volume = v
 			}
 		}
-		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || (admitting && !janitorClearedStates[volume.state]) {
+		stateOK := janitorClearedStates[volume.stateOrEmpty()]
+		if !admitting {
+			// While running, known low-space pressure is not a reason to stop
+			// (owner policy); unknown or unrecognised evidence still is.
+			stateOK = stateOK || janitorPressureStates[volume.stateOrEmpty()]
+		}
+		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || !stateOK {
 			return nil, nil, fmt.Errorf("review device %d (%s) has unknown or unsafe canonical capacity", device, path)
 		}
 		usage, err := measureDiskGuardFilesystem(path)
@@ -281,6 +287,20 @@ func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reas
 }
 
 // reviewCapacityCancelledEventKind records why the capacity monitor cancelled
-// a running review (hard floor, canonical reserve, device change, policy
-// change), so the job history never shows an unexplained cancel.
+// a running review (failed or unknown capacity evidence, device change, policy
+// change; never low space), so the job history never shows an unexplained
+// cancel.
 const reviewCapacityCancelledEventKind = "review_capacity_cancelled"
+
+// janitorPressureStates are Janitor states that report KNOWN low space. They
+// hold new admissions but never stop a running review (#2479); every other
+// non-cleared state, measurement_unknown included, is unknown evidence.
+var janitorPressureStates = map[string]bool{"critical": true, "no_safe_reclaim": true}
+
+// stateOrEmpty is nil-safe so the state lookup can precede the nil check.
+func (v *janitorVolume) stateOrEmpty() string {
+	if v == nil {
+		return ""
+	}
+	return v.state
+}

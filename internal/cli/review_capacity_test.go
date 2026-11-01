@@ -163,10 +163,20 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 
 // Jarvis 380078/380099, owner disk policy: low space decides only where NEW
 // reviews start. A local review admitted above 20GB keeps running when free
-// space falls into the 10-20GB band and even below the 10GB floor ("do not
-// blindly terminate running work"). Failed capacity evidence still stops it
-// fail-closed, and the cancel names its reason on the job.
+// space falls into the 10-20GB band and even below the 10GB floor, also while
+// Janitor reports known pressure states ("do not blindly terminate running
+// work"). Failed or unknown capacity evidence still stops it fail-closed, and
+// the cancel names its reason on the job.
 func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
+	for _, tc := range []struct{ trigger, wantReason string }{
+		{"statfs_failed", "statfs failed"},
+		{"janitor_measurement_unknown", "unknown or unsafe canonical capacity"},
+	} {
+		t.Run(tc.trigger, func(t *testing.T) { runLowSpaceMonitorScenario(t, tc.trigger, tc.wantReason) })
+	}
+}
+
+func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	declareNoRealAdapterExec(t)
 	home, store, head := reviewRouterHome(t)
 	ctx := context.Background()
@@ -200,6 +210,8 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 	var free atomic.Uint64
 	free.Store(25_000_000_000)
 	var broken atomic.Bool
+	var state atomic.Value
+	state.Store("target_recovered")
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		if broken.Load() {
 			return diskFilesystemUsage{}, errors.New("statfs failed")
@@ -210,7 +222,7 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
 		volumes := make([]string, 0, len(devices))
 		for device := range devices {
-			volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"target_recovered","admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"measured"}`, device, device, free.Load()))
+			volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":%q,"admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"measured"}`, device, device, state.Load().(string), free.Load()))
 		}
 		return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
 	}
@@ -234,27 +246,35 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("review never reached delivery")
 	}
-	// Into the warning band, then below the hard floor: each for at least two
-	// monitor intervals, the review still running.
-	for _, bytes := range []uint64{15_000_000_000, 5_000_000_000} {
-		free.Store(bytes)
+	// Into the warning band, then below the hard floor while Janitor reports
+	// known pressure: each for at least two monitor intervals, still running.
+	for _, phase := range []struct {
+		bytes uint64
+		state string
+	}{{15_000_000_000, "cleanup_needed"}, {5_000_000_000, "critical"}, {5_000_000_000, "no_safe_reclaim"}} {
+		free.Store(phase.bytes)
+		state.Store(phase.state)
 		select {
 		case <-finished:
 			events, _ := store.ListJobEvents(ctx, job.ID)
-			t.Fatalf("running local review was stopped at %d free bytes: %v events=%+v", bytes, runErr, events)
+			t.Fatalf("running local review was stopped at %d free bytes (%s): %v events=%+v", phase.bytes, phase.state, runErr, events)
 		case <-time.After(2*reviewCapacityInterval + time.Second):
 		}
 	}
-	// A failed measurement is unknown evidence: fail closed, and say why.
-	broken.Store(true)
+	// Failed or unknown evidence: fail closed, and say why.
+	if trigger == "statfs_failed" {
+		broken.Store(true)
+	} else {
+		state.Store("measurement_unknown")
+	}
 	select {
 	case <-finished:
 	case <-time.After(8 * time.Second):
-		t.Fatal("review kept running after its disk measurement failed")
+		t.Fatalf("review kept running after %s", trigger)
 	}
 	ended, err := store.GetJob(ctx, job.ID)
 	if err != nil || ended.State != string(workflow.JobCancelled) {
-		t.Fatalf("review after failed measurement = %+v, %v; want cancelled", ended, err)
+		t.Fatalf("review after %s = %+v, %v; want cancelled", trigger, ended, err)
 	}
 	events, err := store.ListJobEvents(ctx, job.ID)
 	if err != nil {
@@ -266,7 +286,7 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 			reason = event.Message
 		}
 	}
-	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") || !strings.Contains(reason, "statfs failed") {
+	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") || !strings.Contains(reason, wantReason) {
 		t.Fatalf("cancel has no recorded reason: %+v", events)
 	}
 }
