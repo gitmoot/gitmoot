@@ -250,3 +250,38 @@ func TestReviewChecksRoutingRefusesRuntimeWithoutTemplate(t *testing.T) {
 		}
 	}
 }
+
+// #2476 follow-up: a review already holding the head's claim cannot receive
+// private evidence, so an evidence request must be refused instead of
+// attaching and reporting a review that has no files (seen on herdrup#587).
+func TestReviewEvidenceRequestRefusesToAttachToExistingReview(t *testing.T) {
+	home, store, head := reviewChecksRoutingHome(t, "")
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head,
+		"--branch", "feature/review", "--role", "joltra", "--home", home,
+		"--runtime", runtime.OmpRuntime, "--exec-backend", "remote", "--json"}
+	first, failure := runReviewRequestJSON(t, base...)
+	if failure != "" || first.JobID == "" {
+		t.Fatalf("first review: %q %+v", failure, first)
+	}
+	evidence := filepath.Join(t.TempDir(), "native.log")
+	if err := os.WriteFile(evidence, []byte("log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("log\n"))
+	manifest, _ := json.Marshal(map[string]any{"schema_version": 1, "head_sha": head, "files": []map[string]any{{"path": evidence, "bytes": 4, "sha256": hex.EncodeToString(sum[:])}}})
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, failure := runReviewRequestJSON(t, append(base, "--evidence-manifest", manifestPath)...)
+	if failure == "" || !strings.Contains(failure, first.JobID) || !strings.Contains(failure, "cannot attach") {
+		t.Fatalf("evidence request = %+v failure=%q; want refusal naming %s", second, failure, first.JobID)
+	}
+	jobs, err := store.ListJobsByType(context.Background(), "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("review jobs = %d, want only the first", len(jobs))
+	}
+}
