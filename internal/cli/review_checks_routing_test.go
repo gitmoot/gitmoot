@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -283,5 +285,85 @@ func TestReviewEvidenceRequestRefusesToAttachToExistingReview(t *testing.T) {
 	}
 	if len(jobs) != 1 {
 		t.Fatalf("review jobs = %d, want only the first", len(jobs))
+	}
+}
+
+// Jarvis 381063, owner policy (#2466): 10-20GB free means reviews use E2B.
+// A `review request` without --exec-backend must be queued for E2B in the
+// warning band instead of being refused at local preparation (Phobos hit the
+// refusal on macserve#55). Below the 10GB floor it is still refused; above
+// the warning threshold it stays local.
+func TestReviewRequestRoutesToE2BInWarningBand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		free uint64
+		// janitor, when set, is the canonical sample: available and target bytes.
+		janitor *[2]uint64
+		want    string // "remote", "local" or "refused"
+	}{
+		{"warning_band", 15_000_000_000, nil, "remote"},
+		{"above_warning", 25_000_000_000, nil, "local"},
+		{"below_floor", 5_000_000_000, nil, "refused"},
+		// #2486 review: a recovered statfs reading must not erase a lower
+		// canonical sample, and a canonical target above the configured
+		// threshold widens the band, as for queued reviews.
+		{"canonical_low_statfs_recovered", 30_000_000_000, &[2]uint64{19_999_999_999, 20_000_000_000}, "remote"},
+		{"canonical_target_above_configured", 22_000_000_000, &[2]uint64{22_000_000_000, 25_000_000_000}, "remote"},
+		{"canonical_recovered", 30_000_000_000, &[2]uint64{30_000_000_000, 20_000_000_000}, "local"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store, head := reviewChecksRoutingHome(t, "")
+			paths := config.PathsForHome(home)
+			appendConfig(t, paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+				return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: tc.free}, nil
+			})
+			if tc.janitor != nil {
+				enableJanitorCapacity(t, paths)
+				device, err := janitorDeviceOf(paths.Home)
+				if err != nil {
+					t.Fatal(err)
+				}
+				previous := runJanitorStatus
+				runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+					volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"target_recovered","admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":%d,"reason":"measured"}`, device, device, tc.janitor[0], tc.janitor[1])
+					return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volume)), nil
+				}
+				t.Cleanup(func() { runJanitorStatus = previous })
+			}
+			out, failure := runReviewRequestJSON(t,
+				"--repo", "owner/repo", "--pr", "12", "--head", head,
+				"--branch", "feature/review", "--role", "joltra", "--home", home,
+				"--runtime", runtime.OmpRuntime, "--json",
+			)
+			if tc.want == "refused" {
+				if failure == "" {
+					t.Fatalf("below the floor the review was dispatched: %+v", out)
+				}
+				return
+			}
+			if failure != "" {
+				t.Fatalf("review refused at %d free bytes: %s", tc.free, failure)
+			}
+			job, err := store.GetJob(context.Background(), out.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := daemonJobPayload(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend, present := payload.ExecBackendOverride()
+			remote := present && backend == "remote"
+			if tc.want == "remote" {
+				if !remote || !payload.DiskGuardRouted || !payload.PolicyRoutedReview || payload.WorktreePath != "" {
+					t.Fatalf("warning-band review not routed to E2B before local preparation: %+v", payload)
+				}
+				return
+			}
+			if remote || payload.DiskGuardRouted {
+				t.Fatalf("review above the warning threshold was routed remote: %+v", payload)
+			}
+		})
 	}
 }

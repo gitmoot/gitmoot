@@ -845,9 +845,15 @@ percentage floor. Unknown or invalid measurements still fail closed.
   and a re-review that fails before its job exists gives the claim back. The
   new job records `review_supersedes` and the reason; the old job gets a
   `review_part_superseded` event.
+- **New review requests (#2485):** in the warning band, `review request` and
+  background `agent review` without `--exec-backend` are queued for E2B
+  before any other routing rule (post-merge, draft and routine reviews
+  included), with the same CI rules as moved queued reviews. Below the hard
+  floor they are refused.
 - **Foreground reviews:** local preparation refuses before creating a job when
-  the warning threshold requires E2B. Use an explicit E2B route or background
-  dispatch; foreground execution is not a capacity exception.
+  the warning threshold requires E2B; the error says to use `--exec-backend
+  remote` with an omp or shell runtime. Foreground execution is not a capacity
+  exception.
 - **Janitor pressure:** fresh canonical `target_bytes` is the review warning
   threshold, not a state-name heuristic. `reserve_bytes` remains the hard
   floor. Canonical warning routing happens before fresh-space local admission;

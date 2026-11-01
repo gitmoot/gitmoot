@@ -300,6 +300,10 @@ type JobRequest struct {
 	// PolicyRoutedReview requires a fresh green current-head CI check before a
 	// policy-selected remote review can reserve cloud capacity.
 	PolicyRoutedReview bool
+	// DiskGuardRouted marks a review sent to E2B because free space is in the
+	// review warning band (#2466). Remote admission then allows a repository
+	// with no CI, as for reviews the daemon moves out of the queue.
+	DiskGuardRouted bool
 	// ReviewChecksRouted marks a review routed remote by its repository's
 	// checks_backend (#2316). Such a review needs the remote toolchain, so
 	// admission skips the spend gates and a full provider cap makes it wait.
@@ -928,6 +932,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		ExecProvider:           strings.TrimSpace(request.ExecProvider),
 		ExecTemplate:           strings.TrimSpace(request.ExecTemplate),
 		PolicyRoutedReview:     request.PolicyRoutedReview,
+		DiskGuardRouted:        request.DiskGuardRouted,
 		ReviewChecksRouted:     request.ReviewChecksRouted,
 		Plan:                   request.Plan,
 		PlanInto:               strings.TrimSpace(request.PlanInto),

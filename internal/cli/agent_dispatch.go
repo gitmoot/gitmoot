@@ -144,6 +144,10 @@ var remoteReviewProtectedPaths = []string{
 	"**/lifecycle/**",
 }
 
+// reviewWarningBandRouteReason prefixes the route reason of a review sent to
+// E2B by the 20GB warning band, so dispatch can mark it DiskGuardRouted.
+const reviewWarningBandRouteReason = "disk warning band"
+
 // reviewPolicyBackend makes an opt-in, deterministic decision before enqueue
 // and before the execution backend can reserve cloud capacity. The boolean
 // records whether an enabled policy evaluated the review, even if it stayed
@@ -155,6 +159,23 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	}
 	if !request.Background {
 		return execbackend.Local, false, "foreground review stays local"
+	}
+	// Owner policy (#2466): below the review warning threshold queued reviews
+	// use E2B. Decided before every other rule, so a post-merge, draft or
+	// routine review is sent remote instead of being refused at local
+	// preparation. Below the hard floor nothing is routed; admission refuses as
+	// before. Foreground reviews still refuse in the band, with a hint to pass
+	// --exec-backend remote.
+	if paths, err := pathsFromFlag(request.Home); err == nil {
+		evaluation := evaluateConfiguredDiskGuard(paths)
+		inBand := evaluation.allowsDispatch() && evaluation.reviewsBelowThreshold()
+		if !inBand {
+			// Same canonical widening as the queued router (#2485 review).
+			evaluation, inBand = canonicalReviewWarningBand(paths, loadJanitorAdmission(ctx, paths))
+		}
+		if inBand {
+			return execbackend.Remote, true, fmt.Sprintf("%s: free space %d below review warning threshold %d", reviewWarningBandRouteReason, evaluation.Usage.FreeBytes, evaluation.Policy.RemoteReviewsBelowBytes)
+		}
 	}
 	paths, err := pathsFromFlag(request.Home)
 	if err != nil {
@@ -412,6 +433,8 @@ type localAgentDispatchRequest struct {
 	RouterBypassReason string
 	ReviewRouteReason  string
 	PolicyRoutedReview bool
+	// DiskGuardRouted: routed to E2B by the review warning band (#2466).
+	DiskGuardRouted bool
 	// DispatchWarning surfaces advisory pre-delivery checks to the operator. It
 	// is deliberately not persisted in the job payload.
 	DispatchWarning func(string)
@@ -690,6 +713,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 				selected := string(route)
 				request.ExecBackend = &selected
 				request.PolicyRoutedReview = true
+				request.DiskGuardRouted = strings.HasPrefix(reason, reviewWarningBandRouteReason)
 				execBackend = route
 				request.jobRunner, err = jobSubprocessRunnerForBackend(execBackend)
 				if err != nil {
@@ -1167,6 +1191,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ExecProvider:             request.ExecProvider,
 		ExecTemplate:             request.ExecTemplate,
 		PolicyRoutedReview:       request.PolicyRoutedReview,
+		DiskGuardRouted:          request.DiskGuardRouted,
 		ReviewChecksRouted:       request.ReviewChecksRouted,
 		RuntimeOverride:          overrideRuntime,
 		RuntimeOverrideRef:       overrideRef,
