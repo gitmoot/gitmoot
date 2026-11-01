@@ -469,22 +469,26 @@ detection.
    mv /root/.local/bin/gitmoot-dashboard-web.new /root/.local/bin/gitmoot-dashboard-web
    ```
 
-4. Restart at idle: confirm 0 running/queued **engine-dispatched** jobs
-   first, not raw job count. Session-recorded jobs (`session-ask-*`/
-   `session-implement-*`, #657) run entirely outside the daemon process — no
-   subprocess, no lease — and may legitimately stay `running` for hours, so
-   they don't belong in this check. #1125's reaper keeps genuinely abandoned
-   session jobs from piling up forever, but on an hours-to-a-day timescale;
-   that is a background-hygiene guarantee, not a substitute for checking
-   right now:
+4. Restart when no **engine-dispatched** job is running; queued jobs may
+   remain (owner standing decision 2026-11-01, record
+   `/root/fleet-tools/state/gitmoot-deploy/owner-restart-with-queued-standing-20261101.json`).
+   Queued jobs stay in the database and the restarted daemon picks them up.
+   Session-recorded jobs (`session-ask-*`/`session-implement-*`, #657) run
+   entirely outside the daemon process — no subprocess, no lease — and may
+   legitimately stay `running` for hours, so they don't belong in this check.
+   #1125's reaper keeps genuinely abandoned session jobs from piling up
+   forever, but on an hours-to-a-day timescale; that is a background-hygiene
+   guarantee, not a substitute for checking right now:
 
    ```sh
    gitmoot job list --state running --json | jq '[.[] | select(.id | startswith("session-") | not)]'
-   gitmoot job list --state queued --json | jq '[.[] | select(.id | startswith("session-") | not)]'
+   gitmoot job list --state queued --json | jq -r '.[] | select(.id | startswith("session-") | not) | .id' > queued-before-restart.txt
    ```
 
-   Both empty (`[]`), then:
+   Running list empty (`[]`), then:
    `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
+   Afterwards confirm every id in `queued-before-restart.txt` still exists
+   (queued, running or finished).
 5. Config-only changes (e.g. `[admission]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
 6. **Public releases need explicit OWNER sign-off** —
