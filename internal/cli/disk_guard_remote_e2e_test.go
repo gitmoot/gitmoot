@@ -5,6 +5,7 @@ package cli
 import (
 	"database/sql"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,18 @@ import (
 func diskRoutedAdmissionFixture(t *testing.T) *remoteReviewAdmissionFixture {
 	t.Helper()
 	f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
+	contents, err := os.ReadFile(f.paths.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = []byte(strings.Replace(string(contents), `backend = "remote"`, `backend = "local"`, 1))
+	if err := os.WriteFile(f.paths.ConfigFile, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	appendConfig(t, f.paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: 19_999_999_999}, nil
+	})
 	payload, err := daemonJobPayload(f.job)
 	if err != nil {
 		t.Fatal(err)
@@ -86,6 +99,9 @@ func TestADiskRoutedReviewWhoseRemoteRunIsRefusedWaitsInsteadOfFailing(t *testin
 			t.Fatalf("provision calls = %d, want 1 (the probe refuses it)", f.backend.provisionCalls)
 		}
 		f.assertWaitingLocallyAgain(t)
+		if pending := pendingIDs(t, f.ctx, f.worker); len(pending) != 0 {
+			t.Fatalf("refused E2B review fell back to local dispatch in warning band: %v", pending)
+		}
 	})
 }
 

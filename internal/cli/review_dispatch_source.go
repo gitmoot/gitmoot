@@ -50,6 +50,11 @@ func admitDispatchPreparation(ctx context.Context, store *db.Store, request *loc
 		request.JobID = firstNonEmpty(strings.TrimSpace(request.JobID), localAgentJobID(request.Action, request.Agent))
 		return startReviewCapacityMonitor(ctx, store, paths, repo.FullName(), request.HeadSHA, request.JobID, request.remoteSource, nil, record.CheckoutPath, record.PrimaryCheckoutPath)
 	}
+	if request.Action == "review" {
+		if err := reviewDiskGuardRefusal(evaluateConfiguredDiskGuard(paths), request.remoteSource); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := janitorPressureRefusal(ctx, store, paths, repo.FullName(), record.CheckoutPath, record.PrimaryCheckoutPath); err != nil {
 		return nil, nil, err
 	}

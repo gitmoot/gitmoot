@@ -221,13 +221,11 @@ func diskGuardPaths(worker jobWorker) (config.Paths, error) {
 	return paths, nil
 }
 
-// diskGuardQueuedDispatch returns the queued jobs the disk guard lets dispatch:
-// all of jobs while the disk is healthy; otherwise only the reviews that run on
-// the remote backend (diskGuardRemoteReviews, opt-in), or none. It is called
-// only by the normal queued-job dispatch listing. Daemon maintenance and
-// reconciliation do not pass through this function, so future in-process
-// reclaim remains able to free disk while agent dispatch is paused.
-func diskGuardLocalQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
+// diskGuardQueuedDispatch applies the source-host floor to every delivery,
+// including E2B reviews that still write controller state. Above that floor,
+// the warning band routes reviews before Janitor's fresh-space admission.
+// Maintenance and reconciliation remain outside this new-work guard.
+func diskGuardQueuedDispatch(ctx context.Context, worker jobWorker, jobs []db.Job, repoFilter, rootFilter string) []db.Job {
 	matching := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
@@ -258,14 +256,6 @@ func diskGuardLocalQueuedDispatch(ctx context.Context, worker jobWorker, jobs []
 	}
 
 	detail := evaluation.detail()
-	var remote []db.Job
-	if evaluation.Err == nil && evaluation.Policy.RemoteReviews {
-		remote = diskGuardRemoteReviews(ctx, worker, matching, detail)
-	}
-	routed := make(map[string]bool, len(remote))
-	for _, job := range remote {
-		routed[job.ID] = true
-	}
 	fingerprint := evaluation.refusalFingerprint()
 	now := time.Now()
 	if shouldLogDiskGuardRefusal(evaluation.Path, fingerprint, now) {
@@ -274,9 +264,6 @@ func diskGuardLocalQueuedDispatch(ctx context.Context, worker jobWorker, jobs []
 	failedEventWrites := 0
 	var firstEventWriteErr error
 	for _, job := range matching {
-		if routed[job.ID] {
-			continue
-		}
 		if err := worker.Store.AddJobEventIfAbsent(ctx, db.JobEvent{
 			JobID:   job.ID,
 			Kind:    diskGuardRefusalEventKind,
@@ -299,7 +286,7 @@ func diskGuardLocalQueuedDispatch(ctx context.Context, worker jobWorker, jobs []
 			firstEventWriteErr,
 		)
 	}
-	return remote
+	return nil
 }
 
 const (

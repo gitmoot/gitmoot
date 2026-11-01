@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,9 +19,123 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
+func TestWarningBandRejectsNonE2BReviewRoutes(t *testing.T) {
+	for _, checksRoute := range []bool{false, true} {
+		t.Run(fmt.Sprintf("repository_checks=%t", checksRoute), func(t *testing.T) {
+			ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+			paths, err := diskGuardPaths(worker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := filepath.Join(t.TempDir(), "sandboxd-key")
+			if err := os.WriteFile(key, []byte("isolated-test-key"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			appendConfig(t, paths, fmt.Sprintf("\n[remote_exec.sandboxd]\napi_key_file = %q\ntemplate = \"review-arm64\"\nbase_url = \"https://sandboxd.example:8443\"\nenvd_base_url = \"https://sandboxd.example:8443\"\nmax_concurrent = 1\n", key))
+			extra := `,"exec_backend":"remote","exec_provider":"sandboxd"`
+			if checksRoute {
+				appendConfig(t, paths, "\n[repos.\"owner/repo\".review]\nchecks_backend = \"remote\"\nchecks_provider = \"sandboxd\"\nchecks_template = \"review-arm64\"\n")
+				extra = ""
+			}
+			queueDiskGuardJob(t, ctx, store, "non-e2b-review", "rev-omp", "review", extra)
+			before, err := store.GetJob(ctx, "non-e2b-review")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pendingIDs(t, ctx, worker); len(got) != 0 {
+				t.Fatalf("non-E2B review escaped warning band: %v", got)
+			}
+			after, err := store.GetJob(ctx, before.ID)
+			if err != nil || after.Payload != before.Payload || after.State != before.State {
+				t.Fatalf("holding the route changed its identity: %+v, %v", after, err)
+			}
+		})
+	}
+}
+
+func TestReviewThresholdsApplyBeforeFreshSpaceAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		free   uint64
+		live   uint64
+		target uint64
+		want   string
+		remote bool
+		// optOut runs with [disk_guard] remote_reviews = false: the canonical
+		// warning band must not spend the E2B cap without the operator's opt-in.
+		optOut bool
+	}{
+		{"below_floor", 9_999_999_999, 9_999_999_999, 20_000_000_000, "", false, false},
+		{"floor_equal", 10_000_000_000, 10_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"floor_plus_one", 10_000_000_001, 10_000_000_001, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"below_warning", 19_999_999_999, 19_999_999_999, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"warning_equal", 20_000_000_000, 20_000_000_000, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false, false},
+		{"above_warning", 20_000_000_001, 20_000_000_001, 20_000_000_000, "auto-review,e2b-review,local-review,ordinary", false, false},
+		{"canonical_warning_with_recovered_statfs", 19_999_999_999, 30_000_000_000, 20_000_000_000, "auto-review,e2b-review,ordinary", true, false},
+		{"canonical_floor_with_recovered_statfs", 9_999_999_999, 30_000_000_000, 20_000_000_000, "", false, false},
+		{"unknown_warning_target", 30_000_000_000, 30_000_000_000, 0, "ordinary", false, false},
+		{"canonical_warning_without_remote_opt_in", 19_999_999_999, 30_000_000_000, 20_000_000_000, "e2b-review,ordinary", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, store, worker := diskGuardRemoteFixture(t, !tc.optOut, 4)
+			paths, err := diskGuardPaths(worker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			appendConfig(t, paths, fmt.Sprintf("\n[janitor_capacity]\nenabled = true\nexecutable = \"/usr/local/bin/janitor\"\nreview_admission = \"fresh_space\"\npolicy_hash = %q\n", janitorTestPolicyHash))
+			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+				return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: tc.live}, nil
+			})
+			hostPaths, root, err := janitorHostPaths(ctx, store, paths, "owner/repo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			devices, err := janitorHostDevices(hostPaths, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var volumes []string
+			for device := range devices {
+				volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":%t,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":%d}`, device, device, tc.free < 10_000_000_000, tc.free, tc.target))
+			}
+			replaceJanitorStatus(t, janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...), nil)
+			queueDiskGuardJob(t, ctx, store, "auto-review", "rev-omp", "review", "")
+			queueDiskGuardJob(t, ctx, store, "e2b-review", "rev-omp", "review", `,"exec_backend":"remote"`)
+			queueDiskGuardJob(t, ctx, store, "local-review", "rev-omp", "review", `,"exec_backend":"local"`)
+			queueDiskGuardJob(t, ctx, store, "ordinary", "rev-omp", "ask", "")
+			queueDiskGuardJob(t, ctx, store, "running-review", "rev-omp", "review", `,"exec_backend":"local"`)
+			ok, err := store.TransitionJobState(ctx, "running-review", string(workflow.JobQueued), string(workflow.JobRunning))
+			if err != nil || !ok {
+				t.Fatalf("seed running delivery: %v, %v", ok, err)
+			}
+			running, err := store.GetJob(ctx, "running-review")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for pass := 0; pass < 2; pass++ {
+				gotIDs := pendingIDs(t, ctx, worker)
+				slices.Sort(gotIDs)
+				if got := strings.Join(gotIDs, ","); got != tc.want {
+					t.Fatalf("dispatch at %d bytes = %q, want %q", tc.free, got, tc.want)
+				}
+			}
+			if got := storedBackend(t, ctx, store, "auto-review") == "remote"; got != tc.remote {
+				t.Fatalf("automatic review remote=%v at %d bytes, want %v", got, tc.free, tc.remote)
+			}
+			if got := storedBackend(t, ctx, store, "local-review"); got != "local" {
+				t.Fatalf("explicit queued local identity changed: %q", got)
+			}
+			after, err := store.GetJob(ctx, "running-review")
+			if err != nil || after.Payload != running.Payload || after.LifecycleGeneration != running.LifecycleGeneration || after.State != running.State {
+				t.Fatalf("running delivery was mutated: %+v, %v", after, err)
+			}
+		})
+	}
+}
+
 const diskGuardRemoteHead = "0123456789abcdef0123456789abcdef01234567"
 
-// diskGuardRemoteFixture is a daemon home whose disk is below the guard floor,
+// diskGuardRemoteFixture is a daemon home in the review-only warning band,
 // with a remote-capable reviewer and a [remote_exec] cost cap of maxConcurrent
 // attempts at $1 each.
 func diskGuardRemoteFixture(t *testing.T, remoteReviews bool, maxConcurrent int) (context.Context, *db.Store, jobWorker) {
@@ -33,7 +148,11 @@ func diskGuardRemoteFixture(t *testing.T, remoteReviews bool, maxConcurrent int)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Fprintf(f, "\n[disk_guard]\nremote_reviews = %t\n\n[remote_exec]\nbackend = \"local\"\ncost_max_reserved_usd = 100\ncost_per_attempt_usd = 1\ncost_max_concurrent = %d\n", remoteReviews, maxConcurrent)
+	warningBytes := uint64(0)
+	if remoteReviews {
+		warningBytes = 20_000_000_000
+	}
+	fmt.Fprintf(f, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = %t\nremote_reviews_below_bytes = %d\n\n[remote_exec]\nbackend = \"local\"\ncost_max_reserved_usd = 100\ncost_per_attempt_usd = 1\ncost_max_concurrent = %d\n", remoteReviews, warningBytes, maxConcurrent)
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +164,7 @@ func diskGuardRemoteFixture(t *testing.T, remoteReviews bool, maxConcurrent int)
 		}
 	}
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
-		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 1 << 30}, nil
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 15_000_000_000}, nil
 	})
 	return ctx, store, worker
 }
@@ -91,7 +210,7 @@ func storedBackend(t *testing.T, ctx context.Context, store *db.Store, id string
 	return backend
 }
 
-func TestLowDiskSendsReviewsRemoteAndKeepsEverythingElseWaiting(t *testing.T) {
+func TestWarningDiskRoutesReviewsWithoutHoldingOrdinaryWork(t *testing.T) {
 	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
 	queueDiskGuardJob(t, ctx, store, "review-local", "rev-omp", "review", "")
 	queueDiskGuardJob(t, ctx, store, "implement", "rev-omp", "implement", "")
@@ -100,8 +219,9 @@ func TestLowDiskSendsReviewsRemoteAndKeepsEverythingElseWaiting(t *testing.T) {
 	queueDiskGuardJob(t, ctx, store, "review-no-head", "rev-omp", "review", `,"head_sha":""`)
 
 	got := pendingIDs(t, ctx, worker)
-	if strings.Join(got, ",") != "review-local" {
-		t.Fatalf("pending while disk low = %v, want only the remote-capable review", got)
+	slices.Sort(got)
+	if strings.Join(got, ",") != "implement,review-local" {
+		t.Fatalf("warning-band dispatch = %v, want ordinary work and the E2B review", got)
 	}
 	if b := storedBackend(t, ctx, store, "review-local"); b != "remote" {
 		t.Fatalf("routed review stored backend %q, want remote (the worker reads the stored payload)", b)
@@ -127,8 +247,8 @@ func TestLowDiskSendsReviewsRemoteAndKeepsEverythingElseWaiting(t *testing.T) {
 	if routed != 1 {
 		t.Fatalf("%d %s events, want 1", routed, diskGuardRoutedRemoteEventKind)
 	}
-	if events, _ := store.ListJobEvents(ctx, "implement"); !hasEventKind(events, diskGuardRefusalEventKind) {
-		t.Fatalf("waiting implement job lacks the disk-guard refusal event")
+	if events, _ := store.ListJobEvents(ctx, "implement"); hasEventKind(events, diskGuardRefusalEventKind) {
+		t.Fatal("ordinary work was refused merely for the review warning band")
 	}
 }
 
@@ -178,6 +298,9 @@ func TestLowDiskRoutesNoMoreReviewsThanTheCostCapAdmits(t *testing.T) {
 
 func TestLowDiskWithoutTheSwitchStillPausesEveryReview(t *testing.T) {
 	ctx, store, worker := diskGuardRemoteFixture(t, false, 4)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 1 << 30}, nil
+	})
 	queueDiskGuardJob(t, ctx, store, "review-local", "rev-omp", "review", "")
 	if got := pendingIDs(t, ctx, worker); len(got) != 0 {
 		t.Fatalf("pending with remote_reviews off = %v, want none", got)

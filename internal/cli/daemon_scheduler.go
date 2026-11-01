@@ -2263,9 +2263,10 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if draining {
 			return nil, nil
 		}
-		// While low, the guard may still let reviews through on the remote
-		// backend ([disk_guard] remote_reviews); every other job waits. After
-		// the drain check, because switching a review is a durable change that
+		// Below the hard floor nothing new dispatches, reviews included. In the
+		// review warning band ([disk_guard] remote_reviews) reviews move to E2B
+		// and every other job keeps dispatching. This runs after the drain check,
+		// because switching a review is a durable change that
 		// must not happen while dispatch is off.
 		jobs = diskGuardQueuedDispatch(ctx, worker, jobs, repoFilter, rootFilter)
 		if len(jobs) == 0 {

@@ -63,6 +63,8 @@ type janitorVolume struct {
 	reason             string
 	available, reserve uint64
 	hasByteLimits      bool
+	target             uint64
+	hasTarget          bool
 }
 
 type janitorCapacitySnapshot struct {
@@ -102,6 +104,7 @@ func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitor
 					Reason        string       `json:"reason"`
 					Available     *json.Number `json:"available_bytes"`
 					Reserve       *json.Number `json:"reserve_bytes"`
+					Target        *json.Number `json:"target_bytes"`
 				} `json:"volumes"`
 			} `json:"capacity"`
 		} `json:"data"`
@@ -157,6 +160,12 @@ func parseJanitorCapacity(out []byte, policyHash string, now time.Time) (janitor
 			reserve, reserveErr := strconv.ParseUint(raw.Reserve.String(), 10, 64)
 			if availableErr == nil && reserveErr == nil && reserve > 0 {
 				v.available, v.reserve, v.hasByteLimits = available, reserve, true
+			}
+		}
+		if raw.Target != nil {
+			target, err := strconv.ParseUint(raw.Target.String(), 10, 64)
+			if err == nil && v.hasByteLimits && target >= v.reserve {
+				v.target, v.hasTarget = target, true
 			}
 		}
 		s.volumes = append(s.volumes, v)
@@ -388,7 +397,40 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	if !admission.enabled() {
 		return jobs
 	}
-	remotePolicy, remotePolicyErr := config.LoadDiskGuardPolicy(paths)
+	// Canonical warning bytes apply before fresh-space admission, even when a
+	// newer statfs reading has recovered above the configured review threshold.
+	// The E2B route stays an operator opt-in ([disk_guard] remote_reviews): with
+	// it off the canonical band adds no routing, and local reviews keep the
+	// ordinary Janitor admission below. Invalid evidence never routes.
+	if admission.cfgErr == nil && admission.readErr == nil && admission.expired() == "" {
+		device, deviceErr := janitorDeviceOf(paths.Home)
+		evaluation := evaluateConfiguredDiskGuard(paths)
+		var volume *janitorVolume
+		duplicate := false
+		for i := range admission.snapshot.volumes {
+			v := &admission.snapshot.volumes[i]
+			if v.hasDevice && v.device == device {
+				duplicate = volume != nil
+				volume = v
+				if duplicate {
+					break
+				}
+			}
+		}
+		if evaluation.Policy.RemoteReviews && deviceErr == nil && !duplicate && volume != nil && volume.hasTarget && janitorClearedStates[volume.state] && evaluation.allowsDispatch() {
+			evaluation.Usage.FreeBytes = min(evaluation.Usage.FreeBytes, volume.available)
+			evaluation.Policy.RemoteReviewsBelowBytes = max(evaluation.Policy.RemoteReviewsBelowBytes, volume.target)
+			if evaluation.Usage.FreeBytes >= volume.reserve && evaluation.Usage.FreeBytes < evaluation.Policy.RemoteReviewsBelowBytes {
+				matching := make([]db.Job, 0, len(jobs))
+				for _, job := range jobs {
+					if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
+						matching = append(matching, job)
+					}
+				}
+				jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
+			}
+		}
+	}
 	reasons := map[string]string{}
 	allowed := make([]db.Job, 0, len(jobs))
 	now := time.Now()
@@ -431,23 +473,6 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 			allowed = append(allowed, job)
 			continue
 		}
-		if remotePolicyErr == nil && remotePolicy.RemoteReviews {
-			// Reuse the disk-pressure route, including its cap, eligibility,
-			// notifications and refusal-to-local transition. Only an explicit
-			// remote result can pass this hold; checks-policy passthrough may
-			// still select local execution and must remain held.
-			for _, routed := range diskGuardRemoteReviews(ctx, worker, []db.Job{job}, "janitor capacity: "+reason) {
-				payload, err := daemonJobPayload(routed)
-				if err == nil {
-					if backend, present := payload.ExecBackendOverride(); present && backend == "remote" {
-						allowed = append(allowed, routed)
-					}
-				}
-			}
-			if len(allowed) > 0 && allowed[len(allowed)-1].ID == job.ID {
-				continue
-			}
-		}
 		if shouldLogDiskGuard("janitor_capacity", repo, reason, now) {
 			writeLine(worker.Stdout, "JANITOR PRESSURE HOLDS NEW WORK (%s): %s", repo, reason)
 		}
@@ -460,9 +485,12 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	return allowed
 }
 
-// janitorPressureRefusal is the foreground check: it returns an error naming
-// the hold, or nil when the consumer is off or the devices are cleared.
+// janitorPressureRefusal checks direct heavy-work admission. The independent
+// disk floor still applies when the canonical capacity consumer is disabled.
 func janitorPressureRefusal(ctx context.Context, store *db.Store, paths config.Paths, repo string, knownCheckouts ...string) error {
+	if evaluation := evaluateConfiguredDiskGuard(paths); !evaluation.allowsDispatch() {
+		return fmt.Errorf("disk guard refused new heavy work: %s", evaluation.detail())
+	}
 	admission := loadJanitorAdmission(ctx, paths)
 	if !admission.enabled() {
 		return nil

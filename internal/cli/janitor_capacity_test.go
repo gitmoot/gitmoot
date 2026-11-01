@@ -438,9 +438,9 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 		t.Fatal(err)
 	}
 	enableJanitorCapacity(t, paths)
-	// The existing disk guard is healthy; only Janitor holds this work.
+	// Warning-band routing precedes Janitor's ordinary cleanup hold.
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
-		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 80 << 30}, nil
+		return diskFilesystemUsage{TotalBytes: 100 << 30, FreeBytes: 15_000_000_000}, nil
 	})
 	devices, err := janitorHostDevices([]string{paths.Home, seatTempParent()}, config.WorktreeRoot{})
 	if err != nil {
@@ -448,7 +448,7 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 	}
 	var volumes []string
 	for dev := range devices {
-		volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":2147483648,"reserve_bytes":1048576,"reason":"cleanup target not reached"}`, dev, dev))
+		volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":15000000000,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"cleanup target not reached"}`, dev, dev))
 	}
 	replaceJanitorStatus(t, janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...), nil)
 	queueDiskGuardJob(t, ctx, store, "a-review", "rev-omp", "review", `,"review_requester":"requester"`)
@@ -469,8 +469,8 @@ func TestJanitorPressureRoutesReviewWithCapAndAlerts(t *testing.T) {
 		}
 	}
 	messages := messagesTo(t, ctx, store, "requester")
-	if len(messages) != 1 || !strings.Contains(messages[0].Body, "janitor capacity") || !strings.Contains(messages[0].Body, "E2B") {
-		t.Fatalf("missing or duplicate pressure-route alert: %+v", messages)
+	if len(messages) != 1 || !strings.Contains(messages[0].Body, "E2B") || !strings.Contains(messages[0].Body, "free space") {
+		t.Fatalf("missing, duplicate or empty pressure-route alert: %+v", messages)
 	}
 	job, err := store.GetJob(ctx, "a-review")
 	if err != nil {

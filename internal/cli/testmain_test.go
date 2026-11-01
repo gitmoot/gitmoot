@@ -60,6 +60,16 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "set TMPDIR: %v\n", err)
 		os.Exit(1)
 	}
+	// The disk floor applies to every direct dispatch, so tests must not depend
+	// on how full the machine running them is. Default to a healthy reading of
+	// any existing path; a missing path still fails closed. Disk-guard tests
+	// install their own measurement with replaceDiskGuardMeasurement.
+	measureDiskGuardFilesystem = func(path string) (diskFilesystemUsage, error) {
+		if _, err := os.Stat(path); err != nil {
+			return diskFilesystemUsage{}, err
+		}
+		return diskFilesystemUsage{TotalBytes: 1_000_000_000_000, FreeBytes: 500_000_000_000}, nil
+	}
 	code := m.Run()
 	if tempRoot != "" {
 		if err := removeTestTempRoot(tempRoot); err != nil {
