@@ -451,7 +451,7 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 			}
 		}
 		if job.Type == "review" && (sourceOnly || admission.cfg.ReviewFreshSpace) {
-			_, _, reviewErr := admission.reviewMeasurements(ctx, worker.Store, paths, repo, sourceOnly)
+			_, _, reviewErr := admission.reviewMeasurements(ctx, worker.Store, paths, repo, sourceOnly, true)
 			if reviewErr == nil {
 				allowed = append(allowed, job)
 			} else {

@@ -2703,7 +2703,12 @@ allocation still requires mount preflight without a root fallback.
 
 Every two seconds, a monitor checks capacity through preparation, runtime
 delivery and owned cleanup. Failed checks request cancellation of only the
-owned review generation, never reroute a running job. Measurements and
+owned review generation, never reroute a running job. Free-space thresholds
+(10GB floor, canonical reserve, 20GB warning band) apply only at admission; a
+running review is never stopped for low space. Failed, unknown, stale or
+mismatched evidence and device or policy changes still stop it (#2479), and
+each cancel records `review_capacity_cancelled` with its
+reason. Measurements and
 cancellation requests go to `.gitmoot/review-capacity.jsonl`. Cancellation
 does not prove remote destruction completed or automatically retry the review.
 Shared writers can cross thresholds between checks. Ordinary non-review

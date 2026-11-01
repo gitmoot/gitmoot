@@ -39,7 +39,14 @@ func reviewDiskGuardRefusal(evaluation diskGuardEvaluation, sourceOnly bool) err
 
 // Review admission uses the canonical reserve, not the cleanup-recovery latch.
 // This is best-effort monitoring, not a quota or a promise about other writers.
-func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly bool, checkouts ...string) (map[uint64]string, []reviewCapacityMeasurement, error) {
+//
+// admitting distinguishes starting a review from monitoring one already
+// running. Space thresholds (the 10GB floor, the canonical reserve, the 20GB
+// warning band and Janitor's low-space states) decide only whether NEW work
+// may start. Owner policy (#2466/#2479): do not terminate running work for low
+// space. While running, only failed, unknown, stale or mismatched evidence
+// (and, in the monitor, device or policy changes) stops a review.
+func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Store, paths config.Paths, repo string, sourceOnly, admitting bool, checkouts ...string) (map[uint64]string, []reviewCapacityMeasurement, error) {
 	if a.cfgErr != nil {
 		return nil, nil, a.cfgErr
 	}
@@ -50,8 +57,12 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 		return nil, nil, a.readErr
 	}
 	evaluation := evaluateConfiguredDiskGuard(paths)
-	if err := reviewDiskGuardRefusal(evaluation, sourceOnly); err != nil {
-		return nil, nil, err
+	if admitting {
+		if err := reviewDiskGuardRefusal(evaluation, sourceOnly); err != nil {
+			return nil, nil, err
+		}
+	} else if evaluation.Policy.Enabled && evaluation.Err != nil {
+		return nil, nil, fmt.Errorf("disk guard measurement failed during review: %s", evaluation.detail())
 	}
 	// Remote source preparation writes control state and logs, not local Git.
 	hostPaths := []string{paths.Home}
@@ -83,7 +94,13 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 				volume = v
 			}
 		}
-		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || !janitorClearedStates[volume.state] {
+		stateOK := janitorClearedStates[volume.stateOrEmpty()]
+		if !admitting {
+			// While running, known low-space pressure is not a reason to stop
+			// (owner policy); unknown or unrecognised evidence still is.
+			stateOK = stateOK || janitorPressureStates[volume.stateOrEmpty()]
+		}
+		if volume == nil || !volume.hasByteLimits || !volume.hasTarget || !stateOK {
 			return nil, nil, fmt.Errorf("review device %d (%s) has unknown or unsafe canonical capacity", device, path)
 		}
 		usage, err := measureDiskGuardFilesystem(path)
@@ -96,6 +113,9 @@ func (a janitorAdmission) reviewMeasurements(ctx context.Context, store *db.Stor
 		}
 		available := min(volume.available, usage.FreeBytes)
 		measurements = append(measurements, reviewCapacityMeasurement{device, path, available, volume.reserve})
+		if !admitting {
+			continue
+		}
 		if available < volume.reserve {
 			return nil, measurements, fmt.Errorf("review device %d (%s) has %d available bytes, requires at least canonical reserve %d", device, path, available, volume.reserve)
 		}
@@ -166,7 +186,7 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	if ownsGeneration {
 		ownedGeneration = *generation
 	}
-	check := func() (map[uint64]string, []reviewCapacityMeasurement, error) {
+	check := func(admitting bool) (map[uint64]string, []reviewCapacityMeasurement, error) {
 		current, err := config.LoadJanitorCapacity(paths)
 		if err != nil {
 			return nil, nil, err
@@ -175,9 +195,9 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 			return nil, nil, fmt.Errorf("review capacity policy changed during execution")
 		}
 		a := loadJanitorAdmission(ctx, paths)
-		return a.reviewMeasurements(ctx, store, paths, repo, sourceOnly, checkouts...)
+		return a.reviewMeasurements(ctx, store, paths, repo, sourceOnly, admitting, checkouts...)
 	}
-	devices, first, err := check()
+	devices, first, err := check(true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -200,7 +220,7 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 				done <- ctx.Err()
 				return
 			case <-ticker.C:
-				current, samples, err := check()
+				current, samples, err := check(false)
 				if err == nil && !maps.Equal(current, devices) {
 					err = fmt.Errorf("review backing paths changed during execution")
 				}
@@ -213,7 +233,7 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 				// A dispatch owns only its context. A worker also owns the captured
 				// lifecycle, never a retry that reused this job ID during cleanup.
 				if ownsGeneration {
-					err = errors.Join(err, cancelMonitoredReview(store, jobID, ownedGeneration, func() { cancel(err) }))
+					err = errors.Join(err, cancelMonitoredReview(store, jobID, ownedGeneration, err.Error(), func() { cancel(err) }))
 				} else {
 					cancel(err)
 				}
@@ -235,7 +255,7 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	}, nil
 }
 
-func cancelMonitoredReview(store *db.Store, jobID string, generation int64, stopRuntime func()) error {
+func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reason string, stopRuntime func()) error {
 	defer stopRuntime()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -256,9 +276,31 @@ func cancelMonitoredReview(store *db.Store, jobID string, generation int64, stop
 		// Prevent the stopped worker from recording failure before cancellation
 		// is committed. The lifecycle lock also fences any successor attempt.
 		stopRuntime()
+		// Name the cause on the job itself: a bare "cancel requested" reads as a
+		// person cancelling it.
+		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: reviewCapacityCancelledEventKind, Message: "review capacity monitor cancelled this run: " + reason})
 		_, err = workflow.CancelJob(ctx, store, jobID)
 		return err
 	default:
 		return nil
 	}
+}
+
+// reviewCapacityCancelledEventKind records why the capacity monitor cancelled
+// a running review (failed or unknown capacity evidence, device change, policy
+// change; never low space), so the job history never shows an unexplained
+// cancel.
+const reviewCapacityCancelledEventKind = "review_capacity_cancelled"
+
+// janitorPressureStates are Janitor states that report KNOWN low space. They
+// hold new admissions but never stop a running review (#2479); every other
+// non-cleared state, measurement_unknown included, is unknown evidence.
+var janitorPressureStates = map[string]bool{"critical": true, "no_safe_reclaim": true}
+
+// stateOrEmpty is nil-safe so the state lookup can precede the nil check.
+func (v *janitorVolume) stateOrEmpty() string {
+	if v == nil {
+		return ""
+	}
+	return v.state
 }
