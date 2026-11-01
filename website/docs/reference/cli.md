@@ -1686,6 +1686,16 @@ delivery turn the files are measured again; a change records
 list the in-sandbox paths and hashes, never host paths. Files are destroyed
 with the sandbox. Refused for local, sandboxd and no-execution reviews.
 
+After each delivery turn the daemon also records `review_evidence_inspected`
+(#2483): which pinned files the reviewer's own tool calls named (`opened`) and
+which none did (`not_opened`), measured from the retained transcript, not from
+the verdict text. A directory listing names no file, and a name counts only
+as a whole file name. The requester's verdict wake starts with `verdict <decision>; reviewer
+never opened N pinned evidence file(s): <first three> and M more` when any were
+not opened, so a summary that claims an unopened file is visibly contradicted;
+the full list is in that event.
+The verdict itself is not changed or blocked.
+
 ### No-execution reviews (#2364)
 
 A no-execution review reads the code and the exact-head CI results instead of
