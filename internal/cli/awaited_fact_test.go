@@ -207,10 +207,24 @@ func TestFailedReviewFactWakeRequiresRetryOrExplicitBlocker(t *testing.T) {
 }
 
 // #2484 review: the withdraw command a seat runs must carry the real fact ID
-// even when the failure detail is longer than the 320-byte detail cut.
-func TestReviewFactWakeNamesWithdrawCommandWithFactIDPastTheDetailCut(t *testing.T) {
+// even when the failure detail is longer than the 320-byte detail cut, and it
+// must be runnable as written: the command in the prompt is executed against a
+// real store, and it must end the wait.
+func TestReviewFactWakeNamesARunnableWithdrawCommandPastTheDetailCut(t *testing.T) {
+	home := t.TempDir()
+	paths := config.PathsForHome(home)
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	live, err := db.Open(paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fact := awaitReviewForTest(t, live, "lane", 46, "head-cancelled", time.Now().UTC().Add(time.Hour))
+	_ = live.Close()
+
 	long := "review job review-9 cancelled carrying verdict approved at head " + strings.Repeat("f", 40) + "; " + strings.Repeat("x", 400)
-	payload := `{"id":3846,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_cancelled","job_id":"review-9","detail":"` + long + `"}`
+	payload := fmt.Sprintf(`{"id":%d,"waiter_role":"lane","subject_kind":"review_verdict","subject_key":"acme/widget#46@head","state":"review_cancelled","job_id":"review-9","detail":"%s"}`, fact.ID, long)
 	event, err := wakeOutboxEvent([]db.WakeOutboxObligation{{
 		ID: 3, SourceKind: db.WakeOutboxSourceAwaitedFact, SourceID: payload,
 		TargetRole: "lane", CoalesceKey: "fact:lane", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
@@ -219,8 +233,20 @@ func TestReviewFactWakeNamesWithdrawCommandWithFactIDPastTheDetailCut(t *testing
 		t.Fatal(err)
 	}
 	prompt := eventRuleWakePrompt("fact", event)
-	if !strings.Contains(prompt, "gitmoot org await withdraw 3846 --role lane --reason TEXT") || strings.Contains(prompt, "withdraw <id>") {
-		t.Fatalf("cancelled-review prompt = %q, want the withdraw command with fact ID 3846", prompt)
+	const lead = "end the wait with: gitmoot org await withdraw "
+	at := strings.Index(prompt, lead)
+	if at < 0 || strings.Contains(prompt, "<id>") {
+		t.Fatalf("cancelled-review prompt = %q, want a withdraw command with the fact ID", prompt)
+	}
+	// The command exactly as the prompt words it, with only --home prepended
+	// to point it at this test store.
+	args := append([]string{"--home", home}, strings.Fields(prompt[at+len(lead):])...)
+	var stdout, stderr strings.Builder
+	if code := runOrgAwaitWithdraw(args, &stdout, &stderr); code != 0 {
+		t.Fatalf("prompt command %v exited %d: %s", args, code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), fmt.Sprintf("awaited fact %d state=superseded", fact.ID)) {
+		t.Fatalf("withdraw output = %q", stdout.String())
 	}
 }
 
