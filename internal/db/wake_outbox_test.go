@@ -128,6 +128,44 @@ func TestListWakeOutboxObligationsMatchesMarkerBoundariesExactly(t *testing.T) {
 	}
 }
 
+// #2478 review: source_id is free text. A marker prefix longer than the
+// 64-character indexed range must still match exactly as before; the range
+// alone would compare it greater than every indexed value and miss it.
+func TestListWakeOutboxObligationsMatchesMarkersLongerThanTheIndexedPrefix(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	directive, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "phase/long", Author: "owner",
+		Body: "[org:directive to=worker from=owner wf=phase/long]\nact",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CAST(source_id AS INTEGER) still resolves the directive; the trailing
+	// text makes `[org:directive-done id=<source_id> ` 70+ characters long.
+	sourceID := fmt.Sprintf("%d%s", directive.ID, strings.Repeat("x", 50))
+	if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{
+		WorkflowID: "phase/long", Author: "worker",
+		Body: "[org:directive-done id=" + sourceID + " by=worker]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Format(BlockedEpisodeTimeLayout)
+	if _, err := store.db.ExecContext(ctx, `
+INSERT INTO wake_outbox(source_kind, source_id, target_role, coalesce_key, state,
+	attempt_count, created_at, updated_at)
+VALUES ('workflow_note', ?, 'worker', 'directive:worker', 'pending', 0, ?, ?)`, sourceID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	obligations, err := store.ListWakeOutboxObligations(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obligations.Pending) != 1 || obligations.Pending[0].DirectivePhase != WakeOutboxDirectivePhaseTerminal {
+		t.Fatalf("pending obligations = %+v, want one terminal directive", obligations.Pending)
+	}
+}
+
 func TestWakeOutboxEntryStateRemainsSerializable(t *testing.T) {
 	encoded, err := json.Marshal(WakeOutboxEntry{State: WakeOutboxStatePending})
 	if err != nil {
