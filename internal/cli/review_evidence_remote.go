@@ -12,6 +12,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
+	"github.com/gitmoot/gitmoot/internal/transcript"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -193,6 +194,9 @@ func parseReviewEvidenceMeasurements(output string) map[string]reviewEvidenceRea
 type reviewEvidenceGuardAdapter struct {
 	inner  workflow.DeliveryAdapter
 	verify func(context.Context) error
+	// inspect records which pinned files the reviewer opened this turn
+	// (#2483). Best effort: it never fails the delivery.
+	inspect func(context.Context, runtime.Agent)
 }
 
 func (a reviewEvidenceGuardAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -202,6 +206,9 @@ func (a reviewEvidenceGuardAdapter) Deliver(ctx context.Context, agent runtime.A
 	}
 	if verifyErr := a.verify(ctx); verifyErr != nil {
 		return runtime.Result{}, verifyErr
+	}
+	if a.inspect != nil {
+		a.inspect(ctx, agent)
 	}
 	return result, nil
 }
@@ -215,7 +222,91 @@ func (w jobWorker) guardRemoteReviewEvidence(adapter workflow.DeliveryAdapter, l
 	runner := execbackend.InstanceRunner{Backend: lifecycle, Instance: instance}
 	return reviewEvidenceGuardAdapter{inner: adapter, verify: func(ctx context.Context) error {
 		return w.verifyRemoteReviewEvidence(ctx, runner, instance, jobID, evidence, "after_delivery")
+	}, inspect: func(ctx context.Context, agent runtime.Agent) {
+		w.recordReviewEvidenceInspection(ctx, jobID, evidence, effectiveTranscriptRuntime(payload, agent))
 	}}
+}
+
+// reviewEvidenceInspection is the review_evidence_inspected event (#2483):
+// which pinned files the reviewer's own tool calls named, and which they never
+// did. It is measured from the retained transcript, not from the verdict text,
+// so a verdict cannot claim a file it never opened without the requester
+// seeing the contradiction (db appends NotOpened to the verdict wake).
+type reviewEvidenceInspection struct {
+	JobID     string   `json:"job_id"`
+	Opened    []string `json:"opened"`
+	NotOpened []string `json:"not_opened"`
+}
+
+// recordReviewEvidenceInspection reads the job's retained transcript and
+// records the inspection. A file counts as opened when any tool call's input
+// names its sandbox file name (a read of the image, a cat/sed/grep of the log).
+// A directory listing names no individual file, and a glob that never names it
+// is not counted, so "not opened" means "never named by a tool call". Without
+// a readable transcript nothing is recorded: no evidence is not a flag.
+func (w jobWorker) recordReviewEvidenceInspection(ctx context.Context, jobID string, evidence *workflow.ReviewEvidence, runtimeName string) {
+	paths, err := w.configPaths()
+	if err != nil {
+		return
+	}
+	translator, err := transcript.NewSnapshotTranslator(runtimeName)
+	if err != nil {
+		return
+	}
+	events, err := readTranscriptEvents(transcript.ResolveJobLogPath(paths.Logs, jobID), translator)
+	if err != nil {
+		return
+	}
+	inspection := reviewEvidenceInspectionFrom(jobID, evidence, events)
+	body, err := json.Marshal(inspection)
+	if err != nil {
+		return
+	}
+	_ = w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: db.ReviewEvidenceInspectedEventKind, Message: string(body)})
+}
+
+func reviewEvidenceInspectionFrom(jobID string, evidence *workflow.ReviewEvidence, events []transcript.Event) reviewEvidenceInspection {
+	inspection := reviewEvidenceInspection{JobID: jobID, Opened: []string{}, NotOpened: []string{}}
+	for _, file := range evidence.Files {
+		opened := false
+		for _, event := range events {
+			// InputDigest is the tool's raw arguments (omp keeps the full args
+			// JSON), so a long command cannot hide a file name behind a preview.
+			if event.Kind == transcript.KindToolCall && (namesEvidenceFile(event.InputDigest, file.SandboxName) || namesEvidenceFile(event.Text, file.SandboxName)) {
+				opened = true
+				break
+			}
+		}
+		if opened {
+			inspection.Opened = append(inspection.Opened, file.SandboxName)
+		} else {
+			inspection.NotOpened = append(inspection.NotOpened, file.SandboxName)
+		}
+	}
+	return inspection
+}
+
+// namesEvidenceFile reports whether text names the sandbox file as a whole
+// name: the match must not continue a longer file name on either side, so
+// "01-shot.png" is not found inside "02-01-shot.png" (#2489 review). A path
+// separator, quote, space or punctuation other than '-', '_' and '.' bounds it.
+func namesEvidenceFile(text, name string) bool {
+	for start := 0; ; {
+		index := strings.Index(text[start:], name)
+		if index < 0 {
+			return false
+		}
+		begin := start + index
+		end := begin + len(name)
+		if (begin == 0 || !evidenceNameByte(text[begin-1])) && (end == len(text) || !evidenceNameByte(text[end])) {
+			return true
+		}
+		start = begin + 1
+	}
+}
+
+func evidenceNameByte(b byte) bool {
+	return b == '-' || b == '_' || b == '.' || ('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z')
 }
 
 // reviewEvidenceInstructions tells the reviewer where the pinned files are and

@@ -804,6 +804,11 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 					detail += "; " + extra
 				}
 			}
+			// An alert (#2483) leads the whole entry, ahead of the subject key,
+			// so the prompt's detail cut can never drop it.
+			if alert := strings.TrimSpace(payload.Alert); alert != "" {
+				detail = alert + "; " + detail
+			}
 			details = append(details, detail)
 		}
 		detail := details[0]

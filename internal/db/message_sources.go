@@ -123,6 +123,11 @@ func indexWakeMessageTx(ctx context.Context, tx *sql.Tx, sourceKind, sourceID, r
 				m.Kind = "review"
 			}
 			m.Body = fmt.Sprintf("%s %s: %s\n%s", fact.SubjectKind, fact.SubjectKey, fact.State, fact.Detail)
+			// The alert (#2483) leads the inbox copy too: turn hooks preview
+			// this body, truncated, and may deliver it instead of the prompt.
+			if alert := strings.TrimSpace(fact.Alert); alert != "" {
+				m.Body = alert + "\n" + m.Body
+			}
 			if fact.JobID != "" {
 				m.Body += "\nReview job: " + fact.JobID
 			}

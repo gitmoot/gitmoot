@@ -59,6 +59,9 @@ type AwaitedFactWakePayload struct {
 	JobID               string `json:"job_id,omitempty"`
 	LifecycleGeneration int64  `json:"lifecycle_generation,omitempty"`
 	Detail              string `json:"detail,omitempty"`
+	// Alert is what the waiter must not miss (#2483); the delivered prompt
+	// renders it first, ahead of the subject key and Detail.
+	Alert string `json:"alert,omitempty"`
 }
 
 // ReviewVerdictSubjectKey is the single source of truth for a review wait's
@@ -305,7 +308,7 @@ RETURNING id`, request.WaiterRole, request.SubjectKind, request.SubjectKey, requ
 		return AwaitedFact{}, nil, err
 	}
 	if ok {
-		if _, err := satisfyAwaitedFactTx(ctx, tx, id, request.WaiterRole, request.SubjectKind, request.SubjectKey, detail, time.Now().UTC()); err != nil {
+		if _, err := satisfyAwaitedFactTx(ctx, tx, id, request.WaiterRole, request.SubjectKind, request.SubjectKey, detail, "", time.Now().UTC()); err != nil {
 			return AwaitedFact{}, nil, err
 		}
 	}
@@ -660,9 +663,60 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 	return verdicts, nil
 }
 
+// ReviewEvidenceInspectedEventKind records, per delivery turn of a review with
+// pinned private evidence, which files the reviewer's own tool calls named
+// (#2483). The daemon writes it; the verdict wake reads it.
+const ReviewEvidenceInspectedEventKind = "review_evidence_inspected"
+
+// reviewEvidenceNotOpenedTx returns the pinned files the job's latest
+// inspection says the reviewer never opened. The verdict wake carries them so
+// a summary claiming a file the reviewer never read is visibly contradicted.
+// No inspection (no evidence, or no readable transcript) returns none.
+func reviewEvidenceNotOpenedTx(ctx context.Context, tx *sql.Tx, jobID string) ([]string, error) {
+	var message string
+	err := tx.QueryRowContext(ctx, `
+SELECT message FROM job_events
+WHERE job_id = ? AND kind = ?
+ORDER BY created_at DESC, id DESC LIMIT 1`, jobID, ReviewEvidenceInspectedEventKind).Scan(&message)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var inspection struct {
+		NotOpened []string `json:"not_opened"`
+	}
+	if json.Unmarshal([]byte(message), &inspection) != nil {
+		return nil, nil
+	}
+	return inspection.NotOpened, nil
+}
+
+// ReviewEvidenceUnopenedLead is the alert of a verdict whose reviewer never
+// opened some pinned evidence (#2483): the folded decision word, the count,
+// and at most three names. It travels as the wake payload's Alert, which the
+// delivered prompt places before the subject key, so a long key or role can
+// never push it past the prompt's detail cut. The full list is the job's
+// review_evidence_inspected event.
+func ReviewEvidenceUnopenedLead(decision string, notOpened []string) string {
+	names := notOpened
+	more := ""
+	if len(names) > 3 {
+		names = names[:3]
+		more = fmt.Sprintf(" and %d more", len(notOpened)-3)
+	}
+	return fmt.Sprintf("verdict %s; reviewer never opened %d pinned evidence file(s): %s%s",
+		decision, len(notOpened), strings.Join(names, ", "), more)
+}
+
 type reviewVerdictObservation struct {
 	repo, headSHA, detail string
-	pullRequest           int
+	// alert leads the satisfied wake (unopened pinned evidence, #2483).
+	alert string
+	// decision is the folded decision word the detail reports.
+	decision    string
+	pullRequest int
 }
 
 // pipelineReviewSender mirrors workflow.PipelineJobSender. It is duplicated
@@ -702,7 +756,7 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s; findings=%d executed_checks=%d evidence=%s; inspect with gitmoot job show %s",
 		decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA,
 		len(decoded.Result.Findings), len(decoded.Result.TestsRun), firstNonEmptyString(strings.TrimSpace(decoded.Result.Evidence), "undeclared"), strings.TrimSpace(jobID))
-	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail}, true
+	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail, decision: decision}, true
 }
 
 func resolveStoredAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, state string, blockingSeverity func(repo string) string, now time.Time) error {
@@ -748,6 +802,13 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 		if err != nil {
 			return nil
 		}
+		notOpened, err := reviewEvidenceNotOpenedTx(ctx, tx, jobID)
+		if err != nil {
+			return err
+		}
+		if len(notOpened) > 0 {
+			fact.alert = ReviewEvidenceUnopenedLead(fact.decision, notOpened)
+		}
 	case "failed", "blocked", "cancelled":
 		var err error
 		key, err = ReviewVerdictSubjectKey(decoded.Repo, decoded.PullRequest, decoded.HeadSHA)
@@ -758,6 +819,7 @@ func resolveAwaitedReviewFactTx(ctx context.Context, tx *sql.Tx, jobID, agent, j
 	default:
 		return nil
 	}
+
 	// TWO keys are resolved, and the distinction is the point. The BARE key is
 	// every historical waiter (`org await review`), which asks "is this head
 	// reviewed" and is answered by a verdict of any purpose. The PURPOSE-SCOPED
@@ -811,7 +873,7 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 
 	if state == "succeeded" {
 		for _, target := range targets {
-			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, target.key, fact.detail, now); err != nil {
+			if _, err := satisfyAwaitedFactTx(ctx, tx, target.id, target.role, AwaitedFactSubjectReviewVerdict, target.key, fact.detail, fact.alert, now); err != nil {
 				return err
 			}
 		}
@@ -836,7 +898,7 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 	for _, target := range targets {
 		if err := insertAwaitedFactNoticeWakeTx(
 			ctx, tx, target.id, target.role, target.role, AwaitedFactSubjectReviewVerdict, target.key,
-			noticeState, jobID, lifecycleGeneration, detail,
+			noticeState, jobID, lifecycleGeneration, detail, "",
 		); err != nil {
 			return err
 		}
@@ -844,12 +906,19 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 	return nil
 }
 
-func satisfyAwaitedFactTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, subjectKind, subjectKey, detail string, now time.Time) (bool, error) {
+// satisfyAwaitedFactTx ends a wait as satisfied. alert, when set, is the part
+// of the answer the requester must not miss (#2483): it leads the stored
+// resolution_detail and rides the wake as Alert, rendered before the key.
+func satisfyAwaitedFactTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, subjectKind, subjectKey, detail, alert string, now time.Time) (bool, error) {
 	stamp := now.UTC().Format(time.RFC3339Nano)
+	resolution := detail
+	if alert = strings.TrimSpace(alert); alert != "" {
+		resolution = alert + "; " + detail
+	}
 	result, err := tx.ExecContext(ctx, `
 UPDATE awaited_facts
 SET state = 'satisfied', resolution_detail = ?, satisfied_at = ?, updated_at = ?
-WHERE id = ? AND state = 'waiting'`, detail, stamp, stamp, id)
+WHERE id = ? AND state = 'waiting'`, resolution, stamp, stamp, id)
 	if err != nil {
 		return false, err
 	}
@@ -863,7 +932,7 @@ WHERE id = ? AND state = 'waiting'`, detail, stamp, stamp, id)
 	// The satisfaction wake carries the resolution detail (verdict, findings
 	// count, executed-check count, evidence, job id): the woken requester reads
 	// the answer from the prompt rather than only learning that one exists.
-	return true, insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied, "", 0, detail)
+	return true, insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, waiterRole, subjectKind, subjectKey, AwaitedFactStateSatisfied, "", 0, detail, alert)
 }
 
 func supersedePendingAwaitedFactWakesTx(ctx context.Context, tx *sql.Tx, factID int64, terminalState string, now time.Time) error {
@@ -908,14 +977,14 @@ WHERE id = ? AND state = ?`,
 }
 
 func insertAwaitedFactWakeTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, targetRole, subjectKind, subjectKey, state string) error {
-	return insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, targetRole, subjectKind, subjectKey, state, "", 0, "")
+	return insertAwaitedFactNoticeWakeTx(ctx, tx, id, waiterRole, targetRole, subjectKind, subjectKey, state, "", 0, "", "")
 }
 
-func insertAwaitedFactNoticeWakeTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, targetRole, subjectKind, subjectKey, state, jobID string, lifecycleGeneration int64, detail string) error {
+func insertAwaitedFactNoticeWakeTx(ctx context.Context, tx *sql.Tx, id int64, waiterRole, targetRole, subjectKind, subjectKey, state, jobID string, lifecycleGeneration int64, detail, alert string) error {
 	payload, err := json.Marshal(AwaitedFactWakePayload{
 		ID: id, WaiterRole: waiterRole, SubjectKind: subjectKind, SubjectKey: subjectKey,
 		State: state, JobID: strings.TrimSpace(jobID), LifecycleGeneration: lifecycleGeneration,
-		Detail: strings.TrimSpace(detail),
+		Detail: strings.TrimSpace(detail), Alert: strings.TrimSpace(alert),
 	})
 	if err != nil {
 		return err
