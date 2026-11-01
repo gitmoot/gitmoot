@@ -485,15 +485,20 @@ detection.
    first, which stops claiming and leaves queued jobs queued:
 
    ```sh
-   gitmoot daemon drain --timeout 60m   # exit 0 = nothing engine-dispatched running; exit 1 = still running, drain stays on
-   gitmoot job list --state queued --json | jq -r '.[] | select(.id | startswith("session-") | not) | .id' > queued-before-restart.txt
-   systemctl --user restart gitmoot-daemon gitmoot-dashboard-web
-   gitmoot daemon drain --clear          # the drain marker survives the restart; nothing is claimed until cleared
+   # Restart ONLY if drain exits 0 (nothing engine-dispatched running). Exit 1
+   # means work is still in flight or drain itself failed: do not restart; rerun
+   # drain later (the marker stays on, nothing new is claimed meanwhile).
+   gitmoot daemon drain --timeout 60m &&
+     gitmoot job list --killed --json | jq -r '.[].id' | sort > killed-before-restart.txt &&
+     gitmoot job list --state queued --json | jq -r '.[] | select(.id | startswith("session-") | not) | .id' > queued-before-restart.txt &&
+     systemctl --user restart gitmoot-daemon gitmoot-dashboard-web &&
+     gitmoot daemon drain --clear   # the drain marker survives the restart; nothing is claimed until cleared
    ```
 
    Afterwards confirm every id in `queued-before-restart.txt` still exists
-   with `gitmoot job show <id>`; any state is fine except `failed` with a
-   `delivery_signal_killed` event, which means the restart killed it.
+   (`gitmoot job show <id>`, any state), and that
+   `gitmoot job list --killed --json` lists no id that was not already in
+   `killed-before-restart.txt`; a new id there is a delivery the restart killed.
 5. Config-only changes (e.g. `[admission]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
 6. **Public releases need explicit OWNER sign-off** —
