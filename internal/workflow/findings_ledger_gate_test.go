@@ -50,6 +50,39 @@ func TestPolicyMergeGateRefusesWhenAPriorFindingIsUnobservedAtThisHead(t *testin
 	}
 }
 
+// #2488 (herdrup#595): a review at the head declared f1 answered with quoted
+// evidence only, so the ledger recorded it open AT THIS HEAD. The refusal said
+// the finding "carries no observation", which sent the requester looking for a
+// missing review. It must instead say the finding is not discharged, that it
+// was observed at this head with quoted evidence only, and what discharges it.
+func TestLedgerRefusalNamesQuotedAnswerAtThisHead(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	head := strings.Repeat("c", 40)
+	if _, err := store.RecordReviewFindingObservation(ctx, db.ReviewFindingObservation{
+		Repo: "mobile/app", PullRequest: 595, HeadSHA: head, ObserverJob: "review-at-head",
+		State: db.FindingOpen, Severity: "P2", Title: "settled width", Detail: "final leg can pass without dragging",
+		EvidenceKind: db.EvidenceQuoted, SourceJob: "review-earlier",
+	}); err != nil {
+		t.Fatalf("seed observation: %v", err)
+	}
+	insertLedgerGateReview(t, store, head)
+	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
+		Repo: "mobile/app", PullRequest: 595, TaskID: "task-595", Reviewer: "g6-review-sol",
+	}, head)
+	if err == nil {
+		t.Fatal("an open P2 at this head no longer holds the merge")
+	}
+	for _, want := range []string{"not discharged at head", "observed at this head by review-at-head with quoted evidence only", "file evidence_locator or executed checks"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("refusal %q does not say %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "no observation") {
+		t.Fatalf("refusal still claims no observation exists: %v", err)
+	}
+}
+
 // #2173: ledger observations are facts about one commit line, not permanent PR
 // labels. A force-push to a non-descendant head must stop carrying old
 // obligations, while a descendant must keep them. This enters through the merge

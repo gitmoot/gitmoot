@@ -319,7 +319,7 @@ func LedgerObligationsAtHead(ctx context.Context, observations []db.ReviewFindin
 		var reason string
 		switch obs.State {
 		case db.FindingOpen:
-			reason = "still open"
+			reason = openObligationReason(obs, head)
 		case db.FindingAnswered, db.FindingSuperseded:
 			key, touched, why := scope.answeredIsMandatory(ctx, obs, head)
 			if !touched {
@@ -346,6 +346,19 @@ func LedgerObligationsAtHead(ctx context.Context, observations []db.ReviewFindin
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FindingUID < out[j].FindingUID })
 	return out
+}
+
+// openObligationReason says why an open finding still holds, and when it was
+// last observed at THIS head with only quoted evidence, what discharges it
+// (#2488): an answer is recorded open unless it cites a file evidence_locator
+// (STATIC) or executed checks (EXECUTED) - see the reviewer job's
+// findings_ledger_downgraded event.
+func openObligationReason(obs db.ReviewFindingObservation, head string) string {
+	if strings.EqualFold(strings.TrimSpace(obs.HeadSHA), strings.TrimSpace(head)) && obs.EvidenceKind == db.EvidenceQuoted {
+		return fmt.Sprintf("still open: observed at this head by %s with quoted evidence only; an answer discharges it only with a file evidence_locator or executed checks",
+			firstNonEmptyString(obs.ObserverJob, "a review"))
+	}
+	return "still open"
 }
 
 // answeredIsMandatory decides whether an answered finding is mandatory again.
@@ -496,7 +509,11 @@ func EnsureLedgerObligationsObserved(ctx context.Context, store *db.Store, repo 
 	if len(blocking) == 0 {
 		return nil
 	}
-	refusal := fmt.Errorf("findings ledger: %d prior finding(s) carry no observation at head %s: %s",
+	// "Not discharged", not "no observation" (#2488): an open finding can carry
+	// an observation at this very head - a declared answer the ledger recorded
+	// open for lack of evidence - and the old wording sent requesters looking
+	// for a missing review instead of the missing evidence.
+	refusal := fmt.Errorf("findings ledger: %d prior finding(s) not discharged at head %s: %s",
 		len(blocking), shortHead(headSHA), namedObligations(blocking))
 	if !scope.FindingsAdvisory {
 		return refusal
