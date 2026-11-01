@@ -788,7 +788,8 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
-	// #2171 router fallback: a quota/auth failure on one pool entry is an
+	// #2171 router fallback: a quota, auth or unknown-model (#2469) failure on
+	// one pool entry is an
 	// operational fact about that provider, not about the review, so advance to
 	// the next untried model and re-queue immediately instead of waiting out the
 	// provider's window. Only pre-verdict operational classes qualify; the
@@ -815,7 +816,8 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	}
 	if ok {
 		payload.Model = next
-		// OWNER DECISION 2026-09-14: a quota/auth blocker falls back by moving to
+		// OWNER DECISION 2026-09-14: a quota/auth blocker (and, since #2469, an
+		// unknown model) falls back by moving to
 		// omp with the next pool model, not by retrying the dead runtime.
 		//
 		// This is required for correctness, not preference: a pool entry is an

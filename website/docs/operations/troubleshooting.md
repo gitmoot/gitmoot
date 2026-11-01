@@ -306,6 +306,11 @@ wait (naming the holder), `blocked: awaiting human`, `auth failing: …`,
 the attempt schedule. A deferral that needs a human (dirty/wrong-head checkout)
 also prints a `suggested_action` naming the fix.
 
+An omp `Unknown model: <provider/id>` refusal is class `model_unavailable`
+(#2469): a routed review moves straight to the next usable pool model with no
+hold; with none left the job stays failed, since waiting cannot make omp know
+the model.
+
 Deferred jobs recover on their own (#532): a delivery failure classified as a
 retryable operational blocker — `runtime_auth`, `runtime_quota`,
 `network_outage`, or `checkout_contention` — is re-queued with a bounded retry

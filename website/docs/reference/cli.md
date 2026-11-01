@@ -1627,7 +1627,8 @@ pool exhausted the ordinary timed operational hold applies, and the shared
 attempt budget bounds the whole sequence. A verdict, a finding, or a product
 failure never changes the model: fallback exists for operational failure only.
 A remote review falls back only to models whose provider omp can authenticate
-inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `devin`); it
+inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `kimi-code`,
+`devin`); it
 skips any other entry with event `review_model_remote_skipped`, and the pool
 keeps that entry for local reviews.
 
