@@ -285,3 +285,61 @@ func TestReviewEvidenceRequestRefusesToAttachToExistingReview(t *testing.T) {
 		t.Fatalf("review jobs = %d, want only the first", len(jobs))
 	}
 }
+
+// Jarvis 381063, owner policy (#2466): 10-20GB free means reviews use E2B.
+// A `review request` without --exec-backend must be queued for E2B in the
+// warning band instead of being refused at local preparation (Phobos hit the
+// refusal on macserve#55). Below the 10GB floor it is still refused; above
+// the warning threshold it stays local.
+func TestReviewRequestRoutesToE2BInWarningBand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		free uint64
+		want string // "remote", "local" or "refused"
+	}{
+		{"warning_band", 15_000_000_000, "remote"},
+		{"above_warning", 25_000_000_000, "local"},
+		{"below_floor", 5_000_000_000, "refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, store, head := reviewChecksRoutingHome(t, "")
+			appendConfig(t, config.PathsForHome(home), "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+				return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: tc.free}, nil
+			})
+			out, failure := runReviewRequestJSON(t,
+				"--repo", "owner/repo", "--pr", "12", "--head", head,
+				"--branch", "feature/review", "--role", "joltra", "--home", home,
+				"--runtime", runtime.OmpRuntime, "--json",
+			)
+			if tc.want == "refused" {
+				if failure == "" {
+					t.Fatalf("below the floor the review was dispatched: %+v", out)
+				}
+				return
+			}
+			if failure != "" {
+				t.Fatalf("review refused at %d free bytes: %s", tc.free, failure)
+			}
+			job, err := store.GetJob(context.Background(), out.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := daemonJobPayload(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend, present := payload.ExecBackendOverride()
+			remote := present && backend == "remote"
+			if tc.want == "remote" {
+				if !remote || !payload.DiskGuardRouted || !payload.PolicyRoutedReview || payload.WorktreePath != "" {
+					t.Fatalf("warning-band review not routed to E2B before local preparation: %+v", payload)
+				}
+				return
+			}
+			if remote || payload.DiskGuardRouted {
+				t.Fatalf("review above the warning threshold was routed remote: %+v", payload)
+			}
+		})
+	}
+}

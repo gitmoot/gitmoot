@@ -32,7 +32,7 @@ func reviewDiskGuardRefusal(evaluation diskGuardEvaluation, sourceOnly bool) err
 		return fmt.Errorf("disk guard refused review preparation: %s", evaluation.detail())
 	}
 	if !sourceOnly && evaluation.reviewsBelowThreshold() {
-		return fmt.Errorf("review preparation requires E2B below %d available bytes", evaluation.Policy.RemoteReviewsBelowBytes)
+		return fmt.Errorf("review preparation requires E2B below %d available bytes; request it with --exec-backend remote (E2B) and an omp or shell runtime", evaluation.Policy.RemoteReviewsBelowBytes)
 	}
 	return nil
 }
