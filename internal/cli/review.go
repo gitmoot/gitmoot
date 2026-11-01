@@ -14,6 +14,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -177,7 +178,11 @@ type reviewRequestOptions struct {
 	// runtime with no override is a dead end whenever an unavailability hold is
 	// written for that runtime: the caller has no second choice to reach for.
 	runtime string
-	json    bool
+	// evidenceManifest pins private evidence files for a remote E2B review
+	// (#2476): read, bounded and hash-verified at request time, delivered and
+	// re-verified inside the sandbox at provisioning.
+	evidenceManifest string
+	json             bool
 }
 
 func runReviewRequest(args []string, stdout, stderr io.Writer) int {
@@ -208,6 +213,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.supersede, "supersede", "", "re-review a part at the same head: the settled review job of that part whose verdict this request replaces once it lands; requires --part and --reason")
 	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both jobs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
+	fs.StringVar(&opts.evidenceManifest, "evidence-manifest", "", "absolute path of a JSON manifest (schema_version 1, head_sha, files[{path,bytes,sha256}]) of private files to install read-only into this remote E2B review's sandbox; every file is hash-verified now and again inside the sandbox; requires --exec-backend remote")
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	// Spellings `agent review` uses for the same inputs (#2314), so a caller
 	// can move to this command by changing only the verb.
@@ -432,6 +438,22 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	if err := dispatchHeadSHAError(head); err != nil {
 		return reviewRequestOutput{}, err
 	}
+	var evidence *workflow.ReviewEvidence
+	if manifest := strings.TrimSpace(opts.evidenceManifest); manifest != "" {
+		// Private evidence travels only through the E2B provisioning path that
+		// installs and reads it back; a local or sandboxd review would never
+		// receive it, so it is refused rather than silently dropped.
+		if execBackend != execbackend.Remote || (execProvider != "" && !strings.EqualFold(execProvider, "e2b")) {
+			return reviewRequestOutput{}, errors.New("--evidence-manifest requires a remote E2B review (--exec-backend remote)")
+		}
+		if noExecution {
+			return reviewRequestOutput{}, errors.New("--evidence-manifest cannot be used with a no-execution review: the reviewer could not read the files")
+		}
+		evidence, err = workflow.LoadReviewEvidence(manifest, head)
+		if err != nil {
+			return reviewRequestOutput{}, err
+		}
+	}
 	// claimPurpose is the purpose component for everything keyed on the review
 	// question: claim, subscription, verdict history, loop guard, baseline.
 	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge, opts.part)
@@ -576,6 +598,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		ReviewPart:            opts.part,
 		ReviewSupersedes:      opts.supersede,
 		ReviewSupersedeReason: opts.supersedeReason,
+		ReviewEvidence:        evidence,
 		SelectedAction:        "review",
 		SelectedActionReason:  reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:         reviewRequestExecutionPath,
@@ -606,6 +629,9 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	}
 	request.ReviewScope = scope
 	request.Instructions = reviewRequestInstructions(opts, repo.FullName(), head, scope, noExecution)
+	if block := reviewEvidenceInstructions(evidence); block != "" {
+		request.Instructions += "\n\n" + block
+	}
 	dispatched, err := dispatchLocalAgentJobFromCLI(ctx, store, request)
 	if err != nil {
 		abandonClaim()

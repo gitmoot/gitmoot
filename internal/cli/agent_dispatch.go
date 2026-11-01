@@ -390,8 +390,10 @@ type localAgentDispatchRequest struct {
 	ReviewPart string
 	// ReviewSupersedes/ReviewSupersedeReason carry `review request --supersede`
 	// audit linkage into the job payload (#2405).
-	ReviewSupersedes       string
-	ReviewSupersedeReason  string
+	ReviewSupersedes      string
+	ReviewSupersedeReason string
+	// ReviewEvidence is the pinned private evidence of a remote review (#2476).
+	ReviewEvidence         *workflow.ReviewEvidence
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -1172,6 +1174,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReviewPart:               request.ReviewPart,
 		ReviewSupersedes:         request.ReviewSupersedes,
 		ReviewSupersedeReason:    request.ReviewSupersedeReason,
+		ReviewEvidence:           request.ReviewEvidence,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",

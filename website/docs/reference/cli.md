@@ -1428,7 +1428,7 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
-    [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--allow-prompt-head-mismatch] [--background] [--json] \
+    [--full] [--post-merge] [--no-execution] [--evidence-manifest <abs-path>] [--part NAME [--supersede JOB --reason TEXT]] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]
@@ -1650,6 +1650,31 @@ inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `kimi-code`,
 `devin`); it
 skips any other entry with event `review_model_remote_skipped`, and the pool
 keeps that entry for local reviews.
+
+### Private review evidence (#2476)
+
+A remote E2B review can receive exact private files (logs, screenshots) that
+the reviewer could not otherwise reach:
+
+```sh
+gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target \
+  --exec-backend remote --evidence-manifest /abs/path/manifest.json
+```
+
+The manifest is JSON: `{"schema_version":1,"head_sha":"<40-hex>","files":[{"path":"/abs/file","bytes":N,"sha256":"<64-hex>"}]}`.
+Its head must equal the reviewed head. At most 32 regular files (no
+symlinks), 8 MiB each, 16 MiB in total. Every file is checked against its
+size and sha256 when the request is made; a mismatch refuses the request.
+
+At provisioning the daemon re-reads each file (any change fails the job),
+installs it read-only under `/home/user/.gitmoot/runtime/evidence/attachments`
+(`$GITMOOT_REVIEW_EVIDENCE_DIR`), and reads the bytes back inside the sandbox.
+Event `review_evidence_verified` records job, lifecycle generation, instance,
+head, manifest sha256 and each file's measured size and sha256. After every
+delivery turn the files are measured again; a change records
+`review_evidence_altered` and rejects that verdict. The reviewer's instructions
+list the in-sandbox paths and hashes, never host paths. Files are destroyed
+with the sandbox. Refused for local, sandboxd and no-execution reviews.
 
 ### No-execution reviews (#2364)
 
