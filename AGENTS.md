@@ -469,22 +469,40 @@ detection.
    mv /root/.local/bin/gitmoot-dashboard-web.new /root/.local/bin/gitmoot-dashboard-web
    ```
 
-4. Restart at idle: confirm 0 running/queued **engine-dispatched** jobs
-   first, not raw job count. Session-recorded jobs (`session-ask-*`/
-   `session-implement-*`, #657) run entirely outside the daemon process — no
-   subprocess, no lease — and may legitimately stay `running` for hours, so
-   they don't belong in this check. #1125's reaper keeps genuinely abandoned
-   session jobs from piling up forever, but on an hours-to-a-day timescale;
-   that is a background-hygiene guarantee, not a substitute for checking
-   right now:
+4. Restart when no **engine-dispatched** job is running; queued jobs may
+   remain (owner standing decision 2026-11-01, record
+   `/root/fleet-tools/state/gitmoot-deploy/owner-restart-with-queued-standing-20261101.json`).
+   Session-recorded jobs (`session-ask-*`/`session-implement-*`, #657) run
+   entirely outside the daemon process — no subprocess, no lease — and may
+   legitimately stay `running` for hours, so they don't belong in this check.
+   #1125's reaper keeps genuinely abandoned session jobs from piling up
+   forever, but on an hours-to-a-day timescale; that is a background-hygiene
+   guarantee, not a substitute for checking right now.
+
+   With a non-empty queue the daemon claims new work every second, so an
+   empty running list is not stable on its own: a job claimed between the
+   check and the restart is killed by the restart and is not requeued. Drain
+   first, which stops claiming and leaves queued jobs queued:
 
    ```sh
-   gitmoot job list --state running --json | jq '[.[] | select(.id | startswith("session-") | not)]'
-   gitmoot job list --state queued --json | jq '[.[] | select(.id | startswith("session-") | not)]'
+   # Restart ONLY if drain exits 0 (nothing engine-dispatched running). Exit 1
+   # means work is still in flight or drain itself failed: do not restart; rerun
+   # drain later (the marker stays on, nothing new is claimed meanwhile).
+   # Every step is a simple command (no pipelines): /bin/sh here has no
+   # pipefail, so a failing `gitmoot job list` inside a pipe would not stop it.
+   gitmoot daemon drain --timeout 60m &&
+     gitmoot job list --killed --json > killed-before-restart.json &&
+     gitmoot job list --state queued --json > queued-before-restart.json &&
+     jq -es 'length == 1 and (.[0] | type) == "array"' killed-before-restart.json > /dev/null &&
+     jq -es 'length == 1 and (.[0] | type) == "array"' queued-before-restart.json > /dev/null &&
+     systemctl --user restart gitmoot-daemon gitmoot-dashboard-web &&
+     gitmoot daemon drain --clear   # the drain marker survives the restart; nothing is claimed until cleared
    ```
 
-   Both empty (`[]`), then:
-   `systemctl --user restart gitmoot-daemon gitmoot-dashboard-web`.
+   Afterwards confirm every non-`session-` id in `queued-before-restart.json`
+   still exists (`gitmoot job show <id>`, any state), and that
+   `gitmoot job list --killed --json` lists no id that was not already in
+   `killed-before-restart.json`; a new id there is a delivery the restart killed.
 5. Config-only changes (e.g. `[admission]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
 6. **Public releases need explicit OWNER sign-off** —
