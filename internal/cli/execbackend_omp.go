@@ -154,12 +154,14 @@ http.server.ThreadingHTTPServer((args.host, args.port), Proxy).serve_forever()
 // through OMP's native gateway transport. The host OMP auth-gateway behind the
 // job's credential gateway resolves each request against its broker, which
 // holds the account and performs any OAuth refresh; the sandbox only knows this
-// loopback forwarder and an inert placeholder. Codex and xAI's subscription
-// (xai-oauth) are built into OMP's catalog and need only a route. Devin's swe-2
+// loopback forwarder and an inert placeholder. Codex, xAI's subscription
+// (xai-oauth) and Kimi Code (kimi-code, #2469) are built into OMP's catalog and
+// need only a route. Devin's swe-2
 // is not in a fresh OMP catalog, so it also needs an explicit model entry.
 var remoteOmpCatalogProviders = []struct{ name, models string }{
 	{name: "openai-codex"},
 	{name: "xai-oauth"},
+	{name: "kimi-code"},
 	{name: "devin", models: `    api: openai-completions
     models:
       - id: swe-2

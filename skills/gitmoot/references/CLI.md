@@ -285,8 +285,9 @@ and allowlist failures are fail-closed. The option is off by default and does
 not enable standalone Codex, Claude, or Kimi runtimes on `remote`. Remote shells
 get `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` with a lease-bounded mTLS identity
 and capability. Remote OMP uses an instance-local forwarder and a job-scoped
-model catalog for the `openai-codex`, `xai-oauth` and `devin` providers (for
-example `openai-codex/gpt-6-sol`, `xai-oauth/grok-4.7`, `devin/swe-2`); provider
+model catalog for the `openai-codex`, `xai-oauth`, `kimi-code` and `devin`
+providers (for example `openai-codex/gpt-6-sol`, `xai-oauth/grok-4.7`,
+`kimi-code/k3`, `devin/swe-2`); provider
 credentials remain host-side.
 
 Those remote OMP models require `[credentials].model_gateway_key` to
@@ -1257,7 +1258,8 @@ pool exhausted the ordinary timed operational hold applies, and the shared
 attempt budget bounds the whole sequence. A verdict, a finding, or a product
 failure never changes the model: fallback exists for operational failure only.
 A remote review falls back only to models whose provider omp can authenticate
-inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `devin`); it
+inside the sandbox (`anthropic`, `openai-codex`, `xai-oauth`, `kimi-code`,
+`devin`); it
 skips any other entry with event `review_model_remote_skipped`, and the pool
 keeps that entry for local reviews.
 
@@ -3862,6 +3864,11 @@ credential probe passes; the probe failing just extends the hold without spendin
 a retry. So a job that "failed then reappeared as queued" is the deferral
 working, not a bug. Product failures (the agent answered with a `gitmoot_result`,
 including `decision=failed`) are never auto-retried.
+
+An omp `Unknown model: <provider/id>` refusal is class `model_unavailable`
+(#2469): a routed review moves straight to the next usable pool model, with no
+hold. With no usable next model the job stays failed, because waiting cannot
+make omp know the model.
 
 A **capability refusal is the one class that does not retry** (#1821). When a
 delivery fails because the runtime could not be executed at all - its binary is

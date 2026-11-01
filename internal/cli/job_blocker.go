@@ -65,6 +65,12 @@ const (
 	// internal/github's TransientError / IsTransientMessage signatures — that
 	// reached a terminal job failure. It defers with a short backoff.
 	blockerClassNetworkOutage blockerClass = "network_outage"
+	// blockerClassModelUnavailable (#2469) classifies omp refusing a model it
+	// does not know ("Unknown model: provider/id"), e.g. a pool entry missing
+	// from the remote sandbox's catalog. It is a fact about ONE pool entry, so a
+	// routed review advances to the next entry; waiting cannot teach omp the
+	// model, so with no usable next entry the job stays failed.
+	blockerClassModelUnavailable blockerClass = "model_unavailable"
 	// blockerClassCheckoutContention (#532 slice C) classifies a daemon-owned
 	// pre-flight checkout failure: a branch-lock conflict (self-heals, short
 	// exponential backoff) or a dirty/wrong-head checkout (usually needs a human;
@@ -124,6 +130,15 @@ func isOmpProviderTransportFailure(text string) bool {
 	return strings.Contains(strings.ToLower(text), ompProviderTransportSignature)
 }
 
+// isOmpUnknownModelMessage matches omp's own refusal of an unresolvable model,
+// as measured on remote reviews (#2469): "omp turn failed (stopReason error):
+// Unknown model: openai-codex/gpt-6.1-sol". Both fragments are required so a
+// model name merely quoted in other omp output does not qualify.
+func isOmpUnknownModelMessage(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "omp turn failed") && strings.Contains(lower, "unknown model: ")
+}
+
 // reviewFallbackSwitchesToOmp reports whether a pool fallback should move the
 // retry onto the omp runtime (owner decision 2026-09-14).
 //
@@ -157,7 +172,7 @@ func reviewFallbackSwitchesToOmp(effectiveRuntime string) bool {
 // there (#2333); the pool itself is untouched, so local reviews keep the entry.
 func nextReviewPoolModel(payload workflow.JobPayload, classification blockerClassification, usable func(model string) bool) (next string, skipped []string, ok bool) {
 	switch classification.Class {
-	case blockerClassRuntimeQuota, blockerClassRuntimeAuth:
+	case blockerClassRuntimeQuota, blockerClassRuntimeAuth, blockerClassModelUnavailable:
 	case blockerClassNetworkOutage:
 		if !isOmpProviderTransportFailure(classification.Detail) {
 			return "", nil, false
@@ -382,6 +397,11 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 		}, true
 	case "auth failing":
 		return blockerClassification{Class: blockerClassRuntimeAuth, RetryAt: now.Add(authBlockerRetryDelay), Detail: detail}, true
+	}
+	if isOmpUnknownModelMessage(text) {
+		// RetryAt stays zero: there is nothing to wait for. The pre-terminal seam
+		// either advances a routed review's pool or leaves the failure terminal.
+		return blockerClassification{Class: blockerClassModelUnavailable, Detail: detail}, true
 	}
 	// CAPABILITY refusal (#1821): the runtime could not be executed at all.
 	// Checked AFTER auth/quota so a 401/429 keeps its more specific class, and
@@ -768,7 +788,8 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	payload.BlockerClass = string(classification.Class)
 	payload.BlockerAttempts = attempt
 	payload.BlockerSuggestedAction = classification.SuggestedAction
-	// #2171 router fallback: a quota/auth failure on one pool entry is an
+	// #2171 router fallback: a quota, auth or unknown-model (#2469) failure on
+	// one pool entry is an
 	// operational fact about that provider, not about the review, so advance to
 	// the next untried model and re-queue immediately instead of waiting out the
 	// provider's window. Only pre-verdict operational classes qualify; the
@@ -788,9 +809,15 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 				strings.Join(skipped, ", "), strings.Join(remoteOmpAuthenticatedProviders(), ", ")),
 		})
 	}
+	if !ok && classification.Class == blockerClassModelUnavailable {
+		// No usable next pool entry (or no pool at all): retrying the same model
+		// later fails identically, so keep the failure terminal.
+		return false, nil
+	}
 	if ok {
 		payload.Model = next
-		// OWNER DECISION 2026-09-14: a quota/auth blocker falls back by moving to
+		// OWNER DECISION 2026-09-14: a quota/auth blocker (and, since #2469, an
+		// unknown model) falls back by moving to
 		// omp with the next pool model, not by retrying the dead runtime.
 		//
 		// This is required for correctness, not preference: a pool entry is an

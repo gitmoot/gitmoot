@@ -432,6 +432,10 @@ Fixes:
   (a failing probe extends the hold without spending a retry). Over `[events]`
   the deferral is a first-class `job.deferred` emitted instead of `job.failed`.
   Only act when the retry budget is spent and the job stays failed.
+- An omp `Unknown model: <provider/id>` refusal is class `model_unavailable`
+  (#2469): a routed review moves straight to the next usable pool model with
+  no hold; with none left the job stays failed, since waiting cannot make omp
+  know the model.
 - A job `blocked` with class `runtime_unavailable` will NOT recover on its own
   (#1821). That class means the runtime could not be executed at all: its
   binary is absent from the seat's `PATH`, or resolves to a published

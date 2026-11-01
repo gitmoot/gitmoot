@@ -11,9 +11,10 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// remoteAuthPool mirrors the production `code` pool shape: kimi-code has no
-// credential route into a remote sandbox, the others do.
-var remoteAuthPool = []string{"devin/swe-2", "kimi-code/k3", "xai-oauth/grok-4.7", "openai-codex/gpt-6-sol"}
+// remoteAuthPool mirrors the production `code` pool shape with one provider
+// (moonshot) that has no credential route into a remote sandbox; the others do.
+// kimi-code was the unroutable example until #2469 gave it a route.
+var remoteAuthPool = []string{"devin/swe-2", "moonshot/kimi-k2", "xai-oauth/grok-4.7", "openai-codex/gpt-6-sol"}
 
 // remoteSkippedKind is spelled out rather than taken from the constant so this
 // file states the operator-visible event name it pins.
@@ -68,11 +69,11 @@ func TestRemoteReviewFallbackSkipsModelsThatCannotAuthenticateRemotely(t *testin
 	t.Run("remote", func(t *testing.T) {
 		job, payload, events := quotaOnFirstPoolModel(t, "remote", remoteAuthPool)
 		if job.State != string(workflow.JobQueued) || payload.Model != "xai-oauth/grok-4.7" {
-			t.Fatalf("remote fallback state=%s model=%q, want queued on xai-oauth/grok-4.7 (kimi-code/k3 has no remote credential route)", job.State, payload.Model)
+			t.Fatalf("remote fallback state=%s model=%q, want queued on xai-oauth/grok-4.7 (moonshot/kimi-k2 has no remote credential route)", job.State, payload.Model)
 		}
 		skipped := eventsOfKind(events, remoteSkippedKind)
-		if len(skipped) != 1 || !strings.Contains(skipped[0].Message, "kimi-code/k3") || strings.Contains(skipped[0].Message, "xai-oauth/grok-4.7") {
-			t.Fatalf("%s events = %+v, want one naming only kimi-code/k3", remoteSkippedKind, skipped)
+		if len(skipped) != 1 || !strings.Contains(skipped[0].Message, "moonshot/kimi-k2") || strings.Contains(skipped[0].Message, "xai-oauth/grok-4.7") {
+			t.Fatalf("%s events = %+v, want one naming only moonshot/kimi-k2", remoteSkippedKind, skipped)
 		}
 		if len(eventsOfKind(events, reviewModelFallbackEventKind)) != 1 {
 			t.Fatalf("missing %s event: %+v", reviewModelFallbackEventKind, events)
@@ -80,8 +81,8 @@ func TestRemoteReviewFallbackSkipsModelsThatCannotAuthenticateRemotely(t *testin
 	})
 	t.Run("local keeps every pool entry", func(t *testing.T) {
 		job, payload, events := quotaOnFirstPoolModel(t, "local", remoteAuthPool)
-		if job.State != string(workflow.JobQueued) || payload.Model != "kimi-code/k3" {
-			t.Fatalf("local fallback state=%s model=%q, want queued on kimi-code/k3", job.State, payload.Model)
+		if job.State != string(workflow.JobQueued) || payload.Model != "moonshot/kimi-k2" {
+			t.Fatalf("local fallback state=%s model=%q, want queued on moonshot/kimi-k2", job.State, payload.Model)
 		}
 		if skipped := eventsOfKind(events, remoteSkippedKind); len(skipped) != 0 {
 			t.Fatalf("local review recorded %s: %+v", remoteSkippedKind, skipped)
@@ -93,14 +94,82 @@ func TestRemoteReviewFallbackSkipsModelsThatCannotAuthenticateRemotely(t *testin
 // ordinary timed hold instead of provisioning a sandbox for a model that cannot
 // authenticate, and the skip is still visible on the job.
 func TestRemoteReviewFallbackHoldsWhenOnlyUnauthenticatableModelsRemain(t *testing.T) {
-	job, payload, events := quotaOnFirstPoolModel(t, "remote", []string{"devin/swe-2", "kimi-code/k3"})
+	job, payload, events := quotaOnFirstPoolModel(t, "remote", []string{"devin/swe-2", "moonshot/kimi-k2"})
 	if job.State != string(workflow.JobQueued) || payload.Model != "devin/swe-2" {
 		t.Fatalf("state=%s model=%q, want devin/swe-2 kept for the timed hold", job.State, payload.Model)
 	}
 	if len(eventsOfKind(events, reviewModelFallbackEventKind)) != 0 || len(eventsOfKind(events, blockerDeferredEventKind)) != 1 {
 		t.Fatalf("events = %+v, want the timed hold and no model fallback", events)
 	}
-	if skipped := eventsOfKind(events, remoteSkippedKind); len(skipped) != 1 || !strings.Contains(skipped[0].Message, "kimi-code/k3") {
-		t.Fatalf("%s events = %+v, want one naming kimi-code/k3", remoteSkippedKind, skipped)
+	if skipped := eventsOfKind(events, remoteSkippedKind); len(skipped) != 1 || !strings.Contains(skipped[0].Message, "moonshot/kimi-k2") {
+		t.Fatalf("%s events = %+v, want one naming moonshot/kimi-k2", remoteSkippedKind, skipped)
 	}
+}
+
+// #2469. kimi-code now has a credential route into the sandbox, so a remote
+// review's fallback lands on it instead of skipping past it.
+func TestRemoteReviewFallbackUsesKimiRoute(t *testing.T) {
+	job, payload, events := quotaOnFirstPoolModel(t, "remote", []string{"devin/swe-2", "kimi-code/k3", "xai-oauth/grok-4.7"})
+	if job.State != string(workflow.JobQueued) || payload.Model != "kimi-code/k3" {
+		t.Fatalf("remote fallback state=%s model=%q, want queued on kimi-code/k3", job.State, payload.Model)
+	}
+	if skipped := eventsOfKind(events, remoteSkippedKind); len(skipped) != 0 {
+		t.Fatalf("remote review skipped a routed provider: %+v", skipped)
+	}
+}
+
+// unknownModelFailure is omp's measured refusal when a pool model is missing
+// from the remote catalog (herdrup#589, data-core#29).
+const unknownModelFailure = "omp turn failed (stopReason error): Unknown model: openai-codex/gpt-6.1-sol: remote command exited with code 1: exit status 1"
+
+// #2469. "Unknown model" is a fact about one pool entry: a routed review moves
+// to the next entry immediately; with nothing left it stays failed, because
+// waiting cannot teach omp the model.
+func TestUnknownModelAdvancesReviewPoolOrStaysTerminal(t *testing.T) {
+	run := func(t *testing.T, pool []string) (bool, db.Job, workflow.JobPayload, []db.JobEvent) {
+		t.Helper()
+		ctx := context.Background()
+		store, home := blockerE2EHome(t)
+		checkout := t.TempDir()
+		seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
+		seedDaemonWorkerAgent(t, store, "omp-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo")
+		request := poolReviewRequest("job-2469", "omp-reviewer")
+		request.ReviewModelPool = pool
+		request.Model = pool[0]
+		remote := "remote"
+		request.ExecBackend = &remote
+		enqueueDaemonWorkerJob(t, store, request)
+		if _, err := store.TransitionJobState(ctx, request.ID, string(workflow.JobQueued), string(workflow.JobRunning)); err != nil {
+			t.Fatalf("TransitionJobState: %v", err)
+		}
+		worker := blockerE2EWorker(store, home, checkout)
+		deferred, err := worker.deferOperationalBlockerPreTerminal(ctx, request.ID, workflow.DeliveryError{Err: errors.New(unknownModelFailure)})
+		if err != nil {
+			t.Fatalf("deferOperationalBlockerPreTerminal: %v", err)
+		}
+		job, payload := blockerE2EJobPayload(t, store, request.ID)
+		events, err := store.ListJobEvents(ctx, request.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return deferred, job, payload, events
+	}
+	t.Run("next pool entry", func(t *testing.T) {
+		deferred, job, payload, events := run(t, []string{"openai-codex/gpt-6.1-sol", "kimi-code/k3"})
+		if !deferred || job.State != string(workflow.JobQueued) || payload.Model != "kimi-code/k3" || payload.BlockerClass != "model_unavailable" {
+			t.Fatalf("deferred=%v state=%s model=%q class=%q, want queued on kimi-code/k3 as model_unavailable", deferred, job.State, payload.Model, payload.BlockerClass)
+		}
+		if len(eventsOfKind(events, reviewModelFallbackEventKind)) != 1 {
+			t.Fatalf("missing %s event: %+v", reviewModelFallbackEventKind, events)
+		}
+	})
+	t.Run("exhausted pool stays terminal", func(t *testing.T) {
+		deferred, job, payload, events := run(t, []string{"openai-codex/gpt-6.1-sol"})
+		if deferred || job.State != string(workflow.JobRunning) || payload.BlockerClass != "" {
+			t.Fatalf("deferred=%v state=%s class=%q, want the failure left to the terminal path", deferred, job.State, payload.BlockerClass)
+		}
+		if len(eventsOfKind(events, blockerDeferredEventKind)) != 0 {
+			t.Fatalf("exhausted Unknown model was put on a timed hold: %+v", events)
+		}
+	})
 }

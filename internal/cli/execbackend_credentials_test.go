@@ -185,7 +185,7 @@ credential_gateway_url = %q
 	if err := yaml.Unmarshal(ompInner.runtimeContents[remoteOmpModelsPath], &catalog); err != nil {
 		t.Fatalf("remote omp catalog is not YAML: %v", err)
 	}
-	for _, provider := range []string{"openai-codex", "xai-oauth", "devin"} {
+	for _, provider := range []string{"openai-codex", "xai-oauth", "kimi-code", "devin"} {
 		entry, ok := catalog.Providers[provider]
 		if !ok || entry.BaseURL != remoteOmpForwarderURL || entry.APIKey != "gitmoot-job-gateway" || entry.Transport != "pi-native" {
 			t.Fatalf("remote omp catalog does not route %s through the job gateway: %+v (present=%v)", provider, entry, ok)
