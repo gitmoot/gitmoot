@@ -426,6 +426,10 @@ reports the live scheduler mode and worker count (e.g. `scheduler: pool, workers
 when ≥2 parallelizable jobs are queued under a serializing config. Same-repo
 parallelism is bounded by **distinct runtime sessions** as well as distinct
 checkouts; see [Run Jobs In Parallel On A Repo](../workflows/parallel-jobs-workflow.md).
+`--workers` bounds jobs whose runtime runs on this host; E2B remote jobs run in
+a provider sandbox and are bounded by `[remote_exec] cost_max_concurrent`
+instead, re-read every tick (#2470). sandboxd providers still use host slots,
+and with `cost_max_concurrent` unset E2B jobs count against `--workers`.
 One repo's concurrency can also be capped **from config, without any relaunch**,
 via a `[repos."owner/repo"]` section with `max_parallel = N` (#576) — see
 [Cap one repo's parallelism from config](../workflows/parallel-jobs-workflow.md#cap-one-repos-parallelism-from-config).

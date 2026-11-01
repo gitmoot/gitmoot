@@ -629,6 +629,13 @@ the daemon logs a preflight warning — with the exact relaunch command — when
 parallelizable jobs are queued under a serializing config. Same-repo parallelism
 is bounded by **distinct runtime sessions** as well as distinct checkouts.
 
+`--workers` bounds jobs whose runtime runs **on this host**. A job pinned to the
+E2B remote backend runs in a provider sandbox, so it does not take a host
+worker slot; E2B jobs are bounded instead by `[remote_exec] cost_max_concurrent`
+(and the cost reserve), re-read every tick (#2470). sandboxd providers still use
+host slots. With `cost_max_concurrent` unset, E2B jobs count against
+`--workers` as before.
+
 One repo's concurrency can also be capped **from config, without any relaunch**
 (#576): a `[repos."owner/repo"]` section with `max_parallel = N` caps that
 repo's in-flight jobs (`0` or unset = use the global worker count), and an
