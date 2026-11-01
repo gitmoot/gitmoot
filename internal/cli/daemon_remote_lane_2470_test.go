@@ -153,3 +153,71 @@ func TestRefreshRemoteLaneCapFollowsConfig(t *testing.T) {
 		t.Fatalf("remote cap = %d after an unreadable config, want 0 (lane off)", got)
 	}
 }
+
+// #2470 review (P1). The pool pass reaps jobs (tracker.end) only while it is
+// alive. A pass whose queue holds only E2B jobs must therefore stay up until
+// those jobs finish, release their tracker registration, and leave the repo
+// dispatchable; returning early would wedge the repo (tryBeginPool refuses
+// while perRepo > 0) and leak remote-cap slots until restart.
+func TestPoolPassStaysAliveUntilRemoteLaneJobsAreReaped(t *testing.T) {
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
+	seedDaemonWorkerAgent(t, store, "remote-a", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "remote-b", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
+	remote := "remote"
+	for _, job := range []struct{ id, agent string }{{"remote-1", "remote-a"}, {"remote-2", "remote-b"}} {
+		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: job.id, Agent: job.agent, Action: "review", Repo: "owner/repo", Branch: "main", PullRequest: 1, HeadSHA: "0123456789abcdef0123456789abcdef01234567", ExecBackend: &remote})
+	}
+
+	release := make(chan struct{})
+	started := make(chan string, 2)
+	previous := poolJobRunner
+	poolJobRunner = func(ctx context.Context, worker jobWorker, job db.Job) error {
+		started <- job.ID
+		<-release
+		return worker.Store.UpdateJobState(context.Background(), job.ID, string(workflow.JobSucceeded))
+	}
+	t.Cleanup(func() { poolJobRunner = previous })
+
+	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, true)
+	tracker := newInflightJobTracker(ctx)
+	defer tracker.drain(io.Discard, 5*time.Second)
+	tracker.setRemoteCap(2)
+	if !tracker.tryBeginPool("owner/repo") {
+		t.Fatal("could not begin the pool pass")
+	}
+	passDone := make(chan error, 1)
+	go func() {
+		defer tracker.endPool("owner/repo")
+		passDone <- runQueuedJobsForRepoPoolTracked(ctx, worker, 1, 1, "owner/repo", "", tracker)
+	}()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the E2B jobs were not dispatched")
+		}
+	}
+	select {
+	case err := <-passDone:
+		t.Fatalf("pool pass returned (%v) while E2B jobs were still in flight; nothing would reap them", err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-passDone:
+		if err != nil {
+			t.Fatalf("pool pass: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("pool pass did not finish after its E2B jobs completed")
+	}
+	if n := tracker.inflight("owner/repo"); n != 0 {
+		t.Fatalf("tracker still holds %d jobs for the repo after the pass ended", n)
+	}
+	if !tracker.tryBeginPool("owner/repo") {
+		t.Fatal("repo stays wedged: a new pool pass cannot start")
+	}
+	tracker.endPool("owner/repo")
+}
