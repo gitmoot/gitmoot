@@ -870,6 +870,10 @@ recovery margin or per-review byte reservation.
 
 The two-second monitor spans preparation, execution and owned cleanup; failed
 checks cancel only the owned lifecycle generation, never reroute a running job.
+The 20GB warning band applies only when a review is admitted: a running local
+review that dips into the band keeps running, and only the hard floor, the
+canonical reserve, a device change or a policy change stop it (#2479). A
+monitor cancel records `review_capacity_cancelled` with its reason.
 `.gitmoot/review-capacity.jsonl` records measurements and cancellation requests.
 Cancellation does not prove remote destruction completed or automatically retry
 a review. Shared writers can cross a threshold between checks. Concurrency,

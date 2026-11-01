@@ -159,6 +159,109 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 	}
 }
 
+// Jarvis 380078: a local review admitted above the 20GB warning threshold must
+// keep running when free space dips into the 10-20GB band; the band decides
+// only where NEW reviews start. Crossing the 10GB hard floor still cancels it,
+// and the cancel names its reason on the job.
+func TestLocalReviewMonitorKeepsRunningInWarningBandButStopsAtFloor(t *testing.T) {
+	declareNoRealAdapterExec(t)
+	home, store, head := reviewRouterHome(t)
+	ctx := context.Background()
+	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
+		Home: home, RepoFlag: "owner/repo", Agent: "reviewer", Action: "review",
+		PullRequest: 12, HeadSHA: head, Branch: "feature/review", Instructions: "review this",
+		Background: true, ActingOrgRole: "joltra", NoFixTarget: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, output.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := config.PathsForHome(home)
+	appendConfig(t, paths, fmt.Sprintf("\n[janitor_capacity]\nenabled = true\nreview_admission = \"fresh_space\"\nexecutable = \"/usr/local/bin/janitor\"\npolicy_hash = %q\n", janitorTestPolicyHash))
+	appendConfig(t, paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+	hostPaths, root, err := janitorHostPaths(ctx, store, paths, "owner/repo", payload.WorktreePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices, err := janitorHostDevices(hostPaths, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var free atomic.Uint64
+	free.Store(25_000_000_000)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: free.Load()}, nil
+	})
+	previous := runJanitorStatus
+	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+		volumes := make([]string, 0, len(devices))
+		for device := range devices {
+			volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"target_recovered","admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"measured"}`, device, device, free.Load()))
+		}
+		return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
+	}
+	t.Cleanup(func() { runJanitorStatus = previous })
+	runner := &reviewCapacityBlockingRunner{started: make(chan struct{})}
+	worker := defaultJobWorker(store, io.Discard, home)
+	worker.ExecutionBackendFactory = nil
+	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
+		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
+	}
+	worker.CommenterFactory = func(string) github.Client { return githubtest.NoopClient{} }
+	runCtx, cancel := context.WithCancel(ctx)
+	finished := make(chan struct{})
+	var runErr error
+	go func() { defer close(finished); runErr = worker.run(runCtx, job) }()
+	defer func() { cancel(); <-finished }()
+	select {
+	case <-runner.started:
+	case <-finished:
+		t.Fatalf("review did not start above the warning threshold: %v", runErr)
+	case <-time.After(30 * time.Second):
+		t.Fatal("review never reached delivery")
+	}
+	// Into the warning band: at least two monitor intervals must pass with the
+	// review still running.
+	free.Store(15_000_000_000)
+	select {
+	case <-finished:
+		events, _ := store.ListJobEvents(ctx, job.ID)
+		t.Fatalf("running local review was stopped in the warning band: %v events=%+v", runErr, events)
+	case <-time.After(2*reviewCapacityInterval + time.Second):
+	}
+	// Below the hard floor the monitor still stops it, and says why.
+	free.Store(5_000_000_000)
+	select {
+	case <-finished:
+	case <-time.After(8 * time.Second):
+		t.Fatal("review kept running below the hard floor")
+	}
+	ended, err := store.GetJob(ctx, job.ID)
+	if err != nil || ended.State != string(workflow.JobCancelled) {
+		t.Fatalf("review below floor = %+v, %v; want cancelled", ended, err)
+	}
+	events, err := store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := ""
+	for _, event := range events {
+		if event.Kind == reviewCapacityCancelledEventKind {
+			reason = event.Message
+		}
+	}
+	if reason == "" || !strings.Contains(reason, "review capacity monitor cancelled this run") {
+		t.Fatalf("cancel has no recorded reason: %+v", events)
+	}
+}
+
 type reviewCapacityBlockingRunner struct {
 	started chan struct{}
 	once    sync.Once
