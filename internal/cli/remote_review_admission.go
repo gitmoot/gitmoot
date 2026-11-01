@@ -252,8 +252,9 @@ func (w jobWorker) remoteReviewRetryAdmission(ctx context.Context, job db.Job) e
 	marker := "lifecycle_generation=" + strconv.FormatInt(generation, 10)
 	for _, event := range events {
 		// A review model fallback is a classified provider failure by
-		// construction: the pool only advances on runtime_quota, runtime_auth
-		// or model_unavailable (#2469).
+		// construction: the pool only advances on runtime_quota, runtime_auth,
+		// model_unavailable (#2469), or a network_outage that is an omp
+		// provider-transport failure (a stalled provider stream).
 		// It re-queues the job onto a DIFFERENT model precisely so that model
 		// can run, so it must grant the new lifecycle its cloud attempt. Before
 		// #2245 it did not, and a remote review could never fall through its
