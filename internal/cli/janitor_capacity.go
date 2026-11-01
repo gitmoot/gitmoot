@@ -397,39 +397,14 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 	if !admission.enabled() {
 		return jobs
 	}
-	// Canonical warning bytes apply before fresh-space admission, even when a
-	// newer statfs reading has recovered above the configured review threshold.
-	// The E2B route stays an operator opt-in ([disk_guard] remote_reviews): with
-	// it off the canonical band adds no routing, and local reviews keep the
-	// ordinary Janitor admission below. Invalid evidence never routes.
-	if admission.cfgErr == nil && admission.readErr == nil && admission.expired() == "" {
-		device, deviceErr := janitorDeviceOf(paths.Home)
-		evaluation := evaluateConfiguredDiskGuard(paths)
-		var volume *janitorVolume
-		duplicate := false
-		for i := range admission.snapshot.volumes {
-			v := &admission.snapshot.volumes[i]
-			if v.hasDevice && v.device == device {
-				duplicate = volume != nil
-				volume = v
-				if duplicate {
-					break
-				}
+	if evaluation, inBand := canonicalReviewWarningBand(paths, admission); inBand {
+		matching := make([]db.Job, 0, len(jobs))
+		for _, job := range jobs {
+			if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
+				matching = append(matching, job)
 			}
 		}
-		if evaluation.Policy.RemoteReviews && deviceErr == nil && !duplicate && volume != nil && volume.hasTarget && janitorClearedStates[volume.state] && evaluation.allowsDispatch() {
-			evaluation.Usage.FreeBytes = min(evaluation.Usage.FreeBytes, volume.available)
-			evaluation.Policy.RemoteReviewsBelowBytes = max(evaluation.Policy.RemoteReviewsBelowBytes, volume.target)
-			if evaluation.Usage.FreeBytes >= volume.reserve && evaluation.Usage.FreeBytes < evaluation.Policy.RemoteReviewsBelowBytes {
-				matching := make([]db.Job, 0, len(jobs))
-				for _, job := range jobs {
-					if queuedJobMatchesRepo(job, repoFilter) && queuedJobMatchesSession(job, rootFilter) {
-						matching = append(matching, job)
-					}
-				}
-				jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
-			}
-		}
+		jobs = diskGuardReviewBandDispatch(ctx, worker, jobs, matching, evaluation)
 	}
 	reasons := map[string]string{}
 	allowed := make([]db.Job, 0, len(jobs))
@@ -483,6 +458,41 @@ func janitorPressureQueuedDispatch(ctx context.Context, worker jobWorker, jobs [
 		})
 	}
 	return allowed
+}
+
+// canonicalReviewWarningBand reports whether Janitor's canonical sample puts
+// the Gitmoot home's device in the review warning band (#2466/#2485). Canonical
+// warning bytes apply before fresh-space admission, even when a newer statfs
+// reading has recovered above the configured review threshold: free space is
+// the lower of statfs and the canonical sample, and the threshold the higher of
+// remote_reviews_below_bytes and the canonical target. The E2B route stays an
+// operator opt-in ([disk_guard] remote_reviews). Invalid, stale, duplicate or
+// uncleared evidence never routes. The returned evaluation carries the widened
+// numbers for alerts and route reasons.
+func canonicalReviewWarningBand(paths config.Paths, admission janitorAdmission) (diskGuardEvaluation, bool) {
+	evaluation := evaluateConfiguredDiskGuard(paths)
+	if !admission.enabled() || admission.cfgErr != nil || admission.readErr != nil || admission.expired() != "" {
+		return evaluation, false
+	}
+	device, deviceErr := janitorDeviceOf(paths.Home)
+	var volume *janitorVolume
+	duplicate := false
+	for i := range admission.snapshot.volumes {
+		v := &admission.snapshot.volumes[i]
+		if v.hasDevice && v.device == device {
+			duplicate = volume != nil
+			volume = v
+			if duplicate {
+				break
+			}
+		}
+	}
+	if !evaluation.Policy.RemoteReviews || deviceErr != nil || duplicate || volume == nil || !volume.hasTarget || !janitorClearedStates[volume.state] || !evaluation.allowsDispatch() {
+		return evaluation, false
+	}
+	evaluation.Usage.FreeBytes = min(evaluation.Usage.FreeBytes, volume.available)
+	evaluation.Policy.RemoteReviewsBelowBytes = max(evaluation.Policy.RemoteReviewsBelowBytes, volume.target)
+	return evaluation, evaluation.Usage.FreeBytes >= volume.reserve && evaluation.Usage.FreeBytes < evaluation.Policy.RemoteReviewsBelowBytes
 }
 
 // janitorPressureRefusal checks direct heavy-work admission. The independent

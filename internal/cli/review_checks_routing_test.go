@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -295,18 +297,40 @@ func TestReviewRequestRoutesToE2BInWarningBand(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		free uint64
-		want string // "remote", "local" or "refused"
+		// janitor, when set, is the canonical sample: available and target bytes.
+		janitor *[2]uint64
+		want    string // "remote", "local" or "refused"
 	}{
-		{"warning_band", 15_000_000_000, "remote"},
-		{"above_warning", 25_000_000_000, "local"},
-		{"below_floor", 5_000_000_000, "refused"},
+		{"warning_band", 15_000_000_000, nil, "remote"},
+		{"above_warning", 25_000_000_000, nil, "local"},
+		{"below_floor", 5_000_000_000, nil, "refused"},
+		// #2486 review: a recovered statfs reading must not erase a lower
+		// canonical sample, and a canonical target above the configured
+		// threshold widens the band, as for queued reviews.
+		{"canonical_low_statfs_recovered", 30_000_000_000, &[2]uint64{19_999_999_999, 20_000_000_000}, "remote"},
+		{"canonical_target_above_configured", 22_000_000_000, &[2]uint64{22_000_000_000, 25_000_000_000}, "remote"},
+		{"canonical_recovered", 30_000_000_000, &[2]uint64{30_000_000_000, 20_000_000_000}, "local"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home, store, head := reviewChecksRoutingHome(t, "")
-			appendConfig(t, config.PathsForHome(home), "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
+			paths := config.PathsForHome(home)
+			appendConfig(t, paths, "\n[disk_guard]\nmin_free_bytes = 10000000000\nmin_free_percent = 0\nremote_reviews = true\nremote_reviews_below_bytes = 20000000000\n")
 			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 				return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: tc.free}, nil
 			})
+			if tc.janitor != nil {
+				enableJanitorCapacity(t, paths)
+				device, err := janitorDeviceOf(paths.Home)
+				if err != nil {
+					t.Fatal(err)
+				}
+				previous := runJanitorStatus
+				runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+					volume := fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"target_recovered","admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":%d,"reason":"measured"}`, device, device, tc.janitor[0], tc.janitor[1])
+					return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volume)), nil
+				}
+				t.Cleanup(func() { runJanitorStatus = previous })
+			}
 			out, failure := runReviewRequestJSON(t,
 				"--repo", "owner/repo", "--pr", "12", "--head", head,
 				"--branch", "feature/review", "--role", "joltra", "--home", home,

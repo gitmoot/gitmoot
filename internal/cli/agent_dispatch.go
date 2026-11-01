@@ -167,7 +167,13 @@ func reviewPolicyBackend(ctx context.Context, request localAgentDispatchRequest,
 	// before. Foreground reviews still refuse in the band, with a hint to pass
 	// --exec-backend remote.
 	if paths, err := pathsFromFlag(request.Home); err == nil {
-		if evaluation := evaluateConfiguredDiskGuard(paths); evaluation.allowsDispatch() && evaluation.reviewsBelowThreshold() {
+		evaluation := evaluateConfiguredDiskGuard(paths)
+		inBand := evaluation.allowsDispatch() && evaluation.reviewsBelowThreshold()
+		if !inBand {
+			// Same canonical widening as the queued router (#2485 review).
+			evaluation, inBand = canonicalReviewWarningBand(paths, loadJanitorAdmission(ctx, paths))
+		}
+		if inBand {
 			return execbackend.Remote, true, fmt.Sprintf("%s: free space %d below review warning threshold %d", reviewWarningBandRouteReason, evaluation.Usage.FreeBytes, evaluation.Policy.RemoteReviewsBelowBytes)
 		}
 	}
