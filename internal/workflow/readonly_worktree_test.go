@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,48 @@ func TestReadOnlyPrecleanupFailureRedactsDurableError(t *testing.T) {
 	if strings.Contains(obligation.LastError, secret) || !strings.Contains(obligation.LastError, "[REDACTED]") {
 		t.Fatalf("durable preservation diagnostic exposed a credential: %q", obligation.LastError)
 	}
+}
+
+// #2491 (phobos-assistant#318): the read-only diff snapshot timed out on the
+// sshfs seat. Its failure was recorded on the job, but returning it failed the
+// terminal advance, so the review's verdict never reached its task and the
+// advance retried forever. A deferred preservation must keep the worktree with
+// a retryable obligation and let the advance continue; a real publication
+// failure joined beside it still fails.
+func TestDeferredPreservationKeepsWorktreeWithoutFailingAdvance(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		return fmt.Errorf("%w: read-only worktree diff not captured: signal: killed", ErrPreservationDeferred)
+	}
+	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
+		t.Fatalf("deferred preservation failed the advance: %v", err)
+	}
+	world.assertPreserved(t)
+	resource := db.CleanupObligationResourceID(world.jobID, world.payload.WorktreePath)
+	obligation, err := world.store.GetCleanupObligation(ctx, resource)
+	if err != nil || obligation.State != db.CleanupObligationRetryable {
+		t.Fatalf("kept worktree has no retryable cleanup obligation: %+v %v", obligation, err)
+	}
+	events, err := world.store.ListJobEvents(ctx, world.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped := false
+	for _, event := range events {
+		skipped = skipped || (event.Kind == "delegation_worktree_cleanup_skipped" && strings.Contains(event.Message, "evidence not captured"))
+	}
+	if !skipped {
+		t.Fatalf("kept worktree recorded no reason: %+v", events)
+	}
+
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		return errors.Join(fmt.Errorf("%w: diff", ErrPreservationDeferred), errors.New("pipeline artifact publish failed"))
+	}
+	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err == nil {
+		t.Fatal("a real publication failure beside a deferred one did not fail")
+	}
+	world.assertPreserved(t)
 }
 
 func TestReclaimReadOnlyWorktreeRejectsUnownedPath(t *testing.T) {

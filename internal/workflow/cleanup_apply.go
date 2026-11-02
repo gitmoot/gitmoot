@@ -220,6 +220,19 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 
 func (e Engine) cleanupProducerAutomatically(ctx context.Context, jobID string, policy CleanupPolicy) (bool, error) {
 	ctx, err := e.publishCleanupArtifacts(context.WithoutCancel(ctx), jobID)
+	if onlyPreservationDeferred(err) {
+		// The collector recorded its own failure on the job and
+		// publishCleanupArtifacts deferred the cleanup obligation, so the
+		// workspace stays and the reclaim pass retries. Advancement continues
+		// (#2491): a review whose diff snapshot timed out on the sshfs seat used
+		// to hold its verdict back from the task forever.
+		_, payload, readErr := e.jobPayload(ctx, jobID)
+		if readErr != nil {
+			return false, readErr
+		}
+		e.recordCleanupSkippedOnce(ctx, jobID, payload, "pre-cleanup evidence not captured; worktree kept for a later attempt: "+RedactCommentText(err.Error()))
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}

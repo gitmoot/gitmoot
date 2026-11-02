@@ -143,12 +143,18 @@ func TestAskReviewDiffPrecleanupHookPersistsFailureMarker(t *testing.T) {
 		Payload: mustJobPayload(t, payload),
 	}, "succeeded")
 
-	if err := askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})(ctx, "broken-ask", "ask", payload); err == nil {
-		t.Fatal("capture in a non-repository returned nil error")
+	err := askReviewDiffPrecleanupHookForRunner(store, subprocess.ExecRunner{})(ctx, "broken-ask", "ask", payload)
+	// #2491: a recorded capture failure defers cleanup; it must not read as a
+	// publication failure that holds back advancement, and must stay redacted.
+	if !errors.Is(err, workflow.ErrPreservationDeferred) {
+		t.Fatalf("recorded capture failure = %v, want workflow.ErrPreservationDeferred", err)
 	}
-	job, err := store.GetJob(ctx, "broken-ask")
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("deferred error exposed a credential: %q", err)
+	}
+	job, getErr := store.GetJob(ctx, "broken-ask")
+	if getErr != nil {
+		t.Fatal(getErr)
 	}
 	persisted, err := daemonJobPayload(job)
 	if err != nil {
