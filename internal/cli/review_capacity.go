@@ -186,6 +186,13 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	if ownsGeneration {
 		ownedGeneration = *generation
 	}
+	// lastGood is the newest Janitor sample that was read successfully. One
+	// failed read (a status call timing out under host load) reuses it while
+	// it is still fresh; the measurements are still taken live, and the
+	// sample's own validity still applies, so failed evidence fails closed
+	// once no fresh sample exists (owner decision, #2500: a single 5s timeout
+	// at 21:19Z cancelled five healthy reviews at once).
+	var lastGood *janitorAdmission
 	check := func(admitting bool) (map[uint64]string, []reviewCapacityMeasurement, error) {
 		current, err := config.LoadJanitorCapacity(paths)
 		if err != nil {
@@ -195,7 +202,22 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 			return nil, nil, fmt.Errorf("review capacity policy changed during execution")
 		}
 		a := loadJanitorAdmission(ctx, paths)
-		return a.reviewMeasurements(ctx, store, paths, repo, sourceOnly, admitting, checkouts...)
+		var reusedAfter error
+		if a.cfgErr == nil && a.readErr == nil {
+			good := a
+			lastGood = &good
+		} else if a.cfgErr == nil && !admitting && lastGood != nil && lastGood.expired() == "" {
+			_ = recordReviewCapacity(paths, jobID, repo, head, "janitor_read_failed", "using the last good sample until it is stale: "+a.readErr.Error(), nil)
+			reusedAfter = a.readErr
+			a = *lastGood
+		}
+		devices, measurements, err := a.reviewMeasurements(ctx, store, paths, repo, sourceOnly, admitting, checkouts...)
+		if err != nil && reusedAfter != nil {
+			// The reused sample can expire during this check: name the read
+			// failure that made it the evidence, not only its staleness.
+			err = fmt.Errorf("%w (current janitor read failed: %v)", err, reusedAfter)
+		}
+		return devices, measurements, err
 	}
 	devices, first, err := check(true)
 	if err != nil {
@@ -255,13 +277,23 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	}, nil
 }
 
+// reviewCapacityCancelLockWait bounds how long a monitor cancel waits for the
+// job lifecycle lock. Destructive cleanup holds it exclusively while it works
+// on the sshfs worktrees; a 10s wait timed out there under load, and the run
+// was then stopped with no cancel committed, stranding the job "running" with
+// nothing executing it (#2500). The runtime keeps running while this waits.
+const reviewCapacityCancelLockWait = 2 * time.Minute
+
 func cancelMonitoredReview(store *db.Store, jobID string, generation int64, reason string, stopRuntime func()) error {
+	// Only after the whole wait failed is the runtime stopped without a
+	// committed cancel: capacity evidence is fail-closed, and the error is
+	// recorded beside the cancel request.
 	defer stopRuntime()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), reviewCapacityCancelLockWait)
 	defer cancel()
 	ctx, release, err := store.AcquireJobLifecycle(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("review capacity cancel not committed: job lifecycle lock not acquired within %s: %w", reviewCapacityCancelLockWait, err)
 	}
 	defer release()
 	job, err := store.GetJob(ctx, jobID)
