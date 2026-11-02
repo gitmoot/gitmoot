@@ -818,10 +818,12 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 
 	var firstErr error
 	if len(groups) > externalMergeReconcileLookupLimit {
-		// Rotate the capped window once a minute (#2493): always taking the
+		// Rotate the capped window each minute (#2493): always taking the
 		// first N by task id left every later candidate unread forever once a
-		// repo held more than N stale tasks.
-		start := int(d.now().Unix()/60) % len(groups)
+		// repo held more than N stale tasks. The start advances by the whole
+		// window, so every candidate is read within ceil(G/N) minutes at the
+		// same N reads per poll.
+		start := int((d.now().Unix() / 60 * int64(externalMergeReconcileLookupLimit)) % int64(len(groups)))
 		window := make([]candidateGroup, 0, externalMergeReconcileLookupLimit)
 		for i := 0; i < externalMergeReconcileLookupLimit; i++ {
 			window = append(window, groups[(start+i)%len(groups)])

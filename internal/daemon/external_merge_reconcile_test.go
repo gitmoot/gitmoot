@@ -359,23 +359,26 @@ func TestPollOnceReconcilesBranchReviewTaskWithoutStoredPullRequest(t *testing.T
 }
 
 // #2493: with more candidates than the per-poll lookup limit, the capped
-// window rotates, so a candidate past the first N is still reached.
+// window rotates by its whole size each minute, so every candidate is looked
+// up within ceil(G/N) minutes. Ids are zero-padded so task order is numeric
+// and the merged target sits past the first window: without rotation it is
+// never read.
 func TestPollOnceReachesExternalMergeCandidatesPastTheLookupLimit(t *testing.T) {
 	ctx := context.Background()
 	repo := github.Repository{Owner: "owner", Name: "repo"}
 	store := testStore(t)
-	total := externalMergeReconcileLookupLimit + 5
+	total := 2*externalMergeReconcileLookupLimit + 5
 	pulls := map[int64]github.PullRequest{}
 	for i := 1; i <= total; i++ {
 		// Still open on GitHub but absent from the open listing: looked up,
 		// never merged, never transitioned.
-		pulls[int64(i)] = github.PullRequest{Number: int64(i), State: "open", HeadRef: fmt.Sprintf("b-%02d", i), BaseRef: "main", HeadSHA: "h"}
-		if err := store.UpsertTask(ctx, db.Task{ID: fmt.Sprintf("review-pr-%d-x", i), RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskBlocked), Branch: fmt.Sprintf("b-%02d", i)}); err != nil {
+		pulls[int64(i)] = github.PullRequest{Number: int64(i), State: "open", HeadRef: fmt.Sprintf("b-%04d", i), BaseRef: "main", HeadSHA: "h"}
+		if err := store.UpsertTask(ctx, db.Task{ID: fmt.Sprintf("review-pr-%04d-x", i), RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskBlocked), Branch: fmt.Sprintf("b-%04d", i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	last := int64(total)
-	pulls[last] = mergedPull(last, fmt.Sprintf("b-%02d", total))
+	pulls[last] = mergedPull(last, fmt.Sprintf("b-%04d", total))
 	client := &fakeGitHub{
 		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
 		pullsByNumber: pulls,
@@ -384,17 +387,17 @@ func TestPollOnceReachesExternalMergeCandidatesPastTheLookupLimit(t *testing.T) 
 	engine := workflow.Engine{Store: store}
 	clock := time.Date(2026, 11, 2, 19, 0, 0, 0, time.UTC)
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine, Now: func() time.Time { return clock }}
-	for minute := 0; minute < total; minute++ {
+	cycle := (total + externalMergeReconcileLookupLimit - 1) / externalMergeReconcileLookupLimit
+	for minute := 0; minute < cycle; minute++ {
 		clock = clock.Add(time.Minute)
 		if err := daemon.PollOnce(ctx); err != nil {
 			t.Fatalf("PollOnce: %v", err)
 		}
-		task, err := store.GetTask(ctx, fmt.Sprintf("review-pr-%d-x", total))
-		if err == nil && task.State == string(workflow.TaskMerged) {
-			return
-		}
 	}
-	t.Fatalf("a candidate past the lookup limit was never reconciled in %d polls", total)
+	task, err := store.GetTask(ctx, fmt.Sprintf("review-pr-%04d-x", total))
+	if err != nil || task.State != string(workflow.TaskMerged) {
+		t.Fatalf("candidate %d of %d not reconciled within %d one-minute polls: %+v %v", total, total, cycle, task, err)
+	}
 }
 
 func TestPollOnceReconcilesBranchlessQueuedMergeAsMerged(t *testing.T) {
