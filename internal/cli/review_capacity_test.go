@@ -119,7 +119,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			case <-runner.started:
 			case <-finished:
 				t.Fatalf("worker stopped before review delivery: %v", runErr)
-			case <-time.After(30 * time.Second):
+			case <-time.After(reviewCapacityTestStartWait):
 				observed, _ := store.GetJob(ctx, job.ID)
 				events, _ := store.ListJobEvents(ctx, job.ID)
 				t.Fatalf("local review never reached delivery under cleanup-only hold: job=%+v events=%+v", observed, events)
@@ -133,7 +133,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			broken.Store(true)
 			select {
 			case <-finished:
-			case <-time.After(8 * time.Second):
+			case <-time.After(reviewCapacityTestStopWait):
 				t.Fatal("review kept running after its capacity evidence failed")
 			}
 			if runErr == nil || !strings.Contains(runErr.Error(), "janitor status unavailable") {
@@ -160,6 +160,17 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 		})
 	}
 }
+
+// Event waits for the review-capacity monitor tests. They bound how long the
+// test waits for something that WILL happen (delivery starting, a fail-closed
+// cancel), so they only fail a hung run; they are not part of the behaviour.
+// CI's race shards took 44-57s to reach delivery under load (statfs_failed
+// failed at 56.66s against a 30s wait), so these are sized for that, while the
+// "still running" phases keep their exact monitor-interval sleeps.
+const (
+	reviewCapacityTestStartWait = 2 * time.Minute
+	reviewCapacityTestStopWait  = 30 * time.Second
+)
 
 // Jarvis 380078/380099, owner disk policy: low space decides only where NEW
 // reviews start. A local review admitted above 20GB keeps running when free
@@ -243,7 +254,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	case <-runner.started:
 	case <-finished:
 		t.Fatalf("review did not start above the warning threshold: %v", runErr)
-	case <-time.After(30 * time.Second):
+	case <-time.After(reviewCapacityTestStartWait):
 		t.Fatal("review never reached delivery")
 	}
 	// Into the warning band, then below the hard floor while Janitor reports
@@ -269,7 +280,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	}
 	select {
 	case <-finished:
-	case <-time.After(8 * time.Second):
+	case <-time.After(reviewCapacityTestStopWait):
 		t.Fatalf("review kept running after %s", trigger)
 	}
 	ended, err := store.GetJob(ctx, job.ID)
