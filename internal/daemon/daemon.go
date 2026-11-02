@@ -785,13 +785,22 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 			}
 		} else {
 			stored, err := d.Store.GetPullRequestByRepoBranch(ctx, d.Repo.FullName(), branch)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
+			switch {
+			case err == nil:
+				number = stored.Number
+			case errors.Is(err, sql.ErrNoRows):
+				// A review-request task often has no stored PR row (#2493,
+				// phobos-assistant#318), but its id pins the PR number. The
+				// branch guard after the lookup refuses a PR whose head is not
+				// this task's branch.
+				var ok bool
+				number, ok = reviewTaskPullRequestNumber(task.ID)
+				if !ok {
 					continue
 				}
+			default:
 				return err
 			}
-			number = stored.Number
 		}
 		if number <= 0 {
 			continue
@@ -809,7 +818,15 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 
 	var firstErr error
 	if len(groups) > externalMergeReconcileLookupLimit {
-		groups = groups[:externalMergeReconcileLookupLimit]
+		// Rotate the capped window once a minute (#2493): always taking the
+		// first N by task id left every later candidate unread forever once a
+		// repo held more than N stale tasks.
+		start := int(d.now().Unix()/60) % len(groups)
+		window := make([]candidateGroup, 0, externalMergeReconcileLookupLimit)
+		for i := 0; i < externalMergeReconcileLookupLimit; i++ {
+			window = append(window, groups[(start+i)%len(groups)])
+		}
+		groups = window
 	}
 	for _, group := range groups {
 		pull, err := d.GitHub.GetPullRequest(ctx, d.Repo, group.number)
@@ -826,6 +843,20 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 		if !d.pullRequestHeadIsLocal(pull) {
 			continue
 		}
+		// A number taken from a review task's id (no stored row, #2493) is only
+		// trusted when the fetched PR's head is that task's branch. Branchless
+		// tasks and tasks found through the stored row keep their old meaning.
+		matched := group.tasks[:0:0]
+		for _, task := range group.tasks {
+			branch := strings.TrimSpace(task.Branch)
+			if branch == "" || strings.EqualFold(branch, strings.TrimSpace(pull.HeadRef)) {
+				matched = append(matched, task)
+			}
+		}
+		if len(matched) == 0 {
+			continue
+		}
+		group.tasks = matched
 		if !pullRequestListedAsMerged(pull) {
 			// The PR left the open set without merging. Closed branch-bearing
 			// lifecycle tasks remain owned by their dedicated reconciliation

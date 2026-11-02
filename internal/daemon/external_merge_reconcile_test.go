@@ -320,6 +320,83 @@ func TestPollOnceReconcilesEmptyBranchReviewTaskByPullRequestNumber(t *testing.T
 	}
 }
 
+// #2493 (phobos-assistant#318): a blocked review task with a branch but no
+// stored PR row must still reach merged once its pull request merged
+// externally; its id pins the PR number and the fetched head confirms the
+// branch. A task whose branch is not that PR's head is left alone.
+func TestPollOnceReconcilesBranchReviewTaskWithoutStoredPullRequest(t *testing.T) {
+	ctx := context.Background()
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	store := testStore(t)
+	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-318-c7af4d24", RepoFullName: repo.FullName(), GoalID: "local-review", Title: "Review PR #318", State: string(workflow.TaskBlocked), Branch: "feat/gmail-attachment-limits"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-320-c7af4d24", RepoFullName: repo.FullName(), GoalID: "local-review", Title: "Review PR #320", State: string(workflow.TaskBlocked), Branch: "feat/other"}); err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeGitHub{
+		pullsByState: map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByNumber: map[int64]github.PullRequest{
+			318: mergedPull(318, "feat/gmail-attachment-limits"),
+			// The id says #320, but #320's head is a different branch.
+			320: mergedPull(320, "feat/unrelated"),
+		},
+		comments: map[int64][]github.IssueComment{},
+	}
+	engine := workflow.Engine{Store: store}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+	merged, err := store.GetTask(ctx, "review-pr-318-c7af4d24")
+	if err != nil || merged.State != string(workflow.TaskMerged) {
+		t.Fatalf("review task = %+v, err=%v; want merged", merged, err)
+	}
+	other, err := store.GetTask(ctx, "review-pr-320-c7af4d24")
+	if err != nil || other.State != string(workflow.TaskBlocked) {
+		t.Fatalf("task with a mismatched head = %+v, err=%v; want untouched", other, err)
+	}
+}
+
+// #2493: with more candidates than the per-poll lookup limit, the capped
+// window rotates, so a candidate past the first N is still reached.
+func TestPollOnceReachesExternalMergeCandidatesPastTheLookupLimit(t *testing.T) {
+	ctx := context.Background()
+	repo := github.Repository{Owner: "owner", Name: "repo"}
+	store := testStore(t)
+	total := externalMergeReconcileLookupLimit + 5
+	pulls := map[int64]github.PullRequest{}
+	for i := 1; i <= total; i++ {
+		// Still open on GitHub but absent from the open listing: looked up,
+		// never merged, never transitioned.
+		pulls[int64(i)] = github.PullRequest{Number: int64(i), State: "open", HeadRef: fmt.Sprintf("b-%02d", i), BaseRef: "main", HeadSHA: "h"}
+		if err := store.UpsertTask(ctx, db.Task{ID: fmt.Sprintf("review-pr-%d-x", i), RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskBlocked), Branch: fmt.Sprintf("b-%02d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := int64(total)
+	pulls[last] = mergedPull(last, fmt.Sprintf("b-%02d", total))
+	client := &fakeGitHub{
+		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+		pullsByNumber: pulls,
+		comments:      map[int64][]github.IssueComment{},
+	}
+	engine := workflow.Engine{Store: store}
+	clock := time.Date(2026, 11, 2, 19, 0, 0, 0, time.UTC)
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine, Now: func() time.Time { return clock }}
+	for minute := 0; minute < total; minute++ {
+		clock = clock.Add(time.Minute)
+		if err := daemon.PollOnce(ctx); err != nil {
+			t.Fatalf("PollOnce: %v", err)
+		}
+		task, err := store.GetTask(ctx, fmt.Sprintf("review-pr-%d-x", total))
+		if err == nil && task.State == string(workflow.TaskMerged) {
+			return
+		}
+	}
+	t.Fatalf("a candidate past the lookup limit was never reconciled in %d polls", total)
+}
+
 func TestPollOnceReconcilesBranchlessQueuedMergeAsMerged(t *testing.T) {
 	runBranchlessQueuedMergeTerminalPolls(t, mergedPull(1732, "task-1732"),
 		workflow.TaskMerged, "merged", "pull_request_merged")
