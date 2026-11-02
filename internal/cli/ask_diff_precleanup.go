@@ -17,8 +17,11 @@ import (
 
 const (
 	readOnlyWorktreeDiffMaxBytes = 4 << 20
-	readOnlyWorktreeDiffTimeout  = 10 * time.Second
-	readOnlyWorktreeDiffReserve  = 128
+	// The seats live on the sshfs Storage Box. Measured on a live phobos seat
+	// at host load ~12 (#2491): `git diff HEAD` took 1.2-11s depending on the
+	// sshfs cache, and the old 10s limit killed it on 3/3 daemon attempts.
+	readOnlyWorktreeDiffTimeout = 45 * time.Second
+	readOnlyWorktreeDiffReserve = 128
 )
 
 type beforeReadOnlyWorktreeCleanupHook func(context.Context, string, string, workflow.JobPayload) error
@@ -75,9 +78,18 @@ func askReviewDiffPrecleanupHookForRunner(store *db.Store, runner subprocess.Run
 			persistErr = db.ErrCleanupEvidenceChanged
 		}
 		if persistErr != nil {
-			persistErr = fmt.Errorf("persist read-only worktree diff metadata: %w", persistErr)
+			// Nothing durable records the outcome: keep blocking.
+			return errors.Join(captureErr, fmt.Errorf("persist read-only worktree diff metadata: %w", persistErr))
 		}
-		return errors.Join(captureErr, persistErr)
+		if captureErr != nil {
+			// The failure is recorded on the job (read_only_worktree_diff_error).
+			// The snapshot is evidence for humans, not an input anything
+			// downstream consumes, so it defers cleanup instead of holding back
+			// the job's verdict (#2491); the worktree is kept until a later
+			// attempt captures it.
+			return fmt.Errorf("%w: read-only worktree diff not captured: %s", workflow.ErrPreservationDeferred, workflow.RedactCommentText(captureErr.Error()))
+		}
+		return nil
 	}
 }
 

@@ -17,6 +17,37 @@ type cleanupPreservationProof struct {
 	PayloadHash string
 }
 
+// ErrPreservationDeferred marks a pre-cleanup collector failure that was
+// already recorded durably on the job (#2491), such as a read-only diff
+// capture that timed out on a slow filesystem. The workspace is then KEPT, with
+// a deferred cleanup obligation, and advancement continues: a missing snapshot
+// must never hold back the job's own verdict. A collector returns it only for
+// evidence nothing downstream consumes; publication that a dependent stage
+// needs keeps failing hard.
+var ErrPreservationDeferred = errors.New("cleanup preservation deferred")
+
+// onlyPreservationDeferred reports whether every failure in err (walking
+// errors.Join trees) is a deferred preservation, so one real publication
+// failure joined beside it still blocks.
+func onlyPreservationDeferred(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if child != nil && !onlyPreservationDeferred(child) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, ErrPreservationDeferred)
+}
+
 // Publication cannot wait for dependent consumers: service stages need their
 // producer's deliverables before they can finish. This shared-fenced operation
 // preserves results without granting permission to remove the workspace.
