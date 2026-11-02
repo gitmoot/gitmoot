@@ -382,6 +382,42 @@ func TestTaskDisposalStrandedEscalationIsOneShotAndRoutingIndependent(t *testing
 	}
 }
 
+// #2495 (gitmoot/keyring#101): a branchless review task whose own PR is a
+// draft held open by its seat was stranded with "awaiting_human_merge is
+// protected" and escalated to the owner as approved-and-waiting. The seat
+// recorded on the task's jobs merges its own work (merge_rule = "self") and
+// covers the repo, so it is addressed instead of the owner, and the reason
+// says the PR is a draft.
+func TestTaskDisposalDraftEscalatesToSelfMergingSeat(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "keyring"}
+	seedStaleRepo(t, store, repo)
+	paths := config.Paths{ConfigFile: taskDisposalConfigPath(store)}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"keyring\"]\nparent=\"owner\"\nscope=[\"gitmoot/keyring\"]\nmerge_rule=\"self\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-101-4828d646", RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskAwaitingHumanMerge)}); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(workflow.JobPayload{TaskID: "review-pr-101-4828d646", Repo: repo.FullName(), PullRequest: 101, ActingOrgRole: "keyring"})
+	if err := store.CreateJob(ctx, db.Job{ID: "review-101", Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &taskDisposalGitHub{fakeGitHub: &fakeGitHub{pullsByNumber: map[int64]github.PullRequest{101: {Number: 101, State: "open", Draft: true}}}, issues: map[int64]github.Issue{}}
+	if err := (Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}).reconcileTaskDisposals(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetTask(ctx, "review-pr-101-4828d646")
+	if got.State != string(workflow.TaskStranded) || got.DisposalEscalationRole != "keyring" || !strings.Contains(got.DisposalReason, "own PR #101 is a draft held open") {
+		t.Fatalf("draft task = state %s role %q reason %q; want stranded to keyring naming the draft", got.State, got.DisposalEscalationRole, got.DisposalReason)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, "")
+	if err != nil || len(outbox) != 1 || outbox[0].TargetRole != "keyring" {
+		t.Fatalf("escalation outbox = %+v, err=%v; want one wake to keyring", outbox, err)
+	}
+}
+
 func TestPollOnceTaskDisposalTerminatesBeforeForgeListFailure(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)

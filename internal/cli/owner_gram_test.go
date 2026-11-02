@@ -459,3 +459,16 @@ func TestOwnerGramSpacingCountsPreSendDrainWork(t *testing.T) {
 		t.Fatalf("receipt sent_at = %s, want no earlier than %s", receipts[0].SentAt, sendFloor)
 	}
 }
+
+// #2495 (gitmoot/keyring#101): a stranded draft must not reach the owner as
+// "approved and waiting for someone to merge it".
+func TestOwnerAlertSaysDraftIsHeldNotWaitingForMerge(t *testing.T) {
+	event := events.Event{
+		Repo:   "gitmoot/keyring",
+		Detail: "task review-pr-101-4828d646 stranded: no disposal evidence: own PR #101 is a draft held open; awaiting_human_merge is protected; escalation addressed to owner",
+	}
+	alert := ownerAlertFor(context.Background(), nil, db.WakeOutboxObligation{}, event)
+	if strings.Contains(alert.headline, "waiting for someone to merge") || !strings.Contains(alert.headline, "draft") {
+		t.Fatalf("draft headline = %q", alert.headline)
+	}
+}
