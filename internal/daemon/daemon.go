@@ -818,10 +818,26 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 
 	var firstErr error
 	if len(groups) > externalMergeReconcileLookupLimit {
-		// Rotate the capped window once a minute (#2493): always taking the
-		// first N by task id left every later candidate unread forever once a
-		// repo held more than N stale tasks.
-		start := int(d.now().Unix()/60) % len(groups)
+		// Rotate the capped window per poll (#2493): always taking the first
+		// N by task id left every later candidate unread forever once a repo
+		// held more than N stale tasks. The start is a cursor persisted per
+		// repo and advanced by N each poll, so every candidate is read within
+		// ceil(G/N) polls whatever the poll cadence (a clock-derived start
+		// skipped candidates at multi-minute cadences). A cursor that cannot
+		// be read starts at 0; one that cannot be saved is logged.
+		cursor, cursorErr := d.Store.ExternalMergeReconcileCursor(ctx, d.Repo.FullName())
+		if cursorErr != nil {
+			d.logf("external merge reconcile cursor read failed for %s: %v", d.Repo.FullName(), cursorErr)
+			cursor = 0
+		}
+		if cursor < 0 {
+			cursor = 0
+		}
+		start := int(cursor % int64(len(groups)))
+		next := int64((start + externalMergeReconcileLookupLimit) % len(groups))
+		if err := d.Store.SetExternalMergeReconcileCursor(ctx, d.Repo.FullName(), next); err != nil {
+			d.logf("external merge reconcile cursor write failed for %s: %v", d.Repo.FullName(), err)
+		}
 		window := make([]candidateGroup, 0, externalMergeReconcileLookupLimit)
 		for i := 0; i < externalMergeReconcileLookupLimit; i++ {
 			window = append(window, groups[(start+i)%len(groups)])

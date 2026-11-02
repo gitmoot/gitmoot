@@ -3090,4 +3090,14 @@ CREATE INDEX IF NOT EXISTS idx_workflow_notes_directive_markers
 	ON workflow_notes(workflow_id, substr(body, 1, 64))
 	WHERE substr(body, 1, length('[org:directive-')) = '[org:directive-';
 	`,
+	// #2493: the externally-merged reconcile reads at most N candidates per
+	// repo poll. This cursor is where the next poll's window starts, so every
+	// candidate is read within ceil(G/N) polls whatever the poll cadence.
+	`
+CREATE TABLE IF NOT EXISTS external_merge_reconcile_cursors (
+	repo_full_name TEXT PRIMARY KEY,
+	next_offset INTEGER NOT NULL DEFAULT 0,
+	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+	`,
 }
