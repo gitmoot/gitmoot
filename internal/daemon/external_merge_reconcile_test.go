@@ -359,44 +359,59 @@ func TestPollOnceReconcilesBranchReviewTaskWithoutStoredPullRequest(t *testing.T
 }
 
 // #2493: with more candidates than the per-poll lookup limit, the capped
-// window rotates by its whole size each minute, so every candidate is looked
-// up within ceil(G/N) minutes. Ids are zero-padded so task order is numeric
-// and the merged target sits past the first window: without rotation it is
-// never read.
+// window advances by its whole size each POLL (a cursor persisted per repo),
+// so every candidate is looked up within ceil(G/N) polls whatever the poll
+// cadence. Ids are zero-padded so task order is numeric. Every candidate but
+// the last stays open on GitHub, so the backlog keeps its size G and only the
+// last one may move to merged. At a 2-minute cadence with G=40 a start derived
+// from the clock never read candidates 21-40 (#2497 review).
 func TestPollOnceReachesExternalMergeCandidatesPastTheLookupLimit(t *testing.T) {
-	ctx := context.Background()
-	repo := github.Repository{Owner: "owner", Name: "repo"}
-	store := testStore(t)
-	total := 2*externalMergeReconcileLookupLimit + 5
-	pulls := map[int64]github.PullRequest{}
-	for i := 1; i <= total; i++ {
-		// Still open on GitHub but absent from the open listing: looked up,
-		// never merged, never transitioned.
-		pulls[int64(i)] = github.PullRequest{Number: int64(i), State: "open", HeadRef: fmt.Sprintf("b-%04d", i), BaseRef: "main", HeadSHA: "h"}
-		if err := store.UpsertTask(ctx, db.Task{ID: fmt.Sprintf("review-pr-%04d-x", i), RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskBlocked), Branch: fmt.Sprintf("b-%04d", i)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	last := int64(total)
-	pulls[last] = mergedPull(last, fmt.Sprintf("b-%04d", total))
-	client := &fakeGitHub{
-		pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
-		pullsByNumber: pulls,
-		comments:      map[int64][]github.IssueComment{},
-	}
-	engine := workflow.Engine{Store: store}
-	clock := time.Date(2026, 11, 2, 19, 0, 0, 0, time.UTC)
-	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine, Now: func() time.Time { return clock }}
-	cycle := (total + externalMergeReconcileLookupLimit - 1) / externalMergeReconcileLookupLimit
-	for minute := 0; minute < cycle; minute++ {
-		clock = clock.Add(time.Minute)
-		if err := daemon.PollOnce(ctx); err != nil {
-			t.Fatalf("PollOnce: %v", err)
-		}
-	}
-	task, err := store.GetTask(ctx, fmt.Sprintf("review-pr-%04d-x", total))
-	if err != nil || task.State != string(workflow.TaskMerged) {
-		t.Fatalf("candidate %d of %d not reconciled within %d one-minute polls: %+v %v", total, total, cycle, task, err)
+	n := externalMergeReconcileLookupLimit
+	for _, tc := range []struct {
+		name    string
+		total   int
+		cadence time.Duration
+	}{
+		{"one_minute_G_2N_plus_5", 2*n + 5, time.Minute},
+		{"two_minutes_G_2N", 2 * n, 2 * time.Minute},
+		{"five_minutes_G_3N_plus_1", 3*n + 1, 5 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			repo := github.Repository{Owner: "owner", Name: "repo"}
+			store := testStore(t)
+			pulls := map[int64]github.PullRequest{}
+			for i := 1; i <= tc.total; i++ {
+				pull := github.PullRequest{Number: int64(i), State: "open", HeadRef: fmt.Sprintf("b-%04d", i), BaseRef: "main", HeadSHA: "h"}
+				if i == tc.total {
+					pull = mergedPull(int64(i), fmt.Sprintf("b-%04d", i))
+				}
+				pulls[int64(i)] = pull
+				if err := store.UpsertTask(ctx, db.Task{ID: fmt.Sprintf("review-pr-%04d-x", i), RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskBlocked), Branch: fmt.Sprintf("b-%04d", i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			client := &fakeGitHub{
+				pullsByState:  map[string][]github.PullRequest{"open": nil, "closed": nil},
+				pullsByNumber: pulls,
+				comments:      map[int64][]github.IssueComment{},
+			}
+			engine := workflow.Engine{Store: store}
+			clock := time.Date(2026, 11, 2, 19, 0, 0, 0, time.UTC)
+			polls := (tc.total + n - 1) / n
+			for poll := 0; poll < polls; poll++ {
+				clock = clock.Add(tc.cadence)
+				// A fresh Daemon per poll, as the supervisor builds one.
+				daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine, Now: func() time.Time { return clock }}
+				if err := daemon.PollOnce(ctx); err != nil {
+					t.Fatalf("PollOnce: %v", err)
+				}
+			}
+			task, err := store.GetTask(ctx, fmt.Sprintf("review-pr-%04d-x", tc.total))
+			if err != nil || task.State != string(workflow.TaskMerged) {
+				t.Fatalf("candidate %d of %d not reconciled within %d polls every %s: state %q err %v", tc.total, tc.total, polls, tc.cadence, task.State, err)
+			}
+		})
 	}
 }
 
