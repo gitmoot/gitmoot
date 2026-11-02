@@ -39,6 +39,11 @@ type taskDisposalEvidence struct {
 	subjectRepo  string
 	subjectIssue int64
 	pullRequest  int64
+	// seat is the acting org role recorded on the task's most recent job: the
+	// seat that requested its review or did its work (#2495). Branchless
+	// review tasks have no branch lock, so this is their only record of an
+	// owning seat. seatAt is that job's created_at.
+	seat, seatAt string
 }
 
 type issueGetter interface {
@@ -88,10 +93,10 @@ func (d Daemon) reconcileTaskDisposals(ctx context.Context, ttl time.Duration) e
 func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTaskCandidate, tasks []db.Task, evidence map[string]taskDisposalEvidence, taskErr, jobErr error, orgConfig config.OrgConfig) error {
 	blockedAt, err := parseTaskStoreTime(candidate.UpdatedAt)
 	if err != nil {
-		return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable+": invalid task timestamp", orgConfig)
+		return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable+": invalid task timestamp", orgConfig, evidence[candidate.ID].seat, false)
 	}
 	if taskErr != nil || jobErr != nil {
-		return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+		return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 	}
 	itemEvidence := evidence[candidate.ID]
 	if itemEvidence.pullRequest == 0 && strings.TrimSpace(candidate.Branch) != "" {
@@ -99,7 +104,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 		if lookupErr == nil {
 			itemEvidence.pullRequest = stored.Number
 		} else if !errors.Is(lookupErr, sql.ErrNoRows) {
-			return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+			return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 		}
 	}
 
@@ -108,7 +113,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 	if itemEvidence.pullRequest > 0 {
 		ownPR, err = d.GitHub.GetPullRequest(ctx, d.Repo, itemEvidence.pullRequest)
 		if err != nil {
-			return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+			return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 		}
 		ownPRKnown = true
 		if pullRequestListedAsMerged(ownPR) {
@@ -116,7 +121,13 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 				fmt.Sprintf("own PR #%d is merged in forge", ownPR.Number), "", "")
 		}
 		if workflow.TaskState(candidate.State) == workflow.TaskAwaitingHumanMerge && strings.EqualFold(strings.TrimSpace(ownPR.State), "open") {
-			return d.strandTask(ctx, candidate, taskDisposalReasonNoEvidence+": own PR remains open and awaiting_human_merge is protected", orgConfig)
+			reason := taskDisposalReasonNoEvidence + ": own PR remains open and awaiting_human_merge is protected"
+			if ownPR.Draft {
+				// A draft is held open on purpose; it is not waiting for a
+				// merger (#2495), and the owner text must not say it is.
+				reason = taskDisposalReasonNoEvidence + fmt.Sprintf(": own PR #%d is a draft held open; awaiting_human_merge is protected", ownPR.Number)
+			}
+			return d.strandTask(ctx, candidate, reason, orgConfig, evidence[candidate.ID].seat, true)
 		}
 	}
 
@@ -138,7 +149,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 			}
 			pull, pullErr := d.GitHub.GetPullRequest(ctx, d.Repo, peerEvidence.pullRequest)
 			if pullErr != nil {
-				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 			}
 			if pullRequestListedAsMerged(pull) && mergedAfter(pull.MergedAt, blockedAt) {
 				return d.commitTaskDisposal(ctx, candidate, workflow.TaskSuperseded, taskDisposalTierSuccessorMerged,
@@ -149,11 +160,11 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 		if ok {
 			subjectRepo, parseErr := github.ParseRepository(itemEvidence.subjectRepo)
 			if parseErr != nil {
-				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 			}
 			issue, issueErr := getter.GetIssue(ctx, subjectRepo, itemEvidence.subjectIssue)
 			if issueErr != nil {
-				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig)
+				return d.strandTask(ctx, candidate, taskDisposalReasonUnavailable, orgConfig, evidence[candidate.ID].seat, false)
 			}
 			if strings.EqualFold(strings.TrimSpace(issue.State), "closed") {
 				return d.commitTaskDisposal(ctx, candidate, workflow.TaskSuperseded, taskDisposalTierSubjectClosed,
@@ -165,11 +176,11 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 		return d.commitTaskDisposal(ctx, candidate, workflow.TaskSuperseded, taskDisposalTierSubjectClosed,
 			fmt.Sprintf("referenced PR #%d is closed without a merge", ownPR.Number), "", "")
 	}
-	return d.strandTask(ctx, candidate, taskDisposalReasonNoEvidence, orgConfig)
+	return d.strandTask(ctx, candidate, taskDisposalReasonNoEvidence, orgConfig, evidence[candidate.ID].seat, false)
 }
 
-func (d Daemon) strandTask(ctx context.Context, candidate db.StaleTaskCandidate, reason string, orgConfig config.OrgConfig) error {
-	role := d.taskDisposalEscalationRole(ctx, candidate, orgConfig)
+func (d Daemon) strandTask(ctx context.Context, candidate db.StaleTaskCandidate, reason string, orgConfig config.OrgConfig, seat string, ownPRHeld bool) error {
+	role := d.taskDisposalEscalationRole(ctx, candidate, orgConfig, seat, ownPRHeld)
 	routeDetail := "escalation unroutable: no live ancestor"
 	if role != "" {
 		routeDetail = "escalation addressed to " + role
@@ -198,14 +209,39 @@ func (d Daemon) commitTaskDisposal(ctx context.Context, candidate db.StaleTaskCa
 	return err
 }
 
-func (d Daemon) taskDisposalEscalationRole(ctx context.Context, candidate db.StaleTaskCandidate, orgConfig config.OrgConfig) string {
+// taskDisposalEscalationRole picks who hears about a stranded task. The seat
+// comes from the branch lock, else from the most recent job's acting role
+// (#2495); an archived seat is no seat. Only when the task holds its own open
+// PR (ownPRHeld: awaiting_human_merge) does a seat that merges its own work
+// (merge_rule = "self") and covers the repo hear about it directly, because
+// merging or closing that PR is its decision. A task stranded for any other
+// reason means its seat is stuck or gone, so its supervisor is told: the
+// nearest live ancestor in scope, then a root.
+func (d Daemon) taskDisposalEscalationRole(ctx context.Context, candidate db.StaleTaskCandidate, orgConfig config.OrgConfig, jobSeat string, ownPRHeld bool) string {
+	archived := map[string]bool{}
+	if rows, err := d.Store.ListOrgRolesArchived(ctx); err == nil {
+		for _, row := range rows {
+			archived[strings.ToLower(strings.TrimSpace(row.Role))] = true
+		}
+	}
+	live := func(name string) (config.OrgRole, bool) {
+		role, ok := orgConfig.Role(name)
+		return role, ok && !archived[name]
+	}
 	actingRole := ""
 	if lock, err := d.Store.GetBranchLock(ctx, candidate.RepoFullName, candidate.Branch); err == nil {
 		actingRole = strings.ToLower(strings.TrimSpace(lock.ActingOrgRole))
 	}
+	if _, ok := orgConfig.Role(actingRole); !ok {
+		actingRole = strings.ToLower(strings.TrimSpace(jobSeat))
+	}
+	if seat, ok := live(actingRole); ok && ownPRHeld &&
+		strings.EqualFold(strings.TrimSpace(seat.MergeRule), "self") && config.ScopeMatches(seat.Scope, candidate.RepoFullName) {
+		return actingRole
+	}
 	if _, ok := orgConfig.Role(actingRole); ok {
 		for _, ancestor := range orgConfig.Ancestors(actingRole) {
-			if role, exists := orgConfig.Role(ancestor); exists && config.ScopeMatches(role.Scope, candidate.RepoFullName) {
+			if role, exists := live(ancestor); exists && config.ScopeMatches(role.Scope, candidate.RepoFullName) {
 				return ancestor
 			}
 		}
@@ -246,6 +282,11 @@ func buildTaskDisposalEvidence(repo string, tasks []db.Task, jobs []db.Job) map[
 		}
 		if subjectRepo, issue := taskIssueSubject(repo, payload.Instructions); issue > 0 {
 			item.subjectRepo, item.subjectIssue = subjectRepo, issue
+		}
+		// The most recent job names the seat (#2495 review): jobs come in id
+		// order, and ids sort by agent name, not by time.
+		if seat := strings.TrimSpace(payload.ActingOrgRole); seat != "" && job.CreatedAt >= item.seatAt {
+			item.seat, item.seatAt = seat, job.CreatedAt
 		}
 		byID[taskID] = item
 	}

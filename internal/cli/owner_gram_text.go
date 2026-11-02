@@ -122,6 +122,8 @@ func explainOwnerAlert(alert *ownerAlert, row db.WakeOutboxObligation, event eve
 	leftOpen := strings.Contains(text, workflow.LowRiskAutoMergeLeaveOpenPrefix)
 	mergeQueue := strings.Contains(text, "requires GitHub's merge queue")
 	awaitingMerge := strings.Contains(text, "awaiting_human_merge")
+	// A draft is held open on purpose (#2495); it is not waiting for a merger.
+	draftHeld := strings.Contains(text, "is a draft held open")
 	// Plain words only above the separator: the procedure stays in the original.
 	attributionWhy := fmt.Sprintf("Gitmoot can't confirm who wrote this change, so it won't merge it automatically. Fix: %s, the seat that wrote it, records its work in Gitmoot.", alert.seatName())
 	mergeTodo := "If you want this change, merge it on GitHub. If not, close it."
@@ -144,6 +146,9 @@ func explainOwnerAlert(alert *ownerAlert, row db.WakeOutboxObligation, event eve
 		alert.headline = "Gitmoot can't confirm who wrote this change, so it won't merge it automatically."
 		alert.why = fmt.Sprintf("Fix: %s, the seat that wrote it, records its work in Gitmoot.", alert.seatName())
 		alert.todo = "Nothing is needed from you unless you want to merge it by hand on GitHub."
+	case draftHeld:
+		alert.headline = "its pull request is still a draft, held open on purpose, so it is not ready to merge."
+		alert.todo = "Nothing is needed from you unless the draft has been forgotten; the seat that opened it decides when it is ready."
 	case awaitingMerge:
 		alert.headline = "it's approved and waiting for someone to merge it."
 		alert.todo = "Merge it on GitHub, or close it if it's no longer wanted."

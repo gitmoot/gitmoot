@@ -382,6 +382,42 @@ func TestTaskDisposalStrandedEscalationIsOneShotAndRoutingIndependent(t *testing
 	}
 }
 
+// #2495 (gitmoot/keyring#101): a branchless review task whose own PR is a
+// draft held open by its seat was stranded with "awaiting_human_merge is
+// protected" and escalated to the owner as approved-and-waiting. The seat
+// recorded on the task's jobs merges its own work (merge_rule = "self") and
+// covers the repo, so it is addressed instead of the owner, and the reason
+// says the PR is a draft.
+func TestTaskDisposalDraftEscalatesToSelfMergingSeat(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "keyring"}
+	seedStaleRepo(t, store, repo)
+	paths := config.Paths{ConfigFile: taskDisposalConfigPath(store)}
+	if err := os.WriteFile(paths.ConfigFile, []byte("[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"keyring\"]\nparent=\"owner\"\nscope=[\"gitmoot/keyring\"]\nmerge_rule=\"self\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-101-4828d646", RepoFullName: repo.FullName(), GoalID: "local-review", State: string(workflow.TaskAwaitingHumanMerge)}); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(workflow.JobPayload{TaskID: "review-pr-101-4828d646", Repo: repo.FullName(), PullRequest: 101, ActingOrgRole: "keyring"})
+	if err := store.CreateJob(ctx, db.Job{ID: "review-101", Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload)}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &taskDisposalGitHub{fakeGitHub: &fakeGitHub{pullsByNumber: map[int64]github.PullRequest{101: {Number: 101, State: "open", Draft: true}}}, issues: map[int64]github.Issue{}}
+	if err := (Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}).reconcileTaskDisposals(ctx, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.GetTask(ctx, "review-pr-101-4828d646")
+	if got.State != string(workflow.TaskStranded) || got.DisposalEscalationRole != "keyring" || !strings.Contains(got.DisposalReason, "own PR #101 is a draft held open") {
+		t.Fatalf("draft task = state %s role %q reason %q; want stranded to keyring naming the draft", got.State, got.DisposalEscalationRole, got.DisposalReason)
+	}
+	outbox, err := store.ListWakeOutbox(ctx, "")
+	if err != nil || len(outbox) != 1 || outbox[0].TargetRole != "keyring" {
+		t.Fatalf("escalation outbox = %+v, err=%v; want one wake to keyring", outbox, err)
+	}
+}
+
 func TestPollOnceTaskDisposalTerminatesBeforeForgeListFailure(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
@@ -431,4 +467,88 @@ func setTaskUpdatedAt(t *testing.T, store *db.Store, taskID string, at time.Time
 	if _, err := raw.Exec(`UPDATE tasks SET updated_at = ? WHERE id = ?`, at.UTC().Format("2006-01-02 15:04:05"), taskID); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// #2496 review: the self-seat shortcut applies only while the task holds its
+// own open PR. A blocked task stranded past its TTL means its seat is stuck or
+// gone, so even a self-merging seat's supervisor is told; the newest job, not
+// the lexically last one, names a branchless task's seat; and an archived seat
+// is skipped.
+func TestTaskDisposalEscalationSeatRules(t *testing.T) {
+	const org = "[org.roles.\"owner\"]\nscope=[\"*\"]\n[org.roles.\"lead\"]\nparent=\"owner\"\nscope=[\"owner/repo\"]\n[org.roles.\"lane\"]\nparent=\"lead\"\nscope=[\"owner/repo\"]\nmerge_rule=\"self\"\n[org.roles.\"author\"]\nparent=\"lead\"\nscope=[\"owner/repo\"]\nmerge_rule=\"self\"\n"
+	setup := func(t *testing.T) (context.Context, *db.Store, github.Repository) {
+		ctx := context.Background()
+		store := testStore(t)
+		repo := github.Repository{Owner: "owner", Name: "repo"}
+		seedStaleRepo(t, store, repo)
+		if err := os.WriteFile(taskDisposalConfigPath(store), []byte(org), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return ctx, store, repo
+	}
+	seedJob := func(t *testing.T, store *db.Store, id, taskID, role, created string, pr int) {
+		t.Helper()
+		payload, _ := json.Marshal(workflow.JobPayload{TaskID: taskID, Repo: "owner/repo", PullRequest: pr, ActingOrgRole: role})
+		if err := store.CreateJob(context.Background(), db.Job{ID: id, Type: "review", State: string(workflow.JobSucceeded), Payload: string(payload)}); err != nil {
+			t.Fatal(err)
+		}
+		// CreateJob stamps now; set the job's age explicitly.
+		raw, err := sql.Open("sqlite", store.DatabasePath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		if _, err := raw.Exec(`UPDATE jobs SET created_at = ? WHERE id = ?`, created, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(t *testing.T, ctx context.Context, store *db.Store, repo github.Repository, pulls map[int64]github.PullRequest, taskID string) db.Task {
+		t.Helper()
+		gh := &taskDisposalGitHub{fakeGitHub: &fakeGitHub{pullsByNumber: pulls}, issues: map[int64]github.Issue{}}
+		if err := (Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}).reconcileTaskDisposals(ctx, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := store.GetTask(ctx, taskID)
+		return got
+	}
+
+	t.Run("blocked_task_with_self_seat_lock_goes_to_parent", func(t *testing.T) {
+		ctx, store, repo := setup(t)
+		if err := store.UpsertTask(ctx, db.Task{ID: "task-x", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked), Branch: "feature/x"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "feature/x", Owner: "worker", ActingOrgRole: "lane"}); err != nil {
+			t.Fatal(err)
+		}
+		if got := run(t, ctx, store, repo, nil, "task-x"); got.DisposalEscalationRole != "lead" {
+			t.Fatalf("blocked task with self seat lane routed to %q, want its supervisor lead", got.DisposalEscalationRole)
+		}
+	})
+	t.Run("newest_job_names_the_seat", func(t *testing.T) {
+		ctx, store, repo := setup(t)
+		if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-7-x", RepoFullName: repo.FullName(), State: string(workflow.TaskAwaitingHumanMerge)}); err != nil {
+			t.Fatal(err)
+		}
+		// Lexically last id is the OLDER job.
+		seedJob(t, store, "z-older-implement", "review-pr-7-x", "author", "2026-11-01 09:00:00", 7)
+		seedJob(t, store, "a-newer-review", "review-pr-7-x", "lane", "2026-11-02 09:00:00", 7)
+		got := run(t, ctx, store, repo, map[int64]github.PullRequest{7: {Number: 7, State: "open"}}, "review-pr-7-x")
+		if got.DisposalEscalationRole != "lane" {
+			t.Fatalf("seat = %q, want lane from the newest job", got.DisposalEscalationRole)
+		}
+	})
+	t.Run("archived_seat_falls_back", func(t *testing.T) {
+		ctx, store, repo := setup(t)
+		if err := store.UpsertTask(ctx, db.Task{ID: "review-pr-8-x", RepoFullName: repo.FullName(), State: string(workflow.TaskAwaitingHumanMerge)}); err != nil {
+			t.Fatal(err)
+		}
+		seedJob(t, store, "review-8", "review-pr-8-x", "lane", "2026-11-02 09:00:00", 8)
+		if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{Role: "lane", ArchivedAt: "2026-11-02T10:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		got := run(t, ctx, store, repo, map[int64]github.PullRequest{8: {Number: 8, State: "open"}}, "review-pr-8-x")
+		if got.DisposalEscalationRole != "lead" {
+			t.Fatalf("archived seat lane routed to %q, want its live parent lead", got.DisposalEscalationRole)
+		}
+	})
 }
