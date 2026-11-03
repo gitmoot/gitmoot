@@ -3,7 +3,10 @@
 package sandbox
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -62,6 +65,11 @@ func TestReadableRootsGrantOnlyRequestedAndFixedSystemRoots(t *testing.T) {
 		"/usr/local/bin": true, "/usr/local/sbin": true, "/usr/local/lib": true,
 		"/usr/local/lib64": true, "/usr/local/share": true,
 		"/etc/ssl/certs": true, "/etc/pki": true, "/proc": true,
+		"/sys/devices/system/cpu": true, "/sys/bus/pci": true, "/etc/fonts": true,
+	}
+	pciTrees, _ := filepath.Glob("/sys/devices/pci*")
+	for _, tree := range pciTrees {
+		fixed[tree] = true
 	}
 	for _, root := range roots {
 		if root == requested || fixed[root] {
@@ -82,5 +90,81 @@ func TestReadableRootsGrantOnlyRequestedAndFixedSystemRoots(t *testing.T) {
 				t.Errorf("readableRoots granted %q inside the operator home %q", root, home)
 			}
 		}
+	}
+}
+
+// #2505 (lenscale-admin#37/#38): a read-only review seat names its reads, so it
+// sees only the fixed system list. Headless Chromium then could not start (it
+// reads the CPU topology) or find fonts, and every UI review needing a rendered
+// check blocked. Run through the real launcher exactly as a review seat is
+// launched (--read-only-workdir plus explicit reads, no /etc or /sys grant),
+// the confined process must read both, and still not read an unrelated /etc
+// file.
+func TestReadOnlySeatCanReadBrowserSystemFilesE2E(t *testing.T) {
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+	requireReadOnlySeatLaunchable(t, gitmoot)
+	probeDir := t.TempDir()
+	probe := filepath.Join(probeDir, "noexecprobe")
+	build := exec.Command("go", "build", "-buildvcs=false", "-o", probe, "./internal/sandbox/testdata/noexecprobe")
+	build.Dir = filepath.Join("..", "..")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build probe: %v\n%s", err, output)
+	}
+	workdir, write := t.TempDir(), t.TempDir()
+	read := func(path string) (string, error) {
+		cmd := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", probeDir, "--write", write, "--", probe, "read", path)
+		cmd.Dir = workdir
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		err := cmd.Run()
+		return strings.TrimSpace(out.String()), err
+	}
+	for _, path := range []string{"/sys/devices/system/cpu/online", "/etc/fonts/fonts.conf"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Logf("skip %s: absent on this host", path)
+			continue
+		}
+		if out, err := read(path); err != nil || !strings.HasPrefix(out, "OK read") {
+			t.Fatalf("review seat cannot read %s: %v %q", path, err, out)
+		}
+	}
+	// The grant stays narrow: other /etc files remain unreadable.
+	if _, err := os.Stat("/etc/hostname"); err == nil {
+		if out, err := read("/etc/hostname"); err == nil || !strings.Contains(out, "DENIED") {
+			t.Fatalf("review seat read /etc/hostname: %v %q", err, out)
+		}
+	}
+}
+
+// #2505: the outcome that matters, measured with a real headless Chromium when
+// the host has one (GITMOOT_TEST_CHROME or chrome-headless-shell/chromium on
+// PATH). Launched exactly as in a review seat, it must render a page; before
+// the fix it exited 133 ("GPU process isn't usable").
+func TestReadOnlySeatRunsHeadlessChromiumE2E(t *testing.T) {
+	chrome := os.Getenv("GITMOOT_TEST_CHROME")
+	for _, name := range []string{"chrome-headless-shell", "chromium", "chromium-browser"} {
+		if chrome != "" {
+			break
+		}
+		chrome, _ = exec.LookPath(name)
+	}
+	if chrome == "" {
+		t.Skip("no headless Chromium on this host; set GITMOOT_TEST_CHROME")
+	}
+	requireLandlockABI(t)
+	gitmoot := buildGitmootBinary(t)
+	requireReadOnlySeatLaunchable(t, gitmoot)
+	workdir, write := t.TempDir(), t.TempDir()
+	cmd := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", filepath.Dir(chrome), "--write", write, "--",
+		chrome, "--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir="+filepath.Join(write, "profile"),
+		"--dump-dom", "data:text/html,<p>rendered</p>")
+	cmd.Dir = workdir
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	if err != nil || !strings.Contains(out.String(), "<p>rendered</p>") {
+		t.Fatalf("headless Chromium did not render in a review seat: %v\n%s", err, out.String())
 	}
 }

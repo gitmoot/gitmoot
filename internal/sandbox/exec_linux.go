@@ -340,7 +340,23 @@ func readableRoots(paths []string) ([]string, error) {
 		// Bun-based Claude/Kimi binaries abort without it and codex's managed
 		// bwrap reads /proc/sys/kernel/overflowuid.
 		"/proc",
+		// Headless Chromium for rendered UI checks (#2505): it enumerates PCI
+		// devices and CPU topology to start its GPU process (without them the
+		// GPU process dies six times and Chrome exits 133, also with
+		// --disable-gpu), and fontconfig reads /etc/fonts to render text with
+		// the system fonts. These are read-only hardware description and font
+		// configuration; no secrets. /sys/bus/pci links into the PCI device
+		// trees, which are granted below.
+		"/sys/devices/system/cpu", "/sys/bus/pci", "/etc/fonts",
 	} {
+		if err := add(candidate, false); err != nil {
+			return nil, err
+		}
+	}
+	// The PCI device trees /sys/bus/pci/devices links into (pci0000:00, ...);
+	// their names vary per host.
+	pciTrees, _ := filepath.Glob("/sys/devices/pci*")
+	for _, candidate := range pciTrees {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
