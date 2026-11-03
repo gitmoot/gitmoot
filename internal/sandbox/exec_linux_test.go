@@ -181,9 +181,14 @@ func TestReadOnlySeatRunsHeadlessChromiumE2E(t *testing.T) {
 	t.Logf("chromium: %s -> %s", chrome, resolved)
 	workdir, write := t.TempDir(), t.TempDir()
 	cmd := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", filepath.Dir(resolved), "--write", write, "--",
-		resolved, "--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir="+filepath.Join(write, "profile"),
+		resolved, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir="+filepath.Join(write, "profile"),
 		"--dump-dom", "data:text/html,<p>rendered</p>")
 	cmd.Dir = workdir
+	// Like a reviewer: temp files, crash reports and caches go to the seat's
+	// own writable directory (full Chromium writes under XDG_CONFIG_HOME and
+	// creates its singleton socket in TMPDIR; the headless shell needs
+	// neither). The home directory stays unwritable.
+	cmd.Env = append(os.Environ(), "TMPDIR="+write, "XDG_CONFIG_HOME="+filepath.Join(write, "config"), "XDG_CACHE_HOME="+filepath.Join(write, "cache"))
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
