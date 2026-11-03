@@ -3100,4 +3100,18 @@ CREATE TABLE IF NOT EXISTS external_merge_reconcile_cursors (
 	updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 	`,
+	// #2502: the last agent each "agent:NAME" seat binding resolved to. Herdr
+	// has no stable agent id; pane plus session reference identifies an agent
+	// across a rename, so the daemon can follow it. alerted_at marks a seat
+	// whose unresolved binding was already reported to its lead.
+	`
+CREATE TABLE IF NOT EXISTS org_seat_agent_identity (
+	role TEXT PRIMARY KEY,
+	agent_name TEXT NOT NULL,
+	pane_id TEXT NOT NULL,
+	session TEXT NOT NULL,
+	observed_at TEXT NOT NULL,
+	alerted_at TEXT NOT NULL DEFAULT ''
+);
+	`,
 }

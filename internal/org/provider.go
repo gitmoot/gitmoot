@@ -42,6 +42,18 @@ type Snapshot struct {
 	PaneBindings    map[string]PaneBinding     `json:"-"`
 	Panes           []LivePane                 `json:"-"`
 	Sessions        map[string]SessionActivity `json:"-"`
+	// Agents lists the live local, unarchived registered agents (#2502), so a
+	// seat whose agent was renamed can be recognised by pane and session.
+	Agents []LiveAgent `json:"-"`
+}
+
+// LiveAgent is one registered agent as Herdr reports it. Session is the
+// agent's own session reference (omp's session file); with the pane it is the
+// identity that survives a rename, since Herdr has no stable agent id.
+type LiveAgent struct {
+	Name    string
+	PaneID  string
+	Session string
 }
 
 // SessionActivity is the live, non-durable session metadata Herdr reports for a
@@ -60,6 +72,10 @@ type PaneBinding struct {
 	PaneID    string
 	Detail    string
 	Ambiguous bool
+	// AgentName and Session identify the registered agent an "agent:NAME"
+	// binding resolved to (#2502); empty for other bindings.
+	AgentName string
+	Session   string
 }
 
 // LivePane carries the live identity used by validation plus the two directories

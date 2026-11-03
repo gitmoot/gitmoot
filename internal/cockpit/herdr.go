@@ -112,6 +112,9 @@ type registeredAgent struct {
 	MachineID        string          `json:"machine_id"`
 	MachineProfileID string          `json:"machine_profile_id"`
 	Archived         json.RawMessage `json:"archived"`
+	AgentSession     struct {
+		Value string `json:"value"`
+	} `json:"agent_session"`
 }
 
 func (c herdrClient) registeredAgents(ctx context.Context) ([]registeredAgent, error) {

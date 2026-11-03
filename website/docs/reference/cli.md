@@ -2047,7 +2047,13 @@ repairs a role and installs addressed `reply`, `review-verdict`, `blocked`,
 With `--pane`, Gitmoot resolves a literal live pane id first, then a unique
 exact live label, validates its unique named local Herdr agent, and stores
 `agent:NAME`. The binding follows that registered identity across pane replacement;
-cosmetic label changes do not retarget it. Register the agent before adopting
+cosmetic label changes do not retarget it. A Herdr agent rename is followed
+(#2502): the daemon records the pane and session file the binding resolves to,
+and when the name stops resolving while exactly one live agent has that same
+pane and session, it rewrites the seat's binding in the org config to the new
+name and tells the seat's parent. Anything less certain is not followed; the
+parent is told once that the seat is unreachable and its messages are queued.
+Register the agent before adopting
 its pane. Duplicate labels or agent names, unregistered/remote/archived agents,
 unknown references, and an empty `--pane` fail before role or route writes.
 Omit `--pane` to create an unbound role and the same routes; re-run the command

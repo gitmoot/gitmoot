@@ -405,6 +405,9 @@ func runBlockedRoleWakeOnce(ctx context.Context, store *db.Store, home string, s
 	// whether blocked-role waking is enabled — the /org page must populate even
 	// when blocked_role_wake_after is 0 (its default). Coupling these was #1118.
 	persistOrgRoleLivePresence(ctx, store, snapshot, stdout)
+	// #2502: keep "agent:NAME" seats attached to their agent across a Herdr
+	// rename, or tell the seat's lead once when it cannot be followed.
+	followRenamedOrgSeats(ctx, store, configFile, roles, snapshot, stdout, now.UTC())
 
 	// Blocked-role WAKE evaluation is the opt-in half: only when a wake threshold
 	// is configured and the blocked-role event rule yields a sink.
