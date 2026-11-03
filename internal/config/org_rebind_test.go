@@ -56,4 +56,32 @@ func TestRebindOrgSeatPaneOnlyReplacesTheExpectedBinding(t *testing.T) {
 			t.Fatalf("rebind recreated a removed role:\n%s", after)
 		}
 	})
+	// A hand edit (no lock) landing after the guard read and before the file
+	// is installed: the operator unbinds the seat. The rebind must leave the
+	// operator's file in place.
+	t.Run("hand edit during the rebind wins", func(t *testing.T) {
+		if !canExchangeFiles {
+			t.Skip("atomic exchange is Linux-only")
+		}
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(base+"pane = \"agent:worker\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		previous := beforeConfigExchange
+		t.Cleanup(func() { beforeConfigExchange = previous })
+		beforeConfigExchange = func() {
+			if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := RebindOrgSeatPane(Paths{ConfigFile: path}, "worker", "agent:worker", "agent:tino"); !errors.Is(err, ErrOrgSeatBindingChanged) {
+			t.Fatalf("rebind racing a hand edit err = %v, want refusal", err)
+		}
+		if after, _ := os.ReadFile(path); string(after) != base {
+			t.Fatalf("rebind overwrote the operator's concurrent unbind:\n%s", after)
+		}
+		if leftovers, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".config-*.toml")); len(leftovers) != 0 {
+			t.Fatalf("staged files left behind: %v", leftovers)
+		}
+	})
 }

@@ -3118,8 +3118,22 @@ CREATE TABLE IF NOT EXISTS org_seat_agent_identity (
 	// reported, so it also fires for a seat with no recorded identity and a
 	// changed binding starts a new episode. Appended, not edited in place, so
 	// homes that already applied the previous migration are upgraded too.
+	// Rebuilt rather than altered so every earlier shape of this branch's
+	// table (alerted_at, or alerted_binding already present) upgrades; only
+	// the identity columns are carried over, so at most one already-sent
+	// unreachable notice can repeat.
 	`
-ALTER TABLE org_seat_agent_identity ADD COLUMN alerted_binding TEXT NOT NULL DEFAULT '';
-ALTER TABLE org_seat_agent_identity DROP COLUMN alerted_at;
+CREATE TABLE org_seat_agent_identity_next (
+	role TEXT PRIMARY KEY,
+	agent_name TEXT NOT NULL,
+	pane_id TEXT NOT NULL,
+	session TEXT NOT NULL,
+	observed_at TEXT NOT NULL,
+	alerted_binding TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO org_seat_agent_identity_next (role, agent_name, pane_id, session, observed_at)
+	SELECT role, agent_name, pane_id, session, observed_at FROM org_seat_agent_identity;
+DROP TABLE org_seat_agent_identity;
+ALTER TABLE org_seat_agent_identity_next RENAME TO org_seat_agent_identity;
 	`,
 }

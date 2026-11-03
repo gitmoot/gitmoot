@@ -24,6 +24,12 @@ import (
 // the original is restored on any validation failure so a bad write cannot wedge
 // the daemon.
 func SaveHeartbeat(paths Paths, entry Heartbeat) error {
+	// #2502: serialised with the daemon's automatic seat rebind.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return err
+	}
+	defer release()
 	applyHeartbeatDefaults(&entry)
 	if err := validateHeartbeat(entry); err != nil {
 		return err
@@ -133,6 +139,12 @@ func SetHeartbeatEnabled(paths Paths, agent, name string, enabled bool) error {
 // AST seam, leaving all other config untouched. It reports whether a section was
 // actually removed (false ⇒ the heartbeat did not exist).
 func RemoveHeartbeat(paths Paths, agent, name string) (bool, error) {
+	// #2502: serialised with the daemon's automatic seat rebind.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return false, err
+	}
+	defer release()
 	agent = strings.TrimSpace(agent)
 	name = strings.TrimSpace(name)
 	if agent == "" || name == "" {
