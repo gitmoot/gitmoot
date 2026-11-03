@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -77,6 +79,51 @@ func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (Org
 		return OrgSeatConfigEdit{}, false, err
 	}
 	return edit, !exists, nil
+}
+
+// ErrOrgSeatBindingChanged reports that a conditional rebind found the role
+// missing, its binding no longer the expected one, or the config file edited
+// since it was read. Nothing was written.
+var ErrOrgSeatBindingChanged = errors.New("org seat binding changed; rebind not applied")
+
+// RebindOrgSeatPane replaces the pane binding of an EXISTING role only while it
+// still reads exactly from (#2502). Unlike UpsertOrgSeatRole it never creates a
+// role and never fills an empty binding, so a background writer cannot undo an
+// operator's removal or unbind. The file is re-read just before the atomic
+// rename and the write is abandoned if any byte changed since the guard read
+// it. There is no config lock, so a write landing inside that last
+// microsecond window can still be overwritten; validation after the write
+// restores the original on any parse failure.
+func RebindOrgSeatPane(paths Paths, name, from, to string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	if name == "" || from == "" || to == "" || from == to {
+		return fmt.Errorf("org seat rebind needs a role and two different bindings")
+	}
+	original, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return err
+	}
+	cfg, err := parseOrgContent(original)
+	if err != nil {
+		return err
+	}
+	current, exists := cfg.Role(name)
+	if !exists || strings.TrimSpace(current.Pane) != from {
+		return fmt.Errorf("%w: role %q", ErrOrgSeatBindingChanged, name)
+	}
+	updated, err := setOrgRolePane(string(original), name, to)
+	if err != nil {
+		return err
+	}
+	latest, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(latest, original) {
+		return fmt.Errorf("%w: config file edited during the rebind", ErrOrgSeatBindingChanged)
+	}
+	return writeOrgConfigBytes(paths, []byte(updated), OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true})
 }
 
 // RemoveOrgSeatRole removes exactly one role table and returns the removed role.
