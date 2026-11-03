@@ -81,6 +81,9 @@ var (
 		llsys.AccessFSMakeSock | llsys.AccessFSMakeFifo | llsys.AccessFSMakeBlock |
 		llsys.AccessFSMakeSym | llsys.AccessFSTruncate)
 	execOnly = landlock.AccessFSSet(llsys.AccessFSExecute | llsys.AccessFSReadFile)
+	// listDirOnly lets a seat list a directory tree without reading any file
+	// in it (#2505 PCI enumeration).
+	listDirOnly = landlock.AccessFSSet(llsys.AccessFSReadDir)
 )
 
 func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readOnlyWorkdir, noExecution bool) error {
@@ -167,6 +170,9 @@ func execSandbox(readPaths, readFiles, writePaths []string, argv []string, readO
 			rules = append(rules, landlock.RODirs(readable...))
 			rules = append(rules, landlock.ROFiles(files...))
 			rules = append(rules, landlock.ROFiles(runtimeHostReadFiles...).IgnoreIfMissing())
+			// A seat that may execute can run headless Chromium, which must
+			// enumerate PCI devices; a no-execution seat never starts it.
+			rules = append(rules, browserPCIRules()...)
 		}
 	}
 	if len(writable) > 0 {
@@ -340,28 +346,47 @@ func readableRoots(paths []string) ([]string, error) {
 		// Bun-based Claude/Kimi binaries abort without it and codex's managed
 		// bwrap reads /proc/sys/kernel/overflowuid.
 		"/proc",
-		// Headless Chromium for rendered UI checks (#2505): it enumerates PCI
-		// devices and CPU topology to start its GPU process (without them the
-		// GPU process dies six times and Chrome exits 133, also with
-		// --disable-gpu), and fontconfig reads /etc/fonts to render text with
-		// the system fonts. These are read-only hardware description and font
-		// configuration; no secrets. /sys/bus/pci links into the PCI device
-		// trees, which are granted below.
-		"/sys/devices/system/cpu", "/sys/bus/pci", "/etc/fonts",
+		// Headless Chromium for rendered UI checks (#2505): it reads CPU
+		// topology to start its GPU process, and fontconfig reads /etc/fonts
+		// to render text with the system fonts. PCI enumeration is granted
+		// separately and narrowly (browserPCIRules).
+		"/sys/devices/system/cpu", "/etc/fonts",
 	} {
 		if err := add(candidate, false); err != nil {
 			return nil, err
 		}
 	}
-	// The PCI device trees /sys/bus/pci/devices links into (pci0000:00, ...);
-	// their names vary per host.
-	pciTrees, _ := filepath.Glob("/sys/devices/pci*")
-	for _, candidate := range pciTrees {
-		if err := add(candidate, false); err != nil {
-			return nil, err
+	return roots, nil
+}
+
+// browserPCIAttributes are the only PCI device attribute files headless
+// Chromium opens to enumerate GPUs (traced on chrome-headless-shell 156).
+// Never config or resourceN: those expose device-backed memory.
+var browserPCIAttributes = []string{"vendor", "device", "class", "revision", "subsystem_vendor", "subsystem_device", "uevent"}
+
+// browserPCIRules let a read-only seat enumerate PCI devices the way headless
+// Chromium does (#2505): without it the GPU process dies six times and Chrome
+// exits 133, also with --disable-gpu. It grants directory LISTING of
+// /sys/bus/pci and the /sys/devices/pci* trees (no file reads), plus file
+// reads of only the named attribute files of each device.
+func browserPCIRules() []landlock.Rule {
+	trees, _ := filepath.Glob("/sys/devices/pci*")
+	listing := append([]string{"/sys/bus/pci"}, trees...)
+	var attributes []string
+	devices, _ := filepath.Glob("/sys/bus/pci/devices/*")
+	for _, device := range devices {
+		resolved, err := filepath.EvalSymlinks(device)
+		if err != nil || !strings.HasPrefix(resolved, "/sys/devices/pci") {
+			continue
+		}
+		for _, name := range browserPCIAttributes {
+			attributes = append(attributes, filepath.Join(resolved, name))
 		}
 	}
-	return roots, nil
+	return []landlock.Rule{
+		landlock.PathAccess(listDirOnly, listing...).IgnoreIfMissing(),
+		landlock.PathAccess(noExecReadFile, attributes...).IgnoreIfMissing(),
+	}
 }
 
 func writableRoots(paths []string, workdir string, includeImplicitRoots bool) ([]string, error) {

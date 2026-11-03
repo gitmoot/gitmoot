@@ -65,11 +65,7 @@ func TestReadableRootsGrantOnlyRequestedAndFixedSystemRoots(t *testing.T) {
 		"/usr/local/bin": true, "/usr/local/sbin": true, "/usr/local/lib": true,
 		"/usr/local/lib64": true, "/usr/local/share": true,
 		"/etc/ssl/certs": true, "/etc/pki": true, "/proc": true,
-		"/sys/devices/system/cpu": true, "/sys/bus/pci": true, "/etc/fonts": true,
-	}
-	pciTrees, _ := filepath.Glob("/sys/devices/pci*")
-	for _, tree := range pciTrees {
-		fixed[tree] = true
+		"/sys/devices/system/cpu": true, "/etc/fonts": true,
 	}
 	for _, root := range roots {
 		if root == requested || fixed[root] {
@@ -130,10 +126,29 @@ func TestReadOnlySeatCanReadBrowserSystemFilesE2E(t *testing.T) {
 			t.Fatalf("review seat cannot read %s: %v %q", path, err, out)
 		}
 	}
-	// The grant stays narrow: other /etc files remain unreadable.
-	if _, err := os.Stat("/etc/hostname"); err == nil {
-		if out, err := read("/etc/hostname"); err == nil || !strings.Contains(out, "DENIED") {
-			t.Fatalf("review seat read /etc/hostname: %v %q", err, out)
+	// The grant stays narrow: other /etc files remain unreadable, and of a PCI
+	// device only the enumeration attributes are readable, never its config
+	// space or resourceN memory windows (#2506 review).
+	denied := []string{"/etc/hostname"}
+	if devices, _ := filepath.Glob("/sys/bus/pci/devices/*"); len(devices) > 0 {
+		device, err := filepath.EvalSymlinks(devices[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := read(filepath.Join(device, "vendor")); err != nil || !strings.HasPrefix(out, "OK read") {
+			t.Fatalf("review seat cannot read PCI vendor of %s: %v %q", device, err, out)
+		}
+		denied = append(denied, filepath.Join(device, "config"))
+		if resources, _ := filepath.Glob(filepath.Join(device, "resource[0-9]*")); len(resources) > 0 {
+			denied = append(denied, resources[0])
+		}
+	}
+	for _, path := range denied {
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		if out, err := read(path); err == nil || !strings.Contains(out, "DENIED") {
+			t.Fatalf("review seat read %s: %v %q", path, err, out)
 		}
 	}
 }
