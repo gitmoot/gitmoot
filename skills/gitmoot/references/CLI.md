@@ -887,10 +887,12 @@ Free-space thresholds (the 10GB floor, the canonical reserve and the 20GB
 warning band) apply only when a review is admitted; a running review is never
 stopped for low space. Failed, unknown, stale or mismatched capacity evidence
 and device or policy changes still stop it (#2479), and each monitor cancel
-records `review_capacity_cancelled` with its reason. A failed Janitor status
-read (for example a timeout under load) reuses the last good sample until that
-sample's own `valid_until` passes, logging `janitor_read_failed`; only then does
-the review stop (#2500). A monitor cancel waits up to two minutes for the job
+records `review_capacity_cancelled` with its reason. A Janitor status command
+that does not answer (for example a timeout under load) reuses the last good
+sample until that sample's own `valid_until` passes, logging
+`janitor_read_failed`; only then does the review stop (#2500). An answer that
+arrives and is rejected (another policy, bad schema, stale) still stops it at
+once. A monitor cancel waits up to two minutes for the job
 lifecycle lock that cleanup can hold, so it commits as `cancelled`.
 `.gitmoot/review-capacity.jsonl` records measurements and cancellation requests.
 Cancellation does not prove remote destruction completed or automatically retry

@@ -186,12 +186,14 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 	if ownsGeneration {
 		ownedGeneration = *generation
 	}
-	// lastGood is the newest Janitor sample that was read successfully. One
-	// failed read (a status call timing out under host load) reuses it while
-	// it is still fresh; the measurements are still taken live, and the
-	// sample's own validity still applies, so failed evidence fails closed
-	// once no fresh sample exists (owner decision, #2500: a single 5s timeout
-	// at 21:19Z cancelled five healthy reviews at once).
+	// lastGood is the newest Janitor sample that was read successfully. A
+	// status command that did not answer (a 5s timeout under host load)
+	// reuses it while it is still fresh; the measurements are still taken
+	// live and the sample's own validity still applies, so failed evidence
+	// fails closed once no fresh sample exists (owner decision, #2500: one
+	// timeout at 21:19Z cancelled five healthy reviews at once). An answer
+	// that arrived and was rejected (another policy, bad schema, stale
+	// producer) is evidence, never masked by the cached sample.
 	var lastGood *janitorAdmission
 	check := func(admitting bool) (map[uint64]string, []reviewCapacityMeasurement, error) {
 		current, err := config.LoadJanitorCapacity(paths)
@@ -206,7 +208,7 @@ func startReviewCapacityMonitor(ctx context.Context, store *db.Store, paths conf
 		if a.cfgErr == nil && a.readErr == nil {
 			good := a
 			lastGood = &good
-		} else if a.cfgErr == nil && !admitting && lastGood != nil && lastGood.expired() == "" {
+		} else if a.cfgErr == nil && !admitting && lastGood != nil && lastGood.expired() == "" && errors.As(a.readErr, new(janitorStatusExecError)) {
 			_ = recordReviewCapacity(paths, jobID, repo, head, "janitor_read_failed", "using the last good sample until it is stale: "+a.readErr.Error(), nil)
 			reusedAfter = a.readErr
 			a = *lastGood

@@ -193,6 +193,10 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 		// the lifecycle lock longer than the old 10s wait; before, the run was
 		// stopped with no cancel recorded and the job never ended cancelled.
 		{"statfs_failed_while_cleanup_locked", "statfs failed"},
+		// #2501 review: only a status command that did not answer may reuse
+		// the cached sample. An answer for another policy is evidence and
+		// stops the review although the cached sample is fresh for minutes.
+		{"janitor_other_policy", "is not the approved policy"},
 	} {
 		t.Run(tc.trigger, func(t *testing.T) { runLowSpaceMonitorScenario(t, tc.trigger, tc.wantReason) })
 	}
@@ -242,6 +246,10 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	})
 	previous := runJanitorStatus
 	var janitorDown atomic.Bool
+	var validity atomic.Int64
+	validity.Store(int64(6 * time.Second))
+	var policy atomic.Value
+	policy.Store(janitorTestPolicyHash)
 	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
 		if janitorDown.Load() {
 			return nil, errors.New("janitor status unavailable")
@@ -250,7 +258,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 		for device := range devices {
 			volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":%q,"admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"measured"}`, device, device, state.Load().(string), free.Load()))
 		}
-		return []byte(janitorStatusJSON(time.Now(), 6*time.Second, janitorTestPolicyHash, volumes...)), nil
+		return []byte(janitorStatusJSON(time.Now(), time.Duration(validity.Load()), policy.Load().(string), volumes...)), nil
 	}
 	t.Cleanup(func() { runJanitorStatus = previous })
 	runner := &reviewCapacityBlockingRunner{started: make(chan struct{})}
@@ -291,6 +299,12 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	switch trigger {
 	case "statfs_failed":
 		broken.Store(true)
+	case "janitor_other_policy":
+		// Let a long-lived sample become the cached one, then answer for
+		// another policy: the stop must not wait for that sample to expire.
+		validity.Store(int64(2 * time.Minute))
+		time.Sleep(2*reviewCapacityInterval + time.Second)
+		policy.Store(strings.Repeat("0", len(janitorTestPolicyHash)))
 	case "statfs_failed_while_cleanup_locked":
 		// Destructive cleanup holds the lifecycle lock exclusively for longer
 		// than the old 10s cancel wait.
