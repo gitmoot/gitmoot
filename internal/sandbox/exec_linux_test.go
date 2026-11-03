@@ -171,14 +171,22 @@ func TestReadOnlySeatRunsHeadlessChromiumE2E(t *testing.T) {
 	requireLandlockABI(t)
 	gitmoot := buildGitmootBinary(t)
 	requireReadOnlySeatLaunchable(t, gitmoot)
+	// A review seat reads the browser it installed from its real directory,
+	// where Chromium also keeps icudtl.dat and its resources; a PATH entry is
+	// often a symlink into that directory.
+	resolved, err := filepath.EvalSymlinks(chrome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("chromium: %s -> %s", chrome, resolved)
 	workdir, write := t.TempDir(), t.TempDir()
-	cmd := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", filepath.Dir(chrome), "--write", write, "--",
-		chrome, "--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir="+filepath.Join(write, "profile"),
+	cmd := exec.Command(gitmoot, "sandbox-exec", "--read-only-workdir", "--read", filepath.Dir(resolved), "--write", write, "--",
+		resolved, "--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir="+filepath.Join(write, "profile"),
 		"--dump-dom", "data:text/html,<p>rendered</p>")
 	cmd.Dir = workdir
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil || !strings.Contains(out.String(), "<p>rendered</p>") {
 		t.Fatalf("headless Chromium did not render in a review seat: %v\n%s", err, out.String())
 	}
