@@ -1627,3 +1627,57 @@ func TestOrgSeatRemoveForceIsANoOpOnAHealthyResolvedSeat(t *testing.T) {
 		})
 	}
 }
+
+// #2507: a live seat whose pane works outside any Git checkout (a manager seat
+// in a non-git HOME) is retired with --no-checkout and its pane is closed.
+// Without the flag it is still refused, and the flag never waives the
+// inspection of a checkout that is found.
+func TestOrgSeatRemoveNoCheckoutRetiresANonRepoSeat(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dir        func(*testing.T) string
+		args       []string
+		wantCode   int
+		wantClosed bool
+		wantText   string
+	}{
+		{"non-repo pane without the flag is refused", func(t *testing.T) string { return t.TempDir() }, nil, 1, false, "pass --no-checkout"},
+		{"non-repo pane with the flag is retired", func(t *testing.T) string { return t.TempDir() }, []string{"--no-checkout"}, 0, true, "role worker removed"},
+		{"a found checkout is still inspected", newOrgSeatUnshippedRepo, []string{"--no-checkout"}, 1, false, "has commits not merged into origin/main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home, paths, panes := setupOrgSeatTestHome(t)
+			appendOrgSeatWorker(t, paths)
+			addOrgSeatWorkerRoutes(t, paths)
+			dir := tc.dir(t)
+			panes[1].CWD, panes[1].ForegroundCWD = dir, dir
+			withOrgSeatFixtureProvider(t, &panes)
+			closed := false
+			originalClose := orgSeatClosePane
+			orgSeatClosePane = func(_ context.Context, paneID string) error {
+				for i, pane := range panes {
+					if pane.PaneID == paneID {
+						panes = append(panes[:i], panes[i+1:]...)
+						closed = true
+						return nil
+					}
+				}
+				return errors.New("pane not found")
+			}
+			t.Cleanup(func() { orgSeatClosePane = originalClose })
+			var stdout, stderr bytes.Buffer
+			code := runOrg(append([]string{"seat", "rm", "worker", "--home", home}, tc.args...), &stdout, &stderr)
+			output := stdout.String() + stderr.String()
+			if code != tc.wantCode || closed != tc.wantClosed || !strings.Contains(output, tc.wantText) {
+				t.Fatalf("seat rm code=%d closed=%t, want %d/%t with %q; output:\n%s", code, closed, tc.wantCode, tc.wantClosed, tc.wantText, output)
+			}
+			cfg, err := config.LoadOrg(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := cfg.Role("worker"); ok == tc.wantClosed {
+				t.Fatalf("worker role present=%t after seat rm (want removed=%t)", ok, tc.wantClosed)
+			}
+		})
+	}
+}

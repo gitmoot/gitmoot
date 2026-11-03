@@ -2016,7 +2016,10 @@ a subset of its parent.
 Use `gitmoot org validate` to validate the registry against the live Herdr
 snapshot and event-rule store. It fails when a role has no live pane, has no
 enabled wake route, or a labeled live pane is not claimed by any role; each
-failure includes category counts and a reason. Use `gitmoot org show` to view
+failure includes category counts and a reason. The root role
+`owner` with no `pane` is the human owner (reached by owner Gram), so it is not
+checked for a pane or wake route; given a pane, it is validated like any seat
+(#2507). Use `gitmoot org show` to view
 the configured roles. When enabled, fresh local `agent ask`, `agent run`, `agent
 review`, `orchestrate`, and `review request` dispatches need a requesting role:
 `--org-role <role>`, else `GITMOOT_ORG_ROLE`, else the role registered for the
@@ -2085,7 +2088,7 @@ matching label binding, or replaces a non-empty binding only when its former
 target no longer resolves. It does not rewrite existing policy or duplicate
 routes.
 
-`gitmoot org seat rm <name> [--force] [--home DIR]` resolves the role's live pane
+`gitmoot org seat rm <name> [--force] [--no-checkout] [--home DIR]` resolves the role's live pane
 when it has a binding and checks every distinct Git checkout reported by that
 pane's `cwd` and `foreground_cwd`. It refuses a dirty checkout or a branch whose
 `HEAD` is not merged into the locally known `origin/HEAD` (falling back to
@@ -2095,8 +2098,13 @@ that the role, routes, and closed pane are absent. A role with no configured
 binding has no pane to inspect or close, so removal deletes only that role and
 its routes. A configured binding that is stale, absent, or ambiguous fails
 closed before mutation and reports the `org seat add` rebind command. A provider
-error for a configured binding also fails closed. Roles that still parent
-another role cannot be removed.
+error for a configured binding also fails closed. A pane whose directories are
+not inside any Git checkout is refused too, because that does not prove the seat
+left no work elsewhere; `--no-checkout` states the seat works outside any
+checkout (for example a manager seat in a non-Git home) and waives only that
+refusal: any checkout that is found is still inspected, and an unresolved pane
+still needs `--force` (#2507). Roles that still parent another role cannot be
+removed.
 
 `--force` retires a seat whose configured pane will never resolve again, which
 is otherwise unreachable: rebinding is impossible when the pane is gone, so the

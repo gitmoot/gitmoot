@@ -140,7 +140,7 @@ func printOrgUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot org recycle ROLE --kind KIND --handoff NOTE [--pane ID] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]")
 
 	fmt.Fprintln(w, "  gitmoot org await review --repo OWNER/REPO --pr NUMBER --head SHA --ttl DURATION [--role ROLE] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org await list [--role ROLE] [--state waiting|satisfied|expired|superseded] [--json] [--home DIR]")
@@ -182,7 +182,7 @@ func printOrgSeatUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot org seat add NAME [--pane ID_OR_LABEL] [--parent ROLE] [--scope REPO,...] [--merge-rule owner|self|none] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot org seat bind --name ROLE --agent NAME [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot org seat rm NAME [--force] [--no-checkout] [--home DIR]")
 }
 
 func runOrgSeatAdd(args []string, stdout, stderr io.Writer) int {
@@ -405,6 +405,11 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 	// stating that the pane is gone and accepting the unverified removal; it
 	// never skips the branch check on a pane that DOES resolve.
 	force := fs.Bool("force", false, "remove even when the configured pane cannot be resolved (stale id or ambiguous label)")
+	// #2507: a seat that works outside any Git checkout (a manager seat in a
+	// non-git HOME) has no branch to inspect. The operator states it; only the
+	// "no checkout found" refusal is skipped, never the inspection of a
+	// checkout that is found, nor the unresolved-pane refusal.
+	noCheckout := fs.Bool("no-checkout", false, "the seat works outside any Git checkout: allow removal when its pane directories are not a Git checkout (a checkout that is found is still inspected)")
 	nameArg, flagArgs := leadingOrgSeatName(args)
 	if err := fs.Parse(flagArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -498,7 +503,7 @@ func runOrgSeatRemove(args []string, stdout, stderr io.Writer) int {
 		} else if pane, ok = orgSeatPaneByID(snapshot.Panes, binding.PaneID); !ok {
 			fmt.Fprintf(stderr, "org seat rm: resolved pane %s is absent from the live snapshot\n", binding.PaneID)
 			return 1
-		} else if err := orgSeatBranchCheck(ctx, pane); err != nil {
+		} else if err := orgSeatBranchCheck(ctx, pane); err != nil && !(*noCheckout && errors.Is(err, errOrgSeatNoCheckout)) {
 			fmt.Fprintf(stderr, "org seat rm: refusing to remove %q: %v\n", role.Name, err)
 			return 1
 		} else {
@@ -823,6 +828,10 @@ func closeOrgSeatPane(ctx context.Context, paneID string) error {
 	return fmt.Errorf("%w: %s", err, detail)
 }
 
+// errOrgSeatNoCheckout marks the one branch-check refusal --no-checkout may
+// waive: the pane reports directories, and none is inside a Git checkout.
+var errOrgSeatNoCheckout = errors.New("no git checkout")
+
 func checkOrgSeatBranches(ctx context.Context, pane org.LivePane) error {
 	directories := []string{strings.TrimSpace(pane.ForegroundCWD), strings.TrimSpace(pane.CWD)}
 	roots := map[string]struct{}{}
@@ -849,7 +858,7 @@ func checkOrgSeatBranches(ctx context.Context, pane org.LivePane) error {
 		return fmt.Errorf("pane %s reports neither cwd nor foreground_cwd; branch safety is unverified", pane.PaneID)
 	}
 	if len(roots) == 0 {
-		return fmt.Errorf("pane %s reports no Git checkout; branch safety is unverified", pane.PaneID)
+		return fmt.Errorf("pane %s reports no Git checkout; branch safety is unverified (pass --no-checkout if this seat works outside any checkout): %w", pane.PaneID, errOrgSeatNoCheckout)
 	}
 	for root := range roots {
 		status, err := orgSeatRunner.Run(ctx, root, "git", "status", "--porcelain")
@@ -1067,6 +1076,11 @@ func runOrgValidateReality(ctx context.Context, paths config.Paths, cfg config.O
 	var issues []string
 	for _, role := range roster.Members() {
 		name := strings.ToLower(strings.TrimSpace(role.Name))
+		if humanOwnerRole(role) {
+			// #2507: the org root is the human owner, reached by owner Gram,
+			// not a pane or wake route. Given a pane, it is checked as a seat.
+			continue
+		}
 		binding := snapshot.PaneBindings[name]
 		if strings.TrimSpace(binding.PaneID) == "" {
 			summary.unresolvedRoles++
@@ -1109,6 +1123,13 @@ func runOrgValidateReality(ctx context.Context, paths config.Paths, cfg config.O
 		fmt.Fprintf(stderr, "- %s\n", issue)
 	}
 	return 1
+}
+
+// humanOwnerRole reports the org root "owner" with no pane configured: the
+// human owner, not an agent seat (#2507).
+func humanOwnerRole(role config.OrgRole) bool {
+	return strings.EqualFold(strings.TrimSpace(role.Name), "owner") &&
+		strings.TrimSpace(role.Parent) == "" && strings.TrimSpace(role.Pane) == ""
 }
 
 const starterOrgConfig = `
