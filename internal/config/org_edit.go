@@ -1,8 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -31,6 +34,12 @@ func (e OrgSeatConfigEdit) Restore() error {
 // same file snapshot, so a concurrent config update cannot pass validation
 // against stale bytes. Other existing role fields are never rewritten.
 func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (OrgSeatConfigEdit, bool, error) {
+	// #2502: serialised with the daemon's automatic seat rebind.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return OrgSeatConfigEdit{}, false, err
+	}
+	defer release()
 	desired.Name = strings.ToLower(strings.TrimSpace(desired.Name))
 	desired.Pane = strings.TrimSpace(desired.Pane)
 	if desired.Name == "" {
@@ -79,9 +88,150 @@ func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (Org
 	return edit, !exists, nil
 }
 
+// ErrOrgSeatBindingChanged reports that a conditional rebind found the role
+// missing, its binding no longer the expected one, or the config file edited
+// since it was read. Nothing was written.
+var ErrOrgSeatBindingChanged = errors.New("org seat binding changed; rebind not applied")
+
+// RebindOrgSeatPane replaces the pane binding of an EXISTING role only while it
+// still reads exactly from (#2502). Unlike UpsertOrgSeatRole it never creates a
+// role and never fills an empty binding, so a background writer cannot undo an
+// operator's removal or unbind.
+//
+// It holds the config edit lock, so no other gitmoot command interleaves. A
+// hand edit in an editor takes no lock, so on Linux the new file is installed
+// with an atomic exchange and the file it replaced is compared with the one
+// the guard read: if anything changed in between, the exchange is reversed,
+// putting the operator's file back. On other platforms the comparison runs
+// just before the rename, leaving a sub-millisecond window. Validation after
+// installing reverses the change on any parse failure.
+func RebindOrgSeatPane(paths Paths, name, from, to string) error {
+	name = strings.ToLower(strings.TrimSpace(name))
+	from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+	if name == "" || from == "" || to == "" || from == to {
+		return fmt.Errorf("org seat rebind needs a role and two different bindings")
+	}
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return err
+	}
+	defer release()
+	original, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return err
+	}
+	cfg, err := parseOrgContent(original)
+	if err != nil {
+		return err
+	}
+	current, exists := cfg.Role(name)
+	if !exists || strings.TrimSpace(current.Pane) != from {
+		return fmt.Errorf("%w: role %q", ErrOrgSeatBindingChanged, name)
+	}
+	updated, err := setOrgRolePane(string(original), name, to)
+	if err != nil {
+		return err
+	}
+	if !canExchangeFiles {
+		latest, err := os.ReadFile(paths.ConfigFile)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(latest, original) {
+			return fmt.Errorf("%w: config file edited during the rebind", ErrOrgSeatBindingChanged)
+		}
+		return writeOrgConfigBytes(paths, []byte(updated), OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true})
+	}
+	staged, err := stageConfigFile(paths.ConfigFile, []byte(updated))
+	if err != nil {
+		return err
+	}
+	keepStaged := false
+	defer func() {
+		if !keepStaged {
+			_ = os.Remove(staged)
+		}
+	}()
+	beforeConfigExchange()
+	if err := exchangeFiles(staged, paths.ConfigFile); err != nil {
+		return err
+	}
+	afterConfigExchange()
+	// undo puts the replaced file back, but only while the config still holds
+	// the file this rebind installed: if a newer edit already replaced it,
+	// that newer edit wins and stays (the replaced file it superseded is
+	// dropped). A further unlocked write between this check and the swap is
+	// the remaining window; gitmoot's own writers are excluded by the lock.
+	undo := func() error {
+		current, err := os.ReadFile(paths.ConfigFile)
+		if err != nil || !bytes.Equal(current, []byte(updated)) {
+			return err
+		}
+		return exchangeFiles(staged, paths.ConfigFile)
+	}
+	// staged now holds exactly the file this exchange replaced.
+	replaced, err := os.ReadFile(staged)
+	if err != nil || !bytes.Equal(replaced, original) {
+		if undoErr := undo(); undoErr != nil {
+			keepStaged = true
+			return fmt.Errorf("config file edited during the rebind and restoring it failed (the operator's file is kept at %s): %w", staged, undoErr)
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: config file edited during the rebind", ErrOrgSeatBindingChanged)
+	}
+	if err := validateConfigFile(paths); err != nil {
+		if undoErr := undo(); undoErr != nil {
+			keepStaged = true
+			return fmt.Errorf("rebound config is invalid (%v) and restoring it failed (the previous file is kept at %s): %w", err, staged, undoErr)
+		}
+		return err
+	}
+	return nil
+}
+
+// beforeConfigExchange and afterConfigExchange run just before and just after
+// a conditional rebind installs its file; tests use them to land concurrent
+// hand edits in those windows.
+var (
+	beforeConfigExchange = func() {}
+	afterConfigExchange  = func() {}
+)
+
+// stageConfigFile writes contents to a synced 0600 temporary file beside path.
+func stageConfigFile(path string, contents []byte) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.toml")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	_, err = tmp.Write(contents)
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(name, 0o600)
+	}
+	if err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
 // RemoveOrgSeatRole removes exactly one role table and returns the removed role.
 // The real org parser validates parent references after the edit.
 func RemoveOrgSeatRole(paths Paths, name string) (OrgSeatConfigEdit, OrgRole, error) {
+	// #2502: serialised with the daemon's automatic seat rebind.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return OrgSeatConfigEdit{}, OrgRole{}, err
+	}
+	defer release()
 	name = strings.ToLower(strings.TrimSpace(name))
 	cfg, err := LoadOrg(paths)
 	if err != nil {

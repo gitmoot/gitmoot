@@ -2396,7 +2396,14 @@ live presence and org event-rule wakes).
 Use `org seat bind --name ROLE --agent NAME` for a registered local seat binding
 (`pane = "agent:NAME"`), which follows its current pane after recreation.
 The command validates a unique live local agent and leaves routes and old
-notices unchanged. Legacy literal pane IDs and exact labels remain supported,
+notices unchanged. The daemon also follows a Herdr agent rename (#2502): it
+records the pane and session file each `agent:NAME` binding resolves to, and when
+the name stops resolving while exactly one live agent has that same pane and
+session, it rewrites the seat's `pane` in the org config to `agent:NEWNAME` and
+tells the seat's parent. An agent in that pane with another session is never
+followed; the parent is told once that the seat is unreachable and its messages
+are queued, with the `org seat bind` command to fix it.
+Legacy literal pane IDs and exact labels remain supported,
 but a delivery target must contain a registered agent, not merely a live shell.
 Missing or ambiguous bindings fail closed. There is
 exactly one root named `owner`; accepted scopes are `*`, `owner/*`, and

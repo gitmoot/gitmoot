@@ -20,6 +20,12 @@ import (
 // file fails to re-parse through the Load* parsers, the original is restored
 // and the validation error is returned.
 func SetConfigScalar(paths Paths, keyPath []string, value ConfigScalar) error {
+	// #2502: serialised with the daemon's automatic seat rebind.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if len(keyPath) < 2 {
 		return fmt.Errorf("config key path must include a section and a key")
 	}

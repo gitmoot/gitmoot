@@ -149,7 +149,13 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 			continue
 		}
 		states[role.Name] = mapHerdrPaneState(pane)
-		bindings[role.Name] = org.PaneBinding{PaneID: paneID}
+		resolved := org.PaneBinding{PaneID: paneID}
+		if strings.HasPrefix(binding, "agent:") {
+			if agent, ok := registeredAgentForBinding(agents, binding); ok {
+				resolved.AgentName, resolved.Session = agent.Name, strings.TrimSpace(agent.AgentSession.Value)
+			}
+		}
+		bindings[role.Name] = resolved
 		if strings.TrimSpace(pane.Agent) != "" {
 			title := strings.TrimSpace(pane.TerminalTitleText)
 			if title == "" {
@@ -170,7 +176,22 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	return org.Snapshot{
 		States: states, ObservedAt: now().UTC(), ProviderVersion: version,
 		PaneBindings: bindings, Panes: panes, Sessions: sessions,
+		Agents: liveLocalAgents(agents),
 	}, nil
+}
+
+// liveLocalAgents is the registered agents a binding may resolve to: local,
+// unarchived and in a pane (the registeredAgentForBinding filter).
+func liveLocalAgents(agents []registeredAgent) []org.LiveAgent {
+	var live []org.LiveAgent
+	for _, agent := range agents {
+		if agent.PaneID == "" || agent.MachineID != "" || agent.MachineProfileID != "" ||
+			(len(agent.Archived) != 0 && string(agent.Archived) != "null") {
+			continue
+		}
+		live = append(live, org.LiveAgent{Name: agent.Name, PaneID: agent.PaneID, Session: strings.TrimSpace(agent.AgentSession.Value)})
+	}
+	return live
 }
 
 func herdrTurnNumber(value *json.Number) *int64 {
