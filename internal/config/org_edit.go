@@ -156,10 +156,23 @@ func RebindOrgSeatPane(paths Paths, name, from, to string) error {
 	if err := exchangeFiles(staged, paths.ConfigFile); err != nil {
 		return err
 	}
+	afterConfigExchange()
+	// undo puts the replaced file back, but only while the config still holds
+	// the file this rebind installed: if a newer edit already replaced it,
+	// that newer edit wins and stays (the replaced file it superseded is
+	// dropped). A further unlocked write between this check and the swap is
+	// the remaining window; gitmoot's own writers are excluded by the lock.
+	undo := func() error {
+		current, err := os.ReadFile(paths.ConfigFile)
+		if err != nil || !bytes.Equal(current, []byte(updated)) {
+			return err
+		}
+		return exchangeFiles(staged, paths.ConfigFile)
+	}
 	// staged now holds exactly the file this exchange replaced.
 	replaced, err := os.ReadFile(staged)
 	if err != nil || !bytes.Equal(replaced, original) {
-		if undoErr := exchangeFiles(staged, paths.ConfigFile); undoErr != nil {
+		if undoErr := undo(); undoErr != nil {
 			keepStaged = true
 			return fmt.Errorf("config file edited during the rebind and restoring it failed (the operator's file is kept at %s): %w", staged, undoErr)
 		}
@@ -169,7 +182,7 @@ func RebindOrgSeatPane(paths Paths, name, from, to string) error {
 		return fmt.Errorf("%w: config file edited during the rebind", ErrOrgSeatBindingChanged)
 	}
 	if err := validateConfigFile(paths); err != nil {
-		if undoErr := exchangeFiles(staged, paths.ConfigFile); undoErr != nil {
+		if undoErr := undo(); undoErr != nil {
 			keepStaged = true
 			return fmt.Errorf("rebound config is invalid (%v) and restoring it failed (the previous file is kept at %s): %w", err, staged, undoErr)
 		}
@@ -178,9 +191,13 @@ func RebindOrgSeatPane(paths Paths, name, from, to string) error {
 	return nil
 }
 
-// beforeConfigExchange runs between staging and installing a conditional
-// rebind; tests use it to land a concurrent hand edit in that window.
-var beforeConfigExchange = func() {}
+// beforeConfigExchange and afterConfigExchange run just before and just after
+// a conditional rebind installs its file; tests use them to land concurrent
+// hand edits in those windows.
+var (
+	beforeConfigExchange = func() {}
+	afterConfigExchange  = func() {}
+)
 
 // stageConfigFile writes contents to a synced 0600 temporary file beside path.
 func stageConfigFile(path string, contents []byte) (string, error) {

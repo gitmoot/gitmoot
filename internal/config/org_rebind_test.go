@@ -84,4 +84,27 @@ func TestRebindOrgSeatPaneOnlyReplacesTheExpectedBinding(t *testing.T) {
 			t.Fatalf("staged files left behind: %v", leftovers)
 		}
 	})
+	// #2503 review: a second hand edit right after the exchange (the operator
+	// rebinds the seat elsewhere) must survive; undoing the exchange would
+	// put back the older unbind over it.
+	t.Run("newer hand edit after the exchange wins", func(t *testing.T) {
+		if !canExchangeFiles {
+			t.Skip("atomic exchange is Linux-only")
+		}
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(base+"pane = \"agent:worker\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		newer := base + "pane = \"agent:operator-new\"\n"
+		previousBefore, previousAfter := beforeConfigExchange, afterConfigExchange
+		t.Cleanup(func() { beforeConfigExchange, afterConfigExchange = previousBefore, previousAfter })
+		beforeConfigExchange = func() { _ = os.WriteFile(path, []byte(base), 0o600) }
+		afterConfigExchange = func() { _ = os.WriteFile(path+".tmp-op", []byte(newer), 0o600); _ = os.Rename(path+".tmp-op", path) }
+		if err := RebindOrgSeatPane(Paths{ConfigFile: path}, "worker", "agent:worker", "agent:tino"); !errors.Is(err, ErrOrgSeatBindingChanged) {
+			t.Fatalf("rebind racing two hand edits err = %v, want refusal", err)
+		}
+		if after, _ := os.ReadFile(path); string(after) != newer {
+			t.Fatalf("rebind discarded the operator's newer edit:\n%s", after)
+		}
+	})
 }
