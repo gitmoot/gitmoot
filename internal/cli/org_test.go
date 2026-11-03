@@ -2124,3 +2124,48 @@ func TestOrgEventRuleRepoAliasUsesMatchFilter(t *testing.T) {
 		t.Fatalf("ambiguous add changed rules: rules=%+v err=%v", rules, err)
 	}
 }
+
+// #2507 (deimos-forge customer workspaces): the org root "owner" with no pane
+// is the human owner, reached by owner Gram, so validate must not fail on it
+// for having no pane or wake route. Given a pane, it is validated as a seat.
+func TestOrgValidateTreatsPanelessRootOwnerAsHuman(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ownerPane string
+		wantCode  int
+		want      string
+	}{
+		{"paneless owner is the human", "", 0, "ok 2 roles, 1 live panes, 1 enabled routes"},
+		{"owner with an unresolved pane is still a seat", "pane = \"agent:owner\"\n", 1, "role owner pane unresolved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := os.MkdirAll(filepath.Dir(paths.ConfigFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body := "[org.roles.\"owner\"]\nscope = [\"*\"]\n" + tc.ownerPane + "[org.roles.\"deimos\"]\nparent = \"owner\"\nscope = [\"*\"]\npane = \"w1:p2\"\n"
+			if err := os.WriteFile(paths.ConfigFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := dbtest.Open(t, paths.Database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.AddEventRule(context.Background(), db.EventRule{ID: "route-deimos", OnKind: "reply", WakeRole: "deimos", Enabled: true}); err != nil {
+				t.Fatal(err)
+			}
+			_ = store.Close()
+			withOrgProvider(t, orgFixtureProvider{snapshot: org.Snapshot{
+				PaneBindings: map[string]org.PaneBinding{"owner": {Detail: "no Herdr pane bound"}, "deimos": {PaneID: "w1:p2"}},
+				Panes:        []org.LivePane{{PaneID: "w1:p2", Label: "deimos"}},
+			}})
+			var stdout, stderr bytes.Buffer
+			code := runOrg([]string{"validate", "--home", home}, &stdout, &stderr)
+			output := stdout.String() + stderr.String()
+			if code != tc.wantCode || !strings.Contains(output, tc.want) {
+				t.Fatalf("validate code=%d, want %d with %q; output:\n%s", code, tc.wantCode, tc.want, output)
+			}
+		})
+	}
+}
