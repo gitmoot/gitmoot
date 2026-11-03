@@ -3103,7 +3103,7 @@ CREATE TABLE IF NOT EXISTS external_merge_reconcile_cursors (
 	// #2502: the last agent each "agent:NAME" seat binding resolved to. Herdr
 	// has no stable agent id; pane plus session reference identifies an agent
 	// across a rename, so the daemon can follow it. alerted_at marks a seat
-	// whose unresolved binding (alerted_binding) was already reported to its lead.
+	// whose unresolved binding was already reported to its lead.
 	`
 CREATE TABLE IF NOT EXISTS org_seat_agent_identity (
 	role TEXT PRIMARY KEY,
@@ -3111,7 +3111,15 @@ CREATE TABLE IF NOT EXISTS org_seat_agent_identity (
 	pane_id TEXT NOT NULL,
 	session TEXT NOT NULL,
 	observed_at TEXT NOT NULL,
-	alerted_binding TEXT NOT NULL DEFAULT ''
+	alerted_at TEXT NOT NULL DEFAULT ''
 );
+	`,
+	// #2502 review: an unreachable-seat alert is keyed by the binding it
+	// reported, so it also fires for a seat with no recorded identity and a
+	// changed binding starts a new episode. Appended, not edited in place, so
+	// homes that already applied the previous migration are upgraded too.
+	`
+ALTER TABLE org_seat_agent_identity ADD COLUMN alerted_binding TEXT NOT NULL DEFAULT '';
+ALTER TABLE org_seat_agent_identity DROP COLUMN alerted_at;
 	`,
 }
