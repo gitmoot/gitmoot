@@ -99,7 +99,10 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 				for device := range devices {
 					volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":"cleanup_needed","admission_hold":true,"available_bytes":%d,"reserve_bytes":1048576,"target_bytes":1048576,"reason":"cleanup target held"}`, device, device, uint64(2<<30)))
 				}
-				return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
+				// A short validity: under #2500 a failed read reuses the last
+				// good sample until it is stale, so the fail-closed cancel this
+				// test needs arrives once that sample expires.
+				return []byte(janitorStatusJSON(time.Now(), 4*time.Second, janitorTestPolicyHash, volumes...)), nil
 			}
 			t.Cleanup(func() { runJanitorStatus = previous })
 			queueDiskGuardJob(t, ctx, store, "unrelated-review", "reviewer", "review", "")
@@ -182,6 +185,18 @@ func TestLocalReviewMonitorNeverStopsRunningReviewForLowSpace(t *testing.T) {
 	for _, tc := range []struct{ trigger, wantReason string }{
 		{"statfs_failed", "statfs failed"},
 		{"janitor_measurement_unknown", "unknown or unsafe canonical capacity"},
+		// #2500: one Janitor read timing out must not stop a running review
+		// while the last good sample is fresh; reads that keep failing do,
+		// once it is stale.
+		{"janitor_read_failed", "janitor status unavailable"},
+		// #2500: the cancel must commit even while destructive cleanup holds
+		// the lifecycle lock longer than the old 10s wait; before, the run was
+		// stopped with no cancel recorded and the job never ended cancelled.
+		{"statfs_failed_while_cleanup_locked", "statfs failed"},
+		// #2501 review: only a status command that did not answer may reuse
+		// the cached sample. An answer for another policy is evidence and
+		// stops the review although the cached sample is fresh for minutes.
+		{"janitor_other_policy", "is not the approved policy"},
 	} {
 		t.Run(tc.trigger, func(t *testing.T) { runLowSpaceMonitorScenario(t, tc.trigger, tc.wantReason) })
 	}
@@ -230,12 +245,20 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 		return diskFilesystemUsage{TotalBytes: 500_000_000_000, FreeBytes: free.Load()}, nil
 	})
 	previous := runJanitorStatus
+	var janitorDown atomic.Bool
+	var validity atomic.Int64
+	validity.Store(int64(6 * time.Second))
+	var policy atomic.Value
+	policy.Store(janitorTestPolicyHash)
 	runJanitorStatus = func(context.Context, string, time.Duration) ([]byte, error) {
+		if janitorDown.Load() {
+			return nil, errors.New("janitor status unavailable")
+		}
 		volumes := make([]string, 0, len(devices))
 		for device := range devices {
 			volumes = append(volumes, fmt.Sprintf(`{"filesystem_key":"device:%d","device":%d,"state":%q,"admission_hold":false,"available_bytes":%d,"reserve_bytes":10000000000,"target_bytes":20000000000,"reason":"measured"}`, device, device, state.Load().(string), free.Load()))
 		}
-		return []byte(janitorStatusJSON(time.Now(), time.Minute, janitorTestPolicyHash, volumes...)), nil
+		return []byte(janitorStatusJSON(time.Now(), time.Duration(validity.Load()), policy.Load().(string), volumes...)), nil
 	}
 	t.Cleanup(func() { runJanitorStatus = previous })
 	runner := &reviewCapacityBlockingRunner{started: make(chan struct{})}
@@ -273,9 +296,37 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 		}
 	}
 	// Failed or unknown evidence: fail closed, and say why.
-	if trigger == "statfs_failed" {
+	switch trigger {
+	case "statfs_failed":
 		broken.Store(true)
-	} else {
+	case "janitor_other_policy":
+		// Let a long-lived sample become the cached one, then answer for
+		// another policy: the stop must not wait for that sample to expire.
+		validity.Store(int64(2 * time.Minute))
+		time.Sleep(2*reviewCapacityInterval + time.Second)
+		policy.Store(strings.Repeat("0", len(janitorTestPolicyHash)))
+	case "statfs_failed_while_cleanup_locked":
+		// Destructive cleanup holds the lifecycle lock exclusively for longer
+		// than the old 10s cancel wait.
+		_, releaseLock, err := store.AcquireCleanupLifecycle(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		broken.Store(true)
+		time.Sleep(12 * time.Second)
+		releaseLock()
+	case "janitor_read_failed":
+		janitorDown.Store(true)
+		time.Sleep(reviewCapacityInterval + reviewCapacityInterval/2)
+		janitorDown.Store(false)
+		select {
+		case <-finished:
+			events, _ := store.ListJobEvents(ctx, job.ID)
+			t.Fatalf("one failed Janitor read stopped the review while its last sample was fresh: %v events=%+v", runErr, events)
+		case <-time.After(2*reviewCapacityInterval + time.Second):
+		}
+		janitorDown.Store(true)
+	default:
 		state.Store("measurement_unknown")
 	}
 	select {

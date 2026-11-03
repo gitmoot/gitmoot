@@ -77,12 +77,21 @@ type janitorCapacitySnapshot struct {
 func readJanitorCapacity(ctx context.Context, cfg config.JanitorCapacity) (janitorCapacitySnapshot, error) {
 	out, err := runJanitorStatus(ctx, cfg.Executable, cfg.Timeout)
 	if err != nil {
-		return janitorCapacitySnapshot{}, err
+		return janitorCapacitySnapshot{}, janitorStatusExecError{err}
 	}
 	// Freshness is judged when the answer ARRIVES, not when the call started:
 	// a slow producer must not turn an expired sample into an admission.
 	return parseJanitorCapacity(out, cfg.PolicyHash, janitorNow())
 }
+
+// janitorStatusExecError marks a status command that did not answer (timed
+// out, could not start, exited non-zero). Only this kind of failure lets a
+// running review keep its last good sample (#2500); an answer that arrived
+// and was rejected (policy, schema, freshness) is evidence and fails closed.
+type janitorStatusExecError struct{ err error }
+
+func (e janitorStatusExecError) Error() string { return e.err.Error() }
+func (e janitorStatusExecError) Unwrap() error { return e.err }
 
 // janitorNow is the consumer clock; tests replace it.
 var janitorNow = time.Now
