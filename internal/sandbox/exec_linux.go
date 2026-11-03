@@ -367,17 +367,24 @@ var browserPCIAttributes = []string{"vendor", "device", "class", "revision", "su
 // browserPCIRules let a read-only seat enumerate PCI devices the way headless
 // Chromium does (#2505): without it the GPU process dies six times and Chrome
 // exits 133, also with --disable-gpu. It grants directory LISTING of
-// /sys/bus/pci and the /sys/devices/pci* trees (no file reads), plus file
-// reads of only the named attribute files of each device.
+// /sys/bus/pci and of each device's PCI bus directory (no file reads), plus
+// file reads of only the named attribute files of each device. A device's bus
+// directory is wherever the kernel put it: /sys/devices/pci0000:00 on bare
+// metal, deep under /sys/devices/LNXSYSTM:00/... on Hyper-V (GitHub's Azure
+// runners). Only resolved paths inside /sys/devices are used.
 func browserPCIRules() []landlock.Rule {
-	trees, _ := filepath.Glob("/sys/devices/pci*")
-	listing := append([]string{"/sys/bus/pci"}, trees...)
+	listing := []string{"/sys/bus/pci"}
+	seen := map[string]bool{}
 	var attributes []string
 	devices, _ := filepath.Glob("/sys/bus/pci/devices/*")
 	for _, device := range devices {
 		resolved, err := filepath.EvalSymlinks(device)
-		if err != nil || !strings.HasPrefix(resolved, "/sys/devices/pci") {
+		if err != nil || !strings.HasPrefix(resolved, "/sys/devices/") {
 			continue
+		}
+		if bus := filepath.Dir(resolved); !seen[bus] {
+			seen[bus] = true
+			listing = append(listing, bus)
 		}
 		for _, name := range browserPCIAttributes {
 			attributes = append(attributes, filepath.Join(resolved, name))
