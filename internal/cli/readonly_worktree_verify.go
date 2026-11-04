@@ -105,8 +105,16 @@ func parseReadOnlyWorktreeIndexEntries(listing string) ([]readOnlyWorktreeIndexE
 }
 
 // unverifiedReadOnlyWorktreeEntries returns the ordinary tracked entries whose
-// worktree content was not proven identical to their index blob.
+// worktree content was not proven identical to their index blob. It returns as
+// soon as ctx ends (#2518 review): a read already in progress on a stalled
+// network mount cannot be force-cancelled, so, like the index copy, this stops
+// waiting for it instead of holding the capture (and the daemon tick that runs
+// it) past its deadline. Workers still running then exit on their own: they
+// stop taking work, stop hashing between chunks, and write only to state this
+// call no longer reads.
 func unverifiedReadOnlyWorktreeEntries(ctx context.Context, root *os.Root, entries []readOnlyWorktreeIndexEntry) ([]readOnlyWorktreeIndexEntry, error) {
+	// Read once here: workers may outlive this call after a deadline.
+	verify := verifyReadOnlyWorktreeEntry
 	work := make(chan readOnlyWorktreeIndexEntry)
 	var (
 		mu         sync.Mutex
@@ -116,7 +124,7 @@ func unverifiedReadOnlyWorktreeEntries(ctx context.Context, root *os.Root, entri
 	for range readOnlyWorktreeVerifyWorkers {
 		wg.Go(func() {
 			for entry := range work {
-				if !readOnlyWorktreeEntryMatches(root, entry) {
+				if !verify(ctx, root, entry) {
 					mu.Lock()
 					unverified = append(unverified, entry)
 					mu.Unlock()
@@ -124,29 +132,53 @@ func unverifiedReadOnlyWorktreeEntries(ctx context.Context, root *os.Root, entri
 			}
 		})
 	}
-	var err error
-	for _, entry := range entries {
-		if entry.tag != "H" || entry.stage != "0" || (entry.mode != "100644" && entry.mode != "100755" && entry.mode != "120000") {
-			continue
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(work)
+		for _, entry := range entries {
+			if entry.tag != "H" || entry.stage != "0" || (entry.mode != "100644" && entry.mode != "100755" && entry.mode != "120000") {
+				continue
+			}
+			select {
+			case work <- entry:
+			case <-ctx.Done():
+				return
+			}
 		}
-		if err = ctx.Err(); err != nil {
-			break
-		}
-		work <- entry
+	}()
+	finished := make(chan struct{})
+	go func() {
+		<-done
+		wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-ctx.Done():
 	}
-	close(work)
-	wg.Wait()
-	if err != nil {
+	// Checked after both: an entry the feeder dropped on cancellation was never
+	// verified, so a cancelled run must not report success.
+	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("verify worktree content: %w", err)
 	}
-	return unverified, nil
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]readOnlyWorktreeIndexEntry(nil), unverified...), nil
 }
+
+// verifyReadOnlyWorktreeEntry is readOnlyWorktreeEntryMatches; a var only so a
+// test can stand in for a read that hangs on a stalled mount.
+var verifyReadOnlyWorktreeEntry = readOnlyWorktreeEntryMatches
 
 // readOnlyWorktreeEntryMatches reports whether the worktree holds exactly the
 // entry's blob with the entry's file type and executable bit, as git compares
 // them with core.filemode on. Reads stay inside the worktree (os.Root), never
 // follow a final symlink, and never open anything but a regular file.
-func readOnlyWorktreeEntryMatches(root *os.Root, entry readOnlyWorktreeIndexEntry) bool {
+func readOnlyWorktreeEntryMatches(ctx context.Context, root *os.Root, entry readOnlyWorktreeIndexEntry) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	info, err := root.Lstat(entry.path)
 	if err != nil {
 		return false
@@ -189,10 +221,23 @@ func readOnlyWorktreeEntryMatches(root *os.Root, entry readOnlyWorktreeIndexEntr
 		return false
 	}
 	hasher.Write([]byte("blob " + strconv.FormatInt(size, 10) + "\x00"))
-	copied, err := io.Copy(hasher, io.LimitReader(content, size+1))
+	copied, err := io.Copy(hasher, contextReader{ctx: ctx, r: io.LimitReader(content, size+1)})
 	if err != nil || copied != size {
 		return false
 	}
 	want, err := hex.DecodeString(entry.oid)
 	return err == nil && bytes.Equal(hasher.Sum(nil), want)
+}
+
+// contextReader stops a long hash between reads once ctx ends.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }

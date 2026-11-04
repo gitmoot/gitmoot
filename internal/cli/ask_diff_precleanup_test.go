@@ -449,3 +449,30 @@ func TestCaptureReadOnlyWorktreeDiffSeesEditsThatKeepSizeAndMtime(t *testing.T) 
 		})
 	}
 }
+
+// #2518 review (P2): the content check reads every tracked file on the sshfs
+// mount. A read that hangs there cannot be cancelled, so the check must stop
+// waiting when the capture's deadline passes, and report the deadline rather
+// than success, or one stalled read holds the daemon tick (and every repo's
+// dispatch) indefinitely.
+func TestCaptureContentCheckStopsAtTheCaptureDeadline(t *testing.T) {
+	checkout, _ := gitFixtureRepo(t, "base 1\n")
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	previous := verifyReadOnlyWorktreeEntry
+	verifyReadOnlyWorktreeEntry = func(context.Context, *os.Root, readOnlyWorktreeIndexEntry) bool {
+		<-hang
+		return true
+	}
+	t.Cleanup(func() { verifyReadOnlyWorktreeEntry = previous })
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := captureReadOnlyWorktreeDiffForRunner(ctx, checkout, subprocess.ExecRunner{})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("capture waited %s for a hung read; it must stop at its deadline", elapsed.Round(time.Millisecond))
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capture after a hung read returned %v, want the deadline error (never success)", err)
+	}
+}
