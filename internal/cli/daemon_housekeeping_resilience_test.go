@@ -440,3 +440,47 @@ func TestReclaimSkipOfAnotherReposRowKeepsItsLaterRetry(t *testing.T) {
 		t.Fatalf("another repo's skip moved the retry from %s to %s", later.Format(time.RFC3339), next.Format(time.RFC3339))
 	}
 }
+
+// #2519 review: skip writes had one budget for the skipped and aged passes.
+// The skipped pass runs first, so once it spent that budget every aged skip
+// wrote nothing and the aged pass's ordered window, full of other repos' rows,
+// never advanced. Each pass kind's skip writes need their own budget.
+func TestReclaimSkipWriteBudgetIsPerPassKind(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 30 * time.Millisecond
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	h := newHousekeepingDispatchHarness(t, "aged-skip-advances")
+	cand := newTickCandidates(h.store)
+	seed := func(name string) (string, string) {
+		id := "parent/delegation/" + name
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", name)
+		seedCLIJob(t, h.store, db.Job{ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed), Repo: "owner/other",
+			Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/other", WorktreePath: path})}, "seed")
+		if _, err := h.store.EnsureCleanupObligation(h.ctx, id, path, time.Now().UTC().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		return id, path
+	}
+	// The skipped pass spends its whole skip-write budget.
+	previousDefer := deferDelegationCleanupSkipHook
+	deferDelegationCleanupSkipHook = func() { time.Sleep(40 * time.Millisecond) }
+	t.Cleanup(func() { deferDelegationCleanupSkipHook = previousDefer })
+	for i := 0; i < 2; i++ {
+		id, path := seed(fmt.Sprintf("skipped-%d", i))
+		if err := cand.deferReclaimSkip(h.ctx, h.worker, reclaimPassSkipped, id, path, db.CleanupReasonTerminalDeferred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The aged pass's skip of another repo's row must still be written.
+	id, path := seed("aged")
+	if err := cand.deferReclaimSkip(h.ctx, h.worker, reclaimPassAged, id, path, db.CleanupReasonTerminalDeferred); err != nil {
+		t.Fatal(err)
+	}
+	obligation, err := h.store.GetCleanupObligation(h.ctx, db.CleanupObligationResourceID(id, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err != nil || !next.After(time.Now().UTC()) {
+		t.Fatalf("aged skip was not deferred after the skipped pass spent its budget: next attempt %q (%v)", obligation.NextAttemptAt, err)
+	}
+}
