@@ -308,6 +308,11 @@ const unstageableGoFixture = "#!/bin/sh\nexit 0\n"
 // "could not run ... `go` is a stub that exits 126".
 func seedUnavailableToolchainReviewSeat(t *testing.T, jobID string, action string) (*db.Store, string, string) {
 	t.Helper()
+	return seedToolchainReviewSeat(t, jobID, action, true)
+}
+
+func seedToolchainReviewSeat(t *testing.T, jobID string, action string, goModule bool) (*db.Store, string, string) {
+	t.Helper()
 	hostBin := t.TempDir()
 	// The POSITIVE CONTROL rides inside the fixture: claude stages, so a
 	// failure here can only come from the toolchain predicate.
@@ -326,12 +331,14 @@ func seedUnavailableToolchainReviewSeat(t *testing.T, jobID string, action strin
 	// git worktree of this repository, where an untracked file does not
 	// exist. An earlier attempt only wrote it, the preflight never fired, and
 	// the workspace the seat actually staged against had no go.mod at all.
-	if err := os.WriteFile(filepath.Join(checkout, "go.mod"),
-		[]byte("module fixture\n\ngo 99.0\n"), 0o644); err != nil {
-		t.Fatal(err)
+	if goModule {
+		if err := os.WriteFile(filepath.Join(checkout, "go.mod"),
+			[]byte("module fixture\n\ngo 99.0\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, checkout, "add", "go.mod")
+		runGit(t, checkout, "commit", "-m", "require a Go release no host has")
 	}
-	runGit(t, checkout, "add", "go.mod")
-	runGit(t, checkout, "commit", "-m", "require a Go release no host has")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	sourceDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"),
@@ -427,5 +434,75 @@ func TestSeatToolchainUnavailableDoesNotRefuseANonReviewSeat(t *testing.T) {
 		if event.Kind == seatToolchainUnavailableEvent {
 			t.Fatalf("%q fired on an %q job: the un-evented staging miss is deliberate for every action whose contract does not require running the gate. message=%s", seatToolchainUnavailableEvent, "ask", event.Message)
 		}
+	}
+}
+
+// #2513 (deimos-forge): customer images ship no Go, and every review stopped
+// at seat_toolchain_unavailable even for repositories that are not Go. On a
+// host with no Go at all, a review of a checkout without go.mod or go.work
+// must not be refused for the toolchain; the Go-module case above still is.
+func TestSeatToolchainUnavailableDoesNotRefuseANonGoReview(t *testing.T) {
+	t.Setenv("GOWORK", "off")
+	store, home, checkout := seedToolchainReviewSeat(t, "seat-toolchain-non-go", "review", false)
+	// No Go anywhere: only the fixture dir (claude, unstageable go) and the
+	// system dirs git needs.
+	var kept []string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if _, err := os.Stat(filepath.Join(dir, "go")); err == nil && !strings.HasPrefix(dir, os.TempDir()) {
+			continue
+		}
+		kept = append(kept, dir)
+	}
+	t.Setenv("PATH", strings.Join(kept, string(os.PathListSeparator)))
+	events := runUnavailableToolchainSeatJob(t, store, home, checkout, "seat-toolchain-non-go")
+	for _, event := range events {
+		if event.Kind == seatToolchainUnavailableEvent {
+			t.Fatalf("%q fired for a review of a repository with no go.mod: %s", seatToolchainUnavailableEvent, event.Message)
+		}
+	}
+}
+
+// #2514 review: Go detection must see every tracked module, whatever the
+// directory it sits in, and a parent go.work that Go uses even when it has no
+// go directive; a tree with neither is not Go.
+func TestCheckoutUsesGoFindsEveryModuleAndParentWorkspace(t *testing.T) {
+	write := func(t *testing.T, path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GOWORK", "")
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, root, checkout string)
+		want  bool
+	}{
+		{"no Go files", func(t *testing.T, _, checkout string) { write(t, filepath.Join(checkout, "package.json"), "{}\n") }, false},
+		{"root go.mod", func(t *testing.T, _, checkout string) { write(t, filepath.Join(checkout, "go.mod"), "module x\n") }, true},
+		{"go.mod under node_modules", func(t *testing.T, _, checkout string) {
+			write(t, filepath.Join(checkout, "node_modules", "backend", "go.mod"), "module x\n")
+		}, true},
+		{"go.mod under .venv", func(t *testing.T, _, checkout string) {
+			write(t, filepath.Join(checkout, ".venv", "backend", "go.mod"), "module x\n")
+		}, true},
+		{"parent go.work without go directive", func(t *testing.T, root, _ string) {
+			write(t, filepath.Join(root, "go.work"), "use ./go-project\n")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			checkout := filepath.Join(root, "checkout")
+			if err := os.MkdirAll(checkout, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, root, checkout)
+			if got := checkoutUsesGo(checkout); got != tc.want {
+				t.Fatalf("checkoutUsesGo = %t, want %t", got, tc.want)
+			}
+		})
 	}
 }

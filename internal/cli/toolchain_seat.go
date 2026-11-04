@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -411,4 +413,41 @@ func pathWithin(inner, outer string) bool {
 		return false
 	}
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+// checkoutUsesGo reports whether a review of checkout can need the Go
+// toolchain (#2513): a go.mod or go.work anywhere in the tree, or a go.work in
+// a parent that Go would pick up. An unreadable tree counts as Go, so the
+// review is refused rather than run without a toolchain it may need.
+func checkoutUsesGo(checkout string) bool {
+	checkout = strings.TrimSpace(checkout)
+	if checkout == "" {
+		return true
+	}
+	// A workspace file Go would use (in the checkout, a parent, or GOWORK)
+	// makes it Go even when that file declares no go directive.
+	version, workspace, err := toolchain.WorkspaceGoRequirement(checkout, os.Getenv("GOWORK"))
+	if err != nil || version != "" || (workspace != "" && workspace != "off") {
+		return true
+	}
+	// The review worktree is a fresh checkout of tracked files, so only .git
+	// is skipped: a tracked go.mod under any other directory name (vendor
+	// trees, node_modules, .venv) is still a Go module the reviewer may build.
+	found := errors.New("found")
+	err = filepath.WalkDir(checkout, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" && path != checkout {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if name := entry.Name(); name == "go.mod" || name == "go.work" {
+			return found
+		}
+		return nil
+	})
+	return err != nil
 }
