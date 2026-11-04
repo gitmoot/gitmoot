@@ -461,3 +461,48 @@ func TestSeatToolchainUnavailableDoesNotRefuseANonGoReview(t *testing.T) {
 		}
 	}
 }
+
+// #2514 review: Go detection must see every tracked module, whatever the
+// directory it sits in, and a parent go.work that Go uses even when it has no
+// go directive; a tree with neither is not Go.
+func TestCheckoutUsesGoFindsEveryModuleAndParentWorkspace(t *testing.T) {
+	write := func(t *testing.T, path, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GOWORK", "")
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, root, checkout string)
+		want  bool
+	}{
+		{"no Go files", func(t *testing.T, _, checkout string) { write(t, filepath.Join(checkout, "package.json"), "{}\n") }, false},
+		{"root go.mod", func(t *testing.T, _, checkout string) { write(t, filepath.Join(checkout, "go.mod"), "module x\n") }, true},
+		{"go.mod under node_modules", func(t *testing.T, _, checkout string) {
+			write(t, filepath.Join(checkout, "node_modules", "backend", "go.mod"), "module x\n")
+		}, true},
+		{"go.mod under .venv", func(t *testing.T, _, checkout string) {
+			write(t, filepath.Join(checkout, ".venv", "backend", "go.mod"), "module x\n")
+		}, true},
+		{"parent go.work without go directive", func(t *testing.T, root, _ string) {
+			write(t, filepath.Join(root, "go.work"), "use ./go-project\n")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			checkout := filepath.Join(root, "checkout")
+			if err := os.MkdirAll(checkout, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			tc.setup(t, root, checkout)
+			if got := checkoutUsesGo(checkout); got != tc.want {
+				t.Fatalf("checkoutUsesGo = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}

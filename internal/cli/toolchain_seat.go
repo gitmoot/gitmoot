@@ -424,20 +424,23 @@ func checkoutUsesGo(checkout string) bool {
 	if checkout == "" {
 		return true
 	}
-	if version, _, err := toolchain.WorkspaceGoRequirement(checkout, os.Getenv("GOWORK")); err != nil || version != "" {
+	// A workspace file Go would use (in the checkout, a parent, or GOWORK)
+	// makes it Go even when that file declares no go directive.
+	version, workspace, err := toolchain.WorkspaceGoRequirement(checkout, os.Getenv("GOWORK"))
+	if err != nil || version != "" || (workspace != "" && workspace != "off") {
 		return true
 	}
+	// The review worktree is a fresh checkout of tracked files, so only .git
+	// is skipped: a tracked go.mod under any other directory name (vendor
+	// trees, node_modules, .venv) is still a Go module the reviewer may build.
 	found := errors.New("found")
-	err := filepath.WalkDir(checkout, func(path string, entry fs.DirEntry, err error) error {
+	err = filepath.WalkDir(checkout, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if entry.IsDir() {
-			switch entry.Name() {
-			case ".git", "node_modules", ".venv", "__pycache__":
-				if path != checkout {
-					return filepath.SkipDir
-				}
+			if entry.Name() == ".git" && path != checkout {
+				return filepath.SkipDir
 			}
 			return nil
 		}
