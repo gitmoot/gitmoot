@@ -323,3 +323,164 @@ func TestReclaimBudgetRotatesAcrossReposWhenOneRepoIsSlow(t *testing.T) {
 		}
 	}
 }
+
+// #2517 follow-up (seen live after the first deploy): the reclaim candidate
+// list is shared by every repo in a sweep, and each repo's pass defers the
+// rows of other repos. Those cheap skips were checked against the budget, so
+// with a slow store the first repo used up the whole budget deferring other
+// repos' rows, every owning repo was then turned away, and no worktree was
+// reclaimed at all. Skipping another repo's candidate must not spend the
+// budget: here a repo that owns none of many candidates goes first, and the
+// owning repo must still get its attempt in the same tick.
+func TestReclaimSkipsOfOtherReposRowsDoNotSpendTheBudget(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 50 * time.Millisecond
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	h := newHousekeepingDispatchHarness(t, "owner-gets-its-reclaim")
+	const others = 30
+	for i := 0; i < others+1; i++ {
+		repo := "owner/other"
+		if i == others {
+			repo = "owner/repo"
+		}
+		id := fmt.Sprintf("parent/delegation/cand-%02d", i)
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", fmt.Sprintf("cand-%02d", i))
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+			Repo: repo, ParentJobID: "parent", DelegationID: fmt.Sprintf("cand-%02d", i),
+			Payload: mustJobPayload(t, workflow.JobPayload{
+				Repo: repo, ParentJobID: "parent", DelegationID: fmt.Sprintf("cand-%02d", i),
+				WorktreePath: path, Branch: fmt.Sprintf("gitmoot-delegation-cand-%02d", i),
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}),
+		}, "seed reclaim candidate")
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A slow store: every skip of another repo's row costs time, as the
+	// lifecycle-locked deferral writes do on the busy daemon.
+	previousDefer := deferDelegationCleanupSkipHook
+	deferDelegationCleanupSkipHook = func() { time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { deferDelegationCleanupSkipHook = previousDefer })
+	attempted := map[string]bool{}
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		attempted[checkout] = true
+		return baseWorkflowFactory(checkout)
+	}
+	cand := newTickCandidates(h.store)
+	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
+	// The other repo's pass runs first in the sweep, then the owner's. Its
+	// skip writes are bounded on their own (#2519 review): 31 writes of 20ms
+	// each would take over 600ms; the bound stops writing after about 50ms.
+	started := time.Now()
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/other-without-rows", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("a repo owning none of the candidates spent %s deferring them before dispatch; skip writes must be bounded", elapsed.Round(time.Millisecond))
+	}
+	before := len(attempted)
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/repo", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if len(attempted) == before {
+		t.Fatalf("the owning repo got no reclaim attempt: the first repo's %d skips of other repos' rows used up the budget", others+1)
+	}
+}
+
+// #2519 review: the candidate list is computed once per sweep, so a later
+// repo still sees a row its owner just attempted. If the attempt kept the
+// worktree with a later retry (a failed capture backs off up to six hours),
+// the later repo's skip rewrote it to one minute, making it due again almost
+// at once. A skip must leave a row that is not due alone.
+func TestReclaimSkipOfAnotherReposRowKeepsItsLaterRetry(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "later-retry-kept")
+	id := "parent/delegation/owned"
+	path := managedDelegationReclaimTestPath(t, h.home, "parent", "owned")
+	seedCLIJob(t, h.store, db.Job{
+		ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "owned",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "owned",
+			WorktreePath: path, Branch: "gitmoot-delegation-owned",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed reclaim candidate")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.EnsureCleanupObligation(h.ctx, id, path, time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cand := newTickCandidates(h.store)
+	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
+	// The sweep's candidate list is taken while the row is due ...
+	if ids, err := cand.delegationReclaimCandidates(h.ctx); err != nil || len(ids) == 0 {
+		t.Fatalf("candidates = %v, %v; want the seeded row", ids, err)
+	}
+	// ... then its owner's attempt keeps the worktree for six hours.
+	later := time.Now().UTC().Add(6 * time.Hour)
+	if _, err := h.store.DeferCleanupObligation(h.ctx, id, path, db.CleanupReasonTerminalDeferred, time.Now().UTC(), later); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/other", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	obligation, err := h.store.GetCleanupObligation(h.ctx, db.CleanupObligationResourceID(id, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Before(later.Add(-time.Second)) {
+		t.Fatalf("another repo's skip moved the retry from %s to %s", later.Format(time.RFC3339), next.Format(time.RFC3339))
+	}
+}
+
+// #2519 review: skip writes had one budget for the skipped and aged passes.
+// The skipped pass runs first, so once it spent that budget every aged skip
+// wrote nothing and the aged pass's ordered window, full of other repos' rows,
+// never advanced. Each pass kind's skip writes need their own budget.
+func TestReclaimSkipWriteBudgetIsPerPassKind(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 30 * time.Millisecond
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	h := newHousekeepingDispatchHarness(t, "aged-skip-advances")
+	cand := newTickCandidates(h.store)
+	seed := func(name string) (string, string) {
+		id := "parent/delegation/" + name
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", name)
+		seedCLIJob(t, h.store, db.Job{ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed), Repo: "owner/other",
+			Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/other", WorktreePath: path})}, "seed")
+		if _, err := h.store.EnsureCleanupObligation(h.ctx, id, path, time.Now().UTC().Add(-time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		return id, path
+	}
+	// The skipped pass spends its whole skip-write budget.
+	previousDefer := deferDelegationCleanupSkipHook
+	deferDelegationCleanupSkipHook = func() { time.Sleep(40 * time.Millisecond) }
+	t.Cleanup(func() { deferDelegationCleanupSkipHook = previousDefer })
+	for i := 0; i < 2; i++ {
+		id, path := seed(fmt.Sprintf("skipped-%d", i))
+		if err := cand.deferReclaimSkip(h.ctx, h.worker, reclaimPassSkipped, id, path, db.CleanupReasonTerminalDeferred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The aged pass's skip of another repo's row must still be written.
+	id, path := seed("aged")
+	if err := cand.deferReclaimSkip(h.ctx, h.worker, reclaimPassAged, id, path, db.CleanupReasonTerminalDeferred); err != nil {
+		t.Fatal(err)
+	}
+	obligation, err := h.store.GetCleanupObligation(h.ctx, db.CleanupObligationResourceID(id, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err != nil || !next.After(time.Now().UTC()) {
+		t.Fatalf("aged skip was not deferred after the skipped pass spent its budget: next attempt %q (%v)", obligation.NextAttemptAt, err)
+	}
+}
