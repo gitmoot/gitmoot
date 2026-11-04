@@ -27,6 +27,15 @@ const (
 	readOnlyWorktreeIndexListMaxBytes  = 64 << 20
 )
 
+// readOnlyWorktreeVerifySlots bounds file system operations in flight for
+// content verification across ALL captures in the process (#2518 review). A
+// read stuck on a hung mount outlives its capture (it cannot be cancelled), so
+// without a shared bound every later timed-out capture would leave another
+// batch of blocked goroutines and open files behind. A worker takes a slot
+// before touching the file system and gives up when its capture ends while
+// waiting, so at most this many reads (and open files) are ever outstanding.
+var readOnlyWorktreeVerifySlots = make(chan struct{}, readOnlyWorktreeVerifyWorkers)
+
 // readOnlyWorktreeIndexEntry is one `git ls-files -s -t` record.
 type readOnlyWorktreeIndexEntry struct {
 	tag, mode, oid, stage, path string
@@ -124,7 +133,14 @@ func unverifiedReadOnlyWorktreeEntries(ctx context.Context, root *os.Root, entri
 	for range readOnlyWorktreeVerifyWorkers {
 		wg.Go(func() {
 			for entry := range work {
-				if !verify(ctx, root, entry) {
+				select {
+				case readOnlyWorktreeVerifySlots <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				matched := verify(ctx, root, entry)
+				<-readOnlyWorktreeVerifySlots
+				if !matched {
 					mu.Lock()
 					unverified = append(unverified, entry)
 					mu.Unlock()

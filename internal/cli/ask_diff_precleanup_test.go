@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,5 +475,56 @@ func TestCaptureContentCheckStopsAtTheCaptureDeadline(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("capture after a hung read returned %v, want the deadline error (never success)", err)
+	}
+}
+
+// #2518 review (P2): a read stuck on a hung mount outlives its capture. Each
+// timed-out capture used to leave its own batch of blocked reads (and open
+// files) behind, so repeated cleanup attempts during a mount outage piled them
+// up without limit. Across any number of timed-out captures, file system reads
+// in flight must stay within the one process-wide bound.
+func TestTimedOutCapturesShareOneBoundOnHungReads(t *testing.T) {
+	checkout, _ := gitFixtureRepo(t, "base 1\n")
+	for i := range 2 * readOnlyWorktreeVerifyWorkers {
+		if err := os.WriteFile(filepath.Join(checkout, fmt.Sprintf("f%03d.txt", i)), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit(t, checkout, "add", "-A")
+	runGit(t, checkout, "commit", "-m", "many files")
+	hang := make(chan struct{})
+	var inFlight, peak atomic.Int32
+	previous := verifyReadOnlyWorktreeEntry
+	verifyReadOnlyWorktreeEntry = func(context.Context, *os.Root, readOnlyWorktreeIndexEntry) bool {
+		now := inFlight.Add(1)
+		for {
+			old := peak.Load()
+			if now <= old || peak.CompareAndSwap(old, now) {
+				break
+			}
+		}
+		<-hang
+		inFlight.Add(-1)
+		return true
+	}
+	t.Cleanup(func() {
+		close(hang)
+		// Released reads return their slots before the hook is restored.
+		deadline := time.Now().Add(5 * time.Second)
+		for inFlight.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		verifyReadOnlyWorktreeEntry = previous
+	})
+	for range 4 {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		_, _, err := captureReadOnlyWorktreeDiffForRunner(ctx, checkout, subprocess.ExecRunner{})
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("capture against a hung mount returned %v, want its deadline", err)
+		}
+	}
+	if got := peak.Load(); got > readOnlyWorktreeVerifyWorkers {
+		t.Fatalf("%d reads were stuck at once after 4 timed-out captures; the process-wide bound is %d", got, readOnlyWorktreeVerifyWorkers)
 	}
 }
