@@ -592,3 +592,45 @@ func TestReadOnlyWorktreeContextNote(t *testing.T) {
 		t.Fatalf("ReadOnlyWorktreeContextNote(\"\") = %q, want empty (byte-identical no-note path)", got)
 	}
 }
+
+// #2517: a worktree whose evidence capture failed (it timed out on the sshfs
+// seat) was retried one minute later, forever; when the capture can never
+// finish in time that is every sweep. It now backs off with how long its
+// cleanup has been pending: a quarter of that, between 1 minute and 6 hours.
+func TestDeferredPreservationBacksOffWithPendingAge(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pending time.Duration
+		want    time.Duration
+	}{
+		{"new cleanup", time.Second, time.Minute},
+		{"pending 4 hours", 4 * time.Hour, time.Hour},
+		{"pending 5 days", 5 * 24 * time.Hour, 6 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			world := newProducerCleanupFixture(t, true)
+			ctx := context.Background()
+			if _, err := world.store.EnsureCleanupObligation(ctx, world.jobID, world.payload.WorktreePath, time.Now().UTC().Add(-tc.pending)); err != nil {
+				t.Fatal(err)
+			}
+			world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+				return fmt.Errorf("%w: read-only worktree diff not captured: signal: killed", ErrPreservationDeferred)
+			}
+			before := time.Now().UTC()
+			if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
+				t.Fatalf("deferred preservation failed the advance: %v", err)
+			}
+			obligation, err := world.store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(world.jobID, world.payload.WorktreePath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := next.Sub(before); got < tc.want-5*time.Second || got > tc.want+5*time.Second {
+				t.Fatalf("retry %s after a failed capture, want about %s", got.Round(time.Second), tc.want)
+			}
+		})
+	}
+}

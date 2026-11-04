@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -237,4 +238,88 @@ func TestPendingJobCommentFailureDoesNotBlockDispatch(t *testing.T) {
 	}
 
 	h.runAndAssertDispatched(t, "", "repo must be owner/repo")
+}
+
+// #2517: worktree reclaim runs before dispatch in the sequential repo sweep.
+// With slow cleanup (captures on an sshfs mount took up to two minutes each)
+// a tick with a backlog of cleanup candidates held every queued job back for
+// 8-36 minutes. The tick's reclaim budget must stop starting candidates once
+// spent, so dispatch follows within about one candidate past the budget.
+func TestSlowWorktreeReclaimBacklogDoesNotHoldDispatch(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 300 * time.Millisecond
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	h := newHousekeepingDispatchHarness(t, "queued-behind-reclaim-backlog")
+	const backlog = 8
+	for i := 0; i < backlog; i++ {
+		id := fmt.Sprintf("parent/delegation/slow-%d", i)
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", fmt.Sprintf("slow-%d", i))
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: fmt.Sprintf("slow-%d", i),
+			Payload: mustJobPayload(t, workflow.JobPayload{
+				Repo: "owner/repo", ParentJobID: "parent", DelegationID: fmt.Sprintf("slow-%d", i),
+				WorktreePath: path, Branch: fmt.Sprintf("gitmoot-delegation-slow-%d", i),
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}),
+		}, "seed slow reclaim candidate")
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every engine is slow, as a capture on the sshfs mount is. The tick makes
+	// one engine per reclaim candidate it starts, then one for the dispatch.
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	var engines atomic.Int32
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engines.Add(1)
+		time.Sleep(200 * time.Millisecond)
+		return baseWorkflowFactory(checkout)
+	}
+	started := time.Now()
+	if err := runDaemonWorkerTickTracked(h.ctx, h.store, h.worker, 1, false, "owner/repo", "", &h.stdout, h.now, h.tracker, nil); err != nil {
+		t.Fatalf("worker tick: %v", err)
+	}
+	if !waitForCondition(t, 5*time.Second, h.adapter.stillBlocked) {
+		t.Fatalf("queued job was not dispatched; log=%q", h.stdout.String())
+	}
+	// Budget 300ms, 200ms per candidate: two candidates start, then dispatch.
+	// Without the budget all eight run first (nine engines, about 1.8s).
+	if elapsed, made := time.Since(started), engines.Load(); made > 4 || elapsed > 1500*time.Millisecond {
+		t.Fatalf("tick started %d engines (%d reclaim candidates of %d) over %s before dispatching; the reclaim budget must stop it", made, made-1, backlog, elapsed.Round(time.Millisecond))
+	}
+}
+
+// #2518 review (P2): the repo sweep order is fixed, so with one shared budget
+// the first repo whose cleanup candidates are slow took the whole budget on
+// every tick and later repos never reclaimed anything. The first repo the
+// budget turns away must go first on the next tick, and every repo must get a
+// turn within a few ticks while the first repo still has slow candidates.
+func TestReclaimBudgetRotatesAcrossReposWhenOneRepoIsSlow(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 10 * time.Second
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	tracker := &inflightJobTracker{}
+	repos := []string{"owner/a", "owner/b", "owner/c", "owner/d"}
+	// Every candidate takes 12s, longer than the whole budget; each repo
+	// always has more.
+	served := map[string][]int{}
+	clock := time.Unix(1_800_000_000, 0)
+	for tick := 1; tick <= 4; tick++ {
+		cand := &tickCandidates{}
+		cand.reclaimBudget.resume = tracker.reclaimResumeState()
+		for _, repo := range repos {
+			cand.reclaimPassStart(reclaimPassSkipped, repo)
+			for cand.reclaimMayStart(reclaimPassSkipped, repo, clock) {
+				served[repo] = append(served[repo], tick)
+				clock = clock.Add(12 * time.Second)
+			}
+		}
+		cand.finishReclaimTick()
+	}
+	for i, repo := range repos {
+		if got := served[repo]; len(got) != 1 || got[0] != i+1 {
+			t.Fatalf("repo %s served on ticks %v, want exactly tick %d (round robin); all: %v", repo, got, i+1, served)
+		}
+	}
 }

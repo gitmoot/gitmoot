@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
@@ -88,7 +90,8 @@ func (e Engine) publishCleanupArtifacts(ctx context.Context, jobID string) (cont
 		}
 		return ctx, err
 	}
-	if _, err := e.Store.EnsureCleanupObligation(ctx, jobID, payload.WorktreePath, e.now()); err != nil {
+	obligation, err := e.Store.EnsureCleanupObligation(ctx, jobID, payload.WorktreePath, e.now())
+	if err != nil {
 		return ctx, err
 	}
 	if reason := e.cleanupRuntimeRefusal(ctx, jobID, payload.WorktreePath); reason != "" {
@@ -97,6 +100,16 @@ func (e Engine) publishCleanupArtifacts(ctx context.Context, jobID string) (cont
 	if err := e.BeforeReadOnlyWorktreeCleanup(ctx, jobID, job.Type, payload); err != nil {
 		if errors.Is(err, db.ErrCleanupEvidenceChanged) {
 			return ctx, err
+		}
+		if onlyPreservationDeferred(err) {
+			// The collector already recorded its failure on the job. A capture
+			// that failed once tends to fail again, so back off with how long
+			// the cleanup has been pending (#2517); transient gates elsewhere
+			// keep the one-minute retry.
+			now := e.now().UTC()
+			_, deferErr := e.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, payload.WorktreePath,
+				db.ClassifyCleanupObligationFailure("preserve", err), now, now.Add(PreservationDeferredRetryDelay(obligation.CreatedAt, now)))
+			return ctx, errors.Join(err, deferErr)
 		}
 		return ctx, errors.Join(err, e.deferDelegationCleanupFailure(ctx, jobID, payload.WorktreePath, "preserve", err))
 	}
@@ -135,4 +148,19 @@ func (e Engine) cleanupRuntimeRefusal(ctx context.Context, jobID, path string) s
 		return "process_active_or_unknown"
 	}
 	return ""
+}
+
+// PreservationDeferredRetryDelay is how long a cleanup deferred because its
+// pre-cleanup evidence could not be captured waits before the next attempt
+// (#2517): a quarter of how long the cleanup has been pending, between one
+// minute and six hours. Before, it retried after one minute forever, so a
+// worktree whose capture always timed out was retried on every sweep. An
+// unreadable creation time gets the one-minute floor.
+func PreservationDeferredRetryDelay(obligationCreatedAt string, now time.Time) time.Duration {
+	const floor, ceiling = time.Minute, 6 * time.Hour
+	created, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(obligationCreatedAt))
+	if err != nil {
+		return floor
+	}
+	return min(max(now.Sub(created)/4, floor), ceiling)
 }

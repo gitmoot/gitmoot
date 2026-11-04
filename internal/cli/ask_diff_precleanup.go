@@ -102,6 +102,9 @@ func captureReadOnlyWorktreeDiffForRunner(ctx context.Context, worktree string, 
 		return "", false, err
 	}
 	defer sandbox.close()
+	if err := sandbox.invalidateUnverifiedIndexEntries(ctx); err != nil {
+		return "", false, err
+	}
 
 	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes - readOnlyWorktreeDiffReserve}
 	status, err := sandbox.run(ctx, "git status --short", "status", "--short", "--untracked-files=all", "--ignore-submodules=dirty")
@@ -224,7 +227,17 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes}
 	var stderr boundedCountingBuffer
 	stderr.limit = 4096
-	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	// core.checkStat=minimal and core.trustCtime=false (#2517): on the sshfs
+	// worktree mount inode numbers are not stable (and ctime just mirrors
+	// mtime), so git trusted none of the index's cached stat data and re-read
+	// every file serially: status+diff took ~120s on a 1,325-file review
+	// worktree, past the 45s capture deadline, so capture never succeeded and
+	// cleanup retried forever. Minimal stat alone would miss an edit that keeps
+	// size and mtime second; invalidateUnverifiedIndexEntries closes that by
+	// checking every tracked file's content first and forcing git to compare
+	// each one it could not prove unchanged.
+	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.checkStat=minimal", "-c", "core.trustCtime=false"}, args...)
 	err := runReadOnlyWorktreeGit(ctx, s.runner, s.env, s.worktree, out, &stderr, cmdArgs...)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())

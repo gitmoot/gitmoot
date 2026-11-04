@@ -1077,3 +1077,59 @@ func TestGitClientErrorIncludesBoundedStderr(t *testing.T) {
 		t.Fatalf("git error length = %d, want bounded stderr", len(err.Error()))
 	}
 }
+
+// #2517: the reclaim pass's own deferral used the SWEEP's start time, so after
+// a long sweep its one-minute retry was already past, and it overwrote a longer
+// retry the engine had just chosen for a failed evidence capture, so the
+// capture was retried on every sweep. It now keeps a later retry chosen during
+// the attempt and otherwise retries one minute from the real clock (transient
+// gates must be rechecked soon, #2518 review).
+func TestDeferredWorktreeReclaimKeepsTheAttemptsLaterRetry(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() { _ = store.Close() })
+	worker := defaultJobWorker(store, io.Discard, home)
+	for _, tc := range []struct {
+		name   string
+		chosen time.Duration // retry the attempt itself recorded; 0 = none
+		want   time.Duration
+	}{
+		{"capture failure chose 6 hours", 6 * time.Hour, 6 * time.Hour},
+		{"transient gate chose nothing", 0, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			slug := strings.ReplaceAll(tc.name, " ", "-")
+			jobID := "parent/delegation/" + slug
+			path := managedDelegationReclaimTestPath(t, home, "parent", slug)
+			seedCLIJob(t, store, db.Job{ID: jobID, Agent: "reader", Type: "review", State: string(workflow.JobSucceeded), Repo: "owner/repo",
+				Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: path})}, "seed")
+			created := time.Now().UTC().Add(-5 * 24 * time.Hour)
+			obligation, err := store.EnsureCleanupObligation(ctx, jobID, path, created)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.chosen > 0 {
+				now := time.Now().UTC()
+				if _, err := store.DeferCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(tc.chosen)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := time.Now().UTC()
+			if err := finishDelegationCleanupAttempt(ctx, worker, jobID, path, false); err != nil {
+				t.Fatal(err)
+			}
+			after, err := store.GetCleanupObligation(ctx, obligation.ResourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, err := time.Parse(time.RFC3339Nano, after.NextAttemptAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := next.Sub(before); got < tc.want-5*time.Second || got > tc.want+5*time.Second {
+				t.Fatalf("next attempt %s after the reclaim pass, want about %s", got.Round(time.Second), tc.want)
+			}
+		})
+	}
+}

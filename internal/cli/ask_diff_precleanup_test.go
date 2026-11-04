@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -382,5 +383,148 @@ func assertPathExists(t *testing.T, path, message string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("%s: %v", message, err)
+	}
+}
+
+// #2518 review (P1): the capture runs git with core.checkStat=minimal so it
+// does not re-read every file on the sshfs mount, where inode numbers are not
+// stable. git then trusts size and whole-second mtime, so an edit that keeps
+// both would be reported as no change and the worktree deleted without its
+// evidence. Every tracked file is checked by content first; these edits must
+// still appear in the snapshot.
+func TestCaptureReadOnlyWorktreeDiffSeesEditsThatKeepSizeAndMtime(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, path string)
+	}{
+		{"same size with mtime restored", func(t *testing.T, path string) {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("EDITED\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"same size atomic save in the same second", func(t *testing.T, path string) {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmp := path + ".tmp"
+			if err := os.WriteFile(tmp, []byte("EDITED\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			second := info.ModTime().Truncate(time.Second).Add(500 * time.Millisecond)
+			if err := os.Chtimes(tmp, second, second); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(tmp, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkout, _ := gitFixtureRepo(t, "base 1\n")
+			worktree := filepath.Join(t.TempDir(), "seat")
+			runGit(t, checkout, "worktree", "add", "--detach", worktree, "HEAD")
+			// Like a real seat: the index was last written well after its
+			// files, so its entries are not racily clean and git trusts their
+			// cached stat data instead of comparing content.
+			time.Sleep(1100 * time.Millisecond)
+			runGit(t, worktree, "update-index", "--really-refresh")
+			tc.write(t, filepath.Join(worktree, "marker.txt"))
+			snapshot, _, err := captureReadOnlyWorktreeDiffForRunner(ctx, worktree, subprocess.ExecRunner{})
+			if err != nil {
+				t.Fatalf("capture: %v", err)
+			}
+			for _, want := range []string{" M marker.txt", "+EDITED"} {
+				if !strings.Contains(snapshot, want) {
+					t.Fatalf("capture missed an edit that kept size and mtime second (want %q):\n%s", want, snapshot)
+				}
+			}
+		})
+	}
+}
+
+// #2518 review (P2): the content check reads every tracked file on the sshfs
+// mount. A read that hangs there cannot be cancelled, so the check must stop
+// waiting when the capture's deadline passes, and report the deadline rather
+// than success, or one stalled read holds the daemon tick (and every repo's
+// dispatch) indefinitely.
+func TestCaptureContentCheckStopsAtTheCaptureDeadline(t *testing.T) {
+	checkout, _ := gitFixtureRepo(t, "base 1\n")
+	hang := make(chan struct{})
+	t.Cleanup(func() { close(hang) })
+	previous := verifyReadOnlyWorktreeEntry
+	verifyReadOnlyWorktreeEntry = func(context.Context, *os.Root, readOnlyWorktreeIndexEntry) bool {
+		<-hang
+		return true
+	}
+	t.Cleanup(func() { verifyReadOnlyWorktreeEntry = previous })
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := captureReadOnlyWorktreeDiffForRunner(ctx, checkout, subprocess.ExecRunner{})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("capture waited %s for a hung read; it must stop at its deadline", elapsed.Round(time.Millisecond))
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capture after a hung read returned %v, want the deadline error (never success)", err)
+	}
+}
+
+// #2518 review (P2): a read stuck on a hung mount outlives its capture. Each
+// timed-out capture used to leave its own batch of blocked reads (and open
+// files) behind, so repeated cleanup attempts during a mount outage piled them
+// up without limit. Across any number of timed-out captures, file system reads
+// in flight must stay within the one process-wide bound.
+func TestTimedOutCapturesShareOneBoundOnHungReads(t *testing.T) {
+	checkout, _ := gitFixtureRepo(t, "base 1\n")
+	for i := range 2 * readOnlyWorktreeVerifyWorkers {
+		if err := os.WriteFile(filepath.Join(checkout, fmt.Sprintf("f%03d.txt", i)), []byte("x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit(t, checkout, "add", "-A")
+	runGit(t, checkout, "commit", "-m", "many files")
+	hang := make(chan struct{})
+	var inFlight, peak atomic.Int32
+	previous := verifyReadOnlyWorktreeEntry
+	verifyReadOnlyWorktreeEntry = func(context.Context, *os.Root, readOnlyWorktreeIndexEntry) bool {
+		now := inFlight.Add(1)
+		for {
+			old := peak.Load()
+			if now <= old || peak.CompareAndSwap(old, now) {
+				break
+			}
+		}
+		<-hang
+		inFlight.Add(-1)
+		return true
+	}
+	t.Cleanup(func() {
+		close(hang)
+		// Released reads return their slots before the hook is restored.
+		deadline := time.Now().Add(5 * time.Second)
+		for inFlight.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		verifyReadOnlyWorktreeEntry = previous
+	})
+	for range 4 {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		_, _, err := captureReadOnlyWorktreeDiffForRunner(ctx, checkout, subprocess.ExecRunner{})
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("capture against a hung mount returned %v, want its deadline", err)
+		}
+	}
+	if got := peak.Load(); got > readOnlyWorktreeVerifyWorkers {
+		t.Fatalf("%d reads were stuck at once after 4 timed-out captures; the process-wide bound is %d", got, readOnlyWorktreeVerifyWorkers)
 	}
 }

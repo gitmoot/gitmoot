@@ -107,6 +107,9 @@ type inflightDispatch struct {
 // nil-receiver safe (a nil tracker means "untracked / legacy inline path" and
 // behaves as permanently idle with maintenance always due).
 type inflightJobTracker struct {
+	// reclaimResume is where each worktree reclaim pass kind resumes on the
+	// next tick that runs it (#2517). It has its own lock.
+	reclaimResume              reclaimResume
 	mu                         sync.Mutex
 	wg                         sync.WaitGroup
 	runCtx                     context.Context
@@ -1078,4 +1081,13 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 		}()
 	}
 	return tracker.takeErr(repoFilter)
+}
+
+// reclaimResumeState returns the tracker's cross-tick reclaim resume state;
+// nil for a nil tracker (then every tick starts reclaim at the first repo).
+func (t *inflightJobTracker) reclaimResumeState() *reclaimResume {
+	if t == nil {
+		return nil
+	}
+	return &t.reclaimResume
 }
