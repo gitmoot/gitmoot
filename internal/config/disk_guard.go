@@ -15,6 +15,13 @@ const (
 	// DefaultDiskGuardMinFreePercent scales the floor on larger filesystems where
 	// a fixed byte reserve would be too small relative to agent cache growth.
 	DefaultDiskGuardMinFreePercent = 5.0
+	// DefaultReviewWorktreeMinFreeBytes is the free space an exact-head review
+	// needs before it allocates its read-only worktree (checkout plus the
+	// builds and tests the reviewer runs in it).
+	DefaultReviewWorktreeMinFreeBytes uint64 = 5 << 30
+	// MinReviewWorktreeMinFreeBytes is the lowest accepted setting (#2513):
+	// small single-tenant homes may lower the review floor, not remove it.
+	MinReviewWorktreeMinFreeBytes uint64 = 1 << 30
 )
 
 // DiskGuardPolicy controls the default-on dispatch guard for the filesystem
@@ -33,6 +40,10 @@ type DiskGuardPolicy struct {
 	// (#2372). Other jobs keep dispatching locally until MinFreeBytes /
 	// MinFreePercent. It requires RemoteReviews and must be above MinFreeBytes.
 	RemoteReviewsBelowBytes uint64
+	// ReviewWorktreeMinFreeBytes ([disk_guard] review_worktree_min_free_bytes,
+	// default 5 GiB, at least 1 GiB) is the free space a review needs before
+	// it allocates its read-only worktree (#2513).
+	ReviewWorktreeMinFreeBytes uint64
 }
 
 func DefaultDiskGuardPolicy() DiskGuardPolicy {
@@ -40,6 +51,8 @@ func DefaultDiskGuardPolicy() DiskGuardPolicy {
 		Enabled:        true,
 		MinFreeBytes:   DefaultDiskGuardMinFreeBytes,
 		MinFreePercent: DefaultDiskGuardMinFreePercent,
+
+		ReviewWorktreeMinFreeBytes: DefaultReviewWorktreeMinFreeBytes,
 	}
 }
 
@@ -103,6 +116,12 @@ func LoadDiskGuardPolicy(paths Paths) (DiskGuardPolicy, error) {
 				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].remote_reviews_below_bytes: %w", err)
 			}
 			policy.RemoteReviewsBelowBytes = parsed
+		case "review_worktree_min_free_bytes":
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				return DiskGuardPolicy{}, fmt.Errorf("parse [disk_guard].review_worktree_min_free_bytes: %w", err)
+			}
+			policy.ReviewWorktreeMinFreeBytes = parsed
 		case "min_free_percent":
 			parsed, err := strconv.ParseFloat(value, 64)
 			if err != nil {
@@ -124,6 +143,9 @@ func validateDiskGuardPolicy(policy DiskGuardPolicy) error {
 	}
 	if policy.Enabled && policy.MinFreeBytes == 0 && policy.MinFreePercent == 0 {
 		return fmt.Errorf("disk_guard requires min_free_bytes or min_free_percent when enabled")
+	}
+	if policy.ReviewWorktreeMinFreeBytes < MinReviewWorktreeMinFreeBytes {
+		return fmt.Errorf("disk_guard.review_worktree_min_free_bytes (%d) must be at least %d (1 GiB)", policy.ReviewWorktreeMinFreeBytes, MinReviewWorktreeMinFreeBytes)
 	}
 	if policy.RemoteReviewsBelowBytes > 0 {
 		if !policy.RemoteReviews {

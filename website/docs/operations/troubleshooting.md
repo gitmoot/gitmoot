@@ -786,8 +786,11 @@ If a seat gets exit 126 running `go`, no usable toolchain was staged. The comman
 is an engine-owned failure stub, not a fallthrough to an operator installation;
 it prints `gitmoot: runtime unavailable: no daemon-staged artifact exists`.
 Host-specific causes also print `gitmoot: read-only seat toolchain:` on the
-daemon's stderr. A declared real review also records
-`seat_toolchain_unavailable` with that diagnostic and blocks.
+daemon's stderr. A declared real review of a Go checkout (a `go.mod` or
+`go.work` anywhere in the tree, or a `go.work` Go would pick up from a parent
+directory) also records `seat_toolchain_unavailable` with that diagnostic and
+blocks. A review of a repository with no Go module is not refused for a missing
+Go toolchain (#2513); its seat still gets the exit-126 `go`.
 
 - **No Go installation is on the daemon's `PATH`.** This normal case has no
   daemon diagnostic, so the `seat_toolchain_unavailable` event is the only

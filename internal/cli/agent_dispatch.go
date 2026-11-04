@@ -331,8 +331,6 @@ var fetchDispatchReviewPullRequest = func(ctx context.Context, git gitutil.Clien
 	return git.FetchPullRequest(ctx, "origin", pullRequest)
 }
 
-const reviewReadOnlyWorktreeMinFreeBytes uint64 = 5 << 30
-
 type localAgentDispatchRequest struct {
 	RepoFlag string
 	Agent    string
@@ -2503,12 +2501,18 @@ func reviewReadOnlyWorktreeCapacity(home string) error {
 	if err != nil {
 		return err
 	}
+	policy, err := config.LoadDiskGuardPolicy(paths)
+	if err != nil {
+		return err
+	}
 	usage, err := measureDiskGuardFilesystem(paths.Home)
 	if err != nil {
 		return fmt.Errorf("review worktree capacity is unknown: %w", err)
 	}
-	if usage.FreeBytes < reviewReadOnlyWorktreeMinFreeBytes {
-		return fmt.Errorf("review worktree requires at least %d free bytes; %d available", reviewReadOnlyWorktreeMinFreeBytes, usage.FreeBytes)
+	// #2513: configurable per home ([disk_guard] review_worktree_min_free_bytes),
+	// so a small single-tenant workspace can review small repos.
+	if usage.FreeBytes < policy.ReviewWorktreeMinFreeBytes {
+		return fmt.Errorf("review worktree requires at least %d free bytes ([disk_guard] review_worktree_min_free_bytes); %d available", policy.ReviewWorktreeMinFreeBytes, usage.FreeBytes)
 	}
 	return nil
 }

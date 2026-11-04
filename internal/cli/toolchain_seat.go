@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -411,4 +413,38 @@ func pathWithin(inner, outer string) bool {
 		return false
 	}
 	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+// checkoutUsesGo reports whether a review of checkout can need the Go
+// toolchain (#2513): a go.mod or go.work anywhere in the tree, or a go.work in
+// a parent that Go would pick up. An unreadable tree counts as Go, so the
+// review is refused rather than run without a toolchain it may need.
+func checkoutUsesGo(checkout string) bool {
+	checkout = strings.TrimSpace(checkout)
+	if checkout == "" {
+		return true
+	}
+	if version, _, err := toolchain.WorkspaceGoRequirement(checkout, os.Getenv("GOWORK")); err != nil || version != "" {
+		return true
+	}
+	found := errors.New("found")
+	err := filepath.WalkDir(checkout, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case ".git", "node_modules", ".venv", "__pycache__":
+				if path != checkout {
+					return filepath.SkipDir
+				}
+			}
+			return nil
+		}
+		if name := entry.Name(); name == "go.mod" || name == "go.work" {
+			return found
+		}
+		return nil
+	})
+	return err != nil
 }

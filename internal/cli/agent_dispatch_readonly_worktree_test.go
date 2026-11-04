@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -424,5 +425,50 @@ func reviewDispatchRequest(home, head string) localAgentDispatchRequest {
 		RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
 		Action: "review", Instructions: "Review this exact head.", Background: true,
 		PullRequest: 12, Branch: "feature/review", HeadSHA: head, Home: home,
+	}
+}
+
+// #2513 (deimos-forge): a fresh Forge workspace has a 4 GiB volume, about
+// 3.8 GB free, so the fixed 5 GiB review floor refused every review. The floor
+// is now [disk_guard] review_worktree_min_free_bytes: the default still refuses
+// there, a lower setting admits it, and a setting below 1 GiB is rejected.
+func TestReviewReadOnlyWorktreeCapacityUsesConfiguredFloor(t *testing.T) {
+	original := reviewReadOnlyWorkdirSupported
+	reviewReadOnlyWorkdirSupported = func() bool { return true }
+	t.Cleanup(func() { reviewReadOnlyWorkdirSupported = original })
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 4 << 30, FreeBytes: 3807449088}, nil
+	})
+	for _, tc := range []struct {
+		name    string
+		section string
+		wantErr string
+	}{
+		{"default 5 GiB floor refuses", "", "review_worktree_min_free_bytes"},
+		{"2 GiB floor admits", "[disk_guard]\nreview_worktree_min_free_bytes = 2147483648\n", ""},
+		{"below 1 GiB is rejected", "[disk_guard]\nreview_worktree_min_free_bytes = 1048576\n", "must be at least"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			paths := config.PathsForHome(home)
+			if err := config.Initialize(paths); err != nil {
+				t.Fatal(err)
+			}
+			if tc.section != "" {
+				file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = file.WriteString("\n" + tc.section)
+				_ = file.Close()
+			}
+			err := reviewReadOnlyWorktreeCapacity(home)
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("capacity check refused with the floor lowered: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("capacity check err = %v, want %q", err, tc.wantErr)
+			}
+		})
 	}
 }

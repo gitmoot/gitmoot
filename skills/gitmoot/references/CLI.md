@@ -1852,7 +1852,10 @@ so there is no single Task-level worktree path to display. The requested
 `head_sha` stays on the job payload. Review
 allocation fails closed rather than falling back to the registered checkout,
 and dispatch refuses before Task mutation when the Gitmoot filesystem has less
-than 5 GiB free or free-space measurement is unavailable. The prior verdict is
+free space than `[disk_guard] review_worktree_min_free_bytes` (default
+5368709120, 5 GiB; at least 1073741824, 1 GiB; #2513) or free-space measurement
+is unavailable. A small single-tenant home that reviews small repositories can
+lower it. The prior verdict is
 escalation evidence only and is never served as the new result.
 
 A review dispatch is also bound to its own head by its PROMPT. Before the

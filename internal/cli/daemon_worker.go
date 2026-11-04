@@ -2551,7 +2551,11 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// fact - stageSeatToolchain returns the published-unavailable root in every
 	// failure arm - so key on it and use the diagnostic only to sharpen the
 	// cause when one exists.
-	if staged != "" && filepath.Base(staged) == "go"+toolchain.UnavailableRuntimeSuffix {
+	// #2513: only a checkout that is Go makes a missing `go` a reason to
+	// refuse the review; a repository in another language never runs it, and
+	// requiring Go there forced every image to ship ~250 MB it never uses. The
+	// seat still gets the exit-126 `go` either way.
+	if staged != "" && filepath.Base(staged) == "go"+toolchain.UnavailableRuntimeSuffix && checkoutUsesGo(checkout) {
 		grants.toolchainUnavailable = strings.TrimSpace(diagnostic)
 		if grants.toolchainUnavailable == "" {
 			grants.toolchainUnavailable = "no Go installation resolved on the daemon PATH, so the seat's `go` is the engine's exit-126 unavailable command"
