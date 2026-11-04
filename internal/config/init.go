@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -20,9 +21,33 @@ func Initialize(paths Paths) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat config file: %w", err)
 	}
-
-	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)), 0o600); err != nil {
-		return fmt.Errorf("write config file: %w", err)
+	afterConfigAbsent()
+	// #2510: two commands starting on a fresh home must not let the slower
+	// one truncate what the faster one already initialised and edited. The
+	// absence check and the creation happen under the config edit lock, and
+	// the file is created exclusively, never truncated.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return err
+	}
+	defer release()
+	file, err := os.OpenFile(paths.ConfigFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("create config file: %w", err)
+	}
+	_, writeErr := file.WriteString(DefaultConfig(paths))
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	if closeErr := file.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr != nil {
+		_ = os.Remove(paths.ConfigFile)
+		return fmt.Errorf("write config file: %w", writeErr)
 	}
 	return nil
 }
@@ -360,3 +385,7 @@ path = ""
 # merge_rule = "self"
 `, paths.Database, paths.Logs, paths.Workspaces, paths.Evals, paths.ArtifactBlobs)
 }
+
+// afterConfigAbsent runs after Initialize has seen no config file; tests use
+// it to create the file in that window, as a second command would.
+var afterConfigAbsent = func() {}

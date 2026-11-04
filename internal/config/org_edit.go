@@ -16,15 +16,44 @@ import (
 type OrgSeatConfigEdit struct {
 	path     string
 	original []byte
-	changed  bool
+	// written is the exact file this edit installed; Restore rolls back only
+	// while the config still holds it.
+	written []byte
+	changed bool
 }
 
 func (e OrgSeatConfigEdit) Changed() bool { return e.changed }
 
-// Restore atomically restores the exact config bytes from before the edit.
+// ErrOrgSeatConfigChangedSinceEdit reports that Restore did not roll back
+// because the config was edited after this edit (by the daemon's automatic
+// seat rebind, another command, or by hand): those edits win, and the caller
+// must reconcile the role by hand.
+var ErrOrgSeatConfigChangedSinceEdit = errors.New("config changed since this edit; not restored")
+
+// Restore rolls the config back to its bytes from before the edit, under the
+// config edit lock, but only if the file is still exactly what this edit
+// wrote (#2510). Blindly writing the old bytes would silently revert any edit
+// made in between, such as a seat rebind.
 func (e OrgSeatConfigEdit) Restore() error {
 	if !e.changed {
 		return nil
+	}
+	release, err := lockConfigEdits(Paths{ConfigFile: e.path})
+	if err != nil {
+		return err
+	}
+	defer release()
+	return e.restoreLocked()
+}
+
+// restoreLocked is Restore for a caller that already holds the lock.
+func (e OrgSeatConfigEdit) restoreLocked() error {
+	current, err := os.ReadFile(e.path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, e.written) {
+		return ErrOrgSeatConfigChangedSinceEdit
 	}
 	return writeConfigAtomic(e.path, e.original)
 }
@@ -82,7 +111,7 @@ func UpsertOrgSeatRole(paths Paths, desired OrgRole, rebindFromPane string) (Org
 		return OrgSeatConfigEdit{}, false, err
 	}
 	edit := OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true}
-	if err := writeOrgConfigBytes(paths, []byte(updated), edit); err != nil {
+	if err := writeOrgConfigBytes(paths, []byte(updated), &edit); err != nil {
 		return OrgSeatConfigEdit{}, false, err
 	}
 	return edit, !exists, nil
@@ -140,7 +169,7 @@ func RebindOrgSeatPane(paths Paths, name, from, to string) error {
 		if !bytes.Equal(latest, original) {
 			return fmt.Errorf("%w: config file edited during the rebind", ErrOrgSeatBindingChanged)
 		}
-		return writeOrgConfigBytes(paths, []byte(updated), OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true})
+		return writeOrgConfigBytes(paths, []byte(updated), &OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true})
 	}
 	staged, err := stageConfigFile(paths.ConfigFile, []byte(updated))
 	if err != nil {
@@ -255,7 +284,7 @@ func RemoveOrgSeatRole(paths Paths, name string) (OrgSeatConfigEdit, OrgRole, er
 	}
 	lines = append(lines[:start], lines[end:]...)
 	edit := OrgSeatConfigEdit{path: paths.ConfigFile, original: original, changed: true}
-	if err := writeOrgConfigBytes(paths, []byte(strings.Join(lines, "\n")), edit); err != nil {
+	if err := writeOrgConfigBytes(paths, []byte(strings.Join(lines, "\n")), &edit); err != nil {
 		return OrgSeatConfigEdit{}, OrgRole{}, err
 	}
 	return edit, role, nil
@@ -335,12 +364,16 @@ func orgRoleSectionBounds(lines []string, want string) (start, end int, found bo
 	return 0, 0, false, nil
 }
 
-func writeOrgConfigBytes(paths Paths, updated []byte, edit OrgSeatConfigEdit) error {
+// writeOrgConfigBytes runs under the caller's config edit lock and records
+// the installed bytes on edit, so a later Restore can tell whether anything
+// changed the file since.
+func writeOrgConfigBytes(paths Paths, updated []byte, edit *OrgSeatConfigEdit) error {
+	edit.written = updated
 	if err := writeConfigAtomic(paths.ConfigFile, updated); err != nil {
 		return err
 	}
 	if err := validateConfigFile(paths); err != nil {
-		if restoreErr := edit.Restore(); restoreErr != nil {
+		if restoreErr := edit.restoreLocked(); restoreErr != nil {
 			return fmt.Errorf("config invalid after org seat edit AND restore failed (file left broken: %v): %w", restoreErr, err)
 		}
 		return fmt.Errorf("config invalid after org seat edit (reverted): %w", err)
