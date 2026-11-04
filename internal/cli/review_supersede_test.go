@@ -43,11 +43,28 @@ func partSubjectKey(t *testing.T, head, part string) string {
 // that head. A plain request attached to the old verdict; --supersede moves the
 // claim to a new job on the SAME reviewer, records the linkage on both jobs,
 // and leaves the old job and its verdict untouched.
+//
+// #2515 (herdrup-duo, herdrup#585): a whole-head review without a part had the
+// same dead end and no exit at all, since --supersede required --part and a new
+// part can never approve the head. The same contract now applies to it.
 func TestReviewRequestSupersedeReReviewsASettledBlockingPart(t *testing.T) {
+	for _, part := range []string{"mm-1-mm-9", ""} {
+		name := "part " + part
+		if part == "" {
+			name = "whole-head review"
+		}
+		t.Run(name, func(t *testing.T) { testSupersedeReReviewsSettledBlockingReview(t, part) })
+	}
+}
+
+func testSupersedeReReviewsSettledBlockingReview(t *testing.T, part string) {
 	home, store, head := reviewRouterHome(t)
 	ctx := context.Background()
 	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ShellRuntime, "true", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json", "--role", "joltra", "--part", "mm-1-mm-9"}
+	base := []string{"--repo", "owner/repo", "--pr", "12", "--head", head, "--branch", "feature/review", "--home", home, "--json", "--role", "joltra"}
+	if part != "" {
+		base = append(base, "--part", part)
+	}
 
 	first, failure := runReviewRequestJSON(t, base...)
 	if failure != "" {
@@ -72,7 +89,7 @@ func TestReviewRequestSupersedeReReviewsASettledBlockingPart(t *testing.T) {
 	if second.State != reviewRequestDispatched || second.JobID == first.JobID || second.Supersedes != first.JobID {
 		t.Fatalf("supersede request = %+v, want a new dispatched job superseding %s", second, first.JobID)
 	}
-	claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, "mm-1-mm-9"))
+	claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, part))
 	if err != nil || claim.JobID != second.JobID {
 		t.Fatalf("claim after supersede = %+v (%v), want it on %s", claim, err, second.JobID)
 	}
@@ -85,7 +102,7 @@ func TestReviewRequestSupersedeReReviewsASettledBlockingPart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if newPayload.ReviewSupersedes != first.JobID || newPayload.ReviewSupersedeReason != reason || newPayload.ReviewPart != "mm-1-mm-9" || newPayload.HeadSHA != head {
+	if newPayload.ReviewSupersedes != first.JobID || newPayload.ReviewSupersedeReason != reason || newPayload.ReviewPart != part || newPayload.HeadSHA != head {
 		t.Fatalf("re-review payload linkage = supersedes %q reason %q part %q head %q", newPayload.ReviewSupersedes, newPayload.ReviewSupersedeReason, newPayload.ReviewPart, newPayload.HeadSHA)
 	}
 	oldPayload, err := workflow.ParseJobPayload(oldJob.Payload)
@@ -157,7 +174,7 @@ func TestReviewRequestSupersedeRefusesOutsideItsContract(t *testing.T) {
 	other := append(part("blocked"), "--supersede", blocked.JobID, "--reason", "r")
 	other[len(other)-5] = "other-reviewer" // the value after --reviewer
 	refused(other, "differs from opus-reviewer")
-	refused(append(part("blocked"), "--supersede", blocked.JobID), "requires --part and --reason")
+	refused(append(part("blocked"), "--supersede", blocked.JobID), "requires --reason")
 	refused(append(part("blocked"), "--reason", "r"), "only meaningful with --supersede")
 
 	for name, job := range map[string]string{"live": live.JobID, "clean": approved.JobID, "blocked": blocked.JobID} {

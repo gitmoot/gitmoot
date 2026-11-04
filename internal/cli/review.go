@@ -210,7 +210,7 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.StringVar(&opts.part, "part", "", "one part of a split review of the same head: a slug of letters, digits and dashes (e.g. mm-12-mm-15)")
-	fs.StringVar(&opts.supersede, "supersede", "", "re-review a part at the same head: the settled review job of that part whose verdict this request replaces once it lands; requires --part and --reason")
+	fs.StringVar(&opts.supersede, "supersede", "", "re-review at the same head: the settled blocking review job (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason")
 	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both jobs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.StringVar(&opts.evidenceManifest, "evidence-manifest", "", "absolute path of a JSON manifest (schema_version 1, head_sha, files[{path,bytes,sha256}]) of private files to install read-only into this remote E2B review's sandbox; every file is hash-verified now and again inside the sandbox; requires --exec-backend remote")
@@ -249,8 +249,8 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	opts.supersede = strings.TrimSpace(opts.supersede)
 	opts.supersedeReason = strings.TrimSpace(opts.supersedeReason)
-	if opts.supersede != "" && (strings.TrimSpace(opts.part) == "" || opts.supersedeReason == "") {
-		fmt.Fprintln(stderr, "review request: --supersede re-reviews one part at the same head and requires --part and --reason")
+	if opts.supersede != "" && opts.supersedeReason == "" {
+		fmt.Fprintln(stderr, "review request: --supersede re-reviews a settled review at the same head and requires --reason")
 		return 2
 	}
 	if opts.supersede == "" && opts.supersedeReason != "" {
@@ -642,7 +642,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// exists; this event makes it visible from the old job too.
 		output.Supersedes = supersededJob.ID
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: supersededJob.ID, Kind: reviewPartSupersededEventKind,
-			Message: fmt.Sprintf("part %s re-review %s dispatched by %s at head %s: %s; this verdict stays effective until that job lands its own", opts.part, dispatched.JobID, opts.role, head, opts.supersedeReason)}); err != nil {
+			Message: fmt.Sprintf("%s re-review %s dispatched by %s at head %s: %s; this verdict stays effective until that job lands its own", supersedeScope(opts.part), dispatched.JobID, opts.role, head, opts.supersedeReason)}); err != nil {
 			fmt.Fprintf(stderr, "review request: warning: re-review %s dispatched, but recording it on %s failed: %v\n", dispatched.JobID, supersededJob.ID, err)
 		}
 	}
@@ -935,12 +935,23 @@ func releaseUnenqueuedReviewClaim(ctx context.Context, store *db.Store, subjectK
 	_ = store.ReleaseReviewRequest(ctx, subjectKey, jobID)
 }
 
-// reviewPartSupersededEventKind is recorded on a settled part-review job when
-// `review request --supersede` dispatches its re-review (#2405).
+// reviewPartSupersededEventKind is recorded on a settled review job when
+// `review request --supersede` dispatches its re-review (#2405 for parts,
+// #2515 for whole-head reviews; the kind keeps its original name so existing
+// event queries still find every supersession).
 const reviewPartSupersededEventKind = "review_part_superseded"
 
-// takeSupersededPartClaim moves the claim of one part of a split review at one
-// exact head from a SETTLED part-review job to newJobID (#2405).
+// supersedeScope names what a --supersede request re-reviews.
+func supersedeScope(part string) string {
+	if part = strings.TrimSpace(part); part != "" {
+		return fmt.Sprintf("part %q", part)
+	}
+	return "the whole-head review"
+}
+
+// takeSupersededPartClaim moves the claim of one part of a split review, or of
+// the whole-head review when there is no part (#2515), at one exact head from a
+// SETTLED review job to newJobID (#2405).
 //
 // WHY THIS EXISTS. The merge gate retires a part's objection only with a later
 // verdict from the same reviewer identity for the same part at the evaluated
@@ -948,7 +959,10 @@ const reviewPartSupersededEventKind = "review_part_superseded"
 // an answer, so a second request for that part attached to the old verdict
 // (local) or was refused as a duplicate (remote): an objection that came from
 // a mis-scoped prompt could only be cleared by a new head, which resets every
-// other part. --supersede is the audited exit.
+// other part. --supersede is the audited exit. The same dead end applies to a
+// whole-head review (no part): the gate retires its objection only with the
+// same reviewer's later whole-head verdict, and a new part can never approve
+// the head, so #2515 lets --supersede name a whole-head review too.
 //
 // CONTRACT (Jarvis 365409):
 //   - the named job must hold the claim for EXACTLY this repo, PR, full head,
@@ -964,13 +978,13 @@ const reviewPartSupersededEventKind = "review_part_superseded"
 func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, head string, opts reviewRequestOptions, newJobID string) (db.Job, error) {
 	claim, err := store.GetReviewRequest(ctx, subjectKey)
 	if errors.Is(err, sql.ErrNoRows) {
-		return db.Job{}, fmt.Errorf("review request --supersede: no review holds part %q at head %s; request it without --supersede", opts.part, head)
+		return db.Job{}, fmt.Errorf("review request --supersede: no review holds %s at head %s; request it without --supersede", supersedeScope(opts.part), head)
 	}
 	if err != nil {
 		return db.Job{}, err
 	}
 	if claim.JobID != opts.supersede {
-		return db.Job{}, fmt.Errorf("review request --supersede: part %q at head %s is held by job %s, not %s", opts.part, head, claim.JobID, opts.supersede)
+		return db.Job{}, fmt.Errorf("review request --supersede: %s at head %s is held by job %s, not %s", supersedeScope(opts.part), head, claim.JobID, opts.supersede)
 	}
 	job, err := store.GetJob(ctx, opts.supersede)
 	if err != nil {
@@ -1001,9 +1015,9 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	switch decision {
 	case "changes_requested", "blocked", "failed":
 	case "approved":
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s approved part %q; an approval blocks nothing, so there is nothing to supersede", job.ID, opts.part)
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s approved %s; an approval blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part))
 	default:
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s carries no blocking verdict (decision %q); request the part without --supersede", job.ID, decision)
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)
 	}
 	children, err := store.ListJobsByParent(ctx, job.ID)
 	if err != nil {
@@ -1016,14 +1030,14 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 		}
 	}
 	if explicit := strings.TrimSpace(opts.reviewer); explicit != "" && explicit != job.Agent {
-		return db.Job{}, fmt.Errorf("review request --supersede: --reviewer %s differs from %s, who reviewed this part; the merge gate retires a part objection only with the same reviewer's later verdict", explicit, job.Agent)
+		return db.Job{}, fmt.Errorf("review request --supersede: --reviewer %s differs from %s, who reviewed %s; the merge gate retires an objection only with the same reviewer's later verdict", explicit, job.Agent, supersedeScope(opts.part))
 	}
 	moved, err := store.ReplaceReviewRequestJob(ctx, subjectKey, job.ID, newJobID, opts.role, reviewRequestOwner())
 	if err != nil {
 		return db.Job{}, err
 	}
 	if !moved {
-		return db.Job{}, fmt.Errorf("review request --supersede: the claim for part %q moved away from job %s while this request ran (another re-review won); nothing was dispatched", opts.part, job.ID)
+		return db.Job{}, fmt.Errorf("review request --supersede: the claim for %s moved away from job %s while this request ran (another re-review won); nothing was dispatched", supersedeScope(opts.part), job.ID)
 	}
 	return job, nil
 }
