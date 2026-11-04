@@ -614,6 +614,17 @@ reconstruction path (currently a pinned native read-only PR review). Cleanup
 never cancels consumers or treats an operational failure as permission to
 delete.
 
+Reclaim runs inside the daemon's worker tick, before queued jobs are dispatched,
+so it is bounded (#2517): one tick spends at most about 10 seconds starting
+reclaim candidates across all repos, and the rest wait for a later tick. A
+worktree whose preservation evidence could not be captured yet (for example a
+`git status`/`git diff` that timed out on a slow network mount) is retried
+after a quarter of the time its cleanup has been pending, between one minute
+and six hours. The capture compares files by size and modification time
+(`core.checkStat=minimal`, `core.trustCtime=false`), because network mounts
+such as sshfs report unstable inode numbers and change times that otherwise
+make git re-read every file.
+
 No new fix clone is created — #2203 removed the
 auto-fix leg that allocated one — and no gitmoot path deletes one that already
 exists. It is a standalone object

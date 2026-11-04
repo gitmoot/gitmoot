@@ -332,7 +332,11 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 	return obligation, true, nil
 }
 
-func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool, now time.Time) error {
+// finishDelegationCleanupAttempt records a reclaim outcome. It reads the clock
+// itself: the sweep's start time can be many minutes stale by now, and a retry
+// deadline computed from it was often already past (#2517).
+func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path, obligationCreatedAt string, reclaimed bool) error {
+	now := time.Now().UTC()
 	if reclaimed {
 		if _, err := worker.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, now); err != nil {
 			logDelegationReclaimFailure(worker.Stdout, "state", "removed", jobID, path, err)
@@ -341,11 +345,26 @@ func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID
 		clearDelegationReclaimFailure(path)
 		return nil
 	}
-	if _, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(delegationCleanupRetryDelay)); err != nil {
+	if _, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(deferredReclaimRetryDelay(obligationCreatedAt, now))); err != nil {
 		logDelegationReclaimFailure(worker.Stdout, "state", "deferred", jobID, path, err)
 		return err
 	}
 	return nil
+}
+
+// deferredReclaimRetryDelay is how long a worktree whose cleanup was deferred
+// (its evidence could not be captured yet) waits before the next attempt
+// (#2517): a quarter of how long its cleanup has been pending, between one
+// minute and six hours. Before, every deferral retried after one minute
+// forever, so worktrees whose capture always timed out were retried on every
+// sweep. An unreadable creation time gets the one-minute floor.
+func deferredReclaimRetryDelay(obligationCreatedAt string, now time.Time) time.Duration {
+	const ceiling = 6 * time.Hour
+	created, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(obligationCreatedAt))
+	if err != nil {
+		return delegationCleanupRetryDelay
+	}
+	return min(max(now.Sub(created)/4, delegationCleanupRetryDelay), ceiling)
 }
 
 // daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
@@ -1054,11 +1073,36 @@ type tickCandidates struct {
 	malformedOwnerDone bool
 	malformedOwnerID   string
 	skipAgedReclaim    bool
+	// reclaimStarted is when this tick's first worktree reclaim candidate was
+	// taken (#2517). Every reclaim pass of every repo in the tick shares one
+	// reclaimTickBudget, so cleanup can no longer hold the dispatch sweep.
+	reclaimStarted time.Time
 	// events is the supervisor's CROSS-tick job_events cursor cache (#1758). It
 	// outlives the carrier (it hangs off the tracker), which is exactly why it is
 	// a pointer while config is a value: the config memo must die with the tick,
 	// the cursor must survive it. nil disables cursor gating entirely.
 	events *jobEventCandidateCache
+}
+
+// reclaimTickBudget bounds the wall time one worker tick spends starting
+// worktree reclaim candidates, across all repos and passes (#2517). Housekeeping
+// runs before dispatch in the sequential repo sweep, so unbounded reclaim on a
+// slow worktree mount stalled job dispatch fleet-wide for 8-36 minutes. A
+// candidate already started finishes; no new one starts once the budget is
+// spent, and the rest wait for a later tick. A var only so tests can shorten it.
+var reclaimTickBudget = 10 * time.Second
+
+// reclaimBudgetSpent reports whether this tick may not start another reclaim
+// candidate. The first call starts the budget. A nil carrier never limits.
+func (c *tickCandidates) reclaimBudgetSpent() bool {
+	if c == nil {
+		return false
+	}
+	if c.reclaimStarted.IsZero() {
+		c.reclaimStarted = time.Now()
+		return false
+	}
+	return time.Since(c.reclaimStarted) >= reclaimTickBudget
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -1294,6 +1338,9 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		return err
 	}
 	for _, jobID := range jobIDs {
+		if cand.reclaimBudgetSpent() {
+			break
+		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			// A cleanup-marker event with no surviving job row (e.g. a pruned job):
@@ -1334,7 +1381,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			continue
 		}
-		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
+		obligation, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
 		if err != nil {
 			return stopDelegationCleanupPass(err)
 		}
@@ -1362,7 +1409,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			continue
 		}
-		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, obligation.CreatedAt, reclaimed); err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 	}
@@ -1388,7 +1435,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		// full-clone removal, so the pass is bounded per tick. Every attempted or
 		// skipped row persists a later next_attempt_at; the ordered SQL window
 		// therefore advances without an in-memory rotation cursor.
-		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget || cand.reclaimBudgetSpent() {
 			break
 		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
@@ -1429,7 +1476,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			}
 			continue
 		}
-		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
+		obligation, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
 		if err != nil {
 			return stopDelegationCleanupPass(err)
 		}
@@ -1458,7 +1505,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			}
 			continue
 		}
-		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed, now); err != nil {
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, obligation.CreatedAt, reclaimed); err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 	}
@@ -1541,7 +1588,7 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	attempts := 0
 	resume := ""
 	for i, taskID := range rotated {
-		if attempts >= terminalTaskWorktreeReclaimPassBudget {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget || cand.reclaimBudgetSpent() {
 			resume = rotated[i]
 			break
 		}

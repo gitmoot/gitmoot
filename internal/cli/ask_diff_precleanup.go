@@ -224,7 +224,16 @@ func (s *readOnlyWorktreeGitSandbox) run(ctx context.Context, label string, args
 	out := &boundedCountingBuffer{limit: readOnlyWorktreeDiffMaxBytes}
 	var stderr boundedCountingBuffer
 	stderr.limit = 4096
-	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull}, args...)
+	// core.checkStat=minimal and core.trustCtime=false (#2517): on the sshfs
+	// worktree mount, inode numbers and change times are not stable, so git
+	// trusted none of the index's cached stat data and re-read every file in
+	// full. status+diff took ~120s on a 1,325-file review worktree, past the
+	// 45s capture deadline, so capture never succeeded and cleanup retried
+	// forever. Size and whole-second mtime still flag every edit (and racy-git
+	// content checks still cover edits within the index's own second); the
+	// same commands then take ~14s and report the same result.
+	cmdArgs := append([]string{"--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.DevNull,
+		"-c", "core.checkStat=minimal", "-c", "core.trustCtime=false"}, args...)
 	err := runReadOnlyWorktreeGit(ctx, s.runner, s.env, s.worktree, out, &stderr, cmdArgs...)
 	if err != nil {
 		detail := strings.TrimSpace(stderr.String())

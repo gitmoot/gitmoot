@@ -1077,3 +1077,52 @@ func TestGitClientErrorIncludesBoundedStderr(t *testing.T) {
 		t.Fatalf("git error length = %d, want bounded stderr", len(err.Error()))
 	}
 }
+
+// #2517: a worktree whose cleanup is deferred (its evidence capture timed out)
+// was retried one minute after the SWEEP's start time, forever. After a long
+// sweep that deadline was already past, so it was retried on every sweep. The
+// retry is now measured from the real time of the outcome and grows with how
+// long the cleanup has been pending: a quarter of it, between 1 minute and 6
+// hours.
+func TestDeferredWorktreeReclaimBacksOffFromNow(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() { _ = store.Close() })
+	worker := defaultJobWorker(store, io.Discard, home)
+	for _, tc := range []struct {
+		name    string
+		pending time.Duration
+		want    time.Duration
+	}{
+		{"just created", time.Second, time.Minute},
+		{"pending 4 hours", 4 * time.Hour, time.Hour},
+		{"pending 5 days", 5 * 24 * time.Hour, 6 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jobID := "parent/delegation/" + strings.ReplaceAll(tc.name, " ", "-")
+			path := managedDelegationReclaimTestPath(t, home, "parent", strings.ReplaceAll(tc.name, " ", "-"))
+			seedCLIJob(t, store, db.Job{ID: jobID, Agent: "reader", Type: "review", State: string(workflow.JobSucceeded), Repo: "owner/repo",
+				Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: path})}, "seed")
+			obligation, err := store.EnsureCleanupObligation(ctx, jobID, path, time.Now().UTC().Add(-tc.pending))
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now().UTC()
+			if err := finishDelegationCleanupAttempt(ctx, worker, jobID, path, obligation.CreatedAt, false); err != nil {
+				t.Fatal(err)
+			}
+			after, err := store.GetCleanupObligation(ctx, obligation.ResourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next, err := time.Parse(time.RFC3339Nano, after.NextAttemptAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := next.Sub(before); got < tc.want-5*time.Second || got > tc.want+5*time.Second {
+				t.Fatalf("next attempt %s after the deferral, want about %s", got.Round(time.Second), tc.want)
+			}
+		})
+	}
+}
