@@ -99,6 +99,14 @@ func SaveAgentType(paths Paths, entry AgentType) error {
 }
 
 func saveAgentType(paths Paths, entry AgentType, write func(string, []byte) error) error {
+	// #2510: every read-modify-write of the config holds the config edit
+	// lock, so it cannot interleave with the daemon's automatic seat rebind
+	// (or any other gitmoot edit) and write back a stale copy.
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return err
+	}
+	defer release()
 	types, err := LoadAgentTypes(paths)
 	if err != nil {
 		return err

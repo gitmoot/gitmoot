@@ -347,3 +347,27 @@ func writeOrgConfigBytes(paths Paths, updated []byte, edit OrgSeatConfigEdit) er
 	}
 	return nil
 }
+
+// AppendOrgStarterConfig appends the starter org registry while holding the
+// config edit lock (#2510), and only if the config still has no org roles
+// when the lock is held, so a concurrent edit is neither lost nor doubled.
+// It returns whether it appended.
+func AppendOrgStarterConfig(paths Paths, starter string) (bool, error) {
+	release, err := lockConfigEdits(paths)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		return false, err
+	}
+	cfg, err := parseOrgContent(content)
+	if err != nil {
+		return false, err
+	}
+	if cfg.Enabled() {
+		return false, nil
+	}
+	return true, writeConfigAtomic(paths.ConfigFile, append(content, []byte(starter)...))
+}
