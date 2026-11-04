@@ -1173,19 +1173,8 @@ func runOrgInit(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if !cfg.Enabled() {
-		file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			fmt.Fprintf(stderr, "org init: open config: %v\n", err)
-			return 1
-		}
-		_, writeErr := io.WriteString(file, starterOrgConfig)
-		closeErr := file.Close()
-		if writeErr != nil {
-			fmt.Fprintf(stderr, "org init: write config: %v\n", writeErr)
-			return 1
-		}
-		if closeErr != nil {
-			fmt.Fprintf(stderr, "org init: close config: %v\n", closeErr)
+		if _, err := config.AppendOrgStarterConfig(paths, starterOrgConfig); err != nil {
+			fmt.Fprintf(stderr, "org init: write config: %v\n", err)
 			return 1
 		}
 		cfg, err = config.LoadOrg(paths)
