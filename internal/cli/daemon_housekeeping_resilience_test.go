@@ -323,3 +323,63 @@ func TestReclaimBudgetRotatesAcrossReposWhenOneRepoIsSlow(t *testing.T) {
 		}
 	}
 }
+
+// #2517 follow-up (seen live after the first deploy): the reclaim candidate
+// list is shared by every repo in a sweep, and each repo's pass defers the
+// rows of other repos. Those cheap skips were checked against the budget, so
+// with a slow store the first repo used up the whole budget deferring other
+// repos' rows, every owning repo was then turned away, and no worktree was
+// reclaimed at all. Skipping another repo's candidate must not spend the
+// budget: here a repo that owns none of many candidates goes first, and the
+// owning repo must still get its attempt in the same tick.
+func TestReclaimSkipsOfOtherReposRowsDoNotSpendTheBudget(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 50 * time.Millisecond
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	h := newHousekeepingDispatchHarness(t, "owner-gets-its-reclaim")
+	const others = 12
+	for i := 0; i < others+1; i++ {
+		repo := "owner/other"
+		if i == others {
+			repo = "owner/repo"
+		}
+		id := fmt.Sprintf("parent/delegation/cand-%02d", i)
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", fmt.Sprintf("cand-%02d", i))
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+			Repo: repo, ParentJobID: "parent", DelegationID: fmt.Sprintf("cand-%02d", i),
+			Payload: mustJobPayload(t, workflow.JobPayload{
+				Repo: repo, ParentJobID: "parent", DelegationID: fmt.Sprintf("cand-%02d", i),
+				WorktreePath: path, Branch: fmt.Sprintf("gitmoot-delegation-cand-%02d", i),
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}),
+		}, "seed reclaim candidate")
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A slow store: every skip of another repo's row costs time, as the
+	// lifecycle-locked deferral writes do on the busy daemon.
+	previousDefer := deferDelegationCleanupSkipHook
+	deferDelegationCleanupSkipHook = func() { time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { deferDelegationCleanupSkipHook = previousDefer })
+	attempted := map[string]bool{}
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		attempted[checkout] = true
+		return baseWorkflowFactory(checkout)
+	}
+	cand := newTickCandidates(h.store)
+	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
+	// The other repo's pass runs first in the sweep, then the owner's.
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/other-without-rows", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	before := len(attempted)
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/repo", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	if len(attempted) == before {
+		t.Fatalf("the owning repo got no reclaim attempt: the first repo's %d skips of other repos' rows used up the budget", others+1)
+	}
+}
