@@ -1104,12 +1104,16 @@ const (
 
 // reclaimTickState is one tick's reclaim budget use per pass kind.
 type reclaimTickState struct {
-	started    map[string]time.Time
-	serving    map[string]string
-	ran        map[string]bool
-	resumeSeen map[string]bool
-	denied     map[string]string
-	resume     *reclaimResume
+	// skipWritesStarted is when this tick first deferred a candidate it skipped
+	// (another repo's row, not final, checkout held); skip writes get their
+	// own reclaimTickBudget (#2519 review).
+	skipWritesStarted time.Time
+	started           map[string]time.Time
+	serving           map[string]string
+	ran               map[string]bool
+	resumeSeen        map[string]bool
+	denied            map[string]string
+	resume            *reclaimResume
 }
 
 // reclaimResume carries, across ticks, the repo whose reclaim pass of each
@@ -1194,6 +1198,34 @@ func (c *tickCandidates) reclaimMayStart(kind, repo string, now time.Time) bool 
 	}
 	state.serving[kind] = repo
 	return true
+}
+
+// deferReclaimSkip defers a reclaim candidate this pass skipped without
+// attempting it (#2519 review). The candidate list is shared by every repo in
+// the sweep, so without care each repo rewrote every other repo's rows:
+//   - a row that is not due is left alone: it was already deferred in this
+//     sweep, possibly by its own repo's attempt with a much later retry (a
+//     failed capture backs off up to six hours), which must not be shortened;
+//   - skip writes take a lifecycle lock each, so they have their own time
+//     budget per tick; once it is spent, skips write nothing (the row stays
+//     due and a later tick defers it).
+//
+// The new deadline is taken from the real clock, not the sweep's start.
+func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker, jobID, path string, reason db.CleanupObligationReason) error {
+	now := time.Now().UTC()
+	if current, err := worker.Store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path)); err == nil {
+		if next, err := time.Parse(time.RFC3339Nano, current.NextAttemptAt); err == nil && next.After(now) {
+			return nil
+		}
+	}
+	if c != nil {
+		if c.reclaimBudget.skipWritesStarted.IsZero() {
+			c.reclaimBudget.skipWritesStarted = now
+		} else if now.Sub(c.reclaimBudget.skipWritesStarted) >= reclaimTickBudget {
+			return nil
+		}
+	}
+	return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
 }
 
 // finishReclaimTick moves each kind that ran this tick to its next resume
@@ -1465,20 +1497,20 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue
 		}
 		if !jobStateEligibleForWorktreeReclaim(job.State) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue
 		}
 		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
 			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue
@@ -1568,20 +1600,20 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue
 		}
 		if !workflow.IsFinalJobState(job.State) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue
 		}
 		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
 			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
-			if err := deferDelegationCleanupSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock, now); err != nil {
+			if err := cand.deferReclaimSkip(ctx, worker, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue

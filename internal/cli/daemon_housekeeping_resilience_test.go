@@ -337,7 +337,7 @@ func TestReclaimSkipsOfOtherReposRowsDoNotSpendTheBudget(t *testing.T) {
 	reclaimTickBudget = 50 * time.Millisecond
 	t.Cleanup(func() { reclaimTickBudget = previous })
 	h := newHousekeepingDispatchHarness(t, "owner-gets-its-reclaim")
-	const others = 12
+	const others = 30
 	for i := 0; i < others+1; i++ {
 		repo := "owner/other"
 		if i == others {
@@ -371,9 +371,15 @@ func TestReclaimSkipsOfOtherReposRowsDoNotSpendTheBudget(t *testing.T) {
 	}
 	cand := newTickCandidates(h.store)
 	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
-	// The other repo's pass runs first in the sweep, then the owner's.
+	// The other repo's pass runs first in the sweep, then the owner's. Its
+	// skip writes are bounded on their own (#2519 review): 31 writes of 20ms
+	// each would take over 600ms; the bound stops writing after about 50ms.
+	started := time.Now()
 	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/other-without-rows", "", nil, cand, h.now); err != nil {
 		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("a repo owning none of the candidates spent %s deferring them before dispatch; skip writes must be bounded", elapsed.Round(time.Millisecond))
 	}
 	before := len(attempted)
 	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/repo", "", nil, cand, h.now); err != nil {
@@ -381,5 +387,56 @@ func TestReclaimSkipsOfOtherReposRowsDoNotSpendTheBudget(t *testing.T) {
 	}
 	if len(attempted) == before {
 		t.Fatalf("the owning repo got no reclaim attempt: the first repo's %d skips of other repos' rows used up the budget", others+1)
+	}
+}
+
+// #2519 review: the candidate list is computed once per sweep, so a later
+// repo still sees a row its owner just attempted. If the attempt kept the
+// worktree with a later retry (a failed capture backs off up to six hours),
+// the later repo's skip rewrote it to one minute, making it due again almost
+// at once. A skip must leave a row that is not due alone.
+func TestReclaimSkipOfAnotherReposRowKeepsItsLaterRetry(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "later-retry-kept")
+	id := "parent/delegation/owned"
+	path := managedDelegationReclaimTestPath(t, h.home, "parent", "owned")
+	seedCLIJob(t, h.store, db.Job{
+		ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "owned",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "owned",
+			WorktreePath: path, Branch: "gitmoot-delegation-owned",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed reclaim candidate")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.EnsureCleanupObligation(h.ctx, id, path, time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	cand := newTickCandidates(h.store)
+	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
+	// The sweep's candidate list is taken while the row is due ...
+	if ids, err := cand.delegationReclaimCandidates(h.ctx); err != nil || len(ids) == 0 {
+		t.Fatalf("candidates = %v, %v; want the seeded row", ids, err)
+	}
+	// ... then its owner's attempt keeps the worktree for six hours.
+	later := time.Now().UTC().Add(6 * time.Hour)
+	if _, err := h.store.DeferCleanupObligation(h.ctx, id, path, db.CleanupReasonTerminalDeferred, time.Now().UTC(), later); err != nil {
+		t.Fatal(err)
+	}
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/other", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	obligation, err := h.store.GetCleanupObligation(h.ctx, db.CleanupObligationResourceID(id, path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Before(later.Add(-time.Second)) {
+		t.Fatalf("another repo's skip moved the retry from %s to %s", later.Format(time.RFC3339), next.Format(time.RFC3339))
 	}
 }
