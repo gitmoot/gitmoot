@@ -335,7 +335,7 @@ func prepareDelegationCleanup(ctx context.Context, worker jobWorker, mode string
 // finishDelegationCleanupAttempt records a reclaim outcome. It reads the clock
 // itself: the sweep's start time can be many minutes stale by now, and a retry
 // deadline computed from it was often already past (#2517).
-func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path, obligationCreatedAt string, reclaimed bool) error {
+func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID, path string, reclaimed bool) error {
 	now := time.Now().UTC()
 	if reclaimed {
 		if _, err := worker.Store.MarkCleanupObligationRemoved(context.WithoutCancel(ctx), jobID, path, now); err != nil {
@@ -345,26 +345,24 @@ func finishDelegationCleanupAttempt(ctx context.Context, worker jobWorker, jobID
 		clearDelegationReclaimFailure(path)
 		return nil
 	}
-	if _, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(deferredReclaimRetryDelay(obligationCreatedAt, now))); err != nil {
+	// Retry after a minute, unless this attempt's own deferral already chose a
+	// later time: a failed evidence capture backs off in the engine
+	// (workflow.PreservationDeferredRetryDelay), and overwriting that with one
+	// minute would retry it on every sweep again (#2517). The candidate was due
+	// when picked, so a later time can only come from this attempt; transient
+	// gates keep the minute.
+	next := now.Add(delegationCleanupRetryDelay)
+	resource := db.CleanupObligationResourceID(jobID, path)
+	if current, err := worker.Store.GetCleanupObligation(context.WithoutCancel(ctx), resource); err == nil {
+		if chosen, err := time.Parse(time.RFC3339Nano, current.NextAttemptAt); err == nil && chosen.After(next) {
+			next = chosen
+		}
+	}
+	if _, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, db.CleanupReasonTerminalDeferred, now, next); err != nil {
 		logDelegationReclaimFailure(worker.Stdout, "state", "deferred", jobID, path, err)
 		return err
 	}
 	return nil
-}
-
-// deferredReclaimRetryDelay is how long a worktree whose cleanup was deferred
-// (its evidence could not be captured yet) waits before the next attempt
-// (#2517): a quarter of how long its cleanup has been pending, between one
-// minute and six hours. Before, every deferral retried after one minute
-// forever, so worktrees whose capture always timed out were retried on every
-// sweep. An unreadable creation time gets the one-minute floor.
-func deferredReclaimRetryDelay(obligationCreatedAt string, now time.Time) time.Duration {
-	const ceiling = 6 * time.Hour
-	created, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(obligationCreatedAt))
-	if err != nil {
-		return delegationCleanupRetryDelay
-	}
-	return min(max(now.Sub(created)/4, delegationCleanupRetryDelay), ceiling)
 }
 
 // daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
@@ -1073,10 +1071,8 @@ type tickCandidates struct {
 	malformedOwnerDone bool
 	malformedOwnerID   string
 	skipAgedReclaim    bool
-	// reclaimStarted is when this tick's first worktree reclaim candidate was
-	// taken (#2517). Every reclaim pass of every repo in the tick shares one
-	// reclaimTickBudget, so cleanup can no longer hold the dispatch sweep.
-	reclaimStarted time.Time
+	// reclaimBudget is this tick's worktree reclaim budget state (#2517).
+	reclaimBudget reclaimTickState
 	// events is the supervisor's CROSS-tick job_events cursor cache (#1758). It
 	// outlives the carrier (it hangs off the tracker), which is exactly why it is
 	// a pointer while config is a value: the config memo must die with the tick,
@@ -1085,24 +1081,127 @@ type tickCandidates struct {
 }
 
 // reclaimTickBudget bounds the wall time one worker tick spends starting
-// worktree reclaim candidates, across all repos and passes (#2517). Housekeeping
-// runs before dispatch in the sequential repo sweep, so unbounded reclaim on a
-// slow worktree mount stalled job dispatch fleet-wide for 8-36 minutes. A
-// candidate already started finishes; no new one starts once the budget is
-// spent, and the rest wait for a later tick. A var only so tests can shorten it.
+// worktree reclaim candidates of one reclaim pass kind, across all repos
+// (#2517). Housekeeping runs before dispatch in the sequential repo sweep, so
+// unbounded reclaim on a slow worktree mount stalled job dispatch fleet-wide
+// for 8-36 minutes. A candidate already started finishes; no new one starts
+// once the budget is spent. Each pass kind has its own budget, so the
+// every-tick skipped pass cannot starve the aged and task passes. A var only
+// so tests can shorten it.
 var reclaimTickBudget = 10 * time.Second
 
-// reclaimBudgetSpent reports whether this tick may not start another reclaim
-// candidate. The first call starts the budget. A nil carrier never limits.
-func (c *tickCandidates) reclaimBudgetSpent() bool {
+// Reclaim pass kinds, each with its own budget and resume position.
+const (
+	reclaimPassSkipped = "skipped_delegation"
+	reclaimPassAged    = "aged_delegation"
+	reclaimPassTask    = "terminal_task"
+)
+
+// reclaimTickState is one tick's reclaim budget use per pass kind.
+type reclaimTickState struct {
+	started    map[string]time.Time
+	serving    map[string]string
+	ran        map[string]bool
+	resumeSeen map[string]bool
+	denied     map[string]string
+	resume     *reclaimResume
+}
+
+// reclaimResume carries, across ticks, the repo whose reclaim pass of each
+// kind was the first cut off by the budget (#2517 review). The repo sweep
+// order is fixed, so without it the first repo with slow candidates would take
+// the whole budget on every tick and the later repos would never get one. The
+// next tick that runs that kind skips repos before the resume repo, starts
+// there, and then continues in order; it lives on the tracker.
+type reclaimResume struct {
+	mu   sync.Mutex
+	repo map[string]string
+}
+
+func (r *reclaimResume) get(kind string) string {
+	if r == nil {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.repo[kind]
+}
+
+func (r *reclaimResume) set(kind, repo string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.repo == nil {
+		r.repo = map[string]string{}
+	}
+	if repo == "" {
+		delete(r.repo, kind)
+		return
+	}
+	r.repo[kind] = repo
+}
+
+// reclaimPassStart records that a reclaim pass of kind runs for repo in this
+// tick, so the resume position is consumed once that repo's turn comes, even
+// when the repo has no candidate left.
+func (c *tickCandidates) reclaimPassStart(kind, repo string) {
 	if c == nil {
+		return
+	}
+	state := &c.reclaimBudget
+	if state.ran == nil {
+		state.ran, state.resumeSeen = map[string]bool{}, map[string]bool{}
+	}
+	state.ran[kind] = true
+	if resume := state.resume.get(kind); resume != "" && resume == repo {
+		state.resumeSeen[kind] = true
+	}
+}
+
+// reclaimMayStart reports whether a reclaim pass of kind may start another
+// candidate for repo now. A repo before the resume position (this kind's
+// resume repo not reached yet in this tick) waits; otherwise the kind's budget
+// decides, and the first repo it turns away becomes the next resume position.
+// A nil carrier never limits.
+func (c *tickCandidates) reclaimMayStart(kind, repo string, now time.Time) bool {
+	if c == nil {
+		return true
+	}
+	state := &c.reclaimBudget
+	if resume := state.resume.get(kind); resume != "" && !state.resumeSeen[kind] {
 		return false
 	}
-	if c.reclaimStarted.IsZero() {
-		c.reclaimStarted = time.Now()
+	if state.started == nil {
+		state.started, state.denied, state.serving = map[string]time.Time{}, map[string]string{}, map[string]string{}
+	}
+	started, ok := state.started[kind]
+	if !ok {
+		state.started[kind] = now
+	} else if now.Sub(started) >= reclaimTickBudget {
+		// The repo the budget ran out in had its turn; the next one to be
+		// turned away goes first next time.
+		if state.denied[kind] == "" && state.serving[kind] != repo {
+			state.denied[kind] = repo
+		}
 		return false
 	}
-	return time.Since(c.reclaimStarted) >= reclaimTickBudget
+	state.serving[kind] = repo
+	return true
+}
+
+// finishReclaimTick moves each kind that ran this tick to its next resume
+// position: the first repo the budget turned away, or none (back to the start
+// of the sweep order). A resume repo that never came up this tick is dropped,
+// so a removed repo cannot hold the others back.
+func (c *tickCandidates) finishReclaimTick() {
+	if c == nil {
+		return
+	}
+	for kind := range c.reclaimBudget.ran {
+		c.reclaimBudget.resume.set(kind, c.reclaimBudget.denied[kind])
+	}
 }
 
 // newTickCandidates is a package var (not a plain func) only so the once-per-tick
@@ -1337,8 +1436,9 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 	if err != nil {
 		return err
 	}
+	cand.reclaimPassStart(reclaimPassSkipped, repoFilter)
 	for _, jobID := range jobIDs {
-		if cand.reclaimBudgetSpent() {
+		if !cand.reclaimMayStart(reclaimPassSkipped, repoFilter, time.Now()) {
 			break
 		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
@@ -1381,7 +1481,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			continue
 		}
-		obligation, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
+		_, ok, err := prepareDelegationCleanup(ctx, worker, "skipped", job, path, now)
 		if err != nil {
 			return stopDelegationCleanupPass(err)
 		}
@@ -1409,7 +1509,7 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 			}
 			continue
 		}
-		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, obligation.CreatedAt, reclaimed); err != nil {
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed); err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 	}
@@ -1429,13 +1529,14 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if err != nil {
 		return err
 	}
+	cand.reclaimPassStart(reclaimPassAged, repoFilter)
 	attempts := 0
 	for _, jobID := range jobIDs {
 		// Each attempt can run a remote fetch under a two-minute deadline and a
 		// full-clone removal, so the pass is bounded per tick. Every attempted or
 		// skipped row persists a later next_attempt_at; the ordered SQL window
 		// therefore advances without an in-memory rotation cursor.
-		if attempts >= terminalTaskWorktreeReclaimPassBudget || cand.reclaimBudgetSpent() {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget || !cand.reclaimMayStart(reclaimPassAged, repoFilter, time.Now()) {
 			break
 		}
 		job, err := delegationReclaimCandidateJob(ctx, worker, jobID)
@@ -1476,7 +1577,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			}
 			continue
 		}
-		obligation, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
+		_, ok, err := prepareDelegationCleanup(ctx, worker, "aged", job, path, now)
 		if err != nil {
 			return stopDelegationCleanupPass(err)
 		}
@@ -1505,7 +1606,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 			}
 			continue
 		}
-		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, obligation.CreatedAt, reclaimed); err != nil {
+		if err := finishDelegationCleanupAttempt(ctx, worker, job.ID, path, reclaimed); err != nil {
 			return stopDelegationCleanupPass(err)
 		}
 	}
@@ -1585,10 +1686,11 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 		writeLine(stdout, "terminal task worktree reclaim could not identify malformed non-final owner: %v", malformedErr)
 	}
 	rotated := rotateTerminalTaskWorktreeCandidates(repoFilter, taskIDs)
+	cand.reclaimPassStart(reclaimPassTask, repoFilter)
 	attempts := 0
 	resume := ""
 	for i, taskID := range rotated {
-		if attempts >= terminalTaskWorktreeReclaimPassBudget || cand.reclaimBudgetSpent() {
+		if attempts >= terminalTaskWorktreeReclaimPassBudget || !cand.reclaimMayStart(reclaimPassTask, repoFilter, time.Now()) {
 			resume = rotated[i]
 			break
 		}
@@ -1700,6 +1802,8 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if cand == nil {
 		cand = newTickCandidates(worker.Store)
 		cand.events = tracker.jobEventCandidateCache()
+		cand.reclaimBudget.resume = tracker.reclaimResumeState()
+		defer cand.finishReclaimTick()
 		runWorktreeReclaim := tracker.worktreeReclaimDue(now)
 		cand.skipAgedReclaim = !runWorktreeReclaim
 		if runWorktreeReclaim {
@@ -1855,6 +1959,10 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// The cursor cache is the one piece of candidate state that DOES span ticks:
 	// it hangs off the tracker, and the fresh carrier borrows it for this sweep.
 	cand.events = tracker.jobEventCandidateCache()
+	// So does the reclaim resume position (#2517): the sweep's last repo is
+	// known only once the loop below ends.
+	cand.reclaimBudget.resume = tracker.reclaimResumeState()
+	defer cand.finishReclaimTick()
 	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor

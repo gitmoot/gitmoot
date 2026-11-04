@@ -1078,38 +1078,45 @@ func TestGitClientErrorIncludesBoundedStderr(t *testing.T) {
 	}
 }
 
-// #2517: a worktree whose cleanup is deferred (its evidence capture timed out)
-// was retried one minute after the SWEEP's start time, forever. After a long
-// sweep that deadline was already past, so it was retried on every sweep. The
-// retry is now measured from the real time of the outcome and grows with how
-// long the cleanup has been pending: a quarter of it, between 1 minute and 6
-// hours.
-func TestDeferredWorktreeReclaimBacksOffFromNow(t *testing.T) {
+// #2517: the reclaim pass's own deferral used the SWEEP's start time, so after
+// a long sweep its one-minute retry was already past, and it overwrote a longer
+// retry the engine had just chosen for a failed evidence capture, so the
+// capture was retried on every sweep. It now keeps a later retry chosen during
+// the attempt and otherwise retries one minute from the real clock (transient
+// gates must be rechecked soon, #2518 review).
+func TestDeferredWorktreeReclaimKeepsTheAttemptsLaterRetry(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	t.Cleanup(func() { _ = store.Close() })
 	worker := defaultJobWorker(store, io.Discard, home)
 	for _, tc := range []struct {
-		name    string
-		pending time.Duration
-		want    time.Duration
+		name   string
+		chosen time.Duration // retry the attempt itself recorded; 0 = none
+		want   time.Duration
 	}{
-		{"just created", time.Second, time.Minute},
-		{"pending 4 hours", 4 * time.Hour, time.Hour},
-		{"pending 5 days", 5 * 24 * time.Hour, 6 * time.Hour},
+		{"capture failure chose 6 hours", 6 * time.Hour, 6 * time.Hour},
+		{"transient gate chose nothing", 0, time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			jobID := "parent/delegation/" + strings.ReplaceAll(tc.name, " ", "-")
-			path := managedDelegationReclaimTestPath(t, home, "parent", strings.ReplaceAll(tc.name, " ", "-"))
+			slug := strings.ReplaceAll(tc.name, " ", "-")
+			jobID := "parent/delegation/" + slug
+			path := managedDelegationReclaimTestPath(t, home, "parent", slug)
 			seedCLIJob(t, store, db.Job{ID: jobID, Agent: "reader", Type: "review", State: string(workflow.JobSucceeded), Repo: "owner/repo",
 				Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: path})}, "seed")
-			obligation, err := store.EnsureCleanupObligation(ctx, jobID, path, time.Now().UTC().Add(-tc.pending))
+			created := time.Now().UTC().Add(-5 * 24 * time.Hour)
+			obligation, err := store.EnsureCleanupObligation(ctx, jobID, path, created)
 			if err != nil {
 				t.Fatal(err)
 			}
+			if tc.chosen > 0 {
+				now := time.Now().UTC()
+				if _, err := store.DeferCleanupObligation(ctx, jobID, path, db.CleanupReasonTerminalDeferred, now, now.Add(tc.chosen)); err != nil {
+					t.Fatal(err)
+				}
+			}
 			before := time.Now().UTC()
-			if err := finishDelegationCleanupAttempt(ctx, worker, jobID, path, obligation.CreatedAt, false); err != nil {
+			if err := finishDelegationCleanupAttempt(ctx, worker, jobID, path, false); err != nil {
 				t.Fatal(err)
 			}
 			after, err := store.GetCleanupObligation(ctx, obligation.ResourceID)
@@ -1121,7 +1128,7 @@ func TestDeferredWorktreeReclaimBacksOffFromNow(t *testing.T) {
 				t.Fatal(err)
 			}
 			if got := next.Sub(before); got < tc.want-5*time.Second || got > tc.want+5*time.Second {
-				t.Fatalf("next attempt %s after the deferral, want about %s", got.Round(time.Second), tc.want)
+				t.Fatalf("next attempt %s after the reclaim pass, want about %s", got.Round(time.Second), tc.want)
 			}
 		})
 	}

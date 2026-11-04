@@ -289,3 +289,37 @@ func TestSlowWorktreeReclaimBacklogDoesNotHoldDispatch(t *testing.T) {
 		t.Fatalf("tick started %d engines (%d reclaim candidates of %d) over %s before dispatching; the reclaim budget must stop it", made, made-1, backlog, elapsed.Round(time.Millisecond))
 	}
 }
+
+// #2518 review (P2): the repo sweep order is fixed, so with one shared budget
+// the first repo whose cleanup candidates are slow took the whole budget on
+// every tick and later repos never reclaimed anything. The first repo the
+// budget turns away must go first on the next tick, and every repo must get a
+// turn within a few ticks while the first repo still has slow candidates.
+func TestReclaimBudgetRotatesAcrossReposWhenOneRepoIsSlow(t *testing.T) {
+	previous := reclaimTickBudget
+	reclaimTickBudget = 10 * time.Second
+	t.Cleanup(func() { reclaimTickBudget = previous })
+	tracker := &inflightJobTracker{}
+	repos := []string{"owner/a", "owner/b", "owner/c", "owner/d"}
+	// Every candidate takes 12s, longer than the whole budget; each repo
+	// always has more.
+	served := map[string][]int{}
+	clock := time.Unix(1_800_000_000, 0)
+	for tick := 1; tick <= 4; tick++ {
+		cand := &tickCandidates{}
+		cand.reclaimBudget.resume = tracker.reclaimResumeState()
+		for _, repo := range repos {
+			cand.reclaimPassStart(reclaimPassSkipped, repo)
+			for cand.reclaimMayStart(reclaimPassSkipped, repo, clock) {
+				served[repo] = append(served[repo], tick)
+				clock = clock.Add(12 * time.Second)
+			}
+		}
+		cand.finishReclaimTick()
+	}
+	for i, repo := range repos {
+		if got := served[repo]; len(got) != 1 || got[0] != i+1 {
+			t.Fatalf("repo %s served on ticks %v, want exactly tick %d (round robin); all: %v", repo, got, i+1, served)
+		}
+	}
+}

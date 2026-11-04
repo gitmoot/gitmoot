@@ -615,15 +615,18 @@ never cancels consumers or treats an operational failure as permission to
 delete.
 
 Reclaim runs inside the daemon's worker tick, before queued jobs are dispatched,
-so it is bounded (#2517): one tick spends at most about 10 seconds starting
-reclaim candidates across all repos, and the rest wait for a later tick. A
-worktree whose preservation evidence could not be captured yet (for example a
-`git status`/`git diff` that timed out on a slow network mount) is retried
-after a quarter of the time its cleanup has been pending, between one minute
-and six hours. The capture compares files by size and modification time
-(`core.checkStat=minimal`, `core.trustCtime=false`), because network mounts
-such as sshfs report unstable inode numbers and change times that otherwise
-make git re-read every file.
+so it is bounded (#2517): each kind of reclaim pass spends at most about 10
+seconds per tick starting candidates across all repos, and the rest wait for a
+later tick. The first repo turned away goes first on the next tick, so one repo
+with slow cleanup cannot starve the others. A worktree whose preservation
+evidence could not be captured (for example a `git status`/`git diff` that
+timed out on a slow network mount) is retried after a quarter of the time its
+cleanup has been pending, between one minute and six hours; any other reason to
+keep a worktree is rechecked after a minute. Before running git, the capture
+compares every tracked file's content with the index in parallel, and git then
+runs with `core.checkStat=minimal`: on network mounts such as sshfs, inode
+numbers are unstable, which otherwise makes git re-read every file one at a
+time. A file that does not match is compared by git as usual.
 
 No new fix clone is created — #2203 removed the
 auto-fix leg that allocated one — and no gitmoot path deletes one that already
