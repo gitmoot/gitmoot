@@ -49,8 +49,9 @@ func isCleanupTrashPath(path string) bool {
 
 // moveWorktreeToTrash moves the worktree at path aside and returns the trash
 // path. A manager that cannot move worktrees removes it in place, as before.
-// If the move fails the worktree is removed in place too: slower, but never a
-// copy and never left half cleaned.
+// A failed move fails the attempt (the worktree stays where it was, since git
+// renames atomically) and the reclaim pass retries it under its failure
+// budget; it never falls back to the slow in-place removal under the fence.
 func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string) (string, error) {
 	manager := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	mover, ok := e.DelegationWorktrees.(WorktreeMover)
@@ -65,10 +66,12 @@ func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string) (st
 		return "", fmt.Errorf("record cleanup trash: %w", err)
 	}
 	if err := mover.MoveWorktree(ctx, path, trash); err != nil {
-		if removeErr := manager.RemoveWorktreeForce(ctx, path); removeErr != nil {
-			return "", fmt.Errorf("remove producer worktree: move aside failed (%v), remove in place failed: %w", err, removeErr)
+		if _, statErr := os.Lstat(trash); errors.Is(statErr, os.ErrNotExist) {
+			// Nothing was created; close the pending record now. Otherwise the
+			// sweep finds and deletes whatever is there.
+			err = errors.Join(err, e.recordCleanupTrashRemoved(ctx, jobID, trash))
 		}
-		return "", e.recordCleanupTrashRemoved(ctx, jobID, trash)
+		return "", fmt.Errorf("move producer worktree aside: %w", err)
 	}
 	return trash, nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -76,6 +77,7 @@ func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker job
 			writeLine(stdout, "worktree reclaim loop pass panicked: %v\n%s", r, debug.Stack())
 		}
 	}()
+	sweepCleanupTrash(ctx, store, worker, tracker, stdout)
 	names, err := repos(ctx)
 	if err != nil {
 		writeLine(stdout, "worktree reclaim loop: list repos: %v", err)
@@ -117,5 +119,46 @@ func enabledRepoNames(store *db.Store) func(context.Context) ([]string, error) {
 			}
 		}
 		return names, nil
+	}
+}
+
+// cleanupTrashSweepLimit bounds how many leftover trash directories one loop
+// pass deletes; each can take tens of seconds on the worktree mount.
+const cleanupTrashSweepLimit = 2
+
+// sweepCleanupTrash deletes trash directories whose deletion did not finish
+// right after their cleanup (#2524): a crash between the move and the
+// deletion, or a failed deletion. The worktree's own reclaim already
+// completed; this only frees the space. Like an attempt, it reserves the
+// repo's registered checkout, whose worktree metadata the deletion rewrites.
+func sweepCleanupTrash(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer) {
+	pending, err := store.PendingCleanupTrashes(ctx, cleanupTrashSweepLimit)
+	if err != nil {
+		writeLine(stdout, "worktree reclaim loop: list cleanup trash: %v", err)
+		return
+	}
+	for _, item := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		job, err := store.GetJob(ctx, item.JobID)
+		if err != nil {
+			writeLine(stdout, "cleanup trash %s: load job %s: %v", item.Path, item.JobID, err)
+			continue
+		}
+		checkout := worker.delegationParentCheckout(ctx, job)
+		payload, _ := daemonJobPayload(job)
+		release, ok := tracker.tryReserveCheckouts("repo:"+strings.TrimSpace(payload.Repo), registeredCheckoutWorktreeKey(checkout))
+		if !ok {
+			continue
+		}
+		runner, err := worker.subprocessRunnerForJob(job)
+		if err == nil {
+			err = worker.workflowForJob(checkout, runner).DisposeCleanupTrash(ctx, job.ID, item.Path)
+		}
+		release()
+		if err != nil {
+			writeLine(stdout, "cleanup trash %s: %v", item.Path, err)
+		}
 	}
 }

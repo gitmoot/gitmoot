@@ -217,14 +217,28 @@ type pausedCleanupGit struct {
 	release chan struct{}
 }
 
-func (client pausedCleanupGit) RemoveWorktreeForce(ctx context.Context, path string) error {
+// The pause is where cleanup holds the lifecycle fence: since #2524 that is
+// the move aside (a detached worktree) or the in-place removal (a worktree
+// with a branch); deleting a trash directory later runs outside the fence.
+func (client pausedCleanupGit) pause(ctx context.Context, op func() error) error {
 	close(client.entered)
 	select {
 	case <-client.release:
-		return client.Client.RemoveWorktreeForce(ctx, path)
+		return op()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (client pausedCleanupGit) RemoveWorktreeForce(ctx context.Context, path string) error {
+	if strings.Contains(filepath.Base(path), ".gitmoot-cleanup-trash-") {
+		return client.Client.RemoveWorktreeForce(ctx, path)
+	}
+	return client.pause(ctx, func() error { return client.Client.RemoveWorktreeForce(ctx, path) })
+}
+
+func (client pausedCleanupGit) MoveWorktree(ctx context.Context, from, to string) error {
+	return client.pause(ctx, func() error { return client.Client.MoveWorktree(ctx, from, to) })
 }
 
 type cleanupRetryObservation struct {
@@ -394,6 +408,17 @@ type interruptedCleanupGit struct {
 func (client interruptedCleanupGit) RemoveWorktreeForce(ctx context.Context, path string) error {
 	if client.removeFirst {
 		if err := client.Client.RemoveWorktreeForce(ctx, path); err != nil {
+			return err
+		}
+	}
+	return errors.New("injected interruption at worktree removal")
+}
+
+// MoveWorktree is interrupted the same way (#2524): removeFirst moves the
+// worktree aside before the interruption, so its path is gone.
+func (client interruptedCleanupGit) MoveWorktree(ctx context.Context, from, to string) error {
+	if client.removeFirst {
+		if err := client.Client.MoveWorktree(ctx, from, to); err != nil {
 			return err
 		}
 	}

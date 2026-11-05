@@ -620,9 +620,13 @@ on a network mount no longer delays any queued job (#2517). While an attempt
 removes a worktree it reserves that worktree's checkout and the repo's registered
 checkout: no job starts on either until the attempt ends, and an attempt waits
 while a job holds either. The terminal task worktree pass still runs in the
-worker tick. The removal itself still holds the store-wide cleanup lock,
-so job starts pause for its duration (about 15 s for a large worktree on sshfs;
-#2524).
+worker tick. Under the store-wide cleanup lock a detached worktree is only
+moved aside (`git worktree move` into a sibling `.gitmoot-cleanup-trash-*`
+directory, about half a second), and its files are deleted afterwards without
+that lock, so job starts no longer pause for a slow deletion (#2524). A trash
+directory whose deletion did not finish (a crash, a failed deletion) is recorded
+as pending and deleted by the background loop later. A worktree with its own
+branch is still removed in place.
 
 Each kind of reclaim pass is bounded (#2517): it spends at most about 10
 seconds per pass starting candidates across all repos, and the rest wait for a

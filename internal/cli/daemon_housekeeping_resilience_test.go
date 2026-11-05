@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -718,5 +719,47 @@ func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
 	}
 	if aliasStarted.Load() {
 		t.Fatalf("a job keyed %s started during the reclaim attempt", alias)
+	}
+}
+
+// #2524: a trash directory whose deletion did not finish after its cleanup (a
+// crash, a failed deletion) is deleted by the background loop's sweep, which
+// reserves the repo's registered checkout while it does.
+func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "sweep-leftover-trash")
+	seat := managedDelegationReclaimTestPath(t, h.home, "parent", "trash")
+	trash := filepath.Join(filepath.Dir(seat), ".gitmoot-cleanup-trash-0123456789ab-1")
+	if err := os.MkdirAll(filepath.Dir(trash), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, h.checkout, "init", "-q")
+	runGit(t, h.checkout, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+	runGit(t, h.checkout, "worktree", "add", "--detach", trash, "HEAD")
+	seedCLIJob(t, h.store, db.Job{
+		ID: "parent/delegation/trash", Agent: "reader", Type: "review", State: string(workflow.JobSucceeded),
+		Repo: "owner/repo", Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", WorktreePath: seat, ReadOnlyWorktree: true}),
+	}, "seed trash owner")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: "parent/delegation/trash", Kind: workflow.CleanupTrashPendingEvent, Message: trash}); err != nil {
+		t.Fatal(err)
+	}
+	// While a job holds the registered checkout, the sweep leaves the trash.
+	if admitted, _ := h.tracker.beginWithinLane(0, false, "holder", "owner/repo", "repo:owner/repo", ""); !admitted {
+		t.Fatal("could not start the holder job")
+	}
+	none := func(context.Context) ([]string, error) { return nil, nil }
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	if _, err := os.Lstat(trash); err != nil {
+		t.Fatalf("the sweep deleted trash while a job held the registered checkout: %v", err)
+	}
+	h.tracker.end("holder")
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	if _, err := os.Lstat(trash); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the sweep left the trash: %v; log=%q", err, h.stdout.String())
+	}
+	if pending, err := h.store.PendingCleanupTrashes(h.ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("pending trash after sweep = %+v (%v)", pending, err)
+	}
+	if out := runGitOutput(t, h.checkout, "worktree", "list"); strings.Contains(out, "gitmoot-cleanup-trash") {
+		t.Fatalf("git still lists the trash worktree:\n%s", out)
 	}
 }
