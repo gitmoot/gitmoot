@@ -1291,6 +1291,12 @@ func (c *tickCandidates) reserveCheckouts(keys ...string) (func(), bool) {
 //
 // The new deadline is taken from the real clock, not the sweep's start.
 func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker, kind, jobID, path string, reason db.CleanupObligationReason) error {
+	return c.deferReclaimSkipUntil(ctx, worker, kind, jobID, path, reason, time.Time{})
+}
+
+// deferReclaimSkipUntil is deferReclaimSkip to the deadline until; zero is
+// the usual short retry.
+func (c *tickCandidates) deferReclaimSkipUntil(ctx context.Context, worker jobWorker, kind, jobID, path string, reason db.CleanupObligationReason, until time.Time) error {
 	now := time.Now().UTC()
 	if current, err := worker.Store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path)); err == nil {
 		if next, err := time.Parse(time.RFC3339Nano, current.NextAttemptAt); err == nil && next.After(now) {
@@ -1308,7 +1314,52 @@ func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker,
 			return nil
 		}
 	}
-	return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
+	if until.IsZero() {
+		return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
+	}
+	deferDelegationCleanupSkipHook()
+	if delegationCleanupPathUnavailable(path) {
+		return nil
+	}
+	_, err := worker.Store.DeferCleanupObligation(context.WithoutCancel(ctx), jobID, path, reason, now, until)
+	return err
+}
+
+// leaveSkippedReclaimToAged handles, in the skipped pass, a candidate only
+// aged cleanup can remove (workflow.CleanupRemovableOnlyWhenAged). The
+// skipped pass used to attempt it: ordinary cleanup refused it and the pass
+// pushed the deadline the aged pass shares a minute out, on every loop pass,
+// without counting an attempt. The aged pass runs after it in the same loop
+// pass and selects only due rows, so it never found the row due and the
+// worktree was never reclaimed (#2531: the live herdrup and reframekit
+// reviews). Now the skipped pass does not attempt it: before the aged TTL
+// has passed it defers the row to the moment the aged pass can take it;
+// after, it leaves the row due for the aged pass, whose failures are counted
+// and back off. With the aged pass disabled nothing can remove it, so it
+// backs off like any stable refusal.
+func leaveSkippedReclaimToAged(ctx context.Context, worker jobWorker, cand *tickCandidates, job db.Job, path string) error {
+	now := time.Now().UTC()
+	var obligation *db.CleanupObligation
+	if current, err := worker.Store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(job.ID, path)); err == nil {
+		obligation = &current
+	}
+	ttl, err := cand.config.delegationWorktreeTTL(filepath.Dir(worker.Store.DatabasePath()))
+	if err != nil || ttl <= 0 {
+		created := ""
+		if obligation != nil {
+			created = obligation.CreatedAt
+		}
+		return cand.deferReclaimSkipUntil(ctx, worker, reclaimPassSkipped, job.ID, path, db.CleanupReasonTerminalDeferred,
+			now.Add(workflow.PreservationDeferredRetryDelay(created, now)))
+	}
+	terminal, known := workflow.CleanupTerminalTime(job, obligation)
+	if !known {
+		return nil
+	}
+	if eligible := terminal.Add(ttl); eligible.After(now) {
+		return cand.deferReclaimSkipUntil(ctx, worker, reclaimPassSkipped, job.ID, path, db.CleanupReasonTerminalDeferred, eligible)
+	}
+	return nil
 }
 
 // finishReclaimTick moves each kind that ran this tick to its next resume
@@ -1696,6 +1747,12 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		if checkoutHeld != nil && (checkoutHeld(queuedJobCheckoutKey(ctx, worker.Store, job)) ||
 			(repoFilter != "" && checkoutHeld("repo:"+repoFilter))) {
 			if err := cand.deferReclaimSkip(ctx, worker, reclaimPassSkipped, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {
+				return stopDelegationCleanupPass(err)
+			}
+			continue
+		}
+		if payload, err := daemonJobPayload(job); err == nil && workflow.CleanupRemovableOnlyWhenAged(job, payload) {
+			if err := leaveSkippedReclaimToAged(ctx, worker, cand, job, path); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
 			continue

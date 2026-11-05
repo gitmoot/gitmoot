@@ -156,6 +156,30 @@ func cleanupRetryDispositionUnknown(job db.Job, payload JobPayload, readOnly boo
 	return job.State != string(JobSucceeded) && (!cleanupRebuildable(job, payload, readOnly) || mode != "aged")
 }
 
+// CleanupRemovableOnlyWhenAged reports whether only aged cleanup can remove
+// the worktree of job: a rebuildable review that did not succeed. Ordinary
+// cleanup refuses it as retry_disposition_unknown on every attempt.
+func CleanupRemovableOnlyWhenAged(job db.Job, payload JobPayload) bool {
+	readOnly := isReadOnlyDelegationWorktree(job.Type, payload)
+	return IsFinalJobState(job.State) && readOnly &&
+		cleanupRetryDispositionUnknown(job, payload, readOnly, "ordinary") &&
+		!cleanupRetryDispositionUnknown(job, payload, readOnly, "aged")
+}
+
+// CleanupTerminalTime is the terminal time aged cleanup measures a
+// worktree's age from, as the aged candidate query does: the obligation's
+// terminal clock for the job's current generation, else the job's last
+// update. obligation may be nil.
+func CleanupTerminalTime(job db.Job, obligation *db.CleanupObligation) (time.Time, bool) {
+	if obligation != nil && obligation.LifecycleGeneration == job.LifecycleGeneration {
+		return parseStoredJobTime(obligation.TerminalAt)
+	}
+	if at, ok := parseStoredJobTime(job.UpdatedAt); ok {
+		return at, true
+	}
+	return parseStoredJobTime(job.CreatedAt)
+}
+
 func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy, collected *cleanupEvidence) (CleanupInspection, JobPayload, error) {
 	d := CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
 		OwnerJobID: jobID, ResourceKind: "delegation_worktree", ObservedAt: e.now().UTC().Format(time.RFC3339Nano),

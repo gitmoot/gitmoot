@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -284,5 +285,145 @@ func TestJobCleanupInspectWorksForUnregisteredRepo(t *testing.T) {
 	// The absent one has no owner to inspect it through.
 	if decision := inspect(absent); !slices.Contains(decision.ReasonCodes, "checkout_identity_unknown") {
 		t.Fatalf("absent worktree decision = %+v", decision)
+	}
+}
+
+// preservedUnregisteredReviewFixture is a cancelled pinned PR review of an
+// unregistered repo whose worktree still exists under a registered checkout,
+// and whose terminal cleanup was preserved for the daemon reclaim
+// (delegation_worktree_cleanup_skipped), like the live herdrup and
+// reframekit rows (#2531). Beside it sits another worktree of the same
+// checkout with the same base name, so git named their administrative
+// directories readonly-seat and readonly-seat1.
+type preservedUnregisteredReviewFixture struct {
+	store              *db.Store
+	worker             jobWorker
+	tracker            *inflightJobTracker
+	checkout, id, path string
+	neighbour          string
+	live               bool
+	engines            atomic.Int32
+}
+
+func newPreservedUnregisteredReviewFixture(t *testing.T) *preservedUnregisteredReviewFixture {
+	t.Helper()
+	ctx := context.Background()
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	t.Cleanup(func() { store.Close() })
+	checkout := createDaemonWorkerGitCheckout(t, "main")
+	seedDaemonWorkerRepo(t, store, "renamed/repo", checkout)
+	head := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "HEAD"))
+	f := &preservedUnregisteredReviewFixture{store: store, checkout: checkout, id: "local-review-preserved-1"}
+	f.path = unregisteredCleanupSeat(t, home, f.id)
+	f.neighbour = unregisteredCleanupSeat(t, home, "local-review-neighbour-1")
+	for _, path := range []string{f.neighbour, f.path} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, checkout, "worktree", "add", "--detach", path, "HEAD")
+	}
+	if pointer, err := os.ReadFile(filepath.Join(f.path, ".git")); err != nil || !strings.Contains(string(pointer), "readonly-seat1") {
+		t.Fatalf("fixture worktree .git = %q %v, want the second readonly-seat admin dir", pointer, err)
+	}
+	seedUnregisteredCleanupOwner(t, store, f.id, db.Job{
+		Agent: "reviewer", Type: "review", State: string(workflow.JobCancelled),
+	}, workflow.JobPayload{
+		WorktreePath: f.path, ReadOnlyWorktree: true, ReadOnlySeat: true, PullRequest: 7, HeadSHA: head,
+	})
+	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: f.id, Kind: "delegation_worktree_cleanup_skipped",
+		Message: "read-only worktree cleanup skipped: retry_disposition_unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := filepath.EvalSymlinks(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.worker = defaultJobWorker(store, io.Discard, home)
+	f.tracker = newInflightJobTracker(ctx)
+	f.worker.WorkflowFactory = func(engineCheckout string) workflow.Engine {
+		f.engines.Add(1)
+		engine := f.worker.defaultWorkflow(engineCheckout)
+		// The fixture owns every user of its worktree (see above).
+		engine.WorktreeLiveness = func(candidate string) (bool, bool) {
+			if filepath.Clean(candidate) == owned || filepath.Clean(candidate) == filepath.Clean(f.path) {
+				return f.live, true
+			}
+			return workflow.WorktreeLiveness(candidate)
+		}
+		return engine
+	}
+	return f
+}
+
+// The skipped pass cannot remove a rebuildable review that did not succeed
+// (ordinary cleanup refuses retry_disposition_unknown); only the aged pass
+// can. It used to refuse it on every loop pass and push the shared deadline
+// a minute out, so the aged pass, which runs after it, never found the row
+// due: preserved worktrees of these reviews were never reclaimed.
+func TestReclaimLoopRemovesPreservedWorktreeOfUnregisteredRepo(t *testing.T) {
+	ctx := context.Background()
+	f := newPreservedUnregisteredReviewFixture(t)
+	var stdout bytes.Buffer
+	runWorktreeReclaimLoopPass(ctx, f.store, f.worker, f.tracker, "", fleetReclaimRepos, &stdout, time.Now().UTC(), time.Time{})
+	if _, err := os.Lstat(f.path); !errors.Is(err, os.ErrNotExist) {
+		obligation, _ := f.store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(f.id, f.path))
+		t.Fatalf("the preserved worktree was not removed: %v; obligation=%+v log=%q", err, obligation, stdout.String())
+	}
+	requireCleanupObligationRemoved(t, f.store, f.id, f.path, "delegation_worktree_reclaimed_ttl")
+	list := runGitOutput(t, f.checkout, "worktree", "list", "--porcelain")
+	if strings.Contains(list, f.path) || !strings.Contains(list, f.neighbour) {
+		t.Fatalf("worktrees after the reclaim, want only the neighbour kept:\n%s", list)
+	}
+	if _, err := os.Stat(filepath.Join(f.neighbour, ".git")); err != nil {
+		t.Fatalf("the neighbour worktree sharing the base name was touched: %v", err)
+	}
+}
+
+// A preserved row the cleanup keeps refusing is not retried every minute
+// forever without an attempt being counted. Between aged passes the skipped
+// pass leaves it alone (it used to refuse it on every loop pass, uncounted);
+// each aged attempt that fails is counted, and the budget quarantines it.
+func TestReclaimLoopDoesNotRetryRefusedPreservedWorktreeUncounted(t *testing.T) {
+	ctx := context.Background()
+	f := newPreservedUnregisteredReviewFixture(t)
+	f.live = true
+	resource := db.CleanupObligationResourceID(f.id, f.path)
+	makeDue := func() db.CleanupObligation {
+		t.Helper()
+		obligation, err := f.store.GetCleanupObligation(ctx, resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if obligation.State == db.CleanupObligationRetryable {
+			past := time.Now().Add(-time.Minute)
+			if _, err := f.store.DeferCleanupObligation(ctx, f.id, f.path, obligation.Reason, past, past); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return obligation
+	}
+	var stdout bytes.Buffer
+	// Loop passes between aged passes (the aged pass ran just now).
+	for range 3 {
+		makeDue()
+		runWorktreeReclaimLoopPass(ctx, f.store, f.worker, f.tracker, "", fleetReclaimRepos, &stdout, time.Now().UTC(), time.Now().UTC())
+	}
+	if n := f.engines.Load(); n != 0 {
+		t.Fatalf("loop passes without the aged pass made %d uncounted attempts; obligation=%+v", n, makeDue())
+	}
+	// Aged passes: every failed attempt counts, up to quarantine.
+	for pass := range delegationCleanupRetryBudget {
+		runWorktreeReclaimLoopPass(ctx, f.store, f.worker, f.tracker, "", fleetReclaimRepos, &stdout, time.Now().UTC(), time.Time{})
+		if obligation := makeDue(); obligation.AttemptCount != pass+1 {
+			t.Fatalf("aged pass %d: obligation = %+v, want %d counted attempts", pass, obligation, pass+1)
+		}
+	}
+	obligation, err := f.store.GetCleanupObligation(ctx, resource)
+	if err != nil || obligation.State != db.CleanupObligationQuarantined {
+		t.Fatalf("obligation = %+v %v, want quarantined once the retry budget is spent", obligation, err)
+	}
+	if _, err := os.Stat(f.path); err != nil {
+		t.Fatalf("a worktree in use was removed: %v", err)
 	}
 }
