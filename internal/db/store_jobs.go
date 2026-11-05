@@ -3072,3 +3072,52 @@ func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, erro
 	}
 	return refs, rows.Err()
 }
+
+// PendingCleanupTrash is a cleanup trash directory recorded as created and not
+// yet recorded as deleted (#2524). ExpectedPath and Generation name the cleanup
+// episode that moved the worktree there. GitDir is that worktree's own git
+// administrative directory, read just before the move (a move keeps it), and
+// Nonce is a random value written into that directory just before the move:
+// git deletes the directory with the worktree, so a later worktree reusing the
+// same administrative path cannot carry it. Disposal deletes a directory only
+// if it is still that worktree.
+type PendingCleanupTrash struct {
+	JobID        string `json:"-"`
+	Path         string `json:"trash"`
+	ExpectedPath string `json:"expected"`
+	Generation   int64  `json:"generation"`
+	GitDir       string `json:"gitdir"`
+	Nonce        string `json:"nonce"`
+}
+
+// PendingCleanupTrashes returns up to limit pending cleanup trash directories,
+// oldest first, skipping any whose disposal was retried since retrySince.
+func (s *Store) PendingCleanupTrashes(ctx context.Context, limit int, retrySince time.Time) ([]PendingCleanupTrash, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT p.job_id, p.message FROM job_events p
+		WHERE p.kind = 'delegation_worktree_trash_pending' AND json_valid(p.message)
+		  AND NOT EXISTS (SELECT 1 FROM job_events r
+			WHERE r.kind = 'delegation_worktree_trash_removed' AND r.job_id = p.job_id
+			  AND r.message = json_extract(p.message, '$.trash'))
+		  AND NOT EXISTS (SELECT 1 FROM job_events r
+			WHERE r.kind = 'delegation_worktree_trash_retry' AND r.job_id = p.job_id
+			  AND r.message = json_extract(p.message, '$.trash') AND r.created_at >= ?)
+		ORDER BY p.id LIMIT ?`, retrySince.UTC().Format("2006-01-02 15:04:05"), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingCleanupTrash
+	for rows.Next() {
+		var jobID, message string
+		if err := rows.Scan(&jobID, &message); err != nil {
+			return nil, err
+		}
+		var item PendingCleanupTrash
+		if err := json.Unmarshal([]byte(message), &item); err != nil {
+			continue
+		}
+		item.JobID = jobID
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}

@@ -34,6 +34,9 @@ func NewHostClient(dir string) Client {
 // Dir returns the checkout directory bound to this client.
 func (c Client) Dir() string { return c.dir }
 
+// At returns a client bound to dir with the same runner.
+func (c Client) At(dir string) Client { c.dir = dir; return c }
+
 const maxGitErrorStderrRunes = 4096
 
 type terminalWorktreeRemovalError struct {
@@ -335,6 +338,22 @@ func terminalWorktreeRegistrationFailure(stderr string) bool {
 		strings.Contains(lower, "cannot change to")
 }
 
+// MoveWorktree moves a registered worktree to another path (git worktree move),
+// updating its administrative entry. git renames the directory and refuses a
+// destination on another file system, so it never copies.
+func (c Client) MoveWorktree(ctx context.Context, from, to string) error {
+	from, err := validateWorktreePath(from)
+	if err != nil {
+		return err
+	}
+	to, err = validateWorktreePath(to)
+	if err != nil {
+		return err
+	}
+	_, err = c.run(ctx, "worktree", "move", from, to)
+	return err
+}
+
 // PruneWorktrees removes stale administrative entries left by interrupted or
 // forcibly removed worktrees. It runs against the primary checkout's shared git
 // directory and is idempotent.
@@ -512,6 +531,22 @@ func (c Client) CommonDir(ctx context.Context) (string, error) {
 		}
 	}
 	return c.absoluteGitPath(result.Stdout)
+}
+
+// WorktreeRegistered reports whether path is a worktree registered in this
+// repository (git worktree list --porcelain), compared after cleaning.
+func (c Client) WorktreeRegistered(ctx context.Context, path string) (bool, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	result, err := c.run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if strings.HasPrefix(line, "worktree ") && filepath.Clean(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))) == path {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // PrimaryWorktree returns the first non-bare record from git's porcelain

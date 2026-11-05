@@ -48,7 +48,11 @@ var execBackendLocalEventKindBaseline = []string{
 	"running",
 	"succeeded",
 	"advance_started",
+	// #2524: the seat is moved aside under the cleanup fence and its files
+	// deleted after it.
+	"delegation_worktree_trash_pending",
 	"delegation_worktree_removed",
+	"delegation_worktree_trash_removed",
 	"advance_completed",
 }
 

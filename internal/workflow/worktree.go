@@ -85,6 +85,13 @@ type ReadOnlyWorktreeManager interface {
 	RemoveWorktreeForce(ctx context.Context, path string) error
 }
 
+// WorktreeMover moves a registered worktree (#2524): cleanup moves a worktree
+// aside under the store-wide cleanup fence, which is a rename, and deletes its
+// files after the fence is released.
+type WorktreeMover interface {
+	MoveWorktree(ctx context.Context, from, to string) error
+}
+
 // WorktreePruner removes stale worktree administrative entries after a forced
 // TTL reclaim. The checkout-bound git client satisfies it; tests may omit it
 // because pruning is cleanup of shared git metadata, not the safety gate.

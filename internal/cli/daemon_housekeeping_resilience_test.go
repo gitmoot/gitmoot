@@ -3,15 +3,20 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -719,4 +724,111 @@ func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
 	if aliasStarted.Load() {
 		t.Fatalf("a job keyed %s started during the reclaim attempt", alias)
 	}
+}
+
+// #2524: a trash directory whose deletion did not finish after its cleanup (a
+// crash, a failed deletion) is deleted by the background loop's sweep, which
+// reserves the repo's registered checkout while it does. #2526 review: the
+// reservation is released even when an entry cannot be handled, and entries
+// that cannot be handled do not hold back the others.
+func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "sweep-leftover-trash")
+	runGit(t, h.checkout, "init", "-q")
+	runGit(t, h.checkout, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+	busyCheckout := t.TempDir()
+	runGit(t, busyCheckout, "init", "-q")
+	runGit(t, busyCheckout, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+	seedDaemonWorkerRepo(t, h.store, "owner/busy", busyCheckout)
+	seed := func(name, repo string) db.PendingCleanupTrash {
+		id := "trash-owner-" + name
+		seat, err := workflow.DelegationWorktreePath(filepath.Join(h.home, config.DirName), repo, id, "readonly-seat", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(filepath.Clean(seat)))
+		trash := filepath.Join(filepath.Dir(seat), ".gitmoot-cleanup-trash-"+hex.EncodeToString(sum[:6])+"-1")
+		if err := os.MkdirAll(filepath.Dir(trash), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		owner := h.checkout
+		if repo == "owner/busy" {
+			owner = busyCheckout
+		}
+		runGit(t, owner, "worktree", "add", "--detach", trash, "HEAD")
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "ask", State: string(workflow.JobSucceeded), Repo: repo,
+			Payload: mustJobPayload(t, workflow.JobPayload{Repo: repo, WorktreePath: seat, ReadOnlyWorktree: true}),
+		}, "seed trash owner")
+		resource := db.CleanupObligationResourceID(id, seat)
+		if _, err := h.store.EnsureCleanupObligation(h.ctx, id, seat, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		fenced, releaseFence, err := h.store.AcquireCleanupLifecycle(h.ctx)
+		var receipt db.CleanupReceipt
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer releaseFence()
+		receipt, err = h.store.PrepareCleanupReceipt(fenced, db.CleanupReceipt{ResourceID: resource, OwnerJobID: id, ExpectedPath: seat, TerminalState: "succeeded", Evidence: "{}", EligibilityToken: "t-" + name}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.store.CompleteCleanupReceipt(fenced, resource, 0, receipt.ReceiptID, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		releaseFence()
+		pointer, err := os.ReadFile(filepath.Join(trash, ".git"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitDir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(pointer)), "gitdir:"))
+		nonce := fmt.Sprintf("%032x", len(name)*7919+int(name[len(name)-1]))
+		if err := os.WriteFile(filepath.Join(gitDir, "gitmoot-cleanup-trash-nonce"), []byte(nonce), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		record := db.PendingCleanupTrash{JobID: id, Path: trash, ExpectedPath: seat, Generation: 0, GitDir: gitDir, Nonce: nonce}
+		message, _ := json.Marshal(record)
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: workflow.CleanupTrashPendingEvent, Message: string(message)}); err != nil {
+			t.Fatal(err)
+		}
+		return record
+	}
+	// Entries the sweep cannot handle come first, more than one window of
+	// them: two whose repo is not registered (no checkout to delete them
+	// through), and 32 whose repo's checkout a job holds for the whole test.
+	seed("orphan-a", "owner/gone")
+	seed("orphan-b", "owner/gone")
+	for i := 0; i < 32; i++ {
+		seed(fmt.Sprintf("busy-%02d", i), "owner/busy")
+	}
+	if admitted, _ := h.tracker.beginWithinLane(0, false, "busy-holder", "owner/busy", "repo:owner/busy", ""); !admitted {
+		t.Fatal("could not start the busy holder job")
+	}
+	defer h.tracker.end("busy-holder")
+	ours := seed("trash", "owner/repo")
+	none := func(context.Context) ([]string, error) { return nil, nil }
+	// While a job holds the registered checkout, the sweep leaves our trash.
+	if admitted, _ := h.tracker.beginWithinLane(0, false, "holder", "owner/repo", "repo:owner/repo", ""); !admitted {
+		t.Fatal("could not start the holder job")
+	}
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	if _, err := os.Lstat(ours.Path); err != nil {
+		t.Fatalf("the sweep deleted trash while a job held the registered checkout: %v", err)
+	}
+	h.tracker.end("holder")
+	// Busy and unhandled entries are skipped for a while once seen, so within
+	// a few passes the sweep reaches ours behind them.
+	for pass := 0; pass < 3; pass++ {
+		runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	}
+	if _, err := os.Lstat(ours.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the sweep never reached the trash behind a window of entries it cannot handle: %v", err)
+	}
+	if out := runGitOutput(t, h.checkout, "worktree", "list"); strings.Contains(out, filepath.Base(ours.Path)) {
+		t.Fatalf("git still lists the trash worktree:\n%s", out)
+	}
+	if admitted, _ := h.tracker.beginWithinLane(0, false, "after", "owner/repo", "repo:owner/repo", ""); !admitted {
+		t.Fatal("a sweep reservation was left behind")
+	}
+	h.tracker.end("after")
 }

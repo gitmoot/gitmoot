@@ -3,8 +3,10 @@ package cli
 import (
 	"context"
 	"fmt"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -76,6 +78,7 @@ func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker job
 			writeLine(stdout, "worktree reclaim loop pass panicked: %v\n%s", r, debug.Stack())
 		}
 	}()
+	sweepCleanupTrash(ctx, store, worker, tracker, stdout)
 	names, err := repos(ctx)
 	if err != nil {
 		writeLine(stdout, "worktree reclaim loop: list repos: %v", err)
@@ -118,4 +121,75 @@ func enabledRepoNames(store *db.Store) func(context.Context) ([]string, error) {
 		}
 		return names, nil
 	}
+}
+
+// cleanupTrashSweepLimit bounds how many leftover trash directories one loop
+// pass tries to delete (each can take tens of seconds on the worktree mount);
+// cleanupTrashSweepWindow bounds how many pending records it looks at, so busy
+// or failing entries cannot hold back the rest (#2526 review). An entry whose
+// disposal could not finish is skipped for cleanupTrashRetryAfter.
+const (
+	cleanupTrashSweepLimit  = 2
+	cleanupTrashSweepWindow = 32
+	cleanupTrashRetryAfter  = 10 * time.Minute
+)
+
+// sweepCleanupTrash deletes trash directories whose deletion did not finish
+// right after their cleanup (#2524): a crash between the move and the
+// deletion, or a failed deletion. The worktree's own reclaim already
+// completed; this only frees the space. Like an attempt, it reserves the
+// repo's registered checkout, whose worktree metadata the deletion rewrites.
+func sweepCleanupTrash(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer) {
+	pending, err := store.PendingCleanupTrashes(ctx, cleanupTrashSweepWindow, time.Now().Add(-cleanupTrashRetryAfter))
+	if err != nil {
+		writeLine(stdout, "worktree reclaim loop: list cleanup trash: %v", err)
+		return
+	}
+	attempts := 0
+	for _, item := range pending {
+		if ctx.Err() != nil || attempts >= cleanupTrashSweepLimit {
+			return
+		}
+		if disposeCleanupTrashOnce(ctx, store, worker, tracker, stdout, item) {
+			attempts++
+		}
+	}
+}
+
+// disposeCleanupTrashOnce makes one disposal attempt; it reports whether it
+// reached the deletion step. The reservation is released however the attempt
+// ends, a panic included.
+func disposeCleanupTrashOnce(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, stdout io.Writer, item db.PendingCleanupTrash) (attempted bool) {
+	job, err := store.GetJob(ctx, item.JobID)
+	if err != nil {
+		writeLine(stdout, "cleanup trash %s: load job %s: %v", item.Path, item.JobID, err)
+		return false
+	}
+	checkout := worker.delegationParentCheckout(ctx, job)
+	payload, _ := daemonJobPayload(job)
+	retry := func() {
+		_ = store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: item.JobID, Kind: workflow.CleanupTrashRetryEvent, Message: item.Path})
+	}
+	if strings.TrimSpace(checkout) == "" {
+		writeLine(stdout, "cleanup trash %s: repo %s has no registered checkout", item.Path, payload.Repo)
+		retry()
+		return false
+	}
+	release, ok := tracker.tryReserveCheckouts("repo:"+strings.TrimSpace(payload.Repo), registeredCheckoutWorktreeKey(checkout))
+	if !ok {
+		// Busy now; skip it for a while so busy entries cannot fill the
+		// window on every pass (#2526 review).
+		retry()
+		return false
+	}
+	defer release()
+	runner, err := worker.subprocessRunnerForJob(job)
+	if err == nil {
+		err = worker.workflowForJob(checkout, runner).DisposeCleanupTrash(ctx, item)
+	}
+	if err != nil {
+		writeLine(stdout, "cleanup trash %s: %v", item.Path, err)
+		retry()
+	}
+	return true
 }

@@ -97,6 +97,11 @@ type selectiveReclaimManager struct {
 }
 
 func (m *selectiveReclaimManager) RemoveWorktreeForce(ctx context.Context, path string) error {
+	if strings.HasPrefix(filepath.Base(path), ".gitmoot-cleanup-trash-") {
+		// The files of a worktree already moved aside (#2524); the move is
+		// where removal is observed and failures are injected.
+		return m.Client.RemoveWorktreeForce(ctx, path)
+	}
 	m.calls++
 	if filepath.Clean(path) == filepath.Clean(m.failPath) {
 		return m.err
@@ -105,6 +110,20 @@ func (m *selectiveReclaimManager) RemoveWorktreeForce(ctx context.Context, path 
 		return err
 	}
 	m.removed = append(m.removed, path)
+	return nil
+}
+
+// MoveWorktree is how cleanup removes a detached worktree from its path under
+// the fence since #2524: record and fail it exactly like a removal.
+func (m *selectiveReclaimManager) MoveWorktree(ctx context.Context, from, to string) error {
+	m.calls++
+	if filepath.Clean(from) == filepath.Clean(m.failPath) {
+		return m.err
+	}
+	if err := m.Client.MoveWorktree(ctx, from, to); err != nil {
+		return err
+	}
+	m.removed = append(m.removed, from)
 	return nil
 }
 

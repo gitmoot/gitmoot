@@ -314,6 +314,16 @@ func (m *failingReadOnlyCleanupManager) RemoveWorktreeForce(ctx context.Context,
 	return m.Client.RemoveWorktreeForce(ctx, path)
 }
 
+// MoveWorktree fails like removal does: since #2524 cleanup moves the worktree
+// aside under the fence, and falls back to removing it in place when the move
+// fails, so both must fail for the cleanup itself to fail.
+func (m *failingReadOnlyCleanupManager) MoveWorktree(ctx context.Context, from, to string) error {
+	if m.failure != nil {
+		return m.failure
+	}
+	return m.Client.MoveWorktree(ctx, from, to)
+}
+
 // TestRecordReadOnlyWorktreeReclaimOnAbort pins the #739-review leak fix: a
 // read-only ask aborted (cancel/kill/supersede) before it ever runs must mark its
 // dispatch-allocated worktree for daemon reclaim, but only when the worktree is
