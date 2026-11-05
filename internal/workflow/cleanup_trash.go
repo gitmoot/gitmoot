@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
 // Cleanup trash (#2524). Removing a delegation worktree used to run
@@ -64,6 +65,63 @@ type WorktreeRegistrar interface {
 	WorktreeRegistered(ctx context.Context, path string) (bool, error)
 }
 
+// TrashWorktreeClient is what disposal needs from git, bound to the owning
+// checkout.
+type TrashWorktreeClient interface {
+	WorktreeRegistrar
+	RemoveWorktreeForce(ctx context.Context, path string) error
+}
+
+// trashClientAt binds the engine's worktree manager to the owning checkout: a
+// manager may supply its own binding (TrashClientAt, used by test wrappers);
+// the git client rebinds with At.
+func trashClientAt(manager any, owner string) (TrashWorktreeClient, bool) {
+	if binder, ok := manager.(interface {
+		TrashClientAt(string) TrashWorktreeClient
+	}); ok {
+		return binder.TrashClientAt(owner), true
+	}
+	if binder, ok := manager.(interface{ At(string) gitutil.Client }); ok {
+		return binder.At(owner), true
+	}
+	return nil, false
+}
+
+// ownerCheckoutFromGitDir is the checkout owning a linked worktree whose
+// administrative directory is gitDir (<checkout>/.git/worktrees/<name>, or
+// <bare>/worktrees/<name>). Trash is locked and handled through this checkout
+// (#2526 review): the engine running a cleanup may be bound to the seat
+// itself, and the move and the later deletion must serialize on one key.
+func ownerCheckoutFromGitDir(gitDir string) (string, error) {
+	worktrees := filepath.Dir(filepath.Clean(gitDir))
+	if filepath.Base(worktrees) != "worktrees" {
+		return "", fmt.Errorf("worktree git dir %s is not under a worktrees directory", gitDir)
+	}
+	common := filepath.Dir(worktrees)
+	if filepath.Base(common) == ".git" {
+		return filepath.Dir(common), nil
+	}
+	return common, nil
+}
+
+// lockOwnerCheckout takes the checkout mutation lock of owner unless held
+// already is the same key (a held lock is not reentrant).
+func (e Engine) lockOwnerCheckout(ctx context.Context, owner, held, ownerID string) (func(context.Context) error, error) {
+	ownerKey, err := checkoutMutationLockKey(owner)
+	if err != nil {
+		return nil, err
+	}
+	heldKey, err := checkoutMutationLockKey(held)
+	if err != nil {
+		return nil, err
+	}
+	if ownerKey == heldKey {
+		return func(context.Context) error { return nil }, nil
+	}
+	release, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, owner, ownerID, time.Now().UTC())
+	return release, err
+}
+
 func cleanupTrashNamePrefix(expected string) string {
 	sum := sha256.Sum256([]byte(filepath.Clean(expected)))
 	return cleanupTrashPrefix + hex.EncodeToString(sum[:6]) + "-"
@@ -93,6 +151,15 @@ func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string, gen
 	if err != nil {
 		return db.PendingCleanupTrash{}, fmt.Errorf("identify producer worktree before moving it aside: %w", err)
 	}
+	owner, err := ownerCheckoutFromGitDir(gitDir)
+	if err != nil {
+		return db.PendingCleanupTrash{}, err
+	}
+	releaseOwner, err := e.lockOwnerCheckout(ctx, owner, e.DelegationCheckout, "producer-cleanup:"+jobID)
+	if err != nil {
+		return db.PendingCleanupTrash{}, err
+	}
+	defer func() { _ = releaseOwner(context.WithoutCancel(ctx)) }()
 	nonce, err := writeCleanupTrashNonce(gitDir)
 	if err != nil {
 		return db.PendingCleanupTrash{}, fmt.Errorf("mark producer worktree before moving it aside: %w", err)
@@ -213,9 +280,12 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 		!strings.HasPrefix(filepath.Base(trash), cleanupTrashNamePrefix(expected)) {
 		return fmt.Errorf("refusing to dispose %q: not the cleanup trash of %q", record.Path, record.ExpectedPath)
 	}
-	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
-	registrar, listOK := e.DelegationWorktrees.(WorktreeRegistrar)
-	if !ok || !listOK || strings.TrimSpace(e.DelegationCheckout) == "" {
+	owner, err := ownerCheckoutFromGitDir(record.GitDir)
+	if err != nil {
+		return fmt.Errorf("cleanup trash %s: %w", trash, err)
+	}
+	client, ok := trashClientAt(e.DelegationWorktrees, owner)
+	if !ok {
 		return fmt.Errorf("cleanup trash %s: no checkout worktree manager", trash)
 	}
 	job, payload, err := e.jobPayload(ctx, record.JobID)
@@ -229,7 +299,7 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 	}
 	// The move holds this lock too, so from here on no move to this name is in
 	// flight: what is at the path now is all there will be.
-	release, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, e.DelegationCheckout, "cleanup-trash:"+job.ID, time.Now().UTC())
+	release, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, owner, "cleanup-trash:"+job.ID, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -253,14 +323,14 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 	if nonce, err := readSmallRegularFile(filepath.Join(gitDir, cleanupTrashNonceFile), cleanupTrashSmallFileLimit); err != nil || string(nonce) != record.Nonce {
 		return fmt.Errorf("refusing to dispose %s: it is not the worktree moved there (nonce mismatch, %v)", trash, err)
 	}
-	registered, err := registrar.WorktreeRegistered(ctx, trash)
+	registered, err := client.WorktreeRegistered(ctx, trash)
 	if err != nil {
 		return err
 	}
 	if !registered {
-		return fmt.Errorf("refusing to dispose %s: not a registered worktree of %s", trash, e.DelegationCheckout)
+		return fmt.Errorf("refusing to dispose %s: not a registered worktree of %s", trash, owner)
 	}
-	if err := manager.RemoveWorktreeForce(ctx, trash); err != nil {
+	if err := client.RemoveWorktreeForce(ctx, trash); err != nil {
 		return fmt.Errorf("remove cleanup trash %s: %w", trash, err)
 	}
 	return e.recordCleanupTrashRemoved(ctx, job.ID, trash)

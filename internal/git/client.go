@@ -34,6 +34,9 @@ func NewHostClient(dir string) Client {
 // Dir returns the checkout directory bound to this client.
 func (c Client) Dir() string { return c.dir }
 
+// At returns a client bound to dir with the same runner.
+func (c Client) At(dir string) Client { c.dir = dir; return c }
+
 const maxGitErrorStderrRunes = 4096
 
 type terminalWorktreeRemovalError struct {

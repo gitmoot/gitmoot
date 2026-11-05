@@ -24,6 +24,13 @@ type slowTrashManager struct {
 	fail    error
 }
 
+// TrashClientAt keeps the wrapper when disposal binds to the owning checkout.
+func (m *slowTrashManager) TrashClientAt(dir string) TrashWorktreeClient {
+	bound := *m
+	bound.Client = m.Client.At(dir)
+	return &bound
+}
+
 func (m *slowTrashManager) RemoveWorktreeForce(ctx context.Context, path string) error {
 	if strings.HasPrefix(filepath.Base(path), cleanupTrashPrefix) {
 		m.entered <- path
