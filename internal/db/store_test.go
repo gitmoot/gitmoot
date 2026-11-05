@@ -3045,6 +3045,60 @@ func TestListJobsByType(t *testing.T) {
 	}
 }
 
+// A repo's poll must see every review job its consumers can match and must not
+// pay for the host's other repositories (#2530). Every poll consumer requires
+// payload.repo == repo, so a row projected under another repo can never match;
+// a row whose projection is empty (an unparseable payload) is the one the
+// column cannot vouch for, and must still reach the poll so it fails on it.
+func TestListReviewJobsForRepoPollScopesToRepoAndKeepsUnprojectedRows(t *testing.T) {
+	ctx := context.Background()
+	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	for _, job := range []Job{
+		{ID: "job-a", Agent: "reviewer", Type: "review", State: "queued", Payload: `{"repo":"owner/repo","pull_request":1}`},
+		{ID: "job-b", Agent: "reviewer", Type: "review", State: "queued", Payload: `{"repo":"other/repo","pull_request":1}`},
+		{ID: "job-c", Agent: "reviewer", Type: "review", State: "queued", Payload: `{not json`},
+		{ID: "job-d", Agent: "coder", Type: "implement", State: "queued", Payload: `{"repo":"owner/repo"}`},
+		{ID: "job-e", Agent: "reviewer", Type: "review", State: "succeeded", Payload: `{"repo":"owner/repo","pull_request":2}`},
+		{ID: "job-f", Agent: "reviewer", Type: "review", State: "queued", Payload: `{"repo":"Owner/Repo","pull_request":3}`},
+	} {
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s) returned error: %v", job.ID, err)
+		}
+	}
+	got, err := store.ListReviewJobsForRepoPoll(ctx, "owner/repo")
+	if err != nil {
+		t.Fatalf("ListReviewJobsForRepoPoll returned error: %v", err)
+	}
+	// job-f stays out: consumers compare payload.repo exactly, so a case variant
+	// never matched owner/repo's PRs.
+	wantIDs := []string{"job-a", "job-c", "job-e"}
+	var gotIDs []string
+	for _, job := range got {
+		gotIDs = append(gotIDs, job.ID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("ListReviewJobsForRepoPoll(owner/repo) = %v, want %v", gotIDs, wantIDs)
+	}
+	all, err := store.ListJobsByType(ctx, "review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Job{}
+	for _, job := range all {
+		byID[job.ID] = job
+	}
+	for _, job := range got {
+		if !reflect.DeepEqual(job, byID[job.ID]) {
+			t.Fatalf("job %s = %+v, want the full row %+v", job.ID, job, byID[job.ID])
+		}
+	}
+}
+
 func TestListJobsByStateAndRepoUseIndexedFilters(t *testing.T) {
 	ctx := context.Background()
 	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))

@@ -16,7 +16,7 @@ func TestDaemonPullRequestOpenedDraftDoesNotParkTask(t *testing.T) {
 	engine := workflow.Engine{Store: store, MergeGate: gate}
 	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
 
-	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store)); err != nil {
+	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store, daemon.Repo.FullName())); err != nil {
 		t.Fatalf("handlePullRequestWorkflowChange returned error: %v", err)
 	}
 	assertDaemonDraftReachedGateAndTaskState(t, store, gate, workflow.TaskPullRequestOpen)

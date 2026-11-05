@@ -78,7 +78,7 @@ func reviewPull(headSHA string) github.PullRequest {
 	}
 }
 
-// countingReviewLister wraps a real *db.Store and counts ListJobsByType calls,
+// countingReviewLister wraps a real *db.Store and counts ListReviewJobsForRepoPoll calls,
 // delegating so the query still returns the real rows. It backs
 // TestPollOnceFetchesReviewJobsOncePerPoll's proof that PollOnce's reviewJobsMemo
 // fetches the review-job list once per poll, not once (or ~2×) per open PR.
@@ -87,9 +87,9 @@ type countingReviewLister struct {
 	calls int32
 }
 
-func (c *countingReviewLister) ListJobsByType(ctx context.Context, jobType string) ([]db.Job, error) {
+func (c *countingReviewLister) ListReviewJobsForRepoPoll(ctx context.Context, repo string) ([]db.Job, error) {
 	atomic.AddInt32(&c.calls, 1)
-	return c.inner.ListJobsByType(ctx, jobType)
+	return c.inner.ListReviewJobsForRepoPoll(ctx, repo)
 }
 
 // TestPollOnceFetchesReviewJobsOncePerPoll pins FIX-F (#620 review): PollOnce fetches
@@ -127,7 +127,7 @@ func TestPollOnceFetchesReviewJobsOncePerPoll(t *testing.T) {
 
 	counter := &countingReviewLister{inner: store}
 	realNewReviewJobsMemo := newReviewJobsMemo
-	newReviewJobsMemo = func(reviewJobLister) *reviewJobsMemo { return realNewReviewJobsMemo(counter) }
+	newReviewJobsMemo = func(_ reviewJobLister, repo string) *reviewJobsMemo { return realNewReviewJobsMemo(counter, repo) }
 	defer func() { newReviewJobsMemo = realNewReviewJobsMemo }()
 
 	// seedReviewJob binds its job to PR 7, which is not among the three open PRs above.
@@ -143,7 +143,7 @@ func TestPollOnceFetchesReviewJobsOncePerPoll(t *testing.T) {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
 	if got := atomic.LoadInt32(&counter.calls); got != 1 {
-		t.Fatalf("ListJobsByType(review) ran %d times across %d PRs, want 1 (memoized once per poll)", got, len(pulls))
+		t.Fatalf("ListReviewJobsForRepoPoll ran %d times across %d PRs, want 1 (memoized once per poll)", got, len(pulls))
 	}
 }
 
@@ -263,6 +263,120 @@ func TestPullRequestWorkflowRoutingStaleAmongLargeNonReviewPayload(t *testing.T)
 			t.Fatalf("routing.stale = true, want false when the review matches the current head")
 		}
 	})
+}
+
+// seedRoutingReviewJob inserts a review job bound to PR number at headSHA.
+func seedRoutingReviewJob(t *testing.T, store *db.Store, repo string, number int, id, headSHA string) {
+	t.Helper()
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:        repo,
+		Branch:      fmt.Sprintf("task-%d", number),
+		PullRequest: number,
+		HeadSHA:     headSHA,
+		TaskID:      fmt.Sprintf("task-%03d", number),
+		LeadAgent:   "lead",
+		Reviewers:   []string{"audit"},
+		ReviewRound: id,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobWithEvent(context.Background(), db.Job{
+		ID: id, Agent: "audit", Type: "review", State: string(workflow.JobQueued), Payload: string(payload),
+	}, db.JobEvent{JobID: id, Kind: string(workflow.JobQueued), Message: "seeded review job"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func routingPull(number int64, headSHA string) github.PullRequest {
+	return github.PullRequest{
+		Number: number, State: "open", HeadRef: fmt.Sprintf("task-%d", number), BaseRef: "main", HeadSHA: headSHA,
+	}
+}
+
+// One poll's review consumers must decode each review payload ONCE, not once per
+// open PR (#2530). The review list was host-wide, so re-decoding made every
+// poll cost open PRs x all review jobs JSON decodes: on the live store, 59% of
+// daemon CPU sat in pullRequestWorkflowRouting's json.Unmarshal.
+//
+// Observed as allocations because a decode is nothing else a test can see: after
+// the first PR has warmed the poll's memo, routing and superseding another PR must
+// allocate far less than one object per review job. Re-decoding allocates many per
+// job and fails by orders of magnitude, not by noise.
+func TestPollReviewConsumersDecodeEachPayloadOncePerPoll(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	const reviewJobs = 200
+	for i := range reviewJobs {
+		// Bound to PRs no consumer below routes, so nothing is superseded.
+		seedRoutingReviewJob(t, store, repo.FullName(), 1000+i, fmt.Sprintf("review-%03d", i), "head")
+	}
+	d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
+	memo := newReviewJobsMemo(store, repo.FullName())
+	if _, err := d.pullRequestWorkflowRouting(ctx, routingPull(1, "head-1"), memo); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(5, func() {
+		if _, err := d.pullRequestWorkflowRouting(ctx, routingPull(2, "head-2"), memo); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.supersedeStaleReviewJobs(ctx, routingPull(2, "head-2"), memo); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs >= reviewJobs {
+		t.Fatalf("a warmed poll allocated %.0f objects routing one more PR over %d review jobs: payloads are re-decoded per PR", allocs, reviewJobs)
+	}
+}
+
+// Sharing decoded payloads across a poll must not change any PR's routing: each PR
+// routed through one shared memo gets the answer it gets from a fresh fetch, and a
+// malformed payload fails every consumer that reaches it, not just the first.
+func TestPullRequestWorkflowRoutingSharedMemoMatchesFreshFetch(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
+	seedRoutingReviewJob(t, store, repo.FullName(), 1, "review-1-old", "old-1")
+	seedRoutingReviewJob(t, store, repo.FullName(), 2, "review-2-old", "old-2")
+	seedRoutingReviewJob(t, store, repo.FullName(), 2, "review-2-cur", "cur-2")
+	d := Daemon{Repo: repo, Store: store, Workflow: &workflow.Engine{Store: store}}
+	pulls := []struct {
+		pull  github.PullRequest
+		stale bool
+	}{
+		{routingPull(1, "new-1"), true},  // only an old-head review exists
+		{routingPull(2, "cur-2"), false}, // a review at this head exists
+		{routingPull(3, "cur-3"), false}, // no review targets it
+		{routingPull(1, "new-1"), true},  // repeated: the cached decode answers the same
+	}
+	memo := newReviewJobsMemo(store, repo.FullName())
+	for _, test := range pulls {
+		fresh, err := d.pullRequestWorkflowRouting(ctx, test.pull, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared, err := d.pullRequestWorkflowRouting(ctx, test.pull, memo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if shared != fresh || shared.stale != test.stale {
+			t.Fatalf("PR #%d at %s routed %+v through the shared memo, %+v from a fresh fetch; want stale=%v",
+				test.pull.Number, test.pull.HeadSHA, shared, fresh, test.stale)
+		}
+	}
+
+	if err := store.CreateJobWithEvent(ctx, db.Job{
+		ID: "review-malformed", Agent: "audit", Type: "review", State: string(workflow.JobQueued), Payload: "{not json",
+	}, db.JobEvent{JobID: "review-malformed", Kind: string(workflow.JobQueued), Message: "seeded"}); err != nil {
+		t.Fatal(err)
+	}
+	broken := newReviewJobsMemo(store, repo.FullName())
+	for attempt := range 2 {
+		if _, err := d.pullRequestWorkflowRouting(ctx, routingPull(3, "cur-3"), broken); err == nil || !strings.Contains(err.Error(), `parse job payload "review-malformed"`) {
+			t.Fatalf("attempt %d: routing over a malformed payload returned %v, want its parse error", attempt, err)
+		}
+	}
 }
 
 // TestReconcileReviewingPullRequestAdvancesAmongLargeNonReviewPayload proves the
