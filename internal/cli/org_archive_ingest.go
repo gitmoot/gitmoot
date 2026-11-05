@@ -348,8 +348,8 @@ func refreshOrgArchiveMirror(ctx context.Context, store *db.Store, stdout io.Wri
 	// is the durable retry state, so a park that failed on an earlier tick is
 	// retried here even when the role is OMITTED from today's list (#1643
 	// round 3 block A — a retry that can only fire when the subject happens to
-	// reappear is not a retry). Idempotent by WHERE, so re-parking every tick
-	// costs nothing.
+	// reappear is not a retry). Idempotent by WHERE; re-parking every tick is
+	// cheap only because the park statement is index-bounded (#2530).
 	postRows, err := store.ListOrgRolesArchived(ctx)
 	if err != nil {
 		writeLine(stdout, "org archive mirror: re-list for parking failed: %v", err)

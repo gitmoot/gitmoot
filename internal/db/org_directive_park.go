@@ -40,25 +40,64 @@ func (s *Store) ParkOpenOrgDirectivesForRole(ctx context.Context, targetRole str
 		return 0, nil
 	}
 	stamp := at.UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, `
-UPDATE workflow_notes
-SET directive_parked_at = ?, directive_parked_reason = ?
-WHERE substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
-	AND TRIM(directive_parked_at) = ''
-	AND EXISTS (SELECT 1 FROM org_role_archived WHERE role = ?)
-	AND NOT EXISTS (
-		SELECT 1 FROM workflow_notes r
-		WHERE r.workflow_id = workflow_notes.workflow_id AND (
-			substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
-			OR substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
-		)
-	)`,
+	result, err := s.db.ExecContext(ctx, parkOpenOrgDirectivesForRoleSQL,
 		stamp, strings.TrimSpace(reason), targetRole, targetRole, targetRole)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected()
 }
+
+// parkOpenOrgDirectivesForRoleSQL is named so a test can EXPLAIN the SHIPPED
+// text (#2530). Its binds are stamp, reason, then targetRole three times.
+//
+// The archive mirror re-parks every archived seat on every one-minute tick,
+// and almost every pass parks nothing, so this statement's cost is paid in full
+// for no result. The first spelling scanned every note body for the role
+// prefix and then, for each unparked directive left behind (closed ones stay
+// unparked forever), rescanned every same-workflow sibling note: the #2138
+// correlated shape again. Measured on a snapshot of the live store (60,482
+// notes, 19 archived seats): 3.4s per pass through the C sqlite3 CLI and about
+// 5s of daemon CPU through modernc, every minute, to park 0 rows.
+//
+// Each term below exists for a specific index, and dropping one silently
+// reverts to a scan:
+//
+//   - the '[org:directive ' prefix repeats idx_workflow_notes_directive_oldest's
+//     partial predicate, so the outer statement visits only directive notes.
+//     The role prefix implies it, but the planner only matches the literal term.
+//   - each terminal kind is its own NOT EXISTS shaped for
+//     idx_workflow_notes_directive_markers, as in #2470: the partial predicate
+//     selects marker notes, and the 64-character prefix range bounds the probe
+//     to notes that start with that exact marker. One OR'd subquery loses the
+//     range and walks every marker note in the workflow.
+//
+// The range is exact because the marker prefix always fits in the indexed 64
+// characters: an integer id keeps it under 48. The trailing exact comparison
+// is the original predicate, kept so the range can only narrow, never widen.
+const parkOpenOrgDirectivesForRoleSQL = `
+UPDATE workflow_notes
+SET directive_parked_at = ?, directive_parked_reason = ?
+WHERE substr(body, 1, length('[org:directive ')) = '[org:directive '
+	AND substr(body, 1, length('[org:directive to=' || ? || ' ')) = '[org:directive to=' || ? || ' '
+	AND TRIM(directive_parked_at) = ''
+	AND EXISTS (SELECT 1 FROM org_role_archived WHERE role = ?)
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id
+			AND substr(r.body, 1, length('[org:directive-')) = '[org:directive-'
+			AND substr(r.body, 1, 64) >= '[org:directive-cancel id=' || workflow_notes.id || ' '
+			AND substr(r.body, 1, 64) < '[org:directive-cancel id=' || workflow_notes.id || '!'
+			AND substr(r.body, 1, length('[org:directive-cancel id=' || workflow_notes.id || ' ')) = '[org:directive-cancel id=' || workflow_notes.id || ' '
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM workflow_notes r
+		WHERE r.workflow_id = workflow_notes.workflow_id
+			AND substr(r.body, 1, length('[org:directive-')) = '[org:directive-'
+			AND substr(r.body, 1, 64) >= '[org:directive-done id=' || workflow_notes.id || ' '
+			AND substr(r.body, 1, 64) < '[org:directive-done id=' || workflow_notes.id || '!'
+			AND substr(r.body, 1, length('[org:directive-done id=' || workflow_notes.id || ' ')) = '[org:directive-done id=' || workflow_notes.id || ' '
+	)`
 
 // ParkMalformedOrgDirective removes a syntactically invalid directive from the
 // live TTL sweep without claiming that its obligation completed.
