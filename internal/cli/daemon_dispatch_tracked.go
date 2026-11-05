@@ -107,6 +107,14 @@ type inflightDispatch struct {
 // nil-receiver safe (a nil tracker means "untracked / legacy inline path" and
 // behaves as permanently idle with maintenance always due).
 type inflightJobTracker struct {
+	// reserved counts checkout keys held by the background worktree reclaim
+	// loop (#2517 step 3) while it removes a worktree. beginWithinLane refuses
+	// a job on a reserved key, and the reservation is refused while a job holds
+	// the key, so the check and the claim are one step under mu on both sides.
+	reserved map[string]int
+	// reclaimLoop is set while the background reclaim loop runs; the worker
+	// tick then leaves the delegation reclaim passes to it.
+	reclaimLoop bool
 	// reclaimResume is where each worktree reclaim pass kind resumes on the
 	// next tick that runs it (#2517). It has its own lock.
 	reclaimResume              reclaimResume
@@ -155,6 +163,7 @@ func newInflightJobTracker(ctx context.Context) *inflightJobTracker {
 		runtimes:  map[string]int{},
 		perRepo:   map[string]int{},
 		poolRuns:  map[string]bool{},
+		reserved:  map[string]int{},
 		errs:      map[string][]error{},
 	}
 	tracker.liveness = newDaemonLivenessSweep()
@@ -216,6 +225,11 @@ func (t *inflightJobTracker) beginWithinLane(hostCap int, remote bool, jobID, re
 		return false, false
 	}
 	if _, exists := t.jobs[jobID]; exists {
+		return false, false
+	}
+	if checkoutKey != "" && t.reserved[checkoutKey] > 0 {
+		// The background reclaim loop is removing a worktree under this key;
+		// the job stays queued for a later pass (#2517 step 3).
 		return false, false
 	}
 	remote = remote && t.remoteCap > 0
@@ -697,9 +711,14 @@ func (t *inflightJobTracker) seeds() (map[string]bool, map[string]bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	checkouts := make(map[string]bool, len(t.checkouts))
+	checkouts := make(map[string]bool, len(t.checkouts)+len(t.reserved))
 	for key := range t.checkouts {
 		checkouts[key] = true
+	}
+	for key, n := range t.reserved {
+		if n > 0 {
+			checkouts[key] = true
+		}
 	}
 	runtimes := make(map[string]bool, len(t.runtimes))
 	for key := range t.runtimes {
@@ -1090,4 +1109,66 @@ func (t *inflightJobTracker) reclaimResumeState() *reclaimResume {
 		return nil
 	}
 	return &t.reclaimResume
+}
+
+// tryReserveCheckouts reserves checkout keys for a worktree reclaim attempt
+// (#2517 step 3). It refuses when the tracker is draining, when an in-flight
+// job holds any of the keys, or when another reclaim already reserved one.
+// The returned release must be called exactly once. Empty keys are ignored. A
+// nil tracker reserves nothing and always succeeds.
+func (t *inflightJobTracker) tryReserveCheckouts(keys ...string) (release func(), ok bool) {
+	if t == nil {
+		return func() {}, true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.draining {
+		return nil, false
+	}
+	held := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if t.checkouts[key] > 0 || t.reserved[key] > 0 {
+			return nil, false
+		}
+		held = append(held, key)
+	}
+	for _, key := range held {
+		t.reserved[key]++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			for _, key := range held {
+				if t.reserved[key]--; t.reserved[key] <= 0 {
+					delete(t.reserved, key)
+				}
+			}
+		})
+	}, true
+}
+
+// setReclaimLoopActive records whether the background reclaim loop is running.
+func (t *inflightJobTracker) setReclaimLoopActive(active bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.reclaimLoop = active
+}
+
+// reclaimLoopActive reports whether the background reclaim loop owns the
+// delegation reclaim passes.
+func (t *inflightJobTracker) reclaimLoopActive() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reclaimLoop
 }

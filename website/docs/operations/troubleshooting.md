@@ -614,9 +614,18 @@ reconstruction path (currently a pinned native read-only PR review). Cleanup
 never cancels consumers or treats an operational failure as permission to
 delete.
 
-Reclaim runs inside the daemon's worker tick, before queued jobs are dispatched,
-so it is bounded (#2517): each kind of reclaim pass spends at most about 10
-seconds per tick starting candidates across all repos, and the rest wait for a
+Delegation worktree reclaim (the skipped and aged passes) runs on its own
+background loop in the daemon, beside job dispatch, so a slow capture or removal
+on a network mount no longer delays any queued job (#2517). While an attempt
+removes a worktree it reserves that worktree's checkout and the repo's registered
+checkout: no job starts on either until the attempt ends, and an attempt waits
+while a job holds either. The terminal task worktree pass still runs in the
+worker tick. The removal itself still holds the store-wide cleanup lock,
+so job starts pause for its duration (about 15 s for a large worktree on sshfs;
+#2524).
+
+Each kind of reclaim pass is bounded (#2517): it spends at most about 10
+seconds per pass starting candidates across all repos, and the rest wait for a
 later tick. The first repo turned away goes first on the next tick, so one repo
 with slow cleanup cannot starve the others. A worktree whose preservation
 evidence could not be captured (for example a `git status`/`git diff` that

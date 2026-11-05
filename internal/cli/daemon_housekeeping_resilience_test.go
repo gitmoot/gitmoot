@@ -549,3 +549,174 @@ func TestReclaimCandidateWindowsArePerRepo(t *testing.T) {
 		t.Fatalf("another repo's pass moved this row's retry from %s to %s; its owner would refuse it as not due", before.NextAttemptAt, after.NextAttemptAt)
 	}
 }
+
+// #2517 step 3: a reclaim attempt on the background loop and a job starting
+// on the same checkout must exclude each other atomically: the reservation is
+// refused while a job holds a key, and a job is refused while the reservation
+// is held. A check-then-act between two goroutines would let a job start in
+// the registered checkout while the loop rewrites its worktree metadata.
+func TestReclaimReservationAndJobStartExcludeEachOther(t *testing.T) {
+	tracker := newInflightJobTracker(context.Background())
+	release, ok := tracker.tryReserveCheckouts("worktree:/seat", "repo:owner/repo")
+	if !ok {
+		t.Fatal("reservation refused on free keys")
+	}
+	if admitted, _ := tracker.beginWithinLane(0, false, "job-on-repo", "owner/repo", "repo:owner/repo", ""); admitted {
+		t.Fatal("a job started on the registered checkout while reclaim held it")
+	}
+	if admitted, _ := tracker.beginWithinLane(0, false, "job-elsewhere", "owner/repo", "worktree:/other", ""); !admitted {
+		t.Fatal("a job on an unrelated checkout was refused")
+	}
+	if _, again := tracker.tryReserveCheckouts("repo:owner/repo"); again {
+		t.Fatal("a second reclaim reserved a key already reserved")
+	}
+	if seeds, _ := tracker.seeds(); !seeds["repo:owner/repo"] {
+		t.Fatal("the selector does not see the reserved key as held")
+	}
+	release()
+	release() // idempotent
+	if admitted, _ := tracker.beginWithinLane(0, false, "job-on-repo", "owner/repo", "repo:owner/repo", ""); !admitted {
+		t.Fatal("the job is still refused after the reservation was released")
+	}
+	if _, ok := tracker.tryReserveCheckouts("worktree:/x", "repo:owner/repo"); ok {
+		t.Fatal("reclaim reserved the registered checkout while a job holds it")
+	}
+	if _, ok := tracker.tryReserveCheckouts("worktree:/x"); !ok {
+		t.Fatal("a refused reservation leaked a partial hold on its other key")
+	}
+	tracker.end("job-on-repo")
+	tracker.end("job-elsewhere")
+}
+
+// #2517 step 3: with the background reclaim loop running, the worker tick
+// must not run the delegation reclaim passes itself: a backlog of slow
+// candidates may not delay dispatch at all.
+func TestWorkerTickLeavesDelegationReclaimToTheBackgroundLoop(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "queued-beside-reclaim-loop")
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("slow-%d", i)
+		id := "parent/delegation/" + name
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", name)
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: name,
+			Payload: mustJobPayload(t, workflow.JobPayload{
+				Repo: "owner/repo", ParentJobID: "parent", DelegationID: name,
+				WorktreePath: path, Branch: "gitmoot-delegation-" + name,
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}),
+		}, "seed slow reclaim candidate")
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.tracker.setReclaimLoopActive(true)
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	var engines atomic.Int32
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engines.Add(1)
+		time.Sleep(200 * time.Millisecond)
+		return baseWorkflowFactory(checkout)
+	}
+	if err := runDaemonWorkerTickTracked(h.ctx, h.store, h.worker, 1, false, "owner/repo", "", &h.stdout, h.now, h.tracker, nil); err != nil {
+		t.Fatalf("worker tick: %v", err)
+	}
+	if !waitForCondition(t, 5*time.Second, h.adapter.stillBlocked) {
+		t.Fatalf("queued job was not dispatched; log=%q", h.stdout.String())
+	}
+	if made := engines.Load(); made > 1 {
+		t.Fatalf("the tick started %d engines; with the reclaim loop active it must start only the dispatch's", made)
+	}
+}
+
+// #2517 step 3: the background loop pass reclaims a repo's candidate, and
+// while its attempt runs no job can start on that repo's registered checkout;
+// once the attempt ends the job can start.
+func TestBackgroundReclaimPassHoldsTheRepoCheckoutOnlyDuringItsAttempt(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "background-reclaim-pass")
+	id := "parent/delegation/bg"
+	path := managedDelegationReclaimTestPath(t, h.home, "parent", "bg")
+	seedCLIJob(t, h.store, db.Job{
+		ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "bg",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "bg",
+			WorktreePath: path, Branch: "gitmoot-delegation-bg",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed reclaim candidate")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	var engines atomic.Int32
+	var startedDuringAttempt atomic.Bool
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engines.Add(1)
+		if admitted, _ := h.tracker.beginWithinLane(0, false, "probe-during", "owner/repo", "repo:owner/repo", ""); admitted {
+			startedDuringAttempt.Store(true)
+			h.tracker.end("probe-during")
+		}
+		return baseWorkflowFactory(checkout)
+	}
+	repos := func(context.Context) ([]string, error) { return []string{"owner/repo"}, nil }
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", repos, &h.stdout, time.Now().UTC(), time.Time{})
+	if engines.Load() == 0 {
+		t.Fatalf("the loop pass made no reclaim attempt; log=%q", h.stdout.String())
+	}
+	if startedDuringAttempt.Load() {
+		t.Fatal("a job started on the registered checkout during the reclaim attempt")
+	}
+	if admitted, _ := h.tracker.beginWithinLane(0, false, "probe-after", "owner/repo", "repo:owner/repo", ""); !admitted {
+		t.Fatal("the registered checkout stayed reserved after the attempt")
+	}
+	h.tracker.end("probe-after")
+}
+
+// #2523 review: a job whose worktree path is the registered checkout is keyed
+// worktree:<path>, not repo:<repo>. The reclaim attempt must reserve that
+// identity too, so such a job cannot start during the attempt.
+func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "registered-checkout-alias")
+	id := "parent/delegation/alias"
+	path := managedDelegationReclaimTestPath(t, h.home, "parent", "alias")
+	seedCLIJob(t, h.store, db.Job{
+		ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "alias",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "alias",
+			WorktreePath: path, Branch: "gitmoot-delegation-alias",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed reclaim candidate")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := h.store.GetJob(h.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := registeredCheckoutWorktreeKey(h.worker.delegationParentCheckout(h.ctx, job))
+	if alias == "" {
+		t.Fatal("no worktree key for the registered checkout")
+	}
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	var engines atomic.Int32
+	var aliasStarted atomic.Bool
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engines.Add(1)
+		if admitted, _ := h.tracker.beginWithinLane(0, false, "alias-probe", "owner/repo", alias, ""); admitted {
+			aliasStarted.Store(true)
+			h.tracker.end("alias-probe")
+		}
+		return baseWorkflowFactory(checkout)
+	}
+	repos := func(context.Context) ([]string, error) { return []string{"owner/repo"}, nil }
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", repos, &h.stdout, time.Now().UTC(), time.Time{})
+	if engines.Load() == 0 {
+		t.Fatalf("the loop pass made no reclaim attempt; log=%q", h.stdout.String())
+	}
+	if aliasStarted.Load() {
+		t.Fatalf("a job keyed %s started during the reclaim attempt", alias)
+	}
+}
