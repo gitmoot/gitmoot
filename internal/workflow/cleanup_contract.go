@@ -74,14 +74,17 @@ type CleanupInspection struct {
 }
 
 type cleanupEvidence struct {
-	ResourceID        string                       `json:"resource_id"`
-	OwnerState        string                       `json:"owner_state"`
-	Generation        int64                        `json:"generation"`
-	OwnerPayloadHash  string                       `json:"owner_payload_hash"`
-	Policy            CleanupPolicy                `json:"policy"`
-	PolicyHash        string                       `json:"policy_hash"`
-	TerminalAt        string                       `json:"terminal_at"`
-	PathIdentity      string                       `json:"path_identity"`
+	ResourceID       string        `json:"resource_id"`
+	OwnerState       string        `json:"owner_state"`
+	Generation       int64         `json:"generation"`
+	OwnerPayloadHash string        `json:"owner_payload_hash"`
+	Policy           CleanupPolicy `json:"policy"`
+	PolicyHash       string        `json:"policy_hash"`
+	TerminalAt       string        `json:"terminal_at"`
+	PathIdentity     string        `json:"path_identity"`
+	// Absent marks the evidence of a resource already gone when its cleanup
+	// was recorded (#2531); it names no path or git identity.
+	Absent            bool                         `json:"absent,omitempty"`
 	Git               gitutil.WorktreeIdentity     `json:"git"`
 	Ancestors         []CleanupConsumer            `json:"ancestors"`
 	Consumers         []CleanupConsumer            `json:"consumers"`

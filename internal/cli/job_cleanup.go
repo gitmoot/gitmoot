@@ -165,11 +165,17 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		if err != nil {
 			return err
 		}
-		repo, err := store.GetRepo(ctx, payload.Repo)
+		// A repo no longer registered (removed or renamed, #2531) is inspected
+		// through the checkout owning the worktree; with none provable the
+		// engine refuses checkout_identity_unknown.
+		checkout, err := resolveCleanupCheckout(ctx, store, payload.Repo, payload.WorktreePath)
 		if err != nil {
 			return err
 		}
-		engine := daemonWorkflowEngine(store, nil, repo.CheckoutPath, paths.Home)
+		engine := daemonWorkflowEngine(store, nil, checkout.path, paths.Home)
+		// The engine binds its home only with a checkout; containment is still
+		// checked without one, so the refusal names the missing checkout.
+		engine.Home = paths.Home
 		if operation == "inspect" {
 			decision, err = engine.InspectProducerCleanup(ctx, job.ID, workflow.CleanupPolicy{BudgetGate: workflow.CleanupBudgetGateEnforced})
 			return err

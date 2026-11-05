@@ -664,7 +664,7 @@ func TestBackgroundReclaimPassHoldsTheRepoCheckoutOnlyDuringItsAttempt(t *testin
 		}
 		return baseWorkflowFactory(checkout)
 	}
-	repos := func(context.Context) ([]string, error) { return []string{"owner/repo"}, nil }
+	repos := fixedReclaimRepos("owner/repo")
 	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", repos, &h.stdout, time.Now().UTC(), time.Time{})
 	if engines.Load() == 0 {
 		t.Fatalf("the loop pass made no reclaim attempt; log=%q", h.stdout.String())
@@ -716,7 +716,7 @@ func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
 		}
 		return baseWorkflowFactory(checkout)
 	}
-	repos := func(context.Context) ([]string, error) { return []string{"owner/repo"}, nil }
+	repos := fixedReclaimRepos("owner/repo")
 	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", repos, &h.stdout, time.Now().UTC(), time.Time{})
 	if engines.Load() == 0 {
 		t.Fatalf("the loop pass made no reclaim attempt; log=%q", h.stdout.String())
@@ -751,7 +751,7 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 			t.Fatal(err)
 		}
 		owner := h.checkout
-		if repo == "owner/busy" {
+		if repo != "owner/repo" && repo != "owner/old-name" {
 			owner = busyCheckout
 		}
 		runGit(t, owner, "worktree", "add", "--detach", trash, "HEAD")
@@ -794,8 +794,9 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 		return record
 	}
 	// Entries the sweep cannot handle come first, more than one window of
-	// them: two whose repo is not registered (no checkout to delete them
-	// through), and 32 whose repo's checkout a job holds for the whole test.
+	// them: two whose repo is not registered, and 32 whose repo's checkout a
+	// job holds for the whole test. The unregistered ones are disposed through
+	// the checkout owning them (#2531), the busy one, so they stay unhandled.
 	seed("orphan-a", "owner/gone")
 	seed("orphan-b", "owner/gone")
 	for i := 0; i < 32; i++ {
@@ -806,7 +807,7 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 	}
 	defer h.tracker.end("busy-holder")
 	ours := seed("trash", "owner/repo")
-	none := func(context.Context) ([]string, error) { return nil, nil }
+	none := fixedReclaimRepos()
 	// While a job holds the registered checkout, the sweep leaves our trash.
 	if admitted, _ := h.tracker.beginWithinLane(0, false, "holder", "owner/repo", "repo:owner/repo", ""); !admitted {
 		t.Fatal("could not start the holder job")
@@ -816,16 +817,21 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 		t.Fatalf("the sweep deleted trash while a job held the registered checkout: %v", err)
 	}
 	h.tracker.end("holder")
+	// #2531: the trash of a repo renamed since (no repos row under the name
+	// its job ran under) is disposed through the checkout owning it.
+	renamed := seed("renamed", "owner/old-name")
 	// Busy and unhandled entries are skipped for a while once seen, so within
 	// a few passes the sweep reaches ours behind them.
 	for pass := 0; pass < 3; pass++ {
 		runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
 	}
-	if _, err := os.Lstat(ours.Path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the sweep never reached the trash behind a window of entries it cannot handle: %v", err)
-	}
-	if out := runGitOutput(t, h.checkout, "worktree", "list"); strings.Contains(out, filepath.Base(ours.Path)) {
-		t.Fatalf("git still lists the trash worktree:\n%s", out)
+	for _, item := range []db.PendingCleanupTrash{ours, renamed} {
+		if _, err := os.Lstat(item.Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("the sweep never reached the trash %s behind a window of entries it cannot handle: %v; log=%q", item.Path, err, h.stdout.String())
+		}
+		if out := runGitOutput(t, h.checkout, "worktree", "list"); strings.Contains(out, filepath.Base(item.Path)) {
+			t.Fatalf("git still lists the trash worktree:\n%s", out)
+		}
 	}
 	if admitted, _ := h.tracker.beginWithinLane(0, false, "after", "owner/repo", "repo:owner/repo", ""); !admitted {
 		t.Fatal("a sweep reservation was left behind")

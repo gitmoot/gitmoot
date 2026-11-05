@@ -2,9 +2,12 @@ package cli
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -38,7 +41,7 @@ const worktreeReclaimLoopInterval = 5 * time.Second
 // the local disk). repos lists the repos to visit each pass. The returned stop
 // cancels the loop and waits, bounded by daemonShutdownDrainTimeout, so the
 // supervisor does not close the store under a running attempt.
-func startWorktreeReclaimLoop(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, rootFilter string, repos func(context.Context) ([]string, error), stdout io.Writer) (stop func()) {
+func startWorktreeReclaimLoop(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, rootFilter string, repos reclaimLoopRepos, stdout io.Writer) (stop func()) {
 	loopCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	tracker.setReclaimLoopActive(true)
@@ -67,11 +70,23 @@ func startWorktreeReclaimLoop(ctx context.Context, store *db.Store, worker jobWo
 	}
 }
 
+// reclaimLoopRepos lists the repos one loop pass visits, in order. cand is the
+// pass's candidate carrier, so a lister can read the pass's shared candidate
+// queries instead of running them again.
+type reclaimLoopRepos func(ctx context.Context, store *db.Store, cand *tickCandidates, now time.Time) ([]string, error)
+
+// fixedReclaimRepos visits the named repos, a single-repo daemon's set.
+func fixedReclaimRepos(names ...string) reclaimLoopRepos {
+	return func(context.Context, *db.Store, *tickCandidates, time.Time) ([]string, error) {
+		return names, nil
+	}
+}
+
 // runWorktreeReclaimLoopPass visits every repo once. agedAt is when the aged
 // pass last attempted anything; it runs again after worktreeReclaimInterval,
 // the cadence it had in the tick. The updated value is returned. A panic is
 // logged, never propagated: a reclaim fault must not take the daemon down.
-func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, rootFilter string, repos func(context.Context) ([]string, error), stdout io.Writer, now time.Time, agedAt time.Time) (next time.Time) {
+func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker jobWorker, tracker *inflightJobTracker, rootFilter string, repos reclaimLoopRepos, stdout io.Writer, now time.Time, agedAt time.Time) (next time.Time) {
 	next = agedAt
 	defer func() {
 		if r := recover(); r != nil {
@@ -79,11 +94,6 @@ func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker job
 		}
 	}()
 	sweepCleanupTrash(ctx, store, worker, tracker, stdout)
-	names, err := repos(ctx)
-	if err != nil {
-		writeLine(stdout, "worktree reclaim loop: list repos: %v", err)
-		return next
-	}
 	cand := newTickCandidates(store)
 	cand.reserve = tracker.tryReserveCheckouts
 	cand.reclaimBudget.resume = tracker.reclaimResumeState()
@@ -94,6 +104,11 @@ func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker job
 			next = now
 		}
 	}()
+	names, err := repos(ctx, store, cand, now)
+	if err != nil {
+		writeLine(stdout, "worktree reclaim loop: list repos: %v", err)
+		return next
+	}
 	for _, repo := range names {
 		if ctx.Err() != nil {
 			return next
@@ -105,22 +120,43 @@ func runWorktreeReclaimLoopPass(ctx context.Context, store *db.Store, worker job
 	return next
 }
 
-// enabledRepoNames lists the enabled registered repos, the set the fleet
-// worker sweep visits.
-func enabledRepoNames(store *db.Store) func(context.Context) ([]string, error) {
-	return func(ctx context.Context) ([]string, error) {
-		repos, err := store.ListRepos(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list repos: %w", err)
+// fleetReclaimRepos lists the enabled registered repos, the set the fleet
+// worker sweep visits, then the repos owning reclaim candidates that are not
+// registered at all: removed, or renamed (a job keeps the repo name it ran
+// under). No repo sweep visits those, so their obligations were never
+// attempted (#2531). They come last, under the same per-kind budgets and
+// resume positions. A disabled repo is still registered and stays unvisited.
+func fleetReclaimRepos(ctx context.Context, store *db.Store, cand *tickCandidates, now time.Time) ([]string, error) {
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list repos: %w", err)
+	}
+	names := make([]string, 0, len(repos))
+	registered := make(map[string]bool, len(repos))
+	for _, repo := range repos {
+		registered[repo.FullName()] = true
+		if repo.Enabled {
+			names = append(names, repo.FullName())
 		}
-		names := make([]string, 0, len(repos))
-		for _, repo := range repos {
-			if repo.Enabled {
-				names = append(names, repo.FullName())
-			}
-		}
+	}
+	// An unreadable TTL leaves the aged candidates out here; the aged pass
+	// logs it.
+	ttl, err := cand.config.delegationWorktreeTTL(filepath.Dir(store.DatabasePath()))
+	if err != nil {
+		ttl = 0
+	}
+	owners, err := cand.reclaimCandidateRepos(ctx, now, ttl)
+	if err != nil {
+		// The registered repos still get their pass, which reads the same
+		// queries again.
 		return names, nil
 	}
+	for _, repo := range owners {
+		if !registered[repo] {
+			names = append(names, repo)
+		}
+	}
+	return names, nil
 }
 
 // cleanupTrashSweepLimit bounds how many leftover trash directories one loop
@@ -165,17 +201,22 @@ func disposeCleanupTrashOnce(ctx context.Context, store *db.Store, worker jobWor
 		writeLine(stdout, "cleanup trash %s: load job %s: %v", item.Path, item.JobID, err)
 		return false
 	}
-	checkout := worker.delegationParentCheckout(ctx, job)
 	payload, _ := daemonJobPayload(job)
 	retry := func() {
 		_ = store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: item.JobID, Kind: workflow.CleanupTrashRetryEvent, Message: item.Path})
+	}
+	checkout, keys, err := cleanupTrashCheckout(ctx, store, payload.Repo, item)
+	if err != nil {
+		writeLine(stdout, "cleanup trash %s: %v", item.Path, err)
+		retry()
+		return false
 	}
 	if strings.TrimSpace(checkout) == "" {
 		writeLine(stdout, "cleanup trash %s: repo %s has no registered checkout", item.Path, payload.Repo)
 		retry()
 		return false
 	}
-	release, ok := tracker.tryReserveCheckouts("repo:"+strings.TrimSpace(payload.Repo), registeredCheckoutWorktreeKey(checkout))
+	release, ok := tracker.tryReserveCheckouts(keys...)
 	if !ok {
 		// Busy now; skip it for a while so busy entries cannot fill the
 		// window on every pass (#2526 review).
@@ -192,4 +233,32 @@ func disposeCleanupTrashOnce(ctx context.Context, store *db.Store, worker jobWor
 		retry()
 	}
 	return true
+}
+
+// cleanupTrashCheckout is the checkout a trash disposal runs through, and the
+// checkout keys it reserves: the repo's and its registered checkout's. The
+// trash of a repo no longer registered (#2531) goes through the checkout
+// owning it, from its recorded git administrative directory, as the disposal
+// itself locks it (#2526); the registered repos whose checkout that is are
+// reserved too.
+func cleanupTrashCheckout(ctx context.Context, store *db.Store, repo string, item db.PendingCleanupTrash) (string, []string, error) {
+	repo = strings.TrimSpace(repo)
+	keys := []string{"repo:" + repo}
+	record, err := store.GetRepo(ctx, repo)
+	if err == nil {
+		checkout := strings.TrimSpace(record.CheckoutPath)
+		return checkout, append(keys, registeredCheckoutWorktreeKey(checkout)), nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", nil, err
+	}
+	owner, err := workflow.CleanupTrashOwnerCheckout(item)
+	if err != nil {
+		return "", nil, fmt.Errorf("repo %s is not registered and the checkout owning the trash is unknown: %w", repo, err)
+	}
+	owners, err := checkoutRepoKeys(ctx, store, owner)
+	if err != nil {
+		return "", nil, err
+	}
+	return owner, append(append(keys, registeredCheckoutWorktreeKey(owner)), owners...), nil
 }

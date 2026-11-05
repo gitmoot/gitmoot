@@ -1488,9 +1488,7 @@ func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, 
 // candidates owned by repo (every repo's when empty), from the tick's one
 // shared query.
 func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context, repo string) ([]string, error) {
-	candidates, err := c.reclaim.get(func() ([]db.ReclaimCandidate, error) {
-		return c.store.DelegationReclaimCandidates(ctx)
-	})
+	candidates, err := c.skippedReclaimRows(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1500,16 +1498,53 @@ func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context, repo s
 // agedDelegationReclaimCandidates is delegationReclaimCandidates for the aged
 // pass.
 func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time, repo string) ([]string, error) {
-	if c.skipAgedReclaim {
-		return nil, nil
-	}
-	candidates, err := c.agedReclaim.get(func() ([]db.ReclaimCandidate, error) {
-		return c.store.AgedDelegationReclaimCandidates(ctx, cutoff)
-	})
+	candidates, err := c.agedReclaimRows(ctx, cutoff)
 	if err != nil {
 		return nil, err
 	}
 	return reclaimCandidateIDsFor(candidates, repo), nil
+}
+
+func (c *tickCandidates) skippedReclaimRows(ctx context.Context) ([]db.ReclaimCandidate, error) {
+	return c.reclaim.get(func() ([]db.ReclaimCandidate, error) {
+		return c.store.DelegationReclaimCandidates(ctx)
+	})
+}
+
+func (c *tickCandidates) agedReclaimRows(ctx context.Context, cutoff time.Time) ([]db.ReclaimCandidate, error) {
+	if c.skipAgedReclaim {
+		return nil, nil
+	}
+	return c.agedReclaim.get(func() ([]db.ReclaimCandidate, error) {
+		return c.store.AgedDelegationReclaimCandidates(ctx, cutoff)
+	})
+}
+
+// reclaimCandidateRepos returns, sorted, the repos owning this tick's skipped
+// reclaim candidates and, with a positive ttl, its aged ones, from the same
+// shared queries the passes read.
+func (c *tickCandidates) reclaimCandidateRepos(ctx context.Context, now time.Time, ttl time.Duration) ([]string, error) {
+	candidates, err := c.skippedReclaimRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ttl > 0 {
+		aged, err := c.agedReclaimRows(ctx, now.Add(-ttl))
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates[:len(candidates):len(candidates)], aged...)
+	}
+	seen := map[string]bool{}
+	var repos []string
+	for _, candidate := range candidates {
+		if repo := strings.TrimSpace(candidate.Repo); repo != "" && !seen[repo] {
+			seen[repo] = true
+			repos = append(repos, repo)
+		}
+	}
+	sort.Strings(repos)
+	return repos, nil
 }
 
 func (c *tickCandidates) terminalTaskWorktreeCandidates(ctx context.Context) ([]string, error) {
@@ -1694,15 +1729,90 @@ func registeredCheckoutWorktreeKey(checkout string) string {
 	return "worktree:" + normalized
 }
 
+// cleanupCheckout is the checkout a delegation worktree's cleanup runs git in.
+type cleanupCheckout struct {
+	path string
+	// unregistered is set when the job's repo has no repos row (removed, or
+	// renamed: a job keeps the repo name it ran under, #2531). path is then
+	// the checkout owning the worktree, read from its .git pointer as the
+	// trash disposal does (#2526), and ownerErr is why none was found;
+	// workflow.ErrCleanupWorktreeAbsent when the worktree is gone.
+	unregistered bool
+	ownerErr     error
+}
+
+// resolveCleanupCheckout finds the checkout for the cleanup of the worktree
+// of a job of repo. The owning checkout of an unregistered repo is only where
+// the cleanup looks: the engine bound to it still has git there list the
+// worktree as a linked one before it removes anything, exactly as with a
+// registered checkout.
+func resolveCleanupCheckout(ctx context.Context, store *db.Store, repo, worktree string) (cleanupCheckout, error) {
+	record, err := store.GetRepo(ctx, strings.TrimSpace(repo))
+	if err == nil {
+		return cleanupCheckout{path: strings.TrimSpace(record.CheckoutPath)}, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return cleanupCheckout{}, err
+	}
+	worktree = strings.TrimSpace(worktree)
+	if !filepath.IsAbs(worktree) {
+		return cleanupCheckout{unregistered: true, ownerErr: fmt.Errorf("worktree path %q is not absolute", worktree)}, nil
+	}
+	owner, ownerErr := workflow.WorktreeOwnerCheckout(filepath.Clean(worktree))
+	return cleanupCheckout{path: owner, unregistered: true, ownerErr: ownerErr}, nil
+}
+
+// delegationReclaimCheckout is resolveCleanupCheckout for a reclaim attempt.
+// A failed repo lookup leaves the checkout unknown, as before, and the engine
+// refuses (checkout_identity_unknown).
+func delegationReclaimCheckout(ctx context.Context, worker jobWorker, job db.Job, path string) cleanupCheckout {
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		return cleanupCheckout{}
+	}
+	checkout, err := resolveCleanupCheckout(ctx, worker.Store, payload.Repo, path)
+	if err != nil {
+		return cleanupCheckout{}
+	}
+	return checkout
+}
+
+// checkoutRepoKeys returns the repo:<name> keys of the registered repos whose
+// checkout is checkout. Jobs of those repos run there under their repo's key,
+// so a reclaim through that checkout for another (unregistered) repo reserves
+// them too.
+func checkoutRepoKeys(ctx context.Context, store *db.Store, checkout string) ([]string, error) {
+	want, err := normalizeTaskWorktreePath(checkout)
+	if err != nil || want == "" {
+		return nil, err
+	}
+	repos, err := store.ListRepos(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list repos: %w", err)
+	}
+	var keys []string
+	for _, repo := range repos {
+		for _, path := range []string{repo.CheckoutPath, repo.PrimaryCheckoutPath} {
+			if normalized, err := normalizeTaskWorktreePath(path); err == nil && normalized != "" && normalized == want {
+				keys = append(keys, "repo:"+repo.FullName())
+				break
+			}
+		}
+	}
+	return keys, nil
+}
+
 // attemptDelegationReclaim runs one delegation reclaim attempt: reserve the
 // candidate's checkout keys, preserve, then remove (#2517 step 3). The
 // reservation is what lets this run on the background reclaim loop beside job
 // dispatch: while it is held no job can start on the candidate's checkout or
-// on the repo's registered checkout, whose worktree metadata the removal
-// rewrites; when a job already holds either, the candidate is deferred like a
+// on the checkout whose worktree metadata the removal rewrites (the repo's
+// registered checkout, or the owning one of a repo no longer registered,
+// #2531); when a job already holds either, the candidate is deferred like a
 // held checkout. attempted reports whether the engine was called. A non-nil
 // error ends the pass.
 func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickCandidates, kind, label string, job db.Job, path, repo string, now time.Time, reclaim func(workflow.Engine) (bool, error)) (attempted bool, err error) {
+	checkout := delegationReclaimCheckout(ctx, worker, job, path)
 	keys := []string{queuedJobCheckoutKey(ctx, worker.Store, job)}
 	if repo != "" {
 		keys = append(keys, "repo:"+repo)
@@ -1710,7 +1820,20 @@ func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickC
 	// A job running in the registered checkout is keyed worktree:<path> when
 	// its payload or task names that path, not repo:<repo> (#2523 review), so
 	// reserve that identity too.
-	keys = append(keys, registeredCheckoutWorktreeKey(worker.delegationParentCheckout(ctx, job)))
+	keys = append(keys, registeredCheckoutWorktreeKey(checkout.path))
+	if checkout.unregistered && checkout.path != "" {
+		// The owning checkout can be another registered repo's (a renamed
+		// repo's new name), whose jobs there are keyed by that repo.
+		owners, err := checkoutRepoKeys(ctx, worker.Store, checkout.path)
+		if err != nil {
+			logDelegationReclaimFailure(worker.Stdout, label, "lock", job.ID, path, err)
+			if err := cand.deferReclaimSkip(ctx, worker, kind, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {
+				return false, stopDelegationCleanupPass(err)
+			}
+			return false, nil
+		}
+		keys = append(keys, owners...)
+	}
 	release, reserved := cand.reserveCheckouts(keys...)
 	if !reserved {
 		if err := cand.deferReclaimSkip(ctx, worker, kind, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {
@@ -1726,6 +1849,30 @@ func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickC
 	if !ok {
 		return false, nil
 	}
+	if checkout.unregistered {
+		switch {
+		case errors.Is(checkout.ownerErr, workflow.ErrCleanupWorktreeAbsent):
+			// Nothing left to remove, and nothing to remove it through.
+			policy := workflow.CleanupPolicy{Mode: "ordinary"}
+			if kind == reclaimPassAged {
+				policy.Mode = "aged"
+			}
+			reclaim = func(engine workflow.Engine) (bool, error) {
+				// An engine binds its home only with a checkout; the
+				// containment check still needs it.
+				engine.Home = worker.workflowHome()
+				return engine.ReclaimAbsentWorktreeOutcome(ctx, job.ID, policy)
+			}
+		case checkout.ownerErr != nil:
+			// Counted like any identity failure: quarantined, with this
+			// reason, once the retry budget is spent.
+			cause := fmt.Errorf("repo is not registered and no checkout owning %s can be proven: %w", path, checkout.ownerErr)
+			if _, persistErr := recordDelegationCleanupFailure(ctx, worker, label, "identity", job.ID, path, cause, now); persistErr != nil {
+				return false, stopDelegationCleanupPass(persistErr)
+			}
+			return false, nil
+		}
+	}
 	runner, err := worker.subprocessRunnerForJob(job)
 	if err != nil {
 		if _, persistErr := recordDelegationCleanupFailure(ctx, worker, label, "runner", job.ID, path, err, now); persistErr != nil {
@@ -1733,7 +1880,7 @@ func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickC
 		}
 		return false, nil
 	}
-	engine := worker.workflowForJob(worker.delegationParentCheckout(ctx, job), runner)
+	engine := worker.workflowForJob(checkout.path, runner)
 	reclaimed, err := reclaim(engine)
 	if err != nil {
 		if delegationCleanupContended(err) {

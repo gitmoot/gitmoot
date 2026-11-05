@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -181,4 +183,113 @@ func (e Engine) finishProducerCleanupReceipt(ctx context.Context, receipt db.Cle
 		return db.CleanupReceipt{}, err
 	}
 	return e.Store.CompleteCleanupReceipt(ctx, receipt.ResourceID, receipt.LifecycleGeneration, receipt.ReceiptID, e.now())
+}
+
+// ReclaimAbsentWorktreeOutcome closes the cleanup of a delegation worktree
+// that is already gone and whose repo is no longer registered (removed or
+// renamed, #2531). The daemon calls it only then: with no registered checkout
+// and no .git pointer left to find the owning one, the ordinary path refuses
+// the resource (checkout_identity_unknown, resource_missing_without_receipt)
+// on every pass, forever. It deletes nothing and runs no git. Under the
+// cleanup lifecycle fence it rechecks that the owner is final and owns a
+// delegation worktree, that the path is contained (an unproven worktree mount
+// is never taken for absence), that this generation's obligation is open and
+// due, and that the path is absent; then it records what an ordinary removal
+// records: a receipt, its evidence marked absent, and the removal event. An
+// unfinished receipt of an earlier episode is completed instead. reclaimed
+// reports whether the resource is now accounted removed; the caller marks the
+// obligation, as after any reclaim. An owned branch is left alone: no checkout
+// is known to hold it.
+func (e Engine) ReclaimAbsentWorktreeOutcome(ctx context.Context, jobID string, policy CleanupPolicy) (reclaimed bool, err error) {
+	if err := e.validate(); err != nil {
+		return false, err
+	}
+	ctx, release, err := e.Store.AcquireCleanupLifecycle(context.WithoutCancel(ctx))
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	job, payload, err := e.jobPayload(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	if !IsFinalJobState(job.State) || !isImplementDelegationWorktree(job.Type, payload) && !isReadOnlyDelegationWorktree(job.Type, payload) {
+		return false, nil
+	}
+	validator := ValidateDelegationCleanupTarget
+	if e.cleanupTargetValidator != nil {
+		validator = e.cleanupTargetValidator
+	}
+	if err := validator(e.Home, jobID, job.Type, payload); err != nil {
+		if errors.Is(err, ErrWorktreeRootUnavailable) {
+			return false, nil
+		}
+		return false, err
+	}
+	path := filepath.Clean(strings.TrimSpace(payload.WorktreePath))
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		// There again, or unreadable: not proven absent.
+		return false, err
+	}
+	obligation, err := e.Store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(jobID, path))
+	if err != nil {
+		return false, err
+	}
+	if obligation.LifecycleGeneration != job.LifecycleGeneration ||
+		obligation.State != db.CleanupObligationPending && obligation.State != db.CleanupObligationRetryable {
+		return false, nil
+	}
+	if due, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err != nil || due.After(e.now()) {
+		return false, nil
+	}
+	receipt, err := e.Store.GetCleanupReceipt(ctx, obligation.ResourceID, job.LifecycleGeneration)
+	switch {
+	case err == nil && receipt.RemovedAt != "":
+		return true, nil
+	case err == nil && receipt.SupersededAt != "":
+		return false, nil
+	case errors.Is(err, sql.ErrNoRows):
+		if receipt, err = e.prepareAbsentCleanupReceipt(ctx, job, obligation, policy); err != nil {
+			return false, err
+		}
+	case err != nil:
+		return false, err
+	}
+	if _, err := e.finishProducerCleanupReceipt(ctx, receipt); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// prepareAbsentCleanupReceipt prepares the receipt of an absent resource. Its
+// evidence carries what an ordinary one does except the path and git
+// identity, which no longer exist.
+func (e Engine) prepareAbsentCleanupReceipt(ctx context.Context, job db.Job, obligation db.CleanupObligation, policy CleanupPolicy) (db.CleanupReceipt, error) {
+	policy.Mode = effectiveCleanupMode(policy.Mode, job)
+	if policy.BudgetGate == "" {
+		policy.BudgetGate = CleanupBudgetGateNotApplicable
+	}
+	policy.Budget, policy.SizeLimits = nil, nil
+	encodedPolicy, err := json.Marshal(policy)
+	if err != nil {
+		return db.CleanupReceipt{}, err
+	}
+	evidence := cleanupEvidence{ResourceID: obligation.ResourceID, OwnerState: job.State, Generation: job.LifecycleGeneration,
+		OwnerPayloadHash: cleanupHash(job.Payload), Policy: policy, PolicyHash: cleanupHash(string(encodedPolicy)), Absent: true}
+	terminalAt, known := parseStoredJobTime(obligation.TerminalAt)
+	if !known {
+		terminalAt, known = parseStoredJobTime(job.UpdatedAt)
+	}
+	if known {
+		evidence.TerminalAt = terminalAt.UTC().Format(time.RFC3339Nano)
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return db.CleanupReceipt{}, err
+	}
+	return e.Store.PrepareCleanupReceipt(ctx, db.CleanupReceipt{
+		ResourceID: obligation.ResourceID, LifecycleGeneration: job.LifecycleGeneration,
+		OwnerJobID: job.ID, ExpectedPath: obligation.ExpectedPath, TerminalState: job.State,
+		Evidence: string(encoded), EligibilityToken: cleanupHash(string(encoded)),
+	}, e.now())
 }
