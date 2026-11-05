@@ -1109,12 +1109,15 @@ type reclaimTickState struct {
 	// each kind's skip writes get their own reclaimTickBudget (#2519 review),
 	// so one kind's skips can never stop another kind's window advancing.
 	skipWritesStarted map[string]time.Time
-	started           map[string]time.Time
-	serving           map[string]string
-	ran               map[string]bool
-	resumeSeen        map[string]bool
-	denied            map[string]string
-	resume            *reclaimResume
+	// sweepRepos is the set of repos this fleet sweep runs a tick for; nil for
+	// a single-repo tick (#2517 follow-up).
+	sweepRepos map[string]bool
+	started    map[string]time.Time
+	serving    map[string]string
+	ran        map[string]bool
+	resumeSeen map[string]bool
+	denied     map[string]string
+	resume     *reclaimResume
 }
 
 // reclaimResume carries, across ticks, the repo whose reclaim pass of each
@@ -1231,6 +1234,22 @@ func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker,
 		}
 	}
 	return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
+}
+
+// ownedBySweepRepo reports whether a candidate this pass skips because it
+// belongs to another repo will get that repo's own turn in this same sweep.
+// Such a row must not be deferred here (#2517 follow-up, seen live): an
+// earlier repo's pass pushed the row a minute into the future, so when its
+// owner then reached it the cleanup refused itself with retry_not_due, every
+// tick, and no worktree was removed. Rows of repos outside the sweep (disabled
+// or removed) are still deferred so the candidate window keeps moving.
+func (c *tickCandidates) ownedBySweepRepo(job db.Job) bool {
+	if c == nil || len(c.reclaimBudget.sweepRepos) == 0 {
+		return false
+	}
+	// The same repo identity queuedJobMatchesRepo compares: the payload's.
+	payload, err := daemonJobPayload(job)
+	return err == nil && c.reclaimBudget.sweepRepos[strings.TrimSpace(payload.Repo)]
 }
 
 // finishReclaimTick moves each kind that ran this tick to its next resume
@@ -1502,6 +1521,9 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if queuedJobMatchesSession(job, rootFilter) && cand.ownedBySweepRepo(job) {
+				continue
+			}
 			if err := cand.deferReclaimSkip(ctx, worker, reclaimPassSkipped, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
@@ -1605,6 +1627,9 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 		}
 		path := delegationReclaimPath(job.ID, job.Payload)
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
+			if queuedJobMatchesSession(job, rootFilter) && cand.ownedBySweepRepo(job) {
+				continue
+			}
 			if err := cand.deferReclaimSkip(ctx, worker, reclaimPassAged, job.ID, path, db.CleanupReasonTerminalDeferred); err != nil {
 				return stopDelegationCleanupPass(err)
 			}
@@ -2018,6 +2043,12 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// known only once the loop below ends.
 	cand.reclaimBudget.resume = tracker.reclaimResumeState()
 	defer cand.finishReclaimTick()
+	cand.reclaimBudget.sweepRepos = map[string]bool{}
+	for _, repo := range repos {
+		if repo.Enabled {
+			cand.reclaimBudget.sweepRepos[repo.FullName()] = true
+		}
+	}
 	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
