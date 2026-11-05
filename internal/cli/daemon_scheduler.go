@@ -1596,6 +1596,19 @@ func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, re
 	return nil
 }
 
+// registeredCheckoutWorktreeKey is the worktree:<path> checkout key a job gets
+// when its worktree path is the registered checkout; "" when unknown.
+func registeredCheckoutWorktreeKey(checkout string) string {
+	if strings.TrimSpace(checkout) == "" {
+		return ""
+	}
+	normalized, err := normalizeTaskWorktreePath(checkout)
+	if err != nil || normalized == "" {
+		return ""
+	}
+	return "worktree:" + normalized
+}
+
 // attemptDelegationReclaim runs one delegation reclaim attempt: reserve the
 // candidate's checkout keys, preserve, then remove (#2517 step 3). The
 // reservation is what lets this run on the background reclaim loop beside job
@@ -1609,6 +1622,10 @@ func attemptDelegationReclaim(ctx context.Context, worker jobWorker, cand *tickC
 	if repo != "" {
 		keys = append(keys, "repo:"+repo)
 	}
+	// A job running in the registered checkout is keyed worktree:<path> when
+	// its payload or task names that path, not repo:<repo> (#2523 review), so
+	// reserve that identity too.
+	keys = append(keys, registeredCheckoutWorktreeKey(worker.delegationParentCheckout(ctx, job)))
 	release, reserved := cand.reserveCheckouts(keys...)
 	if !reserved {
 		if err := cand.deferReclaimSkip(ctx, worker, kind, job.ID, path, db.CleanupReasonCheckoutLock); err != nil {

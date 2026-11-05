@@ -620,7 +620,9 @@ on a network mount no longer delays any queued job (#2517). While an attempt
 removes a worktree it reserves that worktree's checkout and the repo's registered
 checkout: no job starts on either until the attempt ends, and an attempt waits
 while a job holds either. The terminal task worktree pass still runs in the
-worker tick.
+worker tick. The removal itself still holds the store-wide cleanup lock,
+so job starts pause for its duration (about 15 s for a large worktree on sshfs;
+#2524).
 
 Each kind of reclaim pass is bounded (#2517): it spends at most about 10
 seconds per pass starting candidates across all repos, and the rest wait for a

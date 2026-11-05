@@ -672,3 +672,51 @@ func TestBackgroundReclaimPassHoldsTheRepoCheckoutOnlyDuringItsAttempt(t *testin
 	}
 	h.tracker.end("probe-after")
 }
+
+// #2523 review: a job whose worktree path is the registered checkout is keyed
+// worktree:<path>, not repo:<repo>. The reclaim attempt must reserve that
+// identity too, so such a job cannot start during the attempt.
+func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "registered-checkout-alias")
+	id := "parent/delegation/alias"
+	path := managedDelegationReclaimTestPath(t, h.home, "parent", "alias")
+	seedCLIJob(t, h.store, db.Job{
+		ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+		Repo: "owner/repo", ParentJobID: "parent", DelegationID: "alias",
+		Payload: mustJobPayload(t, workflow.JobPayload{
+			Repo: "owner/repo", ParentJobID: "parent", DelegationID: "alias",
+			WorktreePath: path, Branch: "gitmoot-delegation-alias",
+			Result: &workflow.AgentResult{Decision: "failed"},
+		}),
+	}, "seed reclaim candidate")
+	if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := h.store.GetJob(h.ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := registeredCheckoutWorktreeKey(h.worker.delegationParentCheckout(h.ctx, job))
+	if alias == "" {
+		t.Fatal("no worktree key for the registered checkout")
+	}
+	baseWorkflowFactory := h.worker.defaultWorkflow
+	var engines atomic.Int32
+	var aliasStarted atomic.Bool
+	h.worker.WorkflowFactory = func(checkout string) workflow.Engine {
+		engines.Add(1)
+		if admitted, _ := h.tracker.beginWithinLane(0, false, "alias-probe", "owner/repo", alias, ""); admitted {
+			aliasStarted.Store(true)
+			h.tracker.end("alias-probe")
+		}
+		return baseWorkflowFactory(checkout)
+	}
+	repos := func(context.Context) ([]string, error) { return []string{"owner/repo"}, nil }
+	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", repos, &h.stdout, time.Now().UTC(), time.Time{})
+	if engines.Load() == 0 {
+		t.Fatalf("the loop pass made no reclaim attempt; log=%q", h.stdout.String())
+	}
+	if aliasStarted.Load() {
+		t.Fatalf("a job keyed %s started during the reclaim attempt", alias)
+	}
+}
