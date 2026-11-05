@@ -2963,7 +2963,7 @@ func TestReviewRouterInstructionsAcceptVerifiedCIOnlyForChecksTheEnvironmentCann
 		"the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths",
 		"never block or request changes for that reason alone",
 		// The entry format the evidence ceiling recognizes (#2522 review).
-		`starting with "CI-verified:"`,
+		`"CI-verified: <check> -> success; run <run id> job <job id>"`,
 		// Second half: real execution where possible, and CI must cover the change.
 		"wherever this review environment can run them; do not approve on static reading alone",
 		"Real execution is still required for every check this environment can run",

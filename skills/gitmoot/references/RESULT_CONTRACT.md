@@ -95,12 +95,15 @@ the platform toolchain (for example Xcode on a Linux image) may treat that check
 as satisfied by a green CI run at the exact reviewed head that it verifies
 itself: the run's head SHA equals the reviewed head, the job succeeded, and the
 job builds or tests the changed paths. It records the check as its own
-`tests_run` entry starting with `CI-verified:` and naming the run and job, sets
+`tests_run` entry of the form `CI-verified: <check> -> success; run <run id> job
+<job id>`, lists the checks it ran itself as separate entries, sets
 `checks_blocked`, and does not block or request changes for that reason alone.
-The remote evidence ceiling ignores `CI-verified:` entries: one that says the
-toolchain is absent locally does not downgrade the review, and one never counts
-as a check the review ran, so a review whose only entries are CI-verified is
-`static_only`. It still runs every check its
+The remote evidence ceiling ignores well-formed `CI-verified:` entries (prefix,
+success, run and job named, no local "command not found"/exit 127): a note that
+the toolchain is absent locally does not downgrade the review, and such an entry
+never counts as a check the review ran. A review whose only `tests_run` entries
+are CI-verified is `static_only`, whatever `changes_made` says. A malformed
+`CI-verified:` entry is read like any other entry. It still runs every check its
 environment can run, and a changed path no green exact-head CI job exercised is
 not CI-verified. An unrecognised value is rejected outright,
 like `evidence`, so a misspelling is an error rather than an uncountable row.
