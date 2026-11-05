@@ -140,7 +140,7 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	// snapshot across every open PR's review-job consumers, instead of re-running
 	// ListJobsByType("review") up to ~2× per PR (#619). Lazy: computed on the first
 	// consumer that needs it, never retained beyond this poll.
-	reviewMemo := newReviewJobsMemo(d.Store)
+	reviewMemo := newReviewJobsMemo(d.Store, d.Repo.FullName())
 	for _, pull := range pulls {
 		// A fork head shares nothing with a local branch but its NAME. Every step
 		// below either resolves, stores or advances a local task keyed on that
@@ -1345,7 +1345,7 @@ func (d Daemon) validate() error {
 // *db.Store). It exists purely so a counting fake can pin the once-per-poll fetch
 // property in tests; production always threads the real *db.Store.
 type reviewJobLister interface {
-	ListJobsByType(ctx context.Context, jobType string) ([]db.Job, error)
+	ListReviewJobsForRepoPoll(ctx context.Context, repo string) ([]db.Job, error)
 }
 
 // reviewJobsMemo fetches the repo's review-job list AT MOST ONCE per PollOnce and
@@ -1360,26 +1360,76 @@ type reviewJobLister interface {
 // a fetch error aborts the whole poll). Lazy: a poll that reaches no consumer fetches
 // nothing. Consumed only on the synchronous poll goroutine, so it needs no locking.
 type reviewJobsMemo struct {
-	store reviewJobLister
-	done  bool
-	jobs  []db.Job
+	store    reviewJobLister
+	repo     string
+	snapshot *reviewJobSnapshot
 	// lifecycleRuns records the head each PR's workflow lifecycle already ran at in
 	// THIS poll. It is not part of the snapshot: it is the one fact that makes the
 	// snapshot's staleness harmless, without re-fetching it.
 	lifecycleRuns map[int64]string
 }
 
-func (m *reviewJobsMemo) get(ctx context.Context) ([]db.Job, error) {
-	if m.done {
-		return m.jobs, nil
+func (m *reviewJobsMemo) get(ctx context.Context) (*reviewJobSnapshot, error) {
+	if m.snapshot != nil {
+		return m.snapshot, nil
 	}
-	jobs, err := m.store.ListJobsByType(ctx, "review")
+	jobs, err := m.store.ListReviewJobsForRepoPoll(ctx, m.repo)
 	if err != nil {
 		return nil, err
 	}
-	m.jobs = jobs
-	m.done = true
-	return m.jobs, nil
+	m.snapshot = newReviewJobSnapshot(jobs)
+	return m.snapshot, nil
+}
+
+// reviewJobSnapshot is one poll's review-job list with each payload decoded at most
+// once (#2530). Sharing the list (#619) was not enough: every open PR's consumers
+// still re-decoded every review payload, and the list was host-wide, so a poll cost
+// open PRs x every review job on the host in JSON decodes. On the live store (10,158
+// review jobs, 169 MB of payload) that was 59% of daemon CPU, in
+// pullRequestWorkflowRouting alone. The list is now also scoped to the polled repo
+// (see db.ListReviewJobsForRepoPoll); every consumer requires payload.repo to equal
+// it, so no consumer can observe the rows that dropped out.
+//
+// Decoding is lazy per job, so each consumer still reaches exactly the jobs, and
+// therefore the first malformed payload, it reached before. The cached value is
+// the decode of the snapshot's payload text, which is what every consumer decoded
+// before too: a job advanced mid-poll was never re-read. Consumers must treat the
+// returned payload as read-only; its slices and pointers are shared.
+type reviewJobSnapshot struct {
+	jobs     []db.Job
+	payloads []decodedReviewPayload
+}
+
+type decodedReviewPayload struct {
+	decoded bool
+	payload workflow.JobPayload
+	err     error
+}
+
+func newReviewJobSnapshot(jobs []db.Job) *reviewJobSnapshot {
+	return &reviewJobSnapshot{jobs: jobs, payloads: make([]decodedReviewPayload, len(jobs))}
+}
+
+// decode is json.Unmarshal of job i's payload: an empty payload is an error.
+func (s *reviewJobSnapshot) decode(i int) (workflow.JobPayload, error) {
+	cached := &s.payloads[i]
+	if !cached.decoded {
+		cached.decoded = true
+		if err := json.Unmarshal([]byte(s.jobs[i].Payload), &cached.payload); err != nil {
+			cached.payload = workflow.JobPayload{}
+			cached.err = fmt.Errorf("parse job payload %q: %w", s.jobs[i].ID, err)
+		}
+	}
+	return cached.payload, cached.err
+}
+
+// workflowPayload is workflowPayload(job) for job i: an empty payload is a zero
+// payload rather than an error.
+func (s *reviewJobSnapshot) workflowPayload(i int) (workflow.JobPayload, error) {
+	if strings.TrimSpace(s.jobs[i].Payload) == "" {
+		return workflow.JobPayload{}, nil
+	}
+	return s.decode(i)
 }
 
 // noteLifecycleRun records that this PR's workflow lifecycle ran at this head in the
@@ -1406,19 +1456,23 @@ func (m *reviewJobsMemo) lifecycleRanAtHead(pull github.PullRequest) bool {
 // newReviewJobsMemo is a package var (not a plain func) only so the once-per-poll
 // regression test can substitute a memo backed by a counting store; production never
 // reassigns it.
-var newReviewJobsMemo = func(store reviewJobLister) *reviewJobsMemo {
-	return &reviewJobsMemo{store: store}
+var newReviewJobsMemo = func(store reviewJobLister, repo string) *reviewJobsMemo {
+	return &reviewJobsMemo{store: store, repo: repo}
 }
 
 // reviewJobs returns the poll's shared review-job snapshot via memo when one is
 // threaded (the PollOnce path), and otherwise fetches fresh from the store. The nil
 // case covers standalone/test calls to a single consumer, which fetch exactly as they
 // did before the per-poll memo (#619).
-func (d Daemon) reviewJobs(ctx context.Context, memo *reviewJobsMemo) ([]db.Job, error) {
+func (d Daemon) reviewJobs(ctx context.Context, memo *reviewJobsMemo) (*reviewJobSnapshot, error) {
 	if memo != nil {
 		return memo.get(ctx)
 	}
-	return d.Store.ListJobsByType(ctx, "review")
+	jobs, err := d.Store.ListReviewJobsForRepoPoll(ctx, d.Repo.FullName())
+	if err != nil {
+		return nil, err
+	}
+	return newReviewJobSnapshot(jobs), nil
 }
 
 func (d Daemon) pullRequestChanged(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (bool, error) {
@@ -1445,21 +1499,21 @@ type pullRequestRouting struct {
 }
 
 func (d Daemon) pullRequestWorkflowRouting(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (pullRequestRouting, error) {
-	// Only review jobs are inspected below; ListJobsByType filters in SQL so this
+	// Only review jobs are inspected below; ListReviewJobsForRepoPoll filters in SQL so this
 	// poll path stops materializing every non-review job's payload (#619). The list is
 	// shared across the poll's review-job consumers via memo (fetched once per poll).
-	jobs, err := d.reviewJobs(ctx, memo)
+	snapshot, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return pullRequestRouting{}, err
 	}
 	routing := pullRequestRouting{}
-	for _, job := range jobs {
+	for i, job := range snapshot.jobs {
 		if job.Type != "review" {
 			continue
 		}
-		var payload workflow.JobPayload
-		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-			return pullRequestRouting{}, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+		payload, err := snapshot.decode(i)
+		if err != nil {
+			return pullRequestRouting{}, err
 		}
 		if workflowReviewJobMatchesPull(d.Repo.FullName(), pull, payload) {
 			if strings.TrimSpace(payload.HeadSHA) == pull.HeadSHA {
@@ -1720,18 +1774,18 @@ func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github
 }
 
 func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
-	// Only review jobs can be superseded here; ListJobsByType filters in SQL so this
+	// Only review jobs can be superseded here; ListReviewJobsForRepoPoll filters in SQL so this
 	// poll path stops materializing every non-review job's payload (#619). The list is
 	// shared across the poll's review-job consumers via memo (fetched once per poll).
-	jobs, err := d.reviewJobs(ctx, memo)
+	snapshot, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return err
 	}
-	for _, job := range jobs {
+	for i, job := range snapshot.jobs {
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := workflowPayload(job)
+		payload, err := snapshot.workflowPayload(i)
 		if err != nil {
 			return err
 		}
@@ -2276,7 +2330,7 @@ func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.Pull
 	if err != nil {
 		return db.Task{}, err
 	}
-	jobs, err := d.reviewJobs(ctx, memo)
+	snapshot, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return db.Task{}, err
 	}
@@ -2290,7 +2344,7 @@ func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.Pull
 		if !ok || number != pull.Number {
 			continue
 		}
-		bound, err := reviewTaskBoundToPullHead(candidate, d.Repo.FullName(), pull, jobs)
+		bound, err := reviewTaskBoundToPullHead(candidate, d.Repo.FullName(), pull, snapshot)
 		if err != nil {
 			return db.Task{}, err
 		}
@@ -2313,14 +2367,14 @@ func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.Pull
 	}
 }
 
-func reviewTaskBoundToPullHead(task db.Task, repoFullName string, pull github.PullRequest, jobs []db.Job) (bool, error) {
-	for _, job := range jobs {
+func reviewTaskBoundToPullHead(task db.Task, repoFullName string, pull github.PullRequest, snapshot *reviewJobSnapshot) (bool, error) {
+	for i, job := range snapshot.jobs {
 		if job.State != string(workflow.JobSucceeded) {
 			continue
 		}
-		var payload workflow.JobPayload
-		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-			return false, fmt.Errorf("parse job payload %q: %w", job.ID, err)
+		payload, err := snapshot.decode(i)
+		if err != nil {
+			return false, err
 		}
 		if payload.TaskID == task.ID &&
 			payload.Repo == repoFullName &&
@@ -2390,19 +2444,19 @@ func (d Daemon) reconcileReviewingPullRequest(ctx context.Context, pull github.P
 	if task.State != string(workflow.TaskReviewing) {
 		return nil
 	}
-	// Only review jobs advance the reviewing PR here; ListJobsByType filters in SQL
+	// Only review jobs advance the reviewing PR here; ListReviewJobsForRepoPoll filters in SQL
 	// so this poll path stops materializing every non-review job's payload (#619). The
 	// list is shared across the poll's review-job consumers via memo (once per poll).
-	jobs, err := d.reviewJobs(ctx, memo)
+	snapshot, err := d.reviewJobs(ctx, memo)
 	if err != nil {
 		return err
 	}
 	hasCurrentReview := false
-	for _, job := range jobs {
+	for i, job := range snapshot.jobs {
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := workflowPayload(job)
+		payload, err := snapshot.workflowPayload(i)
 		if err != nil {
 			return err
 		}

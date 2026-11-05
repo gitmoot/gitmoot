@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -218,5 +219,118 @@ func TestParkSelfInvalidatesWithoutMirrorRow(t *testing.T) {
 	archiveWorkerInMirror(t, store)
 	if parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 8, 27, 10, 1, 0, 0, time.UTC), "seat archived"); err != nil || parked != 1 {
 		t.Fatalf("mirrored park = %d, %v; want 1", parked, err)
+	}
+}
+
+// The archive mirror re-parks every archived seat every minute and almost
+// always parks nothing, so the park statement's plan IS its steady-state cost
+// (#2530). The shipped text scanned every note body and, per unparked closed
+// directive, rescanned every same-workflow sibling through
+// idx_workflow_notes_wid: about 5s of daemon CPU per pass on the live store, to
+// park 0 rows.
+//
+// As in #2138 this asserts the shape, not a duration. The outer statement must
+// walk only the directive partial index, and each terminal-marker probe must be
+// a RANGE on the marker index's 64-character prefix: `workflow_id=?` alone
+// still walks every marker note in the workflow.
+func TestParkOpenOrgDirectivesForRoleIsIndexBounded(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	plan := explainPlan(t, store, parkOpenOrgDirectivesForRoleSQL, "stamp", "reason", "worker", "worker", "worker")
+	if !strings.Contains(plan, "SCAN workflow_notes USING INDEX idx_workflow_notes_directive_oldest") {
+		t.Fatalf("park does not restrict its outer scan to directive notes, so every pass reads every note body:\n%s", plan)
+	}
+	const markerRange = "SEARCH r USING INDEX idx_workflow_notes_directive_markers (workflow_id=? AND <expr>>? AND <expr><?)"
+	if got := strings.Count(plan, markerRange); got != 2 {
+		t.Fatalf("park has %d range-bounded terminal-marker probes, want 2 (cancel and done):\n%s", got, plan)
+	}
+	if strings.Contains(plan, "idx_workflow_notes_wid") {
+		t.Fatalf("park probes every same-workflow sibling through idx_workflow_notes_wid:\n%s", plan)
+	}
+}
+
+// The index-shaped rewrite matches terminal markers by a 64-character prefix
+// RANGE instead of an exact per-row comparison, so these are the cases where a
+// wrong bound silently parks a closed directive or skips an open one. Each is
+// a wrong answer, not a slowdown.
+func TestParkOpenOrgDirectivesForRoleTerminalMarkerScoping(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		marker     func(id int64) (workflow string, body string)
+		wantParked int64
+	}{
+		{
+			name: "done in the same workflow keeps it unparked",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-done id=%d by=worker] finished", id)
+			},
+			wantParked: 0,
+		},
+		{
+			name: "cancel in the same workflow keeps it unparked",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-cancel id=%d by=owner] withdrawn", id)
+			},
+			wantParked: 0,
+		},
+		{
+			// The indexed prefix is 64 characters; the marker's own prefix is
+			// shorter, so a long body must still match through the range.
+			name: "done with a body past the indexed 64 characters keeps it unparked",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-done id=%d by=worker] %s", id, strings.Repeat("x", 200))
+			},
+			wantParked: 0,
+		},
+		{
+			name: "done in a FOREIGN workflow does not close it",
+			marker: func(id int64) (string, string) {
+				return "unrelated/workflow", fmt.Sprintf("[org:directive-done id=%d by=worker] finished", id)
+			},
+			wantParked: 1,
+		},
+		{
+			name: "marker with no space after the id does not close it",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-done id=%d]", id)
+			},
+			wantParked: 1,
+		},
+		{
+			// id=71 sorts inside [id=7 , id=7!) only if the upper bound is wrong.
+			name: "marker for a longer id sharing the prefix does not close it",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-done id=%d1 by=worker] finished", id)
+			},
+			wantParked: 1,
+		},
+		{
+			name: "zero-padded id does not close the unpadded directive",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-cancel id=0%d by=owner] withdrawn", id)
+			},
+			wantParked: 1,
+		},
+		{
+			name: "ack is not a terminal marker",
+			marker: func(id int64) (string, string) {
+				return "wave/scope", fmt.Sprintf("[org:directive-ack id=%d by=worker]", id)
+			},
+			wantParked: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := openWorkflowTestStore(t)
+			ctx := context.Background()
+			directive := insertParkTestDirective(t, store, "wave/scope", "[org:directive to=worker from=owner wf=wave/scope] do the thing")
+			workflowID, body := test.marker(directive.ID)
+			if _, err := store.InsertWorkflowNote(ctx, WorkflowNote{WorkflowID: workflowID, Author: "worker", Body: body}); err != nil {
+				t.Fatal(err)
+			}
+			archiveWorkerInMirror(t, store)
+			parked, err := store.ParkOpenOrgDirectivesForRole(ctx, "worker", time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC), "seat archived")
+			if err != nil || parked != test.wantParked {
+				t.Fatalf("park = %d, %v; want %d for marker %q in %q", parked, err, test.wantParked, body, workflowID)
+			}
+		})
 	}
 }

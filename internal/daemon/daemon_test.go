@@ -1055,7 +1055,7 @@ func TestPollOnceRetriesReadyToMergePullRequestDespiteConsecutiveChangedPolls(t 
 	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
 
 	for poll := 1; poll <= 2; poll++ {
-		changed, err := daemon.pullRequestChanged(ctx, pull, newReviewJobsMemo(store))
+		changed, err := daemon.pullRequestChanged(ctx, pull, newReviewJobsMemo(store, daemon.Repo.FullName()))
 		if err != nil {
 			t.Fatalf("poll %d pullRequestChanged returned error: %v", poll, err)
 		}

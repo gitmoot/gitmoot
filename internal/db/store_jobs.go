@@ -473,6 +473,28 @@ func (s *Store) ListJobsByState(ctx context.Context, state string) ([]Job, error
 	return scanJobs(rows)
 }
 
+// ListReviewJobsForRepoPoll returns the review jobs one repository's poll can
+// match, in id order: those whose denormalized repo is repo, plus every row
+// with an empty repo (#2530).
+//
+// Every poll consumer requires payload.repo == repo, and jobs.repo is written
+// from that same payload member on every insert and payload update, so a row
+// under another repo can never match and only cost a decode: ListJobsByType
+// handed each repo's poll the whole host's review history (10,158 jobs, 169 MB
+// on the live store). The empty-repo rows stay because they are the ones the
+// column cannot vouch for: a payload the projection could not parse, which the
+// poll must still see so it fails on it exactly as before, and any row written
+// before the column existed.
+func (s *Store) ListReviewJobsForRepoPoll(ctx context.Context, repo string) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE type = 'review' AND (repo = ? OR repo = '')
+		ORDER BY id`, repo)
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
+}
+
 func (s *Store) ListJobsByRepo(ctx context.Context, repo string) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE repo = ? ORDER BY id`, repo)
 	if err != nil {

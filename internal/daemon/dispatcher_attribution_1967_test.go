@@ -66,7 +66,7 @@ func TestDaemonPRWatcherFanoutRecordsTheBranchLockOwnerAsDispatcher(t *testing.T
 		HeadSHA: "head1967",
 	}
 
-	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store)); err != nil {
+	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store, daemon.Repo.FullName())); err != nil {
 		t.Fatalf("handlePullRequestWorkflowChange returned error: %v", err)
 	}
 
