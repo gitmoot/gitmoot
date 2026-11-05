@@ -349,6 +349,19 @@ func fixtureCleanupBudget(limit int64) func(string) (*ApprovedCleanupSizeBudget,
 func TestRefusedCleanupSkipsTheCaptureAndBacksOff(t *testing.T) {
 	world := newProducerCleanupFixture(t, true)
 	ctx := context.Background()
+	// Not a pinned PR review, so aged mode refuses it too.
+	job, payload, err := world.engine.jobPayload(ctx, world.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.PullRequest, payload.HeadSHA = 0, ""
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
 	if err := world.store.UpdateJobState(ctx, world.jobID, string(JobFailed)); err != nil {
 		t.Fatal(err)
 	}
@@ -380,5 +393,54 @@ func TestRefusedCleanupSkipsTheCaptureAndBacksOff(t *testing.T) {
 	}
 	if wait := time.Until(next); wait < 90*time.Minute {
 		t.Fatalf("retry in %s after an 8-hour-old refused cleanup, want about 2h (a quarter of its age)", wait.Round(time.Minute))
+	}
+}
+
+// #2529 review: a failed pinned PR review is refused in ordinary mode but may
+// be removed in aged mode, and both modes share the obligation's deadline. The
+// ordinary refusal still skips the capture but must not push the deadline out,
+// or aged reclaim would find the row not due. Automatic cleanup also ignores
+// its caller's cancellation, the new pre-check included.
+func TestOrdinaryRefusalOfARebuildableReviewKeepsAgedCleanupDue(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	job, payload, err := world.engine.jobPayload(ctx, world.jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.PullRequest, payload.HeadSHA = 12, "0123456789abcdef0123456789abcdef01234567"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobState(ctx, world.jobID, string(JobFailed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := world.store.EnsureCleanupObligation(ctx, world.jobID, world.path, time.Now().UTC().Add(-8*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	captured := 0
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		captured++
+		return nil
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	removed, err := world.engine.ReclaimTerminalDelegationWorktreeOutcome(cancelled, world.jobID)
+	if err != nil || removed {
+		t.Fatalf("ordinary cleanup of a failed review: removed=%t err=%v, want kept without error", removed, err)
+	}
+	if captured != 0 {
+		t.Fatalf("the capture ran %d times for an ordinary cleanup that is always refused", captured)
+	}
+	obligation, err := world.store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(world.jobID, world.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err != nil || time.Until(next) > 2*time.Minute {
+		t.Fatalf("retry at %s (%v): an ordinary refusal pushed out a row aged mode may remove", obligation.NextAttemptAt, err)
 	}
 }

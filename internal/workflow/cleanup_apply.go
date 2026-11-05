@@ -223,9 +223,12 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 // That capture takes 10-45 s on the sshfs seats and runs under the shared
 // lifecycle lease; for an owner that did not succeed it bought nothing, because
 // the refusal depends only on the job and the mode, and the reclaim pass then
-// retried a minute later. Such a resource is deferred with the same growing
-// delay as a failed capture (a quarter of its pending age, 1 min..6 h); the
-// aged pass, whose mode can accept a rebuildable review, still sees it.
+// retried a minute later. When aged mode refuses it too (not rebuildable),
+// nothing can remove it until the job changes, so it is deferred with the same
+// growing delay as a failed capture (a quarter of its pending age, 1 min..6 h).
+// A rebuildable review is eligible in aged mode and the deadline is shared by
+// both modes (#2529 review), so it only skips the capture and keeps the pass's
+// usual short retry.
 func (e Engine) deferStablyRefusedCleanup(ctx context.Context, jobID string, policy CleanupPolicy) (bool, error) {
 	if e.Store == nil {
 		// Leave it to the normal path, which reports the missing store.
@@ -240,6 +243,10 @@ func (e Engine) deferStablyRefusedCleanup(ctx context.Context, jobID string, pol
 		strings.TrimSpace(payload.WorktreePath) == "" ||
 		!cleanupRetryDispositionUnknown(job, payload, readOnly, effectiveCleanupMode(policy.Mode, job)) {
 		return false, nil
+	}
+	if !cleanupRetryDispositionUnknown(job, payload, readOnly, "aged") {
+		e.recordCleanupSkippedOnce(ctx, jobID, payload, "retry_disposition_unknown")
+		return true, nil
 	}
 	persistCtx := context.WithoutCancel(ctx)
 	now := e.now().UTC()
@@ -256,7 +263,9 @@ func (e Engine) deferStablyRefusedCleanup(ctx context.Context, jobID string, pol
 }
 
 func (e Engine) cleanupProducerAutomatically(ctx context.Context, jobID string, policy CleanupPolicy) (bool, error) {
-	if refused, err := e.deferStablyRefusedCleanup(ctx, jobID, policy); err != nil || refused {
+	// Like the rest of automatic cleanup, independent of the caller's
+	// cancellation (#2529 review).
+	if refused, err := e.deferStablyRefusedCleanup(context.WithoutCancel(ctx), jobID, policy); err != nil || refused {
 		return false, err
 	}
 	ctx, err := e.publishCleanupArtifacts(context.WithoutCancel(ctx), jobID)
