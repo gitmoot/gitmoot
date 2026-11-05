@@ -99,6 +99,14 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 1,
 		reason:      "credential gateway resolves host GitHub auth locally; only the scoped Git-read lease reaches the review instance, never the host credential or its lookup command",
 	},
+	"internal/cli/review_related_pr.go:reviewRelatedGit": {
+		rawCommands: 1,
+		reason:      "related pull request trees (#2509) are fetched by host git with the daemon's own credential into a private temp repository; only plain file bytes reach a review, never the repository, URL or credential",
+	},
+	"internal/cli/review_related_pr.go:walkReviewRelatedTree": {
+		rawCommands: 1,
+		reason:      "reads the related tree's blobs from the host-private fetch repository with git cat-file; same host-only boundary as reviewRelatedGit",
+	},
 	"internal/cli/repo.go:resolveRegisteredRepoRecord": {
 		execRunners: 1,
 		reason:      "operator repo registration inspects and repairs the selected host checkout",

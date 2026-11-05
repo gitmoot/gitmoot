@@ -287,6 +287,10 @@ func applyReviewChecksRoute(request *localAgentDispatchRequest, repo string) (bo
 	if request.ReviewEvidence != nil && !reviewEvidenceProviderAllowed(route.provider) {
 		return true, fmt.Errorf("review of %s refused: %s routes it to provider %q, but --evidence-manifest is delivered only to E2B reviews", repo, route.setting(), route.provider)
 	}
+	// Related pull request trees (#2509) reach local and E2B reviews only.
+	if len(request.ReviewRelatedPRs) > 0 && !reviewEvidenceProviderAllowed(route.provider) {
+		return true, fmt.Errorf("review of %s refused: %s routes it to provider %q, but --related-pr trees are delivered only to local and E2B reviews", repo, route.setting(), route.provider)
+	}
 	remote := string(execbackend.Remote)
 	request.ExecBackend = &remote
 	request.ExecProvider = route.provider
@@ -418,7 +422,10 @@ type localAgentDispatchRequest struct {
 	ReviewSupersedes      string
 	ReviewSupersedeReason string
 	// ReviewEvidence is the pinned private evidence of a remote review (#2476).
-	ReviewEvidence         *workflow.ReviewEvidence
+	ReviewEvidence *workflow.ReviewEvidence
+	// ReviewRelatedPRs are the related pull requests whose exact head trees the
+	// review receives read-only (#2509), resolved on the host at request time.
+	ReviewRelatedPRs       []workflow.ReviewRelatedPR
 	Reviewers              []string
 	SkipNativeReviewFanout bool
 	Recipe                 string
@@ -1115,6 +1122,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			request.Instructions += brief
 		}
 	}
+	// RELATED PULL REQUESTS (#2509). Appended after the #1819 scan for the same
+	// reason as the brief: the block names another pull request's exact head,
+	// which the scan would rightly call foreign to this one.
+	if block := reviewRelatedPRInstructions(request.ReviewRelatedPRs); request.Action == "review" && block != "" {
+		request.Instructions += "\n\n" + block
+	}
 	// STAGED REVIEW (#1821). Placed here for the same reason as the brief above,
 	// and the reason is #1819's scan: this append must land AFTER
 	// dispatchPromptHeadContradictionWarnings. The preflight block interpolates
@@ -1204,6 +1217,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReviewSupersedes:         request.ReviewSupersedes,
 		ReviewSupersedeReason:    request.ReviewSupersedeReason,
 		ReviewEvidence:           request.ReviewEvidence,
+		ReviewRelatedPRs:         request.ReviewRelatedPRs,
 		TemplateOverride:         recipeTemplate,
 		WorktreePath:             readOnlyWorktreePath,
 		ReadOnlyWorktree:         readOnlyWorktreePath != "",

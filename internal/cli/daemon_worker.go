@@ -1096,6 +1096,22 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 		writeLine(w.Stdout, "job %s tool cache grant failed: %v", job.ID, toolCacheErr)
 	}
+	// Related pull request trees (#2509): a local review gets them inside its own
+	// worktree; a remote E2B review got them at provisioning.
+	removeRelatedTrees := func() {}
+	if execBackend == execbackend.Local && len(payload.ReviewRelatedPRs) > 0 && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		remove, relatedErr := w.installLocalReviewRelatedPRs(ctx, job.ID, payload, deliveryCheckout)
+		if relatedErr != nil {
+			err := fmt.Errorf("prepare related pull request trees: %w", relatedErr)
+			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
+				return finishErr
+			}
+			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
+			return nil
+		}
+		removeRelatedTrees = remove
+		defer removeRelatedTrees()
+	}
 	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, job.ID, agent.Runtime)
 	if err != nil {
 		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
@@ -1319,6 +1335,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	if execBackend == execbackend.Remote {
 		adapter = w.guardRemoteReviewEvidence(adapter, lifecycle, instance, job.ID, payload)
+		adapter = w.guardRemoteReviewRelatedPRs(adapter, lifecycle, instance, job.ID, payload)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	engine.CollectChangeSet = executionChangeSetCollector(lifecycle, instance, execBackend, job.ID)
@@ -1379,6 +1396,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	}
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
+	removeRelatedTrees()
 	stopKillPending()
 	stopProgress()
 	if readOnlyState != nil {

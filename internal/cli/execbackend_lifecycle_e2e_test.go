@@ -438,6 +438,9 @@ func (h *remoteLifecycleHarness) serveControl(w http.ResponseWriter, r *http.Req
 		h.mu.Lock()
 		h.deleted = append(h.deleted, "sandbox-1")
 		h.mu.Unlock()
+		// A destroyed sandbox takes read-only trees with it; the fake restores
+		// write bits first so an unprivileged test user can remove them too.
+		restoreTreeWriteBits(h.workspace)
 		if err := os.RemoveAll(h.workspace); err != nil {
 			h.t.Errorf("remove sandbox workspace: %v", err)
 		}

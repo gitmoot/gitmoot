@@ -357,6 +357,9 @@ func (w jobWorker) provisionExecutionBackend(ctx context.Context, backend execba
 			return lifecycle, instance, nil, nil, err
 		}
 		evidenceEnv = append(evidenceEnv, attachmentEnv...)
+		if err := w.installRemoteReviewRelatedPRs(ctx, lifecycle, instance, job); err != nil {
+			return lifecycle, instance, nil, nil, err
+		}
 	}
 	lease, env, err := w.provisionRemoteCredentialGateway(ctx, backend, runtimeName, job.ID, ttl, credentialPlan, lifecycle, instance)
 	if err != nil {
