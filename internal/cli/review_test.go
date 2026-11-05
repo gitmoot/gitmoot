@@ -2964,6 +2964,7 @@ func TestReviewRouterInstructionsAcceptVerifiedCIOnlyForChecksTheEnvironmentCann
 		"never block or request changes for that reason alone",
 		// The entry format the evidence ceiling recognizes (#2522 review).
 		`"CI-verified: <check> -> success; run <run id> job <job id>"`,
+		"put why it cannot run here in checks_blocked",
 		// Second half: real execution where possible, and CI must cover the change.
 		"wherever this review environment can run them; do not approve on static reading alone",
 		"Real execution is still required for every check this environment can run",

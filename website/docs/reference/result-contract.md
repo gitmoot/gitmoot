@@ -102,14 +102,13 @@ as satisfied by a green CI run at the exact reviewed head that it verifies
 itself: the run's head SHA equals the reviewed head, the job succeeded, and the
 job builds or tests the changed paths. It records the check as its own
 `tests_run` entry of the form `CI-verified: <check> -> success; run <run id> job
-<job id>`, lists the checks it ran itself as separate entries, sets
-`checks_blocked`, and does not block or request changes for that reason alone.
-The remote evidence ceiling ignores well-formed `CI-verified:` entries (prefix,
-success, run and job named, no local "command not found"/exit 127): a note that
-the toolchain is absent locally does not downgrade the review, and such an entry
-never counts as a check the review ran. A review whose only `tests_run` entries
-are CI-verified is `static_only`, whatever `changes_made` says. A malformed
-`CI-verified:` entry is read like any other entry. It still runs every check its
+<job id>` and nothing else in that entry, puts why the check cannot run here in
+`checks_blocked` and `summary`, lists the checks it ran itself as separate
+entries, and does not block or request changes for that reason alone. For the
+remote evidence ceiling a `CI-verified:` entry never counts as a check the
+review ran, so a review whose only `tests_run` entries are CI-verified is
+`static_only` whatever `changes_made` says; and like every entry it clamps the
+result if it reports a missing toolchain. It still runs every check its
 environment can run, and a changed path no green exact-head CI job exercised is
 not CI-verified. An unrecognised value is rejected outright,
 like `evidence`, so a misspelling is an error rather than an uncountable row.
