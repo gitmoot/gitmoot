@@ -18,6 +18,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
@@ -1121,6 +1122,36 @@ type tickCandidates struct {
 	// a pointer while config is a value: the config memo must die with the tick,
 	// the cursor must survive it. nil disables cursor gating entirely.
 	events *jobEventCandidateCache
+	// candidateRepos maps a retry candidate to its owning repo for this tick;
+	// see candidateBelongsToRepo.
+	candidateRepos map[string]candidateJobRepo
+	// blockedTTLSwept records that this tick's host-wide blocked_ttl reaper
+	// already ran successfully.
+	blockedTTLSwept bool
+	// blockedSince memoizes the tick's blocked-since event-rule guard.
+	blockedSince blockedSinceSinkMemo
+}
+
+type blockedSinceSinkMemo struct {
+	done bool
+	home string
+	sink events.Sink
+}
+
+// blockedSinceEventSink is enabledBlockedSinceEventSink resolved once per tick
+// (#2530). It lists every event rule, and the repo sweep asked it once per
+// enabled repo every second. Only a success is memoized, so a failed read is
+// retried by the next repo, as it was before.
+func (c *tickCandidates) blockedSinceEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {
+	if c.blockedSince.done && c.blockedSince.home == home {
+		return c.blockedSince.sink, nil
+	}
+	sink, err := enabledBlockedSinceEventSink(ctx, store, home)
+	if err != nil {
+		return nil, err
+	}
+	c.blockedSince = blockedSinceSinkMemo{done: true, home: home, sink: sink}
+	return sink, nil
 }
 
 // reclaimTickBudget bounds the wall time one worker tick spends starting
@@ -1298,6 +1329,55 @@ func (c *tickCandidates) finishReclaimTick() {
 // never reassigns it.
 var newTickCandidates = func(store tickCandidateStore) *tickCandidates {
 	return &tickCandidates{store: store}
+}
+
+// candidateJobRepo is what one tick learned about a retry candidate's owning
+// repo: the payload repo of the row it read, or that the row is gone.
+type candidateJobRepo struct {
+	missing bool
+	// repo is "" for a payload that does not decode, which matches no filter.
+	repo string
+}
+
+// candidateBelongsToRepo reports whether the retry candidate jobID can pass
+// queuedJobMatchesRepo for repoFilter, reading and decoding its row at most once
+// per tick (#2530).
+//
+// The candidate sets are host-wide and the retry passes run once per enabled
+// repo, so each pass used to GetJob and JSON-decode EVERY candidate only to
+// discard the ones owned by other repos: 89 repos x 18 candidates on the live
+// store, every second, was 28% of daemon CPU. A pass still re-reads its own
+// candidates fresh and re-runs every original predicate on that row, so the
+// cache can never make a pass act on a job it would have skipped. The most a
+// payload whose repo changed mid-tick can cost is being picked up by its new
+// repo's pass one tick (one second) later.
+//
+// Like candidateMemo it memoizes only success: a read error is returned and
+// retried by the next repo's pass, exactly as the uncached read was.
+func (c *tickCandidates) candidateBelongsToRepo(ctx context.Context, store *db.Store, jobID string, repoFilter string) (bool, error) {
+	repoFilter = strings.TrimSpace(repoFilter)
+	if repoFilter == "" {
+		return true, nil
+	}
+	owner, seen := c.candidateRepos[jobID]
+	if !seen {
+		job, err := store.GetJob(ctx, jobID)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			owner.missing = true
+		case err != nil:
+			return false, err
+		default:
+			if payload, err := daemonJobPayload(job); err == nil {
+				owner.repo = payload.Repo
+			}
+		}
+		if c.candidateRepos == nil {
+			c.candidateRepos = map[string]candidateJobRepo{}
+		}
+		c.candidateRepos[jobID] = owner
+	}
+	return !owner.missing && owner.repo != "" && owner.repo == repoFilter, nil
 }
 
 // jobEventCandidateKind indexes the candidate sets whose value is a pure function
@@ -1480,6 +1560,11 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 		return err
 	}
 	for _, jobID := range jobIDs {
+		if owned, err := cand.candidateBelongsToRepo(ctx, worker.Store, jobID, repoFilter); err != nil {
+			return err
+		} else if !owned {
+			continue
+		}
 		job, err := worker.Store.GetJob(ctx, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			// A marker event with no surviving job row (e.g. a pruned job): nothing
@@ -1987,15 +2072,27 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	// above (deliberately) do. Resolved per tick, so the TTL is live-tunable like the
 	// per-repo scheduler override below.
 	workflowHome := worker.workflowHome()
-	if err := sweepExpiredBlockedJobs(ctx, store, cand.config.blockedJobTTL(workflowHome), stdout, now); err != nil {
-		writeLine(stdout, "blocked_ttl sweep failed: %v", err)
+	// The reaper is host-wide (it takes no repo), so it runs once per tick, not
+	// once per enabled repo (#2530); a failed sweep is retried by the next repo.
+	if !cand.blockedTTLSwept {
+		if err := sweepExpiredBlockedJobs(ctx, store, cand.config.blockedJobTTL(workflowHome), stdout, now); err != nil {
+			writeLine(stdout, "blocked_ttl sweep failed: %v", err)
+		} else {
+			cand.blockedTTLSwept = true
+		}
 	}
 	// Opt-in blocked-since source (#1060): stale BLOCKED tasks synthesize one
 	// blocked event per continuous episode for the existing event-rule engine.
 	// Like blocked_ttl, every failure is logged and swallowed so this optional
-	// evaluator can never fail the repo tick.
-	if err := sweepBlockedTaskWakeEvents(ctx, store, workflowHome, repoFilter, cand.config.blockedRoleWakeAfter(workflowHome), stdout, now); err != nil {
-		writeLine(stdout, "blocked_since task sweep failed: %v", err)
+	// evaluator can never fail the repo tick. The wake threshold and the
+	// event-rule guard are host-wide and resolved once per tick; only the
+	// blocked-task evaluation is per repo.
+	if wakeAfter := cand.config.blockedRoleWakeAfter(workflowHome); wakeAfter > 0 {
+		if sink, err := cand.blockedSinceEventSink(ctx, store, workflowHome); err != nil {
+			writeLine(stdout, "blocked_since task sweep failed: %v", err)
+		} else if err := evaluateBlockedTaskEpisodes(ctx, store, sink, repoFilter, wakeAfter, stdout, now); err != nil {
+			writeLine(stdout, "blocked_since task sweep failed: %v", err)
+		}
 	}
 	// Periodic off-box reconciliation (#1539). Before this, reconciliation ran
 	// ONCE PER PROCESS at backend construction, so an instance orphaned while a
@@ -2278,6 +2375,11 @@ func retryPendingJobComments(ctx context.Context, worker jobWorker, repoFilter s
 		return err
 	}
 	for _, jobID := range jobIDs {
+		if owned, err := cand.candidateBelongsToRepo(ctx, worker.Store, jobID, repoFilter); err != nil {
+			return err
+		} else if !owned {
+			continue
+		}
 		job, err := worker.Store.GetJob(ctx, jobID)
 		if errors.Is(err, sql.ErrNoRows) {
 			// A marker event with no surviving job row (e.g. a pruned job): skip

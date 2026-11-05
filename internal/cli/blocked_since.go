@@ -169,24 +169,9 @@ func enabledBlockedSinceEventSink(ctx context.Context, store *db.Store, home str
 	if !hasEnabledEventRule(rules) {
 		return nil, nil
 	}
-	return daemonEventSink(store, home), nil
-}
-
-// sweepBlockedTaskWakeEvents is the per-repo tick entrypoint. Every failure is
-// returned only for logging by the caller; it must never fail the daemon tick.
-//
-// wakeAfter arrives already resolved: it is a config.toml read, and resolving it
-// here made the daemon re-read and re-parse that file once per enabled repo per
-// tick (#1758). The tick now resolves it once and passes it down.
-func sweepBlockedTaskWakeEvents(ctx context.Context, store *db.Store, home, repo string, wakeAfter time.Duration, stdout io.Writer, now time.Time) error {
-	if wakeAfter <= 0 {
-		return nil
-	}
-	sink, err := enabledBlockedSinceEventSink(ctx, store, home)
-	if err != nil || sink == nil {
-		return err
-	}
-	return evaluateBlockedTaskEpisodes(ctx, store, sink, repo, wakeAfter, stdout, now)
+	// The rules just read build the sink: daemonEventSink would list them again
+	// and discard the result, since the sink is cached per home (#2530).
+	return resolveDaemonEventSinkWithRules(store, home, rules), nil
 }
 
 func evaluateBlockedTaskEpisodes(ctx context.Context, store *db.Store, sink events.Sink, repo string, wakeAfter time.Duration, stdout io.Writer, now time.Time) error {

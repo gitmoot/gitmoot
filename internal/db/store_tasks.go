@@ -673,11 +673,15 @@ func (s *Store) ListTasksByRepo(ctx context.Context, repoFullName string) ([]Tas
 	return tasks, rows.Err()
 }
 
-func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, state string) ([]Task, error) {
-	rows, err := s.db.QueryContext(ctx, taskSelectSQL()+`
+// listTasksByRepoStateSQL is named so a test can EXPLAIN the shipped text; it
+// must SEARCH idx_tasks_repo_state (#2530).
+var listTasksByRepoStateSQL = taskSelectSQL() + `
 		FROM tasks
 		WHERE repo_full_name = ? AND state = ?
-		ORDER BY id`, repoFullName, state)
+		ORDER BY id`
+
+func (s *Store) ListTasksByRepoState(ctx context.Context, repoFullName string, state string) ([]Task, error) {
+	rows, err := s.db.QueryContext(ctx, listTasksByRepoStateSQL, repoFullName, state)
 	if err != nil {
 		return nil, err
 	}
