@@ -2945,3 +2945,33 @@ func TestReviewFallbackRuntimeSwitchScope(t *testing.T) {
 		}
 	}
 }
+
+// #2520 (owner decision, Jarvis 396722): herdrup#627 was blocked three times
+// with zero findings because its Linux review image cannot run Xcode, even
+// after the reviewer inspected the green exact-head CI run. The router
+// instruction must carry both halves of the rule: a check the environment
+// cannot run is satisfied by green exact-head CI the reviewer verifies, never
+// a block on its own; and real execution stays required for everything the
+// environment can run and wherever CI did not run the changed code. The
+// no-execution review keeps its own evidence rule.
+func TestReviewRouterInstructionsAcceptVerifiedCIOnlyForChecksTheEnvironmentCannotRun(t *testing.T) {
+	text := reviewRouterInstructions("code", "owner/repo", 12, "0123456789abcdef0123456789abcdef01234567", nil, false)
+	for _, want := range []string{
+		// First half: unrunnable checks, verified exact-head CI, never a block alone.
+		"A check this environment cannot run",
+		"satisfied by a green CI run at the exact reviewed head that you verify yourself",
+		"the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths",
+		"never block or request changes for that reason alone",
+		// Second half: real execution where possible, and CI must cover the change.
+		"wherever this review environment can run them; do not approve on static reading alone",
+		"Real execution is still required for every check this environment can run",
+		"a changed path that no green exact-head CI job exercised is not CI-verified",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("router instruction is missing %q:\n%s", want, text)
+		}
+	}
+	if static := reviewRouterInstructions("code", "owner/repo", 12, "0123456789abcdef0123456789abcdef01234567", nil, true); strings.Contains(static, "CI-verified") || !strings.Contains(static, "evidence=static_only") {
+		t.Errorf("no-execution instruction changed: %s", static)
+	}
+}
