@@ -94,9 +94,13 @@ A router review (#2520) that cannot run a check because its environment lacks
 the platform toolchain (for example Xcode on a Linux image) may treat that check
 as satisfied by a green CI run at the exact reviewed head that it verifies
 itself: the run's head SHA equals the reviewed head, the job succeeded, and the
-job builds or tests the changed paths. It records the check in `tests_run` as
-CI-verified with its run and job, sets `checks_blocked`, and does not block or
-request changes for that reason alone. It still runs every check its
+job builds or tests the changed paths. It records the check as its own
+`tests_run` entry starting with `CI-verified:` and naming the run and job, sets
+`checks_blocked`, and does not block or request changes for that reason alone.
+The remote evidence ceiling ignores `CI-verified:` entries: one that says the
+toolchain is absent locally does not downgrade the review, and one never counts
+as a check the review ran, so a review whose only entries are CI-verified is
+`static_only`. It still runs every check its
 environment can run, and a changed path no green exact-head CI job exercised is
 not CI-verified. An unrecognised value is rejected outright,
 like `evidence`, so a misspelling is an error rather than an uncountable row.

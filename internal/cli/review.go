@@ -1722,7 +1722,7 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	// run and wherever CI did not run the changed code.
 	evidence := "Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths) wherever this review environment can run them; do not approve on static reading alone. " +
 		"A check this environment cannot run (its platform toolchain or runtime is absent, for example Xcode or a Windows host) is satisfied by a green CI run at the exact reviewed head that you verify yourself: the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths. " +
-		"Record each such check in tests_run as CI-verified with its run and job, set checks_blocked for it, and never block or request changes for that reason alone. " +
+		"Record each such check as its own tests_run entry starting with \"CI-verified:\" and naming the run and job, set checks_blocked for it, and never block or request changes for that reason alone. " +
 		"Real execution is still required for every check this environment can run, and a changed path that no green exact-head CI job exercised is not CI-verified. " +
 		"Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding."
 	if noExecution {

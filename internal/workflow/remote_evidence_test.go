@@ -16,6 +16,13 @@ func TestRemoteChecksEvidenceCeiling(t *testing.T) {
 		{"nothing ran", []string{"could not run"}, EvidenceExecuted, true},
 		{"empty", nil, EvidenceExecuted, true},
 		{"already static", []string{"swift: command not found"}, EvidenceStaticOnly, false},
+		// #2520: a CI-verified platform check names its local absence on
+		// purpose; with real local runs beside it the review stays executed.
+		{"local runs plus CI-verified check", []string{"bash -n Tools/ci/ui-shard.sh -> ok", "CI-verified: xcodebuild test -> success; run 41841861442 job 126845298023; exact head verified; Xcode toolchain absent locally"}, EvidenceExecuted, false},
+		// Only CI-verified entries: the review itself ran nothing.
+		{"only CI-verified", []string{"CI-verified: xcodebuild test -> success; run 1 job 2; Xcode toolchain absent locally"}, EvidenceExecuted, true},
+		// The exemption is the prefix, not the word: a local entry still clamps.
+		{"local missing toolchain mentioning CI", []string{"go vet ./... -> ok", "swift build (CI-verified later) -> swift: command not found"}, EvidenceExecuted, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			result := AgentResult{Evidence: tc.evidence, TestsRun: tc.tests}

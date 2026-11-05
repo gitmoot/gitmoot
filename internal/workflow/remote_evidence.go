@@ -17,6 +17,18 @@ var missingToolchain = regexp.MustCompile(`(?i)\bcommand not found\b|\bexecutabl
 	`|\b(?:no|missing|unavailable|absent)\b.{0,20}\btoolchain\b|\bnot installed\b` +
 	`|\b(?:exit(?: code| status)?|rc|status)\s*[=:]?\s*127\b`)
 
+// CIVerifiedEntryPrefix starts a tests_run entry for a check the review
+// environment cannot run that the reviewer verified in green exact-head CI
+// instead (#2520). Such an entry names its local absence on purpose, and the
+// check did not run in the review environment either way.
+const CIVerifiedEntryPrefix = "CI-verified:"
+
+// IsCIVerifiedEntry reports whether a tests_run entry records a CI-verified
+// check (#2520).
+func IsCIVerifiedEntry(entry string) bool {
+	return strings.HasPrefix(strings.TrimSpace(entry), CIVerifiedEntryPrefix)
+}
+
 // ApplyRemoteChecksEvidenceCeiling records a remote review's declared
 // executed evidence as static_only when its own tests_run says the checks did
 // not run (#2316): an entry reports a missing toolchain, or no entry names
@@ -24,18 +36,31 @@ var missingToolchain = regexp.MustCompile(`(?i)\bcommand not found\b|\bexecutabl
 // that then lacked it is a static review, and the merge gate and findings
 // ledger must not read it as executed. It only moves evidence downward and
 // returns the reason it did.
+//
+// CI-verified entries (#2520) are left out of both tests: one that says its
+// toolchain is absent locally is the instruction followed, not a failed run,
+// and one never counts as a check the review itself ran. So a review with
+// real local runs plus CI-verified platform checks stays executed, and a
+// review whose only entries are CI-verified is static_only.
 func ApplyRemoteChecksEvidenceCeiling(result *AgentResult) (string, bool) {
 	if result == nil || strings.TrimSpace(result.Evidence) != EvidenceExecuted {
 		return "", false
 	}
-	reason := ""
+	local := *result
+	local.TestsRun = make([]string, 0, len(result.TestsRun))
 	for _, entry := range result.TestsRun {
+		if !IsCIVerifiedEntry(entry) {
+			local.TestsRun = append(local.TestsRun, entry)
+		}
+	}
+	reason := ""
+	for _, entry := range local.TestsRun {
 		if missingToolchain.MatchString(entry) {
 			reason = "tests_run reports a missing toolchain: " + strings.TrimSpace(entry)
 			break
 		}
 	}
-	if reason == "" && !reviewNamesSomethingItRan(*result) {
+	if reason == "" && !reviewNamesSomethingItRan(local) {
 		reason = "tests_run names no check that ran"
 	}
 	if reason == "" {
