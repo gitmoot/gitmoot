@@ -127,6 +127,32 @@ func (e Engine) InspectProducerCleanup(ctx context.Context, jobID string, policy
 	return decision, err
 }
 
+// effectiveCleanupMode is the cleanup mode an empty policy mode resolves to.
+func effectiveCleanupMode(mode string, job db.Job) string {
+	if mode != "" {
+		return mode
+	}
+	if job.State != string(JobSucceeded) {
+		return "aged"
+	}
+	return "ordinary"
+}
+
+// cleanupRebuildable reports whether the resource can be rebuilt after removal:
+// only pinned native PR reviews have an existing exact-head reconstruction path.
+func cleanupRebuildable(job db.Job, payload JobPayload, readOnly bool) bool {
+	return readOnly && job.Type == "review" && payload.PullRequest > 0 && strings.TrimSpace(payload.HeadSHA) != ""
+}
+
+// cleanupRetryDispositionUnknown reports the stable refusal for an owner that
+// did not succeed: terminal labels alone do not authorize deleting retryable
+// resources, except a rebuildable review in aged mode. It depends only on the
+// job and the mode, so it can be checked before any evidence is captured
+// (#2525).
+func cleanupRetryDispositionUnknown(job db.Job, payload JobPayload, readOnly bool, mode string) bool {
+	return job.State != string(JobSucceeded) && (!cleanupRebuildable(job, payload, readOnly) || mode != "aged")
+}
+
 func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy CleanupPolicy, collected *cleanupEvidence) (CleanupInspection, JobPayload, error) {
 	d := CleanupInspection{SchemaVersion: CleanupSchemaVersion, Producer: "gitmoot", DecisionOwner: "gitmoot",
 		OwnerJobID: jobID, ResourceKind: "delegation_worktree", ObservedAt: e.now().UTC().Format(time.RFC3339Nano),
@@ -201,12 +227,7 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		policy.Retention = retention
 		policy.cutoff = time.Time{}
 	}
-	if policy.Mode == "" {
-		policy.Mode = "ordinary"
-		if job.State != string(JobSucceeded) {
-			policy.Mode = "aged"
-		}
-	}
+	policy.Mode = effectiveCleanupMode(policy.Mode, job)
 	if policy.Mode != "ordinary" && policy.Mode != "aged" {
 		return d.refuse("policy_unknown"), payload, nil
 	}
@@ -300,8 +321,8 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 	}
 	// Only pinned native PR reviews have an existing exact-head reconstruction
 	// path. Terminal labels alone do not authorize deleting retryable resources.
-	d.Rebuildable = readOnly && job.Type == "review" && payload.PullRequest > 0 && strings.TrimSpace(payload.HeadSHA) != ""
-	if job.State != string(JobSucceeded) && (!d.Rebuildable || policy.Mode != "aged") {
+	d.Rebuildable = cleanupRebuildable(job, payload, readOnly)
+	if cleanupRetryDispositionUnknown(job, payload, readOnly, policy.Mode) {
 		return d.refuse("retry_disposition_unknown"), payload, nil
 	}
 	if job.State == string(JobSucceeded) && payload.Result == nil {
