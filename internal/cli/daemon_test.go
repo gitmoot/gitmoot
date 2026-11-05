@@ -325,7 +325,7 @@ func (m *fakeReclaimWorktreeManager) PruneWorktrees(context.Context) error {
 }
 
 func delegationWorktreeCleanupPendingForTest(ctx context.Context, store tickCandidateStore, jobID string) (bool, error) {
-	ids, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	ids, err := reclaimCandidateIDs(store.DelegationReclaimCandidates(ctx))
 	if err != nil {
 		return false, err
 	}
@@ -878,14 +878,14 @@ func (c *countingCandidateStore) JobIDsWithPendingCommentRetry(ctx context.Conte
 	return c.inner.JobIDsWithPendingCommentRetry(ctx)
 }
 
-func (c *countingCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
+func (c *countingCandidateStore) DelegationReclaimCandidates(ctx context.Context) ([]db.ReclaimCandidate, error) {
 	atomic.AddInt32(&c.reclaim, 1)
-	return c.inner.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	return c.inner.DelegationReclaimCandidates(ctx)
 }
 
-func (c *countingCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
+func (c *countingCandidateStore) AgedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]db.ReclaimCandidate, error) {
 	atomic.AddInt32(&c.agedReclaim, 1)
-	return c.inner.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	return c.inner.AgedDelegationReclaimCandidates(ctx, cutoff)
 }
 
 func (c *countingCandidateStore) TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error) {
@@ -933,18 +933,18 @@ func (s *flakyCandidateStore) JobIDsWithPendingCommentRetry(context.Context) ([]
 	return []string{"comment-job"}, nil
 }
 
-func (s *flakyCandidateStore) JobIDsWithPendingDelegationWorktreeReclaim(context.Context) ([]string, error) {
+func (s *flakyCandidateStore) DelegationReclaimCandidates(context.Context) ([]db.ReclaimCandidate, error) {
 	if atomic.AddInt32(&s.reclaimCalls, 1) == 1 {
 		return nil, errCandidateTransient
 	}
-	return []string{"reclaim-job"}, nil
+	return []db.ReclaimCandidate{{JobID: "reclaim-job"}}, nil
 }
 
-func (s *flakyCandidateStore) JobIDsWithAgedTerminalDelegationWorktree(context.Context, time.Time) ([]string, error) {
+func (s *flakyCandidateStore) AgedDelegationReclaimCandidates(context.Context, time.Time) ([]db.ReclaimCandidate, error) {
 	if atomic.AddInt32(&s.agedReclaimCalls, 1) == 1 {
 		return nil, errCandidateTransient
 	}
-	return []string{"aged-reclaim-job"}, nil
+	return []db.ReclaimCandidate{{JobID: "aged-reclaim-job"}}, nil
 }
 
 func (s *flakyCandidateStore) TaskIDsWithTerminalWorktree(context.Context) ([]string, error) {
