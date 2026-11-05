@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
@@ -271,5 +272,41 @@ func TestWorktreeGitDirResolvesRelativePointersAndRefusesOddFiles(t *testing.T) 
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("reading a FIFO .git blocked")
+	}
+}
+
+// #2526 review: whatever already sits at the nonce name (here a FIFO, which
+// would block an open) must not stall the move under the store-wide fence; the
+// marker ends up a regular file holding the recorded nonce.
+func TestNonceMarkerReplacesAnExistingFIFOWithoutBlocking(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	gitDir, err := worktreeGitDir(world.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(gitDir, cleanupTrashNonceFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		record db.PendingCleanupTrash
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		record, err := world.engine.moveWorktreeToTrash(ctx, world.jobID, world.path, 0)
+		done <- result{record, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("move aside: %v", got.err)
+		}
+		data, err := readSmallRegularFile(filepath.Join(got.record.GitDir, cleanupTrashNonceFile), cleanupTrashSmallFileLimit)
+		if err != nil || string(data) != got.record.Nonce {
+			t.Fatalf("nonce marker %q (%v), want regular file with %q", data, err, got.record.Nonce)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("writing the nonce blocked on an existing FIFO")
 	}
 }

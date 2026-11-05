@@ -172,22 +172,30 @@ func worktreeGitDir(worktree string) (string, error) {
 	return value, nil
 }
 
-// writeCleanupTrashNonce writes a fresh random nonce into gitDir.
+// writeCleanupTrashNonce writes a fresh random nonce into gitDir. It never
+// opens what is already at the marker name (#2526 review: an existing FIFO
+// there would block the open under the store-wide fence): the nonce goes into
+// a newly created file (O_EXCL, no-follow, nonblocking) that is then renamed
+// over the marker name, which replaces any non-directory entry atomically.
 func writeCleanupTrashNonce(gitDir string) (string, error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	nonce := hex.EncodeToString(raw)
-	file, err := os.OpenFile(filepath.Join(gitDir, cleanupTrashNonceFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o600)
+	temp := filepath.Join(gitDir, cleanupTrashNonceFile+"."+nonce+".tmp")
+	file, err := os.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return "", err
 	}
-	if _, err := file.WriteString(nonce); err != nil {
-		_ = file.Close()
+	_, writeErr := file.WriteString(nonce)
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		_ = os.Remove(temp)
 		return "", err
 	}
-	if err := file.Close(); err != nil {
+	if err := os.Rename(temp, filepath.Join(gitDir, cleanupTrashNonceFile)); err != nil {
+		_ = os.Remove(temp)
 		return "", err
 	}
 	return nonce, nil
