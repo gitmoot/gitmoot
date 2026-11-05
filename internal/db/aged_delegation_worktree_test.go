@@ -118,9 +118,9 @@ func TestJobIDsWithAgedTerminalDelegationWorktree(t *testing.T) {
 		}
 	}
 
-	got, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	got, err := candidateJobIDs(store.AgedDelegationReclaimCandidates(ctx, cutoff))
 	if err != nil {
-		t.Fatalf("JobIDsWithAgedTerminalDelegationWorktree: %v", err)
+		t.Fatalf("AgedDelegationReclaimCandidates: %v", err)
 	}
 	gotSet := map[string]bool{}
 	for _, id := range got {
@@ -166,7 +166,7 @@ func TestAgedDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T) {
 		t.Fatalf("backdate jobs: %v", err)
 	}
 	cutoff := time.Now().UTC().Add(-72 * time.Hour)
-	first, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	first, err := candidateJobIDs(store.AgedDelegationReclaimCandidates(ctx, cutoff))
 	if err != nil {
 		t.Fatalf("first query: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestAgedDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T) {
 			t.Fatalf("DeferCleanupObligation(%s): %v", jobID, err)
 		}
 	}
-	second, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	second, err := candidateJobIDs(store.AgedDelegationReclaimCandidates(ctx, cutoff))
 	if err != nil {
 		t.Fatalf("second query: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestAgedCleanupSelectorRefusesNewerObligationGeneration(t *testing.T) {
 		job.LifecycleGeneration+1, old, obligation.ResourceID); err != nil {
 		t.Fatal(err)
 	}
-	ids, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, now.Add(-72*time.Hour))
+	ids, err := candidateJobIDs(store.AgedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)))
 	if err != nil || slices.Contains(ids, jobID) {
 		t.Fatalf("newer obligation was treated as disposable older evidence: ids=%v err=%v", ids, err)
 	}
@@ -229,8 +229,17 @@ func TestAgedCleanupSelectorRefusesNewerObligationGeneration(t *testing.T) {
 		job.LifecycleGeneration, obligation.ResourceID); err != nil {
 		t.Fatal(err)
 	}
-	ids, err = store.JobIDsWithAgedTerminalDelegationWorktree(ctx, now.Add(-72*time.Hour))
+	ids, err = candidateJobIDs(store.AgedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)))
 	if err != nil || !slices.Contains(ids, jobID) {
 		t.Fatalf("matching aged generation was not selected: ids=%v err=%v", ids, err)
 	}
+}
+
+// candidateJobIDs is the ids of reclaim candidates, in order.
+func candidateJobIDs(candidates []ReclaimCandidate, err error) ([]string, error) {
+	ids := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ids = append(ids, candidate.JobID)
+	}
+	return ids, err
 }

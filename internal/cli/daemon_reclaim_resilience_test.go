@@ -279,7 +279,7 @@ func TestDelegationReclaimStoreFailureStillAborts(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	seedReclaimResilienceCandidate(t, store, "a-candidate", t.TempDir(), now, false, false)
 	cand := newTickCandidates(store)
-	if _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour)); err != nil {
+	if _, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-72*time.Hour), ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -371,7 +371,7 @@ func TestDelegationCleanupUnknownFailureQuarantinesAndSurvivesRestart(t *testing
 	if strings.Contains(obligation.LastError, secret) || !strings.Contains(obligation.LastError, "[REDACTED]") {
 		t.Fatalf("quarantined diagnostic exposed a credential: %q", obligation.LastError)
 	}
-	if ids, err := store.JobIDsWithAgedTerminalDelegationWorktree(ctx, realNow.Add(-72*time.Hour)); err != nil {
+	if ids, err := reclaimCandidateIDs(store.AgedDelegationReclaimCandidates(ctx, realNow.Add(-72*time.Hour))); err != nil {
 		t.Fatal(err)
 	} else if slices.Contains(ids, "unknown-poison") {
 		t.Fatalf("quarantined job remained selectable: %v", ids)
@@ -787,9 +787,7 @@ func TestTerminalTaskWorktreeReclaimResumeIsPerRepo(t *testing.T) {
 	}
 }
 
-// The scheduler must only close an obligation when the engine explicitly
-// reports a completed removal. Path absence is ambiguous: a fix clone may have
-// been set aside, and no sibling scan can prove an operator intended deletion.
+// A repo's reclaim is not starved by another repo's backlog of candidates.
 func TestSkippedReclaimPersistsFairnessPastFilteredHostWindow(t *testing.T) {
 	ctx := context.Background()
 	home := t.TempDir()
@@ -850,18 +848,25 @@ func TestSkippedReclaimPersistsFairnessPastFilteredHostWindow(t *testing.T) {
 		}
 	}
 
+	// Candidate windows are per repository (#2517): the 256 rows of another
+	// repo can no longer hide the target, so its own repo's first pass
+	// reaches it, without any other repo's row being touched to make room.
 	if err := reclaimSkippedDelegationWorktrees(ctx, worker, "owner/target", "", nil, newTickCandidates(store), now); err != nil {
 		t.Fatalf("first reclaim pass: %v", err)
 	}
-	if len(manager.removed) != 0 {
-		t.Fatalf("first pass removed %v, want target beyond the bounded window", manager.removed)
-	}
-	next, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	obligations, err := store.ListCleanupObligations(ctx, "")
 	if err != nil {
-		t.Fatalf("query next persistent window: %v", err)
+		t.Fatal(err)
 	}
-	if len(next) != 1 || next[0] != targetID {
-		t.Fatalf("next persistent window = %v, want [%s]", next, targetID)
+	reached := false
+	for _, obligation := range obligations {
+		if obligation.OwnerJobID != targetID {
+			t.Fatalf("the target repo's pass touched another repo's row %s", obligation.OwnerJobID)
+		}
+		reached = true
+	}
+	if !reached {
+		t.Fatal("the target repo's first pass did not reach its own row behind another repo's 256 rows")
 	}
 }
 
@@ -1132,4 +1137,9 @@ func TestDeferredWorktreeReclaimKeepsTheAttemptsLaterRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+// reclaimCandidateIDs is the ids of reclaim candidates, in order.
+func reclaimCandidateIDs(candidates []db.ReclaimCandidate, err error) ([]string, error) {
+	return reclaimCandidateIDsFor(candidates, ""), err
 }

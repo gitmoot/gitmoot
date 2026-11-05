@@ -5569,19 +5569,19 @@ func TestTickCandidatesRetriesOnError(t *testing.T) {
 	if got := atomic.LoadInt32(&store.commentCalls); got != 2 {
 		t.Fatalf("comment query ran %d times, want 2", got)
 	}
-	if _, err := cand.delegationReclaimCandidates(ctx); !errors.Is(err, errCandidateTransient) {
+	if _, err := cand.delegationReclaimCandidates(ctx, ""); !errors.Is(err, errCandidateTransient) {
 		t.Fatalf("first delegationReclaimCandidates err = %v, want transient", err)
 	}
-	if ids, err := cand.delegationReclaimCandidates(ctx); err != nil || len(ids) != 1 || ids[0] != "reclaim-job" {
+	if ids, err := cand.delegationReclaimCandidates(ctx, ""); err != nil || len(ids) != 1 || ids[0] != "reclaim-job" {
 		t.Fatalf("second delegationReclaimCandidates ids=%v err=%v, want [reclaim-job] nil", ids, err)
 	}
 	if got := atomic.LoadInt32(&store.reclaimCalls); got != 2 {
 		t.Fatalf("reclaim query ran %d times, want 2", got)
 	}
-	if _, err := cand.agedDelegationReclaimCandidates(ctx, time.Now()); !errors.Is(err, errCandidateTransient) {
+	if _, err := cand.agedDelegationReclaimCandidates(ctx, time.Now(), ""); !errors.Is(err, errCandidateTransient) {
 		t.Fatalf("first agedDelegationReclaimCandidates err = %v, want transient", err)
 	}
-	if ids, err := cand.agedDelegationReclaimCandidates(ctx, time.Now()); err != nil || len(ids) != 1 || ids[0] != "aged-reclaim-job" {
+	if ids, err := cand.agedDelegationReclaimCandidates(ctx, time.Now(), ""); err != nil || len(ids) != 1 || ids[0] != "aged-reclaim-job" {
 		t.Fatalf("second agedDelegationReclaimCandidates ids=%v err=%v, want [aged-reclaim-job] nil", ids, err)
 	}
 	if got := atomic.LoadInt32(&store.agedReclaimCalls); got != 2 {
@@ -5647,11 +5647,11 @@ func (s *scriptedCursorStore) JobIDsWithPendingCommentRetry(context.Context) ([]
 	return nil, nil
 }
 
-func (s *scriptedCursorStore) JobIDsWithPendingDelegationWorktreeReclaim(context.Context) ([]string, error) {
+func (s *scriptedCursorStore) DelegationReclaimCandidates(context.Context) ([]db.ReclaimCandidate, error) {
 	return nil, nil
 }
 
-func (s *scriptedCursorStore) JobIDsWithAgedTerminalDelegationWorktree(context.Context, time.Time) ([]string, error) {
+func (s *scriptedCursorStore) AgedDelegationReclaimCandidates(context.Context, time.Time) ([]db.ReclaimCandidate, error) {
 	return nil, nil
 }
 

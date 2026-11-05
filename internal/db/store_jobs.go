@@ -2207,10 +2207,20 @@ func (s *Store) jobIDsByQuery(ctx context.Context, query string, args ...any) ([
 // so the covering-index plan test (TestJobEventsKindJobIDCoveringIndexPlan) EXPLAINs
 // the PRODUCTION query text — not a hand-copied duplicate — for each. A change to any
 // of these queries is then exactly what the covering-index test asserts a plan for.
-const delegationWorktreeReclaimCandidateLimit = 256
+// delegationWorktreeReclaimCandidateLimit is the reclaim candidate window PER
+// REPOSITORY (#2517): a repo's pass attempts only a few rows per tick, so a
+// small window is enough and keeps the fleet-wide result bounded.
+const delegationWorktreeReclaimCandidateLimit = 64
 
 const (
-	jobIDsWithPendingDelegationWorktreeReclaimSQL = `SELECT e.job_id FROM job_events e
+	jobIDsWithPendingDelegationWorktreeReclaimSQL = `SELECT job_id, repo FROM (
+		SELECT e.job_id AS job_id,
+		       CASE WHEN json_valid(j.payload) THEN COALESCE(json_extract(j.payload, '$.repo'), '') ELSE '' END AS repo,
+		       COALESCE(unixepoch(o.next_attempt_at), 0) AS due,
+		       ROW_NUMBER() OVER (
+			PARTITION BY CASE WHEN json_valid(j.payload) THEN COALESCE(json_extract(j.payload, '$.repo'), '') ELSE '' END
+			ORDER BY COALESCE(unixepoch(o.next_attempt_at), 0), e.job_id) AS repo_rank
+		FROM job_events e
 		JOIN jobs j ON j.id = e.job_id
 		LEFT JOIN cleanup_obligations o
 		  ON o.owner_job_id = e.job_id
@@ -2226,8 +2236,9 @@ const (
 			o.state IN ('pending', 'retryable')
 			AND unixepoch(o.next_attempt_at) <= unixepoch('now')
 		  ))
-		ORDER BY COALESCE(unixepoch(o.next_attempt_at), 0), e.job_id
-		LIMIT ?`
+		)
+		WHERE repo_rank <= ?
+		ORDER BY due, job_id`
 
 	jobIDsWithPendingAdvanceRetrySQL = `SELECT job_id FROM job_events
 		WHERE kind IN ('advance_started', 'advance_retry')
@@ -2315,8 +2326,40 @@ const (
 // that latest outcome per job and the outer filter keeps only the jobs where it
 // is a skip — exactly mirroring the per-job lastCleanupOutcomeIsSkip walk, but
 // set-at-once.
-func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error) {
-	return s.jobIDsByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL, delegationWorktreeReclaimCandidateLimit)
+//
+// The window is PER REPOSITORY (#2517 follow-up): each repo gets its own first
+// delegationWorktreeReclaimCandidateLimit due rows, and every row carries its
+// repo (the payload repo, as the daemon's repo filter compares). The daemon's
+// per-repo reclaim pass therefore never has to touch another repo's rows to
+// move a shared window, which let one repo's pass defer rows its owner was
+// about to reach (they were then refused as not due) or let rows of a repo
+// that never reclaims pin the window for everyone.
+func (s *Store) DelegationReclaimCandidates(ctx context.Context) ([]ReclaimCandidate, error) {
+	return s.reclaimCandidatesByQuery(ctx, jobIDsWithPendingDelegationWorktreeReclaimSQL, delegationWorktreeReclaimCandidateLimit)
+}
+
+// ReclaimCandidate is one delegation-worktree reclaim candidate and the repo
+// (payload repo) that owns it.
+type ReclaimCandidate struct {
+	JobID string
+	Repo  string
+}
+
+func (s *Store) reclaimCandidatesByQuery(ctx context.Context, query string, args ...any) ([]ReclaimCandidate, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var candidates []ReclaimCandidate
+	for rows.Next() {
+		var candidate ReclaimCandidate
+		if err := rows.Scan(&candidate.JobID, &candidate.Repo); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, rows.Err()
 }
 
 // JobIDsWithAgedTerminalDelegationWorktree returns due final jobs whose recorded
@@ -2348,11 +2391,13 @@ func (s *Store) JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) 
 // Current-generation obligations supply the terminal clock and completion state.
 // Publication may refresh jobs.updated_at; old removal events belong to old
 // generations and cannot suppress a replacement generation's obligation.
-func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error) {
+// Like DelegationReclaimCandidates, the window is per repository (#2517).
+func (s *Store) AgedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]ReclaimCandidate, error) {
 	cutoffStr := cutoff.UTC().Format("2006-01-02 15:04:05")
 	rows, err := s.db.QueryContext(ctx, `
 		WITH job_wt AS MATERIALIZED (
 			SELECT id, state, lifecycle_generation,
+			       COALESCE(json_extract(payload, '$.repo'), '') AS repo,
 			       unixepoch(COALESCE(NULLIF(updated_at, ''), created_at)) AS ts,
 			       json_extract(payload, '$.worktree_path') AS worktree_path,
 			       COALESCE(json_extract(payload, '$.delegation_id'), '') AS delegation_id,
@@ -2373,7 +2418,15 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			  ON obligation.owner_job_id = j.id
 			 AND obligation.expected_path = j.worktree_path
 		)
-		SELECT j.id
+		SELECT id, repo FROM (
+		SELECT j.id, j.repo,
+		       CASE WHEN j.cleanup_generation = j.lifecycle_generation
+		            THEN COALESCE(unixepoch(j.next_attempt_at), j.terminal_ts)
+		            ELSE j.terminal_ts END AS due,
+		       ROW_NUMBER() OVER (PARTITION BY j.repo ORDER BY
+		            CASE WHEN j.cleanup_generation = j.lifecycle_generation
+		                 THEN COALESCE(unixepoch(j.next_attempt_at), j.terminal_ts)
+		                 ELSE j.terminal_ts END, j.id) AS repo_rank
 		FROM cleanup_wt j
 		WHERE j.state IN ('succeeded', 'failed', 'cancelled')
 		  AND j.terminal_ts <= unixepoch(?)
@@ -2396,23 +2449,22 @@ func (s *Store) JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cu
 			j.cleanup_state IN ('pending', 'retryable')
 			AND unixepoch(j.next_attempt_at) <= unixepoch('now')
 		  ))
-		ORDER BY CASE WHEN j.cleanup_generation = j.lifecycle_generation
-		              THEN COALESCE(unixepoch(j.next_attempt_at), j.terminal_ts)
-		              ELSE j.terminal_ts END, j.id
-		LIMIT ?`, cutoffStr, cutoffStr, delegationWorktreeReclaimCandidateLimit)
+		)
+		WHERE repo_rank <= ?
+		ORDER BY due, id`, cutoffStr, cutoffStr, delegationWorktreeReclaimCandidateLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []string
+	var candidates []ReclaimCandidate
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var candidate ReclaimCandidate
+		if err := rows.Scan(&candidate.JobID, &candidate.Repo); err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
+		candidates = append(candidates, candidate)
 	}
-	return ids, rows.Err()
+	return candidates, rows.Err()
 }
 
 // JobIDsWithPendingAdvanceRetry returns the IDs of jobs whose LATEST post-delivery

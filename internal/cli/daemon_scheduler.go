@@ -1028,8 +1028,8 @@ func recoveredJobLogTail(store *db.Store, jobID string) string {
 type tickCandidateStore interface {
 	JobIDsWithPendingAdvanceRetry(ctx context.Context) ([]string, error)
 	JobIDsWithPendingCommentRetry(ctx context.Context) ([]string, error)
-	JobIDsWithPendingDelegationWorktreeReclaim(ctx context.Context) ([]string, error)
-	JobIDsWithAgedTerminalDelegationWorktree(ctx context.Context, cutoff time.Time) ([]string, error)
+	DelegationReclaimCandidates(ctx context.Context) ([]db.ReclaimCandidate, error)
+	AgedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]db.ReclaimCandidate, error)
 	TaskIDsWithTerminalWorktree(ctx context.Context) ([]string, error)
 	FirstMalformedNonFinalJob(ctx context.Context) (string, error)
 	MaxJobEventID(ctx context.Context) (int64, error)
@@ -1045,6 +1045,41 @@ type candidateMemo struct {
 	attempted bool
 	done      bool
 	ids       []string
+}
+
+// reclaimCandidateMemo is candidateMemo for reclaim candidates, which carry
+// their repo (#2517).
+type reclaimCandidateMemo struct {
+	attempted  bool
+	done       bool
+	candidates []db.ReclaimCandidate
+}
+
+func (m *reclaimCandidateMemo) get(fetch func() ([]db.ReclaimCandidate, error)) ([]db.ReclaimCandidate, error) {
+	m.attempted = true
+	if m.done {
+		return m.candidates, nil
+	}
+	candidates, err := fetch()
+	if err != nil {
+		return nil, err
+	}
+	m.candidates, m.done = candidates, true
+	return m.candidates, nil
+}
+
+// reclaimCandidateIDsFor returns, in order, the ids of the candidates owned by
+// repo (all of them when repo is empty). A repo's pass looks only at its own
+// rows, so it never has to touch another repo's (#2517).
+func reclaimCandidateIDsFor(candidates []db.ReclaimCandidate, repo string) []string {
+	repo = strings.TrimSpace(repo)
+	var ids []string
+	for _, candidate := range candidates {
+		if repo == "" || candidate.Repo == repo {
+			ids = append(ids, candidate.JobID)
+		}
+	}
+	return ids
 }
 
 func (m *candidateMemo) get(fetch func() ([]string, error)) ([]string, error) {
@@ -1070,8 +1105,8 @@ type tickCandidates struct {
 	config             tickConfigCache
 	advance            candidateMemo
 	comment            candidateMemo
-	reclaim            candidateMemo
-	agedReclaim        candidateMemo
+	reclaim            reclaimCandidateMemo
+	agedReclaim        reclaimCandidateMemo
 	taskReclaim        candidateMemo
 	malformedOwnerDone bool
 	malformedOwnerID   string
@@ -1357,19 +1392,32 @@ func (c *tickCandidates) commentRetryCandidates(ctx context.Context) ([]string, 
 	})
 }
 
-func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context) ([]string, error) {
-	return c.reclaim.get(func() ([]string, error) {
-		return c.store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+// delegationReclaimCandidates returns the skipped-delegation reclaim
+// candidates owned by repo (every repo's when empty), from the tick's one
+// shared query.
+func (c *tickCandidates) delegationReclaimCandidates(ctx context.Context, repo string) ([]string, error) {
+	candidates, err := c.reclaim.get(func() ([]db.ReclaimCandidate, error) {
+		return c.store.DelegationReclaimCandidates(ctx)
 	})
+	if err != nil {
+		return nil, err
+	}
+	return reclaimCandidateIDsFor(candidates, repo), nil
 }
 
-func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time) ([]string, error) {
+// agedDelegationReclaimCandidates is delegationReclaimCandidates for the aged
+// pass.
+func (c *tickCandidates) agedDelegationReclaimCandidates(ctx context.Context, cutoff time.Time, repo string) ([]string, error) {
 	if c.skipAgedReclaim {
 		return nil, nil
 	}
-	return c.agedReclaim.get(func() ([]string, error) {
-		return c.store.JobIDsWithAgedTerminalDelegationWorktree(ctx, cutoff)
+	candidates, err := c.agedReclaim.get(func() ([]db.ReclaimCandidate, error) {
+		return c.store.AgedDelegationReclaimCandidates(ctx, cutoff)
 	})
+	if err != nil {
+		return nil, err
+	}
+	return reclaimCandidateIDsFor(candidates, repo), nil
 }
 
 func (c *tickCandidates) terminalTaskWorktreeCandidates(ctx context.Context) ([]string, error) {
@@ -1474,7 +1522,7 @@ func retryPendingJobAdvancements(ctx context.Context, worker jobWorker, repoFilt
 // worktrees are still reclaimed instead of leaking until full idleness (#562
 // review).
 func reclaimSkippedDelegationWorktrees(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string, checkoutHeld func(string) bool, cand *tickCandidates, now time.Time) error {
-	jobIDs, err := cand.delegationReclaimCandidates(ctx)
+	jobIDs, err := cand.delegationReclaimCandidates(ctx, repoFilter)
 	if err != nil {
 		return err
 	}
@@ -1571,7 +1619,7 @@ func reclaimAgedTerminalDelegationWorktrees(ctx context.Context, worker jobWorke
 	if ttl <= 0 {
 		return nil
 	}
-	jobIDs, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-ttl))
+	jobIDs, err := cand.agedDelegationReclaimCandidates(ctx, now.Add(-ttl), repoFilter)
 	if err != nil {
 		return err
 	}

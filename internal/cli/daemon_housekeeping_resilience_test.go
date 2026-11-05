@@ -417,7 +417,7 @@ func TestReclaimSkipOfAnotherReposRowKeepsItsLaterRetry(t *testing.T) {
 	cand := newTickCandidates(h.store)
 	cand.reclaimBudget.resume = h.tracker.reclaimResumeState()
 	// The sweep's candidate list is taken while the row is due ...
-	if ids, err := cand.delegationReclaimCandidates(h.ctx); err != nil || len(ids) == 0 {
+	if ids, err := cand.delegationReclaimCandidates(h.ctx, ""); err != nil || len(ids) == 0 {
 		t.Fatalf("candidates = %v, %v; want the seeded row", ids, err)
 	}
 	// ... then its owner's attempt keeps the worktree for six hours.
@@ -482,5 +482,70 @@ func TestReclaimSkipWriteBudgetIsPerPassKind(t *testing.T) {
 	}
 	if next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt); err != nil || !next.After(time.Now().UTC()) {
 		t.Fatalf("aged skip was not deferred after the skipped pass spent its budget: next attempt %q (%v)", obligation.NextAttemptAt, err)
+	}
+}
+
+// #2517 follow-up, seen live after #2519: the reclaim candidate window was
+// shared by every repo. An earlier repo's pass deferred another repo's due row
+// by a minute, so when the owning repo reached it in the same sweep the
+// cleanup refused itself as not due, and no worktree was removed; and rows of a
+// repo that never reclaims could fill the shared window for everyone. Each
+// repo now has its own window: a pass sees only its own repo's rows, never
+// touches another repo's, and many due rows of one repo cannot hide another
+// repo's row.
+func TestReclaimCandidateWindowsArePerRepo(t *testing.T) {
+	h := newHousekeepingDispatchHarness(t, "per-repo-windows")
+	seed := func(repo, name string) (string, string) {
+		id := "parent/delegation/" + name
+		path := managedDelegationReclaimTestPath(t, h.home, "parent", name)
+		seedCLIJob(t, h.store, db.Job{
+			ID: id, Agent: "reader", Type: "implement", State: string(workflow.JobFailed),
+			Repo: repo, ParentJobID: "parent", DelegationID: name,
+			Payload: mustJobPayload(t, workflow.JobPayload{
+				Repo: repo, ParentJobID: "parent", DelegationID: name,
+				WorktreePath: path, Branch: "gitmoot-delegation-" + name,
+				Result: &workflow.AgentResult{Decision: "failed"},
+			}),
+		}, "seed reclaim candidate")
+		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: "delegation_worktree_cleanup_skipped", Message: "preserved"}); err != nil {
+			t.Fatal(err)
+		}
+		return id, path
+	}
+	// More due rows of one repo than a whole window holds, all due earlier
+	// than the other repo's single row.
+	for i := 0; i < 70; i++ {
+		id, path := seed("owner/crowded", fmt.Sprintf("crowded-%02d", i))
+		if _, err := h.store.EnsureCleanupObligation(h.ctx, id, path, time.Now().UTC().Add(-2*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ownID, ownPath := seed("owner/later", "later-own")
+	if _, err := h.store.EnsureCleanupObligation(h.ctx, ownID, ownPath, time.Now().UTC().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	resource := db.CleanupObligationResourceID(ownID, ownPath)
+	before, err := h.store.GetCleanupObligation(h.ctx, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cand := newTickCandidates(h.store)
+	later, err := cand.delegationReclaimCandidates(h.ctx, "owner/later")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(later) != 1 || later[0] != ownID {
+		t.Fatalf("owner/later candidates = %v; its row must not be hidden behind owner/crowded's", later)
+	}
+	// Another repo's pass in the same sweep leaves the row untouched.
+	if err := reclaimSkippedDelegationWorktrees(h.ctx, h.worker, "owner/crowded", "", nil, cand, h.now); err != nil {
+		t.Fatal(err)
+	}
+	after, err := h.store.GetCleanupObligation(h.ctx, resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.NextAttemptAt != before.NextAttemptAt {
+		t.Fatalf("another repo's pass moved this row's retry from %s to %s; its owner would refuse it as not due", before.NextAttemptAt, after.NextAttemptAt)
 	}
 }

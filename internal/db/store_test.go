@@ -2283,9 +2283,9 @@ func TestJobIDsWithPendingDelegationWorktreeReclaim(t *testing.T) {
 		}
 	}
 
-	got, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	got, err := candidateJobIDs(store.DelegationReclaimCandidates(ctx))
 	if err != nil {
-		t.Fatalf("JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+		t.Fatalf("DelegationReclaimCandidates returned error: %v", err)
 	}
 	gotSet := map[string]bool{}
 	for _, id := range got {
@@ -2334,7 +2334,7 @@ func TestPendingDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T)
 		}
 	}
 
-	first, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	first, err := candidateJobIDs(store.DelegationReclaimCandidates(ctx))
 	if err != nil {
 		t.Fatalf("first query: %v", err)
 	}
@@ -2352,7 +2352,7 @@ func TestPendingDelegationReclaimBatchIsBoundedAndPersistentlyFair(t *testing.T)
 		}
 	}
 
-	second, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	second, err := candidateJobIDs(store.DelegationReclaimCandidates(ctx))
 	if err != nil {
 		t.Fatalf("second query: %v", err)
 	}
@@ -2396,8 +2396,8 @@ func TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 50; i++ {
-			if _, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx); err != nil {
-				t.Errorf("concurrent JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+			if _, err := candidateJobIDs(store.DelegationReclaimCandidates(ctx)); err != nil {
+				t.Errorf("concurrent DelegationReclaimCandidates returned error: %v", err)
 				return
 			}
 		}
@@ -2406,9 +2406,9 @@ func TestJobIDsWithPendingDelegationWorktreeReclaimRaceSafe(t *testing.T) {
 
 	// Final steady state: odd-indexed jobs kept their preserve marker (pending),
 	// even-indexed jobs reconciled with a removal (not pending).
-	got, err := store.JobIDsWithPendingDelegationWorktreeReclaim(ctx)
+	got, err := candidateJobIDs(store.DelegationReclaimCandidates(ctx))
 	if err != nil {
-		t.Fatalf("JobIDsWithPendingDelegationWorktreeReclaim returned error: %v", err)
+		t.Fatalf("DelegationReclaimCandidates returned error: %v", err)
 	}
 	gotSet := map[string]bool{}
 	for _, id := range got {
