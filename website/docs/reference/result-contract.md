@@ -94,7 +94,23 @@ top-level `"checks_blocked"` field naming the main reason:
 It is optional and carries no policy: `evidence` still says whether anything
 ran, and a review can declare `executed` for the checks it ran alongside a
 `checks_blocked` reason for the ones it could not. Say what you could not run in
-`summary` or `tests_run` as well. An unrecognised value is rejected outright,
+`summary` or `tests_run` as well.
+
+A router review (#2520) that cannot run a check because its environment lacks
+the platform toolchain (for example Xcode on a Linux image) may treat that check
+as satisfied by a green CI run at the exact reviewed head that it verifies
+itself: the run's head SHA equals the reviewed head, the job succeeded, and the
+job builds or tests the changed paths. It records the check as its own
+`tests_run` entry of the form `CI-verified: <check> -> success; run <run id> job
+<job id>` and nothing else in that entry, puts why the check cannot run here in
+`checks_blocked` and `summary`, lists the checks it ran itself as separate
+entries, and does not block or request changes for that reason alone. For the
+remote evidence ceiling a `CI-verified:` entry never counts as a check the
+review ran, so a review whose only `tests_run` entries are CI-verified is
+`static_only` whatever `changes_made` says; and like every entry it clamps the
+result if it reports a missing toolchain. It still runs every check its
+environment can run, and a changed path no green exact-head CI job exercised is
+not CI-verified. An unrecognised value is rejected outright,
 like `evidence`, so a misspelling is an error rather than an uncountable row.
 The field exists so the reasons reviews end static-only can be counted from
 stored results instead of searched for in summaries (#2314). The rollout

@@ -1710,7 +1710,21 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	// seat cannot run anything, so asking it to execute checks would be an
 	// instruction it can only fail or fabricate. The worker appends the
 	// exact-head CI evidence it fetched.
-	evidence := "Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths); do not approve on static reading alone. Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding."
+	//
+	// A CHECK THE ENVIRONMENT CANNOT RUN (#2520). Reviews of the same kind of
+	// change split on how they read "independently execute": herdrup#627 (a
+	// CI-config change, Swift on a Linux image without Xcode) was blocked three
+	// times with zero findings, the second time after inspecting the green
+	// exact-head CI run, while herdr#362 (Windows checks, same model) approved
+	// on supplied CI. Owner decision (Jarvis 396722): such a check is satisfied
+	// by green exact-head CI the reviewer verifies itself, never a block on its
+	// own; real execution stays required for everything the environment can
+	// run and wherever CI did not run the changed code.
+	evidence := "Independently execute substantive focused checks that exercise the changed production code (build, vet, and the tests covering the changed paths) wherever this review environment can run them; do not approve on static reading alone. " +
+		"A check this environment cannot run (its platform toolchain or runtime is absent, for example Xcode or a Windows host) is satisfied by a green CI run at the exact reviewed head that you verify yourself: the run's head SHA equals the head above, the job's conclusion is success, and the job actually builds or tests the changed paths. " +
+		"Record each such check as its own tests_run entry in the form \"CI-verified: <check> -> success; run <run id> job <job id>\" and nothing else in that entry; put why it cannot run here in checks_blocked and the summary, list the checks you ran yourself as separate tests_run entries, and never block or request changes for that reason alone. " +
+		"Real execution is still required for every check this environment can run, and a changed path that no green exact-head CI job exercised is not CI-verified. " +
+		"Return evidence=executed with a nonempty tests_run naming the exact commands and outcomes, and an evidence locator for every finding."
 	if noExecution {
 		evidence = "This is a no-execution review: read the diff and the code, and use the exact-head CI evidence appended below as the record of what ran. Return evidence=static_only with an empty tests_run, and an evidence locator (file:line, or check name and log line) for every finding."
 	}
