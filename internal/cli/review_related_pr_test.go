@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -143,7 +145,10 @@ func TestLocalReviewRelatedPRTreeIsExactAndReadOnly(t *testing.T) {
 	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), RemoteURL: origin, PollInterval: "30s"}); err != nil {
 		t.Fatal(err)
 	}
-	related := []workflow.ReviewRelatedPR{{PR: 7, HeadSHA: sha}}
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
 	job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test")).Enqueue(context.Background(), workflow.JobRequest{
 		ID: "related-review", Agent: "reviewer", Action: "review", Repo: "owner/repo", PullRequest: 12,
 		HeadSHA: strings.Repeat("a", 40), Instructions: "review", ReviewRelatedPRs: related,
@@ -155,7 +160,7 @@ func TestLocalReviewRelatedPRTreeIsExactAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.ReviewRelatedPRs) != 1 || payload.ReviewRelatedPRs[0] != related[0] || !strings.Contains(job.Payload, `"review_related_prs":[{"pr":7,"head_sha":"`+sha+`"}]`) {
+	if len(payload.ReviewRelatedPRs) != 1 || payload.ReviewRelatedPRs[0] != related[0] || !strings.Contains(job.Payload, `"review_related_prs":[{"pr":7,"head_sha":"`+sha+`","tree_sha256":"`+related[0].TreeSHA256+`"}]`) || len(related[0].TreeSHA256) != 64 {
 		t.Fatalf("payload related = %+v (%s)", payload.ReviewRelatedPRs, job.Payload)
 	}
 
@@ -229,17 +234,264 @@ func TestLocalReviewRelatedPRTreeIsExactAndReadOnly(t *testing.T) {
 
 // A pinned head is delivered even after the pull request moves on.
 func TestReviewRelatedPRArchiveHoldsThePinnedTree(t *testing.T) {
-	origin, sha := relatedPROrigin(t)
-	gitDir, entries, cleanup, err := fetchReviewRelatedTree(context.Background(), origin, "owner/repo", workflow.ReviewRelatedPR{PR: 7, HeadSHA: sha})
+	origin, _ := relatedPROrigin(t)
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pushRelatedPR(t, origin, 7, func(work string) { writeRelatedFile(t, work, "moved.txt", "moved on\n") })
+	tree, cleanup, err := fetchReviewRelatedTree(context.Background(), origin, "owner/repo", related[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	archive, count, err := reviewRelatedPRArchive(context.Background(), gitDir, entries)
+	archive, err := reviewRelatedPRArchive(context.Background(), tree)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 4 || !bytes.Contains(archive, []byte("CREATE TABLE sibling")) || bytes.Contains(archive, []byte(origin)) {
-		t.Fatalf("archive count=%d, want 4 entries with the sibling bytes and no fetch URL", count)
+	if tree.files != 4 || !bytes.Contains(archive, []byte("CREATE TABLE sibling")) || bytes.Contains(archive, []byte("moved on")) || bytes.Contains(archive, []byte(origin)) {
+		t.Fatalf("archive files=%d, want the 4 pinned entries, not the moved head, and no fetch URL", tree.files)
 	}
+}
+
+func writeRelatedFile(t *testing.T, work, name, body string) {
+	t.Helper()
+	target := filepath.Join(work, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeRelatedLink(t *testing.T, work, name, target string) {
+	t.Helper()
+	link := filepath.Join(work, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pushRelatedPR commits build's changes on top of origin's main and pushes the
+// commit to refs/pull/N/head, returning its sha.
+func pushRelatedPR(t *testing.T, origin string, number int, build func(work string)) string {
+	t.Helper()
+	work := filepath.Join(t.TempDir(), "pr")
+	run := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	run(filepath.Dir(work), "clone", "-q", "--branch", "main", origin, work)
+	build(work)
+	run(work, "add", "-A")
+	run(work, "commit", "-qm", "pr")
+	run(work, "push", "-q", "-f", origin, fmt.Sprintf("HEAD:refs/pull/%d/head", number))
+	return run(work, "rev-parse", "HEAD")
+}
+
+// #2534 review P2-1: a symlink whose target, following chains, resolves
+// outside .gitmoot-related/pr-N/ refuses the tree at dispatch.
+func TestReviewRelatedPRRefusesEscapingSymlinks(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	pushRelatedPR(t, origin, 8, func(work string) { writeRelatedLink(t, work, "abs", "/etc/passwd") })
+	pushRelatedPR(t, origin, 9, func(work string) { writeRelatedLink(t, work, "sub/up", "../../secret") })
+	pushRelatedPR(t, origin, 10, func(work string) {
+		// Lexically sub/M stays inside; following sub/L (-> "..") it escapes.
+		writeRelatedLink(t, work, "sub/L", "..")
+		writeRelatedLink(t, work, "sub/M", "L/../..")
+	})
+	pushRelatedPR(t, origin, 11, func(work string) { writeRelatedLink(t, work, "loop", "loop/x") })
+	pushRelatedPR(t, origin, 13, func(work string) {
+		writeRelatedFile(t, work, "a/b/file", "inside\n")
+		writeRelatedLink(t, work, "sub/L", "..")
+		writeRelatedLink(t, work, "sub/ok", "L/a/b/file")
+		writeRelatedLink(t, work, "a/b/sib", "../../sub/ok")
+	})
+	for number, want := range map[int]string{8: "absolute symlink target", 9: "outside the pull request tree", 10: "outside the pull request tree", 11: "loops"} {
+		_, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{number})
+		if err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("PR #%d: err = %v, want a symlink refusal naming %q", number, err, want)
+		}
+	}
+	if _, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{13}); err != nil {
+		t.Fatalf("in-tree symlink chains refused: %v", err)
+	}
+}
+
+// #2534 review P2-2: a .gitmoot-related entry the reviewed checkout brought is
+// refused and left untouched, whether a directory or a symlink elsewhere.
+func TestLocalRelatedInstallRefusesACheckoutOwnedRoot(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), RemoteURL: origin, PollInterval: "30s"}); err != nil {
+		t.Fatal(err)
+	}
+	worker := jobWorker{Store: store, Stdout: &bytes.Buffer{}}
+	payload := workflow.JobPayload{Repo: "owner/repo", ReviewRelatedPRs: related}
+
+	tracked := t.TempDir()
+	writeRelatedFile(t, tracked, ".gitmoot-related/keep.txt", "tracked\n")
+	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "job", payload, tracked); err == nil || !strings.Contains(err.Error(), "already contains .gitmoot-related") {
+		t.Fatalf("tracked dir: err = %v, want a refusal", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(tracked, ".gitmoot-related", "keep.txt")); err != nil || string(body) != "tracked\n" {
+		t.Fatalf("tracked file = %q, %v; want it untouched", body, err)
+	}
+	if _, err := os.Lstat(filepath.Join(tracked, ".gitmoot-related", "pr-7")); !os.IsNotExist(err) {
+		t.Fatalf("a tree was written into the checkout's directory: %v", err)
+	}
+
+	linked := t.TempDir()
+	outside := t.TempDir()
+	writeRelatedFile(t, outside, "victim.txt", "outside\n")
+	writeRelatedLink(t, linked, ".gitmoot-related", outside)
+	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "job", payload, linked); err == nil || !strings.Contains(err.Error(), "already contains .gitmoot-related") {
+		t.Fatalf("symlinked root: err = %v, want a refusal", err)
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 1 || entries[0].Name() != "victim.txt" {
+		t.Fatalf("outside dir = %v, want only victim.txt untouched", entries)
+	}
+	if target, err := os.Readlink(filepath.Join(linked, ".gitmoot-related")); err != nil || target != outside {
+		t.Fatalf("checkout symlink = %q, %v; want it untouched", target, err)
+	}
+}
+
+// #2534 review P2-2 and P2-3 for E2B: the sandbox scripts refuse a checkout
+// entry before creating anything, and the digest they measure equals the pin
+// until the sandbox user restores a write bit and edits the tree.
+func TestRemoteRelatedScriptsRefuseCheckoutRootAndDetectTampering(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := func(dir string, script string, args ...string) (string, error) {
+		cmd := exec.Command("sh", append([]string{"-c", script, "related"}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	linked, outside := t.TempDir(), t.TempDir()
+	writeRelatedLink(t, linked, ".gitmoot-related", outside)
+	if out, err := sh(linked, remoteReviewRelatedPRPrepareScript); err == nil || !strings.Contains(out, "already contains .gitmoot-related") {
+		t.Fatalf("prepare over a checkout symlink: err=%v out=%q, want a refusal", err, out)
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("prepare wrote through the checkout symlink: %v", entries)
+	}
+
+	workspace := t.TempDir()
+	if out, err := sh(workspace, remoteReviewRelatedPRPrepareScript); err != nil {
+		t.Fatalf("prepare: %v %s", err, out)
+	}
+	tree, cleanup, err := fetchReviewRelatedTree(context.Background(), origin, "owner/repo", related[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := reviewRelatedPRArchive(context.Background(), tree)
+	cleanup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	archivePath := filepath.Join(t.TempDir(), "pr-7.tar")
+	if err := os.WriteFile(archivePath, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := sh(workspace, remoteReviewRelatedPRUnpackScript, related[0].Path(), archivePath)
+	if err != nil || strings.TrimSpace(out) != fmt.Sprintf("%d 0 %s", tree.files, related[0].TreeSHA256) {
+		t.Fatalf("unpack = %q, %v; want %d read-only files with the pinned digest %s", out, err, tree.files, related[0].TreeSHA256)
+	}
+	if _, err := os.Stat(archivePath); !os.IsNotExist(err) {
+		t.Fatalf("archive survives unpacking: %v", err)
+	}
+	measure := func() string {
+		out, err := sh(workspace, remoteReviewRelatedPRMeasureScript, related[0].Path())
+		if err != nil {
+			t.Fatalf("measure: %v %s", err, out)
+		}
+		return strings.TrimSpace(out)
+	}
+	if got := measure(); got != related[0].TreeSHA256+" "+related[0].Path() {
+		t.Fatalf("measure = %q, want the pinned digest", got)
+	}
+	schema := filepath.Join(workspace, ".gitmoot-related", "pr-7", "db", "schema.sql")
+	if err := os.Chmod(schema, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(schema, []byte("DROP TABLE sibling;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := measure(); strings.HasPrefix(got, related[0].TreeSHA256) {
+		t.Fatalf("measure after tampering = %q, want a different digest", got)
+	}
+}
+
+// #2534 review P2-4: the terminal cleanup's pre-disposal hook removes the
+// 0555 related trees before the worktree goes to trash, so an unprivileged
+// daemon can dispose of it, and nothing of the worktree or trash remains.
+func TestRelatedTreesAreRemovedBeforeWorktreeDisposal(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	world := newCleanupCLIWorld(t, "succeeded", "review")
+	ctx := context.Background()
+	related, err := resolveReviewRelatedPRs(ctx, origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	world.payload.ReviewRelatedPRs = related
+	encoded, err := json.Marshal(world.payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpdateJobPayload(ctx, world.job.ID, string(encoded)); err != nil {
+		t.Fatal(err)
+	}
+	if err := world.store.UpsertRepo(ctx, db.Repo{Owner: "owner", Name: "repo", DefaultBranch: "main", CheckoutPath: world.checkout, RemoteURL: origin}); err != nil {
+		t.Fatal(err)
+	}
+	worker := jobWorker{Store: world.store, Stdout: &bytes.Buffer{}}
+	if _, err := worker.installLocalReviewRelatedPRs(ctx, world.job.ID, world.payload, world.path); err != nil {
+		t.Fatal(err)
+	}
+	engine := daemonWorkflowEngine(world.store, nil, world.checkout, world.paths.Home)
+	engine.WorktreeLiveness = func(string) (bool, bool) { return false, true }
+	hook := engine.BeforeReadOnlyWorktreeCleanup
+	presentAtDisposal := true
+	engine.BeforeReadOnlyWorktreeCleanup = func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
+		err := hook(ctx, jobID, jobType, payload)
+		_, statErr := os.Lstat(filepath.Join(payload.WorktreePath, ".gitmoot-related"))
+		presentAtDisposal = !os.IsNotExist(statErr)
+		return err
+	}
+	removed, err := engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, world.job.ID)
+	if err != nil || !removed {
+		t.Fatalf("cleanup removed=%t err=%v", removed, err)
+	}
+	if presentAtDisposal {
+		t.Fatal("related trees were still in the worktree when the pre-disposal hook finished")
+	}
+	if _, err := os.Lstat(world.path); !os.IsNotExist(err) {
+		t.Fatalf("worktree survives cleanup: %v", err)
+	}
+	_ = filepath.WalkDir(world.home, func(name string, d os.DirEntry, err error) error {
+		if err == nil && (d.Name() == ".gitmoot-related" || strings.Contains(name, "schema.sql")) {
+			t.Fatalf("related tree or trash survives cleanup at %s", name)
+		}
+		return nil
+	})
 }

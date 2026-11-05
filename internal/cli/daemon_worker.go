@@ -1335,6 +1335,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	if execBackend == execbackend.Remote {
 		adapter = w.guardRemoteReviewEvidence(adapter, lifecycle, instance, job.ID, payload)
+		adapter = w.guardRemoteReviewRelatedPRs(adapter, lifecycle, instance, job.ID, payload)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	engine.CollectChangeSet = executionChangeSetCollector(lifecycle, instance, execBackend, job.ID)

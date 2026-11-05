@@ -15,10 +15,14 @@ const ReviewRelatedPRsDir = ".gitmoot-related"
 // ReviewRelatedPR is one same-repository pull request whose exact head tree a
 // review receives read-only (#2509). HeadSHA is resolved on the host when the
 // review is requested; the tree delivered at run time is that commit's, even if
-// the pull request has moved since.
+// the pull request has moved since. TreeSHA256 is the digest of that tree's
+// paths, kinds and contents, pinned at dispatch and re-measured where the tree
+// is installed and again after the review ran, so a tree changed under the
+// reviewer fails the review instead of backing its verdict.
 type ReviewRelatedPR struct {
-	PR      int    `json:"pr"`
-	HeadSHA string `json:"head_sha"`
+	PR         int    `json:"pr"`
+	HeadSHA    string `json:"head_sha"`
+	TreeSHA256 string `json:"tree_sha256,omitempty"`
 }
 
 // Path is where the related tree sits, relative to the review workspace root.

@@ -1336,22 +1336,37 @@ gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target \
 ```
 
 `agent review --related-pr M` passes the flag through the review router.
-Each number must be positive, appear once, and differ from `--pr`. When the
-request is made, host git fetches `refs/pull/M/head` with the daemon's own
-credential into a private temporary repository and pins the exact head SHA.
-A pull request that cannot be fetched refuses the request. The job payload
-records `review_related_prs: [{"pr":M,"head_sha":"<40-hex>"}]`, and
-`review request` prints `related: #M at <sha> -> .gitmoot-related/pr-M/ (read-only)`.
+Each number must be positive, appear once, and differ from `--pr`.
 
-When the review runs, the daemon fetches that pinned SHA again on the host,
-so a pull request that moved after dispatch still delivers the pinned tree.
-It writes the plain file tree, with no `.git`, URL or credential, read-only at
-`.gitmoot-related/pr-M/` relative to the review checkout. A local review gets
-it in its exact-head worktree. An E2B review gets a tar archive streamed into
-its sandbox workspace, unpacked, made read-only and counted back. The
-directory has a `.gitignore` of `*`, so it stays out of the diff. It is
-removed when a local review ends and destroyed with an E2B sandbox. Event
-`review_related_pr_installed` records the PR, SHA, path and file count. The
+When the request is made, host git fetches `refs/pull/M/head` with the
+daemon's own credential into a private temporary repository. It pins the
+exact head SHA and a digest of the tree's paths, kinds and contents. The
+request is refused if the PR cannot be fetched, or if any symlink in the tree
+has an absolute target or resolves outside the tree (following chains through
+other symlinks). The job payload records
+`review_related_prs: [{"pr":M,"head_sha":"<40-hex>","tree_sha256":"<hex>"}]`,
+and `review request` prints
+`related: #M at <sha> -> .gitmoot-related/pr-M/ (read-only)`.
+
+When the review runs, the daemon fetches that pinned SHA again on the host and
+checks it against the pinned digest, so a pull request that moved after
+dispatch still delivers the pinned tree. It writes the plain file tree, with
+no `.git`, URL or credential, read-only at `.gitmoot-related/pr-M/` relative
+to the review checkout. If the reviewed checkout already has a
+`.gitmoot-related` entry (file, directory or symlink), the review fails and
+nothing is touched.
+
+- **Local review:** the tree goes into its exact-head worktree. It is removed
+  when delivery ends and, at the latest, before terminal cleanup disposes of
+  the worktree.
+- **E2B review:** a tar archive is streamed into the sandbox workspace,
+  unpacked, made read-only and measured. The sandbox user still owns those
+  files and could restore write bits, so the digest is measured again after
+  every delivery turn, and a tree that changed rejects the verdict.
+
+The directory has a `.gitignore` of `*`, so it stays out of the diff. Events:
+`review_related_pr_installed` (PR, SHA, path, file count, digest), then
+`review_related_pr_verified` or `review_related_pr_altered` for E2B. The
 reviewer's instructions name each PR, its SHA and its path. Refused for
 sandboxd reviews, and when attaching to a running review that carries
 different related PRs.
