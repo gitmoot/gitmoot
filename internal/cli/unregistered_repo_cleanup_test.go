@@ -129,6 +129,14 @@ func TestReclaimLoopRemovesWorktreeOfUnregisteredRepoThroughOwningCheckout(t *te
 	}, workflow.JobPayload{
 		WorktreePath: path, ReadOnlyWorktree: true, ReadOnlySeat: true, PullRequest: 7, HeadSHA: head,
 	})
+	// The fixture owns every user of its worktree, so it answers liveness for
+	// that path; an unrelated host process whose cwd an unprivileged run
+	// cannot read is not part of this scenario. Any other path keeps the
+	// strict scan.
+	owned, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	worker := defaultJobWorker(store, io.Discard, home)
 	tracker := newInflightJobTracker(ctx)
 	var mu sync.Mutex
@@ -142,7 +150,14 @@ func TestReclaimLoopRemovesWorktreeOfUnregisteredRepoThroughOwningCheckout(t *te
 			renamedRepoStarted = true
 			tracker.end("renamed-probe")
 		}
-		return worker.defaultWorkflow(engineCheckout)
+		engine := worker.defaultWorkflow(engineCheckout)
+		engine.WorktreeLiveness = func(candidate string) (bool, bool) {
+			if filepath.Clean(candidate) == owned || filepath.Clean(candidate) == filepath.Clean(path) {
+				return false, true
+			}
+			return workflow.WorktreeLiveness(candidate)
+		}
+		return engine
 	}
 	var stdout bytes.Buffer
 	runWorktreeReclaimLoopPass(ctx, store, worker, tracker, "", fleetReclaimRepos, &stdout, time.Now().UTC(), time.Time{})
