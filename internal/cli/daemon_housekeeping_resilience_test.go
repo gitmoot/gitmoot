@@ -543,3 +543,20 @@ func TestSweepLeavesOtherReposDueRowsForTheirOwner(t *testing.T) {
 		t.Fatalf("a row of a repo outside the sweep was not deferred; it would hold the candidate window")
 	}
 }
+
+// #2521 review: a repo whose background pool pass stays busy never runs its
+// reclaim passes. If its rows were left untouched for it, they would pin the
+// shared candidate windows and starve every other repo's cleanup. Only repos
+// whose reclaim actually runs this tick count as owners in the sweep.
+func TestSweepDefersRowsOfReposWhosePoolIsBusy(t *testing.T) {
+	tracker := newInflightJobTracker(context.Background())
+	if !tracker.tryBeginPool("owner/busy") {
+		t.Fatal("could not mark the pool busy")
+	}
+	t.Cleanup(func() { tracker.endPool("owner/busy") })
+	repos := []db.Repo{{Owner: "owner", Name: "busy", Enabled: true}, {Owner: "owner", Name: "idle", Enabled: true}}
+	got := reclaimSweepRepos(repos, tracker)
+	if got["owner/busy"] || !got["owner/idle"] {
+		t.Fatalf("sweep owners = %v; want only owner/idle (owner/busy's reclaim does not run)", got)
+	}
+}

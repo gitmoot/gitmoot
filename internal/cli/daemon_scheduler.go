@@ -1236,6 +1236,21 @@ func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker,
 	return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
 }
 
+// reclaimSweepRepos is the set of repos whose reclaim passes run in this
+// sweep: enabled, and not behind a live background pool pass, which skips
+// them (#2521 review). Only these may keep their due cleanup rows untouched by
+// earlier repos; otherwise a repo whose pool stays busy would pin the shared
+// candidate windows for everyone.
+func reclaimSweepRepos(repos []db.Repo, tracker *inflightJobTracker) map[string]bool {
+	owners := map[string]bool{}
+	for _, repo := range repos {
+		if repo.Enabled && !tracker.poolRunning(repo.FullName()) {
+			owners[repo.FullName()] = true
+		}
+	}
+	return owners
+}
+
 // ownedBySweepRepo reports whether a candidate this pass skips because it
 // belongs to another repo will get that repo's own turn in this same sweep.
 // Such a row must not be deferred here (#2517 follow-up, seen live): an
@@ -2043,12 +2058,7 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// known only once the loop below ends.
 	cand.reclaimBudget.resume = tracker.reclaimResumeState()
 	defer cand.finishReclaimTick()
-	cand.reclaimBudget.sweepRepos = map[string]bool{}
-	for _, repo := range repos {
-		if repo.Enabled {
-			cand.reclaimBudget.sweepRepos[repo.FullName()] = true
-		}
-	}
+	cand.reclaimBudget.sweepRepos = reclaimSweepRepos(repos, tracker)
 	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
