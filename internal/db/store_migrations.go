@@ -3136,4 +3136,11 @@ INSERT INTO org_seat_agent_identity_next (role, agent_name, pane_id, session, ob
 DROP TABLE org_seat_agent_identity;
 ALTER TABLE org_seat_agent_identity_next RENAME TO org_seat_agent_identity;
 	`,
+	// #2530: ListTasksByRepoState runs per enabled repo every worker tick (the
+	// blocked-since evaluator) and per repo poll. With no index whose leading
+	// columns serve repo_full_name = ? AND state = ? (the disposal index is
+	// partial on literal states), each call scanned every task in id order.
+	`
+CREATE INDEX IF NOT EXISTS idx_tasks_repo_state ON tasks(repo_full_name, state, id);
+	`,
 }
