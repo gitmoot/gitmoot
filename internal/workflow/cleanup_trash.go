@@ -104,6 +104,35 @@ func ownerCheckoutFromGitDir(gitDir string) (string, error) {
 	return common, nil
 }
 
+// ErrCleanupWorktreeAbsent reports that a cleanup's worktree path does not
+// exist, so there is no .git pointer to find its owning checkout from.
+var ErrCleanupWorktreeAbsent = errors.New("cleanup worktree path is absent")
+
+// WorktreeOwnerCheckout is the checkout owning the linked worktree at path,
+// read from its .git pointer the way the trash move finds it (#2526). The
+// reclaim of a worktree whose repo is no longer registered (removed or
+// renamed, #2531) runs through it. It proves nothing by itself: the cleanup
+// bound to it still requires git there to list the worktree as a linked one
+// (git_identity_unknown otherwise), as with a registered checkout.
+func WorktreeOwnerCheckout(path string) (string, error) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return "", ErrCleanupWorktreeAbsent
+	} else if err != nil {
+		return "", err
+	}
+	gitDir, err := worktreeGitDir(path)
+	if err != nil {
+		return "", err
+	}
+	return ownerCheckoutFromGitDir(gitDir)
+}
+
+// CleanupTrashOwnerCheckout is the checkout owning a pending trash directory,
+// the one its disposal locks and runs git in.
+func CleanupTrashOwnerCheckout(record db.PendingCleanupTrash) (string, error) {
+	return ownerCheckoutFromGitDir(record.GitDir)
+}
+
 // lockOwnerCheckout takes the checkout mutation lock of owner unless held
 // already is the same key (a held lock is not reentrant).
 func (e Engine) lockOwnerCheckout(ctx context.Context, owner, held, ownerID string) (func(context.Context) error, error) {

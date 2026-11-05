@@ -102,7 +102,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			})
 			// Delegation worktree reclaim runs beside dispatch, not in front of
 			// it (#2517 step 3). Stopped before the tracker drains.
-			stopWorktreeReclaim := startWorktreeReclaimLoop(ctx, store, worker, tracker, rootFilter, enabledRepoNames(store), stdout)
+			stopWorktreeReclaim := startWorktreeReclaimLoop(ctx, store, worker, tracker, rootFilter, fleetReclaimRepos, stdout)
 			defer stopWorktreeReclaim()
 			startBlockedRoleWakeLoop(ctx, store, paths.Home, stdout)
 			// The wake outbox is store-global and drains on its own short loop,
@@ -246,7 +246,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	workerErr := startSingleRepoWorkerLoop(ctx, daemonWorkerLoopInterval, store, worker, live, &checkoutLock, tracker, d.Repo.FullName(), rootFilter, stdout)
 	// Delegation worktree reclaim runs beside dispatch (#2517 step 3).
 	singleRepo := d.Repo.FullName()
-	stopWorktreeReclaim := startWorktreeReclaimLoop(ctx, store, worker, tracker, rootFilter, func(context.Context) ([]string, error) { return []string{singleRepo}, nil }, stdout)
+	stopWorktreeReclaim := startWorktreeReclaimLoop(ctx, store, worker, tracker, rootFilter, fixedReclaimRepos(singleRepo), stdout)
 	defer stopWorktreeReclaim()
 	startBlockedRoleWakeLoop(ctx, store, home, stdout)
 	drainWorker := worker
