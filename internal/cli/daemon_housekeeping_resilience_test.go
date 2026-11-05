@@ -782,7 +782,11 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 			t.Fatal(err)
 		}
 		gitDir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(pointer)), "gitdir:"))
-		record := db.PendingCleanupTrash{JobID: id, Path: trash, ExpectedPath: seat, Generation: 0, GitDir: gitDir}
+		nonce := fmt.Sprintf("%032x", len(name)*7919+int(name[len(name)-1]))
+		if err := os.WriteFile(filepath.Join(gitDir, "gitmoot-cleanup-trash-nonce"), []byte(nonce), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		record := db.PendingCleanupTrash{JobID: id, Path: trash, ExpectedPath: seat, Generation: 0, GitDir: gitDir, Nonce: nonce}
 		message, _ := json.Marshal(record)
 		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: workflow.CleanupTrashPendingEvent, Message: string(message)}); err != nil {
 			t.Fatal(err)

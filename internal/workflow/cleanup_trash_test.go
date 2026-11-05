@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -165,6 +166,24 @@ func TestCleanupTrashDisposalRequiresOwnershipProof(t *testing.T) {
 	if err := world.manager.RemoveWorktreeForce(ctx, trash); err != nil {
 		t.Fatal(err)
 	}
+	// #2526 review: a different worktree that reuses the recorded
+	// administrative path (same basename after the original was pruned), moved
+	// to the trash path, names the same git dir but has no nonce.
+	reuse := filepath.Join(t.TempDir(), filepath.Base(world.path))
+	git("worktree", "add", "--detach", reuse, "HEAD")
+	if got, err := worktreeGitDir(reuse); err != nil || got != record.GitDir {
+		t.Fatalf("fixture: reused worktree git dir %q (%v), want the recorded %q", got, err, record.GitDir)
+	}
+	git("worktree", "move", reuse, trash)
+	if err := world.engine.DisposeCleanupTrash(ctx, record); err == nil || !strings.Contains(err.Error(), "nonce") {
+		t.Fatalf("disposal of a worktree reusing the administrative path: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(trash, ".git")); err != nil {
+		t.Fatalf("the reusing worktree was touched: %v", err)
+	}
+	if err := world.manager.RemoveWorktreeForce(ctx, trash); err != nil {
+		t.Fatal(err)
+	}
 	// A plain directory at the trash path.
 	if err := os.MkdirAll(filepath.Join(trash, "keep"), 0o755); err != nil {
 		t.Fatal(err)
@@ -205,5 +224,52 @@ func TestMovedTrashIsDisposedWithoutACompletedReceipt(t *testing.T) {
 	}
 	if again, _ := world.store.PendingCleanupTrashes(ctx, 10, time.Now().Add(-time.Hour)); len(again) != 0 {
 		t.Fatalf("still pending: %+v", again)
+	}
+}
+
+// #2526 review: the .git pointer may be relative (worktree.useRelativePaths),
+// and a .git that is a symlink or not a small regular file is refused rather
+// than followed or read without bound.
+func TestWorktreeGitDirResolvesRelativePointersAndRefusesOddFiles(t *testing.T) {
+	root := t.TempDir()
+	admin := filepath.Join(root, "repo", ".git", "worktrees", "seat")
+	worktree := filepath.Join(root, "seat")
+	for _, dir := range []string{admin, worktree} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: ../repo/.git/worktrees/seat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := worktreeGitDir(worktree); err != nil || got != admin {
+		t.Fatalf("relative pointer resolved to %q (%v), want %q", got, err, admin)
+	}
+	linked := filepath.Join(root, "linked")
+	if err := os.MkdirAll(linked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(worktree, ".git"), filepath.Join(linked, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktreeGitDir(linked); err == nil {
+		t.Error("a symlinked .git was followed")
+	}
+	fifo := filepath.Join(root, "fifo")
+	if err := os.MkdirAll(fifo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(fifo, ".git"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := worktreeGitDir(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO .git was accepted")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a FIFO .git blocked")
 	}
 }
