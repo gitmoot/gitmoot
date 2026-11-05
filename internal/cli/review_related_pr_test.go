@@ -165,6 +165,7 @@ func TestLocalReviewRelatedPRTreeIsExactAndReadOnly(t *testing.T) {
 	}
 
 	workspace := t.TempDir()
+	restoreWriteBitsOnCleanup(t, workspace)
 	worker := jobWorker{Store: store, Stdout: &bytes.Buffer{}}
 	remove, err := worker.installLocalReviewRelatedPRs(context.Background(), job.ID, payload, workspace)
 	if err != nil {
@@ -345,6 +346,7 @@ func TestLocalRelatedInstallRefusesACheckoutOwnedRoot(t *testing.T) {
 	payload := workflow.JobPayload{Repo: "owner/repo", ReviewRelatedPRs: related}
 
 	tracked := t.TempDir()
+	restoreWriteBitsOnCleanup(t, tracked)
 	writeRelatedFile(t, tracked, ".gitmoot-related/keep.txt", "tracked\n")
 	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "job", payload, tracked); err == nil || !strings.Contains(err.Error(), "already contains .gitmoot-related") {
 		t.Fatalf("tracked dir: err = %v, want a refusal", err)
@@ -358,6 +360,7 @@ func TestLocalRelatedInstallRefusesACheckoutOwnedRoot(t *testing.T) {
 
 	linked := t.TempDir()
 	outside := t.TempDir()
+	restoreWriteBitsOnCleanup(t, linked)
 	writeRelatedFile(t, outside, "victim.txt", "outside\n")
 	writeRelatedLink(t, linked, ".gitmoot-related", outside)
 	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "job", payload, linked); err == nil || !strings.Contains(err.Error(), "already contains .gitmoot-related") {
@@ -397,6 +400,7 @@ func TestRemoteRelatedScriptsRefuseCheckoutRootAndDetectTampering(t *testing.T) 
 	}
 
 	workspace := t.TempDir()
+	restoreWriteBitsOnCleanup(t, workspace)
 	if out, err := sh(workspace, remoteReviewRelatedPRPrepareScript); err != nil {
 		t.Fatalf("prepare: %v %s", err, out)
 	}
@@ -448,6 +452,8 @@ func TestRemoteRelatedScriptsRefuseCheckoutRootAndDetectTampering(t *testing.T) 
 func TestRelatedTreesAreRemovedBeforeWorktreeDisposal(t *testing.T) {
 	origin, _ := relatedPROrigin(t)
 	world := newCleanupCLIWorld(t, "succeeded", "review")
+	restoreWriteBitsOnCleanup(t, world.home)
+	restoreWriteBitsOnCleanup(t, world.path)
 	ctx := context.Background()
 	related, err := resolveReviewRelatedPRs(ctx, origin, "owner/repo", []int{7})
 	if err != nil {
@@ -494,4 +500,125 @@ func TestRelatedTreesAreRemovedBeforeWorktreeDisposal(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// restoreWriteBitsOnCleanup makes every directory under root writable again
+// when the test ends, before t.TempDir's own removal runs (cleanups are LIFO),
+// so a read-only related tree never fails the test as a non-root user.
+func restoreWriteBitsOnCleanup(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() { restoreTreeWriteBits(root) })
+}
+
+func restoreTreeWriteBits(root string) {
+	_ = filepath.WalkDir(root, func(name string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(name, 0o755)
+		}
+		return nil
+	})
+}
+
+// snapshotTree records every entry under root with its mode and content.
+func snapshotTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snapshot := map[string]string{}
+	if err := filepath.WalkDir(root, func(name string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		value := info.Mode().String()
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, _ := os.Readlink(name)
+			value += " -> " + target
+		case info.Mode().IsRegular():
+			body, _ := os.ReadFile(name)
+			value += " " + string(body)
+		}
+		snapshot[name] = value
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+// #2534 review round 2, F2: ownership comes from the job's own recorded state,
+// never from the reviewed tree. A checkout directory carrying a marker that
+// names this very job is refused and left byte-for-byte untouched, and the
+// pre-disposal hook does not remove it either.
+func TestLocalRelatedInstallRefusesACheckoutRootWithAForgedMarker(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), RemoteURL: origin, PollInterval: "30s"}); err != nil {
+		t.Fatal(err)
+	}
+	worker := jobWorker{Store: store, Stdout: &bytes.Buffer{}}
+	payload := workflow.JobPayload{Repo: "owner/repo", ReviewRelatedPRs: related}
+	checkout := t.TempDir()
+	restoreWriteBitsOnCleanup(t, checkout)
+	writeRelatedFile(t, checkout, ".gitmoot-related/.gitmoot-owner", "forged-job\n")
+	writeRelatedFile(t, checkout, ".gitmoot-related/pr-7/tracked.sql", "tracked by the checkout\n")
+	before := snapshotTree(t, checkout)
+	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "forged-job", payload, checkout); err == nil || !strings.Contains(err.Error(), "already contains .gitmoot-related") {
+		t.Fatalf("forged marker: err = %v, want a refusal", err)
+	}
+	payload.WorktreePath = checkout
+	if err := reviewRelatedPRPrecleanupHook(store)(context.Background(), "forged-job", "review", payload); err != nil {
+		t.Fatalf("pre-disposal hook: %v", err)
+	}
+	after := snapshotTree(t, checkout)
+	if len(before) != len(after) {
+		t.Fatalf("checkout changed: before=%v after=%v", before, after)
+	}
+	for name, value := range before {
+		if after[name] != value {
+			t.Fatalf("%s changed from %q to %q", name, value, after[name])
+		}
+	}
+}
+
+// A retry of the same job in the same worktree may replace exactly the
+// directory that job recorded creating, and nothing else.
+func TestLocalRelatedInstallReplacesOnlyItsOwnRecordedRoot(t *testing.T) {
+	origin, _ := relatedPROrigin(t)
+	related, err := resolveReviewRelatedPRs(context.Background(), origin, "owner/repo", []int{7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := daemonWorkerStore(t)
+	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: t.TempDir(), RemoteURL: origin, PollInterval: "30s"}); err != nil {
+		t.Fatal(err)
+	}
+	seedCLIJob(t, store, db.Job{ID: "retry-job", Agent: "reviewer", Type: "review", State: string(workflow.JobRunning), Payload: "{}"}, "running")
+	worker := jobWorker{Store: store, Stdout: &bytes.Buffer{}}
+	payload := workflow.JobPayload{Repo: "owner/repo", ReviewRelatedPRs: related}
+	workspace := t.TempDir()
+	restoreWriteBitsOnCleanup(t, workspace)
+	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "retry-job", payload, workspace); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.installLocalReviewRelatedPRs(context.Background(), "other-job", payload, workspace); err == nil {
+		t.Fatal("another job replaced a root it did not create")
+	}
+	remove, err := worker.installLocalReviewRelatedPRs(context.Background(), "retry-job", payload, workspace)
+	if err != nil {
+		t.Fatalf("retry of the recording job refused: %v", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(workspace, ".gitmoot-related", "pr-7", "db", "schema.sql")); err != nil || !strings.Contains(string(body), "sibling") {
+		t.Fatalf("retry tree = %q, %v", body, err)
+	}
+	remove()
+	if _, err := os.Lstat(filepath.Join(workspace, ".gitmoot-related")); !os.IsNotExist(err) {
+		t.Fatalf("recorded root survives removal: %v", err)
+	}
 }

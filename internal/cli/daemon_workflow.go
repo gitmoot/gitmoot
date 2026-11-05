@@ -143,7 +143,7 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
 			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
 			askReviewDiffPrecleanupHookForRunner(store, runner),
-			reviewRelatedPRPrecleanupHook(),
+			reviewRelatedPRPrecleanupHook(store),
 		)
 	}
 	if strings.TrimSpace(home) != "" && strings.TrimSpace(checkout) != "" {

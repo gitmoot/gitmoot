@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -41,9 +42,11 @@ const (
 	reviewRelatedPRVerifiedEventKind  = "review_related_pr_verified"
 	reviewRelatedPRAlteredEventKind   = "review_related_pr_altered"
 
-	// reviewRelatedPROwnerFile marks a .gitmoot-related directory as created by
-	// one job, so removal never deletes a directory the checkout brought.
-	reviewRelatedPROwnerFile = ".gitmoot-owner"
+	// reviewRelatedPRRootEventKind records, in the job's own event log, the
+	// path and device/inode of the .gitmoot-related directory a job created.
+	// That record, never anything inside the reviewed tree, is what proves a
+	// directory is gitmoot's to remove.
+	reviewRelatedPRRootEventKind = "review_related_pr_root"
 )
 
 // remoteReviewRelatedPRArchiveDir is where the host streams each related tree
@@ -465,20 +468,95 @@ func (w jobWorker) reviewRelatedPRSource(ctx context.Context, repoName string) (
 	return reviewRelatedPRFetchURL(record, repo), nil
 }
 
+// reviewRelatedRootRecord is the trusted identity of a .gitmoot-related
+// directory one job created: its path and the device/inode Lstat reported
+// right after Mkdir. It lives in the job's events, outside the reviewed tree.
+type reviewRelatedRootRecord struct {
+	Path string `json:"path"`
+	Dev  uint64 `json:"dev"`
+	Ino  uint64 `json:"ino"`
+}
+
+// reviewRelatedRealDirIdentity returns the device/inode of name when it is a
+// real directory, never following a symlink.
+func reviewRelatedRealDirIdentity(name string) (uint64, uint64, bool) {
+	info, err := os.Lstat(name)
+	if err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+		return 0, 0, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), true
+}
+
+// recordedReviewRelatedRoot returns the last root this job recorded for path.
+func recordedReviewRelatedRoot(ctx context.Context, store *db.Store, jobID, root string) (reviewRelatedRootRecord, bool) {
+	if store == nil || strings.TrimSpace(jobID) == "" {
+		return reviewRelatedRootRecord{}, false
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		return reviewRelatedRootRecord{}, false
+	}
+	var found reviewRelatedRootRecord
+	ok := false
+	for _, event := range events {
+		var record reviewRelatedRootRecord
+		if event.Kind != reviewRelatedPRRootEventKind || json.Unmarshal([]byte(event.Message), &record) != nil || filepath.Clean(record.Path) != filepath.Clean(root) {
+			continue
+		}
+		found, ok = record, true
+	}
+	return found, ok
+}
+
+// removeRecordedReviewRelatedRoot removes root only when it is still the real
+// directory described by record (same path, device and inode). Anything else,
+// including a directory the reviewed checkout brought, is left untouched and
+// reported as not removed. Write bits are restored first, never following a
+// symlink, so an unprivileged daemon can delete the 0555 tree.
+func removeRecordedReviewRelatedRoot(root string, record reviewRelatedRootRecord) (bool, error) {
+	dev, ino, ok := reviewRelatedRealDirIdentity(root)
+	if !ok || filepath.Clean(record.Path) != filepath.Clean(root) || dev != record.Dev || ino != record.Ino {
+		return false, nil
+	}
+	_ = filepath.WalkDir(root, func(name string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(name, 0o755)
+		}
+		return nil
+	})
+	if err := os.RemoveAll(root); err != nil {
+		return false, fmt.Errorf("remove related pull request trees: %w", err)
+	}
+	return true, nil
+}
+
 // installLocalReviewRelatedPRs writes each pinned tree read-only into the
-// review's own worktree at ReviewRelatedPR.Path(). It refuses, touching
-// nothing, when the checkout already has a .gitmoot-related entry it did not
-// create for this job. The returned function removes the trees again.
+// review's own worktree at ReviewRelatedPR.Path(). A .gitmoot-related entry
+// that this job's own recorded identity does not describe came from the
+// reviewed checkout: it is refused and nothing is touched. The returned
+// function removes the trees again.
 func (w jobWorker) installLocalReviewRelatedPRs(ctx context.Context, jobID string, payload workflow.JobPayload, workspace string) (func(), error) {
 	if strings.TrimSpace(workspace) == "" {
 		return nil, errors.New("related pull request trees need the review's checkout")
 	}
+	if w.Store == nil {
+		return nil, errors.New("related pull request trees need the job store to record what they create")
+	}
 	root := filepath.Join(workspace, workflow.ReviewRelatedPRsDir)
 	if _, err := os.Lstat(root); err == nil {
-		// A previous attempt of this same job may have left its own trees.
-		removed, removeErr := removeOwnedReviewRelatedTrees(workspace, jobID)
-		if removeErr != nil {
-			return nil, removeErr
+		// Only a directory this job recorded creating (a retry in the same
+		// worktree) may be replaced.
+		record, recorded := recordedReviewRelatedRoot(ctx, w.Store, jobID, root)
+		removed := false
+		if recorded {
+			var removeErr error
+			if removed, removeErr = removeRecordedReviewRelatedRoot(root, record); removeErr != nil {
+				return nil, removeErr
+			}
 		}
 		if !removed {
 			return nil, fmt.Errorf("the reviewed checkout already contains %s, which gitmoot did not create; refusing to install related pull request trees there", workflow.ReviewRelatedPRsDir)
@@ -491,18 +569,22 @@ func (w jobWorker) installLocalReviewRelatedPRs(ctx context.Context, jobID strin
 		return nil, err
 	}
 	// Mkdir never follows a final-component symlink: it fails if anything is
-	// already there. Lstat then proves it is the real directory just created.
+	// already there. Lstat then proves it is the real directory just created,
+	// and its identity is recorded before anything is written into it.
 	if err := os.Mkdir(root, 0o755); err != nil {
 		return nil, fmt.Errorf("create %s: %w", workflow.ReviewRelatedPRsDir, err)
 	}
-	if info, err := os.Lstat(root); err != nil || !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+	dev, ino, ok := reviewRelatedRealDirIdentity(root)
+	if !ok {
 		return nil, fmt.Errorf("%s is not the directory gitmoot created", workflow.ReviewRelatedPRsDir)
 	}
-	if err := os.WriteFile(filepath.Join(root, reviewRelatedPROwnerFile), []byte(jobID+"\n"), 0o444); err != nil {
-		_ = os.RemoveAll(root)
-		return nil, err
+	record := reviewRelatedRootRecord{Path: root, Dev: dev, Ino: ino}
+	body, _ := json.Marshal(record)
+	if err := w.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: jobID, Kind: reviewRelatedPRRootEventKind, Message: string(body)}); err != nil {
+		_, _ = removeRecordedReviewRelatedRoot(root, record)
+		return nil, fmt.Errorf("record related pull request root: %w", err)
 	}
-	remove := func() { _, _ = removeOwnedReviewRelatedTrees(workspace, jobID) }
+	remove := func() { _, _ = removeRecordedReviewRelatedRoot(root, record) }
 	// Untracked trees stay out of the review worktree's git status.
 	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("*\n"), 0o444); err != nil {
 		remove()
@@ -573,52 +655,21 @@ func materializeLocalReviewRelatedPR(ctx context.Context, fetchURL, repoName str
 	return tree.files, nil
 }
 
-// removeOwnedReviewRelatedTrees removes workspace/.gitmoot-related only when it
-// is a real directory whose owner marker names jobID; anything else is left
-// untouched and reported as not removed. Write bits are restored first (never
-// following a symlink) so an unprivileged daemon can delete the 0555 tree.
-func removeOwnedReviewRelatedTrees(workspace, jobID string) (bool, error) {
-	root := filepath.Join(workspace, workflow.ReviewRelatedPRsDir)
-	info, err := os.Lstat(root)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if !info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
-		return false, nil
-	}
-	marker := filepath.Join(root, reviewRelatedPROwnerFile)
-	markerInfo, err := os.Lstat(marker)
-	if err != nil || !markerInfo.Mode().IsRegular() {
-		return false, nil
-	}
-	owner, err := os.ReadFile(marker)
-	if err != nil || strings.TrimSpace(string(owner)) != strings.TrimSpace(jobID) || strings.TrimSpace(jobID) == "" {
-		return false, nil
-	}
-	_ = filepath.WalkDir(root, func(name string, d fs.DirEntry, err error) error {
-		if err == nil && d.IsDir() {
-			_ = os.Chmod(name, 0o755)
-		}
-		return nil
-	})
-	if err := os.RemoveAll(root); err != nil {
-		return false, fmt.Errorf("remove related pull request trees: %w", err)
-	}
-	return true, nil
-}
-
 // reviewRelatedPRPrecleanupHook removes a terminal review's related trees
 // BEFORE its worktree is disposed of: the 0555 directories would otherwise
 // block an unprivileged `git worktree remove --force` and strand the trash.
-func reviewRelatedPRPrecleanupHook() beforeReadOnlyWorktreeCleanupHook {
-	return func(_ context.Context, jobID, jobType string, payload workflow.JobPayload) error {
+// Only the directory this job recorded creating is removed.
+func reviewRelatedPRPrecleanupHook(store *db.Store) beforeReadOnlyWorktreeCleanupHook {
+	return func(ctx context.Context, jobID, jobType string, payload workflow.JobPayload) error {
 		if strings.TrimSpace(jobType) != "review" || len(payload.ReviewRelatedPRs) == 0 || strings.TrimSpace(payload.WorktreePath) == "" {
 			return nil
 		}
-		_, err := removeOwnedReviewRelatedTrees(payload.WorktreePath, jobID)
+		root := filepath.Join(payload.WorktreePath, workflow.ReviewRelatedPRsDir)
+		record, ok := recordedReviewRelatedRoot(ctx, store, jobID, root)
+		if !ok {
+			return nil
+		}
+		_, err := removeRecordedReviewRelatedRoot(root, record)
 		return err
 	}
 }

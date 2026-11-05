@@ -1731,7 +1731,10 @@ dispatch still delivers the pinned tree. It writes the plain file tree, with
 no `.git`, URL or credential, read-only at `.gitmoot-related/pr-M/` relative
 to the review checkout. If the reviewed checkout already has a
 `.gitmoot-related` entry (file, directory or symlink), the review fails and
-nothing is touched.
+nothing is touched. Ownership comes only from the job's own event log: the
+daemon records the path and device/inode of the directory it creates
+(`review_related_pr_root`) and removes only a real directory that still
+matches that record.
 
 - **Local review:** the tree goes into its exact-head worktree. It is removed
   when delivery ends and, at the latest, before terminal cleanup disposes of
