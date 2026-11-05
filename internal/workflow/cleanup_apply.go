@@ -23,6 +23,10 @@ type CleanupApplyResult struct {
 	Receipt       *db.CleanupReceipt `json:"receipt,omitempty"`
 	// RefusalReceipt is the durable record of a refused consumer apply (#2360 v2).
 	RefusalReceipt *db.CleanupRefusal `json:"refusal_receipt,omitempty"`
+	// TrashPath is where the removed worktree was moved under the fence; its
+	// files are deleted after the fence is released (#2524). Empty when the
+	// worktree was removed in place or was already absent.
+	TrashPath string `json:"trash_path,omitempty"`
 }
 
 // ApplyProducerCleanup accepts only a producer-derived resource and a prior
@@ -33,7 +37,11 @@ func (e Engine) ApplyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		return CleanupApplyResult{}, errors.New("cleanup apply requires resource identity and eligibility token")
 	}
 	policy.BudgetGate = CleanupBudgetGateEnforced
-	return e.applyProducerCleanup(ctx, jobID, resourceID, token, policy, true)
+	result, err := e.applyProducerCleanup(ctx, jobID, resourceID, token, policy, true)
+	if err == nil && result.TrashPath != "" {
+		err = e.DisposeCleanupTrash(context.WithoutCancel(ctx), jobID, result.TrashPath)
+	}
+	return result, err
 }
 
 func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, token string, policy CleanupPolicy, countFailure bool) (result CleanupApplyResult, err error) {
@@ -177,7 +185,19 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 			}
 			result.Decision = current
 		}
-		if err := e.DelegationWorktrees.(ReadOnlyWorktreeManager).RemoveWorktreeForce(ctx, current.ExpectedPath); err != nil {
+		if current.OwnedBranch == "" {
+			// A detached worktree (read-only seats, the large majority) is
+			// moved aside under the fence and deleted after it (#2524).
+			trash, err := e.moveWorktreeToTrash(ctx, jobID, current.ExpectedPath)
+			if err != nil {
+				return result, err
+			}
+			result.TrashPath = trash
+		} else if err := e.DelegationWorktrees.(ReadOnlyWorktreeManager).RemoveWorktreeForce(ctx, current.ExpectedPath); err != nil {
+			// A worktree with its own branch is removed in place, as before:
+			// the branch is deleted below under the same fence, and git
+			// refuses that while any worktree, the trash included, has it
+			// checked out.
 			return result, fmt.Errorf("remove producer worktree: %w", err)
 		}
 	} else if !os.IsNotExist(statErr) {
@@ -237,6 +257,12 @@ func (e Engine) cleanupProducerAutomatically(ctx context.Context, jobID string, 
 		return false, err
 	}
 	result, err := e.applyProducerCleanup(context.WithoutCancel(ctx), jobID, "", "", policy, false)
+	if err == nil && result.TrashPath != "" {
+		// The worktree is already gone from its path and its receipt says so;
+		// a failed deletion here is retried by the trash sweep, never by
+		// failing the cleanup that already happened.
+		_ = e.DisposeCleanupTrash(context.WithoutCancel(ctx), jobID, result.TrashPath)
+	}
 	if errors.Is(err, db.ErrCleanupLifecycleBusy) {
 		// An enclosing resume/advance still owns the shared fence. Preserve the
 		// resource and let the existing deferred-cleanup pass retry after it exits.

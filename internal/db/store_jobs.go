@@ -3072,3 +3072,33 @@ func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, erro
 	}
 	return refs, rows.Err()
 }
+
+// PendingCleanupTrash is a cleanup trash directory recorded as created and not
+// yet recorded as deleted (#2524).
+type PendingCleanupTrash struct {
+	JobID string
+	Path  string
+}
+
+// PendingCleanupTrashes returns up to limit pending cleanup trash directories,
+// oldest first.
+func (s *Store) PendingCleanupTrashes(ctx context.Context, limit int) ([]PendingCleanupTrash, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT p.job_id, p.message FROM job_events p
+		WHERE p.kind = 'delegation_worktree_trash_pending'
+		  AND NOT EXISTS (SELECT 1 FROM job_events r
+			WHERE r.kind = 'delegation_worktree_trash_removed' AND r.job_id = p.job_id AND r.message = p.message)
+		ORDER BY p.id LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingCleanupTrash
+	for rows.Next() {
+		var item PendingCleanupTrash
+		if err := rows.Scan(&item.JobID, &item.Path); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}

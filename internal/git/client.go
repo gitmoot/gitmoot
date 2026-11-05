@@ -335,6 +335,22 @@ func terminalWorktreeRegistrationFailure(stderr string) bool {
 		strings.Contains(lower, "cannot change to")
 }
 
+// MoveWorktree moves a registered worktree to another path (git worktree move),
+// updating its administrative entry. git renames the directory and refuses a
+// destination on another file system, so it never copies.
+func (c Client) MoveWorktree(ctx context.Context, from, to string) error {
+	from, err := validateWorktreePath(from)
+	if err != nil {
+		return err
+	}
+	to, err = validateWorktreePath(to)
+	if err != nil {
+		return err
+	}
+	_, err = c.run(ctx, "worktree", "move", from, to)
+	return err
+}
+
 // PruneWorktrees removes stale administrative entries left by interrupted or
 // forcibly removed worktrees. It runs against the primary checkout's shared git
 // directory and is idempotent.
