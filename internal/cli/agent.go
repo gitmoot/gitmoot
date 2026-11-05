@@ -399,7 +399,10 @@ type agentRunOptions struct {
 	postMerge               bool
 	noExecution             bool
 	part                    string
-	recipe                  string
+	// relatedPRs are `--related-pr N` values (#2509), carried to `review
+	// request`, which validates them and resolves each exact head.
+	relatedPRs []int
+	recipe     string
 }
 
 func runAgentRun(args []string, stdout, stderr io.Writer) int {
@@ -593,6 +596,10 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "agent review: --part requires the review router (pass --org-role and --no-fix-target, without --foreground)")
 		return 2
 	}
+	if len(options.relatedPRs) > 0 {
+		fmt.Fprintln(stderr, "agent review: --related-pr requires the review router (pass --org-role and --no-fix-target, without --foreground)")
+		return 2
+	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
 	// REQUIRES --role because the role is who the verdict is delivered to, and a
 	// review nobody receives is the defect #2194 exists to fix. Since #2363 this
@@ -754,6 +761,9 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 			args = append(args, pair[0], value)
 		}
 	}
+	for _, related := range options.relatedPRs {
+		args = append(args, "--related-pr", strconv.Itoa(related))
+	}
 	if options.allowPromptHeadMismatch {
 		args = append(args, "--allow-prompt-head-mismatch")
 	}
@@ -810,6 +820,10 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	}
 	if strings.TrimSpace(options.part) != "" {
 		fmt.Fprintf(stderr, "%s: --part is only supported by `agent review` through the review router\n", errLabel)
+		return localAgentJobOutput{}, 2
+	}
+	if len(options.relatedPRs) > 0 {
+		fmt.Fprintf(stderr, "%s: --related-pr is only supported by `agent review` through the review router\n", errLabel)
 		return localAgentJobOutput{}, 2
 	}
 	if strings.TrimSpace(options.lead) != "" && action != "review" {
@@ -946,7 +960,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.noExecution = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe" || arg == "--part":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe" || arg == "--part" || arg == "--related-pr":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -998,6 +1012,10 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.branch = strings.TrimPrefix(arg, "--branch=")
 		case strings.HasPrefix(arg, "--lead="):
 			if !setAgentRunOption(&options, "--lead", strings.TrimPrefix(arg, "--lead="), stderr) {
+				return agentRunOptions{}, false
+			}
+		case strings.HasPrefix(arg, "--related-pr="):
+			if !setAgentRunOption(&options, "--related-pr", strings.TrimPrefix(arg, "--related-pr="), stderr) {
 				return agentRunOptions{}, false
 			}
 		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
@@ -1135,6 +1153,13 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 			return false
 		}
 		options.prNumber = parsed
+	case "--related-pr":
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			fmt.Fprintf(stderr, "agent command requires an integer pull request number for --related-pr, got %q\n", value)
+			return false
+		}
+		options.relatedPRs = append(options.relatedPRs, parsed)
 	}
 	return true
 }

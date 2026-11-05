@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,11 +68,14 @@ type reviewRequestOutput struct {
 	BaselineSkipped string `json:"baseline_skipped,omitempty"`
 	// Supersedes names the settled part-review job this dispatch replaces
 	// (#2405); its verdict keeps blocking until this job lands its own.
-	Supersedes    string   `json:"supersedes,omitempty"`
-	AwaitedFactID int64    `json:"awaited_fact_id"`
-	NotifyBy      string   `json:"notify_by"`
-	Holds         []string `json:"holds,omitempty"`
-	WatchCommand  string   `json:"watch_command,omitempty"`
+	Supersedes string `json:"supersedes,omitempty"`
+	// RelatedPRs names each related pull request and the exact head whose tree
+	// the review receives read-only (#2509).
+	RelatedPRs    []workflow.ReviewRelatedPR `json:"related_prs,omitempty"`
+	AwaitedFactID int64                      `json:"awaited_fact_id"`
+	NotifyBy      string                     `json:"notify_by"`
+	Holds         []string                   `json:"holds,omitempty"`
+	WatchCommand  string                     `json:"watch_command,omitempty"`
 	// The fields below repeat the names `agent review --json` prints, so a
 	// caller that parsed that object reads the same keys here (#2314). `state`
 	// above keeps its router meaning (dispatched, attached, verdict_exists);
@@ -107,7 +111,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -182,7 +186,10 @@ type reviewRequestOptions struct {
 	// (#2476): read, bounded and hash-verified at request time, delivered and
 	// re-verified inside the sandbox at provisioning.
 	evidenceManifest string
-	json             bool
+	// relatedPRs are same-repository pull requests whose exact head trees the
+	// review receives read-only at .gitmoot-related/pr-N (#2509).
+	relatedPRs []int
+	json       bool
 }
 
 func runReviewRequest(args []string, stdout, stderr io.Writer) int {
@@ -214,6 +221,14 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both jobs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.StringVar(&opts.evidenceManifest, "evidence-manifest", "", "absolute path of a JSON manifest (schema_version 1, head_sha, files[{path,bytes,sha256}]) of private files to install read-only into this remote E2B review's sandbox; every file is hash-verified now and again inside the sandbox; requires --exec-backend remote")
+	fs.Func("related-pr", "same-repository pull request whose exact head tree the reviewer gets read-only at .gitmoot-related/pr-N; repeatable; the daemon fetches refs/pull/N/head on this host and pins its head now", func(value string) error {
+		number, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("want a pull request number, got %q", value)
+		}
+		opts.relatedPRs = append(opts.relatedPRs, number)
+		return nil
+	})
 	fs.BoolVar(&opts.json, "json", false, "print the request as JSON")
 	// Spellings `agent review` uses for the same inputs (#2314), so a caller
 	// can move to this command by changing only the verb.
@@ -241,6 +256,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
+		return 2
+	}
+	if err := workflow.ValidateReviewRelatedPRNumbers(opts.pr, opts.relatedPRs); err != nil {
+		fmt.Fprintf(stderr, "review request: %v\n", err)
 		return 2
 	}
 	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
@@ -454,6 +473,22 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 			return reviewRequestOutput{}, err
 		}
 	}
+	// Related pull requests (#2509) are fetched and pinned on this host NOW,
+	// before any claim exists, so a pull request that cannot be fetched refuses
+	// the request instead of queueing a review that would miss its tree.
+	var related []workflow.ReviewRelatedPR
+	if len(opts.relatedPRs) > 0 {
+		if err := workflow.ValidateReviewRelatedPRNumbers(opts.pr, opts.relatedPRs); err != nil {
+			return reviewRequestOutput{}, err
+		}
+		if execBackend == execbackend.Remote && !reviewEvidenceProviderAllowed(execProvider) {
+			return reviewRequestOutput{}, fmt.Errorf("--related-pr trees are delivered only to local and E2B reviews; this review targets provider %q", execProvider)
+		}
+		related, err = resolveReviewRelatedPRs(ctx, reviewRelatedPRFetchURL(record, repo), repo.FullName(), opts.relatedPRs)
+		if err != nil {
+			return reviewRequestOutput{}, err
+		}
+	}
 	// claimPurpose is the purpose component for everything keyed on the review
 	// question: claim, subscription, verdict history, loop guard, baseline.
 	claimPurpose := db.ReviewRequestPurpose(opts.purpose, opts.postMerge, opts.part)
@@ -472,6 +507,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		NotifyBy:             "awaited fact wake to " + opts.role,
 		Holds:                holds,
 		Action:               "review",
+		RelatedPRs:           related,
 		SelectedAction:       "review",
 		SelectedActionReason: reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:        reviewRequestExecutionPath,
@@ -599,6 +635,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		ReviewSupersedes:      opts.supersede,
 		ReviewSupersedeReason: opts.supersedeReason,
 		ReviewEvidence:        evidence,
+		ReviewRelatedPRs:      related,
 		SelectedAction:        "review",
 		SelectedActionReason:  reviewRequestSelectedActionReason(opts.purpose),
 		ExecutionPath:         reviewRequestExecutionPath,
@@ -1154,6 +1191,17 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	if strings.TrimSpace(opts.evidenceManifest) != "" {
 		return reviewRequestOutput{}, fmt.Errorf("--evidence-manifest cannot attach to existing review %s (%s) for this head: evidence is pinned only into a newly dispatched review; settle or cancel that review first", firstNonEmpty(job.ID, claim.JobID), firstNonEmpty(job.State, "dispatching"))
 	}
+	// Related trees are likewise pinned only into a dispatched job (#2509): an
+	// attach is honest only when the running review already carries exactly
+	// the requested pull requests at the same heads.
+	var existingRelated []workflow.ReviewRelatedPR
+	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil && job.ID != "" {
+		existingRelated = payload.ReviewRelatedPRs
+	}
+	if len(output.RelatedPRs) > 0 && !sameReviewRelatedPRs(output.RelatedPRs, existingRelated) {
+		return reviewRequestOutput{}, fmt.Errorf("--related-pr cannot attach to existing review %s (%s) for this head: it carries related pull requests %s, not the requested %s; settle or cancel that review first", firstNonEmpty(job.ID, claim.JobID), firstNonEmpty(job.State, "dispatching"), describeReviewRelatedPRs(existingRelated), describeReviewRelatedPRs(output.RelatedPRs))
+	}
+	output.RelatedPRs = existingRelated
 	output.State = reviewRequestAttached
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
@@ -1759,6 +1807,9 @@ func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	}
 	if output.Baseline != "" {
 		fmt.Fprintf(w, "baseline: %s (delta review; prior findings carried)\n", output.Baseline)
+	}
+	for _, related := range output.RelatedPRs {
+		fmt.Fprintf(w, "related: #%d at %s -> %s/ (read-only)\n", related.PR, related.HeadSHA, related.Path())
 	}
 	if output.BaselineSkipped != "" {
 		fmt.Fprintf(w, "baseline: none (%s)\n", output.BaselineSkipped)

@@ -1067,7 +1067,7 @@ gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
     [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
-    [--full] [--post-merge] [--no-execution] [--evidence-manifest <abs-path>] [--part NAME] [--supersede JOB --reason TEXT] [--allow-prompt-head-mismatch] [--background] [--json] \
+    [--full] [--post-merge] [--no-execution] [--evidence-manifest <abs-path>] [--related-pr N]... [--part NAME] [--supersede JOB --reason TEXT] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]
@@ -1324,6 +1324,37 @@ never opened N pinned evidence file(s): <first three> and M more` when any were
 not opened, so a summary that claims an unopened file is visibly contradicted;
 the full list is in that event.
 The verdict itself is not changed or blocked.
+
+### Related pull requests (#2509)
+
+A review can see the exact head of another pull request in the same
+repository, for example a sibling PR a cross-PR schema check depends on:
+
+```sh
+gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target \
+  --related-pr M [--related-pr K ...]
+```
+
+`agent review --related-pr M` passes the flag through the review router.
+Each number must be positive, appear once, and differ from `--pr`. When the
+request is made, host git fetches `refs/pull/M/head` with the daemon's own
+credential into a private temporary repository and pins the exact head SHA.
+A pull request that cannot be fetched refuses the request. The job payload
+records `review_related_prs: [{"pr":M,"head_sha":"<40-hex>"}]`, and
+`review request` prints `related: #M at <sha> -> .gitmoot-related/pr-M/ (read-only)`.
+
+When the review runs, the daemon fetches that pinned SHA again on the host,
+so a pull request that moved after dispatch still delivers the pinned tree.
+It writes the plain file tree, with no `.git`, URL or credential, read-only at
+`.gitmoot-related/pr-M/` relative to the review checkout. A local review gets
+it in its exact-head worktree. An E2B review gets a tar archive streamed into
+its sandbox workspace, unpacked, made read-only and counted back. The
+directory has a `.gitignore` of `*`, so it stays out of the diff. It is
+removed when a local review ends and destroyed with an E2B sandbox. Event
+`review_related_pr_installed` records the PR, SHA, path and file count. The
+reviewer's instructions name each PR, its SHA and its path. Refused for
+sandboxd reviews, and when attaching to a running review that carries
+different related PRs.
 
 ### No-execution reviews (#2364)
 

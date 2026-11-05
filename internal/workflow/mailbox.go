@@ -385,9 +385,12 @@ type JobRequest struct {
 	ReviewSupersedeReason string
 	// ReviewEvidence is the hash-pinned private evidence a remote review
 	// receives in its sandbox (#2476); nil for every other job.
-	ReviewEvidence  *ReviewEvidence
-	ReviewModelPool []string
-	ReviewRequester string
+	ReviewEvidence *ReviewEvidence
+	// ReviewRelatedPRs are same-repository pull requests whose exact head trees
+	// the review receives read-only under ReviewRelatedPRsDir (#2509).
+	ReviewRelatedPRs []ReviewRelatedPR
+	ReviewModelPool  []string
+	ReviewRequester  string
 	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
 	// review and names the agent its verdict delegation must go to (#1821).
 	//
@@ -708,8 +711,12 @@ type JobPayload struct {
 	ReviewSupersedeReason string `json:"review_supersede_reason,omitempty"`
 	// ReviewEvidence pins private evidence files installed into this remote
 	// review's sandbox and read back there before the reviewer starts (#2476).
-	ReviewEvidence  *ReviewEvidence `json:"review_evidence,omitempty"`
-	ReviewModelPool []string        `json:"review_model_pool,omitempty"`
+	ReviewEvidence *ReviewEvidence `json:"review_evidence,omitempty"`
+	// ReviewRelatedPRs records each related pull request and the exact head
+	// resolved on the host at dispatch; that tree is materialized read-only at
+	// ReviewRelatedPR.Path() when the review runs (#2509).
+	ReviewRelatedPRs []ReviewRelatedPR `json:"review_related_prs,omitempty"`
+	ReviewModelPool  []string          `json:"review_model_pool,omitempty"`
 	// ReviewRequester names the org role that asked for this review and is
 	// notified when the verdict is saved. Attribution only; never authorization.
 	ReviewRequester string `json:"review_requester,omitempty"`
@@ -972,6 +979,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		ReviewSupersedes:         strings.TrimSpace(request.ReviewSupersedes),
 		ReviewSupersedeReason:    strings.TrimSpace(request.ReviewSupersedeReason),
 		ReviewEvidence:           request.ReviewEvidence,
+		ReviewRelatedPRs:         request.ReviewRelatedPRs,
 		ReviewModelPool:          reviewPool,
 		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
 	})
