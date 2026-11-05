@@ -411,6 +411,15 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 	payload.ClearExecBackendOverride()
 	payload.PolicyRoutedReview = false
 	payload.DiskGuardRouted = false
+	// A review born on the remote route has no exact-head seat: dispatch skips
+	// the allocation for a remote source. Back on the local route it would run
+	// in the registered checkout and fail on the head (#2527). Mark it as owning
+	// a read-only worktree, the shape a retried seat already has (#2341), so
+	// the worker allocates its exact-head seat before running it locally.
+	if latest.Type == "review" && payload.PullRequest > 0 && strings.TrimSpace(payload.HeadSHA) != "" &&
+		strings.TrimSpace(payload.WorktreePath) == "" {
+		payload.ReadOnlyWorktree = true
+	}
 	if payload.DiskGuardRuntimeSwitched {
 		// Back to the review's own runtime and model: the omp switch was only
 		// for the remote run (#2372).

@@ -515,3 +515,35 @@ func TestLowDiskRoutingIgnoresSandboxdReviewsInTheE2BCap(t *testing.T) {
 		t.Fatalf("pending while a sandboxd attempt is billing = %v, want the review routed to E2B", got)
 	}
 }
+
+// #2527 (enyo-worker, energy-finance-map #413/#414): a review routed to E2B at
+// dispatch has no exact-head seat. When the remote run did not start (CI still
+// pending) the undo put it back on the local route, and the local run used the
+// registered checkout, which sits on main, so it failed on the head three times.
+// After the undo the review must be one the worker gives its own exact-head
+// seat before running locally.
+func TestUndoneRemoteRouteGivesASeatlessReviewItsOwnSeat(t *testing.T) {
+	ctx, store, worker := diskGuardRemoteFixture(t, true, 4)
+	queueDiskGuardJob(t, ctx, store, "born-remote", "rev-omp", "review", `,"read_only_seat":true`)
+	if got := pendingIDs(t, ctx, worker); len(got) != 1 {
+		t.Fatalf("pending = %v, want the routed review", got)
+	}
+	job, err := store.GetJob(ctx, "born-remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.finishQueuedJob(ctx, job, workflow.JobFailed, &remoteReviewAdmissionRefusal{reason: remoteReviewAvoidedCIPending}); err != nil {
+		t.Fatal(err)
+	}
+	undone, err := store.GetJob(ctx, "born-remote")
+	if err != nil || undone.State != string(workflow.JobQueued) {
+		t.Fatalf("review after undo: state %q (%v), want queued", undone.State, err)
+	}
+	payload := storedPayload(t, ctx, store, "born-remote")
+	if _, remote := payload.ExecBackendOverride(); remote {
+		t.Fatal("the remote route was not undone")
+	}
+	if !nativeReviewWorktreeEligible(undone, payload) {
+		t.Fatalf("the undone review would run in the registered checkout instead of its own exact-head seat: %+v", payload)
+	}
+}
