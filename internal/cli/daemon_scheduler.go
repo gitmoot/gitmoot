@@ -1109,15 +1109,17 @@ type reclaimTickState struct {
 	// each kind's skip writes get their own reclaimTickBudget (#2519 review),
 	// so one kind's skips can never stop another kind's window advancing.
 	skipWritesStarted map[string]time.Time
-	// sweepRepos is the set of repos this fleet sweep runs a tick for; nil for
-	// a single-repo tick (#2517 follow-up).
-	sweepRepos map[string]bool
-	started    map[string]time.Time
-	serving    map[string]string
-	ran        map[string]bool
-	resumeSeen map[string]bool
-	denied     map[string]string
-	resume     *reclaimResume
+	// sweepRepos is the set of enabled repos this fleet sweep runs a tick for;
+	// nil for a single-repo tick (#2517 follow-up). poolRunning is the
+	// tracker's live pool check, consulted at skip time (#2521 review).
+	sweepRepos  map[string]bool
+	poolRunning func(repo string) bool
+	started     map[string]time.Time
+	serving     map[string]string
+	ran         map[string]bool
+	resumeSeen  map[string]bool
+	denied      map[string]string
+	resume      *reclaimResume
 }
 
 // reclaimResume carries, across ticks, the repo whose reclaim pass of each
@@ -1236,15 +1238,11 @@ func (c *tickCandidates) deferReclaimSkip(ctx context.Context, worker jobWorker,
 	return deferDelegationCleanupSkip(ctx, worker, jobID, path, reason, now)
 }
 
-// reclaimSweepRepos is the set of repos whose reclaim passes run in this
-// sweep: enabled, and not behind a live background pool pass, which skips
-// them (#2521 review). Only these may keep their due cleanup rows untouched by
-// earlier repos; otherwise a repo whose pool stays busy would pin the shared
-// candidate windows for everyone.
-func reclaimSweepRepos(repos []db.Repo, tracker *inflightJobTracker) map[string]bool {
+// reclaimSweepRepos is the set of enabled repos the fleet sweep ticks.
+func reclaimSweepRepos(repos []db.Repo) map[string]bool {
 	owners := map[string]bool{}
 	for _, repo := range repos {
-		if repo.Enabled && !tracker.poolRunning(repo.FullName()) {
+		if repo.Enabled {
 			owners[repo.FullName()] = true
 		}
 	}
@@ -1252,7 +1250,12 @@ func reclaimSweepRepos(repos []db.Repo, tracker *inflightJobTracker) map[string]
 }
 
 // ownedBySweepRepo reports whether a candidate this pass skips because it
-// belongs to another repo will get that repo's own turn in this same sweep.
+// belongs to another repo will get that repo's own turn in this same sweep:
+// the repo is enabled in the sweep and, right now, not behind a live
+// background pool pass, which skips its reclaim passes (#2521 review). The
+// pool is checked at skip time, not at sweep start, so a pool that ends
+// mid-sweep no longer makes an earlier repo defer rows its owner is about to
+// reach, and a continuously busy pool still cannot pin the shared windows.
 // Such a row must not be deferred here (#2517 follow-up, seen live): an
 // earlier repo's pass pushed the row a minute into the future, so when its
 // owner then reached it the cleanup refused itself with retry_not_due, every
@@ -1264,7 +1267,14 @@ func (c *tickCandidates) ownedBySweepRepo(job db.Job) bool {
 	}
 	// The same repo identity queuedJobMatchesRepo compares: the payload's.
 	payload, err := daemonJobPayload(job)
-	return err == nil && c.reclaimBudget.sweepRepos[strings.TrimSpace(payload.Repo)]
+	if err != nil {
+		return false
+	}
+	repo := strings.TrimSpace(payload.Repo)
+	if !c.reclaimBudget.sweepRepos[repo] {
+		return false
+	}
+	return c.reclaimBudget.poolRunning == nil || !c.reclaimBudget.poolRunning(repo)
 }
 
 // finishReclaimTick moves each kind that ran this tick to its next resume
@@ -2058,7 +2068,8 @@ func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, work
 	// known only once the loop below ends.
 	cand.reclaimBudget.resume = tracker.reclaimResumeState()
 	defer cand.finishReclaimTick()
-	cand.reclaimBudget.sweepRepos = reclaimSweepRepos(repos, tracker)
+	cand.reclaimBudget.sweepRepos = reclaimSweepRepos(repos)
+	cand.reclaimBudget.poolRunning = tracker.poolRunning
 	runAgedReclaim := tracker.worktreeReclaimDue(now)
 	cand.skipAgedReclaim = !runAgedReclaim
 	// Scope tick faults per repo (#555 follow-up): the recovering supervisor

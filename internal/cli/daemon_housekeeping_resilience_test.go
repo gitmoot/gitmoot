@@ -544,19 +544,33 @@ func TestSweepLeavesOtherReposDueRowsForTheirOwner(t *testing.T) {
 	}
 }
 
-// #2521 review: a repo whose background pool pass stays busy never runs its
-// reclaim passes. If its rows were left untouched for it, they would pin the
-// shared candidate windows and starve every other repo's cleanup. Only repos
-// whose reclaim actually runs this tick count as owners in the sweep.
-func TestSweepDefersRowsOfReposWhosePoolIsBusy(t *testing.T) {
+// #2521 review: a repo behind a live background pool pass does not run its
+// reclaim passes, so its rows must be deferred by others (else a busy pool
+// pins the shared windows); but the pool is checked when the row is skipped,
+// not at sweep start, so a pool that ends mid-sweep does not make an earlier
+// repo defer rows its owner is about to reach.
+func TestSweepOwnershipFollowsTheLivePoolState(t *testing.T) {
 	tracker := newInflightJobTracker(context.Background())
-	if !tracker.tryBeginPool("owner/busy") {
-		t.Fatal("could not mark the pool busy")
+	cand := &tickCandidates{}
+	cand.reclaimBudget.sweepRepos = reclaimSweepRepos([]db.Repo{{Owner: "owner", Name: "pooled", Enabled: true}, {Owner: "owner", Name: "off"}})
+	cand.reclaimBudget.poolRunning = tracker.poolRunning
+	job := func(repo string) db.Job {
+		return db.Job{ID: "j", Payload: mustJobPayload(t, workflow.JobPayload{Repo: repo})}
 	}
-	t.Cleanup(func() { tracker.endPool("owner/busy") })
-	repos := []db.Repo{{Owner: "owner", Name: "busy", Enabled: true}, {Owner: "owner", Name: "idle", Enabled: true}}
-	got := reclaimSweepRepos(repos, tracker)
-	if got["owner/busy"] || !got["owner/idle"] {
-		t.Fatalf("sweep owners = %v; want only owner/idle (owner/busy's reclaim does not run)", got)
+	if !cand.ownedBySweepRepo(job("owner/pooled")) {
+		t.Fatal("an enabled sweep repo with no live pool must own its rows")
+	}
+	if cand.ownedBySweepRepo(job("owner/off")) || cand.ownedBySweepRepo(job("owner/elsewhere")) {
+		t.Fatal("disabled or unknown repos must not own rows; their rows would pin the windows")
+	}
+	if !tracker.tryBeginPool("owner/pooled") {
+		t.Fatal("could not start a pool pass")
+	}
+	if cand.ownedBySweepRepo(job("owner/pooled")) {
+		t.Fatal("a repo behind a live pool pass must not own rows: its reclaim does not run")
+	}
+	tracker.endPool("owner/pooled")
+	if !cand.ownedBySweepRepo(job("owner/pooled")) {
+		t.Fatal("once the pool pass ends mid-sweep, the repo must own its rows again")
 	}
 }
