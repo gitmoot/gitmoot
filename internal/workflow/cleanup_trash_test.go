@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 )
 
@@ -21,7 +23,7 @@ type slowTrashManager struct {
 }
 
 func (m *slowTrashManager) RemoveWorktreeForce(ctx context.Context, path string) error {
-	if isCleanupTrashPath(path) {
+	if strings.HasPrefix(filepath.Base(path), cleanupTrashPrefix) {
 		m.entered <- path
 		<-m.release
 		if m.fail != nil {
@@ -68,7 +70,7 @@ func TestWorktreeFilesAreDeletedOutsideTheCleanupFence(t *testing.T) {
 	if !strings.HasPrefix(trash, strings.TrimSuffix(world.path, "readonly-seat")) {
 		t.Errorf("trash %s is not a sibling of %s", trash, world.path)
 	}
-	if pending, err := world.store.PendingCleanupTrashes(ctx, 10); err != nil || len(pending) != 1 || pending[0].Path != trash {
+	if pending, err := world.store.PendingCleanupTrashes(ctx, 10, time.Now().Add(-time.Hour)); err != nil || len(pending) != 1 || pending[0].Path != trash || pending[0].ExpectedPath != world.path {
 		t.Errorf("pending trash = %+v (%v), want exactly %s", pending, err, trash)
 	}
 	close(manager.release)
@@ -78,7 +80,7 @@ func TestWorktreeFilesAreDeletedOutsideTheCleanupFence(t *testing.T) {
 	if _, err := os.Lstat(trash); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("trash %s still exists after disposal: %v", trash, err)
 	}
-	if pending, err := world.store.PendingCleanupTrashes(ctx, 10); err != nil || len(pending) != 0 {
+	if pending, err := world.store.PendingCleanupTrashes(ctx, 10, time.Now().Add(-time.Hour)); err != nil || len(pending) != 0 {
 		t.Errorf("pending trash after disposal = %+v (%v), want none", pending, err)
 	}
 }
@@ -95,7 +97,7 @@ func TestFailedTrashDeletionIsRetriedFromThePendingRecord(t *testing.T) {
 	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
 		t.Fatalf("a failed trash deletion failed the cleanup: %v", err)
 	}
-	pending, err := world.store.PendingCleanupTrashes(ctx, 10)
+	pending, err := world.store.PendingCleanupTrashes(ctx, 10, time.Now().Add(-time.Hour))
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("pending trash = %+v (%v), want one", pending, err)
 	}
@@ -103,16 +105,53 @@ func TestFailedTrashDeletionIsRetriedFromThePendingRecord(t *testing.T) {
 		t.Fatalf("pending trash %s is missing: %v", pending[0].Path, err)
 	}
 	manager.fail = nil
-	if err := world.engine.DisposeCleanupTrash(ctx, pending[0].JobID, pending[0].Path); err != nil {
+	if err := world.engine.DisposeCleanupTrash(ctx, pending[0]); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
 	if _, err := os.Lstat(pending[0].Path); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("trash still exists after retry: %v", err)
 	}
-	if again, _ := world.store.PendingCleanupTrashes(ctx, 10); len(again) != 0 {
+	if again, _ := world.store.PendingCleanupTrashes(ctx, 10, time.Now().Add(-time.Hour)); len(again) != 0 {
 		t.Errorf("pending trash after retry = %+v", again)
 	}
-	if err := world.engine.DisposeCleanupTrash(ctx, world.jobID, world.path); err == nil {
-		t.Error("DisposeCleanupTrash accepted a path that is not a trash directory")
+	impostor := pending[0]
+	impostor.Path = world.path
+	if err := world.engine.DisposeCleanupTrash(ctx, impostor); err == nil {
+		t.Error("DisposeCleanupTrash accepted a path that is not the trash of its expected path")
+	}
+}
+
+// #2526 review (P1): disposal must prove the directory is the one its cleanup
+// episode moved there. Before that episode's receipt completes it waits; a
+// directory at the trash name that git does not list as a worktree of this
+// checkout is never deleted; and a record whose name does not belong to its
+// expected path is refused.
+func TestCleanupTrashDisposalRequiresOwnershipProof(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	fake := db.PendingCleanupTrash{JobID: world.jobID, ExpectedPath: world.path, Generation: 0, Path: cleanupTrashPath(world.path, time.Now())}
+	if err := world.engine.DisposeCleanupTrash(ctx, fake); !errors.Is(err, ErrCleanupTrashNotReady) {
+		t.Fatalf("disposal before the episode completed: %v, want ErrCleanupTrashNotReady", err)
+	}
+	if err := world.engine.cleanupReadOnlyDelegationWorktree(ctx, world.jobID, "review", world.payload); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	// A stray directory at a trash name of the same episode, not a worktree.
+	stray := cleanupTrashPath(world.path, time.Now().Add(time.Hour))
+	if err := os.MkdirAll(filepath.Join(stray, "keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := fake
+	record.Path = stray
+	if err := world.engine.DisposeCleanupTrash(ctx, record); err == nil || !strings.Contains(err.Error(), "not a registered worktree") {
+		t.Fatalf("disposal of an unregistered directory: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stray, "keep")); err != nil {
+		t.Fatalf("the stray directory was touched: %v", err)
+	}
+	other := record
+	other.ExpectedPath = filepath.Join(filepath.Dir(world.path), "someone-else")
+	if err := world.engine.DisposeCleanupTrash(ctx, other); err == nil || !strings.Contains(err.Error(), "not the cleanup trash") {
+		t.Fatalf("disposal of a name that is not the expected path's: %v", err)
 	}
 }

@@ -39,9 +39,15 @@ func (e Engine) ApplyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 	policy.BudgetGate = CleanupBudgetGateEnforced
 	result, err := e.applyProducerCleanup(ctx, jobID, resourceID, token, policy, true)
 	if err == nil && result.TrashPath != "" {
-		err = e.DisposeCleanupTrash(context.WithoutCancel(ctx), jobID, result.TrashPath)
+		err = e.DisposeCleanupTrash(context.WithoutCancel(ctx), result.trashRecord(jobID))
 	}
 	return result, err
+}
+
+// trashRecord is the pending trash record of a cleanup that moved its worktree
+// aside (#2524).
+func (r CleanupApplyResult) trashRecord(jobID string) db.PendingCleanupTrash {
+	return db.PendingCleanupTrash{JobID: jobID, Path: r.TrashPath, ExpectedPath: r.Decision.ExpectedPath, Generation: r.Decision.LifecycleGeneration}
 }
 
 func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, token string, policy CleanupPolicy, countFailure bool) (result CleanupApplyResult, err error) {
@@ -188,7 +194,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 		if current.OwnedBranch == "" {
 			// A detached worktree (read-only seats, the large majority) is
 			// moved aside under the fence and deleted after it (#2524).
-			trash, err := e.moveWorktreeToTrash(ctx, jobID, current.ExpectedPath)
+			trash, err := e.moveWorktreeToTrash(ctx, jobID, current.ExpectedPath, current.LifecycleGeneration)
 			if err != nil {
 				return result, err
 			}
@@ -261,7 +267,7 @@ func (e Engine) cleanupProducerAutomatically(ctx context.Context, jobID string, 
 		// The worktree is already gone from its path and its receipt says so;
 		// a failed deletion here is retried by the trash sweep, never by
 		// failing the cleanup that already happened.
-		_ = e.DisposeCleanupTrash(context.WithoutCancel(ctx), jobID, result.TrashPath)
+		_ = e.DisposeCleanupTrash(context.WithoutCancel(ctx), result.trashRecord(jobID))
 	}
 	if errors.Is(err, db.ErrCleanupLifecycleBusy) {
 		// An enclosing resume/advance still owns the shared fence. Preserve the

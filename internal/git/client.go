@@ -530,6 +530,22 @@ func (c Client) CommonDir(ctx context.Context) (string, error) {
 	return c.absoluteGitPath(result.Stdout)
 }
 
+// WorktreeRegistered reports whether path is a worktree registered in this
+// repository (git worktree list --porcelain), compared after cleaning.
+func (c Client) WorktreeRegistered(ctx context.Context, path string) (bool, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	result, err := c.run(ctx, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		if strings.HasPrefix(line, "worktree ") && filepath.Clean(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))) == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // PrimaryWorktree returns the first non-bare record from git's porcelain
 // worktree list. Git writes the primary checkout first. A worktree-only repo
 // with no non-bare record falls back to the current checkout.
