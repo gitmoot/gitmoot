@@ -339,3 +339,46 @@ func fixtureCleanupBudget(limit int64) func(string) (*ApprovedCleanupSizeBudget,
 			&CleanupSizeLimits{MaxEntries: 100_000, MaxDepth: 64, TimeoutMS: 30_000}, nil
 	}
 }
+
+// #2525: an ordinary cleanup of a review that did not succeed is refused as
+// retry_disposition_unknown whatever the worktree holds, but the slow
+// pre-cleanup evidence capture (10-45 s on the sshfs seats) ran first, and the
+// reclaim pass retried a minute later, so the same refused rows were captured
+// over and over and held back the rows that could be removed. The refusal must
+// be decided before any capture, and the retry pushed back.
+func TestRefusedCleanupSkipsTheCaptureAndBacksOff(t *testing.T) {
+	world := newProducerCleanupFixture(t, true)
+	ctx := context.Background()
+	if err := world.store.UpdateJobState(ctx, world.jobID, string(JobFailed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := world.store.EnsureCleanupObligation(ctx, world.jobID, world.path, time.Now().UTC().Add(-8*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	captured := 0
+	world.engine.BeforeReadOnlyWorktreeCleanup = func(context.Context, string, string, JobPayload) error {
+		captured++
+		return nil
+	}
+	removed, err := world.engine.ReclaimTerminalDelegationWorktreeOutcome(ctx, world.jobID)
+	if err != nil || removed {
+		t.Fatalf("ordinary cleanup of a failed review: removed=%t err=%v, want kept", removed, err)
+	}
+	if captured != 0 {
+		t.Fatalf("the capture ran %d times for a cleanup that is always refused", captured)
+	}
+	if _, err := os.Lstat(world.path); err != nil {
+		t.Fatalf("the worktree was touched: %v", err)
+	}
+	obligation, err := world.store.GetCleanupObligation(ctx, db.CleanupObligationResourceID(world.jobID, world.path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, obligation.NextAttemptAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wait := time.Until(next); wait < 90*time.Minute {
+		t.Fatalf("retry in %s after an 8-hour-old refused cleanup, want about 2h (a quarter of its age)", wait.Round(time.Minute))
+	}
+}
