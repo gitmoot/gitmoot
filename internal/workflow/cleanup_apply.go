@@ -27,6 +27,8 @@ type CleanupApplyResult struct {
 	// files are deleted after the fence is released (#2524). Empty when the
 	// worktree was removed in place or was already absent.
 	TrashPath string `json:"trash_path,omitempty"`
+	// trash is the full pending record of that move, identity included.
+	trash db.PendingCleanupTrash
 }
 
 // ApplyProducerCleanup accepts only a producer-derived resource and a prior
@@ -46,8 +48,8 @@ func (e Engine) ApplyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 
 // trashRecord is the pending trash record of a cleanup that moved its worktree
 // aside (#2524).
-func (r CleanupApplyResult) trashRecord(jobID string) db.PendingCleanupTrash {
-	return db.PendingCleanupTrash{JobID: jobID, Path: r.TrashPath, ExpectedPath: r.Decision.ExpectedPath, Generation: r.Decision.LifecycleGeneration}
+func (r CleanupApplyResult) trashRecord(string) db.PendingCleanupTrash {
+	return r.trash
 }
 
 func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, token string, policy CleanupPolicy, countFailure bool) (result CleanupApplyResult, err error) {
@@ -198,7 +200,7 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 			if err != nil {
 				return result, err
 			}
-			result.TrashPath = trash
+			result.TrashPath, result.trash = trash.Path, trash
 		} else if err := e.DelegationWorktrees.(ReadOnlyWorktreeManager).RemoveWorktreeForce(ctx, current.ExpectedPath); err != nil {
 			// A worktree with its own branch is removed in place, as before:
 			// the branch is deleted below under the same fence, and git

@@ -777,20 +777,25 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 			t.Fatal(err)
 		}
 		releaseFence()
-		record := db.PendingCleanupTrash{JobID: id, Path: trash, ExpectedPath: seat, Generation: 0}
+		pointer, err := os.ReadFile(filepath.Join(trash, ".git"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitDir := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(pointer)), "gitdir:"))
+		record := db.PendingCleanupTrash{JobID: id, Path: trash, ExpectedPath: seat, Generation: 0, GitDir: gitDir}
 		message, _ := json.Marshal(record)
 		if err := h.store.AddJobEvent(h.ctx, db.JobEvent{JobID: id, Kind: workflow.CleanupTrashPendingEvent, Message: string(message)}); err != nil {
 			t.Fatal(err)
 		}
 		return record
 	}
-	// Entries the sweep cannot handle come first: two whose repo is not
-	// registered (no checkout to delete them through), and three whose repo's
-	// checkout a job holds for the whole test (refused without a retry mark).
+	// Entries the sweep cannot handle come first, more than one window of
+	// them: two whose repo is not registered (no checkout to delete them
+	// through), and 32 whose repo's checkout a job holds for the whole test.
 	seed("orphan-a", "owner/gone")
 	seed("orphan-b", "owner/gone")
-	for _, name := range []string{"busy-a", "busy-b", "busy-c"} {
-		seed(name, "owner/busy")
+	for i := 0; i < 32; i++ {
+		seed(fmt.Sprintf("busy-%02d", i), "owner/busy")
 	}
 	if admitted, _ := h.tracker.beginWithinLane(0, false, "busy-holder", "owner/busy", "repo:owner/busy", ""); !admitted {
 		t.Fatal("could not start the busy holder job")
@@ -807,9 +812,13 @@ func TestReclaimLoopSweepsLeftoverCleanupTrash(t *testing.T) {
 		t.Fatalf("the sweep deleted trash while a job held the registered checkout: %v", err)
 	}
 	h.tracker.end("holder")
-	runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	// Busy and unhandled entries are skipped for a while once seen, so within
+	// a few passes the sweep reaches ours behind them.
+	for pass := 0; pass < 3; pass++ {
+		runWorktreeReclaimLoopPass(h.ctx, h.store, h.worker, h.tracker, "", none, &h.stdout, time.Now().UTC(), time.Now().UTC())
+	}
 	if _, err := os.Lstat(ours.Path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the sweep left the trash behind two entries it cannot handle: %v; log=%q", err, h.stdout.String())
+		t.Fatalf("the sweep never reached the trash behind a window of entries it cannot handle: %v", err)
 	}
 	if out := runGitOutput(t, h.checkout, "worktree", "list"); strings.Contains(out, filepath.Base(ours.Path)) {
 		t.Fatalf("git still lists the trash worktree:\n%s", out)

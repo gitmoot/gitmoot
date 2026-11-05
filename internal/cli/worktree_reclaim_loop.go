@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 	"io"
@@ -178,6 +177,9 @@ func disposeCleanupTrashOnce(ctx context.Context, store *db.Store, worker jobWor
 	}
 	release, ok := tracker.tryReserveCheckouts("repo:"+strings.TrimSpace(payload.Repo), registeredCheckoutWorktreeKey(checkout))
 	if !ok {
+		// Busy now; skip it for a while so busy entries cannot fill the
+		// window on every pass (#2526 review).
+		retry()
 		return false
 	}
 	defer release()
@@ -186,9 +188,7 @@ func disposeCleanupTrashOnce(ctx context.Context, store *db.Store, worker jobWor
 		err = worker.workflowForJob(checkout, runner).DisposeCleanupTrash(ctx, item)
 	}
 	if err != nil {
-		if !errors.Is(err, workflow.ErrCleanupTrashNotReady) {
-			writeLine(stdout, "cleanup trash %s: %v", item.Path, err)
-		}
+		writeLine(stdout, "cleanup trash %s: %v", item.Path, err)
 		retry()
 	}
 	return true

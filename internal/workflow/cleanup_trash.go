@@ -3,7 +3,6 @@ package workflow
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,13 +26,16 @@ import (
 // as its expected path. Its files are deleted after the fence is released.
 //
 // The move is recorded durably before it happens (CleanupTrashPendingEvent,
-// with the episode's expected path and lifecycle generation), so a directory
-// left by a crash or a failed deletion is found later. Deletion
-// (DisposeCleanupTrash) proves ownership first, under the checkout mutation
-// lock that the move itself holds: the record's episode receipt is complete
-// (the receipt completes only after the move), the name matches the expected
-// path, the directory is a real directory (not a symlink) beside a contained
-// expected path, and git lists it as a worktree of this checkout.
+// with the episode's expected path and generation and the worktree's own git
+// administrative directory), so a directory left by a crash or a failed
+// deletion is found later. Deletion (DisposeCleanupTrash) proves the directory
+// is that worktree, under the checkout mutation lock the move itself holds:
+// the name belongs to the contained expected path, the directory is a real
+// directory (not a symlink), its .git names the recorded administrative
+// directory, and git lists it as a worktree of this checkout. It does not wait
+// for the episode's receipt (#2526 review): the worktree left its path when
+// the move succeeded, and an interrupted episode whose receipt is superseded
+// later must not keep its trash forever.
 const (
 	CleanupTrashPendingEvent = "delegation_worktree_trash_pending"
 	CleanupTrashRemovedEvent = "delegation_worktree_trash_removed"
@@ -42,10 +44,6 @@ const (
 	CleanupTrashRetryEvent = "delegation_worktree_trash_retry"
 	cleanupTrashPrefix     = ".gitmoot-cleanup-trash-"
 )
-
-// ErrCleanupTrashNotReady means the trash's cleanup episode has not completed
-// yet; the entry stays pending and is retried later.
-var ErrCleanupTrashNotReady = errors.New("cleanup trash episode not complete")
 
 // WorktreeRegistrar reports whether a path is a worktree registered in the
 // checkout (git worktree list).
@@ -69,25 +67,29 @@ func cleanupTrashPath(expected string, now time.Time) string {
 // where it was) and the reclaim pass retries it under its failure budget; it
 // never falls back to the slow in-place removal under the fence. Called with
 // the cleanup fence and the checkout mutation lock held.
-func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string, generation int64) (string, error) {
+func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string, generation int64) (db.PendingCleanupTrash, error) {
 	manager := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
 	mover, ok := e.DelegationWorktrees.(WorktreeMover)
 	if !ok {
 		if err := manager.RemoveWorktreeForce(ctx, path); err != nil {
-			return "", fmt.Errorf("remove producer worktree: %w", err)
+			return db.PendingCleanupTrash{}, fmt.Errorf("remove producer worktree: %w", err)
 		}
-		return "", nil
+		return db.PendingCleanupTrash{}, nil
 	}
-	record := db.PendingCleanupTrash{JobID: jobID, Path: cleanupTrashPath(path, e.now().UTC()), ExpectedPath: filepath.Clean(path), Generation: generation}
+	gitDir, err := worktreeGitDir(path)
+	if err != nil {
+		return db.PendingCleanupTrash{}, fmt.Errorf("identify producer worktree before moving it aside: %w", err)
+	}
+	record := db.PendingCleanupTrash{JobID: jobID, Path: cleanupTrashPath(path, e.now().UTC()), ExpectedPath: filepath.Clean(path), Generation: generation, GitDir: gitDir}
 	if _, err := os.Lstat(record.Path); !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("cleanup trash destination %s already exists or cannot be checked: %v", record.Path, err)
+		return db.PendingCleanupTrash{}, fmt.Errorf("cleanup trash destination %s already exists or cannot be checked: %v", record.Path, err)
 	}
 	message, err := json.Marshal(record)
 	if err != nil {
-		return "", err
+		return db.PendingCleanupTrash{}, err
 	}
 	if err := e.Store.AddJobEvent(context.WithoutCancel(ctx), db.JobEvent{JobID: jobID, Kind: CleanupTrashPendingEvent, Message: string(message)}); err != nil {
-		return "", fmt.Errorf("record cleanup trash: %w", err)
+		return db.PendingCleanupTrash{}, fmt.Errorf("record cleanup trash: %w", err)
 	}
 	if err := mover.MoveWorktree(ctx, path, record.Path); err != nil {
 		if _, statErr := os.Lstat(record.Path); errors.Is(statErr, os.ErrNotExist) {
@@ -95,20 +97,35 @@ func (e Engine) moveWorktreeToTrash(ctx context.Context, jobID, path string, gen
 			// the record now. Otherwise the sweep handles what is there.
 			err = errors.Join(err, e.recordCleanupTrashRemoved(ctx, jobID, record.Path))
 		}
-		return "", fmt.Errorf("move producer worktree aside: %w", err)
+		return db.PendingCleanupTrash{}, fmt.Errorf("move producer worktree aside: %w", err)
 	}
-	return record.Path, nil
+	return record, nil
+}
+
+// worktreeGitDir returns the git administrative directory a linked worktree's
+// .git file names ("gitdir: <path>"); git worktree move keeps it.
+func worktreeGitDir(worktree string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(worktree, ".git"))
+	if err != nil {
+		return "", err
+	}
+	line := strings.TrimSpace(string(data))
+	value, ok := strings.CutPrefix(line, "gitdir:")
+	value = filepath.Clean(strings.TrimSpace(value))
+	if !ok || !filepath.IsAbs(value) || strings.ContainsAny(line, "\n") {
+		return "", fmt.Errorf("%s/.git is not a linked worktree pointer", worktree)
+	}
+	return value, nil
 }
 
 // DisposeCleanupTrash deletes the trash directory of a pending record after
-// proving it is the one its cleanup episode moved there, and records that it is
-// gone. It holds the checkout mutation lock, never the cleanup lifecycle fence.
-// The engine must be bound to the checkout that owns the worktree. An episode
-// that has not completed returns ErrCleanupTrashNotReady and leaves the record.
+// proving it is the worktree its cleanup episode moved there, and records that
+// it is gone. It holds the checkout mutation lock, never the cleanup lifecycle
+// fence. The engine must be bound to the checkout that owns the worktree.
 func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanupTrash) (err error) {
 	trash := filepath.Clean(strings.TrimSpace(record.Path))
 	expected := filepath.Clean(strings.TrimSpace(record.ExpectedPath))
-	if !filepath.IsAbs(trash) || !filepath.IsAbs(expected) || trash != record.Path ||
+	if !filepath.IsAbs(trash) || !filepath.IsAbs(expected) || trash != record.Path || !filepath.IsAbs(record.GitDir) ||
 		filepath.Dir(trash) != filepath.Dir(expected) ||
 		!strings.HasPrefix(filepath.Base(trash), cleanupTrashNamePrefix(expected)) {
 		return fmt.Errorf("refusing to dispose %q: not the cleanup trash of %q", record.Path, record.ExpectedPath)
@@ -128,7 +145,7 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 		return fmt.Errorf("cleanup trash %s: expected path not contained: %w", trash, err)
 	}
 	// The move holds this lock too, so from here on no move to this name is in
-	// flight and the receipt read below is final for the episode.
+	// flight: what is at the path now is all there will be.
 	release, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, e.DelegationCheckout, "cleanup-trash:"+job.ID, time.Now().UTC())
 	if err != nil {
 		return err
@@ -136,13 +153,6 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 	defer func() {
 		err = errors.Join(err, release(context.WithoutCancel(ctx)))
 	}()
-	receipt, err := e.Store.GetCleanupReceipt(ctx, db.CleanupObligationResourceID(job.ID, expected), record.Generation)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && strings.TrimSpace(receipt.RemovedAt) == "" {
-		return ErrCleanupTrashNotReady
-	}
-	if err != nil {
-		return err
-	}
 	info, statErr := os.Lstat(trash)
 	if errors.Is(statErr, os.ErrNotExist) {
 		return e.recordCleanupTrashRemoved(ctx, job.ID, trash)
@@ -152,6 +162,9 @@ func (e Engine) DisposeCleanupTrash(ctx context.Context, record db.PendingCleanu
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refusing to dispose %s: not a directory", trash)
+	}
+	if gitDir, err := worktreeGitDir(trash); err != nil || gitDir != filepath.Clean(record.GitDir) {
+		return fmt.Errorf("refusing to dispose %s: it is not the worktree moved there (git dir %q, recorded %q, %v)", trash, gitDir, record.GitDir, err)
 	}
 	registered, err := registrar.WorktreeRegistered(ctx, trash)
 	if err != nil {

@@ -3075,13 +3075,15 @@ func (s *Store) ListJobWorktreeRefs(ctx context.Context) ([]JobWorktreeRef, erro
 
 // PendingCleanupTrash is a cleanup trash directory recorded as created and not
 // yet recorded as deleted (#2524). ExpectedPath and Generation name the cleanup
-// episode that moved the worktree there; disposal requires that episode's
-// receipt to be complete.
+// episode that moved the worktree there, and GitDir is that worktree's own git
+// administrative directory, read just before the move (a move keeps it):
+// disposal deletes a directory only if it is still that worktree.
 type PendingCleanupTrash struct {
 	JobID        string `json:"-"`
 	Path         string `json:"trash"`
 	ExpectedPath string `json:"expected"`
 	Generation   int64  `json:"generation"`
+	GitDir       string `json:"gitdir"`
 }
 
 // PendingCleanupTrashes returns up to limit pending cleanup trash directories,
