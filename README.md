@@ -14,7 +14,7 @@
 # Run a fleet of coding agents like a team.
 
 **Gitmoot organises your AI coding agents into roles, keeps them talking,
-and holds every change they make to an independent review before it merges.**
+and gates what they merge behind an independent review at the exact commit.**
 
 [Install](#quick-start) · [How it works](#how-it-works) · [Docs](https://gitmoot.io/docs/intro) · [llms.txt](https://gitmoot.io/llms.txt)
 
@@ -26,9 +26,10 @@ whom, who may merge, and who gets woken up when something lands.
 
 Gitmoot is that structure. Your agents (Claude Code, Codex, omp, Kimi) do the
 work in their own sessions. Gitmoot gives each one a **seat** with a role and a
-scope, carries **messages and directives** between them, and puts every pull
-request in front of a **different agent** for an exact-commit review. The
-merge waits until that review is earned. It all runs on your machine: one
+scope, carries **messages and directives** between them, and sends their pull
+requests to a **different agent** for an exact-commit review, as deep as the
+risk calls for. Where review comes first, the merge waits until it is earned.
+It all runs on your machine: one
 static binary, one SQLite file, no hosted control plane.
 
 <table>
@@ -67,10 +68,10 @@ verdict lands, so nobody sits polling.
 # run from a seat's pane: the sender is the seat
 gitmoot message send reviewer-lead "PR 412 is ready, migration included"
 gitmoot message escalate --to owner "Ship the schema change tonight or wait for Monday?"
-gitmoot org await review --repo acme/web --pr 412 --head <sha> --ttl 2h
+gitmoot org await review --role frontend-dev --repo acme/web --pr 412 --head <sha> --ttl 2h
 ```
 
-### 🔍 Review every change, at the exact commit
+### 🔍 Review the work, at the exact commit
 
 A review is a separate job on a separate agent, bound to the 40-character head
 it was asked about. If the branch moves, the old verdict stops counting.
@@ -85,8 +86,8 @@ gitmoot findings --repo acme/web --pr 412 --at-head <sha>  # what still blocks t
 - **The right depth for the change.** An optional risk classifier sorts PRs
   into three levels: merge on green CI, review after merge, or review before
   merge.
-- **Delta reviews** read only what changed since the last verdict. `--supersede`
-  asks for a whole fresh look.
+- **Delta reviews** read only what changed since the last verdict. `--full`
+  asks for a whole fresh look at the diff.
 - **A findings ledger** tracks every finding per head until it is answered, and
   the merge gate blocks on whatever severity you configure.
 - **Reviews that can't run code** (`--no-execution`, or checks like Xcode that
