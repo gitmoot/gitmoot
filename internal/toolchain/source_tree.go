@@ -62,8 +62,9 @@ type sourceTree struct {
 
 // openBeneath (source_tree_linux.go / source_tree_other.go) opens relative under
 // a directory descriptor with no symlink at any component and no resolution
-// outside it: openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH on Linux, a
-// descriptor-anchored O_NOFOLLOW walk elsewhere (#2537).
+// outside it, via openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH. Where openat2
+// does not exist (non-Linux, or Linux before 5.6) it reports ENOSYS and
+// staging fails closed (#2537).
 
 // swapBarrier is a TEST SEAM and is nil in production.
 //
@@ -100,7 +101,7 @@ func (s *sourceTree) openMember(relative string, directory bool) (*os.File, erro
 	fd, err := openBeneath(int(s.file.Fd()), relative, flags)
 	if err != nil {
 		if errors.Is(err, unix.ENOSYS) {
-			return nil, fmt.Errorf("%w: openat2 is unavailable on this kernel, so staging cannot refuse symlink substitution", ErrRuntimeNotStageable)
+			return nil, fmt.Errorf("%w: openat2 is unavailable (non-Linux, or a kernel older than 5.6), so staging cannot refuse symlink substitution", ErrRuntimeNotStageable)
 		}
 		return nil, fmt.Errorf("%w: resolve %q under %q: %v", ErrRuntimeNotStageable, relative, s.name, err)
 	}

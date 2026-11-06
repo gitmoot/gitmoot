@@ -2,8 +2,12 @@
 
 package toolchain
 
-// openBeneath has no openat2 outside Linux, so it walks the path one component
-// at a time (openBeneathByComponents).
-func openBeneath(dirfd int, relative string, flags int) (int, error) {
-	return openBeneathByComponents(dirfd, relative, flags)
+import "golang.org/x/sys/unix"
+
+// openBeneath has no openat2 outside Linux, and a userspace walk cannot give
+// RESOLVE_BENEATH's containment guarantee against concurrent renames (#2538
+// review). Report ENOSYS so openMember fails closed, exactly as on a Linux
+// kernel older than 5.6: runtime staging is unavailable on these systems.
+func openBeneath(int, string, int) (int, error) {
+	return -1, unix.ENOSYS
 }
