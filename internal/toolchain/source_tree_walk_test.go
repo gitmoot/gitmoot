@@ -52,6 +52,7 @@ func TestOpenBeneathByComponentsMatchesOpenat2Refusals(t *testing.T) {
 		// harmless because callers only pass enumerated, clean paths.
 		walkOnly bool
 	}{
+		{".", true, true, false},
 		{"bin/tool", false, true, false},
 		{"lib/deep/file", false, true, false},
 		{"lib/deep", true, true, false},
@@ -88,5 +89,37 @@ func TestOpenBeneathByComponentsMatchesOpenat2Refusals(t *testing.T) {
 				t.Errorf("%s: open %q: opened=%v err=%v, want opened=%v", name, tc.relative, got, err, tc.wantOpen)
 			}
 		}
+	}
+}
+
+// A directory renamed out of the boundary after the walk opened it must not
+// let the walk return a file outside the boundary: openat2's RESOLVE_BENEATH
+// refuses that on Linux, and the walker must too.
+func TestOpenBeneathByComponentsRefusesDirectoryRelocatedMidWalk(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "lib", "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "lib", "deep", "file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	boundary, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(boundary)
+	walkBarrier = func(opened string) {
+		if opened == "lib" {
+			if err := os.Rename(filepath.Join(root, "lib"), filepath.Join(outside, "lib")); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	defer func() { walkBarrier = nil }()
+	fd, err := openBeneathByComponents(boundary, "lib/deep/file", unix.O_RDONLY)
+	if err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("opened lib/deep/file after lib was moved outside the boundary")
 	}
 }
