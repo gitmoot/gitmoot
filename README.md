@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/gitmoot-hero.png" alt="Gitmoot coordinates local agent runtimes through GitHub pull request workflows" width="900">
+  <img src="docs/assets/gitmoot-hero.png" alt="Gitmoot: run a fleet of coding agents like a team" width="900">
 </p>
 
 <div align="center">
@@ -11,173 +11,192 @@
 [![LLM index](https://img.shields.io/badge/llms.txt-agents_start_here-8A2BE2?style=flat-square)](https://gitmoot.io/llms.txt)
 [![Go](https://img.shields.io/badge/go-single_static_binary-00ADD8?style=flat-square&logo=go&logoColor=white)](./go.mod)
 
-**Local-first multi-agent coordination for GitHub pull request workflows.**
+# Run a fleet of coding agents like a team.
+
+**Gitmoot organises your AI coding agents into roles, keeps them talking,
+and holds every change they make to an independent review before it merges.**
+
+[Install](#quick-start) · [How it works](#how-it-works) · [Docs](https://gitmoot.io/docs/intro) · [llms.txt](https://gitmoot.io/llms.txt)
 
 </div>
 
+One agent in one terminal is easy. Ten agents across twenty repos, running
+overnight, is a team, and teams need structure: who owns what, who reviews
+whom, who may merge, and who gets woken up when something lands.
 
-## Built with Codex (OpenAI Build Week 2026)
-
-**The Build Week submission is one feature of this repo: [Gitmoot Pipelines](https://gitmoot.io/docs/workflows/pipelines-workflow)**,
-agent graphs saved as yaml files that you can rerun, inspect, share, and expose as a typed
-service API with verifiable receipts. Start there if you came from Devpost. Demo video: <https://www.youtube.com/watch?v=oiX8OiXAVrM>. The repo keeps evolving after the
-hackathon. The exact tree submitted on July 21 remains available at the
-[`buildweek-2026-submission` tag](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission).
-
-The Pipelines-as-a-Service layer (`pipeline expose` / `serve`, typed input firewall, public
-receipts) and the proof spine were implemented by **Codex running gpt-5.6-sol**, coordinated
-through gitmoot itself. Gitmoot mints receipts for its own implementation jobs, so the
-collaboration is verifiable: Codex session `019f6e86-fdf2-78f1-8f6a-7c5e0f948340`, proof
-manifest `sha256:78b3ab08...` (`gitmoot proof` reproduces it offline). The Build Week demo
-pipeline lives at [gitmoot/appkit-demo](https://github.com/gitmoot/appkit-demo), and its runs
-are public at <https://gitmoot.themartian.app/pipelines/appkit-pro>.
-
-## Our Vision
-
-AI agents can already write code, review diffs, and run your tools. What they can't do is coordinate across sessions, runtimes, and days without losing the one thing software teams actually trust: **the pull request audit trail**.
-
-Gitmoot makes the repository and its PRs the shared surface where humans and agents work together. It runs entirely on **your machine**: one static binary, one local SQLite file, zero runtime dependencies, no cloud control plane. PR comments become agent tasks; agent work flows back as branches, commits, reviews, and merges, every step visible where your team already looks.
-
-And it is built for the hard part: **unattended operation**. Locks, budgets, crash recovery, and graceful degradation are first-class, because an orchestrator you have to babysit is just a slower way of doing the work yourself.
-
-## Key Features
-
-### Orchestrate sub-agents across different runtimes
-
-A coordinator agent returns a validated `delegations[]` DAG; Gitmoot dispatches the children in parallel or dependency order, then reconvenes one continuation to synthesize the results. The coordinator and its workers do not need to share a runtime: a Claude conductor can fan work out to Codex implementers, a Kimi reviewer, and a deterministic shell checker in the same tree. Ephemeral workers spawn mid-orchestration with no pre-registration, and trees recurse up to depth 8, bounded by per-root job, wall-clock, token, and dollar budgets plus loop detection. When any bound trips, a graceful finalize continuation still delivers a best-effort result instead of dropping work.
-
-```sh
-gitmoot orchestrate lead "Review PR #123 from three independent angles." --repo owner/repo --recipe review-panel
-```
-
-<p align="center">
-  <img src="website/static/img/dashboard/galaxy.png" alt="The delegation galaxy — every job, agent, and workflow as a live force-directed graph" width="94%">
-</p>
-
-### Create custom agents in minutes
-
-An agent is a named identity with a role, capabilities, a runtime, and a versioned prompt template. Templates are read-only installed data: list what is installed, inspect one, and bind it to an agent. Templates are versioned, snapshotted into every job, and pinnable (`--template reviewer@v1`).
-
-```sh
-gitmoot agent template list --tag review
-gitmoot agent template show frontend-reviewer
-gitmoot agent start frontend-reviewer --runtime codex --repo owner/repo --template frontend-reviewer --effort high
-```
-
-Codex agents can set a default reasoning effort with `--effort`, and individual
-jobs can override it with the same flag. Gitmoot forwards the free-form value as
-`-c model_reasoning_effort=<value>`; omp receives it as `--thinking <level>` when
-it names one of omp's accepted levels; Claude and Kimi ignore it.
-
-### Built for unattended runs
-
-Checkout, branch, and runtime-session locks; per-root token and dollar budgets; boot-id crash recovery that reclaims jobs and locks the moment a reboot proves their owner dead; `job retry` that explicitly restores a dismissed task before re-running its job; `job kill` for whole delegation trees; paused trees that @-mention you on the PR with the exact resume command. Overnight is the normal case, not the demo case.
-
-### Driven from GitHub, visible everywhere
-
-Route work with `/gitmoot <agent> <action>` or `@agent` mentions on PRs and issues ([comment grammar](https://gitmoot.io/docs/workflows/pr-comment-workflow)). Follow it live in the PR thread, the terminal snapshot (`gitmoot dashboard`), or the [read-only web dashboard](https://gitmoot.io/docs/dashboard/overview): jobs, agents, delegation graphs, token and cost charts.
+Gitmoot is that structure. Your agents (Claude Code, Codex, omp, Kimi) do the
+work in their own sessions. Gitmoot gives each one a **seat** with a role and a
+scope, carries **messages and directives** between them, and puts every pull
+request in front of a **different agent** for an exact-commit review. The
+merge waits until that review is earned. It all runs on your machine: one
+static binary, one SQLite file, no hosted control plane.
 
 <table>
   <tr>
-    <td width="50%"><img src="website/static/img/dashboard/overview.png" alt="Overview — what needs you, live fleet activity, today's outcomes" width="100%"></td>
-    <td width="50%"><img src="website/static/img/dashboard/pipelines.png" alt="Pipelines — collapsible groups with health dots and due hints" width="100%"></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="website/static/img/dashboard/workflows.png" alt="Workflows — coordinated campaigns with lifecycle, journal notes, and token totals" width="100%"></td>
-    <td width="50%"><img src="website/static/img/dashboard/brain.png" alt="Brain — the agent memory galaxy: clusters, facts, and cross-repo links" width="100%"></td>
+    <td align="center"><b>3,105</b><br><sub>independent reviews</sub></td>
+    <td align="center"><b>61</b><br><sub>repositories</sub></td>
+    <td align="center"><b>51</b><br><sub>agent seats</sub></td>
+    <td align="center"><b>~1 min</b><br><sub>from request to reviewer</sub></td>
   </tr>
 </table>
+<p align="center"><sub>The maintainers' own fleet, 30 days to November 2026. Gitmoot reviews and coordinates its own development.</sub></p>
 
-## How It Works
+## What it does
+
+### 🪑 Organise the fleet
+
+Every agent session gets a seat: a role, a parent, a repository scope and an
+explicit merge authority. Seats are agent sessions running in
+[Herdr](https://github.com/jerryfane/herdr) panes, so Gitmoot knows which
+session is which seat and can reach it. The org chart is the source of truth
+for who does what, so agents stop guessing and stop colliding.
+
+```sh
+gitmoot org seat add frontend-dev --pane <herdr-pane> --parent lead --scope acme/web --merge-rule none
+gitmoot org chart                     # who reports to whom, and what each seat owns
+gitmoot org status                    # who is working, waiting or idle right now
+```
+
+### 💬 Keep them talking
+
+Seats send each other durable messages, assign directives, and escalate to
+a human when they are stuck. A seat that requests a review is woken when the
+verdict lands, so nobody sits polling.
+
+```sh
+# run from a seat's pane: the sender is the seat
+gitmoot message send reviewer-lead "PR 412 is ready, migration included"
+gitmoot message escalate --to owner "Ship the schema change tonight or wait for Monday?"
+gitmoot org await review --repo acme/web --pr 412 --head <sha> --ttl 2h
+```
+
+### 🔍 Review every change, at the exact commit
+
+A review is a separate job on a separate agent, bound to the 40-character head
+it was asked about. If the branch moves, the old verdict stops counting.
+
+```sh
+# from a seat: the verdict comes back to it
+gitmoot review request --repo acme/web --pr 412          # the router picks reviewer and model
+gitmoot review status  --repo acme/web --pr 412
+gitmoot findings --repo acme/web --pr 412 --at-head <sha>  # what still blocks this merge
+```
+
+- **The right depth for the change.** An optional risk classifier sorts PRs
+  into three levels: merge on green CI, review after merge, or review before
+  merge.
+- **Delta reviews** read only what changed since the last verdict. `--supersede`
+  asks for a whole fresh look.
+- **A findings ledger** tracks every finding per head until it is answered, and
+  the merge gate blocks on whatever severity you configure.
+- **Reviews that can't run code** (`--no-execution`, or checks like Xcode that
+  the sandbox can't run) accept exact-head CI evidence the reviewer verifies
+  itself.
+- **Off-box reviews** run in E2B sandboxes (`--exec-backend remote`) with a hard
+  dollar cap, read-only private evidence and sibling PRs (`--related-pr`), and no
+  credentials inside.
+
+### 🌙 Run unattended
+
+The daemon watches your repositories, dispatches reviews, and wakes seats.
+Branch and checkout locks, crash recovery after reboots, per-job budgets,
+throwaway review worktrees that are reclaimed in the background, and a
+`daemon drain` for restarts without losing work. Overnight is the normal case.
+
+## How it works
 
 ```mermaid
 flowchart LR
-    A["GitHub PRs & issues<br/>comments · reviews · merges"] --> B["gitmoot daemon<br/>(your machine)"]
-    B --> C["SQLite state machine<br/>jobs · agents · locks · budgets"]
-    C --> D["runtime adapters"]
-    D --> E["Codex"]
-    D --> F["Claude Code"]
-    D --> G["Kimi Code"]
-    D --> H["omp"]
-    D --> J["shell"]
-    E & F & G & H & J --> I["branches · commits<br/>reviews · PR comments"]
-    I --> A
+    subgraph fleet["Your agent fleet"]
+        A["seat · Claude Code"]
+        B["seat · Codex"]
+        C["seat · omp"]
+    end
+    fleet -- "push branches, open PRs" --> GH["GitHub"]
+    GH --> D["gitmoot daemon<br/>your machine · SQLite"]
+    D -- "exact-head review job" --> R["reviewer<br/>local or E2B"]
+    R -- "verdict + findings" --> D
+    D -- "merge gate" --> GH
+    D -- "messages · directives · wakes" --> fleet
 ```
 
-The core primitive is a runtime-neutral Gitmoot agent. Codex, Claude Code, Kimi Code, and omp are adapters behind one internal contract; local SQLite is the source of truth, and GitHub is the collaboration surface.
+Local SQLite is the source of truth; GitHub is where the work is visible. Agent
+runtimes sit behind one adapter contract, so a Claude seat can be reviewed by
+an omp reviewer on another model.
 
-Gitmoot is also agent-native from the first minute: you don't have to install it yourself. Paste this into your coding agent and let it do the setup:
-
-```text
-Install gitmoot on this machine (curl -fsSL https://gitmoot.io/install.sh | sh),
-then set it up for this repo with `gitmoot setup` and verify with `gitmoot doctor`.
-The docs index for agents is https://gitmoot.io/llms.txt
-```
-
-## Quick Start
-
-Three steps to a working agent:
+## Quick start
 
 ```sh
-# 1. Install (single static binary)
+# 1. Install the single static binary
 curl -fsSL https://gitmoot.io/install.sh | sh
 
-# 2. Register the repo, subscribe an agent, start the daemon: one command
-gitmoot setup --repo owner/repo --path . --agent helper --runtime claude --session last --start-daemon
+# 2. Register a repository and an agent, and start the daemon
+gitmoot setup --repo owner/repo --path . --agent reviewer --runtime claude --session last --start-daemon
 
-# 3. Put it to work from any PR or issue
-#    /gitmoot helper ask What is blocking this PR?
+# 3. Ask for an independent review of a pull request
+gitmoot agent review reviewer "Review this PR." --repo owner/repo --pr 123 --no-fix-target
+```
+
+Or let your coding agent do it. Paste this into it:
+
+```text
+Install gitmoot (curl -fsSL https://gitmoot.io/install.sh | sh), set it up for this
+repo with `gitmoot setup`, and verify with `gitmoot doctor`.
+The docs index for agents is https://gitmoot.io/llms.txt
 ```
 
 | Runtime | Flag | Notes |
 |---|---|---|
-| Codex | `--runtime codex` | plans, implements, reviews |
 | Claude Code | `--runtime claude` | `--session last` reuses your login |
+| Codex | `--runtime codex` | `--effort` sets reasoning effort |
+| omp | `--runtime omp` | multi-provider model pools; runs local or in E2B |
 | Kimi Code | `--runtime kimi` | `kimi login` first, then restart the daemon |
-| omp | `--runtime omp` | multi-provider router; fresh session per job, never resumes |
-| Shell | `--runtime shell` | deterministic command runtime: CI-style jobs, no LLM |
+| Shell | `--runtime shell` | deterministic checks, no model |
 
-Your agent can also drive Gitmoot on your behalf: `gitmoot plugin install claude` (or `codex`) packages the Gitmoot Agent Skill into the runtime's plugin system, so your agent discovers the commands, registers repos, subscribes other agents, and launches orchestrations for you. Agents start from the [llms.txt index](https://gitmoot.io/llms.txt).
+More: **[Install](https://gitmoot.io/docs/getting-started/install)** ·
+**[Quick start](https://gitmoot.io/docs/getting-started/quick-start)** ·
+**[Reviews](https://gitmoot.io/docs/workflows/review-agent-workflow)** ·
+**[CLI reference](https://gitmoot.io/docs/reference/cli)**
 
-Full setup, daemon operation, PR-comment grammar, and parallelism: **[Install](https://gitmoot.io/docs/getting-started/install)** · **[Quick Start](https://gitmoot.io/docs/getting-started/quick-start)** · **[CLI reference](https://gitmoot.io/docs/reference/cli)**
+## Also in the box
 
-## Use Cases
-
-Built-in coordinator recipes turn the Orchestra pattern into one command:
-
-- **Review panel**: a panel of diverse-lens reviewers over a PR, synthesized into one verdict.
-  `gitmoot orchestrate lead "Review PR #123." --repo owner/repo --recipe review-panel`
-- **Decompose and verify**: retired with implementer dispatch — Gitmoot no longer dispatches implementation, so parallel implementation legs have no action to run under.
-- **Producer vs. checker**: one producer leg, one independent read-only verification on a different runtime.
-  `gitmoot orchestrate lead "Produce the rate-limiter migration plan and prove it is complete." --repo owner/repo --recipe verifier`
-
-More workflows: **[coordinator recipes](https://gitmoot.io/docs/workflows/coordinator-recipes-workflow)** · [heartbeat schedules](https://gitmoot.io/docs/workflows/heartbeat-schedules-workflow) · [events webhook](https://gitmoot.io/docs/reference/event-stream).
-
-## What's Next
-
-The roadmap lives in the open: follow the [open issues](https://github.com/gitmoot/gitmoot/issues) to see what's coming and weigh in on what matters to you.
+- **Orchestration.** A coordinator fans work out to several agents and merges
+  the answers: `gitmoot orchestrate lead "Review PR #123 from three angles." --recipe review-panel`.
+- **Pipelines.** Agent graphs saved as YAML that you can rerun, schedule and
+  inspect ([docs](https://gitmoot.io/docs/workflows/pipelines-workflow)).
+- **PR comments.** `/gitmoot <agent> ask …` on a PR or issue routes to a named agent.
+- **Proof.** `gitmoot proof` builds an evidence-graded manifest of what a job
+  tree actually did.
+- **Dashboard.** `gitmoot dashboard` in the terminal, or a read-only web view.
 
 ## Documentation
 
-- **[Hosted docs](https://gitmoot.io/docs/intro)**: guides, concepts, reference
-- **[LLM index](https://gitmoot.io/llms.txt)**: machine-readable docs index; agents start here (full context: [llms-full.txt](https://gitmoot.io/llms-full.txt))
-- [Agent Skill package](skills/gitmoot/SKILL.md) · [CLI reference](skills/gitmoot/references/CLI.md): in-repo, versioned with the code
-- [Concepts](https://gitmoot.io/docs/concepts/local-first-coordination) · [Result contract & delegation bounds](https://gitmoot.io/docs/reference/result-contract) · [Dashboard](https://gitmoot.io/docs/dashboard/overview) · [Parallel jobs](https://gitmoot.io/docs/workflows/parallel-jobs-workflow) · [Plugins](https://gitmoot.io/docs/plugins/codex-claude) · [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting)
+- **[Hosted docs](https://gitmoot.io/docs/intro)**: guides, concepts and reference
+- **[llms.txt](https://gitmoot.io/llms.txt)**: the docs index for agents ([full text](https://gitmoot.io/llms-full.txt))
+- **[Agent skill](skills/gitmoot/SKILL.md)** and **[CLI reference](skills/gitmoot/references/CLI.md)**, versioned with the code
+- [Release notes](https://gitmoot.io/docs/release-notes/v0.9.7) · [Troubleshooting](https://gitmoot.io/docs/operations/troubleshooting)
 
-## Status And V1 Limits
+## Design limits
 
-Local-only by design: no hosted dashboard, GitHub App identity, cloud runner, or webhook receiver (the daemon polls). GitHub comments are authored by your authenticated `gh` user; agent identity appears in the comment body. Local SQLite remains the workflow source of truth.
+- **Local-first.** State lives in SQLite on your machine. Only reviews you send
+  to E2B run elsewhere.
+- **Polling, not webhooks.** The daemon polls GitHub; there is no GitHub App.
+  Comments are posted as your authenticated `gh` user, with the agent named in
+  the body.
+- **Seats implement; Gitmoot reviews.** Gitmoot no longer dispatches
+  implementation work itself. Your agents write the code in their own sessions;
+  Gitmoot coordinates them and reviews what they ship.
 
 ## Contributing
 
-Gitmoot is early and moving fast. Keep changes scoped, preserve local-first behavior, add focused tests, and remember: **docs ship with code**. Every user-facing change updates the skill, site, and llms surfaces in the same PR. See [AGENTS.md](AGENTS.md) for the full engineering contract (verify gates, conventions, footguns).
+Gitmoot is moving fast. Keep changes scoped, keep it local-first, add focused
+tests, and ship docs with code. [AGENTS.md](AGENTS.md) has the full engineering
+contract. Every change to this repository gets an independent Gitmoot review
+before it merges.
 
 ```sh
-go test ./...
-go vet ./...
+go build ./... && go vet ./... && go test ./...
 ```
-
-GitHub Actions enforces build, vet, and tests, plus the race detector on the core packages, on every push to `main` and every pull request.
 
 <a href="https://github.com/gitmoot/gitmoot/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=gitmoot/gitmoot" />
@@ -185,8 +204,16 @@ GitHub Actions enforces build, vet, and tests, plus the race detector on the cor
 
 ## Acknowledgements
 
-Gitmoot stands on the runtimes it coordinates: [Codex](https://github.com/openai/codex), [Claude Code](https://claude.com/claude-code), and [Kimi Code](https://github.com/MoonshotAI), and on [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite), which keeps the single-binary, zero-cgo promise honest. Thanks to the downstream builders stress-testing Gitmoot in the wild, including the [council](https://github.com/plotarmordev/council) multi-model quorum system, whose bug reports and PRs make the unattended path real.
+Gitmoot stands on the runtimes it coordinates ([Claude Code](https://claude.com/claude-code),
+[Codex](https://github.com/openai/codex), [Kimi Code](https://github.com/MoonshotAI) and omp) and on
+[modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite), which keeps the
+single-binary, no-cgo promise honest. Thanks to the builders stress-testing it
+in the wild, including the [council](https://github.com/plotarmordev/council)
+multi-model quorum system.
+
+Gitmoot Pipelines started at OpenAI Build Week 2026; the submitted tree is
+kept at the [`buildweek-2026-submission`](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission) tag.
 
 ## License
 
-Gitmoot is open source under the [Apache License 2.0](./LICENSE). See [NOTICE](./NOTICE) for attribution details.
+Apache License 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).

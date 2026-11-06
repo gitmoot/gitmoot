@@ -1,11 +1,15 @@
 # Gitmoot
 
-Gitmoot is a local-first coordinator for AI agents working across repositories,
-goals, reviews, pull request comments, daemon jobs, branch locks, agent
-templates (read-only installed data), current-chat prompt import,
-multi-agent orchestration (the Orchestra delegations DAG), heartbeat schedules,
-declared multi-stage pipelines, an outbound event stream, and Codex, Claude Code,
-Kimi Code, omp, or shell runtime workflows.
+Gitmoot runs a fleet of AI coding agents like a team. It organises agent
+sessions into seats (roles, scopes, merge authority) in Herdr panes, carries
+durable messages, directives and wakes between them, and holds every pull
+request to an independent exact-head review (routed reviewers and model pools,
+risk-sized review levels, delta reviews, a findings ledger, a merge gate, and
+optional off-box E2B reviews) before it merges. Agents write code in their own
+sessions; Gitmoot coordinates and reviews. It also offers multi-agent
+orchestration, declared pipelines, PR-comment routing, and an outbound event
+stream across Codex, Claude Code, Kimi Code, omp and shell runtimes. It runs
+locally: one static binary, one SQLite file.
 
 This file is the machine-readable index of the Gitmoot docs — agents should
 start here, then open [`llms-full.txt`](https://gitmoot.io/llms-full.txt) for the
