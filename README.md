@@ -29,8 +29,8 @@ work in their own sessions. Gitmoot gives each one a **seat** with a role and a
 scope, carries **messages and directives** between them, and sends their pull
 requests to a **different agent** for an exact-commit review, as deep as the
 risk calls for. Where review comes first, the merge waits until it is earned.
-It all runs on your machine: one
-static binary, one SQLite file, no hosted control plane.
+It all runs on your machine: one static binary, one SQLite file, no hosted
+control plane.
 
 <table>
   <tr>

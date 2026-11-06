@@ -9,8 +9,8 @@ Your agents (Claude Code, Codex, omp, Kimi) write the code in their own
 sessions. Gitmoot runs on your machine as one static binary with local SQLite
 state: it watches your repositories, routes reviews to a different agent (on
 another model if you configure one), tracks findings until they are answered,
-and gates the merge.
-no hosted control plane; reviews you choose to send to E2B run there.
+and gates the merge. There is no hosted control plane; reviews you choose to
+send to E2B run there.
 
 :::tip For agents
 New here? Open **[`llms.txt`](https://gitmoot.io/llms.txt)** — the
