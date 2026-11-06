@@ -14,7 +14,7 @@
 # Run a fleet of coding agents like a team.
 
 **Gitmoot organises your AI coding agents into roles, keeps them talking,
-and gates what they merge behind an independent review at the exact commit.**
+and puts their pull requests through an independent review at the exact commit.**
 
 [Install](#quick-start) · [How it works](#how-it-works) · [Docs](https://gitmoot.io/docs/intro) · [llms.txt](https://gitmoot.io/llms.txt)
 
@@ -75,6 +75,11 @@ gitmoot org await review --role frontend-dev --repo acme/web --pr 412 --head <sh
 
 A review is a separate job on a separate agent, bound to the 40-character head
 it was asked about. If the branch moves, the old verdict stops counting.
+
+Ask for a review whenever you want one. To have Gitmoot review every pull
+request on its own and hold the merge for the verdict, turn it on with
+`native_fanout_enabled = true` under `[review]` in `config.toml`, globally or
+per repository.
 
 ```sh
 # from a seat: the verdict comes back to it
