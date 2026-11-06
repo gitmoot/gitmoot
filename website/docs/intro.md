@@ -1,12 +1,17 @@
 # Gitmoot
 
-Gitmoot coordinates local AI agents through the same surface teams already use
-to audit software work: repositories and pull requests.
+**Gitmoot runs a fleet of AI coding agents like a team.** It organises agent
+sessions into seats with roles, scopes and merge authority, keeps them talking
+through durable messages, directives and wake-ups, and puts their pull requests
+through an independent review at the exact commit, sized to the risk.
 
-It runs on the user's machine, stores workflow state in local SQLite, polls
-GitHub pull request comments, routes jobs to registered agent runtimes, and
-writes attributed results back to the pull request discussion. There is no
-hosted control plane in the current beta.
+Your agents (Claude Code, Codex, omp, Kimi) write the code in their own
+sessions. Gitmoot runs on your machine as one static binary with local SQLite
+state: it watches your repositories, routes reviews to a different agent (on
+another model if you configure one), and tracks findings until they are
+answered. Automatic review of every pull request, with a merge gate, is opt-in
+(`[review] native_fanout_enabled`). There is no hosted control plane; reviews you choose to
+send to E2B run there.
 
 :::tip For agents
 New here? Open **[`llms.txt`](https://gitmoot.io/llms.txt)** — the
