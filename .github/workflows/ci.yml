@@ -92,6 +92,19 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Cross-build every release target
+        # release.yml ships these targets; a Linux-only API once broke the
+        # darwin release build unnoticed for two months (#2537). Keep this
+        # list identical to release.yml's.
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "building $t"
+            GOOS="${t%/*}" GOARCH="${t#*/}" go build -o /dev/null ./cmd/gitmoot
+          done
+          GOOS=darwin GOARCH=arm64 go vet ./internal/toolchain/
+
       - name: Generated contract is current
         # The gitmoot_result reply contract is single-sourced from the workflow
         # result structs and regenerated into internal/prompts/contract_generated.go

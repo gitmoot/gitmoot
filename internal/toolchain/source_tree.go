@@ -60,8 +60,10 @@ type sourceTree struct {
 	excludeRoot string
 }
 
-// resolveFlags apply to every component of every path opened through here.
-const resolveFlags = unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_BENEATH
+// openBeneath (source_tree_linux.go / source_tree_other.go) opens relative under
+// a directory descriptor with no symlink at any component and no resolution
+// outside it: openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH on Linux, a
+// descriptor-anchored O_NOFOLLOW walk elsewhere (#2537).
 
 // swapBarrier is a TEST SEAM and is nil in production.
 //
@@ -95,8 +97,7 @@ func (s *sourceTree) openMember(relative string, directory bool) (*os.File, erro
 	if directory {
 		flags |= unix.O_DIRECTORY
 	}
-	how := &unix.OpenHow{Flags: uint64(flags), Resolve: resolveFlags}
-	fd, err := unix.Openat2(int(s.file.Fd()), relative, how)
+	fd, err := openBeneath(int(s.file.Fd()), relative, flags)
 	if err != nil {
 		if errors.Is(err, unix.ENOSYS) {
 			return nil, fmt.Errorf("%w: openat2 is unavailable on this kernel, so staging cannot refuse symlink substitution", ErrRuntimeNotStageable)
