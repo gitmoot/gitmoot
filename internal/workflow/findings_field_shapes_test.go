@@ -305,6 +305,18 @@ func TestWellTypedFindingsDecodeAsEncodingJSONDoes(t *testing.T) {
 		`{"title":"first","title":"second","Title":"third"}`,
 		`{"title":"t","unknown_key":{"nested":[1,2]},"line":-3}`,
 		`{"title":"t","line":7,"relevance_keys":null,"detail":null}`,
+		// NULL IN KEY ORDER (PR #2544 round 1). encoding/json sets a slice to nil
+		// on null and leaves a string or int untouched, so a later null wins for
+		// the slice and is a no-op for the others.
+		`{"relevance_keys":["a"],"relevance_keys":null}`,
+		`{"relevance_keys":["a"],"Relevance_Keys":null}`,
+		`{"relevance_keys":null,"relevance_keys":["b"]}`,
+		`{"title":"a","title":null}`,
+		`{"title":null,"title":"b"}`,
+		`{"evidence_locator":"a/b.go:3","Evidence_Locator":null}`,
+		`{"line":12,"line":null}`,
+		`{"line":null,"line":5}`,
+		`{"title":"a","title":null,"line":12,"line":null,"relevance_keys":["a","b"],"relevance_keys":null}`,
 	} {
 		var plain plainReviewFindingWire
 		if err := json.Unmarshal([]byte(raw), &plain); err != nil {

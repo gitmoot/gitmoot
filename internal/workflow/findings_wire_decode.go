@@ -29,7 +29,10 @@ import (
 // So reviewFindingWire decodes FIELD BY FIELD, and each value shape has one
 // rule, the same for every field:
 //
-//   - null leaves the field unset, as encoding/json does.
+//   - null does what encoding/json does with it, in key order: a slice, map,
+//     pointer or interface field becomes nil, and any other field is left as it
+//     was. So {"relevance_keys":["a"],"relevance_keys":null} ends nil, while
+//     {"title":"a","title":null} keeps "a" - both exactly as json.Unmarshal.
 //   - Text fields: a string is taken as is. An ARRAY is joined with "\n", one
 //     element per line, each element rendered by these same rules. For the
 //     locator-like fields (location, evidence_locator, locator) an OBJECT
@@ -71,7 +74,14 @@ func (w *reviewFindingWire) UnmarshalJSON(data []byte) error {
 	value := reflect.ValueOf(w).Elem()
 	for _, member := range members {
 		index := reviewFindingWireFieldIndex(member.key)
-		if index < 0 || string(bytes.TrimSpace(member.raw)) == "null" {
+		if index < 0 {
+			continue
+		}
+		if string(bytes.TrimSpace(member.raw)) == "null" {
+			switch field := value.Field(index); field.Kind() {
+			case reflect.Slice, reflect.Map, reflect.Pointer, reflect.Interface:
+				field.SetZero()
+			}
 			continue
 		}
 		name := reviewFindingWireFieldNames[index]
