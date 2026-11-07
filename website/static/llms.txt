@@ -76,8 +76,8 @@ until an exact-head reconciliation row exists:
 `[workload-mode-reconciliation repo=<owner/repo> pr=<n> head=<40-char reviewed head> mode=<THROUGHPUT|STEADY|DRAIN> decision_note=<note id|none>]`.
 The decision itself is an append-only `[operating-mode repo=<owner/repo> mode=<mode>]`
 note; `decision_note=none` means the PR is the decision. The newest decision
-wins, an unreadable one supersedes rather than reading as absent, and a hold is
-retryable and bounded by the gate `timeout` or 24h from the episode's start.
+wins, an unreadable one supersedes rather than reading as absent, and the merge
+gate keeps the PR pending, with no timeout, until a matching row is filed.
 
 ## Start Here
 
