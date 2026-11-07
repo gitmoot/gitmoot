@@ -38,7 +38,9 @@ import (
 
 // reviewFindingWire is the subset of a review result's finding object this writer
 // reads. Findings ride as free-form json.RawMessage, so every field is optional
-// and a finding that carries none of them is still recorded.
+// and a finding that carries none of them is still recorded. It is decoded field
+// by field (findings_wire_decode.go), so one oddly shaped field never costs the
+// rest of the finding.
 type reviewFindingWire struct {
 	ID       string `json:"id"`
 	Severity string `json:"severity"`
@@ -132,6 +134,10 @@ type reviewFindingWire struct {
 	Details     string `json:"details"`
 	Message     string `json:"message"`
 	Finding     string `json:"finding"`
+	// decodeNotes names the fields UnmarshalJSON could not take as sent (a line
+	// that is not a number). Unexported and untagged: never decoded, only
+	// reported when the finding is still not recorded.
+	decodeNotes []string
 }
 
 // pathFromLensEvidence extracts the leading repo-relative path from a lens
@@ -218,21 +224,19 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		e.recordLedgerSkip(ctx, job.ID, index, reason)
 	}
 	for index, raw := range payload.Result.Findings {
-		var wire reviewFindingWire
-		if err := json.Unmarshal(raw, &wire); err != nil {
-			// A finding that is not an object (some agents emit bare strings) still
-			// counts as a reported finding, so it is recorded with its text as the
-			// title rather than dropped.
-			var text string
-			if textErr := json.Unmarshal(raw, &text); textErr != nil {
-				skip(index, fmt.Sprintf("finding is neither an object nor a string: %v", err))
-				continue
-			}
-			wire = wireFromBareFindingText(text)
+		// Field by field (findings_wire_decode.go): an odd shape in one field is
+		// rendered or left zero rather than costing the whole finding. A bare
+		// string is still recorded with its text as the title. Only a finding
+		// that is neither an object nor a string is skipped, with what it was.
+		wire, err := decodeReviewFinding(raw)
+		if err != nil {
+			skip(index, err.Error())
+			continue
 		}
+		noted := wire.decodeNoteSuffix()
 		obs, declared, ok := e.ledgerObservationWithDeclaredState(job, payload, wire, head, repo)
 		if !ok {
-			skip(index, "finding carries no file and the review executed nothing, so no evidence kind is truthful")
+			skip(index, "finding carries no file and the review executed nothing, so no evidence kind is truthful"+noted)
 			continue
 		}
 		// A failed review whose only support is quoted output has not established
@@ -242,7 +246,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 		if job.State == string(JobFailed) &&
 			strings.EqualFold(strings.TrimSpace(payload.Result.Decision), "failed") &&
 			obs.EvidenceKind == db.EvidenceQuoted {
-			skip(index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding")
+			skip(index, "failed review supplied only quoted output; retained as a job-level failure rather than a code finding"+noted)
 			continue
 		}
 		if key := ledgerDedupeKey(obs); seen[key] {
@@ -277,7 +281,7 @@ func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, pa
 					fmt.Sprintf("finding[%d] not recorded yet, will retry: %v", index, err))
 				continue
 			}
-			skip(index, fmt.Sprintf("store refused the observation: %v", err))
+			skip(index, fmt.Sprintf("store refused the observation: %v%s", err, noted))
 			continue
 		}
 		written++
@@ -403,6 +407,11 @@ const (
 	// ledgerReadFailedEventKind reports, once per pass, that the job's earlier
 	// observations could not be read, so nothing was recorded.
 	ledgerReadFailedEventKind = "findings_ledger_read_failed"
+	// ledgerSkippedEventKind and ledgerRefusedEventKind each name ONE reported
+	// finding that was not recorded, and their message starts "finding[N]".
+	// UnrecordedLedgerFindings reads them back for `gitmoot findings`.
+	ledgerSkippedEventKind = "findings_ledger_skipped"
+	ledgerRefusedEventKind = "findings_ledger_refused"
 )
 
 // ledgerObservationFor builds the observation, choosing the evidence kind from
@@ -655,9 +664,63 @@ func (e Engine) recordLedgerSkip(ctx context.Context, jobID string, index int, r
 	}
 	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID:   jobID,
-		Kind:    "findings_ledger_skipped",
+		Kind:    ledgerSkippedEventKind,
 		Message: fmt.Sprintf("finding[%d] not recorded to the #1822 ledger: %s", index, reason),
 	})
+}
+
+// UnrecordedLedgerFinding is one reported finding a review job did not record
+// to the ledger: skipped or refused, with the event that says why.
+type UnrecordedLedgerFinding struct {
+	JobID   string `json:"job_id"`
+	Index   int    `json:"index"`
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+
+// UnrecordedLedgerFindings lists the reported findings of this pull request's
+// review jobs that never became ledger rows (tandem#2, message 412412).
+//
+// A skip used to be visible ONLY as a job event, and `gitmoot findings` then
+// answered "no findings recorded" for a PR whose reviewer had reported a P2 -
+// true of the ledger and false of the review. This reads the writer's own
+// skip and refusal events back, so the listing can say how many findings it is
+// not showing and which jobs explain why. It counts each finding of a job once
+// (the latest event wins), because a job retried before #2268 repeated its
+// events on every pass.
+func UnrecordedLedgerFindings(ctx context.Context, store *db.Store, repo string, pullRequest int) ([]UnrecordedLedgerFinding, error) {
+	if store == nil || strings.TrimSpace(repo) == "" || pullRequest <= 0 {
+		return nil, nil
+	}
+	jobs, err := store.ListReviewJobsForPullRequest(ctx, repo, pullRequest)
+	if err != nil {
+		return nil, err
+	}
+	var unrecorded []UnrecordedLedgerFinding
+	for i := len(jobs) - 1; i >= 0; i-- { // oldest job first
+		events, err := store.ListJobEvents(ctx, jobs[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		byIndex := map[int]int{}
+		for _, event := range events {
+			if event.Kind != ledgerSkippedEventKind && event.Kind != ledgerRefusedEventKind {
+				continue
+			}
+			var index int
+			if _, err := fmt.Sscanf(event.Message, "finding[%d]", &index); err != nil {
+				continue
+			}
+			entry := UnrecordedLedgerFinding{JobID: jobs[i].ID, Index: index, Kind: event.Kind, Message: event.Message}
+			if at, seen := byIndex[index]; seen {
+				unrecorded[at] = entry
+				continue
+			}
+			byIndex[index] = len(unrecorded)
+			unrecorded = append(unrecorded, entry)
+		}
+	}
+	return unrecorded, nil
 }
 
 // ReviewObligationBrief exposes the obligation brief to a dispatcher outside
@@ -749,7 +812,7 @@ func (e Engine) recordLedgerContentRefusal(ctx context.Context, jobID string, in
 	}
 	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
 		JobID: jobID,
-		Kind:  "findings_ledger_refused",
+		Kind:  ledgerRefusedEventKind,
 		Message: fmt.Sprintf(
 			"finding[%d] at claimed severity %s was REFUSED, not recorded: it carries no finding text this reader "+
 				"can read, "+

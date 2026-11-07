@@ -127,13 +127,11 @@ func (e Engine) addPostMergeEvent(ctx context.Context, jobID, kind, message stri
 // without a canonical severity are dropped: the verdict still carries them.
 func classifyPostMergeFindings(jobID string, findings []json.RawMessage) (urgent, followups []postMergeFinding) {
 	for index, raw := range findings {
-		var wire reviewFindingWire
-		if err := json.Unmarshal(raw, &wire); err != nil {
-			var text string
-			if json.Unmarshal(raw, &text) != nil {
-				continue
-			}
-			wire = wireFromBareFindingText(text)
+		// The same field-by-field decode as the ledger writer, so a P0-P2 whose
+		// evidence is an array still raises its follow-up.
+		wire, err := decodeReviewFinding(raw)
+		if err != nil {
+			continue
 		}
 		state := strings.ToLower(firstNonEmptyLedgerText(strings.TrimSpace(wire.State), strings.TrimSpace(wire.Disposition)))
 		if state == string(db.FindingAnswered) || state == string(db.FindingWithdrawn) {

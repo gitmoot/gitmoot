@@ -190,9 +190,14 @@ func runFindings(args []string, stdout, stderr io.Writer) int {
 // they are recoverable.
 func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool, stdout, stderr io.Writer) int {
 	var rows []db.ReviewFindingObservation
+	var unrecorded []workflow.UnrecordedLedgerFinding
 	if err := withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
 		var err error
 		rows, err = store.ListReviewFindingObservations(context.Background(), repo, int64(pullRequest))
+		if err != nil {
+			return err
+		}
+		unrecorded, err = workflow.UnrecordedLedgerFindings(context.Background(), store, repo, pullRequest)
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "findings: %v\n", err)
@@ -225,6 +230,9 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 			return 1
 		}
 		fmt.Fprintln(stdout, string(encoded))
+		// stdout stays the row array a dispatch path already parses; the count
+		// of what it does not contain goes to stderr rather than vanishing.
+		printUnrecordedFindings(stderr, unrecorded)
 		return 0
 	}
 
@@ -237,6 +245,7 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		} else {
 			fmt.Fprintf(stdout, "no findings recorded for %s\n", repo)
 		}
+		printUnrecordedFindings(stdout, unrecorded)
 		return 0
 	}
 
@@ -261,6 +270,7 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 		return 1
 	}
 	fmt.Fprintln(stdout)
+	printUnrecordedFindings(stdout, unrecorded)
 	fmt.Fprintln(stdout, "Cite a UID verbatim as \"continues_uid\" to continue a finding; typing its label mints a new one.")
 	// #2086 f2: STATE IS NOT THE SAME QUESTION AS "DOES THIS STILL BLOCK".
 	// LedgerObligationsAtHead can treat an ANSWERED finding as still mandatory
@@ -271,6 +281,26 @@ func runFindingsRows(repo string, pullRequest int, home string, jsonOutput bool,
 	fmt.Fprintln(stdout, "STATE is the last recorded observation. An answered finding can still be MANDATORY at a")
 	fmt.Fprintln(stdout, "later head if the files it names changed again, which only the merge gate can decide.")
 	return 0
+}
+
+// printUnrecordedFindings says how many reported findings the listing above does
+// not contain, and which review jobs' events explain why (tandem#2). Before it,
+// a P2 the ledger had skipped left this command printing "no findings
+// recorded", which a reader reasonably takes as "the review found nothing".
+func printUnrecordedFindings(out io.Writer, unrecorded []workflow.UnrecordedLedgerFinding) {
+	if len(unrecorded) == 0 {
+		return
+	}
+	var jobs []string
+	seen := map[string]bool{}
+	for _, finding := range unrecorded {
+		if !seen[finding.JobID] {
+			seen[finding.JobID] = true
+			jobs = append(jobs, finding.JobID)
+		}
+	}
+	fmt.Fprintf(out, "%d reported finding(s) were NOT recorded to the ledger, so they are not listed here; "+
+		"see `gitmoot job events <id>` for: %s\n", len(unrecorded), strings.Join(jobs, ", "))
 }
 
 // findingsObligation is the printable form of one obligation the merge gate
