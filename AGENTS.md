@@ -128,7 +128,7 @@ go test -timeout 25m ./...
   set -e
   race_dir="$(mktemp -d "${TMPDIR:-/tmp}/gitmoot-race.XXXXXX")"
   printf 'race artifacts: %s\n' "$race_dir"
-  for spec in cli:8 pipeline:4 db:2 workflow:4 daemon:1; do
+  for spec in cli:8 db:2 workflow:4 daemon:1; do
     package="${spec%%:*}"
     shards="${spec##*:}"
     bundle="$race_dir/$package"
@@ -178,16 +178,6 @@ The race block deliberately does not delete `race_dir`: recursive deletion is
 policy-rejected for managed coordinators, and cleanup is not required for gate
 correctness. The printed per-run directory and
 `/tmp/gitmoot-go-build-cache` therefore persist for later owner-managed cleanup.
-
-When the repository checkout itself is under `/tmp`,
-`TestClaudeProduceHookAutoReadLandlockE2E` is a known host-environment confound:
-it fails there on current `main` as well as feature branches, so that failure is
-not evidence about the branch under test. In a `/tmp` checkout, run the non-race
-gate with that one test explicitly skipped:
-
-```sh
-go test -timeout 25m -skip 'TestClaudeProduceHookAutoReadLandlockE2E' ./...
-```
 
 `-buildvcs=false` is required, not optional, inside a gitmoot worktree (#1209):
 Go's VCS auto-stamp only recognizes a `.git` **directory** as a repo root
@@ -291,21 +281,18 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - `internal/cli/` — the command surface (agent, template, memory,
   dashboard) **and the `daemon` command wiring / worker loop**.
 - `internal/daemon/` — the PR-watcher daemon package (poll/resume/revert logic).
-- `internal/pipeline/`: the pipeline engine. Start with:
-  - `pipeline_run.go` for advancement, stage enqueueing, worktree isolation,
-    settlement, run creation, and job-event timestamps.
-  - `pipeline_trigger.go` for trigger evaluation.
-  - `pipeline_service*.go` for service admission, finalization, and artifacts.
-  - `pipeline_expose.go`, `pipeline_auto_merge.go`, and `pipeline_resume.go` for
-    the remaining engine flows.
-  - `spec.go`, `validate.go`, `state.go`, `env.go`, and `service_schema.go` for
-    engine types, validation, state, environments, and schemas.
+- Pipelines were retired in #2542; they live in
+  [stagehand](https://github.com/gitmoot/stagehand). There is no
+  `internal/pipeline/` package and no `gitmoot pipeline` command.
 - `internal/workflow/` — the job/delegation engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
 - `internal/runtime/` — the Codex/Claude/Kimi/omp/shell adapters.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
   template + per-section loaders).
 - `internal/db/` — the SQLite store + the migrations slice.
+- `internal/keychain/` — resolves, validates and reads the operator keychain
+  file (`keychain.env`) for `gitmoot key`, the review-level classifier key and
+  the model-gateway credential.
 - Other notable `internal/` packages: `agenttemplate`, `report` (bug reports),
   `presence`, `memory`, `doctor`, `cockpit` (the herdr wake client + org
   provider), `plugin*`.
@@ -685,13 +672,13 @@ operating-mode note the exact head implements, and that note's `created_at` is
 `decided_at`. A later operating-mode note supersedes the reconciliation and
 requires a new exact-head row.
 
-This is mechanically enforced, not a pre-merge memory check. Both the native
-`PolicyMergeGate` and the separate `PipelineAutoMerger` read the paginated PR
-file list. A changed `+`/`-` line containing the exact `**Current mode:` marker
-requires a matching reconciliation row. An `AGENTS.md` entry whose patch is
-missing or ambiguous fails closed. `PipelineAutoMerger.Merge` re-reads the PR
-and both note streams at the final merge boundary; an older reconciled PR that
-merges after a newer owner decision cannot override the newer decision.
+This is mechanically enforced, not a pre-merge memory check. The native
+`PolicyMergeGate` reads the paginated PR file list immediately before it merges.
+A changed `+`/`-` line containing the exact `**Current mode:` marker requires a
+matching reconciliation row. An `AGENTS.md` entry whose patch is missing or
+ambiguous fails closed. The gate re-reads the PR and both note streams on every
+evaluation, so an older reconciled PR that merges after a newer owner decision
+cannot override the newer decision.
 
 Four properties of that enforcement are worth knowing before you write a row.
 Enforcement is keyed on the repository OWNER, so every `gitmoot/*` repo is held
@@ -707,33 +694,9 @@ optional rather than the only exit. The gate only refuses outright when nothing
 readable remains, meaning the note is unreadable AND the PR's marker patch is
 missing or ambiguous, and the hold then names both steps of the exit: append a
 fresh readable operating-mode note AND file an exact-head row citing it. A
-reconciliation hold at the merge boundary is retryable: the pipeline gate
-RELEASES its at-most-once merge claim, records the cause as a
-`pipeline_auto_merge_held` job event, and re-attempts on a later scan, so the
-row landing merges. It is also BOUNDED, and the bound applies on both the
-ordinary Evaluate path and the merge boundary: with a gate `timeout` the stage
-parks at that timeout carrying the cause, and with no `timeout` it parks 24h
-after the hold episode began, with the park summary naming the `timeout` as the
-lever. A hold against a new head or a new DECISION starts a new episode with a
-fresh budget, so a later hold is never charged for an earlier one - but a
-changed CAUSE alone does not, because the cause carries volatile near-miss
-detail and keying on it let unrelated churn defer the bound indefinitely.
-A scan that LOSES the at-most-once claim is a separate case and never parks the
-run: it cannot see whether the winner is alive, and a hold record has no expiry,
-so believing one killed runs whose reconciliation had already succeeded. It ages
-the wait from THE CLAIM ROW'S OWN `created_at` - one write, no second row to fall
-out of step with the claim, and a value resume does not reset - and records
-`pipeline_auto_merge_claim_orphaned` once the claim has been held 15m, with
-`cause=held_past_bound`. If a genuinely orphaned claim is the cause, THIS run
-cannot merge: nothing in the pipeline releases that claim, its key is fixed for
-the run, and a stage `timeout` on the gate parks the run rather than recovering
-it - re-running the pipeline takes a fresh claim. A claim whose `created_at`
-will not parse cannot be aged at all; that is recorded immediately with
-`cause=claim_timestamp_unreadable`, and a stage `timeout` still parks that wait
-like any other - the gate row carries its ordinary start stamp, and only the
-claim's timestamp is unreadable. A claim released between a losing scan's failed
-claim attempt and its read is neither case: that is the ordinary hold cycle, so
-the loser waits quietly and the next scan takes the claim.
+reconciliation hold is retryable: the gate returns a pending decision whose
+reason names the cause, and the daemon re-evaluates it on a later poll, so the
+row landing merges.
 
 Resolve the active decision from both durable sources: read the marker from
 `origin/main:AGENTS.md`, never a seat worktree, and read the newest typed

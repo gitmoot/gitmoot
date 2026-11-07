@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 )
 
 const keychainSentinel = "keychain-sentinel-value-874"
@@ -37,9 +37,9 @@ func runKeyTestCommand(t *testing.T, args ...string) (int, string, string) {
 	return code, stdout.String(), stderr.String()
 }
 
-func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
+func TestKeyCLIRegistryAndSecretSafety(t *testing.T) {
 	home := t.TempDir()
-	path := writeDefaultKeychain(t, home, "SHARED="+keychainSentinel+"\nPROXY=proxy-"+keychainSentinel+"\n")
+	path := writeDefaultKeychain(t, home, "LEGACY="+keychainSentinel+"\nPROXY=proxy-"+keychainSentinel+"\n")
 
 	if code, out, errOut := runKeyTestCommand(t, "key", "path", "--home", home, "--json"); code != 0 || !strings.Contains(out, path) || !strings.Contains(out, `"status": "ready"`) {
 		t.Fatalf("key path code=%d out=%q err=%q", code, out, errOut)
@@ -47,118 +47,89 @@ func TestKeyCLIRegistryGrantsAndSecretSafety(t *testing.T) {
 		t.Fatalf("key path leaked value: %q %q", out, errOut)
 	}
 
-	for _, tc := range []struct {
-		name string
-		mode string
-	}{
-		{"SHARED", db.KeychainModeInjected},
-		{"PROXY", db.KeychainModeProxied},
-	} {
-		code, out, errOut := runKeyTestCommand(t, "key", "add", tc.name, "--mode", tc.mode, "--home", home, "--json")
-		if code != 0 {
-			t.Fatalf("key add %s code=%d out=%q err=%q", tc.name, code, out, errOut)
-		}
-		if strings.Contains(out+errOut, keychainSentinel) {
-			t.Fatalf("key add leaked value: %q %q", out, errOut)
-		}
+	if code, out, errOut := runKeyTestCommand(t, "key", "add", "PROXY", "--mode", db.KeychainModeProxied, "--home", home, "--json"); code != 0 {
+		t.Fatalf("key add PROXY code=%d out=%q err=%q", code, out, errOut)
+	} else if strings.Contains(out+errOut, keychainSentinel) || strings.Contains(out, "grants") {
+		t.Fatalf("key add output leaked value or grants: %q %q", out, errOut)
 	}
+	// The injected mode is retired (#2542): adding one is refused and the error
+	// names the only remaining mode.
+	if code, out, errOut := runKeyTestCommand(t, "key", "add", "LEGACY", "--mode", "injected", "--home", home); code == 0 || !strings.Contains(errOut, "proxied") {
+		t.Fatalf("injected add code=%d out=%q err=%q", code, out, errOut)
+	}
+	// A row written before #2542 may still carry mode "injected"; it must keep
+	// listing, showing and removing.
 	if err := withStore(home, func(store *db.Store) error {
-		ctx := context.Background()
-		if err := store.CreateOrUpdatePipeline(ctx, db.Pipeline{Name: "pipe", SpecYAML: "name: pipe\nstages: [{id: run, cmd: echo}]\n"}); err != nil {
-			return err
-		}
-		return store.UpsertAgent(ctx, db.Agent{Name: "seat", Runtime: "codex"})
+		return store.ExecForTest(context.Background(), `INSERT INTO keychain_keys(name, mode) VALUES ('LEGACY', 'injected')`)
 	}); err != nil {
 		t.Fatal(err)
 	}
-
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--home", home); code == 0 || !strings.Contains(errOut, "proxied") {
-		t.Fatalf("proxied grant code=%d out=%q err=%q", code, out, errOut)
-	} else if strings.Contains(out+errOut, keychainSentinel) {
-		t.Fatalf("proxied refusal leaked value: %q %q", out, errOut)
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "not configured") {
-		t.Fatalf("unconfigured agent grant code=%d out=%q err=%q", code, out, errOut)
+	for _, removed := range []string{"grant", "revoke"} {
+		if code, out, errOut := runKeyTestCommand(t, "key", removed, "PROXY", "--agent", "seat", "--home", home); code == 0 {
+			t.Fatalf("key %s still accepted: out=%q err=%q", removed, out, errOut)
+		}
 	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "configure", "PROXY", "--upstream", "https://api.example.test/v1/", "--auth", "header:X-Api-Token", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"proxy_upstream": "https://api.example.test/v1"`) || !strings.Contains(out, `"proxy_auth_kind": "header"`) || !strings.Contains(out, `"proxy_header": "X-Api-Token"`) {
 		t.Fatalf("key configure code=%d out=%q err=%q", code, out, errOut)
 	} else if strings.Contains(out+errOut, keychainSentinel) {
 		t.Fatalf("key configure leaked value: %q %q", out, errOut)
 	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--home", home); code != 0 {
-		t.Fatalf("configured proxied grant code=%d out=%q err=%q", code, out, errOut)
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "SHARED", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "proxied-only") {
-		t.Fatalf("injected agent grant code=%d out=%q err=%q", code, out, errOut)
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--agent", "seat", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"agent": "seat"`) {
-		t.Fatalf("agent grant code=%d out=%q err=%q", code, out, errOut)
-	} else if strings.Contains(out+errOut, keychainSentinel) {
-		t.Fatalf("agent grant leaked value: %q %q", out, errOut)
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "PROXY", "--pipeline", "pipe", "--agent", "seat", "--home", home); code == 0 || !strings.Contains(errOut, "exactly one") {
-		t.Fatalf("mutually exclusive consumer flags code=%d out=%q err=%q", code, out, errOut)
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "grant", "SHARED", "--pipeline", "pipe", "--home", home, "--json"); code != 0 {
-		t.Fatalf("grant code=%d out=%q err=%q", code, out, errOut)
-	} else if strings.Contains(out+errOut, keychainSentinel) {
-		t.Fatalf("grant leaked value: %q %q", out, errOut)
-	}
 
 	for _, args := range [][]string{
 		{"key", "list", "--home", home, "--json"},
-		{"key", "show", "SHARED", "--home", home, "--json"},
+		{"key", "show", "LEGACY", "--home", home, "--json"},
 		{"key", "show", "PROXY", "--home", home, "--json"},
 		{"key", "list", "--home", home},
-		{"key", "show", "SHARED", "--home", home},
+		{"key", "show", "LEGACY", "--home", home},
 		{"key", "show", "PROXY", "--home", home},
 	} {
 		code, out, errOut := runKeyTestCommand(t, args...)
-		wantGrantTarget := args[1] == "show" || slices.Contains(args, "--json")
-		wantName := "SHARED"
+		wantName := "LEGACY"
 		if slices.Contains(args, "PROXY") {
 			wantName = "PROXY"
 		}
-		if code != 0 || !strings.Contains(out, wantName) || (wantGrantTarget && !strings.Contains(out, "pipe")) {
+		if code != 0 || !strings.Contains(out, wantName) {
 			t.Fatalf("%v code=%d out=%q err=%q", args, code, out, errOut)
+		}
+		if wantName == "LEGACY" && !strings.Contains(out, "injected") {
+			t.Fatalf("%v omitted the legacy mode: %q", args, out)
 		}
 		if wantName == "PROXY" && (!strings.Contains(out, "https://api.example.test/v1") || !strings.Contains(out, "X-Api-Token")) {
 			t.Fatalf("%v omitted proxy configuration: %q", args, out)
 		}
-		if wantName == "PROXY" && wantGrantTarget && !strings.Contains(out, "seat") {
-			t.Fatalf("%v omitted agent grant: %q", args, out)
+		if strings.Contains(out, "grant") {
+			t.Fatalf("%v still renders grants: %q", args, out)
 		}
 		if strings.Contains(out+errOut, keychainSentinel) {
 			t.Fatalf("%v leaked value: %q %q", args, out, errOut)
 		}
-	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "revoke", "PROXY", "--agent", "seat", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"agent": "seat"`) || !strings.Contains(out, `"changed": true`) {
-		t.Fatalf("agent revoke code=%d out=%q err=%q", code, out, errOut)
-	} else if strings.Contains(out+errOut, keychainSentinel) {
-		t.Fatalf("agent revoke leaked value: %q %q", out, errOut)
 	}
 
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code, out, errOut := runKeyTestCommand(t, "key", "rm", "SHARED", "--force", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"file_entry_remains": true`) {
-		t.Fatalf("rm force code=%d out=%q err=%q", code, out, errOut)
+	if code, out, errOut := runKeyTestCommand(t, "key", "rm", "LEGACY", "--force", "--home", home); code == 0 || !strings.Contains(errOut, "flag provided but not defined") {
+		t.Fatalf("rm --force still accepted: code=%d out=%q err=%q", code, out, errOut)
+	}
+	if code, out, errOut := runKeyTestCommand(t, "key", "rm", "LEGACY", "--home", home, "--json"); code != 0 || !strings.Contains(out, `"removed": true`) || !strings.Contains(out, `"file_entry_remains": true`) || strings.Contains(out, "grants_removed") {
+		t.Fatalf("rm code=%d out=%q err=%q", code, out, errOut)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(before, after) {
-		t.Fatal("key rm --force modified the keychain file")
+		t.Fatal("key rm modified the keychain file")
 	}
 
-	code, out, errOut := runKeyTestCommand(t, "key", "add", "SHARED", "--value", keychainSentinel, "--mode", "injected", "--home", home)
+	code, out, errOut := runKeyTestCommand(t, "key", "add", "LEGACY", "--value", keychainSentinel, "--mode", "proxied", "--home", home)
 	if code == 0 || !strings.Contains(errOut, "flag provided but not defined") {
 		t.Fatalf("value flag unexpectedly accepted: code=%d out=%q err=%q", code, out, errOut)
 	}
-	if strings.Contains(printKeyUsageString(), "value") {
-		t.Fatal("key command usage exposes a value-input option")
+	usage := printKeyUsageString()
+	if strings.Contains(usage, "value") || strings.Contains(usage, "grant") || strings.Contains(usage, "injected") {
+		t.Fatalf("key command usage exposes a removed option: %s", usage)
 	}
 }
 
@@ -203,15 +174,17 @@ func TestKeyConfigureRejectsUnsafeProxyMetadata(t *testing.T) {
 
 	home := t.TempDir()
 	writeDefaultKeychain(t, home, "INJECTED="+keychainSentinel+"\n")
-	if code, out, errOut := runKeyTestCommand(t, "key", "add", "INJECTED", "--mode", "injected", "--home", home); code != 0 {
-		t.Fatalf("key add injected code=%d out=%q err=%q", code, out, errOut)
+	if err := withStore(home, func(store *db.Store) error {
+		return store.ExecForTest(context.Background(), `INSERT INTO keychain_keys(name, mode) VALUES ('INJECTED', 'injected')`)
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if code, out, errOut := runKeyTestCommand(t, "key", "configure", "INJECTED", "--upstream", "https://api.example.test", "--auth", "bearer", "--home", home); code == 0 || !strings.Contains(errOut, "requires proxied mode") {
 		t.Fatalf("configure injected code=%d out=%q err=%q", code, out, errOut)
 	}
 }
 
-func TestKeychainFileValidationMatchesPipelineEnvFile(t *testing.T) {
+func TestKeychainFileValidation(t *testing.T) {
 	tests := []struct {
 		name  string
 		setup func(t *testing.T, home string, store *db.Store)
@@ -270,7 +243,7 @@ func TestKeychainFileValidationMatchesPipelineEnvFile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home, _, store := heartbeatLoopE2EHome(t)
 			tt.setup(t, home, store)
-			code, out, errOut := runKeyTestCommand(t, "key", "add", "TOKEN", "--mode", "injected", "--home", home)
+			code, out, errOut := runKeyTestCommand(t, "key", "add", "TOKEN", "--mode", "proxied", "--home", home)
 			if code == 0 || !strings.Contains(errOut, tt.want) {
 				t.Fatalf("code=%d out=%q err=%q want=%q", code, out, errOut, tt.want)
 			}
@@ -284,10 +257,10 @@ func TestKeychainFileValidationMatchesPipelineEnvFile(t *testing.T) {
 func TestKeychainFileWrongOwner(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	writeDefaultKeychain(t, home, "TOKEN="+keychainSentinel+"\n")
-	original := pipeline.PipelineEnvCurrentUID
-	pipeline.PipelineEnvCurrentUID = func() uint32 { return original() + 1 }
-	t.Cleanup(func() { pipeline.PipelineEnvCurrentUID = original })
-	_, _, err := pipeline.LoadValidatedKeychainFile(context.Background(), store, home)
+	original := keychain.CurrentUID
+	keychain.CurrentUID = func() uint32 { return original() + 1 }
+	t.Cleanup(func() { keychain.CurrentUID = original })
+	_, _, err := keychain.LoadValidated(context.Background(), store, home)
 	if err == nil || !strings.Contains(err.Error(), "owned by uid") || strings.Contains(err.Error(), keychainSentinel) {
 		t.Fatalf("wrong-owner error=%v", err)
 	}

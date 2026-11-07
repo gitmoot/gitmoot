@@ -29,20 +29,18 @@ var toolCacheEnvSubdirs = []struct{ env, subdir string }{
 // per-worktree fallback that duplicates gigabytes of immutable, content-
 // addressed packages per job (#1113 lever 1).
 //
-// MUST be called AFTER applyProduceRuntimeGrants: that call unconditionally
-// OVERWRITES agent.WritablePaths for produce jobs, so appending before it would
-// be silently discarded. Appending (not replacing) here preserves whatever
-// applyProduceRuntimeGrants set.
+// Appends (never replaces) agent.WritablePaths, so a grant set earlier on the
+// same agent survives.
 //
 // Scope: isolated jobs only (payload.WorktreePath != "") — a non-isolated job
 // uses the persistent registered checkout, which does not duplicate caches per
 // job. Widening WritablePaths reaches codex (its sandbox is always on and reads
 // the agent value fresh at Deliver time, so this is what actually makes the
-// cache dir writable there) and claude/kimi "produce" jobs (whose Landlock grant
-// is computed from this same field, later, in wrapProduceSandboxAdapter).
-// Non-produce claude/kimi and shell runtimes run unsandboxed already, so
-// widening WritablePaths for them is a harmless no-op — nothing reads it — and
-// the env vars alone suffice to redirect their cache.
+// cache dir writable there) and read-only seats (whose Landlock grant is
+// computed from this same field in readOnlyRuntimeSandboxGrants). Other
+// claude/kimi and shell runtimes run unsandboxed already, so widening
+// WritablePaths for them is a harmless no-op — nothing reads it — and the env
+// vars alone suffice to redirect their cache.
 //
 // Read-only seats are the exception: each worktree receives its own cache root,
 // because an untrusted review or ask must not poison state consumed by another

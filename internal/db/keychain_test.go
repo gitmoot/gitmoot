@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,7 +26,7 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 	if version == 0 || proxyVersion == 0 {
 		t.Fatalf("keychain migrations not found: create=%d proxy=%d", version, proxyVersion)
 	}
-	if _, err := legacy.db.Exec(`DROP TABLE keychain_grants; DROP TABLE keychain_keys;
+	if _, err := legacy.db.Exec(`DROP TABLE IF EXISTS keychain_grants; DROP TABLE keychain_keys;
 		DELETE FROM schema_migrations WHERE version IN (?, ?)`, version, proxyVersion); err != nil {
 		t.Fatalf("rewind keychain migration: %v", err)
 	}
@@ -39,7 +38,7 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 		t.Fatalf("Open existing database: %v", err)
 	}
 	defer store.Close()
-	for _, table := range []string{"keychain_keys", "keychain_grants"} {
+	for _, table := range []string{"keychain_keys"} {
 		if ok, err := store.HasTable(context.Background(), table); err != nil || !ok {
 			t.Fatalf("table %s ok=%v err=%v", table, ok, err)
 		}
@@ -66,165 +65,71 @@ func TestKeychainMigrationAppliesToExistingDatabase(t *testing.T) {
 	}
 }
 
-func TestKeychainCRUDGrantIdempotenceAndForcedCleanup(t *testing.T) {
-	store := openPipelineStore(t)
+func TestKeychainCRUDProxiedOnly(t *testing.T) {
+	store := openWorkflowTestStore(t)
 	ctx := context.Background()
-	if err := store.CreateOrUpdatePipeline(ctx, samplePipeline()); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := store.AddKeychainKey(ctx, "BAD", "other"); err == nil {
 		t.Fatal("invalid mode was accepted")
+	}
+	if _, err := store.AddKeychainKey(ctx, "API_TOKEN", "injected"); err == nil {
+		t.Fatal("injected mode was accepted")
 	}
 	if _, err := store.db.ExecContext(ctx, `INSERT INTO keychain_keys(name, mode) VALUES ('RAW_BAD', 'other')`); err == nil {
 		t.Fatal("migration CHECK accepted an invalid mode")
 	}
-	injected, err := store.AddKeychainKey(ctx, "API_TOKEN", KeychainModeInjected)
-	if err != nil || injected.Name != "API_TOKEN" || injected.Mode != KeychainModeInjected || injected.CreatedAt == "" {
-		t.Fatalf("AddKeychainKey injected = %+v err=%v", injected, err)
+	added, err := store.AddKeychainKey(ctx, "MODEL_TOKEN", KeychainModeProxied)
+	if err != nil || added.Name != "MODEL_TOKEN" || added.Mode != KeychainModeProxied || added.CreatedAt == "" || added.ProxyConfigured() {
+		t.Fatalf("AddKeychainKey proxied = %+v err=%v", added, err)
 	}
-	if _, err := store.AddKeychainKey(ctx, "API_TOKEN", KeychainModeInjected); err == nil {
+	if _, err := store.AddKeychainKey(ctx, "MODEL_TOKEN", KeychainModeProxied); err == nil {
 		t.Fatal("duplicate key name was accepted")
-	}
-	if _, err := store.AddKeychainKey(ctx, "MODEL_TOKEN", KeychainModeProxied); err != nil {
-		t.Fatal(err)
-	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN"); changed || !errors.Is(err, ErrKeychainProxyUnconfigured) {
-		t.Fatalf("unconfigured proxied grant = changed %v err %v", changed, err)
 	}
 	configured, err := store.ConfigureKeychainProxy(ctx, "MODEL_TOKEN", "https://api.example.test/v1", KeychainProxyAuthHeader, "X-Model-Key")
 	if err != nil || configured.ProxyUpstream != "https://api.example.test/v1" || configured.ProxyAuthKind != KeychainProxyAuthHeader || configured.ProxyHeader != "X-Model-Key" || !configured.ProxyConfigured() {
 		t.Fatalf("ConfigureKeychainProxy = %+v err=%v", configured, err)
 	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN"); err != nil || !changed {
-		t.Fatalf("configured proxied grant = changed %v err %v", changed, err)
+	shown, found, err := store.GetKeychainKey(ctx, "MODEL_TOKEN")
+	if err != nil || !found || shown.ProxyHeader != "X-Model-Key" || !shown.ProxyConfigured() {
+		t.Fatalf("GetKeychainKey = %+v found=%v err=%v", shown, found, err)
 	}
-	grantedProxy, found, err := store.GetGrantedKey(ctx, KeychainConsumerPipeline, "deploy-flow", "MODEL_TOKEN")
-	if err != nil || !found || !grantedProxy.ProxyConfigured() {
-		t.Fatalf("GetGrantedKey proxied = %+v found=%v err=%v", grantedProxy, found, err)
-	}
-	changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN")
-	if err != nil || !changed {
-		t.Fatalf("first grant = changed %v err %v", changed, err)
-	}
-	changed, err = store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN")
-	if err != nil || changed {
-		t.Fatalf("duplicate grant = changed %v err %v", changed, err)
-	}
-	granted, found, err := store.GetGrantedKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN")
-	if err != nil || !found || granted.Mode != KeychainModeInjected {
-		t.Fatalf("GetGrantedKey = %+v found=%v err=%v", granted, found, err)
-	}
-	if removed, count, err := store.RemoveKeychainKey(ctx, "API_TOKEN", false); removed || count != 1 || !errors.Is(err, ErrKeychainKeyHasGrants) {
-		t.Fatalf("guarded remove = removed %v count %d err %v", removed, count, err)
-	}
-	removed, count, err := store.RemoveKeychainKey(ctx, "API_TOKEN", true)
-	if err != nil || !removed || count != 1 {
-		t.Fatalf("forced remove = removed %v count %d err %v", removed, count, err)
-	}
-	if grants, err := store.ListKeychainGrants(ctx, "API_TOKEN"); err != nil || len(grants) != 0 {
-		t.Fatalf("grants after force = %+v err=%v", grants, err)
-	}
-	if changed, err := store.RevokeKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN"); err != nil || changed {
-		t.Fatalf("idempotent revoke = changed %v err %v", changed, err)
+	if _, found, err := store.GetKeychainKey(ctx, "MISSING"); err != nil || found {
+		t.Fatalf("GetKeychainKey missing = found %v err %v", found, err)
 	}
 	keys, err := store.ListKeychainKeys(ctx)
 	if err != nil || len(keys) != 1 || keys[0].Name != "MODEL_TOKEN" || keys[0].ProxyHeader != "X-Model-Key" {
 		t.Fatalf("keys = %+v err=%v", keys, err)
 	}
-}
-
-func TestDeletePipelineCleansKeychainGrantsInSameTransaction(t *testing.T) {
-	store := openPipelineStore(t)
-	ctx := context.Background()
-	if err := store.CreateOrUpdatePipeline(ctx, samplePipeline()); err != nil {
-		t.Fatal(err)
+	if removed, err := store.RemoveKeychainKey(ctx, "MODEL_TOKEN"); err != nil || !removed {
+		t.Fatalf("RemoveKeychainKey = removed %v err %v", removed, err)
 	}
-	if _, err := store.AddKeychainKey(ctx, "API_TOKEN", KeychainModeInjected); err != nil {
-		t.Fatal(err)
+	if removed, err := store.RemoveKeychainKey(ctx, "MODEL_TOKEN"); err != nil || removed {
+		t.Fatalf("second RemoveKeychainKey = removed %v err %v", removed, err)
 	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerPipeline, "deploy-flow", "API_TOKEN"); err != nil || !changed {
-		t.Fatalf("grant = changed %v err %v", changed, err)
-	}
-	if removed, err := store.DeletePipeline(ctx, "deploy-flow"); err != nil || !removed {
-		t.Fatalf("DeletePipeline = removed %v err %v", removed, err)
-	}
-	if grants, err := store.ListKeychainGrants(ctx, "API_TOKEN"); err != nil || len(grants) != 0 {
-		t.Fatalf("pipeline grants after delete = %+v err=%v", grants, err)
-	}
-	if _, found, err := store.GetKeychainKey(ctx, "API_TOKEN"); err != nil || !found {
-		t.Fatalf("key metadata removed with pipeline: found=%v err=%v", found, err)
+	if keys, err := store.ListKeychainKeys(ctx); err != nil || len(keys) != 0 {
+		t.Fatalf("keys after remove = %+v err=%v", keys, err)
 	}
 }
 
-// The two seats are not redundant: removing the first must delete ITS grants and
-// leave the second's standing, which is what proves the cleanup is scoped by
-// consumer_id rather than clearing the grants table. Removing the second then
-// shows the table does empty when its last consumer goes.
-//
-// It was named ...CleansBothPaths when the two seats exercised two different
-// deletion entry points; #1753 deleted DeleteAgentChecked, so both now go
-// through RemoveAgent - which runs the byte-identical grant delete - and the
-// name and the "checked-seat" fixture were left over-claiming (#1787 review
-// round 3, F4).
-func TestAgentKeychainGrantsAreProxiedOnlyAndDeletionCleansThemUp(t *testing.T) {
-	store := openPipelineStore(t)
+// Rows written before #2542 may carry mode "injected"; AddKeychainKey no longer
+// creates them, but they must still list, show and remove.
+func TestKeychainLegacyInjectedRowListsShowsAndRemoves(t *testing.T) {
+	store := openWorkflowTestStore(t)
 	ctx := context.Background()
-	for _, name := range []string{"remove-seat", "second-seat"} {
-		if err := store.UpsertAgent(ctx, Agent{Name: name, Runtime: "codex"}); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := store.db.ExecContext(ctx, `INSERT INTO keychain_keys(name, mode) VALUES ('LEGACY_TOKEN', 'injected')`); err != nil {
+		t.Fatalf("insert legacy injected row: %v", err)
 	}
-	if _, err := store.AddKeychainKey(ctx, "INJECTED", KeychainModeInjected); err != nil {
-		t.Fatal(err)
+	keys, err := store.ListKeychainKeys(ctx)
+	if err != nil || len(keys) != 1 || keys[0].Name != "LEGACY_TOKEN" || keys[0].Mode != "injected" || keys[0].ProxyConfigured() {
+		t.Fatalf("keys = %+v err=%v", keys, err)
 	}
-	if _, err := store.AddKeychainKey(ctx, "PROXY", KeychainModeProxied); err != nil {
-		t.Fatal(err)
+	shown, found, err := store.GetKeychainKey(ctx, "LEGACY_TOKEN")
+	if err != nil || !found || shown.Mode != "injected" {
+		t.Fatalf("GetKeychainKey = %+v found=%v err=%v", shown, found, err)
 	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "INJECTED"); changed || !errors.Is(err, ErrKeychainAgentInjected) {
-		t.Fatalf("injected agent grant = changed %v err %v", changed, err)
+	if removed, err := store.RemoveKeychainKey(ctx, "LEGACY_TOKEN"); err != nil || !removed {
+		t.Fatalf("RemoveKeychainKey = removed %v err %v", removed, err)
 	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainProxyUnconfigured) {
-		t.Fatalf("unconfigured agent grant = changed %v err %v", changed, err)
-	}
-	if _, err := store.ConfigureKeychainProxy(ctx, "PROXY", "https://api.example.test/v1", KeychainProxyAuthBearer, ""); err != nil {
-		t.Fatal(err)
-	}
-	for _, seat := range []string{"remove-seat", "second-seat"} {
-		if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || !changed {
-			t.Fatalf("grant %s = changed %v err %v", seat, changed, err)
-		}
-		if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || changed {
-			t.Fatalf("duplicate grant %s = changed %v err %v", seat, changed, err)
-		}
-		if key, found, err := store.GetGrantedKey(ctx, KeychainConsumerAgent, seat, "PROXY"); err != nil || !found || !key.ProxyConfigured() {
-			t.Fatalf("GetGrantedKey %s = %+v found=%v err=%v", seat, key, found, err)
-		}
-	}
-	if grants, err := store.ListKeychainGrantsForConsumer(ctx, KeychainConsumerAgent, "remove-seat"); err != nil || len(grants) != 1 || grants[0].ConsumerKind != KeychainConsumerAgent {
-		t.Fatalf("agent grants = %+v err=%v", grants, err)
-	}
-	if changed, err := store.RevokeKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); err != nil || !changed {
-		t.Fatalf("agent revoke = changed %v err %v", changed, err)
-	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "remove-seat", "PROXY"); err != nil || !changed {
-		t.Fatalf("agent regrant = changed %v err %v", changed, err)
-	}
-	if removed, err := store.RemoveAgent(ctx, "remove-seat"); err != nil || !removed {
-		t.Fatalf("RemoveAgent = removed %v err %v", removed, err)
-	}
-	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 1 || grants[0].ConsumerID != "second-seat" {
-		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
-	}
-	if _, err := store.RemoveAgent(ctx, "second-seat"); err != nil {
-		t.Fatalf("RemoveAgent: %v", err)
-	}
-	if grants, err := store.ListKeychainGrants(ctx, "PROXY"); err != nil || len(grants) != 0 {
-		t.Fatalf("grants after RemoveAgent = %+v err=%v", grants, err)
-	}
-	if changed, err := store.GrantKeychainKey(ctx, KeychainConsumerAgent, "missing-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainConsumerNotFound) {
-		t.Fatalf("missing agent grant = changed %v err %v", changed, err)
-	}
-	if changed, err := store.RevokeKeychainKey(ctx, KeychainConsumerAgent, "missing-seat", "PROXY"); changed || !errors.Is(err, ErrKeychainConsumerNotFound) {
-		t.Fatalf("missing agent revoke = changed %v err %v", changed, err)
+	if _, found, err := store.GetKeychainKey(ctx, "LEGACY_TOKEN"); err != nil || found {
+		t.Fatalf("GetKeychainKey after remove = found %v err %v", found, err)
 	}
 }

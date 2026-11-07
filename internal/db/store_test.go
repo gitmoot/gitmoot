@@ -1680,7 +1680,7 @@ func TestMigrateCopiesAgentRepoScopeToAgentRepos(t *testing.T) {
 	store := &Store{db: raw}
 	defer store.Close()
 
-	agentReposMigration := len(migrationsBefore(t, "agent_repos"))
+	agentReposMigration := len(migrationsBefore(t, "CREATE TABLE agent_repos"))
 	for i, migration := range migrations {
 		if strings.Contains(migration, "CREATE TABLE agent_repos") {
 			agentReposMigration = i

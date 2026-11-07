@@ -661,31 +661,6 @@ func TestDashboardTierTwoCachesUncoveredWritesUseHardMax(t *testing.T) {
 		after  string
 	}{
 		{
-			name: "overview pipeline schedule", path: "/api/overview", maxAge: dashboardOverviewCachePolicy.maxAge,
-			seed: func(t *testing.T, store *db.Store) {
-				seedTestPipeline(t, store, db.Pipeline{Name: "nightly", Repo: "acme/app", SpecYAML: diamondSpecYAML, Enabled: true, Interval: "1h"})
-				if err := store.UpdatePipelineScheduleState(context.Background(), db.PipelineScheduleState{Name: "nightly", NextDueAt: time.Now().Add(time.Hour), LastStatus: "queued"}); err != nil {
-					t.Fatal(err)
-				}
-			},
-			mutate: func(t *testing.T, store *db.Store) {
-				if err := store.UpdatePipelineScheduleState(context.Background(), db.PipelineScheduleState{Name: "nightly", NextDueAt: time.Now().Add(time.Hour), LastStatus: "succeeded"}); err != nil {
-					t.Fatal(err)
-				}
-			},
-			value: func(t *testing.T, body []byte) string {
-				var overview dashboard.Overview
-				if err := json.Unmarshal(body, &overview); err != nil {
-					t.Fatal(err)
-				}
-				if len(overview.Scheduled) != 1 {
-					t.Fatalf("scheduled = %+v", overview.Scheduled)
-				}
-				return overview.Scheduled[0].LastStatus
-			},
-			before: "queued", after: "succeeded",
-		},
-		{
 			name: "task upsert", path: "/api/tasks", maxAge: dashboardTasksCachePolicy.maxAge,
 			seed: func(t *testing.T, store *db.Store) {
 				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "before", State: "implementing"}); err != nil {

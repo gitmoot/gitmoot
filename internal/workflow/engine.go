@@ -34,10 +34,7 @@ type Engine struct {
 	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy
 	// OrgPolicy is passed to every mailbox the engine creates. Descendant jobs are
 	// exempt from the gate but preserve their initiating role as provenance.
-	OrgPolicy func(repo string) OrgEnforcement
-	// ProduceCheckDir is the resolved checkout cwd for trusted produce-stage
-	// deterministic checks when no disposable worktree path is present.
-	ProduceCheckDir         string
+	OrgPolicy               func(repo string) OrgEnforcement
 	RequiredReviewers       []string
 	MergeGate               MergeGate
 	JobID                   func(JobRequest) string
@@ -85,9 +82,9 @@ type Engine struct {
 	DelegationWorktrees    WorktreeManager
 	DelegationCheckout     string
 	cleanupTargetValidator func(home, jobID, jobType string, payload JobPayload) error
-	// BeforeReadOnlyWorktreeCleanup publishes terminal artifacts independently of
-	// deletion eligibility, so blocked consumers can still receive their inputs.
-	// Missing collectors or preservation failures refuse read-only deletion.
+	// BeforeReadOnlyWorktreeCleanup preserves terminal evidence (such as a
+	// read-only diff) independently of deletion eligibility. Missing collectors
+	// or preservation failures refuse read-only deletion.
 	BeforeReadOnlyWorktreeCleanup func(context.Context, string, string, JobPayload) error
 	// CleanupRetention reloads producer retention policy during each inspection
 	// and immediately before deletion. Nil is reserved for explicit engine policy.

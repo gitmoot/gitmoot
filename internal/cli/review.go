@@ -814,8 +814,8 @@ func reviewJobStillAnswersWithin(ctx context.Context, store *db.Store, job db.Jo
 	// TRAVERSAL IS GATED ON CHILDREN, NOT ON A VERDICT CLASSIFIER (#2176 round
 	// 3). This asked ResultIsFanOut, which requires a terminal REVIEW decision
 	// (approved / changes_requested) - but dispatchDelegations runs for any
-	// decision that is not blocked or failed, and a non-pipeline result keeps
-	// its delegations. So an implement or ask leg that succeeded with, say,
+	// decision that is not blocked or failed, and the result keeps its
+	// delegations. So an implement or ask leg that succeeded with, say,
 	// decision "implemented" has REAL children that were never listed, and a
 	// live matching review grandchild under it was invisible. Whether a node
 	// has children is a question about the store, so ask the store.

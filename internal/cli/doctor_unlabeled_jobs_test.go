@@ -12,7 +12,6 @@ func TestBuildUnlabeledJobsCheck(t *testing.T) {
 	jobs := []db.Job{
 		{Payload: `{"repo":"a/b","sender":"local"}`, CreatedAt: "2026-07-21 11:00:00"},
 		{Payload: `{"repo":"a/b","sender":"local"}`, CreatedAt: "2026-07-21 10:00:00"},
-		{Payload: `{"repo":"a/b","sender":"pipeline"}`, CreatedAt: "2026-07-21 11:00:00"},
 		{Payload: `{"repo":"a/b","sender":"local","workflow_id":"team/x"}`, CreatedAt: "2026-07-21 11:00:00"},
 		{Payload: `{"repo":"old/repo","sender":"local"}`, CreatedAt: "2026-07-19 11:00:00"},
 		{Payload: `{"repo":"a/b","sender":"local","parent_job_id":"legacy-root"}`, CreatedAt: "2026-07-21 11:00:00"},

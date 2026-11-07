@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, pipelines, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
@@ -31,7 +31,7 @@ user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
 structured implementation plans, agent template inspection,
 custom prompt agents, job status, branch lock inspection,
-declarative pipelines, agent memory,
+agent memory,
 routing telemetry, or runtime metadata.
 
 Gitmoot's CLI evolves quickly. If the user names a Gitmoot feature or command
@@ -72,7 +72,7 @@ Code. To use it, run `kimi login`, then restart the Gitmoot daemon so it inherit
 the session. `omp` is the oh-my-pi CLI, a multi-provider routing harness:
 authenticate it once (interactively, via a provider key in the daemon
 environment, or through an auth broker) and restart the daemon so it inherits the
-credential. omp holds `review`/`implement`/`ask` but not `produce`, runs a fresh
+credential. omp holds `review`/`implement`/`ask`, runs a fresh
 session per job and never resumes, and its implement jobs get a loud
 cross-family-review refusal because an opaque router has no model family.
 `agent subscribe` additionally accepts `--runtime shell`, whose
@@ -96,7 +96,7 @@ asks for that action.
 5. Prefer read-only status commands and answer directly before mutating Gitmoot
    state or pointing the user to live monitoring.
 6. Use `gitmoot --help` and subcommand help for version-sensitive features such
-   as `pipeline`, `memory`, `router`, `runtime`, dashboard web,
+   as `memory`, `router`, `runtime`, dashboard web,
    session jobs, and heartbeats.
 
 ## Install And Update
@@ -158,14 +158,6 @@ gitmoot report bug --job <job-id> --preview
 gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
-gitmoot pipeline add <spec.yaml> [--enable]
-gitmoot pipeline list [--json]
-gitmoot pipeline run <name>
-gitmoot pipeline show <name|run-id> [--json]
-gitmoot pipeline resume <run-id> [--from <stage>]
-gitmoot pipeline cancel <run-id>
-gitmoot pipeline enable|disable <name>
-gitmoot pipeline remove <name>
 gitmoot job answer <job-id> "<question-id>: answer text" [--json]
 gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
 ```
@@ -205,11 +197,6 @@ or questions. Add `--background` only when the user wants a queued background
 job. This is the same agent registry and runtime adapter path used by PR-comment
 jobs; the plugin only helps the runtime discover this skill and does not replace
 the `gitmoot` CLI.
-
-Use `gitmoot pipeline` when the workflow is a fixed, repeatable DAG declared in
-YAML rather than a model-driven decomposition. `pipeline add` validates and
-stores the spec, stage commands must emit `gitmoot_result`, `blocked` parks the
-run, and `pipeline resume` reruns the halted stage plus dependents.
 
 Use `gitmoot job answer <job-id> "<question-id>: text"` to resume a job paused at
 `awaiting_human`; it routes through the same escalation-resume path the daemon's

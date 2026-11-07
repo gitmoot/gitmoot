@@ -17,7 +17,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -27,10 +26,10 @@ func TestWebDataSourceOverviewAndTasksEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Overview: %v", err)
 	}
-	if overview.NeedsYou == nil || overview.Activity.Workflows == nil || overview.Today.Notable == nil || overview.Scheduled == nil || overview.Fleet == nil {
+	if overview.NeedsYou == nil || overview.Activity.Workflows == nil || overview.Today.Notable == nil || overview.Fleet == nil {
 		t.Fatalf("Overview contains nil collection: %+v", overview)
 	}
-	if len(overview.NeedsYou)+len(overview.Activity.Workflows)+len(overview.Today.Notable)+len(overview.Scheduled)+len(overview.Fleet) != 0 {
+	if len(overview.NeedsYou)+len(overview.Activity.Workflows)+len(overview.Today.Notable)+len(overview.Fleet) != 0 {
 		t.Fatalf("Overview empty store = %+v", overview)
 	}
 	tasks, err := ds.Tasks(context.Background())
@@ -64,7 +63,6 @@ func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 		id      string
 		payload workflow.JobPayload
 	}{
-		{"pipeline", workflow.JobPayload{Repo: "acme/drift", Sender: workflow.PipelineJobSender}},
 		{"continuation", workflow.JobPayload{Repo: "acme/drift", Sender: "worker", DelegationReason: "runtime_session_busy"}},
 	} {
 		if err := store.CreateJob(ctx, db.Job{ID: entry.id, Agent: "worker", Type: "ask", State: "queued", Payload: mustJSON(t, entry.payload)}); err != nil {
@@ -205,18 +203,6 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 		t.Fatalf("InsertWorkflowAutoNoteWithMeta = (inserted=%v, err=%v)", inserted, err)
 	}
 
-	seedTestPipeline(t, store, db.Pipeline{
-		Name: "nightly", Repo: "acme/data", SpecYAML: diamondSpecYAML, Enabled: true, Interval: "6h", Jitter: "30m",
-	})
-	if err := store.UpdatePipelineScheduleState(ctx, db.PipelineScheduleState{
-		Name: "nightly", LastRunAt: now.Add(-time.Hour), NextDueAt: now.Add(5*time.Hour + 30*time.Minute),
-		LastRunID: "pipeline-run", LastStatus: pipeline.RunSucceeded,
-	}); err != nil {
-		t.Fatalf("UpdatePipelineScheduleState: %v", err)
-	}
-	seedTestRun(t, store, db.PipelineRun{ID: "pipeline-run", Pipeline: "nightly", State: pipeline.RunSucceeded, StartedAt: now.Add(-2 * time.Hour), FinishedAt: now.Add(-90 * time.Minute)}, []db.PipelineRunStage{
-		{StageID: "ingest", State: pipeline.StageSucceeded, JobID: "pipeline-job"},
-	})
 	store.Close()
 
 	raw, err := sql.Open("sqlite", paths.Database)
@@ -301,9 +287,6 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	if hourTotal != 5 {
 		t.Fatalf("per_hour total=%d want 5: %v", hourTotal, overview.Today.PerHour)
 	}
-	if len(overview.Scheduled) != 1 || overview.Scheduled[0].Name != "nightly" || overview.Scheduled[0].Schedule != "every 6h +30m" || overview.Scheduled[0].LastStatus != pipeline.RunSucceeded || overview.Scheduled[0].NextInS != 5*60*60 {
-		t.Fatalf("scheduled = %+v", overview.Scheduled)
-	}
 	if len(overview.Fleet) != 2 || !overview.Fleet[0].Running || !overview.Fleet[1].Running {
 		t.Fatalf("fleet = %+v", overview.Fleet)
 	}
@@ -319,11 +302,8 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 		}
 		workflowByLabel[entry.Label] = entry
 	}
-	if _, ok := workflowByLabel["pipeline/nightly"]; ok {
-		t.Fatalf("pipeline stage leaked into pipeline auto group: %+v", workflows)
-	}
 	if _, ok := workflowByLabel["adhoc/alpha"]; ok {
-		t.Fatalf("pipeline stage was re-bucketed as adhoc/alpha: %+v", workflows)
+		t.Fatalf("unlabeled job was synthesized as adhoc/alpha: %+v", workflows)
 	}
 	if _, ok := workflowByLabel["adhoc/beta"]; ok {
 		t.Fatalf("unlabeled job was synthesized as adhoc/beta: %+v", workflows)

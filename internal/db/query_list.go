@@ -55,7 +55,7 @@ func queryList[T any](
 // A type ALIAS, not a defined type: a defined interface is never identical to an
 // unnamed one, so func(rowScanner) would not match the existing
 // func(interface{ Scan(dest ...any) error }) scanX helpers and generic inference
-// would fail. The alias makes them the same type, so scanRepo, scanPipeline and
+// would fail. The alias makes them the same type, so scanRepo and
 // friends pass straight through with no adapter closure.
 type rowScanner = interface {
 	Scan(dest ...any) error

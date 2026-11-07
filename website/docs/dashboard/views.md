@@ -1,6 +1,6 @@
 # Dashboard Views
 
-The web dashboard has fifteen views, reachable from the left nav rail (or the mobile
+The web dashboard has fourteen views, reachable from the left nav rail (or the mobile
 bottom tab bar). Each is described below with its screenshot. See
 [Dashboard Overview](./overview.md) for launching, routes, refresh cadences, and
 security.
@@ -10,7 +10,7 @@ security.
 Route: `/`
 
 Overview is the operator-first landing page. It combines local Gitmoot state into
-five compact blocks without making GitHub requests or scanning job payloads on
+compact blocks without making GitHub requests or scanning job payloads on
 each refresh:
 
 - **Fleet activity strip** answers whether the host is busy even when session
@@ -25,8 +25,6 @@ each refresh:
   with unlabeled work summarized separately and the total queued count visible.
 - **Today** is a rolling 24-hour summary of terminal jobs, token usage, an hourly
   completion histogram, and the five most recently finished jobs.
-- **Scheduled** shows enabled interval pipelines, their latest status, and the
-  next run computed from the durable schedule state.
 - **Fleet** lists registered agents with runtime, running state, and jobs started
   in the rolling 24-hour window.
 
@@ -130,59 +128,6 @@ Tokens, Started, Duration) and as cards on mobile.
 - Clicking a row (or card) opens a detail panel with the job's prompt, output,
   and event history.
 
-## Pipelines
-
-Route: `/pipelines` (or `/pipelines/<name>`)
-
-Pipelines is the read-only view of the declared **shell-stage pipelines** — the
-scheduled/manual DAGs defined with `gitmoot pipeline add`. It is **strictly
-read-only**: every action it surfaces is a **copyable command**, never a mutation.
-When no pipeline is declared yet, the view shows an empty state prompting
-`gitmoot pipeline add <spec.yaml>`.
-
-**List view** — a table, one row per pipeline (columns: **Name**, **Repo**,
-**Enabled** chip, **Schedule** rendered as `every 24h +15m`, **Last run** state
-chip, **Next due** countdown rendered from the schedule as e.g. `due in 6h 12m`
-and recomputed each poll, and a **Recent** outcomes strip of the last ≤10 runs as
-small state-colored squares, oldest→newest left to right). Clicking a row opens
-that pipeline's detail (`/pipelines/<name>`).
-
-**Detail view** — a back link, a pipeline header (name, repo, enabled, schedule,
-next due), and a **run-history strip** of recent runs (each a chip: state color,
-short run id, relative time). Selecting a run (newest by default) renders that
-run's **stage DAG** and, when the run parked, a banner:
-
-- a **blocked** run shows an amber banner with the halt stage, halt reason, the
-  outstanding **needs**, and a copyable `gitmoot pipeline resume <run-id>`;
-- a **failed** run shows a red banner with the halt reason and a copyable
-  `gitmoot report bug --job <failing-stage-job-id>`.
-
-The **stage DAG** lays stages out in dependency (depth) columns, left to right,
-edges following the spec's `needs`. Each stage chip shows its id, state, attempt
-(when it retried), elapsed time, and a one-line summary; pending and skipped
-stages render dimmed. Clicking a stage opens a side panel: stages with a job show
-the full job detail (prompt, output, events) fetched from `/api/job/<id>`; a
-pending or skipped stage (no job yet) shows a minimal card with its id, state,
-command, and dependencies. An in-flight run's stages flip live as the dashboard
-polls (every 12s).
-
-The detail view also fetches `/api/pipelines/<name>` for the pipeline's full
-history and declared shape. It shows a **run-history table** — one row per run
-(newest-first, capped at the last 100), with started time (absolute and
-relative), trigger, state chip, duration, and halt stage — where selecting a row
-drives the strip, matrix, and DAG together. A **stage×run matrix** places the
-stages down the rows (declared order first, any history-only ids appended) and
-the most recent runs across the columns oldest→newest, each cell a
-state-colored dot, so a stage that keeps failing reads as a streak across a row;
-clicking a cell selects that run. When the pipeline has a schedule, an
-**upcoming card** projects the next few fire times from `next due + k × interval`
-(with the jitter suffixed when set); a disabled schedule shows *paused* and a
-manual-only pipeline shows the copyable `gitmoot pipeline run <name>`. A pipeline
-that has **never run** renders its **declared DAG** (every stage pending, from
-the current spec) as a preview instead of a run. This detail feed is strictly
-read-only and deterministic; the list rows additionally summarize each pipeline's
-recent success rate and average duration.
-
 ## Workflows
 
 Route: `/workflows` (index) and `/workflows/{label}` (mission log)
@@ -192,9 +137,8 @@ dispatched with `--workflow <label>` plus the journal written with
 `gitmoot workflow note`. Labels may carry one namespace slash
 (`fable/dashboard-redesign`) — by convention the coordinator's herdr pane name
 namespaces the campaign. The Workflows page lists only explicitly labeled
-workflows. Unlabeled jobs remain visible on the Jobs page, while pipeline runs
-live on the Pipelines page. An explicitly labeled workflow still appears here
-even when its label begins with `pipeline/` or `adhoc/`.
+workflows. Unlabeled jobs remain visible on the Jobs page. An explicitly
+labeled workflow still appears here even when its label begins with `adhoc/`.
 
 The overview's advisory unlabeled-job item is shown for repositories under the
 default enabled auto policy; it is hidden only for repositories that opt out
@@ -375,7 +319,7 @@ and last-modified time are shown in the footer.
 
 The Keychain section is a names-only registry view: it shows the configured
 keychain path and live file status, each registered key's injected/proxied mode,
-configured proxy upstream and auth placement, and sorted consumer grants. It
+and configured proxy upstream and auth placement. It
 never returns credential values or value-derived data; file rotation and drift
 are reflected on the next request.
 

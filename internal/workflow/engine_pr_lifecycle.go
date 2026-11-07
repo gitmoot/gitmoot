@@ -333,8 +333,8 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 // prepareNativeReviewWorktree gives a ROUTINE native review leg its own detached
 // exact-head worktree BEFORE it is enqueued, so the job is born with its FINAL
 // WorktreePath and FINAL Instructions. That is the invariant every OTHER
-// read-only dispatch path already holds (the `agent review/ask` CLI dispatch, the
-// read-only delegation fan-out, and the pipeline stages all allocate then
+// read-only dispatch path already holds (the `agent review/ask` CLI dispatch and
+// the read-only delegation fan-out both allocate then
 // enqueue). Allocating AFTER enqueue — in the worker, which is where the routine
 // leg alone used to do it — was one asymmetry behind three separate defects:
 //

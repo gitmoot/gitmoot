@@ -88,8 +88,8 @@ artifact_blobs = %q
 # require_workflow = false # opt out (default is true)
 # require_workflow_mode = "auto" # auto | strict
 
-# [cache] gives isolated-worktree jobs (codex is always sandboxed; claude/kimi
-# "produce" jobs are Landlock-sandboxed) a shared, host-level tool-cache
+# [cache] gives isolated-worktree jobs (codex is always sandboxed; read-only
+# review seats are Landlock-sandboxed) a shared, host-level tool-cache
 # directory instead of each job re-materializing its own uv/go/npm/pip caches
 # inside its worktree. Enabled by default; the shared dir is created on first
 # use and is never swept by worktree teardown.
@@ -154,7 +154,7 @@ artifact_blobs = %q
 # [remote_exec] selects the execution backend — WHERE a job's runtime
 # subprocess executes (#1535 contract, #1536). "local" is the default and a
 # byte-for-byte passthrough to the existing runner composition (subprocess
-# GroupRunner innermost; credential-gateway and Landlock produce wrappers
+# GroupRunner innermost; credential-gateway and Landlock seat wrappers
 # unchanged). "remote" runs shell implementation jobs in an E2B sandbox; all
 # unsupported routes fail loudly instead of falling back to the host. With no
 # [remote_exec] section behavior is byte-identical. Any other value FAILS THE
@@ -212,16 +212,6 @@ default_implement_timeout = ""
 default_review_timeout = ""
 default_gate_timeout = ""
 default_repair_timeout = ""
-
-# [pipeline_remote] is the OPTIONAL default GitHub repo used by pipeline
-# publish / pull when --remote is omitted (#941). repo is owner/repo; ref
-# defaults to "main"; path defaults to "pipelines". Pipeline bundles carry
-# agent names, runtimes, and template references — never template prompt
-# bodies (#2204 removed template distribution).
-[pipeline_remote]
-repo = ""
-ref = ""
-path = ""
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
@@ -289,7 +279,7 @@ path = ""
 # runtime's metadata — it cannot add a new first-class runtime (that is a code
 # change); an unknown runtime name here is an error. default_model/default_effort
 # are surfaced by 'runtime list' AND used as delivery fallbacks; models is the
-# advisory known-valid list; capabilities is a subset of review/implement/ask/produce;
+# advisory known-valid list; capabilities is a subset of review/implement/ask;
 # usage_source is a human-readable descriptor.
 # [runtimes.codex]
 # default_model = "gpt-5.5-codex"

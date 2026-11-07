@@ -396,10 +396,6 @@ func (a OmpAdapter) Health(ctx context.Context, agent Agent) error {
 	return err
 }
 
-// Capabilities excludes "produce": the produce path runs the runtime under
-// Gitmoot's Landlock wrapper, and omp ships as a Bun binary whose sandbox
-// interaction is unprobed. Advertising a capability before it is proven would turn
-// an unknown into a silent stage failure.
 func (a OmpAdapter) Capabilities(context.Context) ([]string, error) {
 	return []string{"review", "implement", "ask"}, nil
 }
@@ -597,7 +593,7 @@ func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bo
 	return append(args, "--", prompt)
 }
 
-// ompWorkspaceArgs grants the agent's produce paths as additional workspace roots,
+// ompWorkspaceArgs grants the agent's additive paths as additional workspace roots,
 // writable first then readable — the same ordering kimi uses. These are
 // cooperative visibility hints for omp's own file layer and NOT an enforcement
 // boundary: --add-dir does not make the readable subset read-only. Ordinary

@@ -30,8 +30,8 @@ its `agent_templates` store row.
 ## Jobs
 
 Jobs are units of routed work. They can come from PR comments, local
-`agent ask`/`agent review` dispatches, heartbeat schedules, pipeline stages,
-retries, or merge actions. A seat's own implementation is also a job — not a
+`agent ask`/`agent review` dispatches, heartbeat schedules, retries, or merge
+actions. A seat's own implementation is also a job — not a
 dispatched one: `gitmoot job record --type implement` writes the row after the
 fact, which is how 568 of the last 570 implement rows arrived.
 

@@ -34,9 +34,7 @@ type RuntimeMetadata struct {
 	// change (its behavior is code; only its metadata is data). This field exists
 	// so that invariant is explicit and testable rather than implied.
 	Dispatchable bool
-	// Capabilities are the job actions the runtime's adapter advertises. Every
-	// Codex, Claude, and Kimi advertise produce. Claude/Kimi dispatch remains
-	// fail-closed unless Gitmoot's native Landlock launch sandbox probes healthy.
+	// Capabilities are the job actions the runtime's adapter advertises.
 	Capabilities []string
 	// DefaultModel is the runtime's configured default model, surfaced by
 	// `gitmoot runtime list` AND consulted at delivery (#652): when NEITHER the
@@ -131,7 +129,7 @@ func newBuiltinRegistry() Registry {
 		{
 			Name:         CodexRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask", "produce"},
+			Capabilities: []string{"review", "implement", "ask"},
 			UsageSource:  "codex `exec --json` turn.completed usage (session-cumulative on a resumed thread)",
 			Description:  "OpenAI Codex CLI (exec/resume, sandbox policy, session index)",
 			Contract:     codexRuntimeContract,
@@ -139,7 +137,7 @@ func newBuiltinRegistry() Registry {
 		{
 			Name:         ClaudeRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask", "produce"},
+			Capabilities: []string{"review", "implement", "ask"},
 			UsageSource:  "claude `--output-format json` result envelope usage object",
 			Description:  "Anthropic Claude Code CLI (session-id/resume, permission modes, transient-retry)",
 			Contract:     claudeRuntimeContract,
@@ -147,7 +145,7 @@ func newBuiltinRegistry() Registry {
 		{
 			Name:         KimiRuntime,
 			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask", "produce"},
+			Capabilities: []string{"review", "implement", "ask"},
 			UsageSource:  "kimi `--output-format stream-json` usage event (kimi-code 0.19.2 emits none -> 0)",
 			Description:  "Kimi Code CLI (prompt mode, stream-json, per-job fresh session)",
 			Contract:     kimiRuntimeContract,
@@ -247,10 +245,11 @@ func (r Registry) ApplyOverrides(overrides []MetadataOverride) (Registry, error)
 			meta.Models = append([]string(nil), override.Models...)
 		}
 		if override.CapabilitiesSet {
-			if err := validateRuntimeCapabilities(override.Capabilities); err != nil {
+			capabilities := withoutRetiredCapabilities(override.Capabilities)
+			if err := validateRuntimeCapabilities(capabilities); err != nil {
 				return Registry{}, fmt.Errorf("[runtimes.%s].capabilities: %w", name, err)
 			}
-			meta.Capabilities = append([]string(nil), override.Capabilities...)
+			meta.Capabilities = capabilities
 		}
 		if override.UsageSourceSet {
 			meta.UsageSource = strings.TrimSpace(override.UsageSource)
@@ -263,7 +262,23 @@ func (r Registry) ApplyOverrides(overrides []MetadataOverride) (Registry, error)
 // runtimeCapabilities is the closed set of job actions a runtime may advertise.
 // It matches the actions the dispatch layer understands; a config override that
 // names anything else is rejected so a typo cannot silently disable a capability.
-func runtimeCapabilities() []string { return []string{"review", "implement", "ask", "produce"} }
+func runtimeCapabilities() []string { return []string{"review", "implement", "ask"} }
+
+// retiredRuntimeCapability is the "produce" action, which only pipeline stages
+// dispatched and which left with pipelines (#2542). Runtime capabilities are
+// inspection-only metadata, so an existing config.toml that still lists it keeps
+// loading: the entry is dropped rather than rejected as a typo.
+const retiredRuntimeCapability = "produce"
+
+func withoutRetiredCapabilities(capabilities []string) []string {
+	out := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		if strings.TrimSpace(capability) != retiredRuntimeCapability {
+			out = append(out, capability)
+		}
+	}
+	return out
+}
 
 func validateRuntimeCapabilities(capabilities []string) error {
 	allowed := map[string]bool{}

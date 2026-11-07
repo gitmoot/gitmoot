@@ -17,7 +17,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -121,11 +120,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// no heartbeat sections the scan returns before any store touch. Skip it under
 		// --dry-run (no worker loop runs there, so an enqueued job would just sit).
 		heartbeatEnqueue := newHeartbeatEnqueuer(store, home)
-		// Pipeline schedules (#681) run the same way: the scan advances in-flight runs
-		// and fires due interval schedules, reusing the normal job queue. Off-by-default
-		// (no pipelines => an empty list before any state touch) and skipped under
-		// --dry-run for the same reason.
-		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 		sqliteMaintenance := &sqliteMaintenanceState{}
 		designNotes := &designNotesSweepState{}
 		for {
@@ -140,8 +134,8 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 			if err != nil {
 				return err
 			}
-			// Per-repo idle decay gates GitHub calls only. Heartbeats, pipelines,
-			// and other supervisor maintenance still wake at base cadence.
+			// Per-repo idle decay gates GitHub calls only. Heartbeats and other
+			// supervisor maintenance still wake at base cadence.
 			if wait > baseInterval {
 				wait = baseInterval
 			}
@@ -163,23 +157,6 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
-				}
-				if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
-					writeLine(stdout, "pipeline scan error: %s", err)
-				}
-				// Decouple the pipeline-advance cadence from the repo-poll backoff
-				// (#697): `wait` is the poller's cadence, which grows to minutes when
-				// repo polling backs off, and it would otherwise throttle the pipeline
-				// advancer to that same rate. While any run is in flight, cap the sleep
-				// to the configured (non-backed-off) poll interval so settled stages
-				// fold promptly. NOTE (#911): the idle-decay clamp above already caps
-				// `wait` at the base interval on every pass, so this guard is now a
-				// second, narrower ceiling; it still only reduces the sleep, never
-				// extends it.
-				if inFlight, err := pipeline.PipelineRunsInFlight(ctx, store); err != nil {
-					writeLine(stdout, "pipeline in-flight check error: %s", err)
-				} else {
-					wait = pipeline.PipelineAdvanceWait(wait, live.pollInterval(), inFlight)
 				}
 			}
 			timer := time.NewTimer(wait)
@@ -270,12 +247,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		startTranscriptRetentionLoop(ctx, heartbeatPaths, store, stdout)
 		startRuntimeCollectionLoop(ctx, heartbeatPaths, stdout)
 	}
-	// Pipeline schedules (#681) fire in the single-repo daemon too, or a single-repo
-	// daemon would silently never advance/schedule pipelines. Off-by-default: with no
-	// pipelines the scan returns an empty list before any state touch. Unlike the
-	// heartbeat scan it needs no config paths (it reads the DB), so a paths failure
-	// does not disable it.
-	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 	sqliteMaintenance := &sqliteMaintenanceState{}
 	designNotes := &designNotesSweepState{}
 	// Bounds the poll-error diagnostics below. The poll interval has no minimum, so a
@@ -348,9 +319,6 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if err := runDesignNotesSweepOnce(ctx, store, time.Now().UTC(), designNotes, stdout); err != nil {
 			writeLine(stdout, "design notes sweep error: %s", err)
-		}
-		if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
-			writeLine(stdout, "pipeline scan error: %s", err)
 		}
 		// Read the warm-reloadable poll interval each cycle (#577) so a SIGHUP
 		// change takes effect on the next tick. Fall back to the historical 30s

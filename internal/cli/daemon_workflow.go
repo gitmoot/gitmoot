@@ -13,7 +13,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -59,7 +58,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		ResolveDeliveryWorktree: deliveryWorktreeResolver(store, checkout),
 		RequireWorkflowPolicy:   requireWorkflowPolicyResolverRoot(home),
 		OrgPolicy:               orgPolicyResolverRoot(home),
-		ProduceCheckDir:         checkout,
 		MergeGate:               newDaemonMergeGate(store, gh, checkout, home, runner),
 		ImplementationFinalizer: daemonImplementationFinalizer{Store: store, GitHub: gh, FallbackCheckout: checkout, Runner: runner},
 		// escalate_human (#340): @-tag the human on the tree's PR/issue when a leg
@@ -141,7 +139,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 				}, nil
 		}
 		engine.BeforeReadOnlyWorktreeCleanup = composeBeforeReadOnlyWorktreeCleanupHooks(
-			pipeline.PipelineServiceArtifactPrecleanupHook(store, config.Paths{Home: home}),
 			askReviewDiffPrecleanupHookForRunner(store, runner),
 			reviewRelatedPRPrecleanupHook(store),
 		)

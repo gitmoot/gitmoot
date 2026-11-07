@@ -51,20 +51,3 @@ func emptyText(value string) string {
 	}
 	return value
 }
-
-// repeatedStringFlag collects a flag that may be passed more than once, in order.
-// It moved here from the SkillOpt review command deleted in #1752; `gitmoot
-// pipeline` still uses it for --payload.
-type repeatedStringFlag []string
-
-func (f *repeatedStringFlag) String() string {
-	if f == nil {
-		return ""
-	}
-	return strings.Join(*f, ",")
-}
-
-func (f *repeatedStringFlag) Set(value string) error {
-	*f = append(*f, value)
-	return nil
-}

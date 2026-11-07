@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -96,28 +95,6 @@ func TestPolicyMergeGateRequiresExactModeReconciliation(t *testing.T) {
 			t.Fatalf("decision=%+v merges=%d", decision, len(gh.merges))
 		}
 	})
-}
-
-func TestPipelineAutoMergerRechecksModeReconciliationAtMergeBoundary(t *testing.T) {
-	store, gh, _, _ := newWorkloadModeGateScenario(t)
-	mode := insertOperatingModeDecision(t, store, "STEADY")
-	insertModeReconciliation(t, store, mode, "STEADY", "head123")
-	merger := PipelineAutoMerger{Store: store, GitHub: gh}
-	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
-
-	readiness, err := merger.Evaluate(context.Background(), request)
-	if err != nil || !readiness.Ready {
-		t.Fatalf("Evaluate readiness=%+v err=%v", readiness, err)
-	}
-	insertOperatingModeDecision(t, store, "DRAIN")
-
-	result, err := merger.Merge(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Merge: %v", err)
-	}
-	if result.Merged || len(gh.merges) != 0 || !strings.Contains(result.Reason, "requires reconciliation") {
-		t.Fatalf("result=%+v merges=%d", result, len(gh.merges))
-	}
 }
 
 func TestModeSensitivePullRequestFailsClosedOnMissingPatch(t *testing.T) {
@@ -491,41 +468,6 @@ func TestWorkloadModeGateFindsNotesRecordedWithDifferentRepoCase(t *testing.T) {
 	}
 }
 
-// The merge-boundary recheck must produce a WAITING disposition, not a terminal
-// one: the pipeline folds any !Merged into a blocked stage with "retry
-// stopped", so an owner note landing in the Evaluate->Merge window ended the run
-// and needed a human where the pre-merge path simply waited (#1783 review, F4).
-func TestPipelineAutoMergerHoldsMergeBoundaryAsWaiting(t *testing.T) {
-	store, gh, _, _ := newWorkloadModeGateScenario(t)
-	mode := insertOperatingModeDecision(t, store, "STEADY")
-	insertModeReconciliation(t, store, mode, "STEADY", "head123")
-	merger := PipelineAutoMerger{Store: store, GitHub: gh}
-	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
-	insertOperatingModeDecision(t, store, "DRAIN")
-
-	result, err := merger.Merge(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Merge: %v", err)
-	}
-	if result.Merged || len(gh.merges) != 0 {
-		t.Fatalf("result=%+v merges=%d, want no merge", result, len(gh.merges))
-	}
-	if !result.Waiting {
-		t.Fatalf("a reconciliation hold must be retryable, not terminal: result=%+v", result)
-	}
-
-	// A head drift at the merge boundary stays TERMINAL: the reviewed head is
-	// gone, so no amount of waiting makes this request mergeable.
-	gh.pr.HeadSHA = "head999"
-	drift, err := merger.Merge(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Merge after drift: %v", err)
-	}
-	if drift.Merged || drift.Waiting {
-		t.Fatalf("head drift must not be retryable: result=%+v", drift)
-	}
-}
-
 // A row recorded under ANOTHER repo column is invisible to the repo-scoped
 // lookup, so the coordinator who filed it against the wrong workflow saw only
 // the generic hold with no cause (#1783 review, F2).
@@ -874,124 +816,6 @@ func TestWorkloadModeGateBoundaryToleratesHandWrittenRepoFields(t *testing.T) {
 	}
 }
 
-// F-11 at the SOURCE. The pipeline keys a hold episode's budget on this key, so
-// the key must not move when the operator-facing detail does. Driven through
-// Evaluate, because a pipeline test that injects a key through a stub pins the
-// stub, not the construction.
-func TestPipelineAutoMergerReconciliationKeyIgnoresVolatileDetail(t *testing.T) {
-	store, gh, _, _ := newWorkloadModeGateScenario(t)
-	decision := insertOperatingModeDecision(t, store, "STEADY")
-	// A row for the WRONG head: reconciliation still holds, and the hold's detail
-	// names this row as the near miss.
-	insertModeReconciliation(t, store, decision, "STEADY", "otherhead1")
-	merger := PipelineAutoMerger{Store: store, GitHub: gh}
-	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
-
-	first, err := merger.Evaluate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Evaluate: %v", err)
-	}
-	if !first.ReconciliationHold || strings.TrimSpace(first.ReconciliationKey) == "" {
-		t.Fatalf("readiness = %+v, want a keyed reconciliation hold", first)
-	}
-
-	// Churn in the volatile half: the same hold, same head, same decision, but
-	// the marker patch now reads as ambiguous, which appends a clause to the
-	// detail. The DETAIL must move and the KEY must not.
-	gh.files = []github.PullRequestFile{{
-		Filename: "AGENTS.md",
-		Patch:    "@@ -1 +1 @@\n-**Current mode: DRAIN.**",
-	}}
-	second, err := merger.Evaluate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Evaluate after churn: %v", err)
-	}
-	if second.Reason == first.Reason {
-		t.Fatalf("this fixture must change the detail, or it proves nothing: %q", second.Reason)
-	}
-	if second.ReconciliationKey != first.ReconciliationKey {
-		t.Fatalf("episode key moved with the detail: %q then %q - external churn would reset the hold's budget",
-			first.ReconciliationKey, second.ReconciliationKey)
-	}
-	// And the key must not simply embed the detail, which would key on churn
-	// while comparing equal in this pair by accident.
-	if strings.Contains(first.ReconciliationKey, "otherhead1") || strings.Contains(first.ReconciliationKey, "near") {
-		t.Fatalf("episode key carries near-miss text: %q", first.ReconciliationKey)
-	}
-	for _, want := range []string{"head=head123", "decision-note=" + strconv.FormatInt(decision.ID, 10)} {
-		if !strings.Contains(first.ReconciliationKey, want) {
-			t.Fatalf("episode key %q must name %q", first.ReconciliationKey, want)
-		}
-	}
-}
-
-// Waiting carries a SAFETY PRECONDITION - no GitHub mutation was attempted -
-// because the pipeline RELEASES its at-most-once merge claim on a Waiting
-// return. The type says so, and a comment is not a guard: a mutant that mapped a
-// post-request merge error onto {Waiting: true} passed internal/workflow and
-// internal/pipeline fully green, because nothing pinned the mapping (#1783
-// round-5 review, F-9). A merge API error may have reached GitHub, so it must
-// surface as an ERROR, never as a releasable wait.
-func TestPipelineAutoMergerMergeNeverMapsAMutationErrorToWaiting(t *testing.T) {
-	store, gh, _, _ := newWorkloadModeGateScenario(t)
-	mode := insertOperatingModeDecision(t, store, "STEADY")
-	// Reconciliation satisfied, so Merge reaches the mutation rather than
-	// returning the legitimate reconciliation Waiting before it.
-	insertModeReconciliation(t, store, mode, "STEADY", "head123")
-	mergeErr := errors.New("merge API timed out after the request was sent")
-	gh.mergeErr = mergeErr
-	merger := PipelineAutoMerger{Store: store, GitHub: gh}
-	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
-
-	result, err := merger.Merge(context.Background(), request)
-	if !errors.Is(err, mergeErr) {
-		t.Fatalf("Merge error = %v, want the merge API error to surface", err)
-	}
-	if result.Waiting {
-		t.Fatalf("a refusal that may have reached GitHub must not set Waiting: %+v", result)
-	}
-	if result.Merged {
-		t.Fatalf("a failed merge must not report Merged: %+v", result)
-	}
-}
-
-// The pipeline records and bounds the RECONCILIATION class specifically, so
-// Evaluate must mark it. Without this, the class flag was set in production and
-// asserted only through a pipeline stub, so deleting the production line changed
-// no test (#1783 round-4 review, F-1's second half).
-func TestPipelineAutoMergerEvaluateMarksTheReconciliationHold(t *testing.T) {
-	store, gh, _, _ := newWorkloadModeGateScenario(t)
-	insertOperatingModeDecision(t, store, "STEADY")
-	merger := PipelineAutoMerger{Store: store, GitHub: gh}
-	request := PipelineAutoMergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "head123", Pipeline: "release", RunID: "run-1", StageID: "merge"}
-
-	readiness, err := merger.Evaluate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Evaluate: %v", err)
-	}
-	if !readiness.Waiting || !readiness.ReconciliationHold {
-		t.Fatalf("readiness = %+v, want a marked reconciliation hold", readiness)
-	}
-	if !strings.Contains(readiness.Reason, "requires reconciliation") {
-		t.Fatalf("readiness reason = %q", readiness.Reason)
-	}
-
-	// A NON-reconciliation wait must NOT carry the class, or the pipeline would
-	// bound CI waits too.
-	pending, pendingGH, _, _ := newWorkloadModeGateScenario(t)
-	mode := insertOperatingModeDecision(t, pending, "STEADY")
-	insertModeReconciliation(t, pending, mode, "STEADY", "head123")
-	pendingGH.pr.Mergeable = nil
-	pendingMerger := PipelineAutoMerger{Store: pending, GitHub: pendingGH}
-	pendingReadiness, err := pendingMerger.Evaluate(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Evaluate (mergeability unknown): %v", err)
-	}
-	if !pendingReadiness.Waiting || pendingReadiness.ReconciliationHold {
-		t.Fatalf("a mergeability wait must not be a reconciliation hold: %+v", pendingReadiness)
-	}
-}
-
 // #1783 round-6 review, P2a. A note whose body PARSES but whose repo= field does
 // not confirm this repository, while its repo COLUMN says it IS this
 // repository's, used to satisfy neither arm of latestOperatingModeDecision and
@@ -1047,51 +871,5 @@ func TestWorkloadModeGateFindsTheDecisionBehindRepolessNotes(t *testing.T) {
 	if !decision.Merged || len(gh.merges) != 1 {
 		t.Fatalf("this repository's decision must survive unrelated repo-less traffic: decision=%+v merges=%d reason=%q",
 			decision, len(gh.merges), decision.Reason.Render())
-	}
-}
-
-// #1783 round-6 review, P2c. Every unreadable decision reported decisionID
-// "none", so two DIFFERENT malformed notes at one head produced the same hold
-// key. run.go reuses the earliest matching hold timestamp, so the second
-// decision inherited the first one's elapsed budget. A new decision - readable
-// or not - starts a new episode, and the key is what carries that.
-func TestWorkloadModeGateGivesEachUnreadableDecisionItsOwnEpisode(t *testing.T) {
-	// ONE store, two successive unreadable decisions - the real scenario. A fresh
-	// store per arm would hand both notes the same rowid and prove nothing about
-	// the key; the first version of this test did exactly that and failed for that
-	// reason rather than for the defect.
-	//
-	// ensureWorkloadModeReconciled is the function the merge gate calls and the
-	// one that MINTS the episode key; the key is not carried on MergeDecision, so
-	// this reads it where production produces it.
-	store, gh, _, request := newWorkloadModeGateScenario(t)
-	insertRawModeReconciliation(t, store, "STEADY", "head123", "none")
-	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
-	keyNow := func(t *testing.T) string {
-		t.Helper()
-		required, reconciled, hold, err := ensureWorkloadModeReconciled(
-			context.Background(), store, gh, repo, int64(request.PullRequest), "head123")
-		if err != nil {
-			t.Fatalf("ensureWorkloadModeReconciled: %v", err)
-		}
-		if !required || reconciled {
-			t.Fatalf("an unreadable decision must be required-and-unreconciled: required=%v reconciled=%v", required, reconciled)
-		}
-		return hold.key
-	}
-	firstNote := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=DRAIN urgent]")
-	first := keyNow(t)
-	secondNote := insertRawOperatingMode(t, store, "gitmoot/gitmoot", "[operating-mode repo=gitmoot/gitmoot mode=PAUSED]")
-	second := keyNow(t)
-
-	if firstNote.ID == secondNote.ID {
-		t.Fatalf("fixture defect: both notes have id %d, so the key could not differ either way", firstNote.ID)
-	}
-	if first == "" || second == "" {
-		t.Fatalf("both holds must carry an episode key: %q / %q", first, second)
-	}
-	if first == second {
-		t.Fatalf("unreadable decisions %d and %d shared one episode key %q, so the second inherits the first's elapsed budget",
-			firstNote.ID, secondNote.ID, first)
 	}
 }

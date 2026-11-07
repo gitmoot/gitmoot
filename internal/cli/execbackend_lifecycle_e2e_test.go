@@ -707,10 +707,10 @@ func TestLocalExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
 	expectedSHA := filepath.Join(t.TempDir(), "backend.sha256")
 	backendPWD := filepath.Join(t.TempDir(), "backend.pwd")
 	toolCacheEnvFile := filepath.Join(t.TempDir(), "tool-cache.env")
-	script := `printf 'UV_CACHE_DIR=%s\nPIP_CACHE_DIR=%s\nnpm_config_cache=%s\nGOCACHE=%s\nGOMODCACHE=%s\n' "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$npm_config_cache" "$GOCACHE" "$GOMODCACHE" > "$TOOL_CACHE_ENV_FILE"
+	script := `printf 'UV_CACHE_DIR=%s\nPIP_CACHE_DIR=%s\nnpm_config_cache=%s\nGOCACHE=%s\nGOMODCACHE=%s\n' "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$npm_config_cache" "$GOCACHE" "$GOMODCACHE" > '` + toolCacheEnvFile + `'
 printf 'backend\000produced\377bytes\n' > artifact.bin
-sha256sum artifact.bin | cut -d ' ' -f 1 > "$EXPECTED_SHA"
-pwd > "$BACKEND_PWD"
+sha256sum artifact.bin | cut -d ' ' -f 1 > '` + expectedSHA + `'
+pwd > '` + backendPWD + `'
 printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend bytes produced","findings":[],"changes_made":["created artifact.bin"],"tests_run":[],"needs":[],"delegations":[]}}'`
 	seedDaemonWorkerAgent(t, store, "local-coder", runtime.ShellRuntime, script, []string{"ask", "implement"}, "owner/repo")
 	if err := store.UpsertTask(ctx, db.Task{
@@ -734,7 +734,6 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend byte
 		Repo: "owner/repo", Branch: branch, GoalID: "goal-local-backend", TaskID: "task-local-backend",
 		TaskTitle: "Local backend", WorktreePath: checkout, HeadSHA: baseHEAD,
 		ParentJobID: parent.ID, DelegationID: "local-roundtrip", DelegationDepth: 1, DelegatedBy: "local-coder", RootJobID: parent.ID,
-		ShellEnv: []string{"EXPECTED_SHA=" + expectedSHA, "BACKEND_PWD=" + backendPWD, "TOOL_CACHE_ENV_FILE=" + toolCacheEnvFile},
 	})
 	if err != nil {
 		t.Fatal(err)

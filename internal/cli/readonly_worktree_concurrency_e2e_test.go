@@ -447,7 +447,7 @@ func TestBackgroundAskRejectsMutationBeforeWorktreeCleanupE2E(t *testing.T) {
 	if persisted.ReadOnlyWorktreeDiff != "" || persisted.ReadOnlyWorktreeDiffTruncated || persisted.ReadOnlyWorktreeDiffError != "" {
 		t.Fatalf("denied mutation produced diff metadata: %+v", persisted)
 	}
-	if got := gitOutput(t, checkout, "status", "--porcelain"); got != "" {
+	if got := gitOutputForTest(t, checkout, "status", "--porcelain"); got != "" {
 		t.Fatalf("registered checkout was mutated: %q", got)
 	}
 	if n := countCLIJobEvents(t, store, out.JobID, "delegation_worktree_removed"); n != 1 {

@@ -378,27 +378,6 @@ read-only seat is deliberately NOT observed — it reads a staged clone inside i
 own writable cache root, which the child may legitimately rewrite, and gitmoot
 never grants a seat read or write access to the live profile.
 
-A Claude `produce` stage does NOT run against the operator profile. The daemon
-copies `.credentials.json` and `settings.json` from the configured account
-(`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a job-private profile, points the
-runtime's `CLAUDE_CONFIG_DIR` and `XDG_CACHE_HOME` at that job-private state root
-under `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` — one directory per
-dispatch, so two runs of one job id cannot wipe each other — and removes it when
-the job finishes. The operator profile is never granted writable and is never
-named in any read grant, so a token the runtime refreshes mid-job lands in the
-discarded copy: re-login on the host, not in the job. It may still be READABLE:
-an agent that declares no readable paths falls back to a read-only grant over
-`/`, which is a read, never a write.
-
-Only those two files cross into a produce job. Everything else in the operator
-profile — `agents/`, `commands/`, `plugins/`, `CLAUDE.md`, `settings.local.json`,
-`~/.claude.json` — deliberately does not, so a produce job sees runtime defaults
-rather than operator customisation. A profile that does not exist yet is valid
-and starts the job with an empty one. A `settings.json` that is symlinked is
-followed; one that is empty, holds a non-object, or is not a file at all is
-SKIPPED rather than failing the job. An unusable `.credentials.json` does fail
-the job, because it decides which account the work runs as.
-
 `sandbox-exec: sandbox read path "…": no such file or directory` means a path
 granted to the sandbox does not exist on disk. Explicit read grants are required,
 not skipped — check `readable_paths` in `gitmoot job show <job-id> --json` and
@@ -607,7 +586,7 @@ quarantined cleanup count in its top-level `worktrees` field.
 `[workflow].delegation_worktree_ttl = "72h"` supplies the default aged-cleanup
 grace period; `"0"` disables aged cleanup. Ordinary and aged cleanup share the
 same producer safety gate. Terminal state alone is insufficient: blocked,
-resumable or undispatched consumers, unfinished pipelines, unknown liveness or
+resumable or undispatched consumers, unknown liveness or
 ownership, and preservation failures retain the resource. Succeeded owners need
 a stored result; failed/cancelled owners additionally need a proven
 reconstruction path (currently a pinned native read-only PR review). Cleanup
@@ -679,7 +658,7 @@ either removal. Investigate the ownership overlap; do not bypass the shared gate
 
 `retry_disposition_unknown` means the failed/cancelled owner has no proven
 reconstruction path. Only exact-head native read-only PR reviews currently have
-that proof. Failed/cancelled implement legs, produce stages and shell stages
+that proof. Failed/cancelled implement legs and every other unproven owner
 retain their workspaces and owned branches indefinitely, even after TTL expiry.
 This is intentional: TTL is not a maximum retention or disk-cap guarantee.
 Repeated aged scans may continue to discover these retained jobs; a skip event
@@ -688,11 +667,7 @@ and no force-disposal command is provided. Inspect the job and escalate disk
 capacity to its owner; retry only when the work should genuinely resume. Do not
 retry just to discard evidence or bypass the gate with direct deletion.
 
-Publication does not wait for deletion eligibility. Blocked downstream stages
-can receive their inputs while the producer workspace remains; required service
-outputs have immutable generation snapshots under
-`$GITMOOT_HOME/cleanup-artifacts/`. Missing or changed required evidence refuses
-deletion. Receipts remain in the producer database outside disposable paths.
+Receipts remain in the producer database outside disposable paths.
 
 A completed token replays as `already_removed` without touching a new tree at
 the same path. An unfinished historical episode replaced by retry becomes
@@ -733,9 +708,8 @@ list --state quarantined` and reopen a repaired target with
 `gitmoot job cleanup reopen <resource-id>`.
 Checkout contention defers both ordinary and aged cleanup without spending the
 failure budget. Persisted error text uses the existing credential-redaction
-policy. Aged selection uses the current generation's recorded terminal time;
-artifact publication does not restart retention, and an older generation's
-completion cannot suppress cleanup of its replacement.
+policy. Aged selection uses the current generation's recorded terminal time,
+and an older generation's completion cannot suppress cleanup of its replacement.
 
 Repeated terminal-task failures log three times per path before identical
 messages are suppressed. The terminal-task pass proves at most eight candidates

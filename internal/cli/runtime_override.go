@@ -117,7 +117,7 @@ func overrideRuntimeSessionResourceKey(agent runtime.Agent) (string, bool) {
 // key for a shell-override stage that runs in its OWN detached worktree, or
 // ok=false for any other job (leaving the normal key derivation in force).
 //
-// A pipeline shell stage runs as a runtime override, so it takes the bounded
+// A shell stage runs as a runtime override, so it takes the bounded
 // override key runtime:shell:<hash(cmd)> (overrideRuntimeSessionResourceKey).
 // That key exists (#531) ONLY so the lock provably names the OVERRIDE runtime
 // and can never collide with the agent's default-runtime session lock —

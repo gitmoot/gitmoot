@@ -608,14 +608,6 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 	if !contains(agent.Capabilities, request.Action) && !allowMissingCapability {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
 	}
-	if request.Action == "produce" {
-		if request.Sender != PipelineJobSender {
-			return e.block(ctx, ref, "job action produce is reserved for pipeline stages")
-		}
-		if err := runtime.ProduceDispatchError(request.Action, runtime.Agent{Name: agent.Name, Runtime: agent.Runtime, AutonomyPolicy: agent.AutonomyPolicy}); err != nil {
-			return e.block(ctx, ref, err.Error())
-		}
-	}
 	if request.Action == "implement" {
 		// Fail-closed: an implement job whose agent grants no headless write
 		// (auto/empty or read-only) is BLOCKED here — at the universal dispatch

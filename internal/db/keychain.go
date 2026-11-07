@@ -8,24 +8,18 @@ import (
 	"strings"
 )
 
-const (
-	KeychainModeInjected = "injected"
-	KeychainModeProxied  = "proxied"
+// KeychainModeProxied is the only mode a new key can take: the value is served
+// to an upstream through the credential gateway and never enters a job's
+// environment. Rows written before #2542 may still carry mode "injected"; they
+// list, show and remove like any other row.
+const KeychainModeProxied = "proxied"
 
+const (
 	KeychainProxyAuthBearer = "bearer"
 	KeychainProxyAuthHeader = "header"
-
-	KeychainConsumerPipeline = "pipeline"
-	KeychainConsumerAgent    = "agent"
 )
 
-var (
-	ErrKeychainKeyNotFound       = errors.New("keychain key not found")
-	ErrKeychainConsumerNotFound  = errors.New("keychain consumer not found")
-	ErrKeychainProxyUnconfigured = errors.New("proxied key is not configured")
-	ErrKeychainAgentInjected     = errors.New("agent grants require proxied mode")
-	ErrKeychainKeyHasGrants      = errors.New("keychain key still has grants")
-)
+var ErrKeychainKeyNotFound = errors.New("keychain key not found")
 
 // KeychainKey is value-free registry metadata. Credential bytes never enter
 // SQLite; callers load them from the separately validated keychain file.
@@ -48,31 +42,14 @@ func (k KeychainKey) ProxyConfigured() bool {
 	return k.ProxyAuthKind == KeychainProxyAuthHeader && strings.TrimSpace(k.ProxyHeader) != ""
 }
 
-// KeychainGrant authorizes one named pipeline or registered agent seat to use
-// one registered key. Agent grants are proxied-only.
-type KeychainGrant struct {
-	ConsumerKind string `json:"consumer_kind"`
-	ConsumerID   string `json:"consumer_id"`
-	KeyName      string `json:"key_name"`
-	CreatedAt    string `json:"created_at"`
-}
-
-func validKeychainMode(mode string) bool {
-	return mode == KeychainModeInjected || mode == KeychainModeProxied
-}
-
-func validKeychainConsumer(kind string) bool {
-	return kind == KeychainConsumerPipeline || kind == KeychainConsumerAgent
-}
-
 func (s *Store) AddKeychainKey(ctx context.Context, name, mode string) (KeychainKey, error) {
 	name = strings.TrimSpace(name)
 	mode = strings.TrimSpace(mode)
 	if name == "" {
 		return KeychainKey{}, errors.New("keychain key name is required")
 	}
-	if !validKeychainMode(mode) {
-		return KeychainKey{}, fmt.Errorf("invalid keychain mode %q; use injected or proxied", mode)
+	if mode != KeychainModeProxied {
+		return KeychainKey{}, fmt.Errorf("invalid keychain mode %q; use proxied", mode)
 	}
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO keychain_keys(name, mode) VALUES (?, ?)`, name, mode); err != nil {
 		return KeychainKey{}, err
@@ -176,192 +153,17 @@ func nullableProxyHeader(header string) any {
 	return header
 }
 
-func (s *Store) ListKeychainGrants(ctx context.Context, keyName string) ([]KeychainGrant, error) {
-	query := `SELECT consumer_kind, consumer_id, key_name, created_at FROM keychain_grants`
-	var args []any
-	if keyName = strings.TrimSpace(keyName); keyName != "" {
-		query += ` WHERE key_name = ?`
-		args = append(args, keyName)
-	}
-	query += ` ORDER BY key_name, consumer_kind, consumer_id`
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var grants []KeychainGrant
-	for rows.Next() {
-		var grant KeychainGrant
-		if err := rows.Scan(&grant.ConsumerKind, &grant.ConsumerID, &grant.KeyName, &grant.CreatedAt); err != nil {
-			return nil, err
-		}
-		grants = append(grants, grant)
-	}
-	return grants, rows.Err()
-}
-
-func (s *Store) ListKeychainGrantsForConsumer(ctx context.Context, kind, id string) ([]KeychainGrant, error) {
-	kind = strings.TrimSpace(kind)
-	id = strings.TrimSpace(id)
-	if !validKeychainConsumer(kind) || id == "" {
-		return nil, errors.New("keychain consumer must be a named pipeline or registered agent")
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT consumer_kind, consumer_id, key_name, created_at
-		FROM keychain_grants WHERE consumer_kind = ? AND consumer_id = ? ORDER BY key_name`, kind, id)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var grants []KeychainGrant
-	for rows.Next() {
-		var grant KeychainGrant
-		if err := rows.Scan(&grant.ConsumerKind, &grant.ConsumerID, &grant.KeyName, &grant.CreatedAt); err != nil {
-			return nil, err
-		}
-		grants = append(grants, grant)
-	}
-	return grants, rows.Err()
-}
-
-// GetGrantedKey checks grant existence and current registry mode in one query.
-// Delivery uses this immediately before loading the value to fail closed after
-// a revoke or metadata change.
-func (s *Store) GetGrantedKey(ctx context.Context, kind, id, name string) (KeychainKey, bool, error) {
-	kind = strings.TrimSpace(kind)
-	id = strings.TrimSpace(id)
+// RemoveKeychainKey removes metadata only. The operator-owned keychain file is
+// deliberately untouched.
+func (s *Store) RemoveKeychainKey(ctx context.Context, name string) (bool, error) {
 	name = strings.TrimSpace(name)
-	if !validKeychainConsumer(kind) || id == "" || name == "" {
-		return KeychainKey{}, false, errors.New("keychain grant requires a pipeline or agent consumer and key name")
+	if name == "" {
+		return false, errors.New("keychain key name is required")
 	}
-	var key KeychainKey
-	err := s.db.QueryRowContext(ctx, `SELECT k.name, k.mode,
-		COALESCE(k.proxy_upstream, ''), COALESCE(k.proxy_auth_kind, ''), COALESCE(k.proxy_header, ''), k.created_at
-		FROM keychain_keys k
-		JOIN keychain_grants g ON g.key_name = k.name
-		WHERE g.consumer_kind = ? AND g.consumer_id = ? AND g.key_name = ?`, kind, id, name).
-		Scan(&key.Name, &key.Mode, &key.ProxyUpstream, &key.ProxyAuthKind, &key.ProxyHeader, &key.CreatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return KeychainKey{}, false, nil
-	}
-	return key, err == nil, err
-}
-
-func (s *Store) GrantKeychainKey(ctx context.Context, kind, id, name string) (bool, error) {
-	kind = strings.TrimSpace(kind)
-	id = strings.TrimSpace(id)
-	name = strings.TrimSpace(name)
-	if !validKeychainConsumer(kind) || id == "" || name == "" {
-		return false, errors.New("keychain grant requires a named pipeline or registered agent and key")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	if err := requireKeychainConsumerTx(ctx, tx, kind, id); err != nil {
-		return false, err
-	}
-	var key KeychainKey
-	if err := tx.QueryRowContext(ctx, `SELECT name, mode,
-		COALESCE(proxy_upstream, ''), COALESCE(proxy_auth_kind, ''), COALESCE(proxy_header, ''), created_at
-		FROM keychain_keys WHERE name = ?`, name).
-		Scan(&key.Name, &key.Mode, &key.ProxyUpstream, &key.ProxyAuthKind, &key.ProxyHeader, &key.CreatedAt); errors.Is(err, sql.ErrNoRows) {
-		return false, ErrKeychainKeyNotFound
-	} else if err != nil {
-		return false, err
-	}
-	if kind == KeychainConsumerAgent && key.Mode != KeychainModeProxied {
-		return false, ErrKeychainAgentInjected
-	}
-	if key.Mode == KeychainModeProxied && !key.ProxyConfigured() {
-		return false, ErrKeychainProxyUnconfigured
-	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO keychain_grants(consumer_kind, consumer_id, key_name) VALUES (?, ?, ?)`, kind, id, name)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	return affected == 1, nil
-}
-
-func (s *Store) RevokeKeychainKey(ctx context.Context, kind, id, name string) (bool, error) {
-	kind = strings.TrimSpace(kind)
-	id = strings.TrimSpace(id)
-	name = strings.TrimSpace(name)
-	if !validKeychainConsumer(kind) || id == "" || name == "" {
-		return false, errors.New("keychain revoke requires a named pipeline or registered agent and key")
-	}
-	if kind == KeychainConsumerAgent {
-		if err := requireKeychainConsumer(ctx, s.db, kind, id); err != nil {
-			return false, err
-		}
-	}
-	result, err := s.db.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = ? AND consumer_id = ? AND key_name = ?`, kind, id, name)
+	result, err := s.db.ExecContext(ctx, `DELETE FROM keychain_keys WHERE name = ?`, name)
 	if err != nil {
 		return false, err
 	}
 	affected, err := result.RowsAffected()
 	return affected == 1, err
-}
-
-func requireKeychainConsumerTx(ctx context.Context, tx *sql.Tx, kind, id string) error {
-	return requireKeychainConsumer(ctx, tx, kind, id)
-}
-
-func requireKeychainConsumer(ctx context.Context, q rowQuerier, kind, id string) error {
-	table := "pipelines"
-	if kind == KeychainConsumerAgent {
-		table = "agents"
-	}
-	var exists int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE name = ?`, id).Scan(&exists); err != nil {
-		return err
-	}
-	if exists == 0 {
-		return ErrKeychainConsumerNotFound
-	}
-	return nil
-}
-
-// RemoveKeychainKey removes metadata only. The operator-owned keychain file is
-// deliberately untouched. Forced removal deletes grants in the same transaction.
-func (s *Store) RemoveKeychainKey(ctx context.Context, name string, force bool) (removed bool, grantsRemoved int, err error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return false, 0, errors.New("keychain key name is required")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, 0, err
-	}
-	defer tx.Rollback()
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM keychain_grants WHERE key_name = ?`, name).Scan(&grantsRemoved); err != nil {
-		return false, 0, err
-	}
-	if grantsRemoved > 0 && !force {
-		return false, grantsRemoved, ErrKeychainKeyHasGrants
-	}
-	if force {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE key_name = ?`, name); err != nil {
-			return false, 0, err
-		}
-	}
-	result, err := tx.ExecContext(ctx, `DELETE FROM keychain_keys WHERE name = ?`, name)
-	if err != nil {
-		return false, 0, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, 0, err
-	}
-	return affected == 1, grantsRemoved, nil
 }

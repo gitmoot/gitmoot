@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -774,37 +773,25 @@ func TestIsClaudeSessionMissing(t *testing.T) {
 	}
 }
 
-func TestCodexSandboxArgsProduceGrants(t *testing.T) {
+func TestCodexSandboxArgsAdditiveGrants(t *testing.T) {
 	agent := Agent{
 		AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
 		ReadablePaths:  []string{"/input/one"},
 		WritablePaths:  []string{"/data/one", "/data/two"},
-		ProduceNetwork: true,
 	}
 	args, _ := codexSandboxArgs(agent, "")
-	want := []string{"--sandbox", "workspace-write", "--add-dir", "/data/one", "--add-dir", "/data/two", "-c", "sandbox_workspace_write.network_access=true"}
+	want := []string{"--sandbox", "workspace-write", "--add-dir", "/data/one", "--add-dir", "/data/two"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("codexSandboxArgs = %v, want %v", args, want)
 	}
 	danger := agent
 	danger.AutonomyPolicy = AutonomyPolicyDangerFullAccess
 	if got, _ := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
-		t.Fatalf("danger-full-access produce args = %v, want no leaked grants", got)
-	}
-	for _, runtimeName := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime} {
-		if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: runtimeName, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err != nil {
-			t.Fatalf("%s produce dispatch error = %v", runtimeName, err)
-		}
-	}
-	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyWorkspaceWrite}); err == nil || !strings.Contains(err.Error(), `runtime "omp"`) {
-		t.Fatalf("non-produce runtime error = %v", err)
-	}
-	if err := ProduceDispatchError("produce", Agent{Name: "p", Runtime: CodexRuntime, AutonomyPolicy: AutonomyPolicyReadOnly}); err == nil || !strings.Contains(err.Error(), "writable autonomy policy") {
-		t.Fatalf("read-only produce error = %v", err)
+		t.Fatalf("danger-full-access args = %v, want no leaked grants", got)
 	}
 }
 
-func TestClaudeKimiProducePermissionArgs(t *testing.T) {
+func TestClaudeKimiAdditivePermissionArgs(t *testing.T) {
 	agent := Agent{
 		AutonomyPolicy: AutonomyPolicyWorkspaceWrite,
 		ReadablePaths:  []string{"/input/one"},
@@ -822,10 +809,10 @@ func TestClaudeKimiProducePermissionArgs(t *testing.T) {
 	withoutPaths.WritablePaths = nil
 	if got, _ := claudePermissionArgs(withoutPaths); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits"}) {
 		want := []string{"--permission-mode", "acceptEdits"}
-		t.Fatalf("non-produce Claude args = %v, want %v", got, want)
+		t.Fatalf("no-grant Claude args = %v, want %v", got, want)
 	}
 	if got := kimiPermissionArgs(withoutPaths); got != nil {
-		t.Fatalf("non-produce Kimi args = %v, want nil", got)
+		t.Fatalf("no-grant Kimi args = %v, want nil", got)
 	}
 }
 
@@ -1645,106 +1632,7 @@ func TestShellDeliverInjectsJobEnvironment(t *testing.T) {
 	if !reflect.DeepEqual(runner.gotEnv, env) {
 		t.Fatalf("RunEnv environment = %#v, want %#v", runner.gotEnv, env)
 	}
-	if strings.Contains(strings.Join(runner.gotEnv, "\n"), "GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE=") {
-		t.Fatalf("empty context injected an upstream file variable: %#v", runner.gotEnv)
-	}
 	runner.want(t, 0, "sh", "-c", "printf ok", "gitmoot", "hello")
-}
-
-func TestShellDeliverUpstreamContextFileLifecycle(t *testing.T) {
-	const contextJSON = `{"schema_version":1,"complete":true,"stages":{"source":{"id":"source","state":"succeeded","summary":"first\n第二","summary_truncated":false}}}`
-	baseEnv := []string{
-		"GITMOOT_PIPELINE_NAME=paper-flow",
-		"GITMOOT_PIPELINE_RUN_ID=prun-1",
-		"GITMOOT_PIPELINE_STAGE_ID=summarize",
-	}
-	for _, tc := range []struct {
-		name    string
-		runErr  error
-		wantErr bool
-	}{
-		{name: "success"},
-		{name: "failure", runErr: errors.New("exit 1"), wantErr: true},
-		{name: "timeout", runErr: context.DeadlineExceeded, wantErr: true},
-		{name: "cancel", runErr: context.Canceled, wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var contextPath string
-			runner := &shellContextRunner{
-				result: subprocess.Result{Stdout: "ok\n"},
-				err:    tc.runErr,
-				inspect: func(env []string) {
-					if len(env) != len(baseEnv)+1 || !reflect.DeepEqual(env[:len(baseEnv)], baseEnv) {
-						t.Fatalf("RunEnv environment = %#v, want metadata plus one file variable", env)
-					}
-					const prefix = "GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE="
-					if !strings.HasPrefix(env[len(baseEnv)], prefix) {
-						t.Fatalf("last env entry = %q, want %s<path>", env[len(baseEnv)], prefix)
-					}
-					contextPath = strings.TrimPrefix(env[len(baseEnv)], prefix)
-					info, err := os.Stat(contextPath)
-					if err != nil {
-						t.Fatalf("context file not present during RunEnv: %v", err)
-					}
-					if info.Mode().Perm() != 0o600 {
-						t.Fatalf("context file mode = %o, want 600", info.Mode().Perm())
-					}
-					got, err := os.ReadFile(contextPath)
-					if err != nil {
-						t.Fatalf("read context file: %v", err)
-					}
-					if string(got) != contextJSON {
-						t.Fatalf("context file = %q, want %q", got, contextJSON)
-					}
-				},
-			}
-			adapter := ShellAdapter{Runner: runner}
-			agent := Agent{Name: "custom", Role: "runner", Runtime: ShellRuntime, RuntimeRef: "printf ok", RepoScope: "owner/repo"}
-			job := Job{Prompt: "unchanged prompt", ShellEnv: baseEnv, ShellUpstreamContext: contextJSON}
-			_, err := adapter.Deliver(context.Background(), agent, job)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("Deliver error = %v, wantErr=%v", err, tc.wantErr)
-			}
-			if contextPath == "" {
-				t.Fatal("RunEnv was not called")
-			}
-			if _, err := os.Stat(contextPath); !os.IsNotExist(err) {
-				t.Fatalf("context file still exists after Deliver: %v", err)
-			}
-			if !reflect.DeepEqual(baseEnv, job.ShellEnv) {
-				t.Fatalf("job ShellEnv mutated: got %#v want %#v", job.ShellEnv, baseEnv)
-			}
-			runner.want(t, "sh", "-c", "printf ok", "gitmoot", "unchanged prompt")
-		})
-	}
-}
-
-func TestShellDeliverUpstreamContextThroughTeeRunner(t *testing.T) {
-	const contextJSON = `{"schema_version":1,"complete":true,"stages":{}}`
-	var streamed strings.Builder
-	adapter := ShellAdapter{Runner: subprocess.TeeRunner{Out: subprocess.SyncWriter(&streamed)}}
-	agent := Agent{Name: "custom", Role: "runner", Runtime: ShellRuntime, RuntimeRef: `test -r "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE" && IFS= read -r value < "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE"; printf '%s' "$value"`, RepoScope: "owner/repo"}
-	result, err := adapter.Deliver(context.Background(), agent, Job{Prompt: "unchanged", ShellUpstreamContext: contextJSON})
-	if err != nil {
-		t.Fatalf("Deliver through TeeRunner: %v", err)
-	}
-	if result.Raw != contextJSON || strings.TrimSuffix(streamed.String(), "\n") != contextJSON {
-		t.Fatalf("TeeRunner lost context: raw=%q streamed=%q", result.Raw, streamed.String())
-	}
-}
-
-func TestUpstreamContextFileErrorRedactsPathAndPreservesErrno(t *testing.T) {
-	const secretPath = "/private/host/tmp/gitmoot-pipeline-upstream-secret.json"
-	err := upstreamContextFileError("write", &os.PathError{Op: "write", Path: secretPath, Err: syscall.ENOSPC})
-	if strings.Contains(err.Error(), secretPath) || strings.Contains(err.Error(), "gitmoot-pipeline-upstream-secret") {
-		t.Fatalf("redacted error leaked path: %v", err)
-	}
-	if !strings.Contains(err.Error(), "<redacted>") || !strings.Contains(err.Error(), "write failed") {
-		t.Fatalf("redacted error lost safe context: %v", err)
-	}
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("redacted error lost errno: %v", err)
-	}
 }
 
 func TestShellStartUnsupported(t *testing.T) {
@@ -1859,13 +1747,6 @@ func (s staticCodexSessions) Exists(context.Context, string) (bool, error) {
 type fakeRunner struct {
 	results []subprocess.Result
 	errs    []error
-	calls   [][]string
-}
-
-type shellContextRunner struct {
-	result  subprocess.Result
-	err     error
-	inspect func([]string)
 	calls   [][]string
 }
 
@@ -2011,29 +1892,6 @@ func TestAgentEnvReachesRuntimeFallbackAttempts(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func (r *shellContextRunner) Run(_ context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
-	return subprocess.Result{}, errors.New("unexpected plain Run")
-}
-
-func (r *shellContextRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
-	r.calls = append(r.calls, append([]string{command}, args...))
-	if r.inspect != nil {
-		r.inspect(env)
-	}
-	return r.result, r.err
-}
-
-func (r *shellContextRunner) LookPath(file string) (string, error) {
-	return "/usr/bin/" + file, nil
-}
-
-func (r *shellContextRunner) want(t *testing.T, want ...string) {
-	t.Helper()
-	if len(r.calls) != 1 || !reflect.DeepEqual(r.calls[0], want) {
-		t.Fatalf("calls = %#v, want [%#v]", r.calls, want)
 	}
 }
 

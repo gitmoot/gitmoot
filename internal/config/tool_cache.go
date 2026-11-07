@@ -96,7 +96,7 @@ func LoadToolCache(paths Paths) (ToolCachePolicy, error) {
 // defaultToolCacheDir joins home with the default subdir and normalizes the
 // result to an absolute path: pathsFromFlag does not itself require --home to
 // be absolute, so home (and therefore this join) can be relative. A relative
-// Dir is rejected outright by Landlock (produce jobs) and, for unsandboxed
+// Dir is rejected outright by Landlock (read-only seats) and, for unsandboxed
 // jobs, would resolve against the CHILD PROCESS's cwd (the worktree checkout)
 // rather than the daemon's — a different absolute path per worktree, silently
 // recreating the exact per-worktree cache duplication this feature exists to

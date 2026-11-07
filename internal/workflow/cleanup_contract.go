@@ -43,33 +43,32 @@ type CleanupConsumer struct {
 }
 
 type CleanupInspection struct {
-	SchemaVersion       int                          `json:"schema_version"`
-	Producer            string                       `json:"producer"`
-	DecisionOwner       string                       `json:"decision_owner"`
-	ObservedAt          string                       `json:"observed_at"`
-	ResourceID          string                       `json:"resource_id"`
-	ResourceKind        string                       `json:"resource_kind"`
-	OwnerJobID          string                       `json:"owner_job_id"`
-	OwnerState          string                       `json:"owner_state"`
-	LifecycleGeneration int64                        `json:"lifecycle_generation"`
-	Repo                string                       `json:"repo"`
-	ExpectedPath        string                       `json:"expected_path"`
-	ResolvedPath        string                       `json:"resolved_path"`
-	OwnedBranch         string                       `json:"owned_branch,omitempty"`
-	Eligible            bool                         `json:"eligible"`
-	ReasonCodes         []string                     `json:"reason_codes"`
-	EligibilityToken    string                       `json:"eligibility_token,omitempty"`
-	Consumers           []CleanupConsumer            `json:"consumers"`
-	PipelineConsumers   []db.CleanupPipelineConsumer `json:"pipeline_consumers"`
-	Policy              CleanupPolicy                `json:"policy"`
-	PolicyHash          string                       `json:"policy_hash"`
-	RetentionDeadline   string                       `json:"retention_deadline,omitempty"`
-	Rebuildable         bool                         `json:"rebuildable"`
-	BudgetGate          string                       `json:"budget_gate"`
-	ApprovedSizeBudget  *ApprovedCleanupSizeBudget   `json:"approved_size_budget"`
-	SizeMeasurement     *CleanupSizeMeasurement      `json:"size_measurement"`
-	Receipt             *db.CleanupReceipt           `json:"receipt,omitempty"`
-	Obligation          *db.CleanupObligation        `json:"obligation,omitempty"`
+	SchemaVersion       int                        `json:"schema_version"`
+	Producer            string                     `json:"producer"`
+	DecisionOwner       string                     `json:"decision_owner"`
+	ObservedAt          string                     `json:"observed_at"`
+	ResourceID          string                     `json:"resource_id"`
+	ResourceKind        string                     `json:"resource_kind"`
+	OwnerJobID          string                     `json:"owner_job_id"`
+	OwnerState          string                     `json:"owner_state"`
+	LifecycleGeneration int64                      `json:"lifecycle_generation"`
+	Repo                string                     `json:"repo"`
+	ExpectedPath        string                     `json:"expected_path"`
+	ResolvedPath        string                     `json:"resolved_path"`
+	OwnedBranch         string                     `json:"owned_branch,omitempty"`
+	Eligible            bool                       `json:"eligible"`
+	ReasonCodes         []string                   `json:"reason_codes"`
+	EligibilityToken    string                     `json:"eligibility_token,omitempty"`
+	Consumers           []CleanupConsumer          `json:"consumers"`
+	Policy              CleanupPolicy              `json:"policy"`
+	PolicyHash          string                     `json:"policy_hash"`
+	RetentionDeadline   string                     `json:"retention_deadline,omitempty"`
+	Rebuildable         bool                       `json:"rebuildable"`
+	BudgetGate          string                     `json:"budget_gate"`
+	ApprovedSizeBudget  *ApprovedCleanupSizeBudget `json:"approved_size_budget"`
+	SizeMeasurement     *CleanupSizeMeasurement    `json:"size_measurement"`
+	Receipt             *db.CleanupReceipt         `json:"receipt,omitempty"`
+	Obligation          *db.CleanupObligation      `json:"obligation,omitempty"`
 	evidence            cleanupEvidence
 }
 
@@ -84,11 +83,10 @@ type cleanupEvidence struct {
 	PathIdentity     string        `json:"path_identity"`
 	// Absent marks the evidence of a resource already gone when its cleanup
 	// was recorded (#2531); it names no path or git identity.
-	Absent            bool                         `json:"absent,omitempty"`
-	Git               gitutil.WorktreeIdentity     `json:"git"`
-	Ancestors         []CleanupConsumer            `json:"ancestors"`
-	Consumers         []CleanupConsumer            `json:"consumers"`
-	PipelineConsumers []db.CleanupPipelineConsumer `json:"pipeline_consumers"`
+	Absent    bool                     `json:"absent,omitempty"`
+	Git       gitutil.WorktreeIdentity `json:"git"`
+	Ancestors []CleanupConsumer        `json:"ancestors"`
+	Consumers []CleanupConsumer        `json:"consumers"`
 }
 
 type cleanupWorktreeInspector interface {
@@ -355,11 +353,6 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 	if job.State == string(JobSucceeded) && payload.Result == nil {
 		return d.refuse("terminal_result_missing"), payload, nil
 	}
-	if payload.CleanupArtifacts != nil {
-		if err := ValidateCleanupArtifactSnapshot(e.Home, d.ResourceID, job.LifecycleGeneration, *payload.CleanupArtifacts); err != nil {
-			return d.refuse("artifact_evidence_unavailable"), payload, nil
-		}
-	}
 	refs, err := e.Store.ListJobWorktreeRefs(ctx)
 	if err != nil {
 		return d, payload, err
@@ -443,20 +436,6 @@ func cleanupBranchOwner(job db.Job, payload JobPayload) string {
 }
 
 func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload, d *CleanupInspection) (string, error) {
-	pipelineConsumers, err := e.Store.ListCleanupPipelineConsumers(ctx, d.OwnerJobID, payload.RootJobID)
-	if err != nil {
-		return "", err
-	}
-	d.PipelineConsumers = pipelineConsumers
-	d.evidence.PipelineConsumers = pipelineConsumers
-	if len(pipelineConsumers) == 0 && (payload.Sender == PipelineJobSender || payload.PipelineName != "" || strings.HasPrefix(payload.RootJobID, "prun-")) {
-		return "pipeline_consumers_unknown", nil
-	}
-	for _, consumer := range pipelineConsumers {
-		if consumer.RunState != "succeeded" || (consumer.State != "succeeded" && consumer.State != "skipped") {
-			return "pipeline_consumer_resumable", nil
-		}
-	}
 	parentID := strings.TrimSpace(payload.ParentJobID)
 	if parentID == "" {
 		return "", nil

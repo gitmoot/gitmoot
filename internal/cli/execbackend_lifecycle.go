@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
@@ -24,9 +23,7 @@ import (
 	remoteexec "github.com/gitmoot/gitmoot/internal/execbackend/remote"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -695,20 +692,10 @@ func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.E
 	}
 }
 
-func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout string, outputs ...io.Writer) (workflow.DeliveryAdapter, error) {
+func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
 	runner := w.executionRunner
 	if runner == nil {
 		return nil, errors.New("execution-backend runtime runner is required")
-	}
-	// Keep the run-scoped base runner so a later live-output adapter rebuild
-	// preserves backend execution.
-	w.executionRunner = runner
-	if len(outputs) > 0 && outputs[0] != nil {
-		stream, ok := runner.(subprocess.StreamRunner)
-		if !ok {
-			return nil, errors.New("execution-backend runtime runner does not support streaming")
-		}
-		runner = subprocess.TeeRunner{Inner: stream, Out: pipeline.RuntimeOutputWriter(outputs...)}
 	}
 	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, runner)
 }

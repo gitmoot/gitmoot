@@ -12,7 +12,7 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 )
 
 // Test-only seam for local httptest upstreams. Production configuration remains
@@ -25,14 +25,9 @@ type keychainPathStatus struct {
 	Detail string `json:"detail,omitempty"`
 }
 
-type keychainKeyOutput struct {
-	db.KeychainKey
-	Grants []db.KeychainGrant `json:"grants"`
-}
-
 type keychainListOutput struct {
-	Keychain keychainPathStatus  `json:"keychain"`
-	Keys     []keychainKeyOutput `json:"keys"`
+	Keychain keychainPathStatus `json:"keychain"`
+	Keys     []db.KeychainKey   `json:"keys"`
 }
 
 func runKey(args []string, stdout, stderr io.Writer) int {
@@ -53,10 +48,6 @@ func runKey(args []string, stdout, stderr io.Writer) int {
 		return runKeyConfigure(args[1:], stdout, stderr)
 	case "rm":
 		return runKeyRemove(args[1:], stdout, stderr)
-	case "grant":
-		return runKeyGrant(args[1:], stdout, stderr)
-	case "revoke":
-		return runKeyRevoke(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown key command %q\n", args[0])
 		printKeyUsage(stderr)
@@ -67,22 +58,20 @@ func runKey(args []string, stdout, stderr io.Writer) int {
 func printKeyUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot key path [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key add <NAME> --mode injected|proxied [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot key add <NAME> --mode proxied [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key list [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key show <NAME> [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot key configure <NAME> --upstream <URL> --auth bearer|header:<HeaderName> [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key rm <NAME> [--force] [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key grant <NAME> (--pipeline <PIPELINE> | --agent <SEAT>) [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot key revoke <NAME> (--pipeline <PIPELINE> | --agent <SEAT>) [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot key rm <NAME> [--json] [--home DIR]")
 }
 
 func inspectKeychain(ctx context.Context, store *db.Store, home string) keychainPathStatus {
-	path, err := pipeline.ResolveKeychainPath(store, home)
+	path, err := keychain.ResolvePath(store, home)
 	if err != nil {
 		return keychainPathStatus{Status: "invalid", Detail: err.Error()}
 	}
 	status := keychainPathStatus{Path: path, Status: "ready"}
-	if _, _, err := pipeline.LoadValidatedKeychainFile(ctx, store, home); err != nil {
+	if _, _, err := keychain.LoadValidated(ctx, store, home); err != nil {
 		status.Status = "invalid"
 		status.Detail = err.Error()
 		if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
@@ -145,10 +134,10 @@ func runKeyPath(args []string, stdout, stderr io.Writer) int {
 }
 
 func validateKeyName(name string) error {
-	if err := pipeline.ValidateEnvName(name); err != nil {
+	if err := keychain.ValidateName(name); err != nil {
 		return fmt.Errorf("invalid key name %q: %w", name, err)
 	}
-	if pipeline.ReservedEnvName(name) {
+	if keychain.ReservedName(name) {
 		return fmt.Errorf("key name %q uses reserved GITMOOT_* namespace", name)
 	}
 	return nil
@@ -168,7 +157,7 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	mode := fs.String("mode", "", "delivery mode: injected or proxied")
+	mode := fs.String("mode", "", "delivery mode: proxied")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -176,18 +165,18 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || *mode == "" {
-		fmt.Fprintln(stderr, "key add requires one name and --mode injected|proxied")
+		fmt.Fprintln(stderr, "key add requires one name and --mode proxied")
 		return 2
 	}
 	if err := validateKeyName(name); err != nil {
 		fmt.Fprintf(stderr, "key add: %v\n", err)
 		return 2
 	}
-	if *mode != db.KeychainModeInjected && *mode != db.KeychainModeProxied {
-		fmt.Fprintf(stderr, "key add: invalid mode %q; use injected or proxied\n", *mode)
+	if *mode != db.KeychainModeProxied {
+		fmt.Fprintf(stderr, "key add: invalid mode %q; use proxied\n", *mode)
 		return 2
 	}
-	var output keychainKeyOutput
+	var output db.KeychainKey
 	var status keychainPathStatus
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -196,7 +185,7 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 		} else if found {
 			return fmt.Errorf("key %s is already registered", name)
 		}
-		path, values, err := pipeline.LoadValidatedKeychainFile(ctx, store, *home)
+		path, values, err := keychain.LoadValidated(ctx, store, *home)
 		if err != nil {
 			return err
 		}
@@ -204,7 +193,7 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 			return fmt.Errorf("key %q is absent or empty in %s", name, path)
 		}
 		key, err := store.AddKeychainKey(ctx, name, *mode)
-		output = keychainKeyOutput{KeychainKey: key, Grants: []db.KeychainGrant{}}
+		output = key
 		status = keychainPathStatus{Path: path, Status: "ready"}
 		return err
 	}); err != nil {
@@ -214,26 +203,11 @@ func runKeyAdd(args []string, stdout, stderr io.Writer) int {
 	if *jsonOut {
 		return encodeKeyJSON(stdout, stderr, struct {
 			Keychain keychainPathStatus `json:"keychain"`
-			Key      keychainKeyOutput  `json:"key"`
+			Key      db.KeychainKey     `json:"key"`
 		}{status, output})
 	}
 	writeLine(stdout, "added key %s (%s)", output.Name, output.Mode)
 	return 0
-}
-
-func keyOutputs(ctx context.Context, store *db.Store, keys []db.KeychainKey) ([]keychainKeyOutput, error) {
-	out := make([]keychainKeyOutput, 0, len(keys))
-	for _, key := range keys {
-		grants, err := store.ListKeychainGrants(ctx, key.Name)
-		if err != nil {
-			return nil, err
-		}
-		if grants == nil {
-			grants = []db.KeychainGrant{}
-		}
-		out = append(out, keychainKeyOutput{KeychainKey: key, Grants: grants})
-	}
-	return out, nil
 }
 
 func runKeyList(args []string, stdout, stderr io.Writer) int {
@@ -248,21 +222,21 @@ func runKeyList(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		output.Keys, err = keyOutputs(ctx, store, keys)
+		output.Keys = keys
 		output.Keychain = inspectKeychain(ctx, store, home)
-		return err
+		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "key list: %v\n", err)
 		return 1
 	}
 	if output.Keys == nil {
-		output.Keys = []keychainKeyOutput{}
+		output.Keys = []db.KeychainKey{}
 	}
 	if jsonOut {
 		return encodeKeyJSON(stdout, stderr, output)
 	}
 	for _, key := range output.Keys {
-		writeLine(stdout, "%s\t%s\t%s\tgrants=%d\tupstream=%s\tauth=%s", key.Name, key.Mode, key.CreatedAt, len(key.Grants), firstNonEmpty(key.ProxyUpstream, "-"), keyProxyAuthLabel(key.KeychainKey))
+		writeLine(stdout, "%s\t%s\t%s\tupstream=%s\tauth=%s", key.Name, key.Mode, key.CreatedAt, firstNonEmpty(key.ProxyUpstream, "-"), keyProxyAuthLabel(key))
 	}
 	return 0
 }
@@ -321,7 +295,7 @@ func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "key configure: %v\n", err)
 		return 2
 	}
-	var output keychainKeyOutput
+	var output db.KeychainKey
 	var status keychainPathStatus
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
@@ -335,15 +309,10 @@ func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
 		if key.Mode != db.KeychainModeProxied {
 			return fmt.Errorf("key %s uses %s mode; key configure requires proxied mode", name, key.Mode)
 		}
-		configured, err := store.ConfigureKeychainProxy(ctx, name, policy.Upstream, string(policy.AuthKind), policy.Header)
+		output, err = store.ConfigureKeychainProxy(ctx, name, policy.Upstream, string(policy.AuthKind), policy.Header)
 		if err != nil {
 			return err
 		}
-		rows, err := keyOutputs(ctx, store, []db.KeychainKey{configured})
-		if err != nil {
-			return err
-		}
-		output = rows[0]
 		status = inspectKeychain(ctx, store, *home)
 		return nil
 	}); err != nil {
@@ -353,10 +322,10 @@ func runKeyConfigure(args []string, stdout, stderr io.Writer) int {
 	if *jsonOut {
 		return encodeKeyJSON(stdout, stderr, struct {
 			Keychain keychainPathStatus `json:"keychain"`
-			Key      keychainKeyOutput  `json:"key"`
+			Key      db.KeychainKey     `json:"key"`
 		}{status, output})
 	}
-	writeLine(stdout, "configured key %s upstream=%s auth=%s", name, output.ProxyUpstream, keyProxyAuthLabel(output.KeychainKey))
+	writeLine(stdout, "configured key %s upstream=%s auth=%s", name, output.ProxyUpstream, keyProxyAuthLabel(output))
 	return 0
 }
 
@@ -405,7 +374,7 @@ func runKeyNamedRead(verb string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "key %s accepts exactly one name\n", verb)
 		return 2
 	}
-	var output keychainKeyOutput
+	var output db.KeychainKey
 	var status keychainPathStatus
 	found := false
 	if err := withStore(*home, func(store *db.Store) error {
@@ -416,11 +385,7 @@ func runKeyNamedRead(verb string, args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		found = true
-		rows, err := keyOutputs(ctx, store, []db.KeychainKey{key})
-		if err != nil {
-			return err
-		}
-		output = rows[0]
+		output = key
 		status = inspectKeychain(ctx, store, *home)
 		return nil
 	}); err != nil {
@@ -434,19 +399,15 @@ func runKeyNamedRead(verb string, args []string, stdout, stderr io.Writer) int {
 	if *jsonOut {
 		return encodeKeyJSON(stdout, stderr, struct {
 			Keychain keychainPathStatus `json:"keychain"`
-			Key      keychainKeyOutput  `json:"key"`
+			Key      db.KeychainKey     `json:"key"`
 		}{status, output})
 	}
 	writeLine(stdout, "name: %s", output.Name)
 	writeLine(stdout, "mode: %s", output.Mode)
 	writeLine(stdout, "proxy_upstream: %s", firstNonEmpty(output.ProxyUpstream, "-"))
-	writeLine(stdout, "proxy_auth: %s", keyProxyAuthLabel(output.KeychainKey))
+	writeLine(stdout, "proxy_auth: %s", keyProxyAuthLabel(output))
 	writeLine(stdout, "created_at: %s", output.CreatedAt)
 	writeLine(stdout, "keychain: %s (%s)", status.Path, status.Status)
-	writeLine(stdout, "grants:")
-	for _, grant := range output.Grants {
-		writeLine(stdout, "  %s:%s", grant.ConsumerKind, grant.ConsumerID)
-	}
 	return 0
 }
 
@@ -464,7 +425,6 @@ func runKeyRemove(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOut := fs.Bool("json", false, "print JSON")
-	force := fs.Bool("force", false, "remove metadata and grants even when grants exist")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -476,145 +436,28 @@ func runKeyRemove(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var removed bool
-	var grantsRemoved int
 	var status keychainPathStatus
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
-		removed, grantsRemoved, err = store.RemoveKeychainKey(context.Background(), name, *force)
+		removed, err = store.RemoveKeychainKey(context.Background(), name)
 		status = inspectKeychain(context.Background(), store, *home)
 		return err
 	}); err != nil {
-		if errors.Is(err, db.ErrKeychainKeyHasGrants) {
-			fmt.Fprintf(stderr, "key rm: key %s has %d grant(s); revoke them or use --force\n", name, grantsRemoved)
-		} else {
-			fmt.Fprintf(stderr, "key rm: %v\n", err)
-		}
+		fmt.Fprintf(stderr, "key rm: %v\n", err)
 		return 1
 	}
 	if *jsonOut {
 		return encodeKeyJSON(stdout, stderr, struct {
 			Name             string             `json:"name"`
 			Removed          bool               `json:"removed"`
-			GrantsRemoved    int                `json:"grants_removed"`
 			FileEntryRemains bool               `json:"file_entry_remains"`
 			Keychain         keychainPathStatus `json:"keychain"`
-		}{name, removed, grantsRemoved, true, status})
+		}{name, removed, true, status})
 	}
 	if !removed {
 		writeLine(stdout, "key %s was not registered; keychain file unchanged", name)
 		return 0
 	}
-	writeLine(stdout, "removed key %s metadata and %d grant(s); entry in %s remains unchanged", name, grantsRemoved, status.Path)
+	writeLine(stdout, "removed key %s metadata; entry in %s remains unchanged", name, status.Path)
 	return 0
-}
-
-func runKeyGrant(args []string, stdout, stderr io.Writer) int {
-	return runKeyGrantMutation(true, args, stdout, stderr)
-}
-
-func runKeyRevoke(args []string, stdout, stderr io.Writer) int {
-	return runKeyGrantMutation(false, args, stdout, stderr)
-}
-
-func runKeyGrantMutation(grant bool, args []string, stdout, stderr io.Writer) int {
-	verb := "grant"
-	if !grant {
-		verb = "revoke"
-	}
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
-		printKeyUsage(stderr)
-		if len(args) == 0 {
-			fmt.Fprintf(stderr, "key %s requires a name\n", verb)
-			return 2
-		}
-		return 0
-	}
-	name := strings.TrimSpace(args[0])
-	fs := flag.NewFlagSet("key "+verb, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOut := fs.Bool("json", false, "print JSON")
-	pipelineName := fs.String("pipeline", "", "pipeline consumer")
-	agentName := fs.String("agent", "", "registered agent seat consumer")
-	if err := fs.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	pipelineID := strings.TrimSpace(*pipelineName)
-	agentID := strings.TrimSpace(*agentName)
-	if fs.NArg() != 0 || (pipelineID == "") == (agentID == "") {
-		fmt.Fprintf(stderr, "key %s requires one name and exactly one of --pipeline <pipeline> or --agent <seat>\n", verb)
-		return 2
-	}
-	consumerKind, consumerID := db.KeychainConsumerPipeline, pipelineID
-	if agentID != "" {
-		consumerKind, consumerID = db.KeychainConsumerAgent, agentID
-	}
-	changed := false
-	if err := withStore(*home, func(store *db.Store) error {
-		ctx := context.Background()
-		if grant {
-			if consumerKind == db.KeychainConsumerPipeline {
-				if _, found, err := store.GetPipeline(ctx, consumerID); err != nil {
-					return err
-				} else if !found {
-					return fmt.Errorf("pipeline %s not found", consumerID)
-				}
-			} else if _, err := store.GetAgent(ctx, consumerID); err != nil {
-				return fmt.Errorf("agent %s not found", consumerID)
-			}
-			key, found, err := store.GetKeychainKey(ctx, name)
-			if err != nil {
-				return err
-			}
-			if !found {
-				return fmt.Errorf("key %s is not registered", name)
-			}
-			if consumerKind == db.KeychainConsumerAgent && key.Mode != db.KeychainModeProxied {
-				return fmt.Errorf("key %s uses injected mode; agent grants are proxied-only", name)
-			}
-			if key.Mode == db.KeychainModeProxied && !key.ProxyConfigured() {
-				return fmt.Errorf("key %s uses proxied mode but is not configured; run %s", name, keyConfigureCommand(name))
-			}
-			path, values, err := pipeline.LoadValidatedKeychainFile(ctx, store, *home)
-			if err != nil {
-				return err
-			}
-			if values[name] == "" {
-				return fmt.Errorf("key %q is absent or empty in %s", name, path)
-			}
-			changed, err = store.GrantKeychainKey(ctx, consumerKind, consumerID, name)
-			return err
-		}
-		var err error
-		changed, err = store.RevokeKeychainKey(ctx, consumerKind, consumerID, name)
-		return err
-	}); err != nil {
-		fmt.Fprintf(stderr, "key %s: %v\n", verb, err)
-		return 1
-	}
-	if *jsonOut {
-		return encodeKeyJSON(stdout, stderr, struct {
-			Name     string `json:"name"`
-			Pipeline string `json:"pipeline,omitempty"`
-			Agent    string `json:"agent,omitempty"`
-			Changed  bool   `json:"changed"`
-		}{name, pipelineID, agentID, changed})
-	}
-	past := "granted"
-	if !grant {
-		past = "revoked"
-	}
-	if !changed {
-		writeLine(stdout, "key %s already %s for %s %s", name, past, consumerKind, consumerID)
-		return 0
-	}
-	writeLine(stdout, "%s key %s for %s %s", past, name, consumerKind, consumerID)
-	return 0
-}
-
-func keyConfigureCommand(name string) string {
-	return fmt.Sprintf("gitmoot key configure %s --upstream <url> --auth bearer|header:<HeaderName>", name)
 }

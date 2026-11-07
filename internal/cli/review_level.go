@@ -15,7 +15,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/jev"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 	"github.com/gitmoot/gitmoot/internal/reviewlevel"
 )
 
@@ -163,7 +163,7 @@ func reviewLevelAPIKey(ctx context.Context, home string) string {
 	}
 	var key string
 	_ = withStore(home, func(store *db.Store) error {
-		_, values, err := pipeline.LoadValidatedKeychainFile(ctx, store, home)
+		_, values, err := keychain.LoadValidated(ctx, store, home)
 		if err != nil {
 			return err
 		}

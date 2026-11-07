@@ -89,7 +89,7 @@ var ErrAgentPolicyCommit = errors.New("agent policy commit failed")
 // Round two mirrored GetAgent's precedence instead - agents first, instances
 // only on zero rows affected - on the reasoning that writing a plane dispatch
 // is not reading is worse than leaving it stale. Review disproved that with an
-// executed probe: RemoveAgent (:170) deletes agent_repos, keychain_grants and
+// executed probe: RemoveAgent deletes agent_repos and
 // agents, but NOT agent_instances. So tightening an agent to read-only moved
 // only the row, removing the agent then deleted that row, and GetAgent
 // resolved the surviving instance at its untouched danger-full-access. The
@@ -206,9 +206,6 @@ func (s *Store) RemoveAgent(ctx context.Context, name string) (bool, error) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM agent_repos WHERE agent_name = ?`, name); err != nil {
-		return false, err
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM keychain_grants WHERE consumer_kind = 'agent' AND consumer_id = ?`, name); err != nil {
 		return false, err
 	}
 	result, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE name = ?`, name)
