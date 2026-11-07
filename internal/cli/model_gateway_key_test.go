@@ -29,7 +29,12 @@ func writeModelGatewayKeychainFile(t *testing.T, home, content string) {
 func seedModelGatewayKey(t *testing.T, store *db.Store, name, mode, upstream, authKind, header string) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := store.AddKeychainKey(ctx, name, mode); err != nil {
+	if mode != db.KeychainModeProxied {
+		// A pre-#2542 row: AddKeychainKey now accepts only proxied keys.
+		if err := store.ExecForTest(ctx, `INSERT INTO keychain_keys(name, mode) VALUES (?, ?)`, name, mode); err != nil {
+			t.Fatalf("insert legacy %q key %q: %v", mode, name, err)
+		}
+	} else if _, err := store.AddKeychainKey(ctx, name, mode); err != nil {
 		t.Fatalf("AddKeychainKey(%q, %q) returned error: %v", name, mode, err)
 	}
 	if strings.TrimSpace(upstream) == "" {
@@ -60,9 +65,9 @@ func TestModelGatewayKeyRefusesAtPreflight(t *testing.T) {
 			wantHint: "gitmoot key add",
 		},
 		{
-			name: "registered but injected rather than proxied",
+			name: "legacy injected row rather than proxied",
 			seed: func(t *testing.T, store *db.Store) {
-				seedModelGatewayKey(t, store, "INJECTED_KEY", db.KeychainModeInjected, "", "", "")
+				seedModelGatewayKey(t, store, "INJECTED_KEY", "injected", "", "", "")
 			},
 			lookup:   "INJECTED_KEY",
 			wantHint: db.KeychainModeProxied,
@@ -127,7 +132,7 @@ func TestModelGatewayResolverFailsClosedOnARevokedKey(t *testing.T) {
 	worker := jobWorker{Store: store}
 	resolver := worker.keychainModelGatewayResolver("REVOKED_KEY")
 
-	if _, _, err := store.RemoveKeychainKey(ctx, "REVOKED_KEY", true); err != nil {
+	if _, err := store.RemoveKeychainKey(ctx, "REVOKED_KEY"); err != nil {
 		t.Fatalf("RemoveKeychainKey returned error: %v", err)
 	}
 	if _, err := resolver(ctx); err == nil {

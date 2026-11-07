@@ -101,11 +101,12 @@ type Agent struct {
 	// ConfigHome is the raw --home value used only when constructing a runtime
 	// adapter for one-shot deliveries. It is in-memory only.
 	ConfigHome string
-	// WritablePaths are additive runtime workspace grants for an action: produce
-	// pipeline stage. Codex enforces them itself; Claude/Kimi receive matching
-	// --add-dir hints while Gitmoot's Landlock wrapper provides hard enforcement.
+	// WritablePaths are additive runtime workspace grants (a read-only seat's
+	// isolated tool cache). Codex enforces them itself; Claude/Kimi/omp receive
+	// matching --add-dir hints while Gitmoot's Landlock wrapper provides hard
+	// enforcement.
 	WritablePaths []string
-	// ReadablePaths are produce-only external inputs. Claude/Kimi receive
+	// ReadablePaths are external read-only inputs. Claude/Kimi receive
 	// cooperative --add-dir visibility while Landlock keeps these roots read-only;
 	// Codex's native workspace sandbox already permits filesystem reads and has no
 	// read-only --add-dir equivalent.
@@ -114,8 +115,6 @@ type Agent struct {
 	// Landlock ruleset without exposing their parent directory. They are not
 	// passed as --add-dir hints and remain read-only.
 	ReadableFiles []string
-	// ProduceNetwork opts that produce delivery into workspace-write network access.
-	ProduceNetwork bool
 }
 
 type Job struct {
@@ -138,18 +137,15 @@ type Job struct {
 	// than silently degrading to a normal run.
 	Plan     bool
 	PlanInto string
-	// ShellEnv is an exact list of KEY=value trigger inputs and stage metadata
-	// injected into shell-stage subprocesses. Other runtimes ignore it; ordinary
-	// shell jobs leave it empty.
+	// ShellEnv is an exact list of KEY=value entries injected into the shell
+	// runtime's subprocess (for example the managed-worktree GOFLAGS). Other
+	// runtimes ignore it.
 	ShellEnv []string
-	// AgentEnv is an in-memory-only list of proxied keycard placeholders and
-	// loopback lease URLs for a pipeline agent stage. It is never represented in
-	// workflow.JobPayload. Empty preserves the historical plain Runner path.
+	// AgentEnv is an in-memory-only list of KEY=value entries injected into a
+	// managed agent runtime's subprocess (for example the managed-worktree
+	// GOFLAGS). It is never represented in workflow.JobPayload. Empty preserves
+	// the historical plain Runner path.
 	AgentEnv []string
-	// ShellUpstreamContext is persisted JSON content for a dependent pipeline
-	// shell stage. Shell delivery writes it to a fresh 0600 temporary file and
-	// injects only that path into the subprocess environment.
-	ShellUpstreamContext string
 	// RuntimeDefaultModel is the runtime's configured registry default_model
 	// (#652), threaded in by the dispatch layer from the HOME-AWARE resolved runtime
 	// registry (built-in defaults overlaid with [runtimes.<name>] config). It is the
@@ -875,7 +871,7 @@ func (a CodexAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a CodexAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask", "produce"}, nil
+	return []string{"review", "implement", "ask"}, nil
 }
 
 func (a CodexAdapter) runner() subprocess.Runner {
@@ -1023,35 +1019,14 @@ func codexSandboxArgs(agent Agent, workdir string) ([]string, PermissionPolicyAp
 				property = PermissionPolicyWidened
 			}
 		}
-		if agent.ProduceNetwork {
-			args = append(args, "-c", "sandbox_workspace_write.network_access=true")
-			property = PermissionPolicyWidened
-		}
 		return args, property
 	case AutonomyPolicyDangerFullAccess:
-		// Full access is already unrestricted. Produce-only workspace grants and
-		// network configuration must not leak into this policy's argv.
+		// Full access is already unrestricted. Additive workspace grants must not
+		// leak into this policy's argv.
 		return []string{"--sandbox", "danger-full-access"}, PermissionPolicyApplied
 	default:
 		return nil, PermissionPolicyNotApplied
 	}
-}
-
-// ProduceDispatchError enforces the runtime/policy portion of produce dispatch.
-// The daemon separately requires a successful Landlock probe before Claude or
-// Kimi delivery; keeping that host capability check at the launch boundary lets
-// the workflow engine validate jobs without pretending it enforced a sandbox.
-func ProduceDispatchError(action string, agent Agent) error {
-	if strings.TrimSpace(action) != "produce" {
-		return nil
-	}
-	if agent.Runtime != CodexRuntime && agent.Runtime != ClaudeRuntime && agent.Runtime != KimiRuntime {
-		return fmt.Errorf("produce stages require the codex runtime; agent %q uses runtime %q", agent.Name, agent.Runtime)
-	}
-	if !PolicyGrantsImplementWrite(agent.AutonomyPolicy) {
-		return fmt.Errorf("produce stages require a writable autonomy policy; agent %q uses %q", agent.Name, NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy))
-	}
-	return nil
 }
 
 // linkedWorktreeGitDir resolves the per-worktree git metadata directory of a
@@ -1487,7 +1462,7 @@ func (a ClaudeAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a ClaudeAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask", "produce"}, nil
+	return []string{"review", "implement", "ask"}, nil
 }
 
 func (a ClaudeAdapter) runner() subprocess.Runner {
@@ -1540,22 +1515,6 @@ func (a ShellAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 	}
 	runner := a.runner()
 	env := append([]string(nil), job.ShellEnv...)
-	if job.ShellUpstreamContext != "" {
-		contextFile, err := os.CreateTemp("", "gitmoot-pipeline-upstream-*.json")
-		if err != nil {
-			return Result{}, upstreamContextFileError("create", err)
-		}
-		contextPath := contextFile.Name()
-		defer os.Remove(contextPath)
-		if _, err := contextFile.WriteString(job.ShellUpstreamContext); err != nil {
-			_ = contextFile.Close()
-			return Result{}, upstreamContextFileError("write", err)
-		}
-		if err := contextFile.Close(); err != nil {
-			return Result{}, upstreamContextFileError("close", err)
-		}
-		env = append(env, "GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE="+contextPath)
-	}
 	var result subprocess.Result
 	var err error
 	if len(env) > 0 {
@@ -1573,23 +1532,6 @@ func (a ShellAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result
 		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, "")}, commandError(result, err)
 	}
 	return Result{Raw: result.Stdout, Summary: strings.TrimSpace(result.Stdout), SessionDiag: newSessionDiag(result, nil, "")}, nil
-}
-
-// upstreamContextFileError removes the generated temporary path before an error
-// crosses the adapter boundary. Mailbox persists delivery failures in job history,
-// so wrapping the original *os.PathError would leak a host tempdir and filename.
-// Keep only its underlying errno so errors.Is remains useful without retaining the
-// path-bearing error value or string.
-func upstreamContextFileError(op string, err error) error {
-	cause := err
-	for {
-		var pathErr *os.PathError
-		if !errors.As(cause, &pathErr) || pathErr.Err == nil {
-			break
-		}
-		cause = pathErr.Err
-	}
-	return fmt.Errorf("upstream context file: <redacted>: %s failed: %w", op, cause)
 }
 
 func (a ShellAdapter) Health(ctx context.Context, agent Agent) error {

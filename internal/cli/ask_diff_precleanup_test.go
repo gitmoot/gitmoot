@@ -244,7 +244,7 @@ func TestCaptureReadOnlyWorktreeDiffSupportsSplitIndex(t *testing.T) {
 	worktree := filepath.Join(t.TempDir(), "detached")
 	runGit(t, checkout, "worktree", "add", "--detach", worktree, "HEAD")
 	runGit(t, worktree, "update-index", "--split-index")
-	sharedIndex := gitOutput(t, worktree, "rev-parse", "--shared-index-path")
+	sharedIndex := gitOutputForTest(t, worktree, "rev-parse", "--shared-index-path")
 	if strings.TrimSpace(sharedIndex) == "" {
 		t.Fatal("split-index fixture has no shared index companion")
 	}
@@ -284,13 +284,13 @@ func TestCaptureReadOnlyWorktreeDiffIncludesStagedGitlinkWithoutRunningSubmodule
 	}
 	runGit(t, subRepo, "add", ".")
 	runGit(t, subRepo, "commit", "-m", "submodule v1")
-	firstCommit := gitOutput(t, subRepo, "rev-parse", "HEAD")
+	firstCommit := gitOutputForTest(t, subRepo, "rev-parse", "HEAD")
 	if err := os.WriteFile(filepath.Join(subRepo, "marker.txt"), []byte("submodule v2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, subRepo, "add", "marker.txt")
 	runGit(t, subRepo, "commit", "-m", "submodule v2")
-	secondCommit := gitOutput(t, subRepo, "rev-parse", "HEAD")
+	secondCommit := gitOutputForTest(t, subRepo, "rev-parse", "HEAD")
 	runGit(t, subRepo, "checkout", "--detach", firstCommit)
 
 	parent, _ := gitFixtureRepo(t, "parent\n")

@@ -492,19 +492,16 @@ func TestAwaitedFactOldHeadDoesNotSatisfyNewHead(t *testing.T) {
 // The engine folds a sub-threshold changes_requested review into an approval and
 // dispatches no fix round; job.finished reports that effective decision. A waiter
 // woken through the awaited-fact channel must read the same thing, or it starts
-// the fix round the engine deliberately suppressed. Pipeline reviews are
-// report-only and keep their raw verdict at every threshold.
+// the fix round the engine deliberately suppressed.
 func TestAwaitedReviewFactDetailReportsEffectiveDecision(t *testing.T) {
 	cases := []struct {
 		name       string
 		threshold  string
-		sender     string
 		wantDetail string
 	}{
 		{name: "sub-threshold folds to approved", threshold: reviewseverity.P1, wantDetail: "review verdict approved"},
 		{name: "at-threshold stays blocking", threshold: reviewseverity.P2, wantDetail: "review verdict changes_requested"},
 		{name: "unset policy fails closed", threshold: "", wantDetail: "review verdict changes_requested"},
-		{name: "pipeline verdict stays raw", threshold: reviewseverity.P1, sender: "pipeline", wantDetail: "review verdict changes_requested"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -522,7 +519,6 @@ func TestAwaitedReviewFactDetailReportsEffectiveDecision(t *testing.T) {
 				t.Helper()
 				encoded, err := json.Marshal(map[string]any{
 					"repo": "acme/widget", "pull_request": 46, "head_sha": "head-notes",
-					"sender": tc.sender,
 					"result": map[string]any{"decision": decision, "severity": "P2"},
 				})
 				if err != nil {

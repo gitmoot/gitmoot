@@ -332,6 +332,26 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
+// RuntimeOutputWriter is the one runtime-output composition point. Destinations
+// share one MultiWriter beneath one SyncWriter, so concurrent stdout and stderr
+// copies cannot race any destination. Nil destinations are skipped; with none
+// left it returns nil.
+func RuntimeOutputWriter(writers ...io.Writer) io.Writer {
+	nonNil := make([]io.Writer, 0, len(writers))
+	for _, writer := range writers {
+		if writer != nil {
+			nonNil = append(nonNil, writer)
+		}
+	}
+	if len(nonNil) == 0 {
+		return nil
+	}
+	if len(nonNil) == 1 {
+		return SyncWriter(nonNil[0])
+	}
+	return SyncWriter(io.MultiWriter(nonNil...))
+}
+
 // lineWriter buffers partial writes and forwards only complete lines, so two
 // pipes teeing into one destination interleave at line boundaries instead of
 // arbitrary io.Copy chunk boundaries.

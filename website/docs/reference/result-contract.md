@@ -36,11 +36,8 @@ The `decision` field reports the outcome of the job:
 - `failed`: the attempted action errored or could not complete.
 - `skipped`: the task itself had no work to do. Do not use `skipped` in a PR
   review to mean "nothing to flag"; reviewers use `approved`. A skipped result
-  cannot carry delegations. Outside pipelines it maps to a succeeded job state;
-  it is an abstention for quorum/verify, while vote counts that succeeded state.
-  Pipelines accept it as success by default and persist the existing succeeded
-  stage state, not the separate skipped state used for downstream stages that
-  never ran.
+  cannot carry delegations. It maps to a succeeded job state; it is an
+  abstention for quorum/verify, while vote counts that succeeded state.
 
 ## Review evidence: executed or static-only
 
@@ -589,7 +586,7 @@ Separately from that tree linkage, **every** job Gitmoot creates carries
 the single enqueue chokepoint from the most specific source available, in this
 order: an explicit dispatcher supplied by the dispatch site, then
 `delegated_by`, then the acting org role, then the dispatch channel
-(`local`, `github`, `heartbeat`, the pipeline sender). It never falls back to
+(`local`, `github`, `heartbeat`). It never falls back to
 the job's own agent or to `lead_agent`, because on a CLI review dispatch
 `lead_agent` defaults to the reviewer itself.
 

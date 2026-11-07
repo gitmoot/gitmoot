@@ -373,18 +373,15 @@ func TestCuratedRunnerCompositionPreservesInjectedEnvironment(t *testing.T) {
 	job := runtime.Job{
 		Prompt: "prompt",
 		ShellEnv: []string{
-			"GITMOOT_PIPELINE_NAME=pipe",
-			"GITMOOT_PIPELINE_RUN_ID=run",
-			"GITMOOT_PIPELINE_STAGE_ID=stage",
+			"GITMOOT_TEST_JOB_ENV=job",
 		},
-		ShellUpstreamContext: `{"schema_version":1,"complete":true}`,
 	}
-	agent := runtime.Agent{Name: "shell", Role: "runner", Runtime: runtime.ShellRuntime, RepoScope: "owner/repo", RuntimeRef: `printf '%s|%s|%s|%s|%s' "$GITMOOT_TEST_INJECTED_ENV" "$GITMOOT_TEST_INJECTED_AUTH" "$GITMOOT_PIPELINE_NAME" "$GITMOOT_PIPELINE_STAGE_ID" "$(test -r "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE" && echo context)"`}
+	agent := runtime.Agent{Name: "shell", Role: "runner", Runtime: runtime.ShellRuntime, RepoScope: "owner/repo", RuntimeRef: `printf '%s|%s|%s' "$GITMOOT_TEST_INJECTED_ENV" "$GITMOOT_TEST_INJECTED_AUTH" "$GITMOOT_TEST_JOB_ENV"`}
 	got, err := adapter.Deliver(context.Background(), agent, job)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Raw != "/relay|token|pipe|stage|context" {
+	if got.Raw != "/relay|token|job" {
 		t.Fatalf("injected environment = %q", got.Raw)
 	}
 }

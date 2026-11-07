@@ -141,7 +141,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot pipeline add <spec.yaml>",
+				"gitmoot report bug --job <job-id> --preview",
 				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr <number>",
 				"gitmoot router summary",
@@ -156,7 +156,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot pipeline add",
+				"gitmoot lock list",
 				"gitmoot job answer <job-id>",
 				"gitmoot router summary",
 				"gitmoot job open",
@@ -169,7 +169,7 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			name: "cli reference",
 			text: cli,
 			want: []string{
-				"gitmoot pipeline add",
+				"gitmoot lock list",
 				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr",
 				"gitmoot review status --pr",

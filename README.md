@@ -168,8 +168,6 @@ More: **[Install](https://gitmoot.io/docs/getting-started/install)** ·
 
 - **Orchestration.** A coordinator fans work out to several agents and merges
   the answers: `gitmoot orchestrate lead "Review PR #123 from three angles." --recipe review-panel`.
-- **Pipelines.** Agent graphs saved as YAML that you can rerun, schedule and
-  inspect ([docs](https://gitmoot.io/docs/workflows/pipelines-workflow)).
 - **PR comments.** `/gitmoot <agent> ask …` on a PR or issue routes to a named agent.
 - **Proof.** `gitmoot proof` builds an evidence-graded manifest of what a job
   tree actually did.
@@ -217,8 +215,9 @@ single-binary, no-cgo promise honest. Thanks to the builders stress-testing it
 in the wild, including the [council](https://github.com/plotarmordev/council)
 multi-model quorum system.
 
-Gitmoot Pipelines started at OpenAI Build Week 2026; the submitted tree is
-kept at the [`buildweek-2026-submission`](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission) tag.
+Gitmoot Pipelines started at OpenAI Build Week 2026 and now live in
+[stagehand](https://github.com/gitmoot/stagehand); the submitted tree is kept at
+the [`buildweek-2026-submission`](https://github.com/gitmoot/gitmoot/tree/buildweek-2026-submission) tag.
 
 ## License
 

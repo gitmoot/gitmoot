@@ -242,26 +242,27 @@ fallback. The first adapter build imports legacy `daemon-runtime.env` when the
 new file is absent, otherwise it seeds from ambient managed variables once;
 existing authoritative files are never overwritten.
 
-Shared injected pipeline keys use a separate operator-owned keychain file,
-defaulting to `<base-home>/.config/gitmoot/keychain.env` (override with
-`[credentials] keychain_path`). The CLI manages names and grants only; edit the
-`0600` file at the path it prints to set or rotate values:
+Shared named keys use a separate operator-owned keychain file, defaulting to
+`<base-home>/.config/gitmoot/keychain.env` (override with
+`[credentials] keychain_path`). The CLI manages names, modes, and proxy
+configuration only; edit the `0600` file at the path it prints to set or rotate
+values:
 
 ```sh
 gitmoot key path [--json]
-gitmoot key add <NAME> --mode injected|proxied [--json]
+gitmoot key add <NAME> --mode proxied [--json]
 gitmoot key configure <NAME> --upstream <https-url> --auth bearer|header:<HeaderName> [--json]
 gitmoot key list [--json]
 gitmoot key show <NAME> [--json]
-gitmoot key grant <NAME> (--pipeline <pipeline> | --agent <seat>) [--json]
-gitmoot key revoke <NAME> (--pipeline <pipeline> | --agent <seat>) [--json]
-gitmoot key rm <NAME> [--force] [--json]
+gitmoot key rm <NAME> [--json]
 ```
 
 There is deliberately no value flag, stdin value, or value-derived hash.
 `proxied` keys must be configured with a pinned HTTPS origin/base path and
-bearer or approved custom-header placement before they can be granted.
-`rm --force` removes metadata and grants but leaves the file entry untouched.
+bearer or approved custom-header placement before they can be used; a
+configured key is consumed by name through `[credentials].model_gateway_key`.
+Keys registered in `injected` mode by older releases still list, show, and
+remove. `rm` removes registry metadata but leaves the file entry untouched.
 
 Runtime-child environment curation is off by default. Enable it in
 `config.toml`:
@@ -317,8 +318,7 @@ dropping only the token turns an inherited URL into a hard failure), and
 `--profile` selects omp's auth/state store without isolating process
 environment, so a passed-through key is visible to every omp profile this daemon
 runs. Kimi and shell add nothing.
-Gitmoot-owned relay, shell-stage, pipeline, and upstream-file variables are
-appended after the base and remain available.
+Gitmoot-owned relay variables are appended after the base and remain available.
 
 `env_passthrough` accepts exact names or a single trailing-`*` prefix glob.
 Names containing `=` or NUL and non-trailing `*` forms are invalid. The base
@@ -480,18 +480,8 @@ gitmoot sandbox probe
 `sandbox probe` prints whether this Linux host can enforce Gitmoot's strict
 Landlock launch sandbox and includes the detected ABI. The probe runs the real
 hidden re-exec shim and verifies both an allowed write and a denied outside write;
-unsupported kernels return non-zero. Claude/Kimi `produce` pipeline stages require
-this probe to pass and otherwise retain the explicit Codex-only refusal. Codex
-produce remains on its own native sandbox. Landlock confines filesystem writes but
-does not govern network access; network policy remains the runtime CLI's. Wrapped
-Claude may write its runtime-owned `$HOME/.claude` state and
-`$XDG_CACHE_HOME/claude-cli-nodejs` cache; wrapped Kimi may write its runtime-owned
-`$HOME/.kimi-code` state. Apart from runtime state/cache and standard device nodes,
-only declared data paths, the disposable workdir, and temp roots are writable.
-`omp` never reaches this wrapper: it is applied by runtime **name**, to Claude
-and Kimi only. omp also does not advertise the `produce` capability, because its
-Bun binary's Landlock interaction is unprobed and advertising an unproven
-capability would turn an unknown into a silent stage failure.
+unsupported kernels return non-zero. Landlock confines filesystem writes but does
+not govern network access; network policy remains the runtime CLI's.
 
 ## Repo And Daemon Status
 
@@ -673,7 +663,7 @@ Local `agent review` and review-resolved `agent run` dispatch honor this key:
 they run the requested reviewer as a **preflight** parent. The parent checks
 whether the review can run and delegates exactly once to the configured verdict
 agent. The preflight is marked so its result cannot be consumed as the final
-review verdict. Daemon fanout, heartbeat, pipeline, comment-command, and
+review verdict. Daemon fanout, heartbeat, comment-command, and
 externally recorded session reviews do not consult this key; they keep their
 ordinary review paths.
 
@@ -980,8 +970,8 @@ read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
 `idle_max_multiplier` (default `4`; `1` disables decay). Any response-body miss,
 poll error, queued repo job, or in-flight repo job resets/promotes it immediately.
 Repos with open PRs stay at base cadence because their per-PR comment reads are
-deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat,
-pipeline, and other supervisor maintenance still wake at the resolved base
+deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat
+and other supervisor maintenance still wake at the resolved base
 interval.
 
 `gitmoot dashboard` prints a styled one-shot snapshot of local state — daemon
@@ -1115,7 +1105,7 @@ choice is stored on the
 job and kept across retries. A repository with `checks_backend = "remote"` in
 `[repos."owner/repo".review]` sends every review to its `checks_provider` and
 `checks_template`, whichever producer enqueued it (this command, PR fan-out,
-comment, heartbeat or pipeline reviews); a review without `--exec-provider`
+comment or heartbeat reviews); a review without `--exec-provider`
 adopts `checks_provider`, and `--exec-backend local` or a different
 `--exec-provider` is refused (see the remote execution reference).
 `agent review` forwards the same flag.
@@ -1449,11 +1439,6 @@ fields remain active. Any other review-policy parse or read error rejects the
 entire applied review policy, restoring `P3` with native fanout and risk tiers
 off.
 
-The threshold applies to native review rounds only. A pipeline review stage is
-report-only — the pipeline advancer owns folding its verdict — so its raw
-`changes_requested` keeps blocking the merge gate at every threshold and never
-counts toward required-reviewer approval.
-
 ### Fan-outs are not verdicts
 
 A review result that declares `delegations` is a coordinator **fan-out**: it
@@ -1479,10 +1464,6 @@ Every surface that reads a review decision applies the same rule:
 - if the panel was announced and **never dispatched**, the gate reports
   `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
   delegations that never reported` rather than merging or parking;
-- **pipeline auto-merge** refuses a fan-out. A pipeline stage has its executable
-  `delegations` stripped at the mailbox seam so a leaf can never spawn children,
-  and the classification is preserved across that strip — stripping the
-  instructions must not erase what the row IS;
 - **required-reviewer counting**, the **review-verdict wake**, the **canonical
   same-head verdict history** (`SucceededReviewVerdicts`) and **awaited
   review-verdict facts** all skip fan-outs, so an announcement neither satisfies
@@ -1586,8 +1567,7 @@ than one vendor's CLI, so which provider answers is a property of the omp profil
 the daemon runs under. Practical consequences worth knowing before you register
 an omp seat:
 
-- **Capabilities are `review`, `implement`, `ask` — not `produce`** (its Bun
-  binary's Landlock interaction is unprobed).
+- **Capabilities are `review`, `implement`, `ask`.**
 - **Every job is a fresh session.** omp is stateless in v1 and never resumes:
   `omp --resume` relocates the working directory to the previous session's cwd
   and overwrites `--cwd`, so a resumed job would edit the *old* worktree and
@@ -1848,19 +1828,15 @@ gitmoot job watch <job-id>
 `--task`/`--base`/`--draft`/`--ready` implement flags; an `implement` leg in a
 result's `delegations[]` is refused with the action named, `/gitmoot <agent>
 implement` is not a recognized PR-comment command, and an `implement` heartbeat
-is refused at config validation. The one remaining exception is the pipeline
-`action: implement` stage kind, which still VALIDATES but has no allocator to
-run in; whether `pipeline add` should refuse it is tracked in
-[#2213](https://github.com/gitmoot/gitmoot/issues/2213).
+is refused at config validation.
 
 What was removed in each case is the writable-worktree ALLOCATION plus the
 enqueue — precisely what would have to come back for dispatch to return. The
 removal followed the traffic rather than leading it: 568 of 570 implement rows
 in a 14-day window were seats recording their own sessions, delegation-origin
 implement legs total 47 lifetime with zero in the last 30 days, no PR comment
-has ever carried an implement command, no heartbeat is configured with that
-action, and no pipeline has ever created an implement stage (lifetime stage
-jobs: ask 5,229, produce 92, implement zero). Seats implement in their own
+has ever carried an implement command, and no heartbeat is configured with that
+action. Seats implement in their own
 session and record the work themselves:
 
 ```sh
@@ -3327,10 +3303,8 @@ ordinary/aged safety predicate under the lifecycle fence before removal and
 preserves immutable terminal evidence outside the workspace. Failed/cancelled
 owners use the aged policy and need a producer-proven reconstruction path;
 blocked owners and unresolved consumers are never made terminal by cleanup.
-Artifact publication remains independent so blocked consumers can receive
-their inputs without authorizing deletion.
 
-Without reconstruction proof, failed/cancelled implement, produce and shell
+Without reconstruction proof, failed/cancelled implement and other
 owners retain their workspaces and owned branches indefinitely. TTL is not a
 maximum retention or disk bound. `retry_disposition_unknown` has no force or
 `reopen` override; inspect the job and escalate capacity to its owner. Retry only
@@ -3349,8 +3323,8 @@ decision, `1` for an operational error and `2` for invalid arguments. A prepared
 receipt is not a removal receipt until `removed_at` is set. Historical replay
 never reopens quarantine or grants deletion of the current generation.
 The generation field is `lifecycle_generation` in both the decision and receipt.
-Aged selection uses that generation's terminal time, so artifact publication
-does not restart retention and old completion events cannot hide a replacement.
+Aged selection uses that generation's terminal time, so old completion events
+cannot hide a replacement.
 Checkout contention defers automatic cleanup without consuming its retry budget.
 Persisted cleanup diagnostics use the existing credential-redaction policy.
 Checkout-lock release failures are operational errors, including during
@@ -3631,7 +3605,6 @@ alone moves p50 by roughly 2.6x.
 ```sh
 gitmoot proof <root-id>
 gitmoot proof --json <root-id>
-gitmoot proof --verify <service-run-id>
 # As with other Go-flag commands, place --home before the positional root id:
 gitmoot proof --home /tmp/isolated-home <root-id>
 ```
@@ -3657,13 +3630,7 @@ is future work. The headline grade tally excludes `integrity.*` meta-claims and
 reports those separately on the `integrity:` line. The command never parses
 transcripts, contacts GitHub, or mutates store data.
 
-For a succeeded service pipeline run, `--verify` performs an **offline,
-store-only** outcome check: the run succeeded, all stages succeeded/skipped,
-each jobful stage has its expected terminal structured result, no failed or
-blocked job tail remains, result hashes match, and the projected manifest DAG
-verifies. It records `stored_pipeline_outcome`; it never reruns commands, queries
-CI/GitHub, or upgrades reported test claims. Remote CI upgrades remain future
-work. See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
+See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
 for the structured result and delegation inputs, and [SAFETY.md](SAFETY.md) for
 the read-only and bounded-DAG safety contracts.
 
@@ -4145,13 +4112,68 @@ no single owner, including roles tied on scope and depth, it addresses a live
 fails closed without journaling an addressed note. Archive filtering does not
 predict delivery; `org validate` reports missing wake routes and pane bindings.
 Set `[repos."owner/repo".merge_gate] auto_merge = false` as an explicit
-kill-switch; that deliberate hold does not escalate. Pipeline `allow_auto_merge`
-is independent, and an authorized `@gitmoot merge` remains an explicit override.
+kill-switch; that deliberate hold does not escalate. An authorized `@gitmoot merge` remains an explicit override.
 
 Merge-gate retries are automatic while the daemon is running. Retryable states,
 such as a busy base-branch merge queue or an active job on the PR branch, are
 retried on the next daemon poll tick. The default poll interval is `30s` unless
 the daemon was started with a different `--poll`.
+
+### Satisfying the workload-mode gate
+
+A pull request whose diff changes the `**Current mode:` marker in `AGENTS.md` is
+HELD until an exact-head reconciliation row exists. The gate is keyed on the
+repository OWNER, so every `gitmoot/*` repository is held, human-requested merges
+included.
+
+Two note streams decide it, both matched by an exact body PREFIX and compared
+case-insensitively on repository:
+
+- DECISION: `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]`
+- RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
+
+Every field is `key=value`, whitespace separated, inside the leading bracket. A
+field with an empty key or value makes the whole body unparseable, so the
+`repo=` field inside the body is what identifies the repository:
+
+```
+gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
+```
+
+`<label>` must be a workflow that already has jobs - `workflow note` refuses an
+unknown label to guard against a typo - so file the row under the lane the PR is
+already being coordinated in rather than inventing a label.
+
+The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
+--repo <owner/repo>` sets it and nothing else - it no longer opts the note into
+anything, because the memory surface it used to accompany is gone (#2202). A
+note whose column is empty still counts when its body names this repository,
+which is the ordinary case, so setting the column is optional; getting `repo=`
+right in the BODY is not. Prefer setting it anyway for an operating-mode or
+reconciliation note: the gate reads those through two bounded windows, one
+repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
+out of the window by other repositories' notes.
+
+PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
+it. `decision_note=none` means the PR itself is the decision, and the row's own
+`created_at` is `decided_at`; otherwise `decision_note` names the newest
+operating-mode note the exact head implements. A row that cites a note the PR
+contradicts cannot ratify it.
+
+WHEN A DECISION CANNOT BE READ. An unreadable newest decision - a malformed field
+list, a `mode` that is not a workload mode, or a note recorded for this
+repository whose body omits or contradicts `repo=` - SUPERSEDES like any other
+decision rather than reading as "no decision". It is a recency boundary, not a
+veto: a fresh exact-head row that agrees with the PR's own marker still merges,
+so correcting the note is optional. The gate refuses outright only when nothing
+readable remains - the note is unreadable AND the PR's marker patch is missing or
+ambiguous - and the hold then names both exits: append a readable operating-mode
+note, and file an exact-head row citing it.
+
+CLEARING A HOLD. The hold is a pending merge-gate decision, not a failure: the
+task stays `ready_to_merge`, the gate records the cause as its pending reason
+(also published on the PR's pending merge-gate commit status), and the daemon
+re-evaluates it on the next poll tick, so the PR merges once a valid row lands.
 
 ### Draining before a deploy
 
@@ -4388,554 +4410,7 @@ consume them as structured feedback; nothing consumes them today.
 
 ## Pipelines
 
-A pipeline (#681) runs a **declared DAG of shell and managed-agent stages** — a
-fixed, repeatable multi-step flow — on demand, on an interval schedule, or after
-another pipeline succeeds. Each
-stage is an ordinary queued job: shell commands use the shell runtime, while agent
-stages use their registered runtime. The normal worker tick claims and runs it,
-and a scan-based advancer folds each stage's `gitmoot_result` **decision**
-and enqueues the stages whose `needs` have all succeeded. Pipelines reuse the job
-queue, the result contract, and the heartbeat scheduling idiom (durable `next_due`,
-overlap guard, missed-ticks-coalesce). They are **off by default** (no pipelines ⇒
-the daemon's pipeline scan returns before touching state).
-
-Define a pipeline in a YAML file and register it:
-
-```yaml
-name: nightly-sync          # required, name-safe token (letters, digits, - _)
-repo: owner/repo            # optional to register; REQUIRED to run
-env_file: /root/.config/nightly-sync/env # optional 0600 secret file
-env:                         # optional inline NON-secret defaults
-  OUTPUT_DIR: /srv/nightly-sync
-schedule:                   # optional interval schedule (no cron in v1)
-  interval: 24h             #   positive Go duration (required with a schedule block)
-  jitter: 15m               #   optional random [0, jitter] added to next_due
-trigger:                    # optional pipeline-success chain
-  kind: pipeline
-  pipeline: upstream-name
-stages:                     # the DAG, keyed by unique id and wired by needs
-  - id: source
-    cmd: "curl -sf https://example.com/data > data.json"
-    env_keys: [SOURCE_API_TOKEN]
-  - id: score
-    cmd: "python score.py data.json"
-    isolate: true          # optional shell-only detached read-only worktree
-    needs: [source]         # runs only after every listed stage SUCCEEDS
-  - id: triage              # an AGENT stage instead of a shell cmd (exactly one of cmd|agent|gate)
-    agent: reply-triager    #   #757 read-only leaf
-    action: ask             #   ask (default) | review | implement (+ write: true, #768)
-    prompt: "Triage the scored data; block if a human is needed."
-    needs: [score]          #   upstream results are prepended to the prompt
-  # other agent-stage kinds:
-  #   implement (#768): action: implement + write: true → declarable, but NO allocator (#2203/#2213)
-  #   bound review (#813): action: review + source: <impl stage> -> reviews that PR/head, report-only
-  #   orchestrate (#758): orchestrate: true → sub-tree coordinator (fans out owned children, folds synthesis)
-  #   gate (#768): gate: pr_merged + source: <impl stage> (no agent) → jobless; human merge is default
-  #   auto-merge gate: add merge: auto plus top-level allow_auto_merge: true; requires source-bound review
-  - id: deploy
-    cmd: "rclone copy out/ r2:bucket"
-    needs: [triage]
-    timeout: 30m            # optional per-stage job timeout
-    retry: 2                # optional; re-attempt a FAILED stage up to N times
-```
-
-To start this pipeline once for every newly-succeeded run of another pipeline,
-use the alternative pipeline trigger shape (do not combine it with `schedule`):
-
-```yaml
-trigger:
-  kind: pipeline
-  pipeline: upstream-name
-```
-
-```sh
-gitmoot pipeline add nightly-sync.yaml --enable   # validate + store; omit --enable to add disabled
-gitmoot pipeline export nightly-sync --output ./nightly-sync.bundle
-gitmoot pipeline import ./nightly-sync.bundle --repo new-owner/new-repo
-gitmoot pipeline remote set owner/pipeline-catalog
-gitmoot pipeline remote show
-gitmoot pipeline publish nightly-sync [--remote owner/pipeline-catalog] [--create]
-gitmoot pipeline pull --list [--remote owner/pipeline-catalog]
-gitmoot pipeline pull nightly-sync [--remote owner/pipeline-catalog] --repo new-owner/new-repo [--agent-map exported=local]
-gitmoot pipeline list [--json]
-gitmoot pipeline show nightly-sync [--json]        # registry view for a name
-gitmoot pipeline run nightly-sync [--payload key=value ...] [--payload-json '<obj>']
-gitmoot pipeline watch <run-id> [--timeout 10m] [--poll 5s] [--json]
-gitmoot pipeline show <run-id> [--json]            # run funnel for a "prun-…" id
-gitmoot pipeline expose --schema schema.json <name> # issue one bearer token (shown once)
-gitmoot pipeline serve                              # loopback API on 127.0.0.1:8792
-gitmoot pipeline resume <run-id> [--from <stage>]
-gitmoot pipeline cancel <run-id>
-gitmoot pipeline enable|disable nightly-sync
-gitmoot pipeline remove nightly-sync
-```
-
-### Expose a shell pipeline as a service
-
-Service exposure is explicit and v1 accepts only shell-only, template-free
-pipelines. Define a bounded flat schema, expose the pipeline, then run the
-separate authenticated listener:
-
-```json
-{"version":1,"fields":{"count":{"type":"integer","required":true,"minimum":1,"maximum":5}}}
-```
-
-```sh
-gitmoot pipeline expose --schema schema.json nightly-sync
-gitmoot pipeline serve # --addr defaults to 127.0.0.1:8792
-```
-
-The exposure command stores only the SHA-256 token digest and prints the
-base64url bearer token once. `--disable` blocks new POSTs but does **not** revoke
-read/poll access to already accepted runs; use `--rotate-token` to revoke the old
-bearer credential. The API accepts
-`POST /v1/pipelines/<name>/runs` and exposes authenticated status/bundle reads at
-`/v1/pipelines/runs/<id>`. Inputs are schema-validated and delivered only as
-reserved `GITMOOT_INPUT_*` environment variables, never prompt text. Admission
-is atomic (rate bucket, global cap, per-pipeline overlap, run/stages/receipt),
-uses unpredictable 128-bit run ids, and every service shell stage runs in a
-fail-closed detached worktree. Service exposure rejects any stage that declares
-`env_keys`, network access, or extra read/write authority.
-
-Successful service shell stages may deliver files beneath `out/`. Gitmoot
-collects them before disposing the detached worktree, namespaces them as
-`artifacts/<stage-id>/...`, and caps the run at 64 MiB total; exceeding the cap
-fails finalization instead of truncating output. On the first authenticated GET
-after success, Gitmoot freezes an archive with those files, the accepted #941
-bundle, `proof.json`, and `verification.json`. Per-file size and SHA-256 metadata
-is committed by artifact nodes in the offline proof.
-
-The public, read-only `/receipts/<id>` page lists artifact names, sizes, and
-digests, but its sanitized `/receipts/<id>/bundle` omits artifact bytes. Only the
-authenticated `/v1/pipelines/runs/<id>/bundle` delivers the files. Neither
-surface discloses bearer tokens, inputs, prompts, logs, or raw result text. Both
-bundles intentionally include the frozen pipeline spec with its full shell
-command bodies and referenced environment-variable names. Never inline a secret
-literal in `cmd`; an `env_keys`-bearing pipeline cannot be exposed at all. Public
-capability receipt URLs remain public after token rotation. Use `--allow-remote`
-only behind owner-controlled TLS/firewall policy.
-
-### Export and import a pipeline bundle
-
-`pipeline export <name> --output <dir>` creates a portable directory, never a
-single YAML blob:
-
-```text
-nightly-sync.bundle/
-├── bundle.yaml          # version, requirements, warnings, agents, spec hash
-└── spec.yaml            # stored bytes with only repo replaced by __GITMOOT_REPO__
-```
-
-A bundle carries each agent's template id as a REFERENCE only. #2204 removed
-template distribution, so no prompt body travels in a bundle and there is no
-`templates/` directory.
-
-The exporter carries YAML comments and ordering through unchanged and reports
-host-specific `/root`, `/home`, `/Users`, and `/tmp` paths found in command
-stages. It never exports environment values or local runtime state.
-
-Import on another machine with its real repository and any local agent mapping:
-
-```sh
-gitmoot pipeline import ./nightly-sync.bundle \
-  --repo new-owner/new-repo \
-  --name nightly-sync-copy \
-  --agent-map reply-triager=local-triager
-```
-
-Every import prints a requirements report first: available/missing runtimes,
-present/missing upstream pipelines, write-authority flags that need consent, and
-absolute-path warnings.
-Without `--agent-map`, the declared agents are registered against template ids
-that must already exist in the importing home. Existing agents or pipeline names
-with different content are refused unless `--force`; identical content is a
-no-op. A missing runtime for an unmapped agent is a hard failure.
-
-Imported pipelines land **disabled**, even when replacing an enabled row. Review
-the report and stored spec, then run `pipeline enable <name>` or pass `--enable`
-to the import to explicitly re-consent any `allow_scheduled_writes`,
-`allow_triggered_writes`, or `allow_auto_merge` authority. The target repo and an
-optional new name are injected without re-marshaling the rest of the YAML. The
-stored `spec_hash` therefore hashes the imported bytes and correctly differs from
-the source bundle whenever repo/name/agent mappings changed. Missing upstream
-pipelines are allowed and leave the imported pipeline dormant until they exist.
-
-### Share a pipeline via GitHub
-
-Configure one GitHub repository as the default catalog, publish from the source
-home, then list and pull from another home:
-
-```sh
-# Source home. --create creates owner/pipeline-catalog as a PRIVATE repo.
-gitmoot pipeline remote set owner/pipeline-catalog
-gitmoot pipeline publish nightly-sync --create
-
-# Target home.
-gitmoot pipeline remote set owner/pipeline-catalog
-gitmoot pipeline pull --list
-gitmoot pipeline pull nightly-sync \
-  --repo new-owner/new-repo \
-  --agent-map reply-triager=local-triager
-```
-
-The optional `[pipeline_remote]` config section has the same `repo`, `ref`, and
-`path` shape as the other GitHub-backed remotes; `ref` defaults to `main` and `path` to
-`pipelines`. An explicit `--remote owner/repo` wins over the configured repo.
-`remote set` also accepts `--ref` and `--path`.
-
-Each published entry is a reviewable directory at
-`pipelines/<name>/bundle.yaml` and `spec.yaml`. Publishing
-compares the exported bytes with HEAD: unchanged files cause no commit, changed
-files alone are upserted, and files removed from the current bundle are deleted
-from that managed pipeline directory. `--create` creates a **private**
-repository; without it the remote must already exist.
-
-`pipeline pull --list` prints each available name, description, and a one-line
-requirements summary. Pull downloads the selected directory at HEAD and hands
-it to the same `pipeline import` path: the requirements report, `--agent-map`,
-`--name`, collision/`--force` gates, and `--enable` behavior are unchanged.
-Nothing beyond the spec is installed, and the
-pipeline lands disabled unless `--enable` explicitly re-consents its authority.
-
-### Reading pipeline status
-
-The registry view is self-describing even before the first run. `mode` is
-`after: <upstream>`, `scheduled <interval>`, or `manual`, and stage lines carry
-their kind plus bounded command/prompt previews:
-
-```text
-enabled: true
-mode: after: nightly-sync
-interval: -
-...
-stages:
-  fetch   [SHELL]      cmd: ./fetch-message.sh  needs=-
-  answer  [AGENT ask]  reply-planner (codex/gpt-5.6-sol)  timeout=10m  needs=fetch
-```
-
-An absent agent row renders as `(unregistered)` without failing `show`.
-`pipeline list` appends a seventh description column, truncated to about 60
-characters, and uses `after: <upstream>` in the interval column for a trigger
-pipeline. A removed or missing upstream is shown as
-`after: <upstream> (upstream missing)`. JSON includes the full pipeline
-description plus `mode`, and stage `kind`, `agent_runtime`, `prompt_preview`, and
-`cmd_preview`; the existing full fields remain unchanged.
-
-
-An enabled `trigger.kind: pipeline` pipeline fires once for each upstream run
-that reaches `succeeded`; failed and cancelled runs never fire it. The durable
-upstream-run cursor makes daemon re-ticks and restarts idempotent. Adding or
-enabling the downstream re-arms the cursor at the latest upstream run, so old
-history and successes from a disabled period never backfill. If the downstream
-already has an active run, the scan leaves the cursor unchanged and fires after
-that run settles. Missing upstreams warn at add time and remain dormant; removing
-an upstream is allowed. Add-time validation rejects self-reference and trigger
-cycles such as `B -> A -> B`. Pipeline triggers use local database state.
-
-For example, replace a clock-staggered downstream schedule (such as 24h30m
-after a 24h upstream) with an ordered success chain:
-
-```yaml
-name: nightly-report
-repo: owner/repo
-trigger:
-  kind: pipeline
-  pipeline: nightly-sync
-stages: [...]
-```
-
-`pipeline add` validates the whole spec at add time (unknown keys, duplicate/self/
-cyclic `needs`, self/cyclic pipeline triggers, a schedule+pipeline-trigger hybrid,
-a stage that is not exactly one of `cmd`/`agent`/`gate`, an agent stage
-missing a `prompt` / invalid `action` / `implement` without `write: true` / a mutating
-stage on a scheduled pipeline without `allow_scheduled_writes` / a mutating stage on
-a triggered pipeline without `allow_triggered_writes` / a gate or review's
-bad `source` / `source` on another stage kind / `isolate: true` on a non-shell
-stage, invalid durations, a `success_decisions` outside
-`approved`/`implemented`/`changes_requested`/`skipped`) so a mistake is a clear error, not a
-stuck run. It stores the raw YAML **verbatim** plus a content hash; each run
-snapshots that hash and executes its snapshot, so editing the file later never
-mutates an in-flight run. `pipeline add` also auto-creates one hidden shell runner
-agent (`pipeline-<name>-runner`) that owns the **shell** stage jobs — filtered out of
-`agent list` and disposed by `pipeline remove`. An **agent stage** (#757) instead
-runs a named managed agent on its own runtime as a read-only leaf (`ask`/`review`);
-its `needs` stages' result summaries are prepended to the prompt, and a repo-bound
-agent stage runs in its own detached read-only worktree so same-repo agent stages
-parallelize without touching the live checkout.
-
-A shell stage may set `isolate: true` to opt into a disposable detached read-only
-worktree at the managed checkout's committed tip. The default remains the shared
-checkout, including its uncommitted/gitignored data and any intentional writes.
-Opt-in allocation is fail-open: failure emits `readonly_worktree_skipped` and runs
-on the shared checkout. On success the command receives
-`GITMOOT_CHECKOUT=<live-checkout>` for cwd-independent access to data omitted from
-the clean worktree. This removes checkout-lock serialization, and each isolated stage
-also takes a job-scoped shell runtime-session key (`runtime:shell:job:<hash(job)>`)
-instead of the command-hash key, so same-repo stages run concurrently even when they
-share the identical command (#1034). Service shell stages retain their unconditional,
-fail-closed isolation; agent and gate stages reject this shell-only field.
-
-Shell and agent stages can opt into scoped key access with `env_keys`. Source
-files must be absolute, operator-owned regular files
-with mode exactly `0600`, outside the Gitmoot home and every managed checkout;
-inline `env` is for non-secret defaults. A shell stage with no list gets
-nothing. Its resolution is own
-`env_file`, then a shared `injected` or configured `proxied` key granted with
-`gitmoot key grant`, then inline default. Registered but ungranted names do not
-match exact or glob selectors. Structural errors always fail add; unresolved
-names warn only while the pipeline remains disabled, then hard-fail
-add-with-enable, enable, manual run, and scheduled/triggered preflight.
-
-Agent stages resolve only configured `proxied` registry keys granted to their
-registered seat. The seat grant and the stage selector are both required;
-injected agent grants, pipeline files/defaults/grants, and gate-stage selectors
-are refused. Ordinary agent jobs receive no keys, and delegation children do
-not inherit the parent stage's key access.
-
-Sources are revalidated and reread at delivery, so rotation applies without a
-daemon restart. Each payload audits `PipelineName` and names-only
-`PipelineKeyAccess` rows `{stage,name,source,mode}`; `pipeline show --json`
-exposes the same projection. A shared grant is rechecked immediately before
-delivery: revocation fails closed and never switches to another source. Gitmoot
-internal `GITMOOT_*` entries remain final. Injected mode exposes the value to
-that shell process. Proxied mode puts a per-job placeholder in `<KEY>` and a
-loopback endpoint in `GITMOOT_PROXY_<KEY>_URL`; every request rereads the value,
-rechecks the pipeline or agent-seat grant, and is constrained to the configured
-upstream/base path. For agent stages the real value never enters the process,
-but the authorized agent can exercise it against that pinned upstream.
-The lease is revoked when delivery ends.
-
-Proxied mode hides key bytes; it does **not** prevent an authorized child from
-exercising the credential on the pinned upstream. Curated upstreams and base
-paths are part of the model. Configure only trusted upstreams. Pipeline key
-delivery stays separate from the Claude model gateway. For authenticated remote
-leases, response filtering covers accidental exact-byte reflection in body
-bytes and HTTP field names or values. Malicious upstreams and transformed
-application payloads, including application-layer compression without a
-`Content-Encoding` header, are outside that boundary.
-
-For a non-empty run payload, every agent stage (including roots) receives a
-dynamically fenced, 6000-byte-bounded `UNTRUSTED external data` block before
-upstream context; each rendered value is capped at 1500 bytes. Shell stages receive
-exact `GITMOOT_TRIGGER_<UPPERCASE_KEY>` exec environment entries, never shell-source
-interpolation. The full canonical payload is retained in the SQLite run row and
-shown as redacted/truncated key provenance by text `pipeline show <run-id>` and
-as `payload_json` in JSON; job env/prompt projections follow normal job-data
-retention.
-
-Every pipeline shell stage also receives `GITMOOT_PIPELINE_NAME`,
-`GITMOOT_PIPELINE_RUN_ID`, and `GITMOOT_PIPELINE_STAGE_ID`. A dependent shell
-stage receives `GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE`, naming a delivery-scoped
-`0600` JSON tempfile with v1 `schema_version`, `complete`, and a `stages` map of
-settled state/summary records. Each summary's marshaled JSON string is capped at
-16 KiB with rune-safe truncation, and the final marshaled file at 64 KiB;
-`complete:false` or `summary_truncated:true`
-signals partial data. The content is persisted and re-created at a fresh path for
-retries; the file is removed after delivery. Treat summaries as untrusted data,
-never shell source, and keep credentials out of them. A strict consumer can start
-with `jq -e '.schema_version == 1 and .complete == true' "$GITMOOT_PIPELINE_UPSTREAM_CONTEXT_FILE"`.
-A successfully isolated non-service shell stage additionally receives
-`GITMOOT_CHECKOUT`, a best-effort path to the live managed checkout for reading
-gitignored `repos/**` or uncommitted data. Prefer the stage cwd for committed files.
-Treat this path as read-only, and do not run the isolated reader beside a default
-stage that mutates the checkout: those live reads can observe a torn tree or
-`index.lock` contention. The input, trigger, metadata, keycard, and upstream-context
-variables are unchanged by the detached cwd.
-
-`action: produce` (#814/#825) is a sandboxed pipeline leaf for writing operator-owned
-data, never repo/branch/task/PR state. Codex uses its native sandbox; Claude and
-modern Kimi require a successful `gitmoot sandbox probe` and are re-execed under
-strict Landlock. Non-Linux/unsupported hosts keep the Codex-only refusal. It requires
-`write: true`, one or more absolute
-cleaned `writes:` paths, a `produce`-capable writable agent, and optionally
-`network: true`, `check: <cmd>`, and `check_retries: N`. `pipeline add` resolves
-symlinks and rejects targets overlapping `/`, the Gitmoot home, or a managed checkout.
-The worker repeats that same canonicalization immediately before delivery to close
-symlink-retargeting races. Declared paths are additive `--add-dir` grants. For
-Claude/Kimi, Landlock limits writes to those existing directories plus the workdir,
-temp roots, standard device nodes, and runtime-owned state: `$HOME/.claude` plus
-`$XDG_CACHE_HOME/claude-cli-nodejs` for Claude, and `$HOME/.kimi-code` for Kimi.
-Gitmoot sets `CLAUDE_CONFIG_DIR=$HOME/.claude` so Claude's mutable config stays inside
-that state grant. Apart from runtime state/cache and device nodes, declared data paths,
-the disposable workdir, and temp roots are the only writable locations. Codex behavior
-is unchanged. Landlock does not govern network access.
-A Codex danger-full-access agent receives no add-dir/network arguments because it is
-already unrestricted. Checks re-ask the same session with
-redacted/capped output; stage retries must reconcile partial data idempotently.
-Gitmoot cleans only the disposable cwd, never the declared data directories.
-
-An `action: review` stage may set `source: <implement-stage>` (also listed in its
-`needs`) to bind to that implement job's structured PR stamp. The review payload
-inherits the PR number, head SHA, branch, task, and lead agent; its detached worktree
-is pinned to the exact PR head. The verdict still posts as a PR comment and folds by
-`success_decisions`, but pipeline reviews are report-only: they dispatch no native
-fix job and never run the native merge gate. Declaring this review also sets
-`SkipNativeReviewFanout` on the source implement request, avoiding duplicate native
-reviewer jobs. If the source permanently produces no PR (no-op or `skipped`), the
-review folds blocked immediately with `source stage produced no PR; nothing to
-review` and no unbound review is dispatched.
-
-The implement stage this binding reads is the one `implement` surface #2203 left
-declarable. Its stage KIND still validates, because `write: true` and
-`allow_scheduled_writes` are #768's mutating-safety contract and `action:
-produce` is mutating too — that half is live and was not touched. What went is
-the pipeline-stage writable-worktree ALLOCATION plus the enqueue, so a declared
-implement stage has nothing to run in and no pipeline run will produce the PR
-stamp this review binds to. Lifetime pipeline stage jobs: ask 5,229, produce 92,
-implement zero — no pipeline ever created one. Whether `pipeline add` should
-refuse the kind outright is the open decision in
-[#2213](https://github.com/gitmoot/gitmoot/issues/2213); until it lands, treat
-the `source: <implement-stage>` binding and the `pr_merged` gate below as
-mechanisms whose implement source cannot currently run.
-
-The `pr_merged` gate remains a human-merge waiter by default. Opt-in
-`merge: auto` is gate-only and also requires top-level `allow_auto_merge: true`
-plus at least one review stage bound to the same implement source. The advancer,
-not the report-only review job, performs one squash attempt only after every bound
-review folded `approved`, the live PR head still equals the reviewed payload
-`HeadSHA`, GitHub reports mergeable, and checks pass. Pending checks keep waiting;
-head drift, conflicts/unmergeability, or a merge API error fold the gate blocked.
-Merge errors are not retried. Scheduled pipelines need both `allow_auto_merge` and
-the existing `allow_scheduled_writes` key. Omitting `merge` preserves human merge.
-Pending checks wait; skipped/neutral check-runs pass; failures block; and zero
-external statuses/checks always block regardless of `require_external_ci`. The
-source job atomically records `pipeline_auto_merge_claim` before the write,
-`pipeline_auto_merge_confirmed` after GitHub confirms it. A scan that loses the
-claim never parks the run; it ages its wait from the claim row's own
-`created_at` and records `pipeline_auto_merge_claim_orphaned` past 15m, or
-immediately with `cause=claim_timestamp_unreadable` when that value will not
-parse, and keeps waiting. A stage `timeout` parks either case terminally rather
-than recovering it - nothing releases an orphaned claim, so a new run is the
-remedy. A claim released in the window between a losing scan's failed claim and
-its read is the ordinary hold cycle: the scan retries SILENTLY, so nothing is
-reported while the gate is still waiting. It is not discarded, though - the
-release reason travels with the wait, and if the stage `timeout` has elapsed it
-appears in the TERMINAL PARKED summary, so the human who finds a parked run reads
-why it waited. A workload-mode
-reconciliation hold records `pipeline_auto_merge_held` with its cause, releases
-the claim so the merge is re-attempted when the row lands, and parks with that
-cause at the gate `timeout` or 24h after the hold began when no timeout is set;
-the episode is keyed on the head and the decision, not on the cause text.
-
-### Satisfying the workload-mode gate
-
-A pull request whose diff changes the `**Current mode:` marker in `AGENTS.md` is
-HELD until an exact-head reconciliation row exists. The gate is keyed on the
-repository OWNER, so every `gitmoot/*` repository is held, human-requested merges
-included.
-
-Two note streams decide it, both matched by an exact body PREFIX and compared
-case-insensitively on repository:
-
-- DECISION: `[operating-mode repo=<owner/repo> mode=<THROUGHPUT|STEADY|DRAIN>]`
-- RECONCILIATION: `[workload-mode-reconciliation repo=<owner/repo> pr=<number> head=<40-character reviewed head> mode=<mode> decision_note=<note id|none>]`
-
-Every field is `key=value`, whitespace separated, inside the leading bracket. A
-field with an empty key or value makes the whole body unparseable, so the
-`repo=` field inside the body is what identifies the repository:
-
-```
-gitmoot workflow note <label> "[operating-mode repo=owner/repo mode=STEADY]"
-```
-
-`<label>` must be a workflow that already has jobs - `workflow note` refuses an
-unknown label to guard against a typo - so file the row under the lane the PR is
-already being coordinated in rather than inventing a label.
-
-The note's repo COLUMN is a separate, optional thing. `gitmoot workflow note
---repo <owner/repo>` sets it and nothing else - it no longer opts the note into
-anything, because the memory surface it used to accompany is gone (#2202). A
-note whose column is empty still counts when its body names this repository,
-which is the ordinary case, so setting the column is optional; getting `repo=`
-right in the BODY is not. Prefer setting it anyway for an operating-mode or
-reconciliation note: the gate reads those through two bounded windows, one
-repo-scoped and one for the repo-less rows, and a scoped note cannot be crowded
-out of the window by other repositories' notes.
-
-PRECEDENCE. The NEWEST decision wins, and a reconciliation row must be newer than
-it. `decision_note=none` means the PR itself is the decision, and the row's own
-`created_at` is `decided_at`; otherwise `decision_note` names the newest
-operating-mode note the exact head implements. A row that cites a note the PR
-contradicts cannot ratify it.
-
-WHEN A DECISION CANNOT BE READ. An unreadable newest decision - a malformed field
-list, a `mode` that is not a workload mode, or a note recorded for this
-repository whose body omits or contradicts `repo=` - SUPERSEDES like any other
-decision rather than reading as "no decision". It is a recency boundary, not a
-veto: a fresh exact-head row that agrees with the PR's own marker still merges,
-so correcting the note is optional. The gate refuses outright only when nothing
-readable remains - the note is unreadable AND the PR's marker patch is missing or
-ambiguous - and the hold then names both exits: append a readable operating-mode
-note, and file an exact-head row citing it.
-
-CLEARING A HOLD. The hold is retryable: the pipeline gate releases its
-at-most-once merge claim, records `pipeline_auto_merge_held` with the cause, and
-merges on a later scan once the row lands. It is bounded on both the ordinary
-evaluate path and the final merge boundary - the stage parks at the gate
-`timeout`, or 24h after the episode began when no `timeout` is set. An episode is
-keyed on the head and the decision, so a new head or a new decision (including a
-new unreadable one) starts a fresh budget rather than inheriting the old one.
-
-A stage signals its outcome by printing a `gitmoot_result` blob to stdout; the
-advancer folds by the **decision**, never the job's exit state (`changes_requested`
-is a succeeded job but folds as a stage **failure** by default — a stage folds on the
-decision, not the job state):
-
-```sh
-printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"synced"}}'
-printf '%s' '{"gitmoot_result":{"decision":"blocked","summary":"secret missing","needs":["R2 token"]}}'
-```
-
-- a decision in the stage's `success_decisions` (default `approved`/`implemented`/`skipped`) ->
-  **succeeded**, dependents enqueue;
-- `blocked` → the stage blocks, its `needs` persist at the stage **and** run level,
-  the run **parks blocked** (downstream never enqueues, zero compute while parked);
-- `failed` / any other decision / a cancelled job / no `gitmoot_result` → the stage
-  **fails** (retried if budget remains), else the run **parks failed**.
-
-`skipped` means the stage itself had no work and advances by default with a
-`[skipped: no work]` summary marker. An explicit `success_decisions` list is
-strict: omitting `skipped` makes it fail. A `pr_merged` gate whose source skipped
-parks blocked because no PR can exist for that run.
-
-`pipeline run` prints only the run id (script-stable: `RUN=$(gitmoot pipeline run
-nightly-sync)`); repeat `--payload key=value` or use one `--payload-json` string
-object to enter the existing trigger-input seam. The forms are mutually exclusive
-and share the bridge's key/count/size validation. A manual run ignores `enabled` but still needs a `repo` and refuses
-to start while a run is already active. `pipeline show <run-id>` renders the **text
-funnel** (`source OK -> score BLOCKED (needs: R2 token) -> deploy SKIPPED`) under a
-run header; a **failed** run also prints the exact `gitmoot report bug --job
-<stage-job>` command (gitmoot never auto-files it).
-
-`pipeline watch <run-id>` is the blocking completion primitive. It prints each
-stage state transition once, returns `0` for succeeded, `1` for terminal
-failed/blocked/cancelled, and `2` with `still running` when `--timeout` expires.
-Use `--json` for the same final summary shape as `pipeline show --json`.
-
-While a stage is queued or running, the run view adds an honest
-`STATE; enqueued <elapsed> ago` detail (the stage timestamp is enqueue time, not
-claim time). Long-running pipeline jobs publish a latest-only `progress` event
-after one minute and about every 30 seconds thereafter. A running stage shows the
-event's real age and last sanitized activity line; the age continues increasing if
-the daemon dies. Orchestrate stages whose current coordinator has no fresh event
-show `(sub-tree running; no per-stage progress)`. JSON stage objects add
-`started_at`, `finished_at`, and an optional structured `progress` object.
-
-`pipeline show <run-id>` also reports best-effort total tokens; JSON carries run
-`tokens` plus per-stage `input_tokens` and `output_tokens` where captured. A zero
-can mean the runtime/session shape did not report usage.
-
-`pipeline resume` re-runs a **parked** (blocked/failed) run from its halted stage
-(or `--from <stage>`) plus its transitive dependents — bumping their attempt — while
-**never re-running a succeeded stage**; it refuses a non-parked run and a run whose
-spec drifted. `ResumePipelineRun` is the #682 approval-gate seam. `pipeline cancel`
-abandons a run through the shared `job cancel` path.
-
-A pipeline stage is a **leaf**: a stage result carrying `delegations[]` does not
-spawn children — the advancer ignores them and the engine strips them for a pipeline
-stage job. Use an orchestra for dynamic fan-out, a pipeline for a fixed shell DAG.
-See `docs/pipelines.md` for the full reference and `WORKFLOWS.md → Pipelines` for the
-end-to-end story.
+Pipelines moved to [stagehand](https://github.com/gitmoot/stagehand); gitmoot no longer ships a `pipeline` command.
 
 ## Routing Telemetry (Advisory)
 
@@ -4988,14 +4463,9 @@ gitmoot bridge token [--rotate]                 # prints the token FILE PATH, ne
 ```
 
 The bridge exposes a small authenticated HTTP surface over the same internal
-seams the CLI uses (no new authority): POST /v1/pipelines/{name}/run,
-GET /v1/runs/{id}, GET /v1/jobs/{id},
+seams the CLI uses (no new authority): GET /v1/jobs/{id} and
 POST /v1/agents/{name}/ask. Every request needs
 `Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
-rate-limited (30/min) and generally body-capped at 1 MiB. Pipeline run accepts no
-body, `{}`, or `{"payload":{"key":"value"}}` for any enabled repo-bound pipeline.
-Its raw body cap is 64 KiB: at most 32 entries, 1–64 byte lowercase identifier
-keys, 32 KiB UTF-8 values without U+0000, and 48 KiB decoded keys+values. Invalid
-payloads return 400, oversize 413, missing pipelines 404, and overlapping runs 409.
+rate-limited (30/min) and body-capped at 1 MiB.
 Containers reach the host bridge at `http://host.docker.internal:8791`, or at
 the Docker bridge IP on Linux.

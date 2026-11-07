@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/proof"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -22,7 +21,6 @@ func runProof(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the canonical manifest JSON")
-	verify := fs.Bool("verify", false, "verify a succeeded pipeline run against offline store state")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -46,14 +44,7 @@ func runProof(args []string, stdout, stderr io.Writer) int {
 	}
 	defer store.Close()
 
-	var manifest proof.Manifest
-	if *verify {
-		verified, verifyErr := pipeline.VerifyPipelineRunFromStore(context.Background(), store, paths, rootID)
-		err = verifyErr
-		manifest = verified.Manifest
-	} else {
-		manifest, err = loadProofManifest(context.Background(), store, rootID)
-	}
+	manifest, err := loadProofManifest(context.Background(), store, rootID)
 	if err != nil {
 		fmt.Fprintf(stderr, "proof: %v\n", err)
 		return 1

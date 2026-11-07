@@ -36,8 +36,8 @@ agent template and rendered job prompt before handing work to an adapter.
   or auth field, so there is nothing of kimi's own to classify from.
 - **omp** is the oh-my-pi CLI (v17.2.4), a multi-provider *routing harness*
   rather than one vendor's CLI. Select it with `gitmoot agent start <name>
-  --runtime omp`. It advertises `review`, `implement`, and `ask` — **not**
-  `produce` — and every job runs a fresh, stateless session. The full contract
+  --runtime omp`. It advertises `review`, `implement`, and `ask`, and every job
+  runs a fresh, stateless session. The full contract
   is below.
 - **Shell** invokes a configured shell command and is mainly for smoke tests,
   demos, and adapter contract checks.
@@ -267,8 +267,7 @@ A kernel-enforced `ReadOnlySeat` is the exception. Gitmoot wraps every such omp
 delivery in its Landlock sandbox and passes `--approval-mode=yolo`, declared
 `widened`, so headless shell and test tools can run. Landlock, rather than omp's
 interactive approval UI, is then the write boundary. Ordinary non-seat
-`read-only` deliveries retain `always-ask`; omp still does not advertise
-`produce`, so it never reaches the separate produce-stage wrapper.
+`read-only` deliveries retain `always-ask`.
 
 ### Plan mode
 
@@ -320,10 +319,7 @@ confirmation or an answer from its parent seat or the owner.
 
 ### Capabilities
 
-`review`, `implement`, `ask`. `produce` is deliberately excluded: the produce
-path runs the runtime under Gitmoot's Landlock wrapper, and omp ships as a Bun
-binary whose sandbox interaction is unprobed. Advertising the capability before
-it is proven would turn an unknown into a silent stage failure.
+`review`, `implement`, `ask`.
 
 ### Runtime-family review signal
 

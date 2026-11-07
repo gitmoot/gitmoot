@@ -51,30 +51,6 @@ type Fetcher interface {
 	FetchFile(ctx context.Context, repo string, ref string, path string) (File, error)
 }
 
-// DirEntry is one entry in a remote directory listing (a subset of the GitHub
-// contents API entry shape), used by the pipeline remote sync to discover the
-// files under a remote subdir.
-type DirEntry struct {
-	Name string
-	Path string
-	Type string
-}
-
-// DirLister lists a directory on a remote repo. It is the counterpart to
-// Fetcher's single-file FetchFile; GHFetcher implements both.
-type DirLister interface {
-	ListDir(ctx context.Context, repo string, ref string, path string) ([]DirEntry, error)
-}
-
-// RemoteSource is the combined read surface a remote sync needs: resolve a ref,
-// fetch a file, and list a directory. GHFetcher satisfies it. It is a separate
-// interface from Fetcher so single-file callers and their test fakes stay
-// unaffected.
-type RemoteSource interface {
-	Fetcher
-	DirLister
-}
-
 var builtins = []Definition{
 	{
 		ID:                  ThermoNuclearCodeQualityReviewID,
@@ -270,35 +246,6 @@ func (f GHFetcher) FetchFile(ctx context.Context, repo string, ref string, path 
 		return File{}, fmt.Errorf("decode github contents: %w", err)
 	}
 	return File{Content: string(decoded)}, nil
-}
-
-// ListDir lists path on repo@ref via `gh api repos/<repo>/contents/<path>`,
-// returning the directory's entries. It is the discovery call that finds the
-// files under a remote subdir; per-file content is then fetched via FetchFile.
-func (f GHFetcher) ListDir(ctx context.Context, repo string, ref string, path string) ([]DirEntry, error) {
-	repo = strings.TrimSpace(repo)
-	ref = strings.TrimSpace(ref)
-	path = strings.Trim(strings.TrimSpace(path), "/")
-	if repo == "" || ref == "" || path == "" {
-		return nil, errors.New("repo, ref, and path are required")
-	}
-	result, err := f.run(ctx, "api", "-X", "GET", "repos/"+repo+"/contents/"+path, "-f", "ref="+ref)
-	if err != nil {
-		return nil, err
-	}
-	var entries []struct {
-		Name string `json:"name"`
-		Path string `json:"path"`
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal([]byte(result.Stdout), &entries); err != nil {
-		return nil, fmt.Errorf("decode github directory listing: %w", err)
-	}
-	out := make([]DirEntry, 0, len(entries))
-	for _, entry := range entries {
-		out = append(out, DirEntry{Name: entry.Name, Path: entry.Path, Type: entry.Type})
-	}
-	return out, nil
 }
 
 func (f GHFetcher) run(ctx context.Context, args ...string) (subprocess.Result, error) {

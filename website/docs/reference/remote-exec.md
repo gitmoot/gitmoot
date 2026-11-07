@@ -168,7 +168,7 @@ checks_template = "gitmoot-swift"  # optional; replaces the provider's template
 - Every review of that repository runs remotely on `checks_provider` with
   `checks_template`, whichever producer enqueued it: policy-routed,
   `agent review`, `review request`, native PR fan-out, comment-triggered,
-  heartbeat and pipeline review stages. The dispatch verbs record the route
+  and heartbeat reviews. The dispatch verbs record the route
   when they enqueue; the worker applies it to any other review before it
   resolves the job's backend, with the same `review_backend_route_selected`
   event. The provider and template are stored in the job payload
@@ -411,9 +411,7 @@ deliberately fail-open — allocation failure records
 `readonly_worktree_skipped` and falls back to the registered checkout. Four
 simultaneous legs do contend, so in practice the paths are distinct, but read
 the reported workspace from each `gitmoot_result` and treat distinctness as
-OBSERVED, never assumed. When the gate needs guaranteed writable per-job
-isolation instead, run the legs as pipeline `action: produce` stages with
-declared `writes:` roots: produce is mutating, live, and sandboxed per job.
+OBSERVED, never assumed.
 
 Gitmoot reads `[remote_exec]` when it dispatches a job. Once the process starts
 a remote credential listener for a home, those listener coordinates are

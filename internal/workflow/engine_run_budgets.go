@@ -282,7 +282,7 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 // a fold that is not recorded leaves those surfaces contradicting `gitmoot proof`.
 //
 // It is called once at the TOP of AdvanceJob rather than at any point inside it.
-// Pipeline-sender reviews are excluded for free: effectiveReviewDecisionForPayload
+// Fan-out reviews are excluded for free: effectiveReviewDecisionForPayload
 // keeps their verdict raw, so they never reach "approved" here. blocked/failed are
 // excluded by the changes_requested test. AddJobEventIfAbsent makes every replay,
 // re-advance and stale round idempotent.
@@ -637,28 +637,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		}
 	}
 
-	if job.Type == "review" && payload.Sender == PipelineJobSender {
-		// Pipeline PR reviews are report-only: delivery and the daemon's PR-comment
-		// posting already happened, while the pipeline advancer owns decision folding.
-		// Do not enter the native review lifecycle here: changes_requested would fan
-		// out a fix job and approved could run the merge gate (and merge the PR), both
-		// violating the human-merge pipeline policy. This is the single policy seam
-		// where a future explicit `merge: auto` mode can branch.
-		events, err := e.Store.ListJobEvents(ctx, job.ID)
-		if err != nil {
-			return err
-		}
-		for _, event := range events {
-			if event.Kind == "pipeline_review_report_only" {
-				return nil
-			}
-		}
-		return e.Store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   job.ID,
-			Kind:    "pipeline_review_report_only",
-			Message: "pipeline review recorded as report-only; pipeline advancement owns the verdict and human merge remains required",
-		})
-	}
 	effectiveDecision := payload.Result.Decision
 	if job.Type == "review" {
 		latest, err := e.latestReviewRound(ctx, payload)
@@ -684,10 +662,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			}
 			return nil
 		}
-		// Pipeline-sender reviews already returned above as report-only, so this is
-		// reached only by native reviews. Folding through the payload authority
-		// anyway keeps the invariant LOCAL rather than dependent on that distant
-		// early return surviving future edits.
+		// Folding through the payload authority keeps fan-out exclusion and the
+		// severity bar in one place.
 		effectiveDecision = effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
 		// THE #1822 LEDGER'S PRODUCTION WRITER (#1850 review F1). This is the only
 		// place a review's findings become ledger observations, and without it the

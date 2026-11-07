@@ -132,8 +132,8 @@ not itself dispose the task.
 `gitmoot task --help` prints exactly those two.
 
 Where new worktrees go: by default under `<home>/worktrees`. A `[worktrees]`
-section moves NEW gitmoot-created worktrees (read-only review seats, pipeline
-stages, pool isolation, delegation and integration worktrees) to another root,
+section moves NEW gitmoot-created worktrees (read-only review seats, pool
+isolation, delegation and integration worktrees) to another root,
 for example a network mount; the database, WAL, caches, artifacts and cleanup
 receipts stay in the home:
 

@@ -53,14 +53,9 @@ func TestListMethodsPreserveTheirEmptyResultShape(t *testing.T) {
 	// methods returned nil and six returned an empty slice, and both groups have
 	// HTTP consumers, so neither shape could be standardised away. One of the
 	// nil-returning five, ListAllCockpitPanes, went with the cockpit pane wrapper
-	// in #1753, so four remain pinned here.
+	// in #1753, and ListPipelines/ListActivePipelineRuns went with pipelines in
+	// #2542, so two remain pinned here.
 	t.Run("nil-returning methods", func(t *testing.T) {
-		if got, err := store.ListPipelines(ctx); err != nil || got != nil {
-			t.Fatalf("ListPipelines = %#v, err %v; want nil slice", got, err)
-		}
-		if got, err := store.ListActivePipelineRuns(ctx); err != nil || got != nil {
-			t.Fatalf("ListActivePipelineRuns = %#v, err %v; want nil slice", got, err)
-		}
 		if got, err := store.ListAgents(ctx); err != nil || got != nil {
 			t.Fatalf("ListAgents = %#v, err %v; want nil slice", got, err)
 		}

@@ -195,8 +195,7 @@ diff. Two more properties an adapter author has to keep in mind here:
   otherwise delete a failed final turn from the stream and report an *earlier*
   turn's sentence as the job's answer.
 
-omp advertises `review`, `implement`, and `ask` — not `produce`, whose Landlock
-wrapper interaction with omp's Bun binary is unprobed. The behavioral contract
+omp advertises `review`, `implement`, and `ask`. The behavioral contract
 in full (policies, retries, credentials, transcripts, cross-family) is in the
 [Runtime Adapters reference](https://gitmoot.io/docs/reference/runtime-adapters).
 

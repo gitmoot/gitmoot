@@ -10,10 +10,10 @@
 # resolver rather than from memory:
 #   runtime-auth.env      internal/cli/daemon_runtime_auth.go:24 (runtimeAuthFileName)
 #   daemon-runtime.env    internal/cli/daemon_runtime_auth.go:25 (legacyRuntimeAuthFileName)
-#   .credentials.json     internal/cli/daemon_worker.go:1649, readonly_seat_credential.go:71
-#   auth.json             internal/cli/daemon_worker.go:1654 (codex)
-#   kimi-code.json        internal/cli/daemon_worker.go:1660 (kimi)
-#   keychain.env          internal/pipeline/env_runtime.go, ResolveKeychainPath
+#   .credentials.json     internal/cli/daemon_worker.go:2435, readonly_seat_credential.go:71
+#   auth.json             internal/cli/daemon_worker.go:2444 (codex)
+#   kimi-code.json        internal/cli/daemon_worker.go:2463 (kimi)
+#   keychain.env          internal/keychain/keychain.go, ResolvePath
 #   bridge.token          internal/cli/bridge.go:37, bridgeTokenName
 # The feature's contract is "read a credential overlay out of a directory", so
 # the host that exercises it will produce these files in a work tree. None of

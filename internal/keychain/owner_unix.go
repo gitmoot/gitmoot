@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package pipeline
+package keychain
 
 import (
 	"fmt"
@@ -8,11 +8,13 @@ import (
 	"syscall"
 )
 
-var PipelineEnvCurrentUID = func() uint32 {
+// CurrentUID is the operator uid the keychain file must be owned by. It is a
+// variable so tests can simulate a foreign owner.
+var CurrentUID = func() uint32 {
 	return uint32(syscall.Geteuid())
 }
 
-func pipelineEnvOwnerUID(info os.FileInfo) (uint32, error) {
+func ownerUID(info os.FileInfo) (uint32, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return 0, fmt.Errorf("owner information unavailable")

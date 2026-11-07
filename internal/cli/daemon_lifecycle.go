@@ -359,7 +359,6 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			Store:                 store,
 			RequireWorkflowPolicy: requireWorkflowPolicyResolverRoot(resolvedHome),
 			OrgPolicy:             orgPolicyResolverRoot(resolvedHome),
-			ProduceCheckDir:       checkout,
 			// Resolve [merge_gate] inside daemonMergeGate for every evaluation so a
 			// live auto_merge flip both re-arms parked tasks and changes their next
 			// gate decision without a daemon restart.
