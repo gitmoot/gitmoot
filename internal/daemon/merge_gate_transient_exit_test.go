@@ -106,8 +106,7 @@ func seedBlockedReviewTaskAttributed(t *testing.T, store *db.Store, repo github.
 	// still COMPUTING, and it never merges a pull request whose mergeability it
 	// has not computed - so a fixture that omits the field and then expects a
 	// merge describes an unreachable scenario, not a scenario the gate should
-	// support. `pipeline_auto_merge.go:121` already treated nil as WAITING before
-	// this gate did, and two sibling fixtures in this same package state the
+	// support. Two sibling fixtures in this same package state the
 	// field explicitly (`daemon_test.go:1827`,
 	// `external_merge_reconcile_test.go:251`). The omission here was an oversight.
 	//

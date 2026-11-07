@@ -29,8 +29,7 @@ and you want gitmoot's guardrails while nobody watches:
 
 - parallel fan-out — review a PR from several lenses, research N topics at once;
 - bounded autonomous work, where budgets, timeouts, and failure policies do the
-  babysitting;
-- inside pipelines, as an `orchestrate` stage.
+  babysitting.
 
 ## When to use `--workflow`
 

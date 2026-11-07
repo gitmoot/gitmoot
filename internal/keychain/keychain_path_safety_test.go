@@ -1,4 +1,4 @@
-package pipeline
+package keychain
 
 import (
 	"os"
@@ -11,7 +11,7 @@ import (
 
 // keychain.env is a credential-bearing overlay, and its path is OPERATOR INPUT.
 // A relative credentials.keychain_path resolves against whatever directory the
-// process runs in - for a pipeline stage that is the checkout - so the file is
+// process runs in - for an agent job that is the checkout - so the file is
 // read, and can then be staged, from inside the work tree. That is the class
 // that put a live token in a public repo (#1810), reached through a different
 // door than runtime-auth.env.
@@ -33,7 +33,7 @@ func TestResolveKeychainPathRefusesARelativeKeychain(t *testing.T) {
 	// than duplicated in the resolver as unreachable code.
 	for _, relative := range []string{"keychain.env", "./keychain.env", "config/keychain.env"} {
 		write(t, "\n[credentials]\nkeychain_path = \""+relative+"\"\n")
-		got, err := ResolveKeychainPath(nil, home)
+		got, err := ResolvePath(nil, home)
 		if err == nil {
 			t.Fatalf("keychain_path %q was accepted and resolved to %q", relative, got)
 		}
@@ -56,7 +56,7 @@ func TestResolveKeychainPathRefusesARelativeKeychain(t *testing.T) {
 		if err := os.WriteFile(relPaths.ConfigFile, []byte(config.DefaultConfig(relPaths)), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		got, err := ResolveKeychainPath(nil, "home")
+		got, err := ResolvePath(nil, "home")
 		if err == nil {
 			t.Fatalf("a relative home resolved keychain.env to %q; a credential must never resolve inside the working directory", got)
 		}
@@ -68,12 +68,12 @@ func TestResolveKeychainPathRefusesARelativeKeychain(t *testing.T) {
 	// An absolute configured path still works, and so does the default.
 	absolute := filepath.Join(t.TempDir(), "keychain.env")
 	write(t, "\n[credentials]\nkeychain_path = \""+absolute+"\"\n")
-	got, err := ResolveKeychainPath(nil, home)
+	got, err := ResolvePath(nil, home)
 	if err != nil || got != absolute {
 		t.Fatalf("absolute keychain_path = %q err=%v, want %q", got, err, absolute)
 	}
 	write(t, "")
-	got, err = ResolveKeychainPath(nil, home)
+	got, err = ResolvePath(nil, home)
 	if err != nil {
 		t.Fatalf("default keychain resolution: %v", err)
 	}

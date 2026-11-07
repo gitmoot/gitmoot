@@ -13,7 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -287,17 +287,15 @@ func (w jobWorker) modelGatewayKeychainKey(name string) (db.KeychainKey, error) 
 // keychainModelGatewayResolver returns the upstream credential from the
 // keychain, re-reading it on EVERY request.
 //
-// Re-reading is the point: a key revoked, reconfigured or removed mid-job must
-// stop working immediately rather than at the next daemon restart. This mirrors
-// the pipeline proxied-key resolver, which is the existing proven path for
-// serving a keychain credential through the gateway.
+// Re-reading is the point: a key reconfigured or removed mid-job must stop
+// working immediately rather than at the next daemon restart.
 func (w jobWorker) keychainModelGatewayResolver(name string) credgw.CredentialResolver {
 	return func(ctx context.Context) (credgw.ResolvedCredential, error) {
 		key, err := w.modelGatewayKeychainKey(name)
 		if err != nil {
 			return credgw.ResolvedCredential{}, err
 		}
-		_, values, err := pipeline.LoadValidatedKeychainFile(ctx, w.Store, w.ConfigHome)
+		_, values, err := keychain.LoadValidated(ctx, w.Store, w.ConfigHome)
 		if err != nil {
 			return credgw.ResolvedCredential{}, fmt.Errorf("load keychain for model gateway key %q: %w", name, err)
 		}

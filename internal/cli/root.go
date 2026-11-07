@@ -34,7 +34,7 @@ var rootCommands = []command{
 	{name: "org", summary: "org registry, attribution, and brief/chart/status (RFC #1042)", run: runOrg},
 	{name: "message", summary: "send, read and reply to durable fleet messages", run: runMessage},
 	{name: "auth", summary: "manage runtime authentication", run: runAuth},
-	{name: "key", summary: "manage keycard registry metadata and grants", run: runKey},
+	{name: "key", summary: "manage keycard registry metadata", run: runKey},
 	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},
 	{name: "setup", summary: "register a repo and initial agent", run: runSetup},
 	{name: "repo", summary: "manage watched repositories", run: runRepo},
@@ -56,7 +56,6 @@ var rootCommands = []command{
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
 	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
-	{name: "pipeline", summary: "define, run, and manage declarative pipelines", run: runPipeline},
 	{name: "bridge", summary: "serve the authenticated localhost HTTP bridge", run: runBridge},
 	{name: "router", summary: "inspect execution-grounded routing telemetry (advisory)", run: runRouter},
 }

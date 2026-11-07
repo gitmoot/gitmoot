@@ -18,15 +18,6 @@ import (
 
 const resultKey = `"gitmoot_result"`
 
-// PipelineJobSender is the Sender stamped on every #681 pipeline stage job. It is
-// the single source of truth shared by the CLI (which builds the stage
-// JobRequest) and the mailbox (which strips a stage result's delegations[] so a
-// pipeline stage is provably a LEAF — see Mailbox.Run). A pipeline stage carries
-// an EMPTY ParentJobID, so its own result-borne delegations would otherwise
-// dispatch as top-level jobs; stripping them here keeps stages leaves and matches
-// the advancer, which ignores stage delegations entirely.
-const PipelineJobSender = "pipeline"
-
 // The following slices are the single source of truth for the enum-valued
 // fields of the gitmoot_result contract. The validator below checks against
 // them, and the build-time contract generator (internal/prompts/contractgen)
@@ -365,14 +356,12 @@ type AgentResult struct {
 	// and consumes zero compute until the human answers via the `answer` resume
 	// verb. The same escalation TTL backstop auto-finalizes an unanswered ask.
 	HumanQuestions []HumanQuestion `json:"human_questions,omitempty"`
-	// FanOut records that this result WAS a coordinator fan-out. It exists because
-	// the executable delegations[] do not always survive to the consumers: a
-	// pipeline leaf stage has its delegations STRIPPED at the mailbox seam so a
-	// stage can never spawn phantom children, and an approved announcement then
-	// reached auto-merge indistinguishable from a real leaf approval (#1685).
-	// Stripping the INSTRUCTIONS must not erase the CLASSIFICATION.
+	// FanOut records that this result WAS a coordinator fan-out, for consumers
+	// that cannot see the executable delegations[]. Stored rows may carry it
+	// without their delegations, and an approved announcement must never reach
+	// a merge decision indistinguishable from a real leaf approval (#1685).
 	//
-	// Normalization owns this field; agents are never asked for it. An agent that
+	// The product owns this field; agents are never asked for it. An agent that
 	// sets it anyway can only REMOVE its own verdict's authority, never add any:
 	// ResultIsFanOut ORs it with the delegations it can see, so `fan_out: false`
 	// beside a declared panel is still a fan-out.
@@ -729,8 +718,7 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 }
 
 // extractAgentResultForAction applies action-specific contract rules after the
-// generic wire object is parsed. changes_requested is also a valid pipeline
-// produce outcome, so only review jobs require a severity.
+// generic wire object is parsed. Only review jobs require a severity.
 func extractAgentResultForAction(output, action string) (AgentResult, error) {
 	result, err := ExtractAgentResult(output)
 	if err != nil {

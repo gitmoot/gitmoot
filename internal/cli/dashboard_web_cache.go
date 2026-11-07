@@ -377,9 +377,6 @@ func (d *webDataSource) overviewJSON(ctx context.Context) ([]byte, error) {
 	if overview.Today.Notable == nil {
 		overview.Today.Notable = []dashboard.OverviewNotable{}
 	}
-	if overview.Scheduled == nil {
-		overview.Scheduled = []dashboard.OverviewScheduled{}
-	}
 	if overview.Fleet == nil {
 		overview.Fleet = []dashboard.OverviewFleet{}
 	}

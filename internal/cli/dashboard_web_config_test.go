@@ -16,7 +16,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 )
 
 func TestDashboardConfigProjectionAllowlist(t *testing.T) {
@@ -165,7 +165,7 @@ func TestWebDataSourceConfigKeychainProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipeline.PipelineEnvFileStatusOK {
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != keychain.StatusOK {
 		t.Fatalf("keychain file = %+v", snapshot.Keychain.File)
 	}
 	wantNames := []string{"GH_TOKEN", "OPENAI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
@@ -173,25 +173,19 @@ func TestWebDataSourceConfigKeychainProjection(t *testing.T) {
 		t.Fatalf("keys = %+v", snapshot.Keychain.Keys)
 	}
 	for i, want := range wantNames {
-		if snapshot.Keychain.Keys[i].Name != want || snapshot.Keychain.Keys[i].Grants == nil || snapshot.Keychain.Keys[i].CreatedAt == "" {
-			t.Fatalf("key[%d] = %+v, want %s with non-nil grants and created_at", i, snapshot.Keychain.Keys[i], want)
+		if snapshot.Keychain.Keys[i].Name != want || snapshot.Keychain.Keys[i].CreatedAt == "" {
+			t.Fatalf("key[%d] = %+v, want %s with created_at", i, snapshot.Keychain.Keys[i], want)
 		}
-	}
-	ghGrants := snapshot.Keychain.Keys[0].Grants
-	wantGrants := []dashboard.KeychainGrantView{
-		{ConsumerKind: "pipeline", ConsumerID: "alpha"},
-		{ConsumerKind: "pipeline", ConsumerID: "zeta"},
-	}
-	if !reflect.DeepEqual(ghGrants, wantGrants) {
-		t.Fatalf("GH_TOKEN grants = %+v, want %+v", ghGrants, wantGrants)
 	}
 	proxied := snapshot.Keychain.Keys[1]
 	if proxied.Mode != db.KeychainModeProxied || proxied.ProxyUpstream != "https://api.example.test/v1" || proxied.ProxyAuth != "header:X-Service-Key" {
 		t.Fatalf("proxied key = %+v", proxied)
 	}
+	// Rows written before #2542 may still carry the retired "injected" mode;
+	// they keep rendering as plain registry metadata.
 	for _, key := range []dashboard.KeychainKeyView{snapshot.Keychain.Keys[0], snapshot.Keychain.Keys[2], snapshot.Keychain.Keys[3]} {
-		if key.Mode != db.KeychainModeInjected || key.ProxyUpstream != "" || key.ProxyAuth != "" || len(key.Grants) == 0 {
-			t.Fatalf("injected key = %+v", key)
+		if key.Mode != "injected" || key.ProxyUpstream != "" || key.ProxyAuth != "" {
+			t.Fatalf("legacy injected key = %+v", key)
 		}
 	}
 }
@@ -206,14 +200,8 @@ func TestWebDataSourceConfigKeychainLiveDriftKeepsRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != pipeline.PipelineEnvFileStatusMissing || len(snapshot.Keychain.Keys) != 4 {
+	if snapshot.Keychain.File.Path != path || snapshot.Keychain.File.Status != keychain.StatusMissing || len(snapshot.Keychain.Keys) != 4 {
 		t.Fatalf("drifted keychain = %+v", snapshot.Keychain)
-	}
-	if got := snapshot.Keychain.Keys[0].Grants; !reflect.DeepEqual(got, []dashboard.KeychainGrantView{
-		{ConsumerKind: "pipeline", ConsumerID: "alpha"},
-		{ConsumerKind: "pipeline", ConsumerID: "zeta"},
-	}) {
-		t.Fatalf("registry grants changed after file drift: %+v", got)
 	}
 }
 
@@ -253,12 +241,12 @@ func TestDashboardConfigKeychainHTTPShape(t *testing.T) {
 		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
 	}
 	text := string(body)
-	for _, want := range []string{`"keychain"`, `"proxyUpstream"`, `"proxyAuth"`, `"consumerKind"`, `"consumerID"`, `"createdAt"`} {
+	for _, want := range []string{`"keychain"`, `"proxyUpstream"`, `"proxyAuth"`, `"createdAt"`} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("config wire payload missing %s: %s", want, body)
 		}
 	}
-	for _, unwanted := range []string{`"proxy_upstream"`, `"proxy_auth"`, `"consumer_kind"`, `"consumer_id"`, `"created_at"`} {
+	for _, unwanted := range []string{`"proxy_upstream"`, `"proxy_auth"`, `"created_at"`, `"grants"`} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("config wire payload contains non-camelCase key %s: %s", unwanted, body)
 		}
@@ -272,7 +260,7 @@ func TestDashboardConfigKeychainHTTPShape(t *testing.T) {
 	if err := json.Unmarshal(body, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Keychain.Keys == nil || len(snapshot.Keychain.Keys) != 4 || snapshot.Keychain.Keys[0].Grants == nil {
+	if snapshot.Keychain.Keys == nil || len(snapshot.Keychain.Keys) != 4 {
 		t.Fatalf("non-null array contract failed: %+v", snapshot.Keychain)
 	}
 }
@@ -291,34 +279,23 @@ func seedDashboardConfigKeychain(t *testing.T, home string) (string, []string) {
 		"TELEGRAM_BOT_TOKEN=" + sentinels[2],
 		"TELEGRAM_CHAT_ID=" + sentinels[3],
 	}, "\n")+"\n")
-	store := openPipelineTestStore(t, home)
-	defer store.Close()
-	for _, name := range []string{"zeta", "alpha", "beta"} {
-		seedTestPipeline(t, store, db.Pipeline{Name: name, SpecYAML: "name: " + name + "\nstages:\n  - {id: run, cmd: echo}\n"})
+	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
 	}
-	for _, key := range []struct{ name, mode string }{
-		{"TELEGRAM_CHAT_ID", db.KeychainModeInjected},
-		{"GH_TOKEN", db.KeychainModeInjected},
-		{"OPENAI_API_KEY", db.KeychainModeProxied},
-		{"TELEGRAM_BOT_TOKEN", db.KeychainModeInjected},
-	} {
-		if _, err := store.AddKeychainKey(context.Background(), key.name, key.mode); err != nil {
-			t.Fatalf("AddKeychainKey %s: %v", key.name, err)
+	defer store.Close()
+	// AddKeychainKey accepts only proxied keys now; the legacy injected rows
+	// are inserted directly, as a pre-#2542 store would hold them.
+	for _, name := range []string{"TELEGRAM_CHAT_ID", "GH_TOKEN", "TELEGRAM_BOT_TOKEN"} {
+		if err := store.ExecForTest(context.Background(), `INSERT INTO keychain_keys(name, mode) VALUES (?, 'injected')`, name); err != nil {
+			t.Fatalf("insert legacy injected key %s: %v", name, err)
 		}
+	}
+	if _, err := store.AddKeychainKey(context.Background(), "OPENAI_API_KEY", db.KeychainModeProxied); err != nil {
+		t.Fatalf("AddKeychainKey OPENAI_API_KEY: %v", err)
 	}
 	if _, err := store.ConfigureKeychainProxy(context.Background(), "OPENAI_API_KEY", "https://api.example.test/v1", db.KeychainProxyAuthHeader, "X-Service-Key"); err != nil {
 		t.Fatal(err)
-	}
-	for _, grant := range []struct{ key, pipeline string }{
-		{"GH_TOKEN", "zeta"},
-		{"GH_TOKEN", "alpha"},
-		{"OPENAI_API_KEY", "alpha"},
-		{"TELEGRAM_BOT_TOKEN", "beta"},
-		{"TELEGRAM_CHAT_ID", "zeta"},
-	} {
-		if _, err := store.GrantKeychainKey(context.Background(), db.KeychainConsumerPipeline, grant.pipeline, grant.key); err != nil {
-			t.Fatalf("GrantKeychainKey %s/%s: %v", grant.pipeline, grant.key, err)
-		}
 	}
 	return path, sentinels
 }

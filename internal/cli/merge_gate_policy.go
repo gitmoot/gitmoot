@@ -13,8 +13,8 @@ func applyResolvedMergeGatePolicy(gate *workflow.PolicyMergeGate, policy config.
 	gate.MaxCIWait = policy.MaxCIWait
 }
 
-// resolvedMergeGatePolicy is the single config path for the native merge gate
-// and pipeline auto-merge executor, including per-repo overrides.
+// resolvedMergeGatePolicy is the single config path for the native merge gate,
+// including per-repo overrides.
 func resolvedMergeGatePolicy(home string, repo string) (config.MergeGatePolicy, bool) {
 	cfg := resolveConfigFile(home)
 	if cfg == "" {

@@ -64,7 +64,6 @@ var (
 	// does not re-derive them, and enforced so the list cannot rot.
 	unpinnedSectionHeaderSites = []string{
 		"edit_compat.go::configSectionAtParseError",
-		"github_remote.go::loadGitHubRemote",
 		"orchestrate.go::LoadEventsPolicy",
 		"orchestrate.go::LoadOrchestratePolicy",
 		"org.go::parseOrgContent",
@@ -162,10 +161,11 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 24 since #2375 added worktrees.go::LoadWorktreeRoot (23 after #2360 added
-	// cleanup_budget.go; 22 after #2203 deleted internal/config/implement_base.go).
-	if distinctFiles != 24 {
-		t.Errorf("sectionHeader call sites span %d files, want 24: update this expectation together with the lists above", distinctFiles)
+	// 23 since #2542 deleted github_remote.go (24 after #2375 added
+	// worktrees.go::LoadWorktreeRoot; 23 after #2360 added cleanup_budget.go; 22
+	// after #2203 deleted internal/config/implement_base.go).
+	if distinctFiles != 23 {
+		t.Errorf("sectionHeader call sites span %d files, want 23: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

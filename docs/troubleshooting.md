@@ -502,26 +502,6 @@ Fixes:
   NOT observed — it reads a staged clone inside its own writable cache root,
   which the child may legitimately rewrite, and gitmoot never grants a seat read
   or write access to the live profile.
-- A Claude `produce` stage does NOT run against the operator profile. The daemon
-  copies `.credentials.json` and `settings.json` from the configured account
-  (`CLAUDE_CONFIG_DIR`, else `~/.claude`) into a job-private profile, points the
-  runtime's `CLAUDE_CONFIG_DIR` and `XDG_CACHE_HOME` at that job-private state
-  root under `<gitmoot home>/cache/produce-runtime/<hash>/run-*/` — one
-  directory per dispatch, so two runs of one job id cannot wipe each other — and
-  removes it when the job finishes. The operator profile is never granted
-  writable and is never named in any read grant, so a token the runtime
-  refreshes mid-job lands in the discarded copy: re-login on the host, not in
-  the job. It may still be READABLE: an agent that declares no readable paths
-  falls back to a read-only grant over `/`, which is a read, never a write.
-- Only those two files cross into a produce job. Everything else in the operator
-  profile — `agents/`, `commands/`, `plugins/`, `CLAUDE.md`,
-  `settings.local.json`, `~/.claude.json` — deliberately does not, so a produce
-  job sees runtime defaults rather than operator customisation. A profile that
-  does not exist yet is valid and starts the job with an empty one. A
-  `settings.json` that is symlinked is followed; one that is empty, holds a
-  non-object, or is not a file at all is SKIPPED rather than failing the job. An
-  unusable `.credentials.json` does fail the job, because it decides which
-  account the work runs as.
 - `sandbox-exec: sandbox read path "…": no such file or directory` means a path
   granted to the sandbox does not exist on disk. Explicit read grants are
   required, not skipped — check `readable_paths` in `gitmoot job show <job-id>
@@ -1146,7 +1126,7 @@ to any covered path is refused. Reading the checkout, `git`, `go`, and the
 runtime itself work as before. The seat cannot remove the covers: Landlock
 denies mount changes to a sandboxed process, and denies access to the
 `/proc/<pid>/root` of processes outside the sandbox. Seats that write code
-(implementation and produce jobs) launch without this and keep their access to
+(implementation jobs) launch without this and keep their access to
 the runtime.
 
 ### What is not covered
@@ -1396,7 +1376,7 @@ delete the seat to reconcile it, and does not fall back to the registered
 checkout or the repository root.
 
 A task-owned checkout is different. A review or implement job whose path is
-not marked `read_only_worktree` keeps that path. An ask or produce job that
+not marked `read_only_worktree` keeps that path. An ask job that
 already has a task id also keeps its path. Do not delete the registered
 checkout or the task worktree to force a retry; request a fresh review only
 when the exact head itself is gone.
@@ -1443,7 +1423,7 @@ Gitmoot never force-removes those.
 `[workflow].delegation_worktree_ttl = "72h"` supplies the default aged-cleanup
 grace period; `"0"` disables aged cleanup. Ordinary and aged cleanup now share
 the same producer safety gate. A terminal owner alone is insufficient:
-blocked/resumable or undispatched consumers, unfinished pipelines, unknown
+blocked/resumable or undispatched consumers, unknown
 process/ownership state and failed preservation all retain the worktree.
 Succeeded owners need a stored result; failed/cancelled owners additionally
 need a proven reconstruction path (currently a pinned native read-only PR
@@ -1508,8 +1488,7 @@ are not selected again until an operator inspects `gitmoot job cleanup list
 --state quarantined` and runs `gitmoot job cleanup reopen <resource-id>`.
 Checkout contention defers cleanup without spending that failure budget.
 Persisted error text uses the existing credential-redaction policy. Aged
-selection uses the current generation's recorded terminal time, not a later
-artifact-publication timestamp. An older generation's completion does not
+selection uses the current generation's recorded terminal time. An older generation's completion does not
 suppress cleanup of a replacement generation.
 The five-minute worktree cadence advances after every attempted pass, including
 passes with candidate failures, so a failed cleanup cannot hot-loop.
@@ -1538,7 +1517,7 @@ either removal. Investigate the ownership overlap; do not bypass the shared gate
 
 `retry_disposition_unknown` means the failed/cancelled owner has no proven
 reconstruction path. Only exact-head native read-only PR reviews currently have
-that proof. Failed/cancelled implement legs, produce stages and shell stages
+that proof. Failed/cancelled implement legs and every other unproven owner
 retain their workspaces and owned branches indefinitely, even after TTL expiry.
 This is intentional: TTL is not a maximum retention or disk-cap guarantee.
 Repeated aged scans may continue to discover these retained jobs; a skip event
@@ -1547,10 +1526,6 @@ and no force-disposal command is provided. Inspect the job and escalate disk
 capacity to its owner; retry only when the work should genuinely resume. Do not
 retry just to discard evidence or bypass the gate with direct deletion.
 
-Terminal publication is independent of deletion: blocked downstream stages
-can receive their inputs while the workspace stays intact. Required service
-outputs have immutable generation snapshots under
-`$GITMOOT_HOME/cleanup-artifacts/`; missing or changed evidence refuses removal.
 Cleanup receipts remain in the producer database after workspace disposal.
 
 Replaying a completed token returns `already_removed` and the old receipt,

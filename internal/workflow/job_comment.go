@@ -66,7 +66,7 @@ func RenderJobResultComment(comment JobResultComment) string {
 	// A FAN-OUT ANNOUNCEMENT IS NOT A VERDICT, AND THE PUBLISHED RECORD MUST SAY
 	// SO (#1963). Every surface that ACTS on a decision already discounts this
 	// row through the one shared rule - the merge gate's candidate and objection
-	// scans, the pipeline auto-merge gate, the proof projector, and
+	// scans, the proof projector, and
 	// db.SucceededReviewVerdicts, which mirrors it because workflow cannot be
 	// imported there. This renderer did not, so the one surface a human reads
 	// asserted the opposite of what the engine believed: measured on 70
@@ -82,10 +82,9 @@ func RenderJobResultComment(comment JobResultComment) string {
 		note := "`fan-out` (coordinator announcement, not a verdict: announced `" +
 			markdownInline(decision) + "`"
 		// COUNT THE DECLARED DELEGATIONS, not the agent names: a delegation may
-		// name a role rather than an agent, and the pipeline mailbox seam strips
-		// delegations[] entirely and records FanOut instead, so a name-derived
-		// count reads zero for rows that fanned out to three children. My first
-		// version used delegationAgentNames and the regression above caught it.
+		// name a role rather than an agent, and a stored row may carry FanOut
+		// without its delegations[], so a name-derived count reads zero for rows
+		// that fanned out to three children.
 		if declared := len(comment.Result.Delegations); declared > 0 {
 			note += ", evidence comes from the " + strconv.Itoa(declared) + " delegated child job(s) below"
 		} else {
@@ -99,10 +98,8 @@ func RenderJobResultComment(comment JobResultComment) string {
 	if comment.Result != nil && strings.TrimSpace(comment.Result.Severity) != "" {
 		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
 	}
-	// The renderer folds the payload, not the bare result: the daemon separately
-	// zeroes ReviewBlockingSeverity for pipeline senders, but relying on that
-	// distant guard is what let the pipeline exemption go missing at other call
-	// sites. Keeping the invariant local makes it hold regardless of the caller.
+	// The renderer folds the payload, not the bare result, so fan-out exclusion
+	// holds here regardless of the caller.
 	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
 		effective := effectiveReviewDecisionForPayload(commentReviewPayload(comment), comment.ReviewBlockingSeverity)
 		rawDecision := strings.TrimSpace(comment.Result.Decision)

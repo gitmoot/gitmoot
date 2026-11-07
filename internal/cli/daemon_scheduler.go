@@ -3532,7 +3532,7 @@ func runPoolJobRecovered(ctx context.Context, worker jobWorker, job db.Job) (err
 // (already keyed) or must not run detached without the finalize/merge wiring.
 func poolIsolationEligible(job db.Job, payload workflow.JobPayload) bool {
 	switch strings.TrimSpace(job.Type) {
-	case "ask", "review", "produce":
+	case "ask", "review":
 	default:
 		return false
 	}

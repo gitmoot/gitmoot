@@ -39,7 +39,7 @@ from ambient managed variables once. Existing files are never overwritten.
 For systemd deployments, keep `daemon.env` for operational values such as
 `PATH`; do not duplicate Claude secrets there after bootstrap.
 
-## Key registry and grants
+## Key registry
 
 The shared key source is an operator-owned env file. Its default path
 is `<base-home>/.config/gitmoot/keychain.env`; `gitmoot key path` prints the
@@ -49,38 +49,28 @@ mode exactly `0600`, and outside the Gitmoot home and managed checkouts. Gitmoot
 revalidates and rereads it at every registration, preflight, and delivery, so an
 atomic rewrite rotates values without a daemon restart.
 
-The `key` commands manage names, modes, and grants only. They never accept or
-print values:
+The `key` commands manage names, modes, and proxy configuration only. They
+never accept or print values:
 
 ```sh
 gitmoot key path
-gitmoot key add SOURCE_API_TOKEN --mode injected
-gitmoot key grant SOURCE_API_TOKEN --pipeline nightly-sync
 gitmoot key add PARTNER_API_TOKEN --mode proxied
 gitmoot key configure PARTNER_API_TOKEN --upstream https://api.partner.example/v1 --auth bearer
-gitmoot key grant PARTNER_API_TOKEN --agent researcher
 gitmoot key list --json
-gitmoot key show SOURCE_API_TOKEN
-gitmoot key revoke SOURCE_API_TOKEN --pipeline nightly-sync
-gitmoot key rm SOURCE_API_TOKEN --force
+gitmoot key show PARTNER_API_TOKEN
+gitmoot key rm PARTNER_API_TOKEN
 ```
 
-`rm` removes registry metadata and grants, not the operator's file entry.
-`proxied` keys must be configured before grant with an absolute HTTPS upstream
-and either bearer or approved custom-header placement. Pipeline shell stages
-may request pipeline-granted `injected` or configured `proxied` names with
-`env_keys`. Agent stages require both a configured proxied key granted to their
-registered seat and an explicit stage selector; injected agent grants are
-refused. Gates remain ineligible. Shell resolution includes the pipeline's own
-file/defaults and pipeline grants, while agent resolution never does.
-
-A proxied shell or agent stage receives a per-job placeholder in `<KEY>` and a loopback URL in
-`GITMOOT_PROXY_<KEY>_URL`. Gitmoot pins the destination origin/base path,
-rereads the keychain and rechecks the grant for every request, and revokes the
-lease when delivery ends. The real value never enters an agent process. Proxied mode hides key bytes; it does **not** prevent
-an authorized child from exercising the credential on the pinned upstream.
-Curated upstreams and base paths are part of the model; configure only trusted
-services.
+`key add` registers `proxied` keys only. Keys registered in `injected` mode by
+older releases still appear in `list` and `show` and can be removed with `rm`.
+`rm` removes registry metadata, not the operator's file entry. A `proxied` key
+must be configured with an absolute HTTPS upstream and either bearer or approved
+custom-header placement before it can be used. A configured key is consumed by
+name through `[credentials].model_gateway_key`; see
+[Choosing the model-gateway provider](#choosing-the-model-gateway-provider).
+Proxied mode hides key bytes; it does **not** prevent an authorized child from
+exercising the credential on the pinned upstream. Curated upstreams and base
+paths are part of the model; configure only trusted services.
 
 For an authenticated `RegisterProxy` lease pinned to an operator-selected
 HTTPS upstream, response filtering prevents a non-malicious upstream's
@@ -89,9 +79,6 @@ HTTP field names or values from reaching the sandbox. Malicious or compromised
 upstreams and transformed application payloads are out of scope. That includes
 application-layer compression such as `Content-Type: application/gzip` without
 `Content-Encoding`; this boundary is not a general data-loss-prevention layer.
-
-Ordinary agent jobs receive no keys, and delegation children do not inherit a
-pipeline stage's access.
 
 ## Claude model gateway
 
@@ -112,9 +99,6 @@ credential. Without this the child would authenticate from the cached
 credential and ignore the placeholder — the gateway would then `401` the
 delivery (#936). The mirror never contains a credential; the operator's real
 config is only read, never modified.
-
-Pipeline `injected` and generic `proxied` key delivery is independent of the
-Claude gateway and does not alter its model-runtime placeholder flow.
 
 The feature is off by default. It covers local Claude and can issue broker
 material to an opted-in remote shell. A populated
@@ -155,9 +139,7 @@ Runtime-specific additions are:
   strictly fail-closed), and `--profile` selects omp's auth/state store without
   isolating process environment, so a passed-through key is visible to every omp
   profile this daemon runs.
-- Kimi Code and shell: no additions. Shell stage variables,
-  pipeline metadata, and the upstream-context file variable are job-owned
-  injections and are appended after the curated base.
+- Kimi Code and shell: no additions.
 
 `SSH_AUTH_SOCK`, `GH_*`, `GITHUB_*`, proxy variables, and toolchain cache
 variables such as `GOCACHE` are not in the base list. Add non-secret operational
@@ -232,13 +214,11 @@ unconfigured key refuses **before** a billable sandbox exists, and again on ever
 request, so a revoked or reconfigured key stops working immediately rather than
 at the next daemon restart.
 
-**Scope, stated plainly:** the gateway credential is resolved by NAME, not
-through the keychain's per-consumer grants. It is daemon-wide configuration, so
-any remote job on this daemon can reach the upstream through the gateway. That
-matches the pre-existing `runtime-auth.env` path, which was also daemon-global,
-but it means a grant to one agent is not a restriction here. The value itself
-never enters a sandbox: the sandbox receives only an mTLS client identity and a
-placeholder bearer.
+**Scope, stated plainly:** the gateway credential is resolved by NAME. It is
+daemon-wide configuration, so any remote job on this daemon can reach the
+upstream through the gateway. That matches the pre-existing `runtime-auth.env`
+path, which was also daemon-global. The value itself never enters a sandbox:
+the sandbox receives only an mTLS client identity and a placeholder bearer.
 
 `model_gateway_allow_loopback_upstream` permits a plaintext `http://` upstream
 when, and only when, its host is genuinely loopback — gitmoot still refuses any

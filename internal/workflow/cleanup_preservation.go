@@ -50,9 +50,9 @@ func onlyPreservationDeferred(err error) bool {
 	return errors.Is(err, ErrPreservationDeferred)
 }
 
-// Publication cannot wait for dependent consumers: service stages need their
-// producer's deliverables before they can finish. This shared-fenced operation
-// preserves results without granting permission to remove the workspace.
+// publishCleanupArtifacts runs the pre-cleanup collectors under the shared
+// lifecycle fence before cleanup eligibility is decided. It preserves results
+// without granting permission to remove the workspace.
 func (e Engine) publishCleanupArtifacts(ctx context.Context, jobID string) (context.Context, error) {
 	if e.BeforeReadOnlyWorktreeCleanup == nil {
 		return ctx, nil

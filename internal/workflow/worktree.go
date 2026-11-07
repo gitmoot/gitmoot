@@ -711,10 +711,10 @@ func ValidateDelegationCleanupTarget(home, jobID, jobType string, payload JobPay
 // expectedDelegationCleanupPaths derives every managed path a cleanup owner may hold below root.
 func expectedDelegationCleanupPaths(root, jobID, jobType string, payload JobPayload) ([]string, error) {
 	// Match isReadOnlyDelegationWorktree's precedence: the explicit marker is a
-	// top-level dispatch/pipeline/pool allocation even if legacy payload metadata
+	// top-level dispatch/pool allocation even if legacy payload metadata
 	// also carries a DelegationID.
 	if payload.ReadOnlyWorktree {
-		segments := []string{"readonly-seat", "pipeline-service-stage", "pipeline-stage", "pool-isolation"}
+		segments := []string{"readonly-seat", "pool-isolation"}
 		paths := make([]string, 0, len(segments))
 		for _, segment := range segments {
 			path, err := delegationWorktreePathUnder(root, payload.Repo, jobID, segment, 0)

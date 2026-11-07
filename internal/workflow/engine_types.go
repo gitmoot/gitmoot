@@ -171,7 +171,6 @@ func (e Engine) mailbox() Mailbox {
 	// their sub-threshold verdict into an approval while gitmoot proof, which keys
 	// its claim on the durable event, renders "0 approved".
 	mb.reviewBlockingSeverity = e.reviewBlockingSeverity
-	mb.produceCheckDir = e.ProduceCheckDir
 	if e.EventSink == nil {
 		return mb
 	}

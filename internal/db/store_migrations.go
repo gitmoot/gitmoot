@@ -3143,4 +3143,35 @@ ALTER TABLE org_seat_agent_identity_next RENAME TO org_seat_agent_identity;
 	`
 CREATE INDEX IF NOT EXISTS idx_tasks_repo_state ON tasks(repo_full_name, state, id);
 	`,
+	// #2542 retires gitmoot pipelines; every user moved to stagehand. Every
+	// reader of these tables is deleted in the same change: the `pipeline`
+	// command, the daemon scan and advancer, the bridge run endpoints, the
+	// dashboard Pipelines view and public receipts, `proof --verify`, and the
+	// pipeline cleanup-consumer check. The live data was exported before the
+	// drop, so this is a retirement rather than a data migration.
+	//
+	// Children before parents: pipeline_exposures references pipelines and
+	// pipeline_service_runs references pipeline_runs.
+	//
+	// keychain_grants goes with them. Its only reader was pipeline stage
+	// delivery (both the pipeline and the agent consumer kinds), so `key grant`
+	// and `key revoke` are removed too. keychain_keys and the operator's keychain
+	// file are untouched.
+	//
+	// The hidden per-pipeline shell runner agents (role 'pipeline-runner') are
+	// deleted the way RemoveAgent deletes an agent - agent_repos, then agents -
+	// because `agent list` no longer has a pipeline filter to hide them.
+	// Historical jobs keep their agent name as plain text, so they still list
+	// and show.
+	`
+DROP TABLE IF EXISTS pipeline_exposures;
+DROP TABLE IF EXISTS pipeline_service_runs;
+DROP TABLE IF EXISTS pipeline_run_stages;
+DROP TABLE IF EXISTS pipeline_runs;
+DROP TABLE IF EXISTS pipeline_trigger_states;
+DROP TABLE IF EXISTS pipelines;
+DROP TABLE IF EXISTS keychain_grants;
+DELETE FROM agent_repos WHERE agent_name IN (SELECT name FROM agents WHERE role = 'pipeline-runner');
+DELETE FROM agents WHERE role = 'pipeline-runner';
+	`,
 }

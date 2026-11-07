@@ -5,16 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -175,268 +172,6 @@ func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 	}
 	if payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" || payload.RuntimePGID != 0 {
 		t.Fatalf("runtime identity after terminal = pid %d pgid %d start %q, want cleared", payload.RuntimePID, payload.RuntimePGID, payload.RuntimePIDStartTime)
-	}
-}
-
-func TestMailboxClearsRuntimePIDBeforeProduceCheck(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	dir := t.TempDir()
-	started := filepath.Join(dir, "check.started")
-	release := filepath.Join(dir, "check.release")
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), produceCheckTimeout: 5 * time.Second}
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID: "produce-pid-window", Agent: "producer", Action: "produce", Repo: "owner/repo",
-		Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir},
-		Check: `touch check.started; while test ! -f check.release; do sleep 0.01; done`,
-	}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	adapter := &fakeDelivery{
-		pid: os.Getpid(),
-		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := mailbox.Run(ctx, "produce-pid-window", runtime.Agent{Name: "producer", Runtime: runtime.KimiRuntime, RuntimeRef: "fresh:produce-pid-window"}, adapter)
-		done <- err
-	}()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("produce check did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	stored, err := store.GetJob(ctx, "produce-pid-window")
-	if err != nil {
-		t.Fatalf("GetJob during produce check: %v", err)
-	}
-	payload, err := ParseJobPayload(stored.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload during produce check: %v", err)
-	}
-	if stored.State != string(JobRunning) || payload.RuntimePID != 0 || payload.RuntimePIDStartTime != "" || payload.RuntimePGID != 0 {
-		t.Fatalf("produce check window = state %q pid %d pgid %d start %q, want running with completed runtime identity cleared", stored.State, payload.RuntimePID, payload.RuntimePGID, payload.RuntimePIDStartTime)
-	}
-	if err := os.WriteFile(release, []byte("go"), 0o600); err != nil {
-		t.Fatalf("release produce check: %v", err)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Mailbox.Run: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Mailbox.Run did not finish after produce check release")
-	}
-}
-
-func TestMailboxProduceCheckRetriesSameSessionAndRecordsTokens(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	dir := t.TempDir()
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID: "produce-1", Agent: "producer", Action: "produce", Repo: "owner/repo",
-		Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir}, Check: "test -s artifact.json || { echo ghp_abcdefghijklmnopqrstuvwxyz0123456789; exit 1; }", CheckRetries: 1,
-	}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	deliveries := 0
-	adapter := &fakeDelivery{
-		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"first","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-			`{"gitmoot_result":{"decision":"implemented","summary":"fixed","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		refreshedRefs: []string{"session-produce"},
-		inputTokens:   []int{10, 20},
-		outputTokens:  []int{2, 3},
-		onDeliver: func() {
-			deliveries++
-			if deliveries == 2 {
-				if err := os.WriteFile(filepath.Join(dir, "artifact.json"), []byte("{}"), 0o600); err != nil {
-					t.Fatalf("write artifact: %v", err)
-				}
-			}
-		},
-	}
-	result, err := mailbox.Run(ctx, "produce-1", runtime.Agent{Name: "producer", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh:produce"}, adapter)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if result.Summary != "fixed" || len(adapter.prompts) != 2 {
-		t.Fatalf("result/prompts = %+v / %d", result, len(adapter.prompts))
-	}
-	if !strings.Contains(adapter.prompts[1], "failed the deterministic check") || adapter.agentRefs[1] != "session-produce" {
-		t.Fatalf("correction prompt/ref = %q / %q", adapter.prompts[1], adapter.agentRefs[1])
-	}
-	if strings.Contains(adapter.prompts[1], "ghp_abcdefghijklmnopqrstuvwxyz0123456789") || !strings.Contains(adapter.prompts[1], "[REDACTED]") {
-		t.Fatalf("correction prompt was not redacted: %q", adapter.prompts[1])
-	}
-	job, err := store.GetJob(ctx, "produce-1")
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if job.InputTokens != 30 || job.OutputTokens != 5 {
-		t.Fatalf("tokens = %d/%d, want 30/5", job.InputTokens, job.OutputTokens)
-	}
-}
-
-func TestMailboxProduceCheckExhaustionFails(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-	dir := t.TempDir()
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "produce-fail", Agent: "producer", Action: "produce", Repo: "owner/repo", Sender: PipelineJobSender, WorktreePath: dir, WritablePaths: []string{dir}, Check: "echo nope >&2; exit 1"}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	adapter := &fakeDelivery{outputs: []string{`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}}
-	if _, err := mailbox.Run(ctx, "produce-fail", runtime.Agent{Name: "producer", Runtime: runtime.CodexRuntime}, adapter); err == nil {
-		t.Fatal("Run succeeded despite exhausted check")
-	}
-	job, _ := store.GetJob(ctx, "produce-fail")
-	payload, _ := ParseJobPayload(job.Payload)
-	if job.State != string(JobFailed) || payload.Result == nil || payload.Result.Decision != "failed" || len(adapter.prompts) != 1 {
-		t.Fatalf("exhausted job = %+v payload=%+v prompts=%d", job, payload.Result, len(adapter.prompts))
-	}
-}
-
-func TestProduceCheckOutputIsRedactedAndCapped(t *testing.T) {
-	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	got := sanitizeProduceCheckOutput(secret + strings.Repeat("x", 3*maxProduceCheckOutputBytes))
-	if len(got) > maxProduceCheckOutputBytes {
-		t.Fatalf("output len = %d, want <= %d", len(got), maxProduceCheckOutputBytes)
-	}
-	if strings.Contains(got, secret) {
-		t.Fatalf("output leaked secret: %q", got)
-	}
-}
-
-func TestProduceCheckGroupKillsChildOnTimeout(t *testing.T) {
-	dir := t.TempDir()
-	started := time.Now()
-	_, err := runProduceCheck(context.Background(), JobPayload{
-		WorktreePath: dir,
-		Check:        "sleep 30 & child=$!; echo $child > child.pid; wait $child",
-	}, "", 100*time.Millisecond, execbackend.Local)
-	if err == nil {
-		t.Fatal("runProduceCheck succeeded despite timeout")
-	}
-	if elapsed := time.Since(started); elapsed > 2*time.Second {
-		t.Fatalf("runProduceCheck returned after %s, want prompt group teardown", elapsed)
-	}
-	rawPID, readErr := os.ReadFile(filepath.Join(dir, "child.pid"))
-	if readErr != nil {
-		t.Fatalf("read child pid: %v", readErr)
-	}
-	pid, parseErr := strconv.Atoi(strings.TrimSpace(string(rawPID)))
-	if parseErr != nil {
-		t.Fatalf("parse child pid: %v", parseErr)
-	}
-	defer syscall.Kill(pid, syscall.SIGKILL)
-	deadline := time.Now().Add(time.Second)
-	for {
-		err := syscall.Kill(pid, 0)
-		if err == syscall.ESRCH {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("check child pid %d still exists after group cancellation (kill probe: %v)", pid, err)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func TestProduceCheckNonLocalBackendCannotRunLocally(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "must-not-run")
-	_, err := runProduceCheck(context.Background(), JobPayload{
-		WorktreePath: dir,
-		Check:        "touch must-not-run",
-	}, "", time.Second, execbackend.Backend("p2-probe"))
-	if err == nil || !strings.Contains(err.Error(), "p2-probe") || !strings.Contains(err.Error(), "no execution implementation") {
-		t.Fatalf("runProduceCheck error = %v, want missing p2-probe implementation", err)
-	}
-	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-		t.Fatalf("produce check ran locally for non-local backend (marker err=%v)", statErr)
-	}
-}
-
-func TestRemoteProduceCheckRefusesHostFallback(t *testing.T) {
-	dir := t.TempDir()
-	marker := filepath.Join(dir, "remote-check-must-not-run")
-	_, err := runProduceCheck(context.Background(), JobPayload{
-		WorktreePath: dir,
-		Check:        "touch remote-check-must-not-run",
-	}, "", time.Second, execbackend.Remote)
-	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-		t.Fatalf("remote produce check executed on the host (marker err=%v)", statErr)
-	}
-	if err == nil || !strings.Contains(err.Error(), "not supported on the remote execution backend") {
-		t.Fatalf("runProduceCheck(remote) error = %v, want remote refusal", err)
-	}
-}
-
-func TestMailboxRejectsProduceOutsidePipelineSender(t *testing.T) {
-	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-	_, err := mailbox.Enqueue(context.Background(), JobRequest{ID: "bad-produce", Agent: "p", Action: "produce", Repo: "owner/repo", Sender: "user"})
-	if err == nil || !strings.Contains(err.Error(), "reserved for pipeline stages") {
-		t.Fatalf("Enqueue error = %v", err)
-	}
-}
-
-func TestMailboxRejectsProduceGrantsOnNonProduceRequests(t *testing.T) {
-	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-	cases := []struct {
-		name string
-		req  JobRequest
-		want string
-	}{
-		{"writable paths", JobRequest{WritablePaths: []string{"/data"}}, "writable_paths"},
-		{"readable paths", JobRequest{ReadablePaths: []string{"/input"}}, "readable_paths"},
-		{"network", JobRequest{Network: true}, "network access"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.req.ID = "bad-" + tc.name
-			tc.req.Agent = "a"
-			tc.req.Action = "ask"
-			tc.req.Repo = "owner/repo"
-			_, err := mailbox.Enqueue(context.Background(), tc.req)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("Enqueue error = %v, want %q", err, tc.want)
-			}
-		})
-	}
-}
-
-func TestMailboxPersistsProduceReadablePaths(t *testing.T) {
-	mailbox := Mailbox{store: openTestStore(t), resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
-	job, err := mailbox.Enqueue(context.Background(), JobRequest{
-		ID:            "produce-readable",
-		Agent:         "producer",
-		Action:        "produce",
-		Repo:          "owner/repo",
-		Sender:        PipelineJobSender,
-		PipelineName:  "nightly",
-		WritablePaths: []string{"/output"},
-		ReadablePaths: []string{" /input ", ""},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := unmarshalPayload(job.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if payload.PipelineName != "nightly" || len(payload.ReadablePaths) != 1 || payload.ReadablePaths[0] != "/input" {
-		t.Fatalf("produce payload = %+v", payload)
 	}
 }
 
@@ -2050,9 +1785,7 @@ type fakeDelivery struct {
 	runtimeDefault        []string
 	runtimeDefaultEfforts []string
 	agentRefs             []string
-	shellEnvs             [][]string
 	agentEnvs             [][]string
-	shellUpstreamContexts []string
 	plans                 []bool
 	planIntos             []string
 	onDeliver             func()
@@ -2068,9 +1801,7 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	f.runtimeDefault = append(f.runtimeDefault, job.RuntimeDefaultModel)
 	f.runtimeDefaultEfforts = append(f.runtimeDefaultEfforts, job.RuntimeDefaultEffort)
 	f.agentRefs = append(f.agentRefs, agent.RuntimeRef)
-	f.shellEnvs = append(f.shellEnvs, append([]string(nil), job.ShellEnv...))
 	f.agentEnvs = append(f.agentEnvs, append([]string(nil), job.AgentEnv...))
-	f.shellUpstreamContexts = append(f.shellUpstreamContexts, job.ShellUpstreamContext)
 	f.plans = append(f.plans, job.Plan)
 	f.planIntos = append(f.planIntos, job.PlanInto)
 	if f.pid > 0 && job.OnPID != nil {

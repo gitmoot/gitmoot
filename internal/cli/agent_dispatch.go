@@ -831,8 +831,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	}
 	if !request.Background {
 		// The adapter factory closure already carries this selection, but the
-		// workflow engine also owns job-associated subprocesses (produce checks and
-		// result observation). Stamp the same resolved decision on the effective
+		// workflow engine also owns job-associated subprocesses (result
+		// observation). Stamp the same resolved decision on the effective
 		// foreground agent so those routes cannot silently default back to Local.
 		effectiveAgent.ExecBackend = string(execBackend)
 	}

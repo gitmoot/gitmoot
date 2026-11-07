@@ -209,8 +209,8 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 		// under result_checks=block it failed the job before AdvanceJob ever reached
 		// dispatchDelegations — the announced panel could never run. Emitting a
 		// fan-out is legitimate; COUNTING one as a verdict is the defect, and that is
-		// fixed in the consumers that read decision (merge gate, pipeline auto-merge,
-		// required-reviewer counting, the proof projector, the verdict wake).
+		// fixed in the consumers that read decision (merge gate, required-reviewer
+		// counting, the proof projector, the verdict wake).
 		//
 		// The evidence nudge below is skipped for the same reason: a coordinator that
 		// has just announced a panel legitimately has no findings or tests_run yet,

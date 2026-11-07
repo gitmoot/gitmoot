@@ -249,6 +249,7 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	confirmedMemoryBaseVersion := -1
 	blockedEpisodesBaseVersion := -1
 	skillOptRemovalVersion := -1
+	pipelineRemovalVersion := -1
 	for i, m := range migrations {
 		if tokenMigrationVersion < 0 && strings.Contains(m, "input_tokens") {
 			tokenMigrationVersion = i + 1 // migration versions are 1-indexed
@@ -262,6 +263,9 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 		if strings.Contains(m, "ALTER TABLE agent_template_versions DROP COLUMN canary_sample") {
 			skillOptRemovalVersion = i + 1
 		}
+		if strings.Contains(m, pipelineRemovalMarker) {
+			pipelineRemovalVersion = i + 1
+		}
 	}
 	if tokenMigrationVersion < 1 {
 		t.Fatalf("could not locate the input_tokens migration")
@@ -274,6 +278,9 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	}
 	if skillOptRemovalVersion < 1 {
 		t.Fatalf("could not locate the #1752 SkillOpt-removal migration")
+	}
+	if pipelineRemovalVersion < 1 {
+		t.Fatalf("could not locate the #2542 pipeline-removal migration")
 	}
 	for v := 1; v < tokenMigrationVersion; v++ {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, v); err != nil {
@@ -298,6 +305,13 @@ INSERT INTO jobs(id, agent, type, state, payload) VALUES ('old', 'w', 'ask', 'su
 	if skillOptRemovalVersion >= tokenMigrationVersion {
 		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, skillOptRemovalVersion); err != nil {
 			t.Fatalf("seed skillopt-removal migration v%d returned error: %v", skillOptRemovalVersion, err)
+		}
+	}
+	// The #2542 pipeline-removal migration deletes from agent_repos, which this
+	// minimal fixture never creates; mark it applied for the same reason.
+	if pipelineRemovalVersion >= tokenMigrationVersion {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO schema_migrations(version, applied_at) VALUES (?, 'seed')`, pipelineRemovalVersion); err != nil {
+			t.Fatalf("seed pipeline-removal migration v%d returned error: %v", pipelineRemovalVersion, err)
 		}
 	}
 	if err := raw.Close(); err != nil {

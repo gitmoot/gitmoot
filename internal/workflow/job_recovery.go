@@ -110,7 +110,6 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		return db.Job{}, err
 	}
 	payload.Result = nil
-	payload.CleanupArtifacts = nil
 	// A human-requested retry is a fresh lifecycle for the operational-blocker
 	// machinery (#532): drop any deferral hold so the retried job dispatches now
 	// (a stale blocker_retry_at would silently park a cancel→retried job behind
@@ -135,8 +134,8 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 		payload.WorktreePath = ""
 		// A PR review's HeadSHA is the exact head under review, not a property
 		// of the disposable seat. The allocator uses it as the detached ref
-		// (#2286). Ask/produce seats still drop a stale head so the replacement
-		// is checked at its own tip.
+		// (#2286). Ask seats still drop a stale head so the replacement is
+		// checked at its own tip.
 		if !prReviewHeadSurvivesRetry(job, payload) {
 			payload.HeadSHA = ""
 		}
@@ -268,13 +267,6 @@ func MaybeResumeOnGatesCleared(ctx context.Context, store *db.Store, jobID strin
 	if job.ExternallyDriven {
 		return GateResumeOutcome{Reason: "session job (externally driven) is not auto-resumed"}, nil
 	}
-	// Pipeline stage jobs (#681) resume at the RUN level (ResumePipelineRun mints
-	// attempt+1 with a new job id); retrying the old stage job here would orphan
-	// its re-execution outside the run's stage rows. Refuse, even for gate rows
-	// recorded before the mailbox-side exclusion existed.
-	if payload, perr := ParseJobPayload(job.Payload); perr == nil && payload.Sender == PipelineJobSender {
-		return GateResumeOutcome{Reason: "pipeline stage job; resume the run via `gitmoot pipeline resume`, job gates do not re-run stages"}, nil
-	}
 	awaiting, err := blockedJobAwaitingHuman(ctx, store, job)
 	if err != nil {
 		return GateResumeOutcome{}, err
@@ -324,10 +316,10 @@ func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (
 }
 
 // manualRetryShouldClearReadOnlyWorktree reports whether a retry must drop
-// payload.WorktreePath. The no-task ask/review/produce clear is unchanged.
+// payload.WorktreePath. The no-task ask/review clear is unchanged.
 // The only new exception is a review whose TaskID is set and whose path is an
 // explicitly owned dispatch seat (ReadOnlyWorktree). A review task id does not
-// own that seat. Ask/produce with a task id, an implement job, and a review
+// own that seat. Ask with a task id, an implement job, and a review
 // whose checkout is the unmarked task worktree all keep their path. ReadOnlySeat
 // alone is not ownership.
 func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) (bool, error) {
@@ -335,7 +327,7 @@ func manualRetryShouldClearReadOnlyWorktree(job db.Job, payload JobPayload) (boo
 		return false, nil
 	}
 	switch strings.TrimSpace(job.Type) {
-	case "ask", "review", "produce":
+	case "ask", "review":
 	default:
 		return false, nil
 	}

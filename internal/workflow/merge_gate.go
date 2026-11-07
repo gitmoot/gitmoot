@@ -94,8 +94,6 @@ type PolicyMergeGate struct {
 	MergeMethod  string
 	// AutoMerge permits this native task merge gate to perform a GitHub merge
 	// after the mandatory exact-head review and CI gate. False is a kill-switch.
-	// PipelineAutoMerger does not call Evaluate and remains governed only by its
-	// independent pipeline allow_auto_merge mechanism.
 	AutoMerge bool
 	// LowRiskOnly narrows AutoMerge (per-repo auto_merge = "low_risk"): a
 	// merge without an explicit human request also needs the exact head to be
@@ -460,9 +458,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	// new behind-branch guard never runs - reached
 	// executePullRequestMergeFenced with mergeability GitHub had not computed.
 	//
-	// The two cases are answered differently, mirroring PipelineAutoMerger
-	// (pipeline_auto_merge.go:121-129), which is the same decision made by the
-	// other merge path in this package:
+	// The two cases are answered differently:
 	//
 	//   nil   -> PENDING. GitHub computes mergeability asynchronously, so this is
 	//            normal moments after a base move and resolves on the next poll.
@@ -474,10 +470,10 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if !*pr.Mergeable {
 		return g.block(ctx, request, headSHA, "pull request is not mergeable; rebase or update the branch", MergeBlockTransient)
 	}
-	if required, reconciled, hold, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
+	if required, reconciled, holdDetail, err := ensureWorkloadModeReconciled(ctx, g.Store, g.GitHub, repo, int64(request.PullRequest), headSHA); err != nil {
 		return MergeDecision{}, err
 	} else if required && !reconciled {
-		return g.pending(ctx, request, headSHA, hold.detail)
+		return g.pending(ctx, request, headSHA, holdDetail)
 	}
 	result, err := g.executePullRequestMergeFenced(ctx, request, github.MergePullRequestInput{
 		Repo:            repo,
@@ -696,8 +692,8 @@ func (g PolicyMergeGate) confirmExternalMergeOutcome(ctx context.Context, input 
 	return g.GitHub.GetPullRequest(confirmCtx, input.Repo, input.Number)
 }
 
-// executePullRequestMerge is the single low-level GitHub merge path shared by
-// the native policy merge gate and the opt-in pipeline auto-merge gate.
+// executePullRequestMerge is the single low-level GitHub merge call of the
+// native policy merge gate.
 func executePullRequestMerge(ctx context.Context, client interface {
 	MergePullRequest(context.Context, github.MergePullRequestInput) (github.MergeResult, error)
 }, input github.MergePullRequestInput) (github.MergeResult, error) {
@@ -1646,17 +1642,16 @@ func reviewRowIsFanOut(result *AgentResult) bool {
 
 // ResultIsFanOut is the package-crossing form of the same rule, for the
 // consumers outside this package that read a review decision and act on it
-// (the pipeline auto-merge gate and the proof projector). Every surface that
+// (the proof projector). Every surface that
 // treats "approved" as an answer has to agree on what an answer IS, or the
 // defect simply moves to whichever surface was not updated (#1685).
 func ResultIsFanOut(result *AgentResult) bool {
 	if result == nil || !isTerminalReviewVerdict(result.Decision) {
 		return false
 	}
-	// Either the declared panel is still visible, or normalization recorded that
-	// it was there before the executable instructions were stripped. Reading only
-	// delegations[] made every consumer blind to a pipeline review fan-out, whose
-	// delegations the mailbox seam removes by design.
+	// Either the declared panel is still visible, or the stored row records
+	// that it was there even though its delegations[] are absent. Reading only
+	// delegations[] would make every consumer blind to such a row.
 	return len(result.Delegations) > 0 || result.FanOut
 }
 
@@ -2600,9 +2595,8 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 }
 
 // evaluateStatuses applies the native merge gate's explicit state semantics and
-// returns the total external status/check count. A caller chooses its zero-signal
-// policy: the native gate uses its bounded no-CI machinery, while unattended
-// pipeline auto-merge fails closed immediately.
+// returns the total external status/check count. The caller chooses its
+// zero-signal policy: the native gate uses its bounded no-CI machinery.
 func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) (int, error) {
 	status, err := g.GitHub.GetCombinedStatus(ctx, repo, headSHA)
 	if err != nil {

@@ -16,7 +16,6 @@ const sources = [
   'docs/troubleshooting.md',
   'docs/events.md',
   'docs/heartbeats.md',
-  'docs/pipelines.md',
   'docs/parallel-jobs.md',
   'website/docs/dashboard/overview.md',
   'website/docs/dashboard/views.md',

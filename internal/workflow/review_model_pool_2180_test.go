@@ -538,12 +538,12 @@ func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
 	}
 }
 
-// The four forwards reflection structurally cannot see, each asserted on a
-// distinctive value. Three of these mutants (routerContextEnabled,
-// resultCheckMode, produceCheckDir) survived the entire package before this
-// test existed, and ResultCheckMode had no entry in the declared list at all.
+// The three forwards reflection structurally cannot see, each asserted on a
+// distinctive value. Two of these mutants (routerContextEnabled,
+// resultCheckMode) survived the entire package before this test existed, and
+// ResultCheckMode had no entry in the declared list at all.
 // Renamed (#2188 round 8, P3): "ReflectionCannotSee" was accurate when written
-// and became FALSE as the probe improved - the snapshot census sees all four
+// and became FALSE as the probe improved - the snapshot census sees them all
 // now. A name that decayed into a claim its assertions no longer carry is the
 // same defect this file has been bitten by three times.
 func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
@@ -553,7 +553,6 @@ func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
 		BlockerDeferrer:         func(context.Context, string, error) (bool, error) { return false, nil },
 		RouterContextEnabled:    true,
 		ResultCheckMode:         ResultChecksBlock,
-		ProduceCheckDir:         "/tmp/sentinel-produce-dir",
 	}
 	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test"))
 
@@ -562,9 +561,6 @@ func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
 	}
 	if mailbox.resultCheckMode != ResultChecksBlock {
 		t.Errorf("resultCheckMode = %q, want %q", mailbox.resultCheckMode, ResultChecksBlock)
-	}
-	if mailbox.produceCheckDir != "/tmp/sentinel-produce-dir" {
-		t.Errorf("produceCheckDir = %q, want the engine's", mailbox.produceCheckDir)
 	}
 	if mailbox.deferBlocker == nil {
 		t.Error("BlockerDeferrer -> deferBlocker not forwarded")

@@ -559,6 +559,9 @@ func TestParseRunKindAgent(t *testing.T) {
 		// a multi-token internal action (parts[1] not a known kind) must NOT be
 		// mis-split into kind/agent; it falls back to the root Type/Agent columns.
 		{"local-skillopt-train-candidate-review-sess-abcdef123456", db.Job{Type: "Train", Agent: "skillopt-worker"}, "train", "skillopt-worker"},
+		// a historical produce root (the action is retired) still renders its
+		// kind and agent through the column fallback.
+		{"local-produce-writer-abcdef123456", db.Job{Type: "produce", Agent: "writer"}, "produce", "writer"},
 	}
 	for _, c := range cases {
 		gotKind, gotAgent := parseRunKindAgent(c.rootID, c.root)
