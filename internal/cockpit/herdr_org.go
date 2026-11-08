@@ -56,6 +56,9 @@ type herdrOrgPane struct {
 	TerminalTitleText string                  `json:"terminal_title_stripped"`
 	Turn              *json.Number            `json:"turn"`
 	LastCompletedTurn *herdrCompletedTurnWire `json:"last_completed_turn"`
+	// RestoreError is set when Herdr kept the pane after a restore but could
+	// not start its process; the agent it still lists there is not running.
+	RestoreError string `json:"restore_error"`
 }
 
 type herdrCompletedTurnWire struct {
@@ -103,6 +106,12 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 			}
 		}
 	}
+	unrestored := map[string]bool{}
+	for id, pane := range paneByID {
+		if strings.TrimSpace(pane.RestoreError) != "" {
+			unrestored[id] = true
+		}
+	}
 	states := make(map[string]org.RoleLiveState, len(p.roles))
 	var agents []registeredAgent
 	for _, role := range p.roles {
@@ -148,6 +157,14 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 			bindings[role.Name] = org.PaneBinding{Detail: detail, Ambiguous: ambiguous}
 			continue
 		}
+		if restoreError := strings.TrimSpace(pane.RestoreError); restoreError != "" {
+			// #2554: Herdr still lists the agent as idle, but nothing runs in
+			// the pane, so nothing delivered to it can be read.
+			detail := fmt.Sprintf("Herdr could not restart the agent in pane %s: %s", paneID, restoreError)
+			states[role.Name] = org.RoleLiveState{State: org.StateUnknown, Detail: detail}
+			bindings[role.Name] = org.PaneBinding{Detail: detail, Unavailable: true}
+			continue
+		}
 		states[role.Name] = mapHerdrPaneState(pane)
 		resolved := org.PaneBinding{PaneID: paneID}
 		if strings.HasPrefix(binding, "agent:") {
@@ -176,17 +193,18 @@ func (p *herdrOrgProvider) Snapshot(ctx context.Context) (org.Snapshot, error) {
 	return org.Snapshot{
 		States: states, ObservedAt: now().UTC(), ProviderVersion: version,
 		PaneBindings: bindings, Panes: panes, Sessions: sessions,
-		Agents: liveLocalAgents(agents),
+		Agents: liveLocalAgents(agents, unrestored),
 	}, nil
 }
 
 // liveLocalAgents is the registered agents a binding may resolve to: local,
-// unarchived and in a pane (the registeredAgentForBinding filter).
-func liveLocalAgents(agents []registeredAgent) []org.LiveAgent {
+// unarchived and in a pane (the registeredAgentForBinding filter) that Herdr
+// did not fail to restore.
+func liveLocalAgents(agents []registeredAgent, unrestored map[string]bool) []org.LiveAgent {
 	var live []org.LiveAgent
 	for _, agent := range agents {
 		if agent.PaneID == "" || agent.MachineID != "" || agent.MachineProfileID != "" ||
-			(len(agent.Archived) != 0 && string(agent.Archived) != "null") {
+			(len(agent.Archived) != 0 && string(agent.Archived) != "null") || unrestored[agent.PaneID] {
 			continue
 		}
 		live = append(live, org.LiveAgent{Name: agent.Name, PaneID: agent.PaneID, Session: strings.TrimSpace(agent.AgentSession.Value)})

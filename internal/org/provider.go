@@ -76,6 +76,9 @@ type PaneBinding struct {
 	// binding resolved to (#2502); empty for other bindings.
 	AgentName string
 	Session   string
+	// Unavailable means Herdr still lists the bound agent but could not start
+	// its process (#2554); Detail carries Herdr's reason.
+	Unavailable bool
 }
 
 // LivePane carries the live identity used by validation plus the two directories

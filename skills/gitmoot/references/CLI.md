@@ -2471,6 +2471,10 @@ briefly report the agent with no name; while that pane holds no agent, or only
 an unnamed one on the recorded or a not-yet-reported session, the notice waits
 five minutes from the last resolution (#2546). Messages and review-result wakes
 queue meanwhile and are delivered once the name resolves again.
+When Herdr keeps a seat's pane after a restore but could not start its agent
+(the pane carries a `restore_error`), the seat is unreachable at once: its parent
+is told with Herdr's reason, and messages queue until the agent's session is
+resumed under the same name (#2554).
 Legacy literal pane IDs and exact labels remain supported,
 but a delivery target must contain a registered agent, not merely a live shell.
 Missing or ambiguous bindings fail closed. There is

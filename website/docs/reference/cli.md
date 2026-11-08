@@ -2111,6 +2111,13 @@ and when the name stops resolving while exactly one live agent has that same
 pane and session, it rewrites the seat's binding in the org config to the new
 name and tells the seat's parent. Anything less certain is not followed; the
 parent is told once that the seat is unreachable and its messages are queued.
+An in-place restart (`herdr agent restart`) can briefly report the agent with no
+name in the same pane and session; that notice waits five minutes from the last
+resolution (#2546), and queued messages and review results are delivered once
+the name resolves again. When Herdr keeps a seat's pane after a restore but could
+not start its agent (the pane carries a `restore_error`), the seat is
+unreachable at once: its parent is told with Herdr's reason, and messages queue
+until the agent's session is resumed under the same name (#2554).
 Register the agent before adopting
 its pane. Duplicate labels or agent names, unregistered/remote/archived agents,
 unknown references, and an empty `--pane` fail before role or route writes.
