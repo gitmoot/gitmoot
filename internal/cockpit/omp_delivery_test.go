@@ -341,10 +341,43 @@ func TestOMPNotifyTargetsOnlyThePaneForegroundRuntime(t *testing.T) {
 			if delivered || uncertain || !errors.As(err, &deferred) {
 				t.Fatalf("delivered=%v uncertain=%v err=%v; want deferral", delivered, uncertain, err)
 			}
+			// Live runtimes that claim the process may be probed, but none of
+			// them may receive the notice.
 			for _, addon := range addons {
-				if conns, _ := addon.seen(); conns != 0 {
+				if _, requests := addon.seen(); len(requests) != 0 {
 					t.Fatal("notice reached a runtime that is not the pane's sole foreground runtime")
 				}
+			}
+		})
+	}
+}
+
+// #2550: on a persistent HOME a registration from an earlier boot survives, and
+// a reused pid makes it claim the live runtime's process. Nobody listens on its
+// socket, so it must not block delivery to the runtime that does.
+func TestOMPNotifyIgnoresLeftoverRegistrationForTheSamePID(t *testing.T) {
+	accept := func(id string) string { return `{"v":1,"id":"` + id + `","status":"accepted","mode":"idle"}` }
+	for _, tc := range []struct {
+		name       string
+		keepSocket bool
+	}{
+		{name: "leftover socket refuses connections", keepSocket: true},
+		{name: "leftover socket is gone", keepSocket: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := newOMPRegistry(t)
+			leftover := startFakeOMPAddon(t, dir, "old", testPID, accept)
+			leftover.listener.SetUnlinkOnClose(!tc.keepSocket)
+			if err := leftover.listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			current := startFakeOMPAddon(t, dir, "new", testPID, accept)
+			delivered, uncertain, err := paneProcesses(t, testPane, testPID).agentNotify(context.Background(), dir, ompTestTarget(), "hello")
+			if !delivered || uncertain || err != nil {
+				t.Fatalf("delivered=%v uncertain=%v err=%v; a leftover registration blocked the live runtime", delivered, uncertain, err)
+			}
+			if _, requests := current.seen(); len(requests) != 1 {
+				t.Fatalf("live runtime received %d requests, want 1", len(requests))
 			}
 		})
 	}
