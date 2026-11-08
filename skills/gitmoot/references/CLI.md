@@ -2466,6 +2466,11 @@ session, it rewrites the seat's `pane` in the org config to `agent:NEWNAME` and
 tells the seat's parent. An agent in that pane with another session is never
 followed; the parent is told once that the seat is unreachable and its messages
 are queued, with the `org seat bind` command to fix it.
+An in-place restart (`herdr agent restart`) keeps the pane and session but can
+briefly report the agent with no name; while that pane holds no agent, or only
+an unnamed one on the recorded or a not-yet-reported session, the notice waits
+five minutes from the last resolution (#2546). Messages and review-result wakes
+queue meanwhile and are delivered once the name resolves again.
 Legacy literal pane IDs and exact labels remain supported,
 but a delivery target must contain a registered agent, not merely a live shell.
 Missing or ambiguous bindings fail closed. There is
