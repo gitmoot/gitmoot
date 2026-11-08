@@ -265,7 +265,7 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	gh := &fakeMergeGateGitHub{
 		pr: github.PullRequest{
 			Number:    9,
-			Title:     "Task 9",
+			Title:     "fix(gate): task 9",
 			State:     "open",
 			URL:       "https://github.com/gitmoot/gitmoot/pull/9",
 			HeadRef:   "task-9",
@@ -298,6 +298,11 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 	if len(gh.merges) != 1 || gh.merges[0].Method != "squash" || gh.merges[0].MatchHeadCommit != "head123" || !gh.merges[0].DeleteBranch {
 		t.Fatalf("merge inputs = %+v", gh.merges)
+	}
+	// #2552: the squash subject is GitHub's default, so a repository that
+	// checks commit subjects sees the PR's own title.
+	if gh.merges[0].Subject != "fix(gate): task 9 (#9)" {
+		t.Fatalf("merge subject = %q, want the PR title and number", gh.merges[0].Subject)
 	}
 	if gh.prCheckCalls != 0 || len(gh.checkRefs) != 1 || gh.checkRefs[0] != "head123" {
 		t.Fatalf("check calls = pr:%d refs:%v; want only exact-head check-runs", gh.prCheckCalls, gh.checkRefs)
