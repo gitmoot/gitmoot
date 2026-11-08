@@ -498,3 +498,44 @@ func TestHerdrPresenceRejectsUnregisteredShellBindings(t *testing.T) {
 		t.Fatalf("registered seat did not resolve: %+v", snapshot)
 	}
 }
+
+// #2554: after a server restore, Herdr kept a pane whose agent it could not
+// start and still listed that agent as idle. The seat must not read as live.
+func TestHerdrOrgProviderTreatsUnrestoredPaneAsUnavailable(t *testing.T) {
+	run := func(_ context.Context, args ...string) (string, error) {
+		switch strings.Join(args, " ") {
+		case "api snapshot":
+			return `{"result":{"snapshot":{"version":"0.9.5","panes":[
+{"pane_id":"w1:dead","agent":"omp","agent_status":"idle","restore_error":"Could not start the saved shell: ghostty error -2."},
+{"pane_id":"w1:live","agent":"omp","agent_status":"idle"}]}}}`, nil
+		case "agent list":
+			return `{"result":{"agents":[
+{"name":"tino","pane_id":"w1:dead","agent_session":{"value":"/s/tino.jsonl"}},
+{"name":"numbra","pane_id":"w1:live","agent_session":{"value":"/s/numbra.jsonl"}}]}}`, nil
+		default:
+			t.Fatalf("unexpected command %v", args)
+			return "", nil
+		}
+	}
+	snapshot, err := newHerdrOrgProvider(run, []config.OrgRole{
+		{Name: "enyo-worker", Pane: "agent:tino"}, {Name: "numbra", Pane: "agent:numbra"},
+	}, time.Now).Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := snapshot.PaneBindings["enyo-worker"]
+	if dead.PaneID != "" || !dead.Unavailable || !strings.Contains(dead.Detail, "ghostty error -2") {
+		t.Fatalf("unrestored seat binding = %+v, want unavailable with Herdr's reason", dead)
+	}
+	if state := snapshot.States["enyo-worker"].State; state != org.StateUnknown {
+		t.Fatalf("unrestored seat state = %q, want unknown", state)
+	}
+	for _, agent := range snapshot.Agents {
+		if agent.PaneID == "w1:dead" {
+			t.Fatalf("unrestored agent listed as live: %+v", snapshot.Agents)
+		}
+	}
+	if live := snapshot.PaneBindings["numbra"]; live.PaneID != "w1:live" || live.Unavailable {
+		t.Fatalf("running seat binding = %+v", live)
+	}
+}

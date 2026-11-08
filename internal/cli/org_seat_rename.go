@@ -52,6 +52,12 @@ func followRenamedOrgSeats(ctx context.Context, store *db.Store, configFile stri
 			writeLine(stdout, "org seat %s identity read failed: %v", role.Name, err)
 			continue
 		}
+		if resolved.Unavailable {
+			// Herdr already failed to restart this agent: no restart is in
+			// progress, so the parent is told now, with Herdr's reason.
+			alertUnavailableSeat(ctx, store, role, resolved.Detail, stdout, now)
+			continue
+		}
 		if found && known.AgentName == name {
 			if renamed, ok := renamedSeatAgent(snapshot.Agents, known); ok {
 				followSeatRename(ctx, store, configFile, role, name, renamed, known, stdout, now)
@@ -109,6 +115,21 @@ func alertUnreachableSeat(ctx context.Context, store *db.Store, role config.OrgR
 	body := fmt.Sprintf(
 		"gitmoot: seat %s is unreachable: no live agent is named %q (its binding); %s. Messages to %s are queued until it is rebound: gitmoot org seat bind --name %s --agent NAME.",
 		role.Name, name, where, role.Name, role.Name)
+	if _, err := store.AlertOrgSeatUnreachableOnce(ctx, role.Name, strings.TrimSpace(role.Pane), lead, body, now); err != nil {
+		writeLine(stdout, "org seat %s unreachable notice to %s failed (retried next tick): %v", role.Name, lead, err)
+	}
+}
+
+// alertUnavailableSeat tells the seat's parent, once per binding, that Herdr
+// lists the seat's agent but nothing runs in its pane (#2554).
+func alertUnavailableSeat(ctx context.Context, store *db.Store, role config.OrgRole, detail string, stdout io.Writer, now time.Time) {
+	lead := strings.TrimSpace(role.Parent)
+	if lead == "" {
+		return
+	}
+	body := fmt.Sprintf(
+		"gitmoot: seat %s is unreachable: %s. Messages to %s are queued until its agent runs again; resume its session in a pane under the same name.",
+		role.Name, detail, role.Name)
 	if _, err := store.AlertOrgSeatUnreachableOnce(ctx, role.Name, strings.TrimSpace(role.Pane), lead, body, now); err != nil {
 		writeLine(stdout, "org seat %s unreachable notice to %s failed (retried next tick): %v", role.Name, lead, err)
 	}

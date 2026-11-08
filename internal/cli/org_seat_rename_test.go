@@ -37,6 +37,8 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 		tick.after = 6 * time.Minute
 		return tick
 	}
+	// #2554: Herdr lists the agent but failed to start it after a restore.
+	unrestored := seatTick{binding: org.PaneBinding{Detail: "Herdr could not restart the agent in pane w1:pCK: ghostty error -2", Unavailable: true}}
 	cases := []struct {
 		name        string
 		ticks       []seatTick
@@ -61,6 +63,12 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 		{"unnamed agent on another session is reported at once",
 			[]seatTick{resolvedAs("worker", session), unresolved(org.LiveAgent{PaneID: pane, Session: "/s2.jsonl"})},
 			"agent:worker", []string{`agent "" runs there now, not provably the same agent`}},
+		{"agent Herdr failed to restore is reported at once, once",
+			[]seatTick{resolvedAs("worker", session), unrestored, unrestored},
+			"agent:worker", []string{`seat worker is unreachable: Herdr could not restart the agent in pane w1:pCK: ghostty error -2`}},
+		{"resumed after a failed restore ends the episode",
+			[]seatTick{resolvedAs("worker", session), unrestored, resolvedAs("worker", session), unrestored},
+			"agent:worker", []string{`ghostty error -2`, `ghostty error -2`}},
 		// #2503 review: a seat already unreachable when gitmoot first sees it
 		// has no recorded identity; it is still reported, once.
 		{"already unreachable with no record is reported once",
