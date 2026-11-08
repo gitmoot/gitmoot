@@ -125,7 +125,7 @@ func privateEntry(info fs.FileInfo, want fs.FileMode) error {
 
 // findOMPRegistration returns the one registration whose pid is a foreground
 // process of the recipient's pane. Every failure is a pre-write deferral.
-func findOMPRegistration(dir string, pids []int) (ompRegistration, error) {
+func findOMPRegistration(ctx context.Context, dir string, pids []int) (ompRegistration, error) {
 	dir = filepath.Clean(dir)
 	info, err := os.Lstat(dir)
 	if err != nil {
@@ -160,10 +160,17 @@ func findOMPRegistration(dir string, pids []int) (ompRegistration, error) {
 			refusal = validateOMPRegistration(dir, registration)
 		}
 		if refusal != nil {
+			if errors.Is(refusal, errOMPEndpointGone) {
+				// A leftover of a runtime that exited without cleanup.
+				continue
+			}
 			refusals = append(refusals, fmt.Sprintf("%s %v", path, refusal))
 			continue
 		}
 		matches = append(matches, registration)
+	}
+	if len(matches) > 1 && len(refusals) == 0 {
+		matches = listeningOMPRegistrations(ctx, matches)
 	}
 	switch {
 	case len(matches) == 1 && len(refusals) == 0:
@@ -175,6 +182,30 @@ func findOMPRegistration(dir string, pids []int) (ompRegistration, error) {
 	default:
 		return ompRegistration{}, capabilityUnavailable("")
 	}
+}
+
+// errOMPEndpointGone marks a registration whose socket no longer exists.
+var errOMPEndpointGone = errors.New("endpoint is gone")
+
+// listeningOMPRegistrations drops registrations nobody listens on (#2550). The
+// add-on writes its registration only after its socket listens and removes it
+// before closing the socket, so a refused connection is a leftover of a runtime
+// that died without cleanup, for example before a reboot that reused its pid.
+// The probe connects and closes without writing, which the add-on ignores. Any
+// other outcome keeps the registration, so a real ambiguity still defers.
+func listeningOMPRegistrations(ctx context.Context, registrations []ompRegistration) []ompRegistration {
+	live := make([]ompRegistration, 0, len(registrations))
+	dialer := net.Dialer{Timeout: ompConnectTimeout}
+	for _, registration := range registrations {
+		conn, err := dialer.DialContext(ctx, "unix", registration.Endpoint)
+		if err == nil {
+			_ = conn.Close()
+		} else if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		live = append(live, registration)
+	}
+	return live
 }
 
 // readOMPRegistration never follows a symlink. An insecure file is still parsed
@@ -218,6 +249,9 @@ func validateOMPRegistration(dir string, registration ompRegistration) error {
 		return fmt.Errorf("endpoint %q is outside the registry", registration.Endpoint)
 	}
 	info, err := os.Lstat(endpoint)
+	if errors.Is(err, fs.ErrNotExist) {
+		return errOMPEndpointGone
+	}
 	if err != nil {
 		return fmt.Errorf("endpoint %v", err)
 	}
@@ -343,7 +377,7 @@ func (c herdrClient) agentNotify(ctx context.Context, registryDir string, target
 	if err != nil {
 		return false, false, &NotificationDeferred{Reason: "recipient process unavailable: " + err.Error()}
 	}
-	registration, err := findOMPRegistration(registryDir, pids)
+	registration, err := findOMPRegistration(ctx, registryDir, pids)
 	if err != nil {
 		return false, false, err
 	}
