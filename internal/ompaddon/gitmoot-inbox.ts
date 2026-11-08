@@ -9,7 +9,9 @@
 // never writes to the editor or the terminal: a notification becomes a custom
 // message delivered with `deliverAs: "aside"`. While the agent works, the note
 // joins at the next step boundary. While idle, it starts a turn, but only when
-// the operator is not using the prompt.
+// the operator is not using the prompt. An idle note also sets `triggerTurn`:
+// OMP before 18.2 has no `aside` and would only append it, so no turn would
+// start (#2548); from 18.2 on the `aside` path runs first and ignores it.
 //
 // The file name starts with "00-" on purpose. OMP binds extensions from one
 // directory in byte order of their file names and runs `input` hooks in that
@@ -74,7 +76,7 @@ interface Api {
 	on(event: string, handler: (event: unknown, ctx: Context) => unknown): void;
 	sendMessage(
 		message: { customType: string; content: string; display: boolean; details?: unknown },
-		options: { deliverAs: "aside" },
+		options: { deliverAs: "aside"; triggerTurn?: boolean },
 	): void;
 }
 
@@ -218,7 +220,7 @@ export default function gitmootInbox(pi: Api) {
 		try {
 			pi.sendMessage(
 				{ customType: NOTE_TYPE, content: formatNote(content, ids), display: true, details: { source: "gitmoot", messageIds: ids } },
-				{ deliverAs: "aside" },
+				{ deliverAs: "aside", triggerTurn: decision.mode === "idle" },
 			);
 		} catch (error) {
 			lastError = `sendMessage: ${String(error)}`;
