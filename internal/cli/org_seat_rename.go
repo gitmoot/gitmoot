@@ -29,8 +29,7 @@ func followRenamedOrgSeats(ctx context.Context, store *db.Store, configFile stri
 	}
 	for _, role := range roles {
 		binding := strings.TrimSpace(role.Pane)
-		name, ok := strings.CutPrefix(binding, "agent:")
-		if !ok || strings.TrimSpace(name) == "" {
+		if binding == "" {
 			continue
 		}
 		if _, observed := snapshot.States[role.Name]; !observed {
@@ -47,15 +46,20 @@ func followRenamedOrgSeats(ctx context.Context, store *db.Store, configFile stri
 			}
 			continue
 		}
+		if resolved.Unavailable {
+			// Herdr already failed to restart this seat's agent, whatever the
+			// binding form: no restart is in progress, so the parent is told
+			// now, with Herdr's reason (#2554).
+			alertUnavailableSeat(ctx, store, role, resolved.Detail, stdout, now)
+			continue
+		}
+		name, ok := strings.CutPrefix(binding, "agent:")
+		if !ok || strings.TrimSpace(name) == "" {
+			continue
+		}
 		known, found, err := store.GetOrgSeatAgentIdentity(ctx, role.Name)
 		if err != nil {
 			writeLine(stdout, "org seat %s identity read failed: %v", role.Name, err)
-			continue
-		}
-		if resolved.Unavailable {
-			// Herdr already failed to restart this agent: no restart is in
-			// progress, so the parent is told now, with Herdr's reason.
-			alertUnavailableSeat(ctx, store, role, resolved.Detail, stdout, now)
 			continue
 		}
 		if found && known.AgentName == name {

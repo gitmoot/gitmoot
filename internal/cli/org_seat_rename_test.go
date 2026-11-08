@@ -122,6 +122,36 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 	}
 }
 
+// #2555 review: literal pane-id and exact-label bindings remain supported, so a
+// failed restore behind one is reported too, and resolving ends the episode.
+func TestOrgSeatUnrestoredAgentIsReportedForEveryBindingForm(t *testing.T) {
+	for _, binding := range []string{"w1:pCK", "Lenscale Worker"} {
+		t.Run(binding, func(t *testing.T) {
+			ctx := context.Background()
+			home, store, _ := orgSeatStoreWithBinding(t, binding)
+			resolved := seatTick{binding: org.PaneBinding{PaneID: "w1:pCK"}}
+			unrestored := seatTick{binding: org.PaneBinding{Detail: "Herdr could not restart the agent in pane w1:pCK: ghostty error -2", Unavailable: true}}
+			at := time.Date(2026, 11, 8, 20, 0, 0, 0, time.UTC)
+			for i, tick := range []seatTick{resolved, unrestored, unrestored, resolved, unrestored} {
+				runOrgSeatTick(ctx, t, store, home, tick, at.Add(time.Duration(i)*time.Minute))
+			}
+			messages, err := store.ListMessages(ctx, "owner", 0, 20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notices := 0
+			for _, message := range messages {
+				if strings.Contains(message.Body, "seat worker is unreachable: Herdr could not restart") {
+					notices++
+				}
+			}
+			if notices != 2 {
+				t.Fatalf("owner got %d unavailable notices, want one per outage (2)", notices)
+			}
+		})
+	}
+}
+
 type seatTick struct {
 	binding org.PaneBinding
 	agents  []org.LiveAgent
@@ -130,6 +160,11 @@ type seatTick struct {
 }
 
 func orgSeatRenameStore(t *testing.T) (string, *db.Store, config.Paths) {
+	t.Helper()
+	return orgSeatStoreWithBinding(t, "agent:worker")
+}
+
+func orgSeatStoreWithBinding(t *testing.T, binding string) (string, *db.Store, config.Paths) {
 	t.Helper()
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
@@ -140,7 +175,7 @@ func orgSeatRenameStore(t *testing.T) (string, *db.Store, config.Paths) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.WriteString("\n[org.roles.\"owner\"]\nscope = [\"*\"]\npane = \"agent:owner\"\n[org.roles.\"worker\"]\nparent = \"owner\"\nscope = [\"*\"]\npane = \"agent:worker\"\n"); err != nil {
+	if _, err := file.WriteString("\n[org.roles.\"owner\"]\nscope = [\"*\"]\npane = \"agent:owner\"\n[org.roles.\"worker\"]\nparent = \"owner\"\nscope = [\"*\"]\npane = \"" + binding + "\"\n"); err != nil {
 		t.Fatal(err)
 	}
 	_ = file.Close()
