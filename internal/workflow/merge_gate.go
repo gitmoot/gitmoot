@@ -483,7 +483,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		Repo:            repo,
 		Number:          int64(request.PullRequest),
 		Method:          mergeMethod(g.MergeMethod),
-		Subject:         mergeSubject(request),
+		Subject:         mergeSubject(request, pr),
 		Body:            "Merged by Gitmoot after policy gate passed.",
 		MatchHeadCommit: headSHA,
 		DeleteBranch:    g.DeleteBranch,
@@ -2960,7 +2960,13 @@ func mergeMethod(method string) string {
 	return method
 }
 
-func mergeSubject(request MergeRequest) string {
+// mergeSubject is GitHub's own default squash subject, "<title> (#N)", so a
+// repository that checks commit subjects (for example Conventional Commits)
+// sees the PR author's title rather than a Gitmoot label (#2552).
+func mergeSubject(request MergeRequest, pr github.PullRequest) string {
+	if title := strings.TrimSpace(pr.Title); title != "" {
+		return fmt.Sprintf("%s (#%d)", title, request.PullRequest)
+	}
 	if strings.TrimSpace(request.TaskID) == "" {
 		return "Gitmoot merge"
 	}
