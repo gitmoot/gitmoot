@@ -29,6 +29,14 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 		return seatTick{binding: org.PaneBinding{Detail: "no Herdr pane bound"}, agents: agents}
 	}
 	renamed := org.LiveAgent{Name: "tino", PaneID: pane, Session: session}
+	// #2546: `herdr agent restart` keeps the pane and session but reports the
+	// agent with no name until it is detected again and renamed.
+	restarting := org.LiveAgent{PaneID: pane, Session: session}
+	// Past the five-minute restart grace (seatRestartGrace).
+	afterGrace := func(tick seatTick) seatTick {
+		tick.after = 6 * time.Minute
+		return tick
+	}
 	cases := []struct {
 		name        string
 		ticks       []seatTick
@@ -41,9 +49,18 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 		{"another session in that pane is not followed",
 			[]seatTick{resolvedAs("worker", session), unresolved(org.LiveAgent{Name: "fresh", PaneID: pane, Session: "/s2.jsonl"}), unresolved(org.LiveAgent{Name: "fresh", PaneID: pane, Session: "/s2.jsonl"})},
 			"agent:worker", []string{`agent "fresh" runs there now, not provably the same agent`}},
-		{"no agent left is not followed",
-			[]seatTick{resolvedAs("worker", session), unresolved(), unresolved()},
+		{"no agent left is reported after the restart grace",
+			[]seatTick{resolvedAs("worker", session), unresolved(), afterGrace(unresolved())},
 			"agent:worker", []string{`no agent runs there now`}},
+		{"in-place restart is not reported",
+			[]seatTick{resolvedAs("worker", session), unresolved(), unresolved(org.LiveAgent{PaneID: pane}), unresolved(restarting), resolvedAs("worker", session)},
+			"agent:worker", nil},
+		{"restart that never gets its name back is reported after the grace",
+			[]seatTick{resolvedAs("worker", session), unresolved(restarting), afterGrace(unresolved(restarting))},
+			"agent:worker", []string{`agent "" runs there now, not provably the same agent`}},
+		{"unnamed agent on another session is reported at once",
+			[]seatTick{resolvedAs("worker", session), unresolved(org.LiveAgent{PaneID: pane, Session: "/s2.jsonl"})},
+			"agent:worker", []string{`agent "" runs there now, not provably the same agent`}},
 		// #2503 review: a seat already unreachable when gitmoot first sees it
 		// has no recorded identity; it is still reported, once.
 		{"already unreachable with no record is reported once",
@@ -53,16 +70,20 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 		// and replaces the old proof, so a later rename is not followed and
 		// the new outage is reported again.
 		{"resolution without session ends the episode and the proof",
-			[]seatTick{resolvedAs("worker", session), unresolved(), resolvedAs("worker", ""), unresolved(renamed)},
+			[]seatTick{resolvedAs("worker", session), afterGrace(unresolved()), resolvedAs("worker", ""), unresolved(renamed)},
 			"agent:worker", []string{`no agent runs there now`, `agent "tino" runs there now, not provably the same agent`}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			home, store, paths := orgSeatRenameStore(t)
-			now := time.Date(2026, 11, 3, 6, 0, 0, 0, time.UTC)
-			for i, tick := range tc.ticks {
-				runOrgSeatTick(ctx, t, store, home, tick, now.Add(time.Duration(i)*time.Minute))
+			at := time.Date(2026, 11, 3, 6, 0, 0, 0, time.UTC)
+			for _, tick := range tc.ticks {
+				if tick.after == 0 {
+					tick.after = time.Minute
+				}
+				at = at.Add(tick.after)
+				runOrgSeatTick(ctx, t, store, home, tick, at)
 			}
 			cfg, err := config.LoadOrg(paths)
 			if err != nil {
@@ -96,6 +117,8 @@ func TestOrgSeatFollowsRenamedAgentBySameSession(t *testing.T) {
 type seatTick struct {
 	binding org.PaneBinding
 	agents  []org.LiveAgent
+	// after is the gap since the previous tick; zero means one minute.
+	after time.Duration
 }
 
 func orgSeatRenameStore(t *testing.T) (string, *db.Store, config.Paths) {

@@ -57,6 +57,9 @@ func followRenamedOrgSeats(ctx context.Context, store *db.Store, configFile stri
 				followSeatRename(ctx, store, configFile, role, name, renamed, known, stdout, now)
 				continue
 			}
+			if restartingInPlace(snapshot.Agents, known, now) {
+				continue
+			}
 		}
 		alertUnreachableSeat(ctx, store, role, name, known, found && known.AgentName == name, snapshot.Agents, stdout, now)
 	}
@@ -109,6 +112,38 @@ func alertUnreachableSeat(ctx context.Context, store *db.Store, role config.OrgR
 	if _, err := store.AlertOrgSeatUnreachableOnce(ctx, role.Name, strings.TrimSpace(role.Pane), lead, body, now); err != nil {
 		writeLine(stdout, "org seat %s unreachable notice to %s failed (retried next tick): %v", role.Name, lead, err)
 	}
+}
+
+// seatRestartGrace is how long after its last resolution a seat may sit in an
+// in-place restart before its parent is told it is unreachable (#2546).
+// `herdr agent restart` keeps the pane and session but drops the name until
+// the agent is detected again and renamed; messages only queue meanwhile.
+const seatRestartGrace = 5 * time.Minute
+
+// restartingInPlace reports whether the recorded pane looks like an in-place
+// restart still inside the grace period: either no agent is in it yet, or
+// only an unnamed one whose session is the recorded one or not yet reported.
+// A named or different-session occupant is never a restart.
+func restartingInPlace(agents []org.LiveAgent, known db.OrgSeatAgentIdentity, now time.Time) bool {
+	if strings.TrimSpace(known.PaneID) == "" || strings.TrimSpace(known.Session) == "" {
+		return false
+	}
+	resolvedAt, err := time.Parse(time.RFC3339Nano, known.ObservedAt)
+	if err != nil || now.Sub(resolvedAt) >= seatRestartGrace {
+		return false
+	}
+	for _, agent := range agents {
+		if agent.PaneID != known.PaneID {
+			continue
+		}
+		if strings.TrimSpace(agent.Name) != "" {
+			return false
+		}
+		if session := strings.TrimSpace(agent.Session); session != "" && session != known.Session {
+			return false
+		}
+	}
+	return true
 }
 
 // renamedSeatAgent returns the new name of the recorded agent when exactly one
