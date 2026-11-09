@@ -886,6 +886,33 @@ func (c *GhClient) SearchOpenIssues(ctx context.Context, repo Repository, text s
 	return response.Items, err
 }
 
+// SearchIssuesByTitle returns the repository's issues, open or closed, that
+// carry label and whose title is exactly title. Search matches title words,
+// so the exact comparison is made here.
+func (c *GhClient) SearchIssuesByTitle(ctx context.Context, repo Repository, title, label string) ([]Issue, error) {
+	if strings.TrimSpace(repo.FullName()) == "" {
+		return nil, fmt.Errorf("repository owner/name is required")
+	}
+	title, label = strings.TrimSpace(title), strings.TrimSpace(label)
+	if title == "" || label == "" {
+		return nil, fmt.Errorf("issue title and label are required")
+	}
+	var response struct {
+		Items []Issue `json:"items"`
+	}
+	query := fmt.Sprintf("repo:%s is:issue label:%q in:title %q", repo.FullName(), label, title)
+	if err := c.apiJSON(ctx, false, &response, "-X", "GET", "search/issues", "-f", "q="+query); err != nil {
+		return nil, err
+	}
+	var matches []Issue
+	for _, issue := range response.Items {
+		if !issue.IsPullRequest && strings.TrimSpace(issue.Title) == title {
+			matches = append(matches, issue)
+		}
+	}
+	return matches, nil
+}
+
 func (c *GhClient) CreateIssue(ctx context.Context, input CreateIssueInput) (Issue, error) {
 	var issue Issue
 	bodyArgs, cleanup, err := apiBodyFieldArgs(input.Body)

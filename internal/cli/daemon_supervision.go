@@ -127,6 +127,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 		// --dry-run for the same reason.
 		pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 		sqliteMaintenance := &sqliteMaintenanceState{}
+		designNotes := &designNotesSweepState{}
 		for {
 			if err := receiveSupervisorWorkerError(workerErr); err != nil {
 				return err
@@ -156,6 +157,9 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, live *daemonR
 				}
 				if err := runSQLiteWALCheckpointOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
 					writeLine(stdout, "sqlite WAL checkpoint error: %s", err)
+				}
+				if err := runDesignNotesSweepOnce(ctx, store, time.Now().UTC(), designNotes, stdout); err != nil {
+					writeLine(stdout, "design notes sweep error: %s", err)
 				}
 				if err := runHeartbeatScanOnce(ctx, paths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
 					writeLine(stdout, "heartbeat scan error: %s", err)
@@ -273,6 +277,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	// does not disable it.
 	pipelineEnqueue := newPipelineStageEnqueuer(store, home)
 	sqliteMaintenance := &sqliteMaintenanceState{}
+	designNotes := &designNotesSweepState{}
 	// Bounds the poll-error diagnostics below. The poll interval has no minimum, so a
 	// persistently failing poll would otherwise write an unbounded, perfectly repetitive
 	// stream into the operator's one log -- a diagnostic that drowns the log is a different
@@ -340,6 +345,9 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 		}
 		if err := runSQLiteWALCheckpointOnce(ctx, store, time.Now().UTC(), sqliteMaintenance); err != nil {
 			writeLine(stdout, "sqlite WAL checkpoint error: %s", err)
+		}
+		if err := runDesignNotesSweepOnce(ctx, store, time.Now().UTC(), designNotes, stdout); err != nil {
+			writeLine(stdout, "design notes sweep error: %s", err)
 		}
 		if err := pipeline.RunPipelineScanOnce(ctx, store, pipelineEnqueue, time.Now().UTC()); err != nil {
 			writeLine(stdout, "pipeline scan error: %s", err)
