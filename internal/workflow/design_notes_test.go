@@ -900,3 +900,86 @@ func TestDesignNotesUnreadableAttemptHoldsBackOnlyItsFindings(t *testing.T) {
 		t.Fatalf("attempts after reconciliation = %+v, %v", attempts, err)
 	}
 }
+
+// #2559 review round 4 (the reviewer's probe): F1 is posted with an ambiguous
+// outcome, then answered; an unrelated finding on the same pull request is
+// filed the next week. The unread attempt carrying F1 must survive that sweep,
+// so when F1 reopens it is repaired from the attempted issue, not reposted.
+func TestDesignNotesUnreadAttemptSurvivesUntilItsFindingReopens(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := designNotesNow
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	f1 := recordDesignNote(t, store, designNoteObs{pr: 200, job: "review-1", state: db.FindingOpen, severity: "P3", title: "f1", ago: time.Hour})
+	fake.states[200] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[200] = errors.New("github 502 after the write")
+	fake.landed[200] = true
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	delete(fake.commentErr, 200)
+	recordDesignNote(t, store, designNoteObs{pr: 200, job: "review-1", state: db.FindingAnswered, severity: "P3", title: "f1",
+		continues: f1, head: designNotesLedgerB, ago: 30 * time.Minute})
+
+	clock = clock.Add(7 * 24 * time.Hour)
+	unrelated := recordDesignNote(t, store, designNoteObs{pr: 200, job: "review-1", state: db.FindingOpen, severity: "P3", title: "unrelated", ago: -7*24*time.Hour + time.Hour})
+	if r, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil || r.Filed != 1 {
+		t.Fatalf("next-week sweep = %+v, %v", r, err)
+	}
+	if pending := designNoteFiled(t, store); pending[unrelated] {
+		t.Fatal("the unrelated finding was not filed")
+	}
+	attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 200)
+	if err != nil || len(attempts) != 1 || attempts[0].IssueNumber != 501 {
+		t.Fatalf("attempts = %+v, %v; the unread attempt carrying F1 on #501 must be kept", attempts, err)
+	}
+
+	recordDesignNote(t, store, designNoteObs{pr: 200, job: "review-1", state: db.FindingOpen, severity: "P3", title: "f1",
+		continues: f1, head: designNotesMerged, ago: -7*24*time.Hour + 30*time.Minute})
+	reopened, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("reopen sweep: %v", err)
+	}
+	if n := countDesignNoteMarkers(fake, f1); n != 1 || reopened.Repaired != 1 {
+		t.Fatalf("F1 marker copies = %d, Repaired = %d; want 1 and 1 (repaired from #501, not reposted)", n, reopened.Repaired)
+	}
+	if attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 200); err != nil || len(attempts) != 0 {
+		t.Fatalf("attempts after the read-back = %+v, %v; want it retired", attempts, err)
+	}
+}
+
+// An unread attempt whose findings have all left the window can never matter
+// again, so a later sweep retires it without reading it; rows cannot pile up.
+func TestDesignNotesUnreadAttemptIsRetiredOnceItsFindingsLeaveTheWindow(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := designNotesNow
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	f1 := recordDesignNote(t, store, designNoteObs{pr: 210, job: "review-1", state: db.FindingOpen, severity: "P3", title: "f1", ago: time.Hour})
+	fake.states[210] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[210] = errors.New("github 502 after the write")
+	fake.landed[210] = true
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	recordDesignNote(t, store, designNoteObs{pr: 210, job: "review-1", state: db.FindingAnswered, severity: "P3", title: "f1",
+		continues: f1, head: designNotesLedgerB, ago: 30 * time.Minute})
+
+	clock = clock.Add(7 * 24 * time.Hour)
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("in-window sweep: %v", err)
+	}
+	if attempts, _ := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 210); len(attempts) != 1 {
+		t.Fatalf("attempts inside the window = %+v; want the unread attempt kept", attempts)
+	}
+	clock = designNotesNow.Add(15 * 24 * time.Hour)
+	listCalls := fake.listCalls
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("out-of-window sweep: %v", err)
+	}
+	if attempts, _ := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 210); len(attempts) != 0 || fake.listCalls != listCalls {
+		t.Fatalf("attempts after the window = %+v, reads %d; want it retired unread", attempts, fake.listCalls-listCalls)
+	}
+}

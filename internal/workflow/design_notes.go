@@ -180,6 +180,14 @@ func (e Engine) SweepDesignNotes(ctx context.Context, opts DesignNotesSweepOptio
 		result.Next = pr.key
 		s.sweepPullRequest(ctx, pr)
 	}
+	// Housekeeping last, and only within the deadline: an attempt is deleted
+	// unread only once none of its findings can be filed again (each recorded,
+	// or first seen before the window).
+	if ctx.Err() == nil {
+		if err := e.Store.RetireSettledDesignNotePendingPosts(ctx, now.Add(-DesignNotesWindow)); err != nil {
+			result.Errors = append(result.Errors, "retire settled attempts: "+err.Error())
+		}
+	}
 	return result, nil
 }
 
@@ -309,12 +317,16 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 }
 
 // resolveTarget resolves one unresolved comment attempt against findings and
-// returns the findings still to file. An attempt that can carry none of them
-// is retired unread. A readable attempt has its posted findings recorded and is
-// retired, in one transaction. An unreadable one (deleted, 404, a GitHub error)
-// is reported and kept, and the findings it may carry are added to held, so
-// they wait until it is readable while the others go on. ok is false only when
-// a record could not be written; the pull request then waits for a later sweep.
+// returns the findings still to file. An attempt that can carry none of them is
+// left in place unread: one of its findings may be answered now and reopen
+// later, and only a read-back can tell whether its comment landed (#2559
+// review round 4); RetireSettledDesignNotePendingPosts retires it once none of
+// its findings can be filed again. A readable attempt has its posted findings
+// recorded and is retired, in one transaction. An unreadable one (deleted, 404,
+// a GitHub error) is reported and kept, and the findings it may carry are added
+// to held, so they wait until it is readable while the others go on. ok is
+// false only when a record could not be written; the pull request then waits
+// for a later sweep.
 func (s *designNotesSweep) resolveTarget(ctx context.Context, pr designNotesPullRequest, target db.DesignNotePendingPost, findings []db.DesignNoteCandidate, held map[string]bool) (remaining []db.DesignNoteCandidate, ok bool) {
 	covers := make(map[string]bool, len(target.FindingUIDs))
 	for _, uid := range target.FindingUIDs {
@@ -327,9 +339,6 @@ func (s *designNotesSweep) resolveTarget(ctx context.Context, pr designNotesPull
 		}
 	}
 	if len(relevant) == 0 {
-		if err := s.e.Store.RetireDesignNotePendingPost(ctx, target, nil, s.now); err != nil {
-			s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s#%d: retire resolved attempt on %s: %v", pr.key.Repo, pr.key.PullRequest, target.IssueURL, err))
-		}
 		return findings, true
 	}
 	markers, err := s.issueMarkers(ctx, pr.key.Repo, DesignNotesIssue{Number: target.IssueNumber, URL: target.IssueURL})

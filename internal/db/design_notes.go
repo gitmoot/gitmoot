@@ -230,6 +230,27 @@ ON CONFLICT(repo, pull_request, issue_number) DO UPDATE SET finding_uids = (
 	})
 }
 
+// RetireSettledDesignNotePendingPosts deletes the attempts none of whose
+// findings can be filed again: every finding it covers has a filing row, or
+// was first observed before since (outside the sweep window, so never a
+// candidate again). An attempt with any finding that is unfiled and inside the
+// window is kept, even when that finding is not a candidate now (answered, for
+// example), because it may reopen and only a read-back of the attempted issue
+// can tell whether its comment landed. The wait for the write lock is bounded
+// by ctx's deadline.
+func (s *Store) RetireSettledDesignNotePendingPosts(ctx context.Context, since time.Time) error {
+	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+DELETE FROM design_note_pending_posts
+WHERE NOT EXISTS (
+	SELECT 1 FROM json_each(design_note_pending_posts.finding_uids) j
+	WHERE NOT EXISTS (SELECT 1 FROM design_note_filings f WHERE f.finding_uid = j.value)
+		AND (SELECT MIN(julianday(o.observed_at)) FROM review_finding_observations o WHERE o.finding_uid = j.value) >= julianday(?)
+)`, since.UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
 // RetireDesignNotePendingPost writes filings (possibly none) and deletes the
 // pending post in ONE transaction: the attempt is retired exactly when its
 // outcome is durably recorded. The wait for the write lock is bounded by ctx's
