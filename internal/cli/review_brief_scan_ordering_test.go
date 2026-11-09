@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // TestReviewBriefDoesNotTripTheHeadContradictionScan pins an ORDERING that
@@ -130,5 +131,33 @@ func TestReviewBriefDoesNotTripTheHeadContradictionScan(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// #2556 review: a review dispatched straight from the CLI (agent review
+// --foreground, or a home with no org registry) bypasses the router brief, so
+// the design checklist must be added at dispatch, and only once.
+func TestDirectReviewDispatchCarriesTheDesignChecklistOnce(t *testing.T) {
+	ctx := context.Background()
+	store, home := blockerE2EHome(t)
+	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
+	seedReviewDispatchFixture(t, store, checkout)
+	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
+		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
+	})
+	out, err := dispatchLocalAgentJob(ctx, store, reviewDispatchRequest(home, head))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(ctx, out.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := daemonJobPayload(job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(payload.Instructions, workflow.ReviewDesignChecklist); got != 1 {
+		t.Fatalf("review prompt carries the design checklist %d times, want 1; prompt tail: %q", got, tailOf(payload.Instructions, 400))
 	}
 }

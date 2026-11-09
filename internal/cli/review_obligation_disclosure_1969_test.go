@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 // #1969. The findings ledger has a write half and a read half. The read half -
@@ -117,8 +118,10 @@ func TestCLIReviewDispatchLeavesThePromptUntouchedWithNoObligations(t *testing.T
 	if err != nil {
 		t.Fatalf("daemonJobPayload: %v", err)
 	}
-	if payload.Instructions != request.Instructions {
-		t.Fatalf("prompt changed with an empty ledger:\n got %q\nwant %q", payload.Instructions, request.Instructions)
+	// The design checklist (#2556) is on every review; the ledger brief adds
+	// nothing beyond it when the ledger is empty.
+	if want := request.Instructions + "\n" + workflow.ReviewDesignChecklist; payload.Instructions != want {
+		t.Fatalf("prompt changed with an empty ledger:\n got %q\nwant %q", payload.Instructions, want)
 	}
 }
 

@@ -1113,6 +1113,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// weighing whether this order matters would otherwise weigh the wrong cost.
 	//
 	// TestReviewBriefDoesNotTripTheHeadContradictionScan is the guard.
+	if request.Action == "review" {
+		// Every CLI-dispatched review carries the advisory design checklist
+		// once (#2556): the router and direct `agent review` both arrive here.
+		// The native fan-out appends it in the engine instead.
+		request.Instructions += "\n" + workflow.ReviewDesignChecklist
+	}
 	if request.Action == "review" && request.PullRequest > 0 && strings.TrimSpace(request.HeadSHA) != "" {
 		briefEngine := workflow.Engine{
 			Store:           store,
