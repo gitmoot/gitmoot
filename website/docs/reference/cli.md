@@ -1472,15 +1472,19 @@ about their pull requests, at most 50 per sweep:
 - **Merged:** one comment per pull request on the repository's issue for the
   ISO week, titled `[design-notes] <owner/repo> <YYYY-Www>` and labelled
   `design-notes` and `agent:<role>` (the review requester, as for `review-p2`
-  issues). Each finding lists its title, `file:line`, detail, review job, pull
-  request and merged head, and a `finding-uid:` line. The week's issue is
-  reused once it exists; when the sweep opens it, the role gets one message.
+  issues). Each finding lists its title, `file:line`, detail (quoted, and cut at
+  4000 bytes with a note), review job, pull request and merged head, and a
+  `finding-uid:` line. Notes too long for one comment continue in further
+  comments. The week's issue is reused once it exists; when the sweep opens it,
+  the role gets one message.
 - **Closed without merging:** skipped for good.
 - **Still open:** checked again by a later sweep.
 
-A finding is filed once. A failed lookup or comment is logged and recorded as a
-`design_notes_error` job event on the review job, and its findings stay unfiled
-for the next sweep. Nothing here blocks a merge.
+A finding is filed once: before posting, the sweep reads the issue's comments
+back, and a finding whose `finding-uid:` line is already there is recorded
+without a second comment. A failed lookup or comment is logged and recorded as
+a `design_notes_error` job event on the review job, and its findings stay
+unfiled for the next sweep. Nothing here blocks a merge.
 
 Scripts should use `gitmoot review request ... --json` to get the job id:
 

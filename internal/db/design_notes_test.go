@@ -78,16 +78,54 @@ func TestDesignNotesMigrationUpgradesThroughOpen(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("awaiting notice = %+v, %v", pending, err)
 	}
-	if won, err := store.ClaimDesignNoteIssueNotice(ctx, "o/r", "2026-W46", now); err != nil || !won {
-		t.Fatalf("first claim = %v, %v", won, err)
+}
+
+// The role notice and the notified mark are ONE transaction (#2559 review 6):
+// a message write that fails leaves the issue un-notified, so a later sweep
+// sends it; once sent, it is never sent again.
+func TestDesignNoteIssueNoticeIsAtomicWithItsMessage(t *testing.T) {
+	ctx := context.Background()
+	store := openWorkflowTestStore(t)
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	if _, err := store.RecordDesignNoteIssue(ctx, DesignNoteIssue{Repo: "o/r", ISOWeek: "2026-W46", Number: 5, URL: "https://github.com/o/r/issues/5", Role: "lead", Created: true}, now); err != nil {
+		t.Fatalf("RecordDesignNoteIssue: %v", err)
 	}
-	if won, err := store.ClaimDesignNoteIssueNotice(ctx, "o/r", "2026-W46", now); err != nil || won {
-		t.Fatalf("second claim = %v, %v; a notice is claimed once", won, err)
+	countLead := func() int {
+		t.Helper()
+		messages, err := store.ListMessages(ctx, "lead", 0, 100)
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		return len(messages)
 	}
-	if err := store.ReleaseDesignNoteIssueNotice(ctx, "o/r", "2026-W46"); err != nil {
-		t.Fatalf("release: %v", err)
+	if _, err := store.db.ExecContext(ctx, `CREATE TRIGGER design_note_notice_crash BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'crash between the writes'); END`); err != nil {
+		t.Fatalf("install failing trigger: %v", err)
 	}
-	if won, err := store.ClaimDesignNoteIssueNotice(ctx, "o/r", "2026-W46", now); err != nil || !won {
-		t.Fatalf("claim after release = %v, %v", won, err)
+	if sent, err := store.SendDesignNoteIssueNotice(ctx, "o/r", "2026-W46", "notice", now); err == nil || sent {
+		t.Fatalf("send with a failing message write = %v, %v; want an error", sent, err)
+	}
+	if issue, _, err := store.GetDesignNoteIssue(ctx, "o/r", "2026-W46"); err != nil || issue.NotifiedAt != "" {
+		t.Fatalf("after a failed send the issue is marked notified (%q, %v); the mark must roll back with the message", issue.NotifiedAt, err)
+	}
+	if n := countLead(); n != 0 {
+		t.Fatalf("lead has %d messages after a failed send", n)
+	}
+	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER design_note_notice_crash`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	if pending, err := store.ListDesignNoteIssuesAwaitingNotice(ctx, "2026-W46"); err != nil || len(pending) != 1 {
+		t.Fatalf("awaiting notice = %+v, %v", pending, err)
+	}
+	if sent, err := store.SendDesignNoteIssueNotice(ctx, "o/r", "2026-W46", "notice", now); err != nil || !sent {
+		t.Fatalf("retried send = %v, %v", sent, err)
+	}
+	if sent, err := store.SendDesignNoteIssueNotice(ctx, "o/r", "2026-W46", "notice", now); err != nil || sent {
+		t.Fatalf("second send = %v, %v; a notice is sent once", sent, err)
+	}
+	if n := countLead(); n != 1 {
+		t.Fatalf("lead has %d messages, want exactly 1", n)
+	}
+	if issue, _, _ := store.GetDesignNoteIssue(ctx, "o/r", "2026-W46"); issue.NotifiedAt == "" {
+		t.Fatal("a sent notice left the issue un-notified")
 	}
 }

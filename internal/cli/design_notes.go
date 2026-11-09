@@ -25,6 +25,7 @@ type designNotesGitHubClient interface {
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)
 	SearchIssuesByTitle(ctx context.Context, repo github.Repository, title, label string) ([]github.Issue, error)
 	CreateIssue(ctx context.Context, input github.CreateIssueInput) (github.Issue, error)
+	ListIssueComments(ctx context.Context, repo github.Repository, issueNumber int64) ([]github.IssueComment, error)
 	PostIssueComment(ctx context.Context, repo github.Repository, issueNumber int64, body string) (github.IssueComment, error)
 }
 
@@ -33,7 +34,8 @@ var newDesignNotesGitHubClient = func() designNotesGitHubClient {
 }
 
 // designNotesSweepState is the supervisor's memory between sweeps: when the
-// last one started, and the round-robin cursor of a sweep that hit its bound.
+// last one started, and the round-robin cursor (the last pull request the
+// previous sweep attempted).
 type designNotesSweepState struct {
 	lastRun time.Time
 	cursor  workflow.DesignNotesPullRequestKey
@@ -65,8 +67,8 @@ func runDesignNotesSweepOnce(ctx context.Context, store *db.Store, now time.Time
 		writeLine(stdout, "design notes: opened %s", url)
 	}
 	if result.Filed+result.Skipped > 0 {
-		writeLine(stdout, "design notes: checked %d pull request(s), filed %d finding(s), skipped %d, %d still open",
-			result.Checked, result.Filed, result.Skipped, result.Pending)
+		writeLine(stdout, "design notes: checked %d pull request(s), filed %d finding(s) (%d repaired from posted comments), skipped %d, %d still open",
+			result.Checked, result.Filed, result.Repaired, result.Skipped, result.Pending)
 	}
 	return err
 }
@@ -122,6 +124,21 @@ func wireDesignNotes(engine *workflow.Engine, gh designNotesGitHubClient) {
 			return workflow.DesignNotesIssue{}, fmt.Errorf("created issue %q has no number or url", title)
 		}
 		return workflow.DesignNotesIssue{Number: issue.Number, URL: issue.URL}, nil
+	}
+	engine.DesignNotesListComments = func(ctx context.Context, repo string, issue int64) ([]string, error) {
+		r, err := github.ParseRepository(repo)
+		if err != nil {
+			return nil, err
+		}
+		comments, err := gh.ListIssueComments(ctx, r, issue)
+		if err != nil {
+			return nil, err
+		}
+		bodies := make([]string, 0, len(comments))
+		for _, comment := range comments {
+			bodies = append(bodies, comment.Body)
+		}
+		return bodies, nil
 	}
 	engine.DesignNotesComment = func(ctx context.Context, repo string, issue int64, body string) error {
 		r, err := github.ParseRepository(repo)

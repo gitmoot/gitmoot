@@ -30,25 +30,31 @@ type DesignNoteCandidate struct {
 	Detail      string
 	File        string
 	Line        int64
+	// Seq is the latest observation's rowid: the ledger's insertion order,
+	// comparable across findings.
+	Seq int64
 }
 
-// ListDesignNoteCandidates returns every finding whose latest observation (by
-// observed_at, then insertion order) is an open P3, whose first observation is
-// at or after since, and which has no design_note_filings row. Rows are ordered
-// by repository, pull request and first observation.
+// ListDesignNoteCandidates returns every finding whose latest observation is an
+// open P3, whose first observation is at or after since, and which has no
+// design_note_filings row. Rows are ordered by repository, pull request and
+// first observation.
 //
-// observed_at is compared through julianday so a caller-supplied RFC3339 stamp
-// with an offset orders correctly against the store's own UTC default.
+// LATEST MEANS INSERTION ORDER (rowid), the ledger's authoritative order, as in
+// ListReviewFindingObservations: observed_at is caller-supplied and must not
+// decide which state is current. observed_at serves only the window, compared
+// through julianday so a stamp with an offset orders correctly against the
+// store's own UTC default.
 func (s *Store) ListDesignNoteCandidates(ctx context.Context, since time.Time) ([]DesignNoteCandidate, error) {
 	return queryList(ctx, s.db, `
 WITH ranked AS (
 	SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, state, severity,
-		title, detail, file, line,
-		ROW_NUMBER() OVER (PARTITION BY finding_uid ORDER BY julianday(observed_at) DESC, rowid DESC) AS latest_rank,
+		title, detail, file, line, rowid AS seq,
+		ROW_NUMBER() OVER (PARTITION BY finding_uid ORDER BY rowid DESC) AS latest_rank,
 		MIN(julianday(observed_at)) OVER (PARTITION BY finding_uid) AS first_seen
 	FROM review_finding_observations
 )
-SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, title, detail, file, line
+SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, title, detail, file, line, seq
 FROM ranked
 WHERE latest_rank = 1 AND state = 'open' AND UPPER(TRIM(severity)) = 'P3'
 	AND first_seen >= julianday(?)
@@ -59,7 +65,7 @@ ORDER BY repo, pull_request, first_seen, finding_uid`,
 		func(row rowScanner) (DesignNoteCandidate, error) {
 			var c DesignNoteCandidate
 			err := row.Scan(&c.FindingUID, &c.Repo, &c.PullRequest, &c.HeadSHA, &c.ObservedAt,
-				&c.ObserverJob, &c.Title, &c.Detail, &c.File, &c.Line)
+				&c.ObserverJob, &c.Title, &c.Detail, &c.File, &c.Line, &c.Seq)
 			return c, err
 		})
 }
@@ -169,31 +175,49 @@ ON CONFLICT(repo, iso_week) DO NOTHING`,
 }
 
 // ListDesignNoteIssuesAwaitingNotice returns the week's issues the sweep
-// created whose role notice is not yet claimed.
+// created whose role notice is not yet sent.
 func (s *Store) ListDesignNoteIssuesAwaitingNotice(ctx context.Context, week string) ([]DesignNoteIssue, error) {
 	return queryList(ctx, s.db,
 		`SELECT `+designNoteIssueColumns+` FROM design_note_issues WHERE iso_week = ? AND created = 1 AND role <> '' AND notified_at = '' ORDER BY repo`,
 		[]any{week}, scanDesignNoteIssue)
 }
 
-// ClaimDesignNoteIssueNotice marks the issue's role notice as sent and reports
-// whether this caller won the claim. Claiming BEFORE sending makes the notice
-// at most once per repository per week.
-func (s *Store) ClaimDesignNoteIssueNotice(ctx context.Context, repo, week string, now time.Time) (bool, error) {
-	result, err := s.db.ExecContext(ctx,
-		`UPDATE design_note_issues SET notified_at = ? WHERE repo = ? AND iso_week = ? AND created = 1 AND notified_at = ''`,
-		now.UTC().Format(time.RFC3339Nano), repo, week)
+// SendDesignNoteIssueNotice sends the system message body to the role of the
+// issue recorded for repo and week, and marks the issue notified, in ONE
+// transaction: either both writes land or neither does, so a role hears at
+// most once per repository per week and a failed send stays pending. It
+// reports whether the message was sent; false means the issue was not created
+// by the sweep, has no role, or was already notified.
+func (s *Store) SendDesignNoteIssueNotice(ctx context.Context, repo, week, body string, now time.Time) (bool, error) {
+	if strings.TrimSpace(body) == "" {
+		return false, fmt.Errorf("design note notice needs a body")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	n, err := result.RowsAffected()
-	return n == 1, err
-}
-
-// ReleaseDesignNoteIssueNotice undoes a claim whose notice could not be sent,
-// so the next sweep retries it.
-func (s *Store) ReleaseDesignNoteIssueNotice(ctx context.Context, repo, week string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE design_note_issues SET notified_at = '' WHERE repo = ? AND iso_week = ?`, repo, week)
-	return err
+	defer tx.Rollback()
+	var role string
+	err = tx.QueryRowContext(ctx,
+		`UPDATE design_note_issues SET notified_at = ? WHERE repo = ? AND iso_week = ? AND created = 1 AND role <> '' AND notified_at = '' RETURNING role`,
+		now.UTC().Format(time.RFC3339Nano), repo, week).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	role = strings.TrimSpace(role)
+	if role == MessageSystemSender {
+		return false, fmt.Errorf("design note notice needs a real recipient")
+	}
+	message := Message{Sender: MessageSystemSender, Recipient: role, Body: body, Kind: "message", SourceKind: WakeOutboxSourceWorkflowNote}
+	if _, err := insertWorkflowNoteTx(ctx, tx, WorkflowNote{
+		Author:          MessageSystemSender,
+		Body:            fmt.Sprintf("[message from=%s to=%s]\n%s", MessageSystemSender, role, body),
+		AddressedTarget: role, Inbox: &message,
+	}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }

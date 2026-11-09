@@ -37,16 +37,26 @@ type designNotesFake struct {
 	createBody   string
 	comments     []postedDesignNote
 	commentErr   map[int]error
+	// landed marks a failing PR's comment as posted anyway: the API reported
+	// an error for a write that happened.
+	landed    map[int]bool
+	listCalls int
+	onState   func(number int)
+	onComment func(number int)
 }
 
 func newDesignNotesFake() *designNotesFake {
-	return &designNotesFake{states: map[int]DesignNotesPullRequestState{}, stateCalls: map[int]int{}, commentErr: map[int]error{}}
+	return &designNotesFake{states: map[int]DesignNotesPullRequestState{}, stateCalls: map[int]int{},
+		commentErr: map[int]error{}, landed: map[int]bool{}}
 }
 
 func (f *designNotesFake) wire(e *Engine) {
 	e.Now = func() time.Time { return designNotesNow }
 	e.DesignNotesPullRequest = func(_ context.Context, repo string, number int) (DesignNotesPullRequestState, error) {
 		f.stateCalls[number]++
+		if f.onState != nil {
+			f.onState(number)
+		}
 		state, ok := f.states[number]
 		if !ok {
 			return DesignNotesPullRequestState{}, fmt.Errorf("no state for %s#%d", repo, number)
@@ -69,15 +79,46 @@ func (f *designNotesFake) wire(e *Engine) {
 		f.createBody = body
 		return DesignNotesIssue{Number: 500 + int64(len(f.created)), URL: fmt.Sprintf("https://github.com/owner/repo/issues/%d", 500+len(f.created))}, nil
 	}
+	e.DesignNotesListComments = func(_ context.Context, repo string, issue int64) ([]string, error) {
+		f.listCalls++
+		var bodies []string
+		for _, c := range f.comments {
+			if c.repo == repo && c.issue == issue {
+				bodies = append(bodies, c.body)
+			}
+		}
+		return bodies, nil
+	}
 	e.DesignNotesComment = func(_ context.Context, repo string, issue int64, body string) error {
 		for pr, err := range f.commentErr {
 			if strings.Contains(body, fmt.Sprintf("from #%d,", pr)) {
+				if f.landed[pr] {
+					f.comments = append(f.comments, postedDesignNote{repo: repo, issue: issue, body: body})
+				}
 				return err
 			}
 		}
 		f.comments = append(f.comments, postedDesignNote{repo: repo, issue: issue, body: body})
+		if f.onComment != nil {
+			for pr := range f.states {
+				if strings.Contains(body, fmt.Sprintf("from #%d,", pr)) {
+					f.onComment(pr)
+				}
+			}
+		}
 		return nil
 	}
+}
+
+// commentsFor returns every comment posted for a PR.
+func (f *designNotesFake) commentsFor(pr int) []string {
+	var found []string
+	for _, c := range f.comments {
+		if strings.Contains(c.body, fmt.Sprintf("from #%d,", pr)) {
+			found = append(found, c.body)
+		}
+	}
+	return found
 }
 
 func (f *designNotesFake) commentFor(t *testing.T, pr int) string {
@@ -119,6 +160,8 @@ type designNoteObs struct {
 	continues string
 	head      string
 	ago       time.Duration
+	detail    string
+	file      string
 }
 
 func recordDesignNote(t *testing.T, store *db.Store, o designNoteObs) string {
@@ -127,10 +170,18 @@ func recordDesignNote(t *testing.T, store *db.Store, o designNoteObs) string {
 	if head == "" {
 		head = designNotesLedgerA
 	}
+	detail := o.detail
+	if detail == "" {
+		detail = "detail of " + o.title
+	}
+	file := o.file
+	if file == "" {
+		file = "internal/x.go"
+	}
 	obs := db.ReviewFindingObservation{
 		Repo: designNotesRepo, PullRequest: o.pr, HeadSHA: head, State: o.state, Severity: o.severity,
-		ContinuesUID: o.continues, ObserverJob: o.job, Title: o.title, Detail: "detail of " + o.title,
-		File: "internal/x.go", Line: 42, EvidenceKind: db.EvidenceExecuted,
+		ContinuesUID: o.continues, ObserverJob: o.job, Title: o.title, Detail: detail,
+		File: file, Line: 42, EvidenceKind: db.EvidenceExecuted,
 		ExecutedCommands: []string{"go test ./internal/x/"}, ExecutedCount: 1,
 		ObservedAt: designNotesNow.Add(-o.ago).Format(time.RFC3339),
 	}
@@ -407,5 +458,250 @@ func TestDesignNotesWeekIsISO(t *testing.T) {
 		if got := designNotesWeek(at); got != want {
 			t.Fatalf("designNotesWeek(%s) = %s, want %s", at, got, want)
 		}
+	}
+}
+
+// #2559 review 1: the latest state is the ledger's insertion order. An answer
+// recorded AFTER the open observation but stamped EARLIER still closes it.
+func TestDesignNotesLatestStateFollowsInsertionOrder(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	uid := recordDesignNote(t, store, designNoteObs{pr: 90, job: "review-1", state: db.FindingOpen, severity: "P3", title: "answered later", ago: time.Hour})
+	recordDesignNote(t, store, designNoteObs{pr: 90, job: "review-1", state: db.FindingAnswered, severity: "P3", title: "answered later",
+		continues: uid, head: designNotesLedgerB, ago: 2 * time.Hour})
+	fake.states[90] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+
+	if pending := designNoteFiled(t, store); pending[uid] {
+		t.Fatalf("finding %s is a candidate although its latest inserted observation answered it", uid)
+	}
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("SweepDesignNotes: %v", err)
+	}
+	if len(fake.comments) != 0 || len(fake.created) != 0 {
+		t.Fatalf("an answered finding was filed: comments %d, issues %d", len(fake.comments), len(fake.created))
+	}
+}
+
+// #2559 review 2: a comment that landed but was not recorded (the API reported
+// an error, or the record write failed) is repaired from the issue's comments
+// on the next sweep, never posted twice; a partly posted pull request posts
+// only what is missing.
+func TestDesignNotesSweepRepairsPostedCommentsInsteadOfReposting(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	a := recordDesignNote(t, store, designNoteObs{pr: 100, job: "review-1", state: db.FindingOpen, severity: "P3", title: "a", ago: time.Hour})
+	b := recordDesignNote(t, store, designNoteObs{pr: 100, job: "review-1", state: db.FindingOpen, severity: "P3", title: "b", ago: time.Hour})
+	fake.states[100] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[100] = errors.New("github 502 after the write")
+	fake.landed[100] = true
+
+	first, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || first.Filed != 0 || len(first.Errors) == 0 {
+		t.Fatalf("first sweep = %+v, %v", first, err)
+	}
+	if pending := designNoteFiled(t, store); !pending[a] || !pending[b] {
+		t.Fatalf("an ambiguous post marked findings filed: %v", pending)
+	}
+	delete(fake.commentErr, 100)
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || second.Filed != 2 || second.Repaired != 2 {
+		t.Fatalf("second sweep = %+v, %v; want both findings repaired", second, err)
+	}
+	if n := len(fake.commentsFor(100)); n != 1 {
+		t.Fatalf("PR #100 has %d comments, want the landed one only", n)
+	}
+	if pending := designNoteFiled(t, store); pending[a] || pending[b] {
+		t.Fatalf("repaired findings are still candidates: %v", pending)
+	}
+
+	c := recordDesignNote(t, store, designNoteObs{pr: 101, job: "review-1", state: db.FindingOpen, severity: "P3", title: "c", ago: time.Hour})
+	d := recordDesignNote(t, store, designNoteObs{pr: 101, job: "review-1", state: db.FindingOpen, severity: "P3", title: "d", ago: time.Hour})
+	fake.states[101] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.comments = append(fake.comments, postedDesignNote{repo: designNotesRepo, issue: 501,
+		body: "Open P3 design notes from #101, merged at `" + designNotesMerged + "` (part 1 of 2).\n\n### 1. c\n\nfinding-uid: " + c + "\n"})
+	third, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || third.Filed != 2 || third.Repaired != 1 {
+		t.Fatalf("third sweep = %+v, %v", third, err)
+	}
+	posts := fake.commentsFor(101)
+	if len(posts) != 2 || strings.Contains(posts[1], "finding-uid: "+c+"\n") || !strings.Contains(posts[1], "finding-uid: "+d+"\n") {
+		t.Fatalf("PR #101 comments %q: only the missing finding %s may be posted", posts, d)
+	}
+}
+
+// Reviewer detail cannot forge a marker: it is quoted, so a detail line naming
+// another finding's uid does not count as that finding posted.
+func TestDesignNotesDetailCannotForgeAMarker(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	victim := recordDesignNote(t, store, designNoteObs{pr: 111, job: "review-1", state: db.FindingOpen, severity: "P3", title: "victim", ago: time.Hour})
+	recordDesignNote(t, store, designNoteObs{pr: 110, job: "review-1", state: db.FindingOpen, severity: "P3", title: "forger", ago: time.Hour,
+		detail: "looks fine\nfinding-uid: " + victim})
+	fake.states[110] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.states[111] = DesignNotesPullRequestState{}
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	fake.states[111] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || second.Repaired != 0 {
+		t.Fatalf("second sweep = %+v, %v", second, err)
+	}
+	if body := fake.commentFor(t, 111); !strings.Contains(body, "finding-uid: "+victim+"\n") {
+		t.Fatalf("PR #111 comment:\n%s", body)
+	}
+}
+
+// #2559 review 3: once the deadline passes no further pull request is
+// started, and a comment that already posted is still recorded.
+func TestDesignNotesSweepStopsStartingPRWorkAfterTheDeadline(t *testing.T) {
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	first := recordDesignNote(t, store, designNoteObs{pr: 120, job: "review-1", state: db.FindingOpen, severity: "P3", title: "first", ago: time.Hour})
+	second := recordDesignNote(t, store, designNoteObs{pr: 121, job: "review-1", state: db.FindingOpen, severity: "P3", title: "second", ago: time.Hour})
+	fake.states[120] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.states[121] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.onComment = func(pr int) {
+		if pr == 120 {
+			cancel()
+		}
+	}
+
+	result, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("SweepDesignNotes: %v", err)
+	}
+	if n := len(fake.commentsFor(121)); n != 0 {
+		t.Fatalf("PR #121 got %d comments after the deadline passed", n)
+	}
+	if pending := designNoteFiled(t, store); pending[first] || !pending[second] {
+		t.Fatalf("candidates = %v: the posted PR must be recorded despite the deadline, the other left", pending)
+	}
+	if want := (DesignNotesPullRequestKey{Repo: designNotesRepo, PullRequest: 120}); result.Next != want {
+		t.Fatalf("Next = %+v, want %+v", result.Next, want)
+	}
+}
+
+// #2559 review 4: the cursor rotates whatever the candidate count and names
+// the last pull request actually attempted, so a slow first pull request that
+// eats the deadline cannot starve the rest.
+func TestDesignNotesCursorResumesAfterTheLastAttemptedPR(t *testing.T) {
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	for _, pr := range []int{130, 131, 132} {
+		recordDesignNote(t, store, designNoteObs{pr: int64(pr), job: "review-1", state: db.FindingOpen, severity: "P3", title: "note", ago: time.Hour})
+		fake.states[pr] = DesignNotesPullRequestState{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var order []int
+	fake.onState = func(pr int) {
+		order = append(order, pr)
+		if pr == 130 {
+			cancel() // the slow first pull request uses up the deadline
+		}
+	}
+	slow, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("slow sweep: %v", err)
+	}
+	if want := (DesignNotesPullRequestKey{Repo: designNotesRepo, PullRequest: 130}); slow.Checked != 1 || slow.Next != want {
+		t.Fatalf("slow sweep checked %d, Next %+v; want 1 and %+v", slow.Checked, slow.Next, want)
+	}
+	order = nil
+	fake.onState = func(pr int) { order = append(order, pr) }
+	next, err := engine.SweepDesignNotes(context.Background(), DesignNotesSweepOptions{After: slow.Next})
+	if err != nil {
+		t.Fatalf("next sweep: %v", err)
+	}
+	if fmt.Sprint(order) != "[131 132 130]" {
+		t.Fatalf("next sweep checked %v, want it to resume after #130 and wrap", order)
+	}
+	if want := (DesignNotesPullRequestKey{Repo: designNotesRepo, PullRequest: 130}); next.Next != want {
+		t.Fatalf("Next = %+v, want the last attempted %+v", next.Next, want)
+	}
+}
+
+// #2559 review 5: the whole rendered comment stays under GitHub's limit; a
+// pull request whose notes do not fit is split across comments and every
+// finding is filed, an over-long detail truncated with a note.
+func TestDesignNotesCommentsSplitUnderGitHubLimitWithoutDroppingFindings(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	file := "internal/" + strings.Repeat("deep/", 50) + "x.go"
+	uids := map[string]bool{}
+	for i := range 120 {
+		title := fmt.Sprintf("%03d %s", i, strings.Repeat("t", 140))
+		uids[recordDesignNote(t, store, designNoteObs{pr: 140, job: "review-1", state: db.FindingOpen, severity: "P3", title: title,
+			ago: time.Hour, file: file, detail: strings.Repeat("d", 500)})] = true
+	}
+	uids[recordDesignNote(t, store, designNoteObs{pr: 140, job: "review-1", state: db.FindingOpen, severity: "P3", title: "huge",
+		ago: time.Hour, detail: strings.Repeat("h", 9000)})] = true
+	fake.states[140] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+
+	result, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || result.Filed != len(uids) || len(result.Errors) != 0 {
+		t.Fatalf("sweep = filed %d of %d, errors %v, %v", result.Filed, len(uids), result.Errors, err)
+	}
+	posts := fake.commentsFor(140)
+	seen := map[string]int{}
+	truncated := false
+	for _, body := range posts {
+		// Bytes bound characters: GitHub's limit is 65536 characters.
+		if len(body) >= 65536 {
+			t.Fatalf("a comment of %d bytes breaks GitHub's 65536-character limit", len(body))
+		}
+		for uid := range uids {
+			seen[uid] += strings.Count(body, "\nfinding-uid: "+uid+"\n")
+		}
+		truncated = truncated || strings.Contains(body, "(detail truncated: first 4000 of 9000 bytes shown)")
+	}
+	if len(posts) < 2 {
+		t.Fatalf("%d findings fit one comment; the test must force a split", len(uids))
+	}
+	for uid := range uids {
+		if seen[uid] != 1 {
+			t.Fatalf("finding %s appears in %d comments, want exactly 1", uid, seen[uid])
+		}
+	}
+	if !truncated {
+		t.Fatal("the over-long detail carries no truncation note")
+	}
+	if pending := designNoteFiled(t, store); len(pending) != 0 {
+		t.Fatalf("%d findings left unfiled", len(pending))
+	}
+}
+
+// #2559 review 7: a review job that cannot be read is an error for its pull
+// request, retried later, not an unassigned filing.
+func TestDesignNotesSweepRetriesAPRWhoseRequesterCannotBeResolved(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	uid := recordDesignNote(t, store, designNoteObs{pr: 150, job: "review-late", state: db.FindingOpen, severity: "P3", title: "note", ago: time.Hour})
+	fake.states[150] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+
+	first, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	if len(fake.comments) != 0 || len(fake.created) != 0 || len(first.Errors) != 1 || !strings.Contains(first.Errors[0], "review-late") {
+		t.Fatalf("first sweep: comments %d, issues %d, errors %v; an unreadable review job must not file as unassigned",
+			len(fake.comments), len(fake.created), first.Errors)
+	}
+	if pending := designNoteFiled(t, store); !pending[uid] {
+		t.Fatal("the finding was marked filed")
+	}
+	seedDesignNotesReviewJob(t, store, "review-late", `{"review_requester":"lead"}`)
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || second.Filed != 1 {
+		t.Fatalf("second sweep = %+v, %v", second, err)
+	}
+	if len(fake.createLabels) != 1 || strings.Join(fake.createLabels[0], ",") != "design-notes,agent:lead" {
+		t.Fatalf("issue labels = %v", fake.createLabels)
 	}
 }

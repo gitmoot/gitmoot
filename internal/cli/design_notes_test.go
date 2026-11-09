@@ -20,6 +20,7 @@ type fakeDesignNotesGitHub struct {
 	found    []github.Issue
 	created  []github.CreateIssueInput
 	comments map[int64][]string
+	lists    int
 }
 
 func (f *fakeDesignNotesGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
@@ -35,6 +36,15 @@ func (f *fakeDesignNotesGitHub) SearchIssuesByTitle(_ context.Context, _ github.
 func (f *fakeDesignNotesGitHub) CreateIssue(_ context.Context, input github.CreateIssueInput) (github.Issue, error) {
 	f.created = append(f.created, input)
 	return github.Issue{Number: 900, URL: "https://github.com/owner/repo/issues/900", Title: input.Title}, nil
+}
+
+func (f *fakeDesignNotesGitHub) ListIssueComments(_ context.Context, _ github.Repository, number int64) ([]github.IssueComment, error) {
+	f.lists++
+	var out []github.IssueComment
+	for _, body := range f.comments[number] {
+		out = append(out, github.IssueComment{Body: body})
+	}
+	return out, nil
 }
 
 func (f *fakeDesignNotesGitHub) PostIssueComment(_ context.Context, _ github.Repository, number int64, body string) (github.IssueComment, error) {
@@ -55,15 +65,17 @@ func openDesignNotesStore(t *testing.T) *db.Store {
 	return store
 }
 
-func recordCLIDesignNote(t *testing.T, store *db.Store, pr int64, at time.Time) {
+func recordCLIDesignNote(t *testing.T, store *db.Store, pr int64, at time.Time) string {
 	t.Helper()
-	if _, err := store.RecordReviewFindingObservation(context.Background(), db.ReviewFindingObservation{
+	uid, err := store.RecordReviewFindingObservation(context.Background(), db.ReviewFindingObservation{
 		Repo: "owner/repo", PullRequest: pr, HeadSHA: strings.Repeat("a", 40), State: db.FindingOpen, Severity: "P3",
 		Title: "name the seam", File: "x.go", Line: 3, EvidenceKind: db.EvidenceExecuted,
 		ExecutedCommands: []string{"go test ./..."}, ExecutedCount: 1, ObservedAt: at.Format(time.RFC3339),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("RecordReviewFindingObservation: %v", err)
 	}
+	return uid
 }
 
 func TestRunDesignNotesSweepOnceRunsHourlyThroughTheGitHubClient(t *testing.T) {
@@ -118,5 +130,40 @@ func TestRunDesignNotesSweepOnceRunsHourlyThroughTheGitHubClient(t *testing.T) {
 	}
 	if fake.gets != 4 || len(fake.comments[900]) != 1 {
 		t.Fatalf("hourly run: gets %d, comments %v", fake.gets, fake.comments)
+	}
+}
+
+// The wiring reads an existing week issue's comments through the GitHub
+// client, and a finding whose marker is already posted is recorded without a
+// second comment (#2559 review 2).
+func TestDesignNotesWiringReadsPostedMarkersBackBeforePosting(t *testing.T) {
+	ctx := context.Background()
+	store := openDesignNotesStore(t)
+	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
+	uid := recordCLIDesignNote(t, store, 7, now.Add(-time.Hour))
+	fake := &fakeDesignNotesGitHub{
+		pulls: map[int64]github.PullRequest{7: {Number: 7, State: "closed", Merged: true, HeadSHA: strings.Repeat("c", 40)}},
+		found: []github.Issue{{Number: 77, URL: "https://github.com/owner/repo/issues/77", Title: "[design-notes] owner/repo 2026-W46"}},
+		comments: map[int64][]string{77: {
+			"Open P3 design notes from #7, merged at `" + strings.Repeat("c", 40) + "`.\n\n### 1. name the seam\n\nfinding-uid: " + uid + "\n",
+		}},
+	}
+	previous := newDesignNotesGitHubClient
+	newDesignNotesGitHubClient = func() designNotesGitHubClient { return fake }
+	t.Cleanup(func() { newDesignNotesGitHubClient = previous })
+
+	var out bytes.Buffer
+	if err := runDesignNotesSweepOnce(ctx, store, now, &designNotesSweepState{}, &out); err != nil {
+		t.Fatalf("runDesignNotesSweepOnce: %v", err)
+	}
+	if fake.lists != 1 || len(fake.comments[77]) != 1 || len(fake.created) != 0 {
+		t.Fatalf("lists %d, comments %d, created %d: the posted finding must be repaired, not reposted", fake.lists, len(fake.comments[77]), len(fake.created))
+	}
+	candidates, err := store.ListDesignNoteCandidates(ctx, now.Add(-14*24*time.Hour))
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("candidates after repair = %+v, %v", candidates, err)
+	}
+	if !strings.Contains(out.String(), "1 repaired") {
+		t.Fatalf("log = %q", out.String())
 	}
 }
