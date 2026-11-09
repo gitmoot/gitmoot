@@ -1778,7 +1778,8 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 	}
 	return fmt.Sprintf(`Independent review-only assessment of %s pull request #%d at exact head %s.
 %s
-%s %s Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.`, repo, pullRequest, head, focus, diffScope, evidence)
+%s %s Answer every prior finding recorded for this pull request. Do not edit files, implement or apply fixes, merge, deploy, or perform live-service actions.
+%s`, repo, pullRequest, head, focus, diffScope, evidence, workflow.ReviewDesignChecklist)
 }
 
 func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
