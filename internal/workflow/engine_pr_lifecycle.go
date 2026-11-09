@@ -258,6 +258,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		if scope != nil {
 			instructions = scopedReviewInstructions(event, scope)
 		}
+		instructions += "\n" + ReviewDesignChecklist
 		// DISCLOSE THE LEDGER'S OBLIGATIONS IN THE BRIEF (#1850 review F1's other
 		// half). The gate refuses a verdict at this head while a prior P1 or P2
 		// carries no observation - a P3 is reported and does not hold the merge

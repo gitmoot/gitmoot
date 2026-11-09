@@ -600,6 +600,20 @@ func scopedReviewInstructions(event PullRequestEvent, scope *ReviewScope) string
 	return instructions.String()
 }
 
+// ReviewDesignChecklist is the advisory design check every review brief carries
+// (#2556), adapted from caldoai/skills untangle-codebase. It is bounded to what
+// the pull request introduces or touches, and its findings never block: a
+// design opinion must not hold a merge the way a correctness defect does.
+const ReviewDesignChecklist = "Also check what this pull request adds or changes for design problems: " +
+	"hidden links (logic or values copied from elsewhere, or a call order or shared state that callers must just know about), " +
+	"needless links (code that reaches into another module's internals, or stable code that now imports something more volatile), " +
+	"surplus (pass-through wrappers, config or extension points for things that never vary, dead code), " +
+	"and special cases (an if for one value, a parameter for one caller, a swallowed error, a retry or sleep, a disabled test) that a general fix would remove. " +
+	"Read code outside the diff when you need it to judge this, but report only problems the diff introduces or touches; " +
+	"never report problems that already existed in untouched code, and never ask for a refactor beyond this pull request. " +
+	"Report each as a P3 finding with a file:line locator and the simpler shape you would expect. " +
+	"These findings never justify changes_requested on their own: approve when nothing else blocks."
+
 // ReviewScopeInstructions renders the bounded-input paragraph shared by the
 // engine's follow-up reviews and the review router's delta reviews (#2177).
 // The text is identical on both paths deliberately: a reviewer must not be able

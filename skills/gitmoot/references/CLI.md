@@ -1079,6 +1079,14 @@ message is appended to the router's own brief under a labelled header, so a
 reviewer can tell operator instructions from generated framing — pass it after
 `--` if it starts with a dash.
 
+Every review brief, from the router and from the native PR-watcher fan-out
+alike, also carries an advisory design checklist adapted from the
+`untangle-codebase` skill (#2556): hidden links, needless links, surplus code
+and special cases in what the pull request adds or changes. The reviewer may
+read outside the diff to judge, but reports only problems the diff introduces
+or touches, as P3 findings with a file:line locator, and never requests changes
+for them alone.
+
 Scripts should use `gitmoot review request ... --json` to get the job id:
 
 ```sh
