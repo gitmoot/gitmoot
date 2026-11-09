@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -154,8 +153,10 @@ func (s *Store) designNoteWrite(ctx context.Context, fn func(*sql.Tx) error) err
 }
 
 // RecordDesignNoteFilings writes the rows in one transaction, so a pull
-// request's findings are marked together or not at all. A finding that already
-// has a row keeps it. The wait for the write lock is bounded by ctx's deadline.
+// request's findings are marked together or not at all, and deletes the
+// pending posts of exactly those findings in the same transaction. A finding
+// that already has a row keeps it. The wait for the write lock is bounded by
+// ctx's deadline.
 func (s *Store) RecordDesignNoteFilings(ctx context.Context, filings []DesignNoteFiling, now time.Time) error {
 	if len(filings) == 0 {
 		return nil
@@ -178,115 +179,119 @@ func validateDesignNoteFilings(filings []DesignNoteFiling) error {
 	return nil
 }
 
+// insertDesignNoteFilingsTx records the filings and retires every pending post
+// of each filed finding: a filed finding is never a candidate again.
 func insertDesignNoteFilingsTx(ctx context.Context, tx *sql.Tx, filings []DesignNoteFiling, now time.Time) error {
 	stamp := now.UTC().Format(time.RFC3339Nano)
 	for _, f := range filings {
+		uid := strings.TrimSpace(f.FindingUID)
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO design_note_filings (finding_uid, repo, pull_request, head_sha, issue_url, skip_reason, filed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(finding_uid) DO NOTHING`,
-			strings.TrimSpace(f.FindingUID), f.Repo, f.PullRequest, f.HeadSHA, strings.TrimSpace(f.IssueURL), strings.TrimSpace(f.SkipReason), stamp); err != nil {
+			uid, f.Repo, f.PullRequest, f.HeadSHA, strings.TrimSpace(f.IssueURL), strings.TrimSpace(f.SkipReason), stamp); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM design_note_pending_posts WHERE finding_uid = ?`, uid); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// DesignNotePendingPost is an UNRESOLVED attempt to comment on an issue for a
-// pull request: recorded BEFORE the comment is posted, with the findings the
-// comment may carry, so a comment whose outcome was lost is found on that
-// issue again, even after the week and so the week's issue have changed. It is
-// retired once its outcome is durably known (RetireDesignNotePendingPost).
+// DesignNotePendingPost is one UNRESOLVED attempt to post one finding to one
+// issue: recorded BEFORE the comment is posted, so a comment whose outcome was
+// lost is found on that issue again, even after the week and so the week's
+// issue have changed. A row concerns only its own finding, so resolving one
+// finding never retires another's attempt.
 type DesignNotePendingPost struct {
+	FindingUID  string
+	IssueNumber int64
 	Repo        string
 	PullRequest int64
-	IssueNumber int64
 	IssueURL    string
-	FindingUIDs []string
 }
 
-// RecordDesignNotePendingPost records that the sweep may comment on issue for
-// the pull request carrying post.FindingUIDs. Recording the same issue again
-// widens the recorded findings to the union. The wait for the write lock is
-// bounded by ctx's deadline.
-func (s *Store) RecordDesignNotePendingPost(ctx context.Context, post DesignNotePendingPost, now time.Time) error {
-	if strings.TrimSpace(post.Repo) == "" || post.PullRequest <= 0 || post.IssueNumber <= 0 || strings.TrimSpace(post.IssueURL) == "" || len(post.FindingUIDs) == 0 {
-		return fmt.Errorf("design note pending post needs a repo, pull request, issue number, url and findings")
+// RecordDesignNotePendingPosts records one attempt per uid: the sweep may
+// post each to issue for the pull request. Recording an attempt again is a
+// no-op. The wait for the write lock is bounded by ctx's deadline.
+func (s *Store) RecordDesignNotePendingPosts(ctx context.Context, repo string, pullRequest, issueNumber int64, issueURL string, uids []string, now time.Time) error {
+	if strings.TrimSpace(repo) == "" || pullRequest <= 0 || issueNumber <= 0 || strings.TrimSpace(issueURL) == "" || len(uids) == 0 {
+		return fmt.Errorf("design note pending posts need a repo, pull request, issue number, url and findings")
 	}
-	uids, err := json.Marshal(post.FindingUIDs)
-	if err != nil {
-		return err
-	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
 	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `
-INSERT INTO design_note_pending_posts (repo, pull_request, issue_number, issue_url, recorded_at, finding_uids)
+		for _, uid := range uids {
+			if strings.TrimSpace(uid) == "" {
+				return fmt.Errorf("design note pending post needs a finding uid")
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT INTO design_note_pending_posts (finding_uid, issue_number, repo, pull_request, issue_url, created_at)
 VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(repo, pull_request, issue_number) DO UPDATE SET finding_uids = (
-	SELECT json_group_array(value) FROM (
-		SELECT value FROM json_each(design_note_pending_posts.finding_uids)
-		UNION SELECT value FROM json_each(excluded.finding_uids)))`,
-			post.Repo, post.PullRequest, post.IssueNumber, post.IssueURL, now.UTC().Format(time.RFC3339Nano), string(uids))
-		return err
+ON CONFLICT(finding_uid, issue_number) DO NOTHING`,
+				strings.TrimSpace(uid), issueNumber, repo, pullRequest, issueURL, stamp); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
-// RetireSettledDesignNotePendingPosts deletes the attempts none of whose
-// findings can be filed again: every finding it covers has a filing row, or
-// was first observed before since (outside the sweep window, so never a
-// candidate again). An attempt with any finding that is unfiled and inside the
-// window is kept, even when that finding is not a candidate now (answered, for
-// example), because it may reopen and only a read-back of the attempted issue
-// can tell whether its comment landed. The wait for the write lock is bounded
-// by ctx's deadline.
-func (s *Store) RetireSettledDesignNotePendingPosts(ctx context.Context, since time.Time) error {
+// RecordDesignNoteReadBack records the outcome of reading issueNumber back: the
+// findings whose marker it carries are filed (which retires all their
+// attempts), and the attempts on this issue of the absent uids are retired,
+// since their comment demonstrably did not land there. One transaction. The
+// wait for the write lock is bounded by ctx's deadline.
+func (s *Store) RecordDesignNoteReadBack(ctx context.Context, issueNumber int64, found []DesignNoteFiling, absent []string, now time.Time) error {
+	if len(found) == 0 && len(absent) == 0 {
+		return nil
+	}
+	if err := validateDesignNoteFilings(found); err != nil {
+		return err
+	}
+	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		if err := insertDesignNoteFilingsTx(ctx, tx, found, now); err != nil {
+			return err
+		}
+		for _, uid := range absent {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM design_note_pending_posts WHERE finding_uid = ? AND issue_number = ?`, uid, issueNumber); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// RetireAgedDesignNotePendingPosts deletes the attempts whose finding can never
+// be filed again: it has a filing row, or was first observed before since
+// (outside the sweep window). An attempt whose finding is unfiled and inside
+// the window is kept even when the finding is not a candidate now (answered,
+// for example), because it may reopen and only a read-back can tell whether
+// its comment landed. The wait for the write lock is bounded by ctx's deadline.
+func (s *Store) RetireAgedDesignNotePendingPosts(ctx context.Context, since time.Time) error {
 	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 DELETE FROM design_note_pending_posts
-WHERE NOT EXISTS (
-	SELECT 1 FROM json_each(design_note_pending_posts.finding_uids) j
-	WHERE NOT EXISTS (SELECT 1 FROM design_note_filings f WHERE f.finding_uid = j.value)
-		AND (SELECT MIN(julianday(o.observed_at)) FROM review_finding_observations o WHERE o.finding_uid = j.value) >= julianday(?)
-)`, since.UTC().Format(time.RFC3339Nano))
+WHERE EXISTS (SELECT 1 FROM design_note_filings f WHERE f.finding_uid = design_note_pending_posts.finding_uid)
+	OR COALESCE((SELECT MIN(julianday(o.observed_at)) FROM review_finding_observations o
+		WHERE o.finding_uid = design_note_pending_posts.finding_uid), 0) < julianday(?)`,
+			since.UTC().Format(time.RFC3339Nano))
 		return err
 	})
 }
 
-// RetireDesignNotePendingPost writes filings (possibly none) and deletes the
-// pending post in ONE transaction: the attempt is retired exactly when its
-// outcome is durably recorded. The wait for the write lock is bounded by ctx's
-// deadline.
-func (s *Store) RetireDesignNotePendingPost(ctx context.Context, post DesignNotePendingPost, filings []DesignNoteFiling, now time.Time) error {
-	if err := validateDesignNoteFilings(filings); err != nil {
-		return err
-	}
-	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
-		if err := insertDesignNoteFilingsTx(ctx, tx, filings, now); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx,
-			`DELETE FROM design_note_pending_posts WHERE repo = ? AND pull_request = ? AND issue_number = ?`,
-			post.Repo, post.PullRequest, post.IssueNumber)
-		return err
-	})
-}
-
-// ListDesignNotePendingPosts returns the pull request's unresolved comment
-// attempts, oldest first.
+// ListDesignNotePendingPosts returns the pull request's unresolved attempts,
+// one per finding per issue, oldest first.
 func (s *Store) ListDesignNotePendingPosts(ctx context.Context, repo string, pullRequest int64) ([]DesignNotePendingPost, error) {
 	return queryList(ctx, s.db, `
-SELECT repo, pull_request, issue_number, issue_url, finding_uids FROM design_note_pending_posts
-WHERE repo = ? AND pull_request = ? ORDER BY recorded_at, issue_number`,
+SELECT finding_uid, issue_number, repo, pull_request, issue_url FROM design_note_pending_posts
+WHERE repo = ? AND pull_request = ? ORDER BY created_at, issue_number, finding_uid`,
 		[]any{repo, pullRequest},
 		func(row rowScanner) (DesignNotePendingPost, error) {
 			var p DesignNotePendingPost
-			var uids string
-			if err := row.Scan(&p.Repo, &p.PullRequest, &p.IssueNumber, &p.IssueURL, &uids); err != nil {
-				return p, err
-			}
-			if err := json.Unmarshal([]byte(uids), &p.FindingUIDs); err != nil {
-				return p, fmt.Errorf("decode finding_uids of pending post %s#%d -> %s: %w", p.Repo, p.PullRequest, p.IssueURL, err)
-			}
-			return p, nil
+			err := row.Scan(&p.FindingUID, &p.IssueNumber, &p.Repo, &p.PullRequest, &p.IssueURL)
+			return p, err
 		})
 }
 

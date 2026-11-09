@@ -120,15 +120,17 @@ type designNotesSweep struct {
 // sweep.
 //
 // EXACTLY ONCE: a finding is marked filed only after a comment carrying its
-// finding-uid marker succeeds. Before commenting on an issue for a pull
-// request, the sweep records the attempt: the issue and the findings it may
-// carry. The attempt is retired, in the same transaction as the last filing
-// records, once its outcome is durably known. A later sweep reads back only
-// unresolved attempts, and a finding whose marker is already on one (a comment
-// whose record was lost, or a post that reported failure but landed) has its
-// record repaired against that issue instead of being posted again, even when
-// the ISO week has since rolled over to a new issue. An attempted issue that
-// cannot be read holds back only its own findings until it can be.
+// finding-uid marker succeeds. Before commenting on an issue, the sweep records
+// one attempt per finding about to be posted. An attempt concerns only its own
+// finding: it is retired when that finding is filed (in the filing
+// transaction), when a read-back of its issue shows the finding absent, or
+// when the finding ages out of the window. A later sweep reads back the
+// attempts of the pull request's current candidates, grouped by issue, and a
+// finding whose marker is already there (a comment whose record was lost, or a
+// post that reported failure but landed) has its record repaired against that
+// issue instead of being posted again, even when the ISO week has since rolled
+// over to a new issue. An attempted issue that cannot be read holds back only
+// the findings attempted there until it can be.
 //
 // DEADLINE: pull requests are processed one at a time, and no pull request,
 // comment or diagnostic write is started once ctx is done. The store bounds
@@ -181,11 +183,11 @@ func (e Engine) SweepDesignNotes(ctx context.Context, opts DesignNotesSweepOptio
 		s.sweepPullRequest(ctx, pr)
 	}
 	// Housekeeping last, and only within the deadline: an attempt is deleted
-	// unread only once none of its findings can be filed again (each recorded,
-	// or first seen before the window).
+	// unread only once its finding can never be filed again (recorded, or
+	// first seen before the window).
 	if ctx.Err() == nil {
-		if err := e.Store.RetireSettledDesignNotePendingPosts(ctx, now.Add(-DesignNotesWindow)); err != nil {
-			result.Errors = append(result.Errors, "retire settled attempts: "+err.Error())
+		if err := e.Store.RetireAgedDesignNotePendingPosts(ctx, now.Add(-DesignNotesWindow)); err != nil {
+			result.Errors = append(result.Errors, "retire aged attempts: "+err.Error())
 		}
 	}
 	return result, nil
@@ -211,12 +213,11 @@ func (s *designNotesSweep) sweepPullRequest(ctx context.Context, pr designNotesP
 	}
 }
 
-// file files a merged pull request's findings. First it resolves the pull
-// request's unresolved comment attempts (pending posts): findings whose marker
-// is on the attempted issue are recorded and the attempt retired in one store
-// transaction. An attempted issue that cannot be read holds back only the
-// findings its comment may carry; the rest are posted to the week issue,
-// after recording that attempt.
+// file files a merged pull request's findings. First it reads back the issues
+// its current findings were attempted on: findings whose marker is there are
+// recorded, attempts shown absent are retired. An attempted issue that cannot
+// be read holds back only the findings attempted there; the rest are posted
+// to the week issue, after recording one attempt per finding.
 func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, head string) {
 	issueRole, err := s.role(ctx, latestDesignNote(pr.findings).ObserverJob)
 	if err != nil {
@@ -234,15 +235,15 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 	}
 
 	remaining := pr.findings
-	targets, err := s.e.Store.ListDesignNotePendingPosts(ctx, pr.key.Repo, pr.key.PullRequest)
+	attempts, err := s.e.Store.ListDesignNotePendingPosts(ctx, pr.key.Repo, pr.key.PullRequest)
 	if err != nil {
 		s.fail(ctx, pr, "pending posts: "+err.Error())
 		return
 	}
 	held := map[string]bool{}
-	for _, target := range targets {
+	for _, group := range groupDesignNoteAttempts(attempts, pr.findings) {
 		var ok bool
-		if remaining, ok = s.resolveTarget(ctx, pr, target, remaining, held); !ok {
+		if remaining, ok = s.readBack(ctx, pr, group, remaining, held); !ok {
 			return
 		}
 	}
@@ -275,40 +276,33 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 	for _, f := range remaining {
 		uids = append(uids, f.FindingUID)
 	}
-	attempt := db.DesignNotePendingPost{Repo: pr.key.Repo, PullRequest: pr.key.PullRequest, IssueNumber: issue.Number, IssueURL: issue.URL, FindingUIDs: uids}
-	if err := s.e.Store.RecordDesignNotePendingPost(ctx, attempt, s.now); err != nil {
-		s.fail(ctx, pr, "record target "+issue.URL+" before commenting: "+err.Error())
+	if err := s.e.Store.RecordDesignNotePendingPosts(ctx, pr.key.Repo, pr.key.PullRequest, issue.Number, issue.URL, uids, s.now); err != nil {
+		s.fail(ctx, pr, "record attempts on "+issue.URL+" before commenting: "+err.Error())
 		return
 	}
 	posted := s.markers[designNotesIssueKey(pr.key.Repo, issue.Number)]
-	comments := designNotesComments(pr.key.PullRequest, head, remaining, requesters)
-	for i, comment := range comments {
+	for _, comment := range designNotesComments(pr.key.PullRequest, head, remaining, requesters) {
 		if err := ctx.Err(); err != nil {
 			s.fail(ctx, pr, "deadline before commenting on "+issue.URL+": "+err.Error())
 			return
 		}
 		if err := s.e.DesignNotesComment(ctx, pr.key.Repo, issue.Number, comment.body); err != nil {
-			// The post may have landed regardless; the attempt is recorded, so
-			// the next sweep reads the issue back before posting again.
+			// The post may have landed regardless; the attempts are recorded,
+			// so the next sweep reads the issue back before posting again.
 			s.fail(ctx, pr, "comment on "+issue.URL+": "+err.Error())
 			return
 		}
 		for _, f := range comment.findings {
 			posted[f.FindingUID] = true
 		}
+		// Filing these findings retires exactly their attempts, in the same
+		// transaction; other findings' attempts on this issue are untouched.
 		grace, cancel := designNotesGraceContext(ctx)
-		filings := s.filings(comment.findings, issue.URL, "")
-		if i == len(comments)-1 {
-			// Every finding of the attempt is now posted: retire it with the
-			// last records, in one transaction.
-			err = s.e.Store.RetireDesignNotePendingPost(grace, attempt, filings, s.now)
-		} else {
-			err = s.e.Store.RecordDesignNoteFilings(grace, filings, s.now)
-		}
+		err := s.record(grace, comment.findings, issue.URL, "")
 		cancel()
 		if err != nil {
-			// Posted but unrecorded: the attempt stays, so the next sweep finds
-			// the markers on it and repairs these records without posting again.
+			// Posted but unrecorded: the attempts stay, so the next sweep finds
+			// the markers and repairs these records without posting again.
 			s.fail(ctx, pr, "record filing after comment on "+issue.URL+": "+err.Error())
 			return
 		}
@@ -316,53 +310,84 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 	}
 }
 
-// resolveTarget resolves one unresolved comment attempt against findings and
-// returns the findings still to file. An attempt that can carry none of them is
-// left in place unread: one of its findings may be answered now and reopen
-// later, and only a read-back can tell whether its comment landed (#2559
-// review round 4); RetireSettledDesignNotePendingPosts retires it once none of
-// its findings can be filed again. A readable attempt has its posted findings
-// recorded and is retired, in one transaction. An unreadable one (deleted, 404,
-// a GitHub error) is reported and kept, and the findings it may carry are added
-// to held, so they wait until it is readable while the others go on. ok is
-// false only when a record could not be written; the pull request then waits
-// for a later sweep.
-func (s *designNotesSweep) resolveTarget(ctx context.Context, pr designNotesPullRequest, target db.DesignNotePendingPost, findings []db.DesignNoteCandidate, held map[string]bool) (remaining []db.DesignNoteCandidate, ok bool) {
-	covers := make(map[string]bool, len(target.FindingUIDs))
-	for _, uid := range target.FindingUIDs {
-		covers[uid] = true
+// designNotesAttemptGroup is one attempted issue and the current candidates
+// attempted on it.
+type designNotesAttemptGroup struct {
+	issue DesignNotesIssue
+	uids  map[string]bool
+}
+
+// groupDesignNoteAttempts groups the attempts of the pull request's current
+// candidates by issue, in the order the issues were first attempted. Attempts
+// of findings that are not candidates now (answered, for example) are left
+// alone: they are neither read nor retired here.
+func groupDesignNoteAttempts(attempts []db.DesignNotePendingPost, candidates []db.DesignNoteCandidate) []designNotesAttemptGroup {
+	isCandidate := make(map[string]bool, len(candidates))
+	for _, f := range candidates {
+		isCandidate[f.FindingUID] = true
 	}
-	var relevant []db.DesignNoteCandidate
+	var groups []designNotesAttemptGroup
+	index := map[int64]int{}
+	for _, a := range attempts {
+		if !isCandidate[a.FindingUID] {
+			continue
+		}
+		i, ok := index[a.IssueNumber]
+		if !ok {
+			i = len(groups)
+			index[a.IssueNumber] = i
+			groups = append(groups, designNotesAttemptGroup{issue: DesignNotesIssue{Number: a.IssueNumber, URL: a.IssueURL}, uids: map[string]bool{}})
+		}
+		groups[i].uids[a.FindingUID] = true
+	}
+	return groups
+}
+
+// readBack reads one attempted issue back for the findings attempted there.
+// Those whose marker it carries are filed against it and the attempts of those
+// it lacks are retired, in one transaction. An unreadable issue (deleted, 404,
+// a GitHub error) is reported, its attempts are kept, and its findings are
+// added to held, so they wait until it is readable while the others go on. ok
+// is false only when the outcome could not be recorded; the pull request then
+// waits for a later sweep.
+func (s *designNotesSweep) readBack(ctx context.Context, pr designNotesPullRequest, group designNotesAttemptGroup, findings []db.DesignNoteCandidate, held map[string]bool) (remaining []db.DesignNoteCandidate, ok bool) {
+	var relevant int
 	for _, f := range findings {
-		if covers[f.FindingUID] {
-			relevant = append(relevant, f)
+		if group.uids[f.FindingUID] {
+			relevant++
 		}
 	}
-	if len(relevant) == 0 {
+	if relevant == 0 {
+		// Every finding attempted here was already resolved by an earlier group.
 		return findings, true
 	}
-	markers, err := s.issueMarkers(ctx, pr.key.Repo, DesignNotesIssue{Number: target.IssueNumber, URL: target.IssueURL})
+	markers, err := s.issueMarkers(ctx, pr.key.Repo, group.issue)
 	if err != nil {
-		s.fail(ctx, pr, fmt.Sprintf("%v; holding back the %d finding(s) a comment there may carry until it can be read", err, len(relevant)))
-		for _, f := range relevant {
-			held[f.FindingUID] = true
+		s.fail(ctx, pr, fmt.Sprintf("%v; holding back the %d finding(s) attempted there until it can be read", err, relevant))
+		for uid := range group.uids {
+			held[uid] = true
 		}
 		return findings, true
 	}
-	var posted []db.DesignNoteCandidate
+	var found []db.DesignNoteCandidate
+	var absent []string
 	for _, f := range findings {
-		if markers[f.FindingUID] {
-			posted = append(posted, f)
-		} else {
+		switch {
+		case !group.uids[f.FindingUID]:
+			remaining = append(remaining, f)
+		case markers[f.FindingUID]:
+			found = append(found, f)
+		default:
+			absent = append(absent, f.FindingUID)
 			remaining = append(remaining, f)
 		}
 	}
-	if err := s.e.Store.RetireDesignNotePendingPost(ctx, target, s.filings(posted, target.IssueURL, ""), s.now); err != nil {
-		s.fail(ctx, pr, "resolve attempt on "+target.IssueURL+": "+err.Error())
+	if err := s.e.Store.RecordDesignNoteReadBack(ctx, group.issue.Number, s.filings(found, group.issue.URL, ""), absent, s.now); err != nil {
+		s.fail(ctx, pr, "record read-back of "+group.issue.URL+": "+err.Error())
 		return nil, false
 	}
-	s.result.Filed += len(posted)
-	s.result.Repaired += len(posted)
+	s.result.Filed += len(found)
+	s.result.Repaired += len(found)
 	return remaining, true
 }
 

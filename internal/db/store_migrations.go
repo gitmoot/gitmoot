@@ -3151,10 +3151,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_repo_state ON tasks(repo_full_name, state, 
 	// after its issue comment succeeds. design_note_issues remembers each week's
 	// issue so a later sweep reuses it; created marks an issue the sweep itself
 	// opened, which owes its role exactly one notice, claimed in notified_at.
-	// design_note_pending_posts is an unresolved attempt to comment: recorded
-	// before posting, with the findings the comment may carry, so a comment
-	// whose outcome was lost is read back from THAT issue even after the week
-	// has rolled over, and retired once its outcome is recorded.
+	// design_note_pending_posts holds one row per finding per issue the sweep
+	// was about to comment on: recorded before posting, so a comment whose
+	// outcome was lost is read back from THAT issue even after the week has
+	// rolled over. A row is deleted only for its own finding: when that finding
+	// is filed, when a read-back of that issue shows it absent, or when the
+	// finding has aged out of the sweep window.
 	`
 CREATE TABLE IF NOT EXISTS design_note_filings (
 	finding_uid TEXT PRIMARY KEY,
@@ -3178,13 +3180,14 @@ CREATE TABLE IF NOT EXISTS design_note_issues (
 	PRIMARY KEY (repo, iso_week)
 );
 CREATE TABLE IF NOT EXISTS design_note_pending_posts (
+	finding_uid TEXT NOT NULL,
+	issue_number INTEGER NOT NULL,
 	repo TEXT NOT NULL,
 	pull_request INTEGER NOT NULL,
-	issue_number INTEGER NOT NULL,
 	issue_url TEXT NOT NULL,
-	finding_uids TEXT NOT NULL CHECK(json_array_length(finding_uids) > 0),
-	recorded_at TEXT NOT NULL,
-	PRIMARY KEY (repo, pull_request, issue_number)
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (finding_uid, issue_number)
 );
+CREATE INDEX IF NOT EXISTS idx_design_note_pending_posts_pr ON design_note_pending_posts(repo, pull_request);
 	`,
 }

@@ -983,3 +983,55 @@ func TestDesignNotesUnreadAttemptIsRetiredOnceItsFindingsLeaveTheWindow(t *testi
 		t.Fatalf("attempts after the window = %+v, reads %d; want it retired unread", attempts, fake.listCalls-listCalls)
 	}
 }
+
+// #2559 review round 5 (the reviewer's probe): F1's comment lands ambiguously,
+// F1 is answered, and a day later an unrelated finding of the same pull
+// request is posted to the SAME week issue. Filing the unrelated finding must
+// retire only its own attempt, so when F1 reopens it is repaired from the
+// issue, not reposted.
+func TestDesignNotesFilingAnotherFindingKeepsAnUnresolvedAttemptOnTheSameIssue(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := designNotesNow
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	f1 := recordDesignNote(t, store, designNoteObs{pr: 220, job: "review-1", state: db.FindingOpen, severity: "P3", title: "f1", ago: time.Hour})
+	fake.states[220] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[220] = errors.New("github 502 after the write")
+	fake.landed[220] = true
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	delete(fake.commentErr, 220)
+	recordDesignNote(t, store, designNoteObs{pr: 220, job: "review-1", state: db.FindingAnswered, severity: "P3", title: "f1",
+		continues: f1, head: designNotesLedgerB, ago: 30 * time.Minute})
+
+	clock = clock.Add(24 * time.Hour) // same ISO week, same issue #501
+	unrelated := recordDesignNote(t, store, designNoteObs{pr: 220, job: "review-1", state: db.FindingOpen, severity: "P3", title: "unrelated", ago: -24*time.Hour + time.Hour})
+	if r, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil || r.Filed != 1 {
+		t.Fatalf("next-day sweep = %+v, %v", r, err)
+	}
+	if len(fake.created) != 1 {
+		t.Fatalf("issues created %q, want the one W46 issue", fake.created)
+	}
+	if pending := designNoteFiled(t, store); pending[unrelated] {
+		t.Fatal("the unrelated finding was not filed")
+	}
+	attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 220)
+	if err != nil || len(attempts) != 1 || attempts[0].IssueNumber != 501 {
+		t.Fatalf("attempts = %+v, %v; want only F1's unresolved attempt on #501 kept", attempts, err)
+	}
+
+	recordDesignNote(t, store, designNoteObs{pr: 220, job: "review-1", state: db.FindingOpen, severity: "P3", title: "f1",
+		continues: f1, head: designNotesMerged, ago: -24*time.Hour + 30*time.Minute})
+	reopened, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("reopen sweep: %v", err)
+	}
+	if n := countDesignNoteMarkers(fake, f1); n != 1 || reopened.Repaired != 1 {
+		t.Fatalf("marker_copies = %d, Repaired = %d; want 1 and 1", n, reopened.Repaired)
+	}
+	if attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 220); err != nil || len(attempts) != 0 {
+		t.Fatalf("attempts after the repair = %+v, %v", attempts, err)
+	}
+}

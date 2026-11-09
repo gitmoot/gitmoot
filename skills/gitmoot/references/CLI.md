@@ -1103,12 +1103,12 @@ about their pull requests, at most 50 per sweep:
 - **Closed without merging:** skipped for good.
 - **Still open:** checked again by a later sweep.
 
-A finding is filed once: before commenting, the sweep records the attempt (the
-issue and the findings it may carry), and until the attempt's outcome is
-recorded it reads that issue's comments back before posting again (even an
-earlier week's), so a finding whose `finding-uid:` line is already there is
-recorded without a second comment. If that issue cannot be read, only the
-findings the attempt may carry wait; the others are still filed. A failed
+A finding is filed once: before commenting, the sweep records an attempt for
+each finding it is about to post, and until that finding is filed it reads the
+attempted issue's comments back before posting it again (even an earlier
+week's), so a finding whose `finding-uid:` line is already there is recorded
+without a second comment. If that issue cannot be read, only the findings
+attempted there wait; the others are still filed. A failed
 lookup or comment is logged and recorded as a `design_notes_error` job event on
 the review job, and its findings stay unfiled for the next sweep. A sweep stops
 at its deadline, and its database waits are bounded by it. Nothing here blocks
