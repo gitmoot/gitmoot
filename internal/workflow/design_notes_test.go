@@ -2,8 +2,10 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -703,5 +705,105 @@ func TestDesignNotesSweepRetriesAPRWhoseRequesterCannotBeResolved(t *testing.T) 
 	}
 	if len(fake.createLabels) != 1 || strings.Join(fake.createLabels[0], ",") != "design-notes,agent:lead" {
 		t.Fatalf("issue labels = %v", fake.createLabels)
+	}
+}
+
+// #2559 review round 2, finding 1: a comment that landed with an ambiguous
+// error in the last minute of an ISO week is not posted again to the next
+// week's issue: the next sweep reads back the issue it had recorded as the
+// target, not just the current week's.
+func TestDesignNotesWeekRolloverDoesNotRepostALandedComment(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := time.Date(2026, 11, 15, 23, 59, 0, 0, time.UTC) // last minute of 2026-W46
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	uid := recordDesignNote(t, store, designNoteObs{pr: 160, job: "review-1", state: db.FindingOpen, severity: "P3", title: "note", ago: time.Hour})
+	fake.states[160] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[160] = errors.New("github 502 after the write")
+	fake.landed[160] = true
+
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("Sunday sweep: %v", err)
+	}
+	delete(fake.commentErr, 160)
+	clock = clock.Add(2 * time.Minute) // Monday 00:01, 2026-W47
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil {
+		t.Fatalf("Monday sweep: %v", err)
+	}
+	copies := 0
+	for _, c := range fake.comments {
+		copies += strings.Count(c.body, "\nfinding-uid: "+uid+"\n")
+	}
+	if copies != 1 {
+		t.Fatalf("comments_for_same_finding = %d, want 1 (issues created: %q)", copies, fake.created)
+	}
+	if second.Repaired != 1 || len(fake.created) != 1 {
+		t.Fatalf("Monday sweep = %+v, issues %q; want the finding repaired against the W46 issue and no W47 issue", second, fake.created)
+	}
+	if pending := designNoteFiled(t, store); pending[uid] {
+		t.Fatal("the landed finding is still unfiled")
+	}
+}
+
+// #2559 review round 2, finding 2: under REAL writer contention (a second
+// connection holding BEGIN IMMEDIATE far longer than the sweep's budget) the
+// sweep returns near its deadline, not when the lock frees: the store's 15s
+// busy wait would otherwise ignore the context.
+func TestDesignNotesSweepBoundsLockWaitsByItsDeadline(t *testing.T) {
+	const hold = 7 * time.Second
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store := openEngineStoreAt(t, path)
+	fake := newDesignNotesFake()
+	engine := Engine{Store: store}
+	fake.wire(&engine)
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	uid := recordDesignNote(t, store, designNoteObs{pr: 170, job: "review-1", state: db.FindingOpen, severity: "P3", title: "note", ago: time.Hour})
+	fake.states[170] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.found = &DesignNotesIssue{Number: 77, URL: "https://github.com/owner/repo/issues/77"}
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("second connection: %v", err)
+	}
+	defer raw.Close()
+	blocker, err := raw.Conn(ctx)
+	if err != nil {
+		t.Fatalf("blocker connection: %v", err)
+	}
+	defer blocker.Close()
+	if _, err := blocker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+	release, released := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(released)
+		select {
+		case <-release:
+		case <-time.After(hold):
+		}
+		_, _ = blocker.ExecContext(context.Background(), `ROLLBACK`)
+	}()
+
+	sweepCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	result, err := engine.SweepDesignNotes(sweepCtx, DesignNotesSweepOptions{})
+	elapsed := time.Since(start)
+	close(release)
+	<-released
+	if err != nil {
+		t.Fatalf("SweepDesignNotes: %v", err)
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("a 500ms sweep returned after %s against a %s lock hold; its SQLite waits ignore the deadline", elapsed, hold)
+	}
+	if len(fake.comments) != 0 {
+		t.Fatalf("posted %d comments without first recording the target issue", len(fake.comments))
+	}
+	if pending := designNoteFiled(t, store); !pending[uid] {
+		t.Fatalf("the finding was marked filed; result %+v", result)
 	}
 }

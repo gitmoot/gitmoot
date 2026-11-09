@@ -3174,4 +3174,20 @@ CREATE TABLE IF NOT EXISTS design_note_issues (
 	PRIMARY KEY (repo, iso_week)
 );
 	`,
+	// #2559 review round 2: before the design-notes sweep comments on an issue
+	// for a pull request it records that target here, so a comment whose
+	// outcome was lost (an ambiguous API error, a record write that did not
+	// land) is found on THAT issue by the next sweep, even after the ISO week
+	// and so the week's issue have changed. Appended rather than folded into
+	// the previous migration, which homes may already have applied.
+	`
+CREATE TABLE IF NOT EXISTS design_note_pending_posts (
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	issue_number INTEGER NOT NULL,
+	issue_url TEXT NOT NULL,
+	recorded_at TEXT NOT NULL,
+	PRIMARY KEY (repo, pull_request, issue_number)
+);
+	`,
 }

@@ -21,8 +21,9 @@ const (
 	// DesignNotesSweepLimit bounds the pull requests one sweep checks, so a
 	// backlog cannot stall the daemon; the rest wait for the next sweep.
 	DesignNotesSweepLimit = 50
-	// designNotesGrace bounds a local write that must outlive the sweep's
-	// deadline: the record of a comment already posted, or a diagnostic event.
+	// designNotesGrace bounds a local write that may outlive the sweep's
+	// deadline because it records a GitHub action already taken: a created
+	// issue or a posted comment. Diagnostics never outlive the deadline.
 	designNotesGrace = 5 * time.Second
 	// GitHub rejects a comment over 65536 characters. Every comment is kept
 	// under this many BYTES, which bounds characters too, with margin.
@@ -98,21 +99,16 @@ type designNotesPullRequest struct {
 	findings []db.DesignNoteCandidate
 }
 
-// designNotesWeekIssue is a week issue as this sweep knows it: Posted holds
-// the finding uids its comments already carry.
-type designNotesWeekIssue struct {
-	DesignNotesIssue
-	posted map[string]bool
-}
-
-// designNotesSweep is the state of one sweep.
+// designNotesSweep is the state of one sweep. markers caches, per
+// "repo#issue", the finding uids an issue's comments already carry.
 type designNotesSweep struct {
-	e      Engine
-	now    time.Time
-	week   string
-	result *DesignNotesSweepResult
-	roles  map[string]string
-	issues map[string]*designNotesWeekIssue
+	e       Engine
+	now     time.Time
+	week    string
+	result  *DesignNotesSweepResult
+	roles   map[string]string
+	issues  map[string]DesignNotesIssue
+	markers map[string]map[string]bool
 }
 
 // SweepDesignNotes files the open P3 findings of merged pull requests (#2558).
@@ -124,15 +120,28 @@ type designNotesSweep struct {
 // sweep.
 //
 // EXACTLY ONCE: a finding is marked filed only after a comment carrying its
-// finding-uid marker succeeds. Before posting, the sweep reads the issue's
-// comments back, and a finding whose marker is already there (a comment whose
-// record was lost, or a post that reported failure but landed) has its record
-// repaired instead of being posted again.
+// finding-uid marker succeeds. Before commenting on an issue for a pull
+// request, the sweep records that issue as a pending post target. Every later
+// sweep reads each recorded target's comments back first, and a finding whose
+// marker is already on one (a comment whose record was lost, or a post that
+// reported failure but landed) has its record repaired against that issue
+// instead of being posted again, even when the ISO week has since rolled over
+// to a new issue.
 //
-// Pull requests are processed one at a time, and none is started once ctx is
-// done. Failures are per pull request: each is recorded as a design_notes_error
-// job event on the review job that last observed a finding, returned in
-// Errors, and the sweep continues. Only a failure to read the ledger aborts it.
+// DEADLINE: pull requests are processed one at a time, and no pull request,
+// comment or diagnostic write is started once ctx is done. The store bounds
+// each write's wait for SQLite's write lock by the deadline of the context it
+// is given (the driver alone ignores cancellation while busy). The only writes
+// allowed past the deadline record a GitHub action that already happened (a
+// created issue, a posted comment), each bounded by designNotesGrace, and a
+// lost comment record is repaired by the read-back anyway. So the sweep
+// returns within its deadline plus one in-flight GitHub call plus
+// designNotesGrace.
+//
+// Failures are per pull request: each is recorded as a design_notes_error job
+// event on the review job that last observed a finding (while the deadline
+// allows), returned in Errors, and the sweep continues. Only a failure to read
+// the ledger aborts it.
 func (e Engine) SweepDesignNotes(ctx context.Context, opts DesignNotesSweepOptions) (DesignNotesSweepResult, error) {
 	result := DesignNotesSweepResult{Next: opts.After}
 	if e.Store == nil {
@@ -143,7 +152,7 @@ func (e Engine) SweepDesignNotes(ctx context.Context, opts DesignNotesSweepOptio
 	}
 	now := e.now().UTC()
 	s := designNotesSweep{e: e, now: now, week: designNotesWeek(now), result: &result,
-		roles: map[string]string{}, issues: map[string]*designNotesWeekIssue{}}
+		roles: map[string]string{}, issues: map[string]DesignNotesIssue{}, markers: map[string]map[string]bool{}}
 	s.sendPendingNotices(ctx)
 
 	candidates, err := e.Store.ListDesignNoteCandidates(ctx, now.Add(-DesignNotesWindow))
@@ -192,53 +201,79 @@ func (s *designNotesSweep) sweepPullRequest(ctx context.Context, pr designNotesP
 	}
 }
 
-// file posts a merged pull request's findings to the week issue, minus those
-// whose marker the issue already carries, which are only recorded.
+// file files a merged pull request's findings. Findings whose marker is
+// already on an issue this pull request was posted to are only recorded; the
+// rest are posted to the week issue, after recording it as a target.
 func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, head string) {
+	issueRole, err := s.role(ctx, latestDesignNote(pr.findings).ObserverJob)
+	if err != nil {
+		s.fail(ctx, pr, "resolve requester: "+err.Error())
+		return
+	}
+	requesters := make(map[string]string, len(pr.findings))
 	for _, f := range pr.findings {
-		if _, err := s.role(ctx, f.ObserverJob); err != nil {
+		role, err := s.role(ctx, f.ObserverJob)
+		if err != nil {
 			s.fail(ctx, pr, "resolve requester: "+err.Error())
 			return
 		}
+		requesters[f.FindingUID] = role
 	}
-	issue, err := s.weekIssue(ctx, pr.key.Repo, s.roles[strings.TrimSpace(latestDesignNote(pr.findings).ObserverJob)])
+
+	remaining := pr.findings
+	targets, err := s.e.Store.ListDesignNotePendingPosts(ctx, pr.key.Repo, pr.key.PullRequest)
+	if err != nil {
+		s.fail(ctx, pr, "pending posts: "+err.Error())
+		return
+	}
+	for _, target := range targets {
+		var ok bool
+		if remaining, ok = s.reconcile(ctx, pr, DesignNotesIssue{Number: target.IssueNumber, URL: target.IssueURL}, remaining); !ok {
+			return
+		}
+	}
+	if len(remaining) == 0 {
+		return
+	}
+	issue, err := s.weekIssue(ctx, pr.key.Repo, issueRole)
 	if err != nil {
 		s.fail(ctx, pr, "week issue: "+err.Error())
 		return
 	}
-	var posted, unposted []db.DesignNoteCandidate
-	for _, f := range pr.findings {
-		if issue.posted[f.FindingUID] {
-			posted = append(posted, f)
-		} else {
-			unposted = append(unposted, f)
-		}
+	var ok bool
+	if remaining, ok = s.reconcile(ctx, pr, issue, remaining); !ok || len(remaining) == 0 {
+		return
 	}
-	if len(posted) > 0 {
-		if err := s.record(ctx, posted, issue.URL, ""); err != nil {
-			s.fail(ctx, pr, "repair filing already on "+issue.URL+": "+err.Error())
-			return
-		}
-		s.result.Filed += len(posted)
-		s.result.Repaired += len(posted)
+	if err := ctx.Err(); err != nil {
+		s.fail(ctx, pr, "deadline before commenting on "+issue.URL+": "+err.Error())
+		return
 	}
-	for _, comment := range designNotesComments(pr.key.PullRequest, head, unposted, s.roles) {
+	if err := s.e.Store.RecordDesignNotePendingPost(ctx, db.DesignNotePendingPost{
+		Repo: pr.key.Repo, PullRequest: pr.key.PullRequest, IssueNumber: issue.Number, IssueURL: issue.URL}, s.now); err != nil {
+		s.fail(ctx, pr, "record target "+issue.URL+" before commenting: "+err.Error())
+		return
+	}
+	posted := s.markers[designNotesIssueKey(pr.key.Repo, issue.Number)]
+	for _, comment := range designNotesComments(pr.key.PullRequest, head, remaining, requesters) {
 		if err := ctx.Err(); err != nil {
 			s.fail(ctx, pr, "deadline before commenting on "+issue.URL+": "+err.Error())
 			return
 		}
 		if err := s.e.DesignNotesComment(ctx, pr.key.Repo, issue.Number, comment.body); err != nil {
-			// The post may have landed regardless; the next sweep reads the
-			// issue's comments back before posting again.
+			// The post may have landed regardless; the issue is a recorded
+			// target, so the next sweep reads it back before posting again.
 			s.fail(ctx, pr, "comment on "+issue.URL+": "+err.Error())
 			return
 		}
 		for _, f := range comment.findings {
-			issue.posted[f.FindingUID] = true
+			posted[f.FindingUID] = true
 		}
-		if err := s.record(ctx, comment.findings, issue.URL, ""); err != nil {
+		grace, cancel := designNotesGraceContext(ctx)
+		err := s.record(grace, comment.findings, issue.URL, "")
+		cancel()
+		if err != nil {
 			// Posted but unrecorded: the next sweep finds the markers on the
-			// issue and repairs these records without posting again.
+			// recorded target and repairs these records without posting again.
 			s.fail(ctx, pr, "record filing after comment on "+issue.URL+": "+err.Error())
 			return
 		}
@@ -246,60 +281,91 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 	}
 }
 
-// weekIssue returns the repository's issue for this week: from the store,
-// else from a GitHub search by exact title and label (a lost row must not
-// open a duplicate), else a new issue, whose role is then told once. A known
-// issue's comments are read back for the markers already posted.
-func (s *designNotesSweep) weekIssue(ctx context.Context, repo, role string) (*designNotesWeekIssue, error) {
-	if issue := s.issues[repo]; issue != nil {
-		return issue, nil
-	}
-	recorded, ok, err := s.e.Store.GetDesignNoteIssue(ctx, repo, s.week)
+// reconcile records, as filed into issue, the findings whose marker the
+// issue's comments already carry, and returns the rest. ok is false when the
+// issue could not be read or the repair could not be recorded; the pull
+// request is then left for the next sweep.
+func (s *designNotesSweep) reconcile(ctx context.Context, pr designNotesPullRequest, issue DesignNotesIssue, findings []db.DesignNoteCandidate) (remaining []db.DesignNoteCandidate, ok bool) {
+	markers, err := s.issueMarkers(ctx, pr.key.Repo, issue)
 	if err != nil {
-		return nil, err
+		s.fail(ctx, pr, err.Error())
+		return nil, false
 	}
-	issue := &designNotesWeekIssue{posted: map[string]bool{}}
-	if ok {
-		issue.DesignNotesIssue = DesignNotesIssue{Number: recorded.Number, URL: recorded.URL}
-	} else {
-		created, err := s.findOrCreateIssue(ctx, repo, role, issue)
-		if err != nil {
-			return nil, err
+	var posted []db.DesignNoteCandidate
+	for _, f := range findings {
+		if markers[f.FindingUID] {
+			posted = append(posted, f)
+		} else {
+			remaining = append(remaining, f)
 		}
-		if created {
-			// A new issue has no comments to read back.
-			s.issues[repo] = issue
-			return issue, nil
-		}
+	}
+	if len(posted) == 0 {
+		return remaining, true
+	}
+	if err := s.record(ctx, posted, issue.URL, ""); err != nil {
+		s.fail(ctx, pr, "repair filing already on "+issue.URL+": "+err.Error())
+		return nil, false
+	}
+	s.result.Filed += len(posted)
+	s.result.Repaired += len(posted)
+	return remaining, true
+}
+
+// issueMarkers returns the finding uids an issue's comments carry, reading
+// the comments once per sweep.
+func (s *designNotesSweep) issueMarkers(ctx context.Context, repo string, issue DesignNotesIssue) (map[string]bool, error) {
+	key := designNotesIssueKey(repo, issue.Number)
+	if markers, ok := s.markers[key]; ok {
+		return markers, nil
 	}
 	bodies, err := s.e.DesignNotesListComments(ctx, repo, issue.Number)
 	if err != nil {
 		return nil, fmt.Errorf("list comments of %s: %w", issue.URL, err)
 	}
+	markers := map[string]bool{}
 	for _, body := range bodies {
 		for uid := range designNotesMarkers(body) {
-			issue.posted[uid] = true
+			markers[uid] = true
+		}
+	}
+	s.markers[key] = markers
+	return markers, nil
+}
+
+// weekIssue returns the repository's issue for this week: from the store,
+// else from a GitHub search by exact title and label (a lost row must not
+// open a duplicate), else a new issue, whose role is then told once.
+func (s *designNotesSweep) weekIssue(ctx context.Context, repo, role string) (DesignNotesIssue, error) {
+	if issue, ok := s.issues[repo]; ok {
+		return issue, nil
+	}
+	recorded, ok, err := s.e.Store.GetDesignNoteIssue(ctx, repo, s.week)
+	if err != nil {
+		return DesignNotesIssue{}, err
+	}
+	issue := DesignNotesIssue{Number: recorded.Number, URL: recorded.URL}
+	if !ok {
+		if issue, err = s.findOrCreateIssue(ctx, repo, role); err != nil {
+			return DesignNotesIssue{}, err
 		}
 	}
 	s.issues[repo] = issue
 	return issue, nil
 }
 
-func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo, role string, issue *designNotesWeekIssue) (created bool, err error) {
+func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo, role string) (DesignNotesIssue, error) {
 	title := designNotesIssueTitle(repo, s.week)
 	if s.e.DesignNotesFindIssue != nil {
 		found, exists, err := s.e.DesignNotesFindIssue(ctx, repo, title, designNotesLabel)
 		if err != nil {
-			return false, fmt.Errorf("search %q: %w", title, err)
+			return DesignNotesIssue{}, fmt.Errorf("search %q: %w", title, err)
 		}
 		if exists {
-			issue.DesignNotesIssue = found
-			grace, cancel := designNotesGraceContext(ctx)
-			defer cancel()
-			if _, err := s.e.Store.RecordDesignNoteIssue(grace, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: found.Number, URL: found.URL}, s.now); err != nil {
+			// Not recording it only costs the next sweep another search.
+			if _, err := s.e.Store.RecordDesignNoteIssue(ctx, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: found.Number, URL: found.URL}, s.now); err != nil {
 				s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s: record found issue %s: %v", repo, found.URL, err))
 			}
-			return false, nil
+			return found, nil
 		}
 	}
 	agentLabel := postMergeUnassignedAgentLabel
@@ -308,20 +374,24 @@ func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo, role str
 	}
 	opened, err := s.e.DesignNotesCreateIssue(ctx, repo, title, designNotesIssueBody, []string{designNotesLabel, agentLabel})
 	if err != nil {
-		return false, fmt.Errorf("create %q: %w", title, err)
+		return DesignNotesIssue{}, fmt.Errorf("create %q: %w", title, err)
 	}
-	issue.DesignNotesIssue = opened
 	s.result.Created = append(s.result.Created, opened.URL)
+	// A new issue has no comments to read back.
+	s.markers[designNotesIssueKey(repo, opened.Number)] = map[string]bool{}
 	grace, cancel := designNotesGraceContext(ctx)
-	defer cancel()
-	if _, err := s.e.Store.RecordDesignNoteIssue(grace, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: opened.Number, URL: opened.URL, Role: role, Created: true}, s.now); err != nil {
+	_, err = s.e.Store.RecordDesignNoteIssue(grace, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: opened.Number, URL: opened.URL, Role: role, Created: true}, s.now)
+	cancel()
+	if err != nil {
 		// The issue exists, so file into it; without the row the next sweep
 		// finds it by search instead, and sends no notice rather than risk two.
 		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s: record created issue %s: %v", repo, opened.URL, err))
-		return true, nil
+		return opened, nil
 	}
-	s.notify(grace, repo, opened.URL)
-	return true, nil
+	// Bounded by the sweep's deadline: an unsent notice stays pending and is
+	// retried by the next sweep.
+	s.notify(ctx, repo, opened.URL)
+	return opened, nil
 }
 
 // sendPendingNotices retries the notices of this week's created issues whose
@@ -371,30 +441,37 @@ func (s *designNotesSweep) role(ctx context.Context, jobID string) (string, erro
 	return role, nil
 }
 
-// record writes filing rows under a bounded grace context: a comment already
-// posted must be recorded even when the sweep's deadline has just passed.
+// record writes filing rows; the store bounds the wait for the write lock by
+// ctx's deadline.
 func (s *designNotesSweep) record(ctx context.Context, findings []db.DesignNoteCandidate, issueURL, skipReason string) error {
 	filings := make([]db.DesignNoteFiling, 0, len(findings))
 	for _, f := range findings {
 		filings = append(filings, db.DesignNoteFiling{FindingUID: f.FindingUID, Repo: f.Repo, PullRequest: f.PullRequest,
 			HeadSHA: f.HeadSHA, IssueURL: issueURL, SkipReason: skipReason})
 	}
-	grace, cancel := designNotesGraceContext(ctx)
-	defer cancel()
-	return s.e.Store.RecordDesignNoteFilings(grace, filings, s.now)
+	return s.e.Store.RecordDesignNoteFilings(ctx, filings, s.now)
 }
 
+// fail reports a per-pull-request failure. The job event is a diagnostic, so
+// it is written only while the sweep's deadline allows, and bounded by it.
 func (s *designNotesSweep) fail(ctx context.Context, pr designNotesPullRequest, message string) {
 	s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s#%d: %s", pr.key.Repo, pr.key.PullRequest, message))
+	if ctx.Err() != nil {
+		return
+	}
 	if job := strings.TrimSpace(latestDesignNote(pr.findings).ObserverJob); job != "" {
-		grace, cancel := designNotesGraceContext(ctx)
-		defer cancel()
-		_ = s.e.Store.AddJobEvent(grace, db.JobEvent{JobID: job, Kind: designNotesErrorEvent, Message: message})
+		_ = s.e.Store.AddDesignNoteJobEvent(ctx, db.JobEvent{JobID: job, Kind: designNotesErrorEvent, Message: message})
 	}
 }
 
+// designNotesGraceContext bounds a write that records a GitHub action already
+// taken. The store enforces the bound on its wait for the write lock.
 func designNotesGraceContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), designNotesGrace)
+}
+
+func designNotesIssueKey(repo string, issue int64) string {
+	return repo + "#" + strconv.FormatInt(issue, 10)
 }
 
 // groupDesignNoteCandidates groups candidates, already ordered by repository
@@ -459,13 +536,13 @@ type designNotesCommentPart struct {
 // under designNotesCommentMax bytes in total. Every field of a finding block is
 // bounded, so findings that do not fit one comment continue in the next; none
 // is dropped.
-func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidate, roles map[string]string) []designNotesCommentPart {
+func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidate, requesters map[string]string) []designNotesCommentPart {
 	head = designNotesClip(designNotesLine(head), designNotesFieldMax)
 	var groups [][]int
 	var blocks []string
 	size := 0
 	for i, f := range findings {
-		block := designNotesBlock(i+1, f, pr, head, roles)
+		block := designNotesBlock(i+1, f, pr, head, requesters[f.FindingUID])
 		blocks = append(blocks, block)
 		if len(groups) == 0 || size+len(block) > designNotesCommentMax-designNotesHeaderReserve {
 			groups = append(groups, nil)
@@ -493,7 +570,7 @@ func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidat
 	return parts
 }
 
-func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string, roles map[string]string) string {
+func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string, requester string) string {
 	detail := strings.TrimSpace(f.Detail)
 	title := designNotesClip(designNotesLine(firstNonEmptyLedgerText(f.Title, detail, "(untitled)")), designNotesTitleMax)
 	location := strings.TrimSpace(f.File)
@@ -502,7 +579,7 @@ func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string
 	}
 	location = designNotesClip(designNotesLine(firstNonEmptyLedgerText(location, "not stated")), designNotesFieldMax)
 	job := designNotesClip(designNotesLine(firstNonEmptyLedgerText(f.ObserverJob, "unknown")), designNotesFieldMax)
-	requester := designNotesClip(designNotesLine(firstNonEmptyLedgerText(roles[strings.TrimSpace(f.ObserverJob)], "unassigned")), designNotesFieldMax)
+	requester = designNotesClip(designNotesLine(firstNonEmptyLedgerText(requester, "unassigned")), designNotesFieldMax)
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n### %d. %s\n\n", index, title)
 	fmt.Fprintf(&b, "- Location: `%s`\n", location)

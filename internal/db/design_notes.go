@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -81,33 +82,139 @@ type DesignNoteFiling struct {
 	SkipReason  string
 }
 
+// designNoteWrite runs fn in one write transaction whose wait for SQLite's
+// write lock is bounded by ctx's deadline (#2559 review round 2).
+//
+// A context does NOT shorten a contended write on its own: the driver ignores
+// cancellation while it backs off for busy_timeout (15s here), see
+// TestShortCallerBudgetDiscardsAWriteItAlreadyWon. So, like
+// CheckpointWALTruncate, the write takes a dedicated connection and lowers
+// that connection's busy_timeout to the time left before the deadline for the
+// duration, then restores it; a connection whose restore fails is discarded so
+// database/sql reopens it from the DSN with the normal pragmas. A ctx with no
+// deadline keeps the store's normal wait.
+func (s *Store) designNoteWrite(ctx context.Context, fn func(*sql.Tx) error) error {
+	deadline, bounded := ctx.Deadline()
+	if !bounded {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.DeadlineExceeded
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	waitMillis := (remaining + time.Millisecond - 1) / time.Millisecond
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout=%d`, waitMillis)); err != nil {
+		return fmt.Errorf("bound busy wait: %w", err)
+	}
+	writeErr := func() error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}()
+	if _, err := conn.ExecContext(context.WithoutCancel(ctx), fmt.Sprintf(`PRAGMA busy_timeout=%d`, sqliteBusyTimeoutMillis)); err != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		return errors.Join(writeErr, fmt.Errorf("restore busy timeout (connection discarded): %w", err))
+	}
+	return writeErr
+}
+
 // RecordDesignNoteFilings writes the rows in one transaction, so a pull
 // request's findings are marked together or not at all. A finding that already
-// has a row keeps it.
+// has a row keeps it. The wait for the write lock is bounded by ctx's deadline.
 func (s *Store) RecordDesignNoteFilings(ctx context.Context, filings []DesignNoteFiling, now time.Time) error {
 	if len(filings) == 0 {
 		return nil
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	stamp := now.UTC().Format(time.RFC3339Nano)
 	for _, f := range filings {
 		uid := strings.TrimSpace(f.FindingUID)
 		if uid == "" || (strings.TrimSpace(f.IssueURL) == "") == (strings.TrimSpace(f.SkipReason) == "") {
 			return fmt.Errorf("design note filing %q needs a finding uid and exactly one of issue url or skip reason", uid)
 		}
-		if _, err := tx.ExecContext(ctx, `
+	}
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		for _, f := range filings {
+			if _, err := tx.ExecContext(ctx, `
 INSERT INTO design_note_filings (finding_uid, repo, pull_request, head_sha, issue_url, skip_reason, filed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(finding_uid) DO NOTHING`,
-			uid, f.Repo, f.PullRequest, f.HeadSHA, strings.TrimSpace(f.IssueURL), strings.TrimSpace(f.SkipReason), stamp); err != nil {
-			return err
+				strings.TrimSpace(f.FindingUID), f.Repo, f.PullRequest, f.HeadSHA, strings.TrimSpace(f.IssueURL), strings.TrimSpace(f.SkipReason), stamp); err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+}
+
+// DesignNotePendingPost is an issue the sweep was about to comment on for a
+// pull request. It is recorded BEFORE the comment is posted, so a comment
+// whose outcome was lost is found on that issue again, even after the week
+// and so the week's issue have changed.
+type DesignNotePendingPost struct {
+	Repo        string
+	PullRequest int64
+	IssueNumber int64
+	IssueURL    string
+}
+
+// RecordDesignNotePendingPost records that the sweep may comment on issue for
+// the pull request. Recording it twice is a no-op. The wait for the write lock
+// is bounded by ctx's deadline.
+func (s *Store) RecordDesignNotePendingPost(ctx context.Context, post DesignNotePendingPost, now time.Time) error {
+	if strings.TrimSpace(post.Repo) == "" || post.PullRequest <= 0 || post.IssueNumber <= 0 || strings.TrimSpace(post.IssueURL) == "" {
+		return fmt.Errorf("design note pending post needs a repo, pull request, issue number and url")
 	}
-	return tx.Commit()
+	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+INSERT INTO design_note_pending_posts (repo, pull_request, issue_number, issue_url, recorded_at)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(repo, pull_request, issue_number) DO NOTHING`,
+			post.Repo, post.PullRequest, post.IssueNumber, post.IssueURL, now.UTC().Format(time.RFC3339Nano))
+		return err
+	})
+}
+
+// ListDesignNotePendingPosts returns every issue the sweep has prepared to
+// comment on for the pull request, oldest first.
+func (s *Store) ListDesignNotePendingPosts(ctx context.Context, repo string, pullRequest int64) ([]DesignNotePendingPost, error) {
+	return queryList(ctx, s.db, `
+SELECT repo, pull_request, issue_number, issue_url FROM design_note_pending_posts
+WHERE repo = ? AND pull_request = ? ORDER BY recorded_at, issue_number`,
+		[]any{repo, pullRequest},
+		func(row rowScanner) (DesignNotePendingPost, error) {
+			var p DesignNotePendingPost
+			err := row.Scan(&p.Repo, &p.PullRequest, &p.IssueNumber, &p.IssueURL)
+			return p, err
+		})
+}
+
+// AddDesignNoteJobEvent records a design-notes diagnostic on a job, with the
+// wait for the write lock bounded by ctx's deadline.
+func (s *Store) AddDesignNoteJobEvent(ctx context.Context, event JobEvent) error {
+	return s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
+			event.JobID, event.Kind, event.Message)
+		return err
+	})
 }
 
 // DesignNoteIssue is one repository's design-notes issue for one ISO week.
@@ -149,6 +256,7 @@ func (s *Store) GetDesignNoteIssue(ctx context.Context, repo, week string) (Desi
 
 // RecordDesignNoteIssue stores the week's issue unless one is already recorded,
 // and returns the stored row, so a concurrent writer's issue wins consistently.
+// The wait for the write lock is bounded by ctx's deadline.
 func (s *Store) RecordDesignNoteIssue(ctx context.Context, issue DesignNoteIssue, now time.Time) (DesignNoteIssue, error) {
 	if strings.TrimSpace(issue.Repo) == "" || strings.TrimSpace(issue.ISOWeek) == "" || issue.Number <= 0 || strings.TrimSpace(issue.URL) == "" {
 		return DesignNoteIssue{}, fmt.Errorf("design note issue needs a repo, week, number and url")
@@ -157,11 +265,14 @@ func (s *Store) RecordDesignNoteIssue(ctx context.Context, issue DesignNoteIssue
 	if issue.Created {
 		created = 1
 	}
-	if _, err := s.db.ExecContext(ctx, `
+	if err := s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
 INSERT INTO design_note_issues (repo, iso_week, issue_number, issue_url, role, created, notified_at, recorded_at)
 VALUES (?, ?, ?, ?, ?, ?, '', ?)
 ON CONFLICT(repo, iso_week) DO NOTHING`,
-		issue.Repo, issue.ISOWeek, issue.Number, issue.URL, issue.Role, created, now.UTC().Format(time.RFC3339Nano)); err != nil {
+			issue.Repo, issue.ISOWeek, issue.Number, issue.URL, issue.Role, created, now.UTC().Format(time.RFC3339Nano))
+		return err
+	}); err != nil {
 		return DesignNoteIssue{}, err
 	}
 	stored, ok, err := s.GetDesignNoteIssue(ctx, issue.Repo, issue.ISOWeek)
@@ -187,37 +298,38 @@ func (s *Store) ListDesignNoteIssuesAwaitingNotice(ctx context.Context, week str
 // transaction: either both writes land or neither does, so a role hears at
 // most once per repository per week and a failed send stays pending. It
 // reports whether the message was sent; false means the issue was not created
-// by the sweep, has no role, or was already notified.
+// by the sweep, has no role, or was already notified. The wait for the write
+// lock is bounded by ctx's deadline.
 func (s *Store) SendDesignNoteIssueNotice(ctx context.Context, repo, week, body string, now time.Time) (bool, error) {
 	if strings.TrimSpace(body) == "" {
 		return false, fmt.Errorf("design note notice needs a body")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	var role string
-	err = tx.QueryRowContext(ctx,
-		`UPDATE design_note_issues SET notified_at = ? WHERE repo = ? AND iso_week = ? AND created = 1 AND role <> '' AND notified_at = '' RETURNING role`,
-		now.UTC().Format(time.RFC3339Nano), repo, week).Scan(&role)
-	if errors.Is(err, sql.ErrNoRows) {
+	errNothingToSend := errors.New("no design note notice owed")
+	err := s.designNoteWrite(ctx, func(tx *sql.Tx) error {
+		var role string
+		err := tx.QueryRowContext(ctx,
+			`UPDATE design_note_issues SET notified_at = ? WHERE repo = ? AND iso_week = ? AND created = 1 AND role <> '' AND notified_at = '' RETURNING role`,
+			now.UTC().Format(time.RFC3339Nano), repo, week).Scan(&role)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errNothingToSend
+		}
+		if err != nil {
+			return err
+		}
+		role = strings.TrimSpace(role)
+		if role == MessageSystemSender {
+			return fmt.Errorf("design note notice needs a real recipient")
+		}
+		message := Message{Sender: MessageSystemSender, Recipient: role, Body: body, Kind: "message", SourceKind: WakeOutboxSourceWorkflowNote}
+		_, err = insertWorkflowNoteTx(ctx, tx, WorkflowNote{
+			Author:          MessageSystemSender,
+			Body:            fmt.Sprintf("[message from=%s to=%s]\n%s", MessageSystemSender, role, body),
+			AddressedTarget: role, Inbox: &message,
+		})
+		return err
+	})
+	if errors.Is(err, errNothingToSend) {
 		return false, nil
 	}
-	if err != nil {
-		return false, err
-	}
-	role = strings.TrimSpace(role)
-	if role == MessageSystemSender {
-		return false, fmt.Errorf("design note notice needs a real recipient")
-	}
-	message := Message{Sender: MessageSystemSender, Recipient: role, Body: body, Kind: "message", SourceKind: WakeOutboxSourceWorkflowNote}
-	if _, err := insertWorkflowNoteTx(ctx, tx, WorkflowNote{
-		Author:          MessageSystemSender,
-		Body:            fmt.Sprintf("[message from=%s to=%s]\n%s", MessageSystemSender, role, body),
-		AddressedTarget: role, Inbox: &message,
-	}); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
+	return err == nil, err
 }

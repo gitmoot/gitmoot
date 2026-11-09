@@ -39,7 +39,7 @@ func TestDesignNotesMigrationUpgradesThroughOpen(t *testing.T) {
 		t.Fatalf("upgrade through Open: %v", err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	for _, table := range []string{"design_note_filings", "design_note_issues"} {
+	for _, table := range []string{"design_note_filings", "design_note_issues", "design_note_pending_posts"} {
 		if exists, err := store.HasTable(ctx, table); err != nil || !exists {
 			t.Fatalf("%s after upgrade: exists=%v err=%v", table, exists, err)
 		}
@@ -127,5 +127,63 @@ func TestDesignNoteIssueNoticeIsAtomicWithItsMessage(t *testing.T) {
 	}
 	if issue, _, _ := store.GetDesignNoteIssue(ctx, "o/r", "2026-W46"); issue.NotifiedAt == "" {
 		t.Fatal("a sent notice left the issue un-notified")
+	}
+}
+
+// #2559 review round 2: a design-notes write gives up at its context's
+// deadline under REAL writer contention, instead of waiting out the store's
+// 15s busy_timeout (which the driver alone does not shorten for a context,
+// see TestShortCallerBudgetDiscardsAWriteItAlreadyWon), and the connection's
+// normal busy_timeout is restored afterwards.
+func TestDesignNoteWritesBoundTheirLockWaitByTheDeadline(t *testing.T) {
+	const hold = 4 * time.Second
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("second connection: %v", err)
+	}
+	defer raw.Close()
+	blocker, err := raw.Conn(ctx)
+	if err != nil {
+		t.Fatalf("blocker connection: %v", err)
+	}
+	defer blocker.Close()
+	if _, err := blocker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(hold)
+		_, _ = blocker.ExecContext(context.Background(), `ROLLBACK`)
+	}()
+
+	writeCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = store.RecordDesignNoteFilings(writeCtx, []DesignNoteFiling{{FindingUID: "o/r#1-f1", Repo: "o/r", PullRequest: 1, IssueURL: "u"}}, time.Now())
+	waited := time.Since(start)
+	<-released
+	if err == nil {
+		t.Fatal("a write against a held lock succeeded")
+	}
+	if waited >= hold-time.Second {
+		t.Fatalf("a 300ms write waited %s for a %s lock hold; the deadline did not bound the busy wait", waited, hold)
+	}
+	var busyTimeout int
+	if err := store.db.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("read busy_timeout: %v", err)
+	}
+	if busyTimeout != sqliteBusyTimeoutMillis {
+		t.Fatalf("busy_timeout after a bounded write = %d, want the store's %d restored", busyTimeout, sqliteBusyTimeoutMillis)
+	}
+	if err := store.RecordDesignNoteFilings(ctx, []DesignNoteFiling{{FindingUID: "o/r#1-f1", Repo: "o/r", PullRequest: 1, IssueURL: "u"}}, time.Now()); err != nil {
+		t.Fatalf("write after the lock freed: %v", err)
 	}
 }
