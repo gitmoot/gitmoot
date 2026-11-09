@@ -3151,6 +3151,10 @@ CREATE INDEX IF NOT EXISTS idx_tasks_repo_state ON tasks(repo_full_name, state, 
 	// after its issue comment succeeds. design_note_issues remembers each week's
 	// issue so a later sweep reuses it; created marks an issue the sweep itself
 	// opened, which owes its role exactly one notice, claimed in notified_at.
+	// design_note_pending_posts is an unresolved attempt to comment: recorded
+	// before posting, with the findings the comment may carry, so a comment
+	// whose outcome was lost is read back from THAT issue even after the week
+	// has rolled over, and retired once its outcome is recorded.
 	`
 CREATE TABLE IF NOT EXISTS design_note_filings (
 	finding_uid TEXT PRIMARY KEY,
@@ -3173,19 +3177,12 @@ CREATE TABLE IF NOT EXISTS design_note_issues (
 	recorded_at TEXT NOT NULL,
 	PRIMARY KEY (repo, iso_week)
 );
-	`,
-	// #2559 review round 2: before the design-notes sweep comments on an issue
-	// for a pull request it records that target here, so a comment whose
-	// outcome was lost (an ambiguous API error, a record write that did not
-	// land) is found on THAT issue by the next sweep, even after the ISO week
-	// and so the week's issue have changed. Appended rather than folded into
-	// the previous migration, which homes may already have applied.
-	`
 CREATE TABLE IF NOT EXISTS design_note_pending_posts (
 	repo TEXT NOT NULL,
 	pull_request INTEGER NOT NULL,
 	issue_number INTEGER NOT NULL,
 	issue_url TEXT NOT NULL,
+	finding_uids TEXT NOT NULL CHECK(json_array_length(finding_uids) > 0),
 	recorded_at TEXT NOT NULL,
 	PRIMARY KEY (repo, pull_request, issue_number)
 );

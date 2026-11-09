@@ -43,13 +43,14 @@ type designNotesFake struct {
 	// an error for a write that happened.
 	landed    map[int]bool
 	listCalls int
+	listErr   map[int64]error
 	onState   func(number int)
 	onComment func(number int)
 }
 
 func newDesignNotesFake() *designNotesFake {
 	return &designNotesFake{states: map[int]DesignNotesPullRequestState{}, stateCalls: map[int]int{},
-		commentErr: map[int]error{}, landed: map[int]bool{}}
+		commentErr: map[int]error{}, landed: map[int]bool{}, listErr: map[int64]error{}}
 }
 
 func (f *designNotesFake) wire(e *Engine) {
@@ -83,6 +84,9 @@ func (f *designNotesFake) wire(e *Engine) {
 	}
 	e.DesignNotesListComments = func(_ context.Context, repo string, issue int64) ([]string, error) {
 		f.listCalls++
+		if err := f.listErr[issue]; err != nil {
+			return nil, err
+		}
 		var bodies []string
 		for _, c := range f.comments {
 			if c.repo == repo && c.issue == issue {
@@ -805,5 +809,94 @@ func TestDesignNotesSweepBoundsLockWaitsByItsDeadline(t *testing.T) {
 	}
 	if pending := designNoteFiled(t, store); !pending[uid] {
 		t.Fatalf("the finding was marked filed; result %+v", result)
+	}
+}
+
+// countDesignNoteMarkers counts the comments carrying uid's marker line.
+func countDesignNoteMarkers(fake *designNotesFake, uid string) int {
+	n := 0
+	for _, c := range fake.comments {
+		n += strings.Count(c.body, "\nfinding-uid: "+uid+"\n")
+	}
+	return n
+}
+
+// #2559 review round 3, finding 2 (the probe): a completed attempt is retired,
+// so a week later a new finding on the same pull request reaches the new
+// week's issue although the old issue now returns 404, and nothing is
+// reposted.
+func TestDesignNotesCompletedAttemptDoesNotBlockLaterFindings(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := designNotesNow
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	first := recordDesignNote(t, store, designNoteObs{pr: 180, job: "review-1", state: db.FindingOpen, severity: "P3", title: "first", ago: time.Hour})
+	fake.states[180] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	if r, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil || r.Filed != 1 {
+		t.Fatalf("first sweep = %+v, %v", r, err)
+	}
+	if attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 180); err != nil || len(attempts) != 0 {
+		t.Fatalf("attempts after a completed post = %+v, %v; want it retired", attempts, err)
+	}
+
+	clock = clock.Add(7 * 24 * time.Hour)
+	later := recordDesignNote(t, store, designNoteObs{pr: 180, job: "review-1", state: db.FindingOpen, severity: "P3", title: "later", ago: -7*24*time.Hour + time.Hour})
+	fake.listErr[501] = errors.New("HTTP 404: Not Found")
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || second.Filed != 1 || len(second.Errors) != 0 {
+		t.Fatalf("second sweep = %+v, %v; want the new finding filed with no error", second, err)
+	}
+	if len(fake.created) != 2 {
+		t.Fatalf("issues created %q, want W46 and W47", fake.created)
+	}
+	if a, b := countDesignNoteMarkers(fake, first), countDesignNoteMarkers(fake, later); a != 1 || b != 1 {
+		t.Fatalf("marker copies first=%d later=%d, want 1 and 1", a, b)
+	}
+	if pending := designNoteFiled(t, store); pending[later] {
+		t.Fatal("the later finding is unfiled")
+	}
+}
+
+// #2559 review round 3, finding 2: an unresolved attempt on an issue that
+// cannot be read holds back only the findings it may carry; other findings of
+// the pull request still reach this week's issue, and the held one is
+// reconciled, not reposted, once the issue reads again.
+func TestDesignNotesUnreadableAttemptHoldsBackOnlyItsFindings(t *testing.T) {
+	ctx := context.Background()
+	engine, store, fake := designNotesEngine(t)
+	clock := designNotesNow
+	engine.Now = func() time.Time { return clock }
+	seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+	unknown := recordDesignNote(t, store, designNoteObs{pr: 190, job: "review-1", state: db.FindingOpen, severity: "P3", title: "unknown", ago: time.Hour})
+	fake.states[190] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+	fake.commentErr[190] = errors.New("github 502 after the write")
+	fake.landed[190] = true
+	if _, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil {
+		t.Fatalf("first sweep: %v", err)
+	}
+	delete(fake.commentErr, 190)
+
+	clock = clock.Add(7 * 24 * time.Hour)
+	fresh := recordDesignNote(t, store, designNoteObs{pr: 190, job: "review-1", state: db.FindingOpen, severity: "P3", title: "fresh", ago: -7*24*time.Hour + time.Hour})
+	fake.listErr[501] = errors.New("github 500")
+	second, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || second.Filed != 1 || len(second.Errors) != 1 || !strings.Contains(second.Errors[0], "holding back") {
+		t.Fatalf("second sweep = %+v, %v", second, err)
+	}
+	if a, b := countDesignNoteMarkers(fake, unknown), countDesignNoteMarkers(fake, fresh); a != 1 || b != 1 {
+		t.Fatalf("marker copies unknown=%d fresh=%d, want 1 and 1: the held finding must not be reposted", a, b)
+	}
+	if pending := designNoteFiled(t, store); !pending[unknown] || pending[fresh] {
+		t.Fatalf("candidates = %v: the held finding waits, the fresh one is filed", pending)
+	}
+
+	delete(fake.listErr, 501)
+	third, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+	if err != nil || third.Repaired != 1 || countDesignNoteMarkers(fake, unknown) != 1 {
+		t.Fatalf("third sweep = %+v, %v; copies %d", third, err, countDesignNoteMarkers(fake, unknown))
+	}
+	if attempts, err := store.ListDesignNotePendingPosts(ctx, designNotesRepo, 190); err != nil || len(attempts) != 0 {
+		t.Fatalf("attempts after reconciliation = %+v, %v", attempts, err)
 	}
 }

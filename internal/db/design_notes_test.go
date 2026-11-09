@@ -187,3 +187,62 @@ func TestDesignNoteWritesBoundTheirLockWaitByTheDeadline(t *testing.T) {
 		t.Fatalf("write after the lock freed: %v", err)
 	}
 }
+
+// #2559 review round 3, finding 1: the busy wait is sized from the time left
+// AFTER the store's single pooled connection is acquired. Here another caller
+// holds that connection for most of the budget while an external writer holds
+// the write lock; the write must still return near its deadline.
+func TestDesignNoteWriteBudgetCountsTheWaitForThePooledConnection(t *testing.T) {
+	const (
+		budget   = time.Second
+		poolHold = 800 * time.Millisecond
+		lockHold = 4 * time.Second
+	)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "gitmoot.db")
+	store, err := openCachedTestStore(t, path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("second connection: %v", err)
+	}
+	defer raw.Close()
+	blocker, err := raw.Conn(ctx)
+	if err != nil {
+		t.Fatalf("blocker connection: %v", err)
+	}
+	defer blocker.Close()
+	if _, err := blocker.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+	lockReleased := make(chan struct{})
+	go func() {
+		defer close(lockReleased)
+		time.Sleep(lockHold)
+		_, _ = blocker.ExecContext(context.Background(), `ROLLBACK`)
+	}()
+	pooled, err := store.db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("take the pooled connection: %v", err)
+	}
+	go func() {
+		time.Sleep(poolHold)
+		_ = pooled.Close()
+	}()
+
+	writeCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	start := time.Now()
+	err = store.RecordDesignNoteFilings(writeCtx, []DesignNoteFiling{{FindingUID: "o/r#1-f1", Repo: "o/r", PullRequest: 1, IssueURL: "u"}}, time.Now())
+	elapsed := time.Since(start)
+	<-lockReleased
+	if err == nil {
+		t.Fatal("a write against a held lock succeeded")
+	}
+	if elapsed > budget+250*time.Millisecond {
+		t.Fatalf("a %s write returned after %s: its busy wait was sized before the %s wait for the pooled connection", budget, elapsed, poolHold)
+	}
+}
