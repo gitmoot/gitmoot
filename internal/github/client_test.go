@@ -377,6 +377,28 @@ func TestSearchOpenIssuesUsesIssueSearchEndpoint(t *testing.T) {
 	runner.wantArgs(t, 0, "api", "-X", "GET", "search/issues", "-f", `q=repo:gitmoot/gitmoot is:issue is:open in:body "<!-- gitmoot:dashboard-report fingerprint:abc -->"`)
 }
 
+func TestSearchIssuesByTitleKeepsOnlyExactTitles(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"items":[
+				{"number":8,"title":"[design-notes] o/r 2026-W45","state":"closed","html_url":"https://github.com/o/r/issues/8"},
+				{"number":9,"title":"[design-notes] o/r 2026-W45 follow-up","state":"open","html_url":"https://github.com/o/r/issues/9"},
+				{"number":10,"title":"[design-notes] o/r 2026-W45","state":"open","html_url":"https://github.com/o/r/pull/10","pull_request":{"url":"x"}}
+			]}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	issues, err := client.SearchIssuesByTitle(context.Background(), Repository{Owner: "o", Name: "r"}, "[design-notes] o/r 2026-W45", "design-notes")
+	if err != nil {
+		t.Fatalf("SearchIssuesByTitle returned error: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Number != 8 {
+		t.Fatalf("issues = %+v, want only the exact-title issue #8", issues)
+	}
+	runner.wantArgs(t, 0, "api", "-X", "GET", "search/issues", "-f", `q=repo:o/r is:issue label:"design-notes" in:title "[design-notes] o/r 2026-W45"`)
+}
+
 func TestListIssuesFiltersOutPullRequests(t *testing.T) {
 	// GET /repos/{o}/{r}/issues returns issues AND PRs; PRs carry a
 	// `pull_request` object. ListIssues must drop those so the issue-comment

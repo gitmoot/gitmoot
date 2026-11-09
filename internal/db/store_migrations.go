@@ -3143,4 +3143,51 @@ ALTER TABLE org_seat_agent_identity_next RENAME TO org_seat_agent_identity;
 	`
 CREATE INDEX IF NOT EXISTS idx_tasks_repo_state ON tasks(repo_full_name, state, id);
 	`,
+	// #2558: the weekly design-notes sweep files open P3 findings of merged pull
+	// requests into one issue per repository per ISO week. design_note_filings is
+	// the exactly-once ledger keyed by finding: a row means the finding was filed
+	// into issue_url, or skipped for skip_reason (its pull request closed without
+	// merging), and it is never considered again. The sweep writes a row only
+	// after its issue comment succeeds. design_note_issues remembers each week's
+	// issue so a later sweep reuses it; created marks an issue the sweep itself
+	// opened, which owes its role exactly one notice, claimed in notified_at.
+	// design_note_pending_posts holds one row per finding per issue the sweep
+	// was about to comment on: recorded before posting, so a comment whose
+	// outcome was lost is read back from THAT issue even after the week has
+	// rolled over. A row is deleted only for its own finding: when that finding
+	// is filed, when a read-back of that issue shows it absent, or when the
+	// finding has aged out of the sweep window.
+	`
+CREATE TABLE IF NOT EXISTS design_note_filings (
+	finding_uid TEXT PRIMARY KEY,
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	head_sha TEXT NOT NULL DEFAULT '',
+	issue_url TEXT NOT NULL DEFAULT '',
+	skip_reason TEXT NOT NULL DEFAULT '',
+	filed_at TEXT NOT NULL,
+	CHECK ((issue_url = '') <> (skip_reason = ''))
+);
+CREATE TABLE IF NOT EXISTS design_note_issues (
+	repo TEXT NOT NULL,
+	iso_week TEXT NOT NULL,
+	issue_number INTEGER NOT NULL,
+	issue_url TEXT NOT NULL,
+	role TEXT NOT NULL DEFAULT '',
+	created INTEGER NOT NULL DEFAULT 0,
+	notified_at TEXT NOT NULL DEFAULT '',
+	recorded_at TEXT NOT NULL,
+	PRIMARY KEY (repo, iso_week)
+);
+CREATE TABLE IF NOT EXISTS design_note_pending_posts (
+	finding_uid TEXT NOT NULL,
+	issue_number INTEGER NOT NULL,
+	repo TEXT NOT NULL,
+	pull_request INTEGER NOT NULL,
+	issue_url TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (finding_uid, issue_number)
+);
+CREATE INDEX IF NOT EXISTS idx_design_note_pending_posts_pr ON design_note_pending_posts(repo, pull_request);
+	`,
 }

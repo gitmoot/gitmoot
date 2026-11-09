@@ -318,6 +318,21 @@ type Engine struct {
 	// is wired only in cli, keeping the engine free of the github client; when
 	// nil, the follow-up is recorded as a job event instead.
 	PostMergeFollowUpIssue func(ctx context.Context, repo, title, body string, labels []string) (url string, err error)
+	// The DesignNotes* hooks are the GitHub seams of the weekly design-notes
+	// sweep (#2558, SweepDesignNotes). Like PostMergeFollowUpIssue they are
+	// wired only in cli. DesignNotesPullRequest reports whether a pull request
+	// merged, closed unmerged, or is still open. DesignNotesFindIssue looks up
+	// an existing issue by exact title and label; when nil the sweep relies on
+	// its own record alone. DesignNotesCreateIssue opens the week's issue,
+	// DesignNotesListComments returns the bodies of an issue's comments (the
+	// sweep reconciles against their finding-uid markers before posting), and
+	// DesignNotesComment appends one comment. With any required hook nil the
+	// sweep files nothing.
+	DesignNotesPullRequest  func(ctx context.Context, repo string, number int) (DesignNotesPullRequestState, error)
+	DesignNotesFindIssue    func(ctx context.Context, repo, title, label string) (issue DesignNotesIssue, found bool, err error)
+	DesignNotesCreateIssue  func(ctx context.Context, repo, title, body string, labels []string) (DesignNotesIssue, error)
+	DesignNotesListComments func(ctx context.Context, repo string, issue int64) (bodies []string, err error)
+	DesignNotesComment      func(ctx context.Context, repo string, issue int64, body string) error
 	// LedgerResolvers is the #1822 ledger's SHARED resolver value. The merge gate
 	// holds the SAME value, assigned from one construction in the daemon, so the
 	// review brief and the gate cannot compute different obligation sets. Two

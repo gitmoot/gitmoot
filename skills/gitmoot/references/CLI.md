@@ -1087,6 +1087,33 @@ read outside the diff to judge, but reports only problems the diff introduces
 or touches, as P3 findings with a file:line locator, and never requests changes
 for them alone.
 
+Those P3 findings are not lost when the pull request merges (#2558). At most
+once an hour the daemon collects findings whose latest ledger observation is an
+open P3 and whose first observation is within the last 14 days, and asks GitHub
+about their pull requests, at most 50 per sweep:
+
+- **Merged:** one comment per pull request on the repository's issue for the
+  ISO week, titled `[design-notes] <owner/repo> <YYYY-Www>` and labelled
+  `design-notes` and `agent:<role>` (the review requester, as for `review-p2`
+  issues). Each finding lists its title, `file:line`, detail (quoted, and cut at
+  4000 bytes with a note), review job, pull request and merged head, and a
+  `finding-uid:` line. Notes too long for one comment continue in further
+  comments. The week's issue is reused once it exists; when the sweep opens it,
+  the role gets one message.
+- **Closed without merging:** skipped for good.
+- **Still open:** checked again by a later sweep.
+
+A finding is filed once: before commenting, the sweep records an attempt for
+each finding it is about to post, and until that finding is filed it reads the
+attempted issue's comments back before posting it again (even an earlier
+week's), so a finding whose `finding-uid:` line is already there is recorded
+without a second comment. If that issue cannot be read, only the findings
+attempted there wait; the others are still filed. A failed
+lookup or comment is logged and recorded as a `design_notes_error` job event on
+the review job, and its findings stay unfiled for the next sweep. A sweep stops
+at its deadline, and its database waits are bounded by it. Nothing here blocks
+a merge.
+
 Scripts should use `gitmoot review request ... --json` to get the job id:
 
 ```sh

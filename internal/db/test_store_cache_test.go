@@ -102,6 +102,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// contended write is discarded rather than shortened. A cached shared-memory
 	// store has no file for a second connection to contend over.
 	realPathTests["TestShortCallerBudgetDiscardsAWriteItAlreadyWon"] = true
+	// #2558: upgrades a database built from the migrations before the
+	// design-notes tables through the real Open path.
+	realPathTests["TestDesignNotesMigrationUpgradesThroughOpen"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,
