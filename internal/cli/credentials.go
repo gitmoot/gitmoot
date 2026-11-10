@@ -217,7 +217,7 @@ func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.
 	if runtimeName == runtime.ClaudeRuntime && credentialsCfg.ModelGateway {
 		base := outer
 		if curated != nil {
-			base = graftRuntimeBaseRunner(outer, curated)
+			base = graftRuntimeBaseRunner(outer, curated, "")
 		}
 		gatewayRunner, err := buildModelGatewayRunner(resolvedHome, credentialsCfg, authState, base)
 		if err != nil {
@@ -240,10 +240,14 @@ func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.
 	if curated == nil {
 		return outer, authState, authSource, nil
 	}
-	return graftRuntimeBaseRunner(outer, curated), authState, authSource, nil
+	return graftRuntimeBaseRunner(outer, curated, ""), authState, authSource, nil
 }
 
-func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) subprocess.Runner {
+// graftRuntimeBaseRunner configures the base runner under outer's wrappers
+// with curated's environment. On an execution-backend instance runner it also
+// sets launchDir, the only directory outside the workspace the backend may
+// start a command in (a no-execution seat's, #2563); "" names none.
+func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner, launchDir string) subprocess.Runner {
 	if outer == nil {
 		return curated
 	}
@@ -256,6 +260,7 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		runner.BaseEnv = append([]string(nil), base.BaseEnv...)
 		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
 		runner.MaxOutputBytes = base.MaxOutputBytes
+		runner.LaunchDir = launchDir
 		return runner
 	case *execbackend.InstanceRunner:
 		base, ok := curated.(subprocess.CuratedGroupRunner)
@@ -265,12 +270,13 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		runner.BaseEnv = append([]string(nil), base.BaseEnv...)
 		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
 		runner.MaxOutputBytes = base.MaxOutputBytes
+		runner.LaunchDir = launchDir
 		return runner
 	case *credgw.Runner:
 		if runner.Inner == nil {
 			runner.Inner = subprocess.GroupRunner{}
 		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	case subprocess.CuratedGroupRunner:
 		base, ok := curated.(subprocess.CuratedGroupRunner)
@@ -299,7 +305,7 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		if inner == nil {
 			inner = subprocess.GroupRunner{}
 		}
-		if grafted, ok := graftRuntimeBaseRunner(inner, curated).(subprocess.StreamRunner); ok {
+		if grafted, ok := graftRuntimeBaseRunner(inner, curated, launchDir).(subprocess.StreamRunner); ok {
 			runner.Inner = grafted
 		}
 		return runner
@@ -308,7 +314,7 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		if inner == nil {
 			inner = subprocess.GroupRunner{}
 		}
-		if grafted, ok := graftRuntimeBaseRunner(inner, curated).(subprocess.StreamRunner); ok {
+		if grafted, ok := graftRuntimeBaseRunner(inner, curated, launchDir).(subprocess.StreamRunner); ok {
 			runner.Inner = grafted
 		}
 		return runner
@@ -316,25 +322,25 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner) 
 		if runner.Inner == nil {
 			runner.Inner = subprocess.GroupRunner{}
 		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	case *subprocess.EnvInjectingRunner:
 		if runner.Inner == nil {
 			runner.Inner = subprocess.GroupRunner{}
 		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	case subprocess.WrappingRunner:
 		if runner.Inner == nil {
 			runner.Inner = subprocess.GroupRunner{}
 		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	case *subprocess.WrappingRunner:
 		if runner.Inner == nil {
 			runner.Inner = subprocess.GroupRunner{}
 		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated)
+		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	default:
 		// Explicit custom/fake runners remain authoritative test and extension seams.

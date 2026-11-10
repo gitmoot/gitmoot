@@ -617,6 +617,11 @@ func (b *Backend) InstallInstanceFile(ctx context.Context, instance *execbackend
 }
 
 func (b *Backend) Exec(ctx context.Context, instance *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
+	if command.LaunchDir != "" {
+		// A launch dir outside the workspace exists only for the local
+		// backend's no-execution seat (#2364, #2563).
+		return nil, fmt.Errorf("remote execution backend does not support launch dir %q outside workspace %q", command.LaunchDir, workspacePath)
+	}
 	state, err := b.stateFor(instance)
 	if err != nil {
 		return nil, err

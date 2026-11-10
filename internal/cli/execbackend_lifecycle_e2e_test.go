@@ -166,6 +166,7 @@ func TestLocalBackendInstanceRunnerPreservesCuratedEnvironment(t *testing.T) {
 	runner := graftRuntimeBaseRunner(
 		execbackend.InstanceRunner{Backend: backend, Instance: instance},
 		subprocess.CuratedGroupRunner{BaseEnv: []string{"PATH=" + os.Getenv("PATH"), "CURATED=yes"}},
+		"",
 	)
 	result, err := runner.Run(context.Background(), instance.Workspace, "sh", "-c", "env")
 	if err != nil {

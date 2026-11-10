@@ -1818,7 +1818,16 @@ What the worker does:
   config-discovery provider, MCP, extensions, skills, rules, LSP and PTY turned
   off through `--config`. omp starts in an empty job directory and gets the
   checkout through `--cwd`, so the checkout's `.env` is never loaded. The seat's
-  HOME, XDG directories and launch directory are recreated empty for each job.
+  HOME and XDG directories are recreated empty for each job. The launch
+  directory is a fresh directory in `~/.gitmoot/run/noexec-launch/`, which only
+  the daemon user can write and which no seat is granted write access to. The
+  seat can read it but not write it, and it is removed when the job ends. The
+  local backend starts the seat there, outside the execution instance's
+  workspace, only when the directory is empty, owned by the daemon user, mode
+  0700, not a symlink, in a daemon-owned parent no other user can write, and
+  does not contain the workspace or sit inside it (#2563). It checks this
+  before every delivery, including repair turns. Every other command still has
+  to run inside the workspace.
 - Starts omp under `sandbox-exec --no-execution`. A supervisor allows exactly one
   exec, the runtime itself, and refuses every later `execve`/`execveat` from the
   runtime or any child with `EACCES`. Landlock removes the Execute right from
@@ -1831,9 +1840,11 @@ What the worker does:
   or delegates work. This check runs whatever `result_checks` mode is set. The
   job records `review_no_execution: true`.
 
-Supported scope: Linux amd64, the local execution backend, the omp runtime, and
-omp 18.10.4 or 18.18.6 (the versions measured, #2364 and #2561). Any other architecture, backend,
-runtime or omp version refuses the review before omp starts.
+Supported scope: Linux amd64, the local execution backend without
+`local_uid`/`local_gid`, the omp runtime, and omp 18.10.4 or 18.18.6 (the
+versions measured, #2364 and #2561). Any other architecture, backend, runtime
+or omp version refuses the review before omp starts. With a configured
+`local_uid`, the backend refuses to start the seat in its launch directory.
 
 Trust boundary: the sandbox stops omp from starting programs. It cannot stop a
 bug inside omp itself that runs model-written code inside the omp process.

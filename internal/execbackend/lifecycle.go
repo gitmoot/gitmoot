@@ -186,8 +186,19 @@ type Instance struct {
 // instance workspace or one of its descendants. Env entries are appended to
 // the inherited environment. Output receives stdout/stderr live while Result
 // retains them independently.
+//
+// LaunchDir, when set, is the directory the command starts in instead of Dir,
+// which must then be empty. It is the one exception to the workspace rule and
+// exists for a no-execution seat (#2364, #2563): omp must start in an empty,
+// job-private directory outside the checkout so it never loads the
+// checkout's .env. The local backend accepts only an existing empty directory
+// owned by the daemon user with mode 0700 that is not a symlink, neither lies
+// inside the workspace nor contains it, and sits in a daemon-owned parent no
+// other user can write. A backend that cannot honour a LaunchDir refuses the
+// command.
 type Command struct {
 	Dir            string
+	LaunchDir      string
 	Env            []string
 	BaseEnv        []string
 	ScratchDirs    []string
@@ -472,7 +483,13 @@ func (b *LocalBackend) Exec(ctx context.Context, instance *Instance, command Com
 	if strings.TrimSpace(command.Name) == "" {
 		return nil, errors.New("local execution backend command is required")
 	}
-	dir, err := localCommandDir(instance.Workspace, command.Dir)
+	var dir string
+	var err error
+	if command.LaunchDir != "" {
+		dir, err = b.localLaunchDir(instance.Workspace, command)
+	} else {
+		dir, err = localCommandDir(instance.Workspace, command.Dir)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -756,6 +773,97 @@ func localCommandDir(workspace, dir string) (string, error) {
 	return absolute, nil
 }
 
+// localLaunchDir validates Command.LaunchDir and returns the resolved directory
+// the command starts in. Only an empty directory the daemon user owns with
+// mode 0700, not a symlink itself and disjoint from the workspace, qualifies,
+// and its parent must be a real directory the daemon user owns that no other
+// user can write: nothing but the daemon may then fill or swap the launch dir
+// between this check and the command's chdir. Keeping the parent out of every
+// path a sandboxed seat may write is the caller's half of that property; the
+// backend does not know the seat's grants. Every ordinary command still goes
+// through localCommandDir.
+func (b *LocalBackend) localLaunchDir(workspace string, command Command) (string, error) {
+	launchDir := command.LaunchDir
+	if strings.TrimSpace(command.Dir) != "" {
+		return "", fmt.Errorf("local execution command names both directory %q and launch dir %q", command.Dir, launchDir)
+	}
+	if b.identity != nil {
+		// The command would run as the configured uid, which cannot enter a
+		// 0700 directory the daemon user owns.
+		return "", fmt.Errorf("local execution launch dir %q is not supported with a configured execution identity", launchDir)
+	}
+	if !filepath.IsAbs(launchDir) {
+		return "", fmt.Errorf("local execution launch dir %q must be absolute", launchDir)
+	}
+	clean := filepath.Clean(launchDir)
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return "", fmt.Errorf("inspect local execution launch dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("local execution launch dir %q is a symlink", launchDir)
+	}
+	if info.Mode() != os.ModeDir|0o700 {
+		return "", fmt.Errorf("local execution launch dir %q must be a directory with mode 0700, got %s", launchDir, info.Mode())
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("local execution launch dir %q is not owned by the daemon user", launchDir)
+	}
+	parent := filepath.Dir(clean)
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		return "", fmt.Errorf("inspect local execution launch dir parent: %w", err)
+	}
+	if !parentInfo.IsDir() {
+		return "", fmt.Errorf("local execution launch dir parent %q is not a directory", parent)
+	}
+	if stat, ok := parentInfo.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("local execution launch dir parent %q is not owned by the daemon user", parent)
+	}
+	if parentInfo.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("local execution launch dir parent %q is writable by users other than the daemon user (mode %s)", parent, parentInfo.Mode().Perm())
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return "", fmt.Errorf("resolve local execution launch dir: %w", err)
+	}
+	cleanWorkspace := filepath.Clean(workspace)
+	resolvedWorkspace, err := filepath.EvalSymlinks(cleanWorkspace)
+	if err != nil {
+		return "", fmt.Errorf("resolve local execution workspace: %w", err)
+	}
+	if localPathWithin(cleanWorkspace, clean) || localPathWithin(clean, cleanWorkspace) ||
+		localPathWithin(resolvedWorkspace, resolved) || localPathWithin(resolved, resolvedWorkspace) {
+		return "", fmt.Errorf("local execution launch dir %q must lie outside workspace %q", launchDir, workspace)
+	}
+	dir, err := os.Open(resolved)
+	if err != nil {
+		return "", fmt.Errorf("open local execution launch dir: %w", err)
+	}
+	defer dir.Close()
+	opened, err := dir.Stat()
+	if err != nil {
+		return "", fmt.Errorf("inspect opened local execution launch dir: %w", err)
+	}
+	if !os.SameFile(info, opened) {
+		return "", fmt.Errorf("local execution launch dir %q changed while it was validated", launchDir)
+	}
+	names, err := dir.Readdirnames(1)
+	if len(names) > 0 {
+		return "", fmt.Errorf("local execution launch dir %q is not empty", launchDir)
+	}
+	if !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("read local execution launch dir: %w", err)
+	}
+	return resolved, nil
+}
+
+// localPathWithin reports whether path is root or one of its descendants.
+func localPathWithin(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func localInstanceID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -901,6 +1009,11 @@ type InstanceRunner struct {
 	BaseEnv        []string
 	ScratchDirs    []string
 	MaxOutputBytes int
+	// LaunchDir opts one directory outside the workspace in as a start
+	// directory (see Command.LaunchDir). A command whose dir is exactly
+	// LaunchDir is sent as Command.LaunchDir; every other dir keeps the
+	// backend's workspace check.
+	LaunchDir string
 	// Lifetime, when positive, is the provider's fixed lifetime for Instance,
 	// counted from Started, which must not be later than the provider's create
 	// call. A command that fails once that lifetime has run out is reported as a
@@ -947,7 +1060,7 @@ func (r InstanceRunner) run(ctx context.Context, dir string, env []string, out i
 	if r.Backend == nil || r.Instance == nil {
 		return subprocess.Result{}, errors.New("execution-backend instance runner is not attached")
 	}
-	stream, err := r.Backend.Exec(ctx, r.Instance, Command{
+	execCommand := Command{
 		Dir:            dir,
 		Env:            env,
 		BaseEnv:        r.BaseEnv,
@@ -957,7 +1070,11 @@ func (r InstanceRunner) run(ctx context.Context, dir string, env []string, out i
 		Args:           args,
 		Output:         out,
 		OnStart:        onPID,
-	})
+	}
+	if r.LaunchDir != "" && dir != "" && filepath.Clean(dir) == filepath.Clean(r.LaunchDir) {
+		execCommand.Dir, execCommand.LaunchDir = "", dir
+	}
+	stream, err := r.Backend.Exec(ctx, r.Instance, execCommand)
 	if err != nil {
 		return subprocess.Result{}, r.lifetimeError(ctx, err)
 	}
