@@ -3198,37 +3198,60 @@ CREATE INDEX IF NOT EXISTS idx_design_note_pending_posts_pr ON design_note_pendi
 	//
 	// Rows written before this migration are backfilled from the writer's own
 	// findings_ledger_downgraded events, "finding[N] declared S, recorded R
-	// (...)": N indexes that job's result.findings, whose continues_uid (else
-	// uid, possibly "#<pr>-f<n>" short for "<repo>#<pr>-f<n>") names the row the
-	// job observed. Only rows matched that exactly are touched; a declared
-	// answer that minted a new uid has no uid to match and stays ''. The
-	// payload is read only when json_valid, so a malformed payload cannot abort
-	// the migration.
+	// (...)", where N indexes the job's result.findings. RetryJob keeps the job
+	// id and its events but replaces the result, so N is only meaningful
+	// against the result the event was written for; the payload keeps only
+	// the latest one. A row is therefore backfilled only when ALL of these
+	// hold, and otherwise stays '' (the note is filed, which is advisory):
+	//   - the event is newer than the job's last retry_queued event, so it
+	//     belongs to the current lifecycle;
+	//   - the current finding[N] itself declares S, read as the writer reads
+	//     it (state, else disposition, lowercased);
+	//   - that finding's continues_uid (else uid, possibly "#<pr>-f<n>" short
+	//     for "<repo>#<pr>-f<n>") names the row, and the row is at the
+	//     current payload's head_sha.
+	// A declared answer that minted a new uid has no uid to match and stays
+	// ''. The payload is read only when json_valid, so a malformed payload
+	// cannot abort the migration.
 	`
 ALTER TABLE review_finding_observations ADD COLUMN declared_state TEXT NOT NULL DEFAULT '';
-WITH downgrade AS MATERIALIZED (
+WITH last_retry AS MATERIALIZED (
+	SELECT job_id, MAX(id) AS id FROM job_events WHERE kind = 'retry_queued' GROUP BY job_id
+),
+downgrade AS MATERIALIZED (
 	SELECT e.job_id,
 		CAST(substr(e.message, 9, instr(e.message, ']') - 9) AS INTEGER) AS idx,
 		substr(e.message, instr(e.message, '] declared ') + 11,
 			instr(e.message, ', recorded ') - instr(e.message, '] declared ') - 11) AS declared
-	FROM job_events e
+	FROM job_events e LEFT JOIN last_retry r ON r.job_id = e.job_id
 	WHERE e.kind = 'findings_ledger_downgraded'
 		AND e.message GLOB 'finding[[][0-9]*[]] declared *, recorded *'
+		AND e.id > COALESCE(r.id, 0)
+),
+finding AS MATERIALIZED (
+	SELECT d.job_id, d.declared, j.payload, '$.result.findings[' || d.idx || ']' AS path
+	FROM downgrade d JOIN jobs j ON j.id = d.job_id
+	WHERE d.declared IN ('answered', 'withdrawn', 'superseded') AND json_valid(j.payload)
 ),
 declared AS MATERIALIZED (
-	SELECT d.job_id, d.declared,
-		CASE WHEN json_valid(j.payload) THEN COALESCE(
-			NULLIF(TRIM(json_extract(j.payload, '$.result.findings[' || d.idx || '].continues_uid')), ''),
-			TRIM(json_extract(j.payload, '$.result.findings[' || d.idx || '].uid'))) END AS uid
-	FROM downgrade d JOIN jobs j ON j.id = d.job_id
-	WHERE d.declared IN ('answered', 'withdrawn', 'superseded')
+	SELECT f.job_id, f.declared,
+		TRIM(COALESCE(json_extract(f.payload, '$.head_sha'), '')) AS head,
+		COALESCE(NULLIF(TRIM(COALESCE(json_extract(f.payload, f.path || '.continues_uid'), '')), ''),
+			TRIM(COALESCE(json_extract(f.payload, f.path || '.uid'), ''))) AS uid,
+		LOWER(COALESCE(NULLIF(TRIM(COALESCE(json_extract(f.payload, f.path || '.state'), '')), ''),
+			TRIM(COALESCE(json_extract(f.payload, f.path || '.disposition'), '')))) AS own
+	FROM finding f
+	WHERE json_type(f.payload, f.path) = 'object'
+),
+matched AS MATERIALIZED (
+	SELECT job_id, declared, head, uid FROM declared WHERE own = declared AND uid <> '' AND head <> ''
 )
 UPDATE review_finding_observations AS o
-SET declared_state = (SELECT x.declared FROM declared x
-	WHERE x.job_id = o.observer_job AND x.uid <> '' AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid) LIMIT 1)
+SET declared_state = (SELECT x.declared FROM matched x
+	WHERE x.job_id = o.observer_job AND x.head = o.head_sha AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid) LIMIT 1)
 WHERE o.declared_state = ''
-	AND o.observer_job IN (SELECT job_id FROM declared)
-	AND EXISTS (SELECT 1 FROM declared x
-		WHERE x.job_id = o.observer_job AND x.uid <> '' AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid));
+	AND o.observer_job IN (SELECT job_id FROM matched)
+	AND EXISTS (SELECT 1 FROM matched x
+		WHERE x.job_id = o.observer_job AND x.head = o.head_sha AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid));
 	`,
 }
