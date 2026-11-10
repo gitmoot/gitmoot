@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -633,11 +634,12 @@ func ompWorkspaceArgs(agent Agent) []string {
 const ompNoExecutionTools = "read,grep,glob,todo"
 
 // ompNoExecutionVerifiedVersions are the omp builds whose no-execution
-// behaviour was measured (#2364: tool allowlist, provider and MCP gating,
-// --cwd, settings overlay precedence). Another version may move a discovery
-// path or a flag, so a no-execution seat refuses it until it is measured and
-// added here.
-var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true}
+// behaviour was measured: 18.10.4 in #2364 and 18.18.6 in #2561 (tool
+// allowlist, provider and MCP gating, --cwd, settings overlay precedence;
+// probe and record in /root/fleet-tools/state/gitmoot-2561 on the fleet host).
+// Another version may move a discovery path or a flag, so a no-execution seat
+// refuses it until it is measured and added here.
+var ompNoExecutionVerifiedVersions = map[string]bool{"omp/18.10.4": true, "omp/18.18.6": true}
 
 // OmpNoExecutionVersionError refuses a no-execution seat on an omp build
 // whose behaviour has not been verified. version is the runtime contract
@@ -650,17 +652,22 @@ func OmpNoExecutionVersionError(version string) error {
 	if version == "" {
 		version = "unknown"
 	}
-	return fmt.Errorf("no-execution review refused: installed omp version %q has not been verified for no-execution seats (verified: omp/18.10.4)", version)
+	verified := make([]string, 0, len(ompNoExecutionVerifiedVersions))
+	for v := range ompNoExecutionVerifiedVersions {
+		verified = append(verified, v)
+	}
+	slices.Sort(verified)
+	return fmt.Errorf("no-execution review refused: installed omp version %q has not been verified for no-execution seats (verified: %s)", version, strings.Join(verified, ", "))
 }
 
-// ompDiscoveryProviders is every config-discovery provider omp 18.10.4 ships
-// (the ids registered with its capability registry). A no-execution seat
-// disables ALL of them, because each one can contribute MCP servers, custom
-// tools, hooks, extensions or rules from user or project files. Measured on
-// omp 18.10.4 (#2364): with --no-extensions alone, project and user
-// `tools/*.js` still load in-process and project and user MCP servers are
-// still contacted; with every provider disabled nothing is loaded or
-// contacted and read/grep/glob still work.
+// ompDiscoveryProviders is every config-discovery provider omp ships (the ids
+// registered with its capability registry; the same set in 18.10.4 and
+// 18.18.6). A no-execution seat disables ALL of them, because each one can
+// contribute MCP servers, custom tools, hooks, extensions or rules from user or
+// project files. Measured on both versions (#2364, #2561): with --no-extensions
+// alone, project and user `tools/*.js` still load in-process and project and
+// user MCP servers are still contacted; with every provider disabled nothing is
+// loaded or contacted and read/grep/glob still work.
 var ompDiscoveryProviders = []string{
 	"agent-plugins", "agents", "agents-md", "builtin-defaults", "claude", "claude-md",
 	"claude-plugins", "cline", "codex", "cursor", "custom-context", "gemini", "github",

@@ -335,7 +335,8 @@ path = ""
 # findings_consumption = "advisory"
 # execution = "none" makes every review of the repository a no-execution
 # review: the reviewer reads code and the exact-head CI evidence and its seat
-# cannot start any program (omp 18.10.4, local backend, linux/amd64 only;
+# cannot start any program (omp 18.10.4 or 18.18.6, local backend,
+# linux/amd64 only;
 # anything else refuses). An invalid value refuses the repository's reviews.
 # execution = "none"
 
