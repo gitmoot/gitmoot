@@ -70,18 +70,11 @@ func DetectReviewLoop(ctx context.Context, store *db.Store, repo string, pullReq
 // other repeated verdict still refuses, and an empty supersededJobID is exactly
 // DetectReviewLoop.
 func DetectReviewLoopSuperseding(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose, supersededJobID string) (ReviewLoopMatch, bool, error) {
-	matches, err := FindRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose)
-	if err != nil {
+	matches, err := findRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose, supersededJobID)
+	if err != nil || len(matches) == 0 {
 		return ReviewLoopMatch{}, false, err
 	}
-	supersededJobID = strings.TrimSpace(supersededJobID)
-	for _, match := range matches {
-		if supersededJobID != "" && match.JobID == supersededJobID {
-			continue
-		}
-		return match, true, nil
-	}
-	return ReviewLoopMatch{}, false, nil
+	return matches[0], true, nil
 }
 
 // FindRepeatedReviewers returns exact-head verdict evidence for each requesting
@@ -91,6 +84,15 @@ func DetectReviewLoopSuperseding(ctx context.Context, store *db.Store, repo stri
 // every pre-router caller compares exactly as it did before. The result preserves requester
 // order and performs one verdict query for the whole native roster.
 func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose string) ([]ReviewLoopMatch, error) {
+	return findRepeatedReviewers(ctx, store, repo, pullRequest, headSHA, requestingAgents, purpose, "")
+}
+
+// findRepeatedReviewers is FindRepeatedReviewers with the exempt superseded
+// job. The exemption is applied BEFORE the review_loop_detected claim (#2406):
+// applied after it, every --supersede dispatch stamped the event on the very
+// job it re-reviews, reading as if that re-review had been refused.
+func findRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pullRequest int, headSHA string, requestingAgents []string, purpose, supersededJobID string) ([]ReviewLoopMatch, error) {
+	supersededJobID = strings.TrimSpace(supersededJobID)
 	repo = strings.ToLower(strings.TrimSpace(repo))
 	headSHA = strings.ToLower(strings.TrimSpace(headSHA))
 	verdicts, err := store.SucceededReviewVerdicts(ctx, repo, pullRequest)
@@ -185,6 +187,9 @@ func FindRepeatedReviewers(ctx context.Context, store *db.Store, repo string, pu
 			if !ok {
 				continue
 			}
+		}
+		if supersededJobID != "" && evidence.JobID == supersededJobID {
+			continue
 		}
 		// Reported as the RESOLVED identity for the same reason it is indexed as
 		// one: a match whose author renders empty names nobody.

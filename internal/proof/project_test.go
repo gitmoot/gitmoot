@@ -171,6 +171,45 @@ func TestProjectDoesNotPublishObservedBindingAbsentFromTouchedFiles(t *testing.T
 	assertClaim(t, manifest, KindCommit, "change", GradeReported)
 }
 
+// #2373: a part of a split review decides only that part, so the review node
+// carrying its approval claim must name the part, and the rendered tree must not
+// show the verdict as a whole-head one.
+func TestProjectNamesThePartOfASplitReview(t *testing.T) {
+	root, jobs, results, receipts, events := proofFixture(t, false)
+	for i, job := range jobs {
+		if job.ID != "review-job" {
+			continue
+		}
+		var payload workflow.JobPayload
+		if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
+			t.Fatal(err)
+		}
+		payload.ReviewPart = "mm-1-mm-9"
+		jobs[i].Payload = proofPayload(t, payload)
+	}
+	manifest := Project(root, jobs, results, receipts, events)
+	assertClaim(t, manifest, KindReview, "review.independent_approved", GradeObserved)
+	for _, node := range manifest.Nodes {
+		if node.Kind == KindReview && node.Attrs["review_part"] != "mm-1-mm-9" {
+			t.Fatalf("review node attrs = %v, want review_part mm-1-mm-9 beside its approval claim", node.Attrs)
+		}
+	}
+	var out strings.Builder
+	if err := RenderTree(&out, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "approved · part mm-1-mm-9") {
+		t.Fatalf("rendered review does not name its part:\n%s", out.String())
+	}
+
+	wholeRoot, wholeJobs, wholeResults, wholeReceipts, wholeEvents := proofFixture(t, false)
+	for _, node := range Project(wholeRoot, wholeJobs, wholeResults, wholeReceipts, wholeEvents).Nodes {
+		if _, ok := node.Attrs["review_part"]; ok && node.Kind == KindReview {
+			t.Fatalf("whole-head review node carries review_part: %v", node.Attrs)
+		}
+	}
+}
+
 func TestManifestContentAddressStable(t *testing.T) {
 	root, jobs, results, receipts, events := proofFixture(t, false)
 	first := Project(root, jobs, results, receipts, events)

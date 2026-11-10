@@ -1005,7 +1005,7 @@ func supersedeScope(part string) string {
 //   - the named job must hold the claim for EXACTLY this repo, PR, full head,
 //     purpose and normalized part (the claim key is all of those);
 //   - it must be settled: not queued, running or scheduled for an automatic
-//     retry, with no live child, and carry a BLOCKING verdict (an approved part
+//     retry, with no live descendant, and carry a BLOCKING verdict (an approved part
 //     blocks nothing, so there is nothing to supersede);
 //   - the claim moves by compare-and-set from that exact job, so of two
 //     competing superseders exactly one wins;
@@ -1056,15 +1056,10 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	default:
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)
 	}
-	children, err := store.ListJobsByParent(ctx, job.ID)
-	if err != nil {
+	if live, found, err := liveReviewDescendant(ctx, store, job.ID, map[string]bool{job.ID: true}); err != nil {
 		return db.Job{}, err
-	}
-	for _, child := range children {
-		switch workflow.JobState(child.State) {
-		case workflow.JobQueued, workflow.JobRunning, workflow.JobBlocked:
-			return db.Job{}, fmt.Errorf("review request --supersede: job %s still has live child %s (%s); it is not settled", job.ID, child.ID, child.State)
-		}
+	} else if found {
+		return db.Job{}, fmt.Errorf("review request --supersede: job %s still has live descendant %s (%s); it is not settled", job.ID, live.ID, live.State)
 	}
 	if explicit := strings.TrimSpace(opts.reviewer); explicit != "" && explicit != job.Agent {
 		return db.Job{}, fmt.Errorf("review request --supersede: --reviewer %s differs from %s, who reviewed %s; the merge gate retires an objection only with the same reviewer's later verdict", explicit, job.Agent, supersedeScope(opts.part))
@@ -1077,6 +1072,32 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 		return db.Job{}, fmt.Errorf("review request --supersede: the claim for %s moved away from job %s while this request ran (another re-review won); nothing was dispatched", supersedeScope(opts.part), job.ID)
 	}
 	return job, nil
+}
+
+// liveReviewDescendant returns the first queued, running or blocked job
+// anywhere under parentID. A settled job whose direct child died can still
+// have a live grandchild working the same question, so --supersede walks the
+// whole tree the way reviewJobStillAnswersWithin does (#2406); seen guards a
+// corrupt parent_job_id cycle the same way, and a store error fails closed.
+func liveReviewDescendant(ctx context.Context, store *db.Store, parentID string, seen map[string]bool) (db.Job, bool, error) {
+	children, err := store.ListJobsByParent(ctx, parentID)
+	if err != nil {
+		return db.Job{}, false, err
+	}
+	for _, child := range children {
+		if seen[child.ID] {
+			continue
+		}
+		seen[child.ID] = true
+		switch workflow.JobState(child.State) {
+		case workflow.JobQueued, workflow.JobRunning, workflow.JobBlocked:
+			return child, true, nil
+		}
+		if live, found, err := liveReviewDescendant(ctx, store, child.ID, seen); err != nil || found {
+			return live, found, err
+		}
+	}
+	return db.Job{}, false, nil
 }
 
 // restoreSupersededPartClaim gives the claim back to the superseded job when a

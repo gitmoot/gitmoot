@@ -125,6 +125,11 @@ func testSupersedeReReviewsSettledBlockingReview(t *testing.T, part string) {
 	if !found {
 		t.Fatalf("no %s event naming %s and the reason on the superseded job", reviewPartSupersededEventKind, second.JobID)
 	}
+	// #2406: the superseded verdict is exempt loop evidence, so the re-review
+	// must not stamp review_loop_detected on it as if it had been refused.
+	if got := countCLIJobEvents(t, store, first.JobID, workflow.ReviewLoopDetectedEventKind); got != 0 {
+		t.Fatalf("superseded job %s carries %d %s events, want none", first.JobID, got, workflow.ReviewLoopDetectedEventKind)
+	}
 
 	// One winner: a second superseder naming the same old job finds the claim moved.
 	var out, errOut strings.Builder
@@ -177,7 +182,25 @@ func TestReviewRequestSupersedeRefusesOutsideItsContract(t *testing.T) {
 	refused(append(part("blocked"), "--supersede", blocked.JobID), "requires --reason")
 	refused(append(part("blocked"), "--reason", "r"), "only meaningful with --supersede")
 
-	for name, job := range map[string]string{"live": live.JobID, "clean": approved.JobID, "blocked": blocked.JobID} {
+	// #2406: a settled direct child does not settle the tree. A live grandchild
+	// still works under it, so the job is not settled and the claim stays put.
+	deep, failure := runReviewRequestJSON(t, part("deep")...)
+	if failure != "" {
+		t.Fatal(failure)
+	}
+	settlePartReview(t, store, deep.JobID, string(workflow.JobSucceeded), "changes_requested")
+	leg := deep.JobID + "/delegation/leg"
+	for _, child := range []db.Job{
+		{ID: leg, Agent: "opus-reviewer", Type: "implement", State: string(workflow.JobFailed), Payload: "{}", Repo: "owner/repo", ParentJobID: deep.JobID},
+		{ID: leg + "/delegation/review", Agent: "opus-reviewer", Type: "review", State: string(workflow.JobQueued), Payload: "{}", Repo: "owner/repo", ParentJobID: leg},
+	} {
+		if err := store.CreateJob(ctx, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused(append(part("deep"), "--supersede", deep.JobID, "--reason", "r"), "still has live descendant "+leg+"/delegation/review")
+
+	for name, job := range map[string]string{"live": live.JobID, "clean": approved.JobID, "blocked": blocked.JobID, "deep": deep.JobID} {
 		claim, err := store.GetReviewRequest(ctx, partSubjectKey(t, head, name))
 		if err != nil || claim.JobID != job {
 			t.Fatalf("claim for part %s = %+v (%v), want it unchanged on %s", name, claim, err, job)

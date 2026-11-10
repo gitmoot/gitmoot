@@ -49,7 +49,15 @@ func RenderJobResultComment(comment JobResultComment) string {
 	}
 	builder.WriteString("> Job: `")
 	builder.WriteString(markdownInline(comment.JobID))
-	builder.WriteString("`\n\n")
+	builder.WriteString("`\n")
+	// A part of a split review (#2372) decides only that part, never the head, so
+	// its posted decision must not read as a whole-head verdict (#2373).
+	if part := reviewPartOf(comment.Payload); part != "" {
+		builder.WriteString("> Part: `")
+		builder.WriteString(markdownInline(part))
+		builder.WriteString("` (a part of a split review; it never approves the head)\n")
+	}
+	builder.WriteString("\n")
 
 	decision := strings.TrimSpace(comment.JobState)
 	summary := strings.TrimSpace(comment.Diagnostic)

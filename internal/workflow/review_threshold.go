@@ -91,6 +91,18 @@ func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity stri
 	return effectiveReviewDecision(payload.Result, blockingSeverity)
 }
 
+// recordsApprovedWithNotes reports whether a stored review earns the durable
+// ReviewApprovedWithNotesEventKind outcome: a raw changes_requested verdict
+// folded to approved by repository severity policy, for the WHOLE head. A part
+// of a split review (#2372) never approves the head, and proof/project.go turns
+// this event into a review.approved claim, so a folded part verdict must not
+// carry it (#2373).
+func recordsApprovedWithNotes(payload JobPayload, blockingSeverity string) bool {
+	return payload.Result != nil && payload.Result.Decision == "changes_requested" &&
+		reviewPartOf(payload) == "" &&
+		effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved"
+}
+
 // effectiveDelegationDecision applies repository review policy only to
 // delegations that are reviews. Ask and implement legs retain their raw
 // decisions even when they happen to report a review-shaped severity.

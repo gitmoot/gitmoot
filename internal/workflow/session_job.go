@@ -282,8 +282,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 		if m.reviewBlockingSeverity != nil {
 			blockingSeverity = m.reviewBlockingSeverity(payload.Repo)
 		}
-		if payload.Result.Decision == "changes_requested" &&
-			effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved" {
+		if recordsApprovedWithNotes(payload, blockingSeverity) {
 			extraEvents = append(extraEvents, db.JobEvent{
 				JobID: jobID,
 				Kind:  ReviewApprovedWithNotesEventKind,

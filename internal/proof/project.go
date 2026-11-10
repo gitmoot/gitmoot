@@ -37,7 +37,11 @@ type payloadProjection struct {
 	// OF an agent. internal/proof previously had zero references to it and read
 	// bare job.Agent, so a role-authored review rendered its author as "-" and its
 	// independence stayed unknown rather than being computed (#2008).
-	ActingOrgRole     string                      `json:"acting_org_role"`
+	ActingOrgRole string `json:"acting_org_role"`
+	// ReviewPart names one part of a split review (#2372). A part verdict
+	// decides only that part, so the review node records it and an approval
+	// claim on that node never reads as a head-level approval (#2373).
+	ReviewPart        string                      `json:"review_part"`
 	Result            *workflow.AgentResult       `json:"result"`
 	ResultObservation *workflow.ResultObservation `json:"result_observation"`
 }
@@ -275,6 +279,9 @@ func (p *projector) factNodes(job db.Job, projection payloadProjection, result *
 		attrs := map[string]string{
 			"job_id": job.ID, "agent": reviewerName, "as_of": job.UpdatedAt,
 			"reviewed_ref": emptyDash(p.reviewedRef(job, headSHA)),
+		}
+		if part := db.NormalizeReviewPart(projection.ReviewPart); part != "" {
+			attrs["review_part"] = part
 		}
 		claims := []Claim{}
 		if result != nil {

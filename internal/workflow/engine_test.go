@@ -1560,6 +1560,16 @@ func TestRecordFoldedReviewOutcomeExclusionsSurviveTheHoist(t *testing.T) {
 			want: 0,
 		},
 		{
+			// #2373: a part never approves the head, and proof turns this event
+			// into a review.approved claim.
+			name: "a folded part verdict records nothing", jobType: "review",
+			mutate: func(p *JobPayload) {
+				p.ReviewPart = "mm-1-mm-9"
+				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking"}
+			},
+			want: 0,
+		},
+		{
 			name: "the shape that SHOULD be recorded still is", jobType: "review",
 			mutate: func(p *JobPayload) {
 				p.Result = &AgentResult{Decision: "changes_requested", Severity: reviewseverity.P2, Summary: "non-blocking"}
