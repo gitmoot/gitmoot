@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 )
 
 const (
@@ -37,16 +39,26 @@ const (
 	// comments are read back for markers.
 	designNotesCommentPrefix = "Open P3 design notes from #"
 	designNotesUIDMarker     = "finding-uid: "
-	designNotesIssueBody     = "Design notes are advisory P3 findings from the review design checklist that were still open when their pull request merged. Pick up any worth doing, and close this issue once they are triaged.\n"
+	designNotesIssueBody     = "Design notes are advisory P3 findings from the review design checklist that were still open when their pull request merged. " +
+		"The notes are the comments below, one per merged pull request. " +
+		"Each note may already be fixed on the default branch, so check the current code before acting on it. " +
+		"Pick up any worth doing, and close this issue once every note is triaged.\n"
+	// designNotesLineSlack widens a finding's cited line when the sweep checks
+	// whether the default branch rewrote it after the merge.
+	designNotesLineSlack = 3
 )
 
 // DesignNotesPullRequestState is what GitHub reports for a candidate pull
-// request. Closed means closed WITHOUT merging. HeadSHA is the merged head when
-// known.
+// request. Closed means closed WITHOUT merging. HeadSHA is the merged head,
+// MergeCommitSHA the commit the merge put on the base branch (for a squash
+// merge, the squashed commit), and DefaultBranch the repository's default
+// branch, each when known.
 type DesignNotesPullRequestState struct {
-	Merged  bool
-	Closed  bool
-	HeadSHA string
+	Merged         bool
+	Closed         bool
+	HeadSHA        string
+	MergeCommitSHA string
+	DefaultBranch  string
 }
 
 // DesignNotesIssue identifies a GitHub issue the sweep files into.
@@ -80,9 +92,10 @@ type DesignNotesSweepOptions struct {
 
 // DesignNotesSweepResult reports one sweep. Filed counts findings filed,
 // including Repaired ones whose comment was already on the issue; Skipped
-// counts findings of pull requests closed unmerged; Pending counts pull
-// requests still open. Next is the last pull request this sweep attempted, or
-// the sweep's After when it attempted none.
+// counts findings recorded without a comment (their pull request closed
+// unmerged, or the default branch removed or rewrote what they cite since the
+// merge); Pending counts pull requests still open. Next is the last pull
+// request this sweep attempted, or the sweep's After when it attempted none.
 type DesignNotesSweepResult struct {
 	Next     DesignNotesPullRequestKey
 	Checked  int
@@ -141,6 +154,19 @@ type designNotesSweep struct {
 // lost comment record is repaired by the read-back anyway. So the sweep
 // returns within its deadline plus one in-flight GitHub call plus
 // designNotesGrace.
+//
+// NOT WORTH POSTING: a note can be settled or outdated by the time it is
+// filed. A finding whose reviewer declared it answered or withdrawn (the
+// ledger still records it open when the evidence was weak, for the merge
+// gate) is recorded as skipped. So is one the default branch outdated: before
+// posting, the sweep compares the pull request's merge commit with the
+// repository's default branch, once per pull request (DesignNotesCompare),
+// and a finding whose file was removed or renamed away since, or whose cited
+// lines (within designNotesLineSlack) a later change rewrote, is never
+// posted; one whose file changed elsewhere is posted with a "Changed since
+// merge" line. Notes are advisory, so the compare fails open: with no merge
+// commit, no default branch, a failed compare or a truncated one, every
+// finding is posted as if nothing changed.
 //
 // Failures are per pull request: each is recorded as a design_notes_error job
 // event on the review job that last observed a finding (while the deadline
@@ -201,7 +227,7 @@ func (s *designNotesSweep) sweepPullRequest(ctx context.Context, pr designNotesP
 	}
 	switch {
 	case state.Merged:
-		s.file(ctx, pr, firstNonEmptyLedgerText(state.HeadSHA, latestDesignNote(pr.findings).HeadSHA))
+		s.file(ctx, pr, state)
 	case state.Closed:
 		if err := s.record(ctx, pr.findings, "", db.DesignNoteSkipClosedUnmerged); err != nil {
 			s.fail(ctx, pr, "record skip: "+err.Error())
@@ -216,9 +242,11 @@ func (s *designNotesSweep) sweepPullRequest(ctx context.Context, pr designNotesP
 // file files a merged pull request's findings. First it reads back the issues
 // its current findings were attempted on: findings whose marker is there are
 // recorded, attempts shown absent are retired. An attempted issue that cannot
-// be read holds back only the findings attempted there; the rest are posted
-// to the week issue, after recording one attempt per finding.
-func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, head string) {
+// be read holds back only the findings attempted there. The rest are screened
+// (screen), and those still worth posting go to the week issue, after
+// recording one attempt per finding.
+func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, state DesignNotesPullRequestState) {
+	head := firstNonEmptyLedgerText(state.HeadSHA, latestDesignNote(pr.findings).HeadSHA)
 	issueRole, err := s.role(ctx, latestDesignNote(pr.findings).ObserverJob)
 	if err != nil {
 		s.fail(ctx, pr, "resolve requester: "+err.Error())
@@ -259,12 +287,16 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 	if len(remaining) == 0 {
 		return
 	}
+	screened, ok := s.screen(ctx, pr, state, remaining)
+	if !ok || len(screened.post) == 0 {
+		return
+	}
+	remaining = screened.post
 	issue, err := s.weekIssue(ctx, pr.key.Repo, issueRole)
 	if err != nil {
 		s.fail(ctx, pr, "week issue: "+err.Error())
 		return
 	}
-	var ok bool
 	if remaining, ok = s.reconcile(ctx, pr, issue, remaining); !ok || len(remaining) == 0 {
 		return
 	}
@@ -281,7 +313,7 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 		return
 	}
 	posted := s.markers[designNotesIssueKey(pr.key.Repo, issue.Number)]
-	for _, comment := range designNotesComments(pr.key.PullRequest, head, remaining, requesters) {
+	for _, comment := range designNotesComments(pr.key.PullRequest, head, remaining, requesters, screened.branch, screened.changed) {
 		if err := ctx.Err(); err != nil {
 			s.fail(ctx, pr, "deadline before commenting on "+issue.URL+": "+err.Error())
 			return
@@ -308,6 +340,193 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 		}
 		s.result.Filed += len(comment.findings)
 	}
+}
+
+// designNotesScreen is screen's verdict on the findings about to be posted:
+// those still to post, the default branch they were checked against, and the
+// uids whose file that branch changed elsewhere since the merge.
+type designNotesScreen struct {
+	post    []db.DesignNoteCandidate
+	branch  string
+	changed map[string]bool
+}
+
+// screen records as skipped, for good, the findings not worth posting, in one
+// transaction: those whose reviewer declared them resolved (designNotesResolved)
+// and those the default branch outdated since the merge. For the second it
+// compares the pull request's merge commit with the repository's default
+// branch, in one call (compare). The compare starts at the merge commit, not
+// the pull request's head: after a squash merge the head is no ancestor of the
+// default branch, so a three-dot compare from it would list the pull request's
+// own changes. In any doubt (no merge commit or default branch, a failed or
+// truncated compare, a missing patch, an unreadable hunk header) a finding is
+// posted as if nothing changed. ok is false only when the skips could not be
+// recorded; the pull request then waits for a later sweep.
+func (s *designNotesSweep) screen(ctx context.Context, pr designNotesPullRequest, state DesignNotesPullRequestState, findings []db.DesignNoteCandidate) (verdict designNotesScreen, ok bool) {
+	var skips []db.DesignNoteFiling
+	var live []db.DesignNoteCandidate
+	for _, f := range findings {
+		if designNotesResolved(f) {
+			skips = append(skips, s.filings([]db.DesignNoteCandidate{f}, "", db.DesignNoteSkipDeclaredResolved)...)
+		} else {
+			live = append(live, f)
+		}
+	}
+	verdict = designNotesScreen{post: live}
+	if compare, branch, compared := s.compare(ctx, pr, state, live); compared {
+		files := make(map[string]github.PullRequestFile, len(compare.Files))
+		renamedAway := map[string]bool{}
+		for _, file := range compare.Files {
+			files[designNotesPath(file.Filename)] = file
+			if file.Status == "renamed" {
+				renamedAway[designNotesPath(file.PreviousFilename)] = true
+			}
+		}
+		verdict = designNotesScreen{branch: branch, changed: map[string]bool{}}
+		for _, f := range live {
+			skip, changed := designNotesStaleFinding(f, files, renamedAway)
+			if skip != "" {
+				skips = append(skips, s.filings([]db.DesignNoteCandidate{f}, "", skip)...)
+				continue
+			}
+			verdict.post = append(verdict.post, f)
+			verdict.changed[f.FindingUID] = changed
+		}
+	}
+	if err := s.e.Store.RecordDesignNoteFilings(ctx, skips, s.now); err != nil {
+		s.fail(ctx, pr, "record skips of findings not worth posting: "+err.Error())
+		return designNotesScreen{}, false
+	}
+	s.result.Skipped += len(skips)
+	return verdict, true
+}
+
+// compare returns the compare of the pull request's merge commit with the
+// default branch. A sweep files a pull request once, so this is one GitHub
+// call per pull request per sweep. ok is false when there is nothing to check
+// (no finding cites a file) or nothing to check against: no hook, no merge
+// commit or default branch, a failed compare (reported in Errors) or a
+// truncated one.
+func (s *designNotesSweep) compare(ctx context.Context, pr designNotesPullRequest, state DesignNotesPullRequestState, findings []db.DesignNoteCandidate) (result github.CompareResult, branch string, ok bool) {
+	mergeCommit := strings.TrimSpace(state.MergeCommitSHA)
+	branch = strings.TrimSpace(state.DefaultBranch)
+	if s.e.DesignNotesCompare == nil || mergeCommit == "" || branch == "" || !designNotesCiteFiles(findings) {
+		return github.CompareResult{}, "", false
+	}
+	result, err := s.e.DesignNotesCompare(ctx, pr.key.Repo, mergeCommit, branch)
+	if err != nil {
+		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s#%d: compare %s...%s: %v; filing without the staleness check",
+			pr.key.Repo, pr.key.PullRequest, mergeCommit, branch, err))
+		return github.CompareResult{}, "", false
+	}
+	if result.Truncated {
+		return github.CompareResult{}, "", false
+	}
+	return result, branch, true
+}
+
+// designNotesResolvedTitle matches the titles reviewers give a confirmation
+// rather than a concern: "Resolved: ...", "Addressed at <sha>: ...", "R3
+// addressed: ...", "R8 remains addressed: ...". Measured on the ledger
+// (#2566); "R5 remains unresolved: ..." is a concern and does not match.
+var designNotesResolvedTitle = regexp.MustCompile(`(?i)^(?:resolved|addressed|r\d+\s+(?:remains\s+)?(?:resolved|addressed))\b`)
+
+// designNotesResolved reports whether the reviewer declared a finding's latest
+// observation resolved, though the ledger recorded it open: the writer records
+// a declared answer or withdrawal with weak evidence as open, for the merge
+// gate. A row from before declared_state existed that the migration could not
+// backfill has no declared state, and its title stands in.
+func designNotesResolved(f db.DesignNoteCandidate) bool {
+	switch f.DeclaredState {
+	case db.FindingAnswered, db.FindingWithdrawn:
+		return true
+	case "":
+		return designNotesResolvedTitle.MatchString(strings.TrimSpace(f.Title))
+	default:
+		return false
+	}
+}
+
+// designNotesStaleFinding classifies one finding against the compare of its
+// pull request's merge commit with the default branch: a skip reason, or
+// whether its file changed there (elsewhere than its cited lines).
+func designNotesStaleFinding(f db.DesignNoteCandidate, files map[string]github.PullRequestFile, renamedAway map[string]bool) (skip string, changed bool) {
+	path := designNotesPath(f.File)
+	if path == "" {
+		return "", false
+	}
+	file, listed := files[path]
+	if (listed && file.Status == "removed") || (!listed && renamedAway[path]) {
+		return db.DesignNoteSkipFileRemoved, false
+	}
+	if !listed || file.Patch == "" {
+		// Unchanged, or changed with no patch to read: GitHub omits it for
+		// binary and oversized diffs.
+		return "", false
+	}
+	if f.Line > 0 {
+		touched, ok := designNotesHunksTouch(file.Patch, f.Line)
+		if !ok {
+			return "", false
+		}
+		if touched {
+			return db.DesignNoteSkipLinesChanged, false
+		}
+	}
+	return "", true
+}
+
+// designNotesHunksTouch reports whether a hunk of a unified-diff patch covers,
+// on its old side, any line within designNotesLineSlack of line. A header
+// reads "@@ -start,count +start,count @@", a count omitted meaning 1; its old
+// range includes the hunk's context lines. A count of 0 (a pure insertion,
+// with no context) sits between old lines start and start+1. ok is false when
+// a header cannot be read.
+func designNotesHunksTouch(patch string, line int64) (touched, ok bool) {
+	for _, row := range strings.Split(patch, "\n") {
+		header, isHeader := strings.CutPrefix(row, "@@ -")
+		if !isHeader {
+			continue
+		}
+		old, _, found := strings.Cut(header, " ")
+		if !found {
+			return false, false
+		}
+		startText, countText, hasCount := strings.Cut(old, ",")
+		start, err := strconv.ParseInt(startText, 10, 64)
+		if err != nil {
+			return false, false
+		}
+		count := int64(1)
+		if hasCount {
+			if count, err = strconv.ParseInt(countText, 10, 64); err != nil {
+				return false, false
+			}
+		}
+		last := start + count - 1
+		if count == 0 {
+			last = start + 1
+		}
+		if start <= line+designNotesLineSlack && last >= line-designNotesLineSlack {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func designNotesCiteFiles(findings []db.DesignNoteCandidate) bool {
+	for _, f := range findings {
+		if designNotesPath(f.File) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// designNotesPath normalizes a repository-relative path as a finding cites it
+// and as GitHub lists it.
+func designNotesPath(path string) string {
+	return strings.TrimPrefix(strings.TrimSpace(path), "./")
 }
 
 // designNotesAttemptGroup is one attempted issue and the current candidates
@@ -466,7 +685,7 @@ func (s *designNotesSweep) weekIssue(ctx context.Context, repo, role string) (De
 func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo, role string) (DesignNotesIssue, error) {
 	title := designNotesIssueTitle(repo, s.week)
 	if s.e.DesignNotesFindIssue != nil {
-		found, exists, err := s.e.DesignNotesFindIssue(ctx, repo, title, designNotesLabel)
+		found, exists, err := s.e.DesignNotesFindIssue(ctx, repo, title)
 		if err != nil {
 			return DesignNotesIssue{}, fmt.Errorf("search %q: %w", title, err)
 		}
@@ -649,14 +868,20 @@ type designNotesCommentPart struct {
 // designNotesComments renders a pull request's findings as comments, each
 // under designNotesCommentMax bytes in total. Every field of a finding block is
 // bounded, so findings that do not fit one comment continue in the next; none
-// is dropped.
-func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidate, requesters map[string]string) []designNotesCommentPart {
+// is dropped. A finding in changed gets a line saying its file was modified on
+// branch after the merge.
+func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidate, requesters map[string]string, branch string, changed map[string]bool) []designNotesCommentPart {
 	head = designNotesClip(designNotesLine(head), designNotesFieldMax)
+	branch = designNotesClip(designNotesLine(branch), designNotesFieldMax)
 	var groups [][]int
 	var blocks []string
 	size := 0
 	for i, f := range findings {
-		block := designNotesBlock(i+1, f, pr, head, requesters[f.FindingUID])
+		changedOn := ""
+		if changed[f.FindingUID] {
+			changedOn = branch
+		}
+		block := designNotesBlock(i+1, f, pr, head, requesters[f.FindingUID], changedOn)
 		blocks = append(blocks, block)
 		if len(groups) == 0 || size+len(block) > designNotesCommentMax-designNotesHeaderReserve {
 			groups = append(groups, nil)
@@ -684,9 +909,16 @@ func designNotesComments(pr int64, head string, findings []db.DesignNoteCandidat
 	return parts
 }
 
-func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string, requester string) string {
+func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head, requester, changedOn string) string {
 	detail := strings.TrimSpace(f.Detail)
-	title := designNotesClip(designNotesLine(firstNonEmptyLedgerText(f.Title, detail, "(untitled)")), designNotesTitleMax)
+	heading := designNotesLine(firstNonEmptyLedgerText(f.Title, detail, "(untitled)"))
+	title := designNotesClip(heading, designNotesTitleMax)
+	if fullTitle := strings.TrimSpace(f.Title); fullTitle != "" && title != heading && designNotesLocatorOnly(detail, f.File) {
+		// The heading cut the title, and no detail says the rest: the
+		// reviewer's whole text is in the title, so it becomes the quote,
+		// with the bare locator, if any, kept under it.
+		detail = strings.TrimSpace(fullTitle + "\n\n" + detail)
+	}
 	location := strings.TrimSpace(f.File)
 	if location != "" && f.Line > 0 {
 		location += ":" + strconv.FormatInt(f.Line, 10)
@@ -699,6 +931,10 @@ func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string
 	fmt.Fprintf(&b, "- Location: `%s`\n", location)
 	fmt.Fprintf(&b, "- Review job: `%s` (requested by %s)\n", job, requester)
 	fmt.Fprintf(&b, "- Pull request: #%d, merged head `%s`\n", pr, head)
+	if changedOn != "" {
+		path := designNotesClip(designNotesLine(f.File), designNotesFieldMax)
+		fmt.Fprintf(&b, "- Changed since merge: `%s` was modified on `%s` after this PR merged; check the current code first.\n", path, changedOn)
+	}
 	if detail != "" {
 		if len(detail) > designNotesDetailMax {
 			detail = fmt.Sprintf("%s\n\n(detail truncated: first %d of %d bytes shown)",
@@ -710,6 +946,23 @@ func designNotesBlock(index int, f db.DesignNoteCandidate, pr int64, head string
 	}
 	fmt.Fprintf(&b, "\n%s%s\n", designNotesUIDMarker, f.FindingUID)
 	return b.String()
+}
+
+// designNotesLocatorOnly reports whether a finding's detail says nothing
+// beyond where to look: empty, or one short line that is a locator, or that
+// starts with the cited file ("internal/x.go:107-137 (validateConfigFile)").
+func designNotesLocatorOnly(detail, file string) bool {
+	if detail == "" {
+		return true
+	}
+	if strings.Contains(detail, "\n") || len(detail) > designNotesFieldMax {
+		return false
+	}
+	if db.IsStructuralFindingLocator(detail) {
+		return true
+	}
+	file = designNotesPath(file)
+	return file != "" && strings.HasPrefix(designNotesPath(detail), file)
 }
 
 func designNotesLine(value string) string {

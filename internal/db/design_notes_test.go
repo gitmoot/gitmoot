@@ -246,3 +246,105 @@ func TestDesignNoteWriteBudgetCountsTheWaitForThePooledConnection(t *testing.T) 
 		t.Fatalf("a %s write returned after %s: its busy wait was sized before the %s wait for the pooled connection", budget, elapsed, poolHold)
 	}
 }
+
+// #2566: declared_state keeps the state a reviewer declared beside the state
+// the ledger recorded. Upgrading backfills it from the writer's own
+// findings_ledger_downgraded events, matching only the rows the event's job
+// observed under the uid its finding cited; new rows record it directly, and
+// ListDesignNoteCandidates returns it.
+func TestDeclaredStateMigrationBackfillsFromDowngradeEvents(t *testing.T) {
+	ctx := context.Background()
+	released := migrationsBefore(t, "ADD COLUMN declared_state")
+	path := filepath.Join(t.TempDir(), "previous.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	previous := &Store{db: raw}
+	for version, migration := range released {
+		if err := previous.applyMigration(ctx, version+1, migration); err != nil {
+			t.Fatalf("applyMigration(%d): %v", version+1, err)
+		}
+	}
+	head := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	for _, job := range []struct{ id, payload string }{
+		// f1 cited by uid, f2 by the repo-less short form, f3 minted.
+		{"review-1", `{"result":{"findings":[{"uid":"o/r#1-f1","state":"answered"},{"continues_uid":"#1-f2","disposition":"withdrawn"},{"title":"new"}]}}`},
+		{"review-2", `{"result":{"findings":[{"uid":"o/r#1-f1","state":"answered"}]}}`},
+		{"review-3", `not json`},
+	} {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO jobs (id, agent, type, state, payload) VALUES (?, 'reviewer', 'review', 'succeeded', ?)`, job.id, job.payload); err != nil {
+			t.Fatalf("insert job %s: %v", job.id, err)
+		}
+	}
+	for _, event := range []struct{ job, message string }{
+		{"review-1", "finding[0] declared answered, recorded open (evidence QUOTED: no file or path-shaped evidence_locator, and the review declared no executed checks)"},
+		{"review-1", "finding[1] declared withdrawn, recorded open (withdrawal carried no withdraw_reason)"},
+		{"review-3", "finding[0] declared answered, recorded open (evidence QUOTED)"},
+	} {
+		if _, err := raw.ExecContext(ctx, `INSERT INTO job_events (job_id, kind, message) VALUES (?, 'findings_ledger_downgraded', ?)`, event.job, event.message); err != nil {
+			t.Fatalf("insert event: %v", err)
+		}
+	}
+	type row struct{ uid, job string }
+	rows := []row{{"o/r#1-f1", "review-1"}, {"o/r#1-f2", "review-1"}, {"o/r#1-f3", "review-1"}, {"o/r#1-f1", "review-2"}, {"o/r#1-f1", "review-3"}}
+	for i, r := range rows {
+		// Distinct heads keep (uid, head, observer) unique.
+		rowHead := head[:39] + string(rune('0'+i))
+		if _, err := raw.ExecContext(ctx, `INSERT INTO review_finding_observations (finding_uid, repo, pull_request, head_sha, observer_job, state, severity, title, evidence_kind)
+VALUES (?, 'o/r', 1, ?, ?, 'open', 'P3', 'note', 'QUOTED')`, r.uid, rowHead, r.job); err != nil {
+			t.Fatalf("insert observation %+v: %v", r, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close previous store: %v", err)
+	}
+
+	store, err := openRealTestStore(t, path)
+	if err != nil {
+		t.Fatalf("upgrade through Open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	want := map[row]string{
+		{"o/r#1-f1", "review-1"}: "answered",
+		{"o/r#1-f2", "review-1"}: "withdrawn",
+		// Minted by its review: no cited uid to match.
+		{"o/r#1-f3", "review-1"}: "",
+		// review-2 emitted no downgrade event; review-3's payload is unreadable.
+		{"o/r#1-f1", "review-2"}: "",
+		{"o/r#1-f1", "review-3"}: "",
+	}
+	for r, declared := range want {
+		var got string
+		if err := store.db.QueryRowContext(ctx, `SELECT declared_state FROM review_finding_observations WHERE finding_uid = ? AND observer_job = ?`, r.uid, r.job).Scan(&got); err != nil {
+			t.Fatalf("read %+v: %v", r, err)
+		}
+		if got != declared {
+			t.Fatalf("declared_state of %+v = %q, want %q", r, got, declared)
+		}
+	}
+
+	uid, err := store.RecordReviewFindingObservation(ctx, ReviewFindingObservation{
+		Repo: "o/r", PullRequest: 2, HeadSHA: head, State: FindingOpen, DeclaredState: FindingAnswered, Severity: "P3",
+		Title: "said answered", File: "x.go", EvidenceKind: EvidenceExecuted, ExecutedCommands: []string{"go test ./..."}, ExecutedCount: 1, ObserverJob: "review-4",
+	})
+	if err != nil {
+		t.Fatalf("RecordReviewFindingObservation: %v", err)
+	}
+	candidates, err := store.ListDesignNoteCandidates(ctx, time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("ListDesignNoteCandidates: %v", err)
+	}
+	var found bool
+	for _, c := range candidates {
+		if c.FindingUID == uid {
+			found = true
+			if c.DeclaredState != FindingAnswered {
+				t.Fatalf("candidate %s declared state = %q, want answered", uid, c.DeclaredState)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("candidates %+v lack %s", candidates, uid)
+	}
+}

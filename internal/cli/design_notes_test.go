@@ -21,6 +21,8 @@ type fakeDesignNotesGitHub struct {
 	created  []github.CreateIssueInput
 	comments map[int64][]string
 	lists    int
+	compares []string
+	compare  github.CompareResult
 }
 
 func (f *fakeDesignNotesGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
@@ -28,9 +30,14 @@ func (f *fakeDesignNotesGitHub) GetPullRequest(_ context.Context, _ github.Repos
 	return f.pulls[number], nil
 }
 
-func (f *fakeDesignNotesGitHub) SearchIssuesByTitle(_ context.Context, _ github.Repository, title, label string) ([]github.Issue, error) {
-	f.searches = append(f.searches, label+" "+title)
+func (f *fakeDesignNotesGitHub) SearchIssuesByTitle(_ context.Context, _ github.Repository, title string) ([]github.Issue, error) {
+	f.searches = append(f.searches, title)
 	return f.found, nil
+}
+
+func (f *fakeDesignNotesGitHub) CompareCommits(_ context.Context, repo github.Repository, base, head string) (github.CompareResult, error) {
+	f.compares = append(f.compares, repo.FullName()+" "+base+"..."+head)
+	return f.compare, nil
 }
 
 func (f *fakeDesignNotesGitHub) CreateIssue(_ context.Context, input github.CreateIssueInput) (github.Issue, error) {
@@ -84,10 +91,11 @@ func TestRunDesignNotesSweepOnceRunsHourlyThroughTheGitHubClient(t *testing.T) {
 	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 	fake := &fakeDesignNotesGitHub{pulls: map[int64]github.PullRequest{
 		// The list endpoint's shape: merged only through merged_at.
-		7: {Number: 7, State: "closed", MergedAt: "2026-11-09T10:00:00Z", HeadSHA: strings.Repeat("c", 40)},
+		7: {Number: 7, State: "closed", MergedAt: "2026-11-09T10:00:00Z", HeadSHA: strings.Repeat("c", 40),
+			MergeSHA: strings.Repeat("d", 40), BaseRef: "release", BaseRepoDefaultBranch: "main"},
 		8: {Number: 8, State: "closed"},
 		9: {Number: 9, State: "open"},
-	}}
+	}, compare: github.CompareResult{Files: []github.PullRequestFile{{Filename: "x.go", Status: "modified", Patch: "@@ -40,2 +40,3 @@"}}}}
 	previous := newDesignNotesGitHubClient
 	newDesignNotesGitHubClient = func() designNotesGitHubClient { return fake }
 	t.Cleanup(func() { newDesignNotesGitHubClient = previous })
@@ -103,14 +111,20 @@ func TestRunDesignNotesSweepOnceRunsHourlyThroughTheGitHubClient(t *testing.T) {
 	if fake.gets != 3 || len(fake.created) != 1 || len(fake.comments[900]) != 1 {
 		t.Fatalf("gets %d, created %d, comments %v", fake.gets, len(fake.created), fake.comments)
 	}
-	if got := fake.searches; len(got) != 1 || got[0] != "design-notes [design-notes] owner/repo 2026-W46" {
+	if got := fake.searches; len(got) != 1 || got[0] != "[design-notes] owner/repo 2026-W46" {
 		t.Fatalf("searches = %q", got)
+	}
+	// The staleness check compares the merge commit, not the head, with the
+	// repository's default branch, not the PR's base.
+	if got := fake.compares; len(got) != 1 || got[0] != "owner/repo "+strings.Repeat("d", 40)+"...main" {
+		t.Fatalf("compares = %q", got)
 	}
 	if created := fake.created[0]; created.Title != "[design-notes] owner/repo 2026-W46" ||
 		strings.Join(created.Labels, ",") != "design-notes,agent:unassigned" {
 		t.Fatalf("created = %+v", created)
 	}
-	if body := fake.comments[900][0]; !strings.Contains(body, "from #7,") || !strings.Contains(body, strings.Repeat("c", 40)) {
+	if body := fake.comments[900][0]; !strings.Contains(body, "from #7,") || !strings.Contains(body, strings.Repeat("c", 40)) ||
+		!strings.Contains(body, "Changed since merge: `x.go` was modified on `main` after this PR merged") {
 		t.Fatalf("comment:\n%s", body)
 	}
 	if !strings.Contains(out.String(), "opened https://github.com/owner/repo/issues/900") {

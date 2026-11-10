@@ -105,6 +105,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2558: upgrades a database built from the migrations before the
 	// design-notes tables through the real Open path.
 	realPathTests["TestDesignNotesMigrationUpgradesThroughOpen"] = true
+	// #2566: backfills declared_state while upgrading a database built from
+	// the migrations before it, through the real Open path.
+	realPathTests["TestDeclaredStateMigrationBackfillsFromDowngradeEvents"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

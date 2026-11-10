@@ -3190,4 +3190,45 @@ CREATE TABLE IF NOT EXISTS design_note_pending_posts (
 );
 CREATE INDEX IF NOT EXISTS idx_design_note_pending_posts_pr ON design_note_pending_posts(repo, pull_request);
 	`,
+	// #2566: declared_state keeps the state the REVIEWER declared, beside the
+	// state the ledger recorded. The writer records a declared answer with weak
+	// evidence as open, deliberately, so the merge gate still sees an open
+	// obligation; the design-notes sweep reads declared_state instead, so a note
+	// the reviewer called resolved is not filed as an open design note.
+	//
+	// Rows written before this migration are backfilled from the writer's own
+	// findings_ledger_downgraded events, "finding[N] declared S, recorded R
+	// (...)": N indexes that job's result.findings, whose continues_uid (else
+	// uid, possibly "#<pr>-f<n>" short for "<repo>#<pr>-f<n>") names the row the
+	// job observed. Only rows matched that exactly are touched; a declared
+	// answer that minted a new uid has no uid to match and stays ''. The
+	// payload is read only when json_valid, so a malformed payload cannot abort
+	// the migration.
+	`
+ALTER TABLE review_finding_observations ADD COLUMN declared_state TEXT NOT NULL DEFAULT '';
+WITH downgrade AS MATERIALIZED (
+	SELECT e.job_id,
+		CAST(substr(e.message, 9, instr(e.message, ']') - 9) AS INTEGER) AS idx,
+		substr(e.message, instr(e.message, '] declared ') + 11,
+			instr(e.message, ', recorded ') - instr(e.message, '] declared ') - 11) AS declared
+	FROM job_events e
+	WHERE e.kind = 'findings_ledger_downgraded'
+		AND e.message GLOB 'finding[[][0-9]*[]] declared *, recorded *'
+),
+declared AS MATERIALIZED (
+	SELECT d.job_id, d.declared,
+		CASE WHEN json_valid(j.payload) THEN COALESCE(
+			NULLIF(TRIM(json_extract(j.payload, '$.result.findings[' || d.idx || '].continues_uid')), ''),
+			TRIM(json_extract(j.payload, '$.result.findings[' || d.idx || '].uid'))) END AS uid
+	FROM downgrade d JOIN jobs j ON j.id = d.job_id
+	WHERE d.declared IN ('answered', 'withdrawn', 'superseded')
+)
+UPDATE review_finding_observations AS o
+SET declared_state = (SELECT x.declared FROM declared x
+	WHERE x.job_id = o.observer_job AND x.uid <> '' AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid) LIMIT 1)
+WHERE o.declared_state = ''
+	AND o.observer_job IN (SELECT job_id FROM declared)
+	AND EXISTS (SELECT 1 FROM declared x
+		WHERE x.job_id = o.observer_job AND x.uid <> '' AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid));
+	`,
 }

@@ -389,14 +389,16 @@ func TestSearchIssuesByTitleKeepsOnlyExactTitles(t *testing.T) {
 	}
 	client := GhClient{Runner: runner}
 
-	issues, err := client.SearchIssuesByTitle(context.Background(), Repository{Owner: "o", Name: "r"}, "[design-notes] o/r 2026-W45", "design-notes")
+	issues, err := client.SearchIssuesByTitle(context.Background(), Repository{Owner: "o", Name: "r"}, "[design-notes] o/r 2026-W45")
 	if err != nil {
 		t.Fatalf("SearchIssuesByTitle returned error: %v", err)
 	}
 	if len(issues) != 1 || issues[0].Number != 8 {
 		t.Fatalf("issues = %+v, want only the exact-title issue #8", issues)
 	}
-	runner.wantArgs(t, 0, "api", "-X", "GET", "search/issues", "-f", `q=repo:o/r is:issue label:"design-notes" in:title "[design-notes] o/r 2026-W45"`)
+	// No label in the query (#2566): labels are applied best effort after the
+	// issue is created, so an issue whose labels never landed is still found.
+	runner.wantArgs(t, 0, "api", "-X", "GET", "search/issues", "-f", `q=repo:o/r is:issue in:title "[design-notes] o/r 2026-W45"`)
 }
 
 func TestListIssuesFiltersOutPullRequests(t *testing.T) {
@@ -622,6 +624,45 @@ func TestGetPullRequestDecodesHeadRepository(t *testing.T) {
 	if pr.HeadRepoFullName != "gitmoot/gitmoot" {
 		t.Fatalf("head repository = %q, want gitmoot/gitmoot", pr.HeadRepoFullName)
 	}
+}
+
+// The design-notes sweep (#2566) compares a merged PR's merge commit with the
+// repository's default branch, both read from the single-PR payload.
+func TestGetPullRequestDecodesMergeCommitAndBaseDefaultBranch(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"number": 2, "state": "closed", "merged": true, "merge_commit_sha": "merge123", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "release", "repo": {"default_branch": "main"}}}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	pr, err := client.GetPullRequest(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, 2)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pr.MergeSHA != "merge123" || pr.BaseRef != "release" || pr.BaseRepoDefaultBranch != "main" {
+		t.Fatalf("merge sha %q, base ref %q, base default branch %q", pr.MergeSHA, pr.BaseRef, pr.BaseRepoDefaultBranch)
+	}
+}
+
+// A renamed file in a compare names its old path: the design-notes sweep
+// (#2566) treats a finding citing that path as removed since the merge.
+func TestCompareCommitsDecodesRenamedFilesPreviousPath(t *testing.T) {
+	runner := &fakeRunner{
+		results: []subprocess.Result{{
+			Stdout: `{"status":"ahead","ahead_by":1,"files":[{"filename":"b.go","status":"renamed","previous_filename":"a.go","patch":"@@ -1 +1 @@"}]}`,
+		}},
+	}
+	client := GhClient{Runner: runner}
+
+	compare, err := client.CompareCommits(context.Background(), Repository{Owner: "gitmoot", Name: "gitmoot"}, "merge123", "main")
+	if err != nil {
+		t.Fatalf("CompareCommits returned error: %v", err)
+	}
+	if len(compare.Files) != 1 || compare.Files[0].PreviousFilename != "a.go" || compare.Files[0].Status != "renamed" {
+		t.Fatalf("files = %+v", compare.Files)
+	}
+	runner.wantArgs(t, 0, "api", "repos/gitmoot/gitmoot/compare/merge123...main")
 }
 
 // TestGetPullRequestDecodesBody proves PullRequest.UnmarshalJSON decodes the wire
