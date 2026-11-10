@@ -192,9 +192,10 @@ type Instance struct {
 // exists for a no-execution seat (#2364, #2563): omp must start in an empty,
 // job-private directory outside the checkout so it never loads the
 // checkout's .env. The local backend accepts only an existing empty directory
-// owned by the daemon user with mode 0700 that is not a symlink and neither
-// lies inside the workspace nor contains it. A backend that cannot honour a
-// LaunchDir refuses the command.
+// owned by the daemon user with mode 0700 that is not a symlink, neither lies
+// inside the workspace nor contains it, and sits in a daemon-owned parent no
+// other user can write. A backend that cannot honour a LaunchDir refuses the
+// command.
 type Command struct {
 	Dir            string
 	LaunchDir      string
@@ -774,10 +775,13 @@ func localCommandDir(workspace, dir string) (string, error) {
 
 // localLaunchDir validates Command.LaunchDir and returns the resolved directory
 // the command starts in. Only an empty directory the daemon user owns with
-// mode 0700, not a symlink itself and disjoint from the workspace, qualifies:
-// that is the neutral, job-private start directory a no-execution seat needs,
-// and nothing a command could use to reach files the workspace rule would
-// otherwise deny. Every ordinary command still goes through localCommandDir.
+// mode 0700, not a symlink itself and disjoint from the workspace, qualifies,
+// and its parent must be a real directory the daemon user owns that no other
+// user can write: nothing but the daemon may then fill or swap the launch dir
+// between this check and the command's chdir. Keeping the parent out of every
+// path a sandboxed seat may write is the caller's half of that property; the
+// backend does not know the seat's grants. Every ordinary command still goes
+// through localCommandDir.
 func (b *LocalBackend) localLaunchDir(workspace string, command Command) (string, error) {
 	launchDir := command.LaunchDir
 	if strings.TrimSpace(command.Dir) != "" {
@@ -804,6 +808,20 @@ func (b *LocalBackend) localLaunchDir(workspace string, command Command) (string
 	}
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
 		return "", fmt.Errorf("local execution launch dir %q is not owned by the daemon user", launchDir)
+	}
+	parent := filepath.Dir(clean)
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		return "", fmt.Errorf("inspect local execution launch dir parent: %w", err)
+	}
+	if !parentInfo.IsDir() {
+		return "", fmt.Errorf("local execution launch dir parent %q is not a directory", parent)
+	}
+	if stat, ok := parentInfo.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("local execution launch dir parent %q is not owned by the daemon user", parent)
+	}
+	if parentInfo.Mode().Perm()&0o022 != 0 {
+		return "", fmt.Errorf("local execution launch dir parent %q is writable by users other than the daemon user (mode %s)", parent, parentInfo.Mode().Perm())
 	}
 	resolved, err := filepath.EvalSymlinks(clean)
 	if err != nil {

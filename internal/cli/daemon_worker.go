@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -1879,7 +1880,10 @@ type readOnlyRuntimeAdapter struct {
 	runtime.Adapter
 	cleanupRoot string
 	cleanupTemp seatTempDir
-	ompSession  *readOnlyOmpBrokerSession
+	// cleanupLaunch is a no-execution seat's launch dir (#2563), made under
+	// the daemon-only run dir for this job and removed with it.
+	cleanupLaunch string
+	ompSession    *readOnlyOmpBrokerSession
 	// staticReviewBrief is appended to the prompt of a no-execution review
 	// (#2364): the statement that this seat cannot run anything, and the
 	// exact-head CI evidence the host fetched for it.
@@ -1936,6 +1940,11 @@ func (a readOnlyRuntimeAdapter) cleanup() error {
 	if err := a.cleanupTemp.remove(); err != nil {
 		cleanupErrors = append(cleanupErrors, err)
 	}
+	if a.cleanupLaunch != "" {
+		if err := os.RemoveAll(a.cleanupLaunch); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove no-execution seat launch dir: %w", err))
+		}
+	}
 	return errors.Join(cleanupErrors...)
 }
 
@@ -1980,24 +1989,21 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// named in PI_CONFIG_FILES so no other source can claim that variable.
 		// The launch dir is an empty job-private directory the runtime starts
 		// in, so it never reads the checkout's .env (the checkout is passed
-		// to omp with --cwd instead).
+		// to omp with --cwd instead). It is created below, outside the cache
+		// root, because the seat can write the cache root (#2563).
 		//
 		// The cache root is keyed by worktree path and is WRITABLE by every
 		// seat that used it, including earlier seats that could run commands.
-		// omp reads .env and user settings from HOME, the XDG roots and its
-		// start directory at startup, so each of those is recreated empty
-		// rather than trusted.
+		// omp reads .env and user settings from HOME and the XDG roots at
+		// startup, so each of those is recreated empty rather than trusted.
 		if strings.TrimSpace(agent.NoExecutionConfig) == "" {
 			cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
 			return nil, readOnlySeatSetup{}, errors.Join(errors.New("no-execution seat has no runtime settings overlay"), cleanupErr)
 		}
 		grants.readFiles = append(grants.readFiles, agent.NoExecutionConfig)
 		grants.env = append(grants.env, "PI_CONFIG_FILES="+agent.NoExecutionConfig)
-		launchDir = filepath.Join(grants.cacheRoot, "launch")
-		for _, dir := range []string{launchDir, "home", "xdg-config", "xdg-data", "xdg-state", "xdg-cache"} {
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(grants.cacheRoot, dir)
-			}
+		for _, dir := range []string{"home", "xdg-config", "xdg-data", "xdg-state", "xdg-cache"} {
+			dir = filepath.Join(grants.cacheRoot, dir)
 			if err := errors.Join(os.RemoveAll(dir), os.MkdirAll(dir, 0o700)); err != nil {
 				cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
 				return nil, readOnlySeatSetup{}, errors.Join(fmt.Errorf("reset no-execution seat dir %q: %w", dir, err), cleanupErr)
@@ -2013,6 +2019,17 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		}
 		ompSession = &readOnlyOmpBrokerSession{config: *ompConfig, stateDir: grants.stateDir}
 	}
+	if agent.NoExecution {
+		launchDir, err = createNoExecutionLaunchDir(home, grants.writes)
+		if err != nil {
+			cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
+			return nil, setup, errors.Join(err, cleanupErr)
+		}
+		// Read-only: omp reads its start directory (.env, project settings)
+		// and finds it empty; sandbox-exec grants the working directory no
+		// access of its own once the seat names explicit reads.
+		grants.reads = append(grants.reads, launchDir)
+	}
 	// A seat's env is rebuilt from scratch. Claude therefore needs the same
 	// resolved runtime-auth overlay as every other Claude job. OMP's proxy token
 	// exists only in its job-private config; its upstream bearer, operator
@@ -2022,9 +2039,12 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	// seat is deliberately given none.
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
 		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
+		// The launch dir rides on the same graft: on an execution-backend
+		// instance the backend starts a command outside the workspace only in
+		// a launch dir the runner names (#2563).
 		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
 			BaseEnv: append(baseEnv, seatAuthEnv...),
-		})
+		}, launchDir)
 		// The overlay ALSO rides on the landlock runner's env, and that is the
 		// path that actually reaches every shape. graftRuntimeBaseRunner has no
 		// CuratedGroupRunner case, so for a plain (non-instance) runner the graft
@@ -2032,10 +2052,6 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// then saw only the grant env. #1810's review called this shape-dependence
 		// out; routing through grants.env is what makes the fix shape-independent.
 		if agent.NoExecution {
-			// On an execution-backend instance the backend only starts a
-			// command outside the workspace in a launch dir the runner names
-			// (#2563); a plain host runner starts anywhere.
-			curated = withExecutionInstanceLaunchDir(curated, launchDir)
 			return landlockNoExecutionRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
 		}
 		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
@@ -2047,7 +2063,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if err != nil {
 		// Staging and narrowing are already done at this point, so the
 		// withheld list is reported even though the wrap failed.
-		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
+		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove(), os.RemoveAll(launchDir))
 		return nil, setup, errors.Join(err, cleanupErr)
 	}
 	runtimeAdapter, ok := wrapped.(runtime.Adapter)
@@ -2055,7 +2071,7 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// The narrowing already happened, so report it even though delivery
 		// cannot be built: a withheld credential is news whether or not the
 		// wrap succeeds.
-		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove())
+		cleanupErr := errors.Join(os.RemoveAll(grants.cacheRoot), grants.tempDir.remove(), os.RemoveAll(launchDir))
 		return nil, setup, errors.Join(fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped), cleanupErr)
 	}
 	// A seat without isolated runtime state (a shell seat) keeps its cache
@@ -2066,10 +2082,11 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		cleanupRoot = ""
 	}
 	return readOnlyRuntimeAdapter{
-		Adapter:     runtimeAdapter,
-		cleanupRoot: cleanupRoot,
-		cleanupTemp: grants.tempDir,
-		ompSession:  ompSession,
+		Adapter:       runtimeAdapter,
+		cleanupRoot:   cleanupRoot,
+		cleanupTemp:   grants.tempDir,
+		cleanupLaunch: launchDir,
+		ompSession:    ompSession,
 	}, setup, nil
 }
 
@@ -2151,69 +2168,60 @@ func withOmpNoExecutionLaunchDir(adapter workflow.DeliveryAdapter, launchDir str
 	}
 }
 
-// withExecutionInstanceLaunchDir names launchDir on the execution-backend
-// instance runner inside runner, so the backend may start the no-execution
-// seat there although it lies outside the instance workspace (#2563). The
-// backend still validates the dir. Each wrapper keeps its shape; pointer
-// runners are copied, never mutated. A runner that reaches no instance is
-// returned unchanged in effect.
-func withExecutionInstanceLaunchDir(runner subprocess.Runner, launchDir string) subprocess.Runner {
-	switch r := runner.(type) {
-	case execbackend.InstanceRunner:
-		r.LaunchDir = launchDir
-		return r
-	case *execbackend.InstanceRunner:
-		if r == nil {
-			return runner
-		}
-		copied := *r
-		copied.LaunchDir = launchDir
-		return &copied
-	case subprocess.TeeRunner:
-		if r.Inner != nil {
-			if inner, ok := withExecutionInstanceLaunchDir(r.Inner, launchDir).(subprocess.StreamRunner); ok {
-				r.Inner = inner
-			}
-		}
-		return r
-	case *subprocess.TeeRunner:
-		if r == nil {
-			return runner
-		}
-		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.TeeRunner)
-		return &copied
-	case subprocess.EnvInjectingRunner:
-		if r.Inner != nil {
-			r.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
-		}
-		return r
-	case *subprocess.EnvInjectingRunner:
-		if r == nil {
-			return runner
-		}
-		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.EnvInjectingRunner)
-		return &copied
-	case subprocess.WrappingRunner:
-		if r.Inner != nil {
-			r.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
-		}
-		return r
-	case *subprocess.WrappingRunner:
-		if r == nil {
-			return runner
-		}
-		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.WrappingRunner)
-		return &copied
-	case *credgw.Runner:
-		if r == nil || r.Inner == nil {
-			return runner
-		}
-		copied := *r
-		copied.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
-		return &copied
-	default:
-		return runner
+// noExecutionLaunchParent is the daemon-only directory no-execution launch
+// dirs are made in, beside the other runtime state under <home>/run.
+func noExecutionLaunchParent(paths config.Paths) string {
+	return filepath.Join(paths.Home, "run", "noexec-launch")
+}
+
+// createNoExecutionLaunchDir makes a fresh, empty, mode-0700 launch dir for a
+// no-execution seat (#2563). Its parent is owned by the daemon user, mode
+// 0700, and must not overlap any path the seat may write: a launch dir the
+// seat (or a concurrent seat sharing its cache root) could write could be
+// filled or swapped between the backend's check and the runtime's chdir.
+// The seat is granted the launch dir read-only.
+func createNoExecutionLaunchDir(home string, writes []string) (string, error) {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return "", fmt.Errorf("resolve no-execution launch dir paths: %w", err)
 	}
+	parent := noExecutionLaunchParent(paths)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", fmt.Errorf("create no-execution launch parent: %w", err)
+	}
+	info, err := os.Lstat(parent)
+	if err != nil {
+		return "", fmt.Errorf("inspect no-execution launch parent: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("no-execution launch parent %q is not a directory", parent)
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("no-execution launch parent %q is not owned by the daemon user", parent)
+	}
+	if info.Mode().Perm() != 0o700 {
+		if err := os.Chmod(parent, 0o700); err != nil {
+			return "", fmt.Errorf("restrict no-execution launch parent: %w", err)
+		}
+	}
+	resolvedParent, err := resolvePathForContainment(parent)
+	if err != nil {
+		return "", fmt.Errorf("resolve no-execution launch parent: %w", err)
+	}
+	for _, write := range compactCleanPaths(writes) {
+		resolvedWrite, err := resolvePathForContainment(write)
+		if err != nil {
+			return "", fmt.Errorf("resolve seat write path %q: %w", write, err)
+		}
+		if pathsOverlap(resolvedParent, resolvedWrite) {
+			return "", fmt.Errorf("no-execution launch parent %q overlaps seat-writable path %q", parent, write)
+		}
+	}
+	dir, err := os.MkdirTemp(parent, "seat-")
+	if err != nil {
+		return "", fmt.Errorf("create no-execution launch dir: %w", err)
+	}
+	return dir, nil
 }
 
 // applyReadOnlySeat rewrites an agent for hard runtime isolation.

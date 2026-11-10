@@ -1441,12 +1441,16 @@ What the worker does:
   config-discovery provider, MCP, extensions, skills, rules, LSP and PTY turned
   off through `--config`. omp starts in an empty job directory and gets the
   checkout through `--cwd`, so the checkout's `.env` is never loaded. The seat's
-  HOME, XDG directories and launch directory are recreated empty for each job.
-  The launch directory is outside the execution instance's workspace. The local
-  backend starts the seat there only when that directory is empty, owned by the
-  daemon user, mode 0700, not a symlink, and does not contain the workspace or
-  sit inside it (#2563). Every other command still has to run inside the
-  workspace.
+  HOME and XDG directories are recreated empty for each job. The launch
+  directory is a fresh directory in `~/.gitmoot/run/noexec-launch/`, which only
+  the daemon user can write and which no seat is granted write access to. The
+  seat can read it but not write it, and it is removed when the job ends. The
+  local backend starts the seat there, outside the execution instance's
+  workspace, only when the directory is empty, owned by the daemon user, mode
+  0700, not a symlink, in a daemon-owned parent no other user can write, and
+  does not contain the workspace or sit inside it (#2563). It checks this
+  before every delivery, including repair turns. Every other command still has
+  to run inside the workspace.
 - Starts omp under `sandbox-exec --no-execution`. A supervisor allows exactly one
   exec, the runtime itself, and refuses every later `execve`/`execveat` from the
   runtime or any child with `EACCES`. Landlock removes the Execute right from

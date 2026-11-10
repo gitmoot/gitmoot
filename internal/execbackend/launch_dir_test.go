@@ -137,6 +137,44 @@ func TestLocalBackendRefusesUnsafeLaunchDir(t *testing.T) {
 			}
 			return Command{LaunchDir: dir}
 		}},
+		// #2563 review: a parent anyone else can write lets the launch dir be
+		// filled or swapped between this check and the command's chdir.
+		{name: "parent writable by others", want: "writable by users other than the daemon user", command: func(t *testing.T) Command {
+			parent := t.TempDir()
+			dir := privateLaunchDir(t, parent)
+			if err := os.Chmod(parent, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			return Command{LaunchDir: dir}
+		}},
+		{name: "parent group writable", want: "writable by users other than the daemon user", command: func(t *testing.T) Command {
+			parent := t.TempDir()
+			dir := privateLaunchDir(t, parent)
+			if err := os.Chmod(parent, 0o770); err != nil {
+				t.Fatal(err)
+			}
+			return Command{LaunchDir: dir}
+		}},
+		{name: "parent is a symlink", want: "parent", command: func(t *testing.T) Command {
+			real := t.TempDir()
+			privateLaunchDir(t, real)
+			link := filepath.Join(t.TempDir(), "parent-link")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			return Command{LaunchDir: filepath.Join(link, "launch")}
+		}},
+		{name: "parent not owned by the daemon user", want: "parent", command: func(t *testing.T) Command {
+			if os.Geteuid() != 0 {
+				t.Skip("no privilege to hand a directory to another uid")
+			}
+			parent := t.TempDir()
+			dir := privateLaunchDir(t, parent)
+			if err := os.Chown(parent, 65534, 65534); err != nil {
+				t.Fatal(err)
+			}
+			return Command{LaunchDir: dir}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
