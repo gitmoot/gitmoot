@@ -450,20 +450,23 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 			strings.TrimSpace(wire.Detail),
 			strings.TrimSpace(wire.Body),
 			strings.TrimSpace(wire.Evidence),
-			unstructuredLocatorText(wire.locator()),
-			// #2073 alternates go AFTER the whole pre-existing chain, not beside
+			// #2073 alternates go AFTER the pre-existing prose keys, not beside
 			// their nearest synonym. Ranking `details` next to `detail` reads
 			// better and silently CHANGES already-resolved rows: {body, details}
 			// resolved to body before and would resolve to details after, and
 			// {evidence, message} likewise. Those inputs already produced a
 			// non-empty detail, so re-ranking them is a compatibility change
-			// this PR has no reason to make. Appending makes the new keys reach
-			// only rows that resolved to NOTHING, which is the defect being
-			// fixed (#2077 review F2).
+			// this PR has no reason to make (#2077 review F2).
 			strings.TrimSpace(wire.Details),
 			strings.TrimSpace(wire.Finding),
 			strings.TrimSpace(wire.Message),
 			strings.TrimSpace(wire.Description),
+			// The citation is LAST, after the #2073 keys too (#2566). Ahead of
+			// them it won over the reviewer's whole prose: #2376's review sent
+			// {severity, locator, finding, impact}, and every row recorded only
+			// "internal/config/edit.go:107-137 (validateConfigFile)" as its
+			// detail, with the finding text lost.
+			unstructuredLocatorText(wire.locator()),
 		),
 		File: firstNonEmptyLedgerText(
 			strings.TrimSpace(wire.File),
@@ -539,6 +542,11 @@ func (e Engine) ledgerObservationWithDeclaredState(job db.Job, payload JobPayloa
 		// state can only mean the finding stands.
 		obs.State = db.FindingOpen
 	}
+	// The reviewer's word, kept beside the state the evidence rules below may
+	// downgrade (#2566): the gate reads State, the design-notes sweep reads
+	// this, so a declared answer the gate still counts open is not filed as an
+	// open design note.
+	obs.DeclaredState = obs.State
 	commands := []string(payload.Result.TestsRun)
 	// THE VERDICT'S OWN evidence FIELD IS THE AUTHORITY, NOT THE LENGTH OF ITS
 	// LIST (#1850 merge-head P1, found by me and ruled on in directive 117886).

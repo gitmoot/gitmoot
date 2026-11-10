@@ -110,6 +110,10 @@ type PullRequest struct {
 	// extra API call). It is additive (#650): existing callers that ignore it are
 	// byte-identical; the opt-in risk classifier reads label names from it.
 	Labels []PullRequestLabel `json:"labels,omitempty"`
+
+	// BaseRepoDefaultBranch is the default branch of the repository the PR
+	// targets (base.repo.default_branch), or "" when the payload omits it.
+	BaseRepoDefaultBranch string
 }
 
 // PullRequestLabel is a single GitHub label on a PR (only the name is used).
@@ -149,8 +153,11 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 			} `json:"repo"`
 		} `json:"head"`
 		Base struct {
-			Ref string `json:"ref"`
-			SHA string `json:"sha"`
+			Ref  string `json:"ref"`
+			SHA  string `json:"sha"`
+			Repo *struct {
+				DefaultBranch string `json:"default_branch"`
+			} `json:"repo"`
 		} `json:"base"`
 		Labels []PullRequestLabel `json:"labels"`
 	}
@@ -181,6 +188,10 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.MergeSHA = decoded.MergeSHA
 	p.BaseRef = decoded.Base.Ref
 	p.BaseSHA = decoded.Base.SHA
+	p.BaseRepoDefaultBranch = ""
+	if decoded.Base.Repo != nil {
+		p.BaseRepoDefaultBranch = decoded.Base.Repo.DefaultBranch
+	}
 	p.Labels = decoded.Labels
 	return nil
 }
@@ -394,6 +405,9 @@ type PullRequestFile struct {
 	Status   string `json:"status"`
 	SHA      string `json:"sha"`
 	Patch    string `json:"patch"`
+	// PreviousFilename is the old path of a renamed file; GitHub sets it only
+	// when Status is "renamed".
+	PreviousFilename string `json:"previous_filename,omitempty"`
 }
 
 type PullRequestCommit struct {
@@ -886,21 +900,22 @@ func (c *GhClient) SearchOpenIssues(ctx context.Context, repo Repository, text s
 	return response.Items, err
 }
 
-// SearchIssuesByTitle returns the repository's issues, open or closed, that
-// carry label and whose title is exactly title. Search matches title words,
-// so the exact comparison is made here.
-func (c *GhClient) SearchIssuesByTitle(ctx context.Context, repo Repository, title, label string) ([]Issue, error) {
+// SearchIssuesByTitle returns the repository's issues, open or closed, whose
+// title is exactly title. Search matches title words, so the exact comparison
+// is made here. The query names no label: CreateIssue applies labels best
+// effort, so an issue whose labels never landed must still be found.
+func (c *GhClient) SearchIssuesByTitle(ctx context.Context, repo Repository, title string) ([]Issue, error) {
 	if strings.TrimSpace(repo.FullName()) == "" {
 		return nil, fmt.Errorf("repository owner/name is required")
 	}
-	title, label = strings.TrimSpace(title), strings.TrimSpace(label)
-	if title == "" || label == "" {
-		return nil, fmt.Errorf("issue title and label are required")
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return nil, fmt.Errorf("issue title is required")
 	}
 	var response struct {
 		Items []Issue `json:"items"`
 	}
-	query := fmt.Sprintf("repo:%s is:issue label:%q in:title %q", repo.FullName(), label, title)
+	query := fmt.Sprintf("repo:%s is:issue in:title %q", repo.FullName(), title)
 	if err := c.apiJSON(ctx, false, &response, "-X", "GET", "search/issues", "-f", "q="+query); err != nil {
 		return nil, err
 	}

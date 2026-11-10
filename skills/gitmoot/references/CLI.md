@@ -1095,13 +1095,30 @@ about their pull requests, at most 50 per sweep:
 - **Merged:** one comment per pull request on the repository's issue for the
   ISO week, titled `[design-notes] <owner/repo> <YYYY-Www>` and labelled
   `design-notes` and `agent:<role>` (the review requester, as for `review-p2`
-  issues). Each finding lists its title, `file:line`, detail (quoted, and cut at
-  4000 bytes with a note), review job, pull request and merged head, and a
-  `finding-uid:` line. Notes too long for one comment continue in further
-  comments. The week's issue is reused once it exists; when the sweep opens it,
-  the role gets one message.
+  issues). The issue body says the notes are its comments, that each may
+  already be fixed on the default branch, and to close the issue once every
+  note is triaged. Each finding lists its title, `file:line`, detail (quoted,
+  and cut at 4000 bytes with a note; a title cut in the heading is quoted in
+  full when there is no other detail), review job, pull request and merged
+  head, and a `finding-uid:` line. Notes too long for one comment continue in
+  further comments. The week's issue is reused once it exists, found by exact
+  title even if its labels never landed; when the sweep opens it, the role
+  gets one message.
 - **Closed without merging:** skipped for good.
 - **Still open:** checked again by a later sweep.
+
+Before posting a merged pull request's findings, the sweep skips, for good,
+those not worth a note. A finding the reviewer declared answered or withdrawn
+is skipped even when the ledger kept it open for want of evidence (the merge
+gate still sees it open); for findings recorded before the declared state was
+kept, a title starting `Resolved`, `Addressed` or `R<n> [remains]
+resolved/addressed` stands in. Then one GitHub compare of the pull request's
+merge commit with the default branch: a finding whose file was since removed
+or renamed away, or whose line is within 3 lines of a later hunk, is skipped
+(`cited file removed since merge`, `cited lines changed since merge`); one
+whose file changed elsewhere is posted with a `Changed since merge:` line. If
+the compare fails, is truncated, or the merge commit or default branch is
+unknown, every finding is posted as before.
 
 A finding is filed once: before commenting, the sweep records an attempt for
 each finding it is about to post, and until that finding is filed it reads the

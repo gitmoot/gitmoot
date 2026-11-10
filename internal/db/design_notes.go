@@ -18,6 +18,19 @@ import (
 // request closed without merging: there is nothing merged to follow up on.
 const DesignNoteSkipClosedUnmerged = "closed-unmerged"
 
+// DesignNoteSkipDeclaredResolved is the skip reason for a finding whose latest
+// observation the reviewer declared answered or withdrawn, though the ledger
+// recorded it open for want of evidence (#2566).
+const DesignNoteSkipDeclaredResolved = "declared resolved by its reviewer"
+
+// The skip reasons of a finding the default branch outdated after its pull
+// request merged: the file it cites was removed or renamed away, or a later
+// change rewrote the lines it cites.
+const (
+	DesignNoteSkipFileRemoved  = "cited file removed since merge"
+	DesignNoteSkipLinesChanged = "cited lines changed since merge"
+)
+
 // DesignNoteCandidate is one finding the sweep may file: the LATEST observation
 // of a finding whose first observation is inside the sweep window.
 type DesignNoteCandidate struct {
@@ -31,6 +44,10 @@ type DesignNoteCandidate struct {
 	Detail      string
 	File        string
 	Line        int64
+	// DeclaredState is the state the reviewer declared on the latest
+	// observation (review_finding_observations.declared_state); "" on rows
+	// recorded before #2566 that the migration could not backfill.
+	DeclaredState FindingState
 	// Seq is the latest observation's rowid: the ledger's insertion order,
 	// comparable across findings.
 	Seq int64
@@ -50,12 +67,12 @@ func (s *Store) ListDesignNoteCandidates(ctx context.Context, since time.Time) (
 	return queryList(ctx, s.db, `
 WITH ranked AS (
 	SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, state, severity,
-		title, detail, file, line, rowid AS seq,
+		title, detail, file, line, declared_state, rowid AS seq,
 		ROW_NUMBER() OVER (PARTITION BY finding_uid ORDER BY rowid DESC) AS latest_rank,
 		MIN(julianday(observed_at)) OVER (PARTITION BY finding_uid) AS first_seen
 	FROM review_finding_observations
 )
-SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, title, detail, file, line, seq
+SELECT finding_uid, repo, pull_request, head_sha, observed_at, observer_job, title, detail, file, line, declared_state, seq
 FROM ranked
 WHERE latest_rank = 1 AND state = 'open' AND UPPER(TRIM(severity)) = 'P3'
 	AND first_seen >= julianday(?)
@@ -66,7 +83,7 @@ ORDER BY repo, pull_request, first_seen, finding_uid`,
 		func(row rowScanner) (DesignNoteCandidate, error) {
 			var c DesignNoteCandidate
 			err := row.Scan(&c.FindingUID, &c.Repo, &c.PullRequest, &c.HeadSHA, &c.ObservedAt,
-				&c.ObserverJob, &c.Title, &c.Detail, &c.File, &c.Line, &c.Seq)
+				&c.ObserverJob, &c.Title, &c.Detail, &c.File, &c.Line, &c.DeclaredState, &c.Seq)
 			return c, err
 		})
 }

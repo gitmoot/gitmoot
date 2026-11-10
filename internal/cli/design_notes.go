@@ -23,10 +23,11 @@ const (
 // designNotesGitHubClient is the GitHub surface the design-notes sweep needs.
 type designNotesGitHubClient interface {
 	GetPullRequest(ctx context.Context, repo github.Repository, number int64) (github.PullRequest, error)
-	SearchIssuesByTitle(ctx context.Context, repo github.Repository, title, label string) ([]github.Issue, error)
+	SearchIssuesByTitle(ctx context.Context, repo github.Repository, title string) ([]github.Issue, error)
 	CreateIssue(ctx context.Context, input github.CreateIssueInput) (github.Issue, error)
 	ListIssueComments(ctx context.Context, repo github.Repository, issueNumber int64) ([]github.IssueComment, error)
 	PostIssueComment(ctx context.Context, repo github.Repository, issueNumber int64, body string) (github.IssueComment, error)
+	CompareCommits(ctx context.Context, repo github.Repository, base string, head string) (github.CompareResult, error)
 }
 
 var newDesignNotesGitHubClient = func() designNotesGitHubClient {
@@ -90,17 +91,19 @@ func wireDesignNotes(engine *workflow.Engine, gh designNotesGitHubClient) {
 		}
 		merged := pr.Merged || strings.TrimSpace(pr.MergedAt) != ""
 		return workflow.DesignNotesPullRequestState{
-			Merged:  merged,
-			Closed:  !merged && strings.EqualFold(strings.TrimSpace(pr.State), "closed"),
-			HeadSHA: strings.TrimSpace(pr.HeadSHA),
+			Merged:         merged,
+			Closed:         !merged && strings.EqualFold(strings.TrimSpace(pr.State), "closed"),
+			HeadSHA:        strings.TrimSpace(pr.HeadSHA),
+			MergeCommitSHA: strings.TrimSpace(pr.MergeSHA),
+			DefaultBranch:  strings.TrimSpace(pr.BaseRepoDefaultBranch),
 		}, nil
 	}
-	engine.DesignNotesFindIssue = func(ctx context.Context, repo, title, label string) (workflow.DesignNotesIssue, bool, error) {
+	engine.DesignNotesFindIssue = func(ctx context.Context, repo, title string) (workflow.DesignNotesIssue, bool, error) {
 		r, err := github.ParseRepository(repo)
 		if err != nil {
 			return workflow.DesignNotesIssue{}, false, err
 		}
-		issues, err := gh.SearchIssuesByTitle(ctx, r, title, label)
+		issues, err := gh.SearchIssuesByTitle(ctx, r, title)
 		if err != nil {
 			return workflow.DesignNotesIssue{}, false, err
 		}
@@ -147,5 +150,12 @@ func wireDesignNotes(engine *workflow.Engine, gh designNotesGitHubClient) {
 		}
 		_, err = gh.PostIssueComment(ctx, r, issue, body)
 		return err
+	}
+	engine.DesignNotesCompare = func(ctx context.Context, repo, base, head string) (github.CompareResult, error) {
+		r, err := github.ParseRepository(repo)
+		if err != nil {
+			return github.CompareResult{}, err
+		}
+		return gh.CompareCommits(ctx, r, base, head)
 	}
 }

@@ -86,6 +86,14 @@ type ReviewFindingObservation struct {
 	Rationale        string
 	SourceJob        string
 	WithdrawReason   string
+
+	// DeclaredState is the state the REVIEWER declared, before the ledger
+	// writer weighed the evidence: a declared answer with weak evidence is
+	// recorded open (State) for the merge gate, yet the reviewer did call it
+	// answered. Readers that report findings to people (the design-notes sweep)
+	// honour it; the gate never reads it. "" when the reviewer declared no
+	// known state, and on rows recorded before #2566 that no backfill resolved.
+	DeclaredState FindingState
 }
 
 var (
@@ -470,12 +478,12 @@ func (s *Store) RecordReviewFindingObservation(ctx context.Context, obs ReviewFi
 	finding_uid, repo, pull_request, head_sha, observed_at, observer_job, state,
 	severity, round_label, label_absent, title, detail, file, line,
 	relevance_keys, evidence_kind, executed_commands, executed_count,
-	evidence_locator, rationale, source_job, withdraw_reason)
-VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	evidence_locator, rationale, source_job, withdraw_reason, declared_state)
+VALUES (?, ?, ?, ?, COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%fZ','now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		uid, repo, obs.PullRequest, head, strings.TrimSpace(obs.ObservedAt), obs.ObserverJob, string(obs.State),
 		severity, obs.RoundLabel, labelAbsent, obs.Title, obs.Detail, obs.File, obs.Line,
 		string(keys), string(obs.EvidenceKind), string(cmds), obs.ExecutedCount,
-		obs.EvidenceLocator, obs.Rationale, obs.SourceJob, obs.WithdrawReason); err != nil {
+		obs.EvidenceLocator, obs.Rationale, obs.SourceJob, obs.WithdrawReason, string(obs.DeclaredState)); err != nil {
 		// The key is (finding_uid, head_sha, observer_job), so this fires only for a
 		// REPEAT by one observer. A second reviewer at the same head is admitted by
 		// the key rather than reported here (#1850 review F8).
@@ -660,21 +668,22 @@ func (s *Store) ListReviewFindingObservations(ctx context.Context, repo string, 
 	return queryList(ctx, s.db, `SELECT finding_uid, repo, pull_request, head_sha, observed_at,
 	observer_job, state, severity, round_label, label_absent, title, detail, file, line,
 	relevance_keys, evidence_kind, executed_commands, executed_count, evidence_locator,
-	rationale, source_job, withdraw_reason
+	rationale, source_job, withdraw_reason, declared_state
 FROM review_finding_observations
 WHERE repo = ? AND pull_request = ?
 ORDER BY rowid`, []any{strings.TrimSpace(repo), pullRequest},
 		func(row rowScanner) (ReviewFindingObservation, error) {
 			var obs ReviewFindingObservation
-			var state, kind, keys, cmds string
+			var state, kind, keys, cmds, declared string
 			var labelAbsent int
 			if err := row.Scan(&obs.FindingUID, &obs.Repo, &obs.PullRequest, &obs.HeadSHA, &obs.ObservedAt,
 				&obs.ObserverJob, &state, &obs.Severity, &obs.RoundLabel, &labelAbsent, &obs.Title,
 				&obs.Detail, &obs.File, &obs.Line, &keys, &kind, &cmds, &obs.ExecutedCount,
-				&obs.EvidenceLocator, &obs.Rationale, &obs.SourceJob, &obs.WithdrawReason); err != nil {
+				&obs.EvidenceLocator, &obs.Rationale, &obs.SourceJob, &obs.WithdrawReason, &declared); err != nil {
 				return ReviewFindingObservation{}, err
 			}
 			obs.State = FindingState(state)
+			obs.DeclaredState = FindingState(declared)
 			obs.EvidenceKind = EvidenceKind(kind)
 			obs.LabelAbsent = labelAbsent == 1
 			// DECODE ERRORS ARE RETURNED, NOT SWALLOWED (#1850 review F10). A
@@ -700,21 +709,22 @@ func (s *Store) ListReviewFindingObservationsByJob(ctx context.Context, repo str
 	return queryList(ctx, s.db, `SELECT finding_uid, repo, pull_request, head_sha, observed_at,
 	observer_job, state, severity, round_label, label_absent, title, detail, file, line,
 	relevance_keys, evidence_kind, executed_commands, executed_count, evidence_locator,
-	rationale, source_job, withdraw_reason
+	rationale, source_job, withdraw_reason, declared_state
 FROM review_finding_observations
 WHERE repo = ? AND pull_request = ? AND observer_job = ? AND head_sha = ?
 ORDER BY rowid`, []any{strings.TrimSpace(repo), pullRequest, observerJob, headSHA},
 		func(row rowScanner) (ReviewFindingObservation, error) {
 			var obs ReviewFindingObservation
-			var state, kind, keys, cmds string
+			var state, kind, keys, cmds, declared string
 			var labelAbsent int
 			if err := row.Scan(&obs.FindingUID, &obs.Repo, &obs.PullRequest, &obs.HeadSHA, &obs.ObservedAt,
 				&obs.ObserverJob, &state, &obs.Severity, &obs.RoundLabel, &labelAbsent, &obs.Title,
 				&obs.Detail, &obs.File, &obs.Line, &keys, &kind, &cmds, &obs.ExecutedCount,
-				&obs.EvidenceLocator, &obs.Rationale, &obs.SourceJob, &obs.WithdrawReason); err != nil {
+				&obs.EvidenceLocator, &obs.Rationale, &obs.SourceJob, &obs.WithdrawReason, &declared); err != nil {
 				return ReviewFindingObservation{}, err
 			}
 			obs.State = FindingState(state)
+			obs.DeclaredState = FindingState(declared)
 			obs.EvidenceKind = EvidenceKind(kind)
 			obs.LabelAbsent = labelAbsent == 1
 			// DECODE ERRORS ARE RETURNED, NOT SWALLOWED (#1850 review F10). A

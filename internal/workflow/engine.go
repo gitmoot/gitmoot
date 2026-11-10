@@ -13,6 +13,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
+	"github.com/gitmoot/gitmoot/internal/github"
 )
 
 type Engine struct {
@@ -321,18 +322,24 @@ type Engine struct {
 	// The DesignNotes* hooks are the GitHub seams of the weekly design-notes
 	// sweep (#2558, SweepDesignNotes). Like PostMergeFollowUpIssue they are
 	// wired only in cli. DesignNotesPullRequest reports whether a pull request
-	// merged, closed unmerged, or is still open. DesignNotesFindIssue looks up
-	// an existing issue by exact title and label; when nil the sweep relies on
+	// merged, closed unmerged, or is still open, with its merge commit and the
+	// repository's default branch. DesignNotesFindIssue looks up an existing
+	// issue by exact title, labelled or not (labels are applied best effort,
+	// so an issue may lack them); when nil the sweep relies on
 	// its own record alone. DesignNotesCreateIssue opens the week's issue,
 	// DesignNotesListComments returns the bodies of an issue's comments (the
 	// sweep reconciles against their finding-uid markers before posting), and
 	// DesignNotesComment appends one comment. With any required hook nil the
-	// sweep files nothing.
+	// sweep files nothing. DesignNotesCompare returns the base...head compare
+	// (GitHub's "compare two commits"); the sweep calls it once per merged pull
+	// request, from its merge commit to the default branch, to leave out notes
+	// the default branch has since outdated. When nil, every note is posted.
 	DesignNotesPullRequest  func(ctx context.Context, repo string, number int) (DesignNotesPullRequestState, error)
-	DesignNotesFindIssue    func(ctx context.Context, repo, title, label string) (issue DesignNotesIssue, found bool, err error)
+	DesignNotesFindIssue    func(ctx context.Context, repo, title string) (issue DesignNotesIssue, found bool, err error)
 	DesignNotesCreateIssue  func(ctx context.Context, repo, title, body string, labels []string) (DesignNotesIssue, error)
 	DesignNotesListComments func(ctx context.Context, repo string, issue int64) (bodies []string, err error)
 	DesignNotesComment      func(ctx context.Context, repo string, issue int64, body string) error
+	DesignNotesCompare      func(ctx context.Context, repo, base, head string) (github.CompareResult, error)
 	// LedgerResolvers is the #1822 ledger's SHARED resolver value. The merge gate
 	// holds the SAME value, assigned from one construction in the daemon, so the
 	// review brief and the gate cannot compute different obligation sets. Two

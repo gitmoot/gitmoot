@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 )
 
 const (
@@ -46,11 +47,17 @@ type designNotesFake struct {
 	listErr   map[int64]error
 	onState   func(number int)
 	onComment func(number int)
+	// compares maps a base (merge commit) to its compare with the default
+	// branch; compareErr fails one. compareCalls logs "repo base...head".
+	compares     map[string]github.CompareResult
+	compareErr   map[string]error
+	compareCalls []string
 }
 
 func newDesignNotesFake() *designNotesFake {
 	return &designNotesFake{states: map[int]DesignNotesPullRequestState{}, stateCalls: map[int]int{},
-		commentErr: map[int]error{}, landed: map[int]bool{}, listErr: map[int64]error{}}
+		commentErr: map[int]error{}, landed: map[int]bool{}, listErr: map[int64]error{},
+		compares: map[string]github.CompareResult{}, compareErr: map[string]error{}}
 }
 
 func (f *designNotesFake) wire(e *Engine) {
@@ -66,11 +73,8 @@ func (f *designNotesFake) wire(e *Engine) {
 		}
 		return state, nil
 	}
-	e.DesignNotesFindIssue = func(_ context.Context, _, _, label string) (DesignNotesIssue, bool, error) {
+	e.DesignNotesFindIssue = func(_ context.Context, _, _ string) (DesignNotesIssue, bool, error) {
 		f.searches++
-		if label != designNotesLabel {
-			return DesignNotesIssue{}, false, fmt.Errorf("searched label %q", label)
-		}
 		if f.found != nil {
 			return *f.found, true, nil
 		}
@@ -113,6 +117,13 @@ func (f *designNotesFake) wire(e *Engine) {
 			}
 		}
 		return nil
+	}
+	e.DesignNotesCompare = func(_ context.Context, repo, base, head string) (github.CompareResult, error) {
+		f.compareCalls = append(f.compareCalls, repo+" "+base+"..."+head)
+		if err := f.compareErr[base]; err != nil {
+			return github.CompareResult{}, err
+		}
+		return f.compares[base], nil
 	}
 }
 
@@ -168,6 +179,12 @@ type designNoteObs struct {
 	ago       time.Duration
 	detail    string
 	file      string
+	// noFile records a finding that cites no file; line overrides the
+	// default line 42, and lineless records line 0.
+	noFile   bool
+	line     int64
+	lineless bool
+	declared db.FindingState
 }
 
 func recordDesignNote(t *testing.T, store *db.Store, o designNoteObs) string {
@@ -181,13 +198,17 @@ func recordDesignNote(t *testing.T, store *db.Store, o designNoteObs) string {
 		detail = "detail of " + o.title
 	}
 	file := o.file
-	if file == "" {
+	if file == "" && !o.noFile {
 		file = "internal/x.go"
 	}
+	line := o.line
+	if line == 0 && !o.lineless {
+		line = 42
+	}
 	obs := db.ReviewFindingObservation{
-		Repo: designNotesRepo, PullRequest: o.pr, HeadSHA: head, State: o.state, Severity: o.severity,
+		Repo: designNotesRepo, PullRequest: o.pr, HeadSHA: head, State: o.state, DeclaredState: o.declared, Severity: o.severity,
 		ContinuesUID: o.continues, ObserverJob: o.job, Title: o.title, Detail: detail,
-		File: file, Line: 42, EvidenceKind: db.EvidenceExecuted,
+		File: file, Line: line, EvidenceKind: db.EvidenceExecuted,
 		ExecutedCommands: []string{"go test ./internal/x/"}, ExecutedCount: 1,
 		ObservedAt: designNotesNow.Add(-o.ago).Format(time.RFC3339),
 	}
@@ -255,8 +276,15 @@ func TestDesignNotesSweepFilesMergedOpenP3sOnceIntoTheWeekIssue(t *testing.T) {
 	if got := strings.Join(fake.createLabels[0], ","); got != "design-notes,agent:lead" {
 		t.Fatalf("issue labels = %s", got)
 	}
-	if !strings.Contains(fake.createBody, "advisory P3 findings from the review design checklist") || !strings.Contains(fake.createBody, "close this issue once they are triaged") {
-		t.Fatalf("issue body does not explain design notes: %q", fake.createBody)
+	// The body says where the notes are, that each may already be fixed, and
+	// when to close the issue (#2566).
+	for _, want := range []string{"advisory P3 findings from the review design checklist",
+		"The notes are the comments below, one per merged pull request.",
+		"may already be fixed on the default branch, so check the current code before acting",
+		"close this issue once every note is triaged"} {
+		if !strings.Contains(fake.createBody, want) {
+			t.Fatalf("issue body lacks %q: %q", want, fake.createBody)
+		}
 	}
 	if len(fake.comments) != 2 {
 		t.Fatalf("posted %d comments, want one per merged PR", len(fake.comments))
