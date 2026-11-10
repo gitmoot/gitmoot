@@ -1,6 +1,9 @@
 package runtime
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A no-execution seat runs only on omp builds whose gating was measured
 // (#2364, #2561); anything else, including a neighbouring patch release or a
@@ -12,8 +15,15 @@ func TestOmpNoExecutionVersionGate(t *testing.T) {
 		}
 	}
 	for _, version := range []string{"", "omp/18.18.5", "omp/18.18.7", "omp/18.10.40", "18.18.6", "omp/18.18.6-dev"} {
-		if err := OmpNoExecutionVersionError(version); err == nil {
+		err := OmpNoExecutionVersionError(version)
+		if err == nil {
 			t.Errorf("unmeasured version %q accepted", version)
+			continue
+		}
+		// The refusal names every version the gate accepts, so it cannot
+		// contradict the allowlist.
+		if !strings.Contains(err.Error(), "verified: omp/18.10.4, omp/18.18.6)") {
+			t.Errorf("refusal for %q does not list the verified versions: %v", version, err)
 		}
 	}
 }

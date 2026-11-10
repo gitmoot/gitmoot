@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -651,7 +652,12 @@ func OmpNoExecutionVersionError(version string) error {
 	if version == "" {
 		version = "unknown"
 	}
-	return fmt.Errorf("no-execution review refused: installed omp version %q has not been verified for no-execution seats (verified: omp/18.10.4, omp/18.18.6)", version)
+	verified := make([]string, 0, len(ompNoExecutionVerifiedVersions))
+	for v := range ompNoExecutionVerifiedVersions {
+		verified = append(verified, v)
+	}
+	slices.Sort(verified)
+	return fmt.Errorf("no-execution review refused: installed omp version %q has not been verified for no-execution seats (verified: %s)", version, strings.Join(verified, ", "))
 }
 
 // ompDiscoveryProviders is every config-discovery provider omp ships (the ids
