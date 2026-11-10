@@ -2032,6 +2032,10 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// then saw only the grant env. #1810's review called this shape-dependence
 		// out; routing through grants.env is what makes the fix shape-independent.
 		if agent.NoExecution {
+			// On an execution-backend instance the backend only starts a
+			// command outside the workspace in a launch dir the runner names
+			// (#2563); a plain host runner starts anywhere.
+			curated = withExecutionInstanceLaunchDir(curated, launchDir)
 			return landlockNoExecutionRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
 		}
 		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
@@ -2144,6 +2148,71 @@ func withOmpNoExecutionLaunchDir(adapter workflow.DeliveryAdapter, launchDir str
 		return &copied, nil
 	default:
 		return nil, fmt.Errorf("no-execution seat cannot run on adapter %T; only omp is supported", adapter)
+	}
+}
+
+// withExecutionInstanceLaunchDir names launchDir on the execution-backend
+// instance runner inside runner, so the backend may start the no-execution
+// seat there although it lies outside the instance workspace (#2563). The
+// backend still validates the dir. Each wrapper keeps its shape; pointer
+// runners are copied, never mutated. A runner that reaches no instance is
+// returned unchanged in effect.
+func withExecutionInstanceLaunchDir(runner subprocess.Runner, launchDir string) subprocess.Runner {
+	switch r := runner.(type) {
+	case execbackend.InstanceRunner:
+		r.LaunchDir = launchDir
+		return r
+	case *execbackend.InstanceRunner:
+		if r == nil {
+			return runner
+		}
+		copied := *r
+		copied.LaunchDir = launchDir
+		return &copied
+	case subprocess.TeeRunner:
+		if r.Inner != nil {
+			if inner, ok := withExecutionInstanceLaunchDir(r.Inner, launchDir).(subprocess.StreamRunner); ok {
+				r.Inner = inner
+			}
+		}
+		return r
+	case *subprocess.TeeRunner:
+		if r == nil {
+			return runner
+		}
+		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.TeeRunner)
+		return &copied
+	case subprocess.EnvInjectingRunner:
+		if r.Inner != nil {
+			r.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
+		}
+		return r
+	case *subprocess.EnvInjectingRunner:
+		if r == nil {
+			return runner
+		}
+		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.EnvInjectingRunner)
+		return &copied
+	case subprocess.WrappingRunner:
+		if r.Inner != nil {
+			r.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
+		}
+		return r
+	case *subprocess.WrappingRunner:
+		if r == nil {
+			return runner
+		}
+		copied := withExecutionInstanceLaunchDir(*r, launchDir).(subprocess.WrappingRunner)
+		return &copied
+	case *credgw.Runner:
+		if r == nil || r.Inner == nil {
+			return runner
+		}
+		copied := *r
+		copied.Inner = withExecutionInstanceLaunchDir(r.Inner, launchDir)
+		return &copied
+	default:
+		return runner
 	}
 }
 
