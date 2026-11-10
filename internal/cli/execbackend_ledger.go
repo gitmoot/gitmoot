@@ -485,7 +485,7 @@ func execBackendAttemptStateLive(state string) bool {
 }
 
 // settleExpiredAbandonedAttempt releases a provisioning/running/collecting
-// attempt whose teardown never started (#2365): e.g. a daemon restart or a
+// attempt whose provider destroy never ran (#2365): e.g. a daemon restart or a
 // failure path that settled the JOB but never reached Destroy, so the row
 // stayed `running` - a billing state - and held a cost/concurrency cap slot
 // forever. E2B's list is never complete, so the only proof of absence is the

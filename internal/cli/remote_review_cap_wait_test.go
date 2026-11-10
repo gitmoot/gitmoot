@@ -173,6 +173,23 @@ func TestExplicitRemoteReviewWaitsForFullCap(t *testing.T) {
 	if waiting.State != string(workflow.JobQueued) || !queuedJobBlockerHeld(waiting, time.Now()) {
 		t.Fatalf("cap-full remote review state = %s (held=%v); want queued and held", waiting.State, queuedJobBlockerHeld(waiting, time.Now()))
 	}
+	// A slot frees: the next tick admits it to provisioning again instead of
+	// refusing it as a second cloud attempt, as for the checks-routed review.
+	f.backend.provisionErr = errors.New("slot freed; probe stops after Provision")
+	f.job = waiting
+	f.run(t)
+	if f.backend.provisionCalls != 2 {
+		t.Fatalf("provision calls = %d; want the waiting review admitted again", f.backend.provisionCalls)
+	}
+	events, err := f.store.ListJobEvents(f.ctx, f.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if strings.HasPrefix(event.Kind, "remote_review_admission_avoided_") {
+			t.Fatalf("admitted retry was refused: %+v", event)
+		}
+	}
 	// An unconfigured cap never frees, so it still fails at once.
 	g := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
 	g.backend.provisionErr = &db.ExecBackendCapRefusal{Clause: "unconfigured"}

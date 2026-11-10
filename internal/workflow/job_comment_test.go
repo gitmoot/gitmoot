@@ -116,6 +116,24 @@ func TestRenderJobResultCommentDoesNotAnnotatePlainApproval(t *testing.T) {
 	}
 }
 
+// #2373: a part of a split review decides only that part; its posted comment
+// must say so rather than read as a whole-head decision.
+func TestRenderJobResultCommentLabelsAPartVerdict(t *testing.T) {
+	body := RenderJobResultComment(JobResultComment{
+		JobID:    "review-part",
+		JobType:  "review",
+		JobState: string(JobSucceeded),
+		Payload:  JobPayload{ReviewPart: "MM-1-mm-9"},
+		Result:   &AgentResult{Decision: "approved", Summary: "clean part"},
+	})
+	if !strings.Contains(body, "> Part: `mm-1-mm-9`") {
+		t.Fatalf("part verdict comment does not name its part:\n%s", body)
+	}
+	if whole := RenderJobResultComment(JobResultComment{JobID: "review-whole", JobType: "review", Result: &AgentResult{Decision: "approved"}}); strings.Contains(whole, "> Part:") {
+		t.Fatalf("whole-head comment carries a part label:\n%s", whole)
+	}
+}
+
 func TestRenderJobResultCommentRendersFindings(t *testing.T) {
 	body := RenderJobResultComment(JobResultComment{
 		AgentName: "researcher",

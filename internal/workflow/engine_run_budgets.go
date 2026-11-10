@@ -284,7 +284,8 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 // It is called once at the TOP of AdvanceJob rather than at any point inside it.
 // Pipeline-sender reviews are excluded for free: effectiveReviewDecisionForPayload
 // keeps their verdict raw, so they never reach "approved" here. blocked/failed are
-// excluded by the changes_requested test. AddJobEventIfAbsent makes every replay,
+// excluded by the changes_requested test, and a part verdict by
+// recordsApprovedWithNotes (#2373). AddJobEventIfAbsent makes every replay,
 // re-advance and stale round idempotent.
 func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, payload JobPayload) error {
 	if job.Type != "review" || payload.Result == nil ||
@@ -292,7 +293,7 @@ func (e Engine) recordFoldedReviewOutcome(ctx context.Context, job db.Job, paylo
 		return nil
 	}
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
-	if effectiveReviewDecisionForPayload(payload, blockingSeverity) != "approved" {
+	if !recordsApprovedWithNotes(payload, blockingSeverity) {
 		return nil
 	}
 	return e.Store.AddJobEventIfAbsent(ctx, db.JobEvent{

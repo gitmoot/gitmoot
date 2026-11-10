@@ -356,8 +356,8 @@ own; a `destroying` attempt absent from a successful inventory settles to
 `destroyed` (event `execbackend_destroy_confirmed`, cap slot freed) only once it
 is past `ttl_expires_at` plus a 15-minute grace, when E2B's own timeout has
 killed the sandbox. A per-ID 404 never settles it. The same timeout rule
-settles a `provisioning`, `running` or `collecting` attempt whose teardown never
-started (event `execbackend_expired_attempt_settled`), but only when its job is
+settles a `provisioning`, `running` or `collecting` attempt whose provider
+destroy never ran (event `execbackend_expired_attempt_settled`), but only when its job is
 already final (`succeeded`, `failed` or `cancelled`); a running job or a
 missing job row keeps the reservation.
 
@@ -3548,8 +3548,8 @@ when none is known, e.g. a command still `in_flight`),
 status (omp: `ok`, `error`, `in_flight`; codex and kimi report their own status
 text, e.g. `completed (exit 0)`), start/end time and a redacted output tail cut
 to 400 bytes plus a `…` marker. At most 120 commands are listed; later ones are
-counted in `omitted`. An omp end event whose `result` is a non-object JSON value
-(a string, number or array) cannot be decoded and is kept raw, so its shell call
+counted in `omitted`. An omp end event with a `result` that cannot be decoded
+(a scalar, an array, or an object whose fields conflict) is kept raw, so its shell call
 shows as `in_flight`; a `null` or missing `result` decodes as an empty result.
 `sandboxes` lists the
 execution-backend attempts (provider, sandbox id) of that job generation, so a

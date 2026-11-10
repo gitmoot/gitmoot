@@ -113,6 +113,11 @@ func RenderTree(w io.Writer, manifest Manifest) error {
 						approvedReviews++
 					}
 				}
+				// A part verdict decides one part of a split review, never the head
+				// (#2373), so it must not read as a whole-head decision.
+				if part := strings.TrimSpace(review.Attrs["review_part"]); part != "" {
+					decision = fmt.Sprintf("%s · part %s", decision, part)
+				}
 				fmt.Fprintf(w, "      %s · %s · findings %s · %s [%s]\n",
 					dash(review.Attrs["agent"]), decision,
 					dash(review.Attrs["findings_count"]), independence, reviewClaimGrade(review))
