@@ -96,6 +96,7 @@ func wireDesignNotes(engine *workflow.Engine, gh designNotesGitHubClient) {
 			HeadSHA:        strings.TrimSpace(pr.HeadSHA),
 			MergeCommitSHA: strings.TrimSpace(pr.MergeSHA),
 			DefaultBranch:  strings.TrimSpace(pr.BaseRepoDefaultBranch),
+			Repo:           strings.TrimSpace(pr.BaseRepoFullName),
 		}, nil
 	}
 	engine.DesignNotesFindIssue = func(ctx context.Context, repo, title string) (workflow.DesignNotesIssue, bool, error) {

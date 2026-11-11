@@ -58,7 +58,9 @@ type DesignNotesPullRequestState struct {
 	Closed         bool
 	HeadSHA        string
 	MergeCommitSHA string
-	DefaultBranch  string
+	// Repo is the repository's current owner/name on GitHub, "" when unknown.
+	Repo          string
+	DefaultBranch string
 }
 
 // DesignNotesIssue identifies a GitHub issue the sweep files into.
@@ -110,6 +112,9 @@ type DesignNotesSweepResult struct {
 type designNotesPullRequest struct {
 	key      DesignNotesPullRequestKey
 	findings []db.DesignNoteCandidate
+	// github is the repository's current name on GitHub, which every GitHub
+	// call uses (#2569); key.Repo stays the ledger's name for the database.
+	github string
 }
 
 // designNotesSweep is the state of one sweep. markers caches, per
@@ -225,6 +230,10 @@ func (s *designNotesSweep) sweepPullRequest(ctx context.Context, pr designNotesP
 		s.fail(ctx, pr, "pull request state: "+err.Error())
 		return
 	}
+	pr.github = pr.key.Repo
+	if current := strings.TrimSpace(state.Repo); current != "" {
+		pr.github = current
+	}
 	switch {
 	case state.Merged:
 		s.file(ctx, pr, state)
@@ -292,7 +301,7 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 		return
 	}
 	remaining = screened.post
-	issue, err := s.weekIssue(ctx, pr.key.Repo, issueRole)
+	issue, err := s.weekIssue(ctx, pr.github, issueRole)
 	if err != nil {
 		s.fail(ctx, pr, "week issue: "+err.Error())
 		return
@@ -312,13 +321,13 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 		s.fail(ctx, pr, "record attempts on "+issue.URL+" before commenting: "+err.Error())
 		return
 	}
-	posted := s.markers[designNotesIssueKey(pr.key.Repo, issue.Number)]
+	posted := s.markers[designNotesIssueKey(pr.github, issue.Number)]
 	for _, comment := range designNotesComments(pr.key.PullRequest, head, remaining, requesters, screened.branch, screened.changed) {
 		if err := ctx.Err(); err != nil {
 			s.fail(ctx, pr, "deadline before commenting on "+issue.URL+": "+err.Error())
 			return
 		}
-		if err := s.e.DesignNotesComment(ctx, pr.key.Repo, issue.Number, comment.body); err != nil {
+		if err := s.e.DesignNotesComment(ctx, pr.github, issue.Number, comment.body); err != nil {
 			// The post may have landed regardless; the attempts are recorded,
 			// so the next sweep reads the issue back before posting again.
 			s.fail(ctx, pr, "comment on "+issue.URL+": "+err.Error())
@@ -413,7 +422,7 @@ func (s *designNotesSweep) compare(ctx context.Context, pr designNotesPullReques
 	if s.e.DesignNotesCompare == nil || mergeCommit == "" || branch == "" || !designNotesCiteFiles(findings) {
 		return github.CompareResult{}, "", false
 	}
-	result, err := s.e.DesignNotesCompare(ctx, pr.key.Repo, mergeCommit, branch)
+	result, err := s.e.DesignNotesCompare(ctx, pr.github, mergeCommit, branch)
 	if err != nil {
 		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s#%d: compare %s...%s: %v; filing without the staleness check",
 			pr.key.Repo, pr.key.PullRequest, mergeCommit, branch, err))
@@ -580,7 +589,7 @@ func (s *designNotesSweep) readBack(ctx context.Context, pr designNotesPullReque
 		// Every finding attempted here was already resolved by an earlier group.
 		return findings, true
 	}
-	markers, err := s.issueMarkers(ctx, pr.key.Repo, group.issue)
+	markers, err := s.issueMarkers(ctx, pr.github, group.issue)
 	if err != nil {
 		s.fail(ctx, pr, fmt.Sprintf("%v; holding back the %d finding(s) attempted there until it can be read", err, relevant))
 		for uid := range group.uids {
@@ -615,7 +624,7 @@ func (s *designNotesSweep) readBack(ctx context.Context, pr designNotesPullReque
 // issue could not be read or the repair could not be recorded; the pull
 // request is then left for the next sweep.
 func (s *designNotesSweep) reconcile(ctx context.Context, pr designNotesPullRequest, issue DesignNotesIssue, findings []db.DesignNoteCandidate) (remaining []db.DesignNoteCandidate, ok bool) {
-	markers, err := s.issueMarkers(ctx, pr.key.Repo, issue)
+	markers, err := s.issueMarkers(ctx, pr.github, issue)
 	if err != nil {
 		s.fail(ctx, pr, err.Error())
 		return nil, false

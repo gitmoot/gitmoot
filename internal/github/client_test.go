@@ -631,7 +631,7 @@ func TestGetPullRequestDecodesHeadRepository(t *testing.T) {
 func TestGetPullRequestDecodesMergeCommitAndBaseDefaultBranch(t *testing.T) {
 	runner := &fakeRunner{
 		results: []subprocess.Result{{
-			Stdout: `{"number": 2, "state": "closed", "merged": true, "merge_commit_sha": "merge123", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "release", "repo": {"default_branch": "main"}}}`,
+			Stdout: `{"number": 2, "state": "closed", "merged": true, "merge_commit_sha": "merge123", "head": {"ref": "task", "sha": "head123"}, "base": {"ref": "release", "repo": {"full_name": "neworg/moved", "default_branch": "main"}}}`,
 		}},
 	}
 	client := GhClient{Runner: runner}
@@ -640,8 +640,8 @@ func TestGetPullRequestDecodesMergeCommitAndBaseDefaultBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPullRequest returned error: %v", err)
 	}
-	if pr.MergeSHA != "merge123" || pr.BaseRef != "release" || pr.BaseRepoDefaultBranch != "main" {
-		t.Fatalf("merge sha %q, base ref %q, base default branch %q", pr.MergeSHA, pr.BaseRef, pr.BaseRepoDefaultBranch)
+	if pr.MergeSHA != "merge123" || pr.BaseRef != "release" || pr.BaseRepoDefaultBranch != "main" || pr.BaseRepoFullName != "neworg/moved" {
+		t.Fatalf("merge sha %q, base ref %q, base default branch %q, base repo %q", pr.MergeSHA, pr.BaseRef, pr.BaseRepoDefaultBranch, pr.BaseRepoFullName)
 	}
 }
 

@@ -114,6 +114,11 @@ type PullRequest struct {
 	// BaseRepoDefaultBranch is the default branch of the repository the PR
 	// targets (base.repo.default_branch), or "" when the payload omits it.
 	BaseRepoDefaultBranch string
+	// BaseRepoFullName is the repository's CURRENT owner/name
+	// (base.repo.full_name). After a transfer or rename GitHub still serves
+	// the old name on REST calls but not in issue search (#2569), so callers
+	// that search use this name.
+	BaseRepoFullName string
 }
 
 // PullRequestLabel is a single GitHub label on a PR (only the name is used).
@@ -156,6 +161,7 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 			Ref  string `json:"ref"`
 			SHA  string `json:"sha"`
 			Repo *struct {
+				FullName      string `json:"full_name"`
 				DefaultBranch string `json:"default_branch"`
 			} `json:"repo"`
 		} `json:"base"`
@@ -189,8 +195,10 @@ func (p *PullRequest) UnmarshalJSON(data []byte) error {
 	p.BaseRef = decoded.Base.Ref
 	p.BaseSHA = decoded.Base.SHA
 	p.BaseRepoDefaultBranch = ""
+	p.BaseRepoFullName = ""
 	if decoded.Base.Repo != nil {
 		p.BaseRepoDefaultBranch = decoded.Base.Repo.DefaultBranch
+		p.BaseRepoFullName = decoded.Base.Repo.FullName
 	}
 	p.Labels = decoded.Labels
 	return nil
