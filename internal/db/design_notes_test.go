@@ -75,7 +75,7 @@ func TestDesignNotesMigrationUpgradesThroughOpen(t *testing.T) {
 	if again, err := store.RecordDesignNoteIssue(ctx, DesignNoteIssue{Repo: "o/r", ISOWeek: "2026-W46", Number: 6, URL: "https://github.com/o/r/issues/6"}, now); err != nil || again.Number != 5 {
 		t.Fatalf("second issue for the week = %+v, %v; want the recorded #5 kept", again, err)
 	}
-	pending, err := store.ListDesignNoteIssuesAwaitingNotice(ctx, "2026-W46")
+	pending, err := store.ListDesignNoteIssuesAwaitingNotice(ctx, now.Add(-time.Hour))
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("awaiting notice = %+v, %v", pending, err)
 	}
@@ -114,7 +114,7 @@ func TestDesignNoteIssueNoticeIsAtomicWithItsMessage(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, `DROP TRIGGER design_note_notice_crash`); err != nil {
 		t.Fatalf("drop trigger: %v", err)
 	}
-	if pending, err := store.ListDesignNoteIssuesAwaitingNotice(ctx, "2026-W46"); err != nil || len(pending) != 1 {
+	if pending, err := store.ListDesignNoteIssuesAwaitingNotice(ctx, now.Add(-time.Hour)); err != nil || len(pending) != 1 {
 		t.Fatalf("awaiting notice = %+v, %v", pending, err)
 	}
 	if sent, err := store.SendDesignNoteIssueNotice(ctx, "o/r", "2026-W46", "notice", now); err != nil || !sent {

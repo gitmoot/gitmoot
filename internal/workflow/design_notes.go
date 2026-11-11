@@ -23,6 +23,11 @@ const (
 	// DesignNotesSweepLimit bounds the pull requests one sweep checks, so a
 	// backlog cannot stall the daemon; the rest wait for the next sweep.
 	DesignNotesSweepLimit = 50
+	// designNotesNoticeMaxAge bounds how long an owed role notice is retried:
+	// a notice whose issue was recorded longer ago is left unsent, unmarked
+	// and unreported, as stale news and so an unsendable row cannot fail
+	// every sweep forever.
+	designNotesNoticeMaxAge = 14 * 24 * time.Hour
 	// designNotesGrace bounds a local write that may outlive the sweep's
 	// deadline because it records a GitHub action already taken: a created
 	// issue or a posted comment. Diagnostics never outlive the deadline.
@@ -759,29 +764,32 @@ func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo string, n
 	}
 	// Bounded by the sweep's deadline: an unsent notice stays pending and is
 	// retried by the next sweep.
-	s.notify(ctx, repo, opened.URL)
+	s.notify(ctx, repo, s.week, opened.URL)
 	return opened, nil
 }
 
-// sendPendingNotices retries the notices of this week's created issues whose
-// earlier send failed.
+// sendPendingNotices retries every created issue's notice whose earlier send
+// failed or never ran (the daemon stopped between recording the issue and
+// notifying), whatever its week, if the issue was recorded within
+// designNotesNoticeMaxAge: a notice left owing at a week's end is still sent
+// by the next week's sweep, for its own week's issue.
 func (s *designNotesSweep) sendPendingNotices(ctx context.Context) {
-	pending, err := s.e.Store.ListDesignNoteIssuesAwaitingNotice(ctx, s.week)
+	pending, err := s.e.Store.ListDesignNoteIssuesAwaitingNotice(ctx, s.now.Add(-designNotesNoticeMaxAge))
 	if err != nil {
 		s.result.Errors = append(s.result.Errors, "pending notices: "+err.Error())
 		return
 	}
 	for _, issue := range pending {
-		s.notify(ctx, issue.Repo, issue.URL)
+		s.notify(ctx, issue.Repo, issue.ISOWeek, issue.URL)
 	}
 }
 
-// notify tells the role of the week's created issue, once: the message and
-// the notified mark are one store transaction.
-func (s *designNotesSweep) notify(ctx context.Context, repo, url string) {
-	body := fmt.Sprintf("Design notes for %s this week: %s. Advisory; nothing blocks.", repo, url)
-	if _, err := s.e.Store.SendDesignNoteIssueNotice(ctx, repo, s.week, body, s.now); err != nil {
-		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s: notice: %v", repo, err))
+// notify tells the role of repo's created issue for week, once: the message
+// and the notified mark are one store transaction.
+func (s *designNotesSweep) notify(ctx context.Context, repo, week, url string) {
+	body := fmt.Sprintf("Design notes for %s %s: %s. Advisory; nothing blocks.", repo, week, url)
+	if _, err := s.e.Store.SendDesignNoteIssueNotice(ctx, repo, week, body, s.now); err != nil {
+		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s %s: notice: %v", repo, week, err))
 	}
 }
 

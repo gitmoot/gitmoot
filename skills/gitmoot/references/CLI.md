@@ -1103,7 +1103,9 @@ about their pull requests, at most 50 per sweep:
   head, and a `finding-uid:` line. Notes too long for one comment continue in
   further comments. The week's issue is reused once it exists, found by exact
   title even if its labels never landed; when the sweep opens it, the role
-  gets one message.
+  gets one message naming the issue's week. A message that could not be sent
+  is sent by a later sweep, even one in a later week, for up to 14 days after
+  the issue was opened; after that it is dropped.
 - **Closed without merging:** skipped for good.
 - **Still open:** checked again by a later sweep.
 
