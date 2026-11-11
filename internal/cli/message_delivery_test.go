@@ -42,6 +42,22 @@ func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testi
 				t.Helper()
 				runReplyWakeOutboxDrainOnce(ctx, store, worker, &diagnostic, now, nil)
 			}
+			// The ticks run an hour after the note, so its sender also gets one
+			// deferral notice (#2574); its wake row is the owner's, not this one.
+			workerRows := func() []db.WakeOutboxEntry {
+				t.Helper()
+				rows, err := store.ListWakeOutbox(ctx, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var own []db.WakeOutboxEntry
+				for _, row := range rows {
+					if row.TargetRole == "worker" {
+						own = append(own, row)
+					}
+				}
+				return own
+			}
 			now := time.Now().UTC().Add(time.Hour)
 			for _, held := range []struct {
 				name, agent, reason string
@@ -59,10 +75,7 @@ func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testi
 				for range 2 {
 					tick(now)
 				}
-				rows, err := store.ListWakeOutbox(ctx, "")
-				if err != nil {
-					t.Fatal(err)
-				}
+				rows := workerRows()
 				if len(rows) != 1 || rows[0].State != db.WakeOutboxStatePending || rows[0].AttemptCount != 0 || rows[0].LastError != held.reason || wake.promptCalls != 0 {
 					t.Fatalf("%s was not held pending with reason %q: rows=%+v calls=%d log=%s", held.name, held.reason, rows, wake.promptCalls, diagnostic.String())
 				}
@@ -77,10 +90,7 @@ func TestMessageDaemonDefersUnreachableRecipientsAndNeverReplaysUnknown(t *testi
 			wake.labelToPane = map[string]string{"agent:worker": "w1:p3"}
 			wake.onPrompt = func() error { panic("transport crashed after input may have been written") }
 			tick(now)
-			rows, err := store.ListWakeOutbox(ctx, "")
-			if err != nil {
-				t.Fatal(err)
-			}
+			rows := workerRows()
 			if wake.promptCalls != 1 || wake.pane != "w1:p3" || len(rows) != 1 || rows[0].State != db.WakeOutboxStateDeliveryUnknown {
 				t.Fatalf("recreated recipient/unknown outcome: rows=%+v calls=%d pane=%s", rows, wake.promptCalls, wake.pane)
 			}

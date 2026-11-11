@@ -3254,4 +3254,9 @@ WHERE o.declared_state = ''
 	AND EXISTS (SELECT 1 FROM matched x
 		WHERE x.job_id = o.observer_job AND x.head = o.head_sha AND (x.uid = o.finding_uid OR o.repo || x.uid = o.finding_uid));
 	`,
+	// #2574: when a message's wake stays undelivered, its sender hears once.
+	// The stamp is set in the same transaction as the system notice.
+	`
+ALTER TABLE wake_outbox ADD COLUMN deferral_notice_at TEXT NOT NULL DEFAULT '';
+	`,
 }
