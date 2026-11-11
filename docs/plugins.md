@@ -119,6 +119,20 @@ the last 3 s, no submission still in its input hooks, no dialog or menu, an
 empty editor). After 10 minutes without a key a leftover draft or menu no
 longer blocks delivery; the note never touches either.
 
+An idle session with queued messages (steering, follow-up or next-turn input)
+defers notes as `busy` while OMP may still drain that queue itself, which it
+normally does within seconds. A queue still there will wait for the next
+turn, which OMP does not start on its own, for example after the operator
+interrupted a turn with a follow-up queued. A note starts that turn only when
+both hold: the add-on first saw the queue at least 60 s ago, and no operator
+key has arrived for 10 minutes (counted from when the add-on loaded if there
+was none). Until then it stays deferred, as `busy` or as the operator checks
+above report, so an operator who just stopped the agent does not see it
+resume with the held follow-up. The note then starts a turn as a plain message
+rather than an aside, because OMP folds an idle aside into context without a
+turn after an interrupt; that turn takes the queue with it. The probe reply's
+`state.pendingMessagesForMs` shows how long the queue has waited.
+
 OMP binds extensions from one directory in byte order of their file names and
 runs `input` hooks in that order. The `00-` prefix makes the add-on's input hook
 run before other user extensions' hooks, so it sees a slow operator submission
@@ -133,8 +147,9 @@ outdated (older version, hand edit, or installed for another Gitmoot home), or
 missing. `--live` starts the `omp` on `PATH` in a throwaway pseudo-terminal
 session with its own agent and registry directories and a local stand-in model
 (no network model calls), then checks registration, probe, an idle delivery
-that reaches the model, a deferral while typing, a stale-session refusal, and
-cleanup on exit.
+that reaches the model, a stranded follow-up queue (deferred during the grace
+and after a recent key, then a delivered note whose turn empties the queue),
+a deferral while typing, a stale-session refusal, and cleanup on exit.
 
 ## Verify
 

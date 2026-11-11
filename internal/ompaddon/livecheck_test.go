@@ -16,7 +16,10 @@ func TestLiveCheckAgainstOMP(t *testing.T) {
 		t.Skip("set GITMOOT_TEST_OMP=/path/to/omp to run the add-on in a real OMP")
 	}
 	steps := LiveCheck(context.Background(), omp)
-	want := []string{"session", "probe", "idle-delivery", "deferral", "stale-session", "shutdown"}
+	for _, step := range steps {
+		t.Logf("%s ok=%v: %s", step.Name, step.OK, step.Detail)
+	}
+	want := []string{"session", "probe", "idle-delivery", "stuck-queue", "deferral", "stale-session", "shutdown"}
 	for i, name := range want {
 		if i >= len(steps) {
 			t.Fatalf("live check stopped before %s: %+v", name, steps)
