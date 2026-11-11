@@ -390,12 +390,13 @@ ON CONFLICT(repo, iso_week) DO NOTHING`,
 	return stored, nil
 }
 
-// ListDesignNoteIssuesAwaitingNotice returns the week's issues the sweep
-// created whose role notice is not yet sent.
-func (s *Store) ListDesignNoteIssuesAwaitingNotice(ctx context.Context, week string) ([]DesignNoteIssue, error) {
+// ListDesignNoteIssuesAwaitingNotice returns the issues the sweep created
+// whose role notice is not yet sent, of every week, recorded at or after
+// since, oldest week first.
+func (s *Store) ListDesignNoteIssuesAwaitingNotice(ctx context.Context, since time.Time) ([]DesignNoteIssue, error) {
 	return queryList(ctx, s.db,
-		`SELECT `+designNoteIssueColumns+` FROM design_note_issues WHERE iso_week = ? AND created = 1 AND role <> '' AND notified_at = '' ORDER BY repo`,
-		[]any{week}, scanDesignNoteIssue)
+		`SELECT `+designNoteIssueColumns+` FROM design_note_issues WHERE created = 1 AND role <> '' AND notified_at = '' AND julianday(recorded_at) >= julianday(?) ORDER BY iso_week, repo`,
+		[]any{since.UTC().Format(time.RFC3339Nano)}, scanDesignNoteIssue)
 }
 
 // SendDesignNoteIssueNotice sends the system message body to the role of the

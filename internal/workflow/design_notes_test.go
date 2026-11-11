@@ -325,7 +325,7 @@ func TestDesignNotesSweepFilesMergedOpenP3sOnceIntoTheWeekIssue(t *testing.T) {
 		t.Fatalf("ListMessages: %v", err)
 	}
 	if len(messages) != 1 || messages[0].Sender != db.MessageSystemSender ||
-		messages[0].Body != "Design notes for owner/repo this week: https://github.com/owner/repo/issues/501. Advisory; nothing blocks." {
+		messages[0].Body != "Design notes for owner/repo 2026-W46: https://github.com/owner/repo/issues/501. Advisory; nothing blocks." {
 		t.Fatalf("role messages = %+v, want the one creation notice", messages)
 	}
 
@@ -360,6 +360,42 @@ func TestDesignNotesSweepFilesMergedOpenP3sOnceIntoTheWeekIssue(t *testing.T) {
 	}
 	if messages, _ := store.ListMessages(ctx, "ops", 0, 100); len(messages) != 0 {
 		t.Fatalf("ops got %d messages for a reused issue", len(messages))
+	}
+}
+
+// #2565: a notice still owed when its week ends (a failed send, or a daemon
+// stopped between recording the issue and notifying) is sent by the next
+// week's sweep, for its own week's issue, exactly once. One owed for an issue
+// recorded more than 14 days ago is left alone: not sent, not marked, no error.
+func TestDesignNotesSweepSendsLastWeeksOwedNoticeForItsOwnWeek(t *testing.T) {
+	ctx := context.Background()
+	engine, store, _ := designNotesEngine(t)
+	const lastWeekURL = "https://github.com/owner/repo/issues/400"
+	recordedAt := designNotesNow.Add(-6 * 24 * time.Hour) // Tuesday of 2026-W45
+	if _, err := store.RecordDesignNoteIssue(ctx, db.DesignNoteIssue{Repo: designNotesRepo, ISOWeek: "2026-W45", Number: 400, URL: lastWeekURL, Role: "lead", Created: true}, recordedAt); err != nil {
+		t.Fatalf("RecordDesignNoteIssue: %v", err)
+	}
+	staleAt := designNotesNow.Add(-15 * 24 * time.Hour) // Sunday of 2026-W43
+	if _, err := store.RecordDesignNoteIssue(ctx, db.DesignNoteIssue{Repo: designNotesRepo, ISOWeek: "2026-W43", Number: 300, URL: "https://github.com/owner/repo/issues/300", Role: "lead", Created: true}, staleAt); err != nil {
+		t.Fatalf("RecordDesignNoteIssue (stale): %v", err)
+	}
+	for sweep := 1; sweep <= 2; sweep++ {
+		if r, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil || len(r.Errors) != 0 {
+			t.Fatalf("sweep %d in 2026-W46 = %+v, %v", sweep, r, err)
+		}
+		messages, err := store.ListMessages(ctx, "lead", 0, 100)
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		if len(messages) != 1 || messages[0].Body != "Design notes for owner/repo 2026-W45: "+lastWeekURL+". Advisory; nothing blocks." {
+			t.Fatalf("after sweep %d lead has %+v, want the one 2026-W45 notice", sweep, messages)
+		}
+	}
+	if issue, ok, err := store.GetDesignNoteIssue(ctx, designNotesRepo, "2026-W45"); err != nil || !ok || issue.NotifiedAt == "" {
+		t.Fatalf("2026-W45 issue after its notice = %+v, %v, %v; want it marked notified", issue, ok, err)
+	}
+	if issue, ok, err := store.GetDesignNoteIssue(ctx, designNotesRepo, "2026-W43"); err != nil || !ok || issue.NotifiedAt != "" {
+		t.Fatalf("stale 2026-W43 issue = %+v, %v, %v; want it left unnotified", issue, ok, err)
 	}
 }
 
