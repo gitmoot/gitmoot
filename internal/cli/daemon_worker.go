@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -23,7 +22,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -72,12 +70,7 @@ type jobWorker struct {
 	// declaredRealAdapterPtr is the code pointer of the factory the claim above was
 	// made about, so replacing AdapterFactory withdraws the claim automatically.
 	declaredRealAdapterPtr uintptr
-	// OutputAdapterFactory rebuilds a production runtime adapter around the
-	// shared live-output writer used by progress and retained transcript capture.
-	// Tests that inject an opaque fake AdapterFactory may leave this nil and still
-	// exercise elapsed-only progress without replacing their fake.
-	OutputAdapterFactory func(runtime.Agent, string, io.Writer) (workflow.DeliveryAdapter, error)
-	StartAdapterFactory  func(execbackend.Backend, string, string) (runtime.Adapter, error)
+	StartAdapterFactory    func(execbackend.Backend, string, string) (runtime.Adapter, error)
 	// ExecutionBackendFactory is nil on hand-built/test workers that intentionally
 	// retain the pre-P2b host-only path. executionBackendJobWorker wires it for
 	// real daemon jobs, where one lifecycle instance is acquired after runtime
@@ -135,19 +128,10 @@ type jobWorker struct {
 	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
 	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
 	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
-	// SandboxProbe is the cached host capability check used only for Claude/Kimi
-	// produce stages. nil selects sandbox.SandboxProbe; tests inject deterministic
-	// supported/unsupported results without depending on the test binary's argv.
-	SandboxProbe func() sandbox.ProbeResult
 	// RuntimePreflight evaluates the installed CLI contract immediately before
 	// checkout/adapter construction. nil keeps hand-built test workers unchanged;
 	// defaultJobWorker wires the process-wide identity cache.
 	RuntimePreflight func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult
-	// Progress timing seams keep unit/E2E tests deterministic and short. Zero/nil
-	// values select the package defaults and real timer implementation.
-	PipelineProgressThreshold time.Duration
-	PipelineProgressInterval  time.Duration
-	ProgressTickSource        func(context.Context, time.Duration, time.Duration) <-chan time.Time
 	// PermissionPolicyEffectGit injects the existing git observation primitives.
 	// It is consulted only for a claimed not-applied observation; nil selects the
 	// checkout-bound production client.
@@ -230,7 +214,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	// PRODUCTION assigns through the setter so the factory and the claim that it
 	// execs the declared binary are written together (#1926-f5).
 	worker.setRealAdapterFactory(worker.defaultAdapter)
-	worker.OutputAdapterFactory = worker.outputAdapter
 	worker.StartAdapterFactory = worker.defaultStartAdapter
 	worker.AuthProbe = worker.defaultAuthProbe
 	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
@@ -281,9 +264,9 @@ var recoverKillPendingAtWorkerStartup sync.Once
 // IT WAS "implement" ALONE, AND THAT MADE THE BACKEND UNREACHABLE. The original
 // gate (#1633 slice D) justified itself with "only implement jobs transport
 // changes back to the host", which described the CHANGE-SET path. Then #2203
-// removed implementer dispatch: `agent implement` is gone, DelegationActions is
-// ["ask","review"], and pipeline implement stages are refused at enqueue. No
-// surviving path creates a dispatchable implement job, so the allowlist named
+// removed implementer dispatch: `agent implement` is gone and DelegationActions
+// is ["ask","review"]. No surviving path creates a dispatchable implement job,
+// so the allowlist named
 // exactly one type that can no longer occur and the remote backend accepted
 // nothing at all. Measured on 658ab6ef: a review dispatch failed with that
 // refusal before any sandbox was provisioned.
@@ -644,14 +627,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
 		return nil
 	}
-	if err := w.produceDispatchError(job.Type, agent); err != nil {
-		w.recordProduceSandboxDiagnostic(ctx, job.ID, job.Type, agent)
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
-		return nil
-	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
 		transitioned, blockedFrom, err := markJobPermissionBlocked(ctx, w.Store, job)
 		if err != nil {
@@ -786,16 +761,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 	}
 	deliveryCheckout := checkout
-	var progressTracker *pipeline.PipelineProgressLineTracker
-	if payload.Sender == workflow.PipelineJobSender {
-		progressTracker = &pipeline.PipelineProgressLineTracker{}
-	}
-	var adapter workflow.DeliveryAdapter
-	if progressTracker != nil {
-		adapter, err = w.buildJobAdapterForBackend(execBackend, agent, checkout, progressTracker)
-	} else {
-		adapter, err = w.buildJobAdapterForBackend(execBackend, agent, checkout)
-	}
+	adapter, err := w.buildJobAdapterForBackend(execBackend, agent, checkout)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -963,17 +929,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overridden), Message: jobRuntimeOverrideEventMessage(defaultRuntime, agent, lockKey), Runtime: agent.Runtime}); eventErr != nil {
 		writeLine(w.Stdout, "job %s effective-runtime event failed: %v", job.ID, eventErr)
 	}
-	// This is the last filesystem authorization check before adapter delivery.
-	// It runs after runtime-session admission so a symlink retargeted while the job
-	// waited cannot inherit stale grants. The adapter is then rebuilt in-place with
-	// sandbox-exec as the innermost runner for Claude/Kimi produce only.
-	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, job, payload, &agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-		return nil
-	}
 	// #2245: remote review admission must reason about the job's CURRENT
 	// lifecycle generation, and its refusal must close that same generation.
 	// The snapshot this function was handed can predate a re-queue: a review
@@ -1059,11 +1014,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		if len(credentialEnv) > 0 {
 			w.executionRunner = subprocess.EnvInjectingRunner{Inner: w.executionRunner, Env: credentialEnv}
 		}
-		if progressTracker != nil {
-			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout, progressTracker)
-		} else {
-			adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout)
-		}
+		adapter, err = w.executionDeliveryAdapter(agent, deliveryCheckout)
 		if err != nil {
 			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
 				return finishErr
@@ -1113,33 +1064,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 		removeRelatedTrees = remove
 		defer removeRelatedTrees()
-	}
-	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, job.ID, agent.Runtime)
-	if err != nil {
-		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-		return nil
-	}
-	if produceStateDir != "" {
-		produceStateDir, err = newProduceRunStateDir(produceStateDir)
-		if err != nil {
-			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-			return nil
-		}
-		defer removeProduceRunStateDir(produceStateDir)
-	}
-	adapter, err = wrapProduceSandboxAdapter(job.Type, agent, adapter, produceStateDir)
-	if err != nil {
-		if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-		return nil
 	}
 	// Diagnose the exact adapter credential domain that the seat wrapper below
 	// will use. Reading gateway config separately here could disagree with the
@@ -1272,8 +1196,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	// SCOPED TO REVIEW, not to every seat, because the un-evented staging miss
 	// is a deliberate choice with a named cost: an event here would make a
 	// job's event sequence depend on host disk state. That reason holds for
-	// ask, implement and produce; it does not hold for the one action whose
-	// contract IS to execute the repository's gate.
+	// ask and implement; it does not hold for the one action whose contract IS
+	// to execute the repository's gate.
 	if job.Type == "review" && seatSetup.toolchainUnavailable != "" && w.adapterIsDeclaredReal() {
 		refusal := error(&seatToolchainCapabilityError{agentName: agent.Name, cause: seatSetup.toolchainUnavailable})
 		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatToolchainUnavailableEvent, Message: refusal.Error()}); eventErr != nil {
@@ -1293,8 +1217,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 	}
 	// Default-on retained capture is attached to the already-composed adapter so
-	// relay env, credential curation, gateway leases, Landlock, and pipeline
-	// progress all survive. Any open/composition failure is fail-open.
+	// relay env, credential curation, gateway leases, and Landlock all survive.
+	// Any open/composition failure is fail-open.
 	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, job.ID, job.Type, effectiveTranscriptRuntime(payload, agent), job.LifecycleGeneration, w.Store)
 	if retainedLogErr != nil {
 		writeLine(w.Stdout, "job %s transcript log open failed: %v", job.ID, retainedLogErr)
@@ -1330,7 +1254,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}()
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
-	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if warningRecorded {
 		adapter = w.observePermissionPolicyEffects(adapter, job.ID, deliveryCheckout)
@@ -1360,32 +1283,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	if hasRunDeadline {
 		stopKillPending = armJobKillPending(w.Store, job.ID, runDeadline)
 	}
-	stopProgress := func() {}
-	if progressTracker != nil {
-		progressCtx, cancelProgress := context.WithCancel(runCtx)
-		done := make(chan struct{})
-		threshold := w.PipelineProgressThreshold
-		if threshold <= 0 {
-			threshold = pipeline.PipelineProgressThreshold
-		}
-		interval := w.PipelineProgressInterval
-		if interval <= 0 {
-			interval = pipeline.PipelineProgressInterval
-		}
-		tickSource := w.ProgressTickSource
-		if tickSource == nil {
-			tickSource = pipeline.PipelineProgressTicks
-		}
-		startedAt := time.Now().UTC()
-		go func() {
-			defer close(done)
-			pipeline.EmitPipelineProgress(progressCtx, w.Store, w.Stdout, job.ID, startedAt, progressTracker, tickSource(progressCtx, threshold, interval))
-		}()
-		stopProgress = func() {
-			cancelProgress()
-			<-done
-		}
-	}
 	nativeReviewDeliveryStarted = true
 	// #1856 report-only detector, caller 2 of 2: a NON-SEAT delivery runs the
 	// runtime CLI against the operator's live profile (a read-only seat reads a
@@ -1400,7 +1297,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	removeRelatedTrees()
 	stopKillPending()
-	stopProgress()
 	if readOnlyState != nil {
 		err = errors.Join(err, readOnlyState.cleanup())
 		readOnlyStateCleaned = true
@@ -1524,277 +1420,6 @@ func (w jobWorker) lookupAgent(ctx context.Context, name string) (db.Agent, erro
 		return w.AgentLookup(ctx, name)
 	}
 	return w.Store.GetAgent(ctx, name)
-}
-
-// applyProduceRuntimeGrants performs the final delivery-time path check and only
-// then copies produce-only grants onto the in-memory runtime agent. Non-produce
-// jobs remain byte-identical and can never inherit persisted produce fields.
-func applyProduceRuntimeGrants(ctx context.Context, store *db.Store, home string, job db.Job, payload workflow.JobPayload, agent *runtime.Agent) error {
-	if strings.TrimSpace(job.Type) != "produce" {
-		return nil
-	}
-	if agent == nil {
-		return errors.New("produce runtime agent is required")
-	}
-	subject := fmt.Sprintf("job %q", job.ID)
-	writable, err := pipeline.CanonicalizePipelineProducePaths(ctx, store, home, subject, payload.WritablePaths)
-	if err != nil {
-		return fmt.Errorf("produce writable path preflight failed: %w", err)
-	}
-	envFile := ""
-	if len(payload.ReadablePaths) > 0 {
-		if strings.TrimSpace(payload.PipelineName) == "" {
-			return errors.New("produce readable path preflight failed: pipeline name is required")
-		}
-		record, found, err := store.GetPipeline(ctx, payload.PipelineName)
-		if err != nil {
-			return fmt.Errorf("produce readable path preflight failed: load pipeline: %w", err)
-		}
-		if !found {
-			return fmt.Errorf("produce readable path preflight failed: pipeline %q is unavailable", payload.PipelineName)
-		}
-		spec, err := pipeline.Load([]byte(record.SpecYAML))
-		if err != nil {
-			return fmt.Errorf("produce readable path preflight failed: load pipeline spec: %w", err)
-		}
-		envFile = spec.EnvFile
-	}
-	readable, err := pipeline.CanonicalizePipelineProduceReadPaths(ctx, store, home, subject, payload.ReadablePaths, writable, envFile)
-	if err != nil {
-		return fmt.Errorf("produce readable path preflight failed: %w", err)
-	}
-	var readableFiles []string
-	if len(payload.ReadablePaths) > 0 && agent.Runtime == runtime.ClaudeRuntime {
-		var warnings []runtime.ClaudeHookWarning
-		readable, readableFiles, warnings, err = claudeProduceRuntimeReadAccess(ctx, store, home, envFile, readable)
-		recordClaudeProduceHookWarnings(ctx, store, job.ID, warnings)
-		if err != nil {
-			return fmt.Errorf("produce Claude runtime resource preflight failed: %w", err)
-		}
-	}
-	agent.WritablePaths = writable
-	agent.ReadablePaths = readable
-	agent.ReadableFiles = readableFiles
-	agent.ProduceNetwork = payload.Network
-	return nil
-}
-
-func claudeProduceRuntimeReadAccess(ctx context.Context, store *db.Store, homeFlag, envFile string, declared []string) ([]string, []string, []runtime.ClaudeHookWarning, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("resolve Claude operator home: %w", err)
-	}
-	home = filepath.Clean(home)
-	configDir := realClaudeConfigDir()
-	if strings.TrimSpace(configDir) == "" {
-		configDir = filepath.Join(home, ".claude")
-	}
-	configDir, err = pipeline.ResolveProduceSafetyPath(configDir)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("resolve Claude config directory: %w", err)
-	}
-	protected, err := pipeline.ResolveProduceReadProtectedPaths(ctx, store, homeFlag, envFile)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	resources, warnings := runtime.DiscoverClaudeHookResources(home, configDir)
-	readable := compactCleanPaths(declared)
-	readableFiles := []string{}
-	addDir := func(path, resource string) error {
-		resolved, resolveErr := pipeline.ResolveProduceSafetyPath(path)
-		if resolveErr != nil {
-			return fmt.Errorf("resolve Claude runtime resource %q: %w", resource, resolveErr)
-		}
-		if label, excluded := protected.Exclusion(resolved); excluded {
-			return fmt.Errorf("Claude runtime resource %q cannot be read because its parent %q overlaps %s; move it outside protected state, then add reads: [%q] if needed", resource, resolved, label, resolved)
-		}
-		info, err := os.Stat(resolved)
-		if err != nil {
-			return fmt.Errorf("inspect Claude runtime resource directory %q: %w", resolved, err)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("Claude runtime resource parent %q is not a directory", resolved)
-		}
-		readable = compactCleanPaths(append(readable, resolved))
-		return nil
-	}
-	if info, statErr := os.Stat(configDir); statErr == nil && info.IsDir() {
-		if err := addDir(configDir, configDir); err != nil {
-			return nil, nil, warnings, err
-		}
-	} else if statErr != nil && !os.IsNotExist(statErr) {
-		return nil, nil, warnings, fmt.Errorf("inspect Claude config directory %q: %w", configDir, statErr)
-	}
-
-	userState := filepath.Join(home, ".claude.json")
-	if _, statErr := os.Stat(userState); statErr == nil {
-		resolved, err := pipeline.ResolveProduceSafetyPath(userState)
-		if err != nil {
-			return nil, nil, warnings, fmt.Errorf("resolve Claude user settings %q: %w", userState, err)
-		}
-		if label, excluded := protected.Exclusion(resolved); excluded {
-			return nil, nil, warnings, fmt.Errorf("Claude user settings %q cannot be read because it overlaps %s", userState, label)
-		}
-		readableFiles = compactCleanPaths(append(readableFiles, resolved))
-	} else if !os.IsNotExist(statErr) {
-		return nil, nil, warnings, fmt.Errorf("inspect Claude user settings %q: %w", userState, statErr)
-	}
-
-	for _, resource := range resources {
-		resolved, err := pipeline.ResolveProduceSafetyPath(resource.Path)
-		if err != nil {
-			return nil, nil, warnings, fmt.Errorf("resolve Claude hook path %q: %w", resource.Path, err)
-		}
-		parent := filepath.Dir(resolved)
-		if err := addDir(parent, resource.Path); err != nil {
-			return nil, nil, warnings, err
-		}
-		if info, statErr := os.Stat(resolved); statErr == nil {
-			if info.IsDir() {
-				return nil, nil, warnings, fmt.Errorf("Claude hook path %q is a directory, not a readable script", resource.Path)
-			}
-			file, openErr := os.Open(resolved)
-			if openErr != nil {
-				return nil, nil, warnings, fmt.Errorf("Claude hook path %q is not readable: %w", resource.Path, openErr)
-			}
-			_ = file.Close()
-		} else if os.IsNotExist(statErr) {
-			return nil, nil, warnings, fmt.Errorf("Claude hook path %q does not exist; fix the hook or add a readable absolute script", resource.Path)
-		} else {
-			return nil, nil, warnings, fmt.Errorf("inspect Claude hook path %q: %w", resource.Path, statErr)
-		}
-		if !pathCoveredByRuntimeReads(resolved, readable, readableFiles) {
-			return nil, nil, warnings, fmt.Errorf("Claude hook path %q is outside the final read allowlist; add reads: [%q]", resource.Path, parent)
-		}
-	}
-	return readable, readableFiles, warnings, nil
-}
-
-func pathCoveredByRuntimeReads(path string, dirs, files []string) bool {
-	for _, dir := range dirs {
-		if pipeline.PathWithin(path, dir) {
-			return true
-		}
-	}
-	for _, file := range files {
-		if path == file {
-			return true
-		}
-	}
-	return false
-}
-
-func recordClaudeProduceHookWarnings(ctx context.Context, store *db.Store, jobID string, warnings []runtime.ClaudeHookWarning) {
-	if store == nil || strings.TrimSpace(jobID) == "" {
-		return
-	}
-	for _, warning := range warnings {
-		origin := warning.SettingsPath
-		if warning.Event != "" {
-			origin += " (" + warning.Event + ")"
-		}
-		_ = store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   jobID,
-			Kind:    "produce_runtime_resource_warning",
-			Message: fmt.Sprintf("Claude hook settings %s: %s", origin, warning.Reason),
-		})
-	}
-}
-
-func (w jobWorker) produceDispatchError(action string, agent runtime.Agent) error {
-	if err := runtime.ProduceDispatchError(action, agent); err != nil {
-		return err
-	}
-	if strings.TrimSpace(action) != "produce" || agent.Runtime == runtime.CodexRuntime {
-		return nil
-	}
-	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
-		return nil
-	}
-	result, _ := w.produceSandboxProbe(action, agent)
-	if result.Supported {
-		return nil
-	}
-	return fmt.Errorf("produce stages require the codex runtime; agent %q uses runtime %q", agent.Name, agent.Runtime)
-}
-
-func (w jobWorker) produceSandboxProbe(action string, agent runtime.Agent) (sandbox.ProbeResult, bool) {
-	if strings.TrimSpace(action) != "produce" || (agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime) {
-		return sandbox.ProbeResult{}, false
-	}
-	probe := w.SandboxProbe
-	if probe == nil {
-		probe = sandbox.SandboxProbe
-	}
-	return probe(), true
-}
-
-func (w jobWorker) recordProduceSandboxDiagnostic(ctx context.Context, jobID, action string, agent runtime.Agent) {
-	// Only annotate the probe-gated refusal. Capability/policy/runtime validation
-	// errors from the legacy preflight keep their existing event surface.
-	if err := runtime.ProduceDispatchError(action, agent); err != nil {
-		return
-	}
-	result, applicable := w.produceSandboxProbe(action, agent)
-	if !applicable || result.Supported || w.Store == nil {
-		return
-	}
-	detail := "Landlock enforcement self-test failed"
-	if result.Err != nil {
-		detail = result.Err.Error()
-	}
-	if result.ABI > 0 {
-		detail = fmt.Sprintf("Landlock ABI v%d: %s", result.ABI, detail)
-	}
-	message := fmt.Sprintf("Gitmoot Landlock sandbox unavailable for %s produce: %s; run gitmoot sandbox probe", agent.Runtime, detail)
-	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "produce_sandbox_unsupported", Message: message}); err != nil {
-		writeLine(w.Stdout, "job %s produce_sandbox_unsupported event failed: %v", jobID, err)
-	}
-}
-
-// wrapProduceSandboxAdapter rewrites only Claude/Kimi produce adapters. Codex
-// keeps its existing native sandbox and every non-produce adapter is returned
-// byte-for-byte unchanged.
-func wrapProduceSandboxAdapter(action string, agent runtime.Agent, adapter workflow.DeliveryAdapter, runtimeStateDir string) (workflow.DeliveryAdapter, error) {
-	if strings.TrimSpace(action) != "produce" || agent.Runtime == runtime.CodexRuntime {
-		return adapter, nil
-	}
-	if agent.Runtime != runtime.ClaudeRuntime && agent.Runtime != runtime.KimiRuntime {
-		return adapter, nil
-	}
-	reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, runtimeStateDir, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
-	if err != nil {
-		return nil, err
-	}
-	switch a := adapter.(type) {
-	case modelGatewayRuntimeAdapter:
-		wrapped, err := wrapProduceSandboxAdapter(action, agent, a.Adapter, runtimeStateDir)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, ok := wrapped.(runtime.Adapter)
-		if !ok {
-			return nil, fmt.Errorf("produce Landlock sandbox returned incompatible %T adapter", wrapped)
-		}
-		a.Adapter = runtimeAdapter
-		return a, nil
-	case runtime.ClaudeAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
-		return a, nil
-	case *runtime.ClaudeAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
-		return a, nil
-	case runtime.KimiAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
-		return a, nil
-	case *runtime.KimiAdapter:
-		a.Runner = landlockProduceRunner(a.Runner, reads, readFiles, writes, env)
-		return a, nil
-
-	default:
-		return nil, fmt.Errorf("produce Landlock sandbox cannot wrap %s adapter %T", agent.Runtime, adapter)
-	}
 }
 
 const maxReadOnlyRuntimeStateFileBytes = 1 << 20
@@ -2246,9 +1871,8 @@ func createNoExecutionLaunchDir(home string, writes []string) (string, error) {
 // computed, so rewriting them would desync gate from acquisition.
 //
 // ONLY RESUMABLE RUNTIMES ARE REWRITTEN. A shell ref is a COMMAND, not a
-// session: overwriting it with a fresh ref would replace the stage's work with
-// nothing. Isolated shell pipeline stages carry ReadOnlySeat=true, so this
-// guard is load-bearing rather than defensive.
+// session: overwriting it with a fresh ref would replace the command with
+// nothing, so a read-only shell agent keeps its ref.
 func applyReadOnlySeat(readOnlySeat bool, configDir string, jobID string, agent *runtime.Agent) error {
 	if agent == nil || !readOnlySeat {
 		return nil
@@ -2823,8 +2447,8 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 // TestReadOnlySeatStatePolicyCoversEveryRegisteredRuntime fails when a
 // registered runtime has no policy. That test is the only enforced part, and it
 // covers this switch ALONE: a new runtime also needs
-// selectedRuntimeConfigDir, readOnlyRuntimeBaseEnv, produceRuntimeSandboxGrants
-// and buildLocalRuntimeAdapter, none of which this policy or its test can see.
+// selectedRuntimeConfigDir, readOnlyRuntimeBaseEnv and buildLocalRuntimeAdapter,
+// none of which this policy or its test can see.
 // Do not read the sentence above as "declare it here and you are done".
 type readOnlySeatStatePolicy struct {
 	// defaultSourceDir is the host state dir used when the agent declares none.
@@ -3441,204 +3065,6 @@ func pathsOverlap(left, right string) bool {
 	return contains(left, right) || contains(right, left)
 }
 
-// claudeCredentialSection is the only key a Claude credential file needs to
-// carry an account. Both staging paths - the read-only seat and produce - narrow
-// to it, so a sibling secret in the operator's file cannot ride along.
-const claudeCredentialSection = "claudeAiOauth"
-
-type stagedProduceProfileFile struct {
-	source      string
-	destination string
-	// required marks a file whose presence-but-unusability is a dispatch
-	// failure rather than something to skip.
-	required bool
-	// section narrows the copy to one top-level JSON key. The read-only seat
-	// path has always narrowed its credential; produce copied the whole file,
-	// so a sibling key such as bedrockApiKey rode along into the job-private
-	// profile (#1810 review, round 3). Empty means copy the object whole.
-	section string
-}
-
-// stageProduceProfileFile copies one operator profile file into a job-private
-// profile. It differs from stageReadOnlyRuntimeCredential in two ways that the
-// produce path needs and the read-only seat path does not: it FOLLOWS SYMLINKS,
-// because dotfile managers symlink these files and rejecting a symlink would
-// deny produce to an ordinary host; and it distinguishes required from optional
-// files, so a malformed settings.json costs the operator their settings rather
-// than their job. Errors name the actual cause - file type and size are
-// separate messages, because reporting "too large" for a symlink sends the
-// reader after the wrong problem (#1810 review round 2).
-func stageProduceProfileFile(file stagedProduceProfileFile) error {
-	skip := func(err error) error {
-		if file.required {
-			return err
-		}
-		return nil
-	}
-	info, err := os.Stat(file.source)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return skip(fmt.Errorf("inspect runtime profile file %q: %w", file.source, err))
-	}
-	if !info.Mode().IsRegular() {
-		return skip(fmt.Errorf("runtime profile file %q must be a regular file or a symlink to one, found %s", file.source, info.Mode().Type()))
-	}
-	if info.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return skip(fmt.Errorf("runtime profile file %q is %d bytes, over the %d byte limit", file.source, info.Size(), maxReadOnlyRuntimeStateFileBytes))
-	}
-	data, err := os.ReadFile(file.source)
-	if err != nil {
-		return skip(fmt.Errorf("read runtime profile file %q: %w", file.source, err))
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(data, &object); err != nil || object == nil {
-		if err == nil {
-			err = errors.New("content must be a JSON object")
-		}
-		return skip(fmt.Errorf("validate runtime profile file %q: %w", file.source, err))
-	}
-	if file.section != "" {
-		value, ok := object[file.section]
-		if !ok {
-			return skip(fmt.Errorf("runtime profile file %q lacks required %q section", file.source, file.section))
-		}
-		narrowed, marshalErr := json.Marshal(map[string]json.RawMessage{file.section: value})
-		if marshalErr != nil {
-			return skip(fmt.Errorf("isolate runtime profile file %q: %w", file.source, marshalErr))
-		}
-		data = narrowed
-	}
-	if err := os.MkdirAll(filepath.Dir(file.destination), 0o700); err != nil {
-		return fmt.Errorf("create job-private profile directory: %w", err)
-	}
-	if err := os.WriteFile(file.destination, data, 0o600); err != nil {
-		return fmt.Errorf("stage runtime profile file %q: %w", file.destination, err)
-	}
-	return nil
-}
-
-func produceRuntimeSandboxGrants(runtimeName string, runtimeStateDir string, readable, readFiles, writable []string) ([]string, []string, []string, []string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("resolve runtime state home: %w", err)
-	}
-	home = filepath.Clean(home)
-	var statePaths []string
-	var env []string
-	var staged []stagedProduceProfileFile
-	switch runtimeName {
-	case runtime.ClaudeRuntime:
-		// CLAUDE_CONFIG_DIR names the account the job must authenticate as, and
-		// it normally points at a live operator profile. The Claude CLI writes
-		// inside its own config dir during normal operation - settings, project
-		// state, statsig, and a refreshed OAuth token - so exposing that profile
-		// read-only denies writes the runtime needs, while exposing it writable
-		// lets a job mutate operator credentials. Stage the account into a
-		// job-private profile, point the runtime at that copy, and never expose
-		// the operator profile to the sandbox at all.
-		//
-		// PRECONDITION, because this is a property of the sandbox and not of
-		// these grants: produce runs with implicit write roots, so
-		// sandbox.writableRoots also grants the workdir, os.TempDir() and /tmp
-		// (exec_linux.go). A profile placed UNDER one of those roots stays
-		// writable no matter what this function grants - Landlock adds access,
-		// it cannot subtract it. Not naming the profile here is necessary and
-		// not sufficient; keeping operator profiles out of tmp is the other half.
-		configDir, err := resolveRuntimeConfigDir(runtime.ClaudeRuntime, os.Getenv("CLAUDE_CONFIG_DIR"))
-		if err != nil {
-			return nil, nil, nil, nil, err
-		}
-		if strings.TrimSpace(runtimeStateDir) == "" {
-			return nil, nil, nil, nil, errors.New("Claude produce requires a job-private runtime state root")
-		}
-		if err := os.RemoveAll(runtimeStateDir); err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("reset Claude produce runtime state %q: %w", runtimeStateDir, err)
-		}
-		writeStateDir := filepath.Join(runtimeStateDir, ".claude")
-		// The CLI resolves its node cache under XDG_CACHE_HOME, so redirect the
-		// cache instead of granting write to the ambient one.
-		cacheHome := filepath.Join(runtimeStateDir, "xdg-cache")
-		statePaths = []string{writeStateDir, cacheHome}
-		env = []string{
-			"CLAUDE_CONFIG_DIR=" + writeStateDir,
-			"XDG_CACHE_HOME=" + cacheHome,
-		}
-		// .credentials.json decides WHICH ACCOUNT the job runs as, so a present
-		// but unusable one is worth failing loudly. settings.json is ordinary
-		// configuration the runtime has defaults for, so an unusable one is
-		// skipped rather than failing the dispatch: an operator whose dotfiles
-		// leave it empty, symlinked, or holding a non-object must not lose
-		// produce entirely (#1810 review round 2).
-		staged = append(staged,
-			stagedProduceProfileFile{
-				source:      filepath.Join(configDir, ".credentials.json"),
-				destination: filepath.Join(writeStateDir, ".credentials.json"),
-				required:    true,
-				// Narrowed to the OAuth section, matching the seat path: a
-				// produce job needs the account it runs as and nothing else.
-				section: claudeCredentialSection,
-			},
-			stagedProduceProfileFile{
-				source:      filepath.Join(configDir, "settings.json"),
-				destination: filepath.Join(writeStateDir, "settings.json"),
-			},
-		)
-	case runtime.KimiRuntime:
-		statePaths = []string{filepath.Join(home, ".kimi-code")}
-	default:
-		return compactCleanPaths(readable), compactCleanPaths(readFiles), compactCleanPaths(writable), nil, nil
-	}
-	for _, path := range statePaths {
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("create %s runtime state directory %q: %w", runtimeName, path, err)
-		}
-	}
-	// Staging runs in the daemon, outside the sandbox, so the operator profile
-	// needs no grant. A missing profile stages nothing and is not an error: a
-	// fresh host with no profile is a valid configuration, and neither is a
-	// symlinked one - dotfile managers (chezmoi, stow, yadm) symlink these
-	// files, so staging resolves symlinks rather than rejecting them.
-	for _, file := range staged {
-		if err := stageProduceProfileFile(file); err != nil {
-			return nil, nil, nil, nil, err
-		}
-	}
-	reads := compactCleanPaths(readable)
-	files := compactCleanPaths(readFiles)
-	writes := compactCleanPaths(append(append([]string(nil), writable...), statePaths...))
-	return reads, files, writes, env, nil
-}
-
-func jobProduceRuntimeStateDir(home, jobID, runtimeName string) (string, error) {
-	if runtimeName != runtime.ClaudeRuntime {
-		return "", nil
-	}
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		return "", fmt.Errorf("resolve produce runtime state root: %w", err)
-	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(jobID)))
-	return filepath.Join(paths.Home, "cache", "produce-runtime", fmt.Sprintf("%x", sum[:8])), nil
-}
-
-// newProduceRunStateDir carves a directory unique to one dispatch out of a
-// job's produce state root. The root is keyed on the job id alone, so a lease
-// takeover or a deferral re-dispatch can run the same id twice at once; each
-// run resets its own directory at grant time and removes it when the job
-// finishes, and neither may touch a live sibling's state.
-func newProduceRunStateDir(root string) (string, error) {
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", fmt.Errorf("create produce runtime state root %q: %w", root, err)
-	}
-	dir, err := os.MkdirTemp(root, "run-")
-	if err != nil {
-		return "", fmt.Errorf("create produce runtime state directory under %q: %w", root, err)
-	}
-	return dir, nil
-}
-
 func compactCleanPaths(paths []string) []string {
 	seen := make(map[string]struct{}, len(paths))
 	out := make([]string, 0, len(paths))
@@ -3655,10 +3081,6 @@ func compactCleanPaths(paths []string) []string {
 		out = append(out, path)
 	}
 	return out
-}
-
-func landlockProduceRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
-	return landlockRuntimeRunner(runner, reads, readFiles, writes, env, false, false)
 }
 
 func landlockReadOnlyRunner(runner subprocess.Runner, reads, readFiles, writes, env []string) subprocess.Runner {
@@ -4123,16 +3545,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// See runQueuedJob: thread the owner token so terminal cleanup recognizes this
 	// run's own still-held lock and does not refuse the healthy-path cleanup (#536).
 	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
-	// Produce temp workers use the same post-admission filesystem authorization
-	// and Landlock adapter wrapping as the primary worker path. Without this seam,
-	// runtime-session contention could route Claude/Kimi around the launch sandbox.
-	if err := applyProduceRuntimeGrants(ctx, w.Store, w.ConfigHome, delegatedJob, payload, &started.Agent); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		return nil
-	}
 	// Shared tool-cache grant (#1113 lever 1): mirrors the primary worker path so
 	// runtime-session contention rerouting through the temp worker doesn't
 	// silently lose the cache redirect. Fail-open (disk hygiene, not security).
@@ -4144,25 +3556,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	} else {
 		tempToolCacheEnv = env
 	}
-	produceStateDir, err := jobProduceRuntimeStateDir(w.ConfigHome, delegatedJob.ID, started.Agent.Runtime)
-	if err != nil {
-		return err
-	}
-	if produceStateDir != "" {
-		produceStateDir, err = newProduceRunStateDir(produceStateDir)
-		if err != nil {
-			return err
-		}
-		defer removeProduceRunStateDir(produceStateDir)
-	}
-	adapter, err = wrapProduceSandboxAdapter(delegatedJob.Type, started.Agent, adapter, produceStateDir)
-	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		return nil
-	}
 	if len(tempToolCacheEnv) > 0 {
 		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, tempToolCacheEnv); envErr != nil {
 			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", delegatedJob.ID, envErr)
@@ -4170,7 +3563,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 			adapter = envAdapter
 		}
 	}
-	adapter = pipeline.WrapPipelineEnvDeliveryAdapter(w.Store, w.ConfigHome, payload, adapter)
 	// Temp-session delivery is a separate early-return path; attach the same
 	// append-only capture here or it would be absent from the trajectory corpus.
 	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID, delegatedJob.Type, effectiveTranscriptRuntime(payload, started.Agent), delegatedJob.LifecycleGeneration, w.Store)
@@ -5180,19 +4572,12 @@ func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflo
 	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, nil)
 }
 
-func (w jobWorker) outputAdapter(agent runtime.Agent, checkout string, out io.Writer) (workflow.DeliveryAdapter, error) {
-	return buildRuntimeAdapter(w.ConfigHome, agent, checkout, subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: pipeline.RuntimeOutputWriter(out)})
-}
-
 // buildJobAdapterForBackend consumes the already-resolved backend at the
 // daemon's adapter boundary. Adding a name to the selector's implemented set is
 // insufficient: a new backend must extend execbackend.Consume and supply its
 // builder at every compiler-identified call site before it can execute.
-func (w jobWorker) buildJobAdapterForBackend(backend execbackend.Backend, agent runtime.Agent, checkout string, output ...io.Writer) (workflow.DeliveryAdapter, error) {
+func (w jobWorker) buildJobAdapterForBackend(backend execbackend.Backend, agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
 	return execbackend.Consume(backend, func() (workflow.DeliveryAdapter, error) {
-		if len(output) > 0 && output[0] != nil && w.OutputAdapterFactory != nil {
-			return w.OutputAdapterFactory(agent, checkout, output[0])
-		}
 		return w.AdapterFactory(agent, checkout)
 	}, func() (workflow.DeliveryAdapter, error) {
 		return unprovisionedRemoteDeliveryAdapter{}, nil
@@ -5283,8 +4668,8 @@ func runnerReachesExecutionInstance(runner subprocess.Runner) bool {
 }
 
 // buildLocalRuntimeAdapter is the pre-#1536 runner-composition pipeline. Keep
-// its ordering unchanged: runtimeJobRunner/credgw, optional Landlock produce
-// wrapper, concrete runtime adapter, then model-gateway wrapping.
+// its ordering unchanged: runtimeJobRunner/credgw, concrete runtime adapter,
+// then model-gateway wrapping.
 func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	var err error
 	runner, err = runtimeJobRunner(home, agent.Runtime, runner)
@@ -5292,31 +4677,6 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 		return nil, err
 	}
 	gatewayRunner, _ := runner.(*credgw.Runner)
-	var produceRunDir string
-	if (len(agent.WritablePaths) > 0 || len(agent.ReadablePaths) > 0 || len(agent.ReadableFiles) > 0) && (agent.Runtime == runtime.ClaudeRuntime || agent.Runtime == runtime.KimiRuntime) {
-		runtimeStateRoot, err := jobProduceRuntimeStateDir(home, "local:"+checkout+":"+agent.RuntimeRef, agent.Runtime)
-		if err != nil {
-			return nil, err
-		}
-		runtimeStateDir := runtimeStateRoot
-		if runtimeStateRoot != "" {
-			// Same reason as the worker paths: the key is stable, so two
-			// dispatches for one checkout and runtime ref would otherwise share
-			// a root that each resets, and the second would wipe the first's
-			// live state (#1810 review round 2 measured exactly that).
-			runtimeStateDir, err = newProduceRunStateDir(runtimeStateRoot)
-			if err != nil {
-				return nil, err
-			}
-			produceRunDir = runtimeStateDir
-		}
-		reads, readFiles, writes, env, err := produceRuntimeSandboxGrants(agent.Runtime, runtimeStateDir, agent.ReadablePaths, agent.ReadableFiles, agent.WritablePaths)
-		if err != nil {
-			removeProduceRunStateDir(produceRunDir)
-			return nil, err
-		}
-		runner = landlockProduceRunner(runner, reads, readFiles, writes, env)
-	}
 	var adapter runtime.Adapter
 	switch agent.Runtime {
 	case runtime.CodexRuntime:
@@ -5330,44 +4690,9 @@ func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string,
 	case runtime.ShellRuntime:
 		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
 	default:
-		removeProduceRunStateDir(produceRunDir)
 		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
 	}
-	// The local pipeline has no worker to defer cleanup, so bind it to the one
-	// lifecycle event this path does have: the delivery returning.
-	return produceRunStateCleanupAdapter(wrapModelGatewayAdapter(adapter, gatewayRunner), produceRunDir), nil
-}
-
-// removeProduceRunStateDir removes one dispatch's run directory and then tries
-// to reclaim the hashed job root with a NON-recursive remove: it succeeds
-// exactly when no sibling dispatch is live, which is the correct condition, and
-// otherwise leaves the sibling untouched. Without it the hashed parent survives
-// every job forever (#1810 review round 2 measured 5 empty roots after 5 jobs).
-func removeProduceRunStateDir(runDir string) {
-	if strings.TrimSpace(runDir) == "" {
-		return
-	}
-	if err := os.RemoveAll(runDir); err != nil {
-		return
-	}
-	_ = os.Remove(filepath.Dir(runDir))
-}
-
-type produceRunStateCleanupDeliveryAdapter struct {
-	inner  workflow.DeliveryAdapter
-	runDir string
-}
-
-func (a produceRunStateCleanupDeliveryAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
-	defer removeProduceRunStateDir(a.runDir)
-	return a.inner.Deliver(ctx, agent, job)
-}
-
-func produceRunStateCleanupAdapter(inner workflow.DeliveryAdapter, runDir string) workflow.DeliveryAdapter {
-	if strings.TrimSpace(runDir) == "" {
-		return inner
-	}
-	return produceRunStateCleanupDeliveryAdapter{inner: inner, runDir: runDir}
+	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
 }
 
 func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, runtimeName string, checkout string) (runtime.Adapter, error) {

@@ -110,12 +110,6 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 		result.Decision = result.Decision.refuse("retry_not_due")
 		return result, true, nil
 	}
-	if payload.CleanupArtifacts != nil {
-		if err := ValidateCleanupArtifactSnapshot(e.Home, receipt.ResourceID, receipt.LifecycleGeneration, *payload.CleanupArtifacts); err != nil {
-			result.Decision = result.Decision.refuse("artifact_evidence_unavailable")
-			return result, true, nil
-		}
-	}
 	release, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, e.DelegationCheckout, "cleanup-reconcile:"+jobID, time.Now().UTC())
 	if err != nil {
 		return result, true, err

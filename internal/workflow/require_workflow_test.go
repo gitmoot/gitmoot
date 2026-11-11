@@ -27,9 +27,6 @@ func TestMailboxRequireWorkflow(t *testing.T) {
 	if _, err := mb.Enqueue(ctx, JobRequest{ID: "explicit", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local", WorkflowID: "team/campaign"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mb.Enqueue(ctx, JobRequest{ID: "pipeline", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: PipelineJobSender}); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestMailboxRequireWorkflowStrictRejectsBeforeCreation(t *testing.T) {
@@ -98,7 +95,6 @@ func TestMailboxRequireWorkflowExcludesInternalProducers(t *testing.T) {
 	store := openTestStore(t)
 	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	for _, request := range []JobRequest{
-		{ID: "pipeline", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: PipelineJobSender},
 		{ID: "heartbeat", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "heartbeat"},
 		{ID: "child", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "a", ParentJobID: "parent"},
 		{ID: "merge", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "temp", DelegationReason: "temp_worker_merge_back"},

@@ -15,7 +15,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
@@ -75,7 +74,7 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
 // of rebuilding an adapter. This preserves relay env, credential curation,
-// model-gateway leases, Landlock wrappers, and any pipeline-progress tee.
+// model-gateway leases, and Landlock wrappers.
 func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer) (workflow.DeliveryAdapter, error) {
 	if adapter == nil || out == nil {
 		return adapter, nil
@@ -140,15 +139,15 @@ func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer
 
 func appendRuntimeOutputRunner(runner subprocess.Runner, out io.Writer) subprocess.Runner {
 	if runner == nil {
-		return subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: pipeline.RuntimeOutputWriter(out)}
+		return subprocess.TeeRunner{Inner: subprocess.GroupRunner{}, Out: subprocess.RuntimeOutputWriter(out)}
 	}
 	switch r := runner.(type) {
 	case subprocess.TeeRunner:
-		r.Out = pipeline.RuntimeOutputWriter(r.Out, out)
+		r.Out = subprocess.RuntimeOutputWriter(r.Out, out)
 		return r
 	case *subprocess.TeeRunner:
 		copy := *r
-		copy.Out = pipeline.RuntimeOutputWriter(copy.Out, out)
+		copy.Out = subprocess.RuntimeOutputWriter(copy.Out, out)
 		return &copy
 	case subprocess.EnvInjectingRunner:
 		r.Inner = appendRuntimeOutputRunner(r.Inner, out)
@@ -170,7 +169,7 @@ func appendRuntimeOutputRunner(runner subprocess.Runner, out io.Writer) subproce
 		return &copy
 	default:
 		if stream, ok := runner.(subprocess.StreamRunner); ok {
-			return subprocess.TeeRunner{Inner: stream, Out: pipeline.RuntimeOutputWriter(out)}
+			return subprocess.TeeRunner{Inner: stream, Out: subprocess.RuntimeOutputWriter(out)}
 		}
 		return runner
 	}

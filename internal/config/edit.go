@@ -124,9 +124,6 @@ func validateConfigFile(paths Paths) error {
 	if _, err := LoadRepoConcurrency(paths); err != nil {
 		return err
 	}
-	if _, err := LoadPipelineRemote(paths); err != nil {
-		return err
-	}
 	if _, err := LoadDaemonRuntimeConfig(paths); err != nil {
 		return err
 	}

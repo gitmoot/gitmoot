@@ -101,11 +101,6 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/stale-notifications", ds.handleStaleNotificationsAPI)
 	// #958 single-label detail widening (no module cache policy for this route).
 	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
-	// Public pipeline receipts are deliberately narrow, read-only projections of
-	// already-finalized verified archives. Register them before the dashboard
-	// module fallback so no /api or module behavior changes.
-	mux.HandleFunc("GET /receipts/{id}", ds.handlePipelineReceipt)
-	mux.HandleFunc("GET /receipts/{id}/bundle", ds.handlePipelineReceiptBundle)
 	mux.Handle("/", withDashboardCommsNav(withStaleNotificationAssets(withFleetActivityAssets(dashboard.Serve(ds)))))
 	return mux
 }
@@ -133,7 +128,6 @@ var dashboardNavManifest = []dashboardNavItem{
 	{Href: "/tasks", Title: "Tasks", Group: "WORK"},
 	{Href: "/workflows", Title: "Workflows", Group: "WORK"},
 	{Href: "/jobs", Title: "Jobs", Group: "WORK"},
-	{Href: "/pipelines", Title: "Pipelines", Group: "WORK"},
 	{Href: "/agents", Title: "Agents", Group: "FLEET"},
 	{Href: "/org", Title: "Org", Group: "FLEET"},
 	{Href: "/comms", Title: "Comms", Group: "FLEET"},
@@ -2595,7 +2589,9 @@ func firstInstructionLine(instructions string) string {
 // knownRunKinds is the set of single-token run entrypoints the id parser trusts
 // as parts[1]. Multi-token internal actions are deliberately absent, so their ids
 // fall through to the root job's Type/Agent columns instead of being mis-split.
-var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "produce": true, "orchestrate": true, "goal": true}
+// Retired kinds (historical "produce" rows) take the same fallback, which yields
+// the identical kind and agent from the columns.
+var knownRunKinds = map[string]bool{"ask": true, "review": true, "implement": true, "orchestrate": true, "goal": true}
 
 func parseRunKindAgent(rootID string, root db.Job) (kind, agent string) {
 	parts := strings.Split(strings.TrimSpace(rootID), "-")

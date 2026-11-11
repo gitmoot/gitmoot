@@ -146,11 +146,10 @@ func (d *webDataSource) Overview(ctx context.Context) (dashboard.Overview, error
 
 func emptyDashboardOverview() dashboard.Overview {
 	return dashboard.Overview{
-		NeedsYou:  []dashboard.OverviewNeedsYou{},
-		Activity:  dashboard.OverviewActivity{Workflows: []dashboard.OverviewWorkflowActivity{}},
-		Today:     dashboard.OverviewToday{Notable: []dashboard.OverviewNotable{}},
-		Scheduled: []dashboard.OverviewScheduled{},
-		Fleet:     []dashboard.OverviewFleet{},
+		NeedsYou: []dashboard.OverviewNeedsYou{},
+		Activity: dashboard.OverviewActivity{Workflows: []dashboard.OverviewWorkflowActivity{}},
+		Today:    dashboard.OverviewToday{Notable: []dashboard.OverviewNotable{}},
+		Fleet:    []dashboard.OverviewFleet{},
 	}
 }
 
@@ -249,20 +248,6 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time, requ
 		return out, err
 	}
 	out.Today = dashboardToday(now, terminal, notable)
-
-	pipelines, err := store.ListPipelines(ctx)
-	if err != nil {
-		return out, err
-	}
-	for _, pipeline := range pipelines {
-		if !pipeline.Enabled || strings.TrimSpace(pipeline.Interval) == "" {
-			continue
-		}
-		out.Scheduled = append(out.Scheduled, dashboard.OverviewScheduled{
-			Name: pipeline.Name, Schedule: dashboardPipelineSchedule(pipeline.Interval, pipeline.Jitter),
-			LastStatus: pipeline.LastStatus, NextInS: dashboardPipelineNextIn(now, pipeline),
-		})
-	}
 
 	agents, err := store.ListAgents(ctx)
 	if err != nil {
@@ -386,25 +371,6 @@ func dashboardToday(now time.Time, terminal []db.DashboardTerminalBucket, notabl
 	return out
 }
 
-func dashboardPipelineSchedule(interval, jitter string) string {
-	out := "every " + strings.TrimSpace(interval)
-	if jitter = strings.TrimSpace(jitter); jitter != "" {
-		out += " +" + jitter
-	}
-	return out
-}
-
-func dashboardPipelineNextIn(now time.Time, pipeline db.Pipeline) int64 {
-	next := pipeline.NextDueAt.UTC()
-	if interval, err := time.ParseDuration(strings.TrimSpace(pipeline.Interval)); err == nil && !pipeline.LastRunAt.IsZero() {
-		next = pipeline.LastRunAt.UTC().Add(interval)
-	}
-	if next.IsZero() {
-		return 0
-	}
-	return max(0, int64(next.Sub(now)/time.Second))
-}
-
 func dashboardJobPayloadTitle(payload workflow.JobPayload, fallback string) string {
 	if title := dashboardShortLine(payload.TaskTitle, 160); title != "" {
 		return title
@@ -462,12 +428,6 @@ func sortDashboardOverview(out *dashboard.Overview) {
 			return out.Today.Notable[i].AgeS < out.Today.Notable[j].AgeS
 		}
 		return out.Today.Notable[i].Title < out.Today.Notable[j].Title
-	})
-	sort.SliceStable(out.Scheduled, func(i, j int) bool {
-		if out.Scheduled[i].NextInS != out.Scheduled[j].NextInS {
-			return out.Scheduled[i].NextInS < out.Scheduled[j].NextInS
-		}
-		return out.Scheduled[i].Name < out.Scheduled[j].Name
 	})
 	sort.SliceStable(out.Fleet, func(i, j int) bool {
 		if out.Fleet[i].Running != out.Fleet[j].Running {

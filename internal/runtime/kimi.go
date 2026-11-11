@@ -181,7 +181,7 @@ func (a KimiAdapter) Health(ctx context.Context, agent Agent) error {
 }
 
 func (a KimiAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask", "produce"}, nil
+	return []string{"review", "implement", "ask"}, nil
 }
 
 func (a KimiAdapter) runner() subprocess.Runner {
@@ -208,7 +208,7 @@ var kimiRuntimeContract = RuntimeContract{
 
 func kimiPermissionArgs(agent Agent) []string {
 	// Kimi's prompt mode already runs non-interactively. The --yolo and --auto
-	// flags cannot be combined with -p. Produce paths are still passed as
+	// flags cannot be combined with -p. Additive grant paths are passed as
 	// cooperative workspace hints; Gitmoot's Landlock wrapper is the enforcement
 	// boundary and the flags only let Kimi's own file layer see the same roots.
 	var args []string

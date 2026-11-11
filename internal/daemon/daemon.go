@@ -2240,8 +2240,6 @@ func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload wo
 //     nothing and removes its only way to discard an explicit request.
 //   - a COORDINATOR CONTINUATION synthesizes work that already happened; the
 //     killed-root skip exempts it for the same reason (daemon_scheduler.go).
-//   - a PIPELINE stage job owns run rows, and a pipeline PR review is legitimately
-//     report-only on an already-merged PR.
 //   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
 //     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
 //     here so a future field addition cannot make it collateral.
@@ -2253,7 +2251,7 @@ func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload wo
 //     mere presence: a retry NEWER than the newest supersede means "I know, do it
 //     anyway", while a retry older than the supersede is history.
 func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.Job, payload workflow.JobPayload) (bool, error) {
-	if payload.Sender == workflow.PipelineJobSender || payload.Sender == "local" {
+	if payload.Sender == "local" {
 		return true, nil
 	}
 	if payload.DelegationReason == "temp_worker_merge_back" {

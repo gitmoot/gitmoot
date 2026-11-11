@@ -13,7 +13,7 @@ import (
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/pipeline"
+	"github.com/gitmoot/gitmoot/internal/keychain"
 )
 
 type dashboardConfigSettings struct {
@@ -95,14 +95,14 @@ func (d *webDataSource) Config(ctx context.Context) (dashboard.ConfigSnapshot, e
 }
 
 // projectDashboardConfigKeychain exposes registry metadata only. The live file
-// check reuses the names-only pipeline classifier; credential values have no
+// check reuses the names-only keychain classifier; credential values have no
 // representation in this projection or in the dashboard contract.
 func projectDashboardConfigKeychain(ctx context.Context, store *db.Store, home string) (dashboard.KeychainView, error) {
-	path, err := pipeline.ResolveKeychainPath(store, home)
+	path, err := keychain.ResolvePath(store, home)
 	if err != nil {
 		return dashboard.KeychainView{}, err
 	}
-	inspection := pipeline.ClassifyPipelineEnvFile(ctx, store, home, path)
+	inspection := keychain.Classify(ctx, store, home, path)
 	out := dashboard.KeychainView{
 		File: dashboard.KeychainFileStatus{Path: path, Status: inspection.Status},
 		Keys: []dashboard.KeychainKeyView{},
@@ -112,26 +112,11 @@ func projectDashboardConfigKeychain(ctx context.Context, store *db.Store, home s
 	if err != nil {
 		return dashboard.KeychainView{}, fmt.Errorf("list keychain keys: %w", err)
 	}
-	grants, err := store.ListKeychainGrants(ctx, "")
-	if err != nil {
-		return dashboard.KeychainView{}, fmt.Errorf("list keychain grants: %w", err)
-	}
-	grantsByKey := make(map[string][]dashboard.KeychainGrantView, len(keys))
-	for _, grant := range grants {
-		grantsByKey[grant.KeyName] = append(grantsByKey[grant.KeyName], dashboard.KeychainGrantView{
-			ConsumerKind: grant.ConsumerKind,
-			ConsumerID:   grant.ConsumerID,
-		})
-	}
 	for _, key := range keys {
 		row := dashboard.KeychainKeyView{
 			Name:      key.Name,
 			Mode:      key.Mode,
-			Grants:    grantsByKey[key.Name],
 			CreatedAt: key.CreatedAt,
-		}
-		if row.Grants == nil {
-			row.Grants = []dashboard.KeychainGrantView{}
 		}
 		if key.ProxyConfigured() {
 			row.ProxyUpstream = key.ProxyUpstream

@@ -214,10 +214,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 	// root or no delegation requested artifacts.
 	artifactDir, err := writeDelegationArtifacts(e.ArtifactRoot, job.ID, payload.Result)
 	if err != nil {
-		// #758 dispatch-path edge: an orchestrate root has no task, so e.block would
-		// strand the chain — route to a foldable finalize tail (byte-identical e.block
-		// for every other tree).
-		return e.finalizeOrBlockDispatch(ctx, job, payload, e.block(ctx, ref, fmt.Sprintf("write delegation artifacts: %v", err)))
+		return e.block(ctx, ref, fmt.Sprintf("write delegation artifacts: %v", err))
 	}
 	if artifactDir != "" {
 		_ = e.recordEffectEvent(ctx, db.JobEvent{
@@ -239,9 +236,7 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		// dep-free leg has no upstream deps to inject, and a deps-bearing leg is
 		// deferred to advanceDelegations (which injects #419 upstream results).
 		if err := e.enqueueDelegation(ctx, job, payload, d, artifactDir, "", ref); err != nil {
-			// A worktree/branch-lock allocation block on an orchestrate root routes to a
-			// foldable finalize tail (and stops the loop) instead of stranding the chain.
-			return e.finalizeOrBlockDispatch(ctx, job, payload, err)
+			return err
 		}
 	}
 	return nil
@@ -1109,14 +1104,6 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 				continue
 			}
 			reason := fmt.Sprintf("delegation %q failed (failure_policy block_parent): %s", d.ID, childFailureReason(child))
-			// #758 engine edge: a pipeline-orchestrate root has no task, so e.block
-			// would set no task state and return a BlockedError that mints NO
-			// continuation — stranding the stage's chain with no foldable tail. Route
-			// it through the #305 graceful finalize continuation so the chain always
-			// ends in a settled, delegation-less tail the pipeline advancer folds.
-			if e.isPipelineOrchestrateRoot(ctx, parentJob, parentPayload) {
-				return e.enqueueFinalizeContinuation(ctx, parentJob, parentPayload, reason)
-			}
 			return e.block(ctx, ref, reason)
 		}
 	}
@@ -1160,9 +1147,7 @@ func (e Engine) advanceDelegations(ctx context.Context, parentJob db.Job, parent
 			// a late refusal here would strand a deferred leg whose refused
 			// sibling deps can never satisfy.
 			if err := e.enqueueDelegation(ctx, parentJob, parentPayload, d, artifactDir, upstreamContext, ref); err != nil {
-				// A deferred-dependent dispatch block on an orchestrate root routes to a
-				// foldable finalize tail (and stops the loop) instead of stranding the chain.
-				return e.finalizeOrBlockDispatch(ctx, parentJob, parentPayload, err)
+				return err
 			}
 			// Re-read children AND events so a second satisfied dependent in the
 			// same pass is not mistaken for still-pending, and a delegation

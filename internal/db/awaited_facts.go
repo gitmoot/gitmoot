@@ -443,10 +443,6 @@ type reviewVerdictPayload struct {
 	// persisted by dispatch for every job. Empty for jobs predating #1528; the
 	// review-loop family resolver then falls back to the agent registry default.
 	EffectiveRuntime string `json:"effective_runtime"`
-	// Sender identifies a pipeline-dispatched review, whose verdict is
-	// report-only and is therefore never re-interpreted against repository
-	// severity policy.
-	Sender string `json:"sender"`
 	// ActingOrgRole is read so a session review authored by a role rather than an
 	// agent survives to the caller, which resolves the two into one identity
 	// (#2008). Folding stays in workflow.ReviewerIdentity, not here.
@@ -457,8 +453,8 @@ type reviewVerdictPayload struct {
 		// Delegations and FanOut are the canonical fan-out classification, decoded
 		// here for the same reason every other consumer reads it: a coordinator
 		// announcement carries decision "approved" and is not a verdict (#1685).
-		// Both are needed — the executable delegations do not survive the pipeline
-		// mailbox seam, where normalization records FanOut instead.
+		// Both are needed — a stored row may record FanOut without its
+		// executable delegations.
 		Delegations []json.RawMessage `json:"delegations"`
 		FanOut      bool              `json:"fan_out,omitempty"`
 		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
@@ -478,8 +474,7 @@ type reviewVerdictPayload struct {
 
 // isFanOut reports whether a decoded review result is a coordinator announcement
 // rather than a verdict. It mirrors workflow.ResultIsFanOut, which cannot be
-// imported here because workflow depends on db and never the reverse — the same
-// reason pipelineReviewSender is duplicated above.
+// imported here because workflow depends on db and never the reverse.
 func (p reviewVerdictPayload) isFanOut() bool {
 	if p.Result == nil {
 		return false
@@ -719,15 +714,10 @@ type reviewVerdictObservation struct {
 	pullRequest int
 }
 
-// pipelineReviewSender mirrors workflow.PipelineJobSender. It is duplicated
-// rather than imported because workflow depends on db, never the reverse.
-const pipelineReviewSender = "pipeline"
-
 // reviewVerdictFact renders the awaited-fact observation for one review job.
 // The detail reports the EFFECTIVE decision — the raw verdict folded against
 // blockingSeverity exactly as the engine folds it — so a coordinator woken
 // through this channel cannot dispatch a fix round the engine suppressed.
-// Pipeline-sender reviews are report-only and keep their raw decision.
 func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity func(repo string) string) (reviewVerdictObservation, bool) {
 	if state != "succeeded" {
 		return reviewVerdictObservation{}, false
@@ -749,7 +739,6 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 		return reviewVerdictObservation{}, false
 	}
 	if decision == "changes_requested" &&
-		!strings.EqualFold(strings.TrimSpace(decoded.Sender), pipelineReviewSender) &&
 		!reviewseverity.Blocks(strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)), blockingSeverity(decoded.Repo)) {
 		decision = "approved"
 	}

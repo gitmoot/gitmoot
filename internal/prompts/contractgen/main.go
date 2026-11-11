@@ -62,11 +62,11 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"evidence":        {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
-	// fan_out is NORMALIZATION-OWNED and deliberately carries neither an example
-	// nor help: agents are never asked for it, so advertising it in the prompt
-	// would invite a value the product sets itself. It records that a result WAS
-	// a coordinator fan-out, surviving the pipeline mailbox strip that removes the
-	// executable delegations[] (#1685). The empty entry still satisfies the
+	// fan_out is PRODUCT-OWNED and deliberately carries neither an example nor
+	// help: agents are never asked for it, so advertising it in the prompt would
+	// invite a value the product owns. It records that a result WAS a
+	// coordinator fan-out, even on a stored row whose executable delegations[]
+	// are absent (#1685). The empty entry still satisfies the
 	// generator's every-field-accounted-for check, so a future rename cannot
 	// silently drop it.
 	"fan_out": {},
@@ -136,7 +136,7 @@ var humanQuestionFieldAnnotations = map[string]fieldAnnotation{
 	"choices": {help: `choices (string[], optional)`},
 }
 
-const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- Outside pipelines, skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
+const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
 
 func main() {
 	if err := run(); err != nil {

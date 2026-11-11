@@ -1814,7 +1814,7 @@ func (s *Store) ClaimJobEventKind(ctx context.Context, event JobEvent) (bool, er
 
 // ClaimJobEvent atomically inserts an exact job/kind/message event and reports
 // whether this caller won. The NOT EXISTS guard and insert share one SQLite
-// statement, so concurrent pipeline scans cannot both claim the same external
+// statement, so concurrent scans cannot both claim the same external
 // write identified by the event content.
 func (s *Store) ClaimJobEvent(ctx context.Context, event JobEvent) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message)
@@ -1830,28 +1830,6 @@ func (s *Store) ClaimJobEvent(ctx context.Context, event JobEvent) (bool, error)
 		return false, err
 	}
 	return affected == 1, nil
-}
-
-// ReleaseJobEventClaim deletes an exact job/kind/message claim so a later
-// caller can win it again. It is for a claim whose external write PROVABLY did
-// not happen: the pipeline auto-merge gate claims before calling Merge, and a
-// reconciliation hold is returned before any GitHub mutation, which left the
-// claim consumed and the merge unrepeatable for the life of the run.
-//
-// It reports whether a row was removed, so a caller that loses the race with a
-// concurrent scan can tell it did not release someone else's claim.
-func (s *Store) ReleaseJobEventClaim(ctx context.Context, event JobEvent) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM job_events
-		WHERE job_id = ? AND kind = ? AND message = ?`, event.JobID, event.Kind, event.Message)
-	if err != nil {
-		return false, err
-	}
-
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return affected > 0, nil
 }
 
 // RecordJobEventOnce writes an annotation at most once and reports ONLY whether
@@ -1877,7 +1855,7 @@ func (s *Store) RecordJobEventOnce(ctx context.Context, event JobEvent) error {
 // delayed best-effort progress tick that races terminalization becomes a no-op.
 // This intentionally touches only job_events: the stuck-running reaper keys on
 // the jobs row (including runner_boot_id), so progress cannot refresh or mask
-// job liveness and cannot perturb pipeline_run_stages advancement invariants.
+// job liveness.
 func (s *Store) UpsertLatestJobEvent(ctx context.Context, event JobEvent) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

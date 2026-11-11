@@ -19,8 +19,8 @@ template = "gitmoot-plan-and-goal"
 max_background = 4
 idle_timeout = "10m"
 
-[pipeline_remote]
-repo = "owner/pipelines"
+[workflow]
+auto_settle_after = "48h"
 `
 
 func editTestPaths(t *testing.T, contents string) Paths {
@@ -55,7 +55,7 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 		"# the planner runs ask jobs",
 		`template = "gitmoot-plan-and-goal"`,
 		`idle_timeout = "10m"`,
-		`repo = "owner/pipelines"`,
+		`auto_settle_after = "48h"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("lost %q after edit:\n%s", want, got)
@@ -73,12 +73,12 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 
 func TestSetConfigScalarStringValue(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
-	if err := SetConfigScalar(paths, []string{"pipeline_remote", "repo"}, StringScalar("owner/other")); err != nil {
+	if err := SetConfigScalar(paths, []string{"agents", "planner", "idle_timeout"}, StringScalar("20m")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
-	remote, err := LoadPipelineRemote(paths)
-	if err != nil || remote.Repo != "owner/other" {
-		t.Fatalf("pipeline remote repo = %q (err %v)", remote.Repo, err)
+	types, err := LoadAgentTypes(paths)
+	if err != nil || types["planner"].IdleTimeout != "20m" {
+		t.Fatalf("planner idle_timeout = %q (err %v)", types["planner"].IdleTimeout, err)
 	}
 }
 

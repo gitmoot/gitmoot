@@ -66,10 +66,6 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		// jobs.pull_request was never backfilled, so 0 means "no PR recorded".
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 0, TaskID: "task-7", LeadAgent: "lead",
 	})
-	seedQueuedJob(t, store, "pipeline-stage", "audit", "review", workflow.JobPayload{
-		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
-		Sender: workflow.PipelineJobSender,
-	})
 	seedQueuedJob(t, store, "merge-back-summary", "audit", "ask", workflow.JobPayload{
 		Repo: repo.FullName(), Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "lead",
 		DelegationReason: "temp_worker_merge_back",
@@ -104,7 +100,6 @@ func TestPollOnceSupersedesQueuedLegsWhosePullRequestClosed(t *testing.T) {
 		{"open-pr-review", workflow.JobQueued, "its PR is still open"},
 		{"other-repo-review", workflow.JobQueued, "PR #7 of another repo"},
 		{"no-pr-recorded", workflow.JobQueued, "no PR recorded on the payload"},
-		{"pipeline-stage", workflow.JobQueued, "pipeline stage jobs own run rows"},
 		{"merge-back-summary", workflow.JobQueued, "a merge-back describes work that already ran"},
 		{"human-comment-ask", workflow.JobQueued, "an operator asked for it explicitly"},
 	} {

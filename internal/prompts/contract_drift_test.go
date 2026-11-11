@@ -58,9 +58,9 @@ func renderedJob() string {
 // field simply reappears as uncovered under its new name, which is the outcome
 // this test exists to force.
 var normalizationOwnedResultFields = map[string]string{
-	// Set by Mailbox.Run when it strips a pipeline leaf's executable delegations,
-	// so consumers can still tell the row was a coordinator fan-out (#1685).
-	"fan_out": "set by mailbox normalization, never requested from an agent",
+	// Records that a stored row was a coordinator fan-out even when its
+	// executable delegations are absent (#1685).
+	"fan_out": "product-owned fan-out classification, never requested from an agent",
 	// Set by the closed-PR sweep on the SYNTHETIC result it mints for a delegation
 	// child whose pull request is no longer open (#1673). The retry actuator reads it
 	// to know a delivery-checkout preflight can never validate for that child, and it

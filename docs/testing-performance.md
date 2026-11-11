@@ -77,7 +77,6 @@ The current real-path carve-out files are:
 - `internal/db/memory_harvest_store_test.go`
 - `internal/db/memory_store_test.go`
 - `internal/db/org_presence_store_test.go`
-- `internal/db/pipeline_test.go`
 - `internal/db/session_job_reaper_test.go`
 - `internal/db/session_job_test.go`
 - `internal/db/skillopt_removal_migration_test.go`

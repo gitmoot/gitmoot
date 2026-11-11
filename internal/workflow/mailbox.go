@@ -17,7 +17,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/prompts"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 // maxRepairAttempts bounds how many times a malformed (missing gitmoot_result
@@ -129,12 +128,6 @@ type Mailbox struct {
 	// AdvanceJob. nil fails closed to block-all, under which the effective
 	// decision equals the raw one and no outcome event is owed.
 	reviewBlockingSeverity func(repo string) string
-	// produceCheckDir is the resolved stage checkout used as cwd for trusted
-	// operator checks when the payload has no explicit disposable worktree.
-	produceCheckDir string
-	// produceCheckTimeout bounds each trusted check command. Zero uses the
-	// production default; tests may inject a short timeout.
-	produceCheckTimeout time.Duration
 }
 
 // DeliveryWorktreeResolution is the CLI-owned answer to "where did this job
@@ -172,16 +165,6 @@ var PayloadDeliveryWorktreeResolver DeliveryWorktreeResolver = func(_ context.Co
 		return DeliveryWorktreeResolution{}, errors.New("payload has no delivery worktree path")
 	}
 	return DeliveryWorktreeResolution{Path: path}, nil
-}
-
-// PipelineKeyAccess is the persisted, names-only authorization for one pipeline
-// stage environment name. Source is pinned at enqueue so delivery never changes
-// audit meaning by falling through to another source.
-type PipelineKeyAccess struct {
-	Stage  string `json:"stage"`
-	Name   string `json:"name"`
-	Source string `json:"source"`
-	Mode   string `json:"mode"`
 }
 
 // ReviewScope is the bounded input for a follow-up review. PreviousHeadSHA is
@@ -246,8 +229,8 @@ type JobRequest struct {
 	WorktreePath          string
 	// ReadOnlyWorktree is the historical disposal marker for a top-level
 	// throwaway detached worktree with no DelegationID. Terminal cleanup owns it.
-	// It says nothing about runtime writability: produce and service-shell stages
-	// also use disposable worktrees. ReadOnlySeat carries the security policy.
+	// It says nothing about runtime writability. ReadOnlySeat carries the
+	// security policy.
 	// Additive/omitempty: false leaves legacy requests byte-identical.
 	ReadOnlyWorktree bool
 	// ReadOnlySeat marks an untrusted ask/review runtime that requires the hard
@@ -258,11 +241,7 @@ type JobRequest struct {
 	// runtime gets a read-only tool allowlist and the sandbox denies executing
 	// any program but the runtime itself. It is only meaningful with
 	// ReadOnlySeat.
-	ReviewNoExecution bool
-	// IsolateShellStage is an enqueue-only marker for a non-service pipeline shell
-	// stage that opted into a detached read-only worktree. It is consumed before
-	// payload persistence; false preserves the legacy shared-checkout request.
-	IsolateShellStage      bool
+	ReviewNoExecution      bool
 	OriginalAgent          string
 	DelegatedAgent         string
 	DelegationReason       string
@@ -326,33 +305,7 @@ type JobRequest struct {
 	// RequiredEvents are inserted in the same transaction as the queued job and
 	// its standard queued event. Enqueue fails and rolls back the job if any
 	// required audit event cannot be persisted.
-	RequiredEvents []db.JobEvent
-	// ShellEnv carries pipeline trigger inputs and stage metadata as exact
-	// KEY=value entries to a shell runtime job. It is empty for every non-pipeline
-	// and non-shell job.
-	ShellEnv []string
-	// PipelineInputEnv carries schema-validated service input exclusively in the
-	// reserved GITMOOT_INPUT_* namespace. Values stay out of Instructions and every
-	// other free-form payload field; delivery routes them to ShellEnv for shell
-	// stages and AgentEnv for managed agent runtimes.
-	PipelineInputEnv []string
-	// PipelineName and PipelineKeyAccess are the names-only keycard authority for
-	// a pipeline stage. PipelineKeyAgent pins an agent stage to its registered seat
-	// grant; empty means the existing pipeline/shell consumer. PipelineEnvFile and
-	// PipelineEnvKeys remain for in-flight shell jobs enqueued before registry/grant
-	// resolution shipped. PipelineEnv contains only selected inline NON-secret
-	// defaults; secret values are loaded at delivery and never enter the payload.
-	PipelineName      string
-	PipelineKeyAgent  string
-	PipelineKeyAccess []PipelineKeyAccess
-	PipelineEnvFile   string
-	PipelineEnvKeys   []string
-	PipelineEnv       map[string]string
-	// ShellUpstreamContext carries the persisted JSON CONTENT supplied to a
-	// dependent pipeline shell stage. Delivery writes it to a fresh temporary
-	// file; paths are deliberately never persisted. Additive/omitempty: empty
-	// leaves ordinary and root shell jobs byte-identical.
-	ShellUpstreamContext   string
+	RequiredEvents         []db.JobEvent
 	Phase                  string
 	SkipNativeReviewFanout bool
 	// NoFixTarget carries a review dispatched with --no-fix-target (#2054): it
@@ -414,19 +367,6 @@ type JobRequest struct {
 	// from its preflight (#1821). Set only for the child the preflight's marker
 	// names, never for any other delegation.
 	InheritedEvidence string
-	// OrchestrateStage marks a #758 pipeline orchestrate stage job: the stage's agent
-	// runs as a bounded sub-tree COORDINATOR, so its delegations[] are NOT stripped by
-	// the pipeline-sender leaf strip (they fan out as children owned by this stage
-	// job). It is set ONLY from the validated orchestrate spec by the pipeline
-	// dispatch, never inferred by sender-sniffing, so every other pipeline-sender job
-	// (shell, #757 agent leaf) keeps the delegations strip byte-identically.
-	// Additive/omitempty: false leaves the enqueued payload byte-identical.
-	OrchestrateStage bool
-	WritablePaths    []string
-	ReadablePaths    []string
-	Network          bool
-	Check            string
-	CheckRetries     int
 }
 
 func jobRequestExecBackend(value *string) string {
@@ -488,12 +428,10 @@ type JobPayload struct {
 	// security must consume ReadOnlySeat instead. Additive/omitempty preserves
 	// legacy payloads.
 	ReadOnlyWorktree bool `json:"read_only_worktree,omitempty"`
-	// CleanupArtifacts identifies immutable, generation-bound required outputs.
-	CleanupArtifacts *CleanupArtifactSnapshot `json:"cleanup_artifacts,omitempty"`
 	// ReadOnlySeat selects the hard runtime sandbox and isolated provider state
 	// for untrusted ask/review delivery. It is deliberately separate from the
-	// disposable-worktree cleanup marker above: produce and service-shell jobs
-	// may own throwaway writable worktrees without being read-only runtime seats.
+	// disposable-worktree cleanup marker above, which owns only worktree
+	// lifecycle.
 	ReadOnlySeat bool `json:"read_only_seat,omitempty"`
 	// ReviewNoExecution is the durable form of JobRequest.ReviewNoExecution. The
 	// worker reads it to apply the no-execution sandbox and runtime tool
@@ -583,35 +521,15 @@ type JobPayload struct {
 	// merge gate) read a field instead of parsing the runtime_override event
 	// sentence. Additive/omitempty: payloads predating #1528 simply omit it and
 	// the resolver falls back to the agent registry default.
-	EffectiveRuntime       string              `json:"effective_runtime,omitempty"`
-	ShellEnv               []string            `json:"shell_env,omitempty"`
-	PipelineInputEnv       []string            `json:"pipeline_input_env,omitempty"`
-	PipelineName           string              `json:"pipeline_name,omitempty"`
-	PipelineKeyAgent       string              `json:"pipeline_key_agent,omitempty"`
-	PipelineKeyAccess      []PipelineKeyAccess `json:"pipeline_key_access,omitempty"`
-	PipelineEnvFile        string              `json:"pipeline_env_file,omitempty"`
-	PipelineEnvKeys        []string            `json:"pipeline_env_keys,omitempty"`
-	PipelineEnv            map[string]string   `json:"pipeline_env,omitempty"`
-	ShellUpstreamContext   string              `json:"shell_upstream_context,omitempty"`
-	Phase                  string              `json:"phase,omitempty"`
-	SkipNativeReviewFanout bool                `json:"skip_native_review_fanout,omitempty"`
-	NoFixTarget            bool                `json:"no_fix_target,omitempty"`
-	PostMergeReview        bool                `json:"post_merge_review,omitempty"`
-	Ephemeral              *EphemeralSpec      `json:"ephemeral,omitempty"`
-	HumanAnswer            string              `json:"human_answer,omitempty"`
-	// OrchestrateStage marks a #758 pipeline orchestrate stage job whose delegations[]
-	// survive the pipeline-sender leaf strip (they fan out as children owned by this
-	// stage job, whose own id is the sub-tree RootJobID). Set only from the validated
-	// orchestrate spec, never by sender-sniffing. Additive/omitempty so every other
-	// pipeline-sender payload — shell + #757 agent leaf — serializes byte-identically.
-	OrchestrateStage bool         `json:"orchestrate_stage,omitempty"`
-	WritablePaths    []string     `json:"writable_paths,omitempty"`
-	ReadablePaths    []string     `json:"readable_paths,omitempty"`
-	Network          bool         `json:"network,omitempty"`
-	Check            string       `json:"check,omitempty"`
-	CheckRetries     int          `json:"check_retries,omitempty"`
-	RawOutputs       []string     `json:"raw_outputs,omitempty"`
-	Result           *AgentResult `json:"result,omitempty"`
+	EffectiveRuntime       string         `json:"effective_runtime,omitempty"`
+	Phase                  string         `json:"phase,omitempty"`
+	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
+	NoFixTarget            bool           `json:"no_fix_target,omitempty"`
+	PostMergeReview        bool           `json:"post_merge_review,omitempty"`
+	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
+	HumanAnswer            string         `json:"human_answer,omitempty"`
+	RawOutputs             []string       `json:"raw_outputs,omitempty"`
+	Result                 *AgentResult   `json:"result,omitempty"`
 	// ResultRepair names the engine repair the ACCEPTED parse required, or is
 	// absent for a clean parse (#1507). Today the only value is
 	// AgentResultRepairDelimiterBalance: the agent's bytes were JSON closers
@@ -756,8 +674,8 @@ type PreparedEnqueue struct {
 //     is the coordinator that delegated it, which is narrower than the org role
 //     that whole tree inherits.
 //   - Sender last and never dropped, so the column is non-empty for every
-//     dispatch path. It degrades to a CHANNEL ("local", "github", "heartbeat",
-//     the pipeline sender) rather than a seat, which is honest: a CLI dispatch
+//     dispatch path. It degrades to a CHANNEL ("local", "github", "heartbeat")
+//     rather than a seat, which is honest: a CLI dispatch
 //     with no --org-role and no GITMOOT_ORG_ROLE genuinely carries no seat
 //     identity, and recording the channel says so without inventing one.
 //   - request.Agent and request.LeadAgent are NEVER consulted. On a CLI review
@@ -948,15 +866,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
 		RuntimeConfigDir:       strings.TrimSpace(request.RuntimeConfigDir),
 		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
-		ShellEnv:               append([]string(nil), request.ShellEnv...),
-		PipelineInputEnv:       append([]string(nil), request.PipelineInputEnv...),
-		PipelineName:           strings.TrimSpace(request.PipelineName),
-		PipelineKeyAgent:       strings.TrimSpace(request.PipelineKeyAgent),
-		PipelineKeyAccess:      compactPipelineKeyAccess(request.PipelineKeyAccess),
-		PipelineEnvFile:        strings.TrimSpace(request.PipelineEnvFile),
-		PipelineEnvKeys:        compactStrings(request.PipelineEnvKeys),
-		PipelineEnv:            request.PipelineEnv,
-		ShellUpstreamContext:   request.ShellUpstreamContext,
 		Phase:                  request.Phase,
 		SkipNativeReviewFanout: skipNativeReviewFanout,
 		// #2054: carried onto the payload because AdvanceJob is what records a
@@ -968,12 +877,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		RiskTier:                 strings.TrimSpace(request.RiskTier),
 		StagedReviewVerdictAgent: strings.TrimSpace(request.StagedReviewVerdictAgent),
 		InheritedEvidence:        normalizeInheritedEvidence(request.InheritedEvidence),
-		OrchestrateStage:         request.OrchestrateStage,
-		WritablePaths:            compactStrings(request.WritablePaths),
-		ReadablePaths:            compactStrings(request.ReadablePaths),
-		Network:                  request.Network,
-		Check:                    strings.TrimSpace(request.Check),
-		CheckRetries:             request.CheckRetries,
 		ReviewPurpose:            reviewPurpose,
 		ReviewPart:               strings.ToLower(strings.TrimSpace(request.ReviewPart)),
 		ReviewSupersedes:         strings.TrimSpace(request.ReviewSupersedes),
@@ -1136,7 +1039,7 @@ func OrgScopeDecision(policy OrgEnforcement, actingRole, repo string) (string, e
 // resolveEnqueueOrgScope is deliberately independent of require_workflow: a
 // repo that opted out of workflow labels remains protected by its org registry.
 // Only explicit human CLI dispatches carry OperatorOrigin; shared local helpers
-// also serve comment, pipeline, heartbeat, and other automated producers.
+// also serve comment, heartbeat, and other automated producers.
 func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 	if request.PolicyExempt == "exempt" || strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" || !request.OperatorOrigin {
 		return "", nil
@@ -1157,7 +1060,7 @@ func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 // reason but not the original producer, so a non-empty delegation reason is the
 // durable approximation for internal continuations and merge-backs.
 func IsUnlabeledAgentDispatch(workflowID, sender, delegationReason string) bool {
-	if strings.TrimSpace(workflowID) != "" || strings.TrimSpace(sender) == PipelineJobSender {
+	if strings.TrimSpace(workflowID) != "" {
 		return false
 	}
 	if strings.TrimSpace(delegationReason) != "" {
@@ -1167,9 +1070,9 @@ func IsUnlabeledAgentDispatch(workflowID, sender, delegationReason string) bool 
 }
 
 // resolveEnqueueWorkflowID applies require_workflow only to fresh external
-// dispatches. Engine children inherit their parent's WorkflowID, heartbeat and
-// temporary-worker merge-back are internal producers, and pipeline jobs have
-// their own grouping semantics, so none are auto-filed or strict-rejected. Job
+// dispatches. Engine children inherit their parent's WorkflowID, and heartbeat
+// and temporary-worker merge-back are internal producers, so none are
+// auto-filed or strict-rejected. Job
 // open (Sender "session") intentionally bypasses this chokepoint: diagnostics
 // count its unlabeled rows, but enforcement does not touch them.
 func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
@@ -1644,114 +1547,8 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 
-	// A produce stage may declare a trusted deterministic check. Run it only after
-	// a valid envelope and before terminal persistence. Failures re-deliver to the
-	// SAME in-memory runtime session; m.deliver records every correction turn's
-	// token usage on the same job row.
-	if job.Type == "produce" && strings.TrimSpace(payload.Check) != "" {
-		for correction := 0; ; correction++ {
-			checkOutput, checkErr := runProduceCheck(ctx, payload, m.produceCheckDir, m.produceCheckTimeout, execBackend)
-			if checkErr == nil {
-				break
-			}
-			if correction >= payload.CheckRetries {
-				message := fmt.Sprintf("produce check failed after %d correction attempt(s): %v", correction, checkErr)
-				if strings.TrimSpace(checkOutput) != "" {
-					message += ": " + checkOutput
-				}
-				payload.Result = &AgentResult{Decision: "failed", Summary: message}
-				if err := m.savePayload(ctx, job.ID, payload); err != nil {
-					return AgentResult{}, err
-				}
-				_ = m.addEvent(ctx, job.ID, "produce_check_failed", message)
-				if err := m.fail(ctx, job.ID, message); err != nil {
-					return AgentResult{}, err
-				}
-				return AgentResult{}, errors.New(message)
-			}
-			if err := m.ensureRunning(ctx, job.ID); err != nil {
-				return AgentResult{}, err
-			}
-			if err := m.addEvent(ctx, job.ID, "produce_check_retry", fmt.Sprintf("retrying after deterministic check failure (attempt %d of %d)", correction+1, payload.CheckRetries)); err != nil {
-				return AgentResult{}, err
-			}
-			correctionRaw, refreshedRef, ephemeral, diag, deliveryErr := m.deliver(ctx, adapter, agent, job, &payload, produceCheckCorrectionPrompt(checkOutput))
-			if deliveryErr != nil {
-				m.storeFailureDiagnostics(ctx, job.ID, &payload, diag)
-				_ = m.fail(ctx, job.ID, fmt.Sprintf("produce correction delivery failed: %v", deliveryErr))
-				m.recordDeliverySignalKill(ctx, job.ID, deliveryErr)
-				return AgentResult{}, DeliveryError{Err: deliveryErr}
-			}
-			if payload.RuntimeOverride == "" && !registeredFreshRef && !ephemeral {
-				m.persistRefreshedRuntimeRef(ctx, job.ID, agent, refreshedRef)
-			}
-			if refreshedRef != "" {
-				agent.RuntimeRef = refreshedRef
-			}
-			payload.RawOutputs = append(payload.RawOutputs, correctionRaw)
-			result, parseErr = extractAgentResultForAction(correctionRaw, job.Type)
-			if parseErr != nil {
-				message := fmt.Sprintf("produce correction output malformed: %v", parseErr)
-				payload.Result = &AgentResult{Decision: "failed", Summary: message}
-				if err := m.savePayload(ctx, job.ID, payload); err != nil {
-					return AgentResult{}, err
-				}
-				_ = m.fail(ctx, job.ID, message)
-				return AgentResult{}, parseErr
-			}
-			if err := m.savePayload(ctx, job.ID, payload); err != nil {
-				return AgentResult{}, err
-			}
-		}
-	}
-
 	if err := m.ensureRunning(ctx, job.ID); err != nil {
 		return AgentResult{}, err
-	}
-	// A #681 pipeline stage is a LEAF: it runs a shell command and returns a
-	// decision. Its ParentJobID is empty, so any delegations[] the stage command
-	// emitted would otherwise dispatch as TOP-LEVEL jobs in AdvanceJob. Strip them
-	// for a pipeline-sender job so a stage can never spawn phantom children; the
-	// advancer already ignores stage delegations, and this makes stages-as-leaves
-	// hold at the engine seam too. Cheap and byte-identical for every other sender.
-	if payload.Sender == PipelineJobSender {
-		// #758: an orchestrate stage IS a bounded sub-tree ROOT — it is explicitly
-		// AUTHORIZED to fan out, so its delegations[] survive here and the engine's
-		// dispatchDelegations gives every child ParentJobID = this stage job (owned,
-		// not orphaned). The relaxation is gated STRICTLY on the OrchestrateStage
-		// payload flag, which the pipeline dispatch sets only from the validated
-		// orchestrate:true spec — NEVER by sender-sniffing — so every other
-		// pipeline-sender job (shell + #757 agent leaf) keeps the delegations strip
-		// byte-identically and can never spawn phantom children.
-		if !payload.OrchestrateStage {
-			// Stripping the INSTRUCTIONS must not erase the CLASSIFICATION. Without
-			// this stamp a pipeline review coordinator's announcement arrives at the
-			// auto-merge gate as an ordinary approved leaf, and merges (#1685). A
-			// review stage cannot set orchestrate:true, so this is the ONLY path a
-			// production pipeline fan-out takes.
-			if len(result.Delegations) > 0 {
-				result.FanOut = true
-			}
-			result.Delegations = nil
-		}
-		// Same leaf enforcement for human_questions[] (#757): a healthy agent-stage
-		// result with an empty ParentJobID would otherwise drive the TOP-LEVEL
-		// ask-gate (AdvanceJob, engine.go), opening an escalation / needs-attention
-		// round on a stage job that the pipeline can never resolve (job_recovery
-		// refuses to gate-resume a pipeline-sender job) while the advancer silently
-		// folds the stage on its decision and proceeds — the pause intent is
-		// dropped and a dangling round is left behind. A leaf stage can no more
-		// pause a human than it can spawn a child; strip it so the stage folds
-		// purely on its decision (a stage that must halt returns decision
-		// "blocked", which the advancer parks the whole run on with needs).
-		//
-		// This strip stays unconditional for EVERY pipeline-sender stage job — the
-		// #758 orchestrate coordinator included: the coordinator's own ParentJobID is
-		// empty, so its human_questions would hit the same unresolvable top-level
-		// ask-gate. Per the #758 design a CHILD's ask-gate is what pauses the tree,
-		// and a child is a non-pipeline-sender job (Sender = the coordinator agent,
-		// ParentJobID = this stage job), so this strip never touches it.
-		result.HumanQuestions = nil
 	}
 	// #1821: clamp a staged verdict to what its preflight found runnable, BEFORE
 	// the result is stored, so no consumer ever reads the unclamped claim. The
@@ -1894,9 +1691,6 @@ func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, worktr
 	return errors.New(message)
 }
 
-const maxProduceCheckOutputBytes = 8 * 1024
-const defaultProduceCheckTimeout = 2 * time.Minute
-
 func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {
 	if strings.TrimSpace(agent.ExecBackend) == "" {
 		return execbackend.Local, nil
@@ -1904,49 +1698,10 @@ func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {
 	return execbackend.ParseImplemented(agent.ExecBackend)
 }
 
-func runProduceCheck(ctx context.Context, payload JobPayload, fallbackDir string, timeout time.Duration, backend execbackend.Backend) (string, error) {
-	dir := strings.TrimSpace(payload.WorktreePath)
-	if dir == "" {
-		dir = strings.TrimSpace(fallbackDir)
-	}
-	if timeout <= 0 {
-		timeout = defaultProduceCheckTimeout
-	}
-	checkCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	local := func() (subprocess.Result, error) {
-		return (subprocess.GroupRunner{MaxOutputBytes: 2 * maxProduceCheckOutputBytes}).Run(checkCtx, dir, "sh", "-c", payload.Check)
-	}
-	result, err := execbackend.Consume(backend, local, func() (subprocess.Result, error) {
-		// Produce output stays in the instance because only implement imports a
-		// changeset. A host check here would validate stale pre-delivery bytes.
-		return subprocess.Result{}, errors.New("produce deterministic checks are not supported on the remote execution backend")
-	})
-	return sanitizeProduceCheckOutput(result.Stdout + result.Stderr), err
-}
-
-func sanitizeProduceCheckOutput(output string) string {
-	return strings.TrimSpace(tailBytes(RedactCommentText(output), maxProduceCheckOutputBytes))
-}
-
-func produceCheckCorrectionPrompt(output string) string {
-	if strings.TrimSpace(output) == "" {
-		output = "(check exited non-zero with no output)"
-	}
-	return "Your produce output failed the deterministic check. Fix and return a fresh gitmoot_result. Check output:\n\n~~~text\n" + output + "\n~~~"
-}
-
 // deliver returns the delivery's raw text, refreshed runtime ref, ephemeral
 // flag, redacted crash-diagnostics snapshot (#806, nil when no CLI process
 // ran), and error.
 func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent runtime.Agent, job db.Job, payload *JobPayload, prompt string) (string, string, bool, *FailureDiagnostics, error) {
-	shellEnv := append([]string(nil), payload.ShellEnv...)
-	var agentEnv []string
-	if agent.Runtime == runtime.ShellRuntime {
-		shellEnv = append(shellEnv, payload.PipelineInputEnv...)
-	} else {
-		agentEnv = append(agentEnv, payload.PipelineInputEnv...)
-	}
 	// PLAN GATE (#1479), against the EFFECTIVE runtime — after any #531 per-job
 	// override has been applied to the agent. A plan request the runtime cannot
 	// honour FAILS the delivery here: dropping the flag and running normally would
@@ -1976,19 +1731,16 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		}
 	}
 	delivery := runtime.Job{
-		ID:                   job.ID,
-		AgentName:            agent.Name,
-		Action:               job.Type,
-		Prompt:               prompt,
-		Repository:           payload.Repo,
-		PullRequest:          payload.PullRequest,
-		Model:                payload.Model,
-		Effort:               payload.Effort,
-		Plan:                 payload.Plan,
-		PlanInto:             payload.PlanInto,
-		ShellEnv:             shellEnv,
-		AgentEnv:             agentEnv,
-		ShellUpstreamContext: payload.ShellUpstreamContext,
+		ID:          job.ID,
+		AgentName:   agent.Name,
+		Action:      job.Type,
+		Prompt:      prompt,
+		Repository:  payload.Repo,
+		PullRequest: payload.PullRequest,
+		Model:       payload.Model,
+		Effort:      payload.Effort,
+		Plan:        payload.Plan,
+		PlanInto:    payload.PlanInto,
 		OnPID: func(pid int) {
 			payload.RuntimePID = pid
 			payload.RuntimePIDStartTime = RuntimeProcessIdentity(pid)
@@ -2013,7 +1765,7 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 	}
 	result, err := adapter.Deliver(ctx, agent, delivery)
 	// A successful adapter return ends runtime-process supervision. Clear its
-	// identity before produce/review checks and other settlement work: the runtime
+	// identity before review checks and other settlement work: the runtime
 	// process has exited normally, so a dead PID no longer proves the job is
 	// orphaned. Leaving it recorded would let the daemon's prompt dead-process
 	// reaper cancel legitimate post-delivery work.
@@ -2264,16 +2016,10 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	// non-empty needs list, so every non-blocked terminal — and a blocked result
 	// with no needs — writes nothing and is byte-identical. Best-effort: a gate
 	// write must never turn a successfully-recorded blocked transition into an error.
-	// Pipeline stage jobs (#681) are excluded: their needs are persisted on the
-	// pipeline run/stage rows and resumed at the RUN level via ResumePipelineRun
-	// (attempt+1, new job id). Recording job gates here would let `job gates
-	// clear` RetryJob the OLD stage job id — an orphaned re-execution the
-	// pipeline advancer never folds, and a double execution once the run is
-	// properly resumed.
 	// Content-free needs are dropped BEFORE admission and before recording:
 	// `needs: [{}]` used to be admitted on a raw len() and written to
 	// job_gates verbatim, so a human saw a gate row reading "{}".
-	if state == JobBlocked && payload.Result != nil && payload.Sender != PipelineJobSender {
+	if state == JobBlocked && payload.Result != nil {
 		recordable := actionableEntries(payload.Result.Needs)
 		if len(recordable) > 0 {
 			if _, gateErr := m.store.RecordJobGates(writeCtx, jobID, recordable); gateErr == nil {
@@ -2405,7 +2151,6 @@ func validateExternalJobRequest(request JobRequest) error {
 
 // validateJobRequestExceptActor holds every rule that does not concern WHO acts.
 func validateJobRequestExceptActor(request JobRequest) error {
-	action := strings.TrimSpace(request.Action)
 	switch {
 	case strings.TrimSpace(request.ID) == "":
 		return errors.New("job id is required")
@@ -2413,27 +2158,8 @@ func validateJobRequestExceptActor(request JobRequest) error {
 		return errors.New("job action is required")
 	case strings.TrimSpace(request.Repo) == "":
 		return errors.New("job repo is required")
-	case action == "produce" && request.Sender != PipelineJobSender:
-		return errors.New("job action produce is reserved for pipeline stages")
-	case action == "produce" && len(compactStrings(request.WritablePaths)) == 0:
-		return errors.New("job action produce requires at least one writable path")
-	case action != "produce" && len(compactStrings(request.WritablePaths)) > 0:
-		return errors.New("job writable_paths are only valid for action produce")
-	case action != "produce" && len(compactStrings(request.ReadablePaths)) > 0:
-		return errors.New("job readable_paths are only valid for action produce")
-	case action != "produce" && request.Network:
-		return errors.New("job network access is only valid for action produce")
-	case action != "produce" && strings.TrimSpace(request.Check) != "":
-		return errors.New("job check is only valid for action produce")
-	case action != "produce" && request.CheckRetries > 0:
-		return errors.New("job check_retries are only valid for action produce")
-	case request.CheckRetries < 0:
-		return errors.New("job check_retries must be >= 0")
 	}
 	if err := ValidateWorkflowID(request.WorkflowID); err != nil {
-		return err
-	}
-	if err := validatePipelineInputEnv(request.PipelineInputEnv); err != nil {
 		return err
 	}
 	if err := validateJobPlanRequest(request); err != nil {
@@ -2487,29 +2213,6 @@ func planDispatchError(runtimeName string, plan bool, planInto string) error {
 	}
 	return fmt.Errorf("runtime %q cannot honour plan mode (%s): only the omp runtime implements it; drop plan from the job or route it to an omp seat",
 		strings.TrimSpace(runtimeName), shape)
-}
-
-var pipelineInputEnvNamePattern = regexp.MustCompile(`^GITMOOT_INPUT_[A-Z][A-Z0-9_]*$`)
-
-func validatePipelineInputEnv(entries []string) error {
-	if len(entries) > 32 {
-		return errors.New("pipeline input env accepts at most 32 entries")
-	}
-	seen := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
-		name, _, ok := strings.Cut(entry, "=")
-		if !ok || !pipelineInputEnvNamePattern.MatchString(name) {
-			return fmt.Errorf("pipeline input env entry %q must use GITMOOT_INPUT_<UPPER_SNAKE>=value", name)
-		}
-		if strings.ContainsRune(entry, '\x00') {
-			return fmt.Errorf("pipeline input env %s must not contain U+0000", name)
-		}
-		if _, duplicate := seen[name]; duplicate {
-			return fmt.Errorf("pipeline input env contains duplicate key %s", name)
-		}
-		seen[name] = struct{}{}
-	}
-	return nil
 }
 
 const workflowIDSegmentPattern = `[a-z0-9]+(-[a-z0-9]+)*`
@@ -2640,21 +2343,6 @@ func cloneReviewScope(scope *ReviewScope) *ReviewScope {
 		Findings:        compactStrings(scope.Findings),
 		ChangedFiles:    compactStrings(scope.ChangedFiles),
 	}
-}
-
-func compactPipelineKeyAccess(values []PipelineKeyAccess) []PipelineKeyAccess {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]PipelineKeyAccess, 0, len(values))
-	for _, value := range values {
-		value.Stage = strings.TrimSpace(value.Stage)
-		value.Name = strings.TrimSpace(value.Name)
-		value.Source = strings.TrimSpace(value.Source)
-		value.Mode = strings.TrimSpace(value.Mode)
-		out = append(out, value)
-	}
-	return out
 }
 
 // repairRetryIdenticalEvent records that the repair loop STOPPED EARLY because a

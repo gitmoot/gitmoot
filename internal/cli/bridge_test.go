@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -113,42 +112,13 @@ func TestBridgeEndpointsWithSeededHome(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "planner", runtime.ShellRuntime, heartbeatShellResultScript, []string{"ask"}, "owner/repo")
 	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-
-	specYAML := "name: bridge-flow\nrepo: owner/repo\nstages:\n" +
-		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
-	specFile := writeSpec(t, specYAML)
-	var out, errBuf bytes.Buffer
-	if code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &out, &errBuf); code != 0 {
-		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
-	}
-
-	runResp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{"payload":{"subject":"Snowman ☃\nline","body":"hello"}}`)))
-	if runResp.Code != http.StatusOK {
-		t.Fatalf("pipeline run status=%d body=%s", runResp.Code, runResp.Body.String())
-	}
-	var runOut struct {
-		RunID string `json:"run_id"`
-	}
-	decodeBridgeBody(t, runResp, &runOut)
-	if runOut.RunID == "" {
-		t.Fatalf("pipeline run returned empty run_id")
-	}
-	storedRun, ok, err := store.GetPipelineRun(ctx, runOut.RunID)
-	if err != nil || !ok {
-		t.Fatalf("GetPipelineRun(%s): ok=%v err=%v", runOut.RunID, ok, err)
-	}
-	if storedRun.Trigger != "bridge" || storedRun.PayloadJSON != `{"body":"hello","subject":"Snowman ☃\nline"}` {
-		t.Fatalf("bridge run snapshot = %+v", storedRun)
-	}
-
-	stateResp := bridgeDo(t, handler, bridgeRequest(http.MethodGet, "/v1/runs/"+runOut.RunID, nil))
-	if stateResp.Code != http.StatusOK {
-		t.Fatalf("run state status=%d body=%s", stateResp.Code, stateResp.Body.String())
-	}
-	var runState pipelineRunJSON
-	decodeBridgeBody(t, stateResp, &runState)
-	if runState.ID != runOut.RunID || runState.State == "" || len(runState.Stages) != 1 {
-		t.Fatalf("run state = %+v, want matching run with one stage", runState)
+	for _, removed := range []*http.Request{
+		bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{}`)),
+		bridgeRequest(http.MethodGet, "/v1/runs/run-1", nil),
+	} {
+		if resp := bridgeDo(t, handler, removed); resp.Code != http.StatusNotFound {
+			t.Fatalf("%s %s status=%d, want 404 body=%s", removed.Method, removed.URL.Path, resp.Code, resp.Body.String())
+		}
 	}
 
 	askReq := `{"message":"plan the work","repo":"owner/repo"}`
@@ -182,49 +152,6 @@ func TestBridgeEndpointsWithSeededHome(t *testing.T) {
 	}
 }
 
-func TestBridgePipelineOverlapReturnsConflict(t *testing.T) {
-	home, _, store := heartbeatLoopE2EHome(t)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-	specYAML := "name: bridge-flow\nrepo: owner/repo\nstages:\n" +
-		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
-	specFile := writeSpec(t, specYAML)
-	var out, errBuf bytes.Buffer
-	if code := Run([]string{"pipeline", "add", specFile, "--enable", "--home", home}, &out, &errBuf); code != 0 {
-		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
-	}
-	first := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{}`)))
-	if first.Code != http.StatusOK {
-		t.Fatalf("first run status=%d body=%s", first.Code, first.Body.String())
-	}
-	second := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/bridge-flow/run", strings.NewReader(`{}`)))
-	if second.Code != http.StatusConflict {
-		t.Fatalf("second run status=%d, want 409 body=%s", second.Code, second.Body.String())
-	}
-}
-
-func TestBridgePipelineRejectsDisabledPipeline(t *testing.T) {
-	home, _, store := heartbeatLoopE2EHome(t)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-	specYAML := "name: disabled-flow\nrepo: owner/repo\nstages:\n" +
-		pipelineE2EStage("source", pipelineStageResultCmd("approved", "source ok", nil), "")
-	specFile := writeSpec(t, specYAML)
-	var out, errBuf bytes.Buffer
-	if code := Run([]string{"pipeline", "add", specFile, "--home", home}, &out, &errBuf); code != 0 {
-		t.Fatalf("pipeline add exit=%d stderr=%s", code, errBuf.String())
-	}
-	resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/disabled-flow/run", strings.NewReader(`{}`)))
-	if resp.Code == http.StatusOK || !strings.Contains(resp.Body.String(), "disabled") {
-		t.Fatalf("disabled run status=%d body=%s", resp.Code, resp.Body.String())
-	}
-	if _, ok, err := store.ActivePipelineRun(context.Background(), "disabled-flow"); err != nil || ok {
-		t.Fatalf("disabled pipeline created a run: ok=%v err=%v", ok, err)
-	}
-}
-
 func TestBridgeRateLimitTrip(t *testing.T) {
 	home, _, store := heartbeatLoopE2EHome(t)
 	seedBridgeJob(t, store, "job-rate")
@@ -249,65 +176,6 @@ func TestBridgeBodySizeCap(t *testing.T) {
 	if resp.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize body status=%d, want 413 body=%s", resp.Code, resp.Body.String())
 	}
-}
-
-func TestBridgePipelineRunPayloadValidation(t *testing.T) {
-	home, _, store := heartbeatLoopE2EHome(t)
-	entries := func(n int) string {
-		var b strings.Builder
-		b.WriteString(`{"payload":{`)
-		for i := 0; i < n; i++ {
-			if i > 0 {
-				b.WriteByte(',')
-			}
-			fmt.Fprintf(&b, `"k%d":"v"`, i)
-		}
-		b.WriteString(`}}`)
-		return b.String()
-	}
-	totalTooLarge := `{"payload":{"a":"` + strings.Repeat("a", 24<<10) + `","b":"` + strings.Repeat("b", 24<<10) + `"}}`
-	cases := []struct {
-		name   string
-		body   io.Reader
-		status int
-		want   string
-	}{
-		{name: "absent", body: nil, status: http.StatusNotFound, want: "not found"},
-		{name: "empty object", body: strings.NewReader(`{}`), status: http.StatusNotFound, want: "not found"},
-		{name: "unknown top level", body: strings.NewReader(`{"other":{}}`), status: http.StatusBadRequest, want: "unknown field"},
-		{name: "top level array", body: strings.NewReader(`[]`), status: http.StatusBadRequest, want: "JSON object"},
-		{name: "null body accepted as empty", body: strings.NewReader(`null`), status: http.StatusNotFound, want: "not found"},
-		{name: "duplicate payload key", body: strings.NewReader(`{"payload":{"a":"x","a":"y"}}`), status: http.StatusBadRequest, want: "duplicate JSON key"},
-		{name: "duplicate top-level key", body: strings.NewReader(`{"payload":{"a":"x"},"payload":{"b":"y"}}`), status: http.StatusBadRequest, want: "duplicate JSON key"},
-		{name: "payload null", body: strings.NewReader(`{"payload":null}`), status: http.StatusBadRequest, want: "payload must be a JSON object"},
-		{name: "payload array", body: strings.NewReader(`{"payload":[]}`), status: http.StatusBadRequest, want: "payload must be a JSON object"},
-		{name: "non string value", body: strings.NewReader(`{"payload":{"subject":7}}`), status: http.StatusBadRequest, want: "string values"},
-		{name: "invalid key", body: strings.NewReader(`{"payload":{"Bad-Key":"x"}}`), status: http.StatusBadRequest, want: `key \"Bad-Key\"`},
-		{name: "too many entries", body: strings.NewReader(entries(33)), status: http.StatusBadRequest, want: "maximum is 32"},
-		{name: "value too large", body: strings.NewReader(`{"payload":{"body":"` + strings.Repeat("x", (32<<10)+1) + `"}}`), status: http.StatusBadRequest, want: `key \"body\"`},
-		{name: "nul", body: strings.NewReader(`{"payload":{"body":"x\u0000y"}}`), status: http.StatusBadRequest, want: "U+0000"},
-		{name: "decoded total", body: strings.NewReader(totalTooLarge), status: http.StatusBadRequest, want: "48 KiB"},
-		{name: "raw body too large", body: strings.NewReader(`{"payload":{"body":"` + strings.Repeat("x", bridgePipelineRunBodyLimit) + `"}}`), status: http.StatusRequestEntityTooLarge, want: "request body too large"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-			resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/missing/run", tc.body))
-			if resp.Code != tc.status || !strings.Contains(resp.Body.String(), tc.want) {
-				t.Fatalf("status=%d body=%s, want status=%d containing %q", resp.Code, resp.Body.String(), tc.status, tc.want)
-			}
-		})
-	}
-
-	t.Run("invalid utf8", func(t *testing.T) {
-		handler := newBridgeHandler(home, store, bridgeTestToken, nil)
-		body := append([]byte(`{"payload":{"body":"`), 0xff)
-		body = append(body, []byte(`"}}`)...)
-		resp := bridgeDo(t, handler, bridgeRequest(http.MethodPost, "/v1/pipelines/missing/run", bytes.NewReader(body)))
-		if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "valid UTF-8") {
-			t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
-		}
-	})
 }
 
 func bridgeRequest(method, target string, body io.Reader) *http.Request {

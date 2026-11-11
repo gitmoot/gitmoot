@@ -3773,9 +3773,8 @@ func TestOmpValidateRefShapes(t *testing.T) {
 	})
 }
 
-// TestOmpCapabilities pins the advertised set. "produce" is absent on purpose:
-// that path runs the runtime under Landlock, which is unprobed for omp's Bun
-// binary, and the registry entry must stay byte-equal to this slice.
+// TestOmpCapabilities pins the advertised set; the registry entry must stay
+// byte-equal to this slice.
 func TestOmpCapabilities(t *testing.T) {
 	caps, err := (OmpAdapter{}).Capabilities(context.Background())
 	if err != nil {

@@ -529,8 +529,8 @@ Separately from that tree linkage, **every** job Gitmoot creates carries
 `dispatched_by`: the identity that asked for the job to exist. It is resolved at
 the single enqueue chokepoint from the most specific source available, in order:
 an explicit dispatcher supplied by the dispatch site, then `delegated_by`, then
-the acting org role, then the dispatch channel (`local`, `github`, `heartbeat`,
-the pipeline sender). It never falls back to the job's own agent or to
+the acting org role, then the dispatch channel (`local`, `github`,
+`heartbeat`). It never falls back to the job's own agent or to
 `lead_agent`, because on a CLI review dispatch `lead_agent` defaults to the
 reviewer itself.
 
@@ -735,17 +735,8 @@ removed earlier on the same terms.
 - `failed`: the attempted action errored or could not complete.
 - `skipped`: the task itself had no work to do. Do not use `skipped` in a PR
   review to mean "nothing to flag"; reviewers use `approved`. A skipped result
-  cannot carry delegations. Outside pipelines it maps to a succeeded job state;
-  it is an abstention for quorum/verify, while vote counts that succeeded state.
-  Pipelines accept it as success by default and persist the existing succeeded
-  stage state, not the separate skipped state used for downstream stages that
-  never ran.
-
-For a pipeline `produce` batch, use the same vocabulary without inventing a new
-token: `implemented` means the batch is complete; `changes_requested` means partial
-output (the pipeline must explicitly include it in `success_decisions` to advance);
-`blocked` means human input is required and should carry `needs`; `skipped` means no
-work was available. Produce remains a leaf, so its delegations are stripped.
+  cannot carry delegations. It maps to a succeeded job state; it is an
+  abstention for quorum/verify, while vote counts that succeeded state.
 
 ## Reporting Rules
 

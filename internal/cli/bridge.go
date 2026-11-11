@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -23,22 +22,16 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-
-	"github.com/gitmoot/gitmoot/internal/pipeline"
 )
 
 const (
-	defaultBridgeAddr          = "127.0.0.1:8791"
-	bridgeTokenName            = "bridge.token"
-	bridgeBodyLimit            = 1 << 20
-	bridgePipelineRunBodyLimit = 64 << 10
+	defaultBridgeAddr = "127.0.0.1:8791"
+	bridgeTokenName   = "bridge.token"
+	bridgeBodyLimit   = 1 << 20
 )
-
-var errBridgeConflict = errors.New("bridge conflict")
 
 func runBridge(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
@@ -294,20 +287,6 @@ func (s *bridgeServer) authorized(r *http.Request) bool {
 func (s *bridgeServer) route(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimSuffix(r.URL.Path, "/")
 	switch {
-	case r.Method == http.MethodPost && strings.HasPrefix(path, "/v1/pipelines/") && strings.HasSuffix(path, "/run"):
-		name, ok := bridgePathParam(path, "/v1/pipelines/", "/run")
-		if !ok {
-			writeBridgeError(w, http.StatusNotFound, "not found")
-			return
-		}
-		s.handlePipelineRun(w, r, name)
-	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/runs/"):
-		id, ok := bridgePathTail(path, "/v1/runs/")
-		if !ok {
-			writeBridgeError(w, http.StatusNotFound, "not found")
-			return
-		}
-		s.handleRunGet(w, r, id)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/v1/jobs/"):
 		id, ok := bridgePathTail(path, "/v1/jobs/")
 		if !ok {
@@ -325,185 +304,6 @@ func (s *bridgeServer) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeBridgeError(w, http.StatusNotFound, "not found")
 	}
-}
-
-func (s *bridgeServer) handlePipelineRun(w http.ResponseWriter, r *http.Request, name string) {
-	r.Body = http.MaxBytesReader(w, r.Body, bridgePipelineRunBodyLimit)
-	payloadJSON, err := decodeBridgePipelineRunPayload(r)
-	if err != nil {
-		writeBridgeDecodeError(w, err)
-		return
-	}
-	runID, err := runBridgePipeline(r.Context(), s.store, s.rawHome, name, payloadJSON)
-	if err != nil {
-		writeBridgeMappedError(w, err)
-		return
-	}
-	writeBridgeJSON(w, http.StatusOK, map[string]string{"run_id": runID})
-}
-
-func runBridgePipeline(ctx context.Context, store *db.Store, rawHome, name, payloadJSON string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "", errors.New("pipeline name is required")
-	}
-	rec, ok, err := store.GetPipeline(ctx, name)
-	if err != nil {
-		return "", err
-	}
-	if !ok {
-		return "", sql.ErrNoRows
-	}
-	if !rec.Enabled {
-		return "", fmt.Errorf("pipeline %s is disabled", name)
-	}
-	if strings.TrimSpace(rec.Repo) == "" {
-		return "", fmt.Errorf("pipeline %s has no repo; stages need a managed repo to run", name)
-	}
-	if active, ok, err := store.ActivePipelineRun(ctx, name); err != nil {
-		return "", err
-	} else if ok {
-		return "", fmt.Errorf("%w: pipeline %s already has an active run %s", errBridgeConflict, name, active.ID)
-	}
-	spec, err := pipeline.Load([]byte(rec.SpecYAML))
-	if err != nil {
-		return "", fmt.Errorf("stored spec is invalid: %w", err)
-	}
-	environment, err := pipeline.ResolvePipelineEnvironment(ctx, store, rawHome, spec)
-	if err != nil {
-		return "", err
-	}
-	if err := pipeline.PipelineEnvironmentResolutionError(spec, environment.Unresolved); err != nil {
-		return "", err
-	}
-	now := time.Now().UTC()
-	run, err := pipeline.CreatePipelineRun(ctx, store, rec, spec, "bridge", payloadJSON, now)
-	if err != nil {
-		return "", err
-	}
-	enqueue := newPipelineStageEnqueuer(store, rawHome)
-	if _, err := pipeline.AdvancePipelineRun(ctx, store, enqueue, rec, spec, run, now); err != nil {
-		return "", err
-	}
-	return run.ID, nil
-}
-
-type bridgePipelineRunRequest struct {
-	Payload json.RawMessage `json:"payload"`
-}
-
-// rejectDuplicateJSONKeys walks every object in the document and rejects
-// repeated member names. encoding/json silently keeps the LAST duplicate,
-// which is a parser-differential vector: an upstream validator can approve
-// value A while the bridge stores value B on the immutable run snapshot that
-// feeds agent prompts and shell env.
-func rejectDuplicateJSONKeys(raw []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var walk func() error
-	walk = func() error {
-		token, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		delim, ok := token.(json.Delim)
-		if !ok {
-			return nil // scalar
-		}
-		switch delim {
-		case '{':
-			seen := make(map[string]struct{})
-			for dec.More() {
-				keyToken, err := dec.Token()
-				if err != nil {
-					return err
-				}
-				key, _ := keyToken.(string)
-				if _, dup := seen[key]; dup {
-					return fmt.Errorf("duplicate JSON key %q", key)
-				}
-				seen[key] = struct{}{}
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			_, err = dec.Token() // consume '}'
-			return err
-		case '[':
-			for dec.More() {
-				if err := walk(); err != nil {
-					return err
-				}
-			}
-			_, err = dec.Token() // consume ']'
-			return err
-		}
-		return nil
-	}
-	return walk()
-}
-
-func decodeBridgePipelineRunPayload(r *http.Request) (string, error) {
-	var raw json.RawMessage
-	if r.Body == nil || r.ContentLength == 0 {
-		raw = json.RawMessage(`{}`)
-	} else {
-		dec := json.NewDecoder(r.Body)
-		if err := dec.Decode(&raw); err != nil {
-			return "", err
-		}
-		if err := dec.Decode(&struct{}{}); err != io.EOF {
-			if err == nil {
-				return "", errors.New("request body must contain a single JSON object")
-			}
-			return "", err
-		}
-	}
-	trimmed := bytes.TrimSpace(raw)
-	// A literal null body was accepted by the pre-#863 decoder (a no-op);
-	// keep that compatibility by treating it as an empty request.
-	if bytes.Equal(trimmed, []byte("null")) {
-		trimmed = []byte(`{}`)
-	}
-	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return "", errors.New("request body must be a JSON object")
-	}
-	if !utf8.Valid(trimmed) {
-		return "", errors.New("request body must be valid UTF-8 JSON")
-	}
-	if err := rejectDuplicateJSONKeys(trimmed); err != nil {
-		return "", err
-	}
-	var req bridgePipelineRunRequest
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		return "", err
-	}
-	payload := make(map[string]string)
-	if len(req.Payload) > 0 {
-		payloadRaw := bytes.TrimSpace(req.Payload)
-		if len(payloadRaw) == 0 || payloadRaw[0] != '{' {
-			return "", errors.New("payload must be a JSON object with string values")
-		}
-		if err := json.Unmarshal(payloadRaw, &payload); err != nil {
-			return "", fmt.Errorf("payload must be a JSON object with string values: %w", err)
-		}
-	}
-	return pipeline.ValidateAndEncodeTriggerPayload(payload)
-}
-
-func (s *bridgeServer) handleRunGet(w http.ResponseWriter, r *http.Request, id string) {
-	view, ok, err := loadPipelineRunView(r.Context(), s.store, id)
-	if err != nil {
-		writeBridgeMappedError(w, err)
-		return
-	}
-	if !ok {
-		writeBridgeError(w, http.StatusNotFound, "run not found")
-		return
-	}
-	writeBridgeJSON(w, http.StatusOK, pipelineRunToJSON(view))
 }
 
 func (s *bridgeServer) handleJobGet(w http.ResponseWriter, r *http.Request, id string) {
@@ -620,8 +420,6 @@ func writeBridgeDecodeError(w http.ResponseWriter, err error) {
 
 func writeBridgeMappedError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, errBridgeConflict):
-		writeBridgeError(w, http.StatusConflict, strings.TrimPrefix(err.Error(), errBridgeConflict.Error()+": "))
 	case errors.Is(err, sql.ErrNoRows):
 		writeBridgeError(w, http.StatusNotFound, "not found")
 	default:

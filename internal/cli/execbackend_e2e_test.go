@@ -987,12 +987,9 @@ func execBackendEvents(t *testing.T, store *db.Store, jobID string) []string {
 	return messages
 }
 
-// TestExecBackendCompositionPreservedForLocal is ACCEPTANCE 4: the selector
-// does NOT displace the two wrappers a naive selector would — for a
-// claude/kimi produce job with path grants the Landlock WrappingRunner is
-// still applied and still positioned with GroupRunner{} innermost, and a
-// stamped "local" composes IDENTICALLY to an unstamped agent. An unknown
-// stamped backend fails loud at the composition site itself.
+// TestExecBackendCompositionPreservedForLocal is ACCEPTANCE 4: a stamped
+// "local" composes IDENTICALLY to an unstamped agent. An unknown stamped
+// backend fails loud at the composition site itself.
 //
 // (The credgw half — runtimeJobRunner still yielding the *credgw.Runner the
 // buildRuntimeAdapter type assertion needs — is exercised through the same
@@ -1006,8 +1003,8 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	work := t.TempDir()
 
 	grants := runtime.Agent{
-		Name:           "produce-agent",
-		Role:           "producer",
+		Name:           "grant-agent",
+		Role:           "implementer",
 		Runtime:        runtime.KimiRuntime,
 		RuntimeRef:     "session_550e8400-e29b-41d4-a716-446655440000",
 		RepoScope:      "owner/repo",
@@ -1037,23 +1034,6 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	if !reflect.DeepEqual(unstamped, stamped) {
 		t.Fatalf("stamped local runner = %#v\nunstamped runner = %#v\nwant identical composition", stamped, unstamped)
 	}
-	// The Landlock WrappingRunner is still applied and correctly positioned:
-	// WrappingRunner OUTSIDE, GroupRunner{} innermost.
-	wrapper, ok := stamped.(subprocess.WrappingRunner)
-	if !ok {
-		t.Fatalf("runner = %T, want WrappingRunner (the Landlock produce wrap was displaced)", stamped)
-	}
-	if _, ok := wrapper.Inner.(subprocess.GroupRunner); !ok {
-		t.Fatalf("wrapper inner = %T, want GroupRunner{} innermost", wrapper.Inner)
-	}
-	if !reflect.DeepEqual(wrapper.ReadablePaths, []string{"/data/input"}) {
-		t.Fatalf("wrapper reads = %v, want the agent's readable grant", wrapper.ReadablePaths)
-	}
-	wantWrites := []string{"/data/out", filepath.Join(home, ".kimi-code")}
-	if !reflect.DeepEqual(wrapper.WritablePaths, wantWrites) {
-		t.Fatalf("wrapper writes = %v, want %v (grants + kimi state dir)", wrapper.WritablePaths, wantWrites)
-	}
-
 	// An unknown stamped backend fails loud AT THE COMPOSITION SITE — the
 	// guard behind the dispatch validation, so a selector bypass can never
 	// silently mis-compose a runner.

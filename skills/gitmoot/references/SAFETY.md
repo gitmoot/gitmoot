@@ -32,10 +32,7 @@ branch for any queued or running `ask`, `review`, or `implement` job. An active
 job produces a transient deferral: the task remains `ready_to_merge` (not
 blocked), and the daemon re-evaluates it on the next tick. The native policy
 merge gate therefore never intentionally squash-merges and deletes a branch
-beneath in-flight work. (The separate pipeline auto-merge gate does not yet run
-this branch-activity check; it squash-merges *without* deleting the branch, so it
-cannot strand commits by branch deletion — closing that path is a tracked
-follow-up.) When an
+beneath in-flight work. When an
 **external** system owns the merge decision instead, set
 `GITMOOT_DISABLE_NATIVE_MERGE_GATE=1` (also `true`/`yes`/`on`; #545): Gitmoot
 then **abstains** from its native merge gate — fail-closed, meaning it never
@@ -63,7 +60,6 @@ The kill-switch hold is not a quality block, is not stale-task reaped, and does
 not escalate. A human GitHub merge is reconciled normally, while `@gitmoot merge`
 is an explicit authorized merge request. Turning `auto_merge` back on re-arms
 only tasks parked for this exact kill-switch reason.
-Pipeline `allow_auto_merge` remains a separate double-keyed mechanism.
 
 A repository can instead opt into low-risk auto-merge while the global switch
 stays off:
@@ -362,61 +358,6 @@ The gateway has two explicit limits:
 Codex/Kimi custody, Landlock read rules, MITM CA support, corporate
 proxy/`NO_PROXY` interoperability, and hard egress enforcement remain P3.
 
-## Pipeline Stages Run With Daemon Permissions
-
-`gitmoot pipeline add` (#681) is an **operator-trust action**. A pipeline stage's
-`cmd` is run **verbatim** via `sh -c` with the daemon's own permissions — there is
-no sandbox, allowlist, or policy gate around a stage command the way there is around
-an `implement` job. Registering a spec is exactly as privileged as pasting its stage
-commands into the daemon host's shell, so only add specs you would run yourself, and
-treat `pipeline add` from an untrusted source as arbitrary code execution.
-
-The spec is stored **verbatim** (the raw YAML bytes plus a content hash), so a spec
-that embeds private hostnames, filesystem paths, tokens-by-reference, or repo names
-is retained in the local store as-is — the same private-repo caveat as a captured
-agent template or a published template. Do not register a spec carrying a secret
-in a stage command or inline `env`. Use an operator-owned `0600` pipeline
-`env_file`, or register a name from the separate `gitmoot key path` keychain and
-grant it to the pipeline, then select it with the shell stage's `env_keys`
-allowlist.
-
-Produce agent stages have a separate filesystem allowlist. `writes:` grants
-read/write output directories. Optional `reads:` grants external input directories
-read-only: Claude/Kimi receive a cooperative runtime visibility hint, but Landlock
-is the enforcement boundary and installs those paths with read rights only. Gitmoot
-refuses read roots that expose its home, the configured keychain, or the pipeline
-`env_file`, and refuses a read root that contains a write root. Unsupported
-Claude/Kimi hosts fail closed instead of falling back to advisory confinement;
-Codex uses its native sandbox, and read paths are never passed as writable
-`--add-dir` grants.
-
-When Claude produce declares `reads:`, Gitmoot derives additional read-only
-runtime resources from the operator's user settings: the Claude config directory,
-`~/.claude.json`, and parent directories of absolute command-hook scripts. The same
-Gitmoot-home/keychain/`env_file` exclusions override auto-discovery. An excluded,
-missing, or unreadable script is refused before runtime launch with its path;
-relative or malformed hook commands emit a `produce_runtime_resource_warning`
-job event. No such discovery runs when `reads:` is absent.
-
-Pipeline key access is deny-by-default. An `injected` selection gives only a
-shell stage the real value, which it can print or transmit. Agent stages require
-both a configured proxied key granted to their registered seat and an explicit
-stage selector; injected agent grants are refused. A configured `proxied`
-selection gives the selected shell or agent a per-job placeholder and loopback URL; Gitmoot
-rereads the value and rechecks the grant on every request, pins forwarding to
-the configured HTTPS origin/base path, and revokes the lease when delivery
-ends. Gitmoot stores only `{stage,name,source,mode}` audit rows, never values or
-hashes. Keychain and pipeline files are revalidated as owner-only `0600` files
-outside Gitmoot state and managed checkouts.
-
-For agent stages, the real value never enters the agent process. Proxied mode
-hides key bytes; it does **not** prevent an authorized child from
-exercising the credential on the pinned upstream. Curated upstreams and base
-paths are part of the model, and only trusted upstreams should be configured.
-Gate stages remain ineligible. Ordinary agent jobs receive nothing, and
-delegation children do not inherit a stage grant. This generic pipeline proxy
-is distinct from the Claude model gateway.
-
 ## External Contracts
 
 If the work depends on external APIs, CLIs, env vars, generated scripts, service
@@ -555,31 +496,6 @@ empty delegations. That continuation is terminal: any delegations it returns are
 ignored (`delegation_finalized`), so work is bounded and always ends in a clean
 synthesis, not a silent dead end.
 
-## Pipeline service exposures
-
-Service access is opt-in per pipeline and bounded schema. V1 exposes only
-shell-only, template-free pipelines; submitted values are validated as typed
-fields and delivered only through reserved `GITMOOT_INPUT_*` environment names,
-never prompt text. Stages declaring `env_keys`, network access, or extra
-read/write authority are ineligible for exposure. Every accepted shell stage
-requires a detached worktree and fails closed if isolation cannot be allocated.
-The listener binds to loopback by default; do not expose it to production
-networks without explicit owner action, TLS, and a trusted firewall.
-
-Successful service shell stages can publish up to 64 MiB total from `out/`.
-Collection happens before detached-worktree disposal, rejects absolute/parent
-paths, symlinks, and non-regular files, and binds each accepted file's name,
-size, and SHA-256 digest into the store-verified proof. The authenticated service
-bundle contains those bytes under `artifacts/<stage-id>/`; the public receipt
-lists only their metadata and its sanitized bundle omits artifact bytes.
-
-Both bundles contain the frozen #941 pipeline spec, including full shell command
-bodies and referenced environment-variable names. Never inline secret literals
-in `cmd`. Public receipt handlers only read an already completed archive.
-Disabling an exposure blocks new runs but does not revoke authenticated reads or
-polling for accepted runs; rotate the token to revoke the old bearer credential
-(the public receipt URL remains public once finalized).
-
 ## When To Stop
 
 Stop and report `blocked` when the target repo is unclear, GitHub auth is
@@ -607,12 +523,11 @@ without destroying data.
 
 Ordinary and aged cleanup of recognized owned delegation/read-only worktrees use
 the same producer-owned admission gate. A terminal owner alone is not enough:
-blocked/resumable consumers, declared but undispatched dependencies, unfinished
-pipeline stages, unknown ownership or process state, and preservation failures
-all retain the resource. Succeeded owners require a stored result. Failed or
+blocked/resumable consumers, declared but undispatched dependencies, unknown
+ownership or process state, and preservation failures all retain the resource. Succeeded owners require a stored result. Failed or
 cancelled owners additionally require a proven reconstruction path; currently
 this is a native read-only PR review pinned to an exact head.
-Failed/cancelled implement legs, produce stages and shell stages therefore remain
+Failed/cancelled implement legs and every other unproven owner therefore remain
 retained indefinitely while they lack that proof, including their owned branches.
 TTL is a minimum age for eligible cleanup, not a maximum retention or disk bound.
 `retry_disposition_unknown` cannot be overridden by `apply` or `reopen`; there is
@@ -644,12 +559,6 @@ Ordinary succeeded-owner cleanup keeps its existing retention policy. Neither
 path overrides quarantine, checkout/branch locks or live-process protection.
 Successful aged removal and metadata reconciliation record
 `delegation_worktree_reclaimed_ttl`.
-
-Terminal artifact publication does not wait for deletion eligibility. Blocked
-downstream stages can receive their inputs while the producer worktree remains.
-Required service outputs have generation-bound snapshots under
-`$GITMOOT_HOME/cleanup-artifacts/`, outside disposable workspaces; a missing or
-changed required snapshot refuses deletion.
 
 No NEW fix clone is ever created: #2203 removed the fix-worktree lifecycle
 along with the auto-fix leg that allocated one. The clones already on disk are
@@ -736,10 +645,9 @@ swept by worktree teardown. Non-isolated jobs (the persistent registered
 checkout) are unaffected — they do not duplicate caches per job.
 
 Codex is always sandboxed, so this also widens its `--add-dir` writable-path
-allowlist to the shared cache directory; Claude/Kimi `produce` jobs pick up the
-same grant through their existing Landlock write-allowlist. Non-produce
-Claude/Kimi and `shell` runtime jobs already run unsandboxed, so only the env
-redirect applies to them.
+allowlist to the shared cache directory. Claude/Kimi and `shell` runtime jobs
+outside read-only seats already run unsandboxed, so only the env redirect applies
+to them.
 
 A codex job gets neither the grant nor the env when its sandbox mode cannot
 reach the shared directory: a read-only/`auto`/unrecognized autonomy policy

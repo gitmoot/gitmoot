@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, pipelines, pipeline chaining through the localhost bridge, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
@@ -223,8 +223,8 @@ effort as `--thinking <level>` when the value is one of
 `off|minimal|low|medium|high|xhigh|max|auto`, and no flag at all otherwise.
 Claude and Kimi ignore effort. The `omp` runtime is a multi-provider **routing
 harness**, so a few of its properties differ from the vendor CLIs and are worth
-saying out loud before routing work to it: it holds `review`/`implement`/`ask`
-but not `produce`, every job runs a fresh session (it never resumes), and
+saying out loud before routing work to it: it holds `review`/`implement`/`ask`,
+every job runs a fresh session (it never resumes), and
 read-only seats use Gitmoot's broker-backed sandbox. Runtime-family diversity
 uses the upstream provider proved by a successful OMP delivery, not the `omp`
 wrapper or requested model text. It is advisory: same-family comparisons emit
@@ -293,15 +293,6 @@ draft for failed, blocked, or cancelled jobs; use
 `gitmoot report bug --job <job-id> --create --yes` only when the user
 explicitly asks you to file it or the active workflow policy permits automatic
 bug filing.
-
-For a fixed, repeatable multi-step shell flow (not a model-driven decomposition),
-prefer a **pipeline** (#681) over an orchestra: `gitmoot pipeline add <spec.yaml>`
-registers a declared DAG of shell stages that the daemon runs on demand
-(`pipeline run`) or on an interval schedule. Each stage is an ordinary shell-runtime
-job whose `gitmoot_result` decision drives advancement; a `blocked` stage parks the
-run (resume with `pipeline resume <run-id>`), and a stage is a leaf (its
-`delegations[]` never spawn children). Pipelines are off by default. See CLI.md
-§ Pipelines, WORKFLOWS.md § Pipelines, and `docs/pipelines.md`.
 
 When a job pauses at `awaiting_human`, the local (non-PR) answer path is
 `gitmoot job answer <job-id> "<question-id>: text"`. It resumes through the same
