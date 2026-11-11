@@ -192,6 +192,7 @@ func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, er
 		sink:      resolveDaemonEventSinkWithRules(w.Store, w.workflowHome(), rules),
 		rules:     rules,
 		ready:     messageRecipientReadiness(w.workflowHome()),
+		loadOrg:   messageOrgLoader(w.workflowHome()),
 		ownerGram: w.OwnerGram,
 	}, nil
 }

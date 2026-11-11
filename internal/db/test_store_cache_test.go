@@ -108,6 +108,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2566: backfills declared_state while upgrading a database built from
 	// the migrations before it, through the real Open path.
 	realPathTests["TestDeclaredStateMigrationBackfillsFromDowngradeEvents"] = true
+	// #2574: upgrades a database built from the migrations before the
+	// deferral-notice column through the real Open path.
+	realPathTests["TestMessageDeferralNoticeMigrationUpgradesThroughOpen"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

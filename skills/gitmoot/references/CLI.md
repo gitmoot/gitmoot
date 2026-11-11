@@ -2727,6 +2727,19 @@ Replies reserve SQLite's writer before reading the parent, allowing brief
 contention to clear without retrying the insertion. If an insertion's outcome
 is unknown, inspect saved history before considering a manual retry.
 
+When a message's notification is still queued 15 minutes after it was created
+(deferred by the recipient's runtime, or the recipient offline or its binding
+unresolved), the daemon sends the sender one `@system` message naming the
+message id, the recipient, how long it has waited and the current reason, and
+saying it stays queued for delivery when the recipient can take it, so nobody
+needs to type it into the recipient's pane. It is sent once per message, and
+durably: the wake row is stamped in the same transaction as the notice. No
+notice goes to `@system` or to a sender that is not a registered role, for a
+message to oneself, for mail already delivered, superseded or failed, for a
+recipient that is not registered or has no current seat (those have their own
+notices), or for a notification older than 24 hours, so the first daemon after
+an upgrade does not announce old backlog.
+
 This replaces the old `org message`, `org escalate` and `org directive` sending
 surfaces, without aliases. Historical addressed notes retain their IDs and
 source links. Import creates inbox projections, never new wake obligations;

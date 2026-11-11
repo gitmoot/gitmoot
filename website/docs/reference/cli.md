@@ -2329,6 +2329,15 @@ Replies reserve SQLite's writer before reading the parent, allowing brief
 contention to clear without retrying the insertion. If an insertion's outcome
 is unknown, inspect saved history before considering a manual retry.
 
+A message still queued 15 minutes after creation (deferred by the recipient's
+runtime, or the recipient offline or unbound) earns its sender one `@system`
+message with the message id, recipient, wait and current reason, saying it
+stays queued and there is no need to type into the recipient's pane. It is sent
+once per message and stamped atomically with the notice. There is none for
+`@system` or unregistered senders, self-messages, delivered, superseded or
+failed mail, an unregistered or seatless recipient (those have their own
+notices), or a notification older than 24 hours.
+
 Claude Code and Codex seats receive mail at turn boundaries through the
 Gitmoot plugin's hooks, which run
 `gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop

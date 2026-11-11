@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/org"
@@ -33,6 +34,9 @@ type replyWakeDelivery struct {
 	sink  events.Sink
 	rules []db.EventRule
 	ready func(context.Context, string) (messageRecipientStatus, error)
+	// loadOrg reads the org registry; a deferral notice goes only to a sender
+	// that is a registered role (#2574). Nil sends no notice.
+	loadOrg func() (config.OrgConfig, error)
 	// ownerGram, when set, delivers wakes addressed to the owner role as Herdr
 	// Grams instead of through rules and panes (owner_gram.go).
 	ownerGram ownerGramSender
@@ -147,6 +151,13 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 	// above still describes the store exactly, so the closing health pass
 	// can reuse it instead of issuing the same query a second time (#1758).
 	mutated := false
+	// deferredReasons holds the reason this pass recorded for each row it held
+	// back. Recording a reason is not a claim, so the reused projection still
+	// carries the previous one; the sender notice reads the current one here.
+	deferredReasons := make(map[int64]string)
+	// orgLoader is the registry reader of the last delivery this pass resolved,
+	// so the sender notice needs no resolve of its own.
+	var orgLoader func() (config.OrgConfig, error)
 
 	agedAttempted := len(obligations.AgedAttempted)
 	if agedAttempted > 0 {
@@ -258,6 +269,7 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			if delivery.sink == nil {
 				break
 			}
+			orgLoader = delivery.loadOrg
 			status := messageRecipientStatus{state: org.StateWorking}
 			if delivery.ready != nil {
 				status, err = delivery.ready(ctx, wakeRecipient(event))
@@ -301,6 +313,9 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 					if err := recorder.DeferMessageNotifications(ctx, ids, status.reason); err != nil {
 						return replyWakeOutboxHealth{}, err
 					}
+					for _, id := range ids {
+						deferredReasons[id] = status.reason
+					}
 				}
 				start = end
 				continue
@@ -329,14 +344,20 @@ func drainReplyWakeOutboxWithHealth(ctx context.Context, store wakeOutboxStore, 
 			start = end
 		}
 	}
-	if mutated {
-		return wakeOutboxObligationHealth(ctx, store, attemptedBefore, now, hold, resolve)
-	}
 	// The #1200/#1201 contract is untouched by the reuse: an unreadable outbox
 	// already returned its error above, so only a SUCCESSFUL read can reach
 	// here, and an empty one returned early. Reuse therefore never turns "could
 	// not read" into "nothing to do".
-	return classifyWakeOutboxObligations(ctx, store, obligations, attemptedBefore, now, hold, resolve)
+	current := obligations
+	if mutated {
+		current, err = store.ListWakeOutboxObligations(ctx, attemptedBefore)
+		if err != nil {
+			return replyWakeOutboxHealth{}, fmt.Errorf("read wake outbox obligations: %w", err)
+		}
+	}
+	// After delivery, so a row this pass delivered is never reported waiting.
+	noticeDeferredMessages(ctx, store, current.Pending, deferredReasons, now, orgLoader, resolve)
+	return classifyWakeOutboxObligations(ctx, store, current, attemptedBefore, now, hold, resolve)
 }
 
 func wakeOutboxObligationHealth(

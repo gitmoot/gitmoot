@@ -161,6 +161,9 @@ type WakeOutboxObligation struct {
 	MessageSender        string
 	MessageBody          string
 	MessageSourcePayload string
+	// DeferralNoticeAt is when the message's sender was told this wake is
+	// still undelivered ("" when not yet): one notice per row (#2574).
+	DeferralNoticeAt string
 }
 
 // WakeOutboxObligationProjection exposes decisions, not persisted states.
@@ -428,12 +431,13 @@ func listWakeOutboxObligations(
 		var entry WakeOutboxEntry
 		var directivePhase string
 		var directiveBody string
+		var deferralNoticeAt string
 		var message Message
 		if err := rows.Scan(
 			&entry.ID, &entry.SourceKind, &entry.SourceID, &entry.TargetRole,
 			&entry.CoalesceKey, &entry.State, &entry.AttemptCount,
 			&entry.LastError, &entry.CreatedAt, &entry.AttemptedAt,
-			&entry.FinishedAt, &entry.UpdatedAt, &directivePhase, &directiveBody,
+			&entry.FinishedAt, &entry.UpdatedAt, &deferralNoticeAt, &directivePhase, &directiveBody,
 			&message.ID, &message.ThreadID, &message.Kind, &message.Sender, &message.Body, &message.SourcePayload,
 		); err != nil {
 			return WakeOutboxObligationProjection{}, err
@@ -447,6 +451,7 @@ func listWakeOutboxObligations(
 			MessageID:      message.ID, MessageThreadID: message.ThreadID,
 			MessageKind: message.Kind, MessageSender: message.Sender,
 			MessageBody: message.Body, MessageSourcePayload: message.SourcePayload,
+			DeferralNoticeAt: deferralNoticeAt,
 		}
 		interpretation, ok := interpretWakeOutboxState(entry.State)
 		if !ok {
@@ -558,7 +563,7 @@ func wakeOutboxObligationQuery(attemptedBefore time.Time, targetRole string) (st
 	return `
 SELECT wake_outbox.id, wake_outbox.source_kind, wake_outbox.source_id, target_role, coalesce_key, state,
 		attempt_count, last_error, created_at, COALESCE(attempted_at, ''),
-		COALESCE(finished_at, ''), updated_at,
+		COALESCE(finished_at, ''), updated_at, deferral_notice_at,
 		CASE
 			WHEN wake_outbox.source_kind != 'workflow_note' OR coalesce_key NOT LIKE 'directive:%' THEN ''
 			WHEN ` + wakeOutboxDirectiveMarkerExists("cancel", "done") + ` THEN 'terminal'
