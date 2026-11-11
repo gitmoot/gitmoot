@@ -54,6 +54,8 @@ type designNotesFake struct {
 	compareCalls []string
 	// issueRepos logs the repo every search and create was made against.
 	issueRepos []string
+	// foundByTitle answers a search for one exact title.
+	foundByTitle map[string]DesignNotesIssue
 }
 
 func newDesignNotesFake() *designNotesFake {
@@ -75,11 +77,14 @@ func (f *designNotesFake) wire(e *Engine) {
 		}
 		return state, nil
 	}
-	e.DesignNotesFindIssue = func(_ context.Context, repo, _ string) (DesignNotesIssue, bool, error) {
+	e.DesignNotesFindIssue = func(_ context.Context, repo, title string) (DesignNotesIssue, bool, error) {
 		f.issueRepos = append(f.issueRepos, repo)
 		f.searches++
 		if f.found != nil {
 			return *f.found, true, nil
+		}
+		if issue, ok := f.foundByTitle[title]; ok {
+			return issue, true, nil
 		}
 		return DesignNotesIssue{}, false, nil
 	}
@@ -458,6 +463,63 @@ func TestDesignNotesSweepUsesTheRepositorysCurrentName(t *testing.T) {
 	if _, ok, err := store.GetDesignNoteIssue(ctx, moved, "2026-W46"); err != nil || !ok {
 		t.Fatalf("week issue not recorded under %q: ok=%v err=%v", moved, ok, err)
 	}
+}
+
+// #2570 review: a repository renamed mid-week already has this week's issue
+// under its old name. The sweep must reuse it, whether it is recorded in the
+// store or only findable on GitHub by its old title, rather than open a second
+// issue and send a second notice.
+func TestDesignNotesRenameMidWeekReusesTheOldNameIssue(t *testing.T) {
+	const moved = "neworg/repo"
+	t.Run("recorded in the store", func(t *testing.T) {
+		ctx := context.Background()
+		engine, store, fake := designNotesEngine(t)
+		seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+		recordDesignNote(t, store, designNoteObs{pr: 30, job: "review-1", state: db.FindingOpen, severity: "P3", title: "before the move", ago: 2 * time.Hour})
+		fake.states[30] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged}
+		if result, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{}); err != nil || result.Filed != 1 || len(fake.created) != 1 {
+			t.Fatalf("first sweep filed %d, created %q: %v %v", result.Filed, fake.created, err, result.Errors)
+		}
+		first := fake.comments[0].issue
+
+		recordDesignNote(t, store, designNoteObs{pr: 31, job: "review-1", state: db.FindingOpen, severity: "P3", title: "after the move", ago: time.Hour})
+		fake.states[31] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged, Repo: moved}
+		result, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+		if err != nil || result.Filed != 1 {
+			t.Fatalf("second sweep filed %d: %v %v", result.Filed, err, result.Errors)
+		}
+		if len(fake.created) != 1 {
+			t.Fatalf("created %q: a rename mid-week opened a second week issue", fake.created)
+		}
+		if last := fake.comments[len(fake.comments)-1]; last.issue != first || last.repo != moved {
+			t.Fatalf("second note went to %s#%d, want #%d under the current name %s", last.repo, last.issue, first, moved)
+		}
+		if messages, _ := store.ListMessages(ctx, "lead", 0, 100); len(messages) != 1 {
+			t.Fatalf("lead got %d notices, want exactly one for the week", len(messages))
+		}
+	})
+	t.Run("found only by its old title", func(t *testing.T) {
+		ctx := context.Background()
+		engine, store, fake := designNotesEngine(t)
+		seedDesignNotesReviewJob(t, store, "review-1", `{"review_requester":"lead"}`)
+		recordDesignNote(t, store, designNoteObs{pr: 31, job: "review-1", state: db.FindingOpen, severity: "P3", title: "after the move", ago: time.Hour})
+		fake.states[31] = DesignNotesPullRequestState{Merged: true, HeadSHA: designNotesMerged, Repo: moved}
+		fake.foundByTitle = map[string]DesignNotesIssue{
+			designNotesIssueTitle(designNotesRepo, "2026-W46"): {Number: 77, URL: "https://github.com/neworg/repo/issues/77"},
+		}
+		result, err := engine.SweepDesignNotes(ctx, DesignNotesSweepOptions{})
+		if err != nil || result.Filed != 1 {
+			t.Fatalf("sweep filed %d: %v %v", result.Filed, err, result.Errors)
+		}
+		if len(fake.created) != 0 || len(fake.comments) != 1 || fake.comments[0].issue != 77 {
+			t.Fatalf("created %q, comments %+v: the old-title issue #77 must be reused", fake.created, fake.comments)
+		}
+		for _, repo := range fake.issueRepos {
+			if repo != moved {
+				t.Fatalf("searched %q; GitHub search only accepts the current name %q", repo, moved)
+			}
+		}
+	})
 }
 
 func TestDesignNotesSweepLeavesFindingsUnfiledWhenTheCommentFails(t *testing.T) {

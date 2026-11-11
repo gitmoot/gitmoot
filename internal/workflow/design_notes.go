@@ -301,7 +301,7 @@ func (s *designNotesSweep) file(ctx context.Context, pr designNotesPullRequest, 
 		return
 	}
 	remaining = screened.post
-	issue, err := s.weekIssue(ctx, pr.github, issueRole)
+	issue, err := s.weekIssue(ctx, pr.github, pr.key.Repo, issueRole)
 	if err != nil {
 		s.fail(ctx, pr, "week issue: "+err.Error())
 		return
@@ -673,37 +673,68 @@ func (s *designNotesSweep) issueMarkers(ctx context.Context, repo string, issue 
 // weekIssue returns the repository's issue for this week: from the store,
 // else from a GitHub search by exact title and label (a lost row must not
 // open a duplicate), else a new issue, whose role is then told once.
-func (s *designNotesSweep) weekIssue(ctx context.Context, repo, role string) (DesignNotesIssue, error) {
+//
+// repo is the repository's current name on GitHub; ledger is the name its
+// findings carry. They differ after a transfer or rename (#2569), and an issue
+// opened earlier this week under the old name is still this week's issue: it
+// is looked up by that name too, in the store and by its old title, before a
+// new one is opened.
+func (s *designNotesSweep) weekIssue(ctx context.Context, repo, ledger, role string) (DesignNotesIssue, error) {
 	if issue, ok := s.issues[repo]; ok {
 		return issue, nil
 	}
-	recorded, ok, err := s.e.Store.GetDesignNoteIssue(ctx, repo, s.week)
-	if err != nil {
-		return DesignNotesIssue{}, err
+	names := []string{repo}
+	if ledger != "" && ledger != repo {
+		names = append(names, ledger)
 	}
-	issue := DesignNotesIssue{Number: recorded.Number, URL: recorded.URL}
-	if !ok {
-		if issue, err = s.findOrCreateIssue(ctx, repo, role); err != nil {
+	for i, name := range names {
+		recorded, ok, err := s.e.Store.GetDesignNoteIssue(ctx, name, s.week)
+		if err != nil {
 			return DesignNotesIssue{}, err
 		}
+		if !ok {
+			continue
+		}
+		issue := DesignNotesIssue{Number: recorded.Number, URL: recorded.URL}
+		if i > 0 {
+			s.recordFoundIssue(ctx, repo, issue)
+		}
+		s.issues[repo] = issue
+		return issue, nil
+	}
+	issue, err := s.findOrCreateIssue(ctx, repo, names, role)
+	if err != nil {
+		return DesignNotesIssue{}, err
 	}
 	s.issues[repo] = issue
 	return issue, nil
 }
 
-func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo, role string) (DesignNotesIssue, error) {
+// recordFoundIssue records an existing week issue under repo. It is not a
+// created issue, so no notice is sent for it.
+func (s *designNotesSweep) recordFoundIssue(ctx context.Context, repo string, issue DesignNotesIssue) {
+	// Not recording it only costs the next sweep another lookup.
+	if _, err := s.e.Store.RecordDesignNoteIssue(ctx, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: issue.Number, URL: issue.URL}, s.now); err != nil {
+		s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s: record found issue %s: %v", repo, issue.URL, err))
+	}
+}
+
+// findOrCreateIssue searches repo (the current name, the only one GitHub
+// search accepts) for this week's issue under each of names' titles, and
+// opens one titled for repo when none exists.
+func (s *designNotesSweep) findOrCreateIssue(ctx context.Context, repo string, names []string, role string) (DesignNotesIssue, error) {
 	title := designNotesIssueTitle(repo, s.week)
 	if s.e.DesignNotesFindIssue != nil {
-		found, exists, err := s.e.DesignNotesFindIssue(ctx, repo, title)
-		if err != nil {
-			return DesignNotesIssue{}, fmt.Errorf("search %q: %w", title, err)
-		}
-		if exists {
-			// Not recording it only costs the next sweep another search.
-			if _, err := s.e.Store.RecordDesignNoteIssue(ctx, db.DesignNoteIssue{Repo: repo, ISOWeek: s.week, Number: found.Number, URL: found.URL}, s.now); err != nil {
-				s.result.Errors = append(s.result.Errors, fmt.Sprintf("%s: record found issue %s: %v", repo, found.URL, err))
+		for _, name := range names {
+			searched := designNotesIssueTitle(name, s.week)
+			found, exists, err := s.e.DesignNotesFindIssue(ctx, repo, searched)
+			if err != nil {
+				return DesignNotesIssue{}, fmt.Errorf("search %q: %w", searched, err)
 			}
-			return found, nil
+			if exists {
+				s.recordFoundIssue(ctx, repo, found)
+				return found, nil
+			}
 		}
 	}
 	agentLabel := postMergeUnassignedAgentLabel
