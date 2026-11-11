@@ -325,6 +325,9 @@ runtime, session and generation, and waits a few seconds for one reply. The
 add-on refuses a replaced session (`stale_session`) and defers while the
 operator is typing, a dialog is open or a draft is in progress. A working
 session gets the note at its next step boundary; an idle one starts a turn.
+An idle session that still has queued input defers as `busy` until the queue
+has waited at least 60 s and no operator key has arrived for 10 minutes; the
+note then starts a turn that also delivers the queue.
 The note never touches the editor.
 
 `accepted` marks the row `delivered`. That means runtime admission, not

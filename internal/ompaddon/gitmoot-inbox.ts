@@ -42,6 +42,15 @@ const INACTIVITY_OVERRIDE_MS = positiveMs(process.env.GITMOOT_OMP_INBOX_INACTIVI
 // Compaction and retry flags release on their end events. This cap only
 // covers an end event that never arrives, for example a cancelled compaction.
 const MAINTENANCE_CAP_MS = 10 * 60_000;
+// OMP schedules its own drain of the steering and follow-up queue as soon as a
+// turn settles, so a fresh queue normally empties within seconds. A queue an
+// idle session still holds this long after the add-on first saw it waits for
+// the next turn, so the note starts one, but only once the operator has also
+// been away for INACTIVITY_OVERRIDE_MS: an operator who interrupted the agent
+// with a follow-up queued must not see it resume a minute later. The margin
+// covers slow post-turn work and several daemon ticks. The environment
+// override exists for tests.
+const QUEUE_GRACE_MS = positiveMs(process.env.GITMOOT_OMP_INBOX_QUEUE_GRACE_MS, 60_000);
 const MAX_REQUEST_BYTES = 1 << 20;
 const REQUEST_TIMEOUT_MS = 5_000;
 // Linux and macOS reject Unix socket paths at 108 and 104 bytes.
@@ -76,7 +85,7 @@ interface Api {
 	on(event: string, handler: (event: unknown, ctx: Context) => unknown): void;
 	sendMessage(
 		message: { customType: string; content: string; display: boolean; details?: unknown },
-		options: { deliverAs: "aside"; triggerTurn?: boolean },
+		options: { deliverAs?: "aside"; triggerTurn?: boolean },
 	): void;
 }
 
@@ -139,6 +148,8 @@ export default function gitmootInbox(pi: Api) {
 	let manualCompactAt = 0;
 	let autoCompactAt = 0;
 	let retryAt = 0;
+	// When an idle session was first seen with queued messages; 0 when not.
+	let queuedSince = 0;
 	let unsubscribeKeys: (() => void) | undefined;
 	let server: net.Server | undefined;
 	let registered = false;
@@ -196,12 +207,22 @@ export default function gitmootInbox(pi: Api) {
 	}
 
 	// The admission decision. Callers must act on it in the same synchronous turn.
-	function admission(now: number): { reason: Reason } | { mode: "idle" | "working" } {
+	// `stranded` marks an idle session whose queue outlived the grace while the
+	// operator stayed away.
+	function admission(now: number): { reason: Reason } | { mode: "idle" | "working"; stranded?: boolean } {
 		if (active(manualCompactAt, now) || active(autoCompactAt, now) || active(retryAt, now)) return { reason: "busy" };
-		if (!ctx!.isIdle()) return { mode: "working" };
-		if (ctx!.hasPendingMessages()) return { reason: "busy" };
+		if (!ctx!.isIdle()) {
+			queuedSince = 0;
+			return { mode: "working" };
+		}
+		if (!ctx!.hasPendingMessages()) queuedSince = 0;
+		else if (queuedSince === 0) queuedSince = now;
+		if (queuedSince !== 0 && now - queuedSince < QUEUE_GRACE_MS) return { reason: "busy" };
 		const reason = idleGate(now);
-		return reason ? { reason } : { mode: "idle" };
+		if (reason) return { reason };
+		if (queuedSince === 0) return { mode: "idle" };
+		if (now - Math.max(lastKeyAt, loadedAt) < INACTIVITY_OVERRIDE_MS) return { reason: "busy" };
+		return { mode: "idle", stranded: true };
 	}
 
 	function deliver(id: unknown, request: Record<string, unknown>): Reply {
@@ -218,9 +239,13 @@ export default function gitmootInbox(pi: Api) {
 		const content = request.content.replace(CONTROL_CHARS, "");
 		const ids = messageIds(content);
 		try {
+			// An aside starts an idle turn unless OMP folds it into context instead,
+			// which it does after a user interrupt: the very state that holds a
+			// follow-up queue. A plain turn-triggering message always starts the
+			// turn, and that turn takes the queue with it.
 			pi.sendMessage(
 				{ customType: NOTE_TYPE, content: formatNote(content, ids), display: true, details: { source: "gitmoot", messageIds: ids } },
-				{ deliverAs: "aside", triggerTurn: decision.mode === "idle" },
+				decision.stranded ? { triggerTurn: true } : { deliverAs: "aside", triggerTurn: decision.mode === "idle" },
 			);
 		} catch (error) {
 			lastError = `sendMessage: ${String(error)}`;
@@ -243,6 +268,7 @@ export default function gitmootInbox(pi: Api) {
 				pid: process.pid,
 				idle: ctx.isIdle(),
 				pendingMessages: ctx.hasPendingMessages(),
+				pendingMessagesForMs: queuedSince === 0 ? null : now - queuedSince,
 				...uiState(),
 				activitySource: officialActivity() ? "official" : "fallback",
 				draft: ctx.ui.getEditorText() !== "",
@@ -402,7 +428,7 @@ export default function gitmootInbox(pi: Api) {
 		// print mode have no operator to protect and are not delivery targets.
 		if (!next.hasUI || next.agent?.kind === "sub") return false;
 		ctx = next;
-		manualCompactAt = autoCompactAt = retryAt = 0;
+		manualCompactAt = autoCompactAt = retryAt = queuedSince = 0;
 		submissionAt = 0;
 		unsubscribeKeys?.();
 		unsubscribeKeys = next.ui.onTerminalInput?.(onTerminalInput);
@@ -447,10 +473,12 @@ export default function gitmootInbox(pi: Api) {
 	pi.on("agent_start", () => {
 		submissionAt = 0;
 		manualCompactAt = 0;
+		queuedSince = 0;
 		captureEditor();
 	});
 	pi.on("agent_end", () => {
 		submissionAt = 0;
+		queuedSince = 0;
 	});
 	pi.on("session_before_compact", () => {
 		manualCompactAt = Date.now();

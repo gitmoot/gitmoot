@@ -35,9 +35,10 @@ type LiveStep struct {
 // pseudo-terminal, agent directory and registry directory, with a local
 // stand-in model) carrying the add-on this binary installs. It checks that the
 // session registers, answers a probe, accepts an idle delivery that reaches
-// the model, defers while someone types, refuses a stale target, and removes
-// its registration on shutdown. Nothing outside the temporary directory is
-// touched, and the real Gitmoot registry never sees the session.
+// the model, delivers past a queue OMP left stranded, defers while someone
+// types, refuses a stale target, and removes its registration on shutdown.
+// Nothing outside the temporary directory is touched, and the real Gitmoot
+// registry never sees the session.
 func LiveCheck(ctx context.Context, ompBinary string) []LiveStep {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
@@ -113,6 +114,12 @@ func (r *liveRun) check(ctx context.Context, ompBinary string) []LiveStep {
 	}
 	pass("idle-delivery", "accepted while idle; the note started a turn and reached the model")
 
+	detail, err := r.checkStuckQueue(ctx, reg.Endpoint, target, logPath)
+	if err != nil {
+		return fail("stuck-queue", "%v", err)
+	}
+	pass("stuck-queue", "%s", detail)
+
 	if _, err := r.pty.Write([]byte("x")); err != nil {
 		return fail("deferral", "type into the test session: %v", err)
 	}
@@ -158,6 +165,131 @@ func (r *liveRun) check(ctx context.Context, ompBinary string) []LiveStep {
 	return steps
 }
 
+// liveQueueGrace and liveInactivity replace the add-on's 60 s queue grace and
+// 10 min operator inactivity in the live session.
+const (
+	liveQueueGrace = 5 * time.Second
+	liveInactivity = 15 * time.Second
+)
+
+// checkStuckQueue has the stand-in model leave the session idle with a queued
+// follow-up OMP does not drain by itself. Within the queue grace the add-on
+// defers. After the grace a key the operator pressed still defers it. Once the
+// operator has also been inactive long enough, a note is accepted idle, its
+// turn reaches the model and takes the follow-up with it, and the queue is
+// empty.
+func (r *liveRun) checkStuckQueue(ctx context.Context, endpoint string, target map[string]any, logPath string) (string, error) {
+	queued := "gitmoot-live-check-queued-" + randomHex(6)
+	control := filepath.Join(r.dir, "control")
+	if err := os.WriteFile(control, []byte("Gitmoot plugin doctor live check follow-up "+queued+"; nothing to do."), 0o600); err != nil {
+		return "", err
+	}
+	var stranded struct {
+		Idle            bool   `json:"idle"`
+		PendingMessages bool   `json:"pendingMessages"`
+		Error           string `json:"error"`
+	}
+	if err := waitFor(ctx, 20*time.Second, func() (bool, error) {
+		data, err := os.ReadFile(control + ".done")
+		if err != nil {
+			return false, nil
+		}
+		return true, json.Unmarshal(data, &stranded)
+	}); err != nil {
+		return "", fmt.Errorf("queue a follow-up behind an interrupted turn: %w", err)
+	}
+	if stranded.Error != "" || !stranded.Idle || !stranded.PendingMessages {
+		return "", fmt.Errorf("the session is not idle with a queued follow-up: %+v", stranded)
+	}
+
+	early := "gitmoot-live-check-early-" + randomHex(6)
+	reply, err := call(endpoint, map[string]any{"v": 1, "id": "queued-early", "method": "deliver", "target": target,
+		"content": "Gitmoot plugin doctor live check " + early + "; nothing to do."})
+	if err != nil {
+		return "", err
+	}
+	if reply["status"] != "deferred" || reply["reason"] != "busy" {
+		return "", fmt.Errorf("expected deferred/busy within the queue grace, got %s", compactJSON(reply))
+	}
+	// The add-on started its queue clock at the latest with that request.
+	firstSeen := time.Now()
+
+	// A key and its erasure: operator activity that leaves no draft behind.
+	if _, err := r.pty.Write([]byte("x\x7f")); err != nil {
+		return "", fmt.Errorf("type into the test session: %w", err)
+	}
+	var state map[string]any
+	if err := waitFor(ctx, liveQueueGrace+10*time.Second, func() (bool, error) {
+		reply, err := call(endpoint, map[string]any{"v": 1, "id": "queued-key-probe", "method": "probe"})
+		if err != nil {
+			return false, err
+		}
+		state, _ = reply["state"].(map[string]any)
+		return state["msSinceKey"] != nil && time.Since(firstSeen) > liveQueueGrace+500*time.Millisecond, nil
+	}); err != nil {
+		return "", fmt.Errorf("the add-on did not see the typed key (state %s): %w", compactJSON(state), err)
+	}
+	recent := "gitmoot-live-check-recent-" + randomHex(6)
+	reply, err = call(endpoint, map[string]any{"v": 1, "id": "queued-recent", "method": "deliver", "target": target,
+		"content": "Gitmoot plugin doctor live check " + recent + "; nothing to do."})
+	if err != nil {
+		return "", err
+	}
+	sinceKey, _ := state["msSinceKey"].(float64)
+	if reply["status"] != "deferred" || (reply["reason"] != "busy" && reply["reason"] != "operator_active") {
+		return "", fmt.Errorf("expected deferred/busy or operator_active %vms after a key with the queue past its grace, got %s", sinceKey, compactJSON(reply))
+	}
+	keyDeferral := reply["reason"]
+
+	if err := waitFor(ctx, liveInactivity+10*time.Second, func() (bool, error) {
+		reply, err := call(endpoint, map[string]any{"v": 1, "id": "queued-probe", "method": "probe"})
+		if err != nil {
+			return false, err
+		}
+		state, _ = reply["state"].(map[string]any)
+		admission, _ := state["admission"].(map[string]any)
+		return admission["status"] == "accepted" && admission["mode"] == "idle", nil
+	}); err != nil {
+		return "", fmt.Errorf("still not admitting an idle note %v after the last key (state %s): %w", liveInactivity, compactJSON(state), err)
+	}
+	if state["pendingMessages"] != true || state["pendingMessagesForMs"] == nil {
+		return "", fmt.Errorf("probe does not report the waiting queue: %s", compactJSON(state))
+	}
+	queuedFor := state["pendingMessagesForMs"]
+	keyAge := state["msSinceKey"]
+
+	token := "gitmoot-live-check-late-" + randomHex(6)
+	reply, err = call(endpoint, map[string]any{"v": 1, "id": "queued-late", "method": "deliver", "target": target,
+		"content": "Gitmoot plugin doctor live check " + token + "; nothing to do."})
+	if err != nil {
+		return "", err
+	}
+	if reply["status"] != "accepted" || reply["mode"] != "idle" {
+		return "", fmt.Errorf("expected accepted/idle after the queue grace and operator inactivity, got %s", compactJSON(reply))
+	}
+	if err := waitFor(ctx, 30*time.Second, func() (bool, error) {
+		data, err := os.ReadFile(logPath)
+		return err == nil && bytes.Contains(data, []byte(token)) && bytes.Contains(data, []byte(queued)), nil
+	}); err != nil {
+		return "", fmt.Errorf("accepted, but the note and the queued follow-up did not both reach the model: %w", err)
+	}
+	if err := waitFor(ctx, 20*time.Second, func() (bool, error) {
+		reply, err := call(endpoint, map[string]any{"v": 1, "id": "queued-after", "method": "probe"})
+		if err != nil {
+			return false, err
+		}
+		state, _ = reply["state"].(map[string]any)
+		return state["idle"] == true && state["pendingMessages"] == false, nil
+	}); err != nil {
+		return "", fmt.Errorf("the queue is not empty after the note's turn (state %s): %w", compactJSON(state), err)
+	}
+	if data, err := os.ReadFile(logPath); err != nil || bytes.Contains(data, []byte(early)) || bytes.Contains(data, []byte(recent)) {
+		return "", fmt.Errorf("a deferred note reached the model (read error %v)", err)
+	}
+	return fmt.Sprintf("deferred busy within the %v queue grace; past it, deferred %v %vms after a key; once the operator was inactive %v (queue waiting %vms, last key %vms ago) accepted idle, and the note's turn took the queued follow-up to the model and emptied the queue",
+		liveQueueGrace, keyDeferral, sinceKey, liveInactivity, queuedFor, keyAge), nil
+}
+
 func (r *liveRun) start(ctx context.Context, ompBinary string) (registration, error) {
 	// A short temporary path keeps the socket path under the Unix limit.
 	dir, err := os.MkdirTemp("", "gm-omp-")
@@ -187,6 +319,9 @@ func (r *liveRun) start(ctx context.Context, ompBinary string) (registration, er
 		"OMP_SKIP_SETUP=1",
 		"TERM=xterm-256color",
 		"GITMOOT_OMP_LIVECHECK_LOG="+filepath.Join(dir, "model.jsonl"),
+		"GITMOOT_OMP_LIVECHECK_CONTROL="+filepath.Join(dir, "control"),
+		fmt.Sprintf("GITMOOT_OMP_INBOX_QUEUE_GRACE_MS=%d", liveQueueGrace.Milliseconds()),
+		fmt.Sprintf("GITMOOT_OMP_INBOX_INACTIVITY_MS=%d", liveInactivity.Milliseconds()),
 	)
 	pty, err := startInPTY(cmd)
 	if err != nil {
