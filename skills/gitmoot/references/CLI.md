@@ -1481,8 +1481,8 @@ What the worker does:
   job records `review_no_execution: true`.
 
 Supported scope: Linux amd64, the local execution backend without
-`local_uid`/`local_gid`, the omp runtime, and omp 18.10.4 or 18.18.6 (the
-versions measured, #2364 and #2561). Any other architecture, backend, runtime
+`local_uid`/`local_gid`, the omp runtime, and omp 18.10.4, 18.18.6 or 18.18.8
+(the versions measured, #2364, #2561 and #2571). Any other architecture, backend, runtime
 or omp version refuses the review before omp starts. With a configured
 `local_uid`, the backend refuses to start the seat in its launch directory.
 
