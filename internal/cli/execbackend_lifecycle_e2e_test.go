@@ -30,7 +30,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
-	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -740,9 +739,6 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend byte
 	}
 	finalizerCalled := false
 	worker := executionBackendJobWorker(store, os.Stderr, home)
-	worker.PermissionPolicyEffectGit = func(string) permissionpolicy.EffectGit {
-		return &permissionPolicyEffectGitFake{remote: map[string]struct{}{branch: {}}}
-	}
 	worker.WorkflowFactory = func(string) workflow.Engine {
 		return workflow.Engine{
 			Store:                   store,
@@ -871,9 +867,6 @@ printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backe
 	// GITMOOT-IMPL: executionBackendJobWorker installs a bound value-receiver;
 	// rebind after injecting the offline resolver so no request can leave httptest.
 	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
-	worker.PermissionPolicyEffectGit = func(string) permissionpolicy.EffectGit {
-		return &permissionPolicyEffectGitFake{remote: map[string]struct{}{branch: {}}}
-	}
 	// Worker setup between provisioning and arming the run context takes real
 	// time; stand in for it once the sandbox exists.
 	const remoteSetupDelay = 3 * time.Second

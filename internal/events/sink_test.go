@@ -85,7 +85,6 @@ func TestEventTypeEnumValues(t *testing.T) {
 		EventJobBlocked:            "job.blocked",
 		EventJobNeedsAttention:     "job.needs_attention",
 		EventJobDeferred:           "job.deferred",
-		EventOrgRecycleOverdue:     "org.recycle_overdue",
 		EventOrgInputPending:       "org.input_pending",
 		EventOrgReply:              "org.reply",
 		EventOrgDirective:          "org.directive",

@@ -761,16 +761,15 @@ func (s registeredRepoSchedule) ensure() registeredRepoSchedule {
 }
 
 type registeredRepoPoller struct {
-	Store                   *db.Store
-	Workers                 int
-	DryRun                  bool
-	Stdout                  io.Writer
-	RecoveryOnly            bool
-	WatchIssues             bool
-	EscalationTTL           time.Duration
-	ObservePermissionPolicy bool
-	AutoMergeEnabled        func(repo string) bool
-	CheckoutLocks           *repoCheckoutLocks
+	Store            *db.Store
+	Workers          int
+	DryRun           bool
+	Stdout           io.Writer
+	RecoveryOnly     bool
+	WatchIssues      bool
+	EscalationTTL    time.Duration
+	AutoMergeEnabled func(repo string) bool
+	CheckoutLocks    *repoCheckoutLocks
 	// Inflight is the supervisor's in-flight job tracker (#562). A repo with
 	// dispatched jobs still running gets the recovery-command-only poll: a full
 	// PollOnce may mutate the shared checkout, which used to be excluded by the
@@ -820,17 +819,16 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 	}
 	configCache := &tickConfigCache{}
 	return registeredRepoPoller{
-		ConfigCache:             configCache,
-		Store:                   store,
-		Workers:                 workers,
-		DryRun:                  dryRun,
-		Stdout:                  stdout,
-		EscalationTTL:           resolveEscalationTTL(rawHome),
-		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
-		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
-		IdleGraceTicks:          config.DefaultDaemonIdleGraceTicks,
-		IdleMaxMultiplier:       config.DefaultDaemonIdleMaxMultiplier,
-		GitHubClient:            func(checkout string) github.Client { return github.NewClient(checkout) },
+		ConfigCache:       configCache,
+		Store:             store,
+		Workers:           workers,
+		DryRun:            dryRun,
+		Stdout:            stdout,
+		EscalationTTL:     resolveEscalationTTL(rawHome),
+		AutoMergeEnabled:  autoMergeEnabledResolver(rawHome),
+		IdleGraceTicks:    config.DefaultDaemonIdleGraceTicks,
+		IdleMaxMultiplier: config.DefaultDaemonIdleMaxMultiplier,
+		GitHubClient:      func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
 			return configureWorkflow(daemonWorkflowEngineCached(store, gh, checkout, resolvedRoot, configCache), store)
 		},
@@ -1192,10 +1190,9 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 			}
 			return p.JobWorkflowFactory(ctx, store, gh, repoRecord.CheckoutPath, job)
 		},
-		WatchIssues:             p.WatchIssues,
-		EscalationTTL:           p.EscalationTTL,
-		ObservePermissionPolicy: p.ObservePermissionPolicy,
-		AutoMergeEnabled:        p.AutoMergeEnabled,
+		WatchIssues:      p.WatchIssues,
+		EscalationTTL:    p.EscalationTTL,
+		AutoMergeEnabled: p.AutoMergeEnabled,
 	}
 	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
 	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock

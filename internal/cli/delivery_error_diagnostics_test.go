@@ -208,7 +208,7 @@ func TestTempWorkerRunRecordsDeliveryErrorOnTheJobRow(t *testing.T) {
 	}
 	policy := config.DefaultParallelSessionPolicy()
 	policy.MergeBack = config.ParallelSessionMergeBackOff
-	if err := worker.runWithTempWorker(ctx, admitted, payload, execbackend.Local, original, checkout, policy, "test contention", false); err != nil {
+	if err := worker.runWithTempWorker(ctx, admitted, payload, execbackend.Local, original, checkout, policy, "test contention"); err != nil {
 		t.Fatalf("runWithTempWorker returned error: %v", err)
 	}
 

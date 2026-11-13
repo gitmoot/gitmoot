@@ -112,14 +112,8 @@ type OmpAdapter struct {
 
 func (a OmpAdapter) Name() string { return OmpRuntime }
 
-func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApplication {
-	_, property := ompApprovalArgs(agent)
-	return property
-}
-
 // ompApprovalArgs maps the stored autonomy policy onto omp's --approval-mode,
-// mirroring codexSandboxArgs and claudePermissionArgs: one function owns both
-// the argv and the declaration, so the two cannot drift (#1721).
+// mirroring codexSandboxArgs and claudePermissionArgs (#1721).
 //
 // THE MAPPING IS MEASURED, NOT ASSUMED. Against the installed CLI (omp 18.1.15,
 // headless, stdin closed, no host pre-approvals), with the decider being the
@@ -143,7 +137,7 @@ func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApp
 // the sibling runtimes give this policy - claude maps workspace-write to
 // --permission-mode acceptEdits, which does not unblock Bash, and codex to
 // --sandbox workspace-write - so yolo here granted strictly more than the policy
-// names, and a truthful `widened` declaration did not make the grant narrower.
+// names.
 //
 // auto AND the stored-empty case KEEP yolo, deliberately. Their honest analogue
 // would be omitting the flag entirely, the way claude passes no permission-mode
@@ -155,21 +149,20 @@ func (a OmpAdapter) PermissionPolicyApplication(agent Agent) PermissionPolicyApp
 // A ReadOnlySeat is different: Gitmoot has already put the process inside its
 // kernel-enforced Landlock domain. OMP must use yolo there so headless shell and
 // test tools can execute; Landlock, not OMP's interactive approval UI, remains
-// the read-only boundary. Like the sibling adapters, report this as widened
-// because OMP itself is no longer applying the stored restriction.
-func ompApprovalArgs(agent Agent) (string, PermissionPolicyApplication) {
+// the read-only boundary.
+func ompApprovalArgs(agent Agent) string {
 	if agent.ReadOnlySeat {
-		return "--approval-mode=yolo", PermissionPolicyWidened
+		return "--approval-mode=yolo"
 	}
 	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
 	case AutonomyPolicyReadOnly:
-		return "--approval-mode=always-ask", PermissionPolicyApplied
+		return "--approval-mode=always-ask"
 	case AutonomyPolicyWorkspaceWrite:
-		return "--approval-mode=write", PermissionPolicyApplied
+		return "--approval-mode=write"
 	case AutonomyPolicyDangerFullAccess:
-		return "--approval-mode=yolo", PermissionPolicyApplied
+		return "--approval-mode=yolo"
 	default:
-		return "--approval-mode=yolo", PermissionPolicyWidened
+		return "--approval-mode=yolo"
 	}
 }
 
@@ -558,7 +551,7 @@ func ompPlanTarget(model string, planInto string) string {
 }
 
 func ompArgs(agent Agent, model string, thinking string, maxTime string, plan bool, planInto string, attachArgs []string, prompt string) []string {
-	approval, _ := ompApprovalArgs(agent)
+	approval := ompApprovalArgs(agent)
 	args := []string{"-p", "--mode=json", approval, "--no-session"}
 	args = append(args, ompWorkspaceArgs(agent)...)
 	args = append(args, ompNoExecutionArgs(agent)...)

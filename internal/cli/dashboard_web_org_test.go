@@ -73,7 +73,6 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	}
 
 	base := time.Now().UTC().Truncate(time.Second)
-	sourceMax := base.Add(5 * time.Hour)
 	if err := store.UpsertRoleLivePresence(ctx, "owner", "working", base); err != nil {
 		t.Fatal(err)
 	}
@@ -87,12 +86,6 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.UpsertBlockedEpisode(ctx, "task:acme/widget:review", base.Add(-3*time.Hour), base.Add(-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpsertRecycleOverdueEpisode(ctx, "owner", base.Add(-2*time.Hour), sourceMax); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.MarkRecycleOverdueEpisodeEmitted(ctx, "owner", base.Add(-40*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.IncrementRoleMissedWake(ctx, "review", base.Add(-30*time.Minute)); err != nil {
@@ -140,7 +133,6 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	}{
 		{`UPDATE org_role_presence SET last_seen_at = ? WHERE role = 'owner'`, []any{base.Add(-3 * time.Hour).Format("2006-01-02 15:04:05")}},
 		{`UPDATE org_role_presence SET last_seen_at = ? WHERE role = 'review'`, []any{base.Add(-10 * time.Minute).Format("2006-01-02 15:04:05")}},
-		{`UPDATE org_recycle_overdue_episodes SET updated_at = ? WHERE subject = 'owner'`, []any{sourceMax.Format(db.BlockedEpisodeTimeLayout)}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-25 * time.Minute).Format("2006-01-02 15:04:05"), escalationOld}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{base.Add(-20 * time.Minute).Format("2006-01-02 15:04:05"), escalationNew}},
 		{`UPDATE workflow_notes SET created_at = ? WHERE body = ?`, []any{resolutionMax.Format("2006-01-02 15:04:05"), resolutionBody}},
@@ -188,7 +180,7 @@ func TestDashboardOrgDataSourceStoreBackedProjection(t *testing.T) {
 	if len(view.Escalations) != 1 || view.Escalations[0].Wf != "release/two" {
 		t.Fatalf("escalations = %+v", view.Escalations)
 	}
-	if len(view.Feed) != 5 {
+	if len(view.Feed) != 4 {
 		t.Fatalf("feed = %+v", view.Feed)
 	}
 	for _, row := range view.Feed {

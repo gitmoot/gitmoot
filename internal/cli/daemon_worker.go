@@ -21,7 +21,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/permissionpolicy"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -132,10 +131,6 @@ type jobWorker struct {
 	// checkout/adapter construction. nil keeps hand-built test workers unchanged;
 	// defaultJobWorker wires the process-wide identity cache.
 	RuntimePreflight func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult
-	// PermissionPolicyEffectGit injects the existing git observation primitives.
-	// It is consulted only for a claimed not-applied observation; nil selects the
-	// checkout-bound production client.
-	PermissionPolicyEffectGit func(string) permissionpolicy.EffectGit
 	// OwnerGram delivers wakes addressed to the owner role as Herdr Grams. Only
 	// the daemon supervisors set it, on the worker they hand the wake drain loop
 	// (sendOwnerGramViaHerdr); nil keeps owner wakes on the ordinary rule/pane
@@ -476,17 +471,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	dbAgent, err := w.lookupAgent(ctx, job.Agent)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			warned, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, runtime.Agent{Name: job.Agent}, permissionpolicy.StaticProvider{Property: runtime.PermissionPolicyUnresolved}, time.Now())
-			if warningErr != nil {
-				writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
-			}
-			if warned {
-				defer w.capturePermissionPolicyEffects(context.Background(), job.ID, strings.TrimSpace(payload.WorktreePath))
-			}
-		} else {
-			writeLine(w.Stdout, "job %s permission-policy observation skipped: agent lookup failed: %v", job.ID, err)
-		}
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
 		}
@@ -769,13 +753,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
 		return nil
 	}
-	warningRecorded, warningErr := permissionpolicy.RecordWarning(ctx, w.Store, job, agent, adapter, time.Now())
-	if warningErr != nil {
-		writeLine(w.Stdout, "job %s permission-policy observation failed: %v", job.ID, warningErr)
-	}
-	if warningRecorded {
-		defer w.capturePermissionPolicyEffects(context.Background(), job.ID, checkout)
-	}
 	managed, err := w.managedJobConfig(ctx, agent.Name)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -877,7 +854,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
 				return eventErr
 			}
-			return w.runWithTempWorker(ctx, job, payload, execBackend, agent, checkout, policy, eligibleMessage, warningRecorded)
+			return w.runWithTempWorker(ctx, job, payload, execBackend, agent, checkout, policy, eligibleMessage)
 		} else if strings.TrimSpace(eligibility.Reason) != "" {
 			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
 		}
@@ -1255,9 +1232,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
-	if warningRecorded {
-		adapter = w.observePermissionPolicyEffects(adapter, job.ID, deliveryCheckout)
-	}
 	if execBackend == execbackend.Remote {
 		adapter = w.guardRemoteReviewEvidence(adapter, lifecycle, instance, job.ID, payload)
 		adapter = w.guardRemoteReviewRelatedPRs(adapter, lifecycle, instance, job.ID, payload)
@@ -1514,10 +1488,6 @@ type readOnlyRuntimeAdapter struct {
 	// (#2364): the statement that this seat cannot run anything, and the
 	// exact-head CI evidence the host fetched for it.
 	staticReviewBrief string
-}
-
-func (a readOnlyRuntimeAdapter) PermissionPolicyApplication(agent runtime.Agent) runtime.PermissionPolicyApplication {
-	return runtime.ResolvePermissionPolicyApplication(a.Adapter, agent)
 }
 
 func (a readOnlyRuntimeAdapter) Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
@@ -3405,7 +3375,7 @@ type tempWorkerStartResult struct {
 	JobTimeout  time.Duration
 }
 
-func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string, observePermissionPolicy bool) error {
+func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string) error {
 	jobRunner, err := jobSubprocessRunnerForBackend(backend)
 	if err != nil {
 		return err
@@ -3602,9 +3572,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	stopKillPending := func() {}
 	if hasRunDeadline {
 		stopKillPending = armJobKillPending(w.Store, delegatedJob.ID, runDeadline)
-	}
-	if observePermissionPolicy {
-		adapter = w.observePermissionPolicyEffects(adapter, delegatedJob.ID, checkout)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	// #1856: the DELEGATED-job delivery route. A delegation child whose action is

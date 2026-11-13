@@ -168,27 +168,6 @@ Two consequences matter for implementation jobs:
   stays gated strictly behind explicit `danger-full-access`; a git worktree is not
   a sandbox, so Bash there still reaches the whole machine.
 
-### Permission-policy visibility is instrumentation, not protection
-
-For engine dispatch, Gitmoot records what permission-policy argv it supplied:
-`applied`, `widened`, `not-applied`, or `unresolved` when the agent row is gone.
-The result is derived by the argv builder itself. A `not-applied` warning means
-Gitmoot supplied no policy flag; it does not claim the job was unsandboxed, since
-ambient runtime configuration may still constrain it. Warnings are structured,
-coalesced per agent configuration and capability, and never refuse or block
-work. Interactive coordinator sessions are outside this engine-dispatch
-instrumentation.
-
-For the one winning `not-applied` or `unresolved` sample in each coalescing
-window, Gitmoot also records completion-time repository effects on that same
-warning: whether the checkout was dirty, whether the branch was observed on
-origin, and `payload_had_pull_request`, which says only whether the payload
-already carried a pull request number. A nullable git-derived value means the
-observer could not determine the fact, not `false`; the push instrument
-distinguishes a local upstream answer from an `ls-remote` fallback. This remains
-measurement, not enforcement. Capture failure cannot fail, block, retry, or
-otherwise alter the observed job.
-
 ### Runtime contract preflight
 
 Engine jobs also pass a lazy installed-runtime contract preflight before launch.

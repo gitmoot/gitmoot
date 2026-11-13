@@ -43,7 +43,6 @@ var execBackendLocalEventKindBaseline = []string{
 	"workflow_autolabeled",
 	"route_selected",
 	"readonly_worktree_allocated",
-	"permission_policy_not_applied",
 	"effective_runtime",
 	"running",
 	"succeeded",

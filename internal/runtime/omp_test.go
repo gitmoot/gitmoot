@@ -3148,10 +3148,9 @@ func TestOmpDeliverReadOnlySeatDefersApprovalToLandlock(t *testing.T) {
 		name         string
 		readOnlySeat bool
 		wantFlag     string
-		wantProperty PermissionPolicyApplication
 	}{
-		{"kernel-enforced seat", true, "--approval-mode=yolo", PermissionPolicyWidened},
-		{"unsandboxed non-seat", false, "--approval-mode=always-ask", PermissionPolicyApplied},
+		{"kernel-enforced seat", true, "--approval-mode=yolo"},
+		{"unsandboxed non-seat", false, "--approval-mode=always-ask"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := &fakeRunner{results: []subprocess.Result{{Stdout: ompStreamOK}}}
@@ -3164,9 +3163,6 @@ func TestOmpDeliverReadOnlySeatDefersApprovalToLandlock(t *testing.T) {
 				t.Fatalf("Deliver: %v", err)
 			}
 			runner.want(t, 0, "omp", "-p", "--mode=json", tc.wantFlag, "--no-session", "--", "run the review checks")
-			if got := adapter.PermissionPolicyApplication(agent); got != tc.wantProperty {
-				t.Fatalf("PermissionPolicyApplication = %q, want %q", got, tc.wantProperty)
-			}
 		})
 	}
 }
@@ -3881,37 +3877,28 @@ func TestOmpPlanTargetPreservesRoleAlias(t *testing.T) {
 // TestOmpApprovalModeFollowsTheStoredPolicy is the #1721 regression. Before the
 // mapping, `ompArgs` began with a literal `--approval-mode=yolo` for EVERY
 // policy, so an agent stored read-only dispatched with unrestricted tool
-// access, and `PermissionPolicyApplication` reported not-applied for all four.
-//
-// The argv and the declaration are asserted TOGETHER because they are the two
-// halves a consumer sees: the flag is what the subprocess gets, and the
-// property is what the merge gate and the observation event read. A mapping
-// that changed one without the other would satisfy either assertion alone.
+// access.
 func TestOmpApprovalModeFollowsTheStoredPolicy(t *testing.T) {
 	for _, tc := range []struct {
-		policy       string
-		wantFlag     string
-		wantProperty PermissionPolicyApplication
+		policy   string
+		wantFlag string
 	}{
 		// The defect: read-only is the one policy whose argv changes.
-		{AutonomyPolicyReadOnly, "--approval-mode=always-ask", PermissionPolicyApplied},
-		// Full access IS yolo, so the declaration is honest at `applied`.
-		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo", PermissionPolicyApplied},
+		{AutonomyPolicyReadOnly, "--approval-mode=always-ask"},
+		// Full access IS yolo.
+		{AutonomyPolicyDangerFullAccess, "--approval-mode=yolo"},
 		// workspace-write maps to write, MEASURED against omp 18.1.15 with the
 		// filesystem as the decider: write lands an editing tool's file, refuses
 		// a shell command (nine bash tool calls, zero markers on disk) and
 		// refuses a write to an absolute path outside the working directory.
-		// That is what this policy asks for and what the sibling runtimes give
-		// it, so `applied` is honest here rather than `widened`.
-		{AutonomyPolicyWorkspaceWrite, "--approval-mode=write", PermissionPolicyApplied},
-		// auto KEEPS yolo, which grants more than it asked for, so `widened` is
-		// the only truthful declaration: `applied` would claim a confinement no
-		// argv performs, and not-applied would hide that a flag was passed.
-		{AutonomyPolicyAuto, "--approval-mode=yolo", PermissionPolicyWidened},
+		// That is what this policy asks for and what the sibling runtimes give it.
+		{AutonomyPolicyWorkspaceWrite, "--approval-mode=write"},
+		// auto KEEPS yolo.
+		{AutonomyPolicyAuto, "--approval-mode=yolo"},
 		// An unset policy normalizes to auto, NOT to read-only, so it must not
 		// inherit the restricted argv. This arm is what caught the mapping
 		// keying on the wrong default.
-		{"", "--approval-mode=yolo", PermissionPolicyWidened},
+		{"", "--approval-mode=yolo"},
 	} {
 		t.Run("policy="+tc.policy, func(t *testing.T) {
 			agent := ompTestAgent()
@@ -3932,22 +3919,7 @@ func TestOmpApprovalModeFollowsTheStoredPolicy(t *testing.T) {
 			if approvals != 1 {
 				t.Fatalf("argv carries %d --approval-mode flags, want 1: %v", approvals, argv)
 			}
-			if got := (OmpAdapter{}).PermissionPolicyApplication(agent); got != tc.wantProperty {
-				t.Errorf("PermissionPolicyApplication = %q, want %q: the declaration must match the argv this policy produced", got, tc.wantProperty)
-			}
 		})
-	}
-}
-
-// TestOmpReadOnlyPolicyIsDeclaredThroughTheResolver drives the seam consumers
-// actually use. `ResolvePermissionPolicyApplication` defaults an adapter with
-// no declaration to not-applied, so an adapter that stopped implementing the
-// interface would still read as "no mapping" and this arm would catch it.
-func TestOmpReadOnlyPolicyIsDeclaredThroughTheResolver(t *testing.T) {
-	agent := ompTestAgent()
-	agent.AutonomyPolicy = AutonomyPolicyReadOnly
-	if got := ResolvePermissionPolicyApplication(OmpAdapter{}, agent); got != PermissionPolicyApplied {
-		t.Fatalf("ResolvePermissionPolicyApplication = %q, want %q", got, PermissionPolicyApplied)
 	}
 }
 

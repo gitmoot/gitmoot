@@ -380,7 +380,7 @@ func TestTempWorkerDispatchCapturesQuotaFailureAndClearsOnSuccess(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := worker.runWithTempWorker(context.Background(), job, payload, execbackend.Local, original, checkout, policy, "test contention", false); err != nil {
+		if err := worker.runWithTempWorker(context.Background(), job, payload, execbackend.Local, original, checkout, policy, "test contention"); err != nil {
 			t.Fatalf("runWithTempWorker(%s): %v", jobID, err)
 		}
 	}
