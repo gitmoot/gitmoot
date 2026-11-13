@@ -341,6 +341,20 @@ func (w jobWorker) currentRemoteReviewDelivery(ctx context.Context, job db.Job, 
 }
 
 func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
+	// Registered first so it runs last: after the capacity monitor stops and
+	// every cleanup defer, a run this worker claimed must not stay running.
+	exitGuard := beginWorkerExitGuard(job.ID)
+	settleCtx := ctx
+	// Every engine claim made under this frame (RunJob, the temp worker's
+	// RunJob) reports its exact generation to the guard.
+	ctx = workflow.WithClaimObserver(ctx, exitGuard.claimed)
+	defer func() {
+		panicked := recover()
+		w.settleWorkerExit(settleCtx, exitGuard, returnErr, panicked)
+		if panicked != nil {
+			panic(panicked)
+		}
+	}()
 	payload, err := daemonJobPayload(job)
 	if err != nil {
 		return w.finishQueuedJob(ctx, job, workflow.JobFailed, err)
@@ -915,6 +929,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	runCtx := ctx
 	stopRun := func() {}
 	if remoteReviewAdmitted {
+		// Admission claimed exactly this generation (ClaimRunningJobAtGeneration).
+		exitGuard.claimed(job.ID, job.LifecycleGeneration)
 		// Admission owns the queued->running claim, so cancellation observation
 		// must begin before the cost ledger or provider can see this job.
 		runCtx, stopRun = w.runningJobContext(ctx, job.ID)
@@ -1241,6 +1257,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	} else {
 		_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	}
+	err = w.recordUnrecordedResult(ctx, engine, err)
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	removeRelatedTrees()
 	stopKillPending()
@@ -3552,6 +3569,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	// ReadOnlySeat for those two), so a kimi child here reads the LIVE profile.
 	delegatedCredentialBefore, delegatedCredentialObserved := observeNonSeatKimiCredential(started.Agent)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
+	err = w.recordUnrecordedResult(ctx, engine, err)
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, delegatedJob.ID, started.Agent, delegatedCredentialBefore, delegatedCredentialObserved)
 	stopKillPending()
 	if err != nil {

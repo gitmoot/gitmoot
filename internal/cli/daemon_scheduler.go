@@ -900,6 +900,29 @@ func isSessionRecordedJob(job db.Job) bool {
 // time in both the payload and loud audit event, clears stale process identity,
 // releases locks, and refuses to touch externally recorded session jobs.
 func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, cause string) (bool, error) {
+	return failRunningJob(ctx, store, stdout, now, job, nil, cause)
+}
+
+// failClaimedRunningJob is failRecoveredRunningJob for a run THIS process
+// claimed: the write lands only while the row is still running at exactly
+// generation under runner's claim, so a re-queued and reclaimed row, or one
+// another process claimed, is left alone.
+//
+// A delegation child settled here also records advance_started in the same
+// transaction. Its parent's DAG has not seen this failure, and that marker is
+// what the advance-retry pass selects on, so the retry/failure_policy and
+// continuation run there exactly as for a child whose own advancement failed.
+func failClaimedRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, generation int64, runner db.JobRunner, cause string) (bool, error) {
+	return failRunningJob(ctx, store, stdout, now, job, &claimedRun{generation: generation, runner: runner}, cause)
+}
+
+// claimedRun anchors a settlement to one run this process claimed.
+type claimedRun struct {
+	generation int64
+	runner     db.JobRunner
+}
+
+func failRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, claimed *claimedRun, cause string) (bool, error) {
 	if job.State != string(workflow.JobRunning) || isSessionRecordedJob(job) {
 		return false, nil
 	}
@@ -912,8 +935,10 @@ func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Wri
 	}
 
 	encoded := job.Payload
+	delegationChild := false
 	var payload workflow.JobPayload
 	if err := json.Unmarshal([]byte(job.Payload), &payload); err == nil {
+		delegationChild = strings.TrimSpace(payload.ParentJobID) != ""
 		payload.RuntimePID = 0
 		payload.RuntimePIDStartTime = ""
 		payload.RuntimePGID = 0
@@ -926,9 +951,18 @@ func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Wri
 			encoded = string(b)
 		}
 	}
-	transitioned, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), encoded, db.JobEvent{
-		JobID: job.ID, Kind: jobRecoveryFailedEvent, Message: message,
-	})
+	event := db.JobEvent{JobID: job.ID, Kind: jobRecoveryFailedEvent, Message: message}
+	var transitioned bool
+	var err error
+	if claimed == nil {
+		transitioned, err = store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), encoded, event)
+	} else {
+		var debt []db.JobEvent
+		if delegationChild {
+			debt = append(debt, db.JobEvent{JobID: job.ID, Kind: "advance_started", Message: "workflow advancement owed: the daemon failed this delegation child's unsettled run"})
+		}
+		transitioned, err = store.TransitionClaimedRunningJobPayloadWithEvent(ctx, job.ID, claimed.generation, claimed.runner, string(workflow.JobFailed), encoded, event, debt...)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -2265,6 +2299,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := liveness.sweepRunningJobLiveness(ctx, store, stdout, paths, now, staleAfter, quietAfter, repoFilter, rootFilter); err != nil {
 		return err
 	}
+	tracker.orphanedClaimSweep().sweep(ctx, store, stdout, now)
 	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, inflightIDs); err != nil {
 		return err
 	}

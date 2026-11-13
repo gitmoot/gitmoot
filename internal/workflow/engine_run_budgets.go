@@ -27,6 +27,19 @@ func (e Engine) RunClaimedJob(ctx context.Context, jobID string, agent runtime.A
 	return e.runJob(ctx, jobID, agent, adapter, true)
 }
 
+// RecordUnrecordedResult repeats the terminal write a ResultNotRecordedError
+// describes, on the caller's ctx (no run deadline), and only while the row is
+// still the run this process claimed at that generation. Like the original
+// write it records advance_started, so the daemon's advance-retry pass drives
+// the advancement RunJob did not reach.
+func (e Engine) RecordUnrecordedResult(ctx context.Context, unrecorded *ResultNotRecordedError) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	return e.mailbox().writeTerminalPayload(ctx, unrecorded.JobID, unrecorded.State, unrecorded.Message, unrecorded.Payload,
+		&claimAnchor{generation: unrecorded.Generation, runner: db.CurrentJobRunner()})
+}
+
 func (e Engine) runJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter, claimed bool) (AgentResult, error) {
 	if err := e.validate(); err != nil {
 		return AgentResult{}, err

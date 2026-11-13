@@ -1497,11 +1497,33 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 	state := stateForDecision(result.Decision)
-	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {
-		return AgentResult{}, err
+	message := fmt.Sprintf("job %s", state)
+	if err := m.finishWithPayload(ctx, job.ID, state, message, payload); err != nil {
+		return AgentResult{}, &ResultNotRecordedError{
+			JobID: job.ID, Generation: job.LifecycleGeneration, State: state, Message: message, Payload: payload, Err: err,
+		}
 	}
 	return result, nil
 }
+
+// ResultNotRecordedError reports that the runtime returned a result but its
+// terminal write failed, so the row is most likely still running without it.
+// It carries everything needed to repeat that write: see
+// Engine.RecordUnrecordedResult.
+type ResultNotRecordedError struct {
+	JobID      string
+	Generation int64
+	State      JobState
+	Message    string
+	Payload    JobPayload
+	Err        error
+}
+
+func (e *ResultNotRecordedError) Error() string {
+	return fmt.Sprintf("job %s result (%s) produced but not recorded: %v", e.JobID, e.State, e.Err)
+}
+
+func (e *ResultNotRecordedError) Unwrap() error { return e.Err }
 
 func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {
 	if strings.TrimSpace(agent.ExecBackend) == "" {
@@ -1765,6 +1787,19 @@ func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message str
 func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobState, message string, payload JobPayload) error {
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
+	return m.writeTerminalPayload(writeCtx, jobID, state, message, payload, nil)
+}
+
+// claimAnchor pins a terminal write to one claimed run: still running at
+// generation, under runner's claim.
+type claimAnchor struct {
+	generation int64
+	runner     db.JobRunner
+}
+
+// writeTerminalPayload is finishWithPayload's write on the caller's writeCtx.
+// A nil anchor keeps the historical unanchored running->state transition.
+func (m Mailbox) writeTerminalPayload(writeCtx context.Context, jobID string, state JobState, message string, payload JobPayload, anchor *claimAnchor) error {
 	clearRuntimeIdentity(&payload)
 	// THE STAGED PREFLIGHT CONTRACT IS ENFORCED HERE, AT INGESTION, BECAUSE THIS
 	// IS WHERE A RESULT BECOMES CONSUMABLE (#2029 round four, P1).
@@ -1794,15 +1829,14 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	if err != nil {
 		return err
 	}
-	transitioned, err := m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
-		JobID:   jobID,
-		Kind:    string(state),
-		Message: message,
-	}, db.JobEvent{
-		JobID:   jobID,
-		Kind:    "advance_started",
-		Message: "workflow advancement started",
-	})
+	terminal := db.JobEvent{JobID: jobID, Kind: string(state), Message: message}
+	advance := db.JobEvent{JobID: jobID, Kind: "advance_started", Message: "workflow advancement started"}
+	var transitioned bool
+	if anchor == nil {
+		transitioned, err = m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, terminal, advance)
+	} else {
+		transitioned, err = m.store.TransitionClaimedRunningJobPayloadWithEvent(writeCtx, jobID, anchor.generation, anchor.runner, string(state), encoded, terminal, advance)
+	}
 	if err != nil {
 		return err
 	}
@@ -1810,6 +1844,9 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		latest, getErr := m.store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
+		}
+		if anchor != nil {
+			return fmt.Errorf("job %q is %s at lifecycle generation %d, no longer the run claimed at generation %d", jobID, latest.State, latest.LifecycleGeneration, anchor.generation)
 		}
 		return fmt.Errorf("job %q is %s, not running", jobID, latest.State)
 	}
@@ -1869,6 +1906,16 @@ func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {
 	return nil
 }
 
+type claimObserverKey struct{}
+
+// WithClaimObserver returns ctx carrying observe, which Mailbox.Run calls with
+// the job ID and the exact lifecycle generation of each queued->running claim
+// it makes under ctx. It lets a caller that hands the claim to the engine know
+// precisely which run it owns.
+func WithClaimObserver(ctx context.Context, observe func(jobID string, generation int64)) context.Context {
+	return context.WithValue(ctx, claimObserverKey{}, observe)
+}
+
 func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	if job.State != string(JobQueued) {
 		return fmt.Errorf("job %q is %s, not queued", job.ID, job.State)
@@ -1878,7 +1925,9 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	// that lets the daemon recover this job immediately after a reboot, and
 	// runner_pid is recorded for observability only. Off Linux BootID() is "", so
 	// the row is identity-less and only the existing age/lease recovery applies.
-	claimed, err := m.store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
+	// The claim is anchored to the generation just read, so the generation
+	// reported to a claim observer is exactly the run this claim started (#2618).
+	claimed, err := m.store.ClaimRunningJobAtGeneration(ctx, job.ID, string(JobQueued), job.LifecycleGeneration, string(JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started",
@@ -1891,7 +1940,13 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 		if getErr != nil {
 			return getErr
 		}
+		if latest.State == string(JobQueued) {
+			return fmt.Errorf("job %q was re-queued at lifecycle generation %d before generation %d could be claimed", job.ID, latest.LifecycleGeneration, job.LifecycleGeneration)
+		}
 		return fmt.Errorf("job %q is %s, not queued", job.ID, latest.State)
+	}
+	if observe, ok := ctx.Value(claimObserverKey{}).(func(string, int64)); ok && observe != nil {
+		observe(job.ID, job.LifecycleGeneration)
 	}
 	return nil
 }
