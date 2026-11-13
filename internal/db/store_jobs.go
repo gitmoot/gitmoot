@@ -1985,10 +1985,9 @@ func runtimeEventSession(message string) (string, string) {
 // JobIDsWithEventKind returns a map jobID -> message of the LATEST job_event of
 // the given kind, one entry per job that has at least one such event. It is a
 // single indexed query scoped to one kind so a
-// caller can surface, e.g., a delegation_preflight_failed reason in `job list`
-// without an N-per-job lookup and regardless of whether that event is the job's
-// overall latest event (a corrective continuation makes delegation_continuation_enqueued
-// the latest event of the coordinator).
+// caller can surface, e.g., a historical delegation_preflight_failed reason in
+// `job list` without an N-per-job lookup and regardless of whether that event is
+// the job's overall latest event.
 func (s *Store) JobIDsWithEventKind(ctx context.Context, kind string) (map[string]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT job_id, message FROM job_events
 		WHERE kind = ? AND id IN (SELECT MAX(id) FROM job_events WHERE kind = ? GROUP BY job_id)`, kind, kind)

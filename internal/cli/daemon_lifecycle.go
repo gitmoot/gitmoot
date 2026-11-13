@@ -162,7 +162,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
 	var session string
-	fs.StringVar(&session, "session", "", "scope the daemon worker to a delegation root job id")
+	fs.StringVar(&session, "session", "", "scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)")
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
@@ -628,13 +628,11 @@ func daemonArgValue(args []string, name string) string {
 	return ""
 }
 
-// daemonPreflightFailureLine reports how many coordinator jobs currently carry a
-// delegation_preflight_failed event (#451) for `gitmoot daemon status`. A
-// delegation fan-out that named a runtime instead of a registered agent no longer
-// terminal-blocks the coordinator, so this is the cheap at-a-glance signal that a
-// fan-out produced zero children and is being corrected. It is a single additive
-// line reusing the JobIDsWithEventKind helper (no parallel plumbing); a store-open
-// or query error degrades to "unavailable" rather than failing status.
+// daemonPreflightFailureLine reports how many jobs carry a historical
+// delegation_preflight_failed event (#451) for `gitmoot daemon status`. Nothing
+// emits that event since the delegation engine was removed (#2588); the count
+// only reflects rows recorded before then. A store-open or query error degrades
+// to "unavailable" rather than failing status.
 func daemonPreflightFailureLine(home string) string {
 	var count int
 	err := withStore(home, func(store *db.Store) error {
@@ -811,7 +809,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
 	var session string
-	fs.StringVar(&session, "session", "", "scope the daemon worker to a delegation root job id")
+	fs.StringVar(&session, "session", "", "scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)")
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")

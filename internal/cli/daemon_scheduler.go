@@ -3784,12 +3784,10 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 	return err == nil && payload.Repo == repoFilter
 }
 
-// queuedJobMatchesSession reports whether a job belongs to the delegation tree
-// rooted at rootFilter. An empty filter matches everything (the default daemon
-// behavior). Otherwise a job matches iff it is the root coordinator job itself
-// (job.ID == rootFilter) or carries the root id in its payload
-// (payload.RootJobID == rootFilter); children and continuations inherit the
-// root id via the payload.
+// queuedJobMatchesSession reports whether a job is in scope for the daemon's
+// --session filter. An empty filter matches everything (the default daemon
+// behavior). Otherwise a job matches iff it is the named job itself
+// (job.ID == rootFilter) or carries that id as payload.RootJobID.
 func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	rootFilter = strings.TrimSpace(rootFilter)
 	if rootFilter == "" {

@@ -1,33 +1,13 @@
 # Gitmoot Workflows
 
-## Orchestrate vs. workflow: who is the manager?
-
-Two ways to run multi-job efforts, answering one question differently: who
-decides the next step? `gitmoot orchestrate` makes GITMOOT the manager — a
-coordinator agent JOB returns `delegations[]` and the engine executes the tree
-with its guardrails (dependency ordering, retries, timeouts, failure policies,
-synthesis, tree token budgets, kill scope). `--workflow <label>` makes an
-EXTERNAL coordinator the manager — a Claude Code, Codex or omp session, a script, or a human
-drives independent jobs, judging results between steps; the label plus the
-`workflow note` journal make that project visible (workflow list/show, Galaxy
-hubs, `/workflows/<label>`) and the journal keeps its body verbatim.
-Use `orchestrate` when the plan fits a declarable tree run unattended
-(parallel fan-out, bounded autonomous work); use
-an external coordinator with `--workflow` when judgment between steps is the
-point (build-review-fix loops, test-and-decide sequences, git/PR ownership).
-They compose: `orchestrate --workflow x` labels the whole tree, so a workflow
-can contain orchestrations. `--workflow` is visibility-only by design — never
-scheduling, locking, budgets, or lifecycle.
-
 ## External-coordinator workflows
 
 Use `--workflow <label>` when an external coordinator needs one durable group
-across Gitmoot jobs without lifecycle state. The flag works on agent
-ask/run/review/implement, `orchestrate`, and `job open`; orchestration children
-and continuations inherit it.
+across Gitmoot jobs without lifecycle state. The flag works on `agent ask`,
+`agent review`, and `job open`.
 
 ```sh
-gitmoot orchestrate planner "Run release checks." --repo owner/repo --workflow release-42
+gitmoot agent ask planner "Run release checks." --repo owner/repo --background --workflow release-42
 gitmoot workflow describe release-42 "Validate and ship release 42."
 gitmoot workflow note release-42 "Kickoff." --author operator --status "Release checks running"
 gitmoot workflow note release-42 "Canary passed." --author operator
@@ -107,8 +87,7 @@ gitmoot agent start reviewer --runtime omp --repo owner/repo --role reviewer --c
 gitmoot agent doctor reviewer
 ```
 
-Local `agent review` / review-resolved `agent run` and native engine review
-fan-out enforce an exact-head loop guard before a new review job is created. An
+Local `agent review` and native engine review fan-out enforce an exact-head loop guard before a new review job is created. An
 homogeneous succeeded decision history for `(repo, PR, head_sha)` is refused and
 emits one `review_loop_detected` event on the matched succeeded job; the CLI
 hard-errors while the engine blocks the task. A new commit or mixed decisions at
@@ -314,21 +293,6 @@ important part is that background planner work goes through `gitmoot agent ask`;
 fast "here" planning stays in the current chat and uses `gitmoot agent prompt`
 only to read prompt content.
 
-## Answering A Paused Job
-
-When an agent returns `human_questions[]`, the engine pauses the tree at
-`awaiting_human` (#445). The local (non-PR) way to answer it is:
-
-```sh
-gitmoot job answer <job-id> "<question-id>: answer text"
-```
-
-It routes the answer onto the existing resume path
-(`ResolveEscalation(answer)`), enqueuing the coordinator continuation that
-carries the answer — the same engine path the daemon's PR-comment `answer` verb
-uses. Answering a job with no pending question is a clear refusal, not a false
-success. See `CLI.md § Jobs` for every flag.
-
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.
@@ -415,12 +379,12 @@ a concurrent TTL dismissal cannot be overwritten; a job retry restores it.
 
 A clean closed-unmerged PR moves `pr_open`, `reviewing`, or
 `changes_requested` to `blocked` with `pr_closed_unmerged`; ambiguous PR state
-does not advance or unblock anything. After advancement and delegation handling,
+does not advance or unblock anything. After advancement handling,
 a terminal top-level implement job with no PR and no live successor blocks an
 otherwise-stuck `implementing` task. Implemented success without a PR records
 `task_blocked_terminal_no_pr`; other terminal outcomes record
-`task_blocked_job_failed`. Delegation children and tasks with queued retries,
-fixes, continuations, or pending advancement remain under their existing owner.
+`task_blocked_job_failed`. Tasks with queued retries, fixes, or pending
+advancement remain under their existing owner.
 
 **PR-bound fix pass:** there is no dispatch for one. A `changes_requested`
 verdict reports to the requester and stops there; the requester reopens its own
@@ -463,7 +427,7 @@ jobs, where two mechanisms spin extra sessions for you:
    work stays serialized; an `implement` fork needs a safe task worktree.
 2. **Managed agent types (`max_background`).** `gitmoot agent type set <type>
    --max-background N` defines a *pool* of named, reusable managed instances.
-   Dispatch to the type with `gitmoot agent run <type> --type <type>
+   Dispatch to the type with `gitmoot agent ask <type> --type <type>
    --background …` and the daemon reuses an idle instance or spins a new one, up
    to `N`.
 
@@ -492,185 +456,6 @@ gitmoot agent allow reviewer --repo owner/project-b
 gitmoot status --repo owner/project-a
 gitmoot status --repo owner/project-b
 ```
-
-## Multi-Model Delegation (Orchestra)
-
-Orchestra is gitmoot's name for structured multi-agent delegation: a conductor
-(coordinator) returns a `delegations[]` score, the players (child agents) run in
-parallel or in dependency order, and a finale (continuation) reconvenes and
-synthesizes the results. This is how you orchestrate an orchestra of agents
-across different runtimes.
-
-A coordinator agent can fan work out to other agents by returning a
-`delegations` array in its `gitmoot_result`. Gitmoot
-enqueues one child job per delegation, records a `delegation_enqueued` event on
-the coordinator job, and runs the children in the daemon. Start a coordinator
-and two workers pinned to different omp models so each delegation lands on the
-best model for the job:
-
-```sh
-gitmoot agent start coordinator --runtime omp --model openai-codex/gpt-5.5 --repo owner/repo --role planner --capability ask --start-daemon
-gitmoot agent start ui-worker --runtime omp --model anthropic/claude-sonnet-4-5 --repo owner/repo --role reviewer --capability ask --capability review
-gitmoot agent start api-worker --runtime omp --model kimi-code/k3 --repo owner/repo --role reviewer --capability ask --capability review
-```
-
-Queue the coordinator as background work so the daemon runs it and dispatches
-its delegations (a synchronous `gitmoot agent ask` without `--background` only
-returns the coordinator's own answer and does not fan out):
-
-```sh
-gitmoot agent ask coordinator --repo owner/repo --background "Coordinate the redesign across the API and UI teams."
-```
-
-The coordinator returns two delegations to the workers on different runtimes:
-
-```json
-{
-  "gitmoot_result": {
-    "decision": "approved",
-    "summary": "Delegating UI review and API review to the workers.",
-    "findings": [],
-    "changes_made": [],
-    "tests_run": [],
-    "needs": [],
-    "delegations": [
-      {
-        "id": "ui",
-        "agent": "ui-worker",
-        "action": "ask",
-        "prompt": "Propose the component changes for the new dashboard layout."
-      },
-      {
-        "id": "api",
-        "agent": "api-worker",
-        "action": "review",
-        "prompt": "Review the API contract for the dashboard endpoints."
-      }
-    ]
-  }
-}
-```
-
-Gitmoot enqueues each delegation as a flat parallel child job
-(`<parent-job-id>/delegation/<id>`) with a `delegation_enqueued` event on the
-parent. Delegations that declare `deps` run only after the named siblings
-succeed, and once every top-level delegation is terminal Gitmoot enqueues one
-coordinator continuation job so the coordinator can synthesize the results.
-Inspect the fan-out with `gitmoot job list --repo owner/repo` (one row per child
-job) and `gitmoot job events <job-id>` (the `delegation_enqueued` events).
-Each child job carries job-tree linkage fields — `parent_job_id`,
-`delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
-can be traced back to its parent, its originating delegation, and the root of the
-tree. See `RESULT_CONTRACT.md` for the full delegation field reference.
-
-**Read-only jobs use action-specific refs.** Every top-level local `review` gets
-an owned detached worktree at its requested PR head, even when it carries a
-stable Task ID or runs foreground. That exact-head allocation is correctness and
-fails the dispatch closed. A background taskless `ask` keeps the existing
-committed-tip, fail-open isolation; task-bearing and foreground asks keep their
-existing checkout behavior. Delegation/pool read-only isolation still applies
-when same-repo readers contend.
-
-These detached worktrees do **not** contain gitignored
-paths (e.g. vendored clones under `repos/**`) or any uncommitted working-tree
-changes, so an analysis/research leg cannot see the operator's live working tree
-there. Committed-tip ask/delegation isolation carries a note with the canonical
-base-checkout absolute path so a worker whose sandbox can read it
-reaches the real tree instead of reporting a working-tree feature as absent.
-Review deliberately keeps its exact-head binding and does not add that
-committed-tip context note. For whole-working-tree ask analysis, use a foreground
-or task-bearing ask, or pass an **absolute** path to the file/dir under analysis.
-
-## Coordinator-Owned Review
-
-When a PR appears on a branch Gitmoot holds a lock for, the daemon's PR-watcher
-fans it out to Gitmoot's native reviewers — the configured required reviewers,
-or the ones passed for the task — so each reviewer runs as its own review job
-before the merge gate. When a coordinator already plans review itself (for
-example a `review-panel` leg, or a custom continuation that reconvenes its own
-reviewers), that native fan-out duplicates work. Pass
-`--skip-native-review-fanout` on `gitmoot orchestrate` or `gitmoot agent run`
-to hand review orchestration to the coordinator:
-
-```sh
-gitmoot orchestrate verifier "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --skip-native-review-fanout
-gitmoot agent run lead --repo owner/repo --pr 12 --skip-native-review-fanout "Review this PR."
-```
-
-The flag is persisted on the job payload, and the engine's implement-advance arm
-reads it when the implement job opens a PR. The daemon's PR-watcher never fans
-out native reviews. The flag defaults off; leaving it off keeps the full native
-review fan-out.
-
-## Coordinator Recipes
-
-Coordinator recipes are built-in agent templates that turn the Orchestra pattern
-into one-command workflows. Each recipe is a coordinator prompt that emits a
-`delegations[]` of **ephemeral** workers (no pre-registration), runs them in the
-daemon, then reconvenes their results in a single continuation. Start one with
-`gitmoot orchestrate <agent> "..." --repo owner/repo --recipe <recipe-id>`
-(#477): the `--recipe` flag routes any existing coordinator agent through the
-named recipe prompt without changing the agent's identity. The bare
-`gitmoot orchestrate <recipe-id> "..."` form requires an agent **registered
-under the recipe name** first; on a fresh install it fails with "agent not
-found", so prefer `--recipe`.
-
-Three recipes ship built in:
-
-- **`review-panel`** — fans a PR or change out to a panel of ephemeral reviewers,
-  each with a different lens (correctness and security; performance and
-  maintainability; tests and edge cases), then synthesizes their findings into
-  one verdict. The panelists are dep-free, so they review in parallel, each with
-  a self-contained lens prompt across mixed runtimes so the panel does not share
-  one model's blind spots (point a panelist at an installed review template such
-  as `thermo-nuclear-code-quality-review` only if you want).
-- **`decompose-and-verify`** was RETIRED because Gitmoot no longer dispatches
-  implementation (#2203). It existed to fan one implementation task out to
-  parallel implementation legs, and `ask`/`review` are now the only accepted
-  delegation actions, so those legs have no action to run under. The teaching it
-  carried is still the rule for any fan-out you write yourself: decompose into
-  **file-disjoint** subtasks so parallel legs cannot conflict, and end with a
-  separate verify worker rather than trusting a producer's self-report.
-  Installing it refuses with `agent template is retired; use verifier`, so a
-  stale script gets a named successor rather than "unknown template".
-- **`verifier`** — the minimal **produce vs. independent check** recipe: one
-  producer leg plus one independent verify leg. The verify leg is a read-only
-  ephemeral `review` worker that `deps` on the producer, runs on a **different
-  runtime/model**, and checks the producer's result against the original
-  goal — reading the real code and running its own checks rather than trusting the producer's
-  self-report. It returns `changes_requested` with structured findings on any
-  objective failure (else `approved`), with `failure_policy: escalate` routing a
-  failed verdict back to the coordinator continuation for autonomous correction
-  (or `escalate_human` for a human pause).
-
-**Produce vs. independent check.** A `synthesis_rule` (`summary`/`vote`/`quorum`)
-reconciles what the producers **self-report** — self-evaluation, which inherits
-the producer's blind spots. A `verifier` verify leg is a
-*separate* worker on a different runtime/model that checks the producer's result
-against the goal — cross-evaluation, which the literature finds beats
-self-evaluation (the generator-verifier gap; LLM-as-judge self-preference bias).
-This generalizes ROMA's Verifier (`(goal, candidate_output) -> verdict +
-feedback`, vendored at `repos/ROMA`); it uses only shipped primitives
-(`ephemeral`, `failure_policy`, the merge gate) — no new engine code. See the
-**produce vs. independent check** note in `RESULT_CONTRACT.md`.
-
-```sh
-gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
-```
-
-The panelists in `review-panel` and both legs of `verifier` are **ephemeral**
-workers: Gitmoot creates
-each from the delegation's `ephemeral` spec, runs it, and disposes of it once the
-child job finishes. Ephemeral workers are leaf-only — they return findings, never their own
-delegations — so a recipe's fan-out is exactly one level deep. In both recipes the
-delegations never set `agent`, because `agent` and `ephemeral` are mutually
-exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
-the coordinator to merge the results (the panel verdict, or the verify gate plus
-the producer's artifact). Inspect the run under `gitmoot job list --repo owner/repo`
-and the `delegation_enqueued` events in `gitmoot job events <job-id>`. See
-`RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
-bounds these recipes run inside.
 
 ## Satisfying the workload-mode gate
 
