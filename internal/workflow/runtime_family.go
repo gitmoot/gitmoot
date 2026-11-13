@@ -81,19 +81,20 @@ func resolveRuntimeFamilyDirect(ctx context.Context, store *db.Store, jobID stri
 	return ompProviderRuntimeFamily(provider), true, true, nil
 }
 
-// ompProviderRuntimeFamily preserves the native family for OMP routes that use
-// the same upstream provider as a native adapter. The wrapper is still recorded
-// as effective_runtime=omp; only the independence comparison is canonicalized.
-// Unknown providers stay namespaced so an unrelated native runtime name cannot
-// collide with an operator-defined OMP provider.
+// ompProviderRuntimeFamily maps an OMP route's upstream provider onto the model
+// family name the removed native runtimes recorded (claude, kimi, codex; #2587),
+// so a historical native-runtime job and an omp job on the same provider still
+// compare as the same family. The wrapper is still recorded as
+// effective_runtime=omp; only the independence comparison is canonicalized.
+// Unknown providers stay namespaced so they cannot collide with those names.
 func ompProviderRuntimeFamily(provider string) string {
 	switch provider = normalizeRuntimeFamily(provider); provider {
 	case "anthropic":
-		return runtime.ClaudeRuntime
+		return "claude"
 	case "kimi-code":
-		return runtime.KimiRuntime
+		return "kimi"
 	case "openai", "openai-codex":
-		return runtime.CodexRuntime
+		return "codex"
 	default:
 		return runtime.OmpRuntime + ":" + provider
 	}

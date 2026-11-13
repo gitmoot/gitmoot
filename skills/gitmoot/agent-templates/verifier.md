@@ -124,7 +124,7 @@ Gitmoot enqueues one continuation after verify finishes.
         "id": "produce",
         "action": "ask",
         "prompt": "Produce the migration plan for the token-bucket rate limiter: name every file, handler, and config key that must change in internal/ratelimit and the middleware, the exact test cases needed for burst, steady-state, and reset, and the ordering constraints between them. Return the plan as artifact_body. Acceptance: an implementer can follow it without rediscovering the call graph.",
-        "ephemeral": { "runtime": "codex", "role": "producer", "capabilities": ["ask"] }
+        "ephemeral": { "runtime": "omp", "role": "producer", "capabilities": ["ask"] }
       },
       {
         "id": "verify",
@@ -133,7 +133,7 @@ Gitmoot enqueues one continuation after verify finishes.
         "deps": ["produce"],
         "synthesis_rule": "summary",
         "failure_policy": "escalate",
-        "ephemeral": { "runtime": "claude", "role": "verifier", "capabilities": ["ask", "review"] }
+        "ephemeral": { "runtime": "omp", "role": "verifier", "capabilities": ["ask", "review"] }
       }
     ]
   }

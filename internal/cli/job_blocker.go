@@ -371,11 +371,6 @@ func classifyOperationalBlocker(cause error, now time.Time) (blockerClassificati
 	}
 	text := cause.Error()
 	detail := firstLineTrimmed(text)
-	if errors.Is(cause, runtime.ErrClaudeAuthFailed) {
-		// Typed sentinel: attached by the Claude adapter to a classified genuine
-		// credential rejection, so it is trustworthy without the delivery gate.
-		return blockerClassification{Class: blockerClassRuntimeAuth, RetryAt: now.Add(authBlockerRetryDelay), Detail: detail}, true
-	}
 	if github.AsTransient(cause) {
 		// A typed github.TransientError can reach a TERMINAL job failure directly
 		// from a daemon-owned github op (not the runtime delivery seam), so it is

@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -41,12 +40,6 @@ var curatedBaseEnvNames = []string{
 }
 
 var curatedRuntimeEnvNames = map[string][]string{
-	runtime.CodexRuntime: {"CODEX_HOME"},
-	// Claude's ambient auth names remain available only for the explicit-empty
-	// authoritative-file fallback. A populated runtime-auth.env overlay is
-	// appended later and wins, including explicit blanks for absent names.
-	runtime.ClaudeRuntime: {"CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"},
-	runtime.KimiRuntime:   {},
 	// omp is a multi-provider ROUTING harness, so its curated set is ROUTING
 	// PLUMBING ONLY — which profile to run under, where the coding-agent state
 	// lives, which model each routing tier resolves to, and the optional auth
@@ -173,74 +166,14 @@ func matchesCredentialPassthrough(name string, patterns []string) bool {
 }
 
 func runtimeJobRunner(home string, runtimeName string, outer subprocess.Runner) (subprocess.Runner, error) {
-	runner, _, _, err := runtimeJobRunnerWithAuth(home, runtimeName, outer)
-	return runner, err
-}
-
-// runtimeJobRunnerWithAuth is runtimeJobRunner plus the resolved Claude auth
-// state/source used by `auth probe` and the one-shot doctor. Production adapter
-// construction uses runtimeJobRunner and therefore shares this exact path.
-func runtimeJobRunnerWithAuth(home string, runtimeName string, outer subprocess.Runner) (subprocess.Runner, runtimeAuthFile, string, error) {
-	var authState runtimeAuthFile
-	var authSource string
-	var credentialsCfg config.CredentialsConfig
-	var resolvedHome string
-	if runtimeName == runtime.ClaudeRuntime {
-		authSource = runtimeAuthFileName
-		paths, err := pathsFromFlag(home)
-		if err != nil {
-			return nil, authState, authSource, err
-		}
-		if _, err := bootstrapRuntimeAuth(paths.Home, runtimeAuthEnvLookup, runtimeAuthLogf); err != nil {
-			return nil, authState, authSource, fmt.Errorf("bootstrap Claude runtime auth: %w", err)
-		}
-		authState, err = loadRuntimeAuthFile(paths.Home)
-		if err != nil {
-			return nil, authState, authSource, err
-		}
-		authSource = runtimeAuthSource(authState, runtimeAuthEnvLookup)
-		warnRuntimeAuthConflicts(authState, runtimeAuthEnvLookup, runtimeAuthLogf)
-		credentialsCfg = config.DefaultCredentialsConfig()
-		loadedCredentials, loadErr := config.LoadCredentialsConfig(paths)
-		if loadErr == nil {
-			credentialsCfg = loadedCredentials
-		} else if !errors.Is(loadErr, os.ErrNotExist) {
-			return nil, authState, authSource, fmt.Errorf("load credentials config: %w", loadErr)
-		}
-		resolvedHome = paths.Home
-	}
-
 	curated, err := curatedJobRunner(home, runtimeName)
 	if err != nil {
-		return nil, authState, authSource, err
-	}
-	if runtimeName == runtime.ClaudeRuntime && credentialsCfg.ModelGateway {
-		base := outer
-		if curated != nil {
-			base = graftRuntimeBaseRunner(outer, curated, "")
-		}
-		gatewayRunner, err := buildModelGatewayRunner(resolvedHome, credentialsCfg, authState, base)
-		if err != nil {
-			return nil, authState, authSource, err
-		}
-		return gatewayRunner, authState, runtimeAuthFileName + " via model gateway", nil
-	}
-	if runtimeName == runtime.ClaudeRuntime {
-		authEnv := runtimeAuthInjectionEnv(authState)
-		if curated != nil {
-			base := curated.(subprocess.CuratedGroupRunner)
-			base.BaseEnv = append(base.BaseEnv, authEnv...)
-			curated = base
-		} else if len(authEnv) > 0 {
-			baseEnv := append([]string{}, os.Environ()...)
-			baseEnv = append(baseEnv, authEnv...)
-			curated = subprocess.CuratedGroupRunner{BaseEnv: baseEnv}
-		}
+		return nil, err
 	}
 	if curated == nil {
-		return outer, authState, authSource, nil
+		return outer, nil
 	}
-	return graftRuntimeBaseRunner(outer, curated, ""), authState, authSource, nil
+	return graftRuntimeBaseRunner(outer, curated, ""), nil
 }
 
 // graftRuntimeBaseRunner configures the base runner under outer's wrappers
@@ -271,12 +204,6 @@ func graftRuntimeBaseRunner(outer subprocess.Runner, curated subprocess.Runner, 
 		runner.ScratchDirs = append([]string(nil), base.ScratchDirs...)
 		runner.MaxOutputBytes = base.MaxOutputBytes
 		runner.LaunchDir = launchDir
-		return runner
-	case *credgw.Runner:
-		if runner.Inner == nil {
-			runner.Inner = subprocess.GroupRunner{}
-		}
-		runner.Inner = graftRuntimeBaseRunner(runner.Inner, curated, launchDir)
 		return runner
 	case subprocess.CuratedGroupRunner:
 		base, ok := curated.(subprocess.CuratedGroupRunner)
@@ -366,10 +293,5 @@ func runtimeAdapterFor(home string, runtimeName string, checkout string) (runtim
 	if err != nil {
 		return nil, err
 	}
-	adapter, err := runtimeStartAdapterFor(factory, runtimeName, checkout)
-	if err != nil {
-		return nil, err
-	}
-	gatewayRunner, _ := factory.Runner.(*credgw.Runner)
-	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
+	return runtimeStartAdapterFor(factory, runtimeName, checkout)
 }

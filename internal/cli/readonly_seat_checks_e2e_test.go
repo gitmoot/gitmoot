@@ -338,19 +338,17 @@ func TestReadOnlySeatFallsBackToCacheRootTempWithoutAShortWritableParent(t *test
 	}
 	home := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
-	stateDir := filepath.Join(t.TempDir(), "claude-state")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeSeatFixtureFile(t, stateDir, ".credentials.json", `{"claudeAiOauth":{"accessToken":"seat"}}`)
+	readOnlySeatOmpBrokerEnv(t)
 	t.Setenv("TMPDIR", "/sys")
 	agent := runtime.Agent{
-		Runtime:          runtime.ClaudeRuntime,
-		AutonomyPolicy:   runtime.AutonomyPolicyReadOnly,
-		ReadOnlySeat:     true,
-		RuntimeConfigDir: stateDir,
+		Runtime:        runtime.OmpRuntime,
+		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
+		ReadOnlySeat:   true,
 	}
-	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.OmpAdapter{Runner: subprocess.GroupRunner{}})
 	if err != nil {
 		t.Fatalf("a seat without a short writable temp parent was refused: %v", err)
 	}
@@ -358,9 +356,9 @@ func TestReadOnlySeatFallsBackToCacheRootTempWithoutAShortWritableParent(t *test
 	if !ok {
 		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	runner, ok := seat.Adapter.(runtime.ClaudeAdapter).Runner.(subprocess.WrappingRunner)
+	runner, ok := seat.Adapter.(runtime.OmpAdapter).Runner.(subprocess.WrappingRunner)
 	if !ok {
-		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", seat.Adapter.(runtime.ClaudeAdapter).Runner)
+		t.Fatalf("wrapped runner = %T, want subprocess.WrappingRunner", seat.Adapter.(runtime.OmpAdapter).Runner)
 	}
 	if !seat.cleanupTemp.inCacheRoot || seat.cleanupTemp.dir != filepath.Join(seat.cleanupRoot, "tmp") {
 		t.Fatalf("seat temp = %+v, want the fallback <cache root>/tmp under %s", seat.cleanupTemp, seat.cleanupRoot)

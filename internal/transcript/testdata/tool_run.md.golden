@@ -1,7 +1,7 @@
 # Job Transcript
 - Action: ask
 - Agent: audit
-- Runtime: codex
+- Runtime: omp
 - Model: gpt-test
 - Workflow: demo
 

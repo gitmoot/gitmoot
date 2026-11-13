@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	gitmootruntime "github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 func TestRuntimeRendererGoldens(t *testing.T) {
@@ -22,13 +20,8 @@ func TestRuntimeRendererGoldens(t *testing.T) {
 		input   string
 		golden  string
 	}{
-		{runtime: "codex", input: "codex.jsonl", golden: "codex.golden"},
-		{runtime: "claude", input: "claude.json", golden: "claude.golden"},
-		{runtime: "kimi", input: "kimi.jsonl", golden: "kimi.golden"},
 		{runtime: "shell", input: "shell.txt", golden: "shell.golden"},
-		{runtime: "codex", input: "codex_tool_run.jsonl", golden: "codex_tool_run.golden"},
-		{runtime: "kimi", input: "kimi_tool_run.jsonl", golden: "kimi_tool_run.golden"},
-		{runtime: "claude", input: "claude_envelope_real.json", golden: "claude_envelope_real.golden"},
+		{runtime: "omp", input: "omp_tool_run.jsonl", golden: "omp_tool_run.golden"},
 	} {
 		t.Run(tc.runtime, func(t *testing.T) {
 			translator, err := NewTranslator(tc.runtime)
@@ -59,14 +52,14 @@ func TestRuntimeRendererGoldens(t *testing.T) {
 }
 
 func TestUnknownAndMalformedLinesFailOpenWithRedaction(t *testing.T) {
-	translator, err := NewTranslator("codex")
+	translator, err := NewTranslator("omp")
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := []string{
 		`{"type":"future.event","token":"ghp_abcdefghijklmnopqrstuvwxyz"}`,
 		`not json password=supersecretvalue123456789`,
-		`{"type":"turn.started"}`,
+		`{"type":"session","id":"5b0f3f8a-1f4d-4a9e-9a34-3f0f2f7b1c2d"}`,
 	}
 	var got bytes.Buffer
 	renderer := NewRenderer(&got)
@@ -79,7 +72,7 @@ func TestUnknownAndMalformedLinesFailOpenWithRedaction(t *testing.T) {
 	if strings.Contains(text, "ghp_abcdefghijklmnopqrstuvwxyz") || strings.Contains(text, "supersecretvalue123456789") {
 		t.Fatalf("unredacted transcript: %s", text)
 	}
-	if strings.Count(text, "[REDACTED]") != 2 || !strings.Contains(text, "turn: started") {
+	if strings.Count(text, "[REDACTED]") != 2 || !strings.Contains(text, "session: omp stream started") {
 		t.Fatalf("renderer did not continue per line: %s", text)
 	}
 }
@@ -116,53 +109,6 @@ func TestPlainRendererByteStableWithRoundTwoMetadata(t *testing.T) {
 	want := "▸ bash echo ok\n◂ completed one two\nusage (latest reported usage): in=7 out=3\n"
 	if got.String() != want {
 		t.Fatalf("plain round-two output = %q, want %q", got.String(), want)
-	}
-}
-
-func TestClaudeMalformedLineDoesNotPoisonFinalEnvelope(t *testing.T) {
-	translator, err := NewTranslator("claude")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if events := translator.Translate("diagnostic before envelope"); len(events) != 0 {
-		t.Fatalf("Claude rendered before final flush: %+v", events)
-	}
-	translator.Translate(`{"result":"final text","usage":{"input_tokens":9,"output_tokens":4}}`)
-	var got bytes.Buffer
-	if err := NewRenderer(&got).Render(translator.Flush()...); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"diagnostic before envelope", "final text", "in=9 out=4"} {
-		if !strings.Contains(got.String(), want) {
-			t.Fatalf("Claude transcript missing %q: %q", want, got.String())
-		}
-	}
-}
-
-func TestClaudeNonEnvelopeJSONRendersRaw(t *testing.T) {
-	translator, err := NewTranslator("claude")
-	if err != nil {
-		t.Fatal(err)
-	}
-	line := `{"progress":"still thinking"}`
-	translator.Translate(line)
-	var got bytes.Buffer
-	if err := NewRenderer(&got).Render(translator.Flush()...); err != nil {
-		t.Fatal(err)
-	}
-	if got.String() != line+"\n" || strings.Contains(got.String(), "latest reported usage") || strings.Contains(got.String(), "\u25cf") {
-		t.Fatalf("non-envelope Claude JSON rendered as a result: %q", got.String())
-	}
-}
-
-func TestFileChangeDigestCapsCount(t *testing.T) {
-	changes := make([]gitmootruntime.CodexFileChangeEntry, 10)
-	for i := range changes {
-		changes[i] = gitmootruntime.CodexFileChangeEntry{Kind: "modify", Path: fmt.Sprintf("file-%d", i)}
-	}
-	digest := fileChangeDigest(changes)
-	if strings.Contains(digest, "file-8") || strings.Contains(digest, "file-9") || !strings.Contains(digest, "(+2 more)") {
-		t.Fatalf("capped file-change digest = %q", digest)
 	}
 }
 
@@ -438,11 +384,11 @@ func waitForLine(t *testing.T, lines <-chan string, want string) {
 }
 
 func TestStyledRendererGolden(t *testing.T) {
-	translator, err := newTranslator("codex", func() time.Time { return time.Unix(100, 0) })
+	translator, err := newTranslator("omp", func() time.Time { return time.Unix(100, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := readTestdata(t, "codex_tool_run.jsonl")
+	input := readTestdata(t, "omp_tool_run.jsonl")
 	var got bytes.Buffer
 	renderer := NewStyledRenderer(&got)
 	scanner := bufio.NewScanner(strings.NewReader(input))
@@ -458,7 +404,7 @@ func TestStyledRendererGolden(t *testing.T) {
 	if err := renderer.Render(translator.Flush()...); err != nil {
 		t.Fatal(err)
 	}
-	if want := readTestdata(t, "codex_tool_run_styled.golden"); got.String() != want {
+	if want := readTestdata(t, "omp_tool_run_styled.golden"); got.String() != want {
 		t.Fatalf("styled transcript:\n%q\nwant:\n%q", got.String(), want)
 	}
 }
@@ -539,9 +485,9 @@ func TestToolPresentationTable(t *testing.T) {
 	}
 }
 
-func TestCodexTranslatorThreadsToolDurationAndPresentation(t *testing.T) {
+func TestOmpTranslatorThreadsToolDurationAndPresentation(t *testing.T) {
 	times := []time.Time{time.Unix(100, 0), time.Unix(101, 200_000_000)}
-	translator, err := newTranslator("codex", func() time.Time {
+	translator, err := newTranslator("omp", func() time.Time {
 		got := times[0]
 		times = times[1:]
 		return got
@@ -549,8 +495,8 @@ func TestCodexTranslatorThreadsToolDurationAndPresentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	started := translator.Translate(`{"type":"item.started","item":{"id":"tool-1","type":"command_execution","command":"bash -lc 'echo ok'","status":"in_progress"}}`)
-	completed := translator.Translate(`{"type":"item.completed","item":{"id":"tool-1","type":"command_execution","command":"bash -lc 'echo ok'","aggregated_output":"ok\n","exit_code":0,"status":"completed"}}`)
+	started := translator.Translate(`{"type":"tool_execution_start","toolCallId":"tool-1","toolName":"bash","args":{"command":"echo ok"}}`)
+	completed := translator.Translate(`{"type":"tool_execution_end","toolCallId":"tool-1","toolName":"bash","result":{"content":[{"type":"text","text":"ok\n"}]},"isError":false}`)
 	if len(started) != 1 || started[0].ToolIcon != "$" || started[0].Preview != PreviewTail || started[0].PreviewLines != 5 {
 		t.Fatalf("started event = %+v", started)
 	}
@@ -594,7 +540,7 @@ func TestStyledRendererDurationCancellationAndNarration(t *testing.T) {
 }
 
 func TestMarkdownRendererGolden(t *testing.T) {
-	header := Header{Action: "ask", Agent: "audit", Runtime: "codex", Model: "gpt-test", Workflow: "demo", Prompt: "Check `status`."}
+	header := Header{Action: "ask", Agent: "audit", Runtime: "omp", Model: "gpt-test", Workflow: "demo", Prompt: "Check `status`."}
 	events := []Event{
 		{Kind: KindLifecycle, Phase: "thread", Detail: "started"},
 		{Kind: KindLifecycle, Phase: "turn", Detail: "started"},
@@ -611,7 +557,7 @@ func TestMarkdownRendererGolden(t *testing.T) {
 	if strings.Contains(got.String(), "\x1b[") {
 		t.Fatalf("markdown contains ANSI: %q", got.String())
 	}
-	if want := readTestdata(t, "codex_tool_run.md.golden"); got.String() != want {
+	if want := readTestdata(t, "tool_run.md.golden"); got.String() != want {
 		t.Fatalf("markdown transcript:\n%s\nwant:\n%s", got.String(), want)
 	}
 }
@@ -651,12 +597,12 @@ func TestFormatTokens(t *testing.T) {
 }
 
 func TestRenderHeaderPlainAndStyled(t *testing.T) {
-	full := Header{Action: "ask", Agent: "planner", Runtime: "codex", Model: "gpt-5.5", Workflow: "demo", Prompt: "do the thing"}
+	full := Header{Action: "ask", Agent: "planner", Runtime: "omp", Model: "gpt-5.5", Workflow: "demo", Prompt: "do the thing"}
 	var plain bytes.Buffer
 	if err := NewRenderer(&plain).RenderHeader(full); err != nil {
 		t.Fatal(err)
 	}
-	want := "▶ ask · planner · codex/gpt-5.5 · workflow demo\n  do the thing\n\n"
+	want := "▶ ask · planner · omp/gpt-5.5 · workflow demo\n  do the thing\n\n"
 	if plain.String() != want {
 		t.Fatalf("plain header = %q, want %q", plain.String(), want)
 	}
@@ -674,7 +620,7 @@ func TestRenderHeaderPlainAndStyled(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := styled.String()
-	if !strings.Contains(out, "\x1b[90m▶ ask · planner · codex/gpt-5.5 · workflow demo\x1b[0m") {
+	if !strings.Contains(out, "\x1b[90m▶ ask · planner · omp/gpt-5.5 · workflow demo\x1b[0m") {
 		t.Fatalf("styled meta not dim: %q", out)
 	}
 	if !strings.Contains(out, "\n  do the thing\n") {
@@ -685,7 +631,7 @@ func TestRenderHeaderPlainAndStyled(t *testing.T) {
 func TestRenderHeaderTruncatesAndRedactsPrompt(t *testing.T) {
 	long := "token=ghp_1234567890abcdefghijklmnopqrstuvwxyz " + strings.Repeat("x", 600)
 	var got bytes.Buffer
-	if err := NewRenderer(&got).RenderHeader(Header{Action: "ask", Agent: "a", Runtime: "codex", Prompt: long}); err != nil {
+	if err := NewRenderer(&got).RenderHeader(Header{Action: "ask", Agent: "a", Runtime: "omp", Prompt: long}); err != nil {
 		t.Fatal(err)
 	}
 	out := got.String()

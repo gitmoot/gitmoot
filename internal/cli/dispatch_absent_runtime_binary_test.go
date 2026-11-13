@@ -94,7 +94,7 @@ func seedAbsentBinaryReviewRepo(t *testing.T) (*db.Store, string) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "responder", runtime.ClaudeRuntime, "unused", []string{"review", "ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "responder", runtime.OmpRuntime, "unused", []string{"review", "ask"}, "owner/repo")
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo")
 	return store, home
 }
@@ -113,7 +113,7 @@ func seedAbsentBinaryReviewRepo(t *testing.T) (*db.Store, string) {
 func TestProductionBackgroundReviewRefusesAbsentBinaryBeforeRowOrWorktree(t *testing.T) {
 	ctx := context.Background()
 	store, home := seedAbsentBinaryReviewRepo(t)
-	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.OmpRuntime, "omp"))
 
 	var stdout, stderr bytes.Buffer
 	_, code := dispatchAgentCommand(agentRunOptions{
@@ -124,7 +124,7 @@ func TestProductionBackgroundReviewRefusesAbsentBinaryBeforeRowOrWorktree(t *tes
 	if code == 0 {
 		t.Fatalf("production background review accepted an absent runtime binary; stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
-	for _, want := range []string{`runtime "claude"`, `executable "claude"`, "does not resolve on PATH", "install claude"} {
+	for _, want := range []string{`runtime "omp"`, `executable "omp"`, "does not resolve on PATH", "install omp"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("production stderr does not name %q: %s", want, stderr.String())
 		}
@@ -148,7 +148,7 @@ func TestProductionBackgroundReviewRefusesAbsentBinaryBeforeRowOrWorktree(t *tes
 func TestProductionForegroundAskRefusesAbsentBinaryBeforeRow(t *testing.T) {
 	ctx := context.Background()
 	store, home := seedAbsentBinaryReviewRepo(t)
-	stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+	stubForegroundProbe(t, absentBinaryContract(runtime.OmpRuntime, "omp"))
 
 	var stdout, stderr bytes.Buffer
 	_, code := dispatchAgentCommand(agentRunOptions{
@@ -176,7 +176,7 @@ func TestProductionForegroundAskRefusesAbsentBinaryBeforeRow(t *testing.T) {
 func TestInjectedAdapterWithAbsentBinaryStillDispatches(t *testing.T) {
 	ctx := context.Background()
 	store, home := seedAbsentBinaryReviewRepo(t)
-	stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+	stubForegroundProbe(t, absentBinaryContract(runtime.OmpRuntime, "omp"))
 	stubForegroundAdapter(t)
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
@@ -197,7 +197,7 @@ func TestInjectedAdapterWithAbsentBinaryStillDispatches(t *testing.T) {
 func TestProductionDispatchWithPresentBinaryStillDispatches(t *testing.T) {
 	ctx := context.Background()
 	store, home := seedAbsentBinaryReviewRepo(t)
-	stubForegroundProbe(t, presentBinaryContract(runtime.ClaudeRuntime))
+	stubForegroundProbe(t, presentBinaryContract(runtime.OmpRuntime))
 	stubForegroundAdapter(t)
 
 	var stdout, stderr bytes.Buffer
@@ -223,7 +223,7 @@ func TestProductionDispatchWithPresentBinaryStillDispatches(t *testing.T) {
 // decorative and a broken backend resolver would not have been caught.
 func TestProductionRemoteBackendWithAbsentLocalBinaryIsNotRefused(t *testing.T) {
 	store, home := seedAbsentBinaryReviewRepo(t)
-	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.ClaudeRuntime, "claude"))
+	probeCalls := stubForegroundProbe(t, absentBinaryContract(runtime.OmpRuntime, "omp"))
 
 	previousBackend := localAgentDispatchExecBackendFor
 	resolverCalls := 0
@@ -256,13 +256,13 @@ func TestProductionRemoteBackendWithAbsentLocalBinaryIsNotRefused(t *testing.T) 
 // #1926-f5: THE DAEMON CLAIM ROUTE, REAL ADAPTER, driven through the worker as
 // it actually claims. This is the seam the previous head left open: a delegated
 // or daemon-created job reached adapter construction with an absent executable
-// and reproduced the original missing-claude failure.
+// and reproduced the original missing-binary failure.
 func TestDaemonClaimRealAdapterRefusesAbsentBinary(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "lead", runtime.ClaudeRuntime, "unused", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead", runtime.OmpRuntime, "unused", []string{"implement"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-daemon-absent", Agent: "lead", Action: "implement", Repo: "owner/repo",
 		Branch: "task-1", PullRequest: 41, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
@@ -274,7 +274,7 @@ func TestDaemonClaimRealAdapterRefusesAbsentBinary(t *testing.T) {
 	}
 	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
 	worker.RuntimePreflight = func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
-		return absentBinaryContract(runtime.ClaudeRuntime, "claude")
+		return absentBinaryContract(runtime.OmpRuntime, "omp")
 	}
 	// NOTE: AdapterFactory is left as defaultJobWorker set it, through
 	// setRealAdapterFactory, so this worker declares a REAL adapter. That is the
@@ -310,7 +310,7 @@ func TestDaemonClaimInjectedAdapterWithAbsentBinaryStillDelivers(t *testing.T) {
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "lead", runtime.ClaudeRuntime, "unused", []string{"implement"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "lead", runtime.OmpRuntime, "unused", []string{"implement"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-daemon-injected", Agent: "lead", Action: "implement", Repo: "owner/repo",
 		Branch: "task-1", PullRequest: 42, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
@@ -325,7 +325,7 @@ func TestDaemonClaimInjectedAdapterWithAbsentBinaryStillDelivers(t *testing.T) {
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return adapter, nil }
 	worker.CommenterFactory = func(string) github.Client { return &cliPollFakeGitHub{} }
 	worker.RuntimePreflight = func(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
-		return absentBinaryContract(runtime.ClaudeRuntime, "claude")
+		return absentBinaryContract(runtime.OmpRuntime, "omp")
 	}
 
 	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {

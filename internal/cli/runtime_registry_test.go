@@ -56,27 +56,27 @@ func TestResolveRuntimeRegistryMissingFile(t *testing.T) {
 func TestResolveRuntimeRegistryOverride(t *testing.T) {
 	t.Parallel()
 	paths := writeCLIConfig(t, `
-[runtimes.codex]
-default_model = "gpt-5.5-codex"
+[runtimes.omp]
+default_model = "openai/gpt-5.5"
 default_effort = "high"
-models = ["gpt-5.5-codex"]
+models = ["openai/gpt-5.5"]
 `)
 	got, err := resolveRuntimeRegistry(paths)
 	if err != nil {
 		t.Fatalf("resolveRuntimeRegistry error: %v", err)
 	}
-	codex, ok := got.Metadata(runtime.CodexRuntime)
+	omp, ok := got.Metadata(runtime.OmpRuntime)
 	if !ok {
-		t.Fatal("codex missing")
+		t.Fatal("omp missing")
 	}
-	if codex.DefaultModel != "gpt-5.5-codex" {
-		t.Fatalf("DefaultModel = %q", codex.DefaultModel)
+	if omp.DefaultModel != "openai/gpt-5.5" {
+		t.Fatalf("DefaultModel = %q", omp.DefaultModel)
 	}
-	if codex.DefaultEffort != "high" {
-		t.Fatalf("DefaultEffort = %q", codex.DefaultEffort)
+	if omp.DefaultEffort != "high" {
+		t.Fatalf("DefaultEffort = %q", omp.DefaultEffort)
 	}
-	if !reflect.DeepEqual(codex.Models, []string{"gpt-5.5-codex"}) {
-		t.Fatalf("Models = %v", codex.Models)
+	if !reflect.DeepEqual(omp.Models, []string{"openai/gpt-5.5"}) {
+		t.Fatalf("Models = %v", omp.Models)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestRunRuntimeListText(t *testing.T) {
 // TestRunRuntimeListJSON covers the JSON output shape.
 func TestRunRuntimeListJSON(t *testing.T) {
 	t.Parallel()
-	paths := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
+	paths := writeCLIConfig(t, "[runtimes.omp]\ndefault_effort = \"high\"\n")
 	var stdout, stderr bytes.Buffer
 	code := runRuntimeList([]string{"--home", homeFromConfig(t, paths), "--json"}, &stdout, &stderr)
 	if code != 0 {
@@ -126,11 +126,11 @@ func TestRunRuntimeListJSON(t *testing.T) {
 	if len(entries) != len(runtime.SupportedRuntimes()) {
 		t.Fatalf("expected %d entries, got %d", len(runtime.SupportedRuntimes()), len(entries))
 	}
-	if entries[0].Name != runtime.CodexRuntime || !entries[0].Dispatchable {
+	if entries[0].Name != runtime.OmpRuntime || !entries[0].Dispatchable {
 		t.Fatalf("first entry wrong: %+v", entries[0])
 	}
 	if entries[0].DefaultEffort != "high" {
-		t.Fatalf("codex default_effort = %q, want high", entries[0].DefaultEffort)
+		t.Fatalf("omp default_effort = %q, want high", entries[0].DefaultEffort)
 	}
 }
 
@@ -154,38 +154,38 @@ func TestRunRuntimeListUnknownRuntimeExits(t *testing.T) {
 // resolves NOTHING (byte-identical) for a runtime with no override.
 func TestRuntimeDefaultModelResolverReadsConfig(t *testing.T) {
 	t.Parallel()
-	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_model = \"gpt-5.5\"\n")
+	src := writeCLIConfig(t, "[runtimes.omp]\ndefault_model = \"openai/gpt-5.5\"\n")
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultModelResolver(home)
-	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
-		t.Fatalf("resolve(codex) = %q, want gpt-5.5", got)
+	if got := resolve(runtime.OmpRuntime); got != "openai/gpt-5.5" {
+		t.Fatalf("resolve(omp) = %q, want openai/gpt-5.5", got)
 	}
 	// A runtime with no override records no default: the hook forces nothing.
-	if got := resolve(runtime.ClaudeRuntime); got != "" {
-		t.Fatalf("resolve(claude) = %q, want empty (no override)", got)
+	if got := resolve(runtime.ShellRuntime); got != "" {
+		t.Fatalf("resolve(shell) = %q, want empty (no override)", got)
 	}
 }
 
 func TestRuntimeDefaultEffortResolverReadsConfig(t *testing.T) {
 	t.Parallel()
-	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_effort = \"high\"\n")
+	src := writeCLIConfig(t, "[runtimes.omp]\ndefault_effort = \"high\"\n")
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultEffortResolver(home)
-	if got := resolve(runtime.CodexRuntime); got != "high" {
-		t.Fatalf("resolve(codex) = %q, want high", got)
+	if got := resolve(runtime.OmpRuntime); got != "high" {
+		t.Fatalf("resolve(omp) = %q, want high", got)
 	}
-	if got := resolve(runtime.ClaudeRuntime); got != "" {
-		t.Fatalf("resolve(claude) = %q, want empty (no override)", got)
+	if got := resolve(runtime.ShellRuntime); got != "" {
+		t.Fatalf("resolve(shell) = %q, want empty (no override)", got)
 	}
 }
 
 func TestRuntimeDefaultEffortResolverAbsentConfig(t *testing.T) {
 	t.Parallel()
-	if got := runtimeDefaultEffortResolver(t.TempDir())(runtime.CodexRuntime); got != "" {
-		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
+	if got := runtimeDefaultEffortResolver(t.TempDir())(runtime.OmpRuntime); got != "" {
+		t.Fatalf("missing-config resolve(omp) = %q, want empty", got)
 	}
-	if got := runtimeDefaultEffortResolver("")(runtime.CodexRuntime); got != "" {
-		t.Fatalf("empty-home resolve(codex) = %q, want empty", got)
+	if got := runtimeDefaultEffortResolver("")(runtime.OmpRuntime); got != "" {
+		t.Fatalf("empty-home resolve(omp) = %q, want empty", got)
 	}
 }
 
@@ -195,37 +195,37 @@ func TestRuntimeDefaultEffortResolverAbsentConfig(t *testing.T) {
 func TestRuntimeDefaultModelResolverAbsentConfigByteIdentical(t *testing.T) {
 	t.Parallel()
 	missingHome := t.TempDir() // no config.toml written anywhere under it
-	if got := runtimeDefaultModelResolver(missingHome)(runtime.CodexRuntime); got != "" {
-		t.Fatalf("missing-config resolve(codex) = %q, want empty", got)
+	if got := runtimeDefaultModelResolver(missingHome)(runtime.OmpRuntime); got != "" {
+		t.Fatalf("missing-config resolve(omp) = %q, want empty", got)
 	}
-	if got := runtimeDefaultModelResolver("")(runtime.CodexRuntime); got != "" {
-		t.Fatalf("empty-home resolve(codex) = %q, want empty", got)
+	if got := runtimeDefaultModelResolver("")(runtime.OmpRuntime); got != "" {
+		t.Fatalf("empty-home resolve(omp) = %q, want empty", got)
 	}
-	src := writeCLIConfig(t, "[runtimes.codex]\ndefault_model = \"gpt-5.5\"\n")
+	src := writeCLIConfig(t, "[runtimes.omp]\ndefault_model = \"openai/gpt-5.5\"\n")
 	if got := runtimeDefaultModelResolver(homeFromConfig(t, src))("nonexistent-runtime"); got != "" {
 		t.Fatalf("unknown-runtime resolve = %q, want empty", got)
 	}
 }
 
 // TestRuntimeDefaultModelResolverSkipsBadSection proves the DELIVERY path is
-// PER-SECTION resilient (#652 LOW): a config with one VALID [runtimes.codex]
+// PER-SECTION resilient (#652 LOW): a config with one VALID [runtimes.omp]
 // default_model plus one bad section (an unknown-runtime typo) still resolves the
-// codex override — a single bad section is skipped, not a whole-config failure that
+// omp override — a single bad section is skipped, not a whole-config failure that
 // silently drops every valid override at delivery.
 func TestRuntimeDefaultModelResolverSkipsBadSection(t *testing.T) {
 	t.Parallel()
 	src := writeCLIConfig(t, `
-[runtimes.codex]
-default_model = "gpt-5.5"
+[runtimes.omp]
+default_model = "openai/gpt-5.5"
 
 [runtimes.codxe]
 default_model = "typo-runtime"
 `)
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultModelResolver(home)
-	// The valid codex override still takes effect despite the bad sibling section.
-	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
-		t.Fatalf("resolve(codex) = %q, want gpt-5.5 (bad sibling section must not drop it)", got)
+	// The valid omp override still takes effect despite the bad sibling section.
+	if got := resolve(runtime.OmpRuntime); got != "openai/gpt-5.5" {
+		t.Fatalf("resolve(omp) = %q, want openai/gpt-5.5 (bad sibling section must not drop it)", got)
 	}
 	// The bad section is skipped entirely, not surfaced as a phantom runtime.
 	if got := resolve("codxe"); got != "" {
@@ -240,20 +240,20 @@ default_model = "typo-runtime"
 func TestRuntimeDefaultModelResolverSkipsBadCapabilitySection(t *testing.T) {
 	t.Parallel()
 	src := writeCLIConfig(t, `
-[runtimes.codex]
-default_model = "gpt-5.5"
+[runtimes.omp]
+default_model = "openai/gpt-5.5"
 
-[runtimes.claude]
+[runtimes.shell]
 capabilities = ["review", "bogus"]
 `)
 	home := homeFromConfig(t, src)
 	resolve := runtimeDefaultModelResolver(home)
-	if got := resolve(runtime.CodexRuntime); got != "gpt-5.5" {
-		t.Fatalf("resolve(codex) = %q, want gpt-5.5 (bad capability sibling must not drop it)", got)
+	if got := resolve(runtime.OmpRuntime); got != "openai/gpt-5.5" {
+		t.Fatalf("resolve(omp) = %q, want openai/gpt-5.5 (bad capability sibling must not drop it)", got)
 	}
-	// The claude section is skipped, so it records no default (byte-identical).
-	if got := resolve(runtime.ClaudeRuntime); got != "" {
-		t.Fatalf("resolve(claude) = %q, want empty (bad capability section skipped)", got)
+	// The shell section is skipped, so it records no default (byte-identical).
+	if got := resolve(runtime.ShellRuntime); got != "" {
+		t.Fatalf("resolve(shell) = %q, want empty (bad capability section skipped)", got)
 	}
 }
 

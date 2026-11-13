@@ -3,7 +3,7 @@ name: gitmoot
 description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
 metadata:
   gitmoot-version: "0.8.8"
   source: "gitmoot/gitmoot"
@@ -28,7 +28,7 @@ This root `SKILL.md` is kept as a raw compatibility entrypoint for agents and
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
+background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins,
 structured implementation plans, agent template inspection,
 custom prompt agents, job status, branch lock inspection,
 agent memory,
@@ -61,15 +61,16 @@ verb. A template that must change is edited or re-seeded in its
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex, Claude, or Kimi session, and branch locks protect implementation
+same resumable runtime session (omp runs a fresh session per job), and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
-`codex`, `claude`, `kimi`, or `omp`. Kimi Code is a first-class runtime adapter alongside Codex and Claude
-Code. To use it, run `kimi login`, then restart the Gitmoot daemon so it inherits
-the session. `omp` is the oh-my-pi CLI, a multi-provider routing harness:
+only `omp`, the sole job runtime. Agents still registered on the removed
+`codex`, `claude`, or `kimi` runtimes are reported as unsupported by `gitmoot
+agent list` and `gitmoot doctor`, and their jobs are refused; re-register them
+with `--runtime omp`. `omp` is the oh-my-pi CLI, a multi-provider routing harness:
 authenticate it once (interactively, via a provider key in the daemon
 environment, or through an auth broker) and restart the daemon so it inherits the
 credential. omp holds `review`/`implement`/`ask`, runs a fresh
@@ -177,9 +178,7 @@ only that repo's queued jobs. Omit `--repo` to supervise every enabled
 registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
 (alias `--root`) to pin the worker to one orchestration run: it then runs only
 jobs whose `root_job_id` matches that value plus the root coordinator job
-itself. Claude auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
-set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
-the file per delivery, so no daemon restart is needed.
+itself.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
@@ -226,7 +225,7 @@ Start an agent against the built-in thermo review template:
 
 ```sh
 gitmoot agent start thermo-review \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --template thermo-nuclear-code-quality-review \
   --start-daemon
@@ -248,7 +247,7 @@ Start an agent against an installed custom prompt template:
 
 ```sh
 gitmoot agent start frontend-reviewer \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --template frontend-reviewer \
   --role reviewer \
@@ -265,7 +264,7 @@ Queued jobs keep the exact template content snapshot they were created with.
 Discover templates by metadata:
 
 ```sh
-gitmoot agent template list --runtime codex --output plan
+gitmoot agent template list --runtime omp --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```

@@ -130,23 +130,6 @@ func TestReviewChecksRoutingLeavesUnconfiguredRepoLocal(t *testing.T) {
 	}
 }
 
-func TestReviewChecksRoutingRefusesNonRemoteRuntime(t *testing.T) {
-	home, _, head := reviewChecksRoutingHome(t, "owner/repo")
-	_, failure := runReviewRequestJSON(t,
-		"--repo", "owner/repo", "--pr", "12", "--head", head,
-		"--branch", "feature/review", "--role", "joltra", "--home", home,
-		"--runtime", runtime.ClaudeRuntime, "--json",
-	)
-	if failure == "" {
-		t.Fatal("claude review of a checks-routed repo was dispatched; want refusal")
-	}
-	for _, want := range []string{"claude", "owner/repo", "cannot run remotely"} {
-		if !strings.Contains(failure, want) {
-			t.Fatalf("refusal %q does not name %q", failure, want)
-		}
-	}
-}
-
 func TestReviewChecksRoutingRefusesExplicitLocalBackend(t *testing.T) {
 	home, _, head := reviewChecksRoutingHome(t, "owner/repo")
 	_, failure := runReviewRequestJSON(t,

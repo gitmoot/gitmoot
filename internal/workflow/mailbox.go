@@ -448,16 +448,8 @@ type JobPayload struct {
 	// failing it, and sets DiskGuardRouteDeclined so it is not switched again.
 	DiskGuardRouted        bool `json:"disk_guard_routed,omitempty"`
 	DiskGuardRouteDeclined bool `json:"disk_guard_route_declined,omitempty"`
-	// DiskGuardSwitchedRuntime and DiskGuardSwitchedModel hold the review's own
-	// runtime override and model while the disk guard runs it as omp remotely
-	// (#2372, codex -> omp with the same model). Undoing the route restores them,
-	// so a review that goes back to waiting locally runs exactly as requested.
-	// DiskGuardRuntimeSwitched is true while that switch is in effect.
-	DiskGuardRuntimeSwitched bool   `json:"disk_guard_runtime_switched,omitempty"`
-	DiskGuardSwitchedRuntime string `json:"disk_guard_switched_runtime,omitempty"`
-	DiskGuardSwitchedModel   string `json:"disk_guard_switched_model,omitempty"`
-	execBackendPresent       bool
-	unknownJSONFields        map[string]json.RawMessage
+	execBackendPresent     bool
+	unknownJSONFields      map[string]json.RawMessage
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
@@ -1647,33 +1639,6 @@ func (m Mailbox) deliver(ctx context.Context, adapter DeliveryAdapter, agent run
 		defer cancel()
 	}
 	inTok, outTok := result.InputTokens, result.OutputTokens
-	// codex reports SESSION-CUMULATIVE counts on a resumed thread (#661): the
-	// session's whole running total, not this job's usage. When the adapter flags
-	// them cumulative, convert to this job's per-session delta keyed by the
-	// runtime session (runtime+ref) before persisting. Only a concrete, stable
-	// ref names a session we can key on; an empty or "last" ref does not, so —
-	// as today — it contributes 0 rather than being mis-attributed. A false flag
-	// (fresh/single-use, and every non-codex runtime) skips the delta table
-	// entirely and records the count verbatim (#664).
-	if result.CumulativeUsage && agent.RuntimeRef != "" && agent.RuntimeRef != runtime.LastRef {
-		inTok, outTok, _ = m.store.RecordRuntimeSessionUsageDelta(usageCtx, agent.Runtime+":"+agent.RuntimeRef, result.InputTokens, result.OutputTokens)
-	} else if result.CumulativeUsage {
-		inTok, outTok = 0, 0
-	} else if agent.Runtime == runtime.CodexRuntime && result.RefreshedRuntimeRef != "" && result.RefreshedRuntimeRef != runtime.LastRef {
-		// A fresh codex delivery reports PER-JOB (non-cumulative) usage and skips the
-		// delta table by design (#664), so the runtime_session_usage baseline for its
-		// thread is never seeded. But a fresh codex delivery ALSO adopts its concrete
-		// thread in-memory for same-job repair (#665): if turn 1 is malformed, the
-		// repair delivery resumes that thread, reports SESSION-CUMULATIVE usage, and
-		// (turn1+turn2) would delta against a ZERO baseline — re-counting turn 1 on
-		// top of the verbatim record below (#669 interaction). SEED the baseline with
-		// turn 1's counts, keyed byte-identically to the key the repair path computes
-		// from the adopted ref (runtime+RefreshedRuntimeRef), so a repair delta =
-		// (turn1+turn2)-turn1 = turn2. The returned delta is discarded; the verbatim
-		// UpdateJobUsage below records this turn. Errors are swallowed like the delta
-		// call — usage accounting never fails a delivery.
-		_, _, _ = m.store.RecordRuntimeSessionUsageDelta(usageCtx, agent.Runtime+":"+result.RefreshedRuntimeRef, result.InputTokens, result.OutputTokens)
-	}
 	// Only persist when a positive count remains so runtimes that report nothing
 	// (e.g. the shell runtime) or a delta that resolved to 0 leave the columns at
 	// their 0 default rather than taking a no-op write.

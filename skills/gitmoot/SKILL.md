@@ -2,7 +2,7 @@
 name: gitmoot
 description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
-compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
+compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
 metadata:
   gitmoot-version: "0.8.8"
   source: "gitmoot/gitmoot"
@@ -13,7 +13,7 @@ metadata:
 Gitmoot is a local-first coordinator for AI agents working across repositories,
 reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
-background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup, structured
+background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins, structured
 implementation plans, agent template workflows, custom
 prompt agents, job status, or branch lock inspection. When a job
 pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
@@ -73,14 +73,14 @@ verb. A template that must change is edited or re-seeded in the
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same Codex, Claude, or Kimi session, and branch locks protect implementation
+same resumable runtime session (omp runs a fresh session per job), and branch locks protect implementation
 ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
-Claude runtime auth lives in `runtime-auth.env`; rotate it with `gitmoot auth
-set claude` and clear it with `gitmoot auth unset claude`. Adapter builds read
-the file per delivery, so no daemon restart is needed. See CLI.md for the
-single-source model.
+omp is the only job runtime (`shell` remains a subscribe-only runtime for no-LLM
+tests). Agents still registered on the removed `codex`, `claude`, or `kimi`
+runtimes are reported as unsupported by `gitmoot agent list` and `gitmoot
+doctor`, and their jobs are refused; re-register them with `--runtime omp`.
 
 When a job is **blocked** and the user asks to "resume a blocked job", "clear a
 blocker", or "what does this job need" (#682), route to
@@ -205,14 +205,13 @@ individual job or delegation (via `--model` on run/ask/review or the
 delegation `model` field) can pin a runtime model, with the per-job/delegation
 value overriding the agent default. When neither pins one, a job falls back to the
 runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's own
-default. Codex agents, jobs, delegations, and ephemeral worker specs can likewise
+default. Agents, jobs, delegations, and ephemeral worker specs can likewise
 set reasoning effort with `--effort` or the `effort` field. Job/delegation effort
-overrides agent/worker effort, then `[runtimes.codex].default_effort`, and Gitmoot
-forwards the free-form value as `-c model_reasoning_effort=<value>`. omp receives
+overrides agent/worker effort, then `[runtimes.omp].default_effort`. omp receives
 effort as `--thinking <level>` when the value is one of
 `off|minimal|low|medium|high|xhigh|max|auto`, and no flag at all otherwise.
-Claude and Kimi ignore effort. The `omp` runtime is a multi-provider **routing
-harness**, so a few of its properties differ from the vendor CLIs and are worth
+The `omp` runtime is a multi-provider **routing
+harness**, so a few of its properties are worth
 saying out loud before routing work to it: it holds `review`/`implement`/`ask`,
 every job runs a fresh session (it never resumes), and
 read-only seats use Gitmoot's broker-backed sandbox. Runtime-family diversity
@@ -229,14 +228,12 @@ runtime's resolved metadata: capabilities, default model/effort,
 known models, and the token-usage source.
 Operators can override a built-in runtime's
 metadata without recompiling via a `[runtimes.<name>]` config section — `default_model`
-retargets delivery and `default_effort` selects Codex effort and omp's
+retargets delivery and `default_effort` selects omp's
 `--thinking` level, while
 `models`/`capabilities` stay advisory (see CLI.md
 § Runtime Metadata Registry). Use
-`gitmoot plugin doctor` when checking whether Codex, Claude Code, or Kimi Code
-can discover Gitmoot through an installed runtime plugin. Use
-`gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
-adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
+`gitmoot plugin doctor` when checking whether Codex, Claude Code, or omp
+can discover Gitmoot through an installed plugin.
 Use `gitmoot workflow list`, `gitmoot
 workflow show`, `gitmoot workflow show-note`, `gitmoot workflow describe`,
 `gitmoot workflow note`, and `gitmoot workflow close` to
@@ -300,8 +297,8 @@ For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).
 
 For non-trivial implementation work, default to a plan-gated flow: plan first,
 get the plan approved explicitly, then implement against the approved plan. The
-gate is a convention over existing primitives, so it works unchanged on Codex,
-Claude, Kimi, and omp seats.
+gate is a convention over existing primitives, so it works unchanged on any
+seat (omp jobs, or Claude Code and Codex sessions using the plugins).
 
 1. **Plan read-only.** Produce a decision-complete plan with `gitmoot agent
    ask` (or the `planner` template, or a session job opened with `--type ask`).

@@ -68,13 +68,6 @@ func TestClassifyOperationalBlocker(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			// The typed sentinel is trustworthy without the DeliveryError marker.
-			name:      "typed claude auth sentinel",
-			err:       fmt.Errorf("delivery failed: %w", runtime.ErrClaudeAuthFailed),
-			wantOK:    true,
-			wantClass: blockerClassRuntimeAuth,
-		},
-		{
 			name:      "textual 401 authentication_error",
 			err:       workflow.DeliveryError{Err: errors.New("Failed to authenticate. API Error: 401 authentication_error: invalid x-api-key: exit status 1")},
 			wantOK:    true,
@@ -254,7 +247,7 @@ func TestParseQuotaResetAtRollsDecemberIntoJanuary(t *testing.T) {
 
 func TestClassifyOperationalBlockerAuthUsesFixedDelay(t *testing.T) {
 	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
-	got, ok := classifyOperationalBlocker(fmt.Errorf("delivery failed: %w", runtime.ErrClaudeAuthFailed), now)
+	got, ok := classifyOperationalBlocker(workflow.DeliveryError{Err: errors.New("Failed to authenticate. API Error: 401 authentication_error: invalid x-api-key: exit status 1")}, now)
 	if !ok {
 		t.Fatal("expected auth classification")
 	}

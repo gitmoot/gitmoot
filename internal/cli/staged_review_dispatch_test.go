@@ -126,7 +126,7 @@ func TestStagedReviewRefusesAnAgentWithoutTheReviewCapability(t *testing.T) {
 func TestStagedReviewAcceptsADeclaredReviewCapableAgent(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
-	seedDaemonWorkerAgent(t, store, "gm-review-opus", runtime.ClaudeRuntime, "unused", []string{"review", "ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "gm-review-opus", runtime.OmpRuntime, "unused", []string{"review", "ask"}, "owner/repo")
 	paths := stagedReviewPaths(t, "[repos.\"owner/repo\"]\nstaged_review_verdict_agent = \"gm-review-opus\"\n")
 	agent, staged, err := resolveStagedReviewVerdictAgent(ctx, store, paths, "owner/repo")
 	if err != nil {

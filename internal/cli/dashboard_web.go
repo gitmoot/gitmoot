@@ -1144,7 +1144,7 @@ func jobTitle(payload workflow.JobPayload, job db.Job) string {
 	return job.ID
 }
 
-// resolveJobRuntime resolves a job's runtime family (codex|claude|kimi|shell)
+// resolveJobRuntime resolves a job's runtime (omp|shell, or a removed name)
 // from the agent registry, falling back to the payload's ephemeral worker spec
 // for a delegated ephemeral worker that has no registered agent row. Returns ""
 // when neither source names a runtime.
@@ -2156,7 +2156,7 @@ func (d *webDataSource) sseStateSnapshot(ctx context.Context, runID string) (das
 }
 
 // agentRuntimeMap builds a name->runtime lookup from the agent registry so a
-// node can report its runtime (codex|claude|kimi|shell). A lookup error yields
+// node can report its runtime (omp|shell, or a removed name). A lookup error yields
 // an empty map; ephemeral/delegated agents absent from the registry fall back to
 // their payload's ephemeral spec in buildDashboardNode.
 func agentRuntimeMap(ctx context.Context, store *db.Store) map[string]string {

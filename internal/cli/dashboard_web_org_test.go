@@ -260,7 +260,7 @@ func TestDashboardOrgProjectionDistinguishesUnavailableAvailableAndNeverReported
 	if err := store.UpsertRoleLivePresence(ctx, "owner", string(org.StateIdle), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", runtime.ClaudeRuntime, "quota", now.Add(time.Hour), now); err != nil {
+	if err := store.UpsertOrgRoleUnavailableForRuntime(ctx, "review", runtime.OmpRuntime, "quota", now.Add(time.Hour), now); err != nil {
 		t.Fatal(err)
 	}
 	view, err := buildDashboardOrg(ctx, paths, store, now)

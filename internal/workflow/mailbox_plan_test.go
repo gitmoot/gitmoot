@@ -32,7 +32,7 @@ func TestMailboxEnqueueRejectsImpossiblePlanRequest(t *testing.T) {
 		},
 		"plan on a runtime override that cannot plan": {
 			request: JobRequest{ID: "job-plan-bad", Agent: "a", Action: "ask", Repo: "o/r", Plan: true,
-				RuntimeOverride: runtime.CodexRuntime, RuntimeOverrideRef: "codex-session"},
+				RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "shell-session"},
 			wantText: "cannot honour plan mode",
 		},
 	}
@@ -94,13 +94,13 @@ func TestMailboxDeliverPlanGate(t *testing.T) {
 		payload      JobPayload
 		wantText     string
 	}{
-		"plan on codex is refused": {
-			agentRuntime: runtime.CodexRuntime,
+		"plan on shell is refused": {
+			agentRuntime: runtime.ShellRuntime,
 			payload:      JobPayload{Plan: true},
 			wantText:     "cannot honour plan mode (plan)",
 		},
-		"plan_into on claude names the resolved shape": {
-			agentRuntime: runtime.ClaudeRuntime,
+		"plan_into on shell names the resolved shape": {
+			agentRuntime: runtime.ShellRuntime,
 			payload:      JobPayload{Plan: true, PlanInto: "@smol"},
 			wantText:     "cannot honour plan mode (plan-into:@smol)",
 		},
@@ -191,7 +191,7 @@ func TestMailboxDeliverPlanGate(t *testing.T) {
 
 	t.Run("a normal job carries no plan primitives and records no evidence", func(t *testing.T) {
 		adapter := &fakeDelivery{outputs: []string{planResultJSON}}
-		agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.CodexRuntime, RepoScope: "o/r"}
+		agent := runtime.Agent{Name: "seat", Role: "implementer", Runtime: runtime.OmpRuntime, RepoScope: "o/r"}
 		payload := JobPayload{}
 		if _, _, _, _, err := mailbox.deliver(ctx, adapter, agent, job, &payload, "work"); err != nil {
 			t.Fatalf("deliver returned error: %v", err)

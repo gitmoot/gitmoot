@@ -24,7 +24,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 	// The engine's home MUST be the RESOLVED root (config.Paths.Home), which is what
 	// production hands daemonWorkflowEngine and what the worker's cleanup validator
@@ -57,8 +57,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 		t.Fatalf("scheduled job is not a native workflow review: %+v", job)
 	}
 
-	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
-	runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"exact head reviewed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[\"exact-head smoke\"],\"needs\":[],\"delegations\":[]}}"}`}
+	runner := &sandboxAdapterCaptureRunner{stdout: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[],"delegations":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
 	worker.AdapterFactory = func(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -67,7 +66,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 		}
 		deliveredCheckout = checkout
 		deliveredHead = readonlyWorktreeHead(t, checkout)
-		return runtime.ClaudeAdapter{Runner: runner}, nil
+		return runtime.ShellAdapter{Runner: runner}, nil
 	}
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true}}
 	worker.WorkflowFactory = func(checkout string) workflow.Engine {
@@ -112,7 +111,7 @@ func TestNativeReviewWorkerRetainsFailedPreflightUntilAged(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 	fanout := routineNativeReviewFanoutEngine(store, sharedCheckout, home)
 	if err := fanout.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
@@ -184,7 +183,7 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const jobID = "review-coordinator/task-1698/review-1/delegation/correctness"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID:              jobID,
@@ -314,8 +313,8 @@ func TestRoutineNativeReviewLegsGetDistinctSchedulerCheckoutKeys(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-a", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-b", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-a", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer-b", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 	if err := store.UpsertTask(ctx, db.Task{
 		ID: "task-1698", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing),
@@ -403,7 +402,7 @@ func TestRoutineNativeReviewRepollAtSameHeadIsIdempotentThroughTheWorker(t *test
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
 
 	fanout := routineNativeReviewFanoutEngine(store, sharedCheckout, home)
@@ -468,7 +467,7 @@ func TestNativeReviewWorktreeContentionDefersInsteadOfBurningTheLeg(t *testing.T
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const jobID = "workflow-contended-review"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
@@ -572,7 +571,7 @@ func TestNativeReviewWorktreeHardFailureStaysTerminal(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, _, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const jobID = "workflow-unreachable-head-review"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
@@ -624,7 +623,7 @@ func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const jobID = "review-coordinator/task-1698/review-1/delegation/correctness"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
@@ -714,7 +713,7 @@ func TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild(t *testing.T) 
 	store, home := blockerE2EHome(t)
 	sharedCheckout, _, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const parentID = "review-coordinator/task-1698/review-1"
 	const jobID = parentID + "/delegation/correctness"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
@@ -779,7 +778,7 @@ func TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded(t *testing.T) 
 	store, home := blockerE2EHome(t)
 	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime, runtime.LastRef, []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const parentID = "review-coordinator/task-1698/review-1"
 	const jobID = parentID + "/delegation/correctness"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{

@@ -1,0 +1,7 @@
+{"type":"session","version":3,"id":"5b0f3f8a-1f4d-4a9e-9a34-3f0f2f7b1c2d","cwd":"/tmp/example"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Running the requested shell command, then writing fx.txt."}],"usage":{"input":46938,"output":343}}}
+{"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{"command":"echo transcript-fixture-123"}}
+{"type":"tool_execution_end","toolCallId":"call-1","toolName":"bash","result":{"content":[{"type":"text","text":"transcript-fixture-123\n"}],"details":{"wallTimeMs":12.5}},"isError":false}
+{"type":"tool_execution_start","toolCallId":"call-2","toolName":"write","args":{"path":"/tmp/example/fx.txt","content":"done\n"}}
+{"type":"tool_execution_end","toolCallId":"call-2","toolName":"write","result":{"content":[{"type":"text","text":"Wrote /tmp/example/fx.txt"}]},"isError":false}
+{"type":"agent_end"}

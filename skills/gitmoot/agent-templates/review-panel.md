@@ -97,7 +97,7 @@ gate reports that the declared delegations never reported.
         "prompt": "Review this PR strictly for correctness and security: logic errors, unhandled errors, injection, authz and authn gaps, unsafe input handling. Report blocking issues with file and line. Ignore performance and style.",
         "synthesis_rule": "summary",
         "ephemeral": {
-          "runtime": "claude",
+          "runtime": "omp",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }
@@ -108,7 +108,7 @@ gate reports that the declared delegations never reported.
         "prompt": "Review this PR strictly for performance and maintainability: hot-path allocations, N+1 patterns, complexity, duplication, naming, and abstractions worth extracting. Report blocking issues with file and line. Ignore security and test coverage.",
         "synthesis_rule": "summary",
         "ephemeral": {
-          "runtime": "codex",
+          "runtime": "omp",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }
@@ -119,7 +119,7 @@ gate reports that the declared delegations never reported.
         "prompt": "Review this PR strictly for tests and edge cases: missing coverage, untested branches, boundary and error-path gaps, and flaky or non-deterministic tests. Report blocking issues with file and line. Ignore performance and style.",
         "synthesis_rule": "summary",
         "ephemeral": {
-          "runtime": "claude",
+          "runtime": "omp",
           "role": "reviewer",
           "capabilities": ["ask", "review"]
         }

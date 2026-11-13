@@ -1,0 +1,9 @@
+[90m• session: omp stream started[0m
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Running the requested shell command, then writing fx.txt."}],"usage":{"input":46938,"output":343}}}
+[36m$ [0m[1mbash[0m [90m{"command":"echo transcript-fixture-123"}[0m
+[90m◂ ok[0m
+[90m  ↳ transcript-fixture-123[0m
+[36m← [0m[1mwrite[0m [90m{"path":"/tmp/example/fx.txt","content":"done\n"}[0m
+[90m◂ ok[0m
+[90m  ↳ Wrote /tmp/example/fx.txt[0m
+{"type":"agent_end"}

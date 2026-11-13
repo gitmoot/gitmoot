@@ -1770,60 +1770,6 @@ func (s *Store) UpdateJobUsage(ctx context.Context, id string, inputTokens int, 
 	return requireAffected(result, "job", id)
 }
 
-// RecordRuntimeSessionUsageDelta converts a runtime session's CUMULATIVE token
-// counters into this delivery's per-job usage. codex reports turn.completed usage
-// as the session's running total on a resumed thread (#661), so a job's real cost
-// is the increase since the last delivery on that session. It reads the prior
-// baseline for sessionKey (0 if none), returns deltaInput/deltaOutput =
-// max(0, cumulative_now - prev), and upserts the new cumulative as the baseline —
-// all inside ONE transaction so two daemon workers racing on the same session
-// cannot interleave the read and the write (the store also caps the pool at a
-// single connection). A counter that went backwards (codex session
-// compaction/rollover resets it) yields a 0 delta for the crossing job AND resyncs
-// the baseline to the new lower cumulative: a safe under-count rather than a
-// spurious huge delta. Negative inputs are clamped to 0 so a malformed usage
-// report can never corrupt the baseline.
-func (s *Store) RecordRuntimeSessionUsageDelta(ctx context.Context, sessionKey string, cumInput, cumOutput int) (deltaInput int, deltaOutput int, err error) {
-	if cumInput < 0 {
-		cumInput = 0
-	}
-	if cumOutput < 0 {
-		cumOutput = 0
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer tx.Rollback()
-
-	var prevInput, prevOutput int
-	err = tx.QueryRowContext(ctx, `SELECT input_cum, output_cum FROM runtime_session_usage WHERE session_key = ?`, sessionKey).Scan(&prevInput, &prevOutput)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, err
-	}
-
-	if deltaInput = cumInput - prevInput; deltaInput < 0 {
-		deltaInput = 0
-	}
-	if deltaOutput = cumOutput - prevOutput; deltaOutput < 0 {
-		deltaOutput = 0
-	}
-
-	if _, err := tx.ExecContext(ctx, `INSERT INTO runtime_session_usage(session_key, input_cum, output_cum, updated_at)
-		VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-		ON CONFLICT(session_key) DO UPDATE SET
-			input_cum = excluded.input_cum,
-			output_cum = excluded.output_cum,
-			updated_at = excluded.updated_at`,
-		sessionKey, cumInput, cumOutput); err != nil {
-		return 0, 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, 0, err
-	}
-	return deltaInput, deltaOutput, nil
-}
-
 func (s *Store) AddJobEvent(ctx context.Context, event JobEvent) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message, runtime, provider) VALUES (?, ?, ?, ?, ?)`,
 		event.JobID, event.Kind, event.Message, event.Runtime, event.Provider)
@@ -2094,47 +2040,6 @@ func (s *Store) ListJobEvents(ctx context.Context, jobID string) ([]JobEvent, er
 		events = append(events, event)
 	}
 	return events, rows.Err()
-}
-
-// LatestSuccessfulRuntimeSessionUse returns when agentName most recently
-// completed a succeeded job on the exact runtimeName/runtimeRef session.
-// Runtime selection is dispatch evidence, so the match comes from the newest
-// effective_runtime/runtime_override event for each succeeded job. Restricting
-// each job to its newest selection excludes failed same-row attempts that were
-// followed by a successful retry on another session.
-func (s *Store) LatestSuccessfulRuntimeSessionUse(ctx context.Context, agentName, runtimeName, runtimeRef string) (time.Time, bool, error) {
-	runtimeName = strings.TrimSpace(runtimeName)
-	ref := strings.TrimSpace(runtimeRef)
-	if runtimeName == "" || ref == "" {
-		return time.Time{}, false, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT e.message, j.updated_at
-		FROM jobs j
-		JOIN job_events e ON e.job_id = j.id
-		WHERE j.agent = ?
-		  AND j.state = 'succeeded'
-		  AND e.kind IN ('effective_runtime', 'runtime_override')
-		  AND e.id = (SELECT MAX(latest.id)
-			FROM job_events latest
-			WHERE latest.job_id = j.id
-			  AND latest.kind IN ('effective_runtime', 'runtime_override'))
-		ORDER BY j.updated_at DESC, e.id DESC`, strings.TrimSpace(agentName))
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var message, updatedAt string
-		if err := rows.Scan(&message, &updatedAt); err != nil {
-			return time.Time{}, false, err
-		}
-		eventRuntime, eventRef := runtimeEventSession(message)
-		if eventRuntime == runtimeName && eventRef == ref {
-			return parseStoredTimestamp(updatedAt), true, nil
-		}
-	}
-	return time.Time{}, false, rows.Err()
 }
 
 func runtimeEventSession(message string) (string, string) {

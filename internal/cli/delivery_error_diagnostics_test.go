@@ -11,9 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -170,61 +168,6 @@ func TestRunRedactsDeliveryErrorOnTheJobRow(t *testing.T) {
 	// already-redacted string to match against, so this fails too.
 	if want := workflow.WithDeliveryError(nil, journal).DeliveryError; !strings.Contains(diag.DeliveryError, want) {
 		t.Fatalf("delivery_error = %q, want it to carry the stderr-tail redaction result %q", diag.DeliveryError, want)
-	}
-}
-
-// The delegated (temp-worker) terminal path is a SECOND call site and needs its
-// own case: a delegated run's runtime error was journal-only too.
-func TestTempWorkerRunRecordsDeliveryErrorOnTheJobRow(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	checkout := t.TempDir()
-	runGit(t, checkout, "init")
-	runGit(t, checkout, "branch", "-m", "main")
-	runGit(t, checkout, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	original := runtime.Agent{
-		Name: "codex-reviewer", Role: "worker", Runtime: runtime.CodexRuntime,
-		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
-		Capabilities: []string{"ask"}, AutonomyPolicy: runtime.AutonomyPolicyAuto,
-	}
-	seedDaemonWorkerAgent(t, store, original.Name, original.Runtime, original.RuntimeRef, original.Capabilities, original.RepoScope)
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "job-temp-delivery-error", Agent: original.Name, Action: "ask", Repo: "owner/repo",
-	})
-	admitted := mustWorkerJob(t, store, "job-temp-delivery-error")
-	payload, err := daemonJobPayload(admitted)
-	if err != nil {
-		t.Fatalf("daemonJobPayload returned error: %v", err)
-	}
-
-	stdout := &lockedBuffer{}
-	worker := defaultJobWorker(store, stdout, t.TempDir())
-	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
-		return &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440003"}, nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return &cliWorkerFakeAdapter{err: errors.New(deliveryErrorFixture)}, nil
-	}
-	policy := config.DefaultParallelSessionPolicy()
-	policy.MergeBack = config.ParallelSessionMergeBackOff
-	if err := worker.runWithTempWorker(ctx, admitted, payload, execbackend.Local, original, checkout, policy, "test contention"); err != nil {
-		t.Fatalf("runWithTempWorker returned error: %v", err)
-	}
-
-	after := mustWorkerJob(t, store, admitted.ID)
-	if after.State != string(workflow.JobFailed) {
-		t.Fatalf("state = %q, want failed", after.State)
-	}
-	diag := deliveryErrorDiagnostics(t, store, admitted.ID)
-	if diag == nil {
-		t.Fatal("FailureDiagnostics = nil, want the delegated run's delivery error on the row")
-	}
-	if !strings.Contains(diag.DeliveryError, deliveryErrorFixture) {
-		t.Fatalf("delivery_error = %q, want the delegated runtime's own error", diag.DeliveryError)
-	}
-	if journal := journalFailureText(t, stdout.String(), admitted.ID); !strings.Contains(diag.DeliveryError, journal) {
-		t.Fatalf("delivery_error = %q, want it to carry the daemon's journal text %q", diag.DeliveryError, journal)
 	}
 }
 

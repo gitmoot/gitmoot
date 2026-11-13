@@ -31,7 +31,7 @@ import (
 func TestMissingBinaryIsNamedAsAbsentAndDoesNotBlock(t *testing.T) {
 	// path "" makes the harness LookPath fail, which is what an absent CLI does.
 	checker := NewRuntimeContractChecker(&contractProbeRunner{}, BuiltinRuntimeRegistry())
-	agent := Agent{Name: "gm-review-claude", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "gm-review-omp", Runtime: OmpRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 
@@ -45,8 +45,8 @@ func TestMissingBinaryIsNamedAsAbsentAndDoesNotBlock(t *testing.T) {
 	}
 
 	// EXACTLY ONE requirement row describes the absence, and it is its own kind.
-	// Claude declares two flag requirements and omp declares six; reporting
-	// absence per-flag both multiplies the row and mis-names the defect.
+	// omp declares several flag requirements; reporting absence per-flag both
+	// multiplies the row and mis-names the defect.
 	var absence []RuntimeRequirementResult
 	for _, requirement := range result.Requirements {
 		if requirement.Kind == RuntimeRequirementBinaryPresent {
@@ -67,15 +67,15 @@ func TestMissingBinaryIsNamedAsAbsentAndDoesNotBlock(t *testing.T) {
 	// The row must NAME the executable and carry the resolver's own error, or an
 	// operator reading `runtime inspect` still cannot tell what to install.
 	row := absence[0]
-	for _, want := range []string{`executable "claude"`} {
+	for _, want := range []string{`executable "omp"`} {
 		if !strings.Contains(row.Name, want) {
 			t.Fatalf("requirement name %q does not contain %q", row.Name, want)
 		}
 	}
-	if !strings.Contains(row.Detail, "claude") {
+	if !strings.Contains(row.Detail, "omp") {
 		t.Fatalf("requirement detail %q does not carry the resolver error naming the binary", row.Detail)
 	}
-	if !strings.Contains(row.Remedy, "install claude") {
+	if !strings.Contains(row.Remedy, "install omp") {
 		t.Fatalf("requirement remedy %q does not say what to install", row.Remedy)
 	}
 	// And it must NOT be described as an installed version failing a check.
@@ -90,7 +90,7 @@ func TestMissingBinaryIsNamedAsAbsentAndDoesNotBlock(t *testing.T) {
 // absence would satisfy the test above.
 func TestPresentBinaryWithUnparseableHelpKeepsFlagRows(t *testing.T) {
 	checker, _, path := newContractCheckerForTest(t, "unparseable")
-	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: stubRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 
@@ -124,7 +124,7 @@ func TestPresentBinaryWithUnparseableHelpKeepsFlagRows(t *testing.T) {
 // disarm the gate while making absence quieter.
 func TestParsedHelpMissingRequiredFlagStillBlocks(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unsupported")
-	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: stubRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 

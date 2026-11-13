@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -116,16 +115,6 @@ type jobWorker struct {
 	// EventSinkOverride lets a test inject a recording events.Sink (#446). When
 	// nil (production), eventSink() resolves the shared event-rule sink.
 	EventSinkOverride events.Sink
-	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
-	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
-	// the scheduler only releases the job when the probe reports the credential is
-	// VALID again (an Invalid verdict extends the hold WITHOUT burning a retry
-	// attempt; an Unknown/transient verdict falls back to the coarse cadence). When
-	// nil (foreground CLI, and every construction that does not opt in) the gate is
-	// byte-identical to slice A: the coarse cadence alone governs re-dispatch. Tests
-	// inject a fake verdict; the daemon wires defaultAuthProbe (a bounded
-	// runtime.ClaudeLiveCheck for claude agents, Unknown for other runtimes).
-	AuthProbe func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict
 	// RuntimePreflight evaluates the installed CLI contract immediately before
 	// checkout/adapter construction. nil keeps hand-built test workers unchanged;
 	// defaultJobWorker wires the process-wide identity cache.
@@ -209,7 +198,6 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	// execs the declared binary are written together (#1926-f5).
 	worker.setRealAdapterFactory(worker.defaultAdapter)
 	worker.StartAdapterFactory = worker.defaultStartAdapter
-	worker.AuthProbe = worker.defaultAuthProbe
 	worker.RuntimePreflight = runtime.DefaultRuntimeContractChecker().CheckRequest
 	recoverKillPendingAtWorkerStartup.Do(func() {
 		if err := recoverKillPendingJobs(context.Background(), store, worker.Stdout); err != nil {
@@ -503,7 +491,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	readOnlySeat := payload.ReadOnlySeat
 	runtimeConfigDir := ""
 	if readOnlySeat {
-		runtimeConfigDir = selectedReadOnlyRuntimeConfigDir(agent.Runtime, payload.RuntimeConfigDir)
+		runtimeConfigDir = strings.TrimSpace(payload.RuntimeConfigDir)
 	}
 	// The runtime-session lock keeps naming the agent's REGISTERED session, so
 	// #684's serialization is unchanged for a REGISTERED seat: it still queues
@@ -1032,21 +1020,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		removeRelatedTrees = remove
 		defer removeRelatedTrees()
 	}
-	// Diagnose the exact adapter credential domain that the seat wrapper below
-	// will use. Reading gateway config separately here could disagree with the
-	// already-built adapter and report a staged credential that will not exist.
-	if agent.ReadOnlySeat {
-		_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
-		seatAuthOverlay, seatAuthErr := readOnlySeatRuntimeAuthEnv(w.ConfigHome, agent.Runtime, gatewayMode)
-		if seatAuthErr != nil {
-			writeLine(w.Stdout, "job %s read-only seat auth overlay unresolved: %v", job.ID, seatAuthErr)
-		}
-		if diagnosis := readOnlySeatCredentialPreflight(agent, runtimeConfigDir, gatewayMode, len(seatAuthOverlay) > 0, time.Now().UTC()); diagnosis != "" {
-			if eventErr := w.recordReadOnlySeatCredentialDiagnosis(ctx, job.ID, diagnosis); eventErr != nil {
-				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, readOnlySeatCredentialExpiredEvent, eventErr)
-			}
-		}
-	}
 	// THE HOST READ-ONLY SEAT IS A HOST-BOUNDARY CONTROL, so it does not apply
 	// when the runtime executes off-box. Its Landlock grants restrict what a
 	// review may touch in the HOST filesystem; a remote job never runs on the
@@ -1247,18 +1220,12 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		stopKillPending = armJobKillPending(w.Store, job.ID, runDeadline)
 	}
 	nativeReviewDeliveryStarted = true
-	// #1856 report-only detector, caller 2 of 2: a NON-SEAT delivery runs the
-	// runtime CLI against the operator's live profile (a read-only seat reads a
-	// staged clone instead, which the child may legitimately rewrite - so seats
-	// are excluded here rather than filtered later).
-	credentialBefore, credentialObserved := observeNonSeatKimiCredential(agent)
 	if remoteReviewAdmitted {
 		_, err = engine.RunClaimedJob(runCtx, job.ID, agent, adapter)
 	} else {
 		_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	}
 	err = w.recordUnrecordedResult(ctx, engine, err)
-	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	removeRelatedTrees()
 	stopKillPending()
 	if readOnlyState != nil {
@@ -1542,30 +1509,21 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 	if !agent.ReadOnlySeat {
 		return adapter, readOnlySeatSetup{}, nil
 	}
-	_, gatewayMode := adapter.(modelGatewayRuntimeAdapter)
-	// Resolve credentials before creating or publishing any seat state. Claude
-	// receives its authoritative overlay. OMP reads its upstream token from an
-	// owner-only file now, but starts its provider-filtered proxy only when
-	// Deliver has the job's effective model.
+	// Resolve credentials before creating or publishing any seat state. OMP
+	// reads its upstream token from an owner-only file now, but starts its
+	// provider-filtered proxy only when Deliver has the job's effective model.
 	var (
-		seatAuthEnv []string
-		ompConfig   *readOnlyOmpBrokerConfig
-		launchDir   string
+		ompConfig *readOnlyOmpBrokerConfig
+		launchDir string
 	)
-	var err error
 	if agent.Runtime == runtime.OmpRuntime {
 		config, configErr := readOnlySeatOmpBrokerConfig(os.Environ())
 		if configErr != nil {
 			return nil, readOnlySeatSetup{}, configErr
 		}
 		ompConfig = &config
-	} else {
-		seatAuthEnv, err = readOnlySeatRuntimeAuthEnv(home, agent.Runtime, gatewayMode)
 	}
-	if err != nil {
-		return nil, readOnlySeatSetup{}, err
-	}
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo, gatewayMode)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, reviewRepo)
 	if err != nil {
 		return nil, readOnlySeatSetup{}, err
 	}
@@ -1616,31 +1574,19 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 		// access of its own once the seat names explicit reads.
 		grants.reads = append(grants.reads, launchDir)
 	}
-	// A seat's env is rebuilt from scratch. Claude therefore needs the same
-	// resolved runtime-auth overlay as every other Claude job. OMP's proxy token
-	// exists only in its job-private config; its upstream bearer, operator
-	// profile, and ambient provider keys remain outside the child environment.
-	//
-	// Gateway mode is excluded: there the gateway holds the credential and the
-	// seat is deliberately given none.
+	// A seat's env is rebuilt from scratch. OMP's proxy token exists only in
+	// its job-private config; its upstream bearer, operator profile, and
+	// ambient provider keys remain outside the child environment.
 	wrap := func(runner subprocess.Runner) subprocess.Runner {
-		baseEnv := readOnlyRuntimeBaseEnv(agent.Runtime, os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
+		baseEnv := readOnlyRuntimeBaseEnv(os.Environ(), filepath.Join(grants.cacheRoot, "gh"))
 		// The launch dir rides on the same graft: on an execution-backend
 		// instance the backend starts a command outside the workspace only in
 		// a launch dir the runner names (#2563).
-		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{
-			BaseEnv: append(baseEnv, seatAuthEnv...),
-		}, launchDir)
-		// The overlay ALSO rides on the landlock runner's env, and that is the
-		// path that actually reaches every shape. graftRuntimeBaseRunner has no
-		// CuratedGroupRunner case, so for a plain (non-instance) runner the graft
-		// above is a no-op and BaseEnv is dropped: a wiring test proved the child
-		// then saw only the grant env. #1810's review called this shape-dependence
-		// out; routing through grants.env is what makes the fix shape-independent.
+		curated := graftRuntimeBaseRunner(runner, subprocess.CuratedGroupRunner{BaseEnv: baseEnv}, launchDir)
 		if agent.NoExecution {
-			return landlockNoExecutionRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
+			return landlockNoExecutionRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
 		}
-		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, append(grants.env, seatAuthEnv...))
+		return landlockReadOnlyRunner(curated, grants.reads, grants.readFiles, grants.writes, grants.env)
 	}
 	wrapped, err := wrapReadOnlyAdapterRunner(agent.Runtime, adapter, grants.stateDir, wrap)
 	if err == nil && agent.NoExecution {
@@ -1678,36 +1624,6 @@ func wrapReadOnlySandboxAdapter(home string, agent runtime.Agent, checkout strin
 
 func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdapter, stateDir string, wrap func(subprocess.Runner) subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	switch a := adapter.(type) {
-	case modelGatewayRuntimeAdapter:
-		a.runner.ChildConfigDir = stateDir
-		wrapped, err := wrapReadOnlyAdapterRunner(runtimeName, a.Adapter, stateDir, wrap)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, ok := wrapped.(runtime.Adapter)
-		if !ok {
-			return nil, fmt.Errorf("read-only Landlock sandbox returned incompatible %T adapter", wrapped)
-		}
-		a.Adapter = runtimeAdapter
-		return a, nil
-	case runtime.ClaudeAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case *runtime.ClaudeAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case runtime.CodexAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case *runtime.CodexAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case runtime.KimiAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
-	case *runtime.KimiAdapter:
-		a.Runner = wrap(a.Runner)
-		return a, nil
 	case runtime.OmpAdapter:
 		a.Runner = wrap(a.Runner)
 		return a, nil
@@ -1731,17 +1647,6 @@ func wrapReadOnlyAdapterRunner(runtimeName string, adapter workflow.DeliveryAdap
 // dir must not run from the checkout instead.
 func withOmpNoExecutionLaunchDir(adapter workflow.DeliveryAdapter, launchDir string) (workflow.DeliveryAdapter, error) {
 	switch a := adapter.(type) {
-	case modelGatewayRuntimeAdapter:
-		inner, err := withOmpNoExecutionLaunchDir(a.Adapter, launchDir)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, ok := inner.(runtime.Adapter)
-		if !ok {
-			return nil, fmt.Errorf("no-execution seat returned incompatible %T adapter", inner)
-		}
-		a.Adapter = runtimeAdapter
-		return a, nil
 	case runtime.OmpAdapter:
 		a.LaunchDir = launchDir
 		return a, nil
@@ -1916,13 +1821,12 @@ func ensureOmpNoExecutionOverlay(home string) (string, error) {
 // resumableSessionRuntime reports whether a runtime's RuntimeRef names a
 // resumable session (rather than a shell command or nothing at all). It is the
 // same set runtimeSessionResourceKey keys locks for.
-func resumableSessionRuntime(runtimeName string) bool {
-	switch strings.TrimSpace(runtimeName) {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-		return true
-	default:
-		return false
-	}
+//
+// No current job runtime resumes sessions: omp mints a session per job and shell
+// refs are commands (#2587 removed codex, claude and kimi). The check and the
+// session-lock machinery behind it are kept until a follow-up removes them.
+func resumableSessionRuntime(string) bool {
+	return false
 }
 
 // readOnlySeatRuntimeRef is the fresh session ref a read-only seat DELIVERS on.
@@ -1958,24 +1862,6 @@ func readOnlySeatRuntimeRef(jobID string) (string, error) {
 		return runtime.FreshRefForJob(id), nil
 	}
 	return runtime.NewFreshRef()
-}
-
-func selectedReadOnlyRuntimeConfigDir(runtimeName string, configuredDir string) string {
-	if configuredDir = strings.TrimSpace(configuredDir); configuredDir != "" {
-		return configuredDir
-	}
-	return selectedRuntimeConfigDir(runtimeName)
-}
-
-func selectedRuntimeConfigDir(runtimeName string) string {
-	switch runtimeName {
-	case runtime.ClaudeRuntime:
-		return strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
-	case runtime.CodexRuntime:
-		return strings.TrimSpace(os.Getenv("CODEX_HOME"))
-	default:
-		return ""
-	}
 }
 
 // stagePriorVerdicts writes the read-only seat a RENDERED, REPO-SCOPED list of
@@ -2142,7 +2028,7 @@ func renderPriorVerdicts(repo string, jobs []db.Job) priorVerdictList {
 	return list
 }
 
-func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string, gatewayMode bool) (grants readOnlySandboxGrants, err error) {
+func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout string, reviewRepo string) (grants readOnlySandboxGrants, err error) {
 	paths, err := pathsFromFlag(home)
 	if err != nil {
 		return grants, fmt.Errorf("resolve read-only sandbox config paths: %w", err)
@@ -2190,13 +2076,12 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	}
 	grants.reads = append(grants.reads, metadata...)
 
-	stateDir, stateEnv, dropped, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot, gatewayMode)
+	stateDir, stateEnv, err := prepareReadOnlyRuntimeState(agent, grants.cacheRoot)
 	if err != nil {
 		return grants, err
 	}
 	grants.stateDir = stateDir
 	grants.env = append(grants.env, stateEnv...)
-	grants.dropped = dropped
 	// A DAEMON-OWNED COPY RATHER THAN A GRANT ON THE OPERATOR'S TREE (#1878).
 	// Granting a seat a rule over the operator's installation produced
 	// escape-class defects in three review rounds, including a member symlink
@@ -2392,49 +2277,16 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	return grants, nil
 }
 
-// readOnlySeatStatePolicy declares everything a runtime needs staged into its
-// wiped isolated state dir, and whether a session in that dir can be resumed.
+// readOnlySeatStatePolicy declares where a runtime keeps the state a seat needs
+// in a wiped, job-private dir. No file from the operator's profile is staged:
+// omp authenticates only through the separately validated scoped proxy
+// (#2587 removed the codex, claude and kimi credential and config staging).
 //
-// It is declarative because the seat has now omitted a required startup input
-// THREE times, each presenting as a different failure: `/etc/ssl/openssl.cnf`
-// (#1802, "OpenSSL configuration error"), the codex `sessions/` tree (#1804,
-// "thread/resume: no rollout found"), and the kimi `config.toml` (which reports
-// "No model configured" behind an auth message that sends the reader to
-// `kimi login`, an owner action that cannot fix it). Three sites, one class: an
-// isolated home is missing something the runtime reads at startup.
-//
-// Adding or changing a runtime means declaring its STARTUP INPUTS here, and
 // TestReadOnlySeatStatePolicyCoversEveryRegisteredRuntime fails when a
-// registered runtime has no policy. That test is the only enforced part, and it
-// covers this switch ALONE: a new runtime also needs
-// selectedRuntimeConfigDir, readOnlyRuntimeBaseEnv and buildLocalRuntimeAdapter,
-// none of which this policy or its test can see.
-// Do not read the sentence above as "declare it here and you are done".
+// registered runtime has no policy.
 type readOnlySeatStatePolicy struct {
-	// defaultSourceDir is the host state dir used when the agent declares none.
-	defaultSourceDir string
-	// relativeState is where the isolated copy is staged.
+	// relativeState is where the isolated dir is created under runtime-state.
 	relativeState string
-	// stateAtCacheRoot stages under cacheRoot rather than cacheRoot/runtime-state,
-	// for a runtime that reads its profile from the sandbox HOME.
-	stateAtCacheRoot bool
-	// credentialFile is copied through stageReadOnlyRuntimeCredential, which
-	// validates it and can narrow it to credentialSection.
-	credentialFile    string
-	credentialSection string
-	// credentialUsable answers whether the NARROWED credential can actually
-	// authenticate, not merely whether it exists and parses. Nil means the
-	// runtime offers nothing cheap to check.
-	credentialUsable func([]byte) error
-	// requiredInputs are startup inputs staged verbatim. A missing one is an
-	// error naming the file, because the runtime's own message for it does not.
-	requiredInputs []string
-	// optionalInputs are staged when present and skipped when absent.
-	optionalInputs []string
-	// inputNarrowers strip content an input must not carry into the seat,
-	// keyed by input name. An input with no narrower is staged VERBATIM, which
-	// is only correct for a file that cannot carry a third-party credential.
-	inputNarrowers map[string]func([]byte) (narrowedConfig, error)
 	// stateEnv names the environment variable that points the runtime at the
 	// staged dir. stateRootEnv names a config-root variable whose value the
 	// runtime resolves relative to HOME. Empty when HOME alone locates state.
@@ -2444,160 +2296,42 @@ type readOnlySeatStatePolicy struct {
 
 // readOnlySeatStatePolicyFor returns the staging policy for a runtime. The
 // second result is false for a runtime that needs no isolated state at all.
-func readOnlySeatStatePolicyFor(runtimeName string, userHome string, gatewayMode bool) (readOnlySeatStatePolicy, bool, error) {
-	policy, needsState, err := readOnlySeatStatePolicyForRuntime(runtimeName, userHome, gatewayMode)
-	if err != nil || !needsState || !gatewayMode {
-		return policy, needsState, err
-	}
-	// In gateway mode the gateway supplies the credential, so NO runtime's
-	// credential file is staged. This is applied HERE rather than at the
-	// staging call site so the policy this function returns is the policy that
-	// is actually enforced: a caller (or a test) reading it back used to see
-	// codex's auth.json and kimi's token still listed while the seat withheld
-	// them, which is a policy that disagrees with itself.
-	policy.credentialFile = ""
-	policy.credentialSection = ""
-	policy.credentialUsable = nil
-	return policy, needsState, nil
-}
-
-func readOnlySeatStatePolicyForRuntime(runtimeName string, userHome string, gatewayMode bool) (readOnlySeatStatePolicy, bool, error) {
+func readOnlySeatStatePolicyFor(runtimeName string) (readOnlySeatStatePolicy, bool, error) {
 	switch runtimeName {
-	case runtime.ClaudeRuntime:
-		policy := readOnlySeatStatePolicy{
-			defaultSourceDir: filepath.Join(userHome, ".claude"),
-			relativeState:    ".claude",
-			stateEnv:         "CLAUDE_CONFIG_DIR",
-		}
-		if !gatewayMode {
-			policy.credentialFile = ".credentials.json"
-			policy.credentialSection = "claudeAiOauth"
-			policy.credentialUsable = claudeOAuthUsable
-		}
-		return policy, true, nil
-	case runtime.CodexRuntime:
-		return readOnlySeatStatePolicy{
-			defaultSourceDir: filepath.Join(userHome, ".codex"),
-			relativeState:    ".codex",
-			credentialFile:   "auth.json",
-			// config.toml carries the model and sandbox settings. The codex CLI
-			// reads them from CODEX_HOME/config.toml itself, so a seat without
-			// the file falls back to the runtime default; stage it when the
-			// host has one. It is NARROWED first: the same file holds
-			// third-party credentials, and stateDir is writable by the seat.
-			optionalInputs: []string{"config.toml"},
-			inputNarrowers: map[string]func([]byte) (narrowedConfig, error){
-				"config.toml": narrowCodexConfigDetailed,
-			},
-			stateEnv: "CODEX_HOME",
-		}, true, nil
-	case runtime.KimiRuntime:
-		return readOnlySeatStatePolicy{
-			defaultSourceDir: filepath.Join(userHome, ".kimi-code"),
-			// Kimi reads HOME/.kimi-code. The sandbox supplies HOME=cacheRoot/home,
-			// so stage its isolated profile at that exact path.
-			stateAtCacheRoot: true,
-			relativeState:    filepath.Join("home", ".kimi-code"),
-			credentialFile:   filepath.Join("credentials", "kimi-code.json"),
-			// config.toml holds default_model plus the provider and model blocks.
-			// Without it kimi starts, authenticates, and then refuses with
-			// "No model configured", which reads as an auth failure.
-			requiredInputs: []string{"config.toml"},
-			// NARROWED for the same reason codex's is, and this file needs it
-			// MORE: measured on a live host it carries api_key under
-			// [services.*] and a key under [services.*.oauth], and for kimi
-			// stateAtCacheRoot puts the staged copy directly inside the seat's
-			// one writable root.
-			inputNarrowers: map[string]func([]byte) (narrowedConfig, error){
-				"config.toml": narrowKimiConfigDetailed,
-			},
-		}, true, nil
 	case runtime.ShellRuntime:
 		return readOnlySeatStatePolicy{}, false, nil
 	case runtime.OmpRuntime:
-		// OMP authenticates only through the separately validated scoped proxy.
 		// Its writable config, database, snapshot cache and logs need fresh
 		// job-private roots, but no file from the operator's OMP profile is staged.
 		return readOnlySeatStatePolicy{
-			defaultSourceDir: filepath.Join(userHome, ".omp", "agent"),
-			relativeState:    filepath.Join(".omp", "agent"),
-			stateEnv:         "PI_CODING_AGENT_DIR",
-			stateRootEnv:     "PI_CONFIG_DIR",
+			relativeState: filepath.Join(".omp", "agent"),
+			stateEnv:      "PI_CODING_AGENT_DIR",
+			stateRootEnv:  "PI_CONFIG_DIR",
 		}, true, nil
 	default:
 		return readOnlySeatStatePolicy{}, false, fmt.Errorf("read-only seat runtime %q has no isolated state policy", runtimeName)
 	}
 }
 
-func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayMode bool) (string, []string, []string, error) {
-	// THE THIRD WRITER (#1810). This stages credential-overlay files by joining
-	// onto cacheRoot, so a relative cacheRoot writes them relative to the
-	// working directory - the exact mechanism that published a token. The
-	// policy rewrite that landed on main changed this function's shape but not
-	// that property, so the precondition is re-applied here rather than dropped
-	// in the merge. Production supplies an absolute cacheRoot from the
-	// isolated-tool-cache grant today; this makes that checked.
+func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string) (string, []string, error) {
+	// THE THIRD WRITER (#1810). This creates the seat's state dir by joining
+	// onto cacheRoot, so a relative cacheRoot writes relative to the working
+	// directory - the mechanism that once published a token. Production
+	// supplies an absolute cacheRoot from the isolated-tool-cache grant; this
+	// makes that checked.
 	if err := requireAbsoluteCredentialHome(cacheRoot, "runtime-state"); err != nil {
-		return "", nil, nil, err
+		return "", nil, err
 	}
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("resolve read-only runtime state home: %w", err)
-	}
-	policy, needsState, err := readOnlySeatStatePolicyFor(agent.Runtime, userHome, gatewayMode)
+	policy, needsState, err := readOnlySeatStatePolicyFor(agent.Runtime)
 	if err != nil || !needsState {
-		return "", nil, nil, err
+		return "", nil, err
 	}
-	sourceDir := strings.TrimSpace(agent.RuntimeConfigDir)
-	if sourceDir == "" {
-		sourceDir = policy.defaultSourceDir
-	}
-	sourceDir, err = resolveRuntimeConfigDir(agent.Runtime, sourceDir)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("resolve runtime state directory %q: %w", sourceDir, err)
-	}
-	if resolved, resolveErr := filepath.EvalSymlinks(sourceDir); resolveErr == nil {
-		sourceDir = resolved
-	}
-	stateRoot := filepath.Join(cacheRoot, "runtime-state")
-	if policy.stateAtCacheRoot {
-		stateRoot = cacheRoot
-	}
-	stateDir := filepath.Join(stateRoot, policy.relativeState)
+	stateDir := filepath.Join(cacheRoot, "runtime-state", policy.relativeState)
 	if err := os.RemoveAll(stateDir); err != nil {
-		return "", nil, nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
+		return "", nil, fmt.Errorf("reset isolated runtime state %q: %w", stateDir, err)
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return "", nil, nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
-	}
-	if policy.credentialFile != "" {
-		credentialDestination, err := containedStagePath(stateDir, policy.credentialFile)
-		if err != nil {
-			return "", nil, nil, err
-		}
-		if err := stageReadOnlyRuntimeCredential(
-			filepath.Join(sourceDir, policy.credentialFile),
-			credentialDestination,
-			policy.credentialSection,
-			policy.credentialUsable,
-		); err != nil {
-			return "", nil, nil, err
-		}
-	}
-	var dropped []string
-	for _, name := range policy.requiredInputs {
-		withheld, err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, true, policy.inputNarrowers[name])
-		if err != nil {
-			return "", nil, nil, err
-		}
-		dropped = append(dropped, withheld...)
-	}
-	for _, name := range policy.optionalInputs {
-		withheld, err := stageReadOnlyRuntimeInput(sourceDir, stateDir, name, false, policy.inputNarrowers[name])
-		if err != nil {
-			return "", nil, nil, err
-		}
-		dropped = append(dropped, withheld...)
+		return "", nil, fmt.Errorf("create isolated runtime state %q: %w", stateDir, err)
 	}
 	var stateEnv []string
 	if policy.stateEnv != "" {
@@ -2606,298 +2340,20 @@ func prepareReadOnlyRuntimeState(agent runtime.Agent, cacheRoot string, gatewayM
 	if policy.stateRootEnv != "" {
 		rootFromHome, err := filepath.Rel(filepath.Join(cacheRoot, "home"), filepath.Dir(stateDir))
 		if err != nil {
-			return "", nil, nil, fmt.Errorf("resolve isolated runtime config root: %w", err)
+			return "", nil, fmt.Errorf("resolve isolated runtime config root: %w", err)
 		}
 		if filepath.IsAbs(rootFromHome) {
-			return "", nil, nil, errors.New("isolated runtime config root did not resolve relative to HOME")
+			return "", nil, errors.New("isolated runtime config root did not resolve relative to HOME")
 		}
 		stateEnv = append(stateEnv, policy.stateRootEnv+"="+rootFromHome)
 	}
-	return stateDir, stateEnv, dropped, nil
+	return stateDir, stateEnv, nil
 }
 
-// containedStagePath joins a staged input name under the seat's state dir and
-// refuses anything that escapes it.
-//
-// Every name is a separator-free constant today, and credentialFile is a
-// deliberate two-segment path, so this changes no current behaviour. It exists
-// because the safety of os.WriteFile(filepath.Join(stateDir, name)) rests
-// entirely on that convention, and the failure if the convention ever breaks is
-// a write OUTSIDE the sandbox's one writable root - too quiet to find later.
-func containedStagePath(stateDir, name string) (string, error) {
-	destination := filepath.Join(stateDir, name)
-	relative, err := filepath.Rel(stateDir, destination)
-	if err != nil {
-		return "", fmt.Errorf("resolve staged input %q under %q: %w", name, stateDir, err)
-	}
-	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-		return "", fmt.Errorf("staged runtime input %q escapes the seat state dir %q", name, stateDir)
-	}
-	return destination, nil
-}
-
-// errStagedInputNotRegular is returned when a staged runtime input resolves to
-// something that is not a regular file. Callers name the file themselves,
-// because "runtime input" and "runtime state file" are different nouns to an
-// operator reading the failure.
-var errStagedInputNotRegular = errors.New("not a regular file")
-
-// resolveStagedRuntimeInput resolves one staged input to the regular file it
-// names, FOLLOWING SYMLINKS.
-//
-// A dotfiles manager (stow, chezmoi, or a hand-rolled dotfiles repo) keeps the
-// real file in its own tree and leaves a symlink where the runtime looks, so
-// refusing a symlink outright makes a perfectly valid host profile
-// unlaunchable. prepareReadOnlyRuntimeState already EvalSymlinks the source
-// DIRECTORY; not doing the same for the files inside it is the inconsistency.
-//
-// Everything that is not a regular file AFTER resolution is still refused: a
-// directory, socket, device or fifo is not a config, and reading one can block
-// forever. A dangling symlink resolves to os.ErrNotExist, so it takes the
-// caller's missing-file path - named for a required input, skipped for an
-// optional one - rather than a distinct third outcome.
-func resolveStagedRuntimeInput(source string) (string, os.FileInfo, error) {
-	info, err := os.Lstat(source)
-	if err != nil {
-		return "", nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		resolved, resolveErr := filepath.EvalSymlinks(source)
-		if resolveErr != nil {
-			return "", nil, resolveErr
-		}
-		resolvedInfo, statErr := os.Stat(resolved)
-		if statErr != nil {
-			return "", nil, statErr
-		}
-		source, info = resolved, resolvedInfo
-	}
-	if !info.Mode().IsRegular() {
-		return "", nil, errStagedInputNotRegular
-	}
-	return source, info, nil
-}
-
-// stageReadOnlyRuntimeInput copies one non-credential startup input into the
-// isolated state dir. A required input that the host does not have is an error
-// that NAMES the file: the runtime's own diagnostic for a missing config is
-// what cost a day here, so gitmoot must not depend on it.
-func stageReadOnlyRuntimeInput(sourceDir, stateDir, name string, required bool, narrow func([]byte) (narrowedConfig, error)) ([]string, error) {
-	source := filepath.Join(sourceDir, name)
-	resolved, info, err := resolveStagedRuntimeInput(source)
-	if errors.Is(err, os.ErrNotExist) {
-		if required {
-			return nil, fmt.Errorf("read-only seat requires runtime input %q, and %s does not exist: the runtime will start and then refuse for a reason of its own choosing", name, source)
-		}
-		return nil, nil
-	}
-	if errors.Is(err, errStagedInputNotRegular) {
-		return nil, fmt.Errorf("runtime input %q must be a regular file", source)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("inspect runtime input %q: %w", source, err)
-	}
-	source = resolved
-	if info.Size() > maxReadOnlyRuntimeStateFileBytes {
-		return nil, fmt.Errorf("runtime input %q must be no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
-	}
-	data, err := readStagedRuntimeInput(source)
-	if err != nil {
-		return nil, err
-	}
-	var dropped []string
-	if narrow != nil {
-		narrowed, narrowErr := narrow(data)
-		switch {
-		case narrowErr != nil && !required:
-			// OPTIONAL means optional for CONTENT too, not only for absence.
-			// A file gitmoot cannot narrow is one it must not stage - but the
-			// runtime's own default is a working outcome for an optional
-			// input, so refusing the whole seat would turn "we could not read
-			// your config" into a dead reviewer. Withhold it and SAY SO.
-			return []string{fmt.Sprintf("%s (not staged: %v)", name, narrowErr)}, nil
-		case narrowErr != nil:
-			return nil, fmt.Errorf("narrow runtime input %q: %w", source, narrowErr)
-		}
-		data, dropped = narrowed.data, narrowed.dropped
-	}
-	destination, err := containedStagePath(stateDir, name)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return nil, fmt.Errorf("create runtime input directory for %q: %w", destination, err)
-	}
-	if err := os.WriteFile(destination, data, 0o600); err != nil {
-		return nil, fmt.Errorf("stage runtime input %q: %w", destination, err)
-	}
-	return dropped, nil
-}
-
-// readStagedRuntimeInput reads a staged input under a HARD byte cap.
-//
-// The size check above uses the FileInfo from resolveStagedRuntimeInput, so on
-// its own it is advisory: the file can grow between the stat and the read. An
-// io.LimitReader makes the cap real, and costs nothing.
-func readStagedRuntimeInput(source string) ([]byte, error) {
-	handle, err := os.Open(source)
-	if err != nil {
-		return nil, fmt.Errorf("read runtime input %q: %w", source, err)
-	}
-	defer handle.Close()
-	data, err := io.ReadAll(io.LimitReader(handle, maxReadOnlyRuntimeStateFileBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read runtime input %q: %w", source, err)
-	}
-	if int64(len(data)) > maxReadOnlyRuntimeStateFileBytes {
-		return nil, fmt.Errorf("runtime input %q must be no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
-	}
-	return data, nil
-}
-
-func stageReadOnlyRuntimeCredential(source, destination, section string, usable func([]byte) error) error {
-	resolved, info, err := resolveStagedRuntimeInput(source)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if errors.Is(err, errStagedInputNotRegular) || (err == nil && info.Size() > maxReadOnlyRuntimeStateFileBytes) {
-		return fmt.Errorf("runtime state file %q must be a regular file no larger than %d bytes", source, maxReadOnlyRuntimeStateFileBytes)
-	}
-	if err != nil {
-		return fmt.Errorf("inspect runtime state file %q: %w", source, err)
-	}
-	data, err := os.ReadFile(resolved)
-	if err != nil {
-		return fmt.Errorf("read runtime state file %q: %w", source, err)
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(data, &object); err != nil || object == nil {
-		if err == nil {
-			err = errors.New("credential must be a JSON object")
-		}
-		return fmt.Errorf("validate runtime credential %q: %w", source, err)
-	}
-	if section != "" {
-		value, ok := object[section]
-		if !ok {
-			return fmt.Errorf("runtime credential %q lacks required %q section", source, section)
-		}
-		data, err = json.Marshal(map[string]json.RawMessage{section: value})
-		if err != nil {
-			return fmt.Errorf("isolate runtime credential %q: %w", source, err)
-		}
-	}
-	if usable != nil {
-		if err := usable(data); err != nil {
-			return fmt.Errorf("read-only seat credential %s is unusable: %w", source, err)
-		}
-	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return fmt.Errorf("create isolated runtime state directory: %w", err)
-	}
-	if err := os.WriteFile(destination, data, 0o600); err != nil {
-		return fmt.Errorf("stage runtime state file %q: %w", destination, err)
-	}
-	return nil
-}
-
-// claudeOAuthUsable answers the question presence-and-shape validation cannot:
-// can this credential still authenticate?
-//
-// A claude profile whose OAuth has expired with no refresh token stages
-// perfectly - the file exists, it is JSON, it has a claudeAiOauth section - and
-// then the seat dies on the runtime's own opaque error, which is the exact
-// failure mode this policy exists to eliminate. Naming it here costs one
-// timestamp comparison.
-//
-// It judges ONLY what it can prove locally. An absent expiresAt is not a
-// verdict (nothing to compare), and an expired token WITH a refresh token is
-// fine, because refreshing it is the runtime's job. Rejecting either would turn
-// a late opaque failure into an early wrong one.
-func claudeOAuthUsable(data []byte) error {
-	var envelope struct {
-		OAuth json.RawMessage `json:"claudeAiOauth"`
-	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		// Not our file format: nothing to compare is not a verdict.
-		return nil
-	}
-	var oauth struct {
-		AccessToken  string      `json:"accessToken"`
-		RefreshToken string      `json:"refreshToken"`
-		ExpiresAt    json.Number `json:"expiresAt"`
-	}
-	if err := json.Unmarshal(envelope.OAuth, &oauth); err != nil {
-		// A claudeAiOauth that is not the shape we read is the same "nothing
-		// to compare" case. Aborting here turned a third party's format drift
-		// into a hard seat outage reported as a raw Go unmarshal error.
-		return nil
-	}
-	if strings.TrimSpace(oauth.AccessToken) == "" {
-		return errors.New("claudeAiOauth has no accessToken, so the seat has nothing to authenticate with")
-	}
-	if strings.TrimSpace(oauth.RefreshToken) != "" {
-		// Refreshing is the runtime's job, so an expiry cannot condemn it.
-		return nil
-	}
-	expiry, ok := claudeOAuthExpiry(oauth.ExpiresAt)
-	if !ok {
-		return nil
-	}
-	// A few minutes of grace: a seat refused for clock skew is a wrong
-	// verdict, and this path only fires when there is no refresh token at all.
-	if time.Now().UTC().Before(expiry.Add(claudeOAuthExpiryGrace)) {
-		return nil
-	}
-	return fmt.Errorf("claudeAiOauth expired at %s and carries no refreshToken, so the seat cannot obtain a working token: re-authenticate the host profile", expiry.Format(time.RFC3339))
-}
-
-// claudeOAuthExpiryGrace absorbs clock skew between the host that wrote the
-// credential and this one.
-const claudeOAuthExpiryGrace = 5 * time.Minute
-
-// claudeOAuthExpiry reads expiresAt without depending on how a third party
-// encodes it. A string, a float in exponent notation, and an integer all decode;
-// anything else is NO VERDICT rather than an error, because this function's
-// whole purpose is to avoid depending on another tool's diagnostics.
-//
-// The unit is milliseconds, and a value small enough to be seconds is rejected
-// as unreadable: read as milliseconds it lands in 1970, which produced a
-// confident and wrong "expired at 1971 - re-authenticate".
-func claudeOAuthExpiry(value json.Number) (time.Time, bool) {
-	text := strings.TrimSpace(value.String())
-	if text == "" {
-		return time.Time{}, false
-	}
-	milliseconds, err := value.Int64()
-	if err != nil {
-		float, floatErr := value.Float64()
-		if floatErr != nil {
-			return time.Time{}, false
-		}
-		milliseconds = int64(float)
-	}
-	if milliseconds <= 0 {
-		return time.Time{}, false
-	}
-	// 1e11 ms is 1973; any real millisecond expiry is far above it, and any
-	// plausible SECONDS value is far below.
-	if milliseconds < 100_000_000_000 {
-		return time.Time{}, false
-	}
-	return time.UnixMilli(milliseconds).UTC(), true
-}
-
-func readOnlyRuntimeBaseEnv(runtimeName string, environ []string, githubDir string) []string {
-	allowed := make(map[string]struct{}, len(curatedBaseEnvNames)+2)
+func readOnlyRuntimeBaseEnv(environ []string, githubDir string) []string {
+	allowed := make(map[string]struct{}, len(curatedBaseEnvNames))
 	for _, name := range curatedBaseEnvNames {
 		allowed[name] = struct{}{}
-	}
-	switch runtimeName {
-	case runtime.ClaudeRuntime:
-		allowed["CLAUDE_CONFIG_DIR"] = struct{}{}
-	case runtime.CodexRuntime:
-		allowed["CODEX_HOME"] = struct{}{}
 	}
 	base := make([]string, 0, len(environ)+2)
 	for _, entry := range environ {
@@ -3215,50 +2671,18 @@ func (w jobWorker) loadAdmissionBudget() *admissionBudget {
 	return newAdmissionBudget(policy)
 }
 
-// perJobAdmissionEstimate maps a queued job's runtime to its admission cost
-// (#365): whether it holds a resumable runtime session (so it counts against
-// max_concurrent_sessions) and its configured RAM estimate (GB). A job whose
-// runtime has no resumable session key — exactly the runtimes already exempt from
-// the runtime session lock (queuedJobRuntimeResourceKey returns "") — is "not
-// session-counted" and contributes 0 RAM, per the frozen goal. Otherwise the job
-// is session-counted and its RAM is the per-runtime prior, falling back to
-// default_memory_gb for a session runtime not explicitly mapped.
+// perJobAdmissionEstimate maps a queued job to its admission cost (#365):
+// whether it holds a resumable runtime session (so it counts against
+// max_concurrent_sessions) and its RAM estimate (GB). A job whose runtime has no
+// resumable session key — exactly the runtimes already exempt from the runtime
+// session lock (queuedJobRuntimeResourceKey returns "") — is "not
+// session-counted" and contributes 0 RAM. Otherwise the job is session-counted
+// at default_memory_gb.
 func perJobAdmissionEstimate(ctx context.Context, store *db.Store, job db.Job, policy config.AdmissionPolicy) admissionEstimate {
 	if queuedJobRuntimeResourceKey(ctx, store, job) == "" {
 		return admissionEstimate{session: false, memGB: 0}
 	}
-	if store == nil {
-		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
-	}
-	// #1952: resolve the runtime the job will ACTUALLY run as, so an ephemeral
-	// Claude job is charged Claude's RAM prior rather than a stale same-name
-	// agent row's runtime (or the default, when no row exists yet).
-	//
-	// An UNPARSEABLE payload must not degrade to DefaultMemoryGB: before this
-	// change such a job was still charged its registered runtime's prior, and
-	// silently re-pricing every corrupt-payload job would be a regression this
-	// fix has no business causing. A zero payload carries no ephemeral spec and
-	// no override, so selectedJobRuntimeAgent resolves it from the agents table —
-	// byte-for-byte the previous behaviour. TestPerJobAdmissionEstimate caught
-	// exactly this.
-	payload, payloadErr := daemonJobPayload(job)
-	if payloadErr != nil {
-		payload = workflow.JobPayload{}
-	}
-	agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
-	if !ok {
-		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
-	}
-	switch strings.TrimSpace(agent.Runtime) {
-	case runtime.CodexRuntime:
-		return admissionEstimate{session: true, memGB: policy.CodexMemoryGB}
-	case runtime.ClaudeRuntime:
-		return admissionEstimate{session: true, memGB: policy.ClaudeMemoryGB}
-	case runtime.KimiRuntime:
-		return admissionEstimate{session: true, memGB: policy.KimiMemoryGB}
-	default:
-		return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
-	}
+	return admissionEstimate{session: true, memGB: policy.DefaultMemoryGB}
 }
 
 // admissionEstimate resolves the per-job admission cost (session-ness + RAM) for
@@ -3313,9 +2737,7 @@ func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payloa
 	if policy.SameSession != config.ParallelSessionForkTempSession {
 		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
 	}
-	switch agent.Runtime {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-	default:
+	if !resumableSessionRuntime(agent.Runtime) {
 		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
 	}
 	if !parallelSessionActionAllowed(job.Type, policy.EligibleActions) {
@@ -3564,13 +2986,8 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		stopKillPending = armJobKillPending(w.Store, delegatedJob.ID, runDeadline)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
-	// #1856: the DELEGATED-job delivery route. A delegation child whose action is
-	// neither ask nor review is non-seat (engine_delegation.go only sets
-	// ReadOnlySeat for those two), so a kimi child here reads the LIVE profile.
-	delegatedCredentialBefore, delegatedCredentialObserved := observeNonSeatKimiCredential(started.Agent)
 	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
 	err = w.recordUnrecordedResult(ctx, engine, err)
-	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, delegatedJob.ID, started.Agent, delegatedCredentialBefore, delegatedCredentialObserved)
 	stopKillPending()
 	if err != nil {
 		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, delegatedJob, payload, started.Agent, err, time.Now().UTC()); quotaErr != nil {
@@ -4598,32 +4015,25 @@ func runnerReachesExecutionInstance(runner subprocess.Runner) bool {
 	}
 }
 
-// buildLocalRuntimeAdapter is the pre-#1536 runner-composition pipeline. Keep
-// its ordering unchanged: runtimeJobRunner/credgw, concrete runtime adapter,
-// then model-gateway wrapping.
+// buildLocalRuntimeAdapter is the pre-#1536 runner-composition pipeline:
+// runtimeJobRunner, then the concrete runtime adapter.
 func buildLocalRuntimeAdapter(home string, agent runtime.Agent, checkout string, runner subprocess.Runner) (workflow.DeliveryAdapter, error) {
 	var err error
 	runner, err = runtimeJobRunner(home, agent.Runtime, runner)
 	if err != nil {
 		return nil, err
 	}
-	gatewayRunner, _ := runner.(*credgw.Runner)
-	var adapter runtime.Adapter
 	switch agent.Runtime {
-	case runtime.CodexRuntime:
-		adapter = runtime.CodexAdapter{Dir: checkout, Runner: runner}
-	case runtime.ClaudeRuntime:
-		adapter = runtime.ClaudeAdapter{Dir: checkout, Runner: runner}
-	case runtime.KimiRuntime:
-		adapter = runtime.KimiAdapter{Dir: checkout, Runner: runner}
 	case runtime.OmpRuntime:
-		adapter = runtime.OmpAdapter{Dir: checkout, Runner: runner}
+		return runtime.OmpAdapter{Dir: checkout, Runner: runner}, nil
 	case runtime.ShellRuntime:
-		adapter = runtime.ShellAdapter{Dir: checkout, Runner: runner}
+		return runtime.ShellAdapter{Dir: checkout, Runner: runner}, nil
 	default:
+		if runtime.IsRemovedRuntime(agent.Runtime) {
+			return nil, runtime.UnsupportedAgentRuntimeError(agent.Name, agent.Runtime)
+		}
 		return nil, fmt.Errorf("unsupported runtime: %s", agent.Runtime)
 	}
-	return wrapModelGatewayAdapter(adapter, gatewayRunner), nil
 }
 
 func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, runtimeName string, checkout string) (runtime.Adapter, error) {
@@ -4716,77 +4126,4 @@ func (w jobWorker) workflowHome() string {
 
 func (w jobWorker) defaultCommenter(_ string) github.Client {
 	return github.NewClient("")
-}
-
-// kimiCredentialDegradedEvent names the #1856 report-only observation: the LIVE
-// kimi credential was usable before a non-seat delivery and is not after it.
-// Attribution is INFERRED - the event records that a kimi child ran while the
-// file changed, never that this child wrote it, because gitmoot writes this file
-// nowhere and the only writer is the vendor CLI.
-const kimiCredentialDegradedEvent = "kimi_credential_degraded"
-
-// observeNonSeatKimiCredential reads the LIVE kimi credential a non-seat
-// delivery is about to exercise (#1856).
-//
-// It observes nothing for a read-only seat: that child reads a staged clone
-// inside its own writable cache root, so a change there says nothing about the
-// operator's profile and its events would be indistinguishable from real ones.
-// It also observes nothing for other runtimes - claude's credential has its own
-// staging-side machinery (#1808) and codex was never reported for this.
-//
-// Callers pass the agent DELIVERY actually runs with (the daemon's resolved
-// agent, the dispatch path's effectiveAgent), never the registered row: a
-// per-job runtime override can make those differ, and the observation must
-// describe the child that ran.
-func observeNonSeatKimiCredential(agent runtime.Agent) (runtime.KimiCredentialObservation, bool) {
-	if agent.Runtime != runtime.KimiRuntime || agent.ReadOnlySeat {
-		return runtime.KimiCredentialObservation{}, false
-	}
-	dir, err := resolveRuntimeConfigDir(runtime.KimiRuntime, agent.RuntimeConfigDir)
-	if err != nil {
-		return runtime.KimiCredentialObservation{}, false
-	}
-	return runtime.ObserveKimiCredential(dir)
-}
-
-// recordKimiCredentialDegradation re-reads the credential after the child and
-// records AT MOST ONE job event when it got worse, on success and failure alike
-// - a blanking during a run that SUCCEEDS is the measured #1856 shape.
-//
-// The one-event-per-job bound is enforced HERE rather than left to the call
-// sites' shape. The two CLI dispatch boundaries are mutually exclusive arms of
-// one if/else (agent_dispatch.go's ask arm delivers through mailbox.Run, the
-// else arm through engine.RunJob) so today they cannot double-fire, but a reader
-// should not have to re-derive that from the control flow, and a retried job
-// re-entering delivery must not append a second copy of the same observation.
-// This mirrors recordReadOnlySeatCredentialDiagnosis's existing convention.
-//
-// Report-only: it never writes the credential, and a recording failure is
-// swallowed to a line on stdout rather than affecting the job's outcome.
-func recordKimiCredentialDegradation(ctx context.Context, store *db.Store, stdout io.Writer, jobID string, agent runtime.Agent, before runtime.KimiCredentialObservation, observed bool) {
-	if !observed || store == nil {
-		return
-	}
-	after, ok := observeNonSeatKimiCredential(agent)
-	degraded := runtime.KimiCredentialDegradation(before, after, ok)
-	if degraded == "" {
-		return
-	}
-	events, err := store.ListJobEvents(ctx, jobID)
-	if err != nil {
-		writeLine(stdout, "job %s kimi credential degradation lookup failed: %v", jobID, err)
-		return
-	}
-	for _, event := range events {
-		if event.Kind == kimiCredentialDegradedEvent {
-			return
-		}
-	}
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID:   jobID,
-		Kind:    kimiCredentialDegradedEvent,
-		Message: degraded,
-	}); err != nil {
-		writeLine(stdout, "job %s kimi credential degradation record failed: %v", jobID, err)
-	}
 }

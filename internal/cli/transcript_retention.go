@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -73,24 +72,13 @@ func openRetainedTranscriptLog(home, jobID, jobType, runtimeName string, attempt
 }
 
 // appendDeliveryAdapterOutput adds a writer at the existing runner base instead
-// of rebuilding an adapter. This preserves relay env, credential curation,
-// model-gateway leases, and Landlock wrappers.
+// of rebuilding an adapter. This preserves relay env, credential curation and
+// Landlock wrappers.
 func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer) (workflow.DeliveryAdapter, error) {
 	if adapter == nil || out == nil {
 		return adapter, nil
 	}
 	switch a := adapter.(type) {
-	case modelGatewayRuntimeAdapter:
-		inner, err := appendDeliveryAdapterOutput(a.Adapter, out)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, ok := inner.(runtime.Adapter)
-		if !ok {
-			return nil, fmt.Errorf("transcript tee returned incompatible %T model-gateway adapter", inner)
-		}
-		a.Adapter = runtimeAdapter
-		return a, nil
 	case readOnlyRuntimeAdapter:
 		inner, err := appendDeliveryAdapterOutput(a.Adapter, out)
 		if err != nil {
@@ -101,24 +89,6 @@ func appendDeliveryAdapterOutput(adapter workflow.DeliveryAdapter, out io.Writer
 			return nil, fmt.Errorf("transcript tee returned incompatible %T read-only adapter", inner)
 		}
 		a.Adapter = runtimeAdapter
-		return a, nil
-	case runtime.CodexAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case *runtime.CodexAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case runtime.ClaudeAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case *runtime.ClaudeAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case runtime.KimiAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
-		return a, nil
-	case *runtime.KimiAdapter:
-		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
 		return a, nil
 	case runtime.OmpAdapter:
 		a.Runner = appendRuntimeOutputRunner(a.Runner, out)
@@ -160,10 +130,6 @@ func appendRuntimeOutputRunner(runner subprocess.Runner, out io.Writer) subproce
 		r.Inner = appendRuntimeOutputRunner(r.Inner, out)
 		return r
 	case *subprocess.WrappingRunner:
-		copy := *r
-		copy.Inner = appendRuntimeOutputRunner(copy.Inner, out)
-		return &copy
-	case *credgw.Runner:
 		copy := *r
 		copy.Inner = appendRuntimeOutputRunner(copy.Inner, out)
 		return &copy

@@ -37,7 +37,7 @@ func TestExportJSONLExactSchemaAndRedaction(t *testing.T) {
 		{Kind: KindRaw, RawLine: secret},
 	}
 	var got bytes.Buffer
-	metadata := ExportMetadata{JobID: "j", RootJobID: "j", Runtime: "codex", Agent: "a", Action: "ask", Repo: "o/r", Outcome: "failed", AttemptCount: 2, CreatedAt: "created", EndedAt: "ended"}
+	metadata := ExportMetadata{JobID: "j", RootJobID: "j", Runtime: "omp", Agent: "a", Action: "ask", Repo: "o/r", Outcome: "failed", AttemptCount: 2, CreatedAt: "created", EndedAt: "ended"}
 	if err := ExportJSONL(&got, metadata, events); err != nil {
 		t.Fatal(err)
 	}
@@ -75,9 +75,9 @@ func TestReadSnapshotEventsOversizedLineContinues(t *testing.T) {
 
 func TestSnapshotTranslatorRealFixturesExportJSONL(t *testing.T) {
 	for _, tc := range []struct{ runtime, file string }{
-		{"codex", "codex_tool_run.jsonl"},
-		{"kimi", "kimi_tool_run.jsonl"},
-		{"claude", "claude_envelope_real.json"},
+		{"omp", "omp_tool_run.jsonl"},
+		// A job recorded on a runtime removed in #2587 still exports, raw.
+		{"codex", "omp_tool_run.jsonl"},
 	} {
 		t.Run(tc.runtime, func(t *testing.T) {
 			input, err := os.ReadFile(filepath.Join("testdata", tc.file))

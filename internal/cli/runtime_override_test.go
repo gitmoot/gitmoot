@@ -42,12 +42,12 @@ func TestResolveJobRuntimeOverride(t *testing.T) {
 			t.Fatalf("got (%q, %q, %v)", rt, ref, err)
 		}
 	})
-	t.Run("last is rejected on a resumable runtime", func(t *testing.T) {
+	t.Run("last is rejected on a non-shell runtime", func(t *testing.T) {
 		// SESSION SAFETY: "last" resumes whichever session in the checkout is most
 		// recent — possibly an agent's default-runtime session, mid-flight — while
 		// the lock key would be the literal "runtime:<rt>:last" and so could never
 		// serialize with the concrete session's lock.
-		for _, rt := range []string{runtime.ClaudeRuntime, runtime.CodexRuntime, runtime.KimiRuntime} {
+		for _, rt := range []string{runtime.OmpRuntime} {
 			if _, _, err := resolveJobRuntimeOverride(rt, runtime.LastRef); err == nil {
 				t.Fatalf("accepted --session last with --runtime %s", rt)
 			}
@@ -58,15 +58,21 @@ func TestResolveJobRuntimeOverride(t *testing.T) {
 			t.Fatalf("shell session command %q rejected: %v", runtime.LastRef, err)
 		}
 	})
-	t.Run("resumable runtime without session mints a fresh per-job ref", func(t *testing.T) {
-		rt, ref, err := resolveJobRuntimeOverride(runtime.ClaudeRuntime, "")
-		if err != nil || rt != runtime.ClaudeRuntime {
+	t.Run("removed runtime is refused", func(t *testing.T) {
+		_, _, err := resolveJobRuntimeOverride("codex", "")
+		if err == nil || !strings.Contains(err.Error(), `runtime "codex" is no longer supported`) {
+			t.Fatalf("err = %v, want removed-runtime refusal", err)
+		}
+	})
+	t.Run("runtime without session mints a fresh per-job ref", func(t *testing.T) {
+		rt, ref, err := resolveJobRuntimeOverride(runtime.OmpRuntime, "")
+		if err != nil || rt != runtime.OmpRuntime {
 			t.Fatalf("got (%q, %q, %v)", rt, ref, err)
 		}
 		if !runtime.IsFreshRef(ref) {
 			t.Fatalf("ref = %q, want a fresh ref", ref)
 		}
-		_, other, err := resolveJobRuntimeOverride(runtime.ClaudeRuntime, "")
+		_, other, err := resolveJobRuntimeOverride(runtime.OmpRuntime, "")
 		if err != nil {
 			t.Fatalf("second resolve: %v", err)
 		}
@@ -84,9 +90,9 @@ func TestApplyJobRuntimeOverride(t *testing.T) {
 	agent := runtime.Agent{
 		Name:           "maintainer",
 		Role:           "reviewer",
-		Runtime:        runtime.CodexRuntime,
-		RuntimeRef:     "codex-session",
-		Model:          "gpt-5.5-codex",
+		Runtime:        runtime.OmpRuntime,
+		RuntimeRef:     "omp-session",
+		Model:          "openai/gpt-5.5",
 		Effort:         "high",
 		RepoScope:      "owner/repo",
 		Capabilities:   []string{"ask"},
@@ -112,16 +118,16 @@ func TestApplyJobRuntimeOverride(t *testing.T) {
 		t.Fatalf("override must preserve identity/policy: %+v", effective)
 	}
 	// The stored/default agent value is untouched (value semantics, no aliasing).
-	if agent.Runtime != runtime.CodexRuntime || agent.RuntimeRef != "codex-session" || agent.Model != "gpt-5.5-codex" || agent.Effort != "high" {
+	if agent.Runtime != runtime.OmpRuntime || agent.RuntimeRef != "omp-session" || agent.Model != "openai/gpt-5.5" || agent.Effort != "high" {
 		t.Fatalf("input agent mutated: %+v", agent)
 	}
 }
 
 func TestScopeRegisteredFreshRefForJob(t *testing.T) {
 	agent := runtime.Agent{
-		Name:       "council-codex",
-		Runtime:    runtime.CodexRuntime,
-		RuntimeRef: "fresh:council-codex",
+		Name:       "council-omp",
+		Runtime:    runtime.OmpRuntime,
+		RuntimeRef: "fresh:council-omp",
 	}
 
 	scoped := scopeRegisteredFreshRefForJob(agent, "local-ask-root/delegation/review-codex")
@@ -140,33 +146,19 @@ func TestScopeRegisteredFreshRefForJob(t *testing.T) {
 		t.Fatalf("different jobs must not share fresh lock refs: %q", scoped.RuntimeRef)
 	}
 
-	pinned := runtime.Agent{Name: "reviewer", Runtime: runtime.ClaudeRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440000"}
+	pinned := runtime.Agent{Name: "reviewer", Runtime: runtime.OmpRuntime, RuntimeRef: "550e8400-e29b-41d4-a716-446655440000"}
 	if got := scopeRegisteredFreshRefForJob(pinned, "job-1"); got.RuntimeRef != pinned.RuntimeRef {
 		t.Fatalf("non-fresh ref changed: %q", got.RuntimeRef)
 	}
 }
 
 // TestOverrideRuntimeSessionResourceKey: the lock key always names the
-// OVERRIDE runtime — resumable runtimes keep the normal runtime:<rt>:<ref>
-// shape, and shell (normally lock-less) gets an override-scoped hashed key —
-// so an override job can never collide with the default-runtime session lock.
+// OVERRIDE runtime — shell (normally lock-less) gets an override-scoped hashed
+// key — so an override job can never collide with the default-runtime session
+// lock.
 func TestOverrideRuntimeSessionResourceKey(t *testing.T) {
-	key, ok := overrideRuntimeSessionResourceKey(runtime.Agent{Runtime: runtime.CodexRuntime, RuntimeRef: "abc"})
-	if !ok || key != "runtime:codex:abc" {
-		t.Fatalf("codex key = %q ok=%v", key, ok)
-	}
-
-	freshRef, err := runtime.NewFreshRef()
-	if err != nil {
-		t.Fatalf("NewFreshRef: %v", err)
-	}
-	key, ok = overrideRuntimeSessionResourceKey(runtime.Agent{Runtime: runtime.ClaudeRuntime, RuntimeRef: freshRef})
-	if !ok || key != "runtime:claude:"+freshRef {
-		t.Fatalf("claude fresh key = %q ok=%v", key, ok)
-	}
-
 	command := `printf '%s' '{"gitmoot_result":{}}'`
-	key, ok = overrideRuntimeSessionResourceKey(runtime.Agent{Runtime: runtime.ShellRuntime, RuntimeRef: command})
+	key, ok := overrideRuntimeSessionResourceKey(runtime.Agent{Runtime: runtime.ShellRuntime, RuntimeRef: command})
 	if !ok || !strings.HasPrefix(key, "runtime:shell:") {
 		t.Fatalf("shell key = %q ok=%v, want runtime:shell:<hash>", key, ok)
 	}

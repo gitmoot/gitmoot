@@ -2832,7 +2832,7 @@ func TestEngineContinuationCarriesRuntimeOverride(t *testing.T) {
 		Branch:             "task-005",
 		Sender:             "coord",
 		Model:              "claude-opus-4-5",
-		RuntimeOverride:    runtime.ClaudeRuntime,
+		RuntimeOverride:    runtime.OmpRuntime,
 		RuntimeOverrideRef: freshRef,
 		Result: &AgentResult{
 			Decision: "approved",
@@ -2854,9 +2854,9 @@ func TestEngineContinuationCarriesRuntimeOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshal continuation payload: %v", err)
 	}
-	if cp.RuntimeOverride != runtime.ClaudeRuntime || cp.RuntimeOverrideRef != freshRef {
+	if cp.RuntimeOverride != runtime.OmpRuntime || cp.RuntimeOverrideRef != freshRef {
 		t.Fatalf("continuation payload override = %q/%q, want %q/%q (the override must carry into the synthesis continuation)",
-			cp.RuntimeOverride, cp.RuntimeOverrideRef, runtime.ClaudeRuntime, freshRef)
+			cp.RuntimeOverride, cp.RuntimeOverrideRef, runtime.OmpRuntime, freshRef)
 	}
 	if cp.Model != "claude-opus-4-5" {
 		t.Fatalf("continuation payload Model = %q, want the override-runtime model to stay with its override", cp.Model)
@@ -3511,7 +3511,7 @@ func TestEngineDelegationRequestCopiesPhase(t *testing.T) {
 
 func TestEngineDelegationRequestThreadsEphemeralSpec(t *testing.T) {
 	engine := Engine{}
-	spec := &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"}
+	spec := &EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "gpt-5.4", Effort: "high"}
 	request := engine.delegationRequest(
 		context.Background(), db.Job{ID: "parent-job", Agent: "audit"},
 		JobPayload{Repo: "gitmoot/gitmoot"},
@@ -3562,7 +3562,7 @@ func TestEngineDispatchesEphemeralDelegationWithoutRegisteredAgent(t *testing.T)
 			Decision: "approved",
 			Summary:  "done",
 			Delegations: []Delegation{
-				{ID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.CodexRuntime, Model: "gpt-5.4", Effort: "high"}, Action: "review", Prompt: "hi"},
+				{ID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "gpt-5.4", Effort: "high"}, Action: "review", Prompt: "hi"},
 			},
 		},
 	})
@@ -3582,7 +3582,7 @@ func TestEngineDispatchesEphemeralDelegationWithoutRegisteredAgent(t *testing.T)
 	if payload.Ephemeral == nil {
 		t.Fatalf("child payload missing ephemeral spec: %+v", payload)
 	}
-	if payload.Ephemeral.Runtime != runtime.CodexRuntime || payload.Ephemeral.Model != "gpt-5.4" || payload.Ephemeral.Effort != "high" {
+	if payload.Ephemeral.Runtime != runtime.OmpRuntime || payload.Ephemeral.Model != "gpt-5.4" || payload.Ephemeral.Effort != "high" {
 		t.Fatalf("child payload ephemeral spec = %+v", payload.Ephemeral)
 	}
 	// The stored payload JSON must carry the ephemeral key so downstream consumers
@@ -5537,7 +5537,7 @@ func TestEngineDelegationPreflightRuntimeNameMixup(t *testing.T) {
 	seedAgent(t, store, "shipper", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 
-	// The coordinator names the runtime "claude" instead of a registered agent.
+	// The coordinator names the runtime "omp" instead of a registered agent.
 	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
 		Repo:   "gitmoot/gitmoot",
 		Sender: "coordinator",
@@ -5545,7 +5545,7 @@ func TestEngineDelegationPreflightRuntimeNameMixup(t *testing.T) {
 			Decision: "approved",
 			Summary:  "fan out",
 			Delegations: []Delegation{
-				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+				{ID: "impl", Agent: "omp", Action: "review", Prompt: "do it"},
 			},
 		},
 	})
@@ -5603,12 +5603,12 @@ func TestEngineDelegationPreflightUnknownAgentNoRuntimeLine(t *testing.T) {
 	}
 }
 
-func TestEngineDelegationPreflightAgentNamedClaudeNoFalseTrigger(t *testing.T) {
+func TestEngineDelegationPreflightAgentNamedOmpNoFalseTrigger(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "coordinator", []string{"ask"}, "gitmoot/gitmoot")
-	// A legitimately-registered, capable agent literally named "claude".
-	seedAgent(t, store, "claude", []string{"review"}, "gitmoot/gitmoot")
+	// A legitimately-registered, capable agent literally named "omp".
+	seedAgent(t, store, "omp", []string{"review"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
 
 	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coordinator", Type: "ask"}, JobPayload{
@@ -5618,7 +5618,7 @@ func TestEngineDelegationPreflightAgentNamedClaudeNoFalseTrigger(t *testing.T) {
 			Decision: "approved",
 			Summary:  "fan out",
 			Delegations: []Delegation{
-				{ID: "impl", Agent: "claude", Action: "review", Prompt: "do it"},
+				{ID: "impl", Agent: "omp", Action: "review", Prompt: "do it"},
 			},
 		},
 	})
@@ -5627,8 +5627,8 @@ func TestEngineDelegationPreflightAgentNamedClaudeNoFalseTrigger(t *testing.T) {
 		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	child := mustJob(t, store, "parent-job/delegation/impl")
-	if child.Agent != "claude" || child.State != string(JobQueued) {
-		t.Fatalf("a registered agent named 'claude' must dispatch normally: %+v", child)
+	if child.Agent != "omp" || child.State != string(JobQueued) {
+		t.Fatalf("a registered agent named 'omp' must dispatch normally: %+v", child)
 	}
 	if countJobEvents(t, store, "parent-job", "delegation_preflight_failed") != 0 {
 		t.Fatalf("a routable agent must not emit a preflight failure")

@@ -190,10 +190,10 @@ func TestReadOnlyGrantsStageTheToolchainThroughProduction(t *testing.T) {
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
 
 	agent := runtime.Agent{
-		Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
+		Name: "seat", Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
 		RepoScope: "gitmoot/gitmoot",
 	}
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}
@@ -319,10 +319,10 @@ func TestReadOnlySeatEnvKeepsRuntimeBinariesResolvable(t *testing.T) {
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
 
 	agent := runtime.Agent{
-		Name: "seat", Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true,
+		Name: "seat", Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
 		RepoScope: "gitmoot/gitmoot",
 	}
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}

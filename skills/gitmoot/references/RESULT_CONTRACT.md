@@ -271,7 +271,7 @@ Delegation fields:
 - `id` (required): stable identifier for this delegation, unique within the
   result. Sibling delegations reference it through `deps`.
 - `agent` (required): the **registered agent name** to run (e.g. `shipper`,
-  `researcher`) — **not** a runtime. `codex`, `claude`, and `kimi` are *runtimes*,
+  `researcher`) — **not** a runtime. `omp` is a *runtime*,
   not agent names; naming one here is the common mistake that makes a fan-out
   unroutable. To run a worker that is **not** pre-registered, use the inline
   `ephemeral` spec below instead (it needs no registration). An unroutable `agent` (unknown / not allowed on the repo / lacking
@@ -396,7 +396,7 @@ Delegation fields:
 - `fingerprint` (optional): dedup key. Identical fingerprints are
   de-duplicated, so the same delegation is not dispatched twice.
 - `model` (optional): a free-form, runtime-scoped model string for the child
-  job (for example a Codex, Claude Code, or Kimi Code model name). When omitted,
+  job (for example an omp `provider/model` name such as `anthropic/claude-sonnet-4-5`). When omitted,
   the model resolves in order: this `model` field (the child's job `--model`),
   then the delegated agent's `--model`, then the runtime's registry
   `default_model` (the `[runtimes.<name>].default_model` config), then the
@@ -442,8 +442,8 @@ Delegation fields:
   child job. This job-level value overrides the delegated agent's default or
   the ephemeral worker's `effort`; when omitted, effort falls back to that
   agent/worker default and then `[runtimes.<name>].default_effort`. Gitmoot does
-  not apply an allow-list. Codex receives
-  `-c model_reasoning_effort=<value>`; Claude and Kimi ignore the setting.
+  not apply an allow-list. omp receives `--thinking <level>` when the value is
+  one of `off|minimal|low|medium|high|xhigh|max|auto`, and no flag otherwise.
 - `phase` (optional): a free-form per-delegation string. It is pass-through
   metadata — Gitmoot carries it through to the child job untouched and echoes it
   back in the coordinator continuation for each delegation that set a non-empty
@@ -462,8 +462,8 @@ Delegation fields:
   Gitmoot materializes a worker from the spec, runs the child job, and disposes
   of the worker once the job finishes. The ephemeral child inherits the
   coordinator's allowed repo scope. Fields:
-  - `runtime` (required): the runtime that backs the worker, one of `codex`,
-    `claude`, or `kimi`. It is never `shell`.
+  - `runtime` (required): the runtime that backs the worker; must be `omp`.
+    It is never `shell`.
   - `model` (optional): a runtime-scoped model string, as for the delegation
     `model` field above.
   - `effort` (optional): the worker's default reasoning effort. A top-level
@@ -648,13 +648,12 @@ a job whose runtime reports no usage contributes `0` to the sum, so the budget
 
 | Runtime | Reports token usage? | How |
 | --- | --- | --- |
-| **Claude Code** | Yes | Parsed from the `usage.{input,output}_tokens` of the `--output-format json` envelope on delivery. |
-| **Kimi Code** | Best-effort | Captured if the `--output-format stream-json` stream emits a `usage` object; otherwise `0`. |
-| **Codex** | Yes | Read from the last `turn.completed` usage of the `codex exec --json` JSONL stream (#658). Fresh sessions (ephemeral delegation workers, per-job `--runtime` overrides) and single-use workers report a per-job count directly. On a resumed session codex's usage is session-cumulative, so gitmoot records only the per-session delta — `max(0, cumulative_now − last_seen)`, tracked in the `runtime_session_usage` table (#661); a session reset that rolls the counter backwards clamps the delta to `0` and resyncs. Older CLIs that predate `--json` fall back to plain text and contribute `0`. |
+| **omp** | Yes | Summed across the run from each assistant `message_end` usage in the `-p --mode=json` NDJSON stream. Every omp job is a fresh session, so the count is per-job. |
+| **shell** | No | Contributes `0`. |
 
 Capture is best-effort, so treat the budget as a coarse runaway-cost backstop
-rather than a precise spend limit — a runtime that reports nothing (or an older
-codex CLI that predates `--json`) contributes `0` and is silently under-counted.
+rather than a precise spend limit — a runtime that reports nothing contributes
+`0` and is silently under-counted.
 The same capture also feeds the `$`-denominated
 `[orchestrate].max_delegation_cost_usd` budget — see the dollar-cost bullet in
 [Termination bounds](#termination-bounds) above.

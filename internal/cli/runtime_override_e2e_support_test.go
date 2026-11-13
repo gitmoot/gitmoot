@@ -2,9 +2,10 @@ package cli
 
 import (
 	"context"
+	"testing"
+
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
-	"testing"
 )
 
 // Test helpers shared with UNTAGGED tests, kept out of the e2e build tag
@@ -17,16 +18,16 @@ func runtimeOverrideE2EHome(t *testing.T) (string, *db.Store, string) {
 	home, _, store := daemonE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// Default runtime codex with a stored model: the override must use neither.
+	// Default runtime omp with a stored model: the override must use neither.
 	if err := store.UpsertAgent(context.Background(), db.Agent{
 		Name:           "maintainer",
 		Role:           "worker",
-		Runtime:        runtime.CodexRuntime,
-		RuntimeRef:     runtimeOverrideCodexRef,
+		Runtime:        runtime.OmpRuntime,
+		RuntimeRef:     runtimeOverrideOmpRef,
 		RepoScope:      "owner/repo",
 		Capabilities:   []string{"ask"},
 		AutonomyPolicy: runtime.AutonomyPolicyAuto,
-		Model:          "gpt-5.5-codex",
+		Model:          "openai/gpt-5.5",
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent: %v", err)
@@ -34,4 +35,4 @@ func runtimeOverrideE2EHome(t *testing.T) (string, *db.Store, string) {
 	return home, store, checkout
 }
 
-const runtimeOverrideCodexRef = "codex-session-never-invoked"
+const runtimeOverrideOmpRef = "omp-session-never-invoked"

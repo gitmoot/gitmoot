@@ -1,7 +1,0 @@
-{"type":"thread.started","thread_id":"thread_sanitized"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_reasoning","type":"reasoning","text":"I should inspect the repository."}}
-{"type":"item.completed","item":{"id":"item_tool","type":"command_execution","command":"printf sanitized","status":"completed","aggregated_output":"sanitized output"}}
-{"type":"item.completed","item":{"id":"item_message_1","type":"agent_message","text":"Implemented the renderer."}}
-{"type":"item.completed","item":{"id":"item_message_2","type":"agent_message","text":"All focused tests pass."}}
-{"type":"turn.completed","usage":{"input_tokens":16504,"cached_input_tokens":9600,"output_tokens":20,"reasoning_output_tokens":13}}

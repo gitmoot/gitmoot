@@ -13,7 +13,7 @@ import (
 func TestBuiltinRegistryMatchesSupportedRuntimes(t *testing.T) {
 	reg := BuiltinRuntimeRegistry()
 	got := reg.dispatchableNames()
-	want := []string{CodexRuntime, ClaudeRuntime, KimiRuntime, OmpRuntime, ShellRuntime}
+	want := []string{OmpRuntime, ShellRuntime}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dispatchableNames() = %v, want %v", got, want)
 	}
@@ -86,38 +86,38 @@ func TestApplyOverridesNoOp(t *testing.T) {
 func TestApplyOverridesPartial(t *testing.T) {
 	base := BuiltinRuntimeRegistry()
 	got, err := base.ApplyOverrides([]MetadataOverride{{
-		Name:             CodexRuntime,
-		DefaultModel:     "gpt-5.5-codex",
+		Name:             OmpRuntime,
+		DefaultModel:     "anthropic/claude-opus-5-5",
 		DefaultModelSet:  true,
 		DefaultEffort:    "high",
 		DefaultEffortSet: true,
-		Models:           []string{"gpt-5.5-codex", "gpt-5.4-codex"},
+		Models:           []string{"anthropic/claude-opus-5-5", "openai/gpt-6"},
 		ModelsSet:        true,
 	}})
 	if err != nil {
 		t.Fatalf("ApplyOverrides error: %v", err)
 	}
-	codex, _ := got.Metadata(CodexRuntime)
-	if codex.DefaultModel != "gpt-5.5-codex" {
-		t.Fatalf("DefaultModel = %q", codex.DefaultModel)
+	omp, _ := got.Metadata(OmpRuntime)
+	if omp.DefaultModel != "anthropic/claude-opus-5-5" {
+		t.Fatalf("DefaultModel = %q", omp.DefaultModel)
 	}
-	if codex.DefaultEffort != "high" {
-		t.Fatalf("DefaultEffort = %q", codex.DefaultEffort)
+	if omp.DefaultEffort != "high" {
+		t.Fatalf("DefaultEffort = %q", omp.DefaultEffort)
 	}
-	if !reflect.DeepEqual(codex.Models, []string{"gpt-5.5-codex", "gpt-5.4-codex"}) {
-		t.Fatalf("Models = %v", codex.Models)
+	if !reflect.DeepEqual(omp.Models, []string{"anthropic/claude-opus-5-5", "openai/gpt-6"}) {
+		t.Fatalf("Models = %v", omp.Models)
 	}
 	// Capabilities were NOT overridden — must keep the built-in value.
-	if !reflect.DeepEqual(codex.Capabilities, []string{"review", "implement", "ask"}) {
-		t.Fatalf("Capabilities changed unexpectedly: %v", codex.Capabilities)
+	if !reflect.DeepEqual(omp.Capabilities, []string{"review", "implement", "ask"}) {
+		t.Fatalf("Capabilities changed unexpectedly: %v", omp.Capabilities)
 	}
 	// The built-in registry must be untouched (immutability).
-	baseCodex, _ := base.Metadata(CodexRuntime)
-	if baseCodex.DefaultModel != "" {
-		t.Fatalf("ApplyOverrides mutated the source registry: %q", baseCodex.DefaultModel)
+	baseOmp, _ := base.Metadata(OmpRuntime)
+	if baseOmp.DefaultModel != "" {
+		t.Fatalf("ApplyOverrides mutated the source registry: %q", baseOmp.DefaultModel)
 	}
-	if baseCodex.DefaultEffort != "" {
-		t.Fatalf("ApplyOverrides mutated the source registry effort: %q", baseCodex.DefaultEffort)
+	if baseOmp.DefaultEffort != "" {
+		t.Fatalf("ApplyOverrides mutated the source registry effort: %q", baseOmp.DefaultEffort)
 	}
 }
 
@@ -135,12 +135,28 @@ func TestApplyOverridesUnknownRuntime(t *testing.T) {
 	}
 }
 
+// TestApplyOverridesIgnoresRemovedRuntime proves a [runtimes.codex|claude|kimi]
+// block left in a live config.toml after #2587 keeps loading: the override is
+// skipped instead of failing the whole config as an unknown runtime.
+func TestApplyOverridesIgnoresRemovedRuntime(t *testing.T) {
+	base := BuiltinRuntimeRegistry()
+	for _, name := range []string{"codex", "claude", "kimi"} {
+		got, err := base.ApplyOverrides([]MetadataOverride{{Name: name, DefaultModel: "x", DefaultModelSet: true}})
+		if err != nil {
+			t.Fatalf("ApplyOverrides(%s) error: %v", name, err)
+		}
+		if !reflect.DeepEqual(got, base) {
+			t.Fatalf("ApplyOverrides(%s) changed the registry", name)
+		}
+	}
+}
+
 // TestApplyOverridesRejectsBadCapability proves a capability override outside the
 // closed set (review/implement/ask) is rejected — a typo cannot silently disable a
 // capability.
 func TestApplyOverridesRejectsBadCapability(t *testing.T) {
 	_, err := BuiltinRuntimeRegistry().ApplyOverrides([]MetadataOverride{{
-		Name:            ClaudeRuntime,
+		Name:            OmpRuntime,
 		Capabilities:    []string{"review", "deploy"},
 		CapabilitiesSet: true,
 	}})
@@ -156,9 +172,9 @@ func TestApplyOverridesRejectsBadCapability(t *testing.T) {
 // a returned metadata value's slices.
 func TestMetadataAccessorsAreCopies(t *testing.T) {
 	reg := BuiltinRuntimeRegistry()
-	meta, _ := reg.Metadata(CodexRuntime)
+	meta, _ := reg.Metadata(OmpRuntime)
 	meta.Capabilities[0] = "hacked"
-	again, _ := reg.Metadata(CodexRuntime)
+	again, _ := reg.Metadata(OmpRuntime)
 	if again.Capabilities[0] != "review" {
 		t.Fatalf("Metadata returned a shared slice; registry mutated to %v", again.Capabilities)
 	}

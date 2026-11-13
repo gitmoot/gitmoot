@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"github.com/gitmoot/gitmoot/internal/db"
 	"io"
 	"os"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
+	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -114,7 +114,7 @@ func TestReviewClassDeadlineComesFromTheOperatorsConfig(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	managed, err := worker.managedJobConfig(context.Background(), "opus-reviewer")
@@ -130,7 +130,7 @@ func TestReviewClassDeadlineComesFromTheOperatorsConfig(t *testing.T) {
 // And an absent knob keeps the built-in floor rather than removing it.
 func TestReviewClassDeadlineDefaultsWhenUnconfigured(t *testing.T) {
 	store, home := blockerE2EHome(t)
-	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	managed, err := worker.managedJobConfig(context.Background(), "opus-reviewer")
@@ -191,7 +191,7 @@ func TestUnreadableRouterConfigIsReportedNotSwallowed(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.ClaudeRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "opus-reviewer", runtime.OmpRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 
 	worker := defaultJobWorker(store, io.Discard, home)
 	managed, err := worker.managedJobConfig(context.Background(), "opus-reviewer")

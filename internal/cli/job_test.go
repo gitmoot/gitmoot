@@ -329,21 +329,21 @@ func TestRunJobTranscriptMarkdownExportStdoutAndFile(t *testing.T) {
 		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Instructions: "Inspect the fixture."}),
 	}, "succeeded")
 	store.Close()
-	fixture, err := os.ReadFile(filepath.Join("..", "transcript", "testdata", "codex_tool_run.jsonl"))
+	fixture, err := os.ReadFile(filepath.Join("..", "transcript", "testdata", "omp_tool_run.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	logPath := filepath.Join(t.TempDir(), "codex.jsonl")
+	logPath := filepath.Join(t.TempDir(), "omp.jsonl")
 	if err := os.WriteFile(logPath, fixture, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	args := []string{"job", "transcript", "job-export", "--home", home, "--export", "md", "--log-path", logPath, "--runtime", runtime.CodexRuntime}
+	args := []string{"job", "transcript", "job-export", "--home", home, "--export", "md", "--log-path", logPath, "--runtime", runtime.OmpRuntime}
 	var stdout, stderr bytes.Buffer
 	if code := Run(args, &stdout, &stderr); code != 0 {
 		t.Fatalf("stdout export code=%d stderr=%q", code, stderr.String())
 	}
-	for _, want := range []string{"# Job Transcript", "## User", "Inspect the fixture.", "**Tool: bash**", "FIXTURE COMPLETE"} {
+	for _, want := range []string{"# Job Transcript", "## User", "Inspect the fixture.", "**Tool: bash**", "transcript-fixture-123"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("markdown export missing %q: %q", want, stdout.String())
 		}
@@ -469,27 +469,27 @@ func TestResolveTranscriptRuntimeOrder(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "audit", Runtime: runtime.ClaudeRuntime}); err != nil {
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "audit", Runtime: runtime.OmpRuntime}); err != nil {
 		t.Fatal(err)
 	}
 	job := db.Job{ID: "runtime-order", Agent: "audit"}
-	payload := workflow.JobPayload{RuntimeOverride: runtime.CodexRuntime}
+	payload := workflow.JobPayload{RuntimeOverride: runtime.ShellRuntime}
 	got, err := resolveTranscriptRuntime(context.Background(), store, job, payload, "")
-	if err != nil || got != runtime.CodexRuntime {
+	if err != nil || got != runtime.ShellRuntime {
 		t.Fatalf("payload override runtime = %q, err=%v", got, err)
 	}
-	got, err = resolveTranscriptRuntime(context.Background(), store, job, payload, runtime.KimiRuntime)
-	if err != nil || got != runtime.KimiRuntime {
+	got, err = resolveTranscriptRuntime(context.Background(), store, job, payload, runtime.OmpRuntime)
+	if err != nil || got != runtime.OmpRuntime {
 		t.Fatalf("explicit runtime = %q, err=%v", got, err)
 	}
 	got, err = resolveTranscriptRuntime(context.Background(), store, job, workflow.JobPayload{}, "")
-	if err != nil || got != runtime.ClaudeRuntime {
+	if err != nil || got != runtime.OmpRuntime {
 		t.Fatalf("agent runtime = %q, err=%v", got, err)
 	}
 	ephJob := db.Job{ID: "ephemeral-runtime", Agent: "unregistered-ephemeral"}
-	ephPayload := workflow.JobPayload{Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.KimiRuntime}}
+	ephPayload := workflow.JobPayload{Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.ShellRuntime}}
 	got, err = resolveTranscriptRuntime(context.Background(), store, ephJob, ephPayload, "")
-	if err != nil || got != runtime.KimiRuntime {
+	if err != nil || got != runtime.ShellRuntime {
 		t.Fatalf("ephemeral runtime = %q, err=%v", got, err)
 	}
 }
@@ -1100,24 +1100,24 @@ func TestTranscriptHeaderModelResolution(t *testing.T) {
 	home := t.TempDir()
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.CodexRuntime, Model: "gpt-5.5"}); err != nil {
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.OmpRuntime, Model: "gpt-5.5"}); err != nil {
 		t.Fatal(err)
 	}
 	job := db.Job{ID: "hdr", Type: "ask", Agent: "modeled", WorkflowID: "wf", Model: "gpt-5.6-sol"}
-	h := transcriptHeader(context.Background(), store, job, workflow.JobPayload{Model: "gpt-5.4", Instructions: "prompt text"}, runtime.CodexRuntime)
+	h := transcriptHeader(context.Background(), store, job, workflow.JobPayload{Model: "gpt-5.4", Instructions: "prompt text"}, runtime.OmpRuntime)
 	if h.Model != "gpt-5.6-sol" || h.Action != "ask" || h.Workflow != "wf" || h.Prompt != "prompt text" {
 		t.Fatalf("persisted-model header = %+v", h)
 	}
 	// Mutable agent config must not rewrite the historical transcript header.
-	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.CodexRuntime, Model: "new-agent-default"}); err != nil {
+	if err := store.UpsertAgent(context.Background(), db.Agent{Name: "modeled", Runtime: runtime.OmpRuntime, Model: "new-agent-default"}); err != nil {
 		t.Fatal(err)
 	}
-	h = transcriptHeader(context.Background(), store, job, workflow.JobPayload{}, runtime.CodexRuntime)
+	h = transcriptHeader(context.Background(), store, job, workflow.JobPayload{}, runtime.OmpRuntime)
 	if h.Model != "gpt-5.6-sol" {
 		t.Fatalf("model after agent mutation = %q, want persisted gpt-5.6-sol", h.Model)
 	}
 	eph := db.Job{ID: "hdr2", Type: "ask", Agent: "no-row", Model: "k3"}
-	h = transcriptHeader(context.Background(), store, eph, workflow.JobPayload{}, runtime.KimiRuntime)
+	h = transcriptHeader(context.Background(), store, eph, workflow.JobPayload{}, runtime.OmpRuntime)
 	if h.Model != "k3" {
 		t.Fatalf("ephemeral model = %q, want k3", h.Model)
 	}

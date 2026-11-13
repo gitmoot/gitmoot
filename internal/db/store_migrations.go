@@ -3328,4 +3328,12 @@ DROP TABLE IF EXISTS created_repos;
 	`
 DROP TABLE IF EXISTS heartbeat_state;
 	`,
+	// #2587 removes the codex, claude and kimi job runtimes. runtime_session_usage
+	// held codex's per-session cumulative token baselines (#661); its only writer
+	// was the codex adapter's resumed-thread delta path and nothing reads it (the
+	// dashboard Charts endpoint reads jobs.input_tokens/output_tokens). Per-job
+	// token counts already recorded on jobs are untouched.
+	`
+DROP TABLE IF EXISTS runtime_session_usage;
+	`,
 }

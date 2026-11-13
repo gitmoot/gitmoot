@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -172,48 +171,4 @@ func TestClassifyOperationalBlockerNetworkOutage(t *testing.T) {
 			t.Fatalf("classify = %+v, want no retryable class for sandbox lifetime expiry", got)
 		}
 	})
-}
-
-// ---- Slice B: probe verdict mapping.
-
-func TestClassifyClaudeAuthProbe(t *testing.T) {
-	if got := classifyClaudeAuthProbe(nil); got != authProbeValid {
-		t.Fatalf("nil probe err = %d, want valid", got)
-	}
-	if got := classifyClaudeAuthProbe(errors.New("some network blip")); got != authProbeUnknown {
-		t.Fatalf("transient probe err = %d, want unknown", got)
-	}
-	authErr := errors.Join(errors.New("rejected"), runtime.ErrClaudeAuthFailed)
-	if got := classifyClaudeAuthProbe(authErr); got != authProbeInvalid {
-		t.Fatalf("auth-failed probe err = %d, want invalid", got)
-	}
-}
-
-// A non-auth deferral is never probe-gated (the gate is only for runtime_auth).
-func TestAuthProbeAllowsRedispatchOnlyGatesAuth(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerAgent(t, store, "qbot", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "quota-job", Agent: "qbot", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1,
-	})
-	job, _ := store.GetJob(ctx, "quota-job")
-	payload, _ := daemonJobPayload(job)
-	payload.BlockerClass = string(blockerClassRuntimeQuota)
-	encoded, _ := json.Marshal(payload)
-	_ = store.UpdateJobPayload(ctx, "quota-job", string(encoded))
-	job, _ = store.GetJob(ctx, "quota-job")
-
-	worker := defaultJobWorker(store, io.Discard, t.TempDir())
-	probed := false
-	worker.AuthProbe = func(context.Context, db.Job, workflow.JobPayload) authProbeVerdict {
-		probed = true
-		return authProbeInvalid
-	}
-	if !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC(), nil) {
-		t.Fatal("a runtime_quota deferral was probe-gated; only runtime_auth should be")
-	}
-	if probed {
-		t.Fatal("the auth probe ran for a non-auth deferral")
-	}
 }

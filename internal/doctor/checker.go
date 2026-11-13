@@ -3,15 +3,12 @@ package doctor
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
-	"github.com/gitmoot/gitmoot/internal/presence"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
@@ -76,25 +73,8 @@ type DaemonLogStatus struct {
 type Checker struct {
 	Dir    string
 	Runner subprocess.Runner
-	// ClaudeProbeRunner and ClaudeAuthLookup let the one-shot CLI doctor probe
-	// the exact environment used for Claude deliveries. Other callers leave
-	// these unset and retain the inexpensive ambient-presence behavior.
-	ClaudeProbeRunner subprocess.Runner
-	ClaudeAuthLookup  func(string) (string, bool)
-	ClaudeAuthSource  string
-	ClaudeAuthError   error
-	SkipDaemonAuth    bool
-	// LiveProbe opts the claude auth check into a live `claude -p` probe when the
-	// auth env is not Ready, instead of false-reporting OK:false on a cached-creds
-	// box. It is opt-in because GlobalChecks is re-run on every dashboard refresh
-	// and an unconditional probe would spawn claude each time. The one-shot
-	// `gitmoot doctor` sets this true; dashboards leave it false.
-	LiveProbe bool
-	// Paths locates the running daemon for the daemon-aware claude auth check
-	// (issue #427). When unset, the daemon check is skipped and only the
-	// shell-local check is reported. The signal that actually matters for Claude
-	// background jobs is the daemon's own environment, not the shell that ran
-	// `gitmoot doctor`.
+	// Paths locates the gitmoot home for checks that read its config (the org
+	// registry's herdr version check). Unset skips them.
 	Paths config.Paths
 	// Build is supplied by the CLI so this package stays independent of both
 	// buildinfo and daemon-state persistence. Nil omits the check for callers
@@ -124,29 +104,25 @@ func (c Checker) Run(ctx context.Context) []Check {
 	return append(checks, c.RepoChecks(ctx, c.Dir)...)
 }
 
+// OmpRemediation is appended when the omp binary is missing or broken: omp is
+// the only job runtime (#2587), so every review, ask and implement job needs it.
+const OmpRemediation = "gitmoot requires omp to run jobs; install omp (oh-my-pi) and make sure it is on the daemon's PATH"
+
 // GlobalChecks returns the diagnostics that do not depend on any repo checkout:
-// required/optional runtime binaries and the auth checks. They can run from
-// anywhere, so the dashboard renders them once.
+// the required binaries (git, gh and the omp job runtime) and gh auth. They can
+// run from anywhere, so the dashboard renders them once.
 func (c Checker) GlobalChecks(ctx context.Context) []Check {
 	runner := c.runner()
+	omp := c.command(ctx, runner, "omp", true, "--version")
+	if !omp.OK {
+		omp.Detail = strings.TrimPrefix(strings.TrimSpace(omp.Detail)+"; "+OmpRemediation, "; ")
+	}
 	checks := []Check{
 		c.command(ctx, runner, "git", true, "--version"),
 		c.command(ctx, runner, "gh", true, "--version"),
-		c.command(ctx, runner, "codex", true, "--version"),
-		c.command(ctx, runner, "claude", false, "--help"),
-		c.command(ctx, runner, "kimi", false, "--version"),
-		c.command(ctx, runner, "omp", false, "--version"),
+		omp,
 	}
-	// The daemon is what actually runs Claude background jobs, so report its auth
-	// state first when it can be detected (issue #427). The shell-local check
-	// follows, clearly labeled, so a warn in a terminal can't be mistaken for "the
-	// daemon is broken".
-	if !c.SkipDaemonAuth {
-		if daemon, ok := c.claudeAuthDaemon(ctx); ok {
-			checks = append(checks, daemon)
-		}
-	}
-	checks = append(checks, c.claudeAuthEnv(ctx), c.ghAuth(ctx, runner))
+	checks = append(checks, c.ghAuth(ctx, runner))
 	if c.Build != nil {
 		checks = append(checks, CheckBuild(*c.Build))
 	}
@@ -413,154 +389,6 @@ func (c Checker) baseBranch(ctx context.Context, runner subprocess.Runner, dir s
 		return Check{Name: "base branch", Required: true, Detail: "detached HEAD"}
 	}
 	return Check{Name: "base branch", OK: true, Required: true, Detail: branch}
-}
-
-// claudeShellAuthLabel prefixes the shell-local claude auth detail so a warn in
-// one terminal can't be mistaken for "the daemon is broken": the env-based check
-// only ever reflects the shell that ran the command, not the daemon that runs
-// background jobs (issue #427).
-const claudeShellAuthLabel = "current shell (not the daemon)"
-
-// claudeAuthDaemon reports the running daemon's Claude auth state, best-effort.
-// The daemon is what actually runs Claude background jobs, so its environment —
-// not the invoking shell — is the signal that matters. It is OS-gated and
-// fail-open (Linux /proc only): when the daemon isn't running or its environment
-// can't be read it returns ok=false and the caller falls back to the shell-local
-// check. Secrets are never printed (masked set/unset only).
-func (c Checker) claudeAuthDaemon(ctx context.Context) (Check, bool) {
-	if strings.TrimSpace(c.Paths.Home) == "" {
-		return Check{}, false
-	}
-	snap := presence.InspectDaemonClaudeAuth(c.Paths)
-	base, ok := claudeAuthDaemonCheck(snap)
-	if !ok {
-		return Check{}, false
-	}
-	// Dashboard path (LiveProbe false) or a daemon with no credential: keep the
-	// presence-only report. The dashboard must never spawn claude, and an
-	// unauthenticated daemon is already a warn — only the one-shot `gitmoot doctor`
-	// validates the live token. The prior code reported OK:true for a set-but-
-	// invalid daemon token (#486); below it actually probes that exact token.
-	if !c.LiveProbe || !snap.Auth.Ready() {
-		return base, true
-	}
-	credEnv, hasCred := presence.DaemonClaudeCredEnv(c.Paths)
-	if !hasCred {
-		// Booleans were readable but the values are not (non-Linux, hardened /proc):
-		// fall back to presence rather than probe the doctor's own credential, which
-		// may differ from the daemon's and would give a misleading verdict.
-		return base, true
-	}
-	// Isolate the probe to the injected daemon token: point claude at a throwaway
-	// empty CLAUDE_CONFIG_DIR so cached ~/.claude credentials in the doctor's HOME
-	// cannot mask a bad daemon token — the decisive token-only test for #486. If the
-	// throwaway dir can't be created, fall through with the (already neutralized)
-	// credEnv rather than skipping the probe.
-	if probeDir, err := os.MkdirTemp("", "gitmoot-claude-probe-"); err == nil {
-		defer os.RemoveAll(probeDir)
-		credEnv = append(credEnv, runtime.ClaudeConfigDirEnv+"="+probeDir)
-	}
-	masked := "running daemon (pid " + strconv.Itoa(snap.PID) + "): " + snap.Auth.MaskedDetail()
-	probeErr := runtime.ClaudeLiveCheckEnv(ctx, c.runner(), "", credEnv)
-	return claudeProbeCheck("claude auth (daemon)", masked, "live token check passed", true, probeErr), true
-}
-
-// claudeAuthDaemonCheck builds the daemon-aware claude auth Check from an already
-// inspected snapshot. It is split from claudeAuthDaemon so the Detected=true
-// branches (Check name/detail, pid prefix, masked set/unset, warn vs ok) are
-// testable without a live daemon or readable /proc (issue #427). Secrets never
-// reach the detail — only daemon.Auth.MaskedDetail()'s set/unset booleans.
-func claudeAuthDaemonCheck(daemon presence.DaemonAuthSnapshot) (Check, bool) {
-	if !daemon.Detected {
-		return Check{}, false
-	}
-	masked := daemon.Auth.MaskedDetail()
-	detail := "running daemon (pid " + strconv.Itoa(daemon.PID) + "): " + masked
-	if daemon.Auth.Ready() {
-		if warning := daemon.Auth.Warning(); warning != "" {
-			detail += "; " + warning
-		}
-		return Check{Name: "claude auth (daemon)", OK: true, Required: false, Detail: detail}, true
-	}
-	detail += "; " + runtime.ClaudeBackgroundTokenMessage
-	return Check{Name: "claude auth (daemon)", OK: false, Required: false, Detail: detail}, true
-}
-
-func (c Checker) claudeAuthEnv(ctx context.Context) Check {
-	lookup := c.ClaudeAuthLookup
-	if lookup == nil {
-		lookup = os.LookupEnv
-	}
-	source := strings.TrimSpace(c.ClaudeAuthSource)
-	if source == "" {
-		source = claudeShellAuthLabel
-	}
-	if c.ClaudeAuthError != nil {
-		return Check{Name: "claude auth", Required: false, Detail: source + ": " + c.ClaudeAuthError.Error()}
-	}
-	auth := runtime.InspectClaudeAuthEnv(lookup)
-	masked := source + ": " + auth.MaskedDetail()
-	withWarn := func(detail string) string {
-		if warning := auth.Warning(); warning != "" {
-			return detail + "; " + warning
-		}
-		return detail
-	}
-	// Dashboard path (LiveProbe false): never spawn claude — GlobalChecks reruns
-	// on every dashboard refresh. Report the env-presence signal only. A set token
-	// reads OK; an unset one warns (foreground Claude may still authenticate via
-	// cached ~/.claude credentials, hence non-required).
-	if !c.LiveProbe {
-		return Check{Name: "claude auth", OK: auth.Ready(), Required: false, Detail: withWarn(masked)}
-	}
-	// One-shot `gitmoot doctor` (LiveProbe true): a token that is merely SET is not
-	// proof it authenticates (#486) — the prior code short-circuited a present token
-	// to OK:true and never probed, so an invalid CLAUDE_CODE_OAUTH_TOKEN reported
-	// ok. Probe the real dependency (a fresh `claude -p`, the same non-interactive
-	// path daemon jobs take) and distinguish valid / invalid / unknown. The probe
-	// also covers the cached-creds case (no env token) it always did.
-	probeRunner := c.ClaudeProbeRunner
-	if probeRunner == nil {
-		probeRunner = c.runner()
-	}
-	probeErr := runtime.ClaudeLiveCheckEnv(ctx, probeRunner, "", nil)
-	return claudeProbeCheck("claude auth", masked, runtime.ClaudeBackgroundTokenMessage, auth.Ready(), probeErr)
-}
-
-// claudeProbeCheck maps a live-probe outcome to a claude auth Check, distinguishing
-// valid / invalid / unknown (#486). It is shared by the shell-local and the
-// daemon-aware checks so both VALIDATE the credential instead of trusting that it
-// is merely set:
-//   - valid   → OK:true,  detail + okCaveat (the caveat is empty when the probe
-//     validated the exact credential that matters, e.g. the daemon's own token).
-//   - invalid → OK:false, the credential was rejected — the false-green this fixes.
-//   - unknown → fail-open so doctor never goes red on a transient/network blip or a
-//     missing binary: a binary that could not run is a probe-unavailable warn; a
-//     transient error leaves a SET credential reported (OK) but clearly unvalidated,
-//     while an UNSET credential stays a warn.
-func claudeProbeCheck(name, masked, okCaveat string, ready bool, probeErr error) Check {
-	switch runtime.ClaudeClassifyProbe(probeErr) {
-	case runtime.ClaudeTokenValid:
-		detail := masked
-		if okCaveat != "" {
-			detail += "; " + okCaveat
-		}
-		return Check{Name: name, OK: true, Required: false, Detail: detail}
-	case runtime.ClaudeTokenInvalid:
-		return Check{Name: name, OK: false, Required: false, Detail: masked + "; " + runtime.ClaudeSessionAuthFailedMessage}
-	default: // unknown
-		if runtime.ClaudeProbeUnavailable(probeErr) {
-			// Missing/unrunnable binary is not an auth regression; the claude CLI
-			// presence check already covers it. Keep it a non-required warn.
-			return Check{Name: name, OK: false, Required: false, Detail: masked + "; " + runtime.ClaudeBackgroundTokenMessage + " (probe unavailable)"}
-		}
-		if ready {
-			// A transient/network error must not flip a SET credential to a failure
-			// (that would make doctor flaky); report it as set-but-unvalidated.
-			return Check{Name: name, OK: true, Required: false, Detail: masked + "; could not validate the token (transient error); reporting it set-but-unvalidated"}
-		}
-		return Check{Name: name, OK: false, Required: false, Detail: masked + "; " + runtime.ClaudeBackgroundTokenMessage}
-	}
 }
 
 func FailedRequired(checks []Check) error {

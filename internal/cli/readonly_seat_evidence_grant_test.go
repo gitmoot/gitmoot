@@ -175,10 +175,10 @@ func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
 	// received acme/secret-service's verdicts while the artifact claimed to be
 	// scoped to the repo it was reviewing.
 	agent := runtime.Agent{
-		Name: "seat", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
+		Name: "seat", Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
 		RepoScope: "acme/secret-service",
 	}
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestReadOnlyGrantsStagePriorVerdictsThroughProduction(t *testing.T) {
 
 	// And with no repo under review there is no artifact and a stated reason,
 	// rather than a fallback to the agent's scope.
-	unscoped, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "", true)
+	unscoped, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "")
 	if err != nil {
 		t.Fatalf("readOnlyRuntimeSandboxGrants without a repo: %v", err)
 	}

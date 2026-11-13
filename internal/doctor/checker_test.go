@@ -3,13 +3,9 @@ package doctor
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/presence"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
@@ -33,13 +29,12 @@ func (f fakeRunner) Run(ctx context.Context, dir string, command string, args ..
 }
 
 func TestCheckerRun(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
 	runner := fakeRunner{
-		paths: map[string]bool{"git": true, "gh": true, "codex": true},
+		paths: map[string]bool{"git": true, "gh": true, "omp": true},
 		runs: map[string]subprocess.Result{
 			"git --version":             {Stdout: "git version 2\n"},
 			"gh --version":              {Stdout: "gh version 2\n"},
-			"codex --version":           {Stdout: "codex 1\n"},
+			"omp --version":             {Stdout: "omp/18.5.0\n"},
 			"gh auth status":            {Stdout: "Logged in\n"},
 			"git remote get-url origin": {Stdout: "https://github.com/gitmoot/gitmoot.git\n"},
 			"gh repo view gitmoot/gitmoot --json nameWithOwner": {Stdout: `{"nameWithOwner":"gitmoot/gitmoot"}`},
@@ -51,22 +46,40 @@ func TestCheckerRun(t *testing.T) {
 	if err := FailedRequired(checks); err != nil {
 		t.Fatalf("FailedRequired returned error: %v\nchecks=%+v", err, checks)
 	}
-	foundClaudeAuth := false
 	for _, check := range checks {
-		if check.Name != "claude auth" {
+		switch check.Name {
+		case "codex", "claude", "kimi", "claude auth", "claude auth (daemon)":
+			t.Fatalf("doctor still checks removed runtime %q: %+v", check.Name, check)
+		}
+	}
+}
+
+// TestCheckerFailsClearlyWithoutOmp: omp is the only job runtime (#2587), so a
+// host without it fails doctor with a detail that says gitmoot requires omp.
+func TestCheckerFailsClearlyWithoutOmp(t *testing.T) {
+	runner := fakeRunner{
+		paths: map[string]bool{"git": true, "gh": true},
+		runs: map[string]subprocess.Result{
+			"git --version":  {Stdout: "git version 2\n"},
+			"gh --version":   {Stdout: "gh version 2\n"},
+			"gh auth status": {Stdout: "Logged in\n"},
+		},
+	}
+	checks := Checker{Runner: runner}.GlobalChecks(context.Background())
+	err := FailedRequired(checks)
+	if err == nil || !strings.Contains(err.Error(), "omp") {
+		t.Fatalf("FailedRequired = %v, want a failure naming omp", err)
+	}
+	for _, check := range checks {
+		if check.Name != "omp" {
 			continue
 		}
-		foundClaudeAuth = true
-		if !check.OK || check.Required {
-			t.Fatalf("claude auth check = %+v, want optional ok check", check)
+		if check.OK || !check.Required || !strings.Contains(check.Detail, "requires omp") {
+			t.Fatalf("omp check = %+v, want required failure saying gitmoot requires omp", check)
 		}
-		if !strings.Contains(check.Detail, "CLAUDE_CODE_OAUTH_TOKEN=set") || strings.Contains(check.Detail, "secret-token") {
-			t.Fatalf("claude auth detail = %q", check.Detail)
-		}
+		return
 	}
-	if !foundClaudeAuth {
-		t.Fatalf("checks missing claude auth: %+v", checks)
-	}
+	t.Fatalf("checks missing omp: %+v", checks)
 }
 
 func TestCheckerFailsOnMissingRequiredCommand(t *testing.T) {
@@ -76,244 +89,15 @@ func TestCheckerFailsOnMissingRequiredCommand(t *testing.T) {
 	}
 }
 
-func TestCheckerWarnsWhenClaudeAuthEnvMissing(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	checks := Checker{Runner: fakeRunner{paths: map[string]bool{}}}.Run(context.Background())
-	for _, check := range checks {
-		if check.Name == "claude auth" {
-			if check.OK || check.Required {
-				t.Fatalf("claude auth check = %+v, want optional warning", check)
-			}
-			if !strings.Contains(check.Detail, "claude setup-token") {
-				t.Fatalf("claude auth detail = %q, want setup-token guidance", check.Detail)
-			}
-			return
-		}
-	}
-	t.Fatalf("checks missing claude auth: %+v", checks)
-}
-
-// claudeProbeKey is the fakeRunner key for the live claude -p JSON probe that
-// ClaudeLiveCheck issues.
-var claudeProbeKey = "claude -p --output-format json -- " + runtime.ClaudeLiveCheckPrompt
-
-// countingRunner wraps fakeRunner and records every Run invocation so a test can
-// assert the probe never fired (the dashboard / env-Ready paths).
-type countingRunner struct {
-	fakeRunner
-	runs *int
-}
-
-func (r countingRunner) Run(ctx context.Context, dir, command string, args ...string) (subprocess.Result, error) {
-	*r.runs++
-	return r.fakeRunner.Run(ctx, dir, command, args...)
-}
-
-// TestClaudeAuthEnvLiveProbeOKFlipsWarnToOK is the load-bearing PR3 flip: with
-// no env token but a successful live probe, LiveProbe reports OK:true (the
-// env-only behavior returned OK:false). Reverting claudeAuthEnv to env-only
-// makes this assert OK:true -> false.
-func TestClaudeAuthEnvLiveProbeOKFlipsWarnToOK(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	runs := 0
-	runner := countingRunner{
-		fakeRunner: fakeRunner{
-			runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
-		},
-		runs: &runs,
-	}
-	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-	if !check.OK || check.Required {
-		t.Fatalf("claude auth check = %+v, want OK:true non-required", check)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
-	}
-	if runs != 1 {
-		t.Fatalf("probe ran %d times, want exactly 1", runs)
-	}
-}
-
-func TestClaudeAuthEnvLiveProbeReportsResolvedSource(t *testing.T) {
-	runner := fakeRunner{
-		runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
-	}
-	check := Checker{
-		Runner:            fakeRunner{},
-		LiveProbe:         true,
-		ClaudeProbeRunner: runner,
-		ClaudeAuthLookup: func(name string) (string, bool) {
-			if name == runtime.ClaudeOAuthTokenEnv {
-				return "secret-never-rendered", true
-			}
-			return "", false
-		},
-		ClaudeAuthSource: "runtime-auth.env",
-	}.claudeAuthEnv(context.Background())
-	if !check.OK || !strings.Contains(check.Detail, "runtime-auth.env") {
-		t.Fatalf("check = %+v", check)
-	}
-	if strings.Contains(check.Detail, "secret-never-rendered") {
-		t.Fatalf("detail leaked credential: %q", check.Detail)
-	}
-}
-
-func TestClaudeAuthEnvLiveProbeFailIsNotOK(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	runner := fakeRunner{
-		runs: map[string]subprocess.Result{claudeProbeKey: {Stderr: "401 Invalid authentication credentials"}},
-		errs: map[string]error{claudeProbeKey: fmt.Errorf("exit 1")},
-	}
-	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-	if check.OK {
-		t.Fatalf("claude auth check = %+v, want OK:false on probe failure", check)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeSessionAuthFailedMessage) {
-		t.Fatalf("claude auth detail = %q, want session-failure message", check.Detail)
-	}
-}
-
-func TestClaudeAuthEnvLiveProbeUnavailableWarns(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	runner := fakeRunner{
-		errs: map[string]error{claudeProbeKey: &exec.Error{Name: "claude", Err: exec.ErrNotFound}},
-	}
-	check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-	if check.OK || check.Required {
-		t.Fatalf("claude auth check = %+v, want OK:false non-required (probe unavailable)", check)
-	}
-	if !strings.Contains(check.Detail, "probe unavailable") {
-		t.Fatalf("claude auth detail = %q, want probe-unavailable caveat", check.Detail)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
-	}
-}
-
-// TestClaudeAuthEnvDashboardNeverProbes guards the critical invariant: the
-// dashboard path (LiveProbe false) reports the env-only warn WITHOUT consulting
-// the runner — so a dashboard refresh never spawns claude.
-func TestClaudeAuthEnvDashboardNeverProbes(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	runs := 0
-	// A runner that returns success if ever called for the probe — proving the
-	// dashboard path does not run it (otherwise OK would flip to true).
-	runner := countingRunner{
-		fakeRunner: fakeRunner{
-			runs: map[string]subprocess.Result{claudeProbeKey: {Stdout: `{"result":"OK"}`}},
-		},
-		runs: &runs,
-	}
-	check := Checker{Runner: runner, LiveProbe: false}.claudeAuthEnv(context.Background())
-	if check.OK {
-		t.Fatalf("claude auth check = %+v, want OK:false (env-only warn, no probe)", check)
-	}
-	if runs != 0 {
-		t.Fatalf("dashboard path ran the runner %d times, want 0 (must never spawn claude)", runs)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("claude auth detail = %q, want background-token caveat", check.Detail)
-	}
-}
-
-// TestClaudeAuthEnvLiveProbeValidatesSetToken486 is the #486 regression: with an
-// env token PRESENT and LiveProbe on, `gitmoot doctor` must actually validate the
-// token instead of short-circuiting a set credential to OK:true. The prior code
-// trusted presence and never probed, so an invalid CLAUDE_CODE_OAUTH_TOKEN
-// reported "ok" while it 401'd fresh sessions. Each case asserts the probe RAN
-// (runs==1) and that valid/invalid/transient map to OK / not-OK / set-but-
-// unvalidated, with transient never reported as invalid (no flaky red).
-//
-// Reverting claudeAuthEnv to the set-token instant path makes the invalid case
-// assert OK:false against the old OK:true — a failing-then-passing guard.
-func TestClaudeAuthEnvLiveProbeValidatesSetToken486(t *testing.T) {
-	for _, tt := range []struct {
-		name        string
-		result      subprocess.Result
-		err         error
-		wantOK      bool
-		wantDetail  string
-		wantNoMatch string
-		wantRuns    int
-	}{
-		{
-			name:       "valid token authenticates",
-			result:     subprocess.Result{Stdout: `{"result":"OK"}`},
-			wantOK:     true,
-			wantDetail: runtime.ClaudeBackgroundTokenMessage,
-			wantRuns:   1,
-		},
-		{
-			name:        "invalid token is rejected not ok",
-			result:      subprocess.Result{Stderr: "401 Invalid authentication credentials"},
-			err:         fmt.Errorf("exit 1"),
-			wantOK:      false,
-			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
-			wantNoMatch: "could not validate",
-			wantRuns:    1,
-		},
-		{
-			// The EXACT documented #486 symptom of an invalid CLAUDE_CODE_OAUTH_TOKEN:
-			// it carries "authenticate" + "401" but NOT "authentication", so the prior
-			// probe classified it Unknown and doctor reported OK:true. The probe retries
-			// the 401-socket-closed once (wantRuns 2) and, persisting, reports OK:false.
-			name:        "documented invalid-token socket-closed 401 is rejected",
-			result:      subprocess.Result{Stderr: "Failed to authenticate. API Error: 401 The socket connection was closed unexpectedly"},
-			err:         fmt.Errorf("exit 1"),
-			wantOK:      false,
-			wantDetail:  runtime.ClaudeSessionAuthFailedMessage,
-			wantNoMatch: "could not validate",
-			wantRuns:    2,
-		},
-		{
-			name:        "transient error is unknown not invalid",
-			result:      subprocess.Result{Stderr: "could not connect: network is unreachable"},
-			err:         fmt.Errorf("exit 1"),
-			wantOK:      true,
-			wantDetail:  "could not validate the token",
-			wantNoMatch: runtime.ClaudeSessionAuthFailedMessage,
-			wantRuns:    1,
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-			runs := 0
-			runner := countingRunner{
-				fakeRunner: fakeRunner{
-					runs: map[string]subprocess.Result{claudeProbeKey: tt.result},
-					errs: map[string]error{claudeProbeKey: tt.err},
-				},
-				runs: &runs,
-			}
-			check := Checker{Runner: runner, LiveProbe: true}.claudeAuthEnv(context.Background())
-			if runs != tt.wantRuns {
-				t.Fatalf("probe ran %d times, want exactly %d (a set token must be validated, not trusted)", runs, tt.wantRuns)
-			}
-			if check.OK != tt.wantOK {
-				t.Fatalf("claude auth check = %+v, want OK=%t", check, tt.wantOK)
-			}
-			if !strings.Contains(check.Detail, tt.wantDetail) {
-				t.Fatalf("claude auth detail = %q, want substring %q", check.Detail, tt.wantDetail)
-			}
-			if tt.wantNoMatch != "" && strings.Contains(check.Detail, tt.wantNoMatch) {
-				t.Fatalf("claude auth detail = %q, must not contain %q", check.Detail, tt.wantNoMatch)
-			}
-			if strings.Contains(check.Detail, "secret-token") {
-				t.Fatalf("claude auth detail = %q must never print the token", check.Detail)
-			}
-		})
-	}
-}
-
 func TestCheckerRunsGlobalChecksOutsideRepoDir(t *testing.T) {
 	runner := dirSensitiveRunner{
 		badDir: "/missing",
 		fakeRunner: fakeRunner{
-			paths: map[string]bool{"git": true, "gh": true, "codex": true},
+			paths: map[string]bool{"git": true, "gh": true, "omp": true},
 			runs: map[string]subprocess.Result{
 				"git --version":             {Stdout: "git version 2\n"},
 				"gh --version":              {Stdout: "gh version 2\n"},
-				"codex --version":           {Stdout: "codex 1\n"},
+				"omp --version":             {Stdout: "omp/18.5.0\n"},
 				"gh auth status":            {Stdout: "Logged in\n"},
 				"git remote get-url origin": {Stderr: "not a repo\n"},
 				"git branch --show-current": {Stderr: "not a repo\n"},
@@ -329,7 +113,7 @@ func TestCheckerRunsGlobalChecksOutsideRepoDir(t *testing.T) {
 
 	for _, check := range checks {
 		switch check.Name {
-		case "git", "gh", "codex", "gh auth":
+		case "git", "gh", "omp", "gh auth":
 			if !check.OK {
 				t.Fatalf("%s check failed even though it is global: %+v", check.Name, check)
 			}
@@ -354,40 +138,6 @@ func (r dirSensitiveRunner) Run(ctx context.Context, dir string, command string,
 	return r.fakeRunner.Run(ctx, dir, command, args...)
 }
 
-func withClaudeAuthEnv(t *testing.T, values map[string]string) {
-	t.Helper()
-	names := []string{
-		runtime.ClaudeOAuthTokenEnv,
-		runtime.AnthropicAPIKeyEnv,
-		runtime.AnthropicAuthTokenEnv,
-	}
-	previous := make(map[string]string, len(names))
-	present := make(map[string]bool, len(names))
-	for _, name := range names {
-		if value, ok := os.LookupEnv(name); ok {
-			previous[name] = value
-			present[name] = true
-		}
-		if err := os.Unsetenv(name); err != nil {
-			t.Fatalf("unset %s: %v", name, err)
-		}
-	}
-	for name, value := range values {
-		if err := os.Setenv(name, value); err != nil {
-			t.Fatalf("set %s: %v", name, err)
-		}
-	}
-	t.Cleanup(func() {
-		for _, name := range names {
-			if present[name] {
-				_ = os.Setenv(name, previous[name])
-			} else {
-				_ = os.Unsetenv(name)
-			}
-		}
-	})
-}
-
 func TestRepoChecksNoCheckoutWarns(t *testing.T) {
 	checks := Checker{Runner: fakeRunner{paths: map[string]bool{}}}.RepoChecks(context.Background(), "")
 	if len(checks) != 1 {
@@ -404,12 +154,12 @@ func TestRepoChecksNoCheckoutWarns(t *testing.T) {
 
 func TestGlobalChecksHaveNoRepoChecks(t *testing.T) {
 	runner := fakeRunner{
-		paths: map[string]bool{"git": true, "gh": true, "codex": true},
+		paths: map[string]bool{"git": true, "gh": true, "omp": true},
 		runs: map[string]subprocess.Result{
-			"git --version":   {Stdout: "git version 2\n"},
-			"gh --version":    {Stdout: "gh version 2\n"},
-			"codex --version": {Stdout: "codex 1\n"},
-			"gh auth status":  {Stdout: "Logged in\n"},
+			"git --version":  {Stdout: "git version 2\n"},
+			"gh --version":   {Stdout: "gh version 2\n"},
+			"omp --version":  {Stdout: "omp/18.5.0\n"},
+			"gh auth status": {Stdout: "Logged in\n"},
 		},
 	}
 	for _, c := range (Checker{Runner: runner}).GlobalChecks(context.Background()) {
@@ -477,94 +227,4 @@ func (r pathSensitiveRunner) Run(ctx context.Context, dir string, command string
 		return subprocess.Result{}, fmt.Errorf("ran in %q, want %q", dir, r.want)
 	}
 	return r.fakeRunner.Run(ctx, dir, command, args...)
-}
-
-// TestClaudeAuthEnvLabeledAsShellScoped guards the #427 fix: the shell-local
-// claude auth check must label itself as reflecting the current shell, not the
-// daemon, so a warn in one terminal can't be mistaken for "the daemon is broken".
-func TestClaudeAuthEnvLabeledAsShellScoped(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-	check := Checker{}.claudeAuthEnv(context.Background())
-	if !check.OK {
-		t.Fatalf("claude auth check = %+v, want OK with env token", check)
-	}
-	if !strings.Contains(check.Detail, claudeShellAuthLabel) {
-		t.Fatalf("claude auth detail = %q, want shell-scoped label %q", check.Detail, claudeShellAuthLabel)
-	}
-	if strings.Contains(check.Detail, "secret-token") {
-		t.Fatalf("claude auth detail = %q must never print the token", check.Detail)
-	}
-}
-
-// TestClaudeAuthDaemonSkippedWithoutPaths guards the fail-open contract: with no
-// Paths the daemon-aware check is skipped (ok=false) and callers fall back to the
-// shell-local check, so GlobalChecks never invents a daemon check it can't back.
-func TestClaudeAuthDaemonSkippedWithoutPaths(t *testing.T) {
-	if _, ok := (Checker{}).claudeAuthDaemon(context.Background()); ok {
-		t.Fatalf("claudeAuthDaemon returned a check without Paths set; want skip")
-	}
-}
-
-// TestClaudeAuthDaemonCheckReadyBuildsLabeledCheck exercises the Detected=true
-// ok branch (#427) without a live daemon: a detected daemon whose env carries an
-// OAuth token yields an OK `claude auth (daemon)` check whose detail is prefixed
-// with the daemon pid and reports the masked set/unset booleans — never a secret.
-func TestClaudeAuthDaemonCheckReadyBuildsLabeledCheck(t *testing.T) {
-	check, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{
-		Running:  true,
-		PID:      4321,
-		Detected: true,
-		Auth:     runtime.ClaudeAuthEnv{ClaudeOAuthToken: true},
-	})
-	if !ok {
-		t.Fatalf("claudeAuthDaemonCheck ok=false for a detected daemon, want true")
-	}
-	if check.Name != "claude auth (daemon)" {
-		t.Fatalf("check.Name = %q, want \"claude auth (daemon)\"", check.Name)
-	}
-	if !check.OK || check.Required {
-		t.Fatalf("check = %+v, want optional OK check for a token-bearing daemon", check)
-	}
-	if !strings.Contains(check.Detail, "running daemon (pid 4321):") {
-		t.Fatalf("check.Detail = %q, want pid-prefixed daemon detail", check.Detail)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeOAuthTokenEnv+"=set") {
-		t.Fatalf("check.Detail = %q, want masked CLAUDE_CODE_OAUTH_TOKEN=set", check.Detail)
-	}
-	if strings.Contains(check.Detail, "set; ANTHROPIC") && !strings.Contains(check.Detail, "=unset") {
-		t.Fatalf("check.Detail = %q, want unset reported for absent vars", check.Detail)
-	}
-}
-
-// TestClaudeAuthDaemonCheckUnauthenticatedWarns exercises the Detected=true warn
-// branch: a detected daemon with no token yields an OK:false check carrying the
-// background-token persistence guidance, still pid-prefixed and secret-free.
-func TestClaudeAuthDaemonCheckUnauthenticatedWarns(t *testing.T) {
-	check, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{
-		Running:  true,
-		PID:      7,
-		Detected: true,
-		Auth:     runtime.ClaudeAuthEnv{},
-	})
-	if !ok {
-		t.Fatalf("claudeAuthDaemonCheck ok=false for a detected daemon, want true")
-	}
-	if check.OK || check.Required {
-		t.Fatalf("check = %+v, want optional warn for an unauthenticated daemon", check)
-	}
-	if !strings.Contains(check.Detail, "running daemon (pid 7):") {
-		t.Fatalf("check.Detail = %q, want pid-prefixed daemon detail", check.Detail)
-	}
-	if !strings.Contains(check.Detail, runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("check.Detail = %q, want background-token persistence guidance", check.Detail)
-	}
-}
-
-// TestClaudeAuthDaemonCheckSkipsWhenUndetected guards the fail-open contract at
-// the construction seam: an undetected snapshot (non-Linux, unreadable /proc, or
-// no daemon) yields ok=false so callers fall back to the shell-local check.
-func TestClaudeAuthDaemonCheckSkipsWhenUndetected(t *testing.T) {
-	if _, ok := claudeAuthDaemonCheck(presence.DaemonAuthSnapshot{Running: true, PID: 9, Detected: false}); ok {
-		t.Fatalf("claudeAuthDaemonCheck ok=true for an undetected daemon, want skip")
-	}
 }

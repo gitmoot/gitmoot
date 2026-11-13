@@ -1031,7 +1031,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// #684's "busy reviewer session leaves the review queued" is unchanged.
 	sessionLockAgent := effectiveAgent
 	if readOnlyWorktreePath != "" || request.remoteSource {
-		if err := applyReadOnlySeat(true, selectedRuntimeConfigDir(effectiveAgent.Runtime), jobID, &effectiveAgent); err != nil {
+		if err := applyReadOnlySeat(true, "", jobID, &effectiveAgent); err != nil {
 			return localAgentJobOutput{}, fmt.Errorf("isolate read-only seat session: %w", err)
 		}
 		if request.Action != "review" {
@@ -1431,15 +1431,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// the daemon worker: it must never replace the foreground job's outcome.
 		_ = quotaHooks.recordRuntimeOutcome(ctx, job, payload, effectiveAgent, runErr, time.Now().UTC())
 	}
-	// #1856: the two LOCAL CLI child-delivery boundaries. They are the arms of
-	// this one if/else - an ask delivers through mailbox.Run and never reaches
-	// engine.RunJob - so bracketing only the else arm would leave foreground and
-	// task-scoped asks, the largest non-seat CLI population, unobserved.
-	//
-	// effectiveAgent is deliberately the observed value rather than `agent`: a
-	// per-job runtime override can make them differ, and the observation must
-	// describe the child that actually ran.
-	credentialBefore, credentialObserved := observeNonSeatKimiCredential(effectiveAgent)
 	if request.Action == "ask" {
 		// Wire the home-aware registry defaults so a foreground ask with no
 		// agent/job model or effort pin honors the runtime's defaults too.
@@ -1449,7 +1440,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
 		_, runErr := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter)
-		recordKimiCredentialDegradation(ctx, store, io.Discard, job.ID, effectiveAgent, credentialBefore, credentialObserved)
 		if runErr != nil {
 			recordRuntimeOutcome(runErr)
 			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, runErr)
@@ -1465,7 +1455,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 		engine := daemonWorkflowEngineForRunner(store, newAgentDispatchGitHubClient(checkoutPath), checkoutPath, workflowHome, localDispatchJobRunner(request), nil)
 		_, runErr := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter)
-		recordKimiCredentialDegradation(ctx, store, io.Discard, job.ID, effectiveAgent, credentialBefore, credentialObserved)
 		if runErr != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, runErr); ok {
 				recordRuntimeOutcome(nil)

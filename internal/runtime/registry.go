@@ -26,7 +26,7 @@ import (
 // Gitmoot never REJECTS a --model based on it, so populating it cannot change how a
 // job is delivered.
 type RuntimeMetadata struct {
-	// Name is the runtime id (codex, claude, kimi, omp, shell).
+	// Name is the runtime id (omp, shell).
 	Name string
 	// Dispatchable is true for a runtime backed by a compiled Go adapter (every
 	// built-in). Config can TWEAK a built-in runtime's metadata but cannot add a
@@ -45,9 +45,8 @@ type RuntimeMetadata struct {
 	// Empty (the built-in default for every runtime) means "none recorded": nothing
 	// is forced, so delivery is byte-identical to before #652.
 	DefaultModel string
-	// DefaultEffort is the configured Codex reasoning effort consulted at delivery
-	// when neither the agent nor the job pins --effort. Other runtimes retain the
-	// value as metadata but do not emit a reasoning-effort argument.
+	// DefaultEffort is the configured reasoning effort consulted at delivery when
+	// neither the agent nor the job pins --effort.
 	DefaultEffort string
 	// Models is an ADVISORY list of known-valid model ids for the runtime. Empty
 	// (the default for every built-in) means "unrestricted": Gitmoot passes any
@@ -126,30 +125,6 @@ var builtinRegistry = newBuiltinRegistry()
 // registration order matches the historical SupportedRuntimes order.
 func newBuiltinRegistry() Registry {
 	metas := []RuntimeMetadata{
-		{
-			Name:         CodexRuntime,
-			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
-			UsageSource:  "codex `exec --json` turn.completed usage (session-cumulative on a resumed thread)",
-			Description:  "OpenAI Codex CLI (exec/resume, sandbox policy, session index)",
-			Contract:     codexRuntimeContract,
-		},
-		{
-			Name:         ClaudeRuntime,
-			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
-			UsageSource:  "claude `--output-format json` result envelope usage object",
-			Description:  "Anthropic Claude Code CLI (session-id/resume, permission modes, transient-retry)",
-			Contract:     claudeRuntimeContract,
-		},
-		{
-			Name:         KimiRuntime,
-			Dispatchable: true,
-			Capabilities: []string{"review", "implement", "ask"},
-			UsageSource:  "kimi `--output-format stream-json` usage event (kimi-code 0.19.2 emits none -> 0)",
-			Description:  "Kimi Code CLI (prompt mode, stream-json, per-job fresh session)",
-			Contract:     kimiRuntimeContract,
-		},
 		{
 			Name:         OmpRuntime,
 			Dispatchable: true,
@@ -230,6 +205,12 @@ func (r Registry) ApplyOverrides(overrides []MetadataOverride) (Registry, error)
 	}
 	for _, override := range overrides {
 		name := strings.TrimSpace(override.Name)
+		if IsRemovedRuntime(name) {
+			// A [runtimes.codex|claude|kimi] block written before #2587 is
+			// metadata for a runtime that no longer exists: ignore it so a live
+			// home keeps loading instead of failing on a removed key.
+			continue
+		}
 		meta, ok := out.entries[name]
 		if !ok {
 			return Registry{}, fmt.Errorf("unknown runtime %q in [runtimes.%s]: config can tweak built-in runtime metadata (%s) but cannot add a new runtime; a new first-class runtime requires a code change",

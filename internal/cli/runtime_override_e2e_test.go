@@ -23,9 +23,9 @@ import (
 
 // Per-job --runtime override E2Es (#531): deterministic, NO-LLM, offline.
 //
-// Setup in both tests: a registered agent whose DEFAULT runtime is codex (a
+// Setup in both tests: a registered agent whose DEFAULT runtime is omp (a
 // runtime that is NEVER invoked — its session ref is a non-existent named
-// session, so any accidental codex dispatch fails fast) is dispatched with
+// session, so any accidental omp dispatch fails fast) is dispatched with
 // `--runtime shell --session <script>`, where the script is a shell-runtime
 // fixture (the canary E2E pattern) that writes a marker file and
 // emits a valid approved gitmoot_result.
@@ -33,13 +33,13 @@ import (
 // Proven invariants:
 //   - the job SUCCEEDS via the SHELL adapter (terminal succeeded + the
 //     script's marker file exists). MUTATION: ignoring the override at the
-//     adapter-selection seam re-selects the codex adapter, whose delivery
-//     fails (no such codex session) — this assertion goes red;
+//     adapter-selection seam re-selects the omp adapter, whose delivery
+//     fails (no such omp session) — this assertion goes red;
 //   - the runtime-session lock key names the OVERRIDE runtime
 //     ("runtime:shell:<hash>", exposed by the runtime_override job event) and
 //     never the default runtime's session;
 //   - the agent's registered default runtime is untouched: `agent show`
-//     still reports codex with the original session ref and model.
+//     still reports omp with the original session ref and model.
 //
 // The foreground test drives the CLI dispatch path; the daemon test drives
 // enqueue-with-override -> the REAL worker tick, proving background jobs
@@ -95,7 +95,7 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 		t.Fatalf("payload effective_runtime = %q, want shell (#1528)", payload.EffectiveRuntime)
 	}
 
-	// The runtime-session lock key named the OVERRIDE runtime, never codex.
+	// The runtime-session lock key named the OVERRIDE runtime, never omp.
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
 		t.Fatalf("ListJobEvents: %v", err)
@@ -109,18 +109,18 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	if overrideEvent == "" {
 		t.Fatalf("expected a runtime_override job event, got %+v", events)
 	}
-	if !strings.Contains(overrideEvent, "job runs on runtime shell (agent default codex)") {
+	if !strings.Contains(overrideEvent, "job runs on runtime shell (agent default omp)") {
 		t.Fatalf("runtime_override event %q must expose effective + default runtime", overrideEvent)
 	}
 	if !strings.Contains(overrideEvent, "session lock runtime:shell:") {
 		t.Fatalf("runtime_override event %q must name a runtime:shell: session lock", overrideEvent)
 	}
-	if strings.Contains(overrideEvent, "runtime:codex") {
+	if strings.Contains(overrideEvent, "runtime:omp") {
 		t.Fatalf("override job must not touch the default-runtime session lock: %q", overrideEvent)
 	}
 	// The default-runtime session lock was never taken (and the override lock
 	// was released on the terminal path).
-	if _, err := store.GetResourceLock(ctx, "runtime:codex:"+runtimeOverrideCodexRef); !errors.Is(err, sql.ErrNoRows) {
+	if _, err := store.GetResourceLock(ctx, "runtime:omp:"+runtimeOverrideOmpRef); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("default-runtime session lock exists (err=%v); an override job must never take it", err)
 	}
 
@@ -131,7 +131,7 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 		t.Fatalf("agent show exit = %d, stderr=%s", code, errBuf.String())
 	}
 	show := out.String()
-	for _, want := range []string{"runtime: codex", "runtime_ref: " + runtimeOverrideCodexRef} {
+	for _, want := range []string{"runtime: omp", "runtime_ref: " + runtimeOverrideOmpRef} {
 		if !strings.Contains(show, want) {
 			t.Fatalf("agent show output %q must still report %q", show, want)
 		}
@@ -140,7 +140,7 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	if err != nil {
 		t.Fatalf("GetAgent: %v", err)
 	}
-	if stored.Runtime != runtime.CodexRuntime || stored.RuntimeRef != runtimeOverrideCodexRef || stored.Model != "gpt-5.5-codex" {
+	if stored.Runtime != runtime.OmpRuntime || stored.RuntimeRef != runtimeOverrideOmpRef || stored.Model != "openai/gpt-5.5" {
 		t.Fatalf("override persisted onto the agent config: runtime=%q ref=%q model=%q", stored.Runtime, stored.RuntimeRef, stored.Model)
 	}
 }

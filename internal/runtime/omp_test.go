@@ -929,7 +929,7 @@ func TestSupportsPlanMode(t *testing.T) {
 	if !SupportsPlanMode(OmpRuntime) || !SupportsPlanMode("  "+OmpRuntime+"  ") {
 		t.Fatal("omp must support plan mode")
 	}
-	for _, name := range []string{CodexRuntime, ClaudeRuntime, KimiRuntime, ShellRuntime, "", "bogus"} {
+	for _, name := range []string{"codex", "claude", "kimi", ShellRuntime, "", "bogus"} {
 		if SupportsPlanMode(name) {
 			t.Fatalf("runtime %q must not claim plan mode", name)
 		}
@@ -1207,9 +1207,6 @@ func TestOmpDeliverUsageSums(t *testing.T) {
 	}
 	if result.Summary != "done" {
 		t.Fatalf("Summary = %q, want the LAST assistant text", result.Summary)
-	}
-	if result.CumulativeUsage {
-		t.Fatal("CumulativeUsage = true; omp reports per-run usage, never session-cumulative")
 	}
 	// SessionDiag on the SUCCESS path, not just the failure paths: workflow/mailbox.go
 	// feeds it to storeFailureDiagnostics for a job that succeeded at the adapter but
@@ -3660,7 +3657,7 @@ func TestOmpStartReturnsUsableRef(t *testing.T) {
 			// runtime's agent, and a policy no argv mapping exists for.
 			{name: "unusable runtime ref", mutdt: func(a *Agent) { a.RuntimeRef = "garbage" }},
 			{name: "resume-grammar runtime ref", mutdt: func(a *Agent) { a.RuntimeRef = LastRef }},
-			{name: "another runtime's agent", mutdt: func(a *Agent) { a.Runtime = KimiRuntime }},
+			{name: "another runtime's agent", mutdt: func(a *Agent) { a.Runtime = ShellRuntime }},
 			{name: "unknown autonomy policy", mutdt: func(a *Agent) { a.AutonomyPolicy = "manual" }},
 		}
 		for _, tc := range cases {
@@ -3714,7 +3711,7 @@ func TestOmpValidateRefShapes(t *testing.T) {
 
 	t.Run("runtime mismatch", func(t *testing.T) {
 		agent := ompTestAgent()
-		agent.Runtime = KimiRuntime
+		agent.Runtime = ShellRuntime
 		if err := adapter.Validate(context.Background(), agent); err == nil {
 			t.Fatal("Validate accepted an agent belonging to another runtime")
 		}

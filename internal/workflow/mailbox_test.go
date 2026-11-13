@@ -149,7 +149,7 @@ func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		},
 	}
-	if _, err := mailbox.Run(ctx, "pid-job", runtime.Agent{Name: "worker", Runtime: runtime.KimiRuntime, RuntimeRef: "fresh:pid-job"}, adapter); err != nil {
+	if _, err := mailbox.Run(ctx, "pid-job", runtime.Agent{Name: "worker", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:pid-job"}, adapter); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	stored, err := store.GetJob(ctx, "pid-job")
@@ -329,16 +329,16 @@ func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	for _, agent := range []db.Agent{
-		{Name: "pinned", Runtime: runtime.CodexRuntime, Model: "agent-codex"},
-		{Name: "defaulted", Runtime: runtime.KimiRuntime},
-		{Name: "overridden", Runtime: runtime.CodexRuntime, Model: "agent-codex"},
+		{Name: "pinned", Runtime: runtime.OmpRuntime, Model: "agent-model"},
+		{Name: "defaulted", Runtime: runtime.OmpRuntime},
+		{Name: "overridden", Runtime: runtime.ShellRuntime, Model: "agent-model"},
 	} {
 		if err := store.UpsertAgent(ctx, agent); err != nil {
 			t.Fatalf("UpsertAgent(%s): %v", agent.Name, err)
 		}
 	}
 	mailbox := Mailbox{store: store, RuntimeDefaultModel: func(runtimeName string) string {
-		if runtimeName == runtime.KimiRuntime {
+		if runtimeName == runtime.OmpRuntime {
 			return "k3"
 		}
 		return ""
@@ -357,23 +357,23 @@ func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
 		{
 			name: "agent model beats runtime",
 			req:  JobRequest{ID: "resolved-agent", Agent: "pinned", Action: "ask", Repo: "owner/repo"},
-			want: "agent-codex",
+			want: "agent-model",
 		},
 		{
-			name: "kimi runtime default",
+			name: "omp runtime default",
 			req:  JobRequest{ID: "resolved-runtime", Agent: "defaulted", Action: "ask", Repo: "owner/repo"},
 			want: "k3",
 		},
 		{
 			name: "runtime override clears registered model",
 			req: JobRequest{ID: "resolved-runtime-override", Agent: "overridden", Action: "ask", Repo: "owner/repo",
-				RuntimeOverride: runtime.KimiRuntime, RuntimeOverrideRef: "fresh:override"},
+				RuntimeOverride: runtime.OmpRuntime, RuntimeOverrideRef: "fresh:override"},
 			want: "k3",
 		},
 		{
 			name: "ephemeral inline model",
 			req: JobRequest{ID: "resolved-ephemeral", Agent: "worker-ephemeral-test", Action: "review", Repo: "owner/repo",
-				ParentJobID: "parent", DelegationID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.ClaudeRuntime, Model: "claude-fable-5"}},
+				ParentJobID: "parent", DelegationID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "claude-fable-5"}},
 			want: "claude-fable-5",
 		},
 	} {
@@ -533,12 +533,12 @@ func TestMailboxRunThreadsRuntimeDefaultEffort(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store, RuntimeDefaultEffort: func(rt string) string {
-		if rt == runtime.CodexRuntime {
+		if rt == runtime.OmpRuntime {
 			return "high"
 		}
 		return ""
 	}}
-	agent := runtime.Agent{Name: "audit", Runtime: runtime.CodexRuntime, RuntimeRef: "last", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:audit", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{okDeliveryResult}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -580,53 +580,6 @@ func TestMailboxRunNilRuntimeDefaultHookByteIdentical(t *testing.T) {
 // classifies to a terminal state and the job persists its recorded usage.
 const okDeliveryResult = `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 
-// TestMailboxDeliverDeltasCumulativeUsage pins the #661 wiring: when the adapter
-// flags usage CUMULATIVE (a codex resumed thread reports the session's running
-// total), the mailbox records only this job's per-session delta, not the whole
-// cumulative. Two sequential deliveries on the SAME agent runtime ref report
-// cumulatives 1000/100 then 1500/150; the first job persists the full 1000/100
-// (baseline 0) and the second persists only the 500/50 increase.
-func TestMailboxDeliverDeltasCumulativeUsage(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	agent := runtime.Agent{Name: "planner", Runtime: runtime.CodexRuntime, RuntimeRef: "019f3041-cfed-7e82-8766-b5ca75cf92da", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs:      []string{okDeliveryResult, okDeliveryResult},
-		inputTokens:  []int{1000, 1500},
-		outputTokens: []int{100, 150},
-		cumulative:   []bool{true, true},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-a", Agent: "planner", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue job-a: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-a", agent, adapter); err != nil {
-		t.Fatalf("Run job-a: %v", err)
-	}
-	jobA, err := store.GetJob(ctx, "job-a")
-	if err != nil {
-		t.Fatalf("GetJob job-a: %v", err)
-	}
-	if jobA.InputTokens != 1000 || jobA.OutputTokens != 100 {
-		t.Fatalf("job-a usage = (%d, %d), want (1000, 100) — full cumulative on a fresh session baseline", jobA.InputTokens, jobA.OutputTokens)
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-b", Agent: "planner", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue job-b: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-b", agent, adapter); err != nil {
-		t.Fatalf("Run job-b: %v", err)
-	}
-	jobB, err := store.GetJob(ctx, "job-b")
-	if err != nil {
-		t.Fatalf("GetJob job-b: %v", err)
-	}
-	if jobB.InputTokens != 500 || jobB.OutputTokens != 50 {
-		t.Fatalf("job-b usage = (%d, %d), want (500, 50) — only the per-session delta, not the 1500/150 cumulative", jobB.InputTokens, jobB.OutputTokens)
-	}
-}
-
 func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
 	ctx := context.Background()
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -655,173 +608,6 @@ func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
 	}
 	if job.InputTokens != 8833 || job.OutputTokens != 144 {
 		t.Fatalf("failed runtime usage = (%d, %d), want (8833, 144)", job.InputTokens, job.OutputTokens)
-	}
-}
-
-// TestMailboxDeliverRecordsNonCumulativeVerbatim guards #664 at the mailbox seam:
-// usage NOT flagged cumulative (fresh sessions, single-use ephemeral/temp workers,
-// and every non-codex runtime) is recorded verbatim and NEVER routed through the
-// per-session delta table. Two deliveries on the same ref report independent per-job
-// counts and each lands in full — a delta would have clamped the second (smaller)
-// count against the first.
-func TestMailboxDeliverRecordsNonCumulativeVerbatim(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh-thread-xyz", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs:      []string{okDeliveryResult, okDeliveryResult},
-		inputTokens:  []int{3000, 2000},
-		outputTokens: []int{300, 200},
-		cumulative:   []bool{false, false},
-	}
-
-	for _, tc := range []struct {
-		id      string
-		wantIn  int
-		wantOut int
-	}{
-		{"job-c", 3000, 300},
-		{"job-d", 2000, 200},
-	} {
-		if _, err := mailbox.Enqueue(ctx, JobRequest{ID: tc.id, Agent: "impl", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-			t.Fatalf("Enqueue %s: %v", tc.id, err)
-		}
-		if _, err := mailbox.Run(ctx, tc.id, agent, adapter); err != nil {
-			t.Fatalf("Run %s: %v", tc.id, err)
-		}
-		job, err := store.GetJob(ctx, tc.id)
-		if err != nil {
-			t.Fatalf("GetJob %s: %v", tc.id, err)
-		}
-		if job.InputTokens != tc.wantIn || job.OutputTokens != tc.wantOut {
-			t.Fatalf("%s usage = (%d, %d), want (%d, %d) verbatim — a false flag must not be delta'd", tc.id, job.InputTokens, job.OutputTokens, tc.wantIn, tc.wantOut)
-		}
-	}
-}
-
-// TestMailboxDeliverCumulativeAmbiguousRefContributesZero pins the fallback: a
-// cumulative-flagged delivery on an empty or "last" runtime ref names no concrete,
-// stable session to key a delta on, so — as before #661 — it contributes 0 rather
-// than mis-attributing the whole cumulative to the job.
-func TestMailboxDeliverCumulativeAmbiguousRefContributesZero(t *testing.T) {
-	for _, ref := range []string{"", runtime.LastRef} {
-		t.Run("ref="+ref, func(t *testing.T) {
-			ctx := context.Background()
-			store := openTestStore(t)
-			mailbox := Mailbox{store: store}
-			agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: ref, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-			adapter := &fakeDelivery{
-				outputs:      []string{okDeliveryResult},
-				inputTokens:  []int{2000},
-				outputTokens: []int{200},
-				cumulative:   []bool{true},
-			}
-			if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-e", Agent: "impl", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-				t.Fatalf("Enqueue: %v", err)
-			}
-			if _, err := mailbox.Run(ctx, "job-e", agent, adapter); err != nil {
-				t.Fatalf("Run: %v", err)
-			}
-			job, err := store.GetJob(ctx, "job-e")
-			if err != nil {
-				t.Fatalf("GetJob: %v", err)
-			}
-			if job.InputTokens != 0 || job.OutputTokens != 0 {
-				t.Fatalf("ambiguous-ref usage = (%d, %d), want (0, 0)", job.InputTokens, job.OutputTokens)
-			}
-		})
-	}
-}
-
-// TestMailboxDeliverSeedsBaselineForAdoptedThread pins F2 (#665/#669 interaction):
-// a fresh codex delivery reports PER-JOB usage (non-cumulative, recorded verbatim,
-// #664) AND adopts its concrete thread in-memory for same-job repair (#665). If
-// turn 1 is malformed, the repair delivery resumes that thread and reports
-// SESSION-CUMULATIVE usage. The fresh delivery must SEED the runtime_session_usage
-// baseline with turn 1's counts so the repair deltas against turn 1, not a zero
-// baseline — otherwise turn 1 is double-counted. Turn 1 = 100/10 verbatim; the
-// repair reports cumulative 150/15 -> delta 50/5; job total 150/15 (NOT 250/25).
-// This is the double-count pin: it fails without the seed.
-func TestMailboxDeliverSeedsBaselineForAdoptedThread(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh:codex-solo", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs: []string{
-			"fresh codex turn but no json",
-			okDeliveryResult,
-		},
-		refreshedRefs: []string{"codex-thread-adopted"},
-		inputTokens:   []int{100, 150},
-		outputTokens:  []int{10, 15},
-		cumulative:    []bool{false, true},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "impl", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	job, err := store.GetJob(ctx, "job-1")
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if job.InputTokens != 150 || job.OutputTokens != 15 {
-		t.Fatalf("job usage = (%d, %d), want (150, 15) — turn 1 must not be double-counted (a zero baseline would give 250/25)", job.InputTokens, job.OutputTokens)
-	}
-	// The seeded baseline must advance to the repair's cumulative (150/15) — a probe
-	// with the same cumulative deltas to 0, confirming the key matched byte-for-byte.
-	dIn, dOut, err := store.RecordRuntimeSessionUsageDelta(ctx, runtime.CodexRuntime+":codex-thread-adopted", 150, 15)
-	if err != nil {
-		t.Fatalf("probe RecordRuntimeSessionUsageDelta: %v", err)
-	}
-	if dIn != 0 || dOut != 0 {
-		t.Fatalf("post-run baseline probe delta = (%d, %d), want (0, 0) — baseline should equal the repair cumulative", dIn, dOut)
-	}
-}
-
-// TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread pins that the F2 seed
-// fires ONLY when a concrete thread was adopted: a fresh/single-use codex delivery
-// that produced no adoptable thread (RefreshedRuntimeRef empty) records verbatim
-// and writes NO baseline row.
-func TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	freshRef := "fresh:codex-single"
-	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: freshRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs:      []string{okDeliveryResult},
-		inputTokens:  []int{100},
-		outputTokens: []int{10},
-		cumulative:   []bool{false},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "impl", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	job, err := store.GetJob(ctx, "job-1")
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if job.InputTokens != 100 || job.OutputTokens != 10 {
-		t.Fatalf("job usage = (%d, %d), want (100, 10) verbatim", job.InputTokens, job.OutputTokens)
-	}
-	// No thread was adopted, so no baseline may have been seeded. Probe the key the
-	// seed would have used had it (wrongly) keyed on the agent's own ref: a fresh
-	// probe returns the full cumulative, proving the baseline was 0 (no row).
-	dIn, dOut, err := store.RecordRuntimeSessionUsageDelta(ctx, runtime.CodexRuntime+":"+freshRef, 777, 77)
-	if err != nil {
-		t.Fatalf("probe RecordRuntimeSessionUsageDelta: %v", err)
-	}
-	if dIn != 777 || dOut != 77 {
-		t.Fatalf("probe delta = (%d, %d), want (777, 77) — a baseline was unexpectedly seeded", dIn, dOut)
 	}
 }
 
@@ -1124,7 +910,7 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store}
-	agent := runtime.Agent{Name: "audit", Runtime: runtime.ClaudeRuntime, RuntimeRef: runtime.LastRef, RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
+	agent := runtime.Agent{Name: "audit", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:audit", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{`{"result":"wrapped by runtime"}`},
 		summaries: []string{
@@ -1145,323 +931,6 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	}
 	if len(adapter.prompts) != 1 {
 		t.Fatalf("deliveries = %d, want 1", len(adapter.prompts))
-	}
-}
-
-func TestMailboxRunPersistsRefreshedRuntimeRef(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	oldRef := "550e8400-e29b-41d4-a716-446655440002"
-	newRef := "550e8400-e29b-41d4-a716-446655440099"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "shipper",
-		Role:       "implementer",
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: oldRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	agent := runtime.Agent{Name: "shipper", Runtime: runtime.ClaudeRuntime, RuntimeRef: oldRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		refreshedRefs: []string{newRef},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	stored, err := store.GetAgent(ctx, "shipper")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if stored.RuntimeRef != newRef {
-		t.Fatalf("agent runtime_ref = %q, want re-pinned %q", stored.RuntimeRef, newRef)
-	}
-	events, err := store.ListJobEvents(ctx, "job-1")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	found := false
-	for _, e := range events {
-		if e.Kind == "session_refresh_retry" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected a session_refresh_retry event, got %+v", events)
-	}
-}
-
-// TestMailboxRunRepairRetryResumesRefreshedRef pins the invariant from #443: when
-// the first delivery self-heals a dead session (returning a fresh ref) but emits
-// malformed output, the repair retry must resume the freshly-minted session — not
-// re-resume the dead UUID, which would self-heal a second time and orphan the
-// first healed session. We assert the in-memory agent handed to the second Deliver
-// carries the refreshed ref.
-func TestMailboxRunRepairRetryResumesRefreshedRef(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	oldRef := "550e8400-e29b-41d4-a716-446655440002"
-	newRef := "550e8400-e29b-41d4-a716-446655440099"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "shipper",
-		Role:       "implementer",
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: oldRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	agent := runtime.Agent{Name: "shipper", Runtime: runtime.ClaudeRuntime, RuntimeRef: oldRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		// First delivery self-heals (newRef) but is malformed; the repair delivery
-		// returns a clean result without further refresh.
-		outputs: []string{
-			"healed but no json",
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		refreshedRefs: []string{newRef},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if len(adapter.agentRefs) != 2 {
-		t.Fatalf("deliveries = %d, want 2", len(adapter.agentRefs))
-	}
-	if adapter.agentRefs[0] != oldRef {
-		t.Fatalf("first delivery agent ref = %q, want dead %q", adapter.agentRefs[0], oldRef)
-	}
-	if adapter.agentRefs[1] != newRef {
-		t.Fatalf("repair delivery agent ref = %q, want refreshed %q (must not re-resume the dead ref)", adapter.agentRefs[1], newRef)
-	}
-}
-
-func TestMailboxRunFreshRefRepairUsesConcreteSessionWithoutPersisting(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	freshRef := "fresh:council-codex"
-	concreteRef := "codex-thread-123"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "shipper",
-		Role:       "implementer",
-		Runtime:    runtime.CodexRuntime,
-		RuntimeRef: freshRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	agent := runtime.Agent{Name: "shipper", Runtime: runtime.CodexRuntime, RuntimeRef: freshRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{
-		outputs: []string{
-			"fresh job session but no json",
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		refreshedRefs: []string{concreteRef},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if len(adapter.agentRefs) != 2 {
-		t.Fatalf("deliveries = %d, want 2", len(adapter.agentRefs))
-	}
-	if adapter.agentRefs[0] != freshRef {
-		t.Fatalf("first delivery ref = %q, want registered fresh ref", adapter.agentRefs[0])
-	}
-	if adapter.agentRefs[1] != concreteRef {
-		t.Fatalf("repair delivery ref = %q, want concrete job session", adapter.agentRefs[1])
-	}
-	stored, err := store.GetAgent(ctx, "shipper")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if stored.RuntimeRef != freshRef {
-		t.Fatalf("stored runtime_ref = %q, want registered fresh ref %q", stored.RuntimeRef, freshRef)
-	}
-}
-
-// TestMailboxRunEphemeralRefAdoptedButNotPersisted pins F1 (#665): a delivery
-// that mints a by-design per-job session (SessionEphemeral=true — the
-// last+template coordinator path and the #531 fresh-ref path route through
-// deliverFresh) must ADOPT the concrete session in-memory so a same-job repair
-// resumes it, but must NEVER persist it onto the agent's stored "last"
-// registration, and must NOT emit the dead-session self-heal event. Without the
-// ephemeral guard the "last" agent (registeredFreshRef=false) would be re-pinned
-// to the minted UUID and lose isolation after job 1.
-func TestMailboxRunEphemeralRefAdoptedButNotPersisted(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	concreteRef := "claude-ephemeral-session-1"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "coordinator",
-		Role:       "agent",
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: runtime.LastRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	agent := runtime.Agent{Name: "coordinator", Runtime: runtime.ClaudeRuntime, RuntimeRef: runtime.LastRef, RepoScope: "gitmoot/gitmoot", Role: "agent", TemplateID: "coordinator"}
-	adapter := &fakeDelivery{
-		// First delivery mints an ephemeral session but is malformed; the repair
-		// delivery must resume that concrete session, not "last".
-		outputs: []string{
-			"ephemeral session but no json",
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		refreshedRefs: []string{concreteRef},
-		ephemeral:     []bool{true},
-	}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "coordinator", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	if len(adapter.agentRefs) != 2 {
-		t.Fatalf("deliveries = %d, want 2", len(adapter.agentRefs))
-	}
-	if adapter.agentRefs[0] != runtime.LastRef {
-		t.Fatalf("first delivery ref = %q, want %q", adapter.agentRefs[0], runtime.LastRef)
-	}
-	if adapter.agentRefs[1] != concreteRef {
-		t.Fatalf("repair delivery ref = %q, want in-memory-adopted concrete session %q", adapter.agentRefs[1], concreteRef)
-	}
-	stored, err := store.GetAgent(ctx, "coordinator")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if stored.RuntimeRef != runtime.LastRef {
-		t.Fatalf("stored runtime_ref = %q, want unchanged %q — an ephemeral session must never be persisted", stored.RuntimeRef, runtime.LastRef)
-	}
-	events, err := store.ListJobEvents(ctx, "job-1")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	for _, e := range events {
-		if e.Kind == "session_refresh_retry" {
-			t.Fatalf("unexpected session_refresh_retry event on a healthy ephemeral delivery: %+v", events)
-		}
-	}
-}
-
-// TestMailboxRunEphemeralRefStaysFreshAcrossJobs pins the user-visible F1 (#665)
-// invariant: after a first ephemeral delivery, a SECOND job for the same agent
-// must again take the fresh path. Because job 1 never persisted its minted UUID,
-// the agent's stored ref stays "last", so job 2 (loaded from the store, as the
-// daemon does) delivers on "last" again — never resuming job 1's session.
-func TestMailboxRunEphemeralRefStaysFreshAcrossJobs(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "coordinator",
-		Role:       "agent",
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: runtime.LastRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	adapter := &fakeDelivery{
-		outputs:       []string{okDeliveryResult, okDeliveryResult},
-		refreshedRefs: []string{"claude-ephemeral-job1", "claude-ephemeral-job2"},
-		ephemeral:     []bool{true, true},
-	}
-
-	for _, jobID := range []string{"job-1", "job-2"} {
-		// Reload the agent from the store before each job, exactly as the daemon
-		// does: if job 1 had persisted its minted UUID, job 2 would load it here and
-		// resume the wrong session.
-		stored, err := store.GetAgent(ctx, "coordinator")
-		if err != nil {
-			t.Fatalf("GetAgent before %s returned error: %v", jobID, err)
-		}
-		if stored.RuntimeRef != runtime.LastRef {
-			t.Fatalf("stored runtime_ref before %s = %q, want %q — an ephemeral session leaked into the stored ref", jobID, stored.RuntimeRef, runtime.LastRef)
-		}
-		agent := runtime.Agent{Name: "coordinator", Runtime: runtime.ClaudeRuntime, RuntimeRef: stored.RuntimeRef, RepoScope: "gitmoot/gitmoot", Role: "agent", TemplateID: "coordinator"}
-		if _, err := mailbox.Enqueue(ctx, JobRequest{ID: jobID, Agent: "coordinator", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-			t.Fatalf("Enqueue %s returned error: %v", jobID, err)
-		}
-		if _, err := mailbox.Run(ctx, jobID, agent, adapter); err != nil {
-			t.Fatalf("Run %s returned error: %v", jobID, err)
-		}
-	}
-
-	if len(adapter.agentRefs) != 2 {
-		t.Fatalf("deliveries = %d, want 2 (one per job)", len(adapter.agentRefs))
-	}
-	for i, ref := range adapter.agentRefs {
-		if ref != runtime.LastRef {
-			t.Fatalf("delivery %d ref = %q, want %q — job 2 must not resume job 1's ephemeral session", i, ref, runtime.LastRef)
-		}
-	}
-}
-
-func TestMailboxRunNoRefreshLeavesRefUnchanged(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	oldRef := "550e8400-e29b-41d4-a716-446655440002"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:       "shipper",
-		Role:       "implementer",
-		Runtime:    runtime.ClaudeRuntime,
-		RuntimeRef: oldRef,
-		RepoScope:  "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	agent := runtime.Agent{Name: "shipper", Runtime: runtime.ClaudeRuntime, RuntimeRef: oldRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
-	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["x"],"tests_run":[],"needs":[],"delegations":[]}}`,
-	}}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "shipper", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-	if _, err := mailbox.Run(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("Run returned error: %v", err)
-	}
-
-	stored, err := store.GetAgent(ctx, "shipper")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if stored.RuntimeRef != oldRef {
-		t.Fatalf("agent runtime_ref = %q, want unchanged %q", stored.RuntimeRef, oldRef)
-	}
-	events, err := store.ListJobEvents(ctx, "job-1")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	for _, e := range events {
-		if e.Kind == "session_refresh_retry" {
-			t.Fatalf("unexpected session_refresh_retry event with no refresh: %+v", events)
-		}
 	}
 }
 
@@ -1763,18 +1232,12 @@ func hasEvent(events []db.JobEvent, kind string) bool {
 type fakeDelivery struct {
 	outputs               []string
 	summaries             []string
-	refreshedRefs         []string
-	ephemeral             []bool
-	inputTokens           []int
-	outputTokens          []int
-	cumulative            []bool
 	providers             []string
 	prompts               []string
 	models                []string
 	efforts               []string
 	runtimeDefault        []string
 	runtimeDefaultEfforts []string
-	agentRefs             []string
 	agentEnvs             [][]string
 	plans                 []bool
 	planIntos             []string
@@ -1784,13 +1247,12 @@ type fakeDelivery struct {
 	errorResult           runtime.Result
 }
 
-func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error) {
+func (f *fakeDelivery) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
 	f.prompts = append(f.prompts, job.Prompt)
 	f.models = append(f.models, job.Model)
 	f.efforts = append(f.efforts, job.Effort)
 	f.runtimeDefault = append(f.runtimeDefault, job.RuntimeDefaultModel)
 	f.runtimeDefaultEfforts = append(f.runtimeDefaultEfforts, job.RuntimeDefaultEffort)
-	f.agentRefs = append(f.agentRefs, agent.RuntimeRef)
 	f.agentEnvs = append(f.agentEnvs, append([]string(nil), job.AgentEnv...))
 	f.plans = append(f.plans, job.Plan)
 	f.planIntos = append(f.planIntos, job.PlanInto)
@@ -1818,21 +1280,6 @@ func (f *fakeDelivery) Deliver(_ context.Context, agent runtime.Agent, job runti
 	result.Raw = f.outputs[index]
 	if index < len(f.summaries) {
 		result.Summary = f.summaries[index]
-	}
-	if index < len(f.refreshedRefs) {
-		result.RefreshedRuntimeRef = f.refreshedRefs[index]
-	}
-	if index < len(f.ephemeral) {
-		result.SessionEphemeral = f.ephemeral[index]
-	}
-	if index < len(f.inputTokens) {
-		result.InputTokens = f.inputTokens[index]
-	}
-	if index < len(f.outputTokens) {
-		result.OutputTokens = f.outputTokens[index]
-	}
-	if index < len(f.cumulative) {
-		result.CumulativeUsage = f.cumulative[index]
 	}
 	if index < len(f.providers) {
 		result.UpstreamProvider = f.providers[index]

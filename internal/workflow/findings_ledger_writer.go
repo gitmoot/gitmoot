@@ -839,8 +839,8 @@ const ledgerRefusalQuoteLimit = 2000
 
 // Bounds on the concern text the obligation brief quotes (#2077 review F3).
 // The text is reviewer-authored, the store caps neither its length nor the
-// number of obligations, and codex and claude pass the whole prompt as ONE argv
-// element against ~128 KiB MAX_ARG_STRLEN. An unbounded brief does not degrade
+// number of obligations, and a runtime that passes the whole prompt as ONE argv
+// element hits ~128 KiB MAX_ARG_STRLEN. An unbounded brief does not degrade
 // gracefully: the required review fails to exec and the merge gate then waits
 // forever for an observation that can never be produced.
 const (

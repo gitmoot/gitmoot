@@ -1,30 +1,22 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 const (
-	CodexRuntime  = "codex"
-	ClaudeRuntime = "claude"
-	KimiRuntime   = "kimi"
-	ShellRuntime  = "shell"
-	LastRef       = "last"
+	ShellRuntime = "shell"
+	LastRef      = "last"
 
 	healthPrompt = "Gitmoot health check. Reply OK only."
 
@@ -172,29 +164,12 @@ type Result struct {
 	Decision string
 	Summary  string
 	Raw      string
-	// InputTokens and OutputTokens are best-effort runtime token usage captured
-	// from the CLI's structured output where it exposes one (#338 Part B). They
-	// default to 0. Per-runtime status today: claude reports usage via its
-	// --output-format json envelope; kimi-code 0.19.2 emits no usage event so it
-	// contributes 0; codex Deliver reads the last turn.completed usage from its
-	// `exec --json` JSONL output (#658), falling back to 0 on an older CLI that
-	// predates --json. For codex these counts are SESSION-CUMULATIVE on a resumed
-	// thread — the session's whole running total, not this job's usage — so the
-	// caller must delta them (see CumulativeUsage and codexDeliverResult); fresh
-	// and single-use sessions already report a per-job count. A 0 here means "not
-	// captured", and the per-root delegation token budget simply under-counts that
-	// job rather than failing.
+	// InputTokens and OutputTokens are best-effort per-job runtime token usage
+	// captured from the CLI's structured output where it exposes one (#338 Part
+	// B). They default to 0; a 0 means "not captured", and the per-root
+	// delegation token budget simply under-counts that job rather than failing.
 	InputTokens  int
 	OutputTokens int
-	// CumulativeUsage reports that InputTokens/OutputTokens are runtime-session
-	// cumulative — the session's whole running total, not this job's usage (codex
-	// resumed threads report turn.completed usage this way, #661). When true the
-	// caller must subtract the last-seen counters for the runtime session (keyed by
-	// runtime+ref) and record only the delta. False means the counts are already
-	// per-job — fresh sessions and single-use ephemeral/temp workers, where the
-	// session's cumulative == this job's usage — and are recorded verbatim (#664).
-	// Only codex sets this today; other adapters leave it false.
-	CumulativeUsage bool
 	// RefreshedRuntimeRef is non-empty when the adapter delivered on a runtime
 	// reference other than the agent's stored one: either a #443 dead-session
 	// self-heal that re-pinned the agent to a fresh reference, or a by-design
@@ -333,19 +308,48 @@ type Factory struct {
 
 func (f Factory) Adapter(name string) (Adapter, error) {
 	switch name {
-	case CodexRuntime:
-		return CodexAdapter{Runner: f.Runner}, nil
-	case ClaudeRuntime:
-		return ClaudeAdapter{Runner: f.Runner}, nil
-	case KimiRuntime:
-		return KimiAdapter{Runner: f.Runner}, nil
 	case OmpRuntime:
 		return OmpAdapter{Runner: f.Runner}, nil
 	case ShellRuntime:
 		return ShellAdapter{Runner: f.Runner}, nil
 	default:
+		if IsRemovedRuntime(name) {
+			return nil, RemovedRuntimeError(name)
+		}
 		return nil, fmt.Errorf("unsupported runtime: %s (supported: %s)", name, strings.Join(SupportedRuntimes(), ", "))
 	}
+}
+
+// removedRuntimes are the job runtimes gitmoot no longer drives (#2587): omp is
+// the job runtime and shell runs the no-LLM tests. An agent row or [agents.*]
+// block still naming one keeps loading so it can be listed and re-registered,
+// but every path that needs an adapter refuses it with RemovedRuntimeError.
+var removedRuntimes = []string{"codex", "claude", "kimi"}
+
+// ErrRemovedRuntime marks an error chain refusing an agent on a removed runtime.
+var ErrRemovedRuntime = errors.New("removed job runtime")
+
+// IsRemovedRuntime reports whether name is a job runtime gitmoot removed.
+func IsRemovedRuntime(name string) bool {
+	name = strings.TrimSpace(name)
+	for _, removed := range removedRuntimes {
+		if name == removed {
+			return true
+		}
+	}
+	return false
+}
+
+// RemovedRuntimeError is the refusal for a removed runtime; it says omp is
+// required so the operator knows how to re-register the agent.
+func RemovedRuntimeError(name string) error {
+	return fmt.Errorf("%w: runtime %q is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the agent with --runtime omp", ErrRemovedRuntime, strings.TrimSpace(name))
+}
+
+// UnsupportedAgentRuntimeError names the agent whose registration still points
+// at a removed runtime, for agent list, doctor, the daemon log and job refusal.
+func UnsupportedAgentRuntimeError(agentName, runtimeName string) error {
+	return fmt.Errorf("agent %s: %w", agentName, RemovedRuntimeError(runtimeName))
 }
 
 // SupportedRuntimes enumerates every runtime name the adapter Factory can
@@ -394,12 +398,6 @@ func ValidateAgent(agent Agent) error {
 	if err := validateAgentFields(agent, true); err != nil {
 		return err
 	}
-	if agent.Runtime == ClaudeRuntime && agent.RuntimeRef != LastRef && !isUUID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
-		return fmt.Errorf("claude runtime reference %q must be a UUID, last, or fresh:<suffix>", agent.RuntimeRef)
-	}
-	if isKimiRuntime(agent.Runtime) && agent.RuntimeRef != "" && !isKimiSessionID(agent.RuntimeRef) && !IsFreshRef(agent.RuntimeRef) {
-		return fmt.Errorf("kimi runtime reference %q must be a Kimi session id, fresh:<suffix>, or empty", agent.RuntimeRef)
-	}
 	// omp is STATELESS (OmpAdapter never resumes), so "last" — the resume grammar
 	// the other runtimes accept — is rejected here rather than silently stored on a
 	// registration it can never honor. The grammar mirrors OmpAdapter.Validate EXCEPT
@@ -418,9 +416,8 @@ func ValidateAgent(agent Agent) error {
 	//     with surrounding whitespace — " <uuid> " — is REJECTED here and ACCEPTED
 	//     there; the two are not byte-for-byte mirrors. validateAgentFields' own
 	//     TrimSpace does not close that gap: it trims only for the EMPTINESS test and
-	//     never rewrites the field. That is deliberate rather than an oversight. The
-	//     claude and kimi clauses immediately above test their raw fields the same
-	//     way, and the CLI stores the flag value untrimmed (runAgentSubscribe assigns
+	//     never rewrites the field. That is deliberate rather than an oversight: the
+	//     CLI stores the flag value untrimmed (runAgentSubscribe assigns
 	//     `RuntimeRef: *session`), so the raw string is what actually lands in the
 	//     agent record — refusing to register a ref whose stored form is not a ref is
 	//     the honest behavior for a registration door.
@@ -593,269 +590,6 @@ func ImplementWritePolicyError(capabilities []string, policy string) error {
 	return fmt.Errorf(ImplementWritePolicyGuidance, NormalizeStoredAutonomyPolicy(policy))
 }
 
-type CodexSessionResolver interface {
-	Exists(ctx context.Context, ref string) (bool, error)
-}
-
-type CodexSessionIndex struct {
-	Path string
-	Home string
-}
-
-type CodexAdapter struct {
-	Runner          subprocess.Runner
-	Dir             string
-	SessionResolver CodexSessionResolver
-}
-
-func (a CodexAdapter) Name() string { return CodexRuntime }
-
-func (a CodexAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
-	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
-		return StartResult{}, err
-	}
-	sandboxArgs := codexSandboxArgs(request.Agent, a.Dir)
-	args := append([]string{"exec"}, sandboxArgs...)
-	if request.Agent.Model != "" {
-		args = append(args, "--model", request.Agent.Model)
-	}
-	if request.Agent.Effort != "" {
-		args = append(args, "-c", "model_reasoning_effort="+request.Agent.Effort)
-	}
-	args = append(args, "--json", "--", request.Prompt)
-	result, err := a.runner().Run(ctx, a.Dir, "codex", args...)
-	if err != nil {
-		return StartResult{Raw: result.Stdout + result.Stderr}, codexCommandError(result, err)
-	}
-	threadID, err := parseCodexStartedThreadID(result.Stdout)
-	if err != nil {
-		return StartResult{Raw: result.Stdout}, err
-	}
-	// Unwrap the `codex exec --json` JSONL stream so forked-session consumers
-	// that parse Raw as the assistant's answer see the
-	// agent_message text, not the whole transcript (banner, thread.started,
-	// turn events) — the codex flavor of #722. Reuses the same parser the
-	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
-	// when the stream carries no agent_message (older CLI, plain-text fallback,
-	// or an unexpected shape), so Raw always surfaces the underlying text and
-	// unwrap never errors. RuntimeRef is untouched.
-	raw := result.Stdout
-	if msg, _, _, ok := parseCodexJSONResult(result.Stdout); ok {
-		raw = msg
-	}
-	return StartResult{RuntimeRef: threadID, Raw: raw}, nil
-}
-
-func (a CodexAdapter) Validate(_ context.Context, agent Agent) error {
-	return validateRuntime(agent, a.Name())
-}
-
-func (a CodexAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, error) {
-	if err := a.Validate(ctx, agent); err != nil {
-		return Result{}, err
-	}
-	model := EffectiveModel(agent, job)
-	effort := effectiveEffort(agent, job)
-	// A fresh ref (per-job --runtime override, #531) starts a brand-new exec
-	// session — never `resume` — so an overridden job cannot read or pollute any
-	// stored session's state. Every other ref resumes an existing session, which
-	// we first verify still exists.
-	if !IsFreshRef(agent.RuntimeRef) {
-		if err := a.verifySession(ctx, agent); err != nil {
-			return Result{}, err
-		}
-	}
-	result, err := a.runCodex(ctx, agent, job.Prompt, model, effort, job.AgentEnv, job.OnPID)
-	// The session id in play: the pinned concrete thread on a resume, or the
-	// thread id codex printed for a fresh/`last` run (best-effort — the stream
-	// may not carry one when the run died early).
-	sessionID := concreteSessionRef(agent)
-	if sessionID == "" {
-		sessionID = parseCodexThreadID(result.Stdout)
-	}
-	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, sessionID)}, codexCommandError(result, err)
-	}
-	// Usage is attributable to this job when the session belongs to it alone:
-	// a fresh ref (brand-new session, no resume) or a single-use session
-	// (ephemeral/temp workers — started for the job, disposed after it).
-	freshSession := IsFreshRef(agent.RuntimeRef) || agent.SingleUseSession
-	parsed := codexDeliverResult(result.Stdout, freshSession)
-	if IsFreshRef(agent.RuntimeRef) {
-		parsed.RefreshedRuntimeRef = parseCodexThreadID(result.Stdout)
-	}
-	parsed.SessionDiag = newSessionDiag(result, nil, sessionID)
-	return parsed, nil
-}
-
-var codexRuntimeContract = RuntimeContract{
-	Binary: "codex",
-	Requirements: []RuntimeRequirement{{
-		Kind: RuntimeRequirementFlag, Name: "flag --sandbox", Flag: "--sandbox",
-		Source:   "internal/runtime/adapter.go::codexSandboxArgs",
-		Remedy:   "install a Codex CLI that lists --sandbox, or run this policy on a runtime whose installed CLI satisfies its declared contract",
-		Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess},
-	}},
-}
-
-// codexDeliverArgs builds the `codex exec` argument vector for a Deliver call.
-// dir is the adapter's working directory (the job checkout); when it is a linked
-// git worktree and the sandbox is workspace-write, codexSandboxArgs grants the
-// worktree's resolved gitdir as an extra writable root (#805).
-// jsonOutput adds --json so codex streams JSONL events (thread/turn/item) on
-// stdout, which is what lets a delivery capture token usage (#658). --json is an
-// `exec` option that codex accepts before the `resume` subcommand, which is where
-// we place it. jsonOutput=false is the older-CLI fallback (see runCodex): it
-// reproduces the pre-#658 plain-text command exactly. A fresh ref (#531) always
-// starts a brand-new exec session and never resumes.
-//
-// ARG_MAX exposure (#723): like kimi, codex passes the prompt as a trailing argv
-// arg, so a prompt above the kernel's MAX_ARG_STRLEN (~128 KiB per single arg)
-// would fork/exec with E2BIG. codex, unlike kimi, has a native escape hatch —
-// `codex exec` reads the prompt from stdin when the positional is `-` or omitted
-// ("instructions are read from stdin"). Routing oversize prompts through stdin is
-// deferred to a follow-up; #723 fixes kimi, which offers no stdin/file channel.
-func codexDeliverArgs(agent Agent, dir, prompt, model string, effort string, jsonOutput bool) []string {
-	sandboxArgs := codexSandboxArgs(agent, dir)
-	args := append([]string{"exec"}, sandboxArgs...)
-	if jsonOutput {
-		args = append(args, "--json")
-	}
-	if IsFreshRef(agent.RuntimeRef) {
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-		if effort != "" {
-			args = append(args, "-c", "model_reasoning_effort="+effort)
-		}
-		return append(args, "--", prompt)
-	}
-	args = append(args, "resume")
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	if effort != "" {
-		args = append(args, "-c", "model_reasoning_effort="+effort)
-	}
-	if agent.RuntimeRef == "last" {
-		args = append(args, "--last")
-	} else {
-		args = append(args, agent.RuntimeRef)
-	}
-	return append(args, "--", prompt)
-}
-
-// runCodex performs a single codex Deliver run with --json (for token capture),
-// re-running once WITHOUT --json when an older codex CLI rejects the flag
-// (mirrors runClaude's --output-format fallback). The plain-text re-run keeps the
-// pre-#658 semantics; codexDeliverResult then fails open on the non-JSONL stdout
-// and contributes 0 usage. Only the JSON re-run is retried — a genuine delivery
-// failure surfaces unchanged.
-func (a CodexAdapter) runCodex(ctx context.Context, agent Agent, prompt, model string, effort string, env []string, onPID func(int)) (subprocess.Result, error) {
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, env, onPID, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, true)...)
-	if err != nil && isCodexJSONUnsupported(result) {
-		result, err = runAgentCommand(ctx, a.runner(), a.Dir, env, onPID, "codex", codexDeliverArgs(agent, a.Dir, prompt, model, effort, false)...)
-	}
-	return result, err
-}
-
-// codexDeliverResult turns codex `exec --json` stdout into a Deliver Result: the
-// joined agent_message text becomes Raw — the exact text the engine scans for the
-// gitmoot_result blob, just as the plain-text stdout was before #658 — plus the
-// last turn.completed usage as best-effort token counts. It fails open: stdout
-// carrying no agent_message event (older CLI, the plain-text --json fallback, or
-// an unexpected shape) is returned verbatim as Raw with 0 usage, so a delivery is
-// never lost because usage parsing changed.
-//
-// codex's turn.completed usage is SESSION-CUMULATIVE on a resumed thread, not
-// per-turn: probed live on codex-cli 0.142.4, three one-word turns on one thread
-// reported input 16504 -> 85681 -> 103779 and output 20 -> 40 -> 45 (monotonically
-// accumulating), and a single resumed ask on a long-lived agent reported 22.4M
-// input tokens — orders of magnitude beyond any single turn. So the parsed counts
-// are always returned, with CumulativeUsage set to !freshSession: a resumed
-// (shared) session flags them cumulative so the caller records only the
-// per-session delta (#661), while a fresh ref or single-use session — its
-// cumulative == this job's cost, the #338 budget's primary target — flags them
-// per-job so they are recorded verbatim (#664). The fail-open branch (no
-// agent_message event) returns 0 usage with CumulativeUsage=false, unchanged.
-func codexDeliverResult(stdout string, freshSession bool) Result {
-	raw, inputTokens, outputTokens, ok := parseCodexJSONResult(stdout)
-	if !ok {
-		return Result{Raw: stdout, Summary: strings.TrimSpace(stdout)}
-	}
-	return Result{
-		Raw:             raw,
-		Summary:         strings.TrimSpace(raw),
-		InputTokens:     inputTokens,
-		OutputTokens:    outputTokens,
-		CumulativeUsage: !freshSession,
-	}
-}
-
-func parseCodexThreadID(output string) string {
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var event struct {
-			Type     string `json:"type"`
-			ThreadID string `json:"thread_id"`
-		}
-		if json.Unmarshal([]byte(line), &event) != nil {
-			continue
-		}
-		if event.Type == "thread.started" && strings.TrimSpace(event.ThreadID) != "" {
-			return strings.TrimSpace(event.ThreadID)
-		}
-	}
-	return ""
-}
-
-func (a CodexAdapter) Health(ctx context.Context, agent Agent) error {
-	_, err := a.Deliver(ctx, agent, Job{Prompt: healthPrompt})
-	return err
-}
-
-func (a CodexAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
-}
-
-func (a CodexAdapter) runner() subprocess.Runner {
-	if a.Runner != nil {
-		return a.Runner
-	}
-	// Group semantics so cancelling a job kills the runtime CLI's whole
-	// process tree, not just the immediate child.
-	return subprocess.GroupRunner{}
-}
-
-func (a CodexAdapter) verifySession(ctx context.Context, agent Agent) error {
-	if agent.RuntimeRef == "last" {
-		return nil
-	}
-	exists, err := a.sessionResolver().Exists(ctx, agent.RuntimeRef)
-	if err != nil {
-		return fmt.Errorf("verify codex session: %w", err)
-	}
-	if !exists {
-		if isUUID(agent.RuntimeRef) {
-			return nil
-		}
-		return fmt.Errorf("codex session %q was not found", agent.RuntimeRef)
-	}
-	return nil
-}
-
-func (a CodexAdapter) sessionResolver() CodexSessionResolver {
-	if a.SessionResolver != nil {
-		return a.SessionResolver
-	}
-	return CodexSessionIndex{}
-}
-
 // EffectiveModel resolves which model a delivered job runs on. Precedence, most
 // specific first: the per-job/per-delegation override (job.Model) wins, then the
 // agent's configured default (agent.Model), then — when NEITHER pins a model — the
@@ -903,333 +637,6 @@ func effectiveEffort(agent Agent, job Job) string {
 	return strings.TrimSpace(job.RuntimeDefaultEffort)
 }
 
-func codexSandboxArgs(agent Agent, workdir string) []string {
-	if agent.ReadOnlySeat {
-		// #1812: A READ-ONLY SEAT MUST NOT NEST A SECOND SANDBOX.
-		//
-		// The seat already runs inside gitmoot's Landlock domain, and codex's
-		// own sandbox is bwrap, which needs a user namespace the domain denies.
-		// Measured on this box, one command with only the domain differing:
-		//
-		//	bwrap --dev-bind / / --unshare-user -- /bin/true
-		//	  outside the domain            -> rc=0
-		//	  inside the domain             -> rc=1, "setting up uid map: Permission denied"
-		//	  inside + /proc writable       -> rc=1, "Failed to make / slave"
-		//	  inside + /proc + /dev writable-> rc=1, "Failed to make / slave"
-		//	plain /bin/true inside the domain -> rc=0
-		//
-		// So the domain itself executes fine and NESTING is the isolated cause.
-		// The grant escalation is also a dead end: /proc write clears the uid
-		// map only to fail on mount propagation, which is why #1812 concluded
-		// grants cannot settle it. Every codex command in such a seat failed
-		// BEFORE running, giving reviews an executed-check count of zero.
-		//
-		// Codex's own help names this exact situation for this exact flag:
-		// "Intended solely for running in environments that are externally
-		// sandboxed". That is what the seat is.
-		//
-		// THE BOUNDARY IS NOT WEAKENED, because it was never codex's: the
-		// Landlock ruleset is unchanged, still read-only outside the seat's
-		// single writable cache root, and it is the boundary gitmoot builds and
-		// tests. Turning codex's sandbox off removes a nested mechanism that
-		// could not start; it grants the seat nothing. --add-dir and the
-		// network toggle are dropped with it because they only ever configured
-		// that sandbox.
-		return []string{"--dangerously-bypass-approvals-and-sandbox"}
-	}
-	switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-	case AutonomyPolicyReadOnly:
-		return []string{"--sandbox", "read-only"}
-	case AutonomyPolicyWorkspaceWrite:
-		args := []string{"--sandbox", "workspace-write"}
-		// #805: a linked-worktree checkout keeps its real git metadata under the
-		// main repo's .git/worktrees/<name>, OUTSIDE workspace-write's writable
-		// roots, so every metadata-writing git operation (status refresh, add,
-		// commit) fails on the index lock inside the sandbox. Grant exactly that
-		// resolved gitdir via --add-dir — additive, mirroring how `plugin
-		// codex-launch` grants the gitmoot home, and unlike a
-		// `-c sandbox_workspace_write.writable_roots=[...]` override it cannot
-		// clobber roots the operator's config.toml already grants. A primary
-		// checkout (or empty/unknown workdir) resolves to "" and the argv stays
-		// byte-identical.
-		if gitdir := linkedWorktreeGitDir(workdir); gitdir != "" {
-			args = append(args, "--add-dir", gitdir)
-		}
-		for _, path := range agent.WritablePaths {
-			if path = strings.TrimSpace(path); path != "" {
-				args = append(args, "--add-dir", path)
-			}
-		}
-		return args
-	case AutonomyPolicyDangerFullAccess:
-		// Full access is already unrestricted. Additive workspace grants must not
-		// leak into this policy's argv.
-		return []string{"--sandbox", "danger-full-access"}
-	default:
-		return nil
-	}
-}
-
-// linkedWorktreeGitDir resolves the per-worktree git metadata directory of a
-// linked `git worktree` checkout (#805). In a linked worktree, <dir>/.git is a
-// FILE whose first line is "gitdir: <main-repo>/.git/worktrees/<name>"; that
-// resolved directory holds the worktree's index/HEAD and lives outside the
-// checkout. It returns "" — the fail-open "not applicable" answer — for a
-// primary checkout (.git is a directory), a missing or empty dir, or a
-// malformed .git file. A relative gitdir (git tolerates one) is resolved
-// against dir so the sandbox grant is always an absolute root.
-func linkedWorktreeGitDir(dir string) string {
-	if strings.TrimSpace(dir) == "" {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(dir, ".git"))
-	if err != nil {
-		// A primary checkout's .git is a directory (EISDIR) and a non-repo has
-		// none (ENOENT); both mean there is no linked gitdir to grant.
-		return ""
-	}
-	line, _, _ := strings.Cut(strings.TrimSpace(string(data)), "\n")
-	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
-	if !ok {
-		return ""
-	}
-	gitdir := strings.TrimSpace(rest)
-	if gitdir == "" {
-		return ""
-	}
-	if !filepath.IsAbs(gitdir) {
-		gitdir = filepath.Join(dir, gitdir)
-	}
-	return filepath.Clean(gitdir)
-}
-
-// defaultClaudeRetryBackoff is the base pause between Claude delivery attempts
-// when a transient socket-closed failure is retried. ClaudeAdapter.RetryBackoff
-// overrides it; tests inject a near-zero value to stay fast.
-const defaultClaudeRetryBackoff = 500 * time.Millisecond
-
-// claudeDeliveryMaxAttempts bounds how many times a single Claude delivery is
-// attempted when it keeps hitting the transient socket-closed 401 (#509). A
-// fixed single retry (the old maxAttempts=2) empirically does not clear it, yet
-// a fresh delivery minutes later does, so we retry more and spread the attempts
-// across different transient windows via exponential backoff. Each failing
-// attempt burns ~30-77s, so 4 attempts is ~few min worst case — comfortably
-// inside the managed ask job-timeout (~10m). Only transient errors are retried.
-const claudeDeliveryMaxAttempts = 4
-
-// maxClaudeRetryBackoff caps the exponential per-attempt pause so the backoff
-// never balloons past a sane ceiling on the later attempts.
-const maxClaudeRetryBackoff = 30 * time.Second
-
-type ClaudeAdapter struct {
-	Runner        subprocess.Runner
-	Dir           string
-	NewRuntimeRef func() (string, error)
-	// RetryBackoff is the pause before retrying a transient socket-closed
-	// delivery failure. When zero it defaults to defaultClaudeRetryBackoff.
-	RetryBackoff time.Duration
-}
-
-func (a ClaudeAdapter) Name() string { return ClaudeRuntime }
-
-func (a ClaudeAdapter) Start(ctx context.Context, request StartRequest) (StartResult, error) {
-	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
-		return StartResult{}, err
-	}
-	runtimeRef, err := a.newRuntimeRef()
-	if err != nil {
-		return StartResult{}, err
-	}
-	args := claudePermissionArgs(request.Agent)
-	if request.Agent.Model != "" {
-		args = append(args, "--model", request.Agent.Model)
-	}
-	args = append(args, "--session-id", runtimeRef, "-p", "--output-format", "json", "--", request.Prompt)
-	result, err := a.runner().Run(ctx, a.Dir, "claude", args...)
-	if err != nil {
-		return StartResult{Raw: result.Stdout + result.Stderr}, claudeCommandError(result, err)
-	}
-	// Unwrap the --output-format json result envelope so forked-session
-	// consumers that parse Raw as the assistant's answer see
-	// the answer text, not the CLI envelope (#721). Reuses the same helper the
-	// Deliver path uses to build Summary. Fail-open: fall back to the raw stdout
-	// when stdout is not the envelope or carries no "result" field (e.g. an older
-	// CLI's plain-text --output-format fallback), so Raw always surfaces the
-	// underlying text and unwrap never errors.
-	raw := result.Stdout
-	if summary, _, _ := parseClaudeJSONResult(result.Stdout); summary != "" {
-		raw = summary
-	}
-	return StartResult{RuntimeRef: runtimeRef, Raw: raw}, nil
-}
-
-func (a ClaudeAdapter) Validate(_ context.Context, agent Agent) error {
-	return validateRuntime(agent, a.Name())
-}
-
-func (a ClaudeAdapter) Deliver(ctx context.Context, agent Agent, job Job) (Result, error) {
-	if err := a.Validate(ctx, agent); err != nil {
-		return Result{}, err
-	}
-	model := EffectiveModel(agent, job)
-	// A fresh ref (per-job --runtime override, #531) delivers on a brand-new
-	// dedicated --session-id — never --resume/--continue — so an overridden job
-	// cannot read or pollute any stored session's state.
-	if IsFreshRef(agent.RuntimeRef) {
-		return a.deliverFresh(ctx, agent, job, model)
-	}
-	// Template-backed Claude agents are coordinator-class jobs: they execute a
-	// long-form prompt recipe and must never resume whichever interactive Claude
-	// session happens to be "last". Treat a legacy --session last registration as
-	// a per-job temp session instead of --continue.
-	if agent.RuntimeRef == LastRef && strings.TrimSpace(agent.TemplateID) != "" {
-		return a.deliverFresh(ctx, agent, job, model)
-	}
-	// The Claude CLI intermittently fails a delivery with a transient
-	// "401 socket connection was closed unexpectedly" under sustained
-	// concurrency; a byte-identical retry typically clears it. Retry on that
-	// signature only, never on a permanent failure (e.g. an invalid token).
-	// The retry is safe because the 401 fails before the model turn runs, so the
-	// failed attempt mutates no partial session state. Use exponential backoff
-	// (see waitRetryBackoff) so retries land in different transient windows.
-	var result subprocess.Result
-	var err error
-	for attempt := 1; ; attempt++ {
-		result, err = a.runClaude(ctx, agent, job, model)
-		if attempt >= claudeDeliveryMaxAttempts || !isTransientClaudeDeliveryError(result, err) {
-			break
-		}
-		if waitErr := a.waitRetryBackoff(ctx, attempt); waitErr != nil {
-			break
-		}
-	}
-	// Make ONE last-resort delivery on a fresh dedicated --session-id when a
-	// pinned --resume delivery is still failing after the in-call retries, for
-	// the two pre-execution failure classes a byte-identical --resume retry
-	// cannot clear:
-	//   - the pinned conversation no longer exists (#443), or
-	//   - it keeps hitting the transient socket-closed 401 on EVERY attempt
-	//     (#509). The in-call retries above already spread byte-identical
-	//     --resume attempts across different transient windows; when they all
-	//     fail together yet a fresh, later delivery succeeds, the wedged thing is
-	//     the *current* resume attempt, not the prompt — so a one-off fresh
-	//     session gets this delivery past the flake, mirroring why a separate
-	//     later job clears it.
-	//
-	// The two classes differ in what they do AFTER that one delivery:
-	//   - #443 (sessionMissing): the old session is genuinely GONE, so we thread
-	//     the fresh ref out via Result.RefreshedRuntimeRef and mailbox.Run
-	//     PERMANENTLY re-pins the agent to it. Nothing is lost — there was no
-	//     conversation left to resume.
-	//   - #509 (transient): the old session is still ALIVE (the issue's own
-	//     repro shows the same `--resume <ref>` recovering on a later delivery),
-	//     so we must NOT re-pin. Permanently switching a stateful pinned agent
-	//     (e.g. the researcher/coordinator) to a brand-new empty session would
-	//     silently discard all accumulated conversation context on a transport
-	//     blip. We therefore leave refreshedRef empty: the fresh --session-id is
-	//     used only to unstick THIS delivery, and the agent stays pinned to its
-	//     original, context-bearing session so the next delivery resumes it.
-	//
-	// Bounded to a single pre-execution retry: never loops, never touches the
-	// shared --continue ("last") path, is skipped once the context is cancelled
-	// (so a killed job stops promptly instead of launching one more CLI), and
-	// never masks an auth failure (a fresh start that fails for auth reasons
-	// still surfaces as auth below).
-	var refreshedRef string
-	// The session id this delivery is actually running on, for crash
-	// diagnostics (#806): the pinned concrete ref, replaced by the minted fresh
-	// id when the self-heal below takes over the delivery.
-	diagSessionRef := concreteSessionRef(agent)
-	if err != nil && agent.RuntimeRef != LastRef && ctx.Err() == nil {
-		sessionMissing := isClaudeSessionMissing(result)
-		transient := isTransientClaudeDeliveryError(result, err)
-		if sessionMissing || transient {
-			newRef, refErr := a.newRuntimeRef()
-			if refErr == nil {
-				// Only re-pin permanently for the dead-session class (#443); the
-				// transient class (#509) keeps its still-alive original session.
-				if sessionMissing {
-					refreshedRef = newRef
-				}
-				diagSessionRef = newRef
-				result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, newRef)...)
-				if err != nil {
-					if sessionMissing {
-						return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, a.claudeSessionMissingError(agent, result, err)
-					}
-					return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, claudeCommandError(result, err)
-				}
-			}
-		}
-	}
-	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, diagSessionRef)}, claudeCommandError(result, err)
-	}
-	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: refreshedRef, SessionDiag: newSessionDiag(result, nil, diagSessionRef)}
-	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
-	if summary != "" {
-		parsed.Summary = summary
-	} else {
-		parsed.Summary = strings.TrimSpace(result.Stdout)
-	}
-	parsed.InputTokens = inTok
-	parsed.OutputTokens = outTok
-	return parsed, nil
-}
-
-// deliverFresh delivers one job on a brand-new dedicated Claude session (the
-// fresh-ref path, #531). Each attempt mints a NEW session id, mirroring the
-// #443 self-heal shape (claudeFreshSessionArgs — never --resume/--continue),
-// so a transient-401 retry can never trip over an already-created session id.
-// It returns the successful concrete session id as RefreshedRuntimeRef so
-// malformed-output repair prompts in the same job resume that isolated job
-// session. The mailbox guards registered fresh refs from being re-pinned.
-func (a ClaudeAdapter) deliverFresh(ctx context.Context, agent Agent, job Job, model string) (Result, error) {
-	var result subprocess.Result
-	var err error
-	var sessionID string
-	for attempt := 1; ; attempt++ {
-		sessionID, err = a.newRuntimeRef()
-		if err != nil {
-			return Result{}, err
-		}
-		result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "claude", claudeFreshSessionArgs(agent, job.Prompt, model, sessionID)...)
-		if attempt >= claudeDeliveryMaxAttempts || !isTransientClaudeDeliveryError(result, err) {
-			break
-		}
-		if waitErr := a.waitRetryBackoff(ctx, attempt); waitErr != nil {
-			break
-		}
-	}
-	if err != nil {
-		return Result{Raw: result.Stdout + result.Stderr, SessionDiag: newSessionDiag(result, err, sessionID)}, claudeCommandError(result, err)
-	}
-	// SessionEphemeral marks this session as by-design per-job (fresh-ref #531 or
-	// last+template coordinator): the mailbox adopts sessionID in-memory for
-	// same-job repair but must NOT persist it onto the agent's stored ref, or the
-	// isolation would end after job 1.
-	parsed := Result{Raw: result.Stdout, RefreshedRuntimeRef: sessionID, SessionEphemeral: true, SessionDiag: newSessionDiag(result, nil, sessionID)}
-	summary, inTok, outTok := parseClaudeJSONResult(result.Stdout)
-	if summary != "" {
-		parsed.Summary = summary
-	} else {
-		parsed.Summary = strings.TrimSpace(result.Stdout)
-	}
-	parsed.InputTokens = inTok
-	parsed.OutputTokens = outTok
-	return parsed, nil
-}
-
-// runClaude performs a single Claude delivery attempt, including the JSON
-// output-format fallback re-run for older CLIs that reject --output-format.
-func (a ClaudeAdapter) runClaude(ctx context.Context, agent Agent, job Job, model string) (subprocess.Result, error) {
-	result, err := runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "claude", claudeArgs(agent, job.Prompt, true, model)...)
-	if err != nil && isClaudeJSONUnsupported(result) {
-		result, err = runAgentCommand(ctx, a.runner(), a.Dir, job.AgentEnv, job.OnPID, "claude", claudeArgs(agent, job.Prompt, false, model)...)
-	}
-	return result, err
-}
-
 func runAgentCommand(ctx context.Context, runner subprocess.Runner, dir string, env []string, onPID func(int), command string, args ...string) (subprocess.Result, error) {
 	if onPID == nil {
 		if len(env) == 0 {
@@ -1255,166 +662,6 @@ func runAgentCommand(ctx context.Context, runner subprocess.Runner, dir string, 
 		return subprocess.Result{}, errors.New("runtime runner does not support agent environment injection")
 	}
 	return envRunner.RunEnv(ctx, dir, env, command, args...)
-}
-
-// waitRetryBackoff pauses before the next delivery attempt (1-indexed), returning
-// early if the context is cancelled so a killed job stops promptly. It uses a
-// stopped timer (not time.After) so the timer is released when ctx wins the race.
-func (a ClaudeAdapter) waitRetryBackoff(ctx context.Context, attempt int) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	timer := time.NewTimer(a.retryBackoff(attempt))
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-// retryBackoff computes the exponential pause before the next delivery attempt:
-// base * 2^(attempt-1), capped at maxClaudeRetryBackoff. base is RetryBackoff
-// when set (tests inject a tiny value to stay fast) else defaultClaudeRetryBackoff.
-func (a ClaudeAdapter) retryBackoff(attempt int) time.Duration {
-	base := a.RetryBackoff
-	if base <= 0 {
-		base = defaultClaudeRetryBackoff
-	}
-	if attempt < 1 {
-		attempt = 1
-	}
-	backoff := base
-	for i := 1; i < attempt; i++ {
-		backoff *= 2
-		if backoff >= maxClaudeRetryBackoff {
-			return maxClaudeRetryBackoff
-		}
-	}
-	if backoff > maxClaudeRetryBackoff {
-		return maxClaudeRetryBackoff
-	}
-	return backoff
-}
-
-// isTransientClaudeDeliveryError reports whether a failed Claude delivery is the
-// known intermittent "401 socket connection was closed unexpectedly" transient,
-// which a byte-identical retry typically clears. It returns false when the run
-// succeeded (err == nil) and for permanent failures (e.g. an invalid token,
-// which carries no socket-closed signature). The signature shows up in the JSON
-// result on stdout in practice, so it matches both stdout and stderr; the
-// err != nil gate keeps a successful run from ever being treated as transient.
-//
-// The match also requires a "401" status so the retry is confined to the
-// provably-safe pre-turn handshake case the safety note in Deliver relies on: a
-// 401 fails before the model turn runs, so the failed attempt mutates no partial
-// session state and a byte-identical --resume retry cannot duplicate side
-// effects. A bare "socket connection was closed unexpectedly" (the underlying
-// Node/undici fetch error) can also be thrown on a MID-STREAM drop after the
-// turn has already executed tool calls or file edits, where a retry would be a
-// duplicate-execution hazard; such mid-stream drops carry no status code, so the
-// "401" requirement correctly excludes them.
-func isTransientClaudeDeliveryError(result subprocess.Result, err error) bool {
-	return isClaude401SocketClosed(result, err)
-}
-
-// isClaude401SocketClosed reports whether a failed run carries the
-// "401 socket connection was closed unexpectedly" signature. In the Deliver path
-// this is the concurrency transient a byte-identical retry clears
-// (isTransientClaudeDeliveryError); in the isolated doctor probe path (no
-// concurrency) a signature that SURVIVES a retry is instead the documented #486
-// invalid-token symptom — `Failed to authenticate. API Error: 401 The socket
-// connection was closed unexpectedly` — which carries "401" and "socket connection
-// was closed unexpectedly" but NOT "authentication", so isClaudeAuthFailure alone
-// would miss it. The err != nil gate keeps a successful run from ever matching.
-func isClaude401SocketClosed(result subprocess.Result, err error) bool {
-	if err == nil {
-		return false
-	}
-	// Never treat a genuine auth failure (an invalid/expired token, #486) as a
-	// retryable transient, even if its message also happens to carry a
-	// socket-closed phrase: retrying it claudeDeliveryMaxAttempts times and then
-	// minting a fresh session would burn minutes and could mask the real "fix
-	// your token" signal. The socket-closed transient (#509) carries a "Failed to
-	// authenticate" wording but none of the auth-failure markers, so this guard
-	// excludes only genuinely invalid credentials, not the transient.
-	if isClaudeAuthFailure(result) {
-		return false
-	}
-	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
-	if !strings.Contains(text, "401") {
-		return false
-	}
-	return strings.Contains(text, "socket connection was closed unexpectedly") ||
-		strings.Contains(text, "socket connection closed unexpectedly")
-}
-
-// claudeFreshSessionArgs builds the args for a brand-new dedicated session,
-// mirroring Start's --session-id shape (never --resume/--continue), so self-heal
-// preserves per-agent isolation rather than collapsing onto the shared --continue
-// path.
-func claudeFreshSessionArgs(agent Agent, prompt string, model string, sessionID string) []string {
-	args := claudePermissionArgs(agent)
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	return append(args, "--session-id", sessionID, "-p", "--output-format", "json", "--", prompt)
-}
-
-// claudeSessionMissingError wraps an unrecoverable dead-session failure (the
-// pinned session was gone AND the fresh start also failed) in an actionable,
-// agent-named gitmoot message instead of raw CLI stderr. If the fresh start
-// failed for an auth reason, ClassifyClaudeCommandError still surfaces it as auth
-// so a real auth failure is never masked as a stale session.
-func (a ClaudeAdapter) claudeSessionMissingError(agent Agent, result subprocess.Result, err error) error {
-	if isClaudeAuthFailure(result) {
-		return claudeCommandError(result, err)
-	}
-	return fmt.Errorf("runtime session for agent %q no longer exists and a fresh session could not be started. %s: %w",
-		agent.Name, ClaudeSessionMissingMessage, claudeCommandError(result, err))
-}
-
-// parseClaudeJSONResult extracts the assistant summary and best-effort token
-// usage from a Claude Code --output-format json envelope. It returns ("", 0, 0)
-// when stdout is not the JSON envelope (e.g. the --output-format json fallback to
-// plain text), so the caller can fall back to the raw text and contribute 0 to
-// the token budget. Usage capture is best-effort: a missing "usage" object leaves
-// the counts at 0 rather than erroring.
-func parseClaudeJSONResult(stdout string) (summary string, inputTokens int, outputTokens int) {
-	payload, err := ExtractClaudeResultEnvelope(stdout)
-	if err != nil {
-		return "", 0, 0
-	}
-	return payload.Result, payload.Usage.InputTokens, payload.Usage.OutputTokens
-}
-
-func (a ClaudeAdapter) Health(ctx context.Context, agent Agent) error {
-	if err := a.Validate(ctx, agent); err != nil {
-		return err
-	}
-	_, err := a.Deliver(ctx, agent, Job{Prompt: healthPrompt})
-	return err
-}
-
-func (a ClaudeAdapter) Capabilities(context.Context) ([]string, error) {
-	return []string{"review", "implement", "ask"}, nil
-}
-
-func (a ClaudeAdapter) runner() subprocess.Runner {
-	if a.Runner != nil {
-		return a.Runner
-	}
-	// Group semantics so cancelling a job kills the runtime CLI's whole
-	// process tree, not just the immediate child.
-	return subprocess.GroupRunner{}
-}
-
-func (a ClaudeAdapter) newRuntimeRef() (string, error) {
-	if a.NewRuntimeRef != nil {
-		return a.NewRuntimeRef()
-	}
-	return newUUID()
 }
 
 type ShellAdapter struct {
@@ -1501,242 +748,6 @@ func commandError(result subprocess.Result, err error) error {
 	return fmt.Errorf("%s: %w", detail, err)
 }
 
-// codexCommandError prefers the real failure message from codex's --json events
-// (on stdout) over the stderr-first commandError, which otherwise surfaces
-// codex's harmless "Reading additional input from stdin..." line instead of the
-// actual cause (usage limit, auth, etc.). Falls back to commandError when stdout
-// carries no parseable error event (e.g. the non-json Deliver path).
-func codexCommandError(result subprocess.Result, err error) error {
-	if detail := parseCodexErrorMessage(result.Stdout); detail != "" {
-		return fmt.Errorf("%s: %w", detail, err)
-	}
-	return commandError(result, err)
-}
-
-// parseCodexErrorMessage scans codex --json JSONL for the failure message in an
-// "error" ({"message":...}) or "turn.failed" ({"error":{"message":...}}) event,
-// returning the last non-empty one (turn.failed usually follows the error event).
-func parseCodexErrorMessage(output string) string {
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	message := ""
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var event struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-			Error   struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal([]byte(line), &event) != nil {
-			continue
-		}
-		switch event.Type {
-		case "error":
-			if m := strings.TrimSpace(event.Message); m != "" {
-				message = m
-			}
-		case "turn.failed":
-			if m := strings.TrimSpace(event.Error.Message); m != "" {
-				message = m
-			}
-		}
-	}
-	return message
-}
-
-// codexUsage mirrors the usage object on codex's turn.completed --json event.
-// input_tokens already includes cached_input_tokens, so we read only the billed
-// input/output totals and deliberately ignore cached_input_tokens and
-// reasoning_output_tokens — the per-root delegation token budget sums those two.
-// parseCodexJSONResult extracts the deliverable text and best-effort token usage
-// from codex `exec --json` JSONL output. It joins the .text of every
-// item.completed agent_message event with a blank line (the agent's full reply,
-// which carries the gitmoot_result blob the engine scans for) and reads the LAST
-// turn.completed usage (the final turn is authoritative if codex emits several).
-//
-// ok reports whether at least one agent_message was seen; ok=false means the
-// stream is not the expected JSONL shape (older CLI, the plain-text --json
-// fallback, or an error-only turn), so the caller fails open on the raw stdout
-// with 0 usage. Usage is best-effort: agent_messages with no turn.completed leave
-// the counts at 0 rather than erroring. It mirrors parseCodexErrorMessage's
-// narrow, unmarshal-per-line style so unrelated schema additions stay harmless.
-func parseCodexJSONResult(output string) (raw string, inputTokens int, outputTokens int, ok bool) {
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	var messages []string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		event, err := ExtractCodexStreamEvent(line)
-		if err != nil {
-			continue
-		}
-		switch event.Type {
-		case "item.completed":
-			if event.ItemType == "agent_message" {
-				messages = append(messages, event.Text)
-			}
-		case "turn.completed":
-			inputTokens = event.Usage.InputTokens
-			outputTokens = event.Usage.OutputTokens
-		}
-	}
-	if len(messages) == 0 {
-		return "", 0, 0, false
-	}
-	return strings.Join(messages, "\n\n"), inputTokens, outputTokens, true
-}
-
-// isCodexJSONUnsupported reports whether a failed codex run rejected --json, i.e.
-// an older CLI that predates JSONL event output. codex (clap) prints e.g.
-// "error: unexpected argument '--json' found" to stderr with a nonzero exit;
-// runCodex re-runs plain-text on this signal (mirrors isClaudeJSONUnsupported).
-func isCodexJSONUnsupported(result subprocess.Result) bool {
-	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
-	if !strings.Contains(text, "--json") {
-		return false
-	}
-	return strings.Contains(text, "unexpected argument") ||
-		strings.Contains(text, "unknown") ||
-		strings.Contains(text, "unrecognized") ||
-		strings.Contains(text, "unsupported") ||
-		strings.Contains(text, "invalid")
-}
-
-// claudeCommandError prefers the human-readable result from Claude's JSON
-// failure envelope over the raw stdout blob. The original process error stays
-// wrapped, and auth failures retain their existing typed classification.
-func claudeCommandError(result subprocess.Result, err error) error {
-	base := commandError(result, err)
-	if envelope, parseErr := ExtractClaudeResultEnvelope(result.Stdout); parseErr == nil && envelope.Type == "result" && envelope.IsError {
-		if resultMessage := strings.TrimSpace(envelope.Result); resultMessage != "" {
-			detail := "claude: " + resultMessage
-			if envelope.APIErrorStatus != 0 {
-				detail += fmt.Sprintf(" (api_error_status %d)", envelope.APIErrorStatus)
-			}
-			base = fmt.Errorf("%s: %w", detail, err)
-		}
-	}
-	return classifyClaudeCommandError(result, base)
-}
-
-// classifyClaudeProbeError classifies the error from an ISOLATED doctor live
-// probe (a single `claude -p`, no concurrency). It is ClassifyClaudeCommandError
-// plus one extra Invalid signature: a 401 "socket connection was closed
-// unexpectedly" that survived the probe's retry is the documented #486
-// invalid-token symptom rather than a concurrency transient, so it must be tagged
-// ErrClaudeAuthFailed (→ ClaudeClassifyProbe Invalid) instead of falling through
-// to Unknown, which kept `gitmoot doctor` green for the exact bug it exists to
-// catch. The Deliver path keeps treating the same signature as transient (it
-// never calls this), so retry behavior there is unchanged.
-func classifyClaudeProbeError(result subprocess.Result, err error) error {
-	if !isClaudeAuthFailure(result) && isClaude401SocketClosed(result, err) {
-		base := commandError(result, err)
-		msg := fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
-		return &claudeAuthFailedError{wrapped: msg}
-	}
-	return ClassifyClaudeCommandError(result, err)
-}
-
-func ClassifyClaudeCommandError(result subprocess.Result, err error) error {
-	return claudeCommandError(result, err)
-}
-
-func classifyClaudeCommandError(result subprocess.Result, base error) error {
-	if !isClaudeAuthFailure(result) {
-		return base
-	}
-	msg := fmt.Errorf("Claude Code authentication failed. %s: %w", ClaudeSessionAuthFailedMessage, base)
-	// Tag the classified auth failure with ErrClaudeAuthFailed so callers can
-	// distinguish a genuine credential rejection (401/invalid) from a transient
-	// or network error via errors.Is, without re-matching stderr strings. The
-	// wrapper's Error() is the message verbatim, so existing text assertions and
-	// the wrapped exec error remain reachable.
-	return &claudeAuthFailedError{wrapped: msg}
-}
-
-// ErrClaudeAuthFailed marks an error chain produced by ClassifyClaudeCommandError
-// for a genuine Claude credential rejection. Use errors.Is(err, ErrClaudeAuthFailed)
-// to tell "the token was rejected" (Invalid) apart from "the probe could not
-// reach a verdict" (transient/network/binary-missing → Unknown).
-var ErrClaudeAuthFailed = errors.New("Claude authentication failed")
-
-// claudeAuthFailedError tags wrapped with ErrClaudeAuthFailed while preserving
-// wrapped's message and chain. Go's errors.Is walks the slice returned by
-// Unwrap() []error, so both wrapped (and through it the exec error) and the
-// sentinel stay reachable.
-type claudeAuthFailedError struct{ wrapped error }
-
-func (e *claudeAuthFailedError) Error() string   { return e.wrapped.Error() }
-func (e *claudeAuthFailedError) Unwrap() []error { return []error{e.wrapped, ErrClaudeAuthFailed} }
-
-// claudeSessionMissingMarker is the exact stderr signature emitted by `claude
-// --resume <uuid>` when the pinned conversation no longer exists (captured from
-// claude v2.1.191). It is a pre-execution failure: exit 1, empty stdout, no model
-// turn ran — so a retry on a fresh session duplicates no side effects.
-const claudeSessionMissingMarker = "No conversation found with session ID:"
-
-// isClaudeSessionMissing reports whether a failed Claude delivery is the
-// pre-execution dead-session signal — distinct from auth failures and from
-// generic non-zero exits. It matches the distinctive mixed-case marker without
-// lowercasing (lowercasing would force lowercasing the marker too and weaken the
-// match). The exit!=0 precondition is enforced structurally by the Deliver call
-// site, which only consults this classifier when the runner returned err!=nil;
-// subprocess.Result carries no exit-code field, so the marker is the signal.
-func isClaudeSessionMissing(result subprocess.Result) bool {
-	return strings.Contains(result.Stderr, claudeSessionMissingMarker) ||
-		strings.Contains(result.Stdout, claudeSessionMissingMarker)
-}
-
-func isClaudeAuthFailure(result subprocess.Result) bool {
-	text := strings.ToLower(strings.Join([]string{
-		result.Stdout,
-		result.Stderr,
-	}, "\n"))
-	if strings.Contains(text, "authentication_error") {
-		return true
-	}
-	if strings.Contains(text, "invalid authentication credentials") {
-		return true
-	}
-	if strings.Contains(text, "invalid x-api-key") {
-		return true
-	}
-	return strings.Contains(text, "401") && strings.Contains(text, "authentication")
-}
-
-func parseCodexStartedThreadID(output string) (string, error) {
-	scanner := bufio.NewScanner(strings.NewReader(output))
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var event struct {
-			Type     string `json:"type"`
-			ThreadID string `json:"thread_id"`
-		}
-		if json.Unmarshal([]byte(line), &event) != nil {
-			continue
-		}
-		if event.Type == "thread.started" && strings.TrimSpace(event.ThreadID) != "" {
-			return strings.TrimSpace(event.ThreadID), nil
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("parse codex start output: %w", err)
-	}
-	return "", errors.New("codex start did not emit thread.started thread_id")
-}
-
 func newUUID() (string, error) {
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
@@ -1747,114 +758,6 @@ func newUUID() (string, error) {
 	encoded := make([]byte, 32)
 	hex.Encode(encoded, bytes[:])
 	return fmt.Sprintf("%s-%s-%s-%s-%s", encoded[0:8], encoded[8:12], encoded[12:16], encoded[16:20], encoded[20:32]), nil
-}
-
-// claudeArgs builds the `claude` argument vector; the prompt is the trailing
-// positional after `--`.
-//
-// ARG_MAX exposure (#723): like kimi, claude passes the prompt as a trailing argv
-// arg, so a prompt above the kernel's MAX_ARG_STRLEN (~128 KiB per single arg)
-// would fork/exec with E2BIG. claude, unlike kimi, has a native escape hatch — its
-// `-p/--print` non-interactive mode reads the prompt from stdin when no positional
-// is supplied. Routing oversize prompts through stdin is deferred to a follow-up;
-// #723 fixes kimi, which offers no stdin/file channel.
-func claudeArgs(agent Agent, prompt string, jsonOutput bool, model string) []string {
-	args := claudePermissionArgs(agent)
-	if model != "" {
-		args = append(args, "--model", model)
-	}
-	if agent.RuntimeRef == "last" {
-		args = append(args, "--continue")
-	} else {
-		args = append(args, "--resume", agent.RuntimeRef)
-	}
-	args = append(args, "-p")
-	if jsonOutput {
-		args = append(args, "--output-format", "json")
-	}
-	return append(args, "--", prompt)
-}
-
-var claudeRuntimeContract = RuntimeContract{
-	Binary: "claude",
-	Requirements: []RuntimeRequirement{
-		{
-			Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p",
-			Source: "internal/runtime/adapter.go::claudeArgs",
-			Remedy: "install a Claude CLI that lists -p, or run the job on a runtime whose installed CLI satisfies its declared contract",
-		},
-		{
-			Kind: RuntimeRequirementFlag, Name: "flag --permission-mode", Flag: "--permission-mode",
-			Source:   "internal/runtime/adapter.go::claudePermissionArgs",
-			Remedy:   "install a Claude CLI that lists --permission-mode, or run this policy on a runtime whose installed CLI satisfies its declared contract",
-			Policies: []string{AutonomyPolicyReadOnly, AutonomyPolicyWorkspaceWrite, AutonomyPolicyDangerFullAccess},
-		},
-		{
-			// #1499 measured Claude 2.1.223 with the exact argv this adapter emits.
-			// The discriminator is the root/sudo message, not rc=1: the other rc=1
-			// results reached the API and received the account's quota 429.
-			//
-			//   claude --permission-mode bypassPermissions -p ok --output-format json
-			//     euid 0: rc=1, "--dangerously-skip-permissions cannot be used with root/sudo privileges"
-			//   claude --permission-mode acceptEdits -p ok --output-format json
-			//     euid 0: rc=1, no root refusal; the command reaches the API
-			//   claude -p ok --output-format json
-			//     euid 0: rc=1, no root refusal; the command reaches the API
-			//   setpriv --reuid 65534 --regid 65534 --clear-groups claude --permission-mode bypassPermissions -p ok --output-format json
-			//     euid 65534: no root refusal; the command reaches the API and returns a JSON envelope
-			//
-			// The refusal requires the conjunction of euid 0 and bypassPermissions;
-			// neither condition alone triggers it. The refusal misleadingly names
-			// --dangerously-skip-permissions, a flag Gitmoot does not pass.
-			// This cannot be reduced to a cheap capability probe:
-			// `claude --permission-mode bypassPermissions --version` exits 0 under
-			// root, so re-verification requires the real prompt command above.
-			Kind:     RuntimeRequirementNonRootEUID,
-			Name:     "precondition effective uid != 0 for --permission-mode bypassPermissions",
-			Flag:     "--permission-mode bypassPermissions",
-			Source:   "internal/runtime/adapter.go::claudePermissionArgs",
-			Remedy:   "run Claude danger-full-access as a non-root user, or choose an autonomy policy the installed Claude CLI permits under this user",
-			Policies: []string{AutonomyPolicyDangerFullAccess}, Instrument: "effective-uid",
-		},
-	},
-}
-
-func claudePermissionArgs(agent Agent) []string {
-	var args []string
-	if agent.ReadOnlySeat {
-		args = []string{"--restricted", "--tools", "Bash,WebFetch,WebSearch", "--permission-mode", "dontAsk", "--allowedTools", "Bash,WebFetch,WebSearch"}
-	} else {
-		switch NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-		case AutonomyPolicyReadOnly:
-			args = []string{"--permission-mode", "plan"}
-		case AutonomyPolicyWorkspaceWrite:
-			args = []string{"--permission-mode", "acceptEdits"}
-		case AutonomyPolicyDangerFullAccess:
-			// Upstream refusal, Claude 2.1.223: "--dangerously-skip-permissions cannot
-			// be used with root/sudo privileges". The runtime contract above keeps
-			// this environmental precondition beside the argv that triggers it.
-			args = []string{"--permission-mode", "bypassPermissions"}
-		}
-	}
-	for _, path := range agent.WritablePaths {
-		if path = strings.TrimSpace(path); path != "" {
-			args = append(args, "--add-dir", path)
-		}
-	}
-	for _, path := range agent.ReadablePaths {
-		if path = strings.TrimSpace(path); path != "" {
-			// Claude's --add-dir is the Read-tool visibility gate. Landlock is
-			// the enforcement boundary that keeps this subset read-only.
-			args = append(args, "--add-dir", path)
-		}
-	}
-	return args
-}
-
-func isClaudeJSONUnsupported(result subprocess.Result) bool {
-	text := strings.ToLower(result.Stdout + "\n" + result.Stderr)
-	return strings.Contains(text, "output-format") &&
-		(strings.Contains(text, "unknown") || strings.Contains(text, "unsupported") || strings.Contains(text, "invalid"))
 }
 
 func validateRuntime(agent Agent, runtimeName string) error {
@@ -1889,124 +792,4 @@ func isUUID(value string) bool {
 		}
 	}
 	return true
-}
-
-func (r CodexSessionIndex) Exists(ctx context.Context, ref string) (bool, error) {
-	locations, err := r.locations()
-	if err != nil {
-		return false, err
-	}
-	for _, location := range locations {
-		found, err := codexSessionIndexContains(ctx, location.IndexPath, ref)
-		if err != nil {
-			return false, err
-		}
-		if found {
-			return true, nil
-		}
-		if isUUID(ref) {
-			found, err = codexShellSnapshotsContain(ctx, location.SnapshotsDir, ref)
-			if err != nil {
-				return false, err
-			}
-			if found {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-type codexSessionLocation struct {
-	IndexPath    string
-	SnapshotsDir string
-}
-
-func codexSessionIndexContains(ctx context.Context, path string, ref string) (bool, error) {
-	file, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		if err := ctx.Err(); err != nil {
-			return false, err
-		}
-		var entry struct {
-			ID         string `json:"id"`
-			ThreadName string `json:"thread_name"`
-		}
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return false, fmt.Errorf("parse codex session index: %w", err)
-		}
-		if entry.ID == ref || entry.ThreadName == ref {
-			return true, nil
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return false, err
-	}
-	return false, nil
-}
-
-func codexShellSnapshotsContain(ctx context.Context, dir string, ref string) (bool, error) {
-	pattern := filepath.Join(dir, ref+".*.sh")
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return false, err
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	return len(matches) > 0, nil
-}
-
-func (r CodexSessionIndex) locations() ([]codexSessionLocation, error) {
-	if r.Path != "" {
-		return []codexSessionLocation{codexLocationForIndex(r.Path)}, nil
-	}
-	homes := []string{}
-	if home := strings.TrimSpace(r.Home); home != "" {
-		return []codexSessionLocation{codexLocationForHome(home)}, nil
-	}
-	if home := strings.TrimSpace(os.Getenv("CODEX_HOME")); home != "" {
-		homes = append(homes, home)
-	}
-	userHome, err := os.UserHomeDir()
-	if err != nil && len(homes) == 0 {
-		return nil, err
-	}
-	if err == nil {
-		homes = append(homes, filepath.Join(userHome, ".codex"))
-	}
-	locations := make([]codexSessionLocation, 0, len(homes))
-	seen := map[string]bool{}
-	for _, home := range homes {
-		home = filepath.Clean(home)
-		if seen[home] {
-			continue
-		}
-		seen[home] = true
-		locations = append(locations, codexLocationForHome(home))
-	}
-	return locations, nil
-}
-
-func codexLocationForIndex(path string) codexSessionLocation {
-	home := filepath.Dir(path)
-	return codexSessionLocation{
-		IndexPath:    path,
-		SnapshotsDir: filepath.Join(home, "shell_snapshots"),
-	}
-}
-
-func codexLocationForHome(home string) codexSessionLocation {
-	return codexSessionLocation{
-		IndexPath:    filepath.Join(home, "session_index.jsonl"),
-		SnapshotsDir: filepath.Join(home, "shell_snapshots"),
-	}
 }

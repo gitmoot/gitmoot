@@ -31,17 +31,12 @@ func (w jobWorker) quotaRoleUnavailableHooks() quotaRoleUnavailableHooks {
 }
 
 // classifyRuntimeRoleUnavailable is the provider-specific edge around the
-// shared operational-blocker classifier. Phase 1 recognizes Claude only; the
-// switch deliberately leaves an obvious extension point for Codex/Kimi without
-// duplicating quota parsing or durable incident handling.
-func classifyRuntimeRoleUnavailable(runtimeName string, cause error, now time.Time) (blockerClassification, bool) {
-	switch strings.TrimSpace(runtimeName) {
-	case runtime.ClaudeRuntime:
-		classification, ok := classifyOperationalBlocker(cause, now)
-		return classification, ok && classification.Class == blockerClassRuntimeQuota
-	default:
-		return blockerClassification{}, false
-	}
+// shared operational-blocker classifier. Phase 1 recognized the claude runtime
+// only, and #2587 removed that runtime, so no current runtime opens a role
+// unavailability incident. Whether omp quota walls should is a follow-up; the
+// incident store, routing and clearing paths are kept for it.
+func classifyRuntimeRoleUnavailable(string, error, time.Time) (blockerClassification, bool) {
+	return blockerClassification{}, false
 }
 
 // recordRuntimeOutcome applies the same role-availability transition at every
