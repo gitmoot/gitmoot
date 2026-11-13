@@ -144,9 +144,11 @@ func main() {
 		writeFile(args[0], fmt.Sprintf("%d %d", pidA, pidB))
 		fmt.Println("OK orphan-chain", pidA, pidB)
 	case "hold":
-		// Writes its pid, forks a descendant that tries to exec /bin/true
-		// after a delay (so after the supervisor may be gone), and waits.
-		writeFile(args[0], strconv.Itoa(os.Getpid()))
+		// Forks a descendant that tries to exec /bin/true after a delay (so
+		// after the supervisor may be gone), then writes its pid and waits.
+		// The pid is written only after the fork: the test kills the
+		// supervisor as soon as it sees the pid, and a kill before the fork
+		// takes the runtime down with no descendant to test (#2615).
 		// A raw descriptor, not an *os.File: an os.File's finalizer may
 		// close the descriptor the forked descendant later writes to.
 		resultFD, err := unix.Open(args[1], unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC, 0o600)
@@ -180,6 +182,7 @@ func main() {
 			unix.RawSyscall(unix.SYS_EXIT_GROUP, 0, 0, 0)
 		})
 		fmt.Println("OK hold child", childPid)
+		writeFile(args[0], strconv.Itoa(os.Getpid()))
 		time.Sleep(time.Minute)
 	default:
 		fmt.Println("unknown mode", os.Args[1])

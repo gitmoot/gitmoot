@@ -299,18 +299,88 @@ func otherGroupMembers(self int) []int {
 	return members
 }
 
+// notifyListener is the seccomp listener as superviseExecs uses it, so the
+// loop can be tested without a kernel race (#2615).
+type notifyListener interface {
+	// wait blocks until a notification may be pending or no task uses the
+	// filter any more, and returns the poll revents.
+	wait() (int16, error)
+	recv(*seccompNotif) error
+	send(*seccompNotifResp) error
+	close()
+}
+
+type fdListener int
+
+func (l fdListener) wait() (int16, error) {
+	fds := []unix.PollFd{{Fd: int32(l), Events: unix.POLLIN}}
+	if _, err := unix.Poll(fds, -1); err != nil {
+		return 0, err
+	}
+	return fds[0].Revents, nil
+}
+
+func (l fdListener) recv(req *seccompNotif) error {
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(l), unix.SECCOMP_IOCTL_NOTIF_RECV, uintptr(unsafe.Pointer(req))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (l fdListener) send(resp *seccompNotifResp) error {
+	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(l), unix.SECCOMP_IOCTL_NOTIF_SEND, uintptr(unsafe.Pointer(resp))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func (l fdListener) close() { _ = unix.Close(int(l)) }
+
 // superviseExecs answers seccomp exec notifications until no confined process
 // remains. Only the first is allowed, and only if it is the child's execve.
 func superviseExecs(listener int, childPid int, arch seccompArch) {
-	defer unix.Close(listener)
+	runExecSupervisor(fdListener(listener), childPid, arch)
+}
+
+// runExecSupervisor is the supervisor loop. Closing the listener makes every
+// later exec of a confined process fail with ENOSYS instead of being
+// answered, so it must keep answering while any confined task exists.
+//
+// #2615: NOTIF_RECV returning ENOENT does NOT mean the confined processes are
+// gone. Per seccomp_unotify(2) and kernel/seccomp.c (seccomp_notify_recv) it
+// means the notification it was woken for vanished: the target was killed,
+// or its syscall was interrupted by a signal (Go's SIGURG preemption does
+// this constantly). And RECV never reports "no users left"; it just blocks.
+// The only such signal is poll: seccomp_notify_poll sets EPOLLHUP once the
+// filter's users count is zero, and __seccomp_filter_orphan wakes pollers
+// with EPOLLHUP when the last task detaches. So the loop exits only on
+// POLLHUP with nothing pending, or on an unrecoverable error.
+func runExecSupervisor(l notifyListener, childPid int, arch seccompArch) {
+	defer l.close()
 	bootstrapped := false
 	for {
-		var req seccompNotif
-		if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(listener), unix.SECCOMP_IOCTL_NOTIF_RECV, uintptr(unsafe.Pointer(&req))); errno != 0 {
-			if errno == unix.EINTR {
+		revents, err := l.wait()
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
 				continue
 			}
-			return // ENOENT: every confined process has exited
+			return
+		}
+		if revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			return
+		}
+		if revents&unix.POLLIN == 0 {
+			if revents&unix.POLLHUP != 0 {
+				return // no task uses the filter any more
+			}
+			continue
+		}
+		var req seccompNotif
+		if err := l.recv(&req); err != nil {
+			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return
 		}
 		resp := seccompNotifResp{ID: req.ID, Error: -int32(unix.EACCES)}
 		if !bootstrapped && int(req.Pid) == childPid && uint32(req.Nr) == arch.execve {
@@ -318,7 +388,9 @@ func superviseExecs(listener int, childPid int, arch seccompArch) {
 			resp.Error = 0
 			resp.Flags = unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE
 		}
-		_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(listener), unix.SECCOMP_IOCTL_NOTIF_SEND, uintptr(unsafe.Pointer(&resp)))
+		// ENOENT here means the target went away (killed, or interrupted
+		// by a signal and will re-notify): harmless, keep serving.
+		_ = l.send(&resp)
 	}
 }
 
