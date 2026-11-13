@@ -119,10 +119,6 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		rawCommands: 1,
 		reason:      "operator update lifecycle restarts the local daemon executable",
 	},
-	"internal/workflow/result_observation.go:changedWorktreeFiles": {
-		execRunners: 1,
-		reason:      "result observation inspects the host worktree only after backend output has been collected",
-	},
 }
 
 func TestJobPathsDoNotHardcodeHostRunners(t *testing.T) {
