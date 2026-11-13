@@ -1912,27 +1912,28 @@ func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {
 	return nil
 }
 
-// JobNotClaimedError reports that Mailbox.Run did not claim the job because it
-// was not queued. The caller therefore owns no running claim on it.
-type JobNotClaimedError struct {
-	JobID string
-	State string
-}
+type claimObserverKey struct{}
 
-func (e JobNotClaimedError) Error() string {
-	return fmt.Sprintf("job %q is %s, not queued", e.JobID, e.State)
+// WithClaimObserver returns ctx carrying observe, which Mailbox.Run calls with
+// the job ID and the exact lifecycle generation of each queued->running claim
+// it makes under ctx. It lets a caller that hands the claim to the engine know
+// precisely which run it owns.
+func WithClaimObserver(ctx context.Context, observe func(jobID string, generation int64)) context.Context {
+	return context.WithValue(ctx, claimObserverKey{}, observe)
 }
 
 func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	if job.State != string(JobQueued) {
-		return JobNotClaimedError{JobID: job.ID, State: job.State}
+		return fmt.Errorf("job %q is %s, not queued", job.ID, job.State)
 	}
 	// Stamp the claiming process's identity in the SAME atomic queued->running
 	// UPDATE (#651): runner_boot_id (db.BootID) is the cross-boot liveness signal
 	// that lets the daemon recover this job immediately after a reboot, and
 	// runner_pid is recorded for observability only. Off Linux BootID() is "", so
 	// the row is identity-less and only the existing age/lease recovery applies.
-	claimed, err := m.store.ClaimRunningJob(ctx, job.ID, string(JobQueued), string(JobRunning), db.JobEvent{
+	// The claim is anchored to the generation just read, so the generation
+	// reported to a claim observer is exactly the run this claim started (#2618).
+	claimed, err := m.store.ClaimRunningJobAtGeneration(ctx, job.ID, string(JobQueued), job.LifecycleGeneration, string(JobRunning), db.JobEvent{
 		JobID:   job.ID,
 		Kind:    string(JobRunning),
 		Message: "job started",
@@ -1945,7 +1946,13 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 		if getErr != nil {
 			return getErr
 		}
-		return JobNotClaimedError{JobID: job.ID, State: latest.State}
+		if latest.State == string(JobQueued) {
+			return fmt.Errorf("job %q was re-queued at lifecycle generation %d before generation %d could be claimed", job.ID, latest.LifecycleGeneration, job.LifecycleGeneration)
+		}
+		return fmt.Errorf("job %q is %s, not queued", job.ID, latest.State)
+	}
+	if observe, ok := ctx.Value(claimObserverKey{}).(func(string, int64)); ok && observe != nil {
+		observe(job.ID, job.LifecycleGeneration)
 	}
 	return nil
 }

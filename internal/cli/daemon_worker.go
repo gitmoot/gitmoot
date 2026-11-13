@@ -345,6 +345,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	// every cleanup defer, a run this worker claimed must not stay running.
 	exitGuard := beginWorkerExitGuard(job.ID)
 	settleCtx := ctx
+	// Every engine claim made under this frame (RunJob, the temp worker's
+	// RunJob) reports its exact generation to the guard.
+	ctx = workflow.WithClaimObserver(ctx, exitGuard.claimed)
 	defer func() {
 		panicked := recover()
 		w.settleWorkerExit(settleCtx, exitGuard, returnErr, panicked)
@@ -839,8 +842,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
 				return eventErr
 			}
-			// The temp worker's RunJob claims this job inside this run() frame.
-			exitGuard.claimed(job.LifecycleGeneration)
 			return w.runWithTempWorker(ctx, job, payload, execBackend, agent, checkout, policy, eligibleMessage)
 		} else if strings.TrimSpace(eligibility.Reason) != "" {
 			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
@@ -928,7 +929,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	runCtx := ctx
 	stopRun := func() {}
 	if remoteReviewAdmitted {
-		exitGuard.claimed(job.LifecycleGeneration)
+		// Admission claimed exactly this generation (ClaimRunningJobAtGeneration).
+		exitGuard.claimed(job.ID, job.LifecycleGeneration)
 		// Admission owns the queued->running claim, so cancellation observation
 		// must begin before the cost ledger or provider can see this job.
 		runCtx, stopRun = w.runningJobContext(ctx, job.ID)
@@ -1250,13 +1252,11 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	// staged clone instead, which the child may legitimately rewrite - so seats
 	// are excluded here rather than filtered later).
 	credentialBefore, credentialObserved := observeNonSeatKimiCredential(agent)
-	exitGuard.claimed(job.LifecycleGeneration)
 	if remoteReviewAdmitted {
 		_, err = engine.RunClaimedJob(runCtx, job.ID, agent, adapter)
 	} else {
 		_, err = engine.RunJob(runCtx, job.ID, agent, adapter)
 	}
-	exitGuard.observeRunErr(err)
 	err = w.recordUnrecordedResult(ctx, engine, err)
 	recordKimiCredentialDegradation(ctx, w.Store, w.Stdout, job.ID, agent, credentialBefore, credentialObserved)
 	removeRelatedTrees()

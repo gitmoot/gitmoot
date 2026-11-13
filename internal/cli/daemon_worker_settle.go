@@ -73,9 +73,10 @@ func (r *jobWorkerRegistry) count(jobID string) int {
 	return r.counts[jobID]
 }
 
-// workerExitGuard is one run()'s claim on its job. It is armed where the
-// worker claims (remote review admission) or hands the claim to the engine
-// (RunJob), and disarmed when the engine reports it did not claim.
+// workerExitGuard is one run()'s claim on its job. It is armed only by a
+// successful queued->running claim, with that claim's exact lifecycle
+// generation: remote review admission claims itself, and Mailbox.Run reports
+// its claim through the observer run() installs (workflow.WithClaimObserver).
 type workerExitGuard struct {
 	jobID      string
 	armed      bool
@@ -89,35 +90,27 @@ func beginWorkerExitGuard(jobID string) *workerExitGuard {
 	return &workerExitGuard{jobID: jobID}
 }
 
-// claimed arms the guard for the lifecycle generation the claim is made at.
-// Mailbox.Run claims the generation it reads, which a requeue can have moved
-// past the worker's snapshot, so the guard settles that generation or later.
-func (g *workerExitGuard) claimed(generation int64) {
-	if !g.armed || generation < g.generation {
-		g.generation = generation
+// claimed arms the guard for the run claimed at generation. Every claim starts
+// a distinct generation (a re-queue bumps it), so this names one run.
+func (g *workerExitGuard) claimed(jobID string, generation int64) {
+	if jobID != g.jobID {
+		return
 	}
 	g.armed = true
-}
-
-// observeRunErr disarms the guard when the engine did not claim the job.
-func (g *workerExitGuard) observeRunErr(err error) {
-	var notClaimed workflow.JobNotClaimedError
-	if errors.As(err, &notClaimed) {
-		g.armed = false
-	}
+	g.generation = generation
 }
 
 // settleWorkerExit fails the run this worker claimed if it is still running
 // under this process's claim. It runs after every other defer in run(), on a
 // context detached from the (possibly cancelled) run context.
+//
+// Only the claimed generation is ever settled, and the write is anchored to
+// it: a row at any other generation is a different run (an operator retry
+// claimed by another worker, say) and is not this worker's to fail, however
+// recently it was read.
 func (w jobWorker) settleWorkerExit(ctx context.Context, g *workerExitGuard, returnErr error, panicked any) {
 	defer liveJobWorkers.leave(g.jobID)
 	if !g.armed {
-		return
-	}
-	// Another live worker in this process owns the job now; its own guard
-	// settles whatever it claimed.
-	if liveJobWorkers.count(g.jobID) > 1 {
 		return
 	}
 	cause := "worker returned without settling the job"
@@ -134,10 +127,10 @@ func (w jobWorker) settleWorkerExit(ctx context.Context, g *workerExitGuard, ret
 		writeLine(w.Stdout, "job %s exit settlement read failed (the orphaned-claim sweep will retry): %v", g.jobID, err)
 		return
 	}
-	if job.State != string(workflow.JobRunning) || job.LifecycleGeneration < g.generation {
+	if job.State != string(workflow.JobRunning) || job.LifecycleGeneration != g.generation {
 		return
 	}
-	if _, err := failClaimedRunningJob(settleCtx, w.Store, w.Stdout, time.Now().UTC(), job, db.CurrentJobRunner(), "worker exited without settling its claimed run: "+cause); err != nil {
+	if _, err := failClaimedRunningJob(settleCtx, w.Store, w.Stdout, time.Now().UTC(), job, g.generation, db.CurrentJobRunner(), "worker exited without settling its claimed run: "+cause); err != nil {
 		writeLine(w.Stdout, "job %s exit settlement failed (the orphaned-claim sweep will retry): %v", g.jobID, err)
 	}
 }
@@ -210,7 +203,9 @@ func (s *orphanedClaimSweep) sweep(ctx context.Context, store *db.Store, stdout 
 			orphaned[job.ID] = claim
 			continue
 		}
-		if _, err := failClaimedRunningJob(ctx, store, stdout, now, job, runner,
+		// Anchored to the generation observed orphaned for the whole grace
+		// period: a run claimed since then is a different run and never matches.
+		if _, err := failClaimedRunningJob(ctx, store, stdout, now, job, claim.generation, runner,
 			fmt.Sprintf("no live worker in this daemon has owned the running claim for %s", now.Sub(claim.since).Round(time.Second))); err != nil {
 			writeLine(stdout, "orphaned-claim sweep: job %s settle failed: %v", job.ID, err)
 			orphaned[job.ID] = claim
