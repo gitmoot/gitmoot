@@ -487,7 +487,6 @@ not govern network access; network policy remains the runtime CLI's.
 
 ```sh
 gitmoot status --repo owner/repo
-gitmoot events --repo owner/repo
 gitmoot repo add owner/repo --path <path> [--poll <duration>]
 gitmoot repo list
 gitmoot repo set-interval owner/repo (<duration>|default)
@@ -1006,31 +1005,6 @@ itself; use `gitmoot message resolve` from the CLI.
 The styled output leads with a "needs attention" block, colors and truncates
 long lists, and groups near-identical runtime sessions; `--all` shows
 everything.
-
-## Event Stream (Webhooks)
-
-To notify an external system when jobs finish, configure the off-by-default
-webhook transport in the `[events]` section of the Gitmoot config — it is **not**
-in the generated default config, so this documentation is its discovery surface:
-
-```toml
-[events]
-webhook_url = "https://example.com/gitmoot-events"  # empty (default) = OFF
-timeout = "2s"                                       # per-POST timeout
-# socket_path = ""                                   # reserved, unused today
-```
-
-With `webhook_url` set, Gitmoot POSTs a small, versioned (`schema_version = 1`),
-redacted JSON event to that endpoint for: `job.finished`, `job.failed`,
-`job.blocked`, `job.needs_attention` (an `escalate_human` pause), and
-`job.deferred`. Delivery is best-effort
-(bounded buffer + timeout; drops are recorded as a local `event_sink_drop` job
-event, never blocking the job). Consumer rule: **treat a `job.failed` as final
-only when it is NOT immediately followed by a `job.deferred` for the same job
-id.** Since #532 slice E a deferred run emits `job.deferred` as a first-class
-transition **instead of** `job.failed` (no preceding `job.failed`); the rule
-still holds and is forward-compatible with the older `job.failed`→`job.deferred`
-flap.
 
 ## Review Router
 
@@ -3942,7 +3916,7 @@ branch-lock conflict, or a dirty/wrong-head checkout that carries a
 it as **deferred** with a bounded retry budget and a hold until the earliest
 retry time, shown as `blocked-operational: <class>: attempt n/3`. `gitmoot job
 show --json` carries the `blocker_class`, attempt count, and `suggested_action`.
-Over the `[events]` stream the deferral is now a **first-class** `job.deferred`
+On the event-rule stream the deferral is now a **first-class** `job.deferred`
 transition emitted **instead of** `job.failed` (no preceding `job.failed` for
 that run). A `runtime_auth` deferral only re-dispatches once a live doctor-style
 credential probe passes; the probe failing just extends the hold without spending

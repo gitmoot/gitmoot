@@ -1,11 +1,11 @@
-// Package events defines the off-by-default, best-effort outbound event seam
-// (#446): a typed, versioned JobEvent contract plus a Sink interface the
-// workflow engine and daemon call from the terminal-transition path to fan a
-// redacted event out to one configured transport (the pilot ships a webhook).
+// Package events defines the best-effort outbound event seam (#446): a typed,
+// versioned JobEvent contract plus a Sink interface the workflow engine and
+// daemon call from the terminal-transition path. The organization event-rule
+// sink is the only transport.
 //
 // Design invariants:
-//   - OFF by default: a nil Sink is a no-op everywhere, so with no [events]
-//     config the engine/daemon behave byte-identically (no goroutine, no emit).
+//   - OFF by default: a nil Sink is a no-op everywhere, so with no enabled
+//     event rules the engine/daemon behave byte-identically (no emit).
 //   - BEST-EFFORT: a slow/hung/erroring/full consumer must NEVER block or fail a
 //     job. Emit is fire-and-forget with a bounded transport timeout and
 //     drop-on-full, mirroring the EscalationNotifier contract.

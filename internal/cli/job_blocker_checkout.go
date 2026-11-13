@@ -211,7 +211,7 @@ func (w jobWorker) holdCheckoutContention(ctx context.Context, job db.Job, paylo
 	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: blockerDeferredEventKind, Message: message}); err != nil {
 		return false, err
 	}
-	// Additive job.deferred, best-effort and nil-safe when [events] is OFF. No
+	// Additive job.deferred, best-effort and nil-safe when no event rule is enabled. No
 	// job.failed precedes it: finishQueuedJob was never called (pre-terminal).
 	emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalDeferred, string(workflow.JobQueued), message)
 	return true, nil

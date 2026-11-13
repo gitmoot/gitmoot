@@ -571,7 +571,7 @@ parent. Delegations that declare `deps` run only after the named siblings
 succeed, and once every top-level delegation is terminal Gitmoot enqueues one
 coordinator continuation job so the coordinator can synthesize the results.
 Inspect the fan-out with `gitmoot job list --repo owner/repo` (one row per child
-job) and `gitmoot events --repo owner/repo` (the `delegation_enqueued` events).
+job) and `gitmoot job events <job-id>` (the `delegation_enqueued` events).
 Each child job carries job-tree linkage fields — `parent_job_id`,
 `delegation_id`, `root_job_id`, `delegation_depth`, and `task_id` — so a child
 can be traced back to its parent, its originating delegation, and the root of the
@@ -684,7 +684,7 @@ delegations never set `agent`, because `agent` and `ephemeral` are mutually
 exclusive. Once every leg is terminal, Gitmoot enqueues one continuation back to
 the coordinator to merge the results (the panel verdict, or the verify gate plus
 the producer's artifact). Inspect the run under `gitmoot job list --repo owner/repo`
-and the `delegation_enqueued` events in `gitmoot events --repo owner/repo`. See
+and the `delegation_enqueued` events in `gitmoot job events <job-id>`. See
 `RESULT_CONTRACT.md` for the `ephemeral` field reference and the termination
 bounds these recipes run inside.
 

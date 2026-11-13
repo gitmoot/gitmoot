@@ -45,7 +45,6 @@ var rootCommands = []command{
 	{name: "sandbox", summary: "probe kernel-enforced runtime sandbox support", run: runSandbox},
 	{name: "orchestrate", summary: "Orchestrate work across agents (a coordinator that fans out delegations)", run: runOrchestrate},
 	{name: "plugin", summary: "build and inspect Gitmoot agent plugins", run: runPlugin},
-	{name: "events", summary: "show local repo events", run: runEvents},
 	{name: "status", summary: "show local workflow status", run: runStatus},
 	{name: "task", summary: "inspect review-cycle tasks", run: runTask},
 	{name: "job", summary: "inspect and recover jobs", run: runJob},

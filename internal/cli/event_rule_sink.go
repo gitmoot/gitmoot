@@ -42,7 +42,6 @@ type eventWakeClient interface {
 // Only the daemon drains notification transport; short-lived producers never
 // retain background work against their closing store.
 type eventRuleSink struct {
-	inner events.Sink
 	store *db.Store
 	home  string
 	wake  eventWakeClient
@@ -66,11 +65,10 @@ func (s *eventRuleSink) Emit(ctx context.Context, event events.Event) {
 	}
 	event = s.addressBlockedEvent(ctx, event)
 	event = s.addressUnownedVerdictEvent(ctx, event)
-	events.EmitEvent(ctx, s.inner, event)
 	if s.store == nil {
 		return
 	}
-	// Unclassified webhook traffic does not create inbox notifications.
+	// Unclassified events do not create inbox notifications.
 	kinds := classifyEventRuleKinds(event)
 	if len(kinds) == 0 {
 		return
@@ -127,7 +125,6 @@ func (s *eventRuleSink) emitWakeOutbox(ctx context.Context, event events.Event, 
 	if s == nil {
 		return fmt.Errorf("event-rule sink is nil")
 	}
-	events.EmitEvent(ctx, s.inner, event)
 	if s.store == nil || s.wake == nil {
 		return fmt.Errorf("event-rule sink is not configured for durable delivery")
 	}
@@ -314,7 +311,7 @@ func eventRuleMatchesAddressee(rule db.EventRule, event events.Event) bool {
 }
 
 // addressBlockedEvent enriches every blocked event at the event-sink source
-// boundary before webhook fanout or durable routing. Persisted job attribution
+// boundary before durable routing. Persisted job attribution
 // remains strongest only while that role belongs to the current live roster.
 // Archived or removed attribution falls back to the current live role selected
 // for the event repository.

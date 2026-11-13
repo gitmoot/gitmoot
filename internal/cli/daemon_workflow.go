@@ -64,13 +64,11 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
 		// handle is filled in from policy by applyOrchestratePolicy.
 		EscalationNotifier: &daemonEscalationNotifier{Store: store, GitHub: gh},
-		// Off-by-default outbound event stream (#446): the engine emits
-		// job.finished/job.failed/job.blocked on its terminal Mailbox path and
-		// job.needs_attention on an escalate_human pause through this best-effort,
-		// nil-safe sink. daemonEventSink returns nil unless [events].webhook_url is
-		// set, so with no config NO sink is constructed and behavior is
-		// byte-identical. The sink is a process-global shared singleton (one drain
-		// goroutine), so re-building the engine per tick never leaks goroutines.
+		// Outbound event stream: the engine emits job.finished/job.failed/
+		// job.blocked on its terminal Mailbox path and job.needs_attention on an
+		// escalate_human pause through this best-effort, nil-safe event-rule
+		// sink. The sink is cached per home and store, so re-building the engine
+		// per tick reuses it.
 		EventSink: daemonEventSink(store, home),
 		// Registry default model/effort fallbacks: when a delivered job pins no
 		// agent/job override, fall back to the HOME-AWARE resolved runtime registry

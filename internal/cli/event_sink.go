@@ -16,41 +16,26 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// eventSinkCache holds the process-global webhook Sink and rule decorator the
-// daemon shares across every per-tick / per-repo engine construction (#446).
-// The webhook sink
-// owns a long-lived drain goroutine, so it MUST be constructed once — building a
-// fresh one per engine would leak a goroutine per poll. It is keyed by resolved
-// home so a multi-home test process never crosses streams; in the normal single-
-// daemon deployment there is exactly one entry. A cached nil entry records "this
-// home has [events] OFF" so the disabled path stays a cheap map hit with no
-// re-parse and, crucially, no sink/goroutine — the off-by-default guarantee.
+// eventSinkCache holds the process-global rule decorator the daemon shares
+// across every per-tick / per-repo engine construction. It is keyed by resolved
+// home plus database path so a multi-home test process never crosses streams.
 var eventSinkCache = struct {
 	sync.Mutex
-	webhooks map[string]events.Sink
-	rules    map[string]*eventRuleSink
-}{webhooks: map[string]events.Sink{}, rules: map[string]*eventRuleSink{}}
+	rules map[string]*eventRuleSink
+}{rules: map[string]*eventRuleSink{}}
 
-// daemonEventSink composes the shared best-effort webhook Sink with the opt-in
-// organization rule evaluator. It returns nil when both features are OFF (no
-// [events].webhook_url and zero enabled event_rules rows). Config/store failures
-// fail safe to disabled and never break the daemon. It is safe for concurrent
-// callers and constructs the underlying webhook sink (and its drain goroutine)
-// at most once per home.
-//
-// When enabled, the sink's OnDrop records a single best-effort event_sink_drop
-// job event so a dropped emit (full buffer / dead consumer) is locally
-// observable without coupling the events package to the db layer or ever
-// blocking the caller.
+// daemonEventSink returns the organization event-rule evaluator for the store,
+// or nil when there is no store. Store failures fail safe and never break the
+// daemon. It is safe for concurrent callers.
 func daemonEventSink(store *db.Store, home string) events.Sink {
 	sink, _ := resolveDaemonEventSink(context.Background(), store, home)
 	return sink
 }
 
 // resolveDaemonEventSink exposes event-rule read failures to callers that own
-// durable delivery. Ordinary event emission uses daemonEventSink's historical
-// best-effort wrapper; the wake outbox tick must distinguish "rules disabled"
-// from "rules unreadable" so pending delivery work never looks healthy.
+// durable delivery. Ordinary event emission uses daemonEventSink's best-effort
+// wrapper; the wake outbox tick must distinguish "rules disabled" from "rules
+// unreadable" so pending delivery work never looks healthy.
 func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {
 	if store == nil {
 		return resolveDaemonEventSinkWithRules(store, home, nil), nil
@@ -66,21 +51,10 @@ func resolveDaemonEventSink(ctx context.Context, store *db.Store, home string) (
 // snapshot already read by the caller. The durable outbox uses this form so it
 // never re-reads routing state after claiming rows.
 func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.EventRule) events.Sink {
-	home = strings.TrimSpace(home)
-	eventSinkCache.Lock()
-	webhook, built := eventSinkCache.webhooks[home]
-	if !built {
-		webhook = buildDaemonEventSink(store, home)
-		eventSinkCache.webhooks[home] = webhook
-	}
-	eventSinkCache.Unlock()
-
-	// Event rules can be added or removed while the daemon is running. Probe the
-	// lightweight table when each per-tick engine is built; zero enabled rows
-	// preserve the exact historical sink (including nil when webhooks are off).
 	if store == nil {
-		return webhook
+		return nil
 	}
+	home = strings.TrimSpace(home)
 	key := home + "\x00" + store.DatabasePath()
 	eventSinkCache.Lock()
 	defer eventSinkCache.Unlock()
@@ -88,7 +62,6 @@ func resolveDaemonEventSinkWithRules(store *db.Store, home string, rules []db.Ev
 		return sink
 	}
 	sink := &eventRuleSink{
-		inner: webhook,
 		store: store,
 		home:  home,
 		wake:  cockpit.New(cockpit.Options{HerdrBin: "herdr", OMPRuntimeDir: ompRuntimeDir(home)}),
@@ -107,47 +80,11 @@ func ompRuntimeDir(home string) string {
 	return config.Paths{Home: filepath.Dir(configFile)}.OMPRuntimeDir()
 }
 
-func buildDaemonEventSink(store *db.Store, home string) events.Sink {
-	policy, err := loadEventsPolicy(home)
-	if err != nil || !policy.Enabled() {
-		return nil
-	}
-	webhook := events.NewWebhookSink(policy.WebhookURL, policy.ResolvedTimeout())
-	if webhook == nil {
-		return nil
-	}
-	if store != nil {
-		webhook.OnDrop = func(event events.Event, reason string) {
-			// Best-effort local observability for a dropped outbound event; never
-			// blocks or fails (the drain goroutine is the only caller). A write
-			// error is swallowed.
-			_ = store.AddJobEvent(context.Background(), db.JobEvent{
-				JobID:   event.JobID,
-				Kind:    "event_sink_drop",
-				Message: string(event.Type) + ": " + reason,
-			})
-		}
-	}
-	return webhook
-}
-
-// loadEventsPolicy resolves the [events] policy for a home, fail-safe to the
-// disabled default when the home or config cannot be resolved/parsed so the
-// event stream stays OFF rather than erroring the daemon.
-func loadEventsPolicy(home string) (config.EventsPolicy, error) {
-	cfg := resolveConfigFile(home)
-	if cfg == "" {
-		return config.DefaultEventsPolicy(), nil
-	}
-	return config.LoadEventsPolicy(config.Paths{ConfigFile: cfg})
-}
-
 // resolveConfigFile resolves the gitmoot config.toml for a `home` that may be
 // EITHER an already-resolved <home>/.gitmoot ROOT or a RAW --home. An empty
 // home resolves through config.DefaultPaths, matching the CLI's omitted --home
 // behavior. It is the single, side-effect-free home->config.toml resolver
-// shared by the daemon's read-only policy loaders (loadEventsPolicy,
-// resolveEscalationTTL).
+// shared by the daemon's read-only policy loaders (resolveEscalationTTL).
 //
 // On main the daemon's engine wiring (daemonWorkflowEngine -> daemonEventSink)
 // receives the already-resolved <home>/.gitmoot root on ALL callers
