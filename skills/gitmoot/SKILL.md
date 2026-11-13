@@ -287,12 +287,7 @@ inherit the label automatically. Use
 files fresh unlabeled dispatches under `adhoc/<agent>-<yyyy-mm-dd>` and records
 `workflow_autolabeled`; `strict` instead requires `--workflow`. Per-repo
 overrides live in `[repos."owner/repo"]`, and `repo add --agents-md` scaffolds
-the discipline into a checkout's AGENTS.md. Use
-`gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
-draft for failed, blocked, or cancelled jobs; use
-`gitmoot report bug --job <job-id> --create --yes` only when the user
-explicitly asks you to file it or the active workflow policy permits automatic
-bug filing.
+the discipline into a checkout's AGENTS.md.
 
 When a job pauses at `awaiting_human`, the local (non-PR) answer path is
 `gitmoot job answer <job-id> "<question-id>: text"`. It resumes through the same

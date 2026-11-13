@@ -1570,37 +1570,6 @@ report/dashboard. With `risk_tiers_enabled`
 off, PR review uses the single-reviewer path. The competition tier (two
 implementations + a judge) is a planned follow-up.
 
-## Bug Reports
-
-Use `gitmoot report bug` to build a redacted GitHub-ready issue from local
-Gitmoot error state. Job reports are fully supported; daemon, dashboard, and
-train selectors are reserved and return clear unsupported-source errors until
-their source collectors are implemented.
-
-```sh
-gitmoot report bug --job <job-id> [--preview]
-gitmoot report bug --job <job-id> --create --yes
-gitmoot report bug --source daemon --preview
-gitmoot report bug --source dashboard --preview
-gitmoot report bug --train <session-id> --create --yes
-```
-
-Default behavior is preview. Agents should run preview first, show or summarize
-the redacted draft, and create an issue only when the user explicitly asks or
-the active workflow policy already permits filing reports. Non-interactive
-creation requires `--create --yes`.
-
-Created reports target `gitmoot/gitmoot`, include the labels
-`gitmoot-dashboard-report` and `bug`, and carry a fingerprint marker in the
-body so duplicate open issues can be reused instead of creating another report.
-If duplicate search fails in the CLI path, Gitmoot prints a warning and still
-creates the issue; dashboard creates fail closed and keep the preview open so
-the user can retry.
-
-After creation, report the printed issue URL back to the user. If Gitmoot says
-an existing issue was found, report that URL instead of presenting it as a new
-issue.
-
 ## Agent Setup
 
 Start a new runtime session managed by Gitmoot:
@@ -4053,8 +4022,7 @@ tail is cut, so a secret can never leak partially), the **`delivery_error`** —
 the engine's own terminal error for the delivery, i.e. the exact line the daemon
 logs as `job <id> failed: <err>` (#1620) — and the runtime session id when one is
 known. `gitmoot job show` prints a `failure_diagnostics:` block,
-`job show --json` carries `payload.failure_diagnostics`, and `gitmoot report
-bug` includes a "Failure diagnostics" section. Successful jobs never store one,
+and `job show --json` carries `payload.failure_diagnostics`. Successful jobs never store one,
 and a retried job clears the previous run's crash report. Terminal `failed`
 events embed the same bounded, redacted stderr tail for durable triage.
 

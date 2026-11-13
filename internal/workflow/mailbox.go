@@ -1352,7 +1352,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			return AgentResult{}, deferredError{cause: deliveryErr}
 		}
 		// Persist crash diagnostics (#806) before the terminal fail so `job show`
-		// and `report bug` can explain a session that died without an envelope.
+		// can explain a session that died without an envelope.
 		// Best-effort: diagnostics must never change the failure path.
 		m.storeFailureDiagnostics(ctx, job.ID, &payload, firstDiag)
 		// #2224: preserve the findings this review had already produced. Same

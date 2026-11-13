@@ -141,7 +141,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot report bug --job <job-id> --preview",
 				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr <number>",
 				"gitmoot router summary",

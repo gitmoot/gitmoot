@@ -154,8 +154,6 @@ gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
 gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot job record (--agent <name> | --acting-role <role>) --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
-gitmoot report bug --job <job-id> --preview
-gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 gitmoot job answer <job-id> "<question-id>: answer text" [--json]
@@ -210,12 +208,6 @@ Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note
 for external-coordinator workflow groups.
 Attach `--workflow <label>` to agent ask/run/review, orchestrate, or
 `job open`; orchestration descendants inherit the label automatically.
-
-Use `gitmoot report bug --job <job-id> --preview` when a failed, blocked, or
-cancelled Gitmoot job needs a user-shareable bug report. Preview first by
-default. Create with `--create --yes` only when the user explicitly asks or the
-active workflow policy permits filing reports, then report the created or
-existing GitHub issue URL back to the user.
 
 ## PR Comment Commands
 
