@@ -276,10 +276,10 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 }
 
 // recordFoldedReviewOutcome persists the durable approved-with-notes outcome for a
-// sub-threshold changes-requested review. proof/project.go keys its review.approved
-// claim on this event, and the merge gate, required-reviewer evaluation, delegation
-// quorum and verify synthesis all fold the same verdict to approved regardless — so
-// a fold that is not recorded leaves those surfaces contradicting `gitmoot proof`.
+// sub-threshold changes-requested review. The merge gate, required-reviewer
+// evaluation, delegation quorum and verify synthesis all fold the same verdict to
+// approved regardless — so a fold that is not recorded leaves the job's durable
+// event history contradicting those surfaces.
 //
 // It is called once at the TOP of AdvanceJob rather than at any point inside it.
 // Fan-out reviews are excluded for free: effectiveReviewDecisionForPayload

@@ -172,7 +172,7 @@ func augmentDelegationManifest(root string, parentJobID string, parentResult *Ag
 // serialized on repo:<repo>), so the augment write must not interleave a bare
 // O_TRUNC os.WriteFile. The encoded manifest is deterministic, so a lost-update
 // race over a stable succeeded set converges harmlessly. It mirrors the
-// established in-repo pattern (internal/artifact/store.go, internal/config/edit.go).
+// established in-repo pattern (internal/config/edit.go).
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")

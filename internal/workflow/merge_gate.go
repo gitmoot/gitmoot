@@ -2561,7 +2561,7 @@ func effectiveReviewerIdentity(job db.Job, payload JobPayload) (string, bool) {
 // It exists because the comment above this function already named two consumers
 // that were deliberately left on bare job.Agent for routing: review_loop.go's
 // FindRepeatedReviewers, which could not see a role because db.SucceededReviewVerdict
-// carried only Agent, and internal/proof, which had zero ActingOrgRole references
+// carried only Agent, and the since-removed proof package, which had zero ActingOrgRole references
 // and therefore reported a role-authored review as not comparable. Both now call
 // this, so the count in that comment is no longer two and is deliberately not
 // restated here - quoting a count is the habit #1950 F5 ended.
