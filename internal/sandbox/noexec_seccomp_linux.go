@@ -200,7 +200,7 @@ func SuperviseNoExecution(self string, childArgs []string) (int, error) {
 
 	listener, recvErr := receiveFD(int(parentEnd.Fd()))
 	if recvErr == nil {
-		go superviseExecs(listener, cmd.Process.Pid, arch)
+		go runExecSupervisor(fdListener(listener), cmd.Process.Pid, arch)
 	} else {
 		// The child failed before handing over its listener, so it never
 		// installed the filter and cannot exec anything: its error is on
@@ -299,7 +299,7 @@ func otherGroupMembers(self int) []int {
 	return members
 }
 
-// notifyListener is the seccomp listener as superviseExecs uses it, so the
+// notifyListener is the seccomp listener as runExecSupervisor uses it, so the
 // loop can be tested without a kernel race (#2615).
 type notifyListener interface {
 	// wait blocks until a notification may be pending or no task uses the
@@ -336,15 +336,11 @@ func (l fdListener) send(resp *seccompNotifResp) error {
 
 func (l fdListener) close() { _ = unix.Close(int(l)) }
 
-// superviseExecs answers seccomp exec notifications until no confined process
-// remains. Only the first is allowed, and only if it is the child's execve.
-func superviseExecs(listener int, childPid int, arch seccompArch) {
-	runExecSupervisor(fdListener(listener), childPid, arch)
-}
-
-// runExecSupervisor is the supervisor loop. Closing the listener makes every
-// later exec of a confined process fail with ENOSYS instead of being
-// answered, so it must keep answering while any confined task exists.
+// runExecSupervisor answers seccomp exec notifications until no confined
+// process remains. Only the first is allowed, and only if it is the child's
+// execve. Closing the listener makes every later exec of a confined process
+// fail with ENOSYS instead of being answered, so it must keep answering
+// while any confined task exists.
 //
 // #2615: NOTIF_RECV returning ENOENT does NOT mean the confined processes are
 // gone. Per seccomp_unotify(2) and kernel/seccomp.c (seccomp_notify_recv) it
@@ -354,7 +350,14 @@ func superviseExecs(listener int, childPid int, arch seccompArch) {
 // The only such signal is poll: seccomp_notify_poll sets EPOLLHUP once the
 // filter's users count is zero, and __seccomp_filter_orphan wakes pollers
 // with EPOLLHUP when the last task detaches. So the loop exits only on
-// POLLHUP with nothing pending, or on an unrecoverable error.
+// POLLHUP with nothing pending, POLLNVAL, or an unrecoverable poll/recv error.
+//
+// POLLERR alone is NOT fatal: seccomp_notify_poll returns bare EPOLLERR when
+// mutex_lock_interruptible(&filter->notify_lock) is interrupted by a signal
+// pending on the polling thread, and poll(2) reports that as readiness, not
+// EINTR. The listener is healthy, so the loop just polls again. No backoff:
+// the interruption needs a signal pending on this thread, which is delivered
+// on the return to user space, so the retry does not spin on the same cause.
 func runExecSupervisor(l notifyListener, childPid int, arch seccompArch) {
 	defer l.close()
 	bootstrapped := false
@@ -366,8 +369,8 @@ func runExecSupervisor(l notifyListener, childPid int, arch seccompArch) {
 			}
 			return
 		}
-		if revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
-			return
+		if revents&unix.POLLNVAL != 0 {
+			return // the listener descriptor itself is invalid
 		}
 		if revents&unix.POLLIN == 0 {
 			if revents&unix.POLLHUP != 0 {

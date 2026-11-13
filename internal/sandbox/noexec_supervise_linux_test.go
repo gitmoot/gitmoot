@@ -59,9 +59,10 @@ func (l *scriptedListener) send(resp *seccompNotifResp) error {
 func (l *scriptedListener) close() { l.closed = true }
 
 // TestExecSupervisorSurvivesTransientErrors: #2615. RECV failing with ENOENT
-// (the target was signalled mid-notification) or EINTR, and SEND failing
-// with ENOENT, must not end the supervisor; only POLLHUP does. Every exec
-// after bootstrap is still answered with EACCES.
+// (the target was signalled mid-notification) or EINTR, SEND failing with
+// ENOENT, and a bare POLLERR (notify_lock interrupted by a signal) must not
+// end the supervisor; only POLLHUP does. Every exec after bootstrap is still
+// answered with EACCES.
 func TestExecSupervisorSurvivesTransientErrors(t *testing.T) {
 	arch := seccompArches["amd64"]
 	const child = 100
@@ -75,6 +76,8 @@ func TestExecSupervisorSurvivesTransientErrors(t *testing.T) {
 		{revents: unix.POLLIN, recvErr: unix.EINTR},                     // recv interrupted
 		{revents: unix.POLLIN, req: exec(2, 101), sendErr: unix.ENOENT}, // target gone
 		{revents: unix.POLLIN, req: exec(3, child)},                     // later exec
+		{revents: unix.POLLERR},                                         // poll lock interrupted
+		{revents: unix.POLLIN, req: exec(4, 102)},                       // exec after POLLERR
 		{revents: unix.POLLHUP},                                         // no task left
 	}}
 	runExecSupervisor(l, child, arch)
@@ -88,6 +91,7 @@ func TestExecSupervisorSurvivesTransientErrors(t *testing.T) {
 		{ID: 1, Flags: unix.SECCOMP_USER_NOTIF_FLAG_CONTINUE},
 		{ID: 2, Error: -int32(unix.EACCES)},
 		{ID: 3, Error: -int32(unix.EACCES)},
+		{ID: 4, Error: -int32(unix.EACCES)},
 	}
 	if len(l.sent) != len(want) {
 		t.Fatalf("sent %+v, want %+v", l.sent, want)
