@@ -55,7 +55,6 @@ var rootCommands = []command{
 	{name: "lock", summary: "inspect and release branch locks", run: runLock},
 	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
-	{name: "router", summary: "inspect execution-grounded routing telemetry (advisory)", run: runRouter},
 }
 
 func Run(args []string, stdout, stderr io.Writer) int {

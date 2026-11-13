@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, routing telemetry, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
@@ -32,7 +32,7 @@ background daemon checks, Codex, Claude Code, Kimi Code, or omp agent startup,
 structured implementation plans, agent template inspection,
 custom prompt agents, job status, branch lock inspection,
 agent memory,
-routing telemetry, or runtime metadata.
+or runtime metadata.
 
 Gitmoot's CLI evolves quickly. If the user names a Gitmoot feature or command
 that is not covered here, verify the live surface with `gitmoot --help` and the
@@ -159,7 +159,6 @@ gitmoot report bug --job <job-id> --create --yes
 gitmoot lock list --repo owner/repo
 gitmoot lock show owner/repo <branch>
 gitmoot job answer <job-id> "<question-id>: answer text" [--json]
-gitmoot router summary [--repo owner/repo] [--action ask|review|implement] [--since 30d] [--json]
 ```
 
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
@@ -202,9 +201,7 @@ Use `gitmoot job answer <job-id> "<question-id>: text"` to resume a job paused a
 `awaiting_human`; it routes through the same escalation-resume path the daemon's
 PR-comment `answer` verb uses.
 
-Use `gitmoot runtime list` to inspect runtime metadata and
-`gitmoot router summary` for local observed routing telemetry. Router telemetry
-is advisory only and not a benchmark.
+Use `gitmoot runtime list` to inspect runtime metadata.
 
 Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
 for external-coordinator workflow groups.

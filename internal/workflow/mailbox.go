@@ -111,12 +111,6 @@ type Mailbox struct {
 	// consulted only as the final fallback after payload.Effort and agent.Effort;
 	// nil or empty forces no runtime argument.
 	RuntimeDefaultEffort func(runtimeName string) string
-	// routerContextEnabled gates the off-by-default #530 coordinator context block.
-	// When true, Run appends a bounded (<=12 line) observed-performance table to a
-	// TOP-LEVEL (coordinator) job's prompt. When false (the default, every
-	// construction site that does not opt in) no telemetry query runs and the prompt
-	// is byte-identical. Wired from Engine.RouterContextEnabled via mailbox().
-	routerContextEnabled bool
 	// resultCheckMode is the resolved [workflow] result_checks policy (#526). The
 	// zero value ("") and "off" both disable the deterministic post-parse audit,
 	// so every Mailbox built without explicitly setting it — every test, the ask/
@@ -1308,24 +1302,9 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	} else if err := m.claim(ctx, job); err != nil {
 		return AgentResult{}, err
 	}
-	// Execution clock for #530 routing telemetry: measured from the claim (the real
-	// start of this run) to the terminal transition below. Advisory only.
-	runStart := time.Now()
-
 	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
 	jobPrompt := payload.prompt(job.Type)
 	prompt := prompts.RenderJob(jobPrompt)
-	// Append the off-by-default #530 coordinator routing-context block. Gated on the
-	// [router] context_enabled knob (routerContextEnabled) AND on the job being a
-	// top-level coordinator (no parent) — a delegation child inherits its
-	// coordinator's routing decision, so it needs no table. When the knob is off no
-	// telemetry query runs and the prompt is byte-identical; when on-but-empty the
-	// builder returns "" and the prompt is still byte-identical.
-	if m.routerContextEnabled && strings.TrimSpace(payload.ParentJobID) == "" {
-		if block := m.buildRouterContextBlock(ctx, payload); block != "" {
-			prompt = prompt + "\n\n" + block
-		}
-	}
 	if payload.ResumedSelfDirtyWorktree {
 		prompt = resumedSelfDirtyWorktreeNotice() + "\n\n" + prompt
 	} else if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
@@ -1380,7 +1359,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// still counts against its success rate — otherwise it contributes zero rows
 		// and its recorded SuccessRate stays artificially high. Only reached on the
 		// TERMINAL m.fail path; the tryDeferBlocker re-queue above returns first.
-		m.recordRoutingTelemetry(ctx, job, agent, payload, AgentResult{}, JobFailed, time.Since(runStart))
 		// Typed DeliveryError: this error is FROM the delivery seam (not about the
 		// agent's output), the precondition for #532 operational classification.
 		return AgentResult{}, deliveryErr
@@ -1462,7 +1440,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				// Advisory failure observation (#530): a hard adapter error during repair
 				// is still a runtime-level failure — count it so flaky runtimes are not
 				// over-recommended by the coordinator context block.
-				m.recordRoutingTelemetry(ctx, job, agent, payload, AgentResult{}, JobFailed, time.Since(runStart))
 				return AgentResult{}, deliveryErr
 			}
 			// Same #531 override + #665 ephemeral guard as the first delivery: never
@@ -1526,7 +1503,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			// Advisory failure observation (#530): output that stays malformed after all
 			// repair attempts is a runtime/model failure to honor the contract — count it
 			// so it lowers the recorded success rate instead of being invisible.
-			m.recordRoutingTelemetry(ctx, job, agent, payload, AgentResult{}, JobFailed, time.Since(runStart))
 			return AgentResult{}, parseErr
 		}
 	}
@@ -1646,7 +1622,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// Record advisory routing telemetry (#530) at the settled terminal state.
 	// Best-effort and fail-safe: it swallows every error internally, so a telemetry
 	// write can never turn a successfully-finished job into a failure.
-	m.recordRoutingTelemetry(ctx, job, agent, payload, result, state, time.Since(runStart))
 	return result, nil
 }
 

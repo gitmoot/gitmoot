@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, routing telemetry, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
@@ -70,15 +70,6 @@ the current chat — but it cannot author, update, or distribute one. There is n
 draft, validate, add, export, publish, pull, remote, diff, revert, or update
 verb. A template that must change is edited or re-seeded in the
 `agent_templates` store row by hand. See CLI.md § Agent Templates.
-
-For routing telemetry, phrases like "which runtime/model works best here",
-"show observed routing performance", or "should I route Go tasks to Codex" map to
-Gitmoot's execution-grounded routing telemetry (#530): every job records an
-additive `routing_telemetry` row at terminal, and `gitmoot router summary` reports
-local observed success/approval rates by `(action, runtime, model, template)`. It
-is **advisory only** — nothing auto-overrides routing — and labeled "local observed
-performance, not a benchmark". An optional `[router] context_enabled = true` feeds a
-bounded table into coordinator prompts. See CLI.md § Routing Telemetry.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
