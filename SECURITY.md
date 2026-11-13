@@ -40,6 +40,6 @@ Pay special attention to changes that touch:
 - installer and release artifact verification
 - plugin package generation for Codex or Claude Code
 - GitHub CLI token usage and PR/issue writes
-- daemon job routing, branch locks, and merge gates
+- daemon job routing and merge gates
 - runtime adapter command execution
 - local config, SQLite state, logs, and generated files

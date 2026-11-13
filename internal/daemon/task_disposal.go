@@ -40,9 +40,8 @@ type taskDisposalEvidence struct {
 	subjectIssue int64
 	pullRequest  int64
 	// seat is the acting org role recorded on the task's most recent job: the
-	// seat that requested its review or did its work (#2495). Branchless
-	// review tasks have no branch lock, so this is their only record of an
-	// owning seat. seatAt is that job's created_at.
+	// seat that requested its review or did its work (#2495). It is the only
+	// record of an owning seat. seatAt is that job's created_at.
 	seat, seatAt string
 }
 
@@ -210,8 +209,7 @@ func (d Daemon) commitTaskDisposal(ctx context.Context, candidate db.StaleTaskCa
 }
 
 // taskDisposalEscalationRole picks who hears about a stranded task. The seat
-// comes from the branch lock, else from the most recent job's acting role
-// (#2495); an archived seat is no seat. Only when the task holds its own open
+// comes from the most recent job's acting role (#2495); an archived seat is no seat. Only when the task holds its own open
 // PR (ownPRHeld: awaiting_human_merge) does a seat that merges its own work
 // (merge_rule = "self") and covers the repo hear about it directly, because
 // merging or closing that PR is its decision. A task stranded for any other
@@ -228,13 +226,7 @@ func (d Daemon) taskDisposalEscalationRole(ctx context.Context, candidate db.Sta
 		role, ok := orgConfig.Role(name)
 		return role, ok && !archived[name]
 	}
-	actingRole := ""
-	if lock, err := d.Store.GetBranchLock(ctx, candidate.RepoFullName, candidate.Branch); err == nil {
-		actingRole = strings.ToLower(strings.TrimSpace(lock.ActingOrgRole))
-	}
-	if _, ok := orgConfig.Role(actingRole); !ok {
-		actingRole = strings.ToLower(strings.TrimSpace(jobSeat))
-	}
+	actingRole := strings.ToLower(strings.TrimSpace(jobSeat))
 	if seat, ok := live(actingRole); ok && ownPRHeld &&
 		strings.EqualFold(strings.TrimSpace(seat.MergeRule), "self") && config.ScopeMatches(seat.Scope, candidate.RepoFullName) {
 		return actingRole

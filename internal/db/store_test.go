@@ -34,8 +34,6 @@ func TestOpenMigratesSchema(t *testing.T) {
 		"jobs",
 		"job_events",
 		"task_events",
-		"branch_locks",
-		"lock_events",
 		"resource_locks",
 		"merge_gates",
 		"agent_repos",
@@ -1440,72 +1438,6 @@ func TestRepositoryMethods(t *testing.T) {
 	if len(events) != 1 || events[0].Kind != "queued" {
 		t.Fatalf("events = %+v", events)
 	}
-	acquired, err := store.AcquireLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "lead"})
-	if err != nil {
-		t.Fatalf("AcquireLock returned error: %v", err)
-	}
-	if !acquired {
-		t.Fatal("first AcquireLock did not acquire lock")
-	}
-	acquired, err = store.AcquireLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "lead"})
-	if err != nil {
-		t.Fatalf("same-owner AcquireLock returned error: %v", err)
-	}
-	if !acquired {
-		t.Fatal("same-owner AcquireLock did not return acquired")
-	}
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if lock.Owner != "lead" {
-		t.Fatalf("lock owner = %q, want lead", lock.Owner)
-	}
-	created, err := store.CreateLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "lead"})
-	if err != nil {
-		t.Fatalf("CreateLock existing returned error: %v", err)
-	}
-	if created {
-		t.Fatal("CreateLock reported existing lock as newly created")
-	}
-	acquired, err = store.AcquireLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "other"})
-	if err != nil {
-		t.Fatalf("second AcquireLock returned error: %v", err)
-	}
-	if acquired {
-		t.Fatal("second AcquireLock unexpectedly acquired lock")
-	}
-	released, err := store.ReleaseLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "other"})
-	if err != nil {
-		t.Fatalf("wrong-owner ReleaseLock returned error: %v", err)
-	}
-	if released {
-		t.Fatal("wrong-owner ReleaseLock released lock")
-	}
-	released, err = store.ReleaseLockWithEvent(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task", Owner: "lead"}, BranchLockEvent{Kind: "released", Message: "done"})
-	if err != nil {
-		t.Fatalf("ReleaseLockWithEvent returned error: %v", err)
-	}
-	if !released {
-		t.Fatal("ReleaseLock did not release owned lock")
-	}
-	lockEvents, err := store.ListBranchLockEvents(ctx, "gitmoot/gitmoot", "task")
-	if err != nil {
-		t.Fatalf("ListBranchLockEvents returned error: %v", err)
-	}
-	if len(lockEvents) != 1 || lockEvents[0].Kind != "released" || lockEvents[0].Owner != "lead" {
-		t.Fatalf("lock events = %+v", lockEvents)
-	}
-	if acquired, err := store.AcquireLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-force", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("force lock AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	releasedLock, released, err := store.ForceReleaseLockWithEvent(ctx, "gitmoot/gitmoot", "task-force", BranchLockEvent{Kind: "force_released", Message: "stale"})
-	if err != nil {
-		t.Fatalf("ForceReleaseLockWithEvent returned error: %v", err)
-	}
-	if !released || releasedLock.Owner != "lead" {
-		t.Fatalf("force release returned lock=%+v released=%v", releasedLock, released)
-	}
 	if err := store.UpsertMergeGate(ctx, MergeGate{RepoFullName: "gitmoot/gitmoot", PullRequest: 1, State: "pending", Reason: "waiting"}); err != nil {
 		t.Fatalf("UpsertMergeGate returned error: %v", err)
 	}
@@ -1612,61 +1544,6 @@ func runStoreGit(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
-	}
-}
-
-func TestBranchLockSkipNativeReviewFanout(t *testing.T) {
-	ctx := context.Background()
-	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-
-	if created, err := store.CreateLock(ctx, BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !created {
-		t.Fatalf("CreateLock returned created=%v err=%v", created, err)
-	}
-
-	// CreateLock defaults the flag to false.
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if lock.SkipNativeReviewFanout {
-		t.Fatalf("expected default SkipNativeReviewFanout=false, got %+v", lock)
-	}
-
-	// SetBranchLockReviewFanout flips it; GetBranchLock returns it.
-	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-7", true); err != nil {
-		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
-	}
-	lock, err = store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if !lock.SkipNativeReviewFanout {
-		t.Fatalf("expected SkipNativeReviewFanout=true after set, got %+v", lock)
-	}
-
-	// ListBranchLocks round-trips the column.
-	locks, err := store.ListBranchLocks(ctx, "gitmoot/gitmoot")
-	if err != nil {
-		t.Fatalf("ListBranchLocks returned error: %v", err)
-	}
-	if len(locks) != 1 || !locks[0].SkipNativeReviewFanout {
-		t.Fatalf("ListBranchLocks = %+v", locks)
-	}
-
-	// Flipping back to false round-trips too.
-	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-7", false); err != nil {
-		t.Fatalf("SetBranchLockReviewFanout(false) returned error: %v", err)
-	}
-	lock, err = store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if lock.SkipNativeReviewFanout {
-		t.Fatalf("expected SkipNativeReviewFanout=false after reset, got %+v", lock)
 	}
 }
 
@@ -3669,40 +3546,29 @@ func TestResolvePullRequestOwnerPrecedenceAndFailClosed(t *testing.T) {
 
 	addJob("role-owner", "implementer", "implement", "owner/repo", 10, "task-role", "seat-owner")
 	addJob("role-implement", "implementer", "implement", "owner/repo", 10, "task-role", "")
-	if created, err := store.CreateLock(ctx, BranchLock{
-		RepoFullName: "owner/repo", Branch: "branch-role", Owner: "lock-owner",
-		ActingOrgRole: "branch-owner",
-	}); err != nil || !created {
-		t.Fatalf("create role branch lock = %v, err=%v", created, err)
-	}
 	addJob("other-task-role", "reviewer", "review", "owner/repo", 11, "other-task", "wrong-owner")
 	addJob("same-task-review", "reviewer", "review", "owner/repo", 11, "wanted-task", "auditor")
 	addJob("task-implement", "task-implementer", "implement", "owner/repo", 11, "wanted-task", "")
-	if created, err := store.CreateLock(ctx, BranchLock{
-		RepoFullName: "owner/repo", Branch: "branch-lock", Owner: "lock-owner",
-		ActingOrgRole: "branch-owner",
-	}); err != nil || !created {
-		t.Fatalf("create fallback branch lock = %v, err=%v", created, err)
-	}
+	addJob("other-task-acting", "implementer", "implement", "owner/repo", 14, "seat-free-form", "seat-other")
 	addJob("implement-a", "first-implementer", "implement", "owner/repo", 12, "task-implement", "")
 	addJob("implement-b", "later-implementer", "implement", "owner/repo", 12, "task-implement", "")
 
 	tests := []struct {
 		name        string
-		branch      string
 		pullRequest int
 		taskID      string
 		want        string
 	}{
-		{name: "acting role wins", branch: "branch-role", pullRequest: 10, taskID: "task-role", want: "seat-owner"},
-		{name: "branch lock beats review role", branch: "branch-lock", pullRequest: 11, taskID: "wanted-task", want: "branch-owner"},
+		{name: "acting role wins", pullRequest: 10, taskID: "task-role", want: "seat-owner"},
+		{name: "review role ignored", pullRequest: 11, taskID: "wanted-task", want: "task-implementer"},
+		{name: "acting role keyed by repo and pr only", pullRequest: 14, taskID: "other-task", want: "seat-other"},
 		{name: "earliest implementing agent", pullRequest: 12, taskID: "task-implement", want: "first-implementer"},
 		{name: "unresolved", pullRequest: 13, taskID: "missing"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := store.ResolvePullRequestOwner(
-				ctx, "owner/repo", test.branch, test.pullRequest, test.taskID,
+				ctx, "owner/repo", test.pullRequest, test.taskID,
 			)
 			if err != nil || got != test.want {
 				t.Fatalf("ResolvePullRequestOwner = %q, err=%v, want %q", got, err, test.want)

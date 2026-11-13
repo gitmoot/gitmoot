@@ -194,9 +194,6 @@ func TestPollOnceMarkerReappearsAfterHeadChange(t *testing.T) {
 func TestMergeCommandOnForkHeadRequestsNoMerge(t *testing.T) {
 	ctx := context.Background()
 	store, _, daemon, _ := newSkippedFanoutPendingGateDaemon(t, workflow.TaskReadyToMerge)
-	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-7", false); err != nil {
-		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
-	}
 	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
 	client := &fakeGitHub{comments: map[int64][]github.IssueComment{}}
 	daemon.GitHub = client

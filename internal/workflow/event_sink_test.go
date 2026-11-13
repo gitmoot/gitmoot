@@ -122,8 +122,10 @@ func TestEngineReviewVerdictResolverErrorDoesNotFallbackToLead(t *testing.T) {
 		t.Fatalf("open raw database: %v", err)
 	}
 	defer raw.Close()
-	if _, err := raw.ExecContext(ctx, `DROP TABLE branch_locks`); err != nil {
-		t.Fatalf("drop branch_locks: %v", err)
+	// The owner resolver filters jobs by pull_request; removing the column makes
+	// it fail while GetJob (which never selects it) still succeeds.
+	if _, err := raw.ExecContext(ctx, `ALTER TABLE jobs DROP COLUMN pull_request`); err != nil {
+		t.Fatalf("drop jobs.pull_request: %v", err)
 	}
 
 	sink := &recordingSink{}
@@ -168,14 +170,6 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 		Branch:       "task-43",
 	}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName:  "gitmoot/gitmoot",
-		Branch:        "task-43",
-		Owner:         "audit",
-		ActingOrgRole: "author",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
 	sink := &recordingSink{}
 	engine := testEngine(store)
@@ -274,14 +268,6 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName:  "gitmoot/gitmoot",
-		Branch:        "task-45",
-		Owner:         "audit",
-		ActingOrgRole: "author",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.CreateJob(ctx, db.Job{
 		ID: "review-45", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
 	}); err != nil {
@@ -328,14 +314,6 @@ func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) 
 func TestEngineDoesNotEmitReviewVerdictForFanOut(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName:  "gitmoot/gitmoot",
-		Branch:        "task-47",
-		Owner:         "audit",
-		ActingOrgRole: "author",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.CreateJob(ctx, db.Job{
 		ID: "review-47", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
 	}); err != nil {

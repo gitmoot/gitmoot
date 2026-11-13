@@ -131,7 +131,6 @@ type inflightJobTracker struct {
 	errs                       map[string][]error
 	foreignBootRecoveryAt      time.Time
 	worktreeReclaimAttemptedAt time.Time
-	staleTaskLaneLockReapAt    time.Time
 	wakeOutboxHealthLast       replyWakeOutboxHealth
 	wakeOutboxHealthLogged     bool
 	jobEvents                  jobEventCandidateCache
@@ -620,26 +619,6 @@ func (t *inflightJobTracker) markWorktreeReclaimAttempted(now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.worktreeReclaimAttemptedAt = now
-}
-
-// staleTaskLaneLockReclaimDue gates the low-frequency branch-lock lifecycle
-// backstop. Its zero value is due so daemon start eagerly checks old lanes.
-func (t *inflightJobTracker) staleTaskLaneLockReclaimDue(now time.Time) bool {
-	if t == nil {
-		return true
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return maintenancePassDue(t.staleTaskLaneLockReapAt, now, staleTaskLaneLockReclaimInterval)
-}
-
-func (t *inflightJobTracker) markStaleTaskLaneLockReclaimSuccessful(now time.Time) {
-	if t == nil {
-		return
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.staleTaskLaneLockReapAt = now
 }
 
 // replyWakeOutboxHealthChanged reports whether health differs from the last

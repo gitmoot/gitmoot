@@ -1574,10 +1574,12 @@ const stuckQueuedThreshold = 10 * time.Minute
 // Health returns the daemon liveness, fleet totals, held locks, wedged jobs and
 // recent failures behind the Health page. The daemon block mirrors
 // buildDashboardSnapshot (currentDaemonPID + daemon.json meta over d.home);
-// everything else is a single read-only ListJobs pass plus the lock listings.
+// everything else is a single read-only ListJobs pass plus the resource lock listing.
 // Stuck reasons reuse loadStuckReason/deriveStuckReason unchanged.
 func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 	out := dashboard.Health{
+		// Branch locks retired in #2591; Locks stays an empty list until the
+		// dashboard module drops the field (#2593).
 		Locks:          []dashboard.HealthLock{},
 		ResourceLocks:  []dashboard.HealthResourceLock{},
 		Stuck:          []dashboard.HealthStuckJob{},
@@ -1724,30 +1726,6 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 			failures = failures[:10]
 		}
 		out.RecentFailures = failures
-
-		// Branch/checkout locks (all repos), oldest acquisition first.
-		branchLocks, err := store.ListBranchLocksWithAge(ctx, "")
-		if err != nil {
-			return err
-		}
-		locks := make([]dashboard.HealthLock, 0, len(branchLocks))
-		for _, l := range branchLocks {
-			hl := dashboard.HealthLock{Repo: l.RepoFullName, Branch: l.Branch, Owner: l.Owner}
-			if !l.CreatedAt.IsZero() {
-				hl.AcquiredAt = l.CreatedAt.UnixMilli()
-			}
-			locks = append(locks, hl)
-		}
-		sort.SliceStable(locks, func(i, j int) bool {
-			if locks[i].AcquiredAt != locks[j].AcquiredAt {
-				return locks[i].AcquiredAt < locks[j].AcquiredAt
-			}
-			if locks[i].Repo != locks[j].Repo {
-				return locks[i].Repo < locks[j].Repo
-			}
-			return locks[i].Branch < locks[j].Branch
-		})
-		out.Locks = locks
 
 		// Non-branch resource locks (runtime sessions etc.), oldest acquisition
 		// first — mapped from the slice preloaded before the jobs loop.

@@ -5,22 +5,12 @@
 A PR repository is the routing context for `/gitmoot <agent> ...`. Always confirm
 or pass `--repo owner/repo` when the user works across multiple repositories.
 
-## Branch Locks
+## Branch Ownership
 
-Implementation jobs must respect Gitmoot branch locks. Do not edit or push an
-implementation branch unless Gitmoot assigned the job and the branch lock is held
-by the assigned agent.
+Do not edit or push an implementation branch unless Gitmoot assigned the job.
 
 Review and ask jobs should inspect and report without mutating branches unless
 the task explicitly instructs otherwise.
-
-A task branch lock spans the complete implement, review, and fix lifecycle; an
-implement success does not release it. Cancelling a top-level implement releases
-the lock only when no other non-terminal task or job references the same
-repository and branch. The daemon also reclaims idle locks unchanged for at
-least 24 hours, but only after no non-terminal task or job remains. `blocked`,
-`awaiting_human_merge`, and `awaiting_human` tasks keep their locks because an
-operator can resume them.
 
 Do not ask child agents to run PR lifecycle commands such as `git pull`,
 `git merge`, `git push`, or `gh pr merge` to make parallel task PRs mergeable.
@@ -132,13 +122,6 @@ exact-head review is also clean. Two extra guards layer on top:
 
 A check or status that genuinely reports failure (not merely absent) always
 leaves the PR open with an escalation, regardless of the grace window.
-
-Useful commands:
-
-```sh
-gitmoot lock list --repo owner/repo
-gitmoot lock show owner/repo <branch>
-```
 
 ## Autonomy Policy And Headless Write Permission
 
@@ -441,7 +424,7 @@ synthesis, not a silent dead end.
 ## When To Stop
 
 Stop and report `blocked` when the target repo is unclear, GitHub auth is
-missing, the daemon cannot access the repo, branch lock ownership is wrong, or
+missing, the daemon cannot access the repo, or
 continuing would require credentials or destructive operations the user did not
 approve.
 
@@ -458,8 +441,7 @@ An engine-dispatched `changes_requested` fix uses a different owned shape: an
 independent writable clone attached to the real task branch at its fetched
 remote head. Dispatch fails closed if that clone cannot be allocated; it never
 falls back to the registered checkout. No automatic path deletes the clone.
-Terminal cleanup records it for an operator without deleting the task branch or
-releasing its branch lock. Allocation recovery and enqueue failures atomically
+Terminal cleanup records it for an operator without deleting the task branch. Allocation recovery and enqueue failures atomically
 rename it to a `.ttl-reclaiming-orphaned-*` sibling so retries can proceed
 without destroying data.
 
@@ -498,7 +480,7 @@ holds.
 Aged cleanup also requires the generation's terminal time to precede
 `[workflow].delegation_worktree_ttl` (default `72h`; `"0"` disables aged cleanup).
 Ordinary succeeded-owner cleanup keeps its existing retention policy. Neither
-path overrides quarantine, checkout/branch locks or live-process protection.
+path overrides quarantine, checkout locks or live-process protection.
 Successful aged removal and metadata reconciliation record
 `delegation_worktree_reclaimed_ttl`.
 

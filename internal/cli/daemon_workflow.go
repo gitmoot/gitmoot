@@ -422,11 +422,11 @@ func mergeRuleRefusal(home, actingRole string) (bool, string) {
 			owner = fmt.Sprintf("owner role `%s`", roots[0])
 		}
 		return true, fmt.Sprintf(
-			"branch lock records acting role `%s`, whose `merge_rule = \"owner\"` reserves the merge for %s; `/gitmoot merge` refuses this branch whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
+			"PR implementer role `%s` has `merge_rule = \"owner\"`, which reserves the merge for %s; `/gitmoot merge` refuses this PR whoever asks. Remedy: have that owner merge outside Gitmoot, or change the role's merge rule before retrying `/gitmoot merge`",
 			role.Name, owner)
 	case "none":
 		return true, fmt.Sprintf(
-			"branch lock records acting role `%s`, whose `merge_rule = \"none\"` cannot merge. Remedy: use a branch owned by a role with merge authority, or change this role's merge rule before retrying `/gitmoot merge`",
+			"PR implementer role `%s` has `merge_rule = \"none\"` and cannot merge. Remedy: have a role with merge authority implement the PR, or change this role's merge rule before retrying `/gitmoot merge`",
 			role.Name)
 	default:
 		return false, ""
@@ -500,7 +500,7 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 // a role that never touched it, and reached herdr-app instead of herdr-app's
 // own parent.
 func (g daemonMergeGate) mergeGateEscalationSender(ctx context.Context, roster orgRoster, cfg config.OrgConfig, request workflow.MergeRequest) (string, bool, error) {
-	owner, err := g.Store.ResolvePullRequestOwner(ctx, request.Repo, request.Branch, request.PullRequest, request.TaskID)
+	owner, err := g.Store.ResolvePullRequestOwner(ctx, request.Repo, request.PullRequest, request.TaskID)
 	if err != nil {
 		return "", false, fmt.Errorf("resolve merge-gate escalation sender: %w", err)
 	}

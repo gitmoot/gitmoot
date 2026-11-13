@@ -291,7 +291,6 @@ func TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment(t *t
 		supersedeDebtStageAfterClaim,
 		supersedeDebtStageBeforeCleanup,
 		supersedeDebtStageAfterResourceCommit,
-		supersedeDebtStageBeforeTaskLane,
 		supersedeDebtStageBeforeReclaim,
 		supersedeDebtStageBeforeFinalize,
 		supersedeDebtStageBeforeAdvanceClaim,

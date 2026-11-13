@@ -1090,9 +1090,6 @@ func seedHealthHome(t *testing.T, home string) {
 	mustCreateJob(t, store, db.Job{ID: "f1", Agent: "builder", Type: "implement", State: "failed", Payload: noted}, "", "")
 	mustCreateJob(t, store, db.Job{ID: "f2", Agent: "builder", Type: "implement", State: "failed", Payload: noted}, "", "")
 
-	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "jerryfane/noted", Branch: "feature/x", Owner: "blk"}); err != nil {
-		t.Fatalf("CreateLock: %v", err)
-	}
 	expires := time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339Nano)
 	if _, err := store.AcquireResourceLock(ctx, db.ResourceLock{ResourceKey: "runtime:codex:sess", OwnerJobID: "blk", OwnerToken: "tok", ExpiresAt: expires}, time.Now().UTC()); err != nil {
 		t.Fatalf("AcquireResourceLock: %v", err)
@@ -1167,16 +1164,9 @@ func TestWebDataSourceHealth(t *testing.T) {
 		t.Fatalf("recent failures = %+v, want [f2 f1] newest-first", h.RecentFailures)
 	}
 
-	// Branch lock mapping.
-	if len(h.Locks) != 1 {
-		t.Fatalf("locks = %d, want 1: %+v", len(h.Locks), h.Locks)
-	}
-	lock := h.Locks[0]
-	if lock.Repo != "jerryfane/noted" || lock.Branch != "feature/x" || lock.Owner != "blk" {
-		t.Fatalf("lock = %+v, want jerryfane/noted feature/x blk", lock)
-	}
-	if lock.AcquiredAt <= 0 {
-		t.Fatalf("lock AcquiredAt = %d, want > 0 (mapped from created_at)", lock.AcquiredAt)
+	// Branch locks retired (#2591): the field stays an empty list.
+	if h.Locks == nil || len(h.Locks) != 0 {
+		t.Fatalf("locks = %+v, want an empty non-nil list", h.Locks)
 	}
 
 	// Resource lock mapping.

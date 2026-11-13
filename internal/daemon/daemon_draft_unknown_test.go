@@ -10,21 +10,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func TestDaemonDraftFieldAbsentDoesNotParkTask(t *testing.T) {
-	ctx := context.Background()
-	store, repo, _ := setupDaemonDraftPropagationTest(t, workflow.TaskPlanned)
-	pull := decodeDaemonDraftPull(t, "")
-	gate := &draftKnowledgeGate{}
-	engine := workflow.Engine{Store: store, MergeGate: gate}
-	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
-
-	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store, daemon.Repo.FullName())); err != nil {
-		t.Fatalf("handlePullRequestWorkflowChange returned error: %v", err)
-	}
-	assertDraftTaskState(t, store, workflow.TaskReadyToMerge)
-	assertDraftKnowledgeRequest(t, gate.requests, true)
-}
-
 func TestDaemonDraftFieldNullDoesNotParkTask(t *testing.T) {
 	ctx := context.Background()
 	store, repo, _ := setupDaemonDraftPropagationTest(t, workflow.TaskReadyToMerge)

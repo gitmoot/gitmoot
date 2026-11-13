@@ -463,9 +463,8 @@ var (
 )
 
 // releaseAbortedJobResources runs the best-effort cleanups a job that dies BEFORE
-// its terminal engine path owes: the resource locks it still holds, its
-// per-delegation branch lock, its task lane lock, and its dispatch-time read-only
-// worktree. Every one is swallowed on error, because incidental cleanup must never
+// its terminal engine path owes: the resource locks it still holds and its
+// dispatch-time read-only worktree. Every one is swallowed on error, because incidental cleanup must never
 // roll back a successful abort — but skipping them leaks locks that block the next
 // same-repo work, so any path that ends a job outside AdvanceJob has to call this.
 func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job, cause abortCause) {
@@ -489,8 +488,8 @@ func releaseAbortedJobResources(ctx context.Context, store *db.Store, job db.Job
 // then unrecoverable. A caller that cannot prove the cleanup ran must leave the
 // marker outstanding.
 //
-// guarded false means the row moved: the branch, task-lane and worktree cleanups
-// all belong to the abort of THAT run, and another run owns the row now.
+// guarded false means the row moved: the worktree cleanup belongs to the abort
+// of THAT run, and another run owns the row now.
 func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.Store, job db.Job, cause abortCause, atGeneration int64) (bool, error) {
 	_, guarded, err := store.ReleaseSupersededJobResourceLocksAtGeneration(ctx, job.ID, atGeneration, time.Now().UTC())
 	if err != nil || !guarded {
@@ -504,79 +503,6 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 	payload, perr := unmarshalPayload(job.Payload)
 	if perr != nil {
 		return true, nil
-	}
-	// An implement delegation leg that dies here never runs the engine's terminal
-	// cleanupImplementDelegationWorktree, so its per-delegation branch lock would
-	// leak (#617). The unguarded force-release deletes by (repo, branch) alone, so a
-	// retry that re-queued and re-acquired the SAME delegation lane lost it to this
-	// pass; the generation rides in the DELETE's own predicate instead.
-	if isImplementDelegationWorktree(job.Type, payload) {
-		repo := strings.TrimSpace(payload.Repo)
-		branch := strings.TrimSpace(payload.Branch)
-		if repo != "" && branch != "" {
-			released, rerr := store.ForceReleaseDelegationBranchLockAtJobGeneration(ctx, repo, branch, job.ID, atGeneration, db.BranchLockEvent{
-				Kind:    "released",
-				Message: "released after delegation leg reached a terminal state (#617)",
-			})
-			if rerr != nil {
-				return true, rerr
-			}
-			if released {
-				if _, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
-					JobID:   job.ID,
-					Kind:    "delegation_branch_lock_released",
-					Message: fmt.Sprintf("released delegation branch lock %s on %s (#617)", branch, cause.verb),
-				}, atGeneration); eerr != nil {
-					return true, eerr
-				}
-			}
-		}
-	}
-	if supersedeDebtInterleaveHook != nil {
-		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeTaskLane); err != nil {
-			return true, err
-		}
-	}
-	// The task lane's inactivity vetoes are NOT sufficient for this caller. The
-	// tasks veto deliberately excludes the exact implementing task being cleaned up,
-	// so a retry of that same task cannot re-assert the lane through it, and the jobs
-	// veto only fires while the retry is non-terminal — a retry that re-queued, ran
-	// and settled terminal passes both and loses its lane. The generation therefore
-	// rides in the DELETE's own predicate, its errors propagate, and a lost guard
-	// stops the remaining cleanup.
-	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
-		repo := strings.TrimSpace(payload.Repo)
-		branch := strings.TrimSpace(payload.Branch)
-		if repo != "" && branch != "" {
-			lock, lerr := store.GetBranchLock(ctx, repo, branch)
-			switch {
-			case lerr == nil:
-				released, rerr := store.ReleaseTaskLaneBranchLockAtJobGeneration(ctx, lock, strings.TrimSpace(payload.TaskID), job.ID, atGeneration, db.BranchLockEvent{
-					Kind: "released", Message: fmt.Sprintf("released after task implement %s left no non-terminal branch work (#1565)", cause.noun),
-				})
-				if rerr != nil {
-					return true, rerr
-				}
-				if released {
-					written, eerr := store.AddJobEventAtGeneration(ctx, db.JobEvent{
-						JobID: job.ID, Kind: "task_lane_lock_released",
-						Message: fmt.Sprintf("released task lane lock %s on %s (#1565)", branch, cause.verb),
-					}, atGeneration)
-					if eerr != nil {
-						return true, eerr
-					}
-					if !written {
-						// The row moved between the guarded delete and its audit row. Stop:
-						// the remaining cleanup belongs to a lifecycle that no longer owns
-						// this job, and the debt stays outstanding for a re-drive.
-						return false, nil
-					}
-				}
-			case errors.Is(lerr, sql.ErrNoRows):
-			default:
-				return true, lerr
-			}
-		}
 	}
 	if supersedeDebtInterleaveHook != nil {
 		if err := supersedeDebtInterleaveHook(ctx, supersedeDebtStageBeforeReclaim); err != nil {
@@ -605,29 +531,6 @@ func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db
 		purpose := db.ReviewRequestPurpose(payload.ReviewPurpose, payload.PostMergeReview, payload.ReviewPart)
 		if subjectKey, keyErr := db.ReviewRequestSubjectKey(payload.Repo, payload.PullRequest, payload.HeadSHA, purpose); keyErr == nil {
 			_ = store.ReleaseReviewRequest(ctx, subjectKey, job.ID)
-		}
-	}
-	if released, rerr := releaseDelegationBranchLock(ctx, store, job.Type, payload); rerr == nil && released {
-		_ = store.AddJobEvent(ctx, db.JobEvent{
-			JobID:   job.ID,
-			Kind:    "delegation_branch_lock_released",
-			Message: fmt.Sprintf("released delegation branch lock %s on %s (#617)", strings.TrimSpace(payload.Branch), cause.verb),
-		})
-	}
-	if job.Type == "implement" && strings.TrimSpace(payload.TaskID) != "" && strings.TrimSpace(payload.DelegationID) == "" {
-		repo := strings.TrimSpace(payload.Repo)
-		branch := strings.TrimSpace(payload.Branch)
-		if repo != "" && branch != "" {
-			if lock, lerr := store.GetBranchLock(ctx, repo, branch); lerr == nil {
-				if released, rerr := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, strings.TrimSpace(payload.TaskID), time.Time{}, db.BranchLockEvent{
-					Kind: "released", Message: fmt.Sprintf("released after task implement %s left no non-terminal branch work (#1565)", cause.noun),
-				}); rerr == nil && released {
-					_ = store.AddJobEvent(ctx, db.JobEvent{
-						JobID: job.ID, Kind: "task_lane_lock_released",
-						Message: fmt.Sprintf("released task lane lock %s on %s (#1565)", branch, cause.verb),
-					})
-				}
-			}
 		}
 	}
 	recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
@@ -950,7 +853,6 @@ const (
 	supersedeDebtStageAfterClaim          = "after-claim"
 	supersedeDebtStageBeforeCleanup       = "before-cleanup"
 	supersedeDebtStageAfterResourceCommit = "after-resource-commit"
-	supersedeDebtStageBeforeTaskLane      = "before-task-lane"
 	supersedeDebtStageBeforeReclaim       = "before-reclaim"
 	supersedeDebtStageBeforeFinalize      = "before-finalize"
 	supersedeDebtStageBeforeAdvance       = "before-advance"

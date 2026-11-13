@@ -354,9 +354,6 @@ func TestTaskDisposalStrandedEscalationIsOneShotAndRoutingIndependent(t *testing
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-routed", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked), Branch: "feature/routed"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "feature/routed", Owner: "worker", ActingOrgRole: "lane"}); err != nil {
-		t.Fatal(err)
-	}
 	gh := &taskDisposalGitHub{fakeGitHub: &fakeGitHub{}, issues: map[int64]github.Issue{}}
 	d := Daemon{Repo: repo, Store: store, GitHub: gh, Now: futureClock}
 	for i := 0; i < 3; i++ {
@@ -512,14 +509,12 @@ func TestTaskDisposalEscalationSeatRules(t *testing.T) {
 		return got
 	}
 
-	t.Run("blocked_task_with_self_seat_lock_goes_to_parent", func(t *testing.T) {
+	t.Run("blocked_task_with_self_seat_goes_to_parent", func(t *testing.T) {
 		ctx, store, repo := setup(t)
 		if err := store.UpsertTask(ctx, db.Task{ID: "task-x", RepoFullName: repo.FullName(), State: string(workflow.TaskBlocked), Branch: "feature/x"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "feature/x", Owner: "worker", ActingOrgRole: "lane"}); err != nil {
-			t.Fatal(err)
-		}
+		seedJob(t, store, "implement-x", "task-x", "lane", "2026-11-01 09:00:00", 0)
 		if got := run(t, ctx, store, repo, nil, "task-x"); got.DisposalEscalationRole != "lead" {
 			t.Fatalf("blocked task with self seat lane routed to %q, want its supervisor lead", got.DisposalEscalationRole)
 		}

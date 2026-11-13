@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
-	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -43,9 +41,6 @@ func TestBuildSnapshotCountsRepoLocalState(t *testing.T) {
 			t.Fatalf("create job: %v", err)
 		}
 	}
-	if _, err := store.AcquireLock(context.Background(), db.BranchLock{RepoFullName: "owner/repo", Branch: "task/a", Owner: "agent-a"}); err != nil {
-		t.Fatalf("acquire lock: %v", err)
-	}
 
 	snapshot, err := BuildSnapshot(context.Background(), paths, "owner/repo")
 	if err != nil {
@@ -62,9 +57,6 @@ func TestBuildSnapshotCountsRepoLocalState(t *testing.T) {
 	}
 	if snapshot.JobStates["succeeded"] != 1 || snapshot.JobStates["blocked"] != 1 {
 		t.Fatalf("job states = %#v", snapshot.JobStates)
-	}
-	if len(snapshot.Locks) != 1 || snapshot.Locks[0].Branch != "task/a" || snapshot.Locks[0].Owner != "agent-a" {
-		t.Fatalf("locks = %#v", snapshot.Locks)
 	}
 }
 
@@ -119,35 +111,6 @@ func TestInspectDaemonTreatsLiveNonDaemonPIDAsStale(t *testing.T) {
 	}
 	if _, err := os.Stat(pidPath); err != nil {
 		t.Fatalf("pid file was removed or changed: %v", err)
-	}
-}
-
-func TestFormatSnapshotQuotesLockMetadata(t *testing.T) {
-	text := FormatSnapshot(Snapshot{
-		Daemon:     DaemonSnapshot{State: DaemonRunning, PID: 42},
-		Tasks:      2,
-		TaskStates: map[string]int{"blocked": 1, "planned": 1},
-		Jobs:       1,
-		JobStates:  map[string]int{"succeeded": 1},
-		Locks: []LockSnapshot{
-			{Branch: "task/a\n- injected", Owner: "agent\n- injected"},
-		},
-	})
-
-	for _, want := range []string{
-		"Current snapshot",
-		"- daemon: running (pid 42)",
-		"- tasks: 2 (blocked: 1, planned: 1)",
-		"- jobs: 1 (succeeded: 1)",
-		"- locks: 1",
-		strconv.Quote("task/a\n- injected") + " by " + strconv.Quote("agent\n- injected"),
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("formatted snapshot missing %q:\n%s", want, text)
-		}
-	}
-	if strings.Contains(text, "\n- injected") {
-		t.Fatalf("formatted snapshot contains raw injection:\n%s", text)
 	}
 }
 

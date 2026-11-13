@@ -236,13 +236,6 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		if _, ok := e.DelegationWorktrees.(BranchExistenceChecker); !ok {
 			return d.refuse("branch_identity_unknown"), payload, nil
 		}
-		lock, lerr := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
-		if lerr != nil && !errors.Is(lerr, sql.ErrNoRows) {
-			return d.refuse("branch_owner_unknown"), payload, nil
-		}
-		if lerr == nil && lock.Owner != cleanupBranchOwner(job, payload) {
-			return d.refuse("branch_owner_changed"), payload, nil
-		}
 	}
 	if e.CleanupRetention != nil {
 		retention, err := e.CleanupRetention()
@@ -426,13 +419,6 @@ func (e Engine) inspectProducerCleanup(ctx context.Context, jobID string, policy
 		d.EligibilityToken = d.Receipt.EligibilityToken
 	}
 	return d, payload, nil
-}
-
-func cleanupBranchOwner(job db.Job, payload JobPayload) string {
-	if job.Type == "implement" && payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
-		return payload.OriginalAgent
-	}
-	return job.Agent
 }
 
 func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload, d *CleanupInspection) (string, error) {

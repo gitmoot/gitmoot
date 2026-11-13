@@ -529,15 +529,11 @@ func equalStrings(left []string, right []string) bool {
 }
 
 func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref taskRef) error {
-	return e.ensureAgentAllowedWithBranchOwner(ctx, request, request.Agent, ref, false)
+	return e.ensureAgentAllowedWithCapability(ctx, request, ref, false)
 }
 
 func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
-	branchOwner := job.Agent
 	authorizationAgent := job.Agent
-	if job.Type == "implement" && payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
-		branchOwner = payload.OriginalAgent
-	}
 	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
 		authorizationAgent = payload.OriginalAgent
 	}
@@ -555,15 +551,9 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 	if job.Type == "ask" && payload.RiskTier == RiskTierHigh {
 		allowMissingCapability = true
 	}
-	return e.ensureAgentAllowedWithBranchOwner(ctx, JobRequest{
-		Agent:  authorizationAgent,
-		Action: job.Type,
-		// #1250: the executor preflight is the path that actually reaches
-		// ensureBranchLock for a task-run or isolated-delegation job, and the
-		// allocator has already created that lock BLANK. Reconstructing the request
-		// without the role meant the sole writer was handed an empty value and
-		// correctly refused to fill — so the attribution died here, one call short
-		// of the lock, on a payload that was carrying it the whole time.
+	return e.ensureAgentAllowedWithCapability(ctx, JobRequest{
+		Agent:         authorizationAgent,
+		Action:        job.Type,
 		ActingOrgRole: payload.ActingOrgRole,
 		Repo:          payload.Repo,
 		Sender:        payload.Sender,
@@ -573,21 +563,17 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		// coordinator's repo scope (skip the registered-agent checks) instead of
 		// blocking on a synthetic agent name that no agent row backs.
 		Ephemeral: payload.Ephemeral,
-	}, branchOwner, ref, allowMissingCapability)
+	}, ref, allowMissingCapability)
 }
 
-func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request JobRequest, branchOwner string, ref taskRef, allowMissingCapability bool) error {
+func (e Engine) ensureAgentAllowedWithCapability(ctx context.Context, request JobRequest, ref taskRef, allowMissingCapability bool) error {
 	// An ephemeral worker has no registered agent row: it inherits the
 	// coordinator's allowed repo scope, so the existence, repo-access, and
 	// capability checks are skipped. Validate only that the spec runtime is a real
-	// agent runtime (never shell), then fall through to the shared branch-lock path
-	// so an ephemeral implement still serializes on its branch like any other.
+	// agent runtime (never shell).
 	if request.Ephemeral != nil {
 		if err := validateEphemeralSpec(request.DelegationID, request.Action, request.Ephemeral); err != nil {
 			return e.block(ctx, ref, err.Error())
-		}
-		if request.Action == "implement" {
-			return e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, request.ActingOrgRole, ref)
 		}
 		return nil
 	}
@@ -617,27 +603,6 @@ func (e Engine) ensureAgentAllowedWithBranchOwner(ctx context.Context, request J
 		if err := runtime.ImplementWritePolicyError([]string{request.Action}, agent.AutonomyPolicy); err != nil {
 			return e.block(ctx, ref, err.Error())
 		}
-		if err := e.ensureBranchLock(ctx, request.Repo, request.Branch, branchOwner, request.ActingOrgRole, ref); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// ensureBranchLock also STAMPS the acting org role onto the lock at creation
-// (#1250). This is the single writer of that attribution: it is captured when the
-// branch is taken and never rewritten, so both PR-open triggers read one value
-// and cannot drift. An empty role is legitimate and means unattributed.
-func (e Engine) ensureBranchLock(ctx context.Context, repo string, branch string, owner string, actingOrgRole string, ref taskRef) error {
-	if strings.TrimSpace(branch) == "" {
-		return e.block(ctx, ref, "branch lock rejected action: branch is required")
-	}
-	acquired, err := e.Store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: owner, ActingOrgRole: NormalizeActingOrgRole(actingOrgRole)})
-	if err != nil {
-		return err
-	}
-	if !acquired {
-		return e.block(ctx, ref, fmt.Sprintf("branch lock rejected action for %s", branch))
 	}
 	return nil
 }

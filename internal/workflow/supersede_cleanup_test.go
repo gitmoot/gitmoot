@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -42,10 +41,6 @@ func TestSupersedeClosedPullRequestJobReleasesAbortedResources(t *testing.T) {
 		ID: "task-superseded", RepoFullName: "owner/repo", State: string(TaskImplementing), Branch: branch,
 	}); err != nil {
 		t.Fatal(err)
-	}
-	acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "impl"})
-	if err != nil || !acquired {
-		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
 	}
 	insertQueuedJob(t, store, db.Job{ID: jobID, Agent: "impl", Type: "implement", Repo: "owner/repo"}, JobPayload{
 		Repo: "owner/repo", Branch: branch, TaskID: "task-superseded", PullRequest: 7, LeadAgent: "impl",
@@ -88,36 +83,6 @@ func TestSupersedeClosedPullRequestJobReleasesAbortedResources(t *testing.T) {
 	}
 	if !reacquired {
 		t.Fatal("the next job could not re-acquire the superseded job's runtime-session lock")
-	}
-
-	// Cleanup 2: the task lane lock (#1565). Held, it refuses every later
-	// same-branch dispatch.
-	if _, err := store.GetBranchLock(ctx, "owner/repo", branch); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetBranchLock after supersede error = %v, want sql.ErrNoRows (the superseded job leaked its task lane lock)", err)
-	}
-
-	// The wording is the discriminator between the two abort causes: a supersede
-	// must not be filed in the audit trail as an operator cancellation.
-	lockEvents, err := store.ListBranchLockEvents(ctx, "owner/repo", branch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(lockEvents) != 1 || lockEvents[0].Kind != "released" {
-		t.Fatalf("branch lock events = %+v, want exactly one release", lockEvents)
-	}
-	if !strings.Contains(lockEvents[0].Message, "supersession") {
-		t.Fatalf("branch lock release message = %q, want the supersession cause named", lockEvents[0].Message)
-	}
-	if strings.Contains(lockEvents[0].Message, "cancellation") {
-		t.Fatalf("branch lock release message = %q, blames a cancellation for a supersede", lockEvents[0].Message)
-	}
-
-	laneEvent := jobEventMessage(t, store, jobID, "task_lane_lock_released")
-	if laneEvent == "" {
-		t.Fatal("no task_lane_lock_released job event: the supersede did not record freeing the lane")
-	}
-	if !strings.Contains(laneEvent, "on supersede") {
-		t.Fatalf("task_lane_lock_released message = %q, want \"on supersede\"", laneEvent)
 	}
 
 	// Task state and the dismissal audit stay with the stale-task reconciler, which

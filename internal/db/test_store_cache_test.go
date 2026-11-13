@@ -123,6 +123,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2587: drops runtime_session_usage while upgrading a database built from
 	// the migrations before it, through the real Open path.
 	realPathTests["TestRuntimeSessionUsageRemovalMigrationUpgradesThroughOpen"] = true
+	// #2591: upgrades a database built from the migrations before the branch
+	// lock table drop through the real Open path.
+	realPathTests["TestBranchLockRemovalMigrationOnPreviousSchema"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

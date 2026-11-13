@@ -229,31 +229,6 @@ func TestEngineHandlePullRequestOpenedDispatchesReviewers(t *testing.T) {
 	}
 }
 
-func TestEngineHandlePullRequestOpenedBlocksOnBranchLock(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "other"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	engine := testEngine(store)
-
-	err := engine.HandlePullRequestOpened(ctx, PullRequestEvent{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		LeadAgent:   "lead",
-	})
-
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "branch lock") {
-		t.Fatalf("error = %v, want branch lock BlockedError", err)
-	}
-	assertTaskState(t, store, "task-7", TaskBlocked)
-}
-
 func TestEngineHandlePullRequestOpenedBlocksWhenLeadLacksCapability(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -400,60 +375,6 @@ func TestEngineHandlePullRequestOpenedSkipsReviewFanout(t *testing.T) {
 	if pr.HeadBranch != "task-7" || pr.HeadSHA != "head123" {
 		t.Fatalf("pull request baseline = %+v", pr)
 	}
-}
-
-func TestEngineAdvanceImplementPersistsSkipReviewFanoutOntoLock(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
-	engine.MergeGate = gate
-	// A branch lock owned by the lead must exist for the setter to flip.
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "implement-job",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:                   "gitmoot/gitmoot",
-		Branch:                 "task-7",
-		PullRequest:            7,
-		HeadSHA:                "head123",
-		TaskID:                 "task-7",
-		TaskTitle:              "Workflow Engine",
-		LeadAgent:              "lead",
-		SkipNativeReviewFanout: true,
-		Result:                 &AgentResult{Decision: "implemented", Summary: "opened PR"},
-	})
-
-	err := engine.AdvanceJob(ctx, "implement-job")
-
-	if err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	for _, job := range jobs {
-		if job.Type == "review" {
-			t.Fatalf("expected no review jobs, found %+v", job)
-		}
-	}
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if !lock.SkipNativeReviewFanout {
-		t.Fatalf("expected lock.SkipNativeReviewFanout = true, got %+v", lock)
-	}
-	if len(gate.requests) != 0 {
-		t.Fatalf("merge gate requests = %+v, want none for skip-native-review-fanout", gate.requests)
-	}
-	assertTaskState(t, store, "task-7", TaskPullRequestOpen)
 }
 
 func TestEngineAdvanceImplementDispatchesReviewers(t *testing.T) {
@@ -835,56 +756,6 @@ func TestEngineRunJobDeliveryFailureStaysRaw(t *testing.T) {
 	}
 }
 
-func TestEngineRunJobAllowsDelegatedImplementWithOriginalBranchLock(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	payload, err := marshalPayload(JobPayload{
-		Repo:             "gitmoot/gitmoot",
-		Branch:           "task-7",
-		PullRequest:      7,
-		HeadSHA:          "head123",
-		TaskID:           "task-7",
-		Reviewers:        []string{"audit"},
-		OriginalAgent:    "lead",
-		DelegatedAgent:   "lead-temp-job-1",
-		DelegationReason: "runtime_session_busy",
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	if err := store.CreateJob(ctx, db.Job{ID: "job-1", Agent: "lead-temp-job-1", Type: "implement", State: string(JobQueued), Payload: payload}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
-	engine := testEngine(store)
-	agent := runtime.Agent{Name: "lead-temp-job-1", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "lead"}
-	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-	}}
-
-	if _, err := engine.RunJob(ctx, "job-1", agent, adapter); err != nil {
-		t.Fatalf("RunJob returned error: %v", err)
-	}
-
-	job := mustJob(t, store, "job-1")
-	if job.State != string(JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded", job.State)
-	}
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if lock.Owner != "lead" {
-		t.Fatalf("branch lock owner = %q, want original lead", lock.Owner)
-	}
-	assertTaskState(t, store, "task-7", TaskReviewing)
-	mustJob(t, store, "review-audit-task-7-review-1")
-}
-
 func TestEngineRunJobAllowsMergeBackAskForImplementOnlyOriginal(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -917,50 +788,6 @@ func TestEngineRunJobAllowsMergeBackAskForImplementOnlyOriginal(t *testing.T) {
 	if job.State != string(JobSucceeded) {
 		t.Fatalf("job state = %q, want succeeded", job.State)
 	}
-}
-
-func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "other"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	engine := testEngine(store)
-	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "lead"}
-	delivered := false
-	adapter := &fakeDelivery{
-		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-		},
-		onDeliver: func() {
-			delivered = true
-		},
-	}
-	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
-		ID:          "implement-job",
-		Agent:       "lead",
-		Action:      "implement",
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		LeadAgent:   "lead",
-	}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-
-	_, err := engine.RunJob(ctx, "implement-job", agent, adapter)
-
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "branch lock") {
-		t.Fatalf("error = %v, want branch lock BlockedError", err)
-	}
-	if delivered {
-		t.Fatal("adapter delivered job before branch-lock preflight")
-	}
-	assertTaskState(t, store, "task-7", TaskBlocked)
 }
 
 func TestEngineAdvanceReviewSubthresholdApprovesWithNotes(t *testing.T) {

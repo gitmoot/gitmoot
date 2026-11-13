@@ -157,9 +157,8 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 				return err
 			}
 			d.ensureMergeGateStatus(ctx, pull)
-			mergeReadinessHandled := false
 			if changed {
-				if handled, err := d.handlePullRequestWorkflowChange(ctx, pull, reviewMemo); err != nil {
+				if err := d.handlePullRequestWorkflow(ctx, pull, reviewMemo); err != nil {
 					if firstErr == nil {
 						firstErr = err
 					}
@@ -174,7 +173,6 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 					// repo-wide snapshot instead cost a fresh ListJobsByType per changed
 					// PR, defeating the once-per-poll memo it was added to preserve.
 					reviewMemo.noteLifecycleRun(pull)
-					mergeReadinessHandled = handled
 					merged, err := d.pullRequestStoredMerged(ctx, pull)
 					if err != nil {
 						return err
@@ -192,17 +190,13 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			// Change routing and merge eligibility are independent. A retained stale
 			// review can keep routing "changed" after its job is terminal, while a
 			// ready task still needs its gate re-evaluated on every poll (#1336).
-			// HandlePullRequestOpened runs the gate itself when no reviewers are
-			// configured; avoid evaluating it twice in that one composition.
-			if !mergeReadinessHandled {
-				task, err := d.lookupReadyPullRequestTask(ctx, pull, reviewMemo)
-				if err != nil && !errors.Is(err, sql.ErrNoRows) {
-					return err
-				}
-				if err == nil {
-					if err := d.handleReadyToMergeWorkflow(ctx, pull, task); err != nil && firstErr == nil {
-						firstErr = err
-					}
+			task, err := d.lookupReadyPullRequestTask(ctx, pull, reviewMemo)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil {
+				if err := d.handleReadyToMergeWorkflow(ctx, pull, task); err != nil && firstErr == nil {
+					firstErr = err
 				}
 			}
 		}
@@ -1143,13 +1137,6 @@ func (d Daemon) reconciledPullRequestEvent(ctx context.Context, pull github.Pull
 		return workflow.PullRequestEvent{}, fmt.Errorf("reconcile terminal PR #%d: head branch is empty", number)
 	}
 	leadAgent := "github"
-	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), branch); err == nil {
-		if owner := strings.TrimSpace(lock.Owner); owner != "" {
-			leadAgent = owner
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return workflow.PullRequestEvent{}, err
-	}
 	return workflow.PullRequestEvent{
 		Repo:        d.Repo.FullName(),
 		Branch:      branch,
@@ -1688,79 +1675,15 @@ func (d Daemon) pullRequestStoredMerged(ctx context.Context, pull github.PullReq
 	return strings.TrimSpace(stored.State) == "merged", nil
 }
 
+// handlePullRequestWorkflow runs the PR-watcher's per-change workflow step:
+// superseding review jobs that target an older head. The watcher no longer
+// arms a native review fanout; that arm was gated on a branch lock, retired in
+// #2591.
 func (d Daemon) handlePullRequestWorkflow(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
-	_, err := d.handlePullRequestWorkflowChange(ctx, pull, memo)
-	return err
-}
-
-// handlePullRequestWorkflowChange reports whether HandlePullRequestOpened
-// evaluated merge readiness itself. That happens only for the configured
-// no-reviewer path; PollOnce uses the signal to avoid an immediate duplicate
-// evaluation while independently checking every other ready task.
-func (d Daemon) handlePullRequestWorkflowChange(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) (bool, error) {
 	if d.Workflow == nil {
-		return false, nil
+		return nil
 	}
-	if err := d.supersedeStaleReviewJobs(ctx, pull, memo); err != nil {
-		return false, err
-	}
-	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	ref := workflowTaskRef{
-		id:     pull.HeadRef,
-		title:  pull.Title,
-		branch: pull.HeadRef,
-	}
-	if task, err := d.lookupPolledPullRequestTask(ctx, pull); err == nil {
-		ref.id = task.ID
-		ref.goalID = task.GoalID
-		ref.title = task.Title
-		if task.Branch != "" {
-			ref.branch = task.Branch
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
-	reviewers, err := d.workflowReviewers(ctx)
-	if err != nil {
-		return false, err
-	}
-	mergeReadinessHandled := len(reviewers) == 0 && !lock.SkipNativeReviewFanout
-	err = d.Workflow.HandlePullRequestOpened(ctx, workflow.PullRequestEvent{
-		Repo:                    d.Repo.FullName(),
-		Branch:                  ref.branch,
-		PullRequest:             int(pull.Number),
-		PullRequestDraft:        pull.Draft,
-		PullRequestDraftUnknown: pull.DraftUnknown,
-		HeadSHA:                 pull.HeadSHA,
-		GoalID:                  ref.goalID,
-		TaskID:                  ref.id,
-		TaskTitle:               ref.title,
-		LeadAgent:               lock.Owner,
-		Sender:                  "github",
-		RequiredReviewers:       reviewers,
-		// Trigger 2 (daemon path): the implement-job advancement persisted the
-		// skip flag onto the branch lock; honor it so the PR-watcher path skips
-		// the native review fanout too.
-		SkipReviewFanout: lock.SkipNativeReviewFanout,
-		// #1250 reader 2 of 2: the SAME lock row already fetched above also carries
-		// the acting org role, so this trigger and the in-process one attribute
-		// fanout children identically with zero extra queries. Empty is the legacy
-		// and undirected value; the fanout then behaves exactly as it does today.
-		ActingOrgRole: lock.ActingOrgRole,
-		// #1967: the branch lock owner is the seat whose work caused this review to
-		// be asked for. It is read from the SAME lock row as ActingOrgRole above,
-		// so this costs no extra query, and it is recorded separately from
-		// LeadAgent because LeadAgent means "the reviewer's lead" on other
-		// dispatch paths. An empty owner degrades to Sender ("github").
-		DispatchedBy: lock.Owner,
-	})
-	return mergeReadinessHandled, err
+	return d.supersedeStaleReviewJobs(ctx, pull, memo)
 }
 
 func (d Daemon) supersedeStaleReviewJobs(ctx context.Context, pull github.PullRequest, memo *reviewJobsMemo) error {
@@ -2386,14 +2309,7 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	if !ready {
 		return nil
 	}
-	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	leadAgent := strings.TrimSpace(lock.Owner)
-	if leadAgent == "" {
-		leadAgent = "github"
-	}
+	leadAgent := "github"
 	branch := task.Branch
 	if branch == "" {
 		branch = pull.HeadRef
@@ -2526,11 +2442,6 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 	for _, task := range tasks {
 		if task.Branch == "" {
 			continue
-		}
-		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil && lock.SkipNativeReviewFanout {
-			continue
-		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
 		}
 		if _, open := openBranches[task.Branch]; open {
 			continue
@@ -2672,13 +2583,6 @@ func (d Daemon) reconcileClosedReviewingTasks(ctx context.Context, openBranches 
 			continue
 		}
 		leadAgent := "github"
-		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil {
-			if owner := strings.TrimSpace(lock.Owner); owner != "" {
-				leadAgent = owner
-			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
 		if err := d.Workflow.HandleReviewPullRequestClosed(ctx, workflow.PullRequestEvent{
 			Repo:        d.Repo.FullName(),
 			Branch:      task.Branch,
@@ -3251,11 +3155,6 @@ func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest
 	if strings.TrimSpace(pull.HeadSHA) != "" {
 		lines = append(lines, fmt.Sprintf("- head: `%s`", pull.HeadSHA))
 	}
-	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil {
-		lines = append(lines, fmt.Sprintf("- branch_lock: `%s`", lock.Owner))
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
 	counts, err := d.jobStateCounts(ctx, pull, statusTaskID)
 	if err != nil {
 		return err
@@ -3352,18 +3251,10 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	if task.State != string(workflow.TaskReadyToMerge) && task.State != string(workflow.TaskAwaitingHumanMerge) {
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s` or `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge))
 	}
-	leadAgent := "github"
-	actingOrgRole := ""
-	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
-	if err == nil {
-		if lock.SkipNativeReviewFanout {
-			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot native merge is disabled for PR #%d because branch `%s` is managed by an external council gate.", pull.Number, pull.HeadRef))
-		}
-		if strings.TrimSpace(lock.Owner) != "" {
-			leadAgent = lock.Owner
-		}
-		actingOrgRole = strings.TrimSpace(lock.ActingOrgRole)
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	// merge_rule is enforced against the PR implementer's recorded acting role
+	// (`gitmoot job record --acting-role`); an unattributed PR stays allowed.
+	actingOrgRole, err := d.Store.PullRequestActingRole(ctx, d.Repo.FullName(), int(pull.Number))
+	if err != nil {
 		return err
 	}
 	reviewers, err := d.workflowReviewers(ctx)
@@ -3380,7 +3271,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		GoalID:                  task.GoalID,
 		TaskID:                  task.ID,
 		TaskTitle:               task.Title,
-		LeadAgent:               leadAgent,
+		LeadAgent:               "github",
 		Sender:                  comment.Author,
 		RequiredReviewers:       reviewers,
 		ActingOrgRole:           actingOrgRole,

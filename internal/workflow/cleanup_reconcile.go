@@ -142,17 +142,6 @@ func (e Engine) reconcileCleanupReceipt(ctx context.Context, jobID, resourceID, 
 		if exists {
 			return result, false, nil
 		}
-		lock, err := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return result, true, err
-		}
-		if err == nil && lock.Owner != cleanupBranchOwner(owner, payload) {
-			result.Decision = result.Decision.refuse("branch_owner_changed")
-			return result, true, nil
-		}
-		if _, err := releaseDelegationBranchLock(ctx, e.Store, owner.Type, payload); err != nil {
-			return result, true, err
-		}
 	}
 	result.State = "retryable"
 	completed, err := e.finishProducerCleanupReceipt(ctx, receipt)

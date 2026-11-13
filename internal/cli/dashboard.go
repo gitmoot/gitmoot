@@ -36,7 +36,6 @@ type dashboardSnapshot struct {
 	ActiveJobs      []dashboardActiveJob    `json:"active_jobs"`
 	Jobs            dashboardJobs           `json:"jobs"`
 	Worktrees       []dashboardWorktree     `json:"worktrees"`
-	BranchLocks     []dashboardBranchLock   `json:"branch_locks"`
 	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
 
 	// jobRows carries per-job rows for the web dashboard's run summary. The
@@ -139,12 +138,6 @@ type dashboardWorktree struct {
 	Task string `json:"task"`
 	Repo string `json:"repo,omitempty"`
 	Path string `json:"path"`
-}
-
-type dashboardBranchLock struct {
-	Repo   string `json:"repo"`
-	Branch string `json:"branch"`
-	Owner  string `json:"owner,omitempty"`
 }
 
 // runDashboardWebFn is the --web entry point, replaceable in tests so the
@@ -276,7 +269,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 		RuntimeSessions: []dashboardSession{},
 		ActiveJobs:      []dashboardActiveJob{},
 		Worktrees:       []dashboardWorktree{},
-		BranchLocks:     []dashboardBranchLock{},
 		ResourceLocks:   []dashboardResourceLock{},
 	}
 	now := time.Now().UTC()
@@ -363,13 +355,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			if strings.TrimSpace(task.WorktreePath) != "" {
 				snapshot.Worktrees = append(snapshot.Worktrees, dashboardWorktree{Task: task.ID, Repo: task.RepoFullName, Path: task.WorktreePath})
 			}
-		}
-		locks, err := store.ListBranchLocks(ctx, "")
-		if err != nil {
-			return err
-		}
-		for _, lock := range locks {
-			snapshot.BranchLocks = append(snapshot.BranchLocks, dashboardBranchLock{Repo: lock.RepoFullName, Branch: lock.Branch, Owner: lock.Owner})
 		}
 		resourceLocks, err := store.ListResourceLocks(ctx)
 		if err != nil {
@@ -474,11 +459,6 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 		writeLine(stdout, "  %s %s", worktree.Task, worktree.Path)
 	}
 	dashboardMore(stdout, st, hidden)
-
-	dashboardSectionHeader(stdout, st, "branch_locks", len(snapshot.BranchLocks))
-	for _, lock := range snapshot.BranchLocks {
-		writeLine(stdout, "  %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner))
-	}
 }
 
 // printDashboardAttention prints, before the regular sections, the things a
@@ -491,9 +471,6 @@ func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboar
 	}
 	if failed := snapshot.Jobs.ByState["failed"]; failed > 0 {
 		lines = append(lines, st.Red(fmt.Sprintf("%d failed job(s)", failed)))
-	}
-	for _, lock := range snapshot.BranchLocks {
-		lines = append(lines, fmt.Sprintf("branch lock %s@%s %s", lock.Repo, lock.Branch, emptyText(lock.Owner)))
 	}
 	for _, lock := range snapshot.ResourceLocks {
 		if lock.Stale {

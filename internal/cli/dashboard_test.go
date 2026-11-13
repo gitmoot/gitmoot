@@ -39,7 +39,6 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 		"agents: 0",
 		"runtime_sessions: 0",
 		"jobs: 0",
-		"branch_locks: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)

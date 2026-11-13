@@ -66,15 +66,6 @@ const foreignBootRecoveryInterval = 15 * time.Second
 // out of the daemon's one-second hot path.
 const worktreeReclaimInterval = 5 * time.Minute
 
-// Task lane locks are cheap to inspect but are not part of the one-second hot
-// path. The age floor is the safety boundary: event-driven cancellation may
-// release immediately, while the unattended sweeper never touches a lane until
-// it has been unchanged for at least a day.
-const (
-	staleTaskLaneLockReclaimInterval = 5 * time.Minute
-	staleTaskLaneLockAgeFloor        = 24 * time.Hour
-)
-
 const (
 	delegationReclaimFailureLogLimit  = 3
 	delegationReclaimFailureMaxPaths  = 4096
@@ -2206,32 +2197,6 @@ func reclaimTerminalTaskWorktrees(ctx context.Context, worker jobWorker, repoFil
 	return nil
 }
 
-// reclaimStaleTaskLaneLocks releases only aged task lanes whose repo+branch has
-// no non-terminal task or job. ReleaseBranchLockIfInactiveWithEvent rechecks all
-// predicates atomically with the DELETE, so a concurrent resume or dispatch wins
-// safely and keeps its lane. Candidate-local failures are logged and skipped;
-// this optional housekeeping must never prevent queued-job dispatch.
-func reclaimStaleTaskLaneLocks(ctx context.Context, store *db.Store, repoFilter string, stdout io.Writer, now time.Time) error {
-	locks, err := store.ListBranchLocks(ctx, repoFilter)
-	if err != nil {
-		return err
-	}
-	cutoff := now.Add(-staleTaskLaneLockAgeFloor)
-	for _, lock := range locks {
-		released, err := store.ReleaseBranchLockIfInactiveWithEvent(ctx, lock, "", cutoff, db.BranchLockEvent{
-			Kind: "released", Message: "released stale task lane with no non-terminal branch work (#1565)",
-		})
-		if err != nil {
-			writeLine(stdout, "task lane lock reclaim failed for %s %s: %v", lock.RepoFullName, lock.Branch, err)
-			continue
-		}
-		if released {
-			writeLine(stdout, "released stale task lane lock %s %s", lock.RepoFullName, lock.Branch)
-		}
-	}
-	return nil
-}
-
 // runDaemonWorkerTickTracked is the per-tick worker pass. With a nil tracker it
 // follows the historical synchronous tick behavior: maintenance scans,
 // then a BLOCKING runQueuedJobsForRepo dispatch. The supervisors pass a live
@@ -2273,13 +2238,6 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 					tracker.markWorktreeReclaimAttempted(now)
 				}
 			}()
-		}
-	}
-	if ownsCandidates && tracker.staleTaskLaneLockReclaimDue(now) {
-		if err := reclaimStaleTaskLaneLocks(ctx, store, repoFilter, stdout, now); err != nil {
-			writeLine(stdout, "task lane lock reclaim failed: %v", err)
-		} else {
-			tracker.markStaleTaskLaneLockReclaimSuccessful(now)
 		}
 	}
 	if ownsCandidates {
@@ -2428,13 +2386,6 @@ func runDelegationReclaimPasses(ctx context.Context, store *db.Store, worker job
 }
 
 func runEnabledRepoWorkerTicksTracked(ctx context.Context, store *db.Store, worker jobWorker, workers int, rootFilter string, stdout io.Writer, now time.Time, locks *repoCheckoutLocks, tracker *inflightJobTracker) error {
-	if tracker.staleTaskLaneLockReclaimDue(now) {
-		if err := reclaimStaleTaskLaneLocks(ctx, store, "", stdout, now); err != nil {
-			writeLine(stdout, "task lane lock reclaim failed: %v", err)
-		} else {
-			tracker.markStaleTaskLaneLockReclaimSuccessful(now)
-		}
-	}
 	repos, err := store.ListRepos(ctx)
 	if err != nil {
 		return err

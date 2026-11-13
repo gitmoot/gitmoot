@@ -153,9 +153,6 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
 		}
 	}
-	if _, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "acme/app", Branch: "ship-dashboard", Owner: "alpha"}); err != nil {
-		t.Fatalf("CreateLock: %v", err)
-	}
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "acme/app", Number: 42, URL: "https://github.com/acme/app/pull/42", HeadBranch: "ship-dashboard", BaseBranch: "main", State: "open"}); err != nil {
 		t.Fatalf("UpsertPullRequest: %v", err)
 	}
@@ -244,7 +241,7 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	if len(tasks) != 3 {
 		t.Fatalf("tasks len=%d want 3 (planned, unknown, old merged excluded): %+v", len(tasks), tasks)
 	}
-	if tasks[0].ID != "task-pr" || tasks[0].State != "pr_open" || tasks[0].Agent != "alpha" || tasks[0].PRNumber != 42 || tasks[1].ID != "task-blocked" || tasks[1].BlockedReason != "Awaiting human input" || tasks[2].ID != "task-merged-recent" {
+	if tasks[0].ID != "task-pr" || tasks[0].State != "pr_open" || tasks[0].Agent != "" || tasks[0].PRNumber != 42 || tasks[1].ID != "task-blocked" || tasks[1].BlockedReason != "Awaiting human input" || tasks[2].ID != "task-merged-recent" {
 		t.Fatalf("task projection/order = %+v", tasks)
 	}
 
