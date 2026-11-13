@@ -80,29 +80,6 @@ func TestReviewVerdictWakeStillAnnouncesGenuineApproved(t *testing.T) {
 	}
 }
 
-// SHOULD-SUCCEED CONTROL, and it pins the OTHER defect in this family so my fix
-// cannot re-open it. #1685: a coordinator fan-out is a dispatch record, not an
-// inspection, so it must emit NO review-verdict wake at all. That exclusion is a
-// DIFFERENT mechanism from #1945 - wrong source rather than wrong transform -
-// and it lives on the admission guard, upstream of the value I changed.
-func TestReviewVerdictWakeStaysExcludedForFanOut(t *testing.T) {
-	ctx := context.Background()
-	sink, _ := runReviewVerdictWakeFixtureAllowNoVerdict(t, ctx, reviewVerdictFixture{
-		jobID: "review-fanout", pullRequest: 1947, taskID: "task-1947",
-		decision: "approved", severity: "", blockingSeverity: "P1",
-		delegations: `[{"id":"lens-a","agent":"audit","action":"review","prompt":"look at the diff"}]`,
-	})
-
-	for _, ev := range sink.events {
-		if ev.Cause == events.EventCauseReviewVerdict {
-			t.Fatalf("a fan-out emitted a review-verdict wake, re-opening #1685: %+v", ev)
-		}
-		if strings.TrimSpace(ev.ReviewDecision) != "" {
-			t.Fatalf("a fan-out carried ReviewDecision %q; the delegates' own terminals carry the real verdicts", ev.ReviewDecision)
-		}
-	}
-}
-
 // THE VOCABULARY INVARIANT the fix relies on instead of a defensive branch.
 //
 // engine_types.go admits a wake only when the THRESHOLD-ADJUSTED decision is
@@ -147,7 +124,6 @@ type reviewVerdictFixture struct {
 	decision         string
 	severity         string
 	blockingSeverity string
-	delegations      string
 }
 
 func runReviewVerdictWakeFixture(t *testing.T, ctx context.Context, fx reviewVerdictFixture) (*recordingSink, events.Event) {
@@ -156,12 +132,6 @@ func runReviewVerdictWakeFixture(t *testing.T, ctx context.Context, fx reviewVer
 	if !ok {
 		t.Fatalf("no review-verdict event was emitted; all=%+v", sink.events)
 	}
-	return sink, event
-}
-
-func runReviewVerdictWakeFixtureAllowNoVerdict(t *testing.T, ctx context.Context, fx reviewVerdictFixture) (*recordingSink, events.Event) {
-	t.Helper()
-	sink, event, _ := reviewVerdictWakeRun(t, ctx, fx)
 	return sink, event
 }
 
@@ -201,12 +171,8 @@ func reviewVerdictWakeRun(t *testing.T, ctx context.Context, fx reviewVerdictFix
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
 
-	delegations := "[]"
-	if strings.TrimSpace(fx.delegations) != "" {
-		delegations = fx.delegations
-	}
 	output := `{"gitmoot_result":{"decision":"` + fx.decision + `","severity":"` + fx.severity +
-		`","summary":"verdict summary","findings":[],"changes_made":[],"tests_run":["go test ./... ok"],"needs":[],"delegations":` + delegations + `}}`
+		`","summary":"verdict summary","findings":[],"changes_made":[],"tests_run":["go test ./... ok"],"needs":[],"delegations":[]}}`
 	adapter := &cliWorkerFakeAdapter{output: output}
 
 	if _, err := engine.RunJob(ctx, fx.jobID, runtime.Agent{

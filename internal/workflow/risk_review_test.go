@@ -455,6 +455,18 @@ func TestHighRiskSubthresholdLensSatisfiesQuorum(t *testing.T) {
 		Severity: reviewseverity.P2,
 		Summary:  "non-blocking polish",
 	})
+	securityJob := mustJob(t, store, securityID)
+	securityPayload, err := unmarshalPayload(securityJob.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(security) returned error: %v", err)
+	}
+	quorumMet, err := engine.highRiskLensQuorumMet(ctx, securityPayload)
+	if err != nil {
+		t.Fatalf("highRiskLensQuorumMet returned error: %v", err)
+	}
+	if !quorumMet {
+		t.Fatal("high-risk merge quorum must count the sub-threshold security lens")
+	}
 	if err := engine.AdvanceJob(ctx, securityID); err != nil {
 		t.Fatalf("AdvanceJob(security) returned error: %v", err)
 	}

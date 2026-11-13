@@ -812,6 +812,24 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// implementing lane picks them up.
 			return nil
 		case "approved":
+			// High-risk review (#650): the native required-reviewer gate approves a PR
+			// as soon as every required reviewer has ONE approving review in the round.
+			// With the lens fan-out that is too weak — a single approving lens (or one
+			// approving lens per reviewer) would drive the merge before the sibling
+			// refutation lenses even finish, defeating the adversarial quorum. Gate the
+			// native merge on the coordinator's quorum being satisfied first, so an
+			// approving lens can only advance toward merge once EVERY lens has approved.
+			// A critical/changes_requested lens leaves the quorum unmet (and its own
+			// terminal advance blocks the task), so this never merges a refuted change.
+			if payload.RiskTier == RiskTierHigh {
+				quorumMet, err := e.highRiskLensQuorumMet(ctx, payload)
+				if err != nil {
+					return err
+				}
+				if !quorumMet {
+					return e.setReviewingIfNotChangesRequested(ctx, ref)
+				}
+			}
 			ready, err := e.allRequiredReviewersApproved(ctx, reviewer, payload)
 			if err != nil {
 				return err

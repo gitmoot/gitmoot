@@ -1380,33 +1380,25 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 	payload.Result = &result
-	// #2364: a no-execution review's result is checked whatever the
-	// result_checks mode, because the mode is an audit dial and this is the
-	// review's own contract. A failure takes the block path. The agent flag
-	// covers a review made no-execution by its repository's policy, which the
-	// worker applies on the agent; it is recorded on the payload here so the
-	// stored job says which contract its verdict was produced under.
+	// Mandatory review checks run whatever the result_checks mode, because the
+	// mode is an audit dial and these are the review's own contract. Every
+	// failing mandatory check is recorded, then the job takes the block path.
+	// #2364: a no-execution review must run nothing. The agent flag covers a
+	// review made no-execution by its repository's policy, which the worker
+	// applies on the agent; it is recorded on the payload here so the stored
+	// job says which contract its verdict was produced under.
+	// #2588: reviewers are no longer offered delegation, so a review result
+	// that still carries delegations is refused rather than dispatched or
+	// silently dropped.
+	var mandatoryFailed []ResultCheck
 	if (payload.ReviewNoExecution || agent.NoExecution) && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
 		payload.ReviewNoExecution = true
-		if failed := NoExecutionReviewResultChecks(result); len(failed) > 0 {
-			payload.ResultChecks = failed
-			summary := SummarizeResultChecks(failed)
-			_ = m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary)
-			if err := m.savePayload(ctx, job.ID, payload); err != nil {
-				return AgentResult{}, err
-			}
-			if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
-				return AgentResult{}, err
-			}
-			return AgentResult{}, &ResultChecksError{Failed: failed}
-		}
+		mandatoryFailed = NoExecutionReviewResultChecks(result)
 	}
-	// #2588: reviewers are no longer offered delegation, so a review result
-	// that still carries delegations is refused whatever the result_checks
-	// mode rather than dispatched or silently dropped.
-	if failed := ReviewDelegationResultChecks(job.Type, result); len(failed) > 0 {
-		payload.ResultChecks = failed
-		summary := SummarizeResultChecks(failed)
+	mandatoryFailed = append(mandatoryFailed, ReviewDelegationResultChecks(job.Type, result)...)
+	if len(mandatoryFailed) > 0 {
+		payload.ResultChecks = mandatoryFailed
+		summary := SummarizeResultChecks(mandatoryFailed)
 		_ = m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary)
 		if err := m.savePayload(ctx, job.ID, payload); err != nil {
 			return AgentResult{}, err
@@ -1414,7 +1406,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
 			return AgentResult{}, err
 		}
-		return AgentResult{}, &ResultChecksError{Failed: failed}
+		return AgentResult{}, &ResultChecksError{Failed: mandatoryFailed}
 	}
 	// #526 deterministic binary-checklist audit of the parsed result. The worktree
 	// observation above is recorded in every mode. Off (the zero value and "off")
