@@ -49,6 +49,7 @@ type Client interface {
 	GetUserPermission(ctx context.Context, repo Repository, username string) (UserPermission, error)
 	MergePullRequest(ctx context.Context, input MergePullRequestInput) (MergeResult, error)
 	BaseRequiresUpToDateHead(ctx context.Context, repo Repository, branch string) (required bool, known bool, err error)
+	RequiredStatusCheckContexts(ctx context.Context, repo Repository, branch string) (contexts []string, known bool, err error)
 	GetCombinedStatus(ctx context.Context, repo Repository, ref string) (CombinedStatus, error)
 	ListCheckRunsForRef(ctx context.Context, repo Repository, ref string) ([]PullRequestCheck, error)
 	CompareCommits(ctx context.Context, repo Repository, base string, head string) (CompareResult, error)
@@ -1132,6 +1133,76 @@ func (c *GhClient) BaseRequiresUpToDateHead(ctx context.Context, repo Repository
 	default:
 		return false, false, nil
 	}
+}
+
+// RequiredStatusCheckContexts reports the status-check contexts that branch
+// protection on branch requires before merging, and whether that set could be
+// DETERMINED at all. It unions the classic protection's
+// required_status_checks (both the legacy contexts[] and checks[].context)
+// with every repository ruleset's required_status_checks rule that applies to
+// the branch.
+//
+// #2605: the merge gate blocked on an on-demand check run whose conclusion was
+// action_required although branch protection deliberately did not require it.
+// Ignoring such a check is only safe where the required set is known, so the
+// gate has to be able to ask.
+//
+// known=false means UNDETERMINED, not "nothing required": an unprotected
+// branch returns 404, but so does a token without the permission to read
+// protection, and a failed rulesets read could hide a required check. Callers
+// must fail closed on known=false.
+func (c *GhClient) RequiredStatusCheckContexts(ctx context.Context, repo Repository, branch string) (contexts []string, known bool, err error) {
+	branch = strings.TrimSpace(branch)
+	if strings.TrimSpace(repo.FullName()) == "" || branch == "" {
+		return nil, false, nil
+	}
+	escaped := url.PathEscape(branch)
+	classic, runErr := c.run(ctx, false, "api", endpoint(repo, "branches", escaped, "protection"))
+	if runErr != nil {
+		// 404 on an unprotected branch, or a permission failure: UNDETERMINED.
+		return nil, false, nil
+	}
+	var protection struct {
+		RequiredStatusChecks *struct {
+			Contexts []string `json:"contexts"`
+			Checks   []struct {
+				Context string `json:"context"`
+			} `json:"checks"`
+		} `json:"required_status_checks"`
+	}
+	if json.Unmarshal([]byte(classic.Stdout), &protection) != nil {
+		return nil, false, nil
+	}
+	if checks := protection.RequiredStatusChecks; checks != nil {
+		contexts = append(contexts, checks.Contexts...)
+		for _, check := range checks.Checks {
+			contexts = append(contexts, check.Context)
+		}
+	}
+	rulesResult, runErr := c.run(ctx, false, "api", endpoint(repo, "rules", "branches", escaped)+"?per_page=100")
+	if runErr != nil {
+		return nil, false, nil
+	}
+	var rules []struct {
+		Type       string `json:"type"`
+		Parameters struct {
+			RequiredStatusChecks []struct {
+				Context string `json:"context"`
+			} `json:"required_status_checks"`
+		} `json:"parameters"`
+	}
+	if json.Unmarshal([]byte(rulesResult.Stdout), &rules) != nil {
+		return nil, false, nil
+	}
+	for _, rule := range rules {
+		if rule.Type != "required_status_checks" {
+			continue
+		}
+		for _, check := range rule.Parameters.RequiredStatusChecks {
+			contexts = append(contexts, check.Context)
+		}
+	}
+	return compactUniqueStrings(contexts), true, nil
 }
 
 // GetCombinedStatus reads the combined commit status for a ref. per_page=100
