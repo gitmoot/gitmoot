@@ -899,6 +899,6 @@ pinging X is the action.
   decision either way.
 - **Scope**: preserve existing behavior unless the change requires otherwise.
 - For machine-local agent notes, use a gitignored `CLAUDE.local.md` rather than
-  editing this shared file. Gitignored (local-only, not in the repo): `/GOALS/`,
+  editing this shared file. Gitignored (local-only, not in the repo):
   `/repos/` (vendored helper repos), `/dist/`, `/.gitmoot/evals/` — editing these
   never shows in `git status`.

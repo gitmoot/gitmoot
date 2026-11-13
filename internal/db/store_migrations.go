@@ -3307,4 +3307,13 @@ DROP TABLE IF EXISTS permission_policy_warning_claims;
 DROP TABLE IF EXISTS permission_policy_observation_baseline;
 DROP TABLE IF EXISTS org_recycle_overdue_episodes;
 	`,
+	// #2594: tables whose code is gone. The groom verdict tables outlived the
+	// brain retirement (#2202) and goals outlived the goal planner (#2205);
+	// nothing reads or writes them. tasks.goal_id stays: reviews still set it.
+	`
+DROP TABLE IF EXISTS groom_llm_verdicts;
+DROP TABLE IF EXISTS groom_quality_verdicts;
+DROP TABLE IF EXISTS groom_stale_verdicts;
+DROP TABLE IF EXISTS goals;
+	`,
 }

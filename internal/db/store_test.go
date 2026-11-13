@@ -28,7 +28,6 @@ func TestOpenMigratesSchema(t *testing.T) {
 	for _, table := range []string{
 		"repos",
 		"agents",
-		"goals",
 		"tasks",
 		"pull_requests",
 		"seen_comments",
