@@ -310,61 +310,6 @@ func validateOptionalDuration(name string, value string) error {
 	return nil
 }
 
-// EventsPolicy is the host-level policy read from the [events] section of the
-// gitmoot config (#446). The retired webhook keys (webhook_url, timeout) are
-// ignored so an existing config that still carries them keeps loading.
-type EventsPolicy struct {
-	// SocketPath is RESERVED for a graduate Unix-socket transport (#446 open
-	// question). It is parsed but currently unused; listing it keeps the config
-	// surface forward-compatible.
-	SocketPath string
-}
-
-func DefaultEventsPolicy() EventsPolicy {
-	return EventsPolicy{}
-}
-
-func LoadEventsPolicy(paths Paths) (EventsPolicy, error) {
-	content, err := os.ReadFile(paths.ConfigFile)
-	if err != nil {
-		return EventsPolicy{}, err
-	}
-	policy := DefaultEventsPolicy()
-	current := false
-	for _, raw := range strings.Split(string(content), "\n") {
-		line := strings.TrimSpace(stripConfigComment(raw))
-		if line == "" {
-			continue
-		}
-		if section, ok := sectionHeader(line); ok {
-			current = section == "events"
-			continue
-		}
-		if !current {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		if err := applyEventsPolicyField(&policy, strings.TrimSpace(key), strings.TrimSpace(value)); err != nil {
-			return EventsPolicy{}, fmt.Errorf("parse [events].%s: %w", strings.TrimSpace(key), err)
-		}
-	}
-	return policy, nil
-}
-
-func applyEventsPolicyField(policy *EventsPolicy, key string, value string) error {
-	switch key {
-	case "socket_path":
-		parsed, err := parseConfigString(value)
-		policy.SocketPath = strings.TrimSpace(parsed)
-		return err
-	default:
-		return nil
-	}
-}
-
 // ReviewPolicy is the resolved review policy for one repository. Native review
 // fanout is disabled by default: agents and coordinators request reviews
 // explicitly, while operators may opt a repository back into native scheduling.
