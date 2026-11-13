@@ -233,25 +233,43 @@ jobs:
 
   # One stable, always-reporting context for branch protection (#2627). The
   # matrix above reports per-package names only when it expands; on a skipped
-  # (docs/dep-only) diff it reports a literal `${{ matrix.package }}` name, so
+  # (dep-only) diff it reports a literal `${{ matrix.package }}` name, so
   # requiring the per-package contexts would hold such PRs forever.
+  #
+  # needs.race-build.result alone is not enough: GitHub can report the matrix
+  # as success when a leg was cancelled before a runner picked it up. So when
+  # the matrix ran, every expected leg's own conclusion must be success.
   race-build-result:
     name: race build
     needs: [changes, race-build]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Every race build leg succeeded or was skipped
+      - name: Every race build leg succeeded, or the matrix was skipped
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           RESULT: ${{ needs.race-build.result }}
           CLASSIFY: ${{ needs.changes.result }}
+          CODE: ${{ needs.changes.outputs.code }}
         run: |
-          echo "classify diff: $CLASSIFY; race build: $RESULT"
+          set -euo pipefail
+          echo "classify diff: $CLASSIFY (code=$CODE); race build: $RESULT"
           [ "$CLASSIFY" = success ] || exit 1
-          case "$RESULT" in
-            success|skipped) exit 0 ;;
-            *) exit 1 ;;
-          esac
+          if [ "$RESULT" = skipped ]; then
+            # Only a dep-only diff may skip the matrix.
+            [ "$CODE" != true ] || { echo "race build skipped on a code diff"; exit 1; }
+            exit 0
+          fi
+          [ "$RESULT" = success ] || exit 1
+          jobs=$(gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name | startswith("race build (internal/")) | "\(.name)=\(.conclusion)"')
+          echo "$jobs"
+          for pkg in cli db workflow daemon; do
+            grep -qx "race build (internal/$pkg)=success" <<<"$jobs" || { echo "leg $pkg did not succeed"; exit 1; }
+          done
 
   race:
     name: race (internal/${{ matrix.package }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
