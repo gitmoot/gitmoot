@@ -310,32 +310,6 @@ func TestJobWatchTranscriptSurfacesHoldWithAnExistingLog(t *testing.T) {
 	}
 }
 
-// TestJobWatchSurfacesWithheldHolderDirectly is #1553's cause observed DIRECTLY
-// on the watch surface, not inferred from shared code. It kills the reversion
-// "surface the hold only for the blocker-payload class", which would leave a
-// withheld job silent on watch while job list explained it.
-// TestJobWatchNeverInfersAHoldFromABranchLaneRow is the watch-surface half of
-// the same defect: the withheld cause was read through shared derivation, so the
-// watch path inherited the false hold. The causal rendering it is replaced by is
-// covered by TestJobWatchSurfacesTheCausalCheckoutContentionHold below.
-func TestJobWatchNeverInfersAHoldFromABranchLaneRow(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	seedSessionAgentRepo(t, store)
-	seedQueuedJob(t, store, "watch-lane-row", workflow.JobPayload{
-		Repo:        "owner/repo",
-		Branch:      "task-17",
-		PullRequest: 17,
-	})
-	seedBranchLock(t, home, "owner/repo", "task-17", "implement-holds-the-repo")
-	store.Close()
-
-	out, _ := watchUntil(t, home, "watch-lane-row", "", false)
-	if strings.Contains(out, "HOLD:") {
-		t.Fatalf("job watch output = %q, want no HOLD: a lane row cannot prove this job is withheld", out)
-	}
-}
-
 func TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HERDR_ENV", "")

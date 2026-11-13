@@ -368,7 +368,7 @@ detection.
 
 - `skills/gitmoot/references/RESULT_CONTRACT.md` — `gitmoot_result` + the
   `delegations` fields and termination bounds.
-- `skills/gitmoot/references/SAFETY.md` — checkout/runtime/branch locks and
+- `skills/gitmoot/references/SAFETY.md` — checkout/runtime locks and
   delegation termination bounds.
 - `skills/gitmoot/SKILL.md` — the entry point for the Gitmoot agent skill.
 
@@ -504,7 +504,8 @@ silently dropped the non-empty `tests_run` evidence bar and the immediate
 pre-merge re-read - the two that caught a verdict which executed nothing and
 every head that moved under a review. One review is sufficient; another model
 family is preferred when available but never a gate. `/gitmoot merge` enforces
-the acting role's `merge_rule` from the durable branch lock: `"owner"` refuses
+the acting role's `merge_rule` from the PR implementer's recorded acting role
+(`job record --acting-role`): `"owner"` refuses
 a non-root acting role, while `"none"` refuses every acting role; each refusal
 names the remedy. Other merge paths
 remain advisory: **an armed engine merge gate may merge on its own
@@ -841,10 +842,9 @@ escalations, and an armed merge gate then merged the PR without them.
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
   All DRAIN reviews then run as background engine jobs. Never bypass the shared
   gate with a foreground or persistent-seat reviewer.
-- Before DRAIN activates, allow exactly one review-capable agent on each active `gitmoot/*` repository. For a
-  PR with a branch lock, the native PR watcher is the sole producer; do not also
-  dispatch a manual review. For a PR without a branch lock, native fanout cannot
-  run, so only the coordinator may enqueue its single manual review.
+- Before DRAIN activates, allow exactly one review-capable agent on each active
+  `gitmoot/*` repository. The native PR watcher does not fan out reviews, so the
+  coordinator enqueues each PR's single manual review.
 - Prioritize merge-ready work and merge-gate integrity, then serial dependency
   chains, then resource-safety work. Rebase conflicted branches only after
   upstream merges settle. Keep drafts and backlog work parked.

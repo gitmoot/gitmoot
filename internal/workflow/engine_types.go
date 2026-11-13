@@ -192,7 +192,7 @@ func (e Engine) mailbox() Mailbox {
 				if decision == "approved" || decision == "changes_requested" {
 					owner := ""
 					resolved, resolveErr := e.Store.ResolvePullRequestOwner(
-						ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID,
+						ctx, payload.Repo, payload.PullRequest, payload.TaskID,
 					)
 					if resolveErr == nil {
 						owner = NormalizeActingOrgRole(resolved)

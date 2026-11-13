@@ -131,8 +131,15 @@ func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSu
 
 func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]DashboardTaskRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.title, t.repo_full_name, t.state,
-		COALESCE((SELECT bl.owner FROM branch_locks bl
-			WHERE bl.repo_full_name = t.repo_full_name AND bl.branch = t.branch LIMIT 1), ''),
+		COALESCE((SELECT trim(json_extract(j.payload, '$.acting_org_role')) FROM jobs j
+			WHERE j.repo = t.repo_full_name AND j.type = 'implement'
+				AND j.pull_request = (SELECT pr.number FROM pull_requests pr
+					WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
+					ORDER BY pr.number DESC LIMIT 1)
+				AND json_valid(j.payload)
+				AND json_type(j.payload, '$.acting_org_role') = 'text'
+				AND trim(json_extract(j.payload, '$.acting_org_role')) != ''
+			ORDER BY j.created_at, j.id LIMIT 1), ''),
 		COALESCE((SELECT pr.number FROM pull_requests pr
 			WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
 			ORDER BY pr.number DESC LIMIT 1), 0),

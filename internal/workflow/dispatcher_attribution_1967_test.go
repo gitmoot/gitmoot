@@ -36,13 +36,6 @@ func TestInProcessPROpenRecordsTheDispatchingSeatOnFanoutChildren(t *testing.T) 
 	engine := testEngine(store)
 	engine.RequiredReviewers = []string{"reviewer"}
 
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: "gitmoot/gitmoot",
-		Branch:       "task-1967",
-		Owner:        "lead",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	insertCompletedJob(t, store, db.Job{
 		ID:    "dispatching-implement",
 		Agent: "lead",

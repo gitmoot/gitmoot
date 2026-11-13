@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -344,19 +343,7 @@ func (e Engine) classifyTerminalTaskWorktreeUnremovable(ctx context.Context, tas
 }
 
 func (e Engine) taskWorktreeHasActiveOwner(ctx context.Context, task db.Task, path string) (bool, error) {
-	active, err := e.Store.TaskHasActiveWorktreeOwner(ctx, task.ID, path)
-	if err != nil || active {
-		return active, err
-	}
-	if strings.TrimSpace(task.Branch) == "" {
-		return false, nil
-	}
-	if _, err := e.Store.GetBranchLock(ctx, task.RepoFullName, task.Branch); err == nil {
-		return true, nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
-	return false, nil
+	return e.Store.TaskHasActiveWorktreeOwner(ctx, task.ID, path)
 }
 
 func isTerminalTaskWorktreeState(state string) bool {
@@ -829,40 +816,10 @@ func isImplementDelegationWorktree(jobType string, payload JobPayload) bool {
 		!readOnlyDelegationAction(jobType) // i.e. jobType == "implement"
 }
 
-// releaseDelegationBranchLock releases the branch lock a worktree-isolated
-// implement delegation leg acquired in AllocateDelegationWorktree (#617), once
-// the leg has reached a terminal state. It is force-scoped by (repo, branch): a
-// gitmoot-delegation-<parent-short>-<id>[-retry-N] branch is unique to exactly one
-// leg, so a force release cannot clobber another job's lock and is robust to any
-// owner drift, while an owner-scoped release could silently miss a lock whose
-// recorded owner no longer matches. It is gated by isImplementDelegationWorktree so
-// it fires ONLY for worktree-isolated implement legs — whose Branch is a real
-// per-delegation branch — and NEVER for the shared-checkout fallback leg, whose
-// Branch is the PARENT branch the coordinator still owns. Best-effort and
-// idempotent: a no-op (released=false, no branch_locks event) once the lock is gone
-// or when the payload lacks the repo/branch identity. Returns whether a lock was
-// actually released this call.
-func releaseDelegationBranchLock(ctx context.Context, store *db.Store, jobType string, payload JobPayload) (bool, error) {
-	if store == nil || !isImplementDelegationWorktree(jobType, payload) {
-		return false, nil
-	}
-	repo := strings.TrimSpace(payload.Repo)
-	branch := strings.TrimSpace(payload.Branch)
-	if repo == "" || branch == "" {
-		return false, nil
-	}
-	_, released, err := store.ForceReleaseLockWithEvent(ctx, repo, branch, db.BranchLockEvent{
-		Kind:    "released",
-		Message: "released after delegation leg reached a terminal state (#617)",
-	})
-	return released, err
-}
-
 // cleanupImplementDelegationWorktree disposes the per-delegation worktree AND
 // deletes the gitmoot-delegation-* branch allocated for an implement delegation
 // child once the child job is terminal, so they do not accumulate in the shared
-// checkout and mislead a later coordinator (#478). It also releases the child's
-// per-delegation branch lock, symmetric with AllocateDelegationWorktree (#617). It is best-effort and
+// checkout and mislead a later coordinator (#478). It is best-effort and
 // idempotent: an already-gone worktree+branch short-circuit to a no-op. Removal
 // and branch deletion mutate the shared .git, so it holds the checkout mutation
 // lock like allocation does. The worktree is removed FIRST so the branch is no

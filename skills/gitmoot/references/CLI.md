@@ -1950,12 +1950,10 @@ gitmoot agent ask reviewer "Summarize the risk in this diff." --repo owner/repo 
 `--skip-native-review-fanout` flag. It states that the coordinator owns review
 orchestration, so a PR on this branch must not be fanned out to Gitmoot's
 native reviewers (the configured required reviewers, or the ones passed for the
-task). The flag is persisted on the job payload and on the branch lock, and the
-daemon's GitHub PR-watcher reads the lock, so a PR it observes on that branch
-stays free of native review fan-out. The engine's implement-advance arm reads
-the same flag, but no implement job can be dispatched while #2203 stands, so
-the PR-watcher is the path that still exercises it. The flag defaults off;
-leave it off for the full native review fan-out.
+task). The flag is persisted on the job payload, and the engine's
+implement-advance arm reads it when the implement job opens a PR. The daemon's
+GitHub PR-watcher never fans out native reviews. The flag defaults off; leave it
+off for the full native review fan-out.
 
 When a synchronous `agent run`/`ask`/`review`/`orchestrate` job
 delivers and **succeeds terminally** but a benign *post-success* advancement step
@@ -2728,7 +2726,7 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 `approved` or `changes_requested` matches both `job-terminal` and
 `review-verdict` and addresses both the requesting org role and the resolved
 implementing role. When a successful ownership lookup finds no implement job
-or branch lock attribution, the review's persisted lead identifies a
+attribution, the review's persisted lead identifies a
 persistent implementing seat; lookup errors remain fail-closed. If neither
 role can be resolved, addressed rules fail closed while observer rules remain
 eligible. `pane_input_pending` matches the
@@ -2973,7 +2971,7 @@ Repeating the command returns the existing live successor. A live task is
 refused. The dispatch refusal names the exact command to run.
 
 Dismissal is automatic; no command dismisses a task. The daemon's stale sweep
-preserves the branch and worktree and releases the branch lock best-effort.
+preserves the branch and worktree.
 
 Past `[workflow].stale_task_ttl`, blocked tasks are disposed by forge evidence:
 own merged PR (`merged`), later merged work on the same referenced issue
@@ -3133,8 +3131,6 @@ gitmoot job cancel <job-id>                                        # one queued|
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
 gitmoot job kill <root-job-id>
 gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a job paused at awaiting_human
-gitmoot lock list --repo owner/repo
-gitmoot lock show owner/repo <branch>
 ```
 
 `job cleanup inspect` returns the versioned producer decision (`schema_version:
@@ -3703,22 +3699,16 @@ would read as a retry long overdue.
 
 The sibling cause is surfaced on the same pass (#1553), but it is **never
 inferred from a lock table**: a job withheld while another job works the repo is
-rendered from the deferral the daemon actually recorded for it. The pre-flight
-emits `branch <branch> is locked by <owner>`, which is classified as the
-`checkout_contention` blocker class and persisted as both the payload class and a
-`blocker_deferred` event naming the branch and the holder, so it renders through
-the two forms above like any other deferral.
+rendered from the deferral the daemon actually recorded for it: a
+`checkout_contention` blocker persisted as both the payload class and a
+`blocker_deferred` event naming the holder renders through the two forms above
+like any other deferral.
 
-Neither `resource_locks` nor `branch_locks` is consulted, and that is a
-deliberate reversal of two earlier attempts. Resource-lock keys are
-`runtime:<rt>:<ref>` and `checkout-mutation:<absolute path>` and encode no
-repository segment, so matching them against a repo name attributed unrelated
-holders. Reading `branch_locks` instead was the wrong inference rather than the
-wrong table: a branch lock records who owns a LANE, not who is withholding a
-given job, and the lock is acquired with the agent as owner BEFORE that agent's
-own job is enqueued — so an ordinary queued job was reported as withheld by its
-own agent. A queued row with no recorded deferral is therefore left silent
-rather than given a holder no lock row can prove.
+`resource_locks` is not consulted: its keys are `runtime:<rt>:<ref>` and
+`checkout-mutation:<absolute path>` and encode no repository segment, so
+matching them against a repo name attributed unrelated holders. A queued row
+with no recorded deferral is therefore left silent rather than given a holder no
+lock row can prove.
 
 `gitmoot job watch` surfaces a hold while it waits, as `HOLD: <reason>` with the
 optional `(next retry <RFC3339>)` and `[action: …]` suffixes, re-checked on every

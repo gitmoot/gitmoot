@@ -154,7 +154,7 @@ merge_rule = "owner"
 		t.Fatal("mergeRuleRefusal denied = false, want true")
 	}
 	for _, want := range []string{
-		"acting role `gm-integrity`",
+		"PR implementer role `gm-integrity`",
 		"`merge_rule = \"owner\"`",
 		"owner role `owner`",
 		"Remedy:",

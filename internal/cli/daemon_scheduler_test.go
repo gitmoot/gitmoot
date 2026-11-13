@@ -830,9 +830,6 @@ func TestRunQueuedJobsDefersJobsEnqueuedByCurrentSnapshot(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "lead", runtime.ShellRuntime, "unused", []string{"implement"}, "owner/repo")
 	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID:          "job-implement",
 		Agent:       "lead",

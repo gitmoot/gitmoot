@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,11 +69,6 @@ func TestPollOnceRecoversRetainedClaimForExternallyMergedReviewTask(t *testing.T
 	if err := store.UpsertTask(ctx, task); err != nil {
 		t.Fatal(err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: repo.FullName(), Branch: branch, Owner: "review-agent",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock = acquired %v err %v", acquired, err)
-	}
 
 	token, claimed, current, err := store.ClaimTaskState(ctx, taskID, string(workflow.TaskReviewing),
 		db.TaskStateClaimKindExternalMerge, time.Minute)
@@ -102,9 +96,6 @@ func TestPollOnceRecoversRetainedClaimForExternallyMergedReviewTask(t *testing.T
 	assertExternalMergeState(t, store, repo.FullName(), taskID, 7, workflow.TaskMerged, "merged")
 	if claimed, err := store.HasTaskStateClaim(ctx, taskID); err != nil || claimed {
 		t.Fatalf("retained claim after merged reconciliation = %v, err=%v; want cleared", claimed, err)
-	}
-	if _, err := store.GetBranchLock(ctx, repo.FullName(), branch); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("branch lock after merged reconciliation = %v, want absent", err)
 	}
 	task, err = store.GetTask(ctx, taskID)
 	if err != nil || task.WorktreePath != "" {
@@ -455,14 +446,6 @@ func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullReq
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: repo.FullName(), Branch: open.HeadRef, Owner: "builder",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock = acquired %v err %v", acquired, err)
-	}
-	if err := store.SetBranchLockReviewFanout(ctx, repo.FullName(), open.HeadRef, true); err != nil {
-		t.Fatal(err)
-	}
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: repo.FullName(), Number: open.Number,
 		URL:        "https://github.com/gitmoot/gitmoot/pull/1732",
@@ -604,9 +587,6 @@ func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullReq
 		if terminalGate.State != "merged" {
 			t.Fatalf("terminal merge gate = %+v, want merged", terminalGate)
 		}
-		if _, err := store.GetBranchLock(ctx, repo.FullName(), open.HeadRef); !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("branch lock after merged PollOnce = %v, want released", err)
-		}
 		if task.WorktreePath != "" || len(worktrees.paths) != 1 || worktrees.paths[0] != worktreePath {
 			t.Fatalf("merged worktree task=%+v removals=%v, want one canonical cleanup", task, worktrees.paths)
 		}
@@ -619,9 +599,6 @@ func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullReq
 	} else {
 		if terminalGate.State != "pending" {
 			t.Fatalf("closed-unmerged merge gate = %+v, want retained pending history", terminalGate)
-		}
-		if _, err := store.GetBranchLock(ctx, repo.FullName(), open.HeadRef); err != nil {
-			t.Fatalf("closed-unmerged branch lock = %v, want preserved", err)
 		}
 		if task.WorktreePath != worktreePath || len(worktrees.paths) != 0 ||
 			len(postMergeGit.updates) != 0 || len(nextTasks.taskIDs) != 0 {
@@ -665,11 +642,6 @@ func runBranchlessQueuedMergeTerminalPolls(t *testing.T, terminal github.PullReq
 	if len(client.merges) != 1 || runner.calls != 2 {
 		t.Fatalf("stable production merge attempts=%d adapter calls=%d, want one merge command total",
 			len(client.merges), runner.calls)
-	}
-	if mergedOutcome {
-		if _, err := store.GetBranchLock(ctx, repo.FullName(), open.HeadRef); !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("stable merged branch lock = %v, want absent", err)
-		}
 	}
 }
 

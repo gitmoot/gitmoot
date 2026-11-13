@@ -637,45 +637,6 @@ func TestEngineReclaimTerminalTaskWorktreeClassifiesMissingGitAdmin(t *testing.T
 	}
 }
 
-func TestEngineReclaimTerminalTaskWorktreeKeepsBranchLockOwner(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	home := t.TempDir()
-	path, err := TaskWorktreePath(home, "owner/repo", "task-locked")
-	if err != nil {
-		t.Fatalf("TaskWorktreePath: %v", err)
-	}
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		t.Fatalf("MkdirAll worktree: %v", err)
-	}
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-locked",
-		RepoFullName: "owner/repo",
-		State:        string(TaskMerged),
-		Branch:       "task-locked",
-		WorktreePath: path,
-	}); err != nil {
-		t.Fatalf("UpsertTask: %v", err)
-	}
-	created, err := store.CreateLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-locked", Owner: "live-owner"})
-	if err != nil || !created {
-		t.Fatalf("CreateLock created=%v err=%v", created, err)
-	}
-	manager := &fakeWorktreeManager{}
-	engine := testEngine(store)
-
-	outcome, err := engine.ReclaimTerminalTaskWorktreeOutcome(ctx, home, t.TempDir(), "task-locked", manager)
-	if err != nil {
-		t.Fatalf("ReclaimTerminalTaskWorktreeOutcome: %v", err)
-	}
-	if outcome.Reclaimed || outcome.Classification != TaskWorktreeReclaimActiveOwner {
-		t.Fatalf("outcome = %+v, want active owner keep", outcome)
-	}
-	if len(manager.cleanCalls) != 0 || len(manager.removed) != 0 {
-		t.Fatalf("owned worktree was inspected or removed: clean=%v removed=%v", manager.cleanCalls, manager.removed)
-	}
-}
-
 func TestEngineReclaimTerminalTaskWorktreeRejectsUnmanagedPath(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

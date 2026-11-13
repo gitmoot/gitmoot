@@ -401,9 +401,6 @@ func TestReconcileReviewingPullRequestAdvancesAmongLargeNonReviewPayload(t *test
 	}); err != nil {
 		t.Fatalf("UpsertAgent audit returned error: %v", err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.UpsertTask(ctx, db.Task{
 		ID: "task-007", RepoFullName: repo.FullName(), GoalID: "goal-1",
 		Title: "Task 7", State: string(workflow.TaskReviewing), Branch: "task-7",

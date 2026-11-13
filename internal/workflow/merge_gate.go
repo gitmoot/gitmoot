@@ -721,14 +721,6 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 		log.Printf("WARNING: workflow journal PR-merged breadcrumb failed for %s#%d: %v", request.Repo, request.PullRequest, err)
 	}
 	postMergeWarnings := []string{}
-	lock, err := g.Store.GetBranchLock(ctx, request.Repo, pr.HeadRef)
-	if err == nil {
-		if _, err := g.Store.ReleaseLockWithEvent(ctx, lock, db.BranchLockEvent{Kind: "released", Message: "released after pull request merge"}); err != nil {
-			postMergeWarnings = append(postMergeWarnings, "release branch lock: "+err.Error())
-		}
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		postMergeWarnings = append(postMergeWarnings, "load branch lock: "+err.Error())
-	}
 	if err := g.cleanupTaskWorktree(ctx, request, pr.HeadRef); err != nil {
 		postMergeWarnings = append(postMergeWarnings, "cleanup task worktree: "+err.Error())
 	}

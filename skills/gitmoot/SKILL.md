@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, agent-templates, custom prompt agents, orchestration, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
 metadata:
@@ -15,7 +15,7 @@ reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins, structured
 implementation plans, agent template workflows, custom
-prompt agents, job status, or branch lock inspection. When a job
+prompt agents, or job status. When a job
 pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
 "<question-id>: text"` (see CLI.md § Jobs).
 
@@ -73,8 +73,7 @@ verb. A template that must change is edited or re-seeded in the
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same resumable runtime session (omp runs a fresh session per job), and branch locks protect implementation
-ownership.
+same resumable runtime session (omp runs a fresh session per job).
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 omp is the only job runtime (`shell` remains a subscribe-only runtime for no-LLM
@@ -360,7 +359,7 @@ Flutter/Dart checks are not available in a local seat; report them with
 Preserve existing behavior unless the job explicitly changes it. Keep work
 scoped to the target repo. Do not commit generated data, caches, logs, secrets,
 session archives, cloned helper repos, or large outputs unless explicitly
-requested. Respect Gitmoot branch locks for implementation jobs.
+requested.
 
 For detailed safety and lock rules, read [SAFETY.md](references/SAFETY.md).
 

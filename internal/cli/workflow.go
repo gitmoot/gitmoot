@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -41,7 +42,6 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	var tasks []db.Task
 	var prs []db.PullRequest
 	var jobs []db.Job
-	var locks []db.BranchLock
 	repoFullName := ""
 	if strings.TrimSpace(*repo) != "" {
 		var ok bool
@@ -83,10 +83,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		if prs, err = store.ListPullRequests(context.Background(), repoFullName); err != nil {
 			return err
 		}
-		if jobs, err = store.ListJobs(context.Background()); err != nil {
-			return err
-		}
-		locks, err = store.ListBranchLocks(context.Background(), repoFullName)
+		jobs, err = store.ListJobs(context.Background())
 		return err
 	}); err != nil {
 		fmt.Fprintf(stderr, "status: %v\n", err)
@@ -120,7 +117,6 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 	for _, state := range sortedCountKeys(jobCounts) {
 		fmt.Fprintf(stdout, "  %s: %d\n", state, jobCounts[state])
 	}
-	fmt.Fprintf(stdout, "locks: %d\n", len(locks))
 	return 0
 }
 
@@ -479,4 +475,19 @@ func taskBranchName(taskID string, title string) string {
 func shortHash(value string) string {
 	sum := sha1.Sum([]byte(value))
 	return hex.EncodeToString(sum[:])[:8]
+}
+
+// normalizeOptionalRepoFlag returns "" for an empty --repo flag and the
+// canonical owner/repo otherwise, reporting an invalid value on stderr.
+func normalizeOptionalRepoFlag(value string, stderr io.Writer) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", true
+	}
+	repo, err := github.ParseRepository(value)
+	if err != nil {
+		fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+		return "", false
+	}
+	return repo.FullName(), true
 }

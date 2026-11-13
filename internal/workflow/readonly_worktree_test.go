@@ -191,7 +191,7 @@ func TestReclaimReadOnlyWorktreeRejectsUnownedPath(t *testing.T) {
 	world.assertPreserved(t)
 }
 
-func TestAllocateReadOnlyDelegationWorktreeDetachedNoBranchLock(t *testing.T) {
+func TestAllocateReadOnlyDelegationWorktreeDetached(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	engine := testEngine(store)
@@ -233,17 +233,6 @@ func TestAllocateReadOnlyDelegationWorktreeDetachedNoBranchLock(t *testing.T) {
 	// A read-only worktree must create no branch and take no branch lock.
 	if len(manager.calls) != 0 {
 		t.Fatalf("read-only allocation must not call AddWorktree (branch path): %+v", manager.calls)
-	}
-	// #2203 removed the delegation branch namer along with implement-leg
-	// allocation, so there is no single branch name to probe: assert the stronger
-	// property directly — a read-only allocation leaves the repo with NO branch
-	// lock at all.
-	locks, err := store.ListBranchLocks(ctx, "owner/repo")
-	if err != nil {
-		t.Fatalf("ListBranchLocks: %v", err)
-	}
-	if len(locks) != 0 {
-		t.Fatalf("read-only allocation must not create a branch lock; locks = %+v", locks)
 	}
 	// The checkout mutation lock must be released after allocation.
 	if _, err := store.GetResourceLock(ctx, key); !errors.Is(err, sql.ErrNoRows) {

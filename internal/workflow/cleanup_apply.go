@@ -227,9 +227,6 @@ func (e Engine) applyProducerCleanup(ctx context.Context, jobID, resourceID, tok
 				return result, err
 			}
 		}
-		if _, err := releaseDelegationBranchLock(ctx, e.Store, "implement", payload); err != nil {
-			return result, err
-		}
 	}
 	if current.Policy.Mode == "aged" {
 		if pruner, ok := e.DelegationWorktrees.(WorktreePruner); ok {

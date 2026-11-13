@@ -189,26 +189,12 @@ func deriveQueueHoldReason(job db.Job) stuckReason {
 			SuggestedAction: strings.TrimSpace(payload.BlockerSuggestedAction),
 		}
 	}
-	// #1553's WITHHELD CAUSE IS NOT INFERRED HERE, ON PURPOSE, AND TWO ATTEMPTS TO
-	// INFER IT BOTH INVENTED HOLDS. The first scanned resource_locks with
-	// strings.Contains(key, repo), so the production-shaped key
-	// "merge-queue:owner/repository:main" was attributed to an ordinary owner/repo
-	// job; real keys are "runtime:<rt>:<ref>" and "checkout-mutation:<abs path>" and
-	// encode no repo segment, so that match could not be made sound. The second read
-	// branch_locks, which was the wrong INFERENCE rather than the wrong table: a
-	// branch lock records who owns a LANE, not who is withholding THIS job.
-	// Production acquires that lock with Owner=<agent> BEFORE enqueuing that same
-	// agent's implement job (workflow.go:1273), so a compiled-CLI probe rendered an
-	// ordinary queued job as "withheld ... held by lead" - by its own agent's lock.
-	//
-	// THE ENGINE ALREADY RECORDS THIS CAUSALLY, so nothing needs inferring: the
-	// daemon pre-flight emits "branch %s is locked by %s" (workflow.go:1283),
-	// job_blocker_checkout.go classifies it as the checkout_contention BlockerClass,
-	// and persists it with a blocker_deferred event that names the branch AND the
-	// holder. That flows through the payload arm above and the reason-event path, and
-	// it is strictly better evidence: it is written only when the contention actually
-	// blocked this job. A queued row with no recorded blocker is therefore left
-	// silent rather than given a holder that a lane row cannot prove.
+	// #1553's WITHHELD CAUSE IS NOT INFERRED HERE, ON PURPOSE. Scanning
+	// resource_locks with strings.Contains(key, repo) invented holds: real keys are
+	// "runtime:<rt>:<ref>" and "checkout-mutation:<abs path>" and encode no repo
+	// segment. Recorded contention (a blocker_deferred event naming the holder)
+	// flows through the payload arm and the reason-event path above; a queued row
+	// with no recorded blocker is left silent rather than given an unproven holder.
 	return stuckReason{}
 }
 

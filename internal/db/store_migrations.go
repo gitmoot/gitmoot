@@ -3336,4 +3336,12 @@ DROP TABLE IF EXISTS heartbeat_state;
 	`
 DROP TABLE IF EXISTS runtime_session_usage;
 	`,
+	// #2591 retires branch locks and `gitmoot lock`. No path acquires a lock
+	// since #2586 removed engine implement delivery, and every reader is gone in
+	// the same change: /gitmoot merge reads the PR implementer's recorded acting
+	// role from its implement job instead. resource_locks is unrelated and stays.
+	`
+DROP TABLE IF EXISTS lock_events;
+DROP TABLE IF EXISTS branch_locks;
+	`,
 }

@@ -33,7 +33,6 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		"ClaimTaskState",
 		"ClearTaskWorktreePath",
 		"CompleteTaskStateClaim",
-		"GetBranchLock",
 		"GetNoCIObservation",
 		"GetTask",
 		// JobIDsWithEventKind is a READ, added for #1713, and the guard demands its
@@ -56,7 +55,6 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 		"ListJobs",
 		"RecoverClaimedTaskState",
 		"ReleaseRetainedTaskStateClaim",
-		"ReleaseLockWithEvent",
 		"ReleaseResourceLock",
 		"RecordJobEventOnce",
 		"ReleaseTaskStateClaim",

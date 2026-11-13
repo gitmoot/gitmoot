@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -896,11 +895,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: repoName, Branch: headBranch, Owner: "builder",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock = acquired %v err %v", acquired, err)
-	}
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: repoName, Number: pullRequest,
 		URL: "https://github.com/owner/repo/pull/1732", HeadBranch: headBranch,
@@ -1077,13 +1071,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	if err != nil || terminalGate.State != "merged" {
 		t.Fatalf("terminal gate = %+v err=%v, want merged", terminalGate, err)
 	}
-	if _, err := store.GetBranchLock(ctx, repoName, headBranch); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("terminal branch lock error = %v, want released", err)
-	}
-	lockEvents, err := store.ListBranchLockEvents(ctx, repoName, headBranch)
-	if err != nil || len(lockEvents) != 1 || lockEvents[0].Kind != "released" {
-		t.Fatalf("terminal lock events = %+v err=%v, want one release", lockEvents, err)
-	}
 	terminalTask, err := store.GetTask(ctx, taskID)
 	if err != nil || terminalTask.WorktreePath != "" ||
 		!reflect.DeepEqual(worktrees.paths, []string{worktreePath}) {
@@ -1119,9 +1106,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	if err != nil || claimed {
 		t.Fatalf("stable claim = %v err=%v, want absent", claimed, err)
 	}
-	if _, err := store.GetBranchLock(ctx, repoName, headBranch); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("stable branch lock error = %v, want absent", err)
-	}
 	stablePR, err := store.GetPullRequest(ctx, repoName, pullRequest)
 	if err != nil || !reflect.DeepEqual(stablePR, pr) {
 		t.Fatalf("stable PR = %+v err=%v, want %+v", stablePR, err, pr)
@@ -1141,10 +1125,6 @@ func runDaemonMergeGateTerminalPolls(t *testing.T, options terminalPollOptions) 
 	stableNotes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
 	if err != nil || !reflect.DeepEqual(stableNotes, notes) {
 		t.Fatalf("stable notes = %+v err=%v, want %+v", stableNotes, err, notes)
-	}
-	stableLockEvents, err := store.ListBranchLockEvents(ctx, repoName, headBranch)
-	if err != nil || !reflect.DeepEqual(stableLockEvents, lockEvents) {
-		t.Fatalf("stable lock events = %+v err=%v, want %+v", stableLockEvents, err, lockEvents)
 	}
 	if mergeRunner.mergeCommands != 1 ||
 		!reflect.DeepEqual(worktrees.paths, []string{worktreePath}) ||

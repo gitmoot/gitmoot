@@ -19,11 +19,9 @@ import (
 
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
 
-	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/update"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -807,48 +805,6 @@ func legacyDashboardJobs(home string) ([]dashboard.JobSummary, error) {
 		return nil
 	})
 	return out, err
-}
-
-func TestDashboardHealthSeesLockMutationOnNextResponse(t *testing.T) {
-	original := updateCheckFn
-	t.Cleanup(func() { updateCheckFn = original })
-	updateCheckFn = func(context.Context, buildinfo.Info, string) (update.CheckResult, error) {
-		return update.CheckResult{}, errors.New("offline")
-	}
-
-	home := dashboardTestHome(t)
-	ds := &webDataSource{home: home, responseCache: newDashboardJSONCache(nil)}
-	handler := newDashboardWebHandler(ds)
-	readLocks := func() []dashboard.HealthLock {
-		rr := httptest.NewRecorder()
-		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/health", nil))
-		if rr.Code != http.StatusOK {
-			t.Fatalf("health status = %d: %s", rr.Code, rr.Body.String())
-		}
-		if outcome := rr.Header().Get(dashboardCacheHeader); outcome != "miss" {
-			t.Fatalf("health cache outcome = %q, want miss", outcome)
-		}
-		var response dashboardHealthResponse
-		if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
-			t.Fatal(err)
-		}
-		return response.Locks
-	}
-	if locks := readLocks(); len(locks) != 0 {
-		t.Fatalf("initial locks = %+v", locks)
-	}
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if created, err := store.CreateLock(context.Background(), db.BranchLock{RepoFullName: "acme/repo", Branch: "feat/cache", Owner: "worker"}); err != nil || !created {
-		t.Fatalf("CreateLock created=%v err=%v", created, err)
-	}
-	_ = store.Close()
-	locks := readLocks()
-	if len(locks) != 1 || locks[0].Repo != "acme/repo" || locks[0].Branch != "feat/cache" {
-		t.Fatalf("next locks = %+v", locks)
-	}
 }
 
 func TestDashboardCacheComputePanicReleasesWaiters(t *testing.T) {

@@ -38,98 +38,6 @@ func TestDelegationChildInheritsSkipNativeReviewFanout(t *testing.T) {
 	}
 }
 
-// #1277. An implement job that carries the intent but does NOT open a PR must
-// still publish it onto the branch lock. This is the arm the issue measured:
-// PR #1275 was opened BY HAND on a branch whose implement dispatch had passed
-// the flag, and because the persist lived behind the PullRequest > 0 branch the
-// lock still read skip=false, so the daemon's PR-watcher armed six review jobs.
-// Persisting on the no-PR advance makes the intent a property of the BRANCH, so
-// it no longer matters who opens the PR.
-func TestEngineAdvanceImplementPersistsSkipReviewFanoutWithoutPR(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-7", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "implement-job-no-pr",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:                   "gitmoot/gitmoot",
-		Branch:                 "task-7",
-		PullRequest:            0,
-		TaskID:                 "task-7",
-		TaskTitle:              "Workflow Engine",
-		LeadAgent:              "lead",
-		SkipNativeReviewFanout: true,
-		Result:                 &AgentResult{Decision: "implemented", Summary: "pushed the branch, PR opened by hand"},
-	})
-
-	if err := engine.AdvanceJob(ctx, "implement-job-no-pr"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-7")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if !lock.SkipNativeReviewFanout {
-		t.Fatalf("no-PR implement advance did not publish the intent onto the lock: %+v", lock)
-	}
-}
-
-// Guard the default path, and make the guard LOAD-BEARING. An earlier version of
-// this test asserted only that the stored boolean was false, which an
-// EXTRA_DEFAULT_UPDATE mutant — one that always calls the setter, passing the
-// payload's own false — survived, because false-written and never-written look
-// identical from the boolean alone.
-//
-// Seeding the lock with skip=TRUE and advancing a job that carries NO intent
-// makes the two distinguishable without depending on timestamp granularity: if
-// the default path calls the setter at all it writes false and flips the lock,
-// so the mutant is killed by the assertion rather than by a clock.
-func TestEngineAdvanceImplementWithoutIntentDoesNotTouchTheLock(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-8", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	// Pre-arm the lock. A correct default path must leave this alone.
-	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-8", true); err != nil {
-		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "implement-job-plain",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:      "gitmoot/gitmoot",
-		Branch:    "task-8",
-		TaskID:    "task-8",
-		LeadAgent: "lead",
-		Result:    &AgentResult{Decision: "implemented", Summary: "no intent set"},
-	})
-
-	if err := engine.AdvanceJob(ctx, "implement-job-plain"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-
-	lock, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-8")
-	if err != nil {
-		t.Fatalf("GetBranchLock returned error: %v", err)
-	}
-	if !lock.SkipNativeReviewFanout {
-		t.Fatalf("the default path WROTE to the lock and cleared a pre-armed flag: %+v", lock)
-	}
-}
-
 // #1277, the escape g7-review reproduced against the first version of this fix.
 // The branch lock cannot rescue a multi-generation tree, because at the moment
 // the intent is dropped NO intent-bearing implement job has advanced yet, so
@@ -209,84 +117,13 @@ func TestIntentSurvivesContinuationThenImplementChild(t *testing.T) {
 	}
 }
 
-// A root dispatch with no intent and no parent must stay exactly as built — the
-// inheritance lookup must not invent an intent.
-func TestBranchLockIntentSuppressesTheMergeGateWithNoConfiguredRoster(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	// Deliberately NO configured reviewers — this is the zero-roster arm.
-	engine.RequiredReviewers = nil
-	gate := &fakeMergeGate{decision: MergeDecision{Merged: true}}
-	engine.MergeGate = gate
-
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-15", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
-	// The branch carries the intent; the payload does not.
-	if err := store.SetBranchLockReviewFanout(ctx, "gitmoot/gitmoot", "task-15", true); err != nil {
-		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "zero-roster-implement",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:                   "gitmoot/gitmoot",
-		Branch:                 "task-15",
-		PullRequest:            15,
-		HeadSHA:                "head015",
-		TaskID:                 "task-15",
-		LeadAgent:              "lead",
-		SkipNativeReviewFanout: false,
-		Result:                 &AgentResult{Decision: "implemented", Summary: "opened PR on an intent-bearing branch"},
-	})
-
-	// Assert on the gate BEFORE the advance error: when the intent is dropped the
-	// gate runs and its decision can itself error, which would otherwise mask the
-	// real defect behind a generic "merge gate rejected action". This regression
-	// has to name what went wrong, not merely go red.
-	advanceErr := engine.AdvanceJob(ctx, "zero-roster-implement")
-	if len(gate.requests) != 0 {
-		t.Fatalf("branch intent was dropped and let a zero-roster PR reach the merge gate: %+v", gate.requests)
-	}
-	if advanceErr != nil {
-		t.Fatalf("AdvanceJob returned error: %v", advanceErr)
-	}
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	for _, job := range jobs {
-		if job.Type == "review" {
-			t.Fatalf("expected no review jobs, found %+v", job)
-		}
-	}
-}
-
 // #1277 x #1236 — the MIXED-IDENTITY matrix guard.
 //
-// g7-review audited the full cross-product of (payload intent, lock intent,
-// roster shape, executor-owns-lock, PR opened) and found the committed suite was
-// systematically thin along ONE axis: identity. Three cells were unpinned, and
-// each supported a wrong mutant that passed all twenty committed tests.
-//
-// The axis matters because runtime_session_busy makes executor identity diverge
-// from branch ownership: a temporary worker runs the job while OriginalAgent owns
-// the lock and is restored as LeadAgent. There are exactly three places where
-// identity is semantically active, and this table pins one cell for each:
-//
-//	fallback              — reading the branch intent must not depend on who owns
-//	                        the lock or on whether a roster exists.
-//	no-PR persistence     — writing the branch intent must happen even when a
-//	                        delegated worker advances the job.
-//	implementer exclusion — the roster filter must key on LeadAgent (the restored
-//	                        ORIGINAL implementer), never on Sender (the worker),
-//	                        or the real implementer reviews its own head.
-//
-// Table-driven rather than three point tests, per the reviewer, so the identity
-// axis is explicit and the next cell is cheap to add.
+// runtime_session_busy makes executor identity diverge from the implementer: a
+// temporary worker runs the job while OriginalAgent is restored as LeadAgent.
+// The roster filter must key on LeadAgent (the restored ORIGINAL implementer),
+// never on Sender (the worker), or the real implementer reviews its own head.
+// The branch-lock cells retired with branch locks (#2591).
 func TestMixedIdentityFanoutIntentMatrix(t *testing.T) {
 	const repo = "gitmoot/gitmoot"
 
@@ -294,52 +131,11 @@ func TestMixedIdentityFanoutIntentMatrix(t *testing.T) {
 		name string
 		// branch setup
 		branch      string
-		lockOwner   string
-		lockIntent  bool
 		roster      []string
 		payloadIntt bool
 		pullRequest int
 		assert      func(t *testing.T, ctx context.Context, store *db.Store, gate *fakeMergeGate)
 	}{
-		{
-			// Mutant killed: ROSTER_OR_OWNER_LOCK_FALLBACK — honouring the lock only
-			// when a roster exists OR the executor owns it. With neither true, an
-			// intent-bearing branch fell through to the MERGE GATE.
-			name:        "fallback: zero roster and a worker that does not own the lock",
-			branch:      "task-m1",
-			lockOwner:   "orig",
-			lockIntent:  true,
-			roster:      nil,
-			payloadIntt: false,
-			pullRequest: 16,
-			assert: func(t *testing.T, ctx context.Context, store *db.Store, gate *fakeMergeGate) {
-				if len(gate.requests) != 0 {
-					t.Fatalf("mixed identity + zero roster bypassed the branch intent and reached the merge gate: %+v", gate.requests)
-				}
-				assertNoReviewJobs(t, ctx, store)
-			},
-		},
-		{
-			// Mutant killed: DROP_TEMP_NO_PR_PERSIST — skipping the branch-lock write
-			// for a delegated worker. The ORIGINAL owner's lock stayed false, so a
-			// later hand-opened PR re-armed through the daemon watcher.
-			name:        "no-PR persistence: delegated worker must publish onto the original owner's lock",
-			branch:      "task-m2",
-			lockOwner:   "orig",
-			lockIntent:  false,
-			roster:      nil,
-			payloadIntt: true,
-			pullRequest: 0,
-			assert: func(t *testing.T, ctx context.Context, store *db.Store, gate *fakeMergeGate) {
-				lock, err := store.GetBranchLock(ctx, repo, "task-m2")
-				if err != nil {
-					t.Fatalf("GetBranchLock returned error: %v", err)
-				}
-				if !lock.SkipNativeReviewFanout {
-					t.Fatalf("delegated worker did not publish the intent onto the original owner's lock: %+v", lock)
-				}
-			},
-		},
 		{
 			// Mutant killed: SENDER_AS_IMPLEMENTER — filtering the roster by
 			// event.Sender (the temporary worker) instead of event.LeadAgent (the
@@ -347,8 +143,6 @@ func TestMixedIdentityFanoutIntentMatrix(t *testing.T) {
 			// and got enlisted to review its OWN head.
 			name:        "implementer exclusion: roster must key on the restored LeadAgent, not the worker",
 			branch:      "task-m3",
-			lockOwner:   "orig",
-			lockIntent:  false,
 			roster:      []string{"orig"},
 			payloadIntt: false,
 			pullRequest: 17,
@@ -385,14 +179,6 @@ func TestMixedIdentityFanoutIntentMatrix(t *testing.T) {
 			gate := &fakeMergeGate{decision: MergeDecision{Reason: PlainReason("ci is pending")}}
 			engine.MergeGate = gate
 
-			if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: tc.branch, Owner: tc.lockOwner}); err != nil || !acquired {
-				t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-			}
-			if tc.lockIntent {
-				if err := store.SetBranchLockReviewFanout(ctx, repo, tc.branch, true); err != nil {
-					t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
-				}
-			}
 			// Every cell advances a runtime_session_busy job: the DELEGATED worker
 			// executes while "orig" owns the lock and is restored as LeadAgent.
 			insertCompletedJob(t, store, db.Job{

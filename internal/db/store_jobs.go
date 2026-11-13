@@ -301,25 +301,17 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
-// ResolvePullRequestOwner returns the strongest stored org owner for one pull
-// request task. Implement-job acting-role attribution wins, followed by the
-// branch lock, then the earliest implementing agent. An unresolved owner is
-// ("", nil).
-func (s *Store) ResolvePullRequestOwner(
-	ctx context.Context,
-	repo string,
-	branch string,
-	pullRequest int,
-	taskID string,
-) (string, error) {
+// PullRequestActingRole returns the acting org role recorded on the earliest
+// (created_at, id) implement job for repo + pull request whose payload carries
+// acting_org_role (written by `gitmoot job record --acting-role`). It is keyed
+// by repo + PR only: seats pass free-form or empty task ids, so a task filter
+// misses most attributed PRs. An unattributed PR is ("", nil).
+func (s *Store) PullRequestActingRole(ctx context.Context, repo string, pullRequest int) (string, error) {
 	repo = strings.TrimSpace(repo)
-	branch = strings.TrimSpace(branch)
-	taskID = strings.TrimSpace(taskID)
 	if repo == "" || pullRequest <= 0 {
 		return "", nil
 	}
-
-	var owner string
+	var role string
 	err := s.db.QueryRowContext(ctx, `
 SELECT trim(json_extract(payload, '$.acting_org_role'))
 FROM jobs
@@ -328,24 +320,36 @@ WHERE repo = ? AND pull_request = ?
 	AND json_valid(payload)
 	AND json_type(payload, '$.acting_org_role') = 'text'
 	AND trim(json_extract(payload, '$.acting_org_role')) != ''
-	AND (? = '' OR COALESCE(json_extract(payload, '$.task_id'), '') = ?)
 ORDER BY created_at, id
-LIMIT 1`, repo, pullRequest, taskID, taskID).Scan(&owner)
-	if err == nil {
-		return strings.TrimSpace(owner), nil
+LIMIT 1`, repo, pullRequest).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err != nil {
 		return "", err
 	}
+	return strings.TrimSpace(role), nil
+}
 
-	if branch != "" {
-		lock, err := s.GetBranchLock(ctx, repo, branch)
-		switch {
-		case err == nil && strings.TrimSpace(lock.ActingOrgRole) != "":
-			return strings.TrimSpace(lock.ActingOrgRole), nil
-		case err != nil && !errors.Is(err, sql.ErrNoRows):
-			return "", err
-		}
+// ResolvePullRequestOwner returns the strongest stored org owner for one pull
+// request task. The PR implementer's acting role (PullRequestActingRole) wins,
+// then the earliest implementing agent for the task. An unresolved owner is
+// ("", nil).
+func (s *Store) ResolvePullRequestOwner(
+	ctx context.Context,
+	repo string,
+	pullRequest int,
+	taskID string,
+) (string, error) {
+	repo = strings.TrimSpace(repo)
+	taskID = strings.TrimSpace(taskID)
+	if repo == "" || pullRequest <= 0 {
+		return "", nil
+	}
+
+	owner, err := s.PullRequestActingRole(ctx, repo, pullRequest)
+	if err != nil || owner != "" {
+		return owner, err
 	}
 
 	err = s.db.QueryRowContext(ctx, `

@@ -2,28 +2,23 @@ package workflow
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-// TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree covers #543
+// TestHandleReviewPullRequestClosedMergedRemovesWorktree covers #543
 // finding 2: when the reconciler resolves an externally-merged reviewing task to
-// `merged`, it must release the branch lock and remove the task worktree exactly
-// as the canonical merge path (PolicyMergeGate.finishMerged) does — otherwise the
-// lock is stranded (held forever) and the worktree leaks on disk. The
-// closed-unmerged (`blocked`) branch must NOT clean up, since a blocked task
-// intentionally keeps its worktree/lock for human resumption. A task parked for
-// a human merge is the exception: closing that PR unmerged preserves its
-// worktree, but releases the lock so the abandoned PR cannot strand it.
+// `merged`, it must remove the task worktree exactly as the canonical merge path
+// (PolicyMergeGate.finishMerged) does — otherwise the worktree leaks on disk.
+// The closed-unmerged (`blocked`) branch must NOT clean up, since a blocked task
+// intentionally keeps its worktree for human resumption.
 //
 // It runs from both `reviewing` and `blocked` start states (#953): a blocked
 // task whose branch merged externally is the exact live incident that motivated
-// #953 (a 21h stranded branch lock), so the merged case must release the lock +
-// worktree from `blocked` too, while blocked+closed-unmerged keeps them.
-func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T) {
+// #953, so the merged case must remove the worktree from `blocked` too, while
+// blocked+closed-unmerged keeps it.
+func TestHandleReviewPullRequestClosedMergedRemovesWorktree(t *testing.T) {
 	const (
 		repo    = "gitmoot/gitmoot"
 		branch  = "task-7304-csv-export"
@@ -37,16 +32,14 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 		wantTask      TaskState
 		wantPRState   string
 		wantRemoved   bool
-		wantLockGone  bool
 		wantPathEmpty bool
 	}{
 		{
-			name:          "merged releases lock and removes worktree",
+			name:          "merged removes worktree",
 			merged:        true,
 			wantTask:      TaskMerged,
 			wantPRState:   "merged",
 			wantRemoved:   true,
-			wantLockGone:  true,
 			wantPathEmpty: true,
 		},
 		{
@@ -55,7 +48,6 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 			wantTask:      TaskBlocked,
 			wantPRState:   "closed",
 			wantRemoved:   false,
-			wantLockGone:  false,
 			wantPathEmpty: false,
 		},
 	}
@@ -65,9 +57,6 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 			t.Run(string(startState)+"/"+tc.name, func(t *testing.T) {
 				ctx := context.Background()
 				store := openEngineStore(t)
-				if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo, Branch: branch, Owner: "lead"}); err != nil || !acquired {
-					t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-				}
 				if err := store.UpsertTask(ctx, db.Task{
 					ID:           "task-7304",
 					RepoFullName: repo,
@@ -136,15 +125,6 @@ func TestHandleReviewPullRequestClosedMergedReleasesLockAndWorktree(t *testing.T
 				gotRemoved := len(manager.removedForce) == 1 && manager.removedForce[0] == path
 				if gotRemoved != tc.wantRemoved {
 					t.Fatalf("worktree removed = %v (%v), want %v", gotRemoved, manager.removedForce, tc.wantRemoved)
-				}
-				_, lockErr := store.GetBranchLock(ctx, repo, branch)
-				lockGone := errors.Is(lockErr, sql.ErrNoRows)
-				if !tc.merged && startState == TaskAwaitingHumanMerge {
-					if !lockGone {
-						t.Fatalf("parked closed-unmerged task kept branch lock: %v", lockErr)
-					}
-				} else if lockGone != tc.wantLockGone {
-					t.Fatalf("branch lock gone = %v (err=%v), want %v", lockGone, lockErr, tc.wantLockGone)
 				}
 			})
 		}

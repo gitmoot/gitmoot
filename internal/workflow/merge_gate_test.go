@@ -237,9 +237,6 @@ func insertMergeGateHeadlessIntegrationParent(t *testing.T, store *db.Store, par
 func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.CreateJobWithEvent(ctx, db.Job{
 		ID: "malformed-unrelated-implement", Agent: "other", Type: "implement",
 		State: string(JobSucceeded), Payload: "{not-json",
@@ -318,16 +315,6 @@ func TestPolicyMergeGateMergesPassingPullRequest(t *testing.T) {
 	}
 	if got := strings.Join(gh.operations, ","); got != "merge,status:gitmoot/merge-gate:success" {
 		t.Fatalf("GitHub write order = %q, want merge before success status", got)
-	}
-	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("branch lock after merge error = %v, want sql.ErrNoRows", err)
-	}
-	lockEvents, err := store.ListBranchLockEvents(ctx, "gitmoot/gitmoot", "task-9")
-	if err != nil {
-		t.Fatalf("ListBranchLockEvents returned error: %v", err)
-	}
-	if len(lockEvents) != 1 || lockEvents[0].Kind != "released" || lockEvents[0].Owner != "lead" {
-		t.Fatalf("lock events = %+v", lockEvents)
 	}
 	pr, err := store.GetPullRequest(ctx, "gitmoot/gitmoot", 9)
 	if err != nil {
@@ -2552,9 +2539,6 @@ END`); err != nil {
 func TestPolicyMergeGateCleansTaskWorktreeAfterMerge(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-9", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 9", State: string(TaskReadyToMerge), Branch: "task-9", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-9"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
@@ -2599,9 +2583,6 @@ func TestPolicyMergeGateCleansTaskWorktreeAfterMerge(t *testing.T) {
 func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-9", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 9", State: string(TaskReadyToMerge), Branch: "task-9", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-9"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
@@ -2643,9 +2624,6 @@ func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 func TestPolicyMergeGateDoesNotCleanWorktreeForMismatchedTaskBranch(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.UpsertTask(ctx, db.Task{ID: "task-8", RepoFullName: "gitmoot/gitmoot", GoalID: "goal-1", Title: "Task 8", State: string(TaskImplementing), Branch: "task-8", WorktreePath: "/tmp/gitmoot/worktrees/gitmoot--gitmoot/task-8"}); err != nil {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
@@ -2690,9 +2668,6 @@ func TestPolicyMergeGateDoesNotCleanWorktreeForMismatchedTaskBranch(t *testing.T
 func TestPolicyMergeGateLocksCheckoutDuringLocalBaseUpdate(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
@@ -3044,9 +3019,6 @@ func TestPolicyMergeGateKeepsPendingCIReadyToRetry(t *testing.T) {
 func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
 		Branch:      "task-9",
@@ -3071,9 +3043,6 @@ func TestPolicyMergeGateKeepsQueuedMergePending(t *testing.T) {
 	}
 	if !decision.Ready || decision.Merged || !strings.Contains(decision.Reason.Render(), "pending") {
 		t.Fatalf("decision = %+v", decision)
-	}
-	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); err != nil {
-		t.Fatalf("branch lock after queued merge error = %v", err)
 	}
 	if _, err := store.GetPullRequest(ctx, "gitmoot/gitmoot", 9); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetPullRequest after queued merge error = %v, want sql.ErrNoRows", err)
@@ -3110,9 +3079,6 @@ func TestPolicyMergeGateReviewOptionalDoesNotBypassMandatoryReview(t *testing.T)
 func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "gitmoot/gitmoot", Branch: "task-9", Owner: "lead"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
-	}
 	if err := store.UpsertTask(ctx, db.Task{
 		ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9",
 		State: string(TaskReadyToMerge),
@@ -3150,9 +3116,6 @@ func TestPolicyMergeGateRecordsAlreadyMergedPullRequest(t *testing.T) {
 	}
 	if len(gh.merges) != 0 {
 		t.Fatalf("merge inputs = %+v", gh.merges)
-	}
-	if _, err := store.GetBranchLock(ctx, "gitmoot/gitmoot", "task-9"); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("branch lock after merge error = %v, want sql.ErrNoRows", err)
 	}
 	task, taskErr := store.GetTask(ctx, "task-9")
 	if taskErr != nil || task.State != string(TaskMerged) {

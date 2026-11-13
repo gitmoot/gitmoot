@@ -21,8 +21,6 @@ const (
 	DaemonUnknown = "unknown"
 )
 
-const maxFormattedLocks = 5
-
 type Snapshot struct {
 	Repo       string
 	Home       string
@@ -31,18 +29,12 @@ type Snapshot struct {
 	TaskStates map[string]int
 	Jobs       int
 	JobStates  map[string]int
-	Locks      []LockSnapshot
 }
 
 type DaemonSnapshot struct {
 	State   string
 	PID     int
 	LogFile string
-}
-
-type LockSnapshot struct {
-	Branch string
-	Owner  string
 }
 
 type daemonMeta struct {
@@ -97,17 +89,6 @@ func BuildSnapshot(ctx context.Context, paths config.Paths, repoFullName string)
 		incrementState(snapshot.JobStates, job.State)
 	}
 
-	locks, err := store.ListBranchLocks(ctx, repoFullName)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("list locks: %w", err)
-	}
-	snapshot.Locks = make([]LockSnapshot, 0, len(locks))
-	for _, lock := range locks {
-		snapshot.Locks = append(snapshot.Locks, LockSnapshot{
-			Branch: lock.Branch,
-			Owner:  lock.Owner,
-		})
-	}
 	return snapshot, nil
 }
 
@@ -147,14 +128,6 @@ func FormatSnapshot(snapshot Snapshot) string {
 	fmt.Fprintf(&b, "- daemon: %s\n", formatDaemon(snapshot.Daemon))
 	fmt.Fprintf(&b, "- tasks: %d%s\n", snapshot.Tasks, formatCounts(snapshot.TaskStates))
 	fmt.Fprintf(&b, "- jobs: %d%s\n", snapshot.Jobs, formatCounts(snapshot.JobStates))
-	fmt.Fprintf(&b, "- locks: %d\n", len(snapshot.Locks))
-	for i, lock := range snapshot.Locks {
-		if i >= maxFormattedLocks {
-			fmt.Fprintf(&b, "  - ... %d more\n", len(snapshot.Locks)-i)
-			break
-		}
-		fmt.Fprintf(&b, "  - %s by %s\n", strconv.Quote(strings.TrimSpace(lock.Branch)), strconv.Quote(strings.TrimSpace(lock.Owner)))
-	}
 	return strings.TrimRight(b.String(), "\n")
 }
 

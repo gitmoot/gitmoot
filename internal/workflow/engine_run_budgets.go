@@ -754,23 +754,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
-		// #1277: publish the skip-native-review-fanout intent onto the BRANCH LOCK
-		// before the no-PR early return, so it is a property of the branch rather
-		// than of whoever opens the PR. The persist used to live inside the
-		// PullRequest > 0 arm below, which meant an implement job that carried the
-		// intent but did NOT open a PR left the lock reading skip=false — and a PR
-		// opened by hand on that branch minutes later re-armed the native fanout
-		// through the daemon's PR-watcher path (the measured #1275 arm: six review
-		// jobs, the implementer among them). The write is a bare UPDATE and
-		// never creates a lock, so it can neither establish nor transfer branch
-		// ownership; skipping it on the default (false) keeps the common path free
-		// of an extra UPDATE, since a freshly created lock already defaults to
-		// not-skip.
-		if payload.SkipNativeReviewFanout && strings.TrimSpace(payload.Branch) != "" {
-			if err := e.Store.SetBranchLockReviewFanout(ctx, payload.Repo, payload.Branch, true); err != nil {
-				return err
-			}
-		}
 		if payload.PullRequest <= 0 {
 			return e.recordImplementNoPRAdvance(ctx, job.ID, payload.Result.Decision)
 		}
@@ -783,31 +766,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 				leadAgent = payload.OriginalAgent
 			}
 		}
-		// Trigger 1 (in-process path): carry the implement job's
-		// skip_native_review_fanout onto the PR event, falling back to the BRANCH
-		// LOCK when the payload does not carry it.
-		//
-		// The lock fallback is what makes the intent genuinely branch-scoped. Until
-		// now the two PR-open triggers disagreed: the daemon PR-watcher read
-		// lock.SkipNativeReviewFanout, while this in-process trigger read only the
-		// payload — so an engine hop that lost the flag re-armed the fanout here even
-		// though the branch had already been told. Reading the lock here closes that
-		// class for every parentless engine re-dispatch, present and future,
-		// without reaching into the constructors.
-		// #1250 reader 1 of 2: the acting org role comes from the SAME branch lock,
-		// so this trigger and the daemon PR-watcher cannot disagree about who owns
-		// the work. Empty stays empty (unattributed), which is both the legacy value
-		// and the correct value for an undirected dispatch.
-		skipFanout := payload.SkipNativeReviewFanout
-		actingOrgRole := ""
-		if strings.TrimSpace(payload.Branch) != "" {
-			if lock, lockErr := e.Store.GetBranchLock(ctx, payload.Repo, payload.Branch); lockErr == nil {
-				if lock.SkipNativeReviewFanout {
-					skipFanout = true
-				}
-				actingOrgRole = lock.ActingOrgRole
-			}
-		}
+		// Trigger 1 (in-process path): the implement job's own payload carries
+		// skip_native_review_fanout and the acting org role onto the PR event.
+		// Empty role stays empty (unattributed).
 		event := PullRequestEvent{
 			Repo:                    payload.Repo,
 			Branch:                  payload.Branch,
@@ -821,8 +782,8 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			LeadAgent:               leadAgent,
 			Sender:                  job.Agent,
 			RequiredReviewers:       e.requiredReviewers(payload),
-			SkipReviewFanout:        skipFanout,
-			ActingOrgRole:           actingOrgRole,
+			SkipReviewFanout:        payload.SkipNativeReviewFanout,
+			ActingOrgRole:           NormalizeActingOrgRole(payload.ActingOrgRole),
 			// #1967: the implement job that just opened the PR is the dispatcher.
 			// job.Agent is already used as Sender here, but Sender is a channel on
 			// every other path ("github", "local"), so attribution
@@ -830,9 +791,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// everywhere.
 			DispatchedBy: job.Agent,
 		}
-		// The branch-lock persist for the daemon's PR-watcher path (trigger 2)
-		// happens above, before the no-PR early return, so it covers the PR arm and
-		// the no-PR arm alike.
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
 		// A PR-less review (Action="review" with

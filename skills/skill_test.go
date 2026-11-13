@@ -29,7 +29,6 @@ func TestCanonicalSkillFrontmatter(t *testing.T) {
 		"agent subscriptions",
 		"daemon checks",
 		"jobs",
-		"branch locks",
 		"agent-templates",
 		"custom prompt agents",
 		"Codex",
@@ -65,7 +64,6 @@ func TestCanonicalSkillDocumentsResultAndRereadGuidance(t *testing.T) {
 		"gitmoot_result",
 		"blocked",
 		"failed",
-		"branch locks",
 		"runtime session locks",
 		"--workers 1",
 		"Reread this `SKILL.md`",
@@ -154,7 +152,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot lock list",
 				"gitmoot job answer <job-id>",
 				"gitmoot job open",
 				"gitmoot job gates",
@@ -166,7 +163,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			name: "cli reference",
 			text: cli,
 			want: []string{
-				"gitmoot lock list",
 				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr",
 				"gitmoot review status --pr",
@@ -211,7 +207,6 @@ func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
 		"gitmoot agent prompt <agent-or-template>",
 		"gitmoot.io/SKILL.md",
 		"gitmoot_result",
-		"branch locks",
 		"runtime session locks",
 		"gitmoot agent ask <agent>",
 	} {

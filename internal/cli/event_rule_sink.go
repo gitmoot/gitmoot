@@ -379,7 +379,7 @@ func (s *eventRuleSink) addressUnownedVerdictEvent(ctx context.Context, event ev
 		workflow.NormalizeActingOrgRole(payload.LeadAgent) != "" {
 		return event
 	}
-	prOwner, err := s.store.ResolvePullRequestOwner(ctx, payload.Repo, payload.Branch, payload.PullRequest, payload.TaskID)
+	prOwner, err := s.store.ResolvePullRequestOwner(ctx, payload.Repo, payload.PullRequest, payload.TaskID)
 	if err != nil {
 		// Not guessed and not silent (#2367): a transient lookup failure leaves
 		// the verdict unaddressed, so the job says so. It has its OWN kind:

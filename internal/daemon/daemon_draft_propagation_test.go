@@ -9,19 +9,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-func TestDaemonPullRequestOpenedDraftDoesNotParkTask(t *testing.T) {
-	ctx := context.Background()
-	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskPlanned)
-	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{LeaveOpen: true, Reason: workflow.PlainReason("human merge required")}}
-	engine := workflow.Engine{Store: store, MergeGate: gate}
-	daemon := Daemon{Repo: repo, Store: store, Workflow: &engine}
-
-	if _, err := daemon.handlePullRequestWorkflowChange(ctx, pull, newReviewJobsMemo(store, daemon.Repo.FullName())); err != nil {
-		t.Fatalf("handlePullRequestWorkflowChange returned error: %v", err)
-	}
-	assertDaemonDraftReachedGateAndTaskState(t, store, gate, workflow.TaskPullRequestOpen)
-}
-
 func TestDaemonReadyToMergeDraftDoesNotParkTask(t *testing.T) {
 	ctx := context.Background()
 	store, repo, pull := setupDaemonDraftPropagationTest(t, workflow.TaskReadyToMerge)
@@ -79,13 +66,6 @@ func setupDaemonDraftPropagationTest(t *testing.T, state workflow.TaskState) (*d
 		HealthStatus:   "ok",
 	}); err != nil {
 		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{
-		RepoFullName: repo.FullName(),
-		Branch:       "draft-branch",
-		Owner:        "builder",
-	}); err != nil || !acquired {
-		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
 	}
 	return store, repo, github.PullRequest{
 		Number:  91,

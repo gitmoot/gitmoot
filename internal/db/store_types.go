@@ -1,9 +1,5 @@
 package db
 
-import (
-	"time"
-)
-
 type Repo struct {
 	Owner         string
 	Name          string
@@ -290,28 +286,6 @@ type JobGate struct {
 	SatisfiedAt string
 }
 
-type BranchLock struct {
-	RepoFullName           string
-	Branch                 string
-	Owner                  string
-	SkipNativeReviewFanout bool
-	// ActingOrgRole is the org role attributed to the agent that took this branch
-	// (#1250). Written ONCE at lock creation and read by both PR-open triggers, so
-	// native review fanout children inherit an attribution instead of being
-	// enqueued unattributed — an unattributed job's blocked event has no owner to
-	// wake (#1347). Empty means unattributed, which is both the legacy value for
-	// pre-migration locks and the correct value for an undirected dispatch.
-	ActingOrgRole string
-}
-
-type BranchLockEvent struct {
-	RepoFullName string
-	Branch       string
-	Owner        string
-	Kind         string
-	Message      string
-}
-
 type ResourceLock struct {
 	ResourceKey   string
 	OwnerJobID    string
@@ -378,16 +352,4 @@ type NoCIObservation struct {
 	// FirstZeroAt is the RFC3339Nano timestamp of the first zero-external
 	// observation at HeadSHA.
 	FirstZeroAt string
-}
-
-// BranchLockInfo is a branch lock plus its acquisition timestamps, surfaced by
-// ListBranchLocksWithAge for observability (#617): a stranded lock is only obvious
-// when its owner AND age are visible, so `gitmoot lock list` can show how long each
-// lock has been held and by whom — turning a silent stale-lock mystery into a
-// diagnosable one. CreatedAt/UpdatedAt are parsed best-effort; an unparseable stored
-// timestamp yields a zero time rather than an error.
-type BranchLockInfo struct {
-	BranchLock
-	CreatedAt time.Time
-	UpdatedAt time.Time
 }

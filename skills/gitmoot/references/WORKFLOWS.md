@@ -339,8 +339,7 @@ Background jobs are scheduled against three distinct resources:
 
 - repo checkout mutexes for daemon ticks that use the same local checkout;
 - runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for
-  resumable-session delivery (omp runs a fresh session per job, so it takes none);
-- branch locks for implementation ownership and merge safety.
+  resumable-session delivery (omp runs a fresh session per job, so it takes none).
 
 Delivery is self-healing — a job whose events show one of these errors and then
 a success is working as designed, not flaky:
@@ -362,8 +361,7 @@ implement`.
 
 **Task dismissal and stale reconciliation:** `dismissed` is a terminal task
 state reached only through implicit workflow transitions; no command dismisses a
-task. The daemon preserves the branch and worktree, releases the branch lock
-best-effort, and audits each transition as `task_dismissed_auto` (or
+task. The daemon preserves the branch and worktree and audits each transition as `task_dismissed_auto` (or
 `task_dismissed_planned_ttl`) in `gitmoot task events <id>`.
 
 Each repo poll reads a bounded oldest-first stale window and processes up to 20
@@ -599,12 +597,10 @@ gitmoot orchestrate verifier "Produce the export-feature migration plan and prov
 gitmoot agent run lead --repo owner/repo --pr 12 --skip-native-review-fanout "Review this PR."
 ```
 
-The flag is persisted on the job payload and on the branch lock, and the
-PR-watcher reads the lock, so a PR it observes on that branch stays free of
-native review fan-out. The engine's implement-advance arm reads the same flag,
-but no implement job can be dispatched since #2203, so the PR-watcher is the
-path that still exercises it. The flag defaults off; leaving it off keeps the
-full native review fan-out.
+The flag is persisted on the job payload, and the engine's implement-advance arm
+reads it when the implement job opens a PR. The daemon's PR-watcher never fans
+out native reviews. The flag defaults off; leaving it off keeps the full native
+review fan-out.
 
 ## Coordinator Recipes
 

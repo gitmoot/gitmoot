@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, agent templates, custom prompt agents, orchestration, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
@@ -30,7 +30,7 @@ reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins,
 structured implementation plans, agent template inspection,
-custom prompt agents, job status, branch lock inspection,
+custom prompt agents, job status,
 agent memory,
 or runtime metadata.
 
@@ -61,8 +61,7 @@ verb. A template that must change is edited or re-seeded in its
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
-same resumable runtime session (omp runs a fresh session per job), and branch locks protect implementation
-ownership.
+same resumable runtime session (omp runs a fresh session per job).
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
@@ -153,8 +152,6 @@ gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
 gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot job record (--agent <name> | --acting-role <role>) --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
-gitmoot lock list --repo owner/repo
-gitmoot lock show owner/repo <branch>
 gitmoot job answer <job-id> "<question-id>: answer text" [--json]
 ```
 
@@ -183,8 +180,7 @@ itself.
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
 Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
 coordinator delegation through a registered Gitmoot agent; Gitmoot will route to
-ask or review and own read-only worktrees, branch locks,
-and workflow advancement. To orchestrate an orchestra of agents,
+ask or review and own read-only worktrees and workflow advancement. To orchestrate an orchestra of agents,
 `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for `gitmoot agent run
 <agent> --background "..."`. Use `gitmoot agent ask` only for analysis, planning,
 or questions. Add `--background` only when the user wants a queued background
@@ -306,10 +302,10 @@ is still required and `-race` is still unavailable in a seat. If `go` returns ex
 Preserve existing behavior unless the job explicitly changes it. Keep work
 scoped to the target repo. Do not commit generated data, caches, logs, secrets,
 session archives, cloned helper repos, or large outputs unless explicitly
-requested. Respect Gitmoot branch locks for implementation jobs.
+requested.
 
 Implementation jobs must not edit or push an implementation branch unless
-Gitmoot assigned the job and the branch lock is held by the assigned agent.
+Gitmoot assigned the job.
 Review and ask jobs should inspect and report without mutating branches unless
 the task explicitly instructs otherwise.
 
