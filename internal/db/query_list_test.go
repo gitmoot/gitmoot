@@ -26,19 +26,6 @@ func TestListMethodsPreserveTheirEmptyResultShape(t *testing.T) {
 
 	// Every table below is empty, which is the only state in which the two
 	// shapes are distinguishable.
-	t.Run("ListRecycleOverdueEpisodes promises non-nil", func(t *testing.T) {
-		got, err := store.ListRecycleOverdueEpisodes(ctx)
-		if err != nil {
-			t.Fatalf("ListRecycleOverdueEpisodes: %v", err)
-		}
-		if got == nil {
-			t.Fatal("returned nil; this method promised a non-nil empty slice before #1759 (it marshals to JSON [] not null)")
-		}
-		if len(got) != 0 {
-			t.Fatalf("len = %d, want 0", len(got))
-		}
-	})
-
 	t.Run("ListResourceLocks promises nil", func(t *testing.T) {
 		got, err := store.ListResourceLocks(ctx)
 		if err != nil {

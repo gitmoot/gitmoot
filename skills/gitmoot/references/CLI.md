@@ -1683,38 +1683,6 @@ maps to the runtime permission mode and decides what a headless job may do:
 | `danger-full-access` | `bypassPermissions` | full implementation: file writes plus Bash |
 | `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
 
-Gitmoot also records **permission-policy instrumentation** for engine-dispatched
-jobs. Each adapter derives one of `applied`, `widened`, or `not-applied` while it
-builds argv. A live agent whose runtime does not resolve is `unresolved`; a
-missing agent row also produces an `unresolved` warning for that individual job.
-`not-applied` means only that Gitmoot supplied no permission-policy flag. It does
-**not** mean the process was unsandboxed: host runtime configuration may still
-constrain it, and Gitmoot does not read that configuration. `not-applied` and
-`unresolved` produce a structured `permission_policy_not_applied` job event,
-coalesced once per `(agent, runtime, policy, capability)` per 24-hour window.
-This is visibility, not protection: the warning never refuses, blocks, or
-changes a job. At completion, the one winning sampled job for that window is
-updated in place with `checkout_dirty`, `branch_pushed`, and
-`payload_had_pull_request`. Git-derived booleans are
-`null` when Gitmoot could not determine them; `branch_pushed_instrument` records
-whether the answer came from the local upstream, `ls-remote`, the branchless
-payload, or remained unavailable. `payload_had_pull_request` states only whether
-the job payload already carried a PR number at capture; it does not claim the
-sampled job opened that PR. Capture failures are logged and never change the job
-outcome.
-
-The live-fleet ratchet is off by default. Set
-`[daemon].permission_policy_observation_enabled = true` to record the first
-home-store baseline and compare later daemon ticks against it. Any newly
-introduced configuration emits a `permission_policy_baseline_exceeded` event,
-even when removals leave the total unchanged or lower; only a strict subset
-lowers the stored baseline. `gitmoot doctor` reports current, baseline, and
-delta for fixable live configurations. Durable jobs whose agent identity no
-longer resolves are excluded from that ratchet and reported separately through
-the event's `unresolved_job_agents` count and a healthy informational doctor
-line. This baseline intentionally lives in the Gitmoot home store, not in source
-control or CI, because only that store contains the fleet inventory.
-
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability
 implement` with `auto`/empty or `read-only` is refused at `agent start`, at
@@ -2563,12 +2531,7 @@ dispatches with an actionable error or logs a one-line advisory (`warn`) — the
 never blocked, so an overdue role can always hand off. `recycle_enforce` needs a
 configured `recycle_after` to have any effect. Both fields are **binary-first**:
 a binary predating them fails closed on a config that uses them, so deploy the
-binary before any config sets them. When `recycle_enforce` is not `off`, an
-overdue refusal or warning also emits a repeating (once per `recycle_after`)
-`org.recycle_overdue` event through the org event sink; route it to a wake with
-`org events rule add --on recycle-overdue --wake <role>`. Notification delivery
-is best-effort — reliable from a foreground `agent ask`, but a short-lived
-`--background`/`orchestrate` dispatch may exit before the wake fires.
+binary before any config sets them.
 
 `gitmoot org recycle <role> --kind <kind> --handoff "<note>" [--pane <id>]
 [--json] [--home <dir>]` journals a typed handoff in the role-lifecycle workflow
@@ -2917,7 +2880,7 @@ gitmoot org events rule rm --home /alternate/home <rule-id>
 ```
 
 `--on` accepts `escalation`, `attention`, `guard`, `job-terminal`,
-`review-verdict`, `blocked`, `recycle-overdue`, `pane_input_pending`, `reply`,
+`review-verdict`, `blocked`, `pane_input_pending`, `reply`,
 `directive`, or `fact`. A successful review terminal whose decision is
 `approved` or `changes_requested` matches both `job-terminal` and
 `review-verdict` and addresses both the requesting org role and the resolved
@@ -3008,7 +2971,7 @@ rather than `delivery_unknown`. The proof is a note in the directive's own
 workflow acknowledging it (`[org:directive-ack id=<id> ...]`) or recording its
 delivery (`[org:directive-delivered id=<id> ...]`), naming that row's directive;
 a reply-class row has no equivalent marker and keeps the unknown outcome.
-`attention`, `guard`, `job-terminal`, `review-verdict`, `recycle-overdue`, and
+`attention`, `guard`, `job-terminal`, `review-verdict`, and
 `pane_input_pending` wakes remain best-effort. With no rule rows this path is
 off. Task episodes due in one evaluator pass produce one oldest-first digest
 event; blocked roles retain one event per role.

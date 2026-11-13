@@ -59,6 +59,7 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows":           true,
 		"TestPresetDeliveryRemovalMigrationOnFreshHome":                          true,
 		"TestPipelineRemovalMigrationOnPreviousSchema":                           true,
+		"TestObservabilityRemovalMigrationOnPreviousSchema":                      true,
 		"TestPresetDeliveryRemovalMigrationOnPreChangeHome":                      true,
 		"TestExecBackendAttemptsMigrationFreshAndCached":                         true,
 		"TestExternallyDrivenColumnMigratesOnPreExistingDB":                      true,

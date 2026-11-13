@@ -1021,7 +1021,7 @@ func TestTempWorkerPreflightFailureUsesAdmittedGeneration(t *testing.T) {
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return nil, errors.New("temp-worker adapter preflight failed")
 	}
-	if err := worker.runWithTempWorker(ctx, admitted, payload, execbackend.Local, runtimeAgent(dbAgent), t.TempDir(), config.ParallelSessionPolicy{}, "test contention", false); err != nil {
+	if err := worker.runWithTempWorker(ctx, admitted, payload, execbackend.Local, runtimeAgent(dbAgent), t.TempDir(), config.ParallelSessionPolicy{}, "test contention"); err != nil {
 		t.Fatalf("runWithTempWorker returned error: %v", err)
 	}
 

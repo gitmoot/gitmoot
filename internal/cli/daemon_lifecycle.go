@@ -420,10 +420,9 @@ func newSingleRepoSupervisorDaemon(
 			jobEngine.MergeGate = newDaemonMergeGate(store, gh, checkout, resolvedHome, runner)
 			return &jobEngine, nil
 		},
-		WatchIssues:             watchIssues,
-		EscalationTTL:           resolveEscalationTTL(rawHome),
-		ObservePermissionPolicy: resolvePermissionPolicyObservationEnabled(rawHome),
-		AutoMergeEnabled:        autoMergeEnabledResolver(rawHome),
+		WatchIssues:      watchIssues,
+		EscalationTTL:    resolveEscalationTTL(rawHome),
+		AutoMergeEnabled: autoMergeEnabledResolver(rawHome),
 	}
 }
 

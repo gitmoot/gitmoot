@@ -2879,9 +2879,9 @@ const maxJobEventIDSQL = `SELECT COALESCE(MAX(id), 0) FROM job_events`
 // the (id, kind, job_id) columns of job_events and NOTHING else — no other table,
 // no clock. Production only ever APPENDS to job_events (the sole DELETE is a
 // one-time migration that runs before any tick) and its in-place updates —
-// RefreshLatestAdvanceRetry, the running-job progress refresh, and the claimed
-// permission-policy warning — all SET message/created_at only, never id, kind or
-// job_id. So an unmoved maximum id proves those two result sets are unchanged.
+// RefreshLatestAdvanceRetry and the running-job progress refresh — both SET
+// message/created_at only, never id, kind or job_id. So an unmoved maximum id
+// proves those two result sets are unchanged.
 //
 // It is NOT a sound cursor for the delegation/aged/task reclaim candidates: those
 // join jobs and cleanup_obligations and compare against unixepoch('now'), so their

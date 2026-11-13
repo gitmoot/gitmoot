@@ -58,9 +58,6 @@ const (
 	// handling (recovery, alerting, cleanup) for that job until a later
 	// job.failed arrives WITHOUT a following job.deferred.
 	EventJobDeferred EventType = "job.deferred"
-	// EventOrgRecycleOverdue is emitted when an organization role crosses its
-	// configured recycle age and the CLI dispatch ingress warns or refuses it.
-	EventOrgRecycleOverdue EventType = "org.recycle_overdue"
 	// EventOrgInputPending is emitted when a Herdr pane bound to an organization
 	// role remains at an interactive input dialog past the configured threshold.
 	EventOrgInputPending EventType = "org.input_pending"

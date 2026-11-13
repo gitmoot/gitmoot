@@ -84,9 +84,6 @@ type Daemon struct {
 	// PollOnce auto-finalizes it gracefully (#340). 0 disables the scan, keeping
 	// behavior unchanged for trees that never use escalate_human.
 	EscalationTTL time.Duration
-	// ObservePermissionPolicy opts this daemon into the live-store
-	// #1484 ratchet. False is a cheap short-circuit with no inventory query.
-	ObservePermissionPolicy bool
 	// AutoMergeEnabled resolves the current native auto_merge policy for this
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
@@ -222,13 +219,6 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 			if err := d.reconcileReviewingPullRequest(ctx, pull, reviewMemo); err != nil && firstErr == nil {
 				firstErr = err
 			}
-		}
-	}
-	// Permission-policy visibility is warn-only and best-effort. An observation
-	// error contributes to firstErr but never aborts the remaining poll chain.
-	if d.ObservePermissionPolicy {
-		if err := d.reconcilePermissionPolicyObservation(ctx); err != nil && firstErr == nil {
-			firstErr = err
 		}
 	}
 	if err := d.reconcilePROpenTasks(ctx, pulls); err != nil && firstErr == nil {

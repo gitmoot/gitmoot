@@ -80,7 +80,6 @@ func TestClassifyEventRuleKinds(t *testing.T) {
 		{name: "merge guard", event: events.Event{Type: events.EventJobBlocked, Cause: "merge_guard"}, want: []string{"guard"}},
 		{name: "permission guard", event: events.Event{Type: events.EventJobBlocked, Cause: "permission_guard"}, want: []string{"guard"}},
 		{name: "blocked since only", event: events.Event{Type: events.EventJobBlocked, Cause: "blocked_since"}, want: []string{"blocked"}},
-		{name: "recycle overdue", event: events.Event{Type: events.EventOrgRecycleOverdue, Cause: "recycle_overdue"}, want: []string{"recycle-overdue"}},
 		{name: "pane input pending", event: events.Event{Type: events.EventOrgInputPending, Cause: "input_pending_since"}, want: []string{"pane_input_pending"}},
 		{name: "addressed reply", event: events.Event{Type: events.EventOrgReply, Cause: "addressed_note"}, want: []string{"reply"}},
 		{name: "addressed directive", event: events.Event{Type: events.EventOrgDirective, Cause: "addressed_directive"}, want: []string{"directive"}},

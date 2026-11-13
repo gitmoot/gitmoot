@@ -3297,4 +3297,14 @@ DELETE FROM agents WHERE role = 'pipeline-runner';
 	`
 DROP TABLE IF EXISTS routing_telemetry;
 	`,
+	// #2592 retires unread observability. The #1484 permission-policy warning
+	// claims and ratchet baseline were read only by `gitmoot doctor`, and the
+	// #1061 recycle-overdue episodes only de-duplicated an org event no rule
+	// consumed. Their writers, readers and the doctor check are deleted in the
+	// same change; the recycle_after dispatch warning does not use the table.
+	`
+DROP TABLE IF EXISTS permission_policy_warning_claims;
+DROP TABLE IF EXISTS permission_policy_observation_baseline;
+DROP TABLE IF EXISTS org_recycle_overdue_episodes;
+	`,
 }

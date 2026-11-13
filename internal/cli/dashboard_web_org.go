@@ -98,7 +98,6 @@ type dashboardOrgInputs struct {
 	shared                orgSharedState
 	rows                  []orgStatusOutput
 	blocked               []db.BlockedEpisode
-	recycleOverdue        []db.RecycleOverdueEpisode
 	missedWakes           []db.RoleMissedWake
 	escalationNotes       []db.WorkflowNote
 	resolvedEscalationIDs map[int64]bool
@@ -129,10 +128,6 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 		return dashboardOrgInputs{}, err
 	}
 	blocked, err := shared.loadBlockedEpisodes(ctx)
-	if err != nil {
-		return dashboardOrgInputs{}, err
-	}
-	recycleOverdue, err := store.ListRecycleOverdueEpisodes(ctx)
 	if err != nil {
 		return dashboardOrgInputs{}, err
 	}
@@ -182,7 +177,7 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 	}
 
 	inputs := dashboardOrgInputs{
-		shared: shared, rows: rows, blocked: blocked, recycleOverdue: recycleOverdue,
+		shared: shared, rows: rows, blocked: blocked,
 		missedWakes: missedWakes, escalationNotes: escalationNotes,
 		resolvedEscalationIDs: resolvedEscalationIDs, handoffNotes: handoffNotes,
 		detectionEnabled: enabled, detectionHint: hint,
@@ -194,9 +189,6 @@ func loadDashboardOrgInputs(ctx context.Context, paths config.Paths, store *db.S
 		inputs.observe(presence.ObservedAt)
 	}
 	for _, episode := range blocked {
-		inputs.observe(episode.UpdatedAt)
-	}
-	for _, episode := range recycleOverdue {
 		inputs.observe(episode.UpdatedAt)
 	}
 	for _, missed := range missedWakes {
@@ -230,7 +222,7 @@ func buildDashboardOrg(ctx context.Context, paths config.Paths, store *db.Store,
 		DetectionHint:    inputs.detectionHint,
 		Roles:            []dashboard.OrgNode{},
 		Escalations:      dashboardOrgEscalations(inputs.escalationNotes, "", inputs.resolvedEscalationIDs),
-		Feed:             dashboardOrgFeed(inputs.blocked, inputs.recycleOverdue, inputs.handoffNotes),
+		Feed:             dashboardOrgFeed(inputs.blocked, inputs.handoffNotes),
 	}
 	if !inputs.dataAsOf.IsZero() {
 		out.DataAsOf = inputs.dataAsOf.Format(time.RFC3339)
@@ -486,7 +478,7 @@ func dashboardOrgEscalations(notes []db.WorkflowNote, role string, resolvedIDs m
 	return out
 }
 
-func dashboardOrgFeed(blocked []db.BlockedEpisode, recycle []db.RecycleOverdueEpisode, handoffs []db.WorkflowNote) []dashboard.OrgFeedRow {
+func dashboardOrgFeed(blocked []db.BlockedEpisode, handoffs []db.WorkflowNote) []dashboard.OrgFeedRow {
 	out := []dashboard.OrgFeedRow{}
 	for _, episode := range blocked {
 		if !strings.HasPrefix(episode.Subject, "role:") {
@@ -495,12 +487,6 @@ func dashboardOrgFeed(blocked []db.BlockedEpisode, recycle []db.RecycleOverdueEp
 		out = append(out, dashboard.OrgFeedRow{
 			Kind: "blocked_since", Role: strings.TrimPrefix(episode.Subject, "role:"),
 			At: dashboardOrgTimestamp(episode.EmittedAt), Since: dashboardOrgTimestamp(episode.BlockedSince),
-		})
-	}
-	for _, episode := range recycle {
-		out = append(out, dashboard.OrgFeedRow{
-			Kind: "recycle_overdue", Role: episode.Subject,
-			At: dashboardOrgTimestamp(episode.EmittedAt), Since: dashboardOrgTimestamp(episode.OverdueSince),
 		})
 	}
 	for _, note := range handoffs {

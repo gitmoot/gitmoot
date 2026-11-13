@@ -779,14 +779,14 @@ func TestCodexSandboxArgsAdditiveGrants(t *testing.T) {
 		ReadablePaths:  []string{"/input/one"},
 		WritablePaths:  []string{"/data/one", "/data/two"},
 	}
-	args, _ := codexSandboxArgs(agent, "")
+	args := codexSandboxArgs(agent, "")
 	want := []string{"--sandbox", "workspace-write", "--add-dir", "/data/one", "--add-dir", "/data/two"}
 	if !reflect.DeepEqual(args, want) {
 		t.Fatalf("codexSandboxArgs = %v, want %v", args, want)
 	}
 	danger := agent
 	danger.AutonomyPolicy = AutonomyPolicyDangerFullAccess
-	if got, _ := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
+	if got := codexSandboxArgs(danger, ""); !reflect.DeepEqual(got, []string{"--sandbox", "danger-full-access"}) {
 		t.Fatalf("danger-full-access args = %v, want no leaked grants", got)
 	}
 }
@@ -797,7 +797,7 @@ func TestClaudeKimiAdditivePermissionArgs(t *testing.T) {
 		ReadablePaths:  []string{"/input/one"},
 		WritablePaths:  []string{"/data/one", " ", "/data/two"},
 	}
-	if got, _ := claudePermissionArgs(agent); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}) {
+	if got := claudePermissionArgs(agent); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}) {
 		want := []string{"--permission-mode", "acceptEdits", "--add-dir", "/data/one", "--add-dir", "/data/two", "--add-dir", "/input/one"}
 		t.Fatalf("claudePermissionArgs = %v, want %v", got, want)
 	}
@@ -807,7 +807,7 @@ func TestClaudeKimiAdditivePermissionArgs(t *testing.T) {
 	withoutPaths := agent
 	withoutPaths.ReadablePaths = nil
 	withoutPaths.WritablePaths = nil
-	if got, _ := claudePermissionArgs(withoutPaths); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits"}) {
+	if got := claudePermissionArgs(withoutPaths); !reflect.DeepEqual(got, []string{"--permission-mode", "acceptEdits"}) {
 		want := []string{"--permission-mode", "acceptEdits"}
 		t.Fatalf("no-grant Claude args = %v, want %v", got, want)
 	}
