@@ -231,6 +231,28 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # One stable, always-reporting context for branch protection (#2627). The
+  # matrix above reports per-package names only when it expands; on a skipped
+  # (docs/dep-only) diff it reports a literal `${{ matrix.package }}` name, so
+  # requiring the per-package contexts would hold such PRs forever.
+  race-build-result:
+    name: race build
+    needs: [changes, race-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every race build leg succeeded or was skipped
+        env:
+          RESULT: ${{ needs.race-build.result }}
+          CLASSIFY: ${{ needs.changes.result }}
+        run: |
+          echo "classify diff: $CLASSIFY; race build: $RESULT"
+          [ "$CLASSIFY" = success ] || exit 1
+          case "$RESULT" in
+            success|skipped) exit 0 ;;
+            *) exit 1 ;;
+          esac
+
   race:
     name: race (internal/${{ matrix.package }}, shard ${{ matrix.shard }}/${{ matrix.shards }})
     needs: [changes, race-build]
