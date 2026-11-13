@@ -1425,11 +1425,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey), Runtime: effectiveAgent.Runtime}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	quotaHooks := newQuotaRoleUnavailableHooks(store)
 	clearRoleUnavailable := func() {
 		// Availability bookkeeping is deliberately best-effort here, as it is in
 		// the daemon worker: it must never replace the foreground job's outcome.
-		_ = quotaHooks.clearOnSuccess(ctx, payload.ActingOrgRole, effectiveAgent.Runtime)
+		_ = clearRoleUnavailableOnSuccess(ctx, store, payload.ActingOrgRole, effectiveAgent.Runtime)
 	}
 	if request.Action == "ask" {
 		// Wire the home-aware registry defaults so a foreground ask with no

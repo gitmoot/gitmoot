@@ -58,6 +58,13 @@ func TestRemovedRuntimeIncidentDoesNotRefuseOmpOrShell(t *testing.T) {
 			}
 		}
 	}
+	// The exemption needs a known selected runtime: a dispatch that cannot say
+	// what it runs as stays refused even against a historical incident.
+	for _, selected := range []string{"", "not-a-runtime"} {
+		if !orgRoleUnavailableRefusesRuntime(db.OrgRoleUnavailable{Role: "review", Runtime: "claude"}, selected) {
+			t.Fatalf("historical incident admitted an unresolvable selected runtime %q", selected)
+		}
+	}
 	if !orgRoleUnavailableRefusesRuntime(db.OrgRoleUnavailable{Role: "review", Runtime: "not-a-runtime"}, runtime.OmpRuntime) {
 		t.Fatal("incident with an unrecognized runtime must still refuse (fail closed)")
 	}
@@ -108,7 +115,7 @@ func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.quotaRoleUnavailableHooks().clearOnSuccess(context.Background(), payload.ActingOrgRole, runtime.OmpRuntime); err != nil {
+	if err := clearRoleUnavailableOnSuccess(context.Background(), worker.Store, payload.ActingOrgRole, runtime.OmpRuntime); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || found {

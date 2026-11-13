@@ -11,36 +11,22 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// quotaRoleUnavailableHooks clears a role's per-runtime unavailability
-// incident when a job attributed to that role succeeds on that runtime.
+// clearRoleUnavailableOnSuccess clears a role's per-runtime unavailability
+// incident after a job attributed to role succeeds on runtimeName: that success
+// is the definitive signal that the runtime is available to the role again.
 //
 // Incidents used to be opened by a Claude-only quota classifier at the delivery
 // seams. #2587 removed the Claude job runtime, so nothing opens an incident any
-// more; detecting omp quota walls is a follow-up. Reading, refusing on and
+// more; detecting omp quota walls is follow-up #2625. Reading, refusing on and
 // clearing incidents stay, so any incident already on disk keeps its meaning
 // and still clears.
-type quotaRoleUnavailableHooks struct {
-	store *db.Store
-}
-
-func newQuotaRoleUnavailableHooks(store *db.Store) quotaRoleUnavailableHooks {
-	return quotaRoleUnavailableHooks{store: store}
-}
-
-func (w jobWorker) quotaRoleUnavailableHooks() quotaRoleUnavailableHooks {
-	return newQuotaRoleUnavailableHooks(w.Store)
-}
-
-// clearOnSuccess is called after a job attributed to role succeeds on
-// runtimeName: that success is the definitive signal that the runtime is
-// available to the role again.
-func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role, runtimeName string) error {
+func clearRoleUnavailableOnSuccess(ctx context.Context, store *db.Store, role, runtimeName string) error {
 	role = strings.TrimSpace(role)
 	runtimeName = strings.TrimSpace(runtimeName)
-	if role == "" || runtimeName == "" || h.store == nil {
+	if role == "" || runtimeName == "" || store == nil {
 		return nil
 	}
-	return h.store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
+	return store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
 }
 
 func unavailableRoleDispatchError(incident db.OrgRoleUnavailable) error {
@@ -73,23 +59,27 @@ func knownRuntimeName(name string) bool {
 //     corrupt value: UpsertOrgRoleUnavailable still writes "", and the runtime
 //     column was added by ALTER TABLE ... DEFAULT ” (#1490), so every row
 //     predating runtime attribution is legitimately unattributed.
-//   - An unrecognized stored runtime is corrupt, and corruption is not permission
-//     to dispatch. A runtime gitmoot REMOVED (#2587: claude, codex, kimi) is not
-//     corrupt: it is a recognized historical identity, so its incident bars only
-//     dispatches on that same runtime, which no longer exist. It must not refuse
-//     omp or shell jobs for the role.
 //   - An empty or unrecognized SELECTED runtime means the caller could not say
 //     what this job will run as, so it cannot claim to be a different runtime.
+//     This is checked first, before any exemption.
+//   - A runtime gitmoot REMOVED (#2587: claude, codex, kimi) is not corrupt: it
+//     is a recognized historical identity. Its incident bars only dispatches on
+//     that same runtime, which no longer exist, so it never refuses a known
+//     selected runtime.
+//   - Any other unrecognized stored runtime is corrupt, and corruption is not
+//     permission to dispatch.
 func orgRoleUnavailableRefusesRuntime(incident db.OrgRoleUnavailable, selectedRuntime string) bool {
 	stored := strings.ToLower(strings.TrimSpace(incident.Runtime))
 	selected := strings.ToLower(strings.TrimSpace(selectedRuntime))
-	if runtime.IsRemovedRuntime(stored) {
-		return stored == selected
-	}
-	if !knownRuntimeName(stored) {
+	if !knownRuntimeName(selected) {
 		return true
 	}
-	if !knownRuntimeName(selected) {
+	if runtime.IsRemovedRuntime(stored) {
+		// A removed runtime can never be the selected one (selected is known
+		// above), so its historical incident refuses nothing.
+		return false
+	}
+	if !knownRuntimeName(stored) {
 		return true
 	}
 	return stored == selected

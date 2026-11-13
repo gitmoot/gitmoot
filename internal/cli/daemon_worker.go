@@ -1284,7 +1284,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
 	}
-	if clearErr := w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, payload.ActingOrgRole, agent.Runtime); clearErr != nil {
+	if clearErr := clearRoleUnavailableOnSuccess(ctx, w.Store, payload.ActingOrgRole, agent.Runtime); clearErr != nil {
 		writeLine(w.Stdout, "job %s org-role quota unavailability clear failed: %v", job.ID, clearErr)
 	}
 	if err := engine.ReconcileTerminalDrivingJob(ctx, job.ID); err != nil {
@@ -3007,7 +3007,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
 		return nil
 	}
-	if clearErr := w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, payload.ActingOrgRole, started.Agent.Runtime); clearErr != nil {
+	if clearErr := clearRoleUnavailableOnSuccess(ctx, w.Store, payload.ActingOrgRole, started.Agent.Runtime); clearErr != nil {
 		writeLine(w.Stdout, "job %s org-role quota unavailability clear failed: %v", delegatedJob.ID, clearErr)
 	}
 	if policy.MergeBack == config.ParallelSessionMergeBackSummary {
