@@ -15,16 +15,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
-// ExcludedDeliveryWorktreeResolver is an explicit sentinel for a test context
-// that intentionally does not observe implement worktrees. Production exclusions
-// are selected by a shape-specific CLI predicate, so this lives with the tests
-// that are its only callers.
-func ExcludedDeliveryWorktreeResolver(source string) DeliveryWorktreeResolver {
-	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
-		return DeliveryWorktreeResolution{ExcludedSource: strings.TrimSpace(source)}, nil
-	}
-}
-
 func TestTerminalWriteContextSurvivesRunCancellationAndHasGraceDeadline(t *testing.T) {
 	runCtx, stopRun := context.WithCancel(context.Background())
 	stopRun()
@@ -47,7 +37,7 @@ func TestTerminalWriteContextSurvivesRunCancellationAndHasGraceDeadline(t *testi
 func TestMailboxFailPersistsAfterRunContextDeadline(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	job, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "job-terminal-write", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot",
 	})
@@ -74,7 +64,7 @@ func TestMailboxFailPersistsAfterRunContextDeadline(t *testing.T) {
 func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	job, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:          "job-1",
@@ -116,7 +106,7 @@ func TestMailboxEnqueueCreatesQueuedJobAndEvent(t *testing.T) {
 func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	job, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
+	job, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID: "org-role-job", Agent: "audit", Action: "ask", Repo: "gitmoot/gitmoot", ActingOrgRole: " owner ",
 	})
 	if err != nil {
@@ -134,7 +124,7 @@ func TestMailboxPersistsActingOrgRoleProvenance(t *testing.T) {
 func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "pid-job", Agent: "worker", Action: "ask", Repo: "gitmoot/gitmoot",
 	}); err != nil {
@@ -178,7 +168,7 @@ func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	job, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:              "job-child",
@@ -217,7 +207,7 @@ func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:           "job-ephemeral",
@@ -265,7 +255,7 @@ func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
 	}
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	job, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-claim", Agent: "audit", Action: "ask", Repo: "gitmoot/gitmoot"})
 	if err != nil {
@@ -303,7 +293,7 @@ func TestMailboxClaimStampsRunnerBootID(t *testing.T) {
 func TestMailboxEnqueuePersistsModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:     "job-model",
@@ -347,7 +337,7 @@ func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
 			t.Fatalf("UpsertAgent(%s): %v", agent.Name, err)
 		}
 	}
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RuntimeDefaultModel: func(runtimeName string) string {
+	mailbox := Mailbox{store: store, RuntimeDefaultModel: func(runtimeName string) string {
 		if runtimeName == runtime.KimiRuntime {
 			return "k3"
 		}
@@ -409,7 +399,7 @@ func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
 func TestMailboxEnqueueOmitsEmptyModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:     "job-no-model",
@@ -432,7 +422,7 @@ func TestMailboxEnqueueOmitsEmptyModel(t *testing.T) {
 func TestMailboxEnqueuePersistsPhase(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:     "job-phase",
@@ -463,7 +453,7 @@ func TestMailboxEnqueuePersistsPhase(t *testing.T) {
 func TestMailboxEnqueueOmitsEmptyPhase(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:     "job-no-phase",
@@ -486,7 +476,7 @@ func TestMailboxEnqueueOmitsEmptyPhase(t *testing.T) {
 func TestMailboxRunDeliversModelAndEffortOverrides(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
@@ -515,7 +505,7 @@ func TestMailboxRunDeliversModelAndEffortOverrides(t *testing.T) {
 func TestMailboxRunThreadsRuntimeDefaultModel(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RuntimeDefaultModel: func(rt string) string {
+	mailbox := Mailbox{store: store, RuntimeDefaultModel: func(rt string) string {
 		if rt == runtime.ShellRuntime {
 			return "gpt-5.5"
 		}
@@ -542,7 +532,7 @@ func TestMailboxRunThreadsRuntimeDefaultModel(t *testing.T) {
 func TestMailboxRunThreadsRuntimeDefaultEffort(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RuntimeDefaultEffort: func(rt string) string {
+	mailbox := Mailbox{store: store, RuntimeDefaultEffort: func(rt string) string {
 		if rt == runtime.CodexRuntime {
 			return "high"
 		}
@@ -571,7 +561,7 @@ func TestMailboxRunThreadsRuntimeDefaultEffort(t *testing.T) {
 func TestMailboxRunNilRuntimeDefaultHookByteIdentical(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{okDeliveryResult}}
 
@@ -599,7 +589,7 @@ const okDeliveryResult = `{"gitmoot_result":{"decision":"implemented","summary":
 func TestMailboxDeliverDeltasCumulativeUsage(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "planner", Runtime: runtime.CodexRuntime, RuntimeRef: "019f3041-cfed-7e82-8766-b5ca75cf92da", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
 	adapter := &fakeDelivery{
 		outputs:      []string{okDeliveryResult, okDeliveryResult},
@@ -642,7 +632,7 @@ func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:runtime", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	crash := errors.New("runtime exited before agent_end")
 	adapter := &fakeDelivery{
@@ -677,7 +667,7 @@ func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
 func TestMailboxDeliverRecordsNonCumulativeVerbatim(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh-thread-xyz", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
 	adapter := &fakeDelivery{
 		outputs:      []string{okDeliveryResult, okDeliveryResult},
@@ -719,7 +709,7 @@ func TestMailboxDeliverCumulativeAmbiguousRefContributesZero(t *testing.T) {
 		t.Run("ref="+ref, func(t *testing.T) {
 			ctx := context.Background()
 			store := openTestStore(t)
-			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			mailbox := Mailbox{store: store}
 			agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: ref, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
 			adapter := &fakeDelivery{
 				outputs:      []string{okDeliveryResult},
@@ -756,7 +746,7 @@ func TestMailboxDeliverCumulativeAmbiguousRefContributesZero(t *testing.T) {
 func TestMailboxDeliverSeedsBaselineForAdoptedThread(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: "fresh:codex-solo", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
 	adapter := &fakeDelivery{
 		outputs: []string{
@@ -800,7 +790,7 @@ func TestMailboxDeliverSeedsBaselineForAdoptedThread(t *testing.T) {
 func TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	freshRef := "fresh:codex-single"
 	agent := runtime.Agent{Name: "impl", Runtime: runtime.CodexRuntime, RuntimeRef: freshRef, RepoScope: "gitmoot/gitmoot", Role: "implementer"}
 	adapter := &fakeDelivery{
@@ -838,7 +828,7 @@ func TestMailboxDeliverDoesNotSeedBaselineWithoutAdoptedThread(t *testing.T) {
 func TestMailboxEnqueuePersistsRootJobID(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:        "job-child",
@@ -867,7 +857,7 @@ func TestMailboxEnqueuePersistsRootJobID(t *testing.T) {
 func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
 		ID:             "thermo",
 		Name:           "Thermo",
@@ -958,7 +948,7 @@ func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 func TestMailboxEnqueueAppliesTemplateOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	// The agent carries its own template; a --recipe override should win over it
 	// in the enqueued payload without rebinding the agent's identity.
 	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
@@ -1037,7 +1027,7 @@ func TestMailboxEnqueueAppliesTemplateOverride(t *testing.T) {
 func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
@@ -1098,7 +1088,7 @@ func TestUnmarshalPayloadMapsLegacyPresetSnapshot(t *testing.T) {
 func TestMailboxRunStoresResultAndSucceeds(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["mailbox"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`,
@@ -1133,7 +1123,7 @@ func TestMailboxRunStoresResultAndSucceeds(t *testing.T) {
 func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ClaudeRuntime, RuntimeRef: runtime.LastRef, RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{`{"result":"wrapped by runtime"}`},
@@ -1161,7 +1151,7 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 func TestMailboxRunPersistsRefreshedRuntimeRef(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	oldRef := "550e8400-e29b-41d4-a716-446655440002"
 	newRef := "550e8400-e29b-41d4-a716-446655440099"
 	if err := store.UpsertAgent(ctx, db.Agent{
@@ -1219,7 +1209,7 @@ func TestMailboxRunPersistsRefreshedRuntimeRef(t *testing.T) {
 func TestMailboxRunRepairRetryResumesRefreshedRef(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	oldRef := "550e8400-e29b-41d4-a716-446655440002"
 	newRef := "550e8400-e29b-41d4-a716-446655440099"
 	if err := store.UpsertAgent(ctx, db.Agent{
@@ -1263,7 +1253,7 @@ func TestMailboxRunRepairRetryResumesRefreshedRef(t *testing.T) {
 func TestMailboxRunFreshRefRepairUsesConcreteSessionWithoutPersisting(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	freshRef := "fresh:council-codex"
 	concreteRef := "codex-thread-123"
 	if err := store.UpsertAgent(ctx, db.Agent{
@@ -1320,7 +1310,7 @@ func TestMailboxRunFreshRefRepairUsesConcreteSessionWithoutPersisting(t *testing
 func TestMailboxRunEphemeralRefAdoptedButNotPersisted(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	concreteRef := "claude-ephemeral-session-1"
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:       "coordinator",
@@ -1385,7 +1375,7 @@ func TestMailboxRunEphemeralRefAdoptedButNotPersisted(t *testing.T) {
 func TestMailboxRunEphemeralRefStaysFreshAcrossJobs(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:       "coordinator",
 		Role:       "agent",
@@ -1434,7 +1424,7 @@ func TestMailboxRunEphemeralRefStaysFreshAcrossJobs(t *testing.T) {
 func TestMailboxRunNoRefreshLeavesRefUnchanged(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	oldRef := "550e8400-e29b-41d4-a716-446655440002"
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:       "shipper",
@@ -1478,7 +1468,7 @@ func TestMailboxRunNoRefreshLeavesRefUnchanged(t *testing.T) {
 func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		"review complete, no json",
@@ -1514,7 +1504,7 @@ func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"changes_requested","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
@@ -1554,7 +1544,7 @@ func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 func TestMailboxRunSalvagesMissingEnvelopeAfterSecondRepair(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		"findings posted, no json",
@@ -1601,7 +1591,7 @@ func TestMailboxRunSalvagesMissingEnvelopeAfterSecondRepair(t *testing.T) {
 func TestMailboxRunFailsAfterExhaustingRepairs(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		"no json here",
@@ -1630,7 +1620,7 @@ func TestMailboxRunFailsAfterExhaustingRepairs(t *testing.T) {
 func TestMailboxRunMarksBlockedDecision(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["GITHUB_TOKEN"],"delegations":[]}}`,
@@ -1654,7 +1644,7 @@ func TestMailboxRunMarksBlockedDecision(t *testing.T) {
 func TestMailboxRunRejectsNonQueuedJob(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
@@ -1687,7 +1677,7 @@ func TestMailboxRunRejectsNonQueuedJob(t *testing.T) {
 func TestMailboxRunPreservesCancellationDuringDelivery(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{
@@ -1718,7 +1708,7 @@ func TestMailboxRunPreservesCancellationDuringDelivery(t *testing.T) {
 func TestMailboxRunSkipsRepairAfterCancellation(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{"malformed"},

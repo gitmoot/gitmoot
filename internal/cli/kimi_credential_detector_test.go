@@ -361,7 +361,7 @@ func TestForegroundReviewKimiDispatchIsSeatExcluded(t *testing.T) {
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 
 	out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "kimi-reviewer", LeadAgent: "lead",
+		RepoFlag: "owner/repo", Agent: "kimi-reviewer",
 		Action: "review", Instructions: "review the head", PullRequest: 7,
 		Branch: "main", HeadSHA: readonlyWorktreeHead(t, checkout), Home: home,
 	})

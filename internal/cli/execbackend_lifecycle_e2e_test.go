@@ -7,9 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,10 +27,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
-	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 type localProvisionBackend struct {
@@ -66,10 +62,6 @@ func (b *localProvisionBackend) SyncIn(_ context.Context, _ *execbackend.Instanc
 
 func (*localProvisionBackend) Exec(context.Context, *execbackend.Instance, execbackend.Command) (execbackend.Stream, error) {
 	return nil, nil
-}
-
-func (*localProvisionBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
-	return execbackend.ChangeSet{}, nil
 }
 
 func (*localProvisionBackend) Cancel(context.Context, *execbackend.Instance) error { return nil }
@@ -112,38 +104,6 @@ func TestProvisionExecutionBackendLocalBehaviorUnchanged(t *testing.T) {
 	}
 	if backend.materials.SourceWorktree != "/checkout" {
 		t.Fatalf("local SyncIn source = %q, want /checkout", backend.materials.SourceWorktree)
-	}
-}
-
-func TestExecutionChangeSetCollectorRequiresLiveOwnedInstance(t *testing.T) {
-	backend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "instances"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	instance, err := backend.Provision(context.Background(), execbackend.JobScope{JobID: "owner"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
-
-	for name, lifecycleAndInstance := range map[string]struct {
-		lifecycle execbackend.ExecutionBackend
-		instance  *execbackend.Instance
-	}{
-		"neither":       {},
-		"backend only":  {lifecycle: backend},
-		"instance only": {instance: instance},
-	} {
-		if collector := executionChangeSetCollector(lifecycleAndInstance.lifecycle, lifecycleAndInstance.instance, execbackend.Local, "owner"); collector != nil {
-			t.Fatalf("%s: backend-less job received a live ChangeSet collector", name)
-		}
-	}
-	collector := executionChangeSetCollector(backend, instance, execbackend.Local, "owner")
-	if _, err := collector(context.Background(), execbackend.Backend("e2b"), "owner"); err == nil || !strings.Contains(err.Error(), "does not match live instance backend") {
-		t.Fatalf("backend ownership error = %v", err)
-	}
-	if _, err := collector(context.Background(), execbackend.Local, "intruder"); err == nil || !strings.Contains(err.Error(), "does not own live instance") {
-		t.Fatalf("job ownership error = %v", err)
 	}
 }
 
@@ -324,14 +284,6 @@ func configuredLocalTestIdentity(t *testing.T) (uint32, uint32) {
 	}
 	t.Skip("no unprivileged identity configured in /etc/passwd")
 	return 0, 0
-}
-
-type byteIdentityHostFinalizer struct {
-	checkout    string
-	expectedSHA string
-	called      *bool
-	// deadline, when set, receives the run context's deadline.
-	deadline *time.Time
 }
 
 const (
@@ -662,327 +614,6 @@ func writeRemoteLifecycleConnectJSON(t *testing.T, writer io.Writer, flag byte, 
 	}
 }
 
-func (f byteIdentityHostFinalizer) FinalizeImplementation(ctx context.Context, _ db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
-	*f.called = true
-	if f.deadline != nil {
-		*f.deadline, _ = ctx.Deadline()
-	}
-	expected, err := os.ReadFile(f.expectedSHA)
-	if err != nil {
-		return payload, err
-	}
-	content, err := os.ReadFile(filepath.Join(f.checkout, "artifact.bin"))
-	if err != nil {
-		return payload, err
-	}
-	digest := sha256.Sum256(content)
-	if got, want := hex.EncodeToString(digest[:]), strings.TrimSpace(string(expected)); got != want {
-		return payload, fmt.Errorf("host import hash %s is not backend hash %s", got, want)
-	}
-	git := gitutil.NewHostClient(f.checkout)
-	if err := git.CommitAll(ctx, "test: finalize backend bytes"); err != nil {
-		return payload, err
-	}
-	payload.HeadSHA, err = git.HeadSHA(ctx)
-	return payload, err
-}
-
-// TestLocalExecutionBackendShellImplementRoundTripE2E is the P2b no-LLM
-// acceptance path: a real shell implement job runs in a distinct local backend
-// workspace, Mailbox imports through the production collector before result
-// observation, and a host finalizer commits bytes whose SHA-256 exactly matches
-// the backend-produced file.
-func TestLocalExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
-	ctx := context.Background()
-	home, _, store := heartbeatLoopE2EHome(t)
-	toolCachePolicy, err := config.LoadToolCache(config.PathsForHome(home))
-	if err != nil {
-		t.Fatalf("LoadToolCache: %v", err)
-	}
-	const branch = "gitmoot-delegation-parent-local-roundtrip"
-	checkout := createDaemonWorkerGitCheckout(t, branch)
-	baseHEAD := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "HEAD"))
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	expectedSHA := filepath.Join(t.TempDir(), "backend.sha256")
-	backendPWD := filepath.Join(t.TempDir(), "backend.pwd")
-	toolCacheEnvFile := filepath.Join(t.TempDir(), "tool-cache.env")
-	script := `printf 'UV_CACHE_DIR=%s\nPIP_CACHE_DIR=%s\nnpm_config_cache=%s\nGOCACHE=%s\nGOMODCACHE=%s\n' "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$npm_config_cache" "$GOCACHE" "$GOMODCACHE" > '` + toolCacheEnvFile + `'
-printf 'backend\000produced\377bytes\n' > artifact.bin
-sha256sum artifact.bin | cut -d ' ' -f 1 > '` + expectedSHA + `'
-pwd > '` + backendPWD + `'
-printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"backend bytes produced","findings":[],"changes_made":["created artifact.bin"],"tests_run":[],"needs":[],"delegations":[]}}'`
-	seedDaemonWorkerAgent(t, store, "local-coder", runtime.ShellRuntime, script, []string{"ask", "implement"}, "owner/repo")
-	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-local-backend", RepoFullName: "owner/repo", GoalID: "goal-local-backend",
-		Title: "Local backend", State: string(workflow.TaskImplementing), Branch: branch, WorktreePath: checkout,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "local-coder"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
-	}
-	mailbox := workflow.NewMailbox(store, workflow.PayloadDeliveryWorktreeResolver)
-	parent, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID: "local-backend-parent", Agent: "local-coder", Action: "ask", Repo: "owner/repo", Instructions: "delegate the byte round-trip",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID: "local-backend-shell-implement", Agent: "local-coder", Action: "implement",
-		Repo: "owner/repo", Branch: branch, GoalID: "goal-local-backend", TaskID: "task-local-backend",
-		TaskTitle: "Local backend", WorktreePath: checkout, HeadSHA: baseHEAD,
-		ParentJobID: parent.ID, DelegationID: "local-roundtrip", DelegationDepth: 1, DelegatedBy: "local-coder", RootJobID: parent.ID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	finalizerCalled := false
-	worker := executionBackendJobWorker(store, os.Stderr, home)
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{
-			Store:                   store,
-			ResolveDeliveryWorktree: workflow.PayloadDeliveryWorktreeResolver,
-			ImplementationFinalizer: byteIdentityHostFinalizer{checkout: checkout, expectedSHA: expectedSHA, called: &finalizerCalled},
-		}
-	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatalf("worker.run: %v", err)
-	}
-	if !finalizerCalled {
-		t.Fatal("host finalizer did not run")
-	}
-	completed, err := store.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.State != string(workflow.JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded", completed.State)
-	}
-	payload, err := workflow.ParseJobPayload(completed.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if payload.ResultObservation == nil || fmt.Sprint(payload.ResultObservation.TouchedFiles) != "[artifact.bin]" {
-		t.Fatalf("result observation = %+v, want imported artifact.bin", payload.ResultObservation)
-	}
-	pwdBytes, err := os.ReadFile(backendPWD)
-	if err != nil {
-		t.Fatal(err)
-	}
-	backendWorkspace := strings.TrimSpace(string(pwdBytes))
-	if backendWorkspace == checkout {
-		t.Fatalf("shell ran in host checkout %q, want distinct backend workspace", checkout)
-	}
-	if _, err := os.Stat(backendWorkspace); !os.IsNotExist(err) {
-		t.Fatalf("backend workspace still exists after job teardown: %v", err)
-	}
-	want := []byte{'b', 'a', 'c', 'k', 'e', 'n', 'd', 0, 'p', 'r', 'o', 'd', 'u', 'c', 'e', 'd', 0xff, 'b', 'y', 't', 'e', 's', '\n'}
-	show := exec.Command("git", "-C", checkout, "show", "HEAD:artifact.bin")
-	got, err := show.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(want) {
-		t.Fatalf("committed artifact is not byte-identical: got %x want %x", got, want)
-	}
-	if status := strings.TrimSpace(runGitOutput(t, checkout, "status", "--porcelain")); status != "" {
-		t.Fatalf("host finalizer left a dirty tree: %q", status)
-	}
-	toolCacheEnv, err := os.ReadFile(toolCacheEnvFile)
-	if err != nil {
-		t.Fatalf("read local tool-cache environment: %v", err)
-	}
-	observedToolCacheEnv := make(map[string]string, len(toolCacheEnvSubdirs))
-	for _, line := range strings.Split(strings.TrimSpace(string(toolCacheEnv)), "\n") {
-		name, value, ok := strings.Cut(line, "=")
-		if ok {
-			observedToolCacheEnv[name] = value
-		}
-	}
-	for _, entry := range toolCacheEnvSubdirs {
-		want := filepath.Join(toolCachePolicy.Dir, entry.subdir)
-		if got := observedToolCacheEnv[entry.env]; got != want {
-			t.Fatalf("local runtime %s = %q, want isolated cache path %q; environment=%q", entry.env, got, want, toolCacheEnv)
-		}
-	}
-}
-
-// GITMOOT-IMPL: TestRemoteExecutionBackendShellImplementRoundTripE2E is the
-// spend-free Slice D acceptance path. It proves the host receives exact bytes
-// and, independently, that the billed sandbox is deleted after delivery.
-func TestRemoteExecutionBackendShellImplementRoundTripE2E(t *testing.T) {
-	ctx := context.Background()
-	t.Setenv("HERDR_BIN", filepath.Join(t.TempDir(), "herdr-must-not-run"))
-	harness := newRemoteLifecycleHarness(t)
-	home, paths, store := heartbeatLoopE2EHome(t)
-	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
-
-	const branch = "gitmoot-delegation-parent-remote-roundtrip"
-	checkout := createDaemonWorkerGitCheckout(t, branch)
-	baseHEAD := strings.TrimSpace(runGitOutput(t, checkout, "rev-parse", "HEAD"))
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	want := []byte{'b', 'a', 'c', 'k', 'e', 'n', 'd', 0, 'p', 'r', 'o', 'd', 'u', 'c', 'e', 'd', 0xff, 'b', 'y', 't', 'e', 's', '\n'}
-	digest := sha256.Sum256(want)
-	expectedSHA := filepath.Join(t.TempDir(), "backend.sha256")
-	if err := os.WriteFile(expectedSHA, []byte(hex.EncodeToString(digest[:])+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	script := `if env | grep -Eq '^(UV_CACHE_DIR|PIP_CACHE_DIR|npm_config_cache|GOCACHE|GOMODCACHE)='; then
-  printf 'host tool-cache environment reached remote runtime' >&2
-  exit 41
-fi
-printf 'backend\000produced\377bytes\n' > artifact.bin
-printf '%s' '{"gitmoot_result":{"decision":"implemented","summary":"remote backend bytes produced","findings":[],"changes_made":["created artifact.bin"],"tests_run":[],"needs":[],"delegations":[]}}'`
-	seedDaemonWorkerAgent(t, store, "remote-coder", runtime.ShellRuntime, script, []string{"ask", "implement"}, "owner/repo")
-	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-remote-backend", RepoFullName: "owner/repo", GoalID: "goal-remote-backend",
-		Title: "Remote backend", State: string(workflow.TaskImplementing), Branch: branch, WorktreePath: checkout,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: "owner/repo", Branch: branch, Owner: "remote-coder"}); err != nil || !acquired {
-		t.Fatalf("AcquireLock acquired=%v err=%v", acquired, err)
-	}
-	mailbox := workflow.NewMailbox(store, workflow.PayloadDeliveryWorktreeResolver)
-	parent, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID: "remote-backend-parent", Agent: "remote-coder", Action: "ask", Repo: "owner/repo", Instructions: "delegate the byte round-trip",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID: "remote-backend-shell-implement", Agent: "remote-coder", Action: "implement",
-		Repo: "owner/repo", Branch: branch, GoalID: "goal-remote-backend", TaskID: "task-remote-backend",
-		TaskTitle: "Remote backend", WorktreePath: checkout, HeadSHA: baseHEAD,
-		ParentJobID: parent.ID, DelegationID: "remote-roundtrip", DelegationDepth: 1, DelegatedBy: "remote-coder", RootJobID: parent.ID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	finalizerCalled := false
-	worker := executionBackendJobWorker(store, os.Stderr, home)
-	worker.RemoteEnvdEndpointResolver = func(string, int) string { return harness.envd.URL }
-	// GITMOOT-IMPL: executionBackendJobWorker installs a bound value-receiver;
-	// rebind after injecting the offline resolver so no request can leave httptest.
-	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
-	// Worker setup between provisioning and arming the run context takes real
-	// time; stand in for it once the sandbox exists.
-	const remoteSetupDelay = 3 * time.Second
-	var runDeadline time.Time
-	setupDelayed := false
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		if !setupDelayed && !harness.firstCreateAt().IsZero() {
-			setupDelayed = true
-			time.Sleep(remoteSetupDelay)
-		}
-		return workflow.Engine{
-			Store:                   store,
-			ResolveDeliveryWorktree: workflow.PayloadDeliveryWorktreeResolver,
-			ImplementationFinalizer: byteIdentityHostFinalizer{checkout: checkout, expectedSHA: expectedSHA, called: &finalizerCalled, deadline: &runDeadline},
-		}
-	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatalf("worker.run: %v", err)
-	}
-	if !finalizerCalled {
-		t.Fatal("host finalizer did not run")
-	}
-	completed, err := store.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.State != string(workflow.JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded", completed.State)
-	}
-	payload, err := workflow.ParseJobPayload(completed.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if payload.ResultObservation == nil || fmt.Sprint(payload.ResultObservation.TouchedFiles) != "[artifact.bin]" {
-		t.Fatalf("result observation = %+v, want imported artifact.bin", payload.ResultObservation)
-	}
-	show := exec.Command("git", "-C", checkout, "show", "HEAD:artifact.bin")
-	got, err := show.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("committed artifact is not byte-identical: got %x want %x", got, want)
-	}
-	if status := strings.TrimSpace(runGitOutput(t, checkout, "status", "--porcelain")); status != "" {
-		t.Fatalf("host finalizer left a dirty tree: %q", status)
-	}
-
-	creates, deleted, listCalls, runtimeEnv, runtimeStarted := harness.snapshot()
-	if listCalls != 1 {
-		t.Fatalf("provider startup reap list calls = %d, want 1", listCalls)
-	}
-	if len(creates) != 1 {
-		t.Fatalf("provider create calls = %d, want 1", len(creates))
-	}
-	if create := creates[0]; create.TemplateID != "template-GITMOOT-IMPL" || create.Timeout <= 0 || !create.Secure || create.AutoPause || create.Metadata["job_id"] != job.ID {
-		t.Fatalf("provider create request = %+v", create)
-	}
-	if fmt.Sprint(deleted) != "[sandbox-1]" {
-		t.Fatalf("provider deletes = %v, want exactly [sandbox-1]", deleted)
-	}
-	attempt, err := store.GetExecBackendAttempt(ctx, db.ExecBackendAttemptKey{
-		JobID: job.ID, Attempt: 1, LifecycleGeneration: job.LifecycleGeneration,
-	})
-	if err != nil {
-		t.Fatalf("get remote execution ledger attempt: %v", err)
-	}
-	if attempt.State != db.ExecBackendAttemptStateDestroyed || attempt.SandboxID == nil || *attempt.SandboxID != "sandbox-1" {
-		t.Fatalf("remote execution ledger attempt = %+v, want destroyed sandbox-1", attempt)
-	}
-	if _, err := os.Stat(harness.workspace); !os.IsNotExist(err) {
-		t.Fatalf("sandbox workspace still exists after provider deletion: %v", err)
-	}
-	if !runtimeStarted {
-		t.Fatal("remote runtime command was not observed")
-	}
-	for _, name := range []string{"UV_CACHE_DIR", "PIP_CACHE_DIR", "npm_config_cache", "GOCACHE", "GOMODCACHE"} {
-		if value, ok := runtimeEnv[name]; ok {
-			t.Fatalf("host tool-cache environment reached remote runtime: %s=%s", name, value)
-		}
-	}
-	events, err := store.ListJobEvents(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// #1753 deleted the cockpit pane wrapper, so the remote backend no longer
-	// emits cockpit_unavailable. Pin its absence rather than dropping the check:
-	// a resurrected emitter on the remote path would otherwise go unnoticed.
-	var sandboxClamp string
-	for _, event := range events {
-		if event.Kind == "cockpit_unavailable" {
-			t.Fatalf("cockpit_unavailable survived the pane-wrapper deletion: %+v", event)
-		}
-		if event.Kind == "job_timeout_clamped" && strings.Contains(event.Message, "remote sandbox") {
-			sandboxClamp = event.Message
-		}
-	}
-	if sandboxClamp == "" {
-		t.Fatalf("no job_timeout_clamped event fits the run into the 1h sandbox: events=%+v", events)
-	}
-	// #2331: cloud E2B retires a sandbox one hour after creation and silently
-	// refuses to extend it, so the default 4h run deadline must end inside that
-	// hour, or a long run dies mid-stream with no verdict. The deadline is an
-	// INSTANT tied to the sandbox's creation: the worker setup delay injected
-	// above must not push it later (#2338 review).
-	if runDeadline.IsZero() {
-		t.Fatal("the host finalizer saw no run deadline")
-	}
-	createdAt := harness.firstCreateAt()
-	sandboxDeadline := createdAt.Add(time.Hour - 5*time.Minute)
-	if runDeadline.After(sandboxDeadline) || runDeadline.Before(sandboxDeadline.Add(-30*time.Second)) {
-		t.Fatalf("run deadline %s, want at most and just before %s (sandbox created %s + 55m, after a %s setup delay): %s",
-			runDeadline.Format(time.RFC3339Nano), sandboxDeadline.Format(time.RFC3339Nano), createdAt.Format(time.RFC3339Nano), remoteSetupDelay, sandboxClamp)
-	}
-}
-
 // GITMOOT-IMPL: a daemon restart must reconcile the configured remote account
 // before waiting for another job; the startup path may list but must not create.
 func TestExecutionBackendJobWorkerReapsConfiguredRemoteAtStartup(t *testing.T) {
@@ -1045,8 +676,6 @@ func TestLocalExecutionBackendAllowsNonImplement(t *testing.T) {
 	assertExecBackendLocalSucceeded(t, store, jobID)
 }
 
-// GITMOOT-IMPL: non-implement work must fail before construction; otherwise a
-// billed sandbox could run work whose result has no transport back to the host.
 func writeRemoteLifecycleConfig(t *testing.T, paths config.Paths, baseURL string) {
 	t.Helper()
 	keyFile := filepath.Join(t.TempDir(), "e2b-api-key")

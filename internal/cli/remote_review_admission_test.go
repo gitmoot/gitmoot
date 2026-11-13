@@ -58,9 +58,6 @@ func (*remoteReviewProbeBackend) SyncIn(context.Context, *execbackend.Instance, 
 func (*remoteReviewProbeBackend) Exec(context.Context, *execbackend.Instance, execbackend.Command) (execbackend.Stream, error) {
 	return nil, errors.New("unexpected Exec")
 }
-func (*remoteReviewProbeBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
-	return execbackend.ChangeSet{}, errors.New("unexpected Collect")
-}
 func (*remoteReviewProbeBackend) Cancel(context.Context, *execbackend.Instance) error  { return nil }
 func (*remoteReviewProbeBackend) Destroy(context.Context, *execbackend.Instance) error { return nil }
 
@@ -97,7 +94,7 @@ func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteRe
 	}); err != nil {
 		t.Fatal(err)
 	}
-	job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("worker owns checkout")).Enqueue(ctx, workflow.JobRequest{
+	job, err := workflow.NewMailbox(store).Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-review-admission", Agent: "remote-review-agent", Action: "review",
 		Repo: "owner/repo", PullRequest: 2238, HeadSHA: head, Branch: "remote-review-admission",
 		ReviewPurpose: db.DefaultReviewPurpose, Instructions: "review the exact head",
@@ -218,7 +215,7 @@ func TestRemoteReviewAdmissionRefusesBeforeReservationAndProvider(t *testing.T) 
 
 	t.Run("duplicate", func(t *testing.T) {
 		f := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
-		owner, err := workflow.NewMailbox(f.store, workflow.UnavailableDeliveryWorktreeResolver("not run")).Enqueue(f.ctx, workflow.JobRequest{
+		owner, err := workflow.NewMailbox(f.store).Enqueue(f.ctx, workflow.JobRequest{
 			ID: "remote-review-owner", Agent: "remote-review-agent", Action: "review",
 			Repo: "owner/repo", PullRequest: 2238, HeadSHA: f.head, Branch: "remote-review-admission",
 			ReviewPurpose: db.DefaultReviewPurpose, Instructions: "owns the subject",

@@ -92,8 +92,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
 	fmt.Fprintln(w, "  gitmoot agent heartbeat add|list|show|enable|disable|remove ...")
@@ -387,7 +387,6 @@ type agentRunOptions struct {
 	prNumber       int
 	headSHA        string
 	branch         string
-	lead           string
 	// routerBypassReason names why this dispatch skipped `review request`, so
 	// the job carries it instead of only the operator's terminal (#2199).
 	routerBypassReason      string
@@ -395,7 +394,6 @@ type agentRunOptions struct {
 	message                 string
 	skipNativeReviewFanout  bool
 	allowPromptHeadMismatch bool
-	noFixTarget             bool
 	postMerge               bool
 	noExecution             bool
 	part                    string
@@ -541,9 +539,9 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 	//
 	// The named reviewer SURVIVES: `review request --reviewer` routes a named
 	// agent own-first, which is the property that made this command worth
-	// keeping. The caller's message and --lead survive because they were added
-	// to that command first; delegating without them would have silently dropped
-	// every seat's review instructions and its fix target.
+	// keeping. The caller's message survives because it was added to that
+	// command first; delegating without it would have silently dropped every
+	// seat's review instructions.
 	//
 	// SOME PATHS STAY DIRECT because the router's contract cannot express them:
 	// --foreground, no acting role, and the inputs agentReviewInputsTheRouterCannotCarry
@@ -585,19 +583,19 @@ func runAgentReview(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if options.postMerge {
-		fmt.Fprintln(stderr, "agent review: --post-merge requires the review router (pass --org-role and --no-fix-target, without --foreground)")
+		fmt.Fprintln(stderr, "agent review: --post-merge requires the review router (pass --org-role, without --foreground)")
 		return 2
 	}
 	if options.noExecution {
-		fmt.Fprintln(stderr, "agent review: --no-execution requires the review router (pass --org-role and --no-fix-target, without --foreground)")
+		fmt.Fprintln(stderr, "agent review: --no-execution requires the review router (pass --org-role, without --foreground)")
 		return 2
 	}
 	if strings.TrimSpace(options.part) != "" {
-		fmt.Fprintln(stderr, "agent review: --part requires the review router (pass --org-role and --no-fix-target, without --foreground)")
+		fmt.Fprintln(stderr, "agent review: --part requires the review router (pass --org-role, without --foreground)")
 		return 2
 	}
 	if len(options.relatedPRs) > 0 {
-		fmt.Fprintln(stderr, "agent review: --related-pr requires the review router (pass --org-role and --no-fix-target, without --foreground)")
+		fmt.Fprintln(stderr, "agent review: --related-pr requires the review router (pass --org-role, without --foreground)")
 		return 2
 	}
 	// A DISPATCH WITH NO ACTING ROLE CANNOT BE DELEGATED: `review request`
@@ -703,8 +701,7 @@ func attachReviewVerdictWait(output *localAgentJobOutput, options agentRunOption
 // agentReviewInputsTheRouterCannotCarry names every supplied input that
 // `review request` has no flag for (#2196 review). Enumerated MECHANICALLY
 // against the two flag sets rather than by hand: hand-enumeration found the
-// message and --lead and missed eight others, and the arithmetic said it
-// probably would.
+// message and missed eight others, and the arithmetic said it probably would.
 //
 // The four that ARE carryable - model, effort, workflow, session - were added to
 // the router command instead of listed here, because dropping --model turns an
@@ -719,17 +716,6 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 		{"--type", strings.TrimSpace(options.typeName) != ""},
 		{"--recipe", strings.TrimSpace(options.recipe) != ""},
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
-		{"--no-fix-target", options.noFixTarget && strings.TrimSpace(options.lead) != ""},
-		// NO --lead AND NO --no-fix-target IS A REFUSAL ON THE DIRECT PATH, NOT
-		// A REVIEW-ONLY DISPATCH (#2054): it falls back to the reviewer as lead
-		// and then VALIDATES that agent, refusing an unregistered or unsubscribed
-		// one. The router expresses only "lead" or "no fix target", so delegating
-		// an absent lead would convert a deliberate refusal into a quiet success
-		// - strictly worse than dropping a flag, because the caller gets the
-		// outcome by accident rather than by permission. Same shape as an
-		// auto-merge with no expectedHeadOid: a guard that stops existing and
-		// nothing announces it (#2196 review, P2).
-		{"absent --lead with no --no-fix-target", strings.TrimSpace(options.lead) == "" && !options.noFixTarget},
 	} {
 		if candidate.set {
 			named = append(named, candidate.flag)
@@ -753,7 +739,6 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 		{"--exec-backend", options.execBackend},
 		{"--exec-provider", options.execProvider},
 		{"--runtime", options.runtime},
-		{"--lead", options.lead},
 		{"--home", options.home},
 		{"--part", options.part},
 	} {
@@ -772,9 +757,6 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 	}
 	if options.noExecution {
 		args = append(args, "--no-execution")
-	}
-	if options.noFixTarget {
-		args = append(args, "--no-fix-target")
 	}
 	if options.jsonOutput {
 		args = append(args, "--json")
@@ -806,10 +788,6 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	if executionPath == "orchestrate" {
 		errLabel = "orchestrate"
 	}
-	if options.noFixTarget && action != "review" {
-		fmt.Fprintf(stderr, "%s: --no-fix-target is only supported when routing to review\n", errLabel)
-		return localAgentJobOutput{}, 2
-	}
 	if options.postMerge {
 		fmt.Fprintf(stderr, "%s: --post-merge is only supported by `agent review` through the review router\n", errLabel)
 		return localAgentJobOutput{}, 2
@@ -824,10 +802,6 @@ func dispatchAgentCommand(options agentRunOptions, action string, reason string,
 	}
 	if len(options.relatedPRs) > 0 {
 		fmt.Fprintf(stderr, "%s: --related-pr is only supported by `agent review` through the review router\n", errLabel)
-		return localAgentJobOutput{}, 2
-	}
-	if strings.TrimSpace(options.lead) != "" && action != "review" {
-		fmt.Fprintf(stderr, "%s: --lead is only supported when routing to review\n", errLabel)
 		return localAgentJobOutput{}, 2
 	}
 	dispatchCtx := context.Background()
@@ -898,11 +872,9 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		PullRequest:             options.prNumber,
 		HeadSHA:                 options.headSHA,
 		Branch:                  options.branch,
-		LeadAgent:               options.lead,
 		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
 		AllowPromptHeadMismatch: options.allowPromptHeadMismatch,
 		RouterBypassReason:      options.routerBypassReason,
-		NoFixTarget:             options.noFixTarget,
 		Recipe:                  options.recipe,
 		SelectedAction:          action,
 		SelectedActionReason:    reason,
@@ -911,8 +883,8 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 }
 
 // agentRunCommandLabel is how a parse/usage error names the command. The agent
-// subcommands read as "agent run/review/implement"; the top-level orchestrate
-// alias names itself, not "agent orchestrate".
+// subcommands read as "agent run/review"; the top-level orchestrate alias names
+// itself, not "agent orchestrate".
 func agentRunCommandLabel(command string) string {
 	if command == "orchestrate" {
 		return "orchestrate"
@@ -953,14 +925,15 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		case arg == "--skip-native-review-fanout":
 			options.skipNativeReviewFanout = true
 		case arg == "--no-fix-target":
-			options.noFixTarget = true
+			// Accepted and ignored (#2586): fix-target routing is gone, and every
+			// seat's review command still passes the flag.
 		case arg == "--post-merge":
 			options.postMerge = true
 		case arg == "--no-execution":
 			options.noExecution = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--lead" || arg == "--recipe" || arg == "--part" || arg == "--related-pr":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--recipe" || arg == "--part" || arg == "--related-pr":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -1010,10 +983,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.headSHA = strings.TrimPrefix(arg, "--head-sha=")
 		case strings.HasPrefix(arg, "--branch="):
 			options.branch = strings.TrimPrefix(arg, "--branch=")
-		case strings.HasPrefix(arg, "--lead="):
-			if !setAgentRunOption(&options, "--lead", strings.TrimPrefix(arg, "--lead="), stderr) {
-				return agentRunOptions{}, false
-			}
 		case strings.HasPrefix(arg, "--related-pr="):
 			if !setAgentRunOption(&options, "--related-pr", strings.TrimPrefix(arg, "--related-pr="), stderr) {
 				return agentRunOptions{}, false
@@ -1052,22 +1021,14 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		return agentRunOptions{}, false
 	}
 	// --recipe is scoped to the coordinator fan-out surfaces (orchestrate and
-	// `agent run`). The shared parser/dispatch means review/implement would
-	// otherwise silently honor it and override their job template, so reject it
-	// there rather than apply it undocumented.
+	// `agent run`). The shared parser/dispatch means review would otherwise
+	// silently honor it and override its job template, so reject it there
+	// rather than apply it undocumented.
 	if normalizedRecipe != "" && command != "orchestrate" && command != "run" {
 		fmt.Fprintf(stderr, "%s: recipe is only supported for orchestrate and agent run\n", label)
 		return agentRunOptions{}, false
 	}
 	options.recipe = normalizedRecipe
-	// --lead is scoped to the local review surfaces. The shared parser would
-	// otherwise accept it for implement/orchestrate and silently persist routing
-	// metadata that those commands do not own. agent run is checked again after
-	// action selection because its final action may come from flags or inference.
-	if strings.TrimSpace(options.lead) != "" && command != "review" && command != "run" {
-		fmt.Fprintf(stderr, "%s: --lead is only supported for agent review and agent run when routing to review\n", label)
-		return agentRunOptions{}, false
-	}
 	if options.execBackendSet && command != "review" {
 		fmt.Fprintf(stderr, "%s: --exec-backend is only supported for agent review\n", label)
 		return agentRunOptions{}, false
@@ -1136,12 +1097,6 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.headSHA = value
 	case "--branch":
 		options.branch = value
-	case "--lead":
-		if value == "" {
-			fmt.Fprintln(stderr, "--lead requires a non-blank value")
-			return false
-		}
-		options.lead = value
 	case "--recipe":
 		options.recipe = value
 	case "--part":
@@ -1201,10 +1156,10 @@ func printAgentRunUsage(w io.Writer, command string) {
 	case "orchestrate":
 		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	case "review":
-		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 		fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
 	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--lead implementer] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
+		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
 	}
 	printAgentRuntimeOverrideHelp(w)
 }

@@ -1028,7 +1028,7 @@ func TestPrintJobRendersFailureDiagnosticsBlock(t *testing.T) {
 		},
 	}
 
-	printJob(&buf, db.Job{ID: "job-x", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, "", reviewStatusDisplay{})
+	printJob(&buf, db.Job{ID: "job-x", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, reviewStatusDisplay{})
 
 	out := buf.String()
 	for _, want := range []string{
@@ -1057,7 +1057,7 @@ func TestPrintJobFailureDiagnosticsOmitsBlankPhase(t *testing.T) {
 		FailureDiagnostics: workflow.WithDeliveryError(nil, "unexpected status 404 Not Found"),
 	}
 
-	printJob(&buf, db.Job{ID: "job-z", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, "", reviewStatusDisplay{})
+	printJob(&buf, db.Job{ID: "job-z", State: "failed", Type: "review", Agent: "audit"}, payload, stuckReason{}, false, reviewStatusDisplay{})
 
 	out := buf.String()
 	if !strings.Contains(out, "  delivery_error:") || !strings.Contains(out, "    unexpected status 404 Not Found") {
@@ -1071,7 +1071,7 @@ func TestPrintJobFailureDiagnosticsOmitsBlankPhase(t *testing.T) {
 func TestPrintJobOmitsFailureDiagnosticsWhenAbsent(t *testing.T) {
 	var buf bytes.Buffer
 
-	printJob(&buf, db.Job{ID: "job-y", State: "succeeded", Type: "review", Agent: "audit"}, workflow.JobPayload{Repo: "owner/repo"}, stuckReason{}, false, "", reviewStatusDisplay{})
+	printJob(&buf, db.Job{ID: "job-y", State: "succeeded", Type: "review", Agent: "audit"}, workflow.JobPayload{Repo: "owner/repo"}, stuckReason{}, false, reviewStatusDisplay{})
 
 	if strings.Contains(buf.String(), "failure_diagnostics:") {
 		t.Fatalf("job show output has a failure diagnostics block for a healthy job:\n%s", buf.String())

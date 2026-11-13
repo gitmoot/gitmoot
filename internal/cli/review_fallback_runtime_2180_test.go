@@ -45,7 +45,7 @@ func runBlockerOnRunningReview(t *testing.T, agentRuntime string, request workfl
 func poolReviewRequest(id, agent string) workflow.JobRequest {
 	return workflow.JobRequest{
 		ID: id, Agent: agent, Action: "review", Repo: "owner/repo", Branch: "main",
-		PullRequest: 1, HeadSHA: strings.Repeat("d", 40), NoFixTarget: true,
+		PullRequest: 1, HeadSHA: strings.Repeat("d", 40),
 		ReviewPurpose: "code", ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"},
 	}
 }
@@ -142,7 +142,7 @@ func TestPoollessReviewCarriesTheUnresolvedAdvisory(t *testing.T) {
 	store, _ := blockerE2EHome(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
 	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo")
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := workflow.NewMailbox(store)
 	mailbox.ReviewModelPool = func(string) []string { return nil }
 	if _, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID: "job-poolless", Agent: "reviewer", Action: "review", Repo: "owner/repo",

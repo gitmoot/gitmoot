@@ -148,7 +148,7 @@ func TestIntentSurvivesContinuationThenImplementChild(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "coordinator", []string{"ask", "review"}, "gitmoot/gitmoot")
 	seedAgent(t, store, "impl", []string{"implement"}, "gitmoot/gitmoot")
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	root, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:                     "root-coordinator",

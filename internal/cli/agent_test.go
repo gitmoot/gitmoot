@@ -3325,9 +3325,6 @@ func TestParseAgentRunOptionsNoFixTargetDoesNotEatTheNextArgument(t *testing.T) 
 	if !ok {
 		t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
 	}
-	if !options.noFixTarget {
-		t.Fatal("noFixTarget = false")
-	}
 	// The flags AFTER it must survive. Before the fix --org-role was consumed as
 	// this flag's value and every later flag shifted by one.
 	if options.orgRole != "gm-transport" {
@@ -3335,18 +3332,6 @@ func TestParseAgentRunOptionsNoFixTargetDoesNotEatTheNextArgument(t *testing.T) 
 	}
 	if options.prNumber != 7 {
 		t.Fatalf("prNumber = %d, want 7", options.prNumber)
-	}
-}
-
-// --no-fix-target answers a question only review asks, so it is refused
-// elsewhere exactly as --lead is.
-func TestNoFixTargetIsReviewOnly(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	if code := runAgentRun([]string{"planner", "do the work", "--no-fix-target", "--action", "ask"}, &stdout, &stderr); code == 0 {
-		t.Fatalf("ask accepted --no-fix-target: exit 0, stderr=%q", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "--no-fix-target is only supported when routing to review") {
-		t.Fatalf("stderr = %q, want the review-only refusal", stderr.String())
 	}
 }
 

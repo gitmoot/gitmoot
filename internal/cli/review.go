@@ -111,7 +111,7 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--lead AGENT | --no-fix-target] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
@@ -124,16 +124,10 @@ func printReviewUsage(w io.Writer) {
 }
 
 type reviewRequestOptions struct {
-	// lead and message exist so `agent review` can route THROUGH this command
-	// instead of beside it (#2196). Without them delegation would silently drop
-	// the caller's review instructions and its fix target, which is the whole
-	// reason the other surface was still being used.
-	lead    string
+	// message exists so `agent review` can route THROUGH this command instead
+	// of beside it (#2196). Without it delegation would silently drop the
+	// caller's review instructions.
 	message string
-	// noFixTarget states the default a request without --lead already gets, so
-	// `agent review --no-fix-target` routes here unchanged (#2314). It exists to
-	// refuse --lead alongside it, as the direct path does.
-	noFixTarget bool
 	// noExecution asks for a no-execution review (#2364). It can only turn
 	// the mode on: a repository declaring execution = "none" is a
 	// no-execution review whether or not the flag is passed.
@@ -205,7 +199,6 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
 	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
-	fs.StringVar(&opts.lead, "lead", "", "implementer a changes-requested verdict routes to; empty dispatches with no fix target")
 	fs.StringVar(&opts.model, "model", "", "provider/model the review runs on, overriding the pool head")
 	fs.StringVar(&opts.effort, "effort", "", "reasoning effort for runtimes that accept one")
 	fs.StringVar(&opts.workflowID, "workflow", "", "workflow the review job is filed under")
@@ -235,7 +228,9 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	var headSHA, orgRole string
 	fs.StringVar(&headSHA, "head-sha", "", "same as --head")
 	fs.StringVar(&orgRole, "org-role", "", "same as --role")
-	fs.BoolVar(&opts.noFixTarget, "no-fix-target", false, "state that this review has no implementer for a changes-requested verdict (the default without --lead); refused with --lead")
+	// --no-fix-target is accepted and ignored (#2586): fix-target routing is
+	// gone, and every seat's review command still passes the flag.
+	fs.Bool("no-fix-target", false, "accepted for compatibility and ignored: a review never routes a fix")
 	fs.Bool("background", false, "accepted for parity with `agent review`: the router always queues the review for the daemon")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
@@ -262,10 +257,6 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "review request: %v\n", err)
 		return 2
 	}
-	if opts.postMerge && strings.TrimSpace(opts.lead) != "" {
-		fmt.Fprintln(stderr, "review request: --post-merge and --lead are mutually exclusive")
-		return 2
-	}
 	opts.supersede = strings.TrimSpace(opts.supersede)
 	opts.supersedeReason = strings.TrimSpace(opts.supersedeReason)
 	if opts.supersede != "" && opts.supersedeReason == "" {
@@ -274,10 +265,6 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	}
 	if opts.supersede == "" && opts.supersedeReason != "" {
 		fmt.Fprintln(stderr, "review request: --reason is only meaningful with --supersede")
-		return 2
-	}
-	if opts.noFixTarget && strings.TrimSpace(opts.lead) != "" {
-		fmt.Fprintln(stderr, "review request: --no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
 		return 2
 	}
 	for _, alias := range []struct {
@@ -624,11 +611,6 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		PullRequest:    opts.pr,
 		HeadSHA:        head,
 		Branch:         branch,
-		LeadAgent:      strings.TrimSpace(opts.lead),
-		// A NAMED LEAD IS A FIX TARGET. The router's own requests carry none, so
-		// a changes-requested verdict has nowhere to route and says so; a caller
-		// that names an implementer gets the routing it asked for (#2196).
-		NoFixTarget:           strings.TrimSpace(opts.lead) == "",
 		PostMergeReview:       opts.postMerge,
 		ReviewNoExecution:     noExecution,
 		ReviewPart:            opts.part,
@@ -1180,7 +1162,7 @@ func resolveLostReviewClaim(ctx context.Context, store *db.Store, claim db.Revie
 // attachDiscardedInputs names what an ATTACHING request supplied and did not
 // get (#2196 review, P2). A caller whose request attached to someone else's
 // running review is told it is awaiting a verdict; without this it is NOT told
-// that its own reviewer, message and lead were discarded, so it waits on a
+// that its own reviewer and message were discarded, so it waits on a
 // review it believes it commissioned. That is this campaign's central defect at
 // the dispatch surface, and the remedy is the one #2194 already uses: say what
 // did not happen.
@@ -1191,9 +1173,6 @@ func attachDiscardedInputs(output reviewRequestOutput, opts reviewRequestOptions
 	}
 	if strings.TrimSpace(opts.message) != "" {
 		holds = append(holds, "your review instructions were NOT sent: the running review carries the instructions of whoever dispatched it")
-	}
-	if lead := strings.TrimSpace(opts.lead); lead != "" {
-		holds = append(holds, fmt.Sprintf("your --lead %s was NOT applied: a changes-requested verdict routes wherever the running review says", lead))
 	}
 	if wanted := strings.TrimSpace(opts.runtime); wanted != "" && !strings.EqualFold(wanted, output.Runtime) {
 		holds = append(holds, fmt.Sprintf("your --runtime %s was NOT used: the running review is on %s", wanted, firstNonEmpty(output.Runtime, "an unreported runtime")))

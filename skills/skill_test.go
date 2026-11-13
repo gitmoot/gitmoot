@@ -288,7 +288,6 @@ func TestReviewRouterDocsKeepLoadBearingFacts(t *testing.T) {
 	skill := text[start:end]
 	for _, want := range []string{
 		"routes THROUGH this command",
-		"--lead <implementer>",
 		"ATTACHING request is told what it lost",
 		// Was "names the flag on stderr" until #2199: the stderr claim was
 		// inaccurate for --foreground and a missing --org-role, which print

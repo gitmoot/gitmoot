@@ -3525,18 +3525,15 @@ func hasWritePermission(permission string) bool {
 
 // commentEnqueueMailbox is the mailbox the PR-comment producer enqueues through.
 //
-// It is a named seam rather than an inline construction so the two properties
-// that collided in #2186 can be asserted directly: the engine's config-bearing
+// It is a named seam rather than an inline construction so the property that
+// collided in #2186 can be asserted directly: the engine's config-bearing
 // resolvers ARE inherited (the pool resolver was silently dropped by a
-// three-field copy list, round 4), and the delivery SENTINEL is not replaced
-// (inheriting the engine's mailbox wholesale handed a context that refuses
-// implement delivery the machinery to perform it, round 5).
+// three-field copy list, round 4).
 func (d Daemon) commentEnqueueMailbox() workflow.Mailbox {
-	sentinel := workflow.UnavailableDeliveryWorktreeResolver("daemon comment enqueue")
 	if d.Workflow == nil {
-		return workflow.NewMailbox(d.Store, sentinel)
+		return workflow.NewMailbox(d.Store)
 	}
-	return d.Workflow.EnqueueMailbox(sentinel)
+	return d.Workflow.EnqueueMailbox()
 }
 
 func (d Daemon) enqueueJob(ctx context.Context, request workflow.JobRequest) (db.Job, bool, error) {

@@ -47,11 +47,6 @@ func (e Engine) runJob(ctx context.Context, jobID string, agent runtime.Agent, a
 	if err != nil {
 		return result, err
 	}
-	if e.PayloadRefresher != nil {
-		if err := e.refreshJobPayload(ctx, jobID); err != nil {
-			return result, err
-		}
-	}
 	if err := e.AdvanceJob(ctx, jobID); err != nil {
 		// The agent delivery and the job itself already succeeded; only this
 		// post-success advance step errored. Wrap it so callers can recover the
@@ -249,22 +244,6 @@ func (e Engine) FinalizeRefusedDelegationChild(ctx context.Context, jobID string
 // carries its own kind rather than borrowing the timeout verb.
 func (e Engine) finalizeSupersededDelegationChildAtGeneration(ctx context.Context, jobID string, reason string, generation int64) (bool, error) {
 	return e.finalizeTimedOutJob(ctx, jobID, reason, JobEventDelegationSupersededFinalized, reason, true, &generation)
-}
-
-func (e Engine) refreshJobPayload(ctx context.Context, jobID string) error {
-	job, payload, err := e.jobPayload(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	payload, err = e.PayloadRefresher(ctx, job, payload)
-	if err != nil {
-		return err
-	}
-	encoded, err := marshalPayload(payload)
-	if err != nil {
-		return err
-	}
-	return e.Store.UpdateJobPayload(ctx, jobID, encoded)
 }
 
 func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision string) error {
@@ -606,16 +585,16 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 	// the parent's delegation DAG. The parent advance below may enqueue a dependent
 	// that integrates this leg (#332); if the commit ran later (in the switch), the
 	// leg that *triggered* the integration would not yet be on its branch and its
-	// work would be missing from the merge. The task/PR finalizer path commits its
-	// own way, so this only covers PR-less delegation legs; it is a no-op otherwise.
-	if job.Type == "implement" && payload.Result.Decision == "implemented" && !e.implementationNeedsFinalizer(ctx, payload) {
+	// work would be missing from the merge. This only covers PR-less delegation
+	// legs; it is a no-op otherwise.
+	if job.Type == "implement" && payload.Result.Decision == "implemented" {
 		if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
 			return err
 		}
 	}
-	// Non-implemented terminal decisions never enter the implementation finalizer,
-	// so a missing PR is already final. Record it before delegated-child policy
-	// handling, whose blocked/failed paths may return early after advancing the parent.
+	// A non-implemented terminal decision leaves a missing PR final. Record it
+	// before delegated-child policy handling, whose blocked/failed paths may
+	// return early after advancing the parent.
 	if job.Type == "implement" && payload.Result.Decision != "implemented" && payload.PullRequest <= 0 {
 		if err := e.recordImplementNoPRAdvance(ctx, job.ID, payload.Result.Decision); err != nil {
 			return err
@@ -762,22 +741,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		if payload.Result.Decision != "implemented" {
 			return nil
 		}
-		finalizerRan := false
-		if e.implementationNeedsFinalizer(ctx, payload) {
-			finalizerRan = true
-			finalized, err := e.ImplementationFinalizer.FinalizeImplementation(ctx, job, payload)
-			if err != nil {
-				return err
-			}
-			encoded, err := marshalPayload(finalized)
-			if err != nil {
-				return err
-			}
-			if err := e.Store.UpdateJobPayload(ctx, job.ID, encoded); err != nil {
-				return err
-			}
-			payload = finalized
-		}
 		// #1277: publish the skip-native-review-fanout intent onto the BRANCH LOCK
 		// before the no-PR early return, so it is a property of the branch rather
 		// than of whoever opens the PR. The persist used to live inside the
@@ -785,13 +748,12 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// intent but did NOT open a PR left the lock reading skip=false — and a PR
 		// opened by hand on that branch minutes later re-armed the native fanout
 		// through the daemon's PR-watcher path (the measured #1275 arm: six review
-		// jobs, the implementer among them). Placed AFTER the finalizer block so it
-		// sees exactly the payload the PR path sees. The write is a bare UPDATE and
+		// jobs, the implementer among them). The write is a bare UPDATE and
 		// never creates a lock, so it can neither establish nor transfer branch
 		// ownership; skipping it on the default (false) keeps the common path free
 		// of an extra UPDATE, since a freshly created lock already defaults to
 		// not-skip.
-		if payload.SkipNativeReviewFanout && !finalizerRan && strings.TrimSpace(payload.Branch) != "" {
+		if payload.SkipNativeReviewFanout && strings.TrimSpace(payload.Branch) != "" {
 			if err := e.Store.SetBranchLockReviewFanout(ctx, payload.Repo, payload.Branch, true); err != nil {
 				return err
 			}
@@ -855,11 +817,9 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			// everywhere.
 			DispatchedBy: job.Agent,
 		}
-		// The branch-lock persist for the daemon's PR-watcher path (trigger 2) now
+		// The branch-lock persist for the daemon's PR-watcher path (trigger 2)
 		// happens above, before the no-PR early return, so it covers the PR arm and
-		// the no-PR arm alike. When the finalizer ran it already wrote the flag
-		// BEFORE opening the PR (closing the #390 TOCTOU), which is why both sites
-		// share the !finalizerRan guard.
+		// the no-PR arm alike.
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
 		// A PR-less review (e.g. a review heartbeat enqueues Action="review" with

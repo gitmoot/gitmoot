@@ -31,27 +31,12 @@ const maxRepairAttempts = 2
 
 type Mailbox struct {
 	store *db.Store
-	// resolveDeliveryWorktree is required by NewMailbox. For implement delivery
-	// it resolves the effective host checkout already selected by the CLI, or
-	// returns an explicit typed exclusion. It is private so production callers
-	// cannot recreate the old optional-field failure with a keyed struct literal.
-	resolveDeliveryWorktree DeliveryWorktreeResolver
 	// advanceOwnership, when set, binds every job this mailbox inserts to a live
 	// supersession advance lease: the insert carries the ownership predicate in its
 	// OWN transaction, so a lease lost between the decision and the write refuses
 	// the enqueue instead of minting a job for a lifecycle that has moved (#1673).
 	// Nil on every ordinary path, which is byte-identical to before.
 	advanceOwnership *db.AdvanceOwnership
-	// CollectChangeSet is the P2a host-import seam. A non-local backend wires a
-	// collector here once it owns an instance lifecycle (P2b); nil preserves the
-	// local backend byte-for-byte. It is consulted once after the delivery sequence
-	// produces a valid result, so repair turns may keep advancing the cumulative
-	// sandbox state without exposing an intermediate materialization on the host.
-	CollectChangeSet func(ctx context.Context, backend execbackend.Backend, jobID string) (*execbackend.ChangeSet, error)
-	// ApplyChangeSet is the host materializer paired with CollectChangeSet. Nil
-	// selects execbackend.ImportChangeSet; the field exists so ordering/failure
-	// tests can put a firing barrier exactly at this mailbox seam.
-	ApplyChangeSet func(ctx context.Context, worktree string, changes execbackend.ChangeSet) error
 	// RecordReviewFindings persists a review job's findings to the #1822 ledger.
 	// Injected because the Mailbox owns the DELIVERY-FAILURE path, where a
 	// partial review is salvaged (#2224), while the writer lives on the Engine
@@ -124,41 +109,10 @@ type Mailbox struct {
 	reviewBlockingSeverity func(repo string) string
 }
 
-// DeliveryWorktreeResolution is the CLI-owned answer to "where did this job
-// actually run?" Exactly one of Path or ExcludedSource must be populated.
-type DeliveryWorktreeResolution struct {
-	Path           string
-	ExcludedSource string
-}
-
-// DeliveryWorktreeResolver injects checkout resolution into workflow without
-// introducing the forbidden workflow -> cli import.
-type DeliveryWorktreeResolver func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error)
-
-// NewMailbox requires every construction site to state its delivery-worktree
-// policy. Use UnavailableDeliveryWorktreeResolver at enqueue-only/ask-only sites;
-// it errors loudly if an implement delivery ever reaches that context.
-func NewMailbox(store *db.Store, resolver DeliveryWorktreeResolver) Mailbox {
-	return Mailbox{store: store, resolveDeliveryWorktree: resolver}
-}
-
-// UnavailableDeliveryWorktreeResolver is the explicit sentinel for construction
-// sites that cannot perform implement delivery. Unlike a nil/default resolver,
-// accidental use fails visibly instead of silently suppressing observation.
-func UnavailableDeliveryWorktreeResolver(site string) DeliveryWorktreeResolver {
-	return func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
-		return DeliveryWorktreeResolution{}, fmt.Errorf("delivery worktree resolution is unavailable at %s", strings.TrimSpace(site))
-	}
-}
-
-// PayloadDeliveryWorktreeResolver is the explicit policy for contexts whose
-// payload already owns the effective checkout (notably focused workflow tests).
-var PayloadDeliveryWorktreeResolver DeliveryWorktreeResolver = func(_ context.Context, _ db.Job, payload JobPayload) (DeliveryWorktreeResolution, error) {
-	path := strings.TrimSpace(payload.WorktreePath)
-	if path == "" {
-		return DeliveryWorktreeResolution{}, errors.New("payload has no delivery worktree path")
-	}
-	return DeliveryWorktreeResolution{Path: path}, nil
+// NewMailbox constructs a Mailbox over store. Optional seams are set on the
+// returned value by the engine (Engine.mailbox) or left nil.
+func NewMailbox(store *db.Store) Mailbox {
+	return Mailbox{store: store}
 }
 
 // ReviewScope is the bounded input for a follow-up review. PreviousHeadSHA is
@@ -302,11 +256,6 @@ type JobRequest struct {
 	RequiredEvents         []db.JobEvent
 	Phase                  string
 	SkipNativeReviewFanout bool
-	// NoFixTarget carries a review dispatched with --no-fix-target (#2054): it
-	// has NO implementer for a changes_requested verdict, and advancement must
-	// not invent one. It has to live on the payload rather than only in a job
-	// event, because AdvanceJob is what decides whether to dispatch a fix.
-	NoFixTarget bool
 	// PostMergeReview marks a review of an already-merged head (#2265 level 2):
 	// its findings become follow-ups for the requesting role, and it never
 	// enters the changes_requested/approved lifecycle or the merge gate.
@@ -518,7 +467,6 @@ type JobPayload struct {
 	EffectiveRuntime       string         `json:"effective_runtime,omitempty"`
 	Phase                  string         `json:"phase,omitempty"`
 	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
-	NoFixTarget            bool           `json:"no_fix_target,omitempty"`
 	PostMergeReview        bool           `json:"post_merge_review,omitempty"`
 	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
 	HumanAnswer            string         `json:"human_answer,omitempty"`
@@ -540,11 +488,10 @@ type JobPayload struct {
 	// ReviewStatusGrade records the evidence strength of an externally-driven
 	// review when it closes. Caller-supplied session inputs are always reported.
 	ReviewStatusGrade evidence.Grade `json:"review_status_grade,omitempty"`
-	// ResultObservation records the engine-owned git diff of an implement
-	// worktree at result-persistence time and its bidirectional comparison with
-	// changes_made. It is recorded independently of result-check mode; the
-	// existing off/warn/block policy decides whether divergence is merely stored,
-	// surfaced, or blocks the terminal gate.
+	// ResultObservation is the engine-owned git diff of an implement worktree
+	// that engine implement delivery recorded at result-persistence time. That
+	// delivery is gone (#2586); the field is read-only history for payloads
+	// written before it, consumed by the proof projection.
 	ResultObservation *ResultObservation `json:"result_observation,omitempty"`
 	// FailureDiagnostics captures process-level crash context when the runtime
 	// session ended WITHOUT producing a gitmoot_result envelope (#806): a phase
@@ -600,11 +547,6 @@ type JobPayload struct {
 	// later runtime_auth/quota/network deferral still carries the at-least-once
 	// side-effect warning. Additive/omitempty (byte-identical when unset).
 	BlockerPreDelivery bool `json:"blocker_pre_delivery,omitempty"`
-	// ResumedSelfDirtyWorktree marks a dead implement job re-delivered into its own
-	// task worktree with the prior attempt's completed work still uncommitted. It
-	// selects the accurate recovery notice below instead of the generic operational
-	// retry reconciliation warning. Additive/omitempty when unset.
-	ResumedSelfDirtyWorktree bool `json:"resumed_self_dirty_worktree,omitempty"`
 	// ReviewPurpose and ReviewModelPool are written by `gitmoot review request`
 	// (#2171). The pool is the ordered provider/model list the router chose for
 	// this purpose; Model holds the entry currently in use. An operational
@@ -673,9 +615,9 @@ type PreparedEnqueue struct {
 //     with no --org-role and no GITMOOT_ORG_ROLE genuinely carries no seat
 //     identity, and recording the channel says so without inventing one.
 //   - request.Agent and request.LeadAgent are NEVER consulted. On a CLI review
-//     dispatch LeadAgent defaults to the reviewer agent itself
-//     (agent_dispatch.go: firstNonEmpty(request.LeadAgent, agent.Name)), so
-//     either would reintroduce reviewer-name attribution as a fallback and make
+//     dispatch request.Agent is the reviewer itself, and on other CLI
+//     dispatches LeadAgent is the dispatching agent, so either would
+//     reintroduce agent-name attribution as a fallback and make
 //     the column read as an answer while carrying the same wrong identity.
 func dispatcherIdentity(request JobRequest) string {
 	for _, candidate := range []string{
@@ -766,14 +708,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// leaves the request exactly as the caller built it.
 	skipNativeReviewFanout := request.SkipNativeReviewFanout
 	pullRequestReady := request.PullRequestReady
-	// #2054 review finding: a review-only declaration MUST be inherited too. A
-	// delegated review child is built by delegationRequest, which copies the
-	// review context (LeadAgent, Reviewers, ReviewRound) and did NOT copy
-	// NoFixTarget, so the declaration held at the root and leaked one level
-	// down. Inheriting it here rather than at delegationRequest is deliberate:
-	// this is the seam every review-creating request already passes through.
-	noFixTarget := request.NoFixTarget
-	if (!skipNativeReviewFanout || !pullRequestReady || !noFixTarget) && strings.TrimSpace(request.ParentJobID) != "" {
+	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
 		if parent, parentErr := m.store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
 			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
 				if parentPayload.SkipNativeReviewFanout {
@@ -781,9 +716,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 				}
 				if parentPayload.PullRequestReady {
 					pullRequestReady = true
-				}
-				if parentPayload.NoFixTarget {
-					noFixTarget = true
 				}
 			}
 		}
@@ -800,71 +732,68 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// Cleanup selectors compare WorktreePath textually with the allocator-derived
 	// obligation path, so managed allocators must preserve their canonical path.
 	payload, err := marshalPayload(JobPayload{
-		Repo:                   request.Repo,
-		Branch:                 request.Branch,
-		PullRequest:            request.PullRequest,
-		PullRequestReady:       pullRequestReady,
-		HeadSHA:                request.HeadSHA,
-		GoalID:                 request.GoalID,
-		TaskID:                 request.TaskID,
-		TaskTitle:              request.TaskTitle,
-		LeadAgent:              request.LeadAgent,
-		Reviewers:              compactStrings(request.Reviewers),
-		ReviewRound:            request.ReviewRound,
-		ReviewScope:            cloneReviewScope(request.ReviewScope),
-		Sender:                 request.Sender,
-		ActingOrgRole:          strings.TrimSpace(request.ActingOrgRole),
-		Instructions:           request.Instructions,
-		Constraints:            compactStrings(request.Constraints),
-		ParentJobID:            request.ParentJobID,
-		DelegationID:           request.DelegationID,
-		DelegationDepth:        request.DelegationDepth,
-		DelegatedBy:            request.DelegatedBy,
-		RootJobID:              request.RootJobID,
-		DispatchedBy:           dispatcherIdentity(request),
-		Deps:                   compactStrings(request.Deps),
-		JobTimeout:             strings.TrimSpace(request.JobTimeout),
-		RetryCount:             request.RetryCount,
-		Fingerprint:            strings.TrimSpace(request.Fingerprint),
-		FailurePolicy:          strings.TrimSpace(request.FailurePolicy),
-		SynthesisRule:          strings.TrimSpace(request.SynthesisRule),
-		DelegationArtifactDir:  request.DelegationArtifactDir,
-		WorktreePath:           request.WorktreePath,
-		ReadOnlyWorktree:       request.ReadOnlyWorktree,
-		ReadOnlySeat:           request.ReadOnlySeat,
-		ReviewNoExecution:      request.ReviewNoExecution,
-		TemplateID:             snapshot.ID,
-		TemplateResolvedCommit: snapshot.ResolvedCommit,
-		TemplateContent:        snapshot.Content,
-		OriginalAgent:          request.OriginalAgent,
-		DelegatedAgent:         request.DelegatedAgent,
-		DelegationReason:       request.DelegationReason,
-		RecentDelegationHashes: request.RecentDelegationHashes,
-		DelegationRepeatCount:  request.DelegationRepeatCount,
-		NonProgressStreak:      request.NonProgressStreak,
-		LastProgressDigest:     request.LastProgressDigest,
-		VerifyAttempt:          request.VerifyAttempt,
-		DelegationFinalize:     request.DelegationFinalize,
-		Model:                  request.Model,
-		Effort:                 request.Effort,
-		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
-		ExecProvider:           strings.TrimSpace(request.ExecProvider),
-		ExecTemplate:           strings.TrimSpace(request.ExecTemplate),
-		PolicyRoutedReview:     request.PolicyRoutedReview,
-		DiskGuardRouted:        request.DiskGuardRouted,
-		ReviewChecksRouted:     request.ReviewChecksRouted,
-		Plan:                   request.Plan,
-		PlanInto:               strings.TrimSpace(request.PlanInto),
-		WorkflowID:             strings.TrimSpace(request.WorkflowID),
-		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
-		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
-		RuntimeConfigDir:       strings.TrimSpace(request.RuntimeConfigDir),
-		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
-		Phase:                  request.Phase,
-		SkipNativeReviewFanout: skipNativeReviewFanout,
-		// #2054: carried onto the payload because AdvanceJob is what records a
-		// changes_requested verdict's ownership of the follow-up.
-		NoFixTarget:              noFixTarget,
+		Repo:                     request.Repo,
+		Branch:                   request.Branch,
+		PullRequest:              request.PullRequest,
+		PullRequestReady:         pullRequestReady,
+		HeadSHA:                  request.HeadSHA,
+		GoalID:                   request.GoalID,
+		TaskID:                   request.TaskID,
+		TaskTitle:                request.TaskTitle,
+		LeadAgent:                request.LeadAgent,
+		Reviewers:                compactStrings(request.Reviewers),
+		ReviewRound:              request.ReviewRound,
+		ReviewScope:              cloneReviewScope(request.ReviewScope),
+		Sender:                   request.Sender,
+		ActingOrgRole:            strings.TrimSpace(request.ActingOrgRole),
+		Instructions:             request.Instructions,
+		Constraints:              compactStrings(request.Constraints),
+		ParentJobID:              request.ParentJobID,
+		DelegationID:             request.DelegationID,
+		DelegationDepth:          request.DelegationDepth,
+		DelegatedBy:              request.DelegatedBy,
+		RootJobID:                request.RootJobID,
+		DispatchedBy:             dispatcherIdentity(request),
+		Deps:                     compactStrings(request.Deps),
+		JobTimeout:               strings.TrimSpace(request.JobTimeout),
+		RetryCount:               request.RetryCount,
+		Fingerprint:              strings.TrimSpace(request.Fingerprint),
+		FailurePolicy:            strings.TrimSpace(request.FailurePolicy),
+		SynthesisRule:            strings.TrimSpace(request.SynthesisRule),
+		DelegationArtifactDir:    request.DelegationArtifactDir,
+		WorktreePath:             request.WorktreePath,
+		ReadOnlyWorktree:         request.ReadOnlyWorktree,
+		ReadOnlySeat:             request.ReadOnlySeat,
+		ReviewNoExecution:        request.ReviewNoExecution,
+		TemplateID:               snapshot.ID,
+		TemplateResolvedCommit:   snapshot.ResolvedCommit,
+		TemplateContent:          snapshot.Content,
+		OriginalAgent:            request.OriginalAgent,
+		DelegatedAgent:           request.DelegatedAgent,
+		DelegationReason:         request.DelegationReason,
+		RecentDelegationHashes:   request.RecentDelegationHashes,
+		DelegationRepeatCount:    request.DelegationRepeatCount,
+		NonProgressStreak:        request.NonProgressStreak,
+		LastProgressDigest:       request.LastProgressDigest,
+		VerifyAttempt:            request.VerifyAttempt,
+		DelegationFinalize:       request.DelegationFinalize,
+		Model:                    request.Model,
+		Effort:                   request.Effort,
+		ExecBackend:              jobRequestExecBackend(request.ExecBackend),
+		ExecProvider:             strings.TrimSpace(request.ExecProvider),
+		ExecTemplate:             strings.TrimSpace(request.ExecTemplate),
+		PolicyRoutedReview:       request.PolicyRoutedReview,
+		DiskGuardRouted:          request.DiskGuardRouted,
+		ReviewChecksRouted:       request.ReviewChecksRouted,
+		Plan:                     request.Plan,
+		PlanInto:                 strings.TrimSpace(request.PlanInto),
+		WorkflowID:               strings.TrimSpace(request.WorkflowID),
+		RuntimeOverride:          strings.TrimSpace(request.RuntimeOverride),
+		RuntimeOverrideRef:       strings.TrimSpace(request.RuntimeOverrideRef),
+		RuntimeConfigDir:         strings.TrimSpace(request.RuntimeConfigDir),
+		EffectiveRuntime:         strings.TrimSpace(request.EffectiveRuntime),
+		Phase:                    request.Phase,
+		SkipNativeReviewFanout:   skipNativeReviewFanout,
 		PostMergeReview:          request.PostMergeReview,
 		Ephemeral:                request.Ephemeral,
 		HumanAnswer:              request.HumanAnswer,
@@ -1247,12 +1176,6 @@ func blockerRetryReconciliationNotice(class string, attempt int) string {
 		"artifacts and reuse/reconcile them instead of redoing or duplicating the work.", attempt, class)
 }
 
-func resumedSelfDirtyWorktreeNotice() string {
-	return "A previous attempt of this job COMPLETED work that is present but UNCOMMITTED in your worktree. " +
-		"It was NOT pushed and NO PR was opened. Review the uncommitted changes, finish/correct as needed, and leave them in place — " +
-		"the finalizer will commit and open the PR. Do not discard prior work."
-}
-
 func (m Mailbox) Run(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
 	return m.run(ctx, jobID, agent, adapter, false)
 }
@@ -1305,9 +1228,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	registeredFreshRef := runtime.IsFreshRef(agent.RuntimeRef)
 	jobPrompt := payload.prompt(job.Type)
 	prompt := prompts.RenderJob(jobPrompt)
-	if payload.ResumedSelfDirtyWorktree {
-		prompt = resumedSelfDirtyWorktreeNotice() + "\n\n" + prompt
-	} else if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
+	if payload.BlockerAttempts > 0 && strings.TrimSpace(payload.BlockerClass) != "" && !payload.BlockerPreDelivery {
 		// This run is an automatic operational-blocker retry (#532): the previous
 		// attempt died on an environment condition, not on its own output, and may
 		// have executed side effects before the blocker hit — so warn the agent its
@@ -1495,22 +1416,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			return AgentResult{}, parseErr
 		}
 	}
-	var deliveryWorktree DeliveryWorktreeResolution
-	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
-		var resolveErr error
-		deliveryWorktree, resolveErr = m.deliveryWorktree(ctx, job, payload)
-		if resolveErr != nil {
-			message := fmt.Sprintf("delivery worktree resolution failed: %v", resolveErr)
-			_ = m.addEvent(ctx, job.ID, "delivery_worktree_resolution_failed", message)
-			_ = m.fail(ctx, job.ID, message)
-			return AgentResult{}, errors.New(message)
-		}
-		if deliveryWorktree.ExcludedSource == "" {
-			if err := m.importDeliveryChangeSet(ctx, job, deliveryWorktree.Path, execBackend); err != nil {
-				return AgentResult{}, err
-			}
-		}
-	}
 
 	if err := m.ensureRunning(ctx, job.ID); err != nil {
 		return AgentResult{}, err
@@ -1538,13 +1443,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 	payload.Result = &result
-	if strings.EqualFold(strings.TrimSpace(job.Type), "implement") {
-		if deliveryWorktree.ExcludedSource != "" {
-			payload.ResultObservation = excludedResultObservation(deliveryWorktree.ExcludedSource, result)
-		} else {
-			payload.ResultObservation = observeResultChanges(ctx, deliveryWorktree.Path, result, execBackend)
-		}
-	}
 	// #2364: a no-execution review's result is checked whatever the
 	// result_checks mode, because the mode is an audit dial and this is the
 	// review's own contract. A failure takes the block path. The agent flag
@@ -1573,7 +1471,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// additionally routes a failure down the same terminal path a malformed result
 	// takes (m.fail). The audit itself is pure and LLM-free.
 	if mode := normalizeResultCheckMode(m.resultCheckMode); mode != ResultChecksOff {
-		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result, Observation: payload.ResultObservation}); len(failed) > 0 {
+		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result}); len(failed) > 0 {
 			payload.ResultChecks = failed
 			summary := SummarizeResultChecks(failed)
 			// Surface in `gitmoot job events`/`job show`. Best-effort in block mode
@@ -1609,47 +1507,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		return AgentResult{}, err
 	}
 	return result, nil
-}
-
-func (m Mailbox) deliveryWorktree(ctx context.Context, job db.Job, payload JobPayload) (DeliveryWorktreeResolution, error) {
-	if m.resolveDeliveryWorktree == nil {
-		return DeliveryWorktreeResolution{}, errors.New("mailbox has no delivery worktree resolver")
-	}
-	resolution, err := m.resolveDeliveryWorktree(ctx, job, payload)
-	if err != nil {
-		return DeliveryWorktreeResolution{}, err
-	}
-	resolution.Path = strings.TrimSpace(resolution.Path)
-	resolution.ExcludedSource = strings.TrimSpace(resolution.ExcludedSource)
-	switch {
-	case resolution.Path != "" && resolution.ExcludedSource != "":
-		return DeliveryWorktreeResolution{}, errors.New("delivery worktree resolver returned both a path and an exclusion source")
-	case resolution.Path == "" && resolution.ExcludedSource == "":
-		return DeliveryWorktreeResolution{}, errors.New("delivery worktree resolver returned neither a path nor an exclusion source")
-	default:
-		return resolution, nil
-	}
-}
-
-func (m Mailbox) importDeliveryChangeSet(ctx context.Context, job db.Job, worktree string, backend execbackend.Backend) error {
-	if !strings.EqualFold(strings.TrimSpace(job.Type), "implement") || m.CollectChangeSet == nil {
-		return nil
-	}
-	changes, err := m.CollectChangeSet(ctx, backend, job.ID)
-	if err == nil && changes != nil {
-		apply := m.ApplyChangeSet
-		if apply == nil {
-			apply = execbackend.ImportChangeSet
-		}
-		err = apply(ctx, worktree, *changes)
-	}
-	if err == nil {
-		return nil
-	}
-	message := fmt.Sprintf("transactional changeset import failed: %v", err)
-	_ = m.addEvent(ctx, job.ID, "changeset_import_failed", message)
-	_ = m.fail(ctx, job.ID, message)
-	return errors.New(message)
 }
 
 func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {

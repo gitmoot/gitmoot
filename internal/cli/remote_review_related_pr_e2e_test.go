@@ -72,7 +72,7 @@ func TestRemoteReviewRelatedPRIsVerifiedInsideTheSandbox(t *testing.T) {
 				t.Fatal(err)
 			}
 			remote := "remote"
-			job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("worker owns checkout")).Enqueue(ctx, workflow.JobRequest{
+			job, err := workflow.NewMailbox(store).Enqueue(ctx, workflow.JobRequest{
 				ID: "related-review", Agent: "related-reviewer", Action: "review",
 				Repo: repo, PullRequest: 2509, HeadSHA: head, Branch: "feature",
 				ReviewPurpose: db.DefaultReviewPurpose, Instructions: "check against the sibling",

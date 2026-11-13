@@ -89,7 +89,7 @@ func TestRemoteReviewEvidenceIsVerifiedInsideTheSandbox(t *testing.T) {
 				t.Fatal(err)
 			}
 			remote := "remote"
-			job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("worker owns checkout")).Enqueue(ctx, workflow.JobRequest{
+			job, err := workflow.NewMailbox(store).Enqueue(ctx, workflow.JobRequest{
 				ID: "evidence-review", Agent: "evidence-reviewer", Action: "review",
 				Repo: repo, PullRequest: 2476, HeadSHA: head, Branch: "feature",
 				ReviewPurpose: db.DefaultReviewPurpose, Instructions: "inspect the evidence",

@@ -15,7 +15,8 @@ import (
 // which today TERMINALLY fail a job through finishQueuedJob — and defer the job
 // for automatic re-dispatch instead. Two sub-classes of the checkout_contention
 // class, both keyed off strings the daemon itself emits (validateTargetCheckoutForRunner /
-// validateReviewCheckout / validateImplementationLock):
+// validateReviewCheckout; the branch-lock string's engine-implement emitter is
+// gone since #2586 and the arm is left for the branch-lock removal, #2591):
 //
 //   - branch-LOCK contention ("branch %s is locked by %s"): another worker holds
 //     the branch lock. It self-heals the moment that worker finishes (#328/#329

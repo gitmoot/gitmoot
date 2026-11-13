@@ -201,16 +201,6 @@ func (b *ledgeredExecutionBackend) Exec(ctx context.Context, instance *execbacke
 	return b.inner.Exec(ctx, instance, command)
 }
 
-func (b *ledgeredExecutionBackend) Collect(ctx context.Context, instance *execbackend.Instance) (execbackend.ChangeSet, error) {
-	if key, ok := b.keyFor(instance); ok {
-		changed, err := b.store.MarkExecBackendAttemptCollecting(context.WithoutCancel(ctx), key)
-		if err != nil || !changed {
-			return execbackend.ChangeSet{}, errors.Join(errors.New("mark execution backend attempt collecting"), err)
-		}
-	}
-	return b.inner.Collect(ctx, instance)
-}
-
 func (b *ledgeredExecutionBackend) Cancel(ctx context.Context, instance *execbackend.Instance) error {
 	return b.teardown(ctx, instance, b.inner.Cancel)
 }

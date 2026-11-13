@@ -37,7 +37,7 @@ func TestForegroundReviewCannotPrepareLocallyInWarningBand(t *testing.T) {
 	_, err = dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		Home: home, RepoFlag: "owner/repo", Agent: "reviewer", Action: "review",
 		PullRequest: 12, HeadSHA: head, Branch: "feature/review", Instructions: "review this",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err == nil {
 		t.Fatal("foreground local review bypassed the E2B-only warning band")
@@ -60,7 +60,7 @@ func TestLocalReviewMonitorStopsOnlyOwnedGeneration(t *testing.T) {
 			output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 				Home: home, RepoFlag: "owner/repo", Agent: "reviewer", Action: "review",
 				PullRequest: 12, HeadSHA: head, Branch: "feature/review", Instructions: "review this",
-				Background: true, ActingOrgRole: "joltra", NoFixTarget: true,
+				Background: true, ActingOrgRole: "joltra",
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -209,7 +209,7 @@ func runLowSpaceMonitorScenario(t *testing.T, trigger, wantReason string) {
 	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		Home: home, RepoFlag: "owner/repo", Agent: "reviewer", Action: "review",
 		PullRequest: 12, HeadSHA: head, Branch: "feature/review", Instructions: "review this",
-		Background: true, ActingOrgRole: "joltra", NoFixTarget: true,
+		Background: true, ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -149,7 +149,7 @@ func TestLocalReviewRelatedPRTreeIsExactAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test")).Enqueue(context.Background(), workflow.JobRequest{
+	job, err := workflow.NewMailbox(store).Enqueue(context.Background(), workflow.JobRequest{
 		ID: "related-review", Agent: "reviewer", Action: "review", Repo: "owner/repo", PullRequest: 12,
 		HeadSHA: strings.Repeat("a", 40), Instructions: "review", ReviewRelatedPRs: related,
 	})

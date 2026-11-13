@@ -407,7 +407,6 @@ func TestAskDispatchKeepsItsBlanketPromptHeadWarning(t *testing.T) {
 	seedDaemonWorkerAgentWithPolicy(t, store, "asker", runtime.ShellRuntime, "true", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	request := reviewDispatchRequest(home, head)
 	request.Agent = "asker"
-	request.LeadAgent = ""
 	request.Action = "ask"
 	request.PullRequest = 0
 	// The BASE is an ancestor of the dispatch head, so the review path is now

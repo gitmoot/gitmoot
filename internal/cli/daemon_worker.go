@@ -221,8 +221,7 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 
 // executionBackendJobWorker is the production daemon constructor. Keeping the
 // lifecycle opt-in at this boundary preserves defaultJobWorker as the existing
-// unit-test/foreground seam: a hand-built worker has no backend instance and
-// therefore can never accidentally receive a live ChangeSet importer.
+// unit-test/foreground seam: a hand-built worker has no backend instance.
 func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) jobWorker {
 	worker := defaultJobWorker(store, stdout, home)
 	worker.ExecutionBackendFactory = worker.defaultExecutionBackend
@@ -253,33 +252,13 @@ func executionBackendJobWorker(store *db.Store, stdout io.Writer, home string) j
 var recoverKillPendingAtWorkerStartup sync.Once
 
 // remoteExecutionJobTypes is the allowlist of job types a non-local execution
-// backend will dispatch.
-//
-// IT WAS "implement" ALONE, AND THAT MADE THE BACKEND UNREACHABLE. The original
-// gate (#1633 slice D) justified itself with "only implement jobs transport
-// changes back to the host", which described the CHANGE-SET path. Then #2203
-// removed implementer dispatch: `agent implement` is gone and DelegationActions
-// is ["ask","review"]. No surviving path creates a dispatchable implement job,
-// so the allowlist named
-// exactly one type that can no longer occur and the remote backend accepted
-// nothing at all. Measured on 658ab6ef: a review dispatch failed with that
-// refusal before any sandbox was provisioned.
-//
-// REVIEW IS SAFE TO ADD BECAUSE THE TRANSPORT CONCERN IS ENFORCED ELSEWHERE, and
-// three times over rather than here:
-//   - workflow/mailbox.go skips collection entirely unless the job type is
-//     implement, so a review never even reads a change set;
-//   - refreshDaemonJobPayloadForRunner and refreshImplementedPayloadForRetry both
-//     require type implement AND decision "implemented" before touching a host
-//     worktree.
-//
-// So this gate was never the thing preventing a stray host write; it only
-// decided what may DISPATCH. A review transports FINDINGS in its result
-// envelope, which is the ordinary adapter return path and needs no change set.
+// backend will dispatch. Engine implement delivery is gone (#2586), so review
+// is the only type a non-local backend runs. A review transports FINDINGS in
+// its result envelope, which is the ordinary adapter return path.
 //
 // "ask" stays out deliberately. It has no worktree contract and no acceptance
 // defined in #1529, so admitting it would be scope rather than capability.
-var remoteExecutionJobTypes = []string{"implement", "review"}
+var remoteExecutionJobTypes = []string{"review"}
 
 func remoteExecutionSupportsJobType(jobType string) bool {
 	jobType = strings.TrimSpace(jobType)
@@ -720,28 +699,24 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		checkout, err = w.checkoutForJob(ctx, job, payload, agent, jobRunner)
 	}
 	if err != nil {
-		if resumedCheckout, resumedPayload, ok := w.resumeSelfDirtyWorktreeForRunner(ctx, job, payload, agent, err, jobRunner); ok {
-			checkout, payload, err = resumedCheckout, resumedPayload, nil
-		} else {
-			// Checkout-contention deferral (#532 slice C): a NON-delegation job whose
-			// daemon pre-flight checkout failed on a classified contention string (a
-			// branch-lock conflict that self-heals, or a dirty/wrong-head checkout that
-			// needs a human) is HELD with a backoff instead of terminally failing —
-			// pre-terminal, so no job.failed precedes the additive job.deferred. Every
-			// other checkout error (and every delegation child) falls through to the
-			// existing terminal path byte-identically.
-			if deferred, deferErr := w.deferCheckoutContention(ctx, job, payload, err); deferErr != nil {
-				writeLine(w.Stdout, "job %s checkout-contention deferral failed: %v", job.ID, deferErr)
-			} else if deferred {
-				writeLine(w.Stdout, "job %s deferred on checkout contention: %v", job.ID, err)
-				return nil
-			}
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		// Checkout-contention deferral (#532 slice C): a NON-delegation job whose
+		// daemon pre-flight checkout failed on a classified contention string (a
+		// branch-lock conflict that self-heals, or a dirty/wrong-head checkout that
+		// needs a human) is HELD with a backoff instead of terminally failing —
+		// pre-terminal, so no job.failed precedes the additive job.deferred. Every
+		// other checkout error (and every delegation child) falls through to the
+		// existing terminal path byte-identically.
+		if deferred, deferErr := w.deferCheckoutContention(ctx, job, payload, err); deferErr != nil {
+			writeLine(w.Stdout, "job %s checkout-contention deferral failed: %v", job.ID, deferErr)
+		} else if deferred {
+			writeLine(w.Stdout, "job %s deferred on checkout contention: %v", job.ID, err)
 			return nil
 		}
+		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
+			return finishErr
+		}
+		_ = w.postJobResultComment(ctx, job.ID, agent, "", err)
+		return nil
 	}
 	deliveryCheckout := checkout
 	adapter, err := w.buildJobAdapterForBackend(execBackend, agent, checkout)
@@ -1236,7 +1211,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		adapter = w.guardRemoteReviewRelatedPRs(adapter, lifecycle, instance, job.ID, payload)
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
-	engine.CollectChangeSet = executionChangeSetCollector(lifecycle, instance, execBackend, job.ID)
 	// Wire the PRE-TERMINAL operational-blocker deferrer (#532 slice E) on the LIVE
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
 	// EventSink for the first-class job.deferred emit. When a delivery-seam failure
@@ -3665,7 +3639,7 @@ func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID 
 			"Do not edit files, create commits, open pull requests, or dispatch more agents unless the summary explicitly requires follow-up.",
 		},
 	}
-	mailbox := workflow.NewMailbox(w.Store, workflow.UnavailableDeliveryWorktreeResolver("temporary worker merge-back enqueue"))
+	mailbox := workflow.NewMailbox(w.Store)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(w.workflowHome())
 	mailbox.ReviewModelPool = reviewModelPoolResolver(w.workflowHome())
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(w.workflowHome())
@@ -4117,8 +4091,8 @@ func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeC
 
 // isReviewPayload reports whether this job is a review, for the class-deadline
 // floor. Both markers are checked because they are written by different
-// producers: the router sets a purpose, and every review dispatch sets
-// NoFixTarget or carries a pool.
+// producers: the router sets a purpose, and a pooled review dispatch carries a
+// pool.
 // isReviewJob takes the JOB TYPE as well as the payload markers (#2192 review,
 // P3). Markers alone missed a review carrying NEITHER a purpose NOR a pool -
 // a markerless review escaped the class deadline entirely, which is the defect
@@ -4457,11 +4431,6 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	if err != nil {
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry backend consumption failed: "+err.Error())
 	}
-	if refreshed, ok, err := w.refreshImplementedPayloadForRetry(ctx, job, payload, jobRunner); err != nil {
-		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry refresh failed: "+err.Error())
-	} else if ok {
-		payload = refreshed
-	}
 	checkout, err := w.checkoutForPostDeliveryAdvance(ctx, job, payload, agent, jobRunner)
 	if err != nil {
 		// THE STRUCTURAL ROUTE (#1673). A child terminalized by the closed-PR sweep can
@@ -4510,28 +4479,6 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 		return err
 	}
 	return engine.ReconcileTerminalDrivingJob(ctx, job.ID)
-}
-
-func (w jobWorker) refreshImplementedPayloadForRetry(ctx context.Context, job db.Job, payload workflow.JobPayload, runner subprocess.Runner) (workflow.JobPayload, bool, error) {
-	if job.Type != "implement" || payload.Result == nil || payload.Result.Decision != "implemented" {
-		return payload, false, nil
-	}
-	checkout, err := w.resolveJobCheckoutForRunner(ctx, job, payload, runner)
-	if err != nil {
-		return workflow.JobPayload{}, false, err
-	}
-	payload, err = refreshDaemonJobPayloadForRunner(ctx, w.Store, checkout, job, payload, runner)
-	if err != nil {
-		return workflow.JobPayload{}, false, err
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return workflow.JobPayload{}, false, err
-	}
-	if err := w.Store.UpdateJobPayload(ctx, job.ID, string(encoded)); err != nil {
-		return workflow.JobPayload{}, false, err
-	}
-	return payload, true, nil
 }
 
 func (w jobWorker) defaultAdapter(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {

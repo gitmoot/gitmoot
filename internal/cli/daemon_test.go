@@ -55,53 +55,6 @@ func mustListJobEvents(t *testing.T, store *db.Store, jobID string) []db.JobEven
 	return events
 }
 
-// stubEnsureGitHub adopts a pre-existing open PR via EnsurePullRequest, the way
-// the real GhClient does when GetOpenPullRequestByHead finds one. It records
-// whether CreatePullRequest was called so the test can prove the finalizer took
-// the idempotent adopt path instead of erroring on a 422 race.
-type stubEnsureGitHub struct {
-	githubtest.NoopClient
-	existing    github.PullRequest
-	ensureCalls int
-	createCalls int
-	ensureErr   error
-}
-
-func (s *stubEnsureGitHub) EnsurePullRequest(context.Context, github.CreatePullRequestInput) (github.PullRequest, error) {
-	s.ensureCalls++
-	if s.ensureErr != nil {
-		return github.PullRequest{}, s.ensureErr
-	}
-	return s.existing, nil
-}
-
-func (s *stubEnsureGitHub) CreatePullRequest(context.Context, github.CreatePullRequestInput) (github.PullRequest, error) {
-	s.createCalls++
-	return github.PullRequest{}, errors.New("CreatePullRequest should not be called when EnsurePullRequest adopts")
-}
-
-// stubSkipFlagAtOpenGitHub records whether the branch lock's skip flag was
-// already persisted at the moment the PR is opened — the #390 invariant: the
-// flag must be durable BEFORE the daemon-watched PR becomes observable, or the
-// PR-watcher can fan out native reviews in the gap.
-type stubSkipFlagAtOpenGitHub struct {
-	githubtest.NoopClient
-	store      *db.Store
-	repo       string
-	branch     string
-	pr         github.PullRequest
-	opened     bool
-	skipAtOpen bool
-}
-
-func (s *stubSkipFlagAtOpenGitHub) EnsurePullRequest(ctx context.Context, _ github.CreatePullRequestInput) (github.PullRequest, error) {
-	s.opened = true
-	if lock, err := s.store.GetBranchLock(ctx, s.repo, s.branch); err == nil {
-		s.skipAtOpen = lock.SkipNativeReviewFanout
-	}
-	return s.pr, nil
-}
-
 // --- #394 PR1: opt-in continuous worker-pool scheduler (--scheduler=pool) ---
 
 const poolSchedulerAskResult = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
@@ -140,7 +93,7 @@ func runMidFlightEnqueueScenario(t *testing.T, usePool bool) string {
 	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
 	adapter.onDeliver = func() {
 		once.Do(func() {
-			_, enqErr = (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(ctx, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
+			_, enqErr = (workflow.NewMailbox(store)).Enqueue(ctx, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
 		})
 	}
 	worker := poolSchedulerWorker(t, store, adapter, usePool)
@@ -634,7 +587,7 @@ func seedDaemonWorkerAgentWithPolicy(t *testing.T, store *db.Store, name string,
 
 func enqueueDaemonWorkerJob(t *testing.T, store *db.Store, request workflow.JobRequest) {
 	t.Helper()
-	if _, err := (workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("test enqueue-only mailbox"))).Enqueue(context.Background(), request); err != nil {
+	if _, err := (workflow.NewMailbox(store)).Enqueue(context.Background(), request); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
 	}
 }

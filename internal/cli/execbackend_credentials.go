@@ -224,9 +224,6 @@ func (b *credentialRevokingExecutionBackend) InstallInstanceFile(ctx context.Con
 func (b *credentialRevokingExecutionBackend) Exec(ctx context.Context, instance *execbackend.Instance, command execbackend.Command) (execbackend.Stream, error) {
 	return b.inner.Exec(ctx, instance, command)
 }
-func (b *credentialRevokingExecutionBackend) Collect(ctx context.Context, instance *execbackend.Instance) (execbackend.ChangeSet, error) {
-	return b.inner.Collect(ctx, instance)
-}
 func (b *credentialRevokingExecutionBackend) Cancel(ctx context.Context, instance *execbackend.Instance) error {
 	defer b.revoke(instance)
 	return b.inner.Cancel(ctx, instance)

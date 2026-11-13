@@ -39,7 +39,7 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 		t.Helper()
 		store := openEngineStore(t)
 		seedAgent(t, store, "reviewer", []string{"review", "implement"}, "owner/repo")
-		mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+		mailbox := NewMailbox(store)
 		mailbox.ReviewModelPool = func(purpose string) []string {
 			askedFor = append(askedFor, purpose)
 			return configured
@@ -142,9 +142,8 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 	// written: review-pool fixtures use sentinel names no default can produce.
 	configured := []string{"sentinel/engine-a", "sentinel/engine-b"}
 	engine := Engine{
-		Store:                   store,
-		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		ReviewModelPool:         func(string) []string { return configured },
+		Store:           store,
+		ReviewModelPool: func(string) []string { return configured },
 	}
 
 	prepared, err := engine.mailbox().PrepareEnqueue(context.Background(), JobRequest{
@@ -393,7 +392,7 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 	// create a new place for the class to live.
 	case reflect.Interface:
 		for _, stub := range []any{
-			&recordingSink{}, &recordingNotifier{}, &fakeImplementationFinalizer{},
+			&recordingSink{}, &recordingNotifier{},
 			&fakeMergeGate{}, &fakeWorktreeManager{},
 		} {
 			candidate := reflect.ValueOf(stub)
@@ -485,8 +484,7 @@ func TestForwardedFuncFieldsComeFromTheirOwnCounterpart(t *testing.T) {
 
 	engine := engineValue.Addr().Interface().(*Engine)
 	engine.Store = openEngineStore(t)
-	engine.ResolveDeliveryWorktree = UnavailableDeliveryWorktreeResolver("test")
-	mailbox := reflect.ValueOf(engine.EnqueueMailbox(nil))
+	mailbox := reflect.ValueOf(engine.EnqueueMailbox())
 
 	for _, name := range checked {
 		answered = ""
@@ -494,47 +492,6 @@ func TestForwardedFuncFieldsComeFromTheirOwnCounterpart(t *testing.T) {
 		if answered != name {
 			t.Errorf("Mailbox.%s is wired from Engine.%s, not from its counterpart", name, answered)
 		}
-	}
-}
-
-// #2188 review, M9: the PR's headline fix was UNPINNED. Deleting the line that
-// installs the caller's sentinel passed every test, including the daemon ones -
-// their `delivered` flag is unreachable because the resolver never fires during
-// Enqueue, so they re-proved pool inheritance under a name that promised more.
-//
-// The assertion has to be in-package: resolveDeliveryWorktree is unexported, so
-// the daemon package structurally cannot see what it is being handed. Driving
-// the seam itself is the only honest check - invoke the delivery path and
-// require the SENTINEL's refusal, not the engine's real resolver.
-func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
-	realResolverRan := false
-	engine := Engine{
-		Store: openEngineStore(t),
-		ResolveDeliveryWorktree: func(context.Context, db.Job, JobPayload) (DeliveryWorktreeResolution, error) {
-			realResolverRan = true
-			return DeliveryWorktreeResolution{Path: "/tmp/engine-owned-checkout"}, nil
-		},
-	}
-
-	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("daemon comment enqueue"))
-	_, err := mailbox.deliveryWorktree(context.Background(), db.Job{ID: "job-1"}, JobPayload{})
-	if err == nil {
-		t.Fatal("delivery resolved: the caller's refusal sentinel was not installed")
-	}
-	if !strings.Contains(err.Error(), "daemon comment enqueue") {
-		t.Fatalf("error = %v, want the caller's sentinel naming its site", err)
-	}
-	if realResolverRan {
-		t.Fatal("the engine's real delivery resolver ran: the sentinel was replaced, not installed")
-	}
-
-	// The inverse direction, so the test cannot pass by refusing everything: a
-	// caller that passes no sentinel inherits the engine's real resolver.
-	if _, err := engine.EnqueueMailbox(nil).deliveryWorktree(context.Background(), db.Job{ID: "job-2"}, JobPayload{}); err != nil {
-		t.Fatalf("EnqueueMailbox(nil) refused delivery: %v", err)
-	}
-	if !realResolverRan {
-		t.Fatal("EnqueueMailbox(nil) did not inherit the engine's delivery resolver")
 	}
 }
 
@@ -547,12 +504,11 @@ func TestEnqueueMailboxInstallsTheCallersDeliverySentinel(t *testing.T) {
 // same defect this file has been bitten by three times.
 func TestUnexportedAndTransformedForwardsCarryTheirEngineValues(t *testing.T) {
 	engine := Engine{
-		Store:                   openEngineStore(t),
-		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		BlockerDeferrer:         func(context.Context, string, error) (bool, error) { return false, nil },
-		ResultCheckMode:         ResultChecksBlock,
+		Store:           openEngineStore(t),
+		BlockerDeferrer: func(context.Context, string, error) (bool, error) { return false, nil },
+		ResultCheckMode: ResultChecksBlock,
 	}
-	mailbox := engine.EnqueueMailbox(UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := engine.EnqueueMailbox()
 
 	if mailbox.resultCheckMode != ResultChecksBlock {
 		t.Errorf("resultCheckMode = %q, want %q", mailbox.resultCheckMode, ResultChecksBlock)
@@ -589,13 +545,12 @@ func TestEmittedEventTimestampsComeFromTheEnginesClock(t *testing.T) {
 	frozen := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
 	sink := &recordingSink{}
 	engine := Engine{
-		Store:                   openEngineStore(t),
-		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
-		EventSink:               sink,
-		Now:                     func() time.Time { return frozen },
+		Store:     openEngineStore(t),
+		EventSink: sink,
+		Now:       func() time.Time { return frozen },
 	}
 
-	mailbox := engine.EnqueueMailbox(nil)
+	mailbox := engine.EnqueueMailbox()
 	if mailbox.emitTerminal == nil {
 		t.Fatal("emitTerminal is not wired with an EventSink set")
 	}
@@ -732,8 +687,7 @@ func TestStructSynthesisFillsUnexportedMembers(t *testing.T) {
 // asserted behaviourally rather than by code pointer.
 func TestUnexportedClosureForwardsAnswerWithTheEnginesOwnPolicy(t *testing.T) {
 	engine := Engine{
-		Store:                   openEngineStore(t),
-		ResolveDeliveryWorktree: UnavailableDeliveryWorktreeResolver("test"),
+		Store: openEngineStore(t),
 		// A VALID severity that is NOT the default. P3 IS
 		// reviewseverity.DefaultBlocking, so the previous P3 sentinel could pass
 		// on the very fallback it was written to exclude - the sentinel rule
@@ -741,7 +695,7 @@ func TestUnexportedClosureForwardsAnswerWithTheEnginesOwnPolicy(t *testing.T) {
 		// what this file's own fixture rule forbids for pool names.
 		ReviewBlockingSeverity: func(string) string { return reviewseverity.P1 },
 	}
-	mailbox := engine.EnqueueMailbox(nil)
+	mailbox := engine.EnqueueMailbox()
 
 	// BEHAVIOURAL IDENTITY, not non-nil: the forward must ANSWER with the
 	// engine's own policy. Non-nil proves the field was set, and a

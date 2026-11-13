@@ -81,7 +81,7 @@ func TestUnlabelledLegacyDisplayEventReadsAsCallerAsserted(t *testing.T) {
 func TestLabellingDoesNotPromoteTheHeadIntoThePayload(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	head := strings.Repeat("c", 40)
 
 	job, err := mailbox.OpenExternalJob(ctx, JobRequest{

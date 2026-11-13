@@ -189,8 +189,11 @@ func TestPoolPassStaysAliveUntilRemoteLaneJobsAreReaped(t *testing.T) {
 	}
 	passDone := make(chan error, 1)
 	go func() {
-		defer tracker.endPool("owner/repo")
-		passDone <- runQueuedJobsForRepoPoolTracked(ctx, worker, 1, 1, "owner/repo", "", tracker)
+		// End the pass BEFORE reporting it done: a deferred endPool ran after
+		// the send and raced the tryBeginPool re-check below.
+		err := runQueuedJobsForRepoPoolTracked(ctx, worker, 1, 1, "owner/repo", "", tracker)
+		tracker.endPool("owner/repo")
+		passDone <- err
 	}()
 	for range 2 {
 		select {

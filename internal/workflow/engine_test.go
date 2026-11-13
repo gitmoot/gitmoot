@@ -671,12 +671,11 @@ func TestEngineAdvanceImplementNoPREventConcurrent(t *testing.T) {
 	}
 }
 
-func TestEngineAdvanceImplementDoesNotFinalizeWithoutTaskWorktree(t *testing.T) {
+func TestEngineAdvanceImplementWithoutPullRequestSkips(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 	engine := testEngine(store)
-	engine.ImplementationFinalizer = fakeImplementationFinalizer{err: errors.New("finalizer should not run")}
 	insertCompletedJob(t, store, db.Job{
 		ID:    "implement-job",
 		Agent: "lead",
@@ -708,126 +707,6 @@ func TestEngineAdvanceImplementDoesNotFinalizeWithoutTaskWorktree(t *testing.T) 
 	t.Fatalf("events = %+v, want advance_skipped_no_pr", events)
 }
 
-func TestEngineAdvanceImplementUsesFinalizerBeforePullRequestFlow(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	engine.RequiredReviewers = []string{"audit"}
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-7",
-		RepoFullName: "gitmoot/gitmoot",
-		GoalID:       "goal-1",
-		Title:        "Workflow Engine",
-		State:        string(TaskImplementing),
-		Branch:       "task-7",
-		WorktreePath: "/tmp/gitmoot-task-7",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	engine.ImplementationFinalizer = fakeImplementationFinalizer{
-		payload: JobPayload{
-			Repo:        "gitmoot/gitmoot",
-			Branch:      "task-7",
-			PullRequest: 8,
-			HeadSHA:     "head-after-finalizer",
-			GoalID:      "goal-1",
-			TaskID:      "task-7",
-			TaskTitle:   "Workflow Engine",
-			LeadAgent:   "lead",
-			Result:      &AgentResult{Decision: "implemented", Summary: "done locally"},
-		},
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "implement-job",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:      "gitmoot/gitmoot",
-		Branch:    "task-7",
-		GoalID:    "goal-1",
-		TaskID:    "task-7",
-		TaskTitle: "Workflow Engine",
-		LeadAgent: "lead",
-		Result:    &AgentResult{Decision: "implemented", Summary: "done locally"},
-	})
-
-	if err := engine.AdvanceJob(ctx, "implement-job"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-
-	latest := mustJob(t, store, "implement-job")
-	payload, err := unmarshalPayload(latest.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload returned error: %v", err)
-	}
-	if payload.PullRequest != 8 || payload.HeadSHA != "head-after-finalizer" {
-		t.Fatalf("payload PR/head = #%d %q", payload.PullRequest, payload.HeadSHA)
-	}
-	assertTaskState(t, store, "task-7", TaskReviewing)
-	mustJob(t, store, "review-audit-task-7-review-1")
-}
-
-func TestEngineAdvanceExistingPullRequestImplementStillUsesFinalizer(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	if err := store.UpsertTask(ctx, db.Task{
-		ID:           "task-7",
-		RepoFullName: "gitmoot/gitmoot",
-		GoalID:       "goal-1",
-		Title:        "Workflow Engine",
-		State:        string(TaskImplementing),
-		Branch:       "task-7",
-		WorktreePath: "/tmp/gitmoot-task-7",
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	engine.ImplementationFinalizer = fakeImplementationFinalizer{
-		payload: JobPayload{
-			Repo:        "gitmoot/gitmoot",
-			Branch:      "task-7",
-			PullRequest: 7,
-			HeadSHA:     "head-after-finalizer",
-			GoalID:      "goal-1",
-			TaskID:      "task-7",
-			TaskTitle:   "Workflow Engine",
-			LeadAgent:   "lead",
-			Result:      &AgentResult{Decision: "implemented", Summary: "fixed requested changes"},
-		},
-	}
-	insertCompletedJob(t, store, db.Job{
-		ID:    "implement-job",
-		Agent: "lead",
-		Type:  "implement",
-	}, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-7",
-		PullRequest: 7,
-		HeadSHA:     "old-head",
-		GoalID:      "goal-1",
-		TaskID:      "task-7",
-		TaskTitle:   "Workflow Engine",
-		LeadAgent:   "lead",
-		Result:      &AgentResult{Decision: "implemented", Summary: "fixed requested changes"},
-	})
-
-	if err := engine.AdvanceJob(ctx, "implement-job"); err != nil {
-		t.Fatalf("AdvanceJob returned error: %v", err)
-	}
-
-	latest := mustJob(t, store, "implement-job")
-	payload, err := unmarshalPayload(latest.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload returned error: %v", err)
-	}
-	if payload.HeadSHA != "head-after-finalizer" {
-		t.Fatalf("payload HeadSHA = %q, want finalizer head", payload.HeadSHA)
-	}
-}
-
 func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -839,7 +718,7 @@ func TestEngineRunJobAdvancesCompletedResult(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -882,7 +761,7 @@ func TestEngineRunJobWrapsPostSuccessAdvanceError(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"implemented","summary":"opened PR","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
-	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -929,7 +808,7 @@ func TestEngineRunJobDeliveryFailureStaysRaw(t *testing.T) {
 	agent := runtime.Agent{Name: "lead", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "lead"}
 	// A delivery error before the result is stored.
 	adapter := &fakeDelivery{err: errors.New("runtime exploded")}
-	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:        "implement-job",
 		Agent:     "lead",
 		Action:    "implement",
@@ -1058,7 +937,7 @@ func TestEngineRunJobPreflightsPolicyBeforeDelivery(t *testing.T) {
 			delivered = true
 		},
 	}
-	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).Enqueue(ctx, JobRequest{
+	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:          "implement-job",
 		Agent:       "lead",
 		Action:      "implement",
@@ -2604,8 +2483,7 @@ func openEngineStore(t *testing.T) *db.Store {
 
 func testEngine(store *db.Store) Engine {
 	return Engine{
-		Store:                   store,
-		ResolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test engine explicit no worktree"),
+		Store: store,
 		JobID: func(request JobRequest) string {
 			parts := []string{request.Action, request.Agent, request.TaskID}
 			if request.ReviewRound != "" {
@@ -5017,18 +4895,6 @@ func TestQuorumThresholdExceedingDelegationCountRejected(t *testing.T) {
 	if err := validateAgentResult(result); err != nil {
 		t.Fatalf("quorum K=2 with 2 delegations (== len) must be valid: %v", err)
 	}
-}
-
-type fakeImplementationFinalizer struct {
-	payload JobPayload
-	err     error
-}
-
-func (f fakeImplementationFinalizer) FinalizeImplementation(context.Context, db.Job, JobPayload) (JobPayload, error) {
-	if f.err != nil {
-		return JobPayload{}, f.err
-	}
-	return f.payload, nil
 }
 
 type fakeMergeGate struct {

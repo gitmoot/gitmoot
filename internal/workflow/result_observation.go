@@ -1,8 +1,6 @@
 package workflow
 
 import (
-	"context"
-	"fmt"
 	"path"
 	"regexp"
 	"sort"
@@ -10,8 +8,6 @@ import (
 	"unicode"
 
 	"github.com/gitmoot/gitmoot/internal/evidence"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
 const (
@@ -130,83 +126,6 @@ type ResultObservation struct {
 	Error            string              `json:"error,omitempty"`
 }
 
-// excludedResultObservation records that a caller deliberately excluded a job
-// shape from worktree observation. Keeping the exclusion typed and persisted
-// makes it distinguishable from a completed observation with no divergence.
-func excludedResultObservation(source string, result AgentResult) *ResultObservation {
-	return &ResultObservation{
-		Source:           strings.TrimSpace(source),
-		TouchedFiles:     []string{},
-		Changes:          reportedChangeObservations(result.ChangesMade),
-		ClaimedOnlyFiles: []string{},
-		UnclaimedFiles:   []string{},
-		UnboundClaims:    []string{},
-		Divergent:        false,
-	}
-}
-
-// observeResultChanges captures the worktree diff and binds it to the result.
-// Callers must resolve or explicitly exclude the delivery worktree before this
-// function is reached; an empty path is therefore recorded as an observation
-// error rather than disappearing as nil.
-func observeResultChanges(ctx context.Context, worktree string, result AgentResult, backend execbackend.Backend) *ResultObservation {
-	worktree = strings.TrimSpace(worktree)
-	if worktree == "" {
-		return &ResultObservation{
-			Source:           ResultObservationSourceWorktreeDiff,
-			TouchedFiles:     []string{},
-			Changes:          reportedChangeObservations(result.ChangesMade),
-			ClaimedOnlyFiles: []string{},
-			UnclaimedFiles:   []string{},
-			UnboundClaims:    []string{},
-			Divergent:        false,
-			Error:            "observe worktree diff: resolved delivery worktree is empty",
-		}
-	}
-	files, err := execbackend.Consume(backend, func() ([]string, error) {
-		return changedWorktreeFiles(ctx, worktree)
-	}, func() ([]string, error) {
-		return changedWorktreeFiles(ctx, worktree)
-	})
-	if err != nil {
-		return &ResultObservation{
-			Source:           ResultObservationSourceWorktreeDiff,
-			TouchedFiles:     []string{},
-			Changes:          reportedChangeObservations(result.ChangesMade),
-			ClaimedOnlyFiles: []string{},
-			UnclaimedFiles:   []string{},
-			UnboundClaims:    []string{},
-			Divergent:        false,
-			Error:            err.Error(),
-		}
-	}
-	return compareResultChanges(result.ChangesMade, files)
-}
-
-func changedWorktreeFiles(ctx context.Context, worktree string) ([]string, error) {
-	runner := subprocess.ExecRunner{}
-	tracked, err := runner.Run(ctx, worktree, "git", "diff", "--name-only", "--no-renames", "--no-ext-diff", "--ignore-submodules=none", "-z", "HEAD", "--")
-	if err != nil {
-		return nil, fmt.Errorf("observe tracked worktree diff: %w", err)
-	}
-	untracked, err := runner.Run(ctx, worktree, "git", "ls-files", "--others", "--exclude-standard", "-z", "--")
-	if err != nil {
-		return nil, fmt.Errorf("observe untracked worktree files: %w", err)
-	}
-	files := append(splitNULPaths(tracked.Stdout), splitNULPaths(untracked.Stdout)...)
-	return sortedUniquePaths(files), nil
-}
-
-func splitNULPaths(output string) []string {
-	var paths []string
-	for _, item := range strings.Split(output, "\x00") {
-		if item = strings.TrimSpace(item); item != "" {
-			paths = append(paths, item)
-		}
-	}
-	return paths
-}
-
 func sortedUniquePaths(files []string) []string {
 	seen := make(map[string]struct{}, len(files))
 	for _, file := range files {
@@ -221,91 +140,6 @@ func sortedUniquePaths(files []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func reportedChangeObservations(claims []string) []ChangeObservation {
-	out := make([]ChangeObservation, 0, len(claims))
-	for _, claim := range claims {
-		out = append(out, ChangeObservation{
-			Claim:        claim,
-			ClaimedFiles: []string{},
-			Observation:  []string{},
-			Grade:        evidence.GradeReported,
-			Divergent:    false,
-		})
-	}
-	return out
-}
-
-func compareResultChanges(claims, touchedFiles []string) *ResultObservation {
-	touchedFiles = sortedUniquePaths(touchedFiles)
-	touched := make(map[string]struct{}, len(touchedFiles))
-	byBase := make(map[string][]string, len(touchedFiles))
-	for _, file := range touchedFiles {
-		touched[file] = struct{}{}
-		base := path.Base(file)
-		byBase[base] = append(byBase[base], file)
-	}
-
-	covered := make(map[string]struct{}, len(touchedFiles))
-	claimedOnly := make(map[string]struct{})
-	unboundClaims := make([]string, 0)
-	changes := make([]ChangeObservation, 0, len(claims))
-	for _, claim := range claims {
-		claimedFiles := claimFilePaths(claim, touchedFiles)
-		observed := make([]string, 0, len(claimedFiles))
-		divergent := len(claimedFiles) == 0
-		exactPaths := len(claimedFiles) > 0
-		if divergent {
-			unboundClaims = append(unboundClaims, claim)
-		}
-		for _, claimed := range claimedFiles {
-			switch {
-			case hasPath(touched, claimed):
-				observed = append(observed, claimed)
-				covered[claimed] = struct{}{}
-			case !strings.Contains(claimed, "/") && len(byBase[claimed]) == 1:
-				// A unique basename can assist an unqualified filename claim, but
-				// it is not evidence that the agent named the observed repo path.
-				// Keep the binding reported rather than upgrading it to observed.
-				match := byBase[claimed][0]
-				observed = append(observed, match)
-				covered[match] = struct{}{}
-				exactPaths = false
-			default:
-				divergent = true
-				claimedOnly[claimed] = struct{}{}
-			}
-		}
-		grade := evidence.GradeReported
-		if !divergent && exactPaths {
-			grade = evidence.GradeObserved
-		}
-		changes = append(changes, ChangeObservation{
-			Claim:        claim,
-			ClaimedFiles: claimedFiles,
-			Observation:  sortedUniquePaths(observed),
-			Grade:        grade,
-			Divergent:    divergent,
-		})
-	}
-
-	unclaimed := make([]string, 0)
-	for _, file := range touchedFiles {
-		if _, ok := covered[file]; !ok {
-			unclaimed = append(unclaimed, file)
-		}
-	}
-	claimedOnlyFiles := setKeys(claimedOnly)
-	return &ResultObservation{
-		Source:           ResultObservationSourceWorktreeDiff,
-		TouchedFiles:     touchedFiles,
-		Changes:          changes,
-		ClaimedOnlyFiles: claimedOnlyFiles,
-		UnclaimedFiles:   unclaimed,
-		UnboundClaims:    unboundClaims,
-		Divergent:        len(claimedOnlyFiles) > 0 || len(unclaimed) > 0 || len(unboundClaims) > 0 || anyDivergentChange(changes),
-	}
 }
 
 func claimFilePaths(claim string, touchedFiles []string) []string {
@@ -372,32 +206,4 @@ func normalizeClaimPath(value string) string {
 func hasPath(paths map[string]struct{}, candidate string) bool {
 	_, ok := paths[candidate]
 	return ok
-}
-
-func setKeys(values map[string]struct{}) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func anyDivergentChange(changes []ChangeObservation) bool {
-	for _, change := range changes {
-		if change.Divergent {
-			return true
-		}
-	}
-	return false
-}
-
-func invalidCapturedBindingClaims(changes []ChangeObservation, touchedFiles []string) []string {
-	var claims []string
-	for _, change := range changes {
-		if len(claimFilePaths(change.Claim, touchedFiles)) > 0 && !change.HasCapturedPathBinding(touchedFiles) {
-			claims = append(claims, change.Claim)
-		}
-	}
-	return claims
 }

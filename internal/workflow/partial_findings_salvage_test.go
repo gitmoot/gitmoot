@@ -36,7 +36,7 @@ func TestSalvagePreservesFindingsFromADeadReview(t *testing.T) {
 		t.Fatalf("WriteFile(findings log) returned error: %v", err)
 	}
 
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := shellCrashAgent(`echo "reviewer died before its envelope" >&2; exit 9`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -112,7 +112,7 @@ func TestSalvageIsANoOpWithoutALog(t *testing.T) {
 	store := openTestStore(t)
 	worktree := t.TempDir() // deliberately empty: no findings log
 
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := shellCrashAgent(`echo "no log written" >&2; exit 3`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
@@ -175,7 +175,7 @@ func TestSalvageWritesTheLedgerOnlyAfterTheJobIsFailed(t *testing.T) {
 	}
 
 	var observed []string
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	mailbox.RecordReviewFindings = func(ctx context.Context, jobID string) error {
 		job, err := store.GetJob(ctx, jobID)
 		if err != nil {
@@ -213,7 +213,7 @@ func TestSalvageSkipsTheLedgerWhenNothingWasSalvaged(t *testing.T) {
 	store := openTestStore(t)
 
 	calls := 0
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	mailbox.RecordReviewFindings = func(context.Context, string) error { calls++; return nil }
 
 	agent := shellCrashAgent(`exit 4`)
@@ -249,7 +249,7 @@ func TestSalvageSkipsTheLedgerWhenTheJobIsNotFailed(t *testing.T) {
 	store := openTestStore(t)
 
 	calls := 0
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	mailbox.RecordReviewFindings = func(context.Context, string) error { calls++; return nil }
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{

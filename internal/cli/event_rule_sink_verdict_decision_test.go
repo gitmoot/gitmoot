@@ -187,14 +187,10 @@ func reviewVerdictWakeRun(t *testing.T, ctx context.Context, fx reviewVerdictFix
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "printf ok", []string{"review"}, "owner/repo")
 
 	sink := &recordingSink{}
-	engine := workflow.Engine{
-		Store:                   store,
-		ResolveDeliveryWorktree: workflow.UnavailableDeliveryWorktreeResolver("1945 review wake test"),
-		EventSink:               sink,
-	}
+	engine := workflow.Engine{Store: store, EventSink: sink}
 	applyReviewPolicy(&engine, root)
 
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("1945 review wake test"))
+	mailbox := workflow.NewMailbox(store)
 	if _, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID: fx.jobID, Agent: "audit", Action: "review", Repo: "owner/repo",
 		Branch: "task-branch", PullRequest: fx.pullRequest, HeadSHA: "head1945",

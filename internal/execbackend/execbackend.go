@@ -5,9 +5,10 @@
 //
 // The default backend is "local". P1 introduced its selector as a passthrough;
 // P2b adds the job-scoped lifecycle in lifecycle.go and executes a daemon job in
-// a distinct same-filesystem Git worktree. Host-side checkout/finalizer commands
-// retain their existing runner while runtime delivery uses InstanceRunner and
-// returns changes through BuildChangeSet/ImportChangeSet.
+// a distinct same-filesystem Git worktree. Host-side checkout commands retain
+// their existing runner while runtime delivery uses InstanceRunner; SyncIn
+// carries the host checkout into the instance through BuildChangeSet/
+// ImportChangeSet.
 // Where P1 carries a resolved selection into adapter construction, that route
 // consumes it through Consume. Local and Remote are explicit positional arms;
 // any other parsed backend is refused at runtime. Adding a backend to

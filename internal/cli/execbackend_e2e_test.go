@@ -79,13 +79,15 @@ func execBackendDispatchAsk(t *testing.T, home string) string {
 	return output.JobID
 }
 
-// execBackendDispatchImplement enqueues the implement vehicle needed to reach
-// daemon backend construction without involving implementation preflight.
-func execBackendDispatchImplement(t *testing.T, store *db.Store) string {
+// execBackendDispatchReview enqueues the review vehicle needed to reach daemon
+// backend construction: review is the only type a non-local backend accepts,
+// so the type allowlist cannot pre-empt the backend refusal under test.
+func execBackendDispatchReview(t *testing.T, store *db.Store) string {
 	t.Helper()
-	const jobID = "exec-backend-implement-probe"
+	const jobID = "exec-backend-review-probe"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: jobID, Agent: "shell-asker", Action: "implement", Repo: "owner/repo", Branch: "exec-backend-probe",
+		ID: jobID, Agent: "shell-asker", Action: "review", Repo: "owner/repo", Branch: "exec-backend-probe",
+		PullRequest: 1, HeadSHA: "0123456789abcdef0123456789abcdef01234567",
 	})
 	return jobID
 }
@@ -310,7 +312,7 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyDaemonE2E(t *testing.T) {
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "must-not-run-resolved-remote-daemon")
 	home, store := effectiveRuntimeE2EHome(t, runtimeOverrideShellScript(marker))
-	jobID := execBackendDispatchImplement(t, store)
+	jobID := execBackendDispatchReview(t, store)
 
 	previousResolver := daemonJobExecBackendFor
 	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, config.RemoteExecConfig, error) {
@@ -544,13 +546,6 @@ func TestDaemonWorkflowGitHubRoutesConsumeResolvedSubprocessRunner(t *testing.T)
 	}
 	checkout := t.TempDir()
 	engine := daemonWorkflowEngineForRunner(nil, source, checkout, "", runner, nil)
-	finalizer, ok := engine.ImplementationFinalizer.(daemonImplementationFinalizer)
-	if !ok {
-		t.Fatalf("implementation finalizer = %T, want daemonImplementationFinalizer", engine.ImplementationFinalizer)
-	}
-	if err := finalizer.githubClient(checkout).Ping(context.Background()); !errors.Is(err, errP2ProbeSubprocessReached) {
-		t.Fatalf("finalizer GitHub error = %v, want resolved p2-probe runner refusal", err)
-	}
 	gate, ok := engine.MergeGate.(daemonMergeGate)
 	if !ok {
 		t.Fatalf("merge gate = %T, want daemonMergeGate", engine.MergeGate)

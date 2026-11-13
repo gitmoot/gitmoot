@@ -73,10 +73,6 @@ func (*ledgerTestBackend) Exec(context.Context, *execbackend.Instance, execbacke
 	return nil, errors.New("not executed")
 }
 
-func (*ledgerTestBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
-	return execbackend.ChangeSet{}, nil
-}
-
 func (b *ledgerTestBackend) Cancel(context.Context, *execbackend.Instance) error {
 	b.cancels++
 	return b.cancelErr

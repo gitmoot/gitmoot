@@ -26,7 +26,7 @@ func TestRemoteExecutionBackendStillRefusesAsk(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgent(t, store, "remote-ask-agent", runtime.ShellRuntime, heartbeatShellResultScript, []string{"ask"}, "owner/repo")
 
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("must refuse before checkout"))
+	mailbox := workflow.NewMailbox(store)
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-ask-still-refused", Agent: "remote-ask-agent", Action: "ask",
 		Repo: "owner/repo", Instructions: "must not provision",

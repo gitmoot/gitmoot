@@ -112,7 +112,7 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	job, err := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("worker owns checkout")).Enqueue(ctx, workflow.JobRequest{
+	job, err := workflow.NewMailbox(store).Enqueue(ctx, workflow.JobRequest{
 		ID: "remote-review-exact-head", Agent: "remote-review-agent", Action: "review",
 		Repo: repo, PullRequest: 2281, HeadSHA: head, Branch: "feature",
 		ReviewPurpose: db.DefaultReviewPurpose, Instructions: "review the exact head",
