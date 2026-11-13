@@ -62,7 +62,6 @@ var (
 	// does not re-derive them, and enforced so the list cannot rot.
 	unpinnedSectionHeaderSites = []string{
 		"edit_compat.go::configSectionAtParseError",
-		"orchestrate.go::LoadEventsPolicy",
 		"orchestrate.go::LoadOrchestratePolicy",
 		"org.go::parseOrgContent",
 		"stale_tasks.go::LoadDelegationWorktreeTTL",
