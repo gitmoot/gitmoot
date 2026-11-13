@@ -65,9 +65,9 @@ func TestOrgRosterSeamIsTheOnlyResolveCallSite(t *testing.T) {
 		}
 		if entry.IsDir() {
 			name := entry.Name()
-			// The module's Go source lives outside these; website/ and node
-			// trees hold no production Go and slow the walk down.
-			if name == ".git" || name == "node_modules" || name == "website" || name == "testdata" {
+			// The module's Go source lives outside these; node trees hold no
+			// production Go and slow the walk down.
+			if name == ".git" || name == "node_modules" || name == "testdata" {
 				return filepath.SkipDir
 			}
 			return nil

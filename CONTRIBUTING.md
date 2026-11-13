@@ -50,17 +50,6 @@ example, `os.StartProcess` or `syscall.ForkExec`) are also invisible to it.
 Generated files, test files, and files outside `internal/cli`,
 `internal/workflow`, and `internal/daemon` are excluded from the scan.
 
-For docs:
-
-```sh
-cd website
-npm install
-npm run build
-```
-
-The docs build regenerates the ignored `website/static/llms-full.txt` through
-`npm run build:llms`.
-
 ## Continuous Integration
 
 A GitHub Actions workflow named `CI` (`.github/workflows/ci.yml`) enforces the
@@ -84,26 +73,17 @@ core packages. CI does not run the live
 multi-runtime (codex/claude/kimi) E2E — that needs runtime auth and stays a
 manual step.
 
-## Docs And LLM Context
+## Docs
 
-Public docs live in `website/docs`. Root docs under `docs/` and skill
-references under `skills/gitmoot/references/` are canonical source material for
-agent-facing details.
-
-When updating docs:
-
-- keep `website/docs` in sync with current root docs and skill references
-- update `website/static/llms.txt` when a new important public docs page exists
-- update `website/scripts/build-llms-full.mjs` when agents need fuller context
-- run `cd website && npm run build`
-- quote Mermaid node labels that contain paths or punctuation, for example
-  `P["/var/www/gitmoot-docs"]`
+There is no docs site. The packaged skill (`skills/gitmoot/SKILL.md` and
+`skills/gitmoot/references/`) is the only reference; update it in the same PR as
+any user-facing change.
 
 ## Style
 
 - Prefer existing repo patterns over new abstractions.
 - Keep user-facing command examples runnable.
-- Put full flag matrices in reference docs, not every workflow page.
+- Put full flag matrices in the skill's `references/CLI.md`, not every workflow page.
 - Do not commit caches, local state, logs, generated reports, secrets,
   downloaded release artifacts, or runtime transcripts.
 - Do not paste tokens into issues, PRs, docs, or logs.

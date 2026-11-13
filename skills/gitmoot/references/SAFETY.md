@@ -297,7 +297,6 @@ an external selected workfile receives a file-only read grant. Missing,
 unsatisfying, or unstageable commands are shadowed by engine-owned exit-126
 commands; inherited `PATH` remains available for ordinary system tools but
 cannot fall through to an ungranted host runtime.
-See `docs/troubleshooting.md` for diagnostics and staging boundaries.
 
 Claude runtime credentials live only in the owner-readable (mode `0600`)
 `~/.gitmoot/runtime-auth.env`. Write them with `gitmoot auth set claude`, which

@@ -285,7 +285,7 @@ func TestPollOnceExternallyMergedForkMirrorLeavesLocalTaskAlone(t *testing.T) {
 }
 
 // TestMergeGateMarkerAppliesMatchesDocumentedStates pins the state list the docs
-// promise. Round-8 review found docs/troubleshooting.md and the website page
+// promise. Round-8 review found the then-existing troubleshooting docs
 // claiming that any task "parked for a human or terminal" gets the not-applied
 // clearance, while blocked and awaiting_human in fact KEEP the marker. A prose
 // sentence cannot fail; this table can.
