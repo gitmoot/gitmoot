@@ -47,7 +47,6 @@ func TestMailboxOrgScopeGate(t *testing.T) {
 	for _, request := range []JobRequest{
 		{ID: "automated-local", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local"},
 		{ID: "comment", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "commenter"},
-		{ID: "heartbeat", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "heartbeat"},
 		{ID: "child", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "worker", ParentJobID: "parent"}, {ID: "exempt", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local", PolicyExempt: "exempt"},
 	} {
 		if _, err := mb.Enqueue(ctx, request); err != nil {

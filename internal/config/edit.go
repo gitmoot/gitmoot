@@ -78,21 +78,17 @@ type ConfigScalar struct {
 	str   *string
 	num   *int
 	float *float64
-	flag  *bool
 	list  []string
 }
 
-// StringScalar / IntScalar / BoolScalar / StringListScalar
+// StringScalar / IntScalar / StringListScalar
 // construct a ConfigScalar.
 func StringScalar(v string) ConfigScalar       { return ConfigScalar{str: &v} }
 func IntScalar(v int) ConfigScalar             { return ConfigScalar{num: &v} }
-func BoolScalar(v bool) ConfigScalar           { return ConfigScalar{flag: &v} }
 func StringListScalar(v []string) ConfigScalar { return ConfigScalar{list: v} }
 
 func (c ConfigScalar) toml() string {
 	switch {
-	case c.flag != nil:
-		return strconv.FormatBool(*c.flag)
 	case c.num != nil:
 		return strconv.Itoa(*c.num)
 	case c.float != nil:
@@ -116,9 +112,6 @@ func validateConfigFile(paths Paths) error {
 		return err
 	}
 	if _, err := LoadParallelSessionPolicy(paths); err != nil {
-		return err
-	}
-	if _, err := LoadHeartbeats(paths); err != nil {
 		return err
 	}
 	if _, err := LoadRepoConcurrency(paths); err != nil {

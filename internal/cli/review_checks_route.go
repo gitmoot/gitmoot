@@ -121,7 +121,7 @@ func (r reviewChecksRoute) routed(payload workflow.JobPayload) bool {
 // routeReviewChecks applies the repository's checks routing to a review job
 // before its backend is resolved. Every review reaches the worker here,
 // whichever producer enqueued it (dispatch verbs, native PR fan-out,
-// comment-triggered and heartbeat reviews), so a review of a
+// and comment-triggered reviews), so a review of a
 // configured repository can never silently run locally. The route is
 // persisted onto the queued job, with its review_backend_route_selected event,
 // so admission, the provider cap wait, the cost ledger and every later backend

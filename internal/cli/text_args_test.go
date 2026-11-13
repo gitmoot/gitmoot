@@ -62,9 +62,6 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 		{"job-record", func(h string) []string {
 			return []string{"job", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", h}
 		}, "job record"},
-		{"agent-heartbeat-add", func(h string) []string {
-			return []string{"agent", "heartbeat", "add", "a", "hb", "--repo", "o/r", "--interval", "24h", "--prompt", h}
-		}, "agent heartbeat add"},
 		{"agent-ask", func(h string) []string { return []string{"agent", "ask", "a", h} }, "agent ask"},
 		{"agent-run", func(h string) []string { return []string{"agent", "run", "a", h} }, "agent run"},
 		{"agent-review", func(h string) []string { return []string{"agent", "review", "a", h, "--repo", "o/r", "--pr", "1"} }, "agent review"},
@@ -113,7 +110,6 @@ func TestFreeTextCommandsRefuseFlagLikeText(t *testing.T) {
 		{"job", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
 		{"job", "close", "job-1", "--decision", "approve", "--summary", "-x"},
 		{"job", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", "-x"},
-		{"agent", "heartbeat", "add", "a", "hb", "--repo", "o/r", "--interval", "24h", "--prompt", "-x"},
 		{"agent", "ask", "a", "--bogus"},
 		{"agent", "run", "a", "-x"},
 		{"orchestrate", "a", "-x"},

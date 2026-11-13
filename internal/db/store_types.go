@@ -380,19 +380,6 @@ type NoCIObservation struct {
 	FirstZeroAt string
 }
 
-// HeartbeatState is the persisted state of one named agent heartbeat schedule
-// (#533): when it last ran, when it is next due, and the id/status of its most
-// recent job. The next_due + last_status are what make a heartbeat restart-safe
-// (a restart re-reads next_due rather than firing immediately).
-type HeartbeatState struct {
-	Agent      string
-	Name       string
-	LastRunAt  time.Time
-	NextDueAt  time.Time
-	LastJobID  string
-	LastStatus string
-}
-
 // BranchLockInfo is a branch lock plus its acquisition timestamps, surfaced by
 // ListBranchLocksWithAge for observability (#617): a stranded lock is only obvious
 // when its owner AND age are visible, so `gitmoot lock list` can show how long each

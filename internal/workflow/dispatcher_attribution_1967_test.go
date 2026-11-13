@@ -24,8 +24,8 @@ import (
 // reach the same value through the Sender fallback: removing the explicit
 // DispatchedBy from the trigger leaves this test green (verified by mutation).
 // It pins the end-to-end outcome, not that one line. The line is kept because
-// Sender means the CHANNEL on every other dispatch path ("github", "local",
-// "heartbeat"), so attribution that reads it is correct only by coincidence -
+// Sender means the CHANNEL on every other dispatch path ("github",
+// "local"), so attribution that reads it is correct only by coincidence -
 // and TestPROpenFanoutPrefersTheDispatcherOverTheSenderChannel below is the
 // test that separates the two.
 func TestInProcessPROpenRecordsTheDispatchingSeatOnFanoutChildren(t *testing.T) {

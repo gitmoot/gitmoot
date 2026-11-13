@@ -27,7 +27,7 @@ import (
 // runtime that is NEVER invoked — its session ref is a non-existent named
 // session, so any accidental codex dispatch fails fast) is dispatched with
 // `--runtime shell --session <script>`, where the script is a shell-runtime
-// fixture (the heartbeat/canary E2E pattern) that writes a marker file and
+// fixture (the canary E2E pattern) that writes a marker file and
 // emits a valid approved gitmoot_result.
 //
 // Proven invariants:

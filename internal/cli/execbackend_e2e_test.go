@@ -375,7 +375,7 @@ func TestP2GapJobSubprocessRoutesRefuseLocalFallback(t *testing.T) {
 // implemented, but it cannot reach checkout, git, or verifier execution until
 // Consume has a corresponding runner builder.
 func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	poller := defaultRegisteredRepoPoller(store, 1, false, io.Discard, home, paths.Home)
 	checkout := t.TempDir()
 	repoRecord := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: checkout, PollInterval: "30s"}
@@ -444,7 +444,7 @@ func TestP2GapSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
 }
 
 func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.T) {
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	payload, err := json.Marshal(workflow.JobPayload{ExecBackend: "p2-probe"})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
@@ -493,7 +493,7 @@ func TestP2GapSingleRepoSupervisorAdvanceResolvesJobSubprocessRunner(t *testing.
 // resolved runner compiles, but makes the test fail by executing git locally.
 func TestJobCheckoutRouteConsumesResolvedSubprocessRunner(t *testing.T) {
 	ctx := context.Background()
-	_, _, store := heartbeatLoopE2EHome(t)
+	_, _, store := daemonE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	runner := &p2ProbeSubprocessRunner{}

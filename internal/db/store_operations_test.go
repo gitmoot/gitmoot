@@ -122,8 +122,7 @@ func TestUpdateAgentRuntimeRef(t *testing.T) {
 }
 
 // AgentActiveJobCount is the busy pre-flight behind `agent restart`'s refusal to
-// rebind an agent with in-flight work (cli/agent.go) and the heartbeat
-// scheduler's max_background skip (cli/daemon_supervision.go). Its state list is
+// rebind an agent with in-flight work (cli/agent.go). Its state list is
 // ('queued','running') and BOTH halves are load-bearing: a queued job is work
 // that has not started, so rebinding past it orphans it.
 //

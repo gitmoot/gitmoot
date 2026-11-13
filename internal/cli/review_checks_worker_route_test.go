@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -33,8 +32,8 @@ func appendReviewChecksConfig(t *testing.T, paths config.Paths, body string) {
 
 // producerReviewFixture is a remote-review fixture whose review was enqueued
 // the way every producer other than the dispatch verbs enqueues one (native PR
-// fan-out, comment-triggered, heartbeat, pipeline): a plain Mailbox request
-// with no exec_backend, exec_provider or exec_template. It records the backend
+// fan-out, comment-triggered): a plain Mailbox request with
+// no exec_backend, exec_provider or exec_template. It records the backend
 // and provider view the worker provisioned with.
 type producerReviewFixture struct {
 	*remoteReviewAdmissionFixture
@@ -203,54 +202,5 @@ func TestReviewChecksRoutingRefusesProducerReviewWithoutRuntimeTemplate(t *testi
 	}
 	if !hasJobEvent(events, string(workflow.JobFailed), "owner/repo", `"omp"`, "no e2b_omp_template", "checks_template is unset") {
 		t.Fatalf("failure does not name the runtime-dependent template gap: %+v", events)
-	}
-}
-
-// The heartbeat producer, end to end: a review heartbeat of a configured
-// repository enqueues through its production enqueuer and the worker routes it
-// remote. A heartbeat review has no pull request, so remote admission refuses
-// it loudly; it never runs locally.
-func TestReviewChecksRoutingAppliesToHeartbeatReview(t *testing.T) {
-	base := newRemoteReviewAdmissionFixture(t, runtime.ShellRuntime)
-	appendReviewChecksConfig(t, base.paths, producerChecksE2B)
-	var backends []execbackend.Backend
-	base.worker.ExecutionBackendFactory = func(backend execbackend.Backend, _ config.RemoteExecConfig) (execbackend.ExecutionBackend, error) {
-		backends = append(backends, backend)
-		return base.backend, nil
-	}
-	now := time.Now().UTC()
-	heartbeat := config.Heartbeat{
-		Agent: "remote-review-agent", Name: "nightly", Enabled: true, Repo: "owner/repo",
-		Interval: "1h", Jitter: "0s", Action: "review", Prompt: "review the repository", MaxConcurrent: 1,
-	}
-	if err := runOneHeartbeat(base.ctx, base.store, newHeartbeatEnqueuer(base.store, base.home), nil, heartbeat, base.home, now); err != nil {
-		t.Fatal(err)
-	}
-	job, err := base.store.GetJob(base.ctx, heartbeatJobID(heartbeat.Agent, heartbeat.Name, now))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := base.worker.run(base.ctx, job); err != nil {
-		t.Fatal(err)
-	}
-	job, err = base.store.GetJob(base.ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal([]byte(job.Payload), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["exec_backend"] != "remote" || payload["exec_template"] != "swift-tmpl" || payload["review_checks_routed"] != true {
-		t.Fatalf("heartbeat review payload exec_backend=%v exec_template=%v review_checks_routed=%v; want remote, swift-tmpl, true",
-			payload["exec_backend"], payload["exec_template"], payload["review_checks_routed"])
-	}
-	if job.State == string(workflow.JobSucceeded) {
-		t.Fatalf("heartbeat review of a checks-routed repo succeeded without a remote provision (backends %v): it ran locally", backends)
-	}
-	for _, backend := range backends {
-		if backend != execbackend.Remote {
-			t.Fatalf("heartbeat review reached the %s backend", backend)
-		}
 	}
 }

@@ -241,7 +241,7 @@ func TestKeychainFileValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			home, _, store := heartbeatLoopE2EHome(t)
+			home, _, store := daemonE2EHome(t)
 			tt.setup(t, home, store)
 			code, out, errOut := runKeyTestCommand(t, "key", "add", "TOKEN", "--mode", "proxied", "--home", home)
 			if code == 0 || !strings.Contains(errOut, tt.want) {
@@ -255,7 +255,7 @@ func TestKeychainFileValidation(t *testing.T) {
 }
 
 func TestKeychainFileWrongOwner(t *testing.T) {
-	home, _, store := heartbeatLoopE2EHome(t)
+	home, _, store := daemonE2EHome(t)
 	writeDefaultKeychain(t, home, "TOKEN="+keychainSentinel+"\n")
 	original := keychain.CurrentUID
 	keychain.CurrentUID = func() uint32 { return original() + 1 }

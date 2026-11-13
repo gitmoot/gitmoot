@@ -236,11 +236,11 @@ type rowQuerier interface {
 var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
 
 // AgentActiveJobCount returns how many queued or running jobs reference the
-// named agent. It is the busy pre-flight for `agent restart`'s rebind refusal
-// and for the heartbeat scheduler's max_background skip. BOTH states in the
-// list are load-bearing - a queued job is work that has not started, so
-// rebinding past it orphans it - and TestAgentActiveJobCountCountsQueuedAndRunning
-// pins that, the CLI-level tests of both guards seeding only "running".
+// named agent. It is the busy pre-flight for `agent restart`'s rebind refusal.
+// BOTH states in the list are load-bearing - a queued job is work that has not
+// started, so rebinding past it orphans it - and
+// TestAgentActiveJobCountCountsQueuedAndRunning pins that, the CLI-level test of
+// the guard seeding only "running".
 func (s *Store) AgentActiveJobCount(ctx context.Context, name string) (int, error) {
 	var active int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM jobs WHERE agent = ? AND state IN ('queued', 'running')`, name).Scan(&active); err != nil {
@@ -546,74 +546,6 @@ func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance,
 		}
 	}
 	return instance, nil
-}
-
-// GetHeartbeatState returns the persisted state for one (agent, name) heartbeat.
-// A missing row is NOT an error: it returns ok=false with a zero state, which the
-// daemon treats as "due now" (a zero next_due is in the past). This keeps the
-// table off-by-default — no row exists until a heartbeat first fires.
-func (s *Store) GetHeartbeatState(ctx context.Context, agent, name string) (HeartbeatState, bool, error) {
-	agent = strings.TrimSpace(agent)
-	name = strings.TrimSpace(name)
-	if agent == "" || name == "" {
-		return HeartbeatState{}, false, errors.New("heartbeat agent and name are required")
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT agent, name, last_run_at, next_due_at, last_job_id, last_status
-		FROM heartbeat_state WHERE agent = ? AND name = ?`, agent, name)
-	var (
-		state            HeartbeatState
-		lastRun, nextDue string
-	)
-	if err := row.Scan(&state.Agent, &state.Name, &lastRun, &nextDue, &state.LastJobID, &state.LastStatus); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return HeartbeatState{}, false, nil
-		}
-		return HeartbeatState{}, false, err
-	}
-	state.LastRunAt = parseHeartbeatTime(lastRun)
-	state.NextDueAt = parseHeartbeatTime(nextDue)
-	return state, true, nil
-}
-
-// UpsertHeartbeatState writes (or replaces) a heartbeat's full state. Times are
-// stored as RFC3339Nano UTC text (a zero time becomes empty text, mirroring the
-// table's DEFAULT ”).
-func (s *Store) UpsertHeartbeatState(ctx context.Context, state HeartbeatState) error {
-	state.Agent = strings.TrimSpace(state.Agent)
-	state.Name = strings.TrimSpace(state.Name)
-	if state.Agent == "" || state.Name == "" {
-		return errors.New("heartbeat agent and name are required")
-	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO heartbeat_state(agent, name, last_run_at, next_due_at, last_job_id, last_status)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(agent, name) DO UPDATE SET
-			last_run_at = excluded.last_run_at,
-			next_due_at = excluded.next_due_at,
-			last_job_id = excluded.last_job_id,
-			last_status = excluded.last_status`,
-		state.Agent, state.Name,
-		formatHeartbeatTime(state.LastRunAt), formatHeartbeatTime(state.NextDueAt),
-		strings.TrimSpace(state.LastJobID), strings.TrimSpace(state.LastStatus))
-	return err
-}
-
-func formatHeartbeatTime(value time.Time) string {
-	if value.IsZero() {
-		return ""
-	}
-	return value.UTC().Format(time.RFC3339Nano)
-}
-
-func parseHeartbeatTime(value string) time.Time {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return time.Time{}
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}
-	}
-	return parsed.UTC()
 }
 
 func scanAgent(scanner agentScanner) (Agent, error) {

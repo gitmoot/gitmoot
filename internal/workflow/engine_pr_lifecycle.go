@@ -365,7 +365,7 @@ func (e Engine) prepareNativeReviewWorktree(ctx context.Context, request JobRequ
 	}
 	head := strings.TrimSpace(request.HeadSHA)
 	if head == "" || request.PullRequest <= 0 {
-		// Nothing to pin a worktree to (a PR-less review heartbeat, #564). The
+		// Nothing to pin a worktree to (a PR-less review, #564). The
 		// worker's shared-checkout arm already handles this shape.
 		return request, false, nil
 	}

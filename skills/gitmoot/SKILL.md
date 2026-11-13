@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, heartbeats, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, branch locks, agent-templates, custom prompt agents, orchestration, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
 metadata:
@@ -163,7 +163,7 @@ for its best-effort limits and cancellation behavior. This changes neither
 ordinary non-review admission nor provider spending/concurrency limits.
 
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
-`--action implement`, `task run`, `repo auto-fix`, and the implement heartbeat
+`--action implement`, `task run`, and `repo auto-fix`
 are all gone; an `implement` delegation leg and a `/gitmoot <agent> implement`
 comment are refused. That is the product statement, not a gap: gitmoot reviews,
 seats implement. Do the file changes in THIS session, then record them so the

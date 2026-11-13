@@ -44,7 +44,7 @@ func TestRemoteReviewRelatedPRIsVerifiedInsideTheSandbox(t *testing.T) {
 			}
 			harness := newRemoteLifecycleHarness(t)
 			restoreWriteBitsOnCleanup(t, filepath.Dir(harness.workspace))
-			home, paths, store := heartbeatLoopE2EHome(t)
+			home, paths, store := daemonE2EHome(t)
 			writeRemoteLifecycleConfig(t, paths, harness.control.URL)
 			checkout := createDaemonWorkerGitCheckout(t, "main")
 			makeReviewFixOriginFetchable(t, checkout, "main")

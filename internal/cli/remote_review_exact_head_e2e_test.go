@@ -43,7 +43,7 @@ func TestRemoteReviewRunsOnExactHeadWithBaseAndPriorVerdicts(t *testing.T) {
 	const secret = "ghs_GITMOOT2281hostCREDENTIAL"
 	t.Setenv("HERDR_BIN", filepath.Join(t.TempDir(), "herdr-must-not-run"))
 	harness := newRemoteLifecycleHarness(t)
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
 	contents, err := os.ReadFile(paths.ConfigFile)
 	if err != nil {

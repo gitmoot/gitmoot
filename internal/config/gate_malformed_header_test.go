@@ -157,7 +157,7 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 //	  orchestrate.go:625 (via LoadReviewConfig)
 //	by routing, here: parallel_sessions.go:46, transcripts.go:50, router.go:46,
 //	  daemon_runtime.go:99, github_limiter.go:80, remote_exec.go:72,
-//	  credentials.go:52, heartbeats.go:61
+//	  credentials.go:52
 //	in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
 //	  runtime_registry.go:61, repo_concurrency.go:56
 //
@@ -227,29 +227,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 	})
 
-	t.Run("agents heartbeats", func(t *testing.T) {
-		// The site section.go previously recorded as unpinnable. A same-shape
-		// fixture DID pass under the reverted call site, but only because it
-		// omitted a PRECEDING heartbeat whose field the misattributed key could
-		// overwrite - and because a heartbeat missing repo/interval/prompt fails
-		// validation at both arms, which reads as "unpinnable" rather than as a
-		// broken fixture (#1795 review N2).
-		paths := writeGateConfig(t, "[agents.a.heartbeats.h1]\nrepo = \"owner/repo\"\ninterval = \"1h\"\nprompt = \"first\"\n[agents.a.heartbeats.h2\nprompt = \"second\"\n")
-		beats, err := LoadHeartbeats(paths)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if len(beats) != 1 {
-			t.Fatalf("heartbeats = %d (%+v), want exactly h1: the malformed header must open nothing", len(beats), beats)
-		}
-		if beats[0].Name != "h1" {
-			t.Fatalf("heartbeat name = %q, want h1", beats[0].Name)
-		}
-		if beats[0].Prompt != "first" {
-			t.Fatalf("prompt = %q, want first: the key under the malformed header was misattributed to the previous heartbeat", beats[0].Prompt)
-		}
-	})
-
 	// The valid-header path for the same loaders, so these assertions cannot be
 	// satisfied by a loader that simply ignores everything.
 	t.Run("valid headers still apply their values", func(t *testing.T) {
@@ -272,14 +249,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 // distinguishes pre-header state from a post-malformed-header override, and
 // each was MUTATION-PROVEN: reverting that loader's call site to the inline
 // two-bracket form fails the matching subtest.
-//
-// [agents.*] heartbeats WAS listed here as not-included, on the grounds that a
-// same-shape test passed under the reverted call site. That was wrong twice
-// over and is retracted: the fixture omitted a PRECEDING heartbeat whose field
-// the misattributed key could overwrite, and a heartbeat without
-// repo/interval/prompt fails validation at BOTH arms, so it discriminated
-// nothing. The site is pinned in TestMalformedHeaderRoutingPerCallSite
-// ("agents heartbeats") and counted there (#1795 review N2, P2-1a).
 func TestMalformedHeaderRoutingRemainingLoaders(t *testing.T) {
 	t.Run("result_checks", func(t *testing.T) {
 		mode, err := LoadResultChecksMode(writeGateConfig(t, "[workflow]\nresult_checks = warn\n[workflow\nresult_checks = block\n"))

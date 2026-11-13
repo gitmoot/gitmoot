@@ -2756,42 +2756,6 @@ func (s *Store) CountJobGates(ctx context.Context, jobID string) (total int, ope
 	return total, int(openNull.Int64), nil
 }
 
-// CountActiveJobsByFingerprint counts queued/running jobs whose stored payload
-// carries the given fingerprint — the heartbeat overlap guard (#533), a cousin of
-// countActiveJobsTx that filters on the payload fingerprint instead of the agent
-// column. The fingerprint lives in the JSON payload, and modernc's json_extract
-// raises a SQL error on a malformed payload (see backfillJobRootID), so this
-// counts Go-side: it scans the small set of active rows and tolerates a malformed
-// payload (skipped) rather than aborting. An empty fingerprint matches nothing.
-func (s *Store) CountActiveJobsByFingerprint(ctx context.Context, fingerprint string) (int, error) {
-	fingerprint = strings.TrimSpace(fingerprint)
-	if fingerprint == "" {
-		return 0, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT payload FROM jobs WHERE state IN ('queued', 'running')`)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	count := 0
-	for rows.Next() {
-		var payload string
-		if err := rows.Scan(&payload); err != nil {
-			return 0, err
-		}
-		var probe struct {
-			Fingerprint string `json:"fingerprint"`
-		}
-		if err := json.Unmarshal([]byte(payload), &probe); err != nil {
-			continue
-		}
-		if strings.TrimSpace(probe.Fingerprint) == fingerprint {
-			count++
-		}
-	}
-	return count, rows.Err()
-}
-
 // TransitionJobStateWithEvents is TransitionJobStateWithEvent for a caller that must
 // land the transition AND a durable OBLIGATION in the same commit (#1673).
 //

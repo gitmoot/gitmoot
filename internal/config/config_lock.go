@@ -9,8 +9,8 @@ import (
 
 // lockConfigEdits serialises gitmoot's own read-modify-write edits of the
 // config file (#2502): the daemon now edits it on its own (following a renamed
-// seat agent), so a concurrent `org seat bind/remove`, `config set` or
-// heartbeat edit must not interleave with it and lose one of the two writes.
+// seat agent), so a concurrent `org seat bind/remove` or `config set`
+// edit must not interleave with it and lose one of the two writes.
 // The lock lives beside the config, is advisory, and does not stop a hand edit
 // in an editor. Writers that delegate to another writer must not take it too:
 // flock is per open file description, so nesting would deadlock.

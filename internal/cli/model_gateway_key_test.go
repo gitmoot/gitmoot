@@ -151,7 +151,7 @@ func TestModelGatewayResolverFailsClosedOnARevokedKey(t *testing.T) {
 // THE KEY rather than from config.
 func TestModelGatewayResolverReturnsTheKeychainCredential(t *testing.T) {
 	ctx := context.Background()
-	home, _, store := heartbeatLoopE2EHome(t)
+	home, _, store := daemonE2EHome(t)
 	seedModelGatewayKey(t, store, "GATEWAY_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
 	writeModelGatewayKeychainFile(t, home, "GATEWAY_KEY=super-secret-value\n")
 
@@ -177,7 +177,7 @@ func TestModelGatewayResolverReturnsTheKeychainCredential(t *testing.T) {
 // upstream would reject as an anonymous request.
 func TestModelGatewayResolverFailsClosedWhenTheFileLacksTheKey(t *testing.T) {
 	ctx := context.Background()
-	home, _, store := heartbeatLoopE2EHome(t)
+	home, _, store := daemonE2EHome(t)
 	seedModelGatewayKey(t, store, "ABSENT_VALUE_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
 	seedModelGatewayKey(t, store, "OTHER_KEY", db.KeychainModeProxied, "https://api.example.com/v1", db.KeychainProxyAuthBearer, "")
 	writeModelGatewayKeychainFile(t, home, "OTHER_KEY=some-other-value\n")

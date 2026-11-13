@@ -597,74 +597,7 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	if line := daemonStaleNotificationsLine(paths); line != "" {
 		writeLine(stdout, "%s", line)
 	}
-	for _, line := range daemonHeartbeatLines(paths, *home) {
-		writeLine(stdout, "%s", line)
-	}
 	return 0
-}
-
-// daemonHeartbeatLines surfaces the configured heartbeat schedules and their
-// last-run/next-due/last-status for `gitmoot daemon status` (#533). It is
-// OFF BY DEFAULT: with no [agents.<agent>.heartbeats.<name>] sections it returns
-// no lines, so status output is byte-identical for users without heartbeats. A
-// config-parse or store error degrades to a single "unavailable" line rather than
-// failing status. Each schedule renders as one line so it composes with the other
-// additive status lines.
-func daemonHeartbeatLines(paths config.Paths, home string) []string {
-	heartbeats, err := config.LoadHeartbeats(paths)
-	if err != nil {
-		return []string{"heartbeats: unavailable"}
-	}
-	if len(heartbeats) == 0 {
-		return nil
-	}
-	states := map[string]db.HeartbeatState{}
-	if storeErr := withStore(home, func(store *db.Store) error {
-		for _, heartbeat := range heartbeats {
-			state, ok, err := store.GetHeartbeatState(context.Background(), heartbeat.Agent, heartbeat.Name)
-			if err != nil {
-				return err
-			}
-			if ok {
-				states[heartbeat.Agent+"/"+heartbeat.Name] = state
-			}
-		}
-		return nil
-	}); storeErr != nil {
-		return []string{"heartbeats: unavailable"}
-	}
-	lines := make([]string, 0, len(heartbeats)+1)
-	lines = append(lines, fmt.Sprintf("heartbeats: %d configured", len(heartbeats)))
-	for _, heartbeat := range heartbeats {
-		enabled := "disabled"
-		if heartbeat.Enabled {
-			enabled = "enabled"
-		}
-		line := fmt.Sprintf("  %s/%s: %s action=%s interval=%s repo=%s",
-			heartbeat.Agent, heartbeat.Name, enabled, heartbeat.Action, heartbeat.Interval, heartbeat.Repo)
-		// A runtime override (#611) is surfaced only when set, so heartbeats without
-		// one print byte-identically to the pre-#611 status line.
-		if heartbeat.Runtime != "" {
-			line += fmt.Sprintf(" runtime=%s", heartbeat.Runtime)
-		}
-		if state, ok := states[heartbeat.Agent+"/"+heartbeat.Name]; ok {
-			line += fmt.Sprintf(" last_run=%s next_due=%s last_status=%s",
-				heartbeatTimeForStatus(state.LastRunAt), heartbeatTimeForStatus(state.NextDueAt), firstNonEmpty(state.LastStatus, "-"))
-		} else {
-			line += " last_run=never"
-		}
-		lines = append(lines, line)
-	}
-	return lines
-}
-
-// heartbeatTimeForStatus renders a heartbeat-state timestamp for `daemon status`,
-// printing "-" for the zero time (never run / not yet scheduled).
-func heartbeatTimeForStatus(value time.Time) string {
-	if value.IsZero() {
-		return "-"
-	}
-	return value.UTC().Format(time.RFC3339)
 }
 
 // daemonSchedulerStatusLine reports the running daemon's worker count and

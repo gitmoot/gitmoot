@@ -57,13 +57,13 @@ func (w jobWorker) defaultCheckoutForRunner(ctx context.Context, job db.Job, pay
 				return "", err
 			}
 		case payload.PullRequest <= 0 && strings.TrimSpace(payload.Branch) == "":
-			// A PR-less, branchless review heartbeat (#564: Action="review",
+			// A PR-less, branchless review (#564: Action="review",
 			// PullRequest=0, Branch="") carries no branch identity to validate. Like a
 			// PR-less ask it runs read-only against the registered checkout as-is, and
 			// the engine's PR-less-review guard treats the delivered review as terminal.
 			// Validating it against the empty payload.Branch would reject the registered
 			// default-branch checkout ("checkout branch is main, not job branch "),
-			// wedging the heartbeat at the worker before the engine ever sees it.
+			// wedging the review at the worker before the engine ever sees it.
 		case !isWorktreeLessDelegationChild(payload):
 			// Same empty-payload-worktree escape as the implement arm; a review is
 			// read-only, while taskWorktreeCheckout has already checked any task-table

@@ -117,6 +117,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2594: drops the dead groom verdict and goals tables from a populated
 	// database built from the migrations before it, through the real Open path.
 	realPathTests["TestDeadTablesMigrationDropsPopulatedTablesThroughOpen"] = true
+	// #2585: upgrades a database seeded with heartbeat_state rows through the
+	// real Open path.
+	realPathTests["TestHeartbeatRemovalMigrationOnPreviousSchema"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,
