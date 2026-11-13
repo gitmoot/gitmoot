@@ -95,7 +95,6 @@ func TestMailboxRequireWorkflowExcludesInternalProducers(t *testing.T) {
 	store := openTestStore(t)
 	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	for _, request := range []JobRequest{
-		{ID: "heartbeat", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "heartbeat"},
 		{ID: "child", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "a", ParentJobID: "parent"},
 		{ID: "merge", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "temp", DelegationReason: "temp_worker_merge_back"},
 	} {

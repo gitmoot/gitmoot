@@ -18,7 +18,7 @@ import (
 //
 // WHY THIS IS A TEST RATHER THAN A COMMENT (#1795 review P3-2). Consolidating to
 // one prose derivation made the count auditable in one read but not
-// self-checking, so it could go stale silently three ways: a 27th call site left
+// self-checking, so it could go stale silently three ways: a 26th call site left
 // the prose wrong with the suite green; the hand-maintained file:line citations
 // misaimed on any edit above a cited line, while the behavioural subtests kept
 // passing because they pin BEHAVIOUR and never line numbers; and the pointer
@@ -43,7 +43,6 @@ var (
 		"credentials.go::LoadCredentialsConfig",
 		"daemon_runtime.go::LoadDaemonRuntimeConfig",
 		"github_limiter.go::LoadGitHubLimiterPolicy",
-		"heartbeats.go::LoadHeartbeats",
 		"merge_gate.go::LoadMergeGatePolicy",
 		"orchestrate.go::LoadReviewConfig",
 		"parallel_sessions.go::LoadParallelSessionPolicy",
@@ -117,7 +116,7 @@ func discoverSectionHeaderCallSites(t *testing.T) (sites []string, filesParsed i
 
 // TestSectionHeaderCoverageIsDerivedNotAsserted derives the call-site set from
 // the AST and requires the pinned and unpinned lists to PARTITION it exactly.
-// Add a 27th call site and this fails naming it, whichever file it lands in.
+// Add a 26th call site and this fails naming it, whichever file it lands in.
 func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	sites, filesParsed, distinctFiles := discoverSectionHeaderCallSites(t)
 
@@ -129,8 +128,8 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if len(sites) == 0 {
 		t.Fatal("found 0 sectionHeader call sites: the derivation is broken, not the package")
 	}
-	if !slicesContain(sites, "heartbeats.go::LoadHeartbeats") {
-		t.Fatalf("control site heartbeats.go::LoadHeartbeats missing from %d discovered sites; the walk is not seeing real calls", len(sites))
+	if !slicesContain(sites, "credentials.go::LoadCredentialsConfig") {
+		t.Fatalf("control site credentials.go::LoadCredentialsConfig missing from %d discovered sites; the walk is not seeing real calls", len(sites))
 	}
 
 	classified := map[string]string{}
@@ -160,11 +159,11 @@ func TestSectionHeaderCoverageIsDerivedNotAsserted(t *testing.T) {
 	if want := len(pinnedSectionHeaderSites) + len(unpinnedSectionHeaderSites); len(sites) != want {
 		t.Errorf("discovered %d sectionHeader call sites, classified %d: the lists and the package disagree", len(sites), want)
 	}
-	// 22 since #2584 deleted router.go (23 after #2542 deleted github_remote.go; 24 after #2375 added
+	// 21 since #2585 deleted heartbeats.go (22 after #2584 deleted router.go; 23 after #2542 deleted github_remote.go; 24 after #2375 added
 	// worktrees.go::LoadWorktreeRoot; 23 after #2360 added cleanup_budget.go; 22
 	// after #2203 deleted internal/config/implement_base.go).
-	if distinctFiles != 22 {
-		t.Errorf("sectionHeader call sites span %d files, want 22: update this expectation together with the lists above", distinctFiles)
+	if distinctFiles != 21 {
+		t.Errorf("sectionHeader call sites span %d files, want 21: update this expectation together with the lists above", distinctFiles)
 	}
 }
 

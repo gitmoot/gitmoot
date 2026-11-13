@@ -812,7 +812,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 			ActingOrgRole:           actingOrgRole,
 			// #1967: the implement job that just opened the PR is the dispatcher.
 			// job.Agent is already used as Sender here, but Sender is a channel on
-			// every other path ("github", "local", "heartbeat"), so attribution
+			// every other path ("github", "local"), so attribution
 			// cannot be read off it - it needs its own field to mean the same thing
 			// everywhere.
 			DispatchedBy: job.Agent,
@@ -822,7 +822,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		// the no-PR arm alike.
 		return e.HandlePullRequestOpened(ctx, event)
 	case "review":
-		// A PR-less review (e.g. a review heartbeat enqueues Action="review" with
+		// A PR-less review (Action="review" with
 		// PullRequest=0/Branch="") has no PR-only machinery to route into: an
 		// "approved" decision would runMergeGate against PR #0, erroring every
 		// tick and dropping the review outcome. Mirror the implement arm's guard:

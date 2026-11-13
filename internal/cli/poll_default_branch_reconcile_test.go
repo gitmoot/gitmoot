@@ -42,7 +42,7 @@ func TestPollRepoReconcilesCachedDefaultBranch(t *testing.T) {
 	runGit(t, t.TempDir(), "clone", origin, checkout)
 	runGit(t, checkout, "checkout", "-b", "fix/lan-address-portability")
 
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	ctx := context.Background()
 	repoRecord := db.Repo{
 		Owner: "owner", Name: "repo", CheckoutPath: checkout,
@@ -93,7 +93,7 @@ func TestPollRepoDefaultBranchReconcileIsQuietWhenCorrect(t *testing.T) {
 	checkout := filepath.Join(t.TempDir(), "clone")
 	runGit(t, t.TempDir(), "clone", origin, checkout)
 
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	ctx := context.Background()
 	repoRecord := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: checkout, DefaultBranch: "master", PollInterval: "30s"}
 	if err := store.UpsertRepo(ctx, repoRecord); err != nil {

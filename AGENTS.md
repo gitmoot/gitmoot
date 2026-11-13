@@ -845,8 +845,7 @@ escalations, and an armed merge gate then merged the PR without them.
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
   All DRAIN reviews then run as background engine jobs. Never bypass the shared
   gate with a foreground or persistent-seat reviewer.
-- Before DRAIN activates, disable every `action=review` heartbeat and allow
-  exactly one review-capable agent on each active `gitmoot/*` repository. For a
+- Before DRAIN activates, allow exactly one review-capable agent on each active `gitmoot/*` repository. For a
   PR with a branch lock, the native PR watcher is the sole producer; do not also
   dispatch a manual review. For a PR without a branch lock, native fanout cannot
   run, so only the coordinator may enqueue its single manual review.

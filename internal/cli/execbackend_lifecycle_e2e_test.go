@@ -618,7 +618,7 @@ func writeRemoteLifecycleConnectJSON(t *testing.T, writer io.Writer, flag byte, 
 // before waiting for another job; the startup path may list but must not create.
 func TestExecutionBackendJobWorkerReapsConfiguredRemoteAtStartup(t *testing.T) {
 	harness := newRemoteLifecycleHarness(t)
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
 	staleLocalRoot := filepath.Join(paths.Home, "execbackends", string(execbackend.Local), "stale-local")
 	if err := os.MkdirAll(staleLocalRoot, 0o700); err != nil {
@@ -642,7 +642,7 @@ func TestExecutionBackendJobWorkerReapsConfiguredRemoteAtStartup(t *testing.T) {
 func TestExecutionBackendJobWorkerReportsAndRetriesRemoteStartupReapFailure(t *testing.T) {
 	harness := newRemoteLifecycleHarness(t)
 	harness.listStatus = http.StatusServiceUnavailable
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, harness.control.URL)
 	var output bytes.Buffer
 	worker := executionBackendJobWorker(store, &output, home)

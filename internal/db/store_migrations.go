@@ -3321,4 +3321,11 @@ DROP TABLE IF EXISTS groom_stale_verdicts;
 DROP TABLE IF EXISTS goals;
 DROP TABLE IF EXISTS created_repos;
 	`,
+	// #2585 retires agent heartbeat schedules. The daemon scan, `agent
+	// heartbeat`, and the `daemon status` heartbeat lines are deleted in the
+	// same change, so heartbeat_state has no reader or writer left. The live
+	// home never fired one (0 rows).
+	`
+DROP TABLE IF EXISTS heartbeat_state;
+	`,
 }

@@ -16,8 +16,8 @@ import (
 //
 // It is OFF BY DEFAULT: a config with no [repos.*] sections yields an empty
 // slice and a repo with no matching section behaves EXACTLY as today (the global
-// --workers/--parallel + --scheduler apply). The loader mirrors LoadHeartbeats
-// (Load/applyField/validate, config order preserved).
+// --workers/--parallel + --scheduler apply). The loader uses the
+// Load/applyField/validate shape, config order preserved.
 type RepoConcurrency struct {
 	// Repo is the full name "owner/repo" the section keys on.
 	Repo string
@@ -37,7 +37,7 @@ type RepoConcurrency struct {
 // never errors, so callers that find an empty slice do no further work and every
 // repo keeps today's global behavior.
 //
-// It reuses the same naive line-scanner shape as LoadHeartbeats. Unrelated
+// It reuses the same naive line-scanner shape as the other section loaders. Unrelated
 // sections (agents.*, admission, …) are ignored; a repo name contains
 // a '/', so the section key is the TOML quoted-key form repos."owner/repo".
 func LoadRepoConcurrency(paths Paths) ([]RepoConcurrency, error) {
@@ -149,7 +149,7 @@ func applyRepoConcurrencyDefaults(entry *RepoConcurrency) {
 }
 
 // validateRepoConcurrency enforces the contract with explicit errors (matching
-// the heartbeat/admission validation style). A negative max_parallel is a
+// the admission validation style). A negative max_parallel is a
 // mistake (0/missing already means "use the global default"); an unknown
 // scheduler is rejected rather than silently ignored.
 func validateRepoConcurrency(entry RepoConcurrency) error {

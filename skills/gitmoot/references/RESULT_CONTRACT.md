@@ -529,10 +529,9 @@ Separately from that tree linkage, **every** job Gitmoot creates carries
 `dispatched_by`: the identity that asked for the job to exist. It is resolved at
 the single enqueue chokepoint from the most specific source available, in order:
 an explicit dispatcher supplied by the dispatch site, then `delegated_by`, then
-the acting org role, then the dispatch channel (`local`, `github`,
-`heartbeat`). It never falls back to the job's own agent or to
-`lead_agent`: the job's own agent is the reviewer on a review, and
-`lead_agent` is the dispatching agent on other CLI dispatches.
+the acting org role, then the dispatch channel (`local`, `github`). It never falls back to the job's own agent or to
+`lead_agent`, because on a CLI review dispatch `lead_agent` defaults to the
+reviewer itself.
 
 `dispatched_by` is attribution only, deliberately not `parent_job_id`: nothing
 in the scheduler reads it, so recording it cannot change delegation depth, the

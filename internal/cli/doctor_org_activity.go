@@ -16,8 +16,7 @@ const orgRoleActivityDoctorCheckName = "org role activity"
 
 // orgRoleActivityDoctorCheck reports absence of activity for roles whose
 // recycle_after policy makes that absence meaningful. This is deliberately a
-// deterministic, read-only check; it is unrelated to scheduled agent
-// heartbeats, which enqueue LLM jobs.
+// deterministic, read-only check.
 func orgRoleActivityDoctorCheck(paths config.Paths) (doctor.Check, bool) {
 	cfg, err := config.LoadOrg(paths)
 	if err != nil {

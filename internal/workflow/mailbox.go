@@ -610,7 +610,7 @@ type PreparedEnqueue struct {
 //     is the coordinator that delegated it, which is narrower than the org role
 //     that whole tree inherits.
 //   - Sender last and never dropped, so the column is non-empty for every
-//     dispatch path. It degrades to a CHANNEL ("local", "github", "heartbeat")
+//     dispatch path. It degrades to a CHANNEL ("local", "github")
 //     rather than a seat, which is honest: a CLI dispatch
 //     with no --org-role and no GITMOOT_ORG_ROLE genuinely carries no seat
 //     identity, and recording the channel says so without inventing one.
@@ -962,7 +962,7 @@ func OrgScopeDecision(policy OrgEnforcement, actingRole, repo string) (string, e
 // resolveEnqueueOrgScope is deliberately independent of require_workflow: a
 // repo that opted out of workflow labels remains protected by its org registry.
 // Only explicit human CLI dispatches carry OperatorOrigin; shared local helpers
-// also serve comment, heartbeat, and other automated producers.
+// also serve comment and other automated producers.
 func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 	if request.PolicyExempt == "exempt" || strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" || !request.OperatorOrigin {
 		return "", nil
@@ -979,22 +979,16 @@ func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 }
 
 // IsUnlabeledAgentDispatch is the shared eligibility predicate for enforcement
-// and diagnostics. The stored-row shape has workflow id, sender, and delegation
-// reason but not the original producer, so a non-empty delegation reason is the
+// and diagnostics. The stored-row shape has workflow id and delegation reason
+// but not the original producer, so a non-empty delegation reason is the
 // durable approximation for internal continuations and merge-backs.
-func IsUnlabeledAgentDispatch(workflowID, sender, delegationReason string) bool {
-	if strings.TrimSpace(workflowID) != "" {
-		return false
-	}
-	if strings.TrimSpace(delegationReason) != "" {
-		return false
-	}
-	return strings.TrimSpace(sender) != "heartbeat"
+func IsUnlabeledAgentDispatch(workflowID, delegationReason string) bool {
+	return strings.TrimSpace(workflowID) == "" && strings.TrimSpace(delegationReason) == ""
 }
 
 // resolveEnqueueWorkflowID applies require_workflow only to fresh external
-// dispatches. Engine children inherit their parent's WorkflowID, and heartbeat
-// and temporary-worker merge-back are internal producers, so none are
+// dispatches. Engine children inherit their parent's WorkflowID, and
+// temporary-worker merge-back is an internal producer, so none are
 // auto-filed or strict-rejected. Job
 // open (Sender "session") intentionally bypasses this chokepoint: diagnostics
 // count its unlabeled rows, but enforcement does not touch them.
@@ -1008,7 +1002,7 @@ func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
 	if strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" {
 		return false, nil
 	}
-	if !IsUnlabeledAgentDispatch(request.WorkflowID, request.Sender, request.DelegationReason) || m.RequireWorkflowPolicy == nil {
+	if !IsUnlabeledAgentDispatch(request.WorkflowID, request.DelegationReason) || m.RequireWorkflowPolicy == nil {
 		return false, nil
 	}
 	p := m.RequireWorkflowPolicy(strings.TrimSpace(request.Repo))

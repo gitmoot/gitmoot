@@ -20,11 +20,11 @@ import (
 // exists.
 func TestRemoteExecutionBackendStillRefusesAsk(t *testing.T) {
 	ctx := context.Background()
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, "")
 	checkout := createDaemonWorkerGitCheckout(t, "remote-ask-boundary")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "remote-ask-agent", runtime.ShellRuntime, heartbeatShellResultScript, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "remote-ask-agent", runtime.ShellRuntime, shellApprovedResultScript, []string{"ask"}, "owner/repo")
 
 	mailbox := workflow.NewMailbox(store)
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{

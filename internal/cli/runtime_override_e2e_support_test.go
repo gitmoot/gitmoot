@@ -14,7 +14,7 @@ import (
 
 func runtimeOverrideE2EHome(t *testing.T) (string, *db.Store, string) {
 	t.Helper()
-	home, _, store := heartbeatLoopE2EHome(t)
+	home, _, store := daemonE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	// Default runtime codex with a stored model: the override must use neither.

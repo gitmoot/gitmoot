@@ -1468,7 +1468,7 @@ func TestEngineAdvanceReviewSkipsPullRequestFlowWhenNoPullRequest(t *testing.T) 
 		Repo:      "gitmoot/gitmoot",
 		TaskID:    "task-7",
 		TaskTitle: "Workflow Engine",
-		// PullRequest=0 / Branch="" as a review heartbeat enqueues it.
+		// PullRequest=0 / Branch="" (a PR-less review).
 		Result: &AgentResult{Decision: "changes_requested", Summary: "review stands as a comment"},
 	})
 

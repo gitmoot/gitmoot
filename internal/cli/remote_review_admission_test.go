@@ -80,14 +80,14 @@ func newRemoteReviewAdmissionFixture(t *testing.T, runtimeName string) *remoteRe
 	t.Helper()
 	ctx := context.Background()
 	remoteBackend := string(execbackend.Remote)
-	home, paths, store := heartbeatLoopE2EHome(t)
+	home, paths, store := daemonE2EHome(t)
 	writeRemoteLifecycleConfig(t, paths, "")
 	enableReviewSourceGatewayFixture(t, paths)
 	checkout := createDaemonWorkerGitCheckout(t, "remote-review-admission")
 	head := daemonWorkerHeadSHA(t, checkout)
 	makeReviewFixOriginFetchable(t, checkout, "remote-review-admission")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "remote-review-agent", runtimeName, heartbeatShellResultScript, []string{"review"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "remote-review-agent", runtimeName, shellApprovedResultScript, []string{"review"}, "owner/repo")
 	if err := store.UpsertPullRequest(ctx, db.PullRequest{
 		RepoFullName: "owner/repo", Number: 2238, URL: "https://example.invalid/owner/repo/pull/2238",
 		HeadBranch: "remote-review-admission", BaseBranch: "remote-review-admission", HeadSHA: head, State: "open",

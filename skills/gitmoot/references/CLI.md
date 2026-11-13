@@ -40,8 +40,7 @@ For organization roles with an effective `recycle_after`, doctor also reads the
 durable `org_role_presence.last_seen_at` signal. It warns when a specific role
 has never been observed or has been inactive past that bound; an unreadable,
 malformed, or future timestamp is reported as **unverified**, never healthy.
-This deterministic absence check does not enqueue an agent job and is separate
-from `gitmoot agent heartbeat`, whose configured schedules do enqueue jobs.
+This deterministic absence check does not enqueue an agent job.
 It also reports the SQLite auto-vacuum mode. New homes use bounded incremental
 reclaim automatically. A legacy home remains a non-blocking warning until an
 operator deliberately converts it during an idle maintenance window:
@@ -605,7 +604,7 @@ worker-pool scheduler that re-queries the queue as workers free and reactively
 isolates a contended same-repo read job into an ephemeral worktree (fixing a
 same-repo dependent-job deadlock), versus the default `--scheduler barrier`.
 (Independently of the scheduler, background **read-only ask** jobs — `agent ask
---background` and heartbeat asks — are each given their
+--background` — are each given their
 own detached committed-tip worktree **at dispatch** (#739), so they parallelize
 across same-repo seats under either scheduler with ≥2 workers.)
 To run a repo's queued jobs N-wide, use `--parallel N` (sugar for `--workers N
@@ -662,7 +661,7 @@ Local `agent review` and review-resolved `agent run` dispatch honor this key:
 they run the requested reviewer as a **preflight** parent. The parent checks
 whether the review can run and delegates exactly once to the configured verdict
 agent. The preflight is marked so its result cannot be consumed as the final
-review verdict. Daemon fanout, heartbeat, comment-command, and
+review verdict. Daemon fanout, comment-command, and
 externally recorded session reviews do not consult this key; they keep their
 ordinary review paths.
 
@@ -969,8 +968,8 @@ read is a 304, a repo's GitHub poll cadence decays to 2x and then up to
 `idle_max_multiplier` (default `4`; `1` disables decay). Any response-body miss,
 poll error, queued repo job, or in-flight repo job resets/promotes it immediately.
 Repos with open PRs stay at base cadence because their per-PR comment reads are
-deliberately non-conditional. Idle decay gates only GitHub calls; heartbeat
-and other supervisor maintenance still wake at the resolved base
+deliberately non-conditional. Idle decay gates only GitHub calls; supervisor
+maintenance still wake at the resolved base
 interval.
 
 `gitmoot dashboard` prints a styled one-shot snapshot of local state — daemon
@@ -1130,7 +1129,7 @@ choice is stored on the
 job and kept across retries. A repository with `checks_backend = "remote"` in
 `[repos."owner/repo".review]` sends every review to its `checks_provider` and
 `checks_template`, whichever producer enqueued it (this command, PR fan-out,
-comment or heartbeat reviews); a review without `--exec-provider`
+or comment reviews); a review without `--exec-provider`
 adopts `checks_provider`, and `--exec-backend local` or a different
 `--exec-provider` is refused (see the remote execution reference).
 `agent review` forwards the same flag.
@@ -1506,8 +1505,7 @@ Every surface that reads a review decision applies the same rule:
 - `blocked` and `failed` reviews are never fan-outs. They already refuse on their
   own terms and keep reporting their own cause.
 
-A coordinator is therefore dispatchable into a review slot, by CLI and by
-heartbeat. Gitmoot judges the panel it convenes, not the announcement.
+A coordinator is therefore dispatchable into a review slot by CLI. Gitmoot judges the panel it convenes, not the announcement.
 
 ### Risk-Tiered Adaptive Review
 
@@ -1795,16 +1793,14 @@ gitmoot job watch <job-id>
 (#2203).** There is no `agent implement` verb, no `--action implement`, and no
 `--task`/`--base`/`--draft`/`--ready` implement flags; an `implement` leg in a
 result's `delegations[]` is refused with the action named, `/gitmoot <agent>
-implement` is not a recognized PR-comment command, and an `implement` heartbeat
-is refused at config validation.
+implement` is not a recognized PR-comment command.
 
 What was removed in each case is the writable-worktree ALLOCATION plus the
 enqueue — precisely what would have to come back for dispatch to return. The
 removal followed the traffic rather than leading it: 568 of 570 implement rows
 in a 14-day window were seats recording their own sessions, delegation-origin
 implement legs total 47 lifetime with zero in the last 30 days, no PR comment
-has ever carried an implement command, and no heartbeat is configured with that
-action. Seats implement in their own
+has ever carried an implement command. Seats implement in their own
 session and record the work themselves:
 
 ```sh
@@ -2121,35 +2117,6 @@ default runtime model for that managed agent type.
 
 `agent type set --effort <value>` (or `[agents.<type>].effort`) sets its default
 reasoning effort.
-
-Schedule recurring agent work (heartbeats, off by default):
-
-```sh
-gitmoot agent heartbeat add repo-maintainer daily-status \
-  --repo owner/repo --interval 24h --prompt "Daily status report." --enabled
-# --runtime pins a runtime for this schedule.
-gitmoot agent heartbeat add reviewer stale-prs \
-  --repo owner/repo --interval 12h --action review --runtime codex \
-  --prompt "Review stale open PRs and summarize blockers."
-gitmoot agent heartbeat list
-gitmoot agent heartbeat show repo-maintainer daily-status
-gitmoot agent heartbeat enable|disable repo-maintainer daily-status
-gitmoot agent heartbeat remove repo-maintainer daily-status
-```
-
-A heartbeat enqueues a normal background job on its `interval`. The actions are
-read-only: `ask` (default) and `review` (`review` needs the agent's `review`
-capability). `implement` is refused at config validation (#2203) — the
-heartbeat's writable-worktree allocator and its enqueue are gone, so an
-`implement` schedule could only have produced a branchless job with no checkout
-to resolve. Schedule read-only work and let the seat record its own
-implementation with `gitmoot job record --type implement`. An optional
-`--runtime codex|claude|kimi|omp` runs the scheduled job on that runtime (fresh
-session) instead of the agent default — the accepted set is derived from the
-adapter registry, so `omp` joined it the moment the runtime was registered, and
-an enabled heartbeat pointed at omp will spend whatever credential its profile
-resolves. `gitmoot daemon status` surfaces each
-schedule's last-run/next-due/last-status.
 
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a
@@ -2542,7 +2509,7 @@ body to send flag-like text on purpose.
 The same rules apply to every other command that saves free text: `workflow
 note|describe|register|close --reason`, `task successor --reason`, `escalation
 repair --reason`, `job open|record --title`, `job close|record --summary`,
-`agent heartbeat add --prompt`, the message of `agent ask|run|review` and
+the message of `agent ask|run|review` and
 `orchestrate`, `org events rule add --match`, `org recycle --handoff` and
 `org wake retry|supersede --reason`. A help flag anywhere in those commands, and
 in `setup`, `agent start`, `agent subscribe` and `review request`, prints usage

@@ -35,7 +35,7 @@ import (
 // the script with no --runtime/--session flags.
 func effectiveRuntimeE2EHome(t *testing.T, script string) (string, *db.Store) {
 	t.Helper()
-	home, _, store := heartbeatLoopE2EHome(t)
+	home, _, store := daemonE2EHome(t)
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	if err := store.UpsertAgent(context.Background(), db.Agent{
@@ -115,7 +115,7 @@ func assertEffectiveRuntimeRecordedWithoutOverride(t *testing.T, store *db.Store
 
 func TestPersistJobEffectiveRuntimePreservesUnknownPayloadFields(t *testing.T) {
 	ctx := context.Background()
-	_, _, store := heartbeatLoopE2EHome(t)
+	_, _, store := daemonE2EHome(t)
 	const jobID = "effective-runtime-preserves-envelope"
 	const payload = `{"repo":"owner/repo","future_evidence":{"score":7,"source":"next-version"},"legacy_flag":true}`
 	if err := store.CreateJobWithEvent(ctx, db.Job{
