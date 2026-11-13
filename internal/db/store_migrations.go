@@ -3307,4 +3307,18 @@ DROP TABLE IF EXISTS permission_policy_warning_claims;
 DROP TABLE IF EXISTS permission_policy_observation_baseline;
 DROP TABLE IF EXISTS org_recycle_overdue_episodes;
 	`,
+	// #2594: tables whose code is gone. The groom verdict tables outlived the
+	// brain retirement (#2202) and goals outlived the goal planner (#2205);
+	// nothing reads or writes them. tasks.goal_id stays: reviews still set it.
+	// created_repos, kept by the #2205 drop above as a record of real GitHub
+	// repositories, goes too: the owner decided their fate on 2026-11-13 (the two
+	// empty ones deleted, jerryfane/planner-test-gitmoot kept), so the record has
+	// served its purpose.
+	`
+DROP TABLE IF EXISTS groom_llm_verdicts;
+DROP TABLE IF EXISTS groom_quality_verdicts;
+DROP TABLE IF EXISTS groom_stale_verdicts;
+DROP TABLE IF EXISTS goals;
+DROP TABLE IF EXISTS created_repos;
+	`,
 }
