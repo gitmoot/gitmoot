@@ -34,14 +34,13 @@ var jobStateWritePattern = regexp.MustCompile(`(?is)UPDATE\s+jobs\s+SET\s+state`
 // gitignored local-only roots AGENTS.md documents, plus build output and VCS metadata. Matching
 // is exact and top-level, so a package that merely SHARES one of these names is still scanned.
 var ignoredWalkRoots = map[string]bool{
-	".git":          true,
-	".gitmoot":      true,
-	"node_modules":  true,
-	"dist":          true,
-	"build":         true,
-	"repos":         true,
-	"GOALS":         true,
-	"website/build": true,
+	".git":         true,
+	".gitmoot":     true,
+	"node_modules": true,
+	"dist":         true,
+	"build":        true,
+	"repos":        true,
+	"GOALS":        true,
 }
 
 var jobStateWriteAllowlist = map[string]int{

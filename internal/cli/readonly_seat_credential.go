@@ -125,8 +125,8 @@ func inspectReadOnlySeatCredential(runtimeName string, sourceDir string) (readOn
 //
 //   - the refusal contradicted the engine's own policy for this class.
 //     classifyOperationalBlocker maps a runtime-auth rejection to
-//     blockerClassRuntimeAuth with authBlockerRetryDelay, and docs/events.md
-//     documents job.deferred emitted INSTEAD of job.failed, so a run self-heals
+//     blockerClassRuntimeAuth with authBlockerRetryDelay, and the events contract
+//     emits job.deferred INSTEAD of job.failed, so a run self-heals
 //     after a re-login with no job.failed and no PR comment. Failing at
 //     preflight turned a deferrable blocker into a terminal one;
 //   - after the auth-overlay injection in this same commit, an expired staged

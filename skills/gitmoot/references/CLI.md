@@ -397,8 +397,8 @@ rechecks green current-head CI before reserving capacity, even when
 Local worktrees use Git's absolute gitdir pointer successfully because they share
 the host filesystem. A remote instance instead receives the exact head commit
 and its history back to the review diff base as a credential-free object store,
-so its `HEAD` is the exact head and the base is local (see
-`docs/remote-exec.md`). Foreground dispatch remains on the host path. Unknown
+so its `HEAD` is the exact head and the base is local. Foreground dispatch
+remains on the host path. Unknown
 backend names and explicit blank selectors fail loudly; a job payload's
 `exec_backend` overrides the config for that job.
 
@@ -1033,7 +1033,7 @@ only when it is NOT immediately followed by a `job.deferred` for the same job
 id.** Since #532 slice E a deferred run emits `job.deferred` as a first-class
 transition **instead of** `job.failed` (no preceding `job.failed`); the rule
 still holds and is forward-compatible with the older `job.failed`→`job.deferred`
-flap. See `docs/events.md` for the full contract.
+flap.
 
 ## Review Router
 
@@ -2277,8 +2277,7 @@ session) instead of the agent default — the accepted set is derived from the
 adapter registry, so `omp` joined it the moment the runtime was registered, and
 an enabled heartbeat pointed at omp will spend whatever credential its profile
 resolves. `gitmoot daemon status` surfaces each
-schedule's last-run/next-due/last-status. See `docs/heartbeats.md` for the full
-reference.
+schedule's last-run/next-due/last-status.
 
 A registered single instance **shadows** a managed type of the same name:
 dispatch resolves `gitmoot agent <name>` to a registered single instance before a

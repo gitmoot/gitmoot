@@ -84,8 +84,8 @@ An absent `go` on the daemon `PATH` is silent; an unpinned source, copy failure,
 or unsafe path prints `gitmoot: read-only seat toolchain:` on daemon stderr,
 never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
 installations all take the same daemon-owned copy path; none retains a recursive
-host-root grant. See `docs/troubleshooting.md`, "`Permission denied`, exit 126,
-running Go".
+host-root grant. A candidate counts as a Go installation only if `bin/go` is an
+executable real file and `VERSION` (a real file, not a symlink) names a Go release.
 
 **Race runs on this host, for any session, not only a seat.** These two rules are
 general and a read-only review seat cannot act on either, which is why they sit
@@ -159,8 +159,7 @@ go test -timeout 25m ./...
 )
 ```
 
-See [`docs/testing-performance.md`](docs/testing-performance.md) before changing
-test setup or CI partitioning. Writable test databases should copy the cached,
+Writable test databases should copy the cached,
 migration-keyed schema through `internal/db/dbtest`; tests that exercise
 migration behavior must keep using the real `db.Open` path.
 
@@ -268,8 +267,8 @@ deadline firing** rather than as a verdict on the code - while remembering that
 the deadline firing and the code being slow are not exclusive.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
-**not** build the website or run the live multi-runtime (codex/claude/kimi) E2E
-(those need a Node build / runtime auth and stay manual).
+**not** run the live multi-runtime (codex/claude/kimi) E2E (those need runtime
+auth and stay manual).
 
 Prefer driving engine-feature E2Es with **no LLM** via the `shell` runtime on an
 isolated `/tmp` home, and test home-scoped daemon seams at the true runtime
@@ -299,34 +298,15 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - `skills/gitmoot/` — the packaged Agent Skill: `SKILL.md` + `references/`
   (`CLI.md`, `WORKFLOWS.md`, `RESULT_CONTRACT.md`, `SAFETY.md`, …) +
   `agent-templates/`.
-- `docs/` — in-repo reference docs. `website/` — the Docusaurus site (separate
-  tree). `scripts/` — repo scripts.
+- `scripts/` — repo scripts.
 
-## Documentation — two independent trees
+## Documentation — the skill ships with code
 
-Docs live in **two places that do not auto-sync**, so a docs change usually needs
-both:
-
-1. **In-repo**: `docs/`, `skills/gitmoot/`, `README.md`, `CONTRIBUTING.md`.
-2. **Website**: `website/docs/` (Docusaurus) — published to
-   <https://gitmoot.io/docs>.
-
-The website is **not auto-deployed**. It is served by nginx from
-`/var/www/gitmoot-docs/` and published manually (see
-`website/docs/operations/deployment.md`):
-
-```sh
-cd website && npm install && npm run build       # onBrokenLinks: throw — build fails on bad links/sidebar ids
-rsync -a --delete build/ /var/www/gitmoot-docs/  # destructive; back up the target first
-```
-
-`website/sidebars.ts` is manual; add new pages there. `website/static/llms.txt`
-is hand-curated. `website/static/llms-full.txt` is generated and ignored;
-`npm run build:llms` recreates it as part of `npm run build`.
-
-**Docs ship with code**: every user-facing change updates the skill / `CLI.md` /
-site / `llms.txt` in the **same PR**, and you never document behavior you haven't
-verified against the code — grep `main`, not a stale feature checkout.
+There is no docs site and no `docs/` tree. The packaged skill
+(`skills/gitmoot/SKILL.md` + `references/`) is the only reference; `README.md`
+stays a short pointer to it. Every user-facing change updates the skill in the
+**same PR**, and you never document behavior you haven't verified against the
+code — grep `main`, not a stale feature checkout.
 
 ## Runtime map / this host's live deployment
 
