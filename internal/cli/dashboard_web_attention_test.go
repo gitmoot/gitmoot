@@ -101,17 +101,6 @@ func TestWebDataSourceAttention(t *testing.T) {
 		t.Fatalf("gate title should be resolved from the job payload: %+v", g)
 	}
 
-	// The synth-review and pending-candidate buckets lost their backing tables with
-	// the SkillOpt loop (#1752). Their DataSource fields remain part of the pinned
-	// dashboard module's contract, so they must serialize as EMPTY BUT NON-NIL and
-	// contribute nothing to Total — a nil here would marshal as JSON null and break
-	// a client that iterates them.
-	if att.SynthItems == nil || len(att.SynthItems) != 0 {
-		t.Fatalf("synth items = %+v, want empty non-nil", att.SynthItems)
-	}
-	if att.Candidates == nil || len(att.Candidates) != 0 {
-		t.Fatalf("candidates = %+v, want empty non-nil", att.Candidates)
-	}
 	if att.Total != 1 {
 		t.Fatalf("Total = %d, want 1 (the single open gate)", att.Total)
 	}
@@ -133,8 +122,8 @@ func TestWebDataSourceAttentionEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Attention empty: %v", err)
 	}
-	if att.Gates == nil || att.SynthItems == nil || att.Candidates == nil {
-		t.Fatalf("empty-store lists must be non-nil: %+v", att)
+	if att.Gates == nil {
+		t.Fatalf("empty-store gates must be non-nil: %+v", att)
 	}
 	if att.Total != 0 {
 		t.Fatalf("Total = %d, want 0", att.Total)
@@ -206,29 +195,5 @@ func TestWebDataSourceJobChecksBlockMode(t *testing.T) {
 	}
 	if jc.Mode != string(config.ResultChecksBlock) {
 		t.Fatalf("Mode = %q, want block", jc.Mode)
-	}
-}
-
-// TestWebDataSourceBinaryVerdicts pins the post-#1752 contract: the
-// skillopt_binary_verdicts table is gone, so every run — seeded or not — resolves to
-// zero counts and an empty, never-nil list, and the method never errors. It stays
-// wired because the pinned dashboard module's DataSource interface requires it.
-func TestWebDataSourceBinaryVerdicts(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedAttentionHome(t, home)
-	ds := &webDataSource{home: home}
-	ctx := context.Background()
-
-	for _, runID := range []string{"eval-1", "nope", ""} {
-		v, err := ds.BinaryVerdicts(ctx, runID)
-		if err != nil {
-			t.Fatalf("BinaryVerdicts(%q): %v", runID, err)
-		}
-		if v.RunID != runID {
-			t.Fatalf("BinaryVerdicts(%q) RunID = %q, want the requested run echoed back", runID, v.RunID)
-		}
-		if v.Verdicts == nil || len(v.Verdicts) != 0 || v.Passed != 0 || v.Failed != 0 {
-			t.Fatalf("BinaryVerdicts(%q) = %+v, want empty non-nil with zero counts", runID, v)
-		}
 	}
 }

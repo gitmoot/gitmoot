@@ -11,30 +11,19 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// This file implements the three #528 DataSource methods that surface human gates
-// where a human manages work — Attention (the fleet-wide "Needs a human" roll-up),
-// JobChecks (a job's failed deterministic result checks plus the policy mode, #711),
-// and BinaryVerdicts (#714) — over the same read-only store paths the rest of
-// dashboard_web.go uses (withStore / withStoreAndPaths). All three are deterministic:
-// the UI polls them with a change-signature skip, so ordering must be stable across
-// calls (the store queries already sort).
-//
-// #1752 removed the SkillOpt optimization loop, so two of Attention's three lists and
-// all of BinaryVerdicts lost their backing tables (skillopt_synth_items,
-// agent_template_candidate_reviews and the `pending` version state,
-// skillopt_binary_verdicts). The methods and their response fields remain — they are
-// the pinned dashboard module's DataSource contract — and serialize as empty,
-// never-nil lists.
+// This file implements the two #528 DataSource methods that surface human gates
+// where a human manages work — Attention (the fleet-wide "Needs a human" roll-up)
+// and JobChecks (a job's failed deterministic result checks plus the policy mode,
+// #711) — over the same read-only store paths the rest of dashboard_web.go uses
+// (withStore / withStoreAndPaths). Both are deterministic: the UI polls them with a
+// change-signature skip, so ordering must be stable across calls (the store queries
+// already sort).
 
 // Attention returns the "Needs a human" view: every item across the fleet parked on
-// an explicit human decision. Since #1752 that is blocked job gates (#693) only,
-// ordered oldest-first by insertion id; SynthItems and Candidates are always empty.
+// an explicit human decision — blocked job gates (#693), ordered oldest-first by
+// insertion id.
 func (d *webDataSource) Attention(ctx context.Context) (dashboard.Attention, error) {
-	out := dashboard.Attention{
-		Gates:      []dashboard.AttentionGate{},
-		SynthItems: []dashboard.AttentionSynthItem{},
-		Candidates: []dashboard.AttentionCandidate{},
-	}
+	out := dashboard.Attention{Gates: []dashboard.AttentionGate{}}
 	err := withStore(d.home, func(store *db.Store) error {
 		// --- blocked job gates (#693) ---
 		gates, err := store.ListOpenJobGates(ctx)
@@ -131,12 +120,4 @@ func (d *webDataSource) JobChecks(ctx context.Context, jobID string) (dashboard.
 		return dashboard.JobChecks{}, err
 	}
 	return out, nil
-}
-
-// BinaryVerdicts returns the per-run binary-check breakdown (#714). The
-// skillopt_binary_verdicts table it read was dropped with the SkillOpt loop (#1752),
-// so every run now resolves to zero counts and an empty (never nil) list. The method
-// stays because it is part of the pinned dashboard module's DataSource interface.
-func (d *webDataSource) BinaryVerdicts(ctx context.Context, runID string) (dashboard.BinaryVerdicts, error) {
-	return dashboard.BinaryVerdicts{RunID: runID, Verdicts: []dashboard.BinaryVerdict{}}, nil
 }
