@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, event webhooks, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, daemon jobs, stuck jobs, branch locks, agent templates, custom prompt agents, orchestration, heartbeats, the web dashboard, runtime metadata, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 version: 0.1.0
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex, Claude Code, Kimi Code, or omp.
