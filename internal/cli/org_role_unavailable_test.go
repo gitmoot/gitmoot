@@ -86,7 +86,7 @@ func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "gitmoot/gitmoot", checkout)
 	seedDaemonWorkerAgent(t, store, "success-worker", runtime.ShellRuntime,
-		`printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
+		`printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`,
 		[]string{"ask"}, "gitmoot/gitmoot")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-success-clear", Agent: "success-worker", Action: "ask", Repo: "gitmoot/gitmoot",

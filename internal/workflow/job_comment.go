@@ -88,7 +88,6 @@ func RenderJobResultComment(comment JobResultComment) string {
 		writeList(&builder, "Changes Made", comment.Result.ChangesMade)
 		writeList(&builder, "Tests Run", comment.Result.TestsRun)
 		writeList(&builder, "Needs", comment.Result.Needs)
-		writeList(&builder, "Delegations", delegationAgentNames(comment.Result.Delegations))
 	}
 	if strings.TrimSpace(comment.Diagnostic) != "" && (comment.Result == nil || strings.TrimSpace(comment.Diagnostic) != strings.TrimSpace(comment.Result.Summary)) {
 		writeScalar(&builder, "Diagnostics", limitCommentText(comment.Diagnostic))
@@ -97,17 +96,6 @@ func RenderJobResultComment(comment JobResultComment) string {
 		builder.WriteString("\nRaw runtime output was retained in local Gitmoot state and is not posted here.\n")
 	}
 	return limitCommentBody(builder.String())
-}
-
-func delegationAgentNames(delegations []Delegation) []string {
-	names := make([]string, 0, len(delegations))
-	for _, d := range delegations {
-		name := strings.TrimSpace(d.Agent)
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
 }
 
 func writeScalar(builder *strings.Builder, label string, value string) {

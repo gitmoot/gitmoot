@@ -81,15 +81,6 @@ func (e Engine) blockMergeGate(ctx context.Context, ref taskRef, reason string) 
 	return e.blockAttributed(ctx, ref, "merge_gate_blocked", reason, "merge-gate")
 }
 
-// blockSynthesisGate attributes a coordinator synthesis-gate block (vote or
-// quorum unmet) on the task, mirroring blockMergeGate (#1562).
-// Generic workflow blocks use workflow_blocked at the same choke point, making
-// the latest blocking event a complete ownership record rather than a selective
-// list of callers.
-func (e Engine) blockSynthesisGate(ctx context.Context, ref taskRef, kind string, reason string) error {
-	return e.blockAttributed(ctx, ref, kind, reason, "synthesis-gate")
-}
-
 // blockAttributed routes named blockers through the shared block-first,
 // attribute-second choke point.
 func (e Engine) blockAttributed(ctx context.Context, ref taskRef, kind string, reason string, label string) error {
@@ -411,24 +402,6 @@ func (e Engine) enqueue(ctx context.Context, request JobRequest) error {
 	if request.ID == "" {
 		request.ID = e.jobID(request)
 	}
-	// An enqueue is irreversible, so it is bound to advance ownership immediately
-	// before it happens rather than at the barrier that decided it (#1673). A pass
-	// that has lost ownership aborts here instead of minting a job for a lifecycle
-	// that no longer exists; ordinary callers carry no anchor and are unaffected.
-	if err := e.renewSupersedeAdvanceLease(ctx); err != nil {
-		return err
-	}
-	// CAPTURING: a resolution's enqueue is PREPARED, not written, so it can commit in
-	// the same transaction as the task write and the receipt. PrepareEnqueue performs
-	// no durable write and no git/network work.
-	if e.capturing() {
-		prepared, perr := e.mailbox().PrepareEnqueue(ctx, request)
-		if perr != nil {
-			return perr
-		}
-		e.resolutionSink.jobs = append(e.resolutionSink.jobs, db.PreparedJob{Job: prepared.Job, Events: prepared.Events})
-		return nil
-	}
 	_, err := e.mailbox().Enqueue(ctx, request)
 	if err == nil {
 		return nil
@@ -529,17 +502,6 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 	allowMissingCapability := job.Type == "ask" &&
 		payload.DelegationReason == "temp_worker_merge_back" &&
 		payload.OriginalAgent == job.Agent
-	// Risk-tiered synthesis continuation (#650): the high-risk review coordinator is
-	// a SYNTHETIC job the engine seeds on the LEAD agent, and its continuation
-	// (maybeEnqueueContinuation) is an `ask` job on that same lead. A normal lead
-	// carries implement/review but need not carry `ask`, so requiring `ask` here
-	// would BLOCK the synthesis of an already-approved high-risk review — a
-	// non-additive capability demand the routine review path never imposed. The
-	// continuation is synthesis-only (it summarizes the lens findings; it does not
-	// grant any write/review authority), so allow it to run without the `ask` grant.
-	if job.Type == "ask" && payload.RiskTier == RiskTierHigh {
-		allowMissingCapability = true
-	}
 	return e.ensureAgentAllowedWithCapability(ctx, JobRequest{
 		Agent:         authorizationAgent,
 		Action:        job.Type,
@@ -547,25 +509,10 @@ func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payloa
 		Repo:          payload.Repo,
 		Sender:        payload.Sender,
 		Branch:        payload.Branch,
-		DelegationID:  payload.DelegationID,
-		// Carry the worker spec so an ephemeral child's executor check inherits the
-		// coordinator's repo scope (skip the registered-agent checks) instead of
-		// blocking on a synthetic agent name that no agent row backs.
-		Ephemeral: payload.Ephemeral,
 	}, ref, allowMissingCapability)
 }
 
 func (e Engine) ensureAgentAllowedWithCapability(ctx context.Context, request JobRequest, ref taskRef, allowMissingCapability bool) error {
-	// An ephemeral worker has no registered agent row: it inherits the
-	// coordinator's allowed repo scope, so the existence, repo-access, and
-	// capability checks are skipped. Validate only that the spec runtime is a real
-	// agent runtime (never shell).
-	if request.Ephemeral != nil {
-		if err := validateEphemeralSpec(request.DelegationID, request.Action, request.Ephemeral); err != nil {
-			return e.block(ctx, ref, err.Error())
-		}
-		return nil
-	}
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

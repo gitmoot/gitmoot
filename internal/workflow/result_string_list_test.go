@@ -17,7 +17,7 @@ func TestExtractAgentResultAcceptsObjectElementsInTestsRun(t *testing.T) {
 		`"findings":[],"changes_made":[],` +
 		`"tests_run":[{"name":"PR diff scope confirmation","command":"git show --stat 663321c9","result":"pass","detail":"one file changed"},` +
 		`"go test ./internal/workflow/"],` +
-		`"needs":[],"delegations":[]}}`
+		`"needs":[]}}`
 
 	result, err := ExtractAgentResult(output)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestResultStringListAcceptsNull(t *testing.T) {
 func TestExtractAgentResultAcceptsObjectElementsInEveryStringList(t *testing.T) {
 	output := `{"gitmoot_result":{"decision":"implemented","summary":"did the thing",` +
 		`"findings":[],"changes_made":[{"file":"a.go","change":"added a guard"}],` +
-		`"tests_run":[],"needs":[{"blocked_on":"owner","why":"merge authority"}],"delegations":[]}}`
+		`"tests_run":[],"needs":[{"blocked_on":"owner","why":"merge authority"}]}}`
 
 	result, err := ExtractAgentResult(output)
 	if err != nil {

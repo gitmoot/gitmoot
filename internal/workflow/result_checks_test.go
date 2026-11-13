@@ -173,31 +173,6 @@ func TestRunResultChecksBlockedBlockersActionable(t *testing.T) {
 	}
 }
 
-func TestRunResultChecksCoordinatorFinalize(t *testing.T) {
-	// A finalize continuation (action ask + IsFinalize) is audited by the
-	// coordinator check, NOT the ask-answer check.
-	failed := failedIDs(ResultCheckInput{
-		Action:     "ask",
-		IsFinalize: true,
-		Result:     AgentResult{Decision: "failed", Summary: "x"},
-	})
-	if _, ok := failed["coordinator-outcome-reconciled"]; !ok {
-		t.Fatalf("expected coordinator-outcome-reconciled to fail on a terse finalize; failed=%v", keys(failed))
-	}
-	if _, ok := failed["ask-answer-actionable"]; ok {
-		t.Fatalf("a finalize continuation must not run the plain ask-answer check; failed=%v", keys(failed))
-	}
-
-	ok := failedIDs(ResultCheckInput{
-		Action:     "ask",
-		IsFinalize: true,
-		Result:     AgentResult{Decision: "failed", Summary: "reconciled: child A merged, child B failed and was escalated"},
-	})
-	if _, bad := ok["coordinator-outcome-reconciled"]; bad {
-		t.Fatalf("a substantive reconciliation must pass; failed=%v", keys(ok))
-	}
-}
-
 func TestFailedResultChecksCleanIsEmpty(t *testing.T) {
 	if got := FailedResultChecks(ResultCheckInput{Action: "ask", Result: AgentResult{Decision: "approved", Summary: "a real answer"}}); len(got) != 0 {
 		t.Fatalf("clean result should yield no failures, got %+v", got)
@@ -335,10 +310,7 @@ func TestRunResultChecksVerdictNudgeIsScopedToReviewJobs(t *testing.T) {
 	for _, action := range []string{"implement", "ask"} {
 		ran := checkIDs(ResultCheckInput{
 			Action: action,
-			Result: AgentResult{
-				Decision: "approved", Summary: "fanning out the work",
-				Delegations: []Delegation{{ID: "child", Agent: "a", Action: "implement"}},
-			},
+			Result: AgentResult{Decision: "approved", Summary: "done with the work"},
 		})
 		if _, ok := ran["review-verdict-has-evidence"]; ok {
 			t.Fatalf("action %q must not run the review verdict nudge; ran = %v", action, keys(ran))

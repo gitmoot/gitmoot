@@ -48,8 +48,6 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentStart(args[1:], stdout, stderr)
 	case "ask":
 		return runAgentAsk(args[1:], stdout, stderr)
-	case "run":
-		return runAgentRun(args[1:], stdout, stderr)
 	case "review":
 		return runAgentReview(args[1:], stdout, stderr)
 	case "type":
@@ -91,7 +89,6 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
@@ -398,108 +395,6 @@ type agentRunOptions struct {
 	// relatedPRs are `--related-pr N` values (#2509), carried to `review
 	// request`, which validates them and resolves each exact head.
 	relatedPRs []int
-	recipe     string
-}
-
-func runAgentRun(args []string, stdout, stderr io.Writer) int {
-	if helpRequested(args) {
-		printAgentRunUsage(stdout, "run")
-		return 0
-	}
-	options, ok := parseAgentRunOptions("run", args, stderr)
-	if !ok {
-		return 2
-	}
-	if !resolveAgentOrgRole(&options.orgRole, options.home, "agent run", stderr) {
-		return 2
-	}
-	selected, reason := selectAgentRunAction(options)
-	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
-		fmt.Fprintf(stderr, "agent run: %v\n", err)
-		return 2
-	}
-	output, exit := dispatchAgentCommand(options, selected, reason, "agent_run", stdout, stderr)
-	if exit != 0 {
-		return exit
-	}
-	if options.jsonOutput {
-		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "agent run: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	printLocalAgentJobOutput(stdout, output)
-	printQueuedDaemonHint(stdout, output, options.background, options.home)
-	return 0
-}
-
-// runOrchestrate is the top-level `gitmoot orchestrate` command: sugar for
-// `gitmoot agent run <agent> --background "<message>"`. The named agent is the
-// conductor (coordinator) that returns a delegations[] score; the players
-// (child agents) run in parallel or in dependency order, and a finale
-// (continuation) reconvenes and synthesizes the results. It forwards to the
-// SAME dispatch as `agent run` with the run action and Background forced on, so
-// the engine and the delegations schema are untouched.
-func runOrchestrate(args []string, stdout, stderr io.Writer) int {
-	if helpRequested(args) || len(args) == 0 {
-		printOrchestrateUsage(stdout)
-		if len(args) == 0 {
-			fmt.Fprintln(stderr, "orchestrate requires exactly one agent and one message")
-			return 2
-		}
-		return 0
-	}
-	options, ok := parseAgentRunOptions("orchestrate", args, stderr)
-	if !ok {
-		return 2
-	}
-	if !resolveAgentOrgRole(&options.orgRole, options.home, "orchestrate", stderr) {
-		return 2
-	}
-	// Force the background run path: orchestrate always fans out delegations.
-	if options.foreground {
-		fmt.Fprintln(stderr, "orchestrate: --foreground is not supported; orchestrate always runs in background")
-		return 2
-	}
-	options.background = true
-	selected, reason := selectOrchestrateAction(options)
-	if err := normalizeReviewExecutionMode(&options, selected); err != nil {
-		fmt.Fprintf(stderr, "orchestrate: %v\n", err)
-		return 2
-	}
-	output, exit := dispatchAgentCommand(options, selected, reason, "orchestrate", stdout, stderr)
-	if exit != 0 {
-		return exit
-	}
-	if options.jsonOutput {
-		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "orchestrate: %v\n", err)
-			return 1
-		}
-		return 0
-	}
-	printLocalAgentJobOutput(stdout, output)
-	printQueuedDaemonHint(stdout, output, options.background, options.home)
-	return 0
-}
-
-func printOrchestrateUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--recipe id] [--home path] [--json]")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Orchestrate work across agents (a coordinator that fans out delegations).")
-	fmt.Fprintln(w, "Sugar for `gitmoot agent run <agent> --background`: the named agent is the")
-	fmt.Fprintln(w, "conductor (coordinator) that returns a delegations[] score; the players (child")
-	fmt.Fprintln(w, "agents) run in parallel or in dependency order, and a finale (continuation)")
-	fmt.Fprintln(w, "reconvenes and synthesizes the results.")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Example:")
-	fmt.Fprintln(w, "  gitmoot orchestrate planner \"audit the auth flow and fan out fixes\" --repo owner/repo")
-	fmt.Fprintln(w)
-	fmt.Fprintf(w, "--recipe <%s> routes the coordinator\n", strings.Join(recipeTemplateIDs, "|"))
-	fmt.Fprintln(w, "to a named built-in recipe prompt (an opt-in deterministic decomposition")
-	fmt.Fprintln(w, "shape) instead of the agent's own prompt; the agent's identity is unchanged.")
 }
 
 func runAgentReview(args []string, stdout, stderr io.Writer) int {
@@ -712,7 +607,6 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 	}{
 		{"--action", strings.TrimSpace(options.action) != "" && !strings.EqualFold(strings.TrimSpace(options.action), "review")},
 		{"--type", strings.TrimSpace(options.typeName) != ""},
-		{"--recipe", strings.TrimSpace(options.recipe) != ""},
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
 	} {
 		if candidate.set {
@@ -780,12 +674,7 @@ func normalizeReviewExecutionMode(options *agentRunOptions, action string) error
 }
 
 func dispatchAgentCommand(options agentRunOptions, action string, reason string, executionPath string, stdout, stderr io.Writer) (localAgentJobOutput, int) {
-	// Error prefix names the invoked surface: the orchestrate alias names itself;
-	// the agent subcommands keep "agent <action>".
 	errLabel := "agent " + action
-	if executionPath == "orchestrate" {
-		errLabel = "orchestrate"
-	}
 	if options.postMerge {
 		fmt.Fprintf(stderr, "%s: --post-merge is only supported by `agent review` through the review router\n", errLabel)
 		return localAgentJobOutput{}, 2
@@ -873,20 +762,18 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		SkipNativeReviewFanout:  options.skipNativeReviewFanout,
 		AllowPromptHeadMismatch: options.allowPromptHeadMismatch,
 		RouterBypassReason:      options.routerBypassReason,
-		Recipe:                  options.recipe,
 		SelectedAction:          action,
 		SelectedActionReason:    reason,
 		ExecutionPath:           executionPath,
 	}
 }
 
-// agentRunCommandLabel is how a parse/usage error names the command. The agent
-// subcommands read as "agent run/review"; the top-level orchestrate alias names
-// itself, not "agent orchestrate".
+// agentRunActions are the --action values `agent review` parses; only review
+// is accepted by validateAgentRunActionOptions.
+var agentRunActions = []string{"ask", "review"}
+
+// agentRunCommandLabel is how a parse/usage error names the command.
 func agentRunCommandLabel(command string) string {
-	if command == "orchestrate" {
-		return "orchestrate"
-	}
 	return "agent " + command
 }
 
@@ -931,7 +818,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.noExecution = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--recipe" || arg == "--part" || arg == "--related-pr":
+		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--part" || arg == "--related-pr":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -959,8 +846,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.runtime = strings.TrimSpace(strings.TrimPrefix(arg, "--runtime="))
 		case strings.HasPrefix(arg, "--session="):
 			options.session = strings.TrimSpace(strings.TrimPrefix(arg, "--session="))
-		case strings.HasPrefix(arg, "--recipe="):
-			options.recipe = strings.TrimSpace(strings.TrimPrefix(arg, "--recipe="))
 		case strings.HasPrefix(arg, "--repo="):
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--exec-backend="):
@@ -1013,20 +898,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		return agentRunOptions{}, false
 	}
 
-	normalizedRecipe, err := validateRecipeID(options.recipe)
-	if err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", label, err)
-		return agentRunOptions{}, false
-	}
-	// --recipe is scoped to the coordinator fan-out surfaces (orchestrate and
-	// `agent run`). The shared parser/dispatch means review would otherwise
-	// silently honor it and override its job template, so reject it there
-	// rather than apply it undocumented.
-	if normalizedRecipe != "" && command != "orchestrate" && command != "run" {
-		fmt.Fprintf(stderr, "%s: recipe is only supported for orchestrate and agent run\n", label)
-		return agentRunOptions{}, false
-	}
-	options.recipe = normalizedRecipe
 	if options.execBackendSet && command != "review" {
 		fmt.Fprintf(stderr, "%s: --exec-backend is only supported for agent review\n", label)
 		return agentRunOptions{}, false
@@ -1056,13 +927,13 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 	case "--type":
 		options.typeName = value
 	case "--action":
-		for _, action := range workflow.DelegationActions {
+		for _, action := range agentRunActions {
 			if value == action {
 				options.action = value
 				return true
 			}
 		}
-		fmt.Fprintf(stderr, "--action must be one of %s; got %q\n", actionChoices(workflow.DelegationActions), value)
+		fmt.Fprintf(stderr, "--action must be one of %s; got %q\n", actionChoices(agentRunActions), value)
 		return false
 	case "--model":
 		options.model = value
@@ -1095,8 +966,6 @@ func setAgentRunOption(options *agentRunOptions, flagName string, value string, 
 		options.headSHA = value
 	case "--branch":
 		options.branch = value
-	case "--recipe":
-		options.recipe = value
 	case "--part":
 		options.part = value
 	case "--pr":
@@ -1133,7 +1002,7 @@ func validateAgentRunActionOptions(command string, options agentRunOptions) erro
 		return nil
 	}
 	if command == "review" && action != "review" {
-		return fmt.Errorf("agent review only supports --action review; use agent run to choose %s", action)
+		return fmt.Errorf("agent review only supports --action review; got %s", action)
 	}
 	switch action {
 	case "ask":
@@ -1150,75 +1019,9 @@ func validateAgentRunActionOptions(command string, options agentRunOptions) erro
 
 func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
-	switch command {
-	case "orchestrate":
-		fmt.Fprintln(w, "  gitmoot orchestrate <agent> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
-	case "review":
-		fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
-		fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
-	default:
-		fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--recipe id] [--skip-native-review-fanout] [--home path] [--json]")
-	}
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
 	printAgentRuntimeOverrideHelp(w)
-}
-
-// recipeTemplateIDs is the allowlist of built-in coordinator recipes the
-// --recipe flag may select. It is keyed off the agenttemplate registry consts so
-// the set stays coupled to the registry of installable templates.
-var recipeTemplateIDs = []string{
-	agenttemplate.ReviewPanelTemplateID,
-	agenttemplate.VerifierTemplateID,
-}
-
-// validateRecipeID normalizes and validates the --recipe value against the
-// built-in coordinator recipe registry. Empty (flag absent) is valid and
-// means "use the agent's own prompt".
-func validateRecipeID(recipe string) (string, error) {
-	recipe = strings.TrimSpace(recipe)
-	if recipe == "" {
-		return "", nil
-	}
-	for _, id := range recipeTemplateIDs {
-		if recipe == id {
-			return recipe, nil
-		}
-	}
-	return "", fmt.Errorf("unknown recipe %q; choose one of %s", recipe, strings.Join(recipeTemplateIDs, ", "))
-}
-
-// selectOrchestrateAction routes an orchestrate job by EXPLICIT FLAGS only
-// (--action first, then --task to implement, --pr/--head-sha to review), defaulting to the background
-// coordinator ("ask") path. Unlike selectAgentRunAction it ignores message
-// keywords, so a natural orchestration prompt that happens to mention
-// "review"/"refactor" still queues a coordinator that fans out delegations
-// instead of erroring on a missing --pr/--task.
-func selectOrchestrateAction(options agentRunOptions) (string, string) {
-	if action := strings.TrimSpace(options.action); action != "" {
-		return action, "--action explicitly selects " + action + " workflow"
-	}
-	if options.prNumber > 0 {
-		return "review", "--pr selects review workflow"
-	}
-	if strings.TrimSpace(options.headSHA) != "" {
-		return "review", "--head-sha selects review workflow"
-	}
-	return "ask", "orchestrate runs a background coordinator that fans out delegations"
-}
-
-func selectAgentRunAction(options agentRunOptions) (string, string) {
-	if action := strings.TrimSpace(options.action); action != "" {
-		return action, "--action explicitly selects " + action + " workflow"
-	}
-	if options.prNumber > 0 {
-		return "review", "--pr selects review workflow"
-	}
-	if strings.TrimSpace(options.headSHA) != "" {
-		return "review", "--head-sha selects review workflow"
-	}
-	if looksLikeReviewRequest(options.message) {
-		return "review", "message asks for PR review or approval"
-	}
-	return "ask", "message is analysis, planning, or a question"
 }
 
 func looksLikeWorkflowOrchestration(message string) bool {
@@ -1243,17 +1046,6 @@ func looksLikeWorkflowOrchestration(message string) bool {
 		"merge pull request",
 		"full implementation workflow",
 	}
-	for _, phrase := range phrases {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-func looksLikeReviewRequest(message string) bool {
-	lower := strings.ToLower(message)
-	phrases := []string{"review pr", "review this pr", "review pull request", "code review", "approve pr", "approve pull request", "request changes", "audit pr", "audit pull request"}
 	for _, phrase := range phrases {
 		if strings.Contains(lower, phrase) {
 			return true

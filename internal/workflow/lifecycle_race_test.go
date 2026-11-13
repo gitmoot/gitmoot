@@ -70,174 +70,6 @@ func TestSupersedeClosedPullRequestJobRefusesAStaleObservedGeneration(t *testing
 	}
 }
 
-// TestFinalizeClosedPullRequestDelegationChildRefusesAStaleObservedGeneration is the
-// same window on the child path, where the cost is worse: the stale settlement
-// would drive a synthetic `failed` result into a run that is alive.
-func TestFinalizeClosedPullRequestDelegationChildRefusesAStaleObservedGeneration(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "fan out",
-			Delegations: []Delegation{
-				{ID: "api", Agent: "api", Action: "review", Prompt: "review api"},
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-		t.Fatalf("AdvanceJob(parent-job) returned error: %v", err)
-	}
-	const child = "parent-job/delegation/api"
-	stale := mustJob(t, store, child)
-	for _, state := range []JobState{JobRunning, JobSucceeded, JobQueued} {
-		if err := store.UpdateJobState(ctx, child, string(state)); err != nil {
-			t.Fatalf("UpdateJobState(%s): %v", state, err)
-		}
-	}
-	if mustJob(t, store, child).LifecycleGeneration == stale.LifecycleGeneration {
-		t.Fatal("fixture did not advance the child's generation")
-	}
-
-	finalized, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, stale, "pr closed")
-	if err != nil {
-		t.Fatalf("FinalizeClosedPullRequestDelegationChild returned error: %v", err)
-	}
-	if finalized {
-		t.Fatal("a stale observation finalized a newer child lifecycle")
-	}
-	live := mustJob(t, store, child)
-	if live.State != string(JobQueued) {
-		t.Fatalf("child state = %q, want the re-queued run left alone", live.State)
-	}
-	payload, err := unmarshalPayload(live.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	if payload.Result != nil {
-		t.Fatalf("a synthetic result was stamped on a live run: %+v", payload.Result)
-	}
-}
-
-// TestCompletePendingSupersedeFinalizationVoidsADebtFromAnOlderLifecycle is the
-// recovery side of the same ABA problem, and it bites in both directions.
-//
-// The debt is recorded for the run that incurred it. `gitmoot job retry` then puts
-// the job back in queued at a NEWER generation, and:
-//
-//	if that newer run FAILS, paying the old debt stamps it with the PR-closed
-//	synthetic failure and advances the parent on a run that failed for its own
-//	reasons;
-//
-//	if that newer run SUCCEEDS, the debt can never be paid at all, so the job stays
-//	a candidate on every poll forever.
-//
-// Both are answered the same way: the debt is VOIDED — closed, with no work — and
-// the newer run settles through its own path.
-//
-// MUTATION PROOF: drop the generation from the pending marker (or compare only the
-// state) and the newer-failed arm stamps a result and advances the parent, while
-// the newer-succeeded arm stays pending.
-func TestCompletePendingSupersedeFinalizationVoidsADebtFromAnOlderLifecycle(t *testing.T) {
-	for _, newer := range []JobState{JobFailed, JobSucceeded} {
-		t.Run("newer "+string(newer), func(t *testing.T) {
-			ctx := context.Background()
-			store := openEngineStore(t)
-			seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-			seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-			engine := testEngine(store)
-			insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-				Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-				Result: &AgentResult{
-					Decision: "approved",
-					Summary:  "fan out",
-					Delegations: []Delegation{
-						{ID: "api", Agent: "api", Action: "review", Prompt: "review api"},
-					},
-				},
-			})
-			if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-				t.Fatalf("AdvanceJob(parent-job): %v", err)
-			}
-			const child = "parent-job/delegation/api"
-			superseded := mustJob(t, store, child)
-			// The supersession records its debt for THIS generation.
-			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, superseded, "pr closed"); err != nil && !isDelegationPolicyOutcome(err) {
-				t.Fatalf("FinalizeClosedPullRequestDelegationChild: %v", err)
-			}
-			// PRODUCTION must anchor the marker itself: the recovery below can only
-			// tell lifecycles apart if the generation is in the row the sweep wrote.
-			// The NET debt is already settled at this point — block_parent is a policy
-			// outcome, which pays it — so the marker event is what to inspect.
-			markedGeneration, anchored := pendingDebtMarker(t, store, child)
-			if !anchored || markedGeneration != superseded.LifecycleGeneration {
-				t.Fatalf("pending marker generation = %d anchored=%v, want the observed generation %d", markedGeneration, anchored, superseded.LifecycleGeneration)
-			}
-			// A retry starts a new lifecycle, and that run reaches its own outcome.
-			if _, err := RetryJob(ctx, store, child); err != nil {
-				t.Fatalf("RetryJob: %v", err)
-			}
-			retried := mustJob(t, store, child)
-			if retried.State != string(JobQueued) {
-				t.Fatalf("retried child = %q, want queued", retried.State)
-			}
-			if retried.LifecycleGeneration == superseded.LifecycleGeneration {
-				t.Fatal("RetryJob did not start a new lifecycle generation")
-			}
-			// Re-arm the debt as an OUTSTANDING one against the new lifecycle: this is
-			// the state a poll would find if the original finalization had failed. It
-			// reuses the generation PRODUCTION recorded above, not an invented one.
-			if err := store.AddJobEvent(ctx, db.JobEvent{
-				JobID: child, Kind: JobEventSupersedeFinalizePending,
-				Message: formatSupersedeFinalizeDebt(markedGeneration),
-			}); err != nil {
-				t.Fatalf("re-arm pending debt: %v", err)
-			}
-			if err := clearChildResult(ctx, store, child); err != nil {
-				t.Fatalf("clear child result: %v", err)
-			}
-			if err := store.UpdateJobState(ctx, child, string(newer)); err != nil {
-				t.Fatalf("UpdateJobState(%s): %v", newer, err)
-			}
-			taskBefore := mustTaskState(t, store, "task-7")
-
-			handled, err := engine.CompletePendingSupersedeFinalization(ctx, child)
-			if err != nil {
-				t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
-			}
-			if !handled {
-				t.Fatal("the outstanding debt was not handled at all; it would stay a candidate forever")
-			}
-			// Voided: closed for the candidate query, with no synthetic result and no
-			// parent advance against the newer run.
-			pending, err := store.JobIDsWithPendingSupersedeFinalization(ctx)
-			if err != nil {
-				t.Fatalf("JobIDsWithPendingSupersedeFinalization: %v", err)
-			}
-			for _, id := range pending {
-				if id == child {
-					t.Fatal("the debt is still outstanding: this job is a candidate on every future poll")
-				}
-			}
-			live := mustJob(t, store, child)
-			payload, err := unmarshalPayload(live.Payload)
-			if err != nil {
-				t.Fatalf("unmarshalPayload: %v", err)
-			}
-			if payload.Result != nil {
-				t.Fatalf("the old debt stamped a result on lifecycle %d: %+v", live.LifecycleGeneration, payload.Result)
-			}
-			if got := mustTaskState(t, store, "task-7"); got != taskBefore {
-				t.Fatalf("task state moved %q -> %q: the parent was advanced on a newer lifecycle", taskBefore, got)
-			}
-		})
-	}
-}
-
 func countWorkflowJobEvents(t *testing.T, store *db.Store, jobID string, kind string) int {
 	t.Helper()
 	count := 0
@@ -247,192 +79,6 @@ func countWorkflowJobEvents(t *testing.T, store *db.Store, jobID string, kind st
 		}
 	}
 	return count
-}
-
-// TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment drives the
-// interleaving itself through the production entry point, at every window a read
-// cannot close.
-//
-// The recovery reads the job and its debt in one transaction and writes in others.
-// `gitmoot job retry` can queue generation N+1 and a worker can claim it in ANY of
-// those gaps, and a payment that acts by job id would then release the claimed
-// run's locks, stamp the superseded run's PR-closed failure onto it, and advance
-// its coordinator on that.
-//
-// One subtest per gap, because a different guard owns each and mutual masking would
-// otherwise make all of them look tested by one:
-//
-//	after-read             the atomic claim CAS on (state, generation)
-//	after-claim            the payment's own re-read, which gates the cleanups
-//	before-cleanup         the transactional generation guard inside the lock release
-//	after-resource-commit  the anchored delegation branch-lock release, which runs
-//	                       AFTER the resource transaction has already committed
-//	before-task-lane       the task lane's own fail-closed inactivity check
-//	before-reclaim         the anchored read-only worktree reclaim marker, which
-//	                       would otherwise hand a LIVE run's checkout to the reclaim
-//	                       pass because the path is derived from the job id
-//	before-finalize        the anchored payload write inside the finalizer
-//	before-advance-claim   the parent-advance bracket's claim, which refuses to start
-//	                       an advance for a lifecycle that has already moved
-//
-// The window INSIDE the advance is covered separately: a retry cannot even reach it
-// (RetryJob refuses while the claim is live, see TestRetryIsRefusedInsideASupersede-
-// Advance), and each parent-effect class has its own barrier test.
-//
-// before-cleanup is the window F-1 named: the re-read has already VALIDATED
-// generation N, and the resource-lock delete happens statements later. The three
-// stages after it are the windows F-2 named: each sibling cleanup ran outside the
-// guarded transaction that authorised it.
-//
-// The expected outcome is identical at every stage — that is the point.
-func TestCompletePendingSupersedeFinalizationRefusesARetryClaimedMidPayment(t *testing.T) {
-	for _, stage := range []string{
-		supersedeDebtStageAfterRead,
-		supersedeDebtStageAfterClaim,
-		supersedeDebtStageBeforeCleanup,
-		supersedeDebtStageAfterResourceCommit,
-		supersedeDebtStageBeforeReclaim,
-		supersedeDebtStageBeforeFinalize,
-		supersedeDebtStageBeforeAdvanceClaim,
-	} {
-		t.Run(stage, func(t *testing.T) {
-			runSupersedeDebtInterleaveCase(t, stage)
-		})
-	}
-}
-
-func runSupersedeDebtInterleaveCase(t *testing.T, stage string) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-7", RepoFullName: "gitmoot/gitmoot", State: string(TaskImplementing), Branch: "task-7",
-	}); err != nil {
-		t.Fatalf("UpsertTask: %v", err)
-	}
-	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "fan out",
-			Delegations: []Delegation{
-				{ID: "api", Agent: "api", Action: "review", Prompt: "review api"},
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-		t.Fatalf("AdvanceJob(parent-job): %v", err)
-	}
-	const child = "parent-job/delegation/api"
-	observed := mustJob(t, store, child)
-	if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, observed, "pr closed"); err != nil && !isDelegationPolicyOutcome(err) {
-		t.Fatalf("FinalizeClosedPullRequestDelegationChild: %v", err)
-	}
-	// The debt is outstanding again, anchored on the superseded run.
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID: child, Kind: JobEventSupersedeFinalizePending,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
-	}); err != nil {
-		t.Fatalf("arm the superseded run's debt: %v", err)
-	}
-	// Which arm of the payment the stage lives in is decided by whether the
-	// synthetic result is still owed. Every stage up to the finalizer needs it
-	// UNWRITTEN, or the finalizer's idempotence gate short-circuits before the guard
-	// under test; before-advance is the already-stamped arm and needs it PRESENT.
-	if stage != supersedeDebtStageBeforeAdvance {
-		if err := clearChildResult(ctx, store, child); err != nil {
-			t.Fatalf("clear child result: %v", err)
-		}
-	}
-
-	// The retry+claim happens in the window named by stage.
-	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
-	const lockKey = "runtime:codex:session-retry"
-	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
-		if at != stage || interleaved > 0 {
-			// Once only: a stage can be reached twice (the finalizer arm and the
-			// already-stamped arm both bracket the advance), and re-running the retry
-			// would model something no operator does.
-			return nil
-		}
-		interleaved++
-		if _, err := RetryJob(hookCtx, store, child); err != nil {
-			t.Fatalf("RetryJob in the interleave window: %v", err)
-		}
-		// No result clearing here: production's RetryJob leaves the payload alone, and
-		// modelling it otherwise would make AdvanceJob fail for a reason no retry
-		// causes.
-		if err := store.UpdateJobState(hookCtx, child, string(JobRunning)); err != nil {
-			t.Fatalf("UpdateJobState(running): %v", err)
-		}
-		// The claimed run holds its own runtime-session lock, which a stale payment
-		// would release: the observable that separates "refused" from "acted".
-		locked, err := store.AcquireResourceLock(hookCtx, db.ResourceLock{
-			ResourceKey: lockKey, OwnerJobID: child, OwnerToken: "token-retry",
-			ExpiresAt: now.Add(30 * time.Minute).Format(time.RFC3339Nano),
-		}, now)
-		if err != nil || !locked {
-			t.Fatalf("AcquireResourceLock acquired=%v err=%v", locked, err)
-		}
-		return nil
-	}
-	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
-	finalizedBefore := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized)
-	confirmedBefore := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed)
-
-	handled, err := engine.CompletePendingSupersedeFinalization(ctx, child)
-	if err != nil {
-		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
-	}
-	if interleaved != 1 {
-		t.Fatalf("interleave hook ran %d times at stage %q; the window under test was not entered", interleaved, stage)
-	}
-	if !handled {
-		t.Fatal("the debt was left outstanding with no disposition")
-	}
-	live := mustJob(t, store, child)
-	if live.State != string(JobRunning) {
-		t.Fatalf("claimed run = %q, want running: the stale payment terminated it", live.State)
-	}
-	payload, err := unmarshalPayload(live.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	if payload.Result != nil {
-		t.Fatalf("the superseded run's failure was stamped onto the claimed run: %+v", payload.Result)
-	}
-	// The finalizer runs BEFORE the advance bracket, so at before-advance-claim it has
-	// legitimately finalized the still-claimed lifecycle by the time the retry lands.
-	// Every earlier stage must show no new finalization at all. The kind is the
-	// SUPERSEDED one: this path is finalizeSupersededDelegationChildAtGeneration, so
-	// counting the timeout kind here watched a string the code can no longer emit and
-	// the guard could not fail (#1512).
-	if stage != supersedeDebtStageBeforeAdvanceClaim {
-		if got := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized); got != finalizedBefore {
-			t.Fatalf("%s events = %d, want %d: the claimed run was finalized", JobEventDelegationSupersededFinalized, got, finalizedBefore)
-		}
-	} else {
-		// LIVENESS of the counter itself: at this one stage the finalizer HAS run, so
-		// the counted kind must actually have been emitted. Without this, a future
-		// rename would leave the guard above watching a dead string, which is exactly
-		// how it became vacuous.
-		if got := countWorkflowJobEvents(t, store, child, JobEventDelegationSupersededFinalized); got <= finalizedBefore {
-			t.Fatalf("%s events = %d, want more than %d: the counter is watching a kind this path does not emit",
-				JobEventDelegationSupersededFinalized, got, finalizedBefore)
-		}
-	}
-	// The parent advance is only ever CONFIRMED for a lifecycle that never moved, so
-	// a stale payment must add no confirmation at any stage.
-	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed); got != confirmedBefore {
-		t.Fatalf("%s events = %d, want %d: a moved lifecycle had its parent advance confirmed", JobEventSupersedeAdvanceConfirmed, got, confirmedBefore)
-	}
-	held, err := store.GetResourceLock(ctx, lockKey)
-	if err != nil || held.OwnerJobID != child {
-		t.Fatalf("resource lock = %+v err=%v, want still held by the claimed run", held, err)
-	}
 }
 
 // TestSupersedeDebtCompletionDoesNotClearANewerDebt closes the other half of the
@@ -570,7 +216,7 @@ func TestSupersedeDebtClosureRefusesADebtAppendedMidClosure(t *testing.T) {
 			}
 			t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
-			if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil && !isDelegationPolicyOutcome(err) {
+			if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil {
 				t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
 			}
 			if fired != 1 {
@@ -664,7 +310,7 @@ func TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration(t *testing.T) {
 	}
 	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
 
-	if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil && !isDelegationPolicyOutcome(err) {
+	if _, err := engine.CompletePendingSupersedeFinalization(ctx, job); err != nil {
 		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
 	}
 	if interleaved != 1 {
@@ -678,51 +324,6 @@ func TestSupersedeCleanupRefusesATerminalRetryAtANewerGeneration(t *testing.T) {
 	if live.LifecycleGeneration == observed.LifecycleGeneration {
 		t.Fatalf("interleave did not move the generation off %d", observed.LifecycleGeneration)
 	}
-}
-
-// clearChildResult removes a synthetic result so the retried lifecycle starts from
-// the same shape a real re-dispatch would: queued work with no verdict yet.
-func clearChildResult(ctx context.Context, store *db.Store, jobID string) error {
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		return err
-	}
-	payload, err := unmarshalPayload(job.Payload)
-	if err != nil {
-		return err
-	}
-	payload.Result = nil
-	encoded, err := marshalPayload(payload)
-	if err != nil {
-		return err
-	}
-	return store.UpdateJobPayload(ctx, jobID, encoded)
-}
-
-// pendingDebtMarker returns the generation, reason and anchored flag of the LAST
-// pending-debt marker a job carries. It reads the marker EVENT rather than the net
-// debt on purpose: a supersession that ends in a policy outcome pays its debt
-// immediately, so the net debt is empty while the marker's contents are still the
-// thing production has to get right.
-func pendingDebtMarker(t *testing.T, store *db.Store, jobID string) (int64, bool) {
-	t.Helper()
-	events, err := store.ListJobEvents(context.Background(), jobID)
-	if err != nil {
-		t.Fatalf("ListJobEvents(%s): %v", jobID, err)
-	}
-	generation, anchored := int64(0), false
-	found := false
-	for _, event := range events {
-		if event.Kind != JobEventSupersedeFinalizePending {
-			continue
-		}
-		found = true
-		generation, anchored = parseSupersedeFinalizeDebt(event.Message)
-	}
-	if !found {
-		t.Fatalf("job %s carries no %s marker", jobID, JobEventSupersedeFinalizePending)
-	}
-	return generation, anchored
 }
 
 // TestPersistTaskStateRefusesADisposalWrittenAfterTheRead pins the third race.
@@ -763,7 +364,7 @@ func TestPersistTaskStateRefusesADisposalWrittenAfterTheRead(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				written, err := persistTaskStateOwned(ctx, store, snapshot, target, nil)
+				written, err := persistTaskStateOwned(ctx, store, snapshot, target)
 				if written {
 					t.Fatalf("wrote %s over a %s task", target, disposed)
 				}
@@ -807,7 +408,7 @@ func TestPersistTaskStateStillWritesEveryNonDisposedState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			written, err := persistTaskStateOwned(ctx, store, task, target, nil)
+			written, err := persistTaskStateOwned(ctx, store, task, target)
 			if err != nil || !written {
 				t.Fatalf("persistTaskStateOwned(%s) written=%v err=%v", target, written, err)
 			}
@@ -816,7 +417,7 @@ func TestPersistTaskStateStillWritesEveryNonDisposedState(t *testing.T) {
 			}
 			// Idempotent: writing the same state again is permitted, including for a
 			// disposed target, so a repeated disposal is not an error.
-			written, err = persistTaskStateOwned(ctx, store, task, target, nil)
+			written, err = persistTaskStateOwned(ctx, store, task, target)
 			if err != nil || !written {
 				t.Fatalf("repeated persistTaskStateOwned(%s) written=%v err=%v", target, written, err)
 			}

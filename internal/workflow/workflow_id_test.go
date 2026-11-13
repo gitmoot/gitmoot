@@ -4,8 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-
-	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 func TestWorkflowIDOmittedPayloadIsByteIdentical(t *testing.T) {
@@ -55,15 +53,7 @@ func TestValidateWorkflowID(t *testing.T) {
 	}
 }
 
-func TestWorkflowIDInheritedByDelegationAndComparedForIdempotency(t *testing.T) {
-	request := (Engine{}).delegationRequest(
-		context.Background(), db.Job{ID: "parent", Agent: "coord"},
-		JobPayload{Repo: "acme/widget", WorkflowID: "release-42"},
-		Delegation{ID: "child", Agent: "worker", Action: "ask", Prompt: "check"},
-	)
-	if request.WorkflowID != "release-42" {
-		t.Fatalf("delegation WorkflowID = %q", request.WorkflowID)
-	}
+func TestWorkflowIDComparedForIdempotency(t *testing.T) {
 	payload := JobPayload{Repo: "acme/widget", WorkflowID: "release-42"}
 	base := JobRequest{Repo: "acme/widget", WorkflowID: "release-42"}
 	if !payloadMatchesRequest(payload, base) {

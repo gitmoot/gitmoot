@@ -166,10 +166,8 @@ func runAgentTemplateShow(args []string, stdout, stderr io.Writer) int {
 }
 
 func retiredAgentTemplateError(id string) error {
-	// #2203 added a SECOND retired id (decompose-and-verify -> verifier), so the
-	// successor is per-id and agenttemplate.RetiredReplacement is the map that
-	// knows it. Pointing every refusal at the planner told a decompose-and-verify
-	// caller to use a template that does not do what it asked for.
+	// The successor is per-id: agenttemplate.RetiredReplacement knows it, and a
+	// retired coordinator recipe (#2588) has none.
 	if replacement, ok := agenttemplate.RetiredReplacement(id); ok {
 		return fmt.Errorf("agent template %s is retired; use %s", id, replacement)
 	}

@@ -14,7 +14,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 )
 
-const approvedProviderTestResult = `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":["go test ./internal/workflow"],"needs":[],"delegations":[]}}`
+const approvedProviderTestResult = `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":["go test ./internal/workflow"],"needs":[]}}`
 
 func TestMailboxPersistsSuccessfulOmpProviderEvidence(t *testing.T) {
 	ctx := context.Background()

@@ -169,9 +169,7 @@ const noLiveSupersedeAdvanceLockSQL = ` AND NOT EXISTS (
 			  AND advance.expires_at > ?
 		)`
 
-// AdvanceOwnershipHeld is the non-transactional read used by renewal checks and by
-// tests. The authoritative check for a WRITE is advanceOwnershipLiveTx inside that
-// write's own transaction.
+// AdvanceOwnershipHeld is the non-transactional ownership read used by tests.
 func (s *Store) AdvanceOwnershipHeld(ctx context.Context, resourceKey string, ownerToken string, now time.Time) (bool, error) {
 	var held int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_locks
@@ -243,71 +241,6 @@ func (s *Store) ReleaseResourceLock(ctx context.Context, resourceKey string, own
 		return false, err
 	}
 	return affected == 1, nil
-}
-
-// AdvanceOwnership names the exact lease an advance holds: key, token, the job it
-// advances, and the lifecycle generation it was granted for. Every renewal and
-// every irreversible effect is bound to ALL FOUR, in one predicate.
-type AdvanceOwnership struct {
-	LockKey      string
-	OwnerToken   string
-	OwnerJobID   string
-	AtGeneration int64
-}
-
-// advanceOwnershipLiveSQL is the predicate: this exact token still holds this exact
-// key, its lease has NOT expired, and the job is still on the generation the lease
-// was granted for.
-//
-// Expiry is part of it because a lapsed lease is how an abandoned pass is
-// recovered: once RetryJob commits generation N+1 against an expired lock, the old
-// token must be permanently dead. A renewal that only matched key+token would
-// RESURRECT it and let a dead pass emit effects against a lifecycle that has moved.
-// The generation clause closes the same door from the other side.
-const advanceOwnershipLiveSQL = `SELECT 1 FROM resource_locks
-		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?
-		  AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.lifecycle_generation = ?)`
-
-// RenewAdvanceOwnershipLease extends a lease that is STILL live and still on its
-// granted lifecycle. Zero rows means ownership is gone for good, never "try again".
-//
-// It is deliberately separate from HeartbeatResourceLock: a runtime-session
-// heartbeat has different recovery semantics, and widening that method would change
-// behaviour for every session on the box.
-func (s *Store) RenewAdvanceOwnershipLease(ctx context.Context, own AdvanceOwnership, expiresAt time.Time, now time.Time) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE resource_locks
-		SET expires_at = ?, updated_at = ?
-		WHERE resource_key = ? AND owner_token = ? AND expires_at > ?
-		  AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.lifecycle_generation = ?)`,
-		formatResourceLockTime(expiresAt), formatResourceLockTime(now),
-		strings.TrimSpace(own.LockKey), strings.TrimSpace(own.OwnerToken), formatResourceLockTime(now),
-		strings.TrimSpace(own.OwnerJobID), own.AtGeneration)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return affected == 1, nil
-}
-
-// advanceOwnershipLiveTx answers the same predicate INSIDE a caller's transaction,
-// so an irreversible write can be bound to live ownership at COMMIT rather than by
-// a preceding read. A pre-write heartbeat is not sufficient: the gap between it and
-// the write is exactly where a lease loss lands.
-func advanceOwnershipLiveTx(ctx context.Context, tx *sql.Tx, own AdvanceOwnership, now time.Time) (bool, error) {
-	if strings.TrimSpace(own.LockKey) == "" || strings.TrimSpace(own.OwnerToken) == "" {
-		return false, nil
-	}
-	var live int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM (`+advanceOwnershipLiveSQL+`)`,
-		strings.TrimSpace(own.LockKey), strings.TrimSpace(own.OwnerToken), formatResourceLockTime(now),
-		strings.TrimSpace(own.OwnerJobID), own.AtGeneration).Scan(&live)
-	if err != nil {
-		return false, err
-	}
-	return live > 0, nil
 }
 
 // excludeLiveAdvanceLockSQL keeps a supersession parent-advance lease OUT of every

@@ -500,8 +500,8 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"plan ready","findings":[{"title":"clear"}],"changes_made":[],"tests_run":["go test ./internal/cli"],"needs":["ship it"],"delegations":[{"id":"review","agent":"thermo-review","action":"review","prompt":"review the plan"}]}}` + "\n"},
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"json ready","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"plan ready","findings":[{"title":"clear"}],"changes_made":[],"tests_run":["go test ./internal/cli"],"needs":["ship it"]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"json ready","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -526,8 +526,6 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 		"- ship it",
 		"tests_run:",
 		"- go test ./internal/cli",
-		"delegations:",
-		"- thermo-review",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("ask output missing %q:\n%s", want, stdout.String())
@@ -626,33 +624,6 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	}
 	if jsonPayload.Branch != "feature/local-ask" || jsonPayload.Instructions != "- Write JSON" {
 		t.Fatalf("json ask payload = %+v", jsonPayload)
-	}
-}
-
-func TestSelectAgentRunAction(t *testing.T) {
-	tests := []struct {
-		name    string
-		options agentRunOptions
-		action  string
-	}{
-		{name: "pr selects review", options: agentRunOptions{prNumber: 7, message: "anything"}, action: "review"},
-		{name: "head sha selects review", options: agentRunOptions{headSHA: strings.Repeat("a", 40), message: "anything"}, action: "review"},
-		{name: "review language selects review", options: agentRunOptions{message: "please review this PR"}, action: "review"},
-		// #2203: implementation language no longer selects a dispatch action.
-		// Gitmoot does not dispatch implementation, so a prompt asking for code
-		// routes to the read-only ask path rather than minting a write job.
-		{name: "implementation language falls back to ask", options: agentRunOptions{message: "update docs and add tests"}, action: "ask"},
-		{name: "write code falls back to ask", options: agentRunOptions{message: "write code for the new command"}, action: "ask"},
-		{name: "code question selects ask", options: agentRunOptions{message: "what does this code do?"}, action: "ask"},
-		{name: "plain question selects ask", options: agentRunOptions{message: "what is the risk here?"}, action: "ask"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			action, _ := selectAgentRunAction(tt.options)
-			if action != tt.action {
-				t.Fatalf("action = %q, want %q", action, tt.action)
-			}
-		})
 	}
 }
 
@@ -1285,7 +1256,7 @@ func TestDispatchForegroundAskToManagedTypeSpinsInstance(t *testing.T) {
 	defer store.Close()
 	runner := &agentStartRunner{results: []subprocess.Result{
 		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440222", "ready")},
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440223", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440223", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`)},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1398,7 +1369,7 @@ func TestDispatchForegroundAskSingleInstanceUnchanged(t *testing.T) {
 		t.Fatalf("UpsertAgent returned error: %v", err)
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"},
+		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}` + "\n"},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -2892,100 +2863,6 @@ func TestParseAgentRunOptionsCapturesEffort(t *testing.T) {
 	}
 }
 
-func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
-	tests := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "space form", args: []string{"planner", "do the work", "--recipe", "review-panel"}, want: "review-panel"},
-		// #2203 retired decompose-and-verify, so the inline form is exercised with a
-		// SURVIVING id. Keeping it on the retired one asserted that a removed recipe
-		// is still selectable.
-		{name: "inline form", args: []string{"planner", "do the work", "--recipe=verifier"}, want: "verifier"},
-		{name: "absent leaves empty", args: []string{"planner", "do the work"}, want: ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			options, ok := parseAgentRunOptions("orchestrate", tt.args, &stderr)
-			if !ok {
-				t.Fatalf("parseAgentRunOptions failed: %q", stderr.String())
-			}
-			if options.recipe != tt.want {
-				t.Fatalf("recipe = %q, want %q", options.recipe, tt.want)
-			}
-		})
-	}
-
-	t.Run("unknown recipe rejected", func(t *testing.T) {
-		var stderr bytes.Buffer
-		_, ok := parseAgentRunOptions("orchestrate", []string{"planner", "do the work", "--recipe=bogus"}, &stderr)
-		if ok {
-			t.Fatalf("parseAgentRunOptions accepted an unknown recipe")
-		}
-		errText := stderr.String()
-		if !strings.Contains(errText, `unknown recipe "bogus"`) {
-			t.Fatalf("stderr missing unknown-recipe message: %q", errText)
-		}
-		for _, id := range []string{"review-panel", "verifier"} {
-			if !strings.Contains(errText, id) {
-				t.Fatalf("stderr missing valid id %q: %q", id, errText)
-			}
-		}
-		// The retired id must NOT be offered as a choice. Without this the list
-		// could regrow it and the loop above would still pass.
-		if strings.Contains(errText, "decompose-and-verify") {
-			t.Fatalf("stderr offers the retired decompose-and-verify recipe: %q", errText)
-		}
-	})
-}
-
-// A valid recipe id that has not been installed must surface
-// loadInstalledTemplate's not-installed error at dispatch time, rather than
-// silently queueing a job with no recipe prompt.
-func TestRunOrchestrateRejectsUninstalledRecipe(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{
-		"agent", "subscribe", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--session", "550e8400-e29b-41d4-a716-446655440099",
-		"--role", "planner",
-		"--repo", "owner/repo",
-		"--capability", "ask",
-	}, &stdout, &stderr); code != 0 {
-		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	code := Run([]string{"orchestrate", "planner", "fan out fixes", "--home", home, "--repo", "owner/repo", "--recipe", "review-panel"}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("orchestrate exit code = %d, want 1; stderr=%s stdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stderr.String(), "agent template review-panel is not installed") {
-		t.Fatalf("stderr missing not-installed error: %q", stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	if len(jobs) != 0 {
-		t.Fatalf("jobs = %+v, want none (dispatch should fail before enqueue)", jobs)
-	}
-}
-
 func TestParseAgentAskOptionsCapturesModel(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3637,32 +3514,12 @@ func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
 	}
 }
 
-func TestAgentRunForegroundRejectsNonReviewAction(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runAgentRun([]string{
-		"responder", "answer it", "--action", "ask", "--foreground",
-	}, &stdout, &stderr)
-	if code != 2 || !strings.Contains(stderr.String(), "--foreground is only supported when routing to review") {
-		t.Fatalf("exit=%d stdout=%q stderr=%q, want selected-action refusal", code, stdout.String(), stderr.String())
-	}
-}
-
-func TestOrchestrateRejectsForegroundReview(t *testing.T) {
-	var stdout, stderr bytes.Buffer
-	code := runOrchestrate([]string{
-		"reviewer", "review it", "--action", "review", "--foreground", "--repo", "owner/repo", "--pr", "7",
-	}, &stdout, &stderr)
-	if code != 2 || !strings.Contains(stderr.String(), "orchestrate always runs in background") {
-		t.Fatalf("exit=%d stdout=%q stderr=%q, want foreground refusal", code, stdout.String(), stderr.String())
-	}
-}
-
 func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := runAgent([]string{"--help"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent help exit=%d stderr=%q", code, stderr.String())
 	}
-	for _, command := range []string{"agent run", "agent review"} {
+	for _, command := range []string{"agent review"} {
 		line := ""
 		for _, candidate := range strings.Split(stdout.String(), "\n") {
 			if strings.Contains(candidate, "gitmoot "+command+" ") {
@@ -3673,15 +3530,6 @@ func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 		if !strings.Contains(line, "[--background|--foreground]") {
 			t.Fatalf("%s help line = %q, want both execution modes", command, line)
 		}
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := runAgent([]string{"run", "--help"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("agent run help exit=%d stderr=%q", code, stderr.String())
-	}
-	if help := stdout.String() + stderr.String(); !strings.Contains(help, "[--background|--foreground]") {
-		t.Fatalf("agent run help = %q, want both execution modes", help)
 	}
 }
 

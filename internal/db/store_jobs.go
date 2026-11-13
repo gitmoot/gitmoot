@@ -144,69 +144,6 @@ func createJobWithEventTx(ctx context.Context, tx *sql.Tx, s *Store, job Job, ev
 	return resolveAwaitedReviewFactTx(ctx, tx, job.ID, job.Agent, job.Type, job.State, job.Payload, 0, s.blockingSeverityFor, time.Now().UTC())
 }
 
-// ErrAdvanceOwnershipLost is returned when an irreversible write is refused because
-// the supersession advance that requested it no longer owns the job.
-var ErrAdvanceOwnershipLost = errors.New("supersede advance no longer owns this job")
-
-// CreateJobWithEventIfAdvanceOwned is CreateJobWithEvent with live advance ownership
-// asserted INSIDE the insert's own transaction (#1673).
-//
-// Enqueueing a job is irreversible, so the binding cannot be a preceding read or a
-// pre-write heartbeat: the gap between such a check and the insert is exactly where
-// a lease loss or a lifecycle rollover lands. Checking in the transaction that
-// carries the insert means either both the ownership predicate held and the job
-// exists, or neither.
-func (s *Store) CreateJobWithEventIfAdvanceOwned(ctx context.Context, job Job, own AdvanceOwnership, now time.Time, event JobEvent, additionalEvents ...JobEvent) error {
-	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
-	if fenceErr != nil {
-		return fenceErr
-	}
-	defer releaseLifecycle()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
-	if err != nil {
-		return err
-	}
-	if !live {
-		return fmt.Errorf("%w: job %s at generation %d", ErrAdvanceOwnershipLost, own.OwnerJobID, own.AtGeneration)
-	}
-	if err := createJobWithEventTx(ctx, tx, s, job, event, additionalEvents...); err != nil {
-		return err
-	}
-	return tx.Commit()
-
-}
-
-// AddJobEventIfAdvanceOwned appends a job event only while the advance that asked
-// for it still owns the job, asserted in the append's own transaction (#1673). It is
-// the taskless counterpart of the round-open write: a coordinator with no task still
-// owes a durable round record, and a superseded pass still must not write one.
-func (s *Store) AddJobEventIfAdvanceOwned(ctx context.Context, event JobEvent, own AdvanceOwnership, now time.Time) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	live, err := advanceOwnershipLiveTx(ctx, tx, own, now)
-	if err != nil {
-		return false, err
-	}
-	if !live {
-		return false, fmt.Errorf("%w: event %q for job %s at generation %d",
-			ErrAdvanceOwnershipLost, event.Kind, own.OwnerJobID, own.AtGeneration)
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`,
-		event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
-}
-
 // CreateExternallyDrivenJobWithEvent creates a session job (#657) whose execution
 // happens OUTSIDE the engine: it sets externally_driven = 1 so the daemon's
 // queued selector never claims it and the engine lease reaper skips it. It
@@ -265,31 +202,6 @@ func (s *Store) JobCreatedAt(ctx context.Context, id string) (string, error) {
 		return "", err
 	}
 	return createdAt, nil
-}
-
-// SetRootJobKilled marks a delegation tree's root job as killed by an operator
-// (#341). Only the root row carries the flag; the engine and daemon scope to a
-// tree by joining children's payload RootJobID back to this id. No-op-safe: an
-// unknown id simply affects zero rows (the caller verifies existence).
-func (s *Store) SetRootJobKilled(ctx context.Context, rootID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET root_killed = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, rootID)
-	return err
-}
-
-// IsRootJobKilled reports whether the root job rootID has been killed by an
-// operator (#341). An unknown id reads as not killed (COALESCE over no rows
-// yields zero rows, so the scan defaults to false), so the backstop fails open
-// and never blocks dispatch on a lookup miss.
-func (s *Store) IsRootJobKilled(ctx context.Context, rootID string) (bool, error) {
-	var killed bool
-	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(root_killed, 0) FROM jobs WHERE id = ?`, rootID)
-	if err := row.Scan(&killed); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	return killed, nil
 }
 
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
@@ -2548,48 +2460,6 @@ func (s *Store) AddJobEventAtGeneration(ctx context.Context, event JobEvent, atG
 	return affected == 1, nil
 }
 
-// JobIDsWithOpenEscalation returns the IDs of coordinator jobs with an OPEN
-// escalation round — strictly more delegation_escalation_requested than
-// delegation_escalation_resolved events — the same requested>resolved rule
-// Engine.escalationOpen applies per job (engine.go), evaluated set-at-once over
-// idx_job_events_kind. It lets AutoFinalizeExpiredEscalations iterate only the
-// (small) set of trees currently paused awaiting a human instead of listing EVERY
-// job and re-reading each one's full event history TWICE on every repo poll — which
-// sustained ~37MB/s and ~1108 queries per poll x18 repos (#598/#340). Zero rows =>
-// the caller returns with no further per-job queries.
-//
-// Both ask-gate (#445) and failure escalations ride these same two kinds, and the
-// per-job candidate gate is purely count-based on them (never branching on the
-// record's Kind), so this count reproduces the exact candidate set the original
-// loadEscalation(exists) + !escalationResolved(open) gates passed. The literal
-// strings MUST equal the escalationRequestedEvent/escalationResolvedEvent constants;
-// a store test pins this.
-func (s *Store) JobIDsWithOpenEscalation(ctx context.Context) ([]string, error) {
-	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
-		WHERE kind IN ('delegation_escalation_requested', 'delegation_escalation_resolved')
-		GROUP BY job_id
-		HAVING SUM(CASE WHEN kind = 'delegation_escalation_requested' THEN 1 ELSE 0 END)
-		     > SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
-		ORDER BY job_id`)
-}
-
-// JobIDsWithUnfinishedEscalationResolution returns coordinator jobs whose escalation
-// resolution was CLAIMED but whose effects never finished: strictly more
-// delegation_escalation_resolved than delegation_escalation_effects_completed events.
-//
-// The claim is committed before the verb's irreversible effects so that only one
-// resolver runs them (#1673). This query is what stops that ordering from turning a
-// crash into a permanent stall: a closed round is no candidate for any other sweep,
-// so the receipt gap is the only remaining evidence that work is owed.
-func (s *Store) JobIDsWithUnfinishedEscalationResolution(ctx context.Context) ([]string, error) {
-	return s.jobIDsByQuery(ctx, `SELECT job_id FROM job_events
-		WHERE kind IN ('delegation_escalation_resolved', 'delegation_escalation_effects_completed')
-		GROUP BY job_id
-		HAVING SUM(CASE WHEN kind = 'delegation_escalation_resolved' THEN 1 ELSE 0 END)
-		     > SUM(CASE WHEN kind = 'delegation_escalation_effects_completed' THEN 1 ELSE 0 END)
-		ORDER BY job_id`)
-}
-
 // RecordJobGates persists one resumable gate per non-blank need for a blocked job
 // (#682). It is an UPSERT keyed on (job_id, need): a fresh need inserts an OPEN
 // gate; a re-blocked job that repeats a need REOPENS the existing row (resets
@@ -3039,4 +2909,12 @@ func (s *Store) PendingCleanupTrashes(ctx context.Context, limit int, retrySince
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// ExecForTest runs a raw statement against this store. It exists so a test can
+// put the database into a state no production code path creates. Production
+// code must never call it.
+func (s *Store) ExecForTest(ctx context.Context, statement string, args ...any) error {
+	_, err := s.db.ExecContext(ctx, statement, args...)
+	return err
 }

@@ -24,9 +24,6 @@ import (
 
 const ThermoNuclearCodeQualityReviewID = "thermo-nuclear-code-quality-review"
 const PlannerTemplateID = "planner"
-const ReviewPanelTemplateID = "review-panel"
-const DecomposeAndVerifyTemplateID = "decompose-and-verify"
-const VerifierTemplateID = "verifier"
 
 var idPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 
@@ -74,32 +71,22 @@ var builtins = []Definition{
 		SourceRef:           "main",
 		SourcePath:          "skills/gitmoot/agent-templates/planner.md",
 	},
-	{ID: ReviewPanelTemplateID, Name: "Review Panel Coordinator",
-		Description: "Coordinator recipe that fans a PR or change out to a panel of ephemeral reviewers with diverse lenses, then synthesizes their findings.",
-		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review"}, Mutation: false,
-		SourceRepo: "gitmoot/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/review-panel.md"},
-	{ID: VerifierTemplateID, Name: "Verifier Coordinator",
-		Description: "Coordinator recipe that runs one producer leg, then an independent read-only verify leg on a different runtime that checks the combined result against the original goal before reporting back.",
-		DefaultRole: "coordinator", DefaultCapabilities: []string{"ask", "review"}, Mutation: false,
-		SourceRepo: "gitmoot/gitmoot", SourceRef: "main", SourcePath: "skills/gitmoot/agent-templates/verifier.md"},
 }
 
 // retiredIDs maps a built-in template id that NO LONGER SHIPS to the recipe
-// that supersedes it. Membership is what keeps a removed id recognisable:
-// Lookup misses it, so without an entry here `agent template add`/pull would
-// report an unknown template, while a retired entry refuses by name and points
-// at something real.
+// that supersedes it, or "" when nothing does. Membership is what keeps a
+// removed id recognisable: Lookup misses it, so without an entry here `agent
+// template add`/pull would report an unknown template, while a retired entry
+// refuses by name.
 //
-// decompose-and-verify joined after #2203 removed the implement delegation
-// action. That recipe existed to split one task into parallel WRITE legs and
-// merge them for a verify gate; with DelegationActions reduced to ask|review
-// there is no writable delegation action to retarget it to, so it is retired
-// BECAUSE gitmoot no longer dispatches implementation — not for lack of use,
-// which was never measured. Its successor is verifier: the same
-// producer-then-independent-verify shape with a read-only producer.
+// review-panel, verifier and decompose-and-verify were coordinator recipes
+// whose whole output was a delegations[] fan-out; #2588 removed the delegation
+// engine, so they have no successor.
 var retiredIDs = map[string]string{
-	"planner-" + "here":          PlannerTemplateID,
-	DecomposeAndVerifyTemplateID: VerifierTemplateID,
+	"planner-" + "here":    PlannerTemplateID,
+	"review-panel":         "",
+	"verifier":             "",
+	"decompose-and-verify": "",
 }
 
 func Builtins() []Definition {
@@ -125,10 +112,10 @@ func IsRetired(id string) bool {
 
 // RetiredReplacement returns the recipe that supersedes a retired id, so a
 // refusal can name a successor that actually exists instead of always pointing
-// at the planner.
+// at the planner. ok is false for a retired id with no successor.
 func RetiredReplacement(id string) (string, bool) {
-	replacement, ok := retiredIDs[strings.TrimSpace(id)]
-	return replacement, ok
+	replacement := retiredIDs[strings.TrimSpace(id)]
+	return replacement, replacement != ""
 }
 
 func ValidateID(id string) error {
@@ -186,14 +173,6 @@ func MetadataForDefinition(definition Definition) Metadata {
 			"driver":         "code-review",
 			"preferred_gate": "human-review",
 		}
-	case ReviewPanelTemplateID:
-		metadata.Tags = []string{"coordinator", "review", "orchestra"}
-		metadata.Inputs = []string{"repo", "pull_request", "task"}
-		metadata.Outputs = []string{"delegations", "review_synthesis"}
-	case VerifierTemplateID:
-		metadata.Tags = []string{"coordinator", "review", "orchestra"}
-		metadata.Inputs = []string{"repo", "task"}
-		metadata.Outputs = []string{"delegations", "verification_report"}
 	}
 	return metadata
 }

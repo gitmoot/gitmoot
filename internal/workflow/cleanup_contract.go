@@ -442,18 +442,6 @@ func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload,
 		}
 		ancestor = strings.TrimSpace(p.ParentJobID)
 	}
-	_, parent, err := e.jobPayload(ctx, parentID)
-	if err != nil {
-		return "consumer_graph_unknown", nil
-	}
-	declared := map[string]bool{}
-	for _, delegation := range parent.Result.Delegations {
-		for _, dep := range delegation.Deps {
-			if strings.TrimSpace(dep) == strings.TrimSpace(payload.DelegationID) {
-				declared[strings.TrimSpace(delegation.ID)] = false
-			}
-		}
-	}
 	children, err := e.Store.ListJobsByParent(ctx, parentID)
 	if err != nil {
 		return "consumer_graph_unknown", nil
@@ -466,28 +454,19 @@ func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload,
 		if err != nil {
 			return "consumer_graph_unknown", nil
 		}
-		_, consumes := declared[strings.TrimSpace(child.DelegationID)]
+		consumes := false
 		for _, dep := range p.Deps {
 			consumes = consumes || strings.TrimSpace(dep) == strings.TrimSpace(payload.DelegationID)
 		}
-		// Continuations can consume the completed tree as a whole, rather than
-		// naming an individual delegation dependency.
+		// A historical continuation row (no delegation id) consumed the completed
+		// tree as a whole rather than naming an individual delegation dependency.
 		consumes = consumes || strings.TrimSpace(child.DelegationID) == ""
 		if !consumes {
 			continue
 		}
 		d.Consumers = append(d.Consumers, cleanupConsumer(child))
-		if _, exists := declared[strings.TrimSpace(child.DelegationID)]; exists {
-			declared[strings.TrimSpace(child.DelegationID)] = true
-		}
 		if child.State != string(JobSucceeded) {
 			return "consumer_resumable", nil
-		}
-	}
-	for id, found := range declared {
-		if !found {
-			d.Consumers = append(d.Consumers, CleanupConsumer{Delegation: id, State: "undispatched"})
-			return "consumer_undispatched", nil
 		}
 	}
 	sort.Slice(d.Consumers, func(i, j int) bool { return d.Consumers[i].JobID < d.Consumers[j].JobID })

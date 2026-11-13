@@ -645,6 +645,15 @@ func seedSameStateNewerGeneration(t *testing.T, store *db.Store, jobID string, s
 	return observed
 }
 
+func mustWorkerJob(t *testing.T, store *db.Store, jobID string) db.Job {
+	t.Helper()
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatalf("GetJob(%s) returned error: %v", jobID, err)
+	}
+	return job
+}
+
 // TestPermissionBlockDoesNotBlockANewerRun anchors WRITER 1 (markJobPermissionBlocked).
 //
 // Review reproduced this one: the state-only CAS accepted a NEWER run's `running` and blocked it,
@@ -663,7 +672,7 @@ func TestPermissionBlockDoesNotBlockANewerRun(t *testing.T) {
 		t.Fatalf("admitted generation = %d, observed generation = %d", admitted.LifecycleGeneration, observed.generation)
 	}
 
-	if _, _, err := markJobPermissionBlocked(ctx, store, admitted); err != nil {
+	if _, err := markJobPermissionBlocked(ctx, store, admitted); err != nil {
 		t.Fatalf("markJobPermissionBlocked returned error: %v", err)
 	}
 	after, err := store.GetJob(ctx, "perm-aba")

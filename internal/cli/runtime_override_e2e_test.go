@@ -50,7 +50,7 @@ import (
 // executed (the marker file) and emits a valid approved gitmoot_result so the
 // job runs to terminal succeeded with no LLM and no network.
 func runtimeOverrideShellScript(marker string) string {
-	result := `printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"ran on shell override","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+	result := `printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"ran on shell override","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`
 	if strings.TrimSpace(marker) == "" {
 		return result
 	}

@@ -345,10 +345,7 @@ func TestWebDataSourceWorkflowGroupsTreesAndPaginates(t *testing.T) {
 	}
 	rootPayload := workflow.JobPayload{
 		WorkflowID: "release-42", TaskTitle: "ship release", Model: "gpt-root",
-		Result: &workflow.AgentResult{Delegations: []workflow.Delegation{
-			{ID: "prep", Agent: "worker", Action: "prepare"},
-			{ID: "ship", Agent: "worker", Action: "ship", Deps: []string{"prep"}},
-		}},
+		Result: &workflow.AgentResult{},
 	}
 	mustCreateJob(t, store, db.Job{ID: "root", Agent: "lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, rootPayload), Model: "gpt-root"}, "", "")
 	prepPayload := workflow.JobPayload{WorkflowID: "release-42", RootJobID: "root", ParentJobID: "root", DelegationID: "prep", TaskTitle: "prepare release"}

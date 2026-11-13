@@ -3344,4 +3344,12 @@ DROP TABLE IF EXISTS runtime_session_usage;
 DROP TABLE IF EXISTS lock_events;
 DROP TABLE IF EXISTS branch_locks;
 	`,
+	// #2588 deletes the Orchestra delegation engine. escalation_rounds held the
+	// human-escalation rounds of a paused delegation tree (`gitmoot escalation`,
+	// `job answer`, /gitmoot resume); its writers and readers are deleted in the
+	// same change and the live table never held a row. Dropping it drops its two
+	// indexes with it. The jobs delegation columns stay as history.
+	`
+DROP TABLE IF EXISTS escalation_rounds;
+	`,
 }

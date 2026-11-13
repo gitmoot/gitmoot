@@ -104,24 +104,6 @@ type BranchDeleter interface {
 	DeleteBranch(ctx context.Context, branch string) error
 }
 
-// IntegrationWorktreeManager builds a detached worktree off the parent base and
-// merges the per-delegation branches of succeeded implement legs into it, so a
-// dependent verify/review step sees the legs' combined work instead of the base
-// checkout (issue #332). The detached worktree carries no branch and no branch
-// lock, so it is disposed by the same read-only cleanup as fan-out worktrees.
-type IntegrationWorktreeManager interface {
-	AddDetachedWorktree(ctx context.Context, path string, ref string) error
-	MergeBranches(ctx context.Context, dir string, branches []string, message string) error
-}
-
-// WorktreeCommitter commits an implement delegation leg's work to its own branch
-// on success, so the leg's changes are available on its branch for a dependent
-// integration step (#332) even in a PR-less local orchestrate where the task/PR
-// finalizer never runs. The checkout-bound gitutil.Client satisfies it.
-type WorktreeCommitter interface {
-	CommitWorktree(ctx context.Context, dir string, message string) (bool, error)
-}
-
 // ReclaimTerminalTaskWorktreeOutcome removes a task-owned worktree only after
 // terminal state, deterministic ownership, active-job absence, conclusive
 // process liveness, and cleanliness are all revalidated under the same checkout
@@ -357,26 +339,6 @@ func isTerminalWorktreeRemovalError(err error) bool {
 	return errors.As(err, &terminal) && terminal.TerminalWorktreeRemoval()
 }
 
-// DelegationWorktreeRequest carries the inputs needed to allocate a git
-// worktree for a delegated implement job. Unlike TaskWorktreeRequest it does not
-// touch the tasks table; the resulting path and branch are returned to the
-// dispatcher for storage in the child JobPayload.
-type DelegationWorktreeRequest struct {
-	Home         string
-	Repo         string
-	ParentJobID  string
-	DelegationID string
-	Delegation   Delegation
-	BaseBranch   string
-	Owner        string
-	Checkout     string
-	// RetryAttempt is the 1-based retry number for a re-enqueued delegation. It
-	// is 0 for the original attempt. A non-zero value gives the retry an isolated
-	// worktree path and branch so it never collides with the failed attempt's
-	// still-present worktree directory and checked-out branch.
-	RetryAttempt int
-}
-
 // ReadOnlyWorktreeDispatchLockWaitBudget bounds how long the SCHEDULER-LOOP
 // read-only worktree allocators (#739 dispatch-time isolation and the reactive
 // pool-isolation dispatcher) wait for the checkout mutation lock. They run
@@ -464,134 +426,12 @@ func AllocateReadOnlyWorktree(ctx context.Context, store *db.Store, home string,
 	return path, nil
 }
 
-// AllocateReadOnlyDelegationWorktree creates a detached, branch-lock-free git
-// worktree for a read-only (ask/review) delegation child so it does not
-// serialize with its same-repo siblings on the shared repo checkout key. It
-// reuses the deterministic DelegationWorktreePath and the checkout mutation lock
-// (a detached `git worktree add` mutates the shared .git) but takes no branch
-// lock and creates no branch: a read-only child owns nothing to merge. The
-// worktree is disposed by cleanupReadOnlyDelegationWorktree once the child job
-// reaches a terminal state. It is a thin Engine wrapper over the shared
-// AllocateReadOnlyWorktree primitive: the delegation-specific validation (a
-// present parent+delegation id) is kept here so its error messages are unchanged.
-func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request DelegationWorktreeRequest, manager ReadOnlyWorktreeManager) (string, error) {
-	if err := e.validate(); err != nil {
-		return "", err
-	}
-	if manager == nil {
-		return "", errors.New("read-only worktree manager is required")
-	}
-	if strings.TrimSpace(request.ParentJobID) == "" {
-		return "", errors.New("delegation worktree parent job id is required")
-	}
-	if strings.TrimSpace(request.DelegationID) == "" {
-		return "", errors.New("delegation worktree delegation id is required")
-	}
-	return AllocateReadOnlyWorktree(ctx, e.Store, request.Home, request.Repo, request.Checkout, request.ParentJobID, request.DelegationID, request.RetryAttempt, request.BaseBranch, checkoutMutationWaitTimeout, manager)
-}
-
-// AllocateIntegrationWorktree creates a detached worktree off the parent base
-// branch and sequentially merges the given succeeded implement-leg branches into
-// it, so a dependent read-only step (a decompose-and-verify verify gate) sees the
-// legs' combined work rather than the base checkout (issue #332). The worktree is
-// keyed on a synthetic "integration-<delegation-id>" so it never collides with
-// the dependent's own id, carries no branch/branch lock, and is disposed by the
-// same read-only cleanup as fan-out worktrees. A merge conflict means the
-// decomposition was not actually file-disjoint: it is returned as a BlockedError
-// so the caller blocks the parent rather than auto-resolving.
-func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request DelegationWorktreeRequest, legBranches []string, manager IntegrationWorktreeManager) (string, error) {
-	if err := e.validate(); err != nil {
-		return "", err
-	}
-	if manager == nil {
-		return "", errors.New("integration worktree manager is required")
-	}
-	if strings.TrimSpace(request.ParentJobID) == "" {
-		return "", errors.New("delegation worktree parent job id is required")
-	}
-	if strings.TrimSpace(request.DelegationID) == "" {
-		return "", errors.New("delegation worktree delegation id is required")
-	}
-	if len(legBranches) == 0 {
-		return "", errors.New("integration worktree requires at least one leg branch")
-	}
-	integrationID := "integration-" + request.DelegationID
-	placement, err := ResolveWorktreePlacement(request.Home)
-	if err != nil {
-		return "", err
-	}
-	if err := placement.Preflight(); err != nil {
-		return "", err
-	}
-	path, err := placement.DelegationPath(request.Repo, request.ParentJobID, integrationID, request.RetryAttempt)
-	if err != nil {
-		return "", err
-	}
-	ref := strings.TrimSpace(request.BaseBranch)
-	if ref == "" {
-		ref = "HEAD"
-	}
-	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.ParentJobID+"/"+integrationID, time.Now().UTC())
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		if releaseCheckoutLock != nil {
-			_ = releaseCheckoutLock(context.Background())
-		}
-	}()
-	// A delegation is dispatched once (advanceDelegations skips already-enqueued
-	// dependents; retries use a retry-suffixed path), so allocate a fresh detached
-	// worktree like the implement and read-only paths rather than reusing one.
-	// Under a configured root the parents are created on the verified mount first, so
-	// git's own leading-directory creation can never land on the local disk (#2375).
-	if placement.External() {
-		if err := placement.PrepareParent(path); err != nil {
-			return "", err
-		}
-	}
-	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
-		return "", err
-	}
-	msg := "Gitmoot integration merge for delegation " + request.DelegationID
-	if err := manager.MergeBranches(ctx, path, legBranches, msg); err != nil {
-		return "", BlockedError{Reason: fmt.Sprintf("integration merge for delegation %q failed (decomposition is not file-disjoint): %v", request.DelegationID, err)}
-	}
-	return path, nil
-}
-
 // readOnlyDelegationAction reports whether a delegation action runs read-only.
 // implement is the only write action (it mutates a branch and merges); every
 // other action (ask, review) only reads the checkout.
 func readOnlyDelegationAction(action string) bool {
 	a := strings.ToLower(strings.TrimSpace(action))
 	return a != "" && a != "implement"
-}
-
-// readOnlyFanoutNeedsWorktree reports whether read-only delegation d should run
-// in its own detached worktree to avoid serializing with its siblings. It is
-// true only when d is read-only and the coordinator emitted >=2 read-only
-// delegations: all delegation children inherit the parent repo, so >=2 read-only
-// siblings otherwise collapse to the same repo:<repo> checkout key and run
-// one-at-a-time. A single read-only delegation stays in the shared checkout (a
-// worktree would be pure overhead with no parallelism to gain).
-func readOnlyFanoutNeedsWorktree(payload JobPayload, d Delegation) bool {
-	if !readOnlyDelegationAction(d.Action) {
-		return false
-	}
-	if payload.Result == nil {
-		return false
-	}
-	count := 0
-	for _, sib := range payload.Result.Delegations {
-		if readOnlyDelegationAction(sib.Action) {
-			count++
-			if count >= 2 {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // readOnlyWorktreeContextNote returns a deterministic prompt appendix warning a
@@ -1333,38 +1173,6 @@ func parseStoredJobTime(value string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
-}
-
-// cleanupConsumedImplementLegWorktrees rechecks producers after an integration
-// step advances. The shared cleanup gate retains their worktrees and branches
-// until all declared consumers succeed, including consumers not yet dispatched.
-// Already-cleaned resources are idempotent; accounting failures remain errors.
-func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payload JobPayload) error {
-	parentID := strings.TrimSpace(payload.ParentJobID)
-	deps := compactStrings(payload.Deps)
-	if parentID == "" || len(deps) == 0 {
-		return nil
-	}
-	children, err := e.childDelegationJobs(ctx, parentID)
-	if err != nil {
-		return err
-	}
-	var cleanupErr error
-	for _, dep := range deps {
-		legJob, ok := children[strings.TrimSpace(dep)]
-		if !ok {
-			continue
-		}
-		legPayload, err := DecodeJobPayload(legJob)
-		if err != nil {
-			cleanupErr = errors.Join(cleanupErr, err)
-			continue
-		}
-		if err := e.cleanupImplementDelegationWorktree(ctx, legJob.ID, legJob.Type, legPayload); err != nil {
-			return errors.Join(cleanupErr, err)
-		}
-	}
-	return cleanupErr
 }
 
 func TaskWorktreePath(home string, repo string, taskID string) (string, error) {

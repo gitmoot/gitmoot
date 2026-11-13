@@ -348,17 +348,16 @@ type blockerClassification struct {
 // String matching only runs for an error that provably originated from the
 // DELIVERY seam (workflow.DeliveryError): a gitmoot_result contract/validation
 // failure — including the post-repair-loop parse error, whose text is
-// agent-authored and can mention "quota"/"rate limit" in a summary or a
-// delegation id — is a PRODUCT failure and must never be auto-retried (#532
+// agent-authored and can mention "quota"/"rate limit" in a summary — is a
+// PRODUCT failure and must never be auto-retried (#532
 // design: "missing gitmoot_result contract output ... treat as
 // product/contract, not operational").
 func classifyOperationalBlocker(cause error, now time.Time) (blockerClassification, bool) {
 	if cause == nil {
 		return blockerClassification{}, false
 	}
-	var awaiting workflow.AwaitingHumanError
 	var blocked workflow.BlockedError
-	if errors.As(cause, &awaiting) || errors.As(cause, &blocked) ||
+	if errors.As(cause, &blocked) ||
 		errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
 		return blockerClassification{}, false
 	}

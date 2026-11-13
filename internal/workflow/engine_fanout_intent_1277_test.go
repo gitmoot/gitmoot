@@ -7,37 +7,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 )
 
-// #1277. The skip-native-review-fanout intent must survive an engine-initiated
-// hop. A coordinator dispatched with --skip-native-review-fanout that delegates
-// its implement leg produced a child whose payload had the flag CLEARED, so the
-// child's PR-open re-armed the native fanout and enlisted the implementer as its
-// own reviewer (#1236). delegationRequest inherits many parent fields, including
-// RiskTier and ActingOrgRole, but dropped this one.
-func TestDelegationChildInheritsSkipNativeReviewFanout(t *testing.T) {
-	store := openEngineStore(t)
-	engine := testEngine(store)
-
-	parent := db.Job{ID: "coordinator-job", Agent: "lead", Type: "ask"}
-	payload := JobPayload{
-		Repo:                   "gitmoot/gitmoot",
-		Branch:                 "task-7",
-		TaskID:                 "task-7",
-		LeadAgent:              "lead",
-		SkipNativeReviewFanout: true,
-	}
-
-	child := engine.delegationRequest(context.Background(), parent, payload, Delegation{
-		ID:     "leg-1",
-		Agent:  "impl",
-		Action: "implement",
-		Prompt: "do the work",
-	})
-
-	if !child.SkipNativeReviewFanout {
-		t.Fatalf("delegation child dropped SkipNativeReviewFanout: %+v", child)
-	}
-}
-
 // #1277, the escape g7-review reproduced against the first version of this fix.
 // The branch lock cannot rescue a multi-generation tree, because at the moment
 // the intent is dropped NO intent-bearing implement job has advanced yet, so

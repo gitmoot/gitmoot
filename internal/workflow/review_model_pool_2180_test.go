@@ -392,8 +392,7 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 	// create a new place for the class to live.
 	case reflect.Interface:
 		for _, stub := range []any{
-			&recordingSink{}, &recordingNotifier{},
-			&fakeMergeGate{}, &fakeWorktreeManager{},
+			&recordingSink{}, &fakeMergeGate{}, &fakeWorktreeManager{},
 		} {
 			candidate := reflect.ValueOf(stub)
 			if candidate.Type().Implements(fieldType) {

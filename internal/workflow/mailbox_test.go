@@ -146,7 +146,7 @@ func TestMailboxPersistsRuntimeIdentityUntilTerminal(t *testing.T) {
 			}
 		},
 		outputs: []string{
-			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		},
 	}
 	if _, err := mailbox.Run(ctx, "pid-job", runtime.Agent{Name: "worker", Runtime: runtime.OmpRuntime, RuntimeRef: "fresh:pid-job"}, adapter); err != nil {
@@ -201,43 +201,6 @@ func TestMailboxEnqueuePersistsDelegationMetadata(t *testing.T) {
 	}
 	if payload.ParentJobID != "job-parent" || payload.DelegationID != "delegation-1" || payload.DelegationDepth != 2 || payload.DelegatedBy != "lead" {
 		t.Fatalf("payload metadata = %+v", payload)
-	}
-}
-
-func TestMailboxEnqueuePersistsEphemeralSpec(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID:           "job-ephemeral",
-		Agent:        "worker-ephemeral-abc123",
-		Action:       "review",
-		Repo:         "gitmoot/gitmoot",
-		ParentJobID:  "job-parent",
-		DelegationID: "worker",
-		Ephemeral:    &EphemeralSpec{Runtime: "codex", Model: "gpt-5.4", Effort: "high"},
-	}); err != nil {
-		t.Fatalf("Enqueue returned error: %v", err)
-	}
-
-	stored, err := store.GetJob(ctx, "job-ephemeral")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	// The marshalled payload must carry the ephemeral key for downstream consumers.
-	if !strings.Contains(stored.Payload, `"ephemeral"`) {
-		t.Fatalf("payload = %q, want it to contain the ephemeral spec", stored.Payload)
-	}
-	payload, err := unmarshalPayload(stored.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload returned error: %v", err)
-	}
-	if payload.Ephemeral == nil {
-		t.Fatalf("payload missing ephemeral spec: %+v", payload)
-	}
-	if payload.Ephemeral.Runtime != "codex" || payload.Ephemeral.Model != "gpt-5.4" || payload.Ephemeral.Effort != "high" {
-		t.Fatalf("payload ephemeral spec = %+v", payload.Ephemeral)
 	}
 }
 
@@ -370,12 +333,6 @@ func TestMailboxEnqueuePersistsResolvedModel(t *testing.T) {
 				RuntimeOverride: runtime.OmpRuntime, RuntimeOverrideRef: "fresh:override"},
 			want: "k3",
 		},
-		{
-			name: "ephemeral inline model",
-			req: JobRequest{ID: "resolved-ephemeral", Agent: "worker-ephemeral-test", Action: "review", Repo: "owner/repo",
-				ParentJobID: "parent", DelegationID: "worker", Ephemeral: &EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "claude-fable-5"}},
-			want: "claude-fable-5",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			queued, err := mailbox.Enqueue(ctx, tc.req)
@@ -479,7 +436,7 @@ func TestMailboxRunDeliversModelAndEffortOverrides(t *testing.T) {
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", Model: "opus", Effort: "high"}); err != nil {
@@ -578,7 +535,7 @@ func TestMailboxRunNilRuntimeDefaultHookByteIdentical(t *testing.T) {
 
 // okDeliveryResult is a minimal well-formed gitmoot_result so a fake delivery
 // classifies to a terminal state and the job persists its recorded usage.
-const okDeliveryResult = `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const okDeliveryResult = `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 func TestMailboxDeliverRecordsPartialUsageFromFailedRuntime(t *testing.T) {
 	ctx := context.Background()
@@ -731,92 +688,13 @@ func TestMailboxEnqueueSnapshotsAgentTemplate(t *testing.T) {
 	}
 }
 
-func TestMailboxEnqueueAppliesTemplateOverride(t *testing.T) {
-	ctx := context.Background()
-	store := openTestStore(t)
-	mailbox := Mailbox{store: store}
-	// The agent carries its own template; a --recipe override should win over it
-	// in the enqueued payload without rebinding the agent's identity.
-	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
-		ID:             "agent-own",
-		Name:           "Agent Own",
-		SourceRepo:     "gitmoot/gitmoot",
-		SourceRef:      "main",
-		ResolvedCommit: "own123",
-		Content:        "Agent's own prompt.",
-	}); err != nil {
-		t.Fatalf("UpsertAgentTemplate own returned error: %v", err)
-	}
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name:         "planner",
-		Role:         "coordinator",
-		Runtime:      "codex",
-		RuntimeRef:   "last",
-		RepoScope:    "gitmoot/gitmoot",
-		TemplateID:   "agent-own",
-		Capabilities: []string{"ask"},
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-
-	override := db.AgentTemplate{
-		ID:             "review-panel",
-		Name:           "Review Panel",
-		SourceRepo:     "gitmoot/gitmoot",
-		SourceRef:      "main",
-		ResolvedCommit: "recipe456",
-		Content:        "Recipe prompt.",
-	}
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID:               "job-override",
-		Agent:            "planner",
-		Action:           "ask",
-		Repo:             "gitmoot/gitmoot",
-		TemplateOverride: &override,
-	}); err != nil {
-		t.Fatalf("Enqueue with override returned error: %v", err)
-	}
-	stored, err := store.GetJob(ctx, "job-override")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	payload, err := unmarshalPayload(stored.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload returned error: %v", err)
-	}
-	if payload.TemplateID != "review-panel" || payload.TemplateResolvedCommit != "recipe456" || payload.TemplateContent != "Recipe prompt." {
-		t.Fatalf("override payload template snapshot = %+v, want the recipe override", payload)
-	}
-
-	// Without an override the agent's own template still wins.
-	if _, err := mailbox.Enqueue(ctx, JobRequest{
-		ID:     "job-no-override",
-		Agent:  "planner",
-		Action: "ask",
-		Repo:   "gitmoot/gitmoot",
-	}); err != nil {
-		t.Fatalf("Enqueue without override returned error: %v", err)
-	}
-	baselineJob, err := store.GetJob(ctx, "job-no-override")
-	if err != nil {
-		t.Fatalf("GetJob baseline returned error: %v", err)
-	}
-	baseline, err := unmarshalPayload(baselineJob.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload baseline returned error: %v", err)
-	}
-	if baseline.TemplateID != "agent-own" || baseline.TemplateContent != "Agent's own prompt." {
-		t.Fatalf("baseline payload template snapshot = %+v, want the agent's own template", baseline)
-	}
-}
-
 func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 	templateContent := agenttemplate.FormatTemplateContent(agenttemplate.Metadata{
 		ID:                   "thermo",
@@ -877,7 +755,7 @@ func TestMailboxRunStoresResultAndSucceeds(t *testing.T) {
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["mailbox"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["mailbox"],"tests_run":["go test ./..."],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot", Branch: "task-005", PullRequest: 5}); err != nil {
@@ -914,7 +792,7 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	adapter := &fakeDelivery{
 		outputs: []string{`{"result":"wrapped by runtime"}`},
 		summaries: []string{
-			`{"gitmoot_result":{"decision":"approved","summary":"parsed from summary","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			`{"gitmoot_result":{"decision":"approved","summary":"parsed from summary","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		},
 	}
 
@@ -941,7 +819,7 @@ func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		"review complete, no json",
-		`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -976,9 +854,9 @@ func TestMailboxRunRepairsReviewVerdictMissingSeverity(t *testing.T) {
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"changes_requested","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-		`{"gitmoot_result":{"decision":"changes_requested","summary":"still missing severity","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-		`{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","summary":"still missing severity","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","severity":"P1","summary":"fix the finding","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-review-severity", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -1018,7 +896,7 @@ func TestMailboxRunSalvagesMissingEnvelopeAfterSecondRepair(t *testing.T) {
 	adapter := &fakeDelivery{outputs: []string{
 		"findings posted, no json",
 		"still no json",
-		`{"gitmoot_result":{"decision":"approved","summary":"salvaged after second repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"salvaged after second repair","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -1092,7 +970,7 @@ func TestMailboxRunMarksBlockedDecision(t *testing.T) {
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["GITHUB_TOKEN"],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["GITHUB_TOKEN"]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -1116,7 +994,7 @@ func TestMailboxRunRejectsNonQueuedJob(t *testing.T) {
 	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -1150,7 +1028,7 @@ func TestMailboxRunPreservesCancellationDuringDelivery(t *testing.T) {
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{
-			`{"gitmoot_result":{"decision":"approved","summary":"completed after cancellation","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			`{"gitmoot_result":{"decision":"approved","summary":"completed after cancellation","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		},
 		onDeliver: func() {
 			if err := store.UpdateJobState(ctx, "job-1", string(JobCancelled)); err != nil {

@@ -552,9 +552,9 @@ cleanly). To cap one repo's parallelism on a shared (no-`--repo`) daemon, use
 the per-repo config keys below instead.
 
 Both `daemon run` and `daemon start` accept `--session <root-job-id>` (alias
-`--root`) to pin the worker to one orchestration run. With `--session` set, the
+`--root`) to pin the worker to one job tree. With `--session` set, the
 worker runs only jobs whose `root_job_id` matches that value plus the root
-coordinator job itself, and ignores every other queued job. Leaving it empty
+job itself, and ignores every other queued job. Leaving it empty
 keeps the default behavior of matching all jobs.
 
 Both `daemon run` and `daemon start` also accept three opt-in flags (all off by
@@ -622,7 +622,7 @@ job payload, the review class floor below, the registered agent type's
 a hard ceiling (default `8h`) applied last and clamping every source including
 an explicit payload value; a larger request is clamped and the job receives a
 `job_timeout_clamped` event recording the requested and applied durations. This
-prevents a delegation tree from granting itself an unbounded run. These keys are
+prevents a job from granting itself an unbounded run. These keys are
 read when a job dispatches, so edits affect newly started jobs without changing
 an in-flight deadline.
 
@@ -844,7 +844,7 @@ A `[github]` config section installs a **GitHub call budget + secondary-rate-lim
 backoff** over the `gh`/API calls gitmoot issues **from the daemon process** —
 polling, comments, merges, status (#683). It is enforced **per daemon process**
 (like the admission budget), so it does not reach separate foreground processes (a
-foreground `gitmoot orchestrate`/`pool`/`review`/`pr comment`) or the `gh` calls a
+foreground `gitmoot pool`/`review`/`pr comment`) or the `gh` calls a
 runtime subprocess makes on its own. GitHub's **secondary**
 (abuse-detection) rate limit fires on burstiness/concurrency — not total volume —
 so a busy daemon plus concurrent in-process calls can trip it (HTTP 403 "secondary
@@ -905,10 +905,10 @@ gitmoot dashboard --web [--addr 127.0.0.1:8080]
 ```
 
 `gitmoot dashboard --web` serves the **read-only web dashboard** (a live
-orchestration/delegation graph with run summaries and prompt/output inspection)
+job graph with run summaries and prompt/output inspection)
 until interrupted; `--addr` sets the listen address (default
 `127.0.0.1:8080`). Use it when the user wants a browser view of a running
-orchestration. The Overview and Org pages also show the fleet activity strip:
+job tree. The Overview and Org pages also show the fleet activity strip:
 live Herdr sessions are counted separately from engine jobs and unresolved
 escalations. Org tree nodes retain the hierarchy while adding session status,
 terminal task title, turn age, and last-completed-turn detail. No session,
@@ -1098,7 +1098,7 @@ Three things `agent review` reports that are easy to miss:
 
 - **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
   router requires a verdict recipient), `--foreground`, or any flag the router
-  cannot express (`--type`, `--recipe`, `--skip-native-review-fanout`, or an
+  cannot express (`--type`, `--skip-native-review-fanout`, or an
   `--action` other than `review`) keeps the direct path and writes a
   `router_bypassed` job event
   naming the reason — read it months later with `gitmoot job events <id>` (NOT
@@ -1108,7 +1108,7 @@ Three things `agent review` reports that are easy to miss:
   exists — they may still emit unrelated warnings there, so stderr silence is
   not the discriminator. A silently different review is worse than a refused one.
   **Counting unrouted reviews:** `router_bypassed` alone UNDERCOUNTS, because
-  `agent run --action review` and `orchestrate --pr` never reach that gate and
+  some review dispatches never reach that gate and
   record their reason in `route_selected` instead. The complete query is
   `route_selected NOT LIKE '%review_request%'`.
 - **A foreground dispatch that fails before delivery leaves no job to run.** If
@@ -1180,10 +1180,7 @@ What one request does, in order:
    and the subscribe-time recheck matches purpose as well as head, so a waiter
    registering after a different-purpose verdict is not satisfied by it.
    `gitmoot org await review` keeps the bare `owner/repo#N@sha` key and its
-   any-purpose meaning, and a routed review inherits its purpose into REVIEW
-   delegation children so a delegated review still answers the purposed wait —
-   scoped to review legs, because a non-review leg carrying a review purpose is
-   read by consumers keyed on review type. The wake fires from the reviewing job's own
+   any-purpose meaning. The wake fires from the reviewing job's own
    state transition when the verdict is persisted, before and independently of
    gate advancement, and it carries the decision, findings count, executed-check
    count, evidence declaration and the `gitmoot job show <id>` command. A second
@@ -1390,73 +1387,23 @@ is `P3`, so every valid finding blocks unless a repository overrides it.
 Configured values must be `P0`, `P1`, `P2`, or `P3`.
 An invalid `blocking_severity` value falls back to `P3` while other valid review
 fields remain active. Any other review-policy parse or read error rejects the
-entire applied review policy, restoring `P3` with native fanout and risk tiers
-off.
+entire applied review policy, restoring `P3` with native fanout.
 
-### Fan-outs are not verdicts
+### Risk Paths and Labels
 
-A review result that declares `delegations` is a coordinator **fan-out**: it
-announces a panel. Gitmoot dispatches a result's delegations *after* the result
-is stored, so such a row was written before any delegate could report, and it is
-not an answer about the code (#1685). This is the shape the shipped
-`review-panel` agent template produces, and it is legitimate — what is not
-legitimate is counting it as a verdict.
-
-Every surface that reads a review decision applies the same rule:
-
-- the **merge gate** excludes a fan-out row from the verdict population. It
-  neither satisfies nor blocks the reviewer slot, so an independent verdict at
-  the same head still decides the PR;
-- if the panel **reported**, the gate walks nested fan-outs to their leaf
-  verdicts and decides that slot on those leaves — at least one approving leaf,
-  no blocking verdict, no crashed, abstaining or still-running node, and every
-  declared delegation accounted for. A coordinating child is still an
-  announcement, not a verdict. Identity, family and
-  `merge_gate_approval_evidence` records use the
-  actual approving leaves. Only the LATEST attempt of each delegation counts, so
-  an approved retry supersedes a failed original instead of being poisoned by it;
-- if the panel was announced and **never dispatched**, the gate reports
-  `no review verdict at evaluated head: <agent> (job <id>, N declared) declared
-  delegations that never reported` rather than merging or parking;
-- **required-reviewer counting**, the **review-verdict wake**, the **canonical
-  same-head verdict history** (`SucceededReviewVerdicts`) and **awaited
-  review-verdict facts** all skip fan-outs, so an announcement neither satisfies
-  a reviewer slot nor wakes a waiter nor suppresses the retry that would produce
-  a real verdict;
-- `blocked` and `failed` reviews are never fan-outs. They already refuse on their
-  own terms and keep reporting their own cause.
-
-A coordinator is therefore dispatchable into a review slot by CLI. Gitmoot judges the panel it convenes, not the announcement.
-
-### Risk-Tiered Adaptive Review
-
-Set `risk_tiers_enabled = true` in `[review]` to scale review depth to a
-change's blast radius:
+`[review]` risk keys classify a PR's blast radius for review routing:
 
 ```toml
 [review]
-risk_tiers_enabled = true                     # empty/false (default) = OFF
 # high_risk_paths matched against the PR's changed files (** = any path depth):
 high_risk_paths = ["**/auth/**", "**/security/**", "**/payment/**", "**/migration/**", "go.mod"]
 risk_label_high = "risk:high"                 # PR label that forces the high tier
 risk_label_routine = "risk:routine"           # PR label that forces the routine tier
 ```
 
-With `risk_tiers_enabled = true`, each opened PR is classified: **explicit PR
-label > changed-path glob match > default routine** (a `risk:high`/`risk:routine`
-label wins over paths; a high label wins a label tie). A `routine` PR keeps the
-unchanged single-reviewer fan-out. A `high` PR instead fans out a delegation
-batch of **refutation-framed lens reviewers** (correctness, security, and, with
-three or more configured reviewers, regression), each prompted to *disprove*
-the change and return structured findings `{lens, refuted, severity, confidence,
-evidence}` in `gitmoot_result.findings`. The lenses are synthesized by the
-existing delegation `synthesis_rule = quorum` engine: **any blocking refutation
-fails the quorum and blocks the merge**; the configured quorum of effective
-approvals satisfies it. The resolved tier is recorded as a
-`risk_tier_resolved` job event so an escalation is explainable in the
-report/dashboard. With `risk_tiers_enabled`
-off, PR review uses the single-reviewer path. The competition tier (two
-implementations + a judge) is a planned follow-up.
+Classification is **explicit PR label > changed-path glob match > default
+routine** (a `risk:high`/`risk:routine` label wins over paths; a high label wins
+a label tie).
 
 ## Agent Setup
 
@@ -1526,10 +1473,7 @@ an omp seat:
   is advisory, not an independence gate: same-family comparisons emit
   `merge_gate_family_advisory`, while unresolved comparisons retain the
   `merge_gate_family_unresolved` event; neither disqualifies a substantive
-  approval from a reviewer whose identity is not an implementer. For a review
-  fan-out, every coordinating parent is an announcement rather than a verdict,
-  including nested fan-outs. The gate applies identity and family checks to each
-  approving leaf and records approval evidence on that leaf. Requested model
+  approval from a reviewer whose identity is not an implementer. Requested model
   text alone and failed delivery are not provider evidence.
 - **Authentication depends on the seat policy.** Ordinary omp jobs use the
   profile, provider keys, or auth broker visible to the daemon. Read-only review
@@ -1552,12 +1496,12 @@ an omp seat:
 `--model <name>` flag that sets the agent's default runtime model. It is a
 free-form, runtime-scoped string (an omp `provider/model` name such as
 `anthropic/claude-sonnet-4-5`) with no allow-list; both `--model X` and `--model=X` are accepted.
-A per-job `--model` (or a delegation's `model` field) overrides this default,
+A per-job `--model` overrides this default,
 and an omitted model preserves the runtime's own default. The same default can
 be set in config under `[agents.<type>].model`.
 
 The same commands accept `--effort <value>` as the agent's default reasoning
-effort, and `agent run`, `ask`, `review`, and `orchestrate` accept it
+effort, and `ask` and `review` accept it
 as a per-job override. The resolution order mirrors model selection: job effort,
 agent effort, `[runtimes.<runtime>].default_effort`, then no explicit override.
 Values are free-form pass-through strings. omp receives `--thinking <level>` when the
@@ -1690,23 +1634,21 @@ otherwise tempt a re-register. It refuses while the session is live or the
 agent has in-flight jobs (finish or cancel those first). `gitmoot agent remove
 <name>` unregisters the agent.
 
-Delegate to a registered agent from the current local chat:
+Hand work to a registered agent from the current local chat:
 
 ```sh
-gitmoot agent run project-planner --repo owner/repo "Return the plan status."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 --background "Review this PR."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --model openai-codex/gpt-5.5 "Review this PR."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --effort xhigh "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 --model openai-codex/gpt-5.5 "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 --effort xhigh "Review this PR."
 gitmoot job watch <job-id>
 ```
 
 **Gitmoot does not dispatch implementation by any route a user can reach
 (#2203).** There is no `agent implement` verb, no `--action implement`, and no
-`--task`/`--base`/`--draft`/`--ready` implement flags; an `implement` leg in a
-result's `delegations[]` is refused with the action named, `/gitmoot <agent>
+`--task`/`--base`/`--draft`/`--ready` implement flags; `/gitmoot <agent>
 implement` is not a recognized PR-comment command.
 
 What was removed in each case is the writable-worktree ALLOCATION plus the
@@ -1726,21 +1668,14 @@ gitmoot job record --agent lead --repo owner/repo --type implement \
 A `changes_requested` verdict therefore reports to the requester; it never
 mints a fix job.
 
-`agent review` and review-resolved `agent run` with `--org-role` queue the job
+`agent review` with `--org-role` queues the job
 for daemon ownership by default. This keeps a review running if the calling
 seat or its command runner exits. Use `--foreground` only when synchronous
 ownership is intentional. Unattributed reviews retain their synchronous
 default; `--background` remains accepted.
 
-`agent run --action ask|review` explicitly selects the job action and wins
-before the usual inference order (`--pr`/review `--head-sha` -> review, then
-message heuristics, else ask). `--type <name>` has a separate meaning: it
-selects a managed agent type. The flags can be used together. Invalid actions
-and contradictions are rejected before enqueue; notably, `--action review`
-requires `--pr`, and `implement` is no longer an accepted action.
-
 Review admission is evidence-gated before Gitmoot creates a new review job.
-For local `agent review` / `agent run` requests that resolve to review, and for
+For local `agent review` requests, and for
 native engine review fan-out, Gitmoot reads succeeded review jobs for the same
 repository and pull request. If every succeeded verdict at the requested exact
 head agrees on one decision, dispatch is refused: the local CLI returns a hard
@@ -1856,7 +1791,7 @@ legitimately discuss historical commits. Hex strings that do not resolve to a
 commit, including mutation-hygiene SHA-256 restore hashes, do not warn.
 
 **The scan covers the instructions you pass on the command line, and nothing
-else.** Text contributed by a recipe template (`--recipe`) or by the selected
+else.** Text contributed by the selected
 agent's own template is not scanned, so a stale commit cited inside a template
 body dispatches with no warning. If you drive dispatches through templates,
 treat this warning as covering your instructions only.
@@ -1876,7 +1811,7 @@ the registered checkout after such a rename; until then Gitmoot treats the
 cached ref as authoritative and may reconcile `repos.default_branch` back to
 the stale name.
 
-`gitmoot agent run`, `ask`, and `review` (and `orchestrate`) accept
+`gitmoot agent ask` and `agent review` accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
 overriding the agent's configured default. It is a free-form, runtime-scoped
 string (an omp `provider/model` name) with no allow-list;
@@ -1903,11 +1838,8 @@ runtime; an override without `--model` uses the override runtime's default
 model — the agent's configured default model is never applied to a different
 runtime. The same rule applies to `--effort`: an explicit job value belongs to
 the override runtime, while the agent's default effort does not cross runtimes.
-An unknown `--runtime` fails before any job is enqueued, background (daemon) jobs honor
-the override identically to foreground, and a coordinator's delegation-tree
-continuations (synthesis, corrective, replan, finalize) inherit the override,
-so an `orchestrate --runtime` tree stays on the override runtime across
-generations:
+An unknown `--runtime` fails before any job is enqueued, and background (daemon)
+jobs honor the override identically to foreground:
 
 ```sh
 # Run one job on a different omp model without re-registering the reviewer:
@@ -1917,8 +1849,8 @@ gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --
 gitmoot agent ask reviewer "Summarize the risk in this diff." --repo owner/repo --runtime omp --effort high
 ```
 
-`gitmoot orchestrate` and `agent run` also accept an optional
-`--skip-native-review-fanout` flag. It states that the coordinator owns review
+`agent review` also accepts an optional
+`--skip-native-review-fanout` flag. It states that the caller owns review
 orchestration, so a PR on this branch must not be fanned out to Gitmoot's
 native reviewers (the configured required reviewers, or the ones passed for the
 task). The flag is persisted on the job payload, and the engine's
@@ -1926,7 +1858,7 @@ implement-advance arm reads it when the implement job opens a PR. The daemon's
 GitHub PR-watcher never fans out native reviews. The flag defaults off; leave it
 off for the full native review fan-out.
 
-When a synchronous `agent run`/`ask`/`review`/`orchestrate` job
+When a synchronous `agent ask`/`review` job
 delivers and **succeeds terminally** but a benign *post-success* advancement step
 errors — for example a merge-gate block on the freshly-opened PR, or a 422
 "a pull request already exists" race — the command no longer discards the result.
@@ -1944,8 +1876,8 @@ the older re-sync behavior only for legacy/fallback review jobs that lack an
 owned read-only worktree: when their shared checkout advances and the PR remains
 open on the same branch, it re-targets the payload and records
 `review_head_resynced`; closed/merged, dirty, or wrong-branch checkouts fail.
-A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`) and keeps the original wrong-head error, which a **non-delegation** review job defers and auto-retries within the shared blocker budget before failing terminally, while a **delegation-child** leg (a high-risk lens child, say) is routed terminally by its own DAG on the first tick — either way the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
-Any dispatched head that git resolves to the checkout's own commit — an abbreviation of any length, a case-differing 40-character SHA, a rev expression, a ref name — is recorded as `review_head_normalized` and is never a re-sync, while a dispatched head this checkout cannot resolve at all leaves the re-sync refused and keeps the original wrong-head failure, deferrable on the same non-delegation terms.
+A re-target requires the checkout head to have the dispatched head as an ancestor, so a review queued before an amend or a rebase force-push will **not** follow the branch: it refuses (recording `review_head_resync_refused`) and keeps the original wrong-head error, which the review job defers and auto-retries within the shared blocker budget before failing terminally — the remedy is to dispatch a **new** review at the new head, which is what exact-head review does anyway.
+Any dispatched head that git resolves to the checkout's own commit — an abbreviation of any length, a case-differing 40-character SHA, a rev expression, a ref name — is recorded as `review_head_normalized` and is never a re-sync, while a dispatched head this checkout cannot resolve at all leaves the re-sync refused and keeps the original wrong-head failure, deferrable on the same terms.
 Relatedly,
 when a foreground `agent review` finds the agent's serialized runtime session
 **busy**, the review is now **left queued** for the daemon to run when the session
@@ -1953,57 +1885,9 @@ frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled a
 dropped; `agent ask` stays synchronous and keeps its existing
 busy-session cancel behavior.
 
-Start an orchestra of agents with `gitmoot orchestrate`:
-
-```sh
-gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
-gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model openai-codex/gpt-5.5
-gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --effort high
-```
-
-The built-in coordinator recipes `review-panel` and
-`verifier` run a coordinator that fans work out to ephemeral workers and
-reconvenes them in a continuation, with no agent pre-registration. The primary
-invocation is the `--recipe` flag (also accepted on `agent run`), which routes
-**any existing coordinator agent** through the named built-in recipe prompt
-without changing the agent's identity or registration:
-
-```sh
-gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
-```
-
-`decompose-and-verify` was RETIRED because Gitmoot no longer dispatches
-implementation (#2203). The recipe existed to split one implementation task
-into parallel implementation legs, and there is no writable delegation action
-left for those legs — `ask` and `review` are the only accepted ones. Its
-teaching survives in WORKFLOWS.md § Multi-Model Delegation: decompose, keep the
-legs file-disjoint, and verify with a separate worker rather than trusting a
-producer's self-report.
-
-The id stays reserved rather than unknown: `agent template list` hides it,
-`agent template show <id>` and `agent prompt <id>` refuse it by name and point
-at a successor recipe, and an agent or managed type still configured with it
-fails dispatch with that same named refusal — so a stale script or a saved
-command gets a successor instead of "unknown template".
-
-The bare `gitmoot orchestrate <recipe-id> "..."` form also works, but the
-positional argument must resolve to a **registered agent** (or configured
-managed type) — so it requires an agent registered under the recipe name
-(e.g. `agent start review-panel --template review-panel …` against an installed
-`review-panel` row). On a fresh install without that registration it
-fails with "agent not found"; prefer `--recipe`.
-
-`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
-`gitmoot agent run <agent> --background "..."`. It starts a conductor
-(coordinator) that returns a `delegations[]` score; the players (child agents)
-then run in parallel or in dependency order, and a finale (continuation)
-reconvenes and synthesizes the results.
-
 This uses the same agent registry, repo access grants, cached template snapshot,
-runtime adapter, and local job history as PR-comment jobs. `agent run` is the
-default coordinator-safe entrypoint because it routes to `ask` or `review` and
-keeps branch, worktree, commit, push, PR, and workflow lifecycle
+runtime adapter, and local job history as PR-comment jobs. `agent review`
+keeps branch, worktree, and workflow lifecycle
 inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it is
 read-only, so when the message reads like branch/commit/push/PR orchestration it
 prints a non-fatal note and still runs (pass `--force` to suppress the note).
@@ -2082,15 +1966,6 @@ default, or a pinned version when configured with a reference such as
 `--template frontend-reviewer@v1`. Queued jobs keep the exact template content
 snapshot they were created with. The dashboard's Agents page shows a template's
 version history.
-
-The built-in coordinator recipes (`review-panel`, `verifier`) are coordinator prompts for the Orchestra pattern, selected per
-invocation with `--recipe <id>` rather than started as long-lived agents:
-
-```sh
-gitmoot agent template show review-panel
-gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
-```
 
 For fast current-chat planning, use the Gitmoot skill with the same packaged
 `agent-templates/planner.md` instructions instead of starting a background job:
@@ -2360,7 +2235,7 @@ binary before adding the fail-closed field to config. Brief and chart surface
 the configured pin, but live-vs-pinned drift detection awaits a running-model
 signal from Herdr.
 
-Fresh local `agent ask`, `agent run`, `agent review`, `orchestrate`, and
+Fresh local `agent ask`, `agent review`, and
 `review request` dispatches resolve the requesting role from `--org-role
 <name>`, else `GITMOOT_ORG_ROLE`, else the role registered for the calling Herdr
 pane (`HERDR_PANE_ID`); a pane bound to two roles is an error. The role is
@@ -2414,10 +2289,10 @@ such as `-1`, is sent normally. `message directive send` accepts `--` before a
 body to send flag-like text on purpose.
 
 The same rules apply to every other command that saves free text: `workflow
-note|describe|register|close --reason`, `task successor --reason`, `escalation
-repair --reason`, `job open|record --title`, `job close|record --summary`,
-the message of `agent ask|run|review` and
-`orchestrate`, `org events rule add --match`, `org recycle --handoff` and
+note|describe|register|close --reason`, `task successor --reason`,
+`job open|record --title`, `job close|record --summary`,
+the message of `agent ask|review`,
+`org events rule add --match`, `org recycle --handoff` and
 `org wake retry|supersede --reason`. A help flag anywhere in those commands, and
 in `setup`, `agent start`, `agent subscribe` and `review request`, prints usage
 on stdout instead of saving anything.
@@ -2794,9 +2669,7 @@ Attach a global workflow label to work started outside Gitmoot's own task
 coordinator. Labels are lowercase slugs up to 64 characters. They may contain
 one `/` to split a namespace from a campaign; each side uses lowercase letters,
 digits, and single hyphens with no leading or trailing hyphen. The label is
-accepted by `agent ask`, `agent run`, `agent review`,
-`orchestrate`, and `job open`; delegation children and every coordinator
-continuation inherit it.
+accepted by `agent ask`, `agent review`, and `job open`.
 
 ### Require workflow labels
 
@@ -2822,7 +2695,7 @@ doctor drift diagnostics remain always-on advisory, and the overview item
 remains policy-gated.
 
 ```sh
-gitmoot orchestrate planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
+gitmoot agent ask planner "Coordinate the dashboard wave." --repo owner/repo --workflow fable/dashboard-redesign
 gitmoot job list --workflow fable/dashboard-redesign
 gitmoot workflow list
 gitmoot workflow show fable/dashboard-redesign --limit 100
@@ -3003,7 +2876,6 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
-/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
 @<agent> ask|review [instructions]
 ```
 
@@ -3027,11 +2899,7 @@ that the gate passed. The explicit command still runs the gate.
 
 A bare `@<agent> <action> …` mention on a PR comment (or, with the daemon's
 `--watch-issues` flag, an issue comment) is treated as the same command as the
-`/gitmoot <agent> <action>` form (#389). `/gitmoot resume <jobID>
-retry|continue|abort|answer` resumes a delegation tree paused by
-`escalate_human` or an ask-gate `human_questions` pause — see
-`references/RESULT_CONTRACT.md` for the pause/resume semantics (`answer` is
-PR-comment-only).
+`/gitmoot <agent> <action>` form (#389).
 
 Before parsing, Gitmoot removes triple-backtick and tilde fenced code blocks and
 closed inline backtick spans (including single-backtick spans).
@@ -3100,8 +2968,6 @@ gitmoot job gates <job-id>                                         # list resuma
 gitmoot job gates clear <job-id> --need "<text>"|--all             # satisfy gate(s); auto-resume on last
 gitmoot job cancel <job-id>                                        # one queued|running|blocked job
 gitmoot job cancel --state blocked [--older-than 7d] [--repo owner/repo] [--agent name] [--yes]
-gitmoot job kill <root-job-id>
-gitmoot job answer <job-id> "<question-id>: answer text" [--json]  # resume a job paused at awaiting_human
 ```
 
 `job cleanup inspect` returns the versioned producer decision (`schema_version:
@@ -3497,11 +3363,9 @@ gitmoot job gates clear <job-id> --all                   # satisfy every open ga
 When the **last** gate is cleared, the blocked stage **auto-re-runs** via the same
 `RetryJob` machinery `gitmoot job retry` uses (re-queued, then dispatched by the
 daemon; downstream stages follow the normal delegation DAG) — no polling, resume
-happens on clear. Two cases are deliberately **never** auto-resumed even with all
-gates cleared: a **session job** (externally driven, #657) and a stage whose tree is
-**paused awaiting a human** (`escalate_human` / ask-gate, #305/#340/#445) — a
-resource gate must not bypass the human's `gitmoot resume` decision; the command
-reports `not resumed: …` with the reason. A blocked job with **no** `needs` records
+happens on clear. A **session job** (externally driven, #657) is deliberately
+**never** auto-resumed even with all gates cleared; the command reports
+`not resumed: …` with the reason. A blocked job with **no** `needs` records
 no gates and is byte-identical to before this feature.
 
 ### Session jobs (record "here"-method work)
@@ -3626,13 +3490,6 @@ recorded as the identity, #673). Apply the prompt, do the work, then clock out w
 current-chat ("here") work to appear in `job list`, the dashboard, and the event
 stream — no daemon, no runtime, no PR comment. Use plain `agent prompt` (no
 `--record`) only when you just want to read a prompt without tracking it.
-
-`gitmoot job kill <root-job-id>` is the operator kill switch for a runaway
-delegation tree: it terminates the tree identified by its **root** job id
-gracefully. In-flight jobs finish normally; the coordinator's next continuation
-is routed through the graceful finalize path (synthesize what completed → stop)
-and the daemon stops starting queued children of that root. See
-`references/SAFETY.md` for how it relates to the other termination bounds.
 
 For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a
@@ -3836,7 +3693,7 @@ recovery).
 human — an operator permission gate or an unrecoverable blocker — so dismissing it
 is the same abandon intent as cancelling a queued/running one; #631). Cancel is a
 single-row transition: it does **not** propagate to a delegation tree, touch task
-state, or set the killed flag — abandoning a whole tree is `gitmoot job kill`.
+state, or set the killed flag.
 Cancelling also releases any resource locks the cancelled job still owned —
 including a stranded `runtime:<rt>:<session>` lock left behind when a foreground
 `gitmoot agent ask` was killed — so the next ask on that agent does not wait out
@@ -3863,9 +3720,7 @@ blocked job whose blocked-transition timestamp (updated_at, created_at fallback)
 is older than the TTL, through the same `CancelJob` abandon path, recording a
 distinct `blocked_ttl_expired` job event so a TTL auto-expiry is distinguishable
 from a manual `job cancel`. It is **off by default** — an empty or `0s` value
-disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl`
-(which auto-finalizes a whole paused delegation *tree* and is on by default, 24h),
-`blocked_ttl` dismisses a *single* blocked job and is off by default.
+disables it (a negative value is rejected).
 
 Native task auto-merge is enabled by default only behind an exact-head approved
 review and green SHA-scoped commit statuses/check-runs. A check-run in
@@ -4144,10 +3999,7 @@ or missing evidence. Each check is a yes/no question with an explanation, e.g.:
   docs-only approval that explains what it read passes on its rationale.
 
   The check measures ACCOUNTING, not truth: it cannot detect fabricated evidence,
-  and no deterministic check can. A **coordinator fan-out** — a review result
-  that declares `delegations` — is exempt, because it announces a panel that has
-  not reported yet and legitimately has nothing to record. See
-  [Fan-outs are not verdicts](#fan-outs-are-not-verdicts).
+  and no deterministic check can.
 - **ask** — the answer (`summary`/`artifact_body`) must be non-empty and
   actionable.
 - **blocked** (any action) — a `blocked` result must list actionable `needs`.

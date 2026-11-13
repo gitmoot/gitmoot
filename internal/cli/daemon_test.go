@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -57,7 +56,7 @@ func mustListJobEvents(t *testing.T, store *db.Store, jobID string) []db.JobEven
 
 // --- #394 PR1: opt-in continuous worker-pool scheduler (--scheduler=pool) ---
 
-const poolSchedulerAskResult = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const poolSchedulerAskResult = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 func poolSchedulerWorker(t *testing.T, store *db.Store, adapter workflow.DeliveryAdapter, usePool bool) jobWorker {
 	t.Helper()
@@ -621,103 +620,6 @@ func daemonWorkerHasEvent(events []db.JobEvent, kind string) bool {
 		}
 	}
 	return false
-}
-
-// seedDelegationCoordinator inserts a completed coordinator parent job whose
-// result carries the given delegations and advances it so the engine dispatches
-// the top-level delegation children. It returns the worker wired to the same
-// store. The coordinator runs an "ask" job; delegations use "review" so dispatch
-// stays on the shared-checkout path (no per-delegation worktree allocation).
-func seedDelegationCoordinator(t *testing.T, store *db.Store, parentID string, delegations []workflow.Delegation) jobWorker {
-	t.Helper()
-	ctx := context.Background()
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "coord", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	seenAgents := map[string]bool{"coord": true}
-	for _, d := range delegations {
-		if seenAgents[d.Agent] {
-			continue
-		}
-		seenAgents[d.Agent] = true
-		seedDaemonWorkerAgent(t, store, d.Agent, runtime.ShellRuntime, "unused", []string{d.Action}, "owner/repo")
-	}
-
-	if err := store.CreateJob(ctx, db.Job{ID: parentID, Agent: "coord", Type: "ask", State: string(workflow.JobRunning)}); err != nil {
-		t.Fatalf("CreateJob(parent) returned error: %v", err)
-	}
-	payload := workflow.JobPayload{
-		Repo:      "owner/repo",
-		Branch:    "task-1",
-		TaskID:    "task-1",
-		TaskTitle: "Coordinator",
-		Sender:    "coord",
-		Result: &workflow.AgentResult{
-			Decision:    "approved",
-			Summary:     "delegated",
-			Delegations: delegations,
-		},
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		t.Fatalf("marshal parent payload returned error: %v", err)
-	}
-	if err := store.UpdateJobPayload(ctx, parentID, string(encoded)); err != nil {
-		t.Fatalf("UpdateJobPayload(parent) returned error: %v", err)
-	}
-	if err := store.UpdateJobState(ctx, parentID, string(workflow.JobSucceeded)); err != nil {
-		t.Fatalf("UpdateJobState(parent) returned error: %v", err)
-	}
-
-	worker := defaultJobWorker(store, io.Discard)
-	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
-	}
-	engine := worker.WorkflowFactory("")
-	if err := engine.AdvanceJob(ctx, parentID); err != nil {
-		t.Fatalf("AdvanceJob(parent) returned error: %v", err)
-	}
-	return worker
-}
-
-// markDelegationChildTimedOut simulates a per-delegation timeout kill: the child
-// is left JobRunning with no stored result, exactly as Mailbox.Run leaves it when
-// the run context deadline fires mid-delivery (the cancelled context aborts its
-// own fail write).
-func markDelegationChildTimedOut(t *testing.T, store *db.Store, childID string) {
-	t.Helper()
-	if err := store.UpdateJobState(context.Background(), childID, string(workflow.JobRunning)); err != nil {
-		t.Fatalf("UpdateJobState(%s, running) returned error: %v", childID, err)
-	}
-}
-
-// cliWorkerDelegationAdapter returns a per-job-id canned gitmoot_result, so a
-// fan-out test can give the coordinator a delegating result and each child a
-// plain approval.
-type cliWorkerDelegationAdapter struct {
-	mu            sync.Mutex
-	outputs       map[string]string
-	defaultOutput string
-	delivered     []string
-}
-
-func (a *cliWorkerDelegationAdapter) Name() string { return "fake-delegation" }
-
-func (a *cliWorkerDelegationAdapter) Validate(context.Context, runtime.Agent) error { return nil }
-
-func (a *cliWorkerDelegationAdapter) Deliver(_ context.Context, _ runtime.Agent, job runtime.Job) (runtime.Result, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.delivered = append(a.delivered, job.ID)
-	if out, ok := a.outputs[job.ID]; ok {
-		return runtime.Result{Raw: out}, nil
-	}
-	return runtime.Result{Raw: a.defaultOutput}, nil
-}
-
-func (a *cliWorkerDelegationAdapter) Health(context.Context, runtime.Agent) error { return nil }
-
-func (a *cliWorkerDelegationAdapter) Capabilities(context.Context) ([]string, error) {
-	return nil, nil
 }
 
 // --- #444: same-repo parallel-job discoverability ---

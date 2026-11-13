@@ -27,14 +27,11 @@ func TestLoadReviewConfigDefaultsNativeFanoutOff(t *testing.T) {
 	if cfg.For("owner/repo").NativeFanoutEnabled {
 		t.Fatal("missing config must default native fanout OFF")
 	}
-	if cfg.For("owner/repo").RiskTiersEnabled {
-		t.Fatal("missing config must default risk tiers OFF")
-	}
 	if cfg.For("owner/repo").BlockingSeverity != reviewseverity.DefaultBlocking {
 		t.Fatalf("missing config blocking severity = %q, want %q", cfg.For("owner/repo").BlockingSeverity, reviewseverity.DefaultBlocking)
 	}
 
-	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\nescalation_handle = \"@owner\"\n"))
+	cfg, err = LoadReviewConfig(writeReviewConfig(t, "[orchestrate]\nblocked_ttl = \"2h\"\n"))
 	if err != nil {
 		t.Fatalf("LoadReviewConfig(no section) error: %v", err)
 	}
@@ -61,7 +58,7 @@ risk_label_routine = "sev:routine"
 		t.Fatalf("LoadReviewConfig error: %v", err)
 	}
 	policy := cfg.For("owner/repo")
-	if !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled {
+	if !policy.NativeFanoutEnabled {
 		t.Fatalf("parsed switches = %+v", policy)
 	}
 	if policy.BlockingSeverity != reviewseverity.P2 {
@@ -153,7 +150,6 @@ func TestLoadReviewConfigRejectsBadBlockingSeverityWithoutDiscardingValidFields(
 	body := `[review]
 blocking_severity = "P4"
 native_fanout_enabled = true
-risk_tiers_enabled = true
 high_risk_paths = ["cmd/**"]
 `
 	cfg, err := LoadReviewConfig(writeReviewConfig(t, body))
@@ -161,7 +157,7 @@ high_risk_paths = ["cmd/**"]
 		t.Fatalf("bad blocking severity error = %v, want canonical choices", err)
 	}
 	policy := cfg.For("owner/repo")
-	if policy.BlockingSeverity != reviewseverity.P3 || !policy.NativeFanoutEnabled || !policy.RiskTiersEnabled ||
+	if policy.BlockingSeverity != reviewseverity.P3 || !policy.NativeFanoutEnabled ||
 		len(policy.HighRiskPaths) != 1 || policy.HighRiskPaths[0] != "cmd/**" {
 		t.Fatalf("partial policy = %+v, want P3 with valid review fields retained", policy)
 	}

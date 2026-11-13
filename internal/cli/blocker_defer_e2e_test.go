@@ -41,7 +41,7 @@ func blockerE2EDeliveryCount(t *testing.T, countFile string) int {
 	return strings.Count(string(data), "x")
 }
 
-const blockerE2EApprovedResult = `{"gitmoot_result":{"decision":"approved","summary":"second attempt succeeded","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const blockerE2EApprovedResult = `{"gitmoot_result":{"decision":"approved","summary":"second attempt succeeded","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 func TestE2E532QuotaBlockerDeferredAndAutoRedispatched(t *testing.T) {
 	ctx := context.Background()
@@ -251,7 +251,7 @@ func TestE2E532ProductFailureIsNeverRetried(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
 	countFile := filepath.Join(t.TempDir(), "count")
-	result := `{"gitmoot_result":{"decision":"failed","summary":"could not finish: upstream rate limit made the approach infeasible","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	result := `{"gitmoot_result":{"decision":"failed","summary":"could not finish: upstream rate limit made the approach infeasible","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 	script := fmt.Sprintf("printf x >> %q\nprintf '%%s' '%s'", countFile, result)
 	seedDaemonWorkerAgent(t, store, "prodbot", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
@@ -301,7 +301,7 @@ func TestE2E532ContractValidationFailureIsNeverRetried(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 
 	countFile := filepath.Join(t.TempDir(), "count")
-	malformed := `{"gitmoot_result":{"decision":"blocked: rate limit","summary":"quota","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	malformed := `{"gitmoot_result":{"decision":"blocked: rate limit","summary":"quota","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 	script := fmt.Sprintf("printf x >> %q\nprintf '%%s' '%s'", countFile, malformed)
 	seedDaemonWorkerAgent(t, store, "contractbot", runtime.ShellRuntime, script, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{

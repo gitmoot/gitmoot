@@ -370,14 +370,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 			// Result-check audit (#526), home-aware and fail-safe to the default warn.
 			ResultCheckMode: resultChecksMode(*home),
 		}
-		// Honor the opt-in [orchestrate] policy (artifact-body inlining + per-root
-		// delegation token budget) on this single-repo engine too; fail-safe to the
-		// defaults if the policy cannot load.
-		defaultJobWorker(store, stdout, *home).applyOrchestratePolicy(&engine)
-		// Opt-in risk-tiered adaptive review (#650); off by default so this is a
-		// no-op unless the home config enables it.
 		applyReviewPolicy(&engine, *home)
-		wireReviewRiskSignals(&engine, gh)
 		fmt.Fprintf(stdout, "watching %s every %s\n", repo.FullName(), poll.String())
 		supervisor := newSingleRepoSupervisorDaemon(repo, store, gh, engine, *home, resolvedHome, checkout, stdout, *poll, *watchIssues)
 		return runSingleRepoSupervisor(ctx, *home, supervisor, store, live, session, stdout)
@@ -420,7 +413,6 @@ func newSingleRepoSupervisorDaemon(
 			return &jobEngine, nil
 		},
 		WatchIssues:      watchIssues,
-		EscalationTTL:    resolveEscalationTTL(rawHome),
 		AutoMergeEnabled: autoMergeEnabledResolver(rawHome),
 	}
 }

@@ -33,7 +33,7 @@ func TestRemoteReviewWorkerExitSettlesItsClaimedRun(t *testing.T) {
 	}{
 		{
 			name:      "result_produced",
-			script:    `printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"reviewed 2618","findings":[],"changes_made":[],"tests_run":["true"],"needs":[],"delegations":[]}}'`,
+			script:    `printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"reviewed 2618","findings":[],"changes_made":[],"tests_run":["true"],"needs":[]}}'`,
 			lose:      1,
 			wantState: string(workflow.JobSucceeded),
 			wantKind:  string(workflow.JobSucceeded),

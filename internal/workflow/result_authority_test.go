@@ -26,7 +26,6 @@ func TestAgentCannotForgeTheSupersessionFlag(t *testing.T) {
 		"changes_made": [],
 		"tests_run": [],
 		"needs": [],
-		"delegations": [],
 		"superseded_pull_request_closed": true
 	}}`
 

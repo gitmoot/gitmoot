@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"encoding/json"
 	"testing"
 )
 
@@ -108,82 +107,5 @@ func TestGlobMatch(t *testing.T) {
 		if got := globMatch(tc.pattern, tc.path); got != tc.want {
 			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, tc.path, got, tc.want)
 		}
-	}
-}
-
-func TestSynthesizeLensDecisionCriticalBlocks(t *testing.T) {
-	findings := []LensFinding{
-		{Lens: "security", Refuted: true, Severity: "critical", Confidence: 0.9, Evidence: "auth bypass"},
-	}
-	if got := SynthesizeLensDecision(findings); got != "blocked" {
-		t.Fatalf("decision = %q, want blocked", got)
-	}
-}
-
-func TestSynthesizeLensDecisionNonCriticalApproves(t *testing.T) {
-	findings := []LensFinding{
-		{Lens: "correctness", Refuted: true, Severity: "medium", Confidence: 0.5},
-		{Lens: "security", Refuted: false, Severity: "critical"}, // not refuted -> ignored
-	}
-	if got := SynthesizeLensDecision(findings); got != "approved" {
-		t.Fatalf("decision = %q, want approved", got)
-	}
-}
-
-func TestSynthesizeLensDecisionEmptyApproves(t *testing.T) {
-	if got := SynthesizeLensDecision(nil); got != "approved" {
-		t.Fatalf("decision = %q, want approved", got)
-	}
-}
-
-func TestParseLensFindingsSkipsMalformed(t *testing.T) {
-	raw := []json.RawMessage{
-		json.RawMessage(`{"lens":"security","refuted":true,"severity":"critical","confidence":0.8,"evidence":"x"}`),
-		json.RawMessage(`"not an object"`),
-		json.RawMessage(`{"lens":"correctness","refuted":false,"severity":"low"}`),
-	}
-	got := ParseLensFindings(raw)
-	if len(got) != 2 {
-		t.Fatalf("parsed %d findings, want 2 (malformed skipped): %+v", len(got), got)
-	}
-	if got[0].Lens != "security" || !got[0].Refuted || got[0].Severity != "critical" {
-		t.Fatalf("first finding = %+v", got[0])
-	}
-}
-
-func TestHighRiskLensDelegations(t *testing.T) {
-	event := PullRequestEvent{PullRequest: 42, TaskID: "task-x", TaskTitle: "T"}
-
-	two := highRiskLensDelegations([]string{"audit"}, event, nil, "")
-	if len(two) != 2 {
-		t.Fatalf("single reviewer -> %d lenses, want 2", len(two))
-	}
-	for _, d := range two {
-		if d.Agent != "audit" {
-			t.Fatalf("lens %q agent = %q, want audit", d.ID, d.Agent)
-		}
-		if d.Action != "review" {
-			t.Fatalf("lens %q action = %q, want review", d.ID, d.Action)
-		}
-		if d.SynthesisRule != "quorum" || d.Quorum != 2 {
-			t.Fatalf("lens %q synthesis = %q quorum = %d, want quorum/2", d.ID, d.SynthesisRule, d.Quorum)
-		}
-	}
-
-	three := highRiskLensDelegations([]string{"a", "b", "c"}, event, nil, "")
-	if len(three) != 3 {
-		t.Fatalf("3 reviewers -> %d lenses, want 3 (regression added)", len(three))
-	}
-	if three[0].Agent != "a" || three[1].Agent != "b" || three[2].Agent != "c" {
-		t.Fatalf("round-robin agents = %q/%q/%q", three[0].Agent, three[1].Agent, three[2].Agent)
-	}
-	for _, d := range three {
-		if d.Quorum != 3 {
-			t.Fatalf("3-lens quorum = %d, want 3", d.Quorum)
-		}
-	}
-
-	if got := highRiskLensDelegations(nil, event, nil, ""); got != nil {
-		t.Fatalf("no reviewers -> %+v, want nil", got)
 	}
 }

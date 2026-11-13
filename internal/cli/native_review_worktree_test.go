@@ -57,7 +57,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 		t.Fatalf("scheduled job is not a native workflow review: %+v", job)
 	}
 
-	runner := &sandboxAdapterCaptureRunner{stdout: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[],"delegations":[]}}`}
+	runner := &sandboxAdapterCaptureRunner{stdout: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
 	worker.AdapterFactory = func(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -208,7 +208,7 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 		t.Fatalf("GetJob: %v", err)
 	}
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"correctness lens reviewed","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"correctness lens reviewed","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
 	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -480,7 +480,7 @@ func TestNativeReviewWorktreeContentionDefersInsteadOfBurningTheLeg(t *testing.T
 		t.Fatalf("GetJob: %v", err)
 	}
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"re-attempted after contention","findings":[],"changes_made":[],"tests_run":["retry smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"re-attempted after contention","findings":[],"changes_made":[],"tests_run":["retry smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
@@ -636,7 +636,7 @@ func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"lens re-attempted after contention","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"lens re-attempted after contention","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil

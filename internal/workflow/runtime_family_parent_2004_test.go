@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -15,7 +17,7 @@ import (
 //
 // The two shapes recover differently and that is the point of testing both.
 // A temp name CARRIES its parent agent as a prefix. An ephemeral name does not
-// carry its parent at all - ephemeralAgentName hashes the parent job id - so it
+// carry its parent at all - the retired minting hashed the parent job id - so it
 // recovers through the job row's parent_job_id column instead. #2004 as filed
 // claimed both were name-recoverable; only one is.
 func TestRuntimeFamilyResolvesATempAgentThroughItsNamedParent(t *testing.T) {
@@ -44,9 +46,9 @@ func TestRuntimeFamilyResolvesAnEphemeralAgentThroughItsParentJob(t *testing.T) 
 	seedReviewLoopAgent(t, store, "coordinator", "claude", "sonnet")
 
 	insertCompletedJob(t, store, db.Job{ID: "job-parent", Agent: "coordinator", Type: "review"}, JobPayload{})
-	// ephemeralAgentName(delegationID, parentJobID) - the parent job survives only
+	// historicalEphemeralAgentName(delegationID, parentJobID) - the parent job survives only
 	// as a hash, so nothing in this string identifies job-parent.
-	ephemeral := ephemeralAgentName("lens-db-path", "job-parent")
+	ephemeral := historicalEphemeralAgentName("lens-db-path", "job-parent")
 	insertCompletedJob(t, store, db.Job{ID: "job-lens", Agent: ephemeral, Type: "review", ParentJobID: "job-parent"}, JobPayload{})
 
 	family, ok, err := ResolveRuntimeFamily(ctx, store, "job-lens", ephemeral, "")
@@ -72,7 +74,7 @@ func TestEphemeralAgentDoesNotResolveWithoutItsJob(t *testing.T) {
 	store := openEngineStore(t)
 	seedReviewLoopAgent(t, store, "coordinator", "claude", "sonnet")
 	insertCompletedJob(t, store, db.Job{ID: "job-parent", Agent: "coordinator", Type: "review"}, JobPayload{})
-	ephemeral := ephemeralAgentName("lens-db-path", "job-parent")
+	ephemeral := historicalEphemeralAgentName("lens-db-path", "job-parent")
 	insertCompletedJob(t, store, db.Job{ID: "job-lens", Agent: ephemeral, Type: "review", ParentJobID: "job-parent"}, JobPayload{})
 
 	family, ok, err := ResolveRuntimeFamily(ctx, store, "", ephemeral, "")
@@ -124,7 +126,7 @@ func TestUnregisteredPlainNameStillDoesNotResolve(t *testing.T) {
 func TestParentWalkTerminatesOnASelfParent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
-	ephemeral := ephemeralAgentName("lens-loop", "job-loop")
+	ephemeral := historicalEphemeralAgentName("lens-loop", "job-loop")
 	insertCompletedJob(t, store, db.Job{ID: "job-loop", Agent: ephemeral, Type: "review", ParentJobID: "job-loop"}, JobPayload{})
 
 	family, ok, err := ResolveRuntimeFamily(ctx, store, "job-loop", ephemeral, "")
@@ -149,7 +151,7 @@ func TestParentWalkResolvesATempWorkerForkedFromAnEphemeralChild(t *testing.T) {
 	seedReviewLoopAgent(t, store, "coordinator", "kimi", "k2")
 
 	insertCompletedJob(t, store, db.Job{ID: "job-coord", Agent: "coordinator", Type: "review"}, JobPayload{})
-	ephemeral := ephemeralAgentName("lens-chain", "job-coord")
+	ephemeral := historicalEphemeralAgentName("lens-chain", "job-coord")
 	insertCompletedJob(t, store, db.Job{ID: "job-eph", Agent: ephemeral, Type: "review", ParentJobID: "job-coord"}, JobPayload{})
 	tempOfEphemeral := ephemeral + "-temp-" + "job-eph"
 	insertCompletedJob(t, store, db.Job{ID: "job-temp-chain", Agent: tempOfEphemeral, Type: "review"}, JobPayload{})
@@ -161,4 +163,12 @@ func TestParentWalkResolvesATempWorkerForkedFromAnEphemeralChild(t *testing.T) {
 	if !ok || family != "kimi" {
 		t.Fatalf("chained temp-of-ephemeral resolved to (%q, %v), want (\"kimi\", true)", family, ok)
 	}
+}
+
+// historicalEphemeralAgentName reproduces the `<delegation-id>-ephemeral-<hash>`
+// shape the retired delegation engine minted. Rows with that shape remain in
+// job history, and the parent walk must keep resolving them.
+func historicalEphemeralAgentName(delegationID, parentJobID string) string {
+	sum := sha256.Sum256([]byte(parentJobID + "\x00" + delegationID))
+	return delegationID + ephemeralAgentInfix + hex.EncodeToString(sum[:])[:12]
 }

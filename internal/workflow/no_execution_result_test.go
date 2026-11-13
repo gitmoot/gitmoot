@@ -44,8 +44,8 @@ func TestNoExecutionReviewResultChecks(t *testing.T) {
 // policy (which the worker marks on the agent), and a truthful static-only
 // verdict still succeeds and is stored as a no-execution review.
 func TestMailboxRefusesExecutedClaimFromNoExecutionReviewInEveryMode(t *testing.T) {
-	const executed = `{"gitmoot_result":{"decision":"approved","summary":"ran the suite and it passed","evidence":"executed","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
-	const static = `{"gitmoot_result":{"decision":"approved","summary":"read the diff and the CI log; the failing test was fixed","evidence":"static_only","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	const executed = `{"gitmoot_result":{"decision":"approved","summary":"ran the suite and it passed","evidence":"executed","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[]}}`
+	const static = `{"gitmoot_result":{"decision":"approved","summary":"read the diff and the CI log; the failing test was fixed","evidence":"static_only","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 	reviewer := func(noExecution bool) runtime.Agent {
 		agent := shellAgent()
 		agent.Role = "reviewer"

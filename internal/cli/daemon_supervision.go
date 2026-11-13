@@ -507,7 +507,6 @@ type registeredRepoPoller struct {
 	Stdout           io.Writer
 	RecoveryOnly     bool
 	WatchIssues      bool
-	EscalationTTL    time.Duration
 	AutoMergeEnabled func(repo string) bool
 	CheckoutLocks    *repoCheckoutLocks
 	// Inflight is the supervisor's in-flight job tracker (#562). A repo with
@@ -531,32 +530,17 @@ type registeredRepoPoller struct {
 // poller. It takes TWO home values with DISTINCT, documented shapes (#459):
 //
 //   - rawHome: the RAW --home (NOT <home>/.gitmoot). It feeds the READ-ONLY policy
-//     loaders — resolveEscalationTTL and jobWorker.ConfigHome (orchestratePolicy) —
-//     each of which resolves it to the config.toml exactly once. Passing a resolved
-//     root here would re-append ".gitmoot" inside those loaders and create the
-//     phantom <home>/.gitmoot/.gitmoot.
+//     loaders — autoMergeEnabledResolver and jobWorker.ConfigHome — each of which
+//     resolves it to the config.toml exactly once. Passing a resolved root here
+//     would re-append ".gitmoot" inside those loaders and create the phantom
+//     <home>/.gitmoot/.gitmoot.
 //   - resolvedRoot: the already-resolved <home>/.gitmoot root (config.Paths.Home).
-//     It feeds the engine wiring — daemonWorkflowEngine's ArtifactRoot/Home and
+//     It feeds the engine wiring — daemonWorkflowEngine's Home and
 //     daemonEventSink — which expect the resolved root and do NOT re-resolve.
 //
 // The direct pollRegisteredReposWithPoller caller passes "" for both, which is a
-// no-op: resolveEscalationTTL("") returns the default and daemonWorkflowEngine("")
-// leaves ArtifactRoot/Home/EventSink unset.
+// no-op: daemonWorkflowEngine("") leaves Home/EventSink unset.
 func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdout io.Writer, rawHome, resolvedRoot string) registeredRepoPoller {
-	configureWorkflow := func(engine workflow.Engine, store *db.Store) *workflow.Engine {
-		// Apply only the escalate_human notifier handle from policy (#340),
-		// keeping the budget/inlining knobs out of this path so its existing
-		// behavior is unchanged. The notifier itself is already wired by
-		// daemonWorkflowEngine; this just sets the configured @-handle.
-		// orchestratePolicy reads via jobWorker.ConfigHome, which is ALWAYS the
-		// RAW --home (#459) so it never re-resolves into a phantom doubled home.
-		if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
-			if policy, err := defaultJobWorker(store, stdout, rawHome).orchestratePolicy(); err == nil {
-				notifier.Handle = policy.EscalationHandle
-			}
-		}
-		return &engine
-	}
 	configCache := &tickConfigCache{}
 	return registeredRepoPoller{
 		ConfigCache:       configCache,
@@ -564,63 +548,33 @@ func defaultRegisteredRepoPoller(store *db.Store, workers int, dryRun bool, stdo
 		Workers:           workers,
 		DryRun:            dryRun,
 		Stdout:            stdout,
-		EscalationTTL:     resolveEscalationTTL(rawHome),
 		AutoMergeEnabled:  autoMergeEnabledResolver(rawHome),
 		IdleGraceTicks:    config.DefaultDaemonIdleGraceTicks,
 		IdleMaxMultiplier: config.DefaultDaemonIdleMaxMultiplier,
 		GitHubClient:      func(checkout string) github.Client { return github.NewClient(checkout) },
 		WorkflowFactory: func(store *db.Store, gh github.Client, checkout string) *workflow.Engine {
-			return configureWorkflow(daemonWorkflowEngineCached(store, gh, checkout, resolvedRoot, configCache), store)
+			engine := daemonWorkflowEngineCached(store, gh, checkout, resolvedRoot, configCache)
+			return &engine
 		},
 		JobWorkflowFactory: func(_ context.Context, store *db.Store, gh github.Client, checkout string, job db.Job) (*workflow.Engine, error) {
 			runner, err := defaultJobWorker(store, stdout, rawHome).subprocessRunnerForJob(job)
 			if err != nil {
 				return nil, err
 			}
-			return configureWorkflow(daemonWorkflowEngineForRunner(store, gh, checkout, resolvedRoot, runner, nil), store), nil
+			engine := daemonWorkflowEngineForRunner(store, gh, checkout, resolvedRoot, runner, nil)
+			return &engine, nil
 		},
 	}
 }
 
-// resolveEscalationTTL reads the [orchestrate].escalation_ttl policy (#340),
-// falling back to DefaultEscalationTTL when unset and to 0 (scan disabled) only
-// on a hard parse failure, so the auto-finalize backstop is on by default.
-//
-// It is READ-ONLY and shape-tolerant (#459): it resolves the config.toml for
-// EITHER a raw --home or an already-resolved <home>/.gitmoot root via
-// resolveConfigFile, then LoadOrchestratePolicy (which only ReadFile-s, never
-// MkdirAll-s). It MUST NOT call initializedPaths/config.Initialize: the real home
-// is already initialized upstream by withStore/withStoreAndPaths, and Initializing
-// here on a resolved root would re-append ".gitmoot" and create the phantom
-// <home>/.gitmoot/.gitmoot. Being side-effect-free makes it phantom-free even if a
-// caller hands it the resolved root by mistake — defense in depth.
-func resolveEscalationTTL(home string) time.Duration {
-	policy := config.DefaultOrchestratePolicy()
-	if cfg := resolveConfigFile(home); cfg != "" {
-		if loaded, err := config.LoadOrchestratePolicy(config.Paths{ConfigFile: cfg}); err == nil {
-			policy = loaded
-		}
-	}
-	raw := strings.TrimSpace(policy.EscalationTTL)
-	if raw == "" {
-		raw = config.DefaultEscalationTTL
-	}
-	ttl, err := time.ParseDuration(raw)
-	if err != nil || ttl <= 0 {
-		return 0
-	}
-	return ttl
-}
-
 // resolveBlockedTTL reads the [orchestrate].blocked_ttl policy (#631) and returns
-// the blocked-job sweep window, or 0 when the sweep is DISABLED. Unlike
-// resolveEscalationTTL it has NO default fallback: an unset/empty (or zero, or
-// unparseable) value resolves to 0 so the sweep stays OFF by default — a blocked
-// job is a human-awaiting decision and is never auto-dismissed unless the operator
-// opted in with a positive duration. It mirrors resolveEscalationTTL's read-only,
-// shape-tolerant config resolution (resolveConfigFile + LoadOrchestratePolicy,
-// never config.Initialize) so it is phantom-free for either a raw --home or an
-// already-resolved <home>/.gitmoot root.
+// the blocked-job sweep window, or 0 when the sweep is DISABLED. It has NO
+// default fallback: an unset/empty (or zero, or unparseable) value resolves to 0
+// so the sweep stays OFF by default — a blocked job is a human-awaiting decision
+// and is never auto-dismissed unless the operator opted in with a positive
+// duration. Its config resolution is read-only and shape-tolerant
+// (resolveConfigFile + LoadOrchestratePolicy, never config.Initialize) so it is
+// phantom-free for either a raw --home or an already-resolved <home>/.gitmoot root.
 func resolveBlockedTTL(home string) time.Duration {
 	policy := config.DefaultOrchestratePolicy()
 	if cfg := resolveConfigFile(home); cfg != "" {
@@ -931,7 +885,6 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 			return p.JobWorkflowFactory(ctx, store, gh, repoRecord.CheckoutPath, job)
 		},
 		WatchIssues:      p.WatchIssues,
-		EscalationTTL:    p.EscalationTTL,
 		AutoMergeEnabled: p.AutoMergeEnabled,
 	}
 	// Bound the poll the same way the single-repo supervisor does (#555 / #536):

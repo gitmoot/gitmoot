@@ -32,4 +32,4 @@ func daemonE2EHome(t *testing.T) (string, config.Paths, *db.Store) {
 // `sh -c <script> gitmoot <prompt>`. It ignores its input and echoes a valid
 // gitmoot_result with decision "approved" so the ask job runs to a TERMINAL
 // succeeded state with NO LLM and NO network — fully deterministic offline.
-const shellApprovedResultScript = `printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"shell fixture ran","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`
+const shellApprovedResultScript = `printf '%s' '{"gitmoot_result":{"decision":"approved","summary":"shell fixture ran","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`

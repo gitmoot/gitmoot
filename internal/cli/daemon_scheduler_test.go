@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,10 +21,8 @@ import (
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/db/dbtest"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
 	gitutil "github.com/gitmoot/gitmoot/internal/git"
 	"github.com/gitmoot/gitmoot/internal/github"
-	"github.com/gitmoot/gitmoot/internal/github/githubtest"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/transcript"
@@ -37,7 +34,7 @@ func TestRunQueuedJobsExecutesShellAdapterSuccess(t *testing.T) {
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-success", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -62,7 +59,7 @@ func TestRuntimePreflightUnknownRecordsEventAndDispatches(t *testing.T) {
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-runtime-unknown", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main"})
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -181,7 +178,7 @@ func TestRunQueuedJobsBlocksReadOnlyImplementBeforeRuntime(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-readonly-implement", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
 	comments := &cliPollFakeGitHub{}
 	checkoutCalls := 0
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		checkoutCalls++
@@ -298,7 +295,7 @@ func TestRunQueuedJobsAllowsReadOnlyAsk(t *testing.T) {
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
 	seedDaemonWorkerAgentWithPolicy(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-readonly-ask", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"ask ran","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"ask ran","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
@@ -434,7 +431,7 @@ func TestRunQueuedJobsUsesMailboxRepairForMalformedOutput(t *testing.T) {
 	store := daemonWorkerStore(t)
 	checkout := t.TempDir()
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `if printf '%s' "$1" | grep -q 'Previous raw output'; then printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"repaired","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'; else printf '%s\n' 'not json'; fi`, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `if printf '%s' "$1" | grep -q 'Previous raw output'; then printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"repaired","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'; else printf '%s\n' 'not json'; fi`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-repair", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -475,7 +472,7 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return &cliWorkerFakeAdapter{
-			output: `{"gitmoot_result":{"decision":"approved","summary":"done with token=ghp_abcdefghijklmnopqrstuvwxyz123456","findings":[{"severity":"low","body":"ok"}],"changes_made":["commented"],"tests_run":["go test ./..."],"needs":["none"],"delegations":[{"id":"follow-up","agent":"lead","action":"ask","prompt":"coordinate next steps"}]}}`,
+			output: `{"gitmoot_result":{"decision":"approved","summary":"done with token=ghp_abcdefghijklmnopqrstuvwxyz123456","findings":[{"severity":"low","body":"ok"}],"changes_made":["commented"],"tests_run":["go test ./..."],"needs":["none"]}}`,
 		}, nil
 	}
 	worker.CommenterFactory = func(string) github.Client {
@@ -500,8 +497,6 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 		"**Changes Made**",
 		"**Tests Run**",
 		"**Needs**",
-		"**Delegations**",
-		"- lead",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("comment body missing %q:\n%s", want, body)
@@ -546,7 +541,7 @@ func TestRunQueuedReviewCommentExplainsApprovedWithNotes(t *testing.T) {
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return &cliWorkerFakeAdapter{
-			output: `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"non-blocking polish","findings":[{"severity":"P2","summary":"rename helper"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			output: `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"non-blocking polish","findings":[{"severity":"P2","summary":"rename helper"}],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		}, nil
 	}
 	worker.CommenterFactory = func(string) github.Client { return comments }
@@ -655,7 +650,7 @@ func TestDaemonWorkerTickRetriesFailedResultCommentPost(t *testing.T) {
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return &cliWorkerFakeAdapter{
-			output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		}, nil
 	}
 	worker.CommenterFactory = func(string) github.Client {
@@ -763,7 +758,7 @@ func TestRunQueuedJobsPostsCommentAfterRetryDespitePriorComment(t *testing.T) {
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		return &cliWorkerFakeAdapter{
-			output: `{"gitmoot_result":{"decision":"approved","summary":"retried","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+			output: `{"gitmoot_result":{"decision":"approved","summary":"retried","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		}, nil
 	}
 	worker.CommenterFactory = func(string) github.Client {
@@ -791,7 +786,7 @@ func TestRunQueuedJobsDrainsBeyondWorkerLimit(t *testing.T) {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -838,7 +833,7 @@ func TestRunQueuedJobsDefersJobsEnqueuedByCurrentSnapshot(t *testing.T) {
 		HeadSHA:     strings.Repeat("a", 40),
 	})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"implemented","summary":"opened","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"implemented","summary":"opened","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -879,7 +874,7 @@ func TestRunQueuedJobsSerializesSameRepoCheckout(t *testing.T) {
 	active := 0
 	maxActive := 0
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		onDeliver: func() {
 			mu.Lock()
 			active++
@@ -926,7 +921,7 @@ func TestRunQueuedJobsAllowsDifferentRuntimeSessionsAcrossRepos(t *testing.T) {
 	active := 0
 	maxActive := 0
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		onDeliver: func() {
 			mu.Lock()
 			active++
@@ -960,141 +955,6 @@ func TestRunQueuedJobsAllowsDifferentRuntimeSessionsAcrossRepos(t *testing.T) {
 	}
 }
 
-// TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker proves a queued child
-// carrying an inline EphemeralSpec (no pre-registered agent) gets a throwaway
-// agent materialized from the spec, runs the job (Start + Deliver invoked), and
-// is auto-disposed afterwards — both the agent row and its instance are gone.
-func TestRunQueuedJobsMaterializesAndDisposesEphemeralWorker(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	checkout := t.TempDir()
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	ephemeralName := "reviewer-ephemeral-abc1234567"
-	// No agent row is seeded: the worker must be materialized from the spec.
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID:        "job-eph",
-		Agent:     ephemeralName,
-		Action:    "ask",
-		Repo:      "owner/repo",
-		Branch:    "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "openai/gpt-5.4", Effort: "high"},
-	})
-
-	startAdapter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440555"}
-	deliveryAdapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-	}
-	var deliveredModel, deliveredEffort string
-	startCheckouts := []string{}
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return checkout, nil
-	}
-	worker.StartAdapterFactory = func(_ execbackend.Backend, _ string, path string) (runtime.Adapter, error) {
-		startCheckouts = append(startCheckouts, path)
-		return startAdapter, nil
-	}
-	worker.AdapterFactory = func(agent runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
-		deliveredModel = agent.Model
-		deliveredEffort = agent.Effort
-		return deliveryAdapter, nil
-	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store}
-	}
-
-	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
-		t.Fatalf("runQueuedJobs returned error: %v", err)
-	}
-
-	job, err := store.GetJob(ctx, "job-eph")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	if job.State != string(workflow.JobSucceeded) {
-		t.Fatalf("job state = %q, want succeeded", job.State)
-	}
-	if startAdapter.startCalls != 1 || deliveryAdapter.calls != 1 {
-		t.Fatalf("start calls=%d delivery calls=%d, want 1 each", startAdapter.startCalls, deliveryAdapter.calls)
-	}
-	if deliveredModel != "openai/gpt-5.4" {
-		t.Fatalf("delivered agent model = %q, want openai/gpt-5.4", deliveredModel)
-	}
-	if deliveredEffort != "high" {
-		t.Fatalf("delivered agent effort = %q, want high", deliveredEffort)
-	}
-	if len(startCheckouts) != 1 || startCheckouts[0] != checkout {
-		t.Fatalf("start checkouts = %+v, want %q", startCheckouts, checkout)
-	}
-	// The throwaway agent row and its instance must be gone after the run.
-	if _, err := store.GetAgentInstance(ctx, ephemeralName); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetAgentInstance after run error = %v, want no rows", err)
-	}
-	if _, err := store.GetAgent(ctx, ephemeralName); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetAgent after run error = %v, want no rows", err)
-	}
-	if !daemonWorkerHasEvent(mustListJobEvents(t, store, "job-eph"), "ephemeral_worker_started") {
-		t.Fatalf("missing ephemeral_worker_started event")
-	}
-}
-
-// TestRunQueuedJobsDisposesEphemeralWorkerOnFailure proves the throwaway agent
-// is auto-disposed even when delivery fails: the job reaches a terminal failed
-// state and neither the agent row nor its instance survives.
-func TestRunQueuedJobsDisposesEphemeralWorkerOnFailure(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	checkout := t.TempDir()
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	ephemeralName := "impl-ephemeral-def7654321"
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID:        "job-eph-fail",
-		Agent:     ephemeralName,
-		Action:    "ask",
-		Repo:      "owner/repo",
-		Branch:    "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.OmpRuntime, Model: "openai/gpt-5.4"},
-	})
-
-	startAdapter := &cliWorkerFakeAdapter{startRuntimeRef: "550e8400-e29b-41d4-a716-446655440666"}
-	deliveryAdapter := &cliWorkerFakeAdapter{err: errors.New("delivery failed")}
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return checkout, nil
-	}
-	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
-		return startAdapter, nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return deliveryAdapter, nil
-	}
-	worker.WorkflowFactory = func(string) workflow.Engine {
-		return workflow.Engine{Store: store}
-	}
-
-	if err := runQueuedJobsForRepo(ctx, worker, 1, "", ""); err != nil {
-		t.Fatalf("runQueuedJobs returned error: %v", err)
-	}
-
-	job, err := store.GetJob(ctx, "job-eph-fail")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	if job.State != string(workflow.JobFailed) {
-		t.Fatalf("job state = %q, want failed", job.State)
-	}
-	if deliveryAdapter.calls != 1 {
-		t.Fatalf("delivery calls = %d, want 1", deliveryAdapter.calls)
-	}
-	// Cleanup must still run on the failure path.
-	if _, err := store.GetAgentInstance(ctx, ephemeralName); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetAgentInstance after failed run error = %v, want no rows", err)
-	}
-	if _, err := store.GetAgent(ctx, ephemeralName); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("GetAgent after failed run error = %v, want no rows", err)
-	}
-}
-
 func TestRunQueuedJobsPreservesCreationOrderForSameRepo(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -1104,7 +964,7 @@ func TestRunQueuedJobsPreservesCreationOrderForSameRepo(t *testing.T) {
 		enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: id, Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -1131,7 +991,7 @@ func TestRunQueuedJobsPreservesCancellationRace(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-cancel", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"late","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"late","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 		onDeliver: func() {
 			if _, err := workflow.CancelJob(ctx, store, "job-cancel"); err != nil {
 				t.Fatalf("CancelJob returned error: %v", err)
@@ -1234,7 +1094,7 @@ func TestRunQueuedJobsUsesConfiguredMergeGate(t *testing.T) {
 	})
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -1279,7 +1139,7 @@ func TestRunQueuedJobsUsesTaskWorktreeForReview(t *testing.T) {
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-review-worktree", Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, HeadSHA: head, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard)
 	adapterCheckout := ""
 	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -1320,7 +1180,7 @@ func TestRunQueuedJobsKeepsReviewOnRegisteredCheckoutWithoutTaskWorktree(t *test
 		t.Fatalf("UpsertTask returned error: %v", err)
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-review-main-checkout", Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "task-1", PullRequest: 7, HeadSHA: head, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1"})
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard)
 	adapterCheckout := ""
 	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -1390,7 +1250,7 @@ func TestRunQueuedJobsFailsReviewOnWrongCheckoutBranchBeforeDelivery(t *testing.
 	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-review", Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "task-1", PullRequest: 1, HeadSHA: head})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -1434,7 +1294,7 @@ func TestRunQueuedJobsDefersReviewOnWrongCheckoutHeadBeforeDelivery(t *testing.T
 	seedDaemonWorkerAgent(t, store, "reviewer", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-review", Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "task-1", PullRequest: 1, HeadSHA: strings.Repeat("0", 40), TaskID: "task-1"})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -1484,7 +1344,7 @@ func TestRunQueuedJobsDefersPRScopedAskOnWrongCheckoutHeadBeforeDelivery(t *test
 	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-ask", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "task-1", PullRequest: 1, HeadSHA: strings.Repeat("0", 40)})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -1526,7 +1386,7 @@ func TestRunQueuedJobsForRepoSkipsOtherRepos(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -1641,7 +1501,7 @@ func TestRunQueuedJobsPoolIsolatesContendedReadJob(t *testing.T) {
 	checkout := createDaemonWorkerGitCheckout(t, "main")
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "audit", runtime.ShellRuntime, `printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`, []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-1", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-2", Agent: "audit", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
 	worker := poolSchedulerWorker(t, store, nil, true)
@@ -1863,7 +1723,7 @@ func TestRunQueuedJobsForRepoSkipsOtherSessions(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "child-of-root", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 2, RootJobID: "root-coordinator"})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "other-root-job", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 3, RootJobID: "other-root"})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -1920,7 +1780,7 @@ func TestRunQueuedJobsForRepoAppliesRepoAndSessionAndMatch(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "wrong-repo", Agent: "audit", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2, RootJobID: "root-coordinator"})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "wrong-session", Agent: "audit", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 3, RootJobID: "other-root"})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -1975,7 +1835,7 @@ func TestRunEnabledRepoWorkerTicksSkipsDisabledRepos(t *testing.T) {
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-enabled", Agent: "audit", Action: "ask", Repo: "owner/enabled", Branch: "main", PullRequest: 1})
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-disabled", Agent: "audit", Action: "ask", Repo: "owner/disabled", Branch: "main", PullRequest: 2})
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -2025,7 +1885,7 @@ func TestRunQueuedJobsRecordsPostDeliveryWorkflowErrorForRetry(t *testing.T) {
 	})
 	gate := &cliWorkerFakeMergeGate{err: errors.New("github unavailable")}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -2126,7 +1986,7 @@ func TestReviewAdvancementRetrySurvivesReadOnlyWorktreeCleanup(t *testing.T) {
 	})
 	gate := &cliWorkerFakeMergeGate{err: errors.New("github unavailable")}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
@@ -2248,7 +2108,7 @@ func TestRetryPendingJobAdvancementsDoesNotAccumulateAdvanceRetry(t *testing.T) 
 	})
 	gate := &cliWorkerFakeMergeGate{err: errors.New("github unavailable")}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -2495,7 +2355,7 @@ func TestRunQueuedJobsSwallowsPostDeliveryBlockedWorkflow(t *testing.T) {
 	})
 	gate := &cliWorkerFakeMergeGate{decision: workflow.MergeDecision{Ready: false, Reason: workflow.PlainReason("ci pending")}}
 	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		output: `{"gitmoot_result":{"decision":"approved","summary":"approved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
@@ -3319,86 +3179,6 @@ func TestRunDaemonWorkerTickNoRepoConfigIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestRunQueuedJobsForRepoSkipsChildrenOfKilledRoot pins the #341 daemon half of
-// the operator kill switch: once a tree's root is marked killed, a queued CHILD
-// of that root is skipped by runQueuedJobsForRepo (never delivered, stays
-// queued), while a queued child of an un-killed root still runs.
-func TestRunQueuedJobsForRepoSkipsChildrenOfKilledRoot(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "w", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-
-	killedChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "killed-root", DelegationID: "d1"})
-	liveChildPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "live-root", DelegationID: "d2"})
-	// A continuation of the killed root carries NO DelegationID and MUST still run
-	// so the engine routes the tree through the graceful #305 finalize.
-	killedContinuationPayload := mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "main", Sender: "w", RootJobID: "killed-root", DelegationFinalize: true})
-	for _, j := range []db.Job{
-		{ID: "killed-root", Agent: "w", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Sender: "w"})},
-		{ID: "live-root", Agent: "w", Type: "ask", State: string(workflow.JobSucceeded), Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Sender: "w"})},
-		{ID: "killed-child", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: killedChildPayload},
-		{ID: "killed-root/continuation", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: killedContinuationPayload},
-		{ID: "live-child", Agent: "w", Type: "ask", State: string(workflow.JobQueued), Payload: liveChildPayload},
-	} {
-		if err := store.CreateJobWithEvent(ctx, j, db.JobEvent{Kind: j.State, Message: "seed"}); err != nil {
-			t.Fatalf("CreateJobWithEvent(%s) returned error: %v", j.ID, err)
-		}
-	}
-
-	// Operator kills only the first tree.
-	if err := store.SetRootJobKilled(ctx, "killed-root"); err != nil {
-		t.Fatalf("SetRootJobKilled returned error: %v", err)
-	}
-
-	adapter := &cliWorkerFakeAdapter{
-		output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
-	}
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return t.TempDir(), nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return adapter, nil
-	}
-
-	if err := runQueuedJobsForRepo(ctx, worker, 4, "", ""); err != nil {
-		t.Fatalf("runQueuedJobsForRepo returned error: %v", err)
-	}
-
-	for _, id := range adapter.delivered {
-		if id == "killed-child" {
-			t.Fatalf("a queued child of a killed root must not be delivered; delivered=%v", adapter.delivered)
-		}
-	}
-	liveDelivered := false
-	for _, id := range adapter.delivered {
-		if id == "live-child" {
-			liveDelivered = true
-		}
-	}
-	if !liveDelivered {
-		t.Fatalf("a queued child of an un-killed root must still run; delivered=%v", adapter.delivered)
-	}
-	continuationDelivered := false
-	for _, id := range adapter.delivered {
-		if id == "killed-root/continuation" {
-			continuationDelivered = true
-		}
-	}
-	if !continuationDelivered {
-		t.Fatalf("the continuation of a killed root must run so the graceful finalize executes; delivered=%v", adapter.delivered)
-	}
-
-	killedChild, err := store.GetJob(ctx, "killed-child")
-	if err != nil {
-		t.Fatalf("GetJob(killed-child) returned error: %v", err)
-	}
-	if killedChild.State != string(workflow.JobQueued) {
-		t.Fatalf("killed-child state = %q, want still queued", killedChild.State)
-	}
-}
-
 func TestRunDaemonPollWithTimeoutCancelsPoll(t *testing.T) {
 	start := time.Now()
 	err := runDaemonPollWithTimeout(context.Background(), time.Millisecond, func(ctx context.Context) error {
@@ -3410,81 +3190,6 @@ func TestRunDaemonPollWithTimeoutCancelsPoll(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("runDaemonPollWithTimeout took %v, want bounded", elapsed)
-	}
-}
-
-func TestRunQueuedJobsFansOutDelegationsAndEnqueuesContinuation(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "coord", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	seedDaemonWorkerAgent(t, store, "api", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
-	seedDaemonWorkerAgent(t, store, "ui", runtime.ShellRuntime, "unused", []string{"review"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID:     "coordinator",
-		Agent:  "coord",
-		Action: "ask",
-		Repo:   "owner/repo",
-		Branch: "task-1",
-		TaskID: "task-1",
-		Sender: "coord",
-	})
-
-	// Acceptance criterion #1: a coordinator returning delegations fans out one
-	// child per delegation. Each subsequent reviewer approves, and the last sibling
-	// to finish triggers the auto-created continuation (acceptance criterion #4).
-	outputs := map[string]string{
-		"coordinator": `{"gitmoot_result":{"decision":"approved","summary":"split the work","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[{"id":"api","agent":"api","action":"review","prompt":"review the api"},{"id":"ui","agent":"ui","action":"review","prompt":"review the ui"}]}}`,
-	}
-	defaultOutput := `{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
-	adapter := &cliWorkerDelegationAdapter{outputs: outputs, defaultOutput: defaultOutput}
-
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return t.TempDir(), nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return adapter, nil
-	}
-	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, "")
-	}
-
-	// Drain the DAG: coordinator -> two reviewer children -> continuation.
-	for range 5 {
-		if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
-			t.Fatalf("runQueuedJobs returned error: %v", err)
-		}
-	}
-
-	// Both delegation children were fanned out and succeeded.
-	for _, id := range []string{"coordinator/delegation/api", "coordinator/delegation/ui"} {
-		child, err := store.GetJob(ctx, id)
-		if err != nil {
-			t.Fatalf("delegation child %s not created: %v", id, err)
-		}
-		if child.State != string(workflow.JobSucceeded) {
-			t.Fatalf("child %s state = %q, want succeeded", id, child.State)
-		}
-		if child.ParentJobID != "coordinator" {
-			t.Fatalf("child %s parent = %q, want coordinator", id, child.ParentJobID)
-		}
-	}
-
-	// The continuation job was auto-created after the children finished.
-	cont, err := store.GetJob(ctx, "coordinator/continuation")
-	if err != nil {
-		t.Fatalf("continuation job not auto-created: %v", err)
-	}
-	if cont.ParentJobID != "coordinator" || strings.TrimSpace(cont.DelegationID) != "" {
-		t.Fatalf("continuation job = %+v, want parent=coordinator and empty delegation id", cont)
-	}
-	events, err := store.ListJobEvents(ctx, "coordinator")
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !daemonWorkerHasEvent(events, "delegation_continuation_enqueued") {
-		t.Fatalf("coordinator events = %+v, want delegation_continuation_enqueued", events)
 	}
 }
 

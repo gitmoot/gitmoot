@@ -139,7 +139,7 @@ w_tmp=$(probe '@TMP_PROBE@')
 w_other=$(probe '@OTHER@/seat-write-probe')
 w_other_seat=$(probe '@OTHER_SEAT@/seat-write-probe')
 w_own=$(probe "$TMPDIR/seat-write-probe")
-printf '{"gitmoot_result":{"decision":"approved","summary":"tmpdir=%s mode=%s sock=%s build=%s checkout=%s home=%s parent=%s tmp=%s other=%s other_seat=%s own=%s || sock_log=%s || build_log=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}\n' "$TMPDIR" "$mode" "$sock" "$build" "$w_checkout" "$w_home" "$w_parent" "$w_tmp" "$w_other" "$w_other_seat" "$w_own" "$sock_log" "$build_log"
+printf '{"gitmoot_result":{"decision":"approved","summary":"tmpdir=%s mode=%s sock=%s build=%s checkout=%s home=%s parent=%s tmp=%s other=%s other_seat=%s own=%s || sock_log=%s || build_log=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}\n' "$TMPDIR" "$mode" "$sock" "$build" "$w_checkout" "$w_home" "$w_parent" "$w_tmp" "$w_other" "$w_other_seat" "$w_own" "$sock_log" "$build_log"
 `)
 	seedDaemonWorkerAgent(t, store, "seat", "shell", script, []string{"ask"}, "owner/repo")
 	seedCLIJob(t, store, db.Job{

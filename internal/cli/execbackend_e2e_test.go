@@ -5,7 +5,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"go/ast"
@@ -777,54 +776,6 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 	})
 	if localDeliveryCalls != 0 {
 		t.Fatalf("remote routes invoked local delivery factory %d times, want 0", localDeliveryCalls)
-	}
-}
-
-func TestExecBackendEphemeralResolvesBeforeRuntimeStart(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	const jobID = "exec-backend-ephemeral-preflight"
-	const agentName = "reviewer-ephemeral-backend"
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: jobID, Agent: agentName, Action: "ask", Repo: "owner/repo", Branch: "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.OmpRuntime},
-	})
-
-	previousResolver := daemonJobExecBackendFor
-	daemonJobExecBackendFor = func(jobWorker, string, bool) (execbackend.Backend, config.RemoteExecConfig, error) {
-		return "", config.RemoteExecConfig{}, errors.New("backend preflight refused")
-	}
-	t.Cleanup(func() { daemonJobExecBackendFor = previousResolver })
-
-	startCalls := 0
-	worker := defaultJobWorker(store, io.Discard)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return t.TempDir(), nil
-	}
-	worker.StartAdapterFactory = func(execbackend.Backend, string, string) (runtime.Adapter, error) {
-		startCalls++
-		return &cliWorkerFakeAdapter{}, nil
-	}
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatalf("worker run: %v", err)
-	}
-	if startCalls != 0 {
-		t.Fatalf("runtime start factory calls = %d, want 0 before backend validation", startCalls)
-	}
-	if _, err := store.GetAgent(ctx, agentName); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("ephemeral agent lookup error = %v, want no materialized agent", err)
-	}
-	after, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatalf("GetJob(after): %v", err)
-	}
-	if after.State != string(workflow.JobFailed) {
-		t.Fatalf("job state = %q, want failed", after.State)
 	}
 }
 

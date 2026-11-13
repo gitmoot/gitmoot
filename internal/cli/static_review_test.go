@@ -62,7 +62,7 @@ func TestWorkerEnforcesRepositoryNoExecutionPolicy(t *testing.T) {
 			}
 			worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 				launched = true
-				return &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"reviewed","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
+				return &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"reviewed","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}, nil
 			}
 			job, err := store.GetJob(ctx, "policy-review")
 			if err != nil {

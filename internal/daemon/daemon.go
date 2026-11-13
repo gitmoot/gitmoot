@@ -80,10 +80,6 @@ type Daemon struct {
 	// PollOnce also polls open non-PR issues and routes `@<agent> ask …`
 	// comments to jobs. Default false keeps the PR-only behavior unchanged.
 	WatchIssues bool
-	// EscalationTTL bounds how long a tree may sit paused awaiting a human before
-	// PollOnce auto-finalizes it gracefully (#340). 0 disables the scan, keeping
-	// behavior unchanged for trees that never use escalate_human.
-	EscalationTTL time.Duration
 	// AutoMergeEnabled resolves the current native auto_merge policy for this
 	// repository. When it turns on, only tasks parked by the auto-merge-disabled
 	// leave-open reason are re-armed. Nil preserves direct daemon users' behavior.
@@ -249,14 +245,6 @@ func (d Daemon) PollOnce(ctx context.Context) error {
 	}
 	if d.WatchIssues {
 		if err := d.PollIssuesOnce(ctx); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	// escalate_human TTL scan (#340): auto-finalize trees that have sat paused
-	// awaiting a human past the configured TTL. No-op when the engine is unset or
-	// EscalationTTL is 0, so default behavior is unchanged.
-	if d.Workflow != nil && d.EscalationTTL > 0 {
-		if _, err := d.Workflow.AutoFinalizeExpiredEscalations(ctx, d.EscalationTTL); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -1816,46 +1804,6 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 		}
 		reason := fmt.Sprintf("queued %s job superseded: %s pull request #%d is no longer open",
 			job.Type, payload.Repo, number)
-		releasesCoordinator, err := d.queuedChildCanReleaseCoordinator(ctx, payload)
-		if err != nil {
-			// A store error here is not evidence about the coordinator. Skipping keeps a
-			// transient failure from silently downgrading a child with a LIVE parent to
-			// the cancel path, which would strand that coordinator for good.
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if releasesCoordinator {
-			engine, err := d.workflowForJob(ctx, job)
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-				continue
-			}
-			// A delegation child must also release its coordinator; see
-			// FinalizeClosedPullRequestDelegationChild for why its terminal state
-			// differs from the top-level path. The OBSERVED row is passed, not its
-			// id: the verdict is about the run this poll listed, and the settlement
-			// is anchored on that row's lifecycle generation so a job that
-			// completed and re-queued in the meantime is left alone.
-			if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, job, reason); err != nil {
-				// The parent's failure_policy decides what a dead child means, and it
-				// RECORDS that decision: block_parent surfaces as BlockedError,
-				// escalate_human as AwaitingHumanError. Both are the DAG acting, not this
-				// sweep failing, and treating either as a poll error would stamp the
-				// repo's last_error and (first-wins) mask a genuine error from a later
-				// reconciler. Same treatment reconcileReviewingPullRequest gives an
-				// AdvanceJob block.
-				var blocked workflow.BlockedError
-				var awaiting workflow.AwaitingHumanError
-				if !errors.As(err, &blocked) && !errors.As(err, &awaiting) && firstErr == nil {
-					firstErr = err
-				}
-			}
-			continue
-		}
 		if _, _, err := workflow.SupersedeClosedPullRequestJob(ctx, d.Store, job, reason); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1868,14 +1816,12 @@ func (d Daemon) supersedeQueuedJobsForClosedPullRequests(ctx context.Context, op
 //
 // The terminal state write moves a superseded job out of `queued`, and
 // supersedeQueuedJobsForClosedPullRequests selects only queued jobs — so before
-// this pass, a child whose cleanup, synthetic result or parent advance failed
-// after the transition was UNREACHABLE by any later sweep and its coordinator
-// waited forever. The pending marker written inside that transition is what makes
-// the window recoverable, and this is the pass that closes it.
+// this pass, a job whose cleanup failed after the transition was UNREACHABLE by
+// any later sweep. The pending marker written inside that transition is what
+// makes the window recoverable, and this is the pass that closes it.
 //
 // Bounded by the store's marker query, so a poll with no outstanding debt costs
-// one indexed read. A BlockedError/AwaitingHumanError is the parent's
-// failure_policy acting — the same classification the creating sweep uses.
+// one indexed read.
 func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error {
 	ids, err := d.Store.JobIDsWithPendingSupersedeFinalization(ctx)
 	if err != nil {
@@ -1913,8 +1859,7 @@ func (d Daemon) completePendingSupersedeFinalizations(ctx context.Context) error
 		}
 		if _, err := engine.CompletePendingSupersedeFinalization(ctx, id); err != nil {
 			var blocked workflow.BlockedError
-			var awaiting workflow.AwaitingHumanError
-			if !errors.As(err, &blocked) && !errors.As(err, &awaiting) && firstErr == nil {
+			if !errors.As(err, &blocked) && firstErr == nil {
 				firstErr = err
 			}
 		}
@@ -2088,54 +2033,6 @@ func (d Daemon) workflowForJob(ctx context.Context, job db.Job) (*workflow.Engin
 	return engine, nil
 }
 
-// queuedChildCanReleaseCoordinator reports whether terminating this queued job
-// should drive its coordinator, and distinguishes "no" from "cannot tell".
-//
-// It requires a delegation parent whose row still EXISTS. An orphaned child — parent
-// purged, or a synthetic id never persisted — takes the top-level path, because the
-// child finalizer walks to the parent and would fail with "job not found" on every
-// poll, and an error that recurs forever is the camouflage this sweep removes.
-//
-// It does NOT refuse on a merged task any more, and that reversal is the point. The
-// merged-task refusal traded one strand for another: in the PR's own headline case —
-// reconcileExternallyMergedTasks drives the task to `merged` EARLIER IN THE SAME POLL
-// — every child then took the cancel path and its coordinator was never released, so
-// the strand simply moved from the child to the parent. Protecting `merged` belongs in
-// the state machine, not here: setTaskState now refuses merged -> blocked, so the
-// advance can run and the record that the work landed still cannot be undone.
-//
-// A store error returns an error rather than false. Reading a transient failure as
-// "no coordinator" would downgrade a child with a LIVE parent to the cancel path and
-// strand that coordinator permanently, for the duration of one failed query.
-func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload workflow.JobPayload) (bool, error) {
-	parentID := strings.TrimSpace(payload.ParentJobID)
-	if parentID == "" || d.Workflow == nil {
-		return false, nil
-	}
-	if _, err := d.Store.GetJob(ctx, parentID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		return false, err
-	}
-	taskID := strings.TrimSpace(payload.TaskID)
-	if taskID == "" {
-		return true, nil
-	}
-	task, err := d.Store.GetTask(ctx, taskID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			// No task at all: the child still has a coordinator to release, and there
-			// is no task state for the advance to write.
-			return true, nil
-		}
-		return false, err
-	}
-	// A DISPOSED task (dismissed, superseded, stranded) is deliberately outside the
-	// state machine's normal transitions, so leave those alone.
-	return !workflow.IsDisposedTaskState(task.State), nil
-}
-
 // queuedJobSurvivesClosedPullRequest reports whether a queued PR-bound job must be
 // left alone even though its pull request is closed. Each class is here because
 // killing it would discard work whose purpose outlives the PR:
@@ -2151,8 +2048,6 @@ func (d Daemon) queuedChildCanReleaseCoordinator(ctx context.Context, payload wo
 //     stranded population this sweep exists for is ENGINE fan-out (Sender "github"),
 //     never an operator's own dispatch, so exempting Sender "local" costs the fix
 //     nothing and removes its only way to discard an explicit request.
-//   - a COORDINATOR CONTINUATION synthesizes work that already happened; the
-//     killed-root skip exempts it for the same reason (daemon_scheduler.go).
 //   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
 //     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
 //     here so a future field addition cannot make it collateral.
@@ -2168,9 +2063,6 @@ func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.J
 		return true, nil
 	}
 	if payload.DelegationReason == "temp_worker_merge_back" {
-		return true, nil
-	}
-	if job.ID == workflow.DelegationContinuationID(strings.TrimSpace(payload.ParentJobID)) {
 		return true, nil
 	}
 	events, err := d.Store.ListJobEvents(ctx, job.ID)
@@ -2939,7 +2831,7 @@ func (d Daemon) commentCommandParser() func(string) (Command, bool) {
 
 func onlyJobRecoveryCommands(commands []Command) bool {
 	for _, command := range commands {
-		if command.Action != "retry" && command.Action != "cancel" && command.Action != "help" && command.Action != "resume" {
+		if command.Action != "retry" && command.Action != "cancel" && command.Action != "help" {
 			return false
 		}
 	}
@@ -2966,8 +2858,6 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		return d.handleRetryCommand(ctx, pull, command)
 	case "cancel":
 		return d.handleCancelCommand(ctx, pull, command)
-	case "resume":
-		return d.handleResumeCommand(ctx, pull, command)
 	}
 
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
@@ -3034,8 +2924,6 @@ func (d Daemon) handleHelpCommand(ctx context.Context, pull github.PullRequest) 
 		"- `/gitmoot status`",
 		"- `/gitmoot retry <job-id>`",
 		"- `/gitmoot cancel <job-id>`",
-		"- `/gitmoot resume <job-id> <retry|continue|abort> [instructions]`",
-		"- `/gitmoot resume <job-id> answer \"<id>: ...\"` — answer a paused ask-gate question",
 		"- `/gitmoot merge`",
 	}
 	agents, err := d.Store.ListAgents(ctx)
@@ -3087,33 +2975,6 @@ func (d Daemon) handleCancelCommand(ctx context.Context, pull github.PullRequest
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not cancel job `%s`: %v.", command.JobID, err))
 	}
 	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cancelled job `%s`.", job.ID))
-}
-
-// handleResumeCommand resolves a tree paused at awaiting_human (#340) via
-// `/gitmoot resume <jobID> retry|continue|abort|answer [instructions]`. It is
-// authorize-commenter gated by the caller (handleComment / handleRecoveryComment)
-// and job-scope gated here, exactly like retry/cancel. retry re-enqueues the
-// failed leg with the human's instructions; continue proceeds the coordinator
-// continuation; abort routes to the #305 graceful finalize; answer (#445)
-// delivers the human's reply to a non-failure ask-gate pause as injected context
-// on the coordinator continuation. The engine rejects a verb whose flavor does
-// not match the open round's kind (answer on a failure round, or
-// retry/continue/abort on an ask round) with a clear message.
-func (d Daemon) handleResumeCommand(ctx context.Context, pull github.PullRequest, command Command) error {
-	if d.Workflow == nil {
-		return d.ack(ctx, pull.Number, "Gitmoot cannot resume this tree because the workflow engine is not configured.")
-	}
-	if err := d.validateJobCommandScope(ctx, pull, command.JobID); err != nil {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: %v.", command.JobID, err))
-	}
-	decision, ok := workflow.ParseResumeDecision(command.Decision)
-	if !ok {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: decision must be retry, continue, abort, or answer.", command.JobID))
-	}
-	if err := d.Workflow.ResolveEscalation(ctx, command.JobID, decision, command.Instructions); err != nil {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not resume job `%s`: %v.", command.JobID, err))
-	}
-	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot resumed job `%s` with `%s`.", command.JobID, decision))
 }
 
 func (d Daemon) validateJobCommandScope(ctx context.Context, pull github.PullRequest, jobID string) error {

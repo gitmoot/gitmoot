@@ -128,11 +128,6 @@ func TestClassifyOperationalBlocker(t *testing.T) {
 			err:    workflow.BlockedError{Reason: "task blocked: quota policy"},
 			wantOK: false,
 		},
-		{
-			name:   "escalate-human pause is never a blocker",
-			err:    workflow.AwaitingHumanError{Reason: "rate limit decision needs a human"},
-			wantOK: false,
-		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

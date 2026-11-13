@@ -87,7 +87,6 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			name: "skill",
 			text: text,
 			want: []string{
-				"gitmoot agent run <agent>",
 				"gitmoot agent ask <agent>",
 				"The plugin is only the runtime discovery surface",
 				"gitmoot agent prompt <agent-or-template>",
@@ -97,7 +96,6 @@ func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
 			name: "cli",
 			text: cli,
 			want: []string{
-				"gitmoot agent run project-planner --repo owner/repo",
 				"gitmoot agent ask project-planner --repo owner/repo",
 				"gitmoot agent prompt frontend-reviewer",
 				"agent ask` is for analysis, planning, and questions only",
@@ -139,7 +137,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr <number>",
 				"gitmoot job gates <id>",
 				"gitmoot workflow list",
@@ -152,7 +149,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			want: []string{
 				"gitmoot --help",
 				"gitmoot runtime list",
-				"gitmoot job answer <job-id>",
 				"gitmoot job open",
 				"gitmoot job gates",
 				"gitmoot workflow list",
@@ -163,7 +159,6 @@ func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
 			name: "cli reference",
 			text: cli,
 			want: []string{
-				"gitmoot job answer <job-id>",
 				"gitmoot review request --pr",
 				"gitmoot review status --pr",
 				"gitmoot workflow list",

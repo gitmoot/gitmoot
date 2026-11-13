@@ -10,7 +10,7 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
-const planResultJSON = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const planResultJSON = `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 // TestMailboxEnqueueRejectsImpossiblePlanRequest pins the two plan shapes that
 // can never run, refused at the enqueue chokepoint BEFORE a job row exists

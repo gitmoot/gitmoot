@@ -13,9 +13,6 @@ type Command struct {
 	Agent        string
 	JobID        string
 	Instructions string
-	// Decision is the resume verb (retry|continue|abort) for the `resume` action
-	// (#340); empty for every other action.
-	Decision string
 }
 
 type parsedCommentCommand struct {
@@ -257,14 +254,6 @@ func ParseCommand(line string) (Command, bool) {
 			return Command{}, false
 		}
 		return Command{Action: fields[1], JobID: fields[2], Instructions: trailing(fields, 3)}, true
-	case "resume":
-		// `/gitmoot resume <jobID> <retry|continue|abort|answer> [instructions]`
-		// (#340; `answer` added by #445). For `answer`, Instructions is the trailing
-		// `<id>: text` payload (multi-line for several questions).
-		if len(fields) < 4 {
-			return Command{}, false
-		}
-		return Command{Action: "resume", JobID: fields[2], Decision: strings.ToLower(fields[3]), Instructions: trailing(fields, 4)}, true
 	case "ask":
 		if len(fields) < 3 {
 			return Command{}, false
@@ -293,21 +282,14 @@ func (c Command) Validate() error {
 	// `/gitmoot <agent> implement ...` comment takes the SAME path as any other
 	// unrecognized action — ErrUnsupportedAction, which handleCommand logs and
 	// stays silent about rather than replying on the thread (#1355).
-	case "review", "ask", "status", "merge", "retry", "cancel", "help", "resume":
+	case "review", "ask", "status", "merge", "retry", "cancel", "help":
 	default:
 		return fmt.Errorf("%w %q", ErrUnsupportedAction, c.Action)
 	}
-	if (c.Action == "retry" || c.Action == "cancel" || c.Action == "resume") && c.JobID == "" {
+	if (c.Action == "retry" || c.Action == "cancel") && c.JobID == "" {
 		return fmt.Errorf("command %q requires a job id", c.Action)
 	}
-	if c.Action == "resume" {
-		switch c.Decision {
-		case "retry", "continue", "abort", "answer":
-		default:
-			return fmt.Errorf("command resume requires a decision of retry, continue, abort, or answer")
-		}
-	}
-	if c.Action != "status" && c.Action != "merge" && c.Action != "retry" && c.Action != "cancel" && c.Action != "help" && c.Action != "resume" && c.Agent == "" {
+	if c.Action != "status" && c.Action != "merge" && c.Action != "retry" && c.Action != "cancel" && c.Action != "help" && c.Agent == "" {
 		return fmt.Errorf("command %q requires an agent", c.Action)
 	}
 	return nil

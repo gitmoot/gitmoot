@@ -41,25 +41,19 @@ func seedWebDashboardTree(t *testing.T, home string) {
 		t.Fatalf("UpsertAgent builder: %v", err)
 	}
 
-	// Coordinator (originating root) whose settled result declares two
-	// delegations: "export" depends on "search".
+	// Coordinator (originating root) that fanned out two delegations: "export"
+	// depends on "search" (recorded on the child's payload Deps).
 	coordPayload := workflow.JobPayload{
 		Repo:      "jerryfane/noted",
 		TaskTitle: "add search + export",
-		Result: &workflow.AgentResult{
-			Decision: "delegated",
-			Delegations: []workflow.Delegation{
-				{ID: "d-search", Agent: "builder", Action: "implement: search"},
-				{ID: "d-export", Agent: "builder", Action: "implement: export", Deps: []string{"d-search"}},
-			},
-		},
+		Result:    &workflow.AgentResult{Decision: "delegated"},
 	}
 	mustCreateJob(t, store, db.Job{ID: "coord", Agent: "project-lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, coordPayload)}, "delegation_enqueued", "fanned out 2 delegations")
 
 	searchPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: search", PullRequest: 12, Model: "payload-override-is-not-history"}
 	mustCreateJob(t, store, db.Job{ID: "child-search", Agent: "builder", Type: "implement", State: "succeeded", Payload: mustJSON(t, searchPayload), Model: "claude-fable-5", ParentJobID: "coord", DelegationID: "d-search", DelegationDepth: 1}, "worker_started", "picked up d-search")
 
-	exportPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: export"}
+	exportPayload := workflow.JobPayload{Repo: "jerryfane/noted", TaskTitle: "implement: export", Deps: []string{"d-search"}}
 	mustCreateJob(t, store, db.Job{ID: "child-export", Agent: "builder", Type: "implement", State: "running", Payload: mustJSON(t, exportPayload), ParentJobID: "coord", DelegationID: "d-export", DelegationDepth: 1}, "worker_started", "picked up d-export")
 
 	// Continuation job carries no delegation id.

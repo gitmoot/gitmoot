@@ -375,7 +375,7 @@ func TestEffectiveRuntimeNullPayloadBlocksDaemonExecution(t *testing.T) {
 func TestForegroundEffectiveRuntimePersistsAtomicallyWithEnqueue(t *testing.T) {
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "foreground-runs")
-	script := fmt.Sprintf(`printf 'run\n' >> %q; printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"ran with atomic runtime evidence","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`, marker)
+	script := fmt.Sprintf(`printf 'run\n' >> %q; printf '%%s' '{"gitmoot_result":{"decision":"approved","summary":"ran with atomic runtime evidence","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`, marker)
 	home, store := effectiveRuntimeE2EHome(t, script)
 
 	raw, err := sql.Open("sqlite", store.DatabasePath())

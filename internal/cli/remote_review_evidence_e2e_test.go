@@ -25,7 +25,7 @@ import (
 const remoteEvidenceProbe = `ev=absent
 if [ -n "${GITMOOT_REVIEW_EVIDENCE_DIR:-}" ]; then ev=$(ls "$GITMOOT_REVIEW_EVIDENCE_DIR" | tr '\n' ','):$(cat "$GITMOOT_REVIEW_EVIDENCE_DIR"/* | sha256sum | cut -c1-16); fi
 %s
-printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"evidence=%%s","findings":[],"changes_made":[],"tests_run":["ls evidence"],"needs":[],"delegations":[]}}' "$ev"`
+printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"evidence=%%s","findings":[],"changes_made":[],"tests_run":["ls evidence"],"needs":[]}}' "$ev"`
 
 // #2476. Pinned private evidence reaches a remote review's sandbox, is read
 // back there before the reviewer starts, and is re-verified after delivery:

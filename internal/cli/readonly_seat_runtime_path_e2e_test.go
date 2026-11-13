@@ -70,7 +70,7 @@ func TestReadOnlySeatJobRunShipsAPathThatResolvesRuntimeBinariesE2E(t *testing.T
 	// failing the job.
 	probe := `claude_path=$(command -v claude || echo MISSING); ` +
 		`kimi_path=$(command -v kimi || echo MISSING); ` +
-		`printf '{"gitmoot_result":{"decision":"approved","summary":"claude=%s kimi=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}\n' "$claude_path" "$kimi_path"`
+		`printf '{"gitmoot_result":{"decision":"approved","summary":"claude=%s kimi=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}\n' "$claude_path" "$kimi_path"`
 	seedDaemonWorkerAgent(t, store, "seat", "shell", probe, []string{"ask"}, "owner/repo")
 
 	seedCLIJob(t, store, db.Job{

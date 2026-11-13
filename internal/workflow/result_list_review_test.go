@@ -13,7 +13,7 @@ func envelopeWithList(field, list string) string {
 	lists[field] = list
 	return `{"gitmoot_result":{"decision":"approved","summary":"s","findings":[],"changes_made":` +
 		lists["changes_made"] + `,"tests_run":` + lists["tests_run"] +
-		`,"needs":` + lists["needs"] + `,"delegations":[]}}`
+		`,"needs":` + lists["needs"] + `}}`
 }
 
 // TestNullListElementStaysAnEmptyEntry is the #1809 P2 regression.

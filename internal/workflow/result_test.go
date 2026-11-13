@@ -7,7 +7,7 @@ import (
 
 func TestExtractAgentResultFromFencedOutput(t *testing.T) {
 	output := "done\n```json\n" +
-		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}` +
+		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[]}}` +
 		"\n```"
 
 	result, err := ExtractAgentResult(output)
@@ -37,14 +37,14 @@ func TestExtractAgentResultNormalizesMissingArrays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExtractAgentResult returned error: %v", err)
 	}
-	if result.Findings == nil || result.ChangesMade == nil || result.TestsRun == nil || result.Needs == nil || result.Delegations == nil {
+	if result.Findings == nil || result.ChangesMade == nil || result.TestsRun == nil || result.Needs == nil {
 		t.Fatalf("result arrays were not normalized: %+v", result)
 	}
 }
 
 func TestExtractAgentResultSkipsDecoyJSONCandidate(t *testing.T) {
 	output := `{"note":"mentions gitmoot_result but is not the envelope"}` + "\n" +
-		`{"gitmoot_result":{"decision":"approved","summary":"real result","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+		`{"gitmoot_result":{"decision":"approved","summary":"real result","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 	result, err := ExtractAgentResult(output)
 
@@ -57,7 +57,7 @@ func TestExtractAgentResultSkipsDecoyJSONCandidate(t *testing.T) {
 }
 
 func TestExtractAgentResultRejectsUnsupportedDecision(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"maybe","summary":"unclear","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"maybe","summary":"unclear","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 	if _, err := ExtractAgentResult(output); err == nil {
 		t.Fatal("ExtractAgentResult accepted unsupported decision")
@@ -109,7 +109,7 @@ func TestExtractAgentResultRejectsUnsupportedReviewSeverity(t *testing.T) {
 }
 
 func TestExtractAgentResultAcceptsSkipped(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"skipped","summary":"no new replies","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	output := `{"gitmoot_result":{"decision":"skipped","summary":"no new replies","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 	result, err := ExtractAgentResult(output)
 	if err != nil {
@@ -120,20 +120,8 @@ func TestExtractAgentResultAcceptsSkipped(t *testing.T) {
 	}
 }
 
-func TestExtractAgentResultRejectsSkippedWithDelegations(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"skipped","summary":"nothing to do","delegations":[{"id":"child","agent":"impl","action":"ask","prompt":"check anyway"}]}}`
-
-	_, err := ExtractAgentResult(output)
-	if err == nil {
-		t.Fatal("ExtractAgentResult accepted skipped with delegations")
-	}
-	if !strings.Contains(err.Error(), "decision skipped cannot be used with delegations") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
 func TestExtractAgentResultRejectsUnsupportedField(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"unexpected_field":[]}}`
+	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"unexpected_field":[]}}`
 
 	_, err := ExtractAgentResult(output)
 
@@ -145,76 +133,8 @@ func TestExtractAgentResultRejectsUnsupportedField(t *testing.T) {
 	}
 }
 
-func TestExtractAgentResultAcceptsDelegationDeps(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
-		`"delegations":[` +
-		`{"id":"api","agent":"impl","action":"review","prompt":"build api"},` +
-		`{"id":"ui","agent":"impl","action":"review","prompt":"build ui"},` +
-		`{"id":"integrate","agent":"impl","action":"review","prompt":"wire up","deps":["api","ui"]}` +
-		`]}}`
-
-	result, err := ExtractAgentResult(output)
-
-	if err != nil {
-		t.Fatalf("ExtractAgentResult returned error: %v", err)
-	}
-	if len(result.Delegations) != 3 {
-		t.Fatalf("delegations = %+v", result.Delegations)
-	}
-	if got := result.Delegations[2].Deps; len(got) != 2 || got[0] != "api" || got[1] != "ui" {
-		t.Fatalf("deps = %+v", got)
-	}
-}
-
-// TestExtractAgentResultRefusesAnImplementDelegationAndKeepsAskReview is route 1 of
-// #2203: a coordinator that declares an implement delegation must be REFUSED, and the
-// refusal must name the action.
-//
-// The refusal is the point, not the absence. A silent downgrade to ask would leave the
-// coordinator believing implementation had been dispatched when nothing can write, so
-// this asserts an error rather than a rewritten action — and the control half asserts
-// the surviving actions still extract untouched, so the refusal is not over-broad.
-//
-// MUTATION PROOF: put "implement" back into DelegationActions and the first half fails
-// (the result extracts cleanly); make the validator reject every action and the control
-// half fails.
-func TestExtractAgentResultRefusesAnImplementDelegationAndKeepsAskReview(t *testing.T) {
-	refused := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
-		`"delegations":[` +
-		`{"id":"impl-api","agent":"builder","action":"implement","prompt":"build the api"}` +
-		`]}}`
-
-	result, err := ExtractAgentResult(refused)
-	if err == nil {
-		t.Fatalf("ExtractAgentResult accepted an implement delegation: %+v", result.Delegations)
-	}
-	for _, want := range []string{`"implement"`, "must be one of ask, review", "impl-api"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("refusal %q does not name %q: a coordinator cannot tell which leg was refused", err, want)
-		}
-	}
-	// NOT DOWNGRADED: the delegation must not come back rewritten as a read-only leg.
-	if len(result.Delegations) != 0 {
-		t.Fatalf("a refused result returned delegations %+v: an implement leg was silently kept", result.Delegations)
-	}
-
-	// CONTROL: ask and review still dispatch, with their actions preserved verbatim.
-	surviving := `{"gitmoot_result":{"decision":"approved","summary":"fan out",` +
-		`"delegations":[` +
-		`{"id":"q","agent":"audit","action":"ask","prompt":"what changed"},` +
-		`{"id":"r","agent":"reviewer","action":"review","prompt":"review it","deps":["q"]}` +
-		`]}}`
-	control, err := ExtractAgentResult(surviving)
-	if err != nil {
-		t.Fatalf("ExtractAgentResult refused a surviving ask/review fan-out: %v", err)
-	}
-	if len(control.Delegations) != 2 || control.Delegations[0].Action != "ask" || control.Delegations[1].Action != "review" {
-		t.Fatalf("surviving delegations = %+v, want an ask leg and a review leg", control.Delegations)
-	}
-}
-
 func TestExtractAgentResultRejectsNextAgentsField(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"next_agents":["impl"]}}`
+	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":["impl"]}}`
 
 	_, err := ExtractAgentResult(output)
 
@@ -223,407 +143,6 @@ func TestExtractAgentResultRejectsNextAgentsField(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `unsupported gitmoot_result field "next_agents"`) {
 		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestExtractAgentResultAcceptsHumanQuestions(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"approved","summary":"need a decision",` +
-		`"human_questions":[` +
-		`{"id":"q1","prompt":"Target v2 or v3 API?","choices":["v2","v3"]},` +
-		`{"id":"q2","prompt":"Use the legacy auth flow?"}` +
-		`]}}`
-
-	result, err := ExtractAgentResult(output)
-	if err != nil {
-		t.Fatalf("ExtractAgentResult returned error: %v", err)
-	}
-	if len(result.HumanQuestions) != 2 {
-		t.Fatalf("human_questions = %+v", result.HumanQuestions)
-	}
-	if q := result.HumanQuestions[0]; q.ID != "q1" || q.Prompt != "Target v2 or v3 API?" || len(q.Choices) != 2 {
-		t.Fatalf("human_questions[0] = %+v", q)
-	}
-	if q := result.HumanQuestions[1]; q.ID != "q2" || len(q.Choices) != 0 {
-		t.Fatalf("human_questions[1] = %+v", q)
-	}
-}
-
-func TestExtractAgentResultRejectsMalformedHumanQuestions(t *testing.T) {
-	cases := []struct {
-		name    string
-		entries string
-		want    string
-	}{
-		{"missing id", `[{"prompt":"x"}]`, "id is required"},
-		{"blank id", `[{"id":"  ","prompt":"x"}]`, "id is required"},
-		{"blank prompt", `[{"id":"q1","prompt":"   "}]`, "prompt is required"},
-		{"dup id", `[{"id":"q1","prompt":"a"},{"id":"q1","prompt":"b"}]`, "is not unique"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			output := `{"gitmoot_result":{"decision":"approved","summary":"ok","human_questions":` + tc.entries + `}}`
-			_, err := ExtractAgentResult(output)
-			if err == nil {
-				t.Fatalf("ExtractAgentResult accepted malformed human_questions (%s)", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error = %v, want substring %q", err, tc.want)
-			}
-		})
-	}
-}
-
-func TestValidateAgentResultRejectsDelegationMissingFields(t *testing.T) {
-	cases := []struct {
-		name string
-		del  Delegation
-		want string
-	}{
-		{"missing id", Delegation{Agent: "impl", Action: "review", Prompt: "do"}, `delegations[0] (id "<missing>"): id is required`},
-		{"missing agent", Delegation{ID: "a", Action: "review", Prompt: "do"}, `delegation "a" must set exactly one of agent or ephemeral`},
-		{"missing action", Delegation{ID: "a", Agent: "impl", Prompt: "do"}, `delegations[0] (id "a"): action is required`},
-		{"unsupported action", Delegation{ID: "a", Agent: "impl", Action: "produce", Prompt: "do"}, `delegations[0] (id "a"): action "produce" must be one of ask, review`},
-		// #2203: implement is no longer a dispatchable action, and the refusal must
-		// NAME it so a coordinator is not left guessing which leg was rejected.
-		{"implement action", Delegation{ID: "a", Agent: "impl", Action: "implement", Prompt: "do"}, `delegations[0] (id "a"): action "implement" must be one of ask, review`},
-		{"missing prompt", Delegation{ID: "a", Agent: "impl", Action: "review"}, `delegations[0] (id "a"): prompt is required`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := AgentResult{Decision: "implemented", Summary: "x", Delegations: []Delegation{tc.del}}
-			err := validateAgentResult(result)
-			if err == nil {
-				t.Fatalf("validateAgentResult accepted %s", tc.name)
-			}
-			if !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("error = %v, want %q", err, tc.want)
-			}
-		})
-	}
-}
-
-func TestValidateAgentResultAggregatesDelegationFieldErrors(t *testing.T) {
-	// Two delegations, each missing a different field, must surface BOTH failures
-	// in a single error so the one repair retry can fix the whole batch.
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{Agent: "impl", Action: "review", Prompt: "do"}, // missing id
-			{ID: "build-api", Agent: "impl", Prompt: "do"},  // missing action
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted two delegations missing fields")
-	}
-	if !strings.Contains(err.Error(), `delegations[0] (id "<missing>"): id is required`) {
-		t.Fatalf("error missing delegations[0] line: %v", err)
-	}
-	if !strings.Contains(err.Error(), `delegations[1] (id "build-api"): action is required`) {
-		t.Fatalf("error missing delegations[1] line: %v", err)
-	}
-}
-
-func TestDelegationValidationErrorFormat(t *testing.T) {
-	cases := []struct {
-		name string
-		err  DelegationValidationError
-		want string
-	}{
-		{
-			name: "with id",
-			err:  DelegationValidationError{Index: 1, ID: "build-api", Field: "action", Msg: "is required"},
-			want: `delegations[1] (id "build-api"): action is required`,
-		},
-		{
-			name: "blank id renders as <missing>",
-			err:  DelegationValidationError{Index: 0, ID: "", Field: "id", Msg: "is required"},
-			want: `delegations[0] (id "<missing>"): id is required`,
-		},
-		{
-			name: "whitespace id renders as <missing>",
-			err:  DelegationValidationError{Index: 2, ID: "   ", Field: "id", Msg: "is required"},
-			want: `delegations[2] (id "<missing>"): id is required`,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.err.Error(); got != tc.want {
-				t.Fatalf("Error() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestValidateAgentResultRejectsDuplicateDelegationID(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "dup", Agent: "impl", Action: "review", Prompt: "first"},
-			{ID: "dup", Agent: "other", Action: "review", Prompt: "second"},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted duplicate delegation id")
-	}
-	if !strings.Contains(err.Error(), `delegation id "dup" is not unique`) {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsUnknownDep(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "a", Agent: "impl", Action: "review", Prompt: "do", Deps: []string{"nonexistent"}},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted unknown dep")
-	}
-	if !strings.Contains(err.Error(), `delegation "a" references unknown dep "nonexistent"`) {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsSelfDep(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "a", Agent: "impl", Action: "review", Prompt: "do", Deps: []string{"a"}},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted self-dep")
-	}
-	if !strings.Contains(err.Error(), `delegation "a" depends on itself`) {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsDependencyCycle(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "a", Agent: "impl", Action: "review", Prompt: "do", Deps: []string{"b"}},
-			{ID: "b", Agent: "impl", Action: "review", Prompt: "do", Deps: []string{"a"}},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted dependency cycle")
-	}
-	if !strings.Contains(err.Error(), "dependency cycle") {
-		t.Fatalf("error = %v", err)
-	}
-	// The error must name both delegations in the cycle.
-	if !strings.Contains(err.Error(), "a") || !strings.Contains(err.Error(), "b") {
-		t.Fatalf("cycle error does not name the delegations: %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsArtifactsWithoutBody(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "a", Agent: "impl", Action: "review", Prompt: "do", Artifacts: []string{"brief.md"}},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted delegation requesting artifacts with empty body")
-	}
-	if !strings.Contains(err.Error(), "artifact_body is required when delegations request artifacts") {
-		t.Fatalf("error = %v", err)
-	}
-
-	// With a brief written, the same delegations are valid.
-	result.ArtifactBody = "shared brief"
-	if err := validateAgentResult(result); err != nil {
-		t.Fatalf("validateAgentResult rejected delegations with a written brief: %v", err)
-	}
-}
-
-func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
-	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
-		`"delegations":[` +
-		`{"id":"worker","ephemeral":{"runtime":"omp","model":"gpt-5.4","effort":"high","autonomy_policy":"workspace-write"},"action":"review","prompt":"hi","effort":"xhigh"}` +
-		`]}}`
-
-	result, err := ExtractAgentResult(output)
-	if err != nil {
-		t.Fatalf("ExtractAgentResult rejected a valid ephemeral delegation: %v", err)
-	}
-	if len(result.Delegations) != 1 {
-		t.Fatalf("delegations = %+v", result.Delegations)
-	}
-	spec := result.Delegations[0].Ephemeral
-	if spec == nil {
-		t.Fatalf("ephemeral spec was not parsed: %+v", result.Delegations[0])
-	}
-	if spec.Runtime != "omp" || spec.Model != "gpt-5.4" || spec.Effort != "high" {
-		t.Fatalf("ephemeral spec = %+v", spec)
-	}
-	if result.Delegations[0].Effort != "xhigh" {
-		t.Fatalf("delegation effort = %q, want %q", result.Delegations[0].Effort, "xhigh")
-	}
-	if strings.TrimSpace(result.Delegations[0].Agent) != "" {
-		t.Fatalf("ephemeral delegation should not carry an agent: %q", result.Delegations[0].Agent)
-	}
-}
-
-func TestValidateAgentResultRejectsBothAgentAndEphemeral(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "d", Agent: "impl", Ephemeral: &EphemeralSpec{Runtime: "omp"}, Action: "review", Prompt: "go"},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted a delegation with both agent and ephemeral")
-	}
-	if !strings.Contains(err.Error(), "sets both agent and ephemeral") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsNeitherAgentNorEphemeral(t *testing.T) {
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "d", Action: "review", Prompt: "go"},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil {
-		t.Fatal("validateAgentResult accepted a delegation with neither agent nor ephemeral")
-	}
-	if !strings.Contains(err.Error(), "must set exactly one of agent or ephemeral") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsShellEphemeralRuntime(t *testing.T) {
-	cases := map[string]string{
-		"shell":   "shell",
-		"empty":   "",
-		"unknown": "bash",
-	}
-	for name, rt := range cases {
-		t.Run(name, func(t *testing.T) {
-			result := AgentResult{
-				Decision: "implemented",
-				Summary:  "x",
-				Delegations: []Delegation{
-					{ID: "d", Ephemeral: &EphemeralSpec{Runtime: rt}, Action: "review", Prompt: "go"},
-				},
-			}
-			err := validateAgentResult(result)
-			if err == nil {
-				t.Fatalf("validateAgentResult accepted ephemeral runtime %q", rt)
-			}
-			if !strings.Contains(err.Error(), "ephemeral runtime") {
-				t.Fatalf("error = %v", err)
-			}
-		})
-	}
-}
-
-func TestValidateAgentResultRejectsInvalidEphemeralAutonomyPolicy(t *testing.T) {
-	// An unknown policy must be rejected at parse time so it cannot normalize to
-	// a writable "auto" downstream and defeat the read-only default.
-	result := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", AutonomyPolicy: "writable"}, Action: "ask", Prompt: "go"},
-		},
-	}
-	err := validateAgentResult(result)
-	if err == nil || !strings.Contains(err.Error(), "autonomy_policy") {
-		t.Fatalf("expected an autonomy_policy validation error, got %v", err)
-	}
-	// A valid policy passes.
-	result.Delegations[0].Ephemeral.AutonomyPolicy = "read-only"
-	if err := validateAgentResult(result); err != nil {
-		t.Fatalf("valid read-only policy rejected: %v", err)
-	}
-}
-
-func TestValidateAgentResultRejectsEphemeralImplementWithoutWritePolicy(t *testing.T) {
-	// Fail-closed (#452/#451): an ephemeral worker that asks for the implement
-	// CAPABILITY with a non-write policy (empty/auto/read-only) is refused with the
-	// shared guidance so the child never runs and produces no files. #2203 removed
-	// the implement ACTION, so the capability set is the only way a spec can still
-	// request write authority — and it is still gated here.
-	for _, policy := range []string{"", "auto", "read-only"} {
-		result := AgentResult{
-			Decision: "implemented",
-			Summary:  "x",
-			Delegations: []Delegation{
-				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
-			},
-		}
-		err := validateAgentResult(result)
-		if err == nil || !strings.Contains(err.Error(), "grants no write permission") {
-			t.Fatalf("policy %q: expected an implement write-policy refusal, got %v", policy, err)
-		}
-		if !strings.Contains(err.Error(), "danger-full-access") || !strings.Contains(err.Error(), "workspace-write") {
-			t.Fatalf("policy %q: error must name both fixes, got %v", policy, err)
-		}
-	}
-
-	// Write policies are accepted for an ephemeral worker holding the capability.
-	for _, policy := range []string{"workspace-write", "danger-full-access"} {
-		result := AgentResult{
-			Decision: "implemented",
-			Summary:  "x",
-			Delegations: []Delegation{
-				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
-			},
-		}
-		if err := validateAgentResult(result); err != nil {
-			t.Fatalf("policy %q: write policy rejected for ephemeral implement capability: %v", policy, err)
-		}
-	}
-
-	// A non-implement ephemeral worker with auto/read-only is unaffected.
-	askResult := AgentResult{
-		Decision: "implemented",
-		Summary:  "x",
-		Delegations: []Delegation{
-			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", AutonomyPolicy: "auto"}, Action: "ask", Prompt: "go"},
-		},
-	}
-	if err := validateAgentResult(askResult); err != nil {
-		t.Fatalf("ask ephemeral worker with auto policy must be allowed: %v", err)
-	}
-}
-
-func TestEphemeralAgentNameContainsInfix(t *testing.T) {
-	name := ephemeralAgentName("worker-1", "parent-job")
-	if !strings.Contains(name, "-ephemeral-") {
-		t.Fatalf("ephemeral agent name %q does not contain the %q infix", name, "-ephemeral-")
-	}
-	// The name is stable for the same (delegation, parent) pair and distinct for
-	// different parents, so registry filtering and idempotent enqueue agree.
-	if again := ephemeralAgentName("worker-1", "parent-job"); again != name {
-		t.Fatalf("ephemeralAgentName not stable: %q vs %q", name, again)
-	}
-	if other := ephemeralAgentName("worker-1", "other-parent"); other == name {
-		t.Fatalf("ephemeralAgentName collided across parents: %q", name)
 	}
 }
 

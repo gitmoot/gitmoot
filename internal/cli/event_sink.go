@@ -84,7 +84,7 @@ func ompRuntimeDir(home string) string {
 // EITHER an already-resolved <home>/.gitmoot ROOT or a RAW --home. An empty
 // home resolves through config.DefaultPaths, matching the CLI's omitted --home
 // behavior. It is the single, side-effect-free home->config.toml resolver
-// shared by the daemon's read-only policy loaders (resolveEscalationTTL).
+// shared by the daemon's read-only policy loaders (resolveBlockedTTL).
 //
 // On main the daemon's engine wiring (daemonWorkflowEngine -> daemonEventSink)
 // receives the already-resolved <home>/.gitmoot root on ALL callers

@@ -63,7 +63,7 @@ func TestEngineEmitsJobFinishedOnSucceededTerminal(t *testing.T) {
 	engine.EventSink = sink
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:            "review-job",
@@ -200,7 +200,7 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 		Role:       "reviewer",
 	}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"one blocking issue","findings":[{"severity":"P2","file":"x.go","line":1,"title":"edge","body":"fix it"}],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"one blocking issue","findings":[{"severity":"P2","file":"x.go","line":1,"title":"edge","body":"fix it"}],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 
 	result, err := engine.RunJob(ctx, "review-43", agent, adapter)
@@ -349,7 +349,7 @@ func TestEngineEmitsJobFailedOnFailedDecision(t *testing.T) {
 	engine.EventSink = sink
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"failed","summary":"could not finish","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"failed","summary":"could not finish","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:        "review-job",
@@ -483,63 +483,6 @@ func TestEngineEmitsJobFailedOnMalformedOutputAfterRepair(t *testing.T) {
 	}
 }
 
-// TestEngineEmitsNeedsAttentionOnEscalateHumanPause proves the escalate_human
-// pause fans a job.needs_attention out carrying the redacted question in detail,
-// rooted at the coordinator.
-func TestEngineEmitsNeedsAttentionOnEscalateHumanPause(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "ui", []string{"review"}, "gitmoot/gitmoot")
-	sink := &recordingSink{}
-	engine := testEngine(store)
-	engine.EventSink = sink
-
-	seedEscalateHumanCoordinator(t, store, engine)
-
-	err := engine.AdvanceJob(ctx, "parent-job/delegation/api")
-	var awaiting AwaitingHumanError
-	if !errors.As(err, &awaiting) {
-		t.Fatalf("AdvanceJob(api) error = %v, want AwaitingHumanError", err)
-	}
-
-	attention := sink.byType(events.EventJobNeedsAttention)
-	if len(attention) != 1 {
-		t.Fatalf("job.needs_attention emissions = %d, want 1; all=%+v", len(attention), sink.snapshot())
-	}
-	ev := attention[0]
-	if ev.JobID != "parent-job" || ev.RootID != "parent-job" || ev.Status != string(TaskAwaitingHuman) {
-		t.Fatalf("needs_attention event = %+v", ev)
-	}
-	if ev.Detail != "build api" {
-		t.Fatalf("detail = %q, want the escalation question", ev.Detail)
-	}
-}
-
-// TestEngineNeedsAttentionEmitIsOneShot proves a re-advance of the failing leg
-// (idempotent re-pause) does NOT re-emit job.needs_attention, mirroring the
-// one-shot escalationRequested event.
-func TestEngineNeedsAttentionEmitIsOneShot(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "ui", []string{"review"}, "gitmoot/gitmoot")
-	sink := &recordingSink{}
-	engine := testEngine(store)
-	engine.EventSink = sink
-
-	seedEscalateHumanCoordinator(t, store, engine)
-
-	for i := 0; i < 2; i++ {
-		_ = engine.AdvanceJob(ctx, "parent-job/delegation/api")
-	}
-	if got := sink.byType(events.EventJobNeedsAttention); len(got) != 1 {
-		t.Fatalf("job.needs_attention emissions after re-advance = %d, want 1 (one-shot)", len(got))
-	}
-}
-
 // TestEngineNilSinkIsByteIdentical proves the off-by-default path: with no
 // EventSink, a terminal transition succeeds exactly as before and no event is
 // constructed (no panic, the job still reaches its terminal state).
@@ -550,7 +493,7 @@ func TestEngineNilSinkIsByteIdentical(t *testing.T) {
 	engine := testEngine(store) // no EventSink
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:     "review-job",
@@ -588,7 +531,7 @@ func TestEngineSlowSinkDoesNotDeadlockEngine(t *testing.T) {
 	engine.EventSink = sink
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "agent"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`,
 	}}
 	if _, err := (Mailbox{store: store}).Enqueue(ctx, JobRequest{
 		ID:     "review-job",

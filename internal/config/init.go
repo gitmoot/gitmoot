@@ -189,28 +189,12 @@ max_temp_sessions_per_agent = 4
 eligible_actions = ["ask", "review", "implement"]
 
 [orchestrate]
-# Escalation handling for a job that opts in with the
-# escalate_human failure_policy (#340): when a delegation pauses awaiting a human,
-# the daemon @-tags escalation_handle (default: the repo owner) in a comment with
-# the resume instructions. escalation_ttl auto-finalizes a never-answered pause
-# (Go duration; default 24h). Both optional.
-escalation_handle = ""
-escalation_ttl = ""
 # Emit one synthetic blocked event per continuously blocked task or Herdr org
 # role after this Go duration. 0s keeps both evaluators disabled.
 blocked_role_wake_after = "0s"
 # Flag an org role in chart/status after this many consecutive stalled wakes.
 # 0 keeps flagging disabled while the best-effort counter remains available.
 max_consecutive_missed_wakes = 0
-# Optional default timeouts for child delegation jobs. Empty means unbounded,
-# preserving historical behavior. Per-delegation timeout always wins; otherwise
-# phase-specific defaults apply, then default_delegation_timeout, then unbounded.
-default_delegation_timeout = ""
-default_plan_timeout = ""
-default_implement_timeout = ""
-default_review_timeout = ""
-default_gate_timeout = ""
-default_repair_timeout = ""
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool
@@ -291,13 +275,12 @@ default_repair_timeout = ""
 # findings remain posted while resolving the round as approved with notes.
 # Repository overrides under [repos."owner/repo".review] win. Enabled fanout
 # selects the runtime family of the first configured reviewer whose family resolves,
-# then dispatches only reviewers in that family. Risk tiers remain independently
-# opt-in and global.
+# then dispatches only reviewers in that family. high_risk_paths and the risk
+# labels classify a review for remote routing and stay global.
 # [review]
 # native_fanout_enabled = false
 # blocking_severity = "P3"
 # remote_require_ci_green = false
-# risk_tiers_enabled = false
 # high_risk_paths = ["**/auth/**", "cmd/**"]
 # risk_label_high = "risk:high"
 # risk_label_routine = "risk:routine"
