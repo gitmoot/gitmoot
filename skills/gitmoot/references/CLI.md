@@ -4541,18 +4541,3 @@ context_enabled = true   # inject the advisory table into top-level coordinator 
 The injected block carries the same "not a benchmark" disclaimer and is only added
 to top-level (coordinator) jobs — a delegation child inherits its coordinator's
 routing decision. Routing stays advisory: the block never forces a route.
-
-## Bridge (localhost HTTP for external automation)
-
-```bash
-gitmoot bridge serve [--addr 127.0.0.1:8791]   # localhost-only unless --allow-remote (dangerous)
-gitmoot bridge token [--rotate]                 # prints the token FILE PATH, never the token
-```
-
-The bridge exposes a small authenticated HTTP surface over the same internal
-seams the CLI uses (no new authority): GET /v1/jobs/{id} and
-POST /v1/agents/{name}/ask. Every request needs
-`Authorization: Bearer $(cat ~/.gitmoot/bridge.token)`. Requests are
-rate-limited (30/min) and body-capped at 1 MiB.
-Containers reach the host bridge at `http://host.docker.internal:8791`, or at
-the Docker bridge IP on Linux.
