@@ -77,7 +77,7 @@ func RenderJob(prompt JobPrompt) string {
 	builder.WriteString(resultContractShape)
 	builder.WriteByte('\n')
 	builder.WriteString(resultDecisionHelp)
-	builder.WriteString(delegationSchemaHelp)
+	builder.WriteString(resultFieldHelp)
 	return builder.String()
 }
 
@@ -92,7 +92,7 @@ func RenderRepairPrompt(rawOutput string, parseError error) string {
 	builder.WriteString(resultContractShape)
 	builder.WriteString("\n")
 	builder.WriteString(resultDecisionHelp)
-	builder.WriteString(delegationSchemaHelp)
+	builder.WriteString(resultFieldHelp)
 	builder.WriteString("\nPrevious raw output:\n")
 	builder.WriteString(repairRawOutputExcerpt(rawOutput))
 	builder.WriteByte('\n')

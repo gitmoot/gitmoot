@@ -694,14 +694,11 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 // recovery writes a synthetic `failed` result, and an agent may report `failed`
 // itself, and neither answers "is this head acceptable".
 //
-// THE FAN-OUT ARM IS LOAD-BEARING ON A STAGED-REVIEW REPO (#2172 review round
-// 2, interacting with #2029 which merged the same day). Where
-// staged_review_verdict_agent is configured the routed job becomes a PREFLIGHT
-// whose own result is a fan-out announcement, not a verdict. Judged on its own
-// row it looks finished-without-a-verdict, so the claim became takeover-
-// eligible while the verdict child was still running and a second reviewer was
-// dispatched. The question is answered by the tree, so the tree is what must be
-// consulted.
+// THE FAN-OUT ARM (#2172 review round 2): a historical review whose result
+// was a fan-out announcement looks finished-without-a-verdict on its own row,
+// so the claim became takeover-eligible while its children were still running
+// and a second reviewer was dispatched. The question is answered by the tree,
+// so the tree is what must be consulted.
 // reviewClaimSubject is the QUESTION a claim was minted for. #2176: the walk
 // was subject-blind, so a review job under a non-review leg answering a
 // DIFFERENT pull request or head counted as answering this claim - and because

@@ -17,7 +17,7 @@
 //
 // Drift guard: every struct field MUST have an annotation. An un-annotated NEW
 // field is a hard error here — that is the mechanism by which adding a field to
-// AgentResult/Delegation/EphemeralSpec/HumanQuestion forces the prompt
+// AgentResult/HumanQuestion forces the prompt
 // to be regenerated. CI
 // re-runs `go generate ./... && git diff --exit-code` so a stale checked-in
 // artifact fails the build.
@@ -42,25 +42,31 @@ type fieldAnnotation struct {
 	// non-omitempty AgentResult fields that appear in that literal.
 	example string
 	// help is the human-readable, one-line description rendered into the
-	// delegations[] schema help. Empty help means the field is documented
-	// structurally (e.g. via the example literal) and needs no prose line.
+	// result field help. Empty help means the field is documented
+	// structurally (e.g. via the example literal) or not offered to agents.
 	help string
 }
 
 // resultFieldAnnotations covers every JSON field of workflow.AgentResult. The
 // example values reproduce the battle-tested literal shape verbatim; changing
-// one here changes the shape agents copy, so treat them as load-bearing.
+// one here changes the shape agents copy, so treat them as load-bearing. A
+// field with neither example nor help is not offered to agents at all.
 var resultFieldAnnotations = map[string]fieldAnnotation{
-	"decision":        {example: enumExample(workflow.ResultDecisions)},
-	"severity":        {help: `top-level severity (string, one of ` + enumList(workflow.ReviewSeverities) + `): required when a review returns changes_requested; report the highest-severity finding. Omit it for non-review results and approved reviews with no findings.`},
-	"summary":         {example: `"..."`},
-	"findings":        {example: "[]"},
-	"changes_made":    {example: "[]"},
-	"tests_run":       {example: "[]"},
-	"needs":           {example: "[]"},
-	"delegations":     {example: "[]"},
-	"evidence":        {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
-	"artifact_body":   {help: `top-level artifact_body (string) is required when any delegation requests artifacts.`},
+	"decision":     {example: enumExample(workflow.ResultDecisions)},
+	"severity":     {help: `top-level severity (string, one of ` + enumList(workflow.ReviewSeverities) + `): required when a review returns changes_requested; report the highest-severity finding. Omit it for non-review results and approved reviews with no findings.`},
+	"summary":      {example: `"..."`},
+	"findings":     {example: "[]"},
+	"changes_made": {example: "[]"},
+	"tests_run":    {example: "[]"},
+	"needs":        {example: "[]"},
+	// delegations is NOT offered to agents (#2588): reviewers no longer fan
+	// out, and a result that still carries delegations fails the result
+	// check. The field stays on AgentResult only to read historical results.
+	"delegations": {},
+	"evidence":    {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
+	// artifact_body was only required by delegations that requested
+	// artifacts (#2588), so it is no longer offered to agents.
+	"artifact_body":   {},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
 	// fan_out is PRODUCT-OWNED and deliberately carries neither an example nor
 	// help: agents are never asked for it, so advertising it in the prompt would
@@ -95,48 +101,13 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"checks_blocked":    {help: `top-level checks_blocked (string, optional, one of ` + enumList(workflow.ChecksBlockedKinds) + `): when you could not run some or all of the project's checks, name the main reason: toolchain (the language toolchain or test runner is missing or not runnable), dependencies (it ran but the project's dependencies were missing), sandbox (the sandbox refused a path or device), network, service (a database, browser or credentialed API was needed), or other. Say what you could not run in summary or tests_run as well. Omit it when every check you wanted to run ran.`},
 }
 
-// delegationFieldAnnotations covers every JSON field of workflow.Delegation.
-// The order of rendering follows the struct's declaration order (reflection),
-// not this map; this map only supplies the prose.
-var delegationFieldAnnotations = map[string]fieldAnnotation{
-	"id":             {help: `id (string, required): unique within this batch; deps reference it and validation names entries as delegations[<index>] (id "<id>").`},
-	"agent":          {help: `agent (string): the target Gitmoot agent's NAME — use "agent", not "to". Set exactly one of agent or ephemeral.`},
-	"ephemeral":      {help: `ephemeral (object): an inline one-off worker instead of a registered agent; exactly one of agent or ephemeral. Fields: ` + ephemeralFieldsHelp() + ".\n  Ephemeral workers are leaf-only and cannot themselves delegate."},
-	"action":         {help: `action (string, required): one of ` + enumList(workflow.DelegationActions) + `.`},
-	"worktree":       {help: `worktree (string, optional): worktree path for the child job.`},
-	"prompt":         {help: `prompt (string, required): what the agent should do.`},
-	"review_scope":   {help: `review_scope (object, engine-owned; agents must omit): persisted native follow-up scope containing the prior reviewer head, named findings, and files changed since that exact head.`},
-	"artifacts":      {help: `artifacts (string[], optional): named artifact handles passed to the child; when any delegation sets this, the parent result must also set the top-level artifact_body.`},
-	"deps":           {help: `deps (string[], optional): sibling delegation ids this entry waits for; it runs only after every dep succeeds.`},
-	"timeout":        {help: `timeout (string, optional): a positive Go duration (e.g. "10m").`},
-	"retry":          {help: `retry (integer, optional): >= 0; how many times to re-run the leg on failure.`},
-	"failure_policy": {help: `failure_policy (string, optional): one of ` + enumList(workflow.DelegationFailurePolicies) + `; controls what happens to the parent when this leg fails.`},
-	"fingerprint":    {help: `fingerprint (string, optional): dedup key; identical fingerprints are deduplicated.`},
-	"synthesis_rule": {help: `synthesis_rule (string, optional): one of ` + enumList(workflow.DelegationSynthesisRules) + `; how the coordinator combines child results.`},
-	"quorum":         {help: `quorum (integer, optional): K > 0, required when synthesis_rule is quorum; the continuation proceeds only if at least K children approve (K <= number of delegations).`},
-	"model":          {help: `model (string, optional): a free-form, runtime-scoped model string for the child; omit to use the agent's configured default.`},
-	"effort":         {help: `effort (string, optional): a free-form, runtime-scoped reasoning effort for the child; omit to inherit the agent/parent effort.`},
-	"phase":          {help: `phase (string, optional): a free-form pass-through label (metadata only; does not change routing).`},
-}
-
-// ephemeralFieldAnnotations covers every JSON field of workflow.EphemeralSpec.
-var ephemeralFieldAnnotations = map[string]fieldAnnotation{
-	"runtime":         {help: `runtime (required, one of ` + enumList(workflow.EphemeralRuntimes) + `)`},
-	"model":           {help: `model (optional)`},
-	"effort":          {help: `effort (optional)`},
-	"template":        {help: `template (optional)`},
-	"role":            {help: `role (optional)`},
-	"capabilities":    {help: `capabilities (string[], optional)`},
-	"autonomy_policy": {help: `autonomy_policy (optional)`},
-}
-
 var humanQuestionFieldAnnotations = map[string]fieldAnnotation{
 	"id":      {help: `id (string, required, unique)`},
 	"prompt":  {help: `prompt (string, required)`},
 	"choices": {help: `choices (string[], optional)`},
 }
 
-const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. skipped must not be returned with delegations.\n- skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
+const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. - skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
 
 func main() {
 	if err := run(); err != nil {
@@ -151,18 +122,12 @@ func run() error {
 	if err := requireAnnotations(reflect.TypeOf(workflow.AgentResult{}), resultFieldAnnotations, "AgentResult"); err != nil {
 		return err
 	}
-	if err := requireAnnotations(reflect.TypeOf(workflow.Delegation{}), delegationFieldAnnotations, "Delegation"); err != nil {
-		return err
-	}
-	if err := requireAnnotations(reflect.TypeOf(workflow.EphemeralSpec{}), ephemeralFieldAnnotations, "EphemeralSpec"); err != nil {
-		return err
-	}
 	if err := requireAnnotations(reflect.TypeOf(workflow.HumanQuestion{}), humanQuestionFieldAnnotations, "HumanQuestion"); err != nil {
 		return err
 	}
 
 	shape := renderResultShape()
-	help := renderDelegationHelp()
+	help := renderResultFieldHelp()
 
 	src := renderFile(shape, help)
 	formatted, err := format.Source([]byte(src))
@@ -221,13 +186,14 @@ func requireAnnotations(t reflect.Type, table map[string]fieldAnnotation, name s
 
 // renderResultShape builds the byte-identical {"gitmoot_result":{…}} example
 // literal from the AgentResult fields, in declaration order, skipping omitempty
-// fields (which do not appear in the example shape agents copy).
+// fields (which do not appear in the example shape agents copy) and fields
+// with no example (which are not offered to agents).
 func renderResultShape() string {
 	t := reflect.TypeOf(workflow.AgentResult{})
 	var parts []string
 	for i := 0; i < t.NumField(); i++ {
 		name, omitempty := jsonField(t.Field(i))
-		if name == "" || omitempty {
+		if name == "" || omitempty || resultFieldAnnotations[name].example == "" {
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%q:%s", name, resultFieldAnnotations[name].example))
@@ -235,30 +201,11 @@ func renderResultShape() string {
 	return `{"gitmoot_result":{` + strings.Join(parts, ",") + `}}`
 }
 
-// renderDelegationHelp builds the complete delegations[] schema help, covering
-// every Delegation field in declaration order. The fixed lead and trailing
-// lines preserve the battle-tested phrasings verbatim.
-func renderDelegationHelp() string {
-	t := reflect.TypeOf(workflow.Delegation{})
+// renderResultFieldHelp builds the prose help for the top-level result
+// fields that the example shape cannot express.
+func renderResultFieldHelp() string {
 	var b strings.Builder
-	b.WriteString("\nEach delegations[] entry is an object. Fields:\n")
-	for i := 0; i < t.NumField(); i++ {
-		name, _ := jsonField(t.Field(i))
-		if name == "" {
-			continue
-		}
-		help := delegationFieldAnnotations[name].help
-		if help == "" {
-			continue
-		}
-		b.WriteString("- ")
-		b.WriteString(help)
-		b.WriteByte('\n')
-	}
-	// Battle-tested phrasings preserved verbatim (golden-tested): the
-	// "empty delegations = done" signal and the delegations[<index>] error shape.
-	b.WriteString("- Leave delegations empty ([]) when no follow-up agents are needed — that is how you signal the work is complete.\n")
-	b.WriteString("- Validation errors name the offending entry as delegations[<index>] (id \"<id>\"); fix every listed field.\n")
+	b.WriteString("\nResult fields:\n")
 	// severity is a top-level review field. It stays out of the generic example
 	// shape because non-review results must not invent a review severity.
 	if h := resultFieldAnnotations["severity"].help; h != "" {
@@ -275,14 +222,8 @@ func renderDelegationHelp() string {
 	// artifact announced solely through an environment variable and an
 	// operator-facing troubleshooting page is staged and undirected.
 	b.WriteString("- if the environment variable GITMOOT_PRIOR_VERDICTS names a file, it holds the prior review verdicts for the repo under review, rendered as JSON and frozen at its own as_of time. READ IT before concluding there are none, and treat a verdict recorded after as_of as absent rather than missing. Each entry carries the reviewer, head_sha, decision, severity, findings count and that verdict's own evidence mode.\n")
-	// artifact_body lives on the top-level result, not on a delegation, but it
-	// is conditionally required by delegations, so document it here.
-	if h := resultFieldAnnotations["artifact_body"].help; h != "" {
-		b.WriteString("- " + h + "\n")
-	}
-	// human_questions is a top-level ask-gate field (#445), not a delegation field,
-	// but it composes with delegations (a coordinator can fan out AND ask), so it is
-	// documented in the same prompt block the runtime agent actually receives.
+	// human_questions is a top-level ask-gate field (#445), documented in the
+	// prompt block the runtime agent actually receives.
 	if h := resultFieldAnnotations["human_questions"].help; h != "" {
 		b.WriteString("- " + h + "\n")
 	}
@@ -298,12 +239,6 @@ func enumExample(values []string) string {
 // enumList renders an enum slice as a backtick-free, comma-joined prose list.
 func enumList(values []string) string {
 	return strings.Join(values, "|")
-}
-
-// ephemeralFieldsHelp renders the EphemeralSpec sub-field roster inline, in
-// declaration order, for the ephemeral delegation field's help line.
-func ephemeralFieldsHelp() string {
-	return structFieldsHelp(reflect.TypeOf(workflow.EphemeralSpec{}), ephemeralFieldAnnotations)
 }
 
 func humanQuestionFieldsHelp() string {
@@ -326,7 +261,7 @@ func renderFile(shape, help string) string {
 	var b bytes.Buffer
 	b.WriteString("// Code generated by internal/prompts/contractgen; DO NOT EDIT.\n")
 	b.WriteString("// Regenerate with `go generate ./...` after changing the workflow result\n")
-	b.WriteString("// structs (AgentResult/Delegation/EphemeralSpec) or the generator's\n")
+	b.WriteString("// structs (AgentResult/HumanQuestion) or the generator's\n")
 	b.WriteString("// annotation table. CI runs `go generate ./... && git diff --exit-code`.\n\n")
 	b.WriteString("package prompts\n\n")
 	b.WriteString("// resultContractShape is the byte-identical {\"gitmoot_result\":{…}} example\n")
@@ -335,11 +270,9 @@ func renderFile(shape, help string) string {
 	b.WriteString("// resultDecisionHelp documents semantic constraints that the decision enum alone\n")
 	b.WriteString("// cannot express. It is emitted beside the shape in job and repair prompts.\n")
 	b.WriteString("const resultDecisionHelp = " + goQuote(resultDecisionHelp) + "\n\n")
-	b.WriteString("// delegationSchemaHelp documents the full delegations[] object shape inside\n")
-	b.WriteString("// the rendered prompt. Runtime agents only receive this prompt, not the\n")
-	b.WriteString("// gitmoot skill docs, so without it they guess field names (e.g. \"to\"\n")
-	b.WriteString("// instead of \"agent\") and the result fails validation.\n")
-	b.WriteString("const delegationSchemaHelp = " + goQuote(help) + "\n")
+	b.WriteString("// resultFieldHelp documents the top-level result fields the shape cannot\n")
+	b.WriteString("// express. Runtime agents only receive this prompt, not the gitmoot skill docs.\n")
+	b.WriteString("const resultFieldHelp = " + goQuote(help) + "\n")
 	return b.String()
 }
 

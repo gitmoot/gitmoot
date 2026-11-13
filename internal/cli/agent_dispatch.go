@@ -336,21 +336,17 @@ var fetchDispatchReviewPullRequest = func(ctx context.Context, git gitutil.Clien
 }
 
 type localAgentDispatchRequest struct {
-	RepoFlag string
-	Agent    string
-	Action   string
-	// StagedReviewVerdictAgent is the staged-review marker (#1821), resolved from
-	// config at dispatch and threaded onto the enqueued JobRequest beside the
-	// preflight instructions. Empty for every unstaged review.
-	StagedReviewVerdictAgent string
-	Instructions             string
-	Background               bool
-	Type                     string
-	Model                    string
-	Effort                   string
-	WorkflowID               string
-	ActingOrgRole            string
-	OperatorOrigin           bool
+	RepoFlag       string
+	Agent          string
+	Action         string
+	Instructions   string
+	Background     bool
+	Type           string
+	Model          string
+	Effort         string
+	WorkflowID     string
+	ActingOrgRole  string
+	OperatorOrigin bool
 	// ExecBackend is nil when the operator omitted the per-job selector. A
 	// pointer preserves explicit-local as distinct from absence.
 	ExecBackend *string
@@ -856,33 +852,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := refuseDispatchOnAbsentRuntimeBinary(ctx, execBackend, effectiveAgent, request.ExecsDeclaredBinary); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// #2029 round two, P2: THE STAGED DECLARATION IS RESOLVED AND VALIDATED
-	// BEFORE ANY MUTATION, and only its PROMPT BLOCK is appended later.
-	//
-	// It used to be resolved after prepareLocalReviewDispatchRequest had created a
-	// reviewing task and maybeAllocateDispatchReadOnlyWorktree had allocated a
-	// detached worktree. A refusal then returned directly, past the Enqueue-error
-	// rollback, leaving an ownerless worktree and possibly a reviewing task with
-	// no job - and every retry accumulated another one. A refusal must cost
-	// nothing.
-	//
-	// The append itself still has to happen after
-	// dispatchPromptHeadContradictionWarnings (#1819's scan), so the two halves
-	// are deliberately separated rather than moved together.
-	var stagedVerdictAgent string
-	if request.Action == "review" {
-		paths, pathsErr := pathsFromFlag(request.Home)
-		if pathsErr != nil {
-			return localAgentJobOutput{}, fmt.Errorf("resolve config paths before staged review dispatch: %w", pathsErr)
-		}
-		verdictAgent, staged, stagedErr := resolveStagedReviewVerdictAgent(ctx, store, paths, repo.FullName())
-		if stagedErr != nil {
-			return localAgentJobOutput{}, stagedErr
-		}
-		if staged {
-			stagedVerdictAgent = verdictAgent
-		}
-	}
 	switch request.Action {
 	case "review":
 		if !request.remoteSource {
@@ -1124,28 +1093,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if block := reviewRelatedPRInstructions(request.ReviewRelatedPRs); request.Action == "review" && block != "" {
 		request.Instructions += "\n\n" + block
 	}
-	// STAGED REVIEW (#1821). Placed here for the same reason as the brief above,
-	// and the reason is #1819's scan: this append must land AFTER
-	// dispatchPromptHeadContradictionWarnings. The preflight block interpolates
-	// only an agent name, which is not commit-shaped, so it cannot trip the
-	// 7-to-64-hex token match - but "cannot today" is not a place to rely on
-	// ordering, and the guard test pins it.
-	//
-	// The REFUSAL is the point of the branch. A repo that declared a verdict
-	// agent which is not registered, or cannot review, has declared a staged
-	// review that cannot produce one - so this returns before the job row exists
-	// rather than enqueueing a review whose verdict stage can never be filled.
-	// A repo that declared nothing takes the unstaged path byte-identically.
-	if stagedVerdictAgent != "" {
-		// The PROMPT tells the agent what to delegate; the MARKER tells the engine
-		// that this job is a preflight and which child is its verdict. Both come
-		// from the ONE resolution performed before any mutation above, so a
-		// preflight can never carry instructions naming an agent the marker does
-		// not - and a refusal never reaches this point, so it cannot strand a
-		// worktree or a task.
-		request.StagedReviewVerdictAgent = stagedVerdictAgent
-		request.Instructions += stagedReviewPreflightInstructions(stagedVerdictAgent)
-	}
 	// A foreground dispatch already knows the runtime it will execute. Persist it
 	// in the initial job insert so recording cannot fail separately and leave a
 	// daemon-claimable queued row. Background jobs deliberately omit it here: the
@@ -1169,54 +1116,53 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
 	mailbox.OrgPolicy = orgPolicy
 	job, err := mailbox.Enqueue(ctx, workflow.JobRequest{
-		ID:                       jobID,
-		Agent:                    agent.Name,
-		Action:                   request.Action,
-		Repo:                     repo.FullName(),
-		Branch:                   firstNonEmpty(request.Branch, dispatchBranch),
-		PullRequest:              request.PullRequest,
-		PullRequestReady:         request.PullRequestReady,
-		HeadSHA:                  request.HeadSHA,
-		GoalID:                   request.GoalID,
-		TaskID:                   request.TaskID,
-		TaskTitle:                request.TaskTitle,
-		LeadAgent:                localDispatchLeadAgent(request.Action, agent.Name),
-		Reviewers:                request.Reviewers,
-		Sender:                   "local",
-		ActingOrgRole:            request.ActingOrgRole,
-		OperatorOrigin:           request.OperatorOrigin,
-		Instructions:             request.Instructions,
-		StagedReviewVerdictAgent: request.StagedReviewVerdictAgent,
-		Model:                    request.Model,
-		Effort:                   request.Effort,
-		WorkflowID:               request.WorkflowID,
-		ExecBackend:              request.ExecBackend,
-		ExecProvider:             request.ExecProvider,
-		ExecTemplate:             request.ExecTemplate,
-		PolicyRoutedReview:       request.PolicyRoutedReview,
-		DiskGuardRouted:          request.DiskGuardRouted,
-		ReviewChecksRouted:       request.ReviewChecksRouted,
-		RuntimeOverride:          overrideRuntime,
-		RuntimeOverrideRef:       overrideRef,
-		RuntimeConfigDir:         effectiveAgent.RuntimeConfigDir,
-		EffectiveRuntime:         effectiveRuntimeAtEnqueue,
-		RequiredEvents:           requiredEvents,
-		SkipNativeReviewFanout:   request.SkipNativeReviewFanout,
-		PostMergeReview:          request.PostMergeReview,
-		ReviewNoExecution:        request.ReviewNoExecution,
-		ReviewPart:               request.ReviewPart,
-		ReviewSupersedes:         request.ReviewSupersedes,
-		ReviewSupersedeReason:    request.ReviewSupersedeReason,
-		ReviewEvidence:           request.ReviewEvidence,
-		ReviewRelatedPRs:         request.ReviewRelatedPRs,
-		TemplateOverride:         recipeTemplate,
-		WorktreePath:             readOnlyWorktreePath,
-		ReadOnlyWorktree:         readOnlyWorktreePath != "",
-		ReadOnlySeat:             readOnlyWorktreePath != "" || request.remoteSource,
-		ReviewPurpose:            request.ReviewPurpose,
-		ReviewModelPool:          request.ReviewModelPool,
-		ReviewRequester:          request.ReviewRequester,
-		ReviewScope:              request.ReviewScope,
+		ID:                     jobID,
+		Agent:                  agent.Name,
+		Action:                 request.Action,
+		Repo:                   repo.FullName(),
+		Branch:                 firstNonEmpty(request.Branch, dispatchBranch),
+		PullRequest:            request.PullRequest,
+		PullRequestReady:       request.PullRequestReady,
+		HeadSHA:                request.HeadSHA,
+		GoalID:                 request.GoalID,
+		TaskID:                 request.TaskID,
+		TaskTitle:              request.TaskTitle,
+		LeadAgent:              localDispatchLeadAgent(request.Action, agent.Name),
+		Reviewers:              request.Reviewers,
+		Sender:                 "local",
+		ActingOrgRole:          request.ActingOrgRole,
+		OperatorOrigin:         request.OperatorOrigin,
+		Instructions:           request.Instructions,
+		Model:                  request.Model,
+		Effort:                 request.Effort,
+		WorkflowID:             request.WorkflowID,
+		ExecBackend:            request.ExecBackend,
+		ExecProvider:           request.ExecProvider,
+		ExecTemplate:           request.ExecTemplate,
+		PolicyRoutedReview:     request.PolicyRoutedReview,
+		DiskGuardRouted:        request.DiskGuardRouted,
+		ReviewChecksRouted:     request.ReviewChecksRouted,
+		RuntimeOverride:        overrideRuntime,
+		RuntimeOverrideRef:     overrideRef,
+		RuntimeConfigDir:       effectiveAgent.RuntimeConfigDir,
+		EffectiveRuntime:       effectiveRuntimeAtEnqueue,
+		RequiredEvents:         requiredEvents,
+		SkipNativeReviewFanout: request.SkipNativeReviewFanout,
+		PostMergeReview:        request.PostMergeReview,
+		ReviewNoExecution:      request.ReviewNoExecution,
+		ReviewPart:             request.ReviewPart,
+		ReviewSupersedes:       request.ReviewSupersedes,
+		ReviewSupersedeReason:  request.ReviewSupersedeReason,
+		ReviewEvidence:         request.ReviewEvidence,
+		ReviewRelatedPRs:       request.ReviewRelatedPRs,
+		TemplateOverride:       recipeTemplate,
+		WorktreePath:           readOnlyWorktreePath,
+		ReadOnlyWorktree:       readOnlyWorktreePath != "",
+		ReadOnlySeat:           readOnlyWorktreePath != "" || request.remoteSource,
+		ReviewPurpose:          request.ReviewPurpose,
+		ReviewModelPool:        request.ReviewModelPool,
+		ReviewRequester:        request.ReviewRequester,
+		ReviewScope:            request.ReviewScope,
 	})
 	if err != nil {
 		// #739: the read-only worktree is created on disk BEFORE Enqueue. If Enqueue

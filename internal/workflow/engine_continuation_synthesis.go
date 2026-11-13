@@ -1258,49 +1258,6 @@ func reviewDelegationQuorumSatisfied(delegations []Delegation, children map[stri
 	return approving >= k
 }
 
-// highRiskLensQuorumMet reports whether the high-risk review coordinator that owns
-// a lens child (childPayload.ParentJobID) has its cross-lens quorum satisfied
-// (#650). It is the gate the native required-reviewer merge path consults for a
-// high-risk lens child so an approving lens cannot drive the merge before every
-// sibling refutation lens has approved. It fails OPEN (returns true) for a child
-// with no coordinator, a missing/pruned coordinator, or a coordinator carrying no
-// quorum rule, so it only ever ADDS a wait for a genuine quorum tree and never
-// strands a non-quorum review.
-func (e Engine) highRiskLensQuorumMet(ctx context.Context, childPayload JobPayload) (bool, error) {
-	coordID := strings.TrimSpace(childPayload.ParentJobID)
-	if coordID == "" {
-		return true, nil
-	}
-	coord, err := e.Store.GetJob(ctx, coordID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil
-		}
-		return false, err
-	}
-	coordPayload, err := unmarshalPayload(coord.Payload)
-	if err != nil {
-		return false, err
-	}
-	if coordPayload.Result == nil || !delegationSynthesisRequiresQuorum(coordPayload.Result.Delegations) {
-		return true, nil
-	}
-	children, err := e.childDelegationJobs(ctx, coordID)
-	if err != nil {
-		return false, err
-	}
-	childPayloads := make(map[string]JobPayload, len(children))
-	for id, child := range children {
-		payload, err := unmarshalPayload(child.Payload)
-		if err != nil {
-			return false, err
-		}
-		childPayloads[id] = payload
-	}
-	k := delegationQuorumThreshold(coordPayload.Result.Delegations)
-	return reviewDelegationQuorumSatisfied(coordPayload.Result.Delegations, children, childPayloads, k, e.reviewBlockingSeverity(childPayload.Repo)), nil
-}
-
 func delegationDecisionApproves(decision string) bool {
 	switch strings.ToLower(strings.TrimSpace(decision)) {
 	case "approved", "succeeded", "implemented":

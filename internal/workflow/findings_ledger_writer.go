@@ -171,11 +171,7 @@ func pathFromLensEvidence(evidence string) string {
 // indistinguishable from a successful write. The closing summary event is
 // likewise best-effort - see the comment at its call.
 func (e Engine) RecordReviewFindingsToLedger(ctx context.Context, job db.Job, payload JobPayload) error {
-	if e.Store == nil || payload.Result == nil || job.Type != "review" ||
-		strings.TrimSpace(payload.StagedReviewVerdictAgent) != "" {
-		// A marked job is the non-authoritative preflight, including when it
-		// honestly blocks or fails. Only its delegated verdict may author PR
-		// findings; otherwise cheap-stage diagnostics become obligations.
+	if e.Store == nil || payload.Result == nil || job.Type != "review" {
 		return nil
 	}
 	head := strings.TrimSpace(payload.HeadSHA)

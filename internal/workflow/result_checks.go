@@ -157,21 +157,9 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Explanation: explain(pass, "the review requests changes but findings[] is empty, so there is no evidence to act on"),
 			})
 		}
-		// #1685: a review result that declares delegations is a coordinator FAN-OUT.
-		// It is NOT refused here, and an earlier version of this file that refused it
-		// was wrong twice over: the shipped review-panel template prescribes exactly
-		// that result, so the check failed the product's own documented recipe, and
-		// under result_checks=block it failed the job before AdvanceJob ever reached
-		// dispatchDelegations — the announced panel could never run. Emitting a
-		// fan-out is legitimate; COUNTING one as a verdict is the defect, and that is
-		// fixed in the consumers that read decision (merge gate, required-reviewer
-		// counting, the proof projector, the verdict wake).
-		//
-		// The evidence nudge below is skipped for the same reason: a coordinator that
-		// has just announced a panel legitimately has no findings or tests_run yet,
-		// and recording a contract violation on every panel run would train readers
-		// to ignore the check.
-		if isTerminalReviewVerdict(r.Decision) && len(r.Delegations) == 0 {
+		// A review result carrying delegations never reaches here: the mailbox
+		// refuses it first (ReviewDelegationResultChecks, #2588).
+		if isTerminalReviewVerdict(r.Decision) {
 			// The obligation is that a verdict ACCOUNTS FOR ITSELF: it cites what it
 			// found, names something it actually ran, or states why there was nothing
 			// to run. Field non-emptiness is not that obligation, and testing it
@@ -345,8 +333,7 @@ func actionableEntries(values []string) []string {
 
 // NoExecutionReviewResultChecks returns the failed checks for the result of a
 // no-execution review (#2364), or nil. Such a seat cannot start any program,
-// so a result claiming executed evidence, naming commands in tests_run, or
-// delegating work to other jobs (which would run without the restriction) is
+// so a result claiming executed evidence or naming commands in tests_run is
 // not a truthful record of that review. Unlike RunResultChecks it is not
 // subject to the result_checks mode: the mailbox always refuses a failure, so
 // a stored no-execution verdict can never carry an execution claim.
@@ -362,15 +349,28 @@ func NoExecutionReviewResultChecks(r AgentResult) []ResultCheck {
 				strings.TrimSpace(r.Evidence), len(actionableEntries(r.TestsRun)), EvidenceStaticOnly),
 		})
 	}
-	if len(r.Delegations) > 0 {
-		failed = append(failed, ResultCheck{
-			ID:          "review-no-execution-delegates-nothing",
-			Action:      "review",
-			Question:    "Does a no-execution review delegate no work?",
-			Explanation: fmt.Sprintf("the review ran on a no-execution seat but declared %d delegations; delegated jobs would run outside the no-execution restriction", len(r.Delegations)),
-		})
-	}
 	return failed
+}
+
+// ReviewDelegationResultChecks returns the failed check for a review result
+// that still carries delegations, or nil (#2588). Reviewers are no longer
+// offered delegation: the prompt contract does not mention it, so a review
+// that returns delegations[] is off-contract, and dispatching or silently
+// dropping them would both misreport the review. Like
+// NoExecutionReviewResultChecks it is not subject to the result_checks mode:
+// the mailbox always refuses a failure.
+func ReviewDelegationResultChecks(action string, r AgentResult) []ResultCheck {
+	if !strings.EqualFold(strings.TrimSpace(action), "review") || len(r.Delegations) == 0 {
+		return nil
+	}
+	return []ResultCheck{{
+		ID:       "review-delegates-nothing",
+		Action:   "review",
+		Question: "Does the review result carry no delegations?",
+		Explanation: fmt.Sprintf(
+			"the review declared %d delegations, but reviewers can no longer delegate work to other jobs; return the verdict with findings directly and omit delegations",
+			len(r.Delegations)),
+	}}
 }
 
 // hasActionableEntries reports whether a string slice contains at least one

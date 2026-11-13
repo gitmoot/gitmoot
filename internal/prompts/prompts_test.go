@@ -134,24 +134,21 @@ delegations[1] (id "build-api"): action is required`)
 	}
 }
 
-func TestRenderRepairPromptIncludesSchemaHelpHint(t *testing.T) {
-	prompt := RenderRepairPrompt("bad output", errors.New("missing gitmoot_result"))
-	want := `delegations[<index>] (id "<id>")`
-	if !strings.Contains(prompt, want) {
-		t.Fatalf("repair prompt missing schema-help hint %q:\n%s", want, prompt)
-	}
-}
-
-func TestRenderJobIncludesDelegationValidationHint(t *testing.T) {
-	prompt := RenderJob(JobPrompt{
-		Repo:         "gitmoot/gitmoot",
-		Branch:       "task-005",
-		Action:       "implement",
-		Instructions: "build the api",
-	})
-	want := `delegations[<index>] (id "<id>")`
-	if !strings.Contains(prompt, want) {
-		t.Fatalf("job prompt missing delegation validation hint %q:\n%s", want, prompt)
+// #2588: reviewers are no longer offered delegation, so neither the job nor
+// the repair prompt may teach the delegations[] field or its schema.
+func TestPromptsDoNotOfferDelegations(t *testing.T) {
+	for name, prompt := range map[string]string{
+		"job": RenderJob(JobPrompt{
+			Repo:         "gitmoot/gitmoot",
+			Branch:       "task-005",
+			Action:       "review",
+			Instructions: "review the change",
+		}),
+		"repair": RenderRepairPrompt("bad output", errors.New("missing gitmoot_result")),
+	} {
+		if strings.Contains(prompt, "delegations") {
+			t.Fatalf("%s prompt still offers delegations:\n%s", name, prompt)
+		}
 	}
 }
 
