@@ -36,7 +36,7 @@ func TestProductionSeatStagingLaunchesRealHostRuntimes(t *testing.T) {
 		t.Skip("set GITMOOT_SEAT_HOST_PROBE=1 to stage this host's real runtimes")
 	}
 	installed := map[string]string{}
-	for _, name := range append([]string{"go"}, seatRuntimeNames...) {
+	for _, name := range append([]string{"go", runtime.OmpRuntime}, seatRuntimeNames...) {
 		if resolved, err := exec.LookPath(name); err == nil {
 			installed[name] = resolved
 		} else {
@@ -53,9 +53,10 @@ func TestProductionSeatStagingLaunchesRealHostRuntimes(t *testing.T) {
 	runGit(t, checkout, "config", "user.name", "Gitmoot")
 	runGit(t, checkout, "commit", "--allow-empty", "-m", "init")
 
-	// One seat per runtime class, so a failure names the runtime it belongs to
-	// rather than reporting one arm's launch failure for the whole host.
-	for _, selected := range []string{runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.CodexRuntime} {
+	// One omp seat per staged command, so a failure names the command it
+	// belongs to rather than reporting one arm's launch failure for the whole
+	// host. omp is the only job runtime; the provider CLIs are staged beside it.
+	for _, selected := range append([]string{runtime.OmpRuntime}, seatRuntimeNames...) {
 		resolved, ok := installed[selected]
 		if !ok {
 			continue
@@ -64,10 +65,10 @@ func TestProductionSeatStagingLaunchesRealHostRuntimes(t *testing.T) {
 			home := t.TempDir()
 			live := config.PathsForHome(home)
 			agent := runtime.Agent{
-				Name: "probe-seat", Runtime: selected, ReadOnlySeat: true,
+				Name: "probe-seat", Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
 				RepoScope: "gitmoot/gitmoot",
 			}
-			grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+			grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot")
 			if err != nil {
 				t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 			}

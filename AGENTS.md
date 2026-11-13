@@ -15,9 +15,9 @@ single static Go binary plus a background daemon; workflow state lives in local
 SQLite (the **modernc pure-Go** driver — no cgo). The single static binary with
 **zero runtime dependencies** is a core invariant.
 
-It drives five runtimes (`codex`, `claude`, `kimi`, `omp`, `shell`). `agent start` supports codex/claude/kimi/omp; `shell` is a
-subscribe-only command runtime used mainly to drive engine-feature E2Es with no
-LLM.
+Jobs run on `omp`, which is required. `shell` is a subscribe-only command
+runtime used mainly to drive engine-feature E2Es with no LLM. The codex, claude
+and kimi job runtimes were removed (#2587); the Claude and Codex plugins stay.
 
 ## Build, test, and verify (the gate)
 
@@ -267,8 +267,7 @@ deadline firing** rather than as a verdict on the code - while remembering that
 the deadline firing and the code being slow are not exclusive.
 
 The CLI entrypoint lives under `cmd/gitmoot/`. The CI gate is Go-only — it does
-**not** run the live multi-runtime (codex/claude/kimi) E2E (those need runtime
-auth and stay manual).
+**not** run live omp E2Es (those need provider auth and stay manual).
 
 Prefer driving engine-feature E2Es with **no LLM** via the `shell` runtime on an
 isolated `/tmp` home, and test home-scoped daemon seams at the true runtime
@@ -285,7 +284,7 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
   `internal/pipeline/` package and no `gitmoot pipeline` command.
 - `internal/workflow/` — the job/delegation engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
-- `internal/runtime/` — the Codex/Claude/Kimi/omp/shell adapters.
+- `internal/runtime/` — the omp/shell adapters.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
   template + per-section loaders).
 - `internal/db/` — the SQLite store + the migrations slice.
@@ -347,22 +346,19 @@ portable code behavior.
   author, update, or distribute one, so seed or edit the `agent_templates` store
   row directly. `agent template list` / `agent template show <id>` inspect what
   is installed.
-- An invalid `CLAUDE_CODE_OAUTH_TOKEN` 401s fresh claude sessions but `--resume`
-  masks it; `gitmoot doctor` "auth ok" is set-not-valid (a false green).
 - Killing a foreground `agent ask` strands a runtime-session resource lock;
   clear the lock to recover.
-- codex ephemeral workers need `~/.codex/config.toml`
-  `[sandbox_workspace_write] network_access=true` to push / open PRs.
-- Agent permission policies gate Bash: `--policy workspace-write` auto-accepts
-  **file edits only** and does **not** unblock Bash (`go`/`git`/`gh`). A full
-  implement/push agent needs broader access; workspace-write alone is edits-only.
+- Agent permission policies gate the shell: `--policy workspace-write` (omp
+  `--approval-mode=write`) permits **file edits only** and does **not** unblock
+  shell commands (`go`/`git`/`gh`). A full implement/push agent needs
+  `danger-full-access`; workspace-write alone is edits-only.
 - The single static binary is sacred: no cgo, no runtime deps (modernc pure-Go
   SQLite).
 
 ## Agent jobs & the result contract
 
-gitmoot runs agents through registered runtimes — **Codex, Claude Code, Kimi
-Code, and omp** (`gitmoot agent start --runtime codex|claude|kimi|omp`).
+gitmoot runs agents through registered runtimes — **omp** for every job
+(`gitmoot agent start --runtime omp`), plus subscribe-only `shell` for no-LLM tests.
 Jobs return a `gitmoot_result` JSON object, and agents can fan work out via a
 validated `delegations[]` DAG with a coordinator continuation job (the
 **Orchestra** pattern), bounded by depth, a per-root job budget, and loop

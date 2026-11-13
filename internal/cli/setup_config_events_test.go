@@ -43,7 +43,7 @@ func TestRunSetupRegistersRepoAndAgent(t *testing.T) {
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "codex", "--session", "last"}, &stdout, &stderr)
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440077"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -62,7 +62,7 @@ func TestRunSetupRegistersRepoAndAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Runtime != "codex" || agent.RuntimeRef != "last" {
+	if agent.Runtime != "omp" || agent.RuntimeRef != "550e8400-e29b-41d4-a716-446655440077" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	allowed, err := store.AgentCanAccessRepo(context.Background(), "lead", "owner/repo")
@@ -82,7 +82,7 @@ func TestRunSetupPrintsTaggingReadinessByDefault(t *testing.T) {
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "codex", "--session", "last"}, &stdout, &stderr)
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440077"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -109,7 +109,7 @@ func TestRunSetupWatchIssuesFalseSuppressesTagHelp(t *testing.T) {
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "codex", "--session", "last", "--watch-issues=false"}, &stdout, &stderr)
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/repo", "--path", repoDir, "--agent", "lead", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440077", "--watch-issues=false"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -132,7 +132,7 @@ func TestRunSetupPreservesExistingAgentRepoAccess(t *testing.T) {
 	runGit(t, secondRepoDir, "remote", "add", "origin", "https://github.com/owner/second.git")
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"setup", "--home", home, "--repo", "owner/first", "--path", firstRepoDir, "--agent", "lead", "--runtime", "codex", "--session", "last"}, &stdout, &stderr)
+	code := Run([]string{"setup", "--home", home, "--repo", "owner/first", "--path", firstRepoDir, "--agent", "lead", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440077"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("first setup exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -140,8 +140,8 @@ func TestRunSetupPreservesExistingAgentRepoAccess(t *testing.T) {
 	if err := store.UpsertAgent(context.Background(), db.Agent{
 		Name:           "lead",
 		Role:           "reviewer",
-		Runtime:        "codex",
-		RuntimeRef:     "last",
+		Runtime:        "omp",
+		RuntimeRef:     "550e8400-e29b-41d4-a716-446655440077",
 		RepoScope:      "owner/first",
 		Capabilities:   []string{"review"},
 		AutonomyPolicy: "manual",
@@ -154,7 +154,7 @@ func TestRunSetupPreservesExistingAgentRepoAccess(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"setup", "--home", home, "--repo", "owner/second", "--path", secondRepoDir, "--agent", "lead", "--runtime", "codex", "--session", "last"}, &stdout, &stderr)
+	code = Run([]string{"setup", "--home", home, "--repo", "owner/second", "--path", secondRepoDir, "--agent", "lead", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440077"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("second setup exit code = %d, stderr=%s", code, stderr.String())
 	}

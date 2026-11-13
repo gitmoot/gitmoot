@@ -34,7 +34,7 @@ func TestMailboxPersistsSuccessfulOmpProviderEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveRuntimeFamily: %v", err)
 	}
-	if !ok || family != runtime.KimiRuntime {
+	if !ok || family != "kimi" {
 		t.Fatalf("family = %q, ok=%v; want native Kimi family from successful OMP evidence", family, ok)
 	}
 	events, err := store.ListJobEvents(ctx, "omp-review")
@@ -79,7 +79,7 @@ func TestOmpProviderEvidenceProductionPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || family != runtime.KimiRuntime {
+	if !ok || family != "kimi" {
 		t.Fatalf("production OMP delivery resolved to family %q, ok=%v; want Kimi from runtime output, not requested Devin", family, ok)
 	}
 }
@@ -208,10 +208,10 @@ func TestOmpProviderFamiliesInformMergeAdvisory(t *testing.T) {
 		nativeRuntime string
 		ompProvider   string
 	}{
-		{name: "Anthropic matches Claude", nativeRuntime: runtime.ClaudeRuntime, ompProvider: "anthropic"},
-		{name: "Kimi Code matches Kimi", nativeRuntime: runtime.KimiRuntime, ompProvider: "kimi-code"},
-		{name: "OpenAI matches Codex", nativeRuntime: runtime.CodexRuntime, ompProvider: "openai"},
-		{name: "OpenAI Codex matches Codex", nativeRuntime: runtime.CodexRuntime, ompProvider: "openai-codex"},
+		{name: "Anthropic matches Claude", nativeRuntime: "claude", ompProvider: "anthropic"},
+		{name: "Kimi Code matches Kimi", nativeRuntime: "kimi", ompProvider: "kimi-code"},
+		{name: "OpenAI matches Codex", nativeRuntime: "codex", ompProvider: "openai"},
+		{name: "OpenAI Codex matches Codex", nativeRuntime: "codex", ompProvider: "openai-codex"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := openTestStore(t)

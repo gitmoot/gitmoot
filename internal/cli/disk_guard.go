@@ -344,17 +344,9 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 		if payload.DiskGuardRouteDeclined || payload.PolicyRoutedReview || queuedJobBlockerHeld(job, time.Now().UTC()) {
 			continue
 		}
-		plan, err := diskGuardRemoteRoutePlan(ctx, worker.Store, job, payload)
-		if err != nil {
+		if err := diskGuardRemoteRouteCheck(ctx, worker.Store, job, payload); err != nil {
 			diskGuardHoldReview(ctx, worker, job, payload, reason, err)
 			continue
-		}
-		if plan.runtimeOverride != "" {
-			payload.DiskGuardRuntimeSwitched = true
-			payload.DiskGuardSwitchedRuntime = payload.RuntimeOverride
-			payload.DiskGuardSwitchedModel = payload.Model
-			payload.RuntimeOverride = plan.runtimeOverride
-			payload.Model = plan.model
 		}
 		payload.ExecBackend = string(execbackend.Remote)
 		payload.PolicyRoutedReview = true
@@ -372,11 +364,7 @@ func diskGuardRemoteReviews(ctx context.Context, worker jobWorker, jobs []db.Job
 		if err != nil || !routed {
 			continue
 		}
-		if plan.runtimeOverride != "" {
-			_ = worker.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: diskGuardRuntimeChangedEventKind,
-				Message: fmt.Sprintf("runtime %s cannot run remotely; this review runs as %s with the same model %s", plan.fromRuntime, plan.runtimeOverride, plan.model)})
-		}
-		diskGuardAlert(ctx, worker, job, payload, diskGuardRoutedAlertEventKind, diskGuardRoutedAlertText(reason, plan))
+		diskGuardAlert(ctx, worker, job, payload, diskGuardRoutedAlertEventKind, diskGuardRoutedAlertText(reason))
 		job.Payload = string(encoded)
 		allowed = append(allowed, job)
 	}
@@ -419,15 +407,6 @@ func (w jobWorker) undoDiskGuardRoute(ctx context.Context, job db.Job, state wor
 	if latest.Type == "review" && payload.PullRequest > 0 && strings.TrimSpace(payload.HeadSHA) != "" &&
 		strings.TrimSpace(payload.WorktreePath) == "" {
 		payload.ReadOnlyWorktree = true
-	}
-	if payload.DiskGuardRuntimeSwitched {
-		// Back to the review's own runtime and model: the omp switch was only
-		// for the remote run (#2372).
-		payload.RuntimeOverride = payload.DiskGuardSwitchedRuntime
-		payload.Model = payload.DiskGuardSwitchedModel
-		payload.DiskGuardRuntimeSwitched = false
-		payload.DiskGuardSwitchedRuntime = ""
-		payload.DiskGuardSwitchedModel = ""
 	}
 	waitFor := "waits for local disk again"
 	var refusal *remoteReviewAdmissionRefusal

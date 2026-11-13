@@ -668,18 +668,6 @@ func TestP2GapEveryJobAdapterConstructionRouteRefusesLocalFallback(t *testing.T)
 			t.Fatalf("local runtime contract preflight calls = %d, want 0", calls)
 		}
 	})
-	t.Run("deferred auth probe", func(t *testing.T) {
-		calls := 0
-		if _, err := authProbeForBackend(backend, func() authProbeVerdict {
-			calls++
-			return authProbeValid
-		}); err == nil {
-			t.Fatal("deferred auth probe accepted p2-probe without an implementation")
-		}
-		if calls != 0 {
-			t.Fatalf("local deferred auth probe calls = %d, want 0", calls)
-		}
-	})
 	if localDeliveryCalls != 0 {
 		t.Fatalf("local delivery factory calls = %d, want 0", localDeliveryCalls)
 	}
@@ -744,7 +732,7 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 			t.Fatalf("remote omp adapter = %T, want runtime.OmpAdapter", adapter)
 		}
 		unsupportedRuntime := agent
-		unsupportedRuntime.Runtime = runtime.CodexRuntime
+		unsupportedRuntime.Runtime = "codex"
 		if _, err := buildRuntimeAdapter("", unsupportedRuntime, t.TempDir(), runner); err == nil {
 			t.Fatal("remote runtime composition accepted an unsupported runtime")
 		}
@@ -778,16 +766,6 @@ func TestRemoteBackendRefusesEveryHostOnlyRoute(t *testing.T) {
 			t.Fatalf("remote preflight = checked %t, error %v, host calls %d; want skipped", checked, err, calls)
 		}
 	})
-	t.Run("pre-provision auth is unknown", func(t *testing.T) {
-		calls := 0
-		verdict, err := authProbeForBackend(execbackend.Remote, func() authProbeVerdict {
-			calls++
-			return authProbeValid
-		})
-		if err != nil || verdict != authProbeUnknown || calls != 0 {
-			t.Fatalf("remote auth probe = verdict %d, error %v, host calls %d; want unknown without host probe", verdict, err, calls)
-		}
-	})
 	t.Run("job subprocesses remain host-only", func(t *testing.T) {
 		runner, err := jobSubprocessRunnerForBackend(execbackend.Remote)
 		if err != nil {
@@ -810,7 +788,7 @@ func TestExecBackendEphemeralResolvesBeforeRuntimeStart(t *testing.T) {
 	const agentName = "reviewer-ephemeral-backend"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: agentName, Action: "ask", Repo: "owner/repo", Branch: "main",
-		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.CodexRuntime},
+		Ephemeral: &workflow.EphemeralSpec{Runtime: runtime.OmpRuntime},
 	})
 
 	previousResolver := daemonJobExecBackendFor
@@ -984,12 +962,6 @@ func execBackendEvents(t *testing.T, store *db.Store, jobID string) []string {
 // TestExecBackendCompositionPreservedForLocal is ACCEPTANCE 4: a stamped
 // "local" composes IDENTICALLY to an unstamped agent. An unknown stamped
 // backend fails loud at the composition site itself.
-//
-// (The credgw half — runtimeJobRunner still yielding the *credgw.Runner the
-// buildRuntimeAdapter type assertion needs — is exercised through the same
-// modified buildRuntimeAdapter by the existing
-// TestClaudeModelGatewayCredentialCustodyE2E, which builds its adapter with
-// an unstamped agent and asserts full gateway behaviour.)
 func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -999,8 +971,7 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 	grants := runtime.Agent{
 		Name:           "grant-agent",
 		Role:           "implementer",
-		Runtime:        runtime.KimiRuntime,
-		RuntimeRef:     "session_550e8400-e29b-41d4-a716-446655440000",
+		Runtime:        runtime.OmpRuntime,
 		RepoScope:      "owner/repo",
 		ReadablePaths:  []string{"/data/input"},
 		WritablePaths:  []string{"/data/out"},
@@ -1014,11 +985,11 @@ func TestExecBackendCompositionPreservedForLocal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("buildRuntimeAdapter(exec_backend=%q): %v", execBackend, err)
 		}
-		kimi, ok := adapter.(runtime.KimiAdapter)
+		omp, ok := adapter.(runtime.OmpAdapter)
 		if !ok {
-			t.Fatalf("adapter = %T, want KimiAdapter", adapter)
+			t.Fatalf("adapter = %T, want OmpAdapter", adapter)
 		}
-		return kimi.Runner
+		return omp.Runner
 	}
 
 	unstamped := buildRunner("")

@@ -80,7 +80,7 @@ func TestGlobalChecksGatesHerdrOnlyWhenOrgEnabled(t *testing.T) {
 		{name: "malformed", body: "[org]\nenforce = \"invalid\"\n", wantOrg: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			checks := (Checker{Runner: runner, Paths: writeConfig(t, test.body), SkipDaemonAuth: true}).GlobalChecks(context.Background())
+			checks := (Checker{Runner: runner, Paths: writeConfig(t, test.body)}).GlobalChecks(context.Background())
 			var foundHerdr, foundOrg bool
 			for _, check := range checks {
 				foundHerdr = foundHerdr || check.Name == "herdr"
@@ -95,7 +95,7 @@ func TestGlobalChecksGatesHerdrOnlyWhenOrgEnabled(t *testing.T) {
 
 func TestGlobalChecksMissingConfigDoesNotEnableOrg(t *testing.T) {
 	paths := config.PathsForHome(t.TempDir())
-	checks := (Checker{Runner: fakeRunner{}, Paths: paths, SkipDaemonAuth: true}).GlobalChecks(context.Background())
+	checks := (Checker{Runner: fakeRunner{}, Paths: paths}).GlobalChecks(context.Background())
 	for _, check := range checks {
 		if check.Name == "herdr" || check.Name == "org registry" {
 			t.Fatalf("absent org config added check: %+v", check)

@@ -11,15 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	goruntime "runtime"
-	"strconv"
 	"strings"
 
 	"github.com/gitmoot/gitmoot/internal/buildinfo"
 	"github.com/gitmoot/gitmoot/internal/plugincontext"
 	"github.com/gitmoot/gitmoot/internal/plugininstall"
 	"github.com/gitmoot/gitmoot/internal/pluginpack"
-	gitmootruntime "github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/shellquote"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/skills"
@@ -29,7 +26,6 @@ var pluginExecutable = os.Executable
 var pluginLookPath = exec.LookPath
 var pluginHookInput io.Reader = os.Stdin
 var pluginInstallRunner subprocess.Runner = subprocess.ExecRunner{}
-var pluginDoctorRunner subprocess.Runner = subprocess.ExecRunner{}
 
 type pluginCheck struct {
 	Name     string `json:"name"`
@@ -62,8 +58,6 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 		return runPluginPath(args[1:], stdout, stderr)
 	case "doctor":
 		return runPluginDoctor(args[1:], stdout, stderr)
-	case "codex-launch":
-		return runPluginCodexLaunch(args[1:], stdout, stderr)
 	case "hook-context":
 		return runPluginHookContext(args[1:], stdout, stderr)
 	case "install":
@@ -80,8 +74,7 @@ func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot plugin build codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin install codex|claude|omp")
 	fmt.Fprintln(w, "  gitmoot plugin path codex|claude|omp")
-	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude|omp] [--live]")
-	fmt.Fprintln(w, "  gitmoot plugin codex-launch [--repo <path>] [--cli codex-face] [--config-snippet]")
+	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude|omp]")
 }
 
 func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
@@ -267,7 +260,6 @@ func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print doctor output as JSON")
-	live := fs.Bool("live", false, "run an explicit live Claude print-mode smoke check")
 	selected, explicitRuntime, help, ok := parsePluginDoctorArgs(args, fs, stderr)
 	if help {
 		return 0
@@ -288,7 +280,7 @@ func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
 
 	output := pluginDoctorOutput{Home: paths.Home}
 	for _, provider := range providers {
-		output.Runtimes = append(output.Runtimes, doctorRuntime(paths.Home, provider, explicitRuntime, *live))
+		output.Runtimes = append(output.Runtimes, doctorRuntime(paths.Home, provider, explicitRuntime))
 	}
 	if *jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
@@ -313,52 +305,6 @@ func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stderr, "plugin doctor: no supported plugin runtime is healthy")
 	return 1
-}
-
-func runPluginCodexLaunch(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("plugin codex-launch", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	repo := fs.String("repo", ".", "repository directory to use as the Codex working root")
-	cli := fs.String("cli", "codex-face", "Codex CLI command to launch")
-	configSnippet := fs.Bool("config-snippet", false, "print a Codex config.toml snippet instead of a launch command")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "plugin codex-launch does not accept positional arguments")
-		return 2
-	}
-
-	paths, err := pathsFromFlag(*home)
-	if err != nil {
-		fmt.Fprintf(stderr, "plugin codex-launch: %v\n", err)
-		return 1
-	}
-	repoDir := strings.TrimSpace(*repo)
-	if repoDir == "" {
-		repoDir = "."
-	}
-	absRepo, err := filepath.Abs(repoDir)
-	if err != nil {
-		fmt.Fprintf(stderr, "plugin codex-launch: resolve repo path: %v\n", err)
-		return 1
-	}
-
-	if *configSnippet {
-		writeLine(stdout, "%s", formatCodexAccessConfig(paths.Home))
-		return 0
-	}
-	cliName := strings.TrimSpace(*cli)
-	if cliName == "" {
-		fmt.Fprintln(stderr, "plugin codex-launch: --cli is required")
-		return 2
-	}
-	writeLine(stdout, "%s", formatCodexLaunchCommand(cliName, absRepo, paths.Home, codexLaunchShell()))
-	return 0
 }
 
 func parsePluginProviderArg(args []string, fs *flag.FlagSet, stderr io.Writer, commandName string) (pluginpack.Provider, bool, bool) {
@@ -429,7 +375,7 @@ func parsePluginDoctorArgs(args []string, fs *flag.FlagSet, stderr io.Writer) (p
 	return provider, true, false, true
 }
 
-func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bool, live bool) pluginDoctorRuntime {
+func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bool) pluginDoctorRuntime {
 	packagePath := pluginpack.DefaultPackageDir(home, provider)
 	runtime := pluginDoctorRuntime{
 		Runtime: string(provider),
@@ -444,24 +390,9 @@ func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bo
 	runtime.Checks = append(runtime.Checks, checkCopiedSkill(packagePath))
 	runtime.Checks = append(runtime.Checks, checkMarketplacePath(home, provider))
 	runtime.Checks = append(runtime.Checks, checkRuntimeCLI(provider, explicitRuntime))
-	if provider == pluginpack.ProviderClaude {
-		// When --live is set, checkClaudeLive already runs the authoritative
-		// claude -p probe, so the auth-env check stays env-only (no second probe).
-		runtime.Checks = append(runtime.Checks, checkClaudeAuthEnv(live))
-		if live {
-			runtime.Checks = append(runtime.Checks, checkClaudeLive())
-		}
-	}
 	runtime.Checks = append(runtime.Checks, checkValidationCommand(provider, explicitRuntime))
 	runtime.Healthy = runtimeChecksHealthy(runtime.Checks)
 	return runtime
-}
-
-func checkClaudeLive() pluginCheck {
-	if err := gitmootruntime.ClaudeLiveCheck(context.Background(), pluginDoctorRunner, ""); err != nil {
-		return failCheck("runtime-live", err.Error(), true)
-	}
-	return okCheck("runtime-live", "live Claude print-mode check succeeded", true)
 }
 
 func checkHome(home string) pluginCheck {
@@ -542,91 +473,12 @@ func checkRuntimeCLI(provider pluginpack.Provider, explicitRuntime bool) pluginC
 	return okCheck("runtime-cli", path, true)
 }
 
-func checkClaudeAuthEnv(live bool) pluginCheck {
-	auth := gitmootruntime.InspectClaudeAuthEnv(os.LookupEnv)
-	masked := auth.MaskedDetail()
-	if auth.Ready() {
-		detail := masked
-		if warning := auth.Warning(); warning != "" {
-			detail += "; " + warning
-		}
-		if auth.Warning() == "" {
-			return okCheck("runtime-auth-env", detail, false)
-		}
-		return warnCheck("runtime-auth-env", detail, false)
-	}
-	if live {
-		// checkClaudeLive runs the authoritative probe in the --live path; keep
-		// the auth-env check env-only here so we don't spawn claude twice.
-		return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage, false)
-	}
-	// Env not Ready does not mean auth is broken: foreground Claude may
-	// authenticate fine via cached ~/.claude credentials. `plugin doctor` is an
-	// operator one-shot (infrequent), so probe the real dependency (claude -p)
-	// instead of false-warning on the env check. A successful probe reports ok
-	// with the background-token caveat; a missing binary stays warn (the runtime
-	// CLI presence check already covers absence); a genuine auth/session failure
-	// stays warn (this is a non-required runtime-auth check) with the session
-	// message. The `--live` checkClaudeLive path is unchanged.
-	if err := gitmootruntime.ClaudeLiveCheck(context.Background(), pluginDoctorRunner, ""); err != nil {
-		if gitmootruntime.ClaudeProbeUnavailable(err) {
-			return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage+" (probe unavailable)", false)
-		}
-		return warnCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeSessionAuthFailedMessage, false)
-	}
-	return okCheck("runtime-auth-env", masked+"; "+gitmootruntime.ClaudeBackgroundTokenMessage, false)
-}
-
-func formatCodexLaunchCommand(cli string, repo string, gitmootHome string, shell string) string {
-	args := []string{cli, "--cd", repo, "--add-dir", gitmootHome, "-s", "workspace-write"}
-	quoted := make([]string, 0, len(args))
-	for _, arg := range args {
-		quoted = append(quoted, shellQuote(arg, shell))
-	}
-	return strings.Join(quoted, " ")
-}
-
-func formatCodexAccessConfig(gitmootHome string) string {
-	return strings.TrimRight(fmt.Sprintf(`# Gitmoot presence hook access.
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-writable_roots = [%s]
-`, strconv.Quote(gitmootHome)), "\n")
-}
-
-func codexLaunchShell() string {
-	if goruntime.GOOS == "windows" {
-		return "powershell"
-	}
-	return "posix"
-}
-
-func shellQuote(value string, shell string) string {
-	switch shell {
-	case "powershell":
-		return powershellQuote(value)
-	default:
-		return posixQuote(value)
-	}
-}
-
 // posixQuote delegates to the single shared implementation (#1759). It kept a
 // DENYLIST until then, which passed '~', '#' and every non-ASCII rune through
 // unquoted; the shared allowlist quotes them. The multi-shell dispatch in
 // shellQuote above is a real feature and stays.
 func posixQuote(value string) string {
 	return shellquote.Posix(value)
-}
-
-func powershellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	if !strings.ContainsAny(value, " \t\r\n'\"`$;(){}[]&|<>") {
-		return value
-	}
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func checkValidationCommand(provider pluginpack.Provider, explicitRuntime bool) pluginCheck {

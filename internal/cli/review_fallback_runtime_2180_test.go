@@ -16,9 +16,7 @@ import (
 const quotaFailure = "HTTP 429 Too Many Requests: rate limit reached; try again in 3 seconds"
 
 // runBlockerOnRunningReview drives the REAL pre-terminal blocker seam against a
-// running review, without a delivery: the runtime switch under test happens
-// here, and exercising it through a live claude or codex delivery is impossible
-// on this box while the only authenticated Codex home is quota-capped.
+// running review, without a delivery.
 func runBlockerOnRunningReview(t *testing.T, agentRuntime string, request workflow.JobRequest, cause error) workflow.JobPayload {
 	t.Helper()
 	ctx := context.Background()
@@ -50,56 +48,6 @@ func poolReviewRequest(id, agent string) workflow.JobRequest {
 	}
 }
 
-// The owner's fallback decision, exercised rather than inspected (#2186 round 3
-// led with this): a quota-blocked review on a MODEL-DRIVEN runtime retries on
-// omp with the next pool model. Without the switch the retry would emit an
-// omp-qualified model name on a runtime that cannot resolve it.
-func TestQuotaBlockerMovesAClaudeReviewToOmpWithThePoolHead(t *testing.T) {
-	payload := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
-		poolReviewRequest("job-claude", "claude-reviewer"), errors.New(quotaFailure))
-
-	if payload.Model != "sentinel/router-a" {
-		t.Fatalf("model = %q, want the first untried pool entry", payload.Model)
-	}
-	if payload.RuntimeOverride != runtime.OmpRuntime {
-		t.Fatalf("runtime_override = %q, want %q: the retry would otherwise hand an omp model to claude",
-			payload.RuntimeOverride, runtime.OmpRuntime)
-	}
-	if !strings.HasPrefix(payload.RuntimeOverrideRef, runtime.FreshRefPrefix) {
-		t.Fatalf("runtime_override_ref = %q, want a fresh session: an empty ref resumes an unspecified session", payload.RuntimeOverrideRef)
-	}
-}
-
-// The auth-profile question the reviewer led with, answered by execution rather
-// than by inspection. ApplyJobRuntimeOverride clears the agent's model/effort
-// and switches its config dir - the stripping that made runtime PARITY wrong at
-// dispatch. It is correct HERE and the difference is the precondition: at
-// dispatch the claude credential was fine and the override destroyed it; at
-// fallback that credential has ALREADY failed, and the job's own pool model
-// replaces the cleared one in the same write.
-func TestFallbackOverrideLeavesAnExecutableOmpAgent(t *testing.T) {
-	payload := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
-		poolReviewRequest("job-profile", "claude-reviewer"), errors.New(quotaFailure))
-
-	effective := applyJobRuntimeOverride(runtime.Agent{
-		Name: "claude-reviewer", Runtime: runtime.ClaudeRuntime,
-		Model: "anthropic/claude-opus-5", Effort: "high",
-	}, payload)
-
-	if effective.Runtime != runtime.OmpRuntime {
-		t.Fatalf("effective runtime = %q, want omp", effective.Runtime)
-	}
-	// The agent-level model is cleared by the override; the job carries the
-	// replacement. A cleared agent model with no job model would dispatch a
-	// review with no model at all, which is the failure this pins.
-	if effective.Model != "" {
-		t.Fatalf("agent model = %q, want cleared by the override", effective.Model)
-	}
-	if payload.Model == "" {
-		t.Fatal("job carries no model after the override cleared the agent's: the retry has nothing to run")
-	}
-}
-
 // A script agent must NOT be switched: on the shell runtime the agent's command
 // is what executes and the model names nothing, so moving it to omp would
 // silently replace the operator's script with a model.
@@ -119,15 +67,15 @@ func TestQuotaBlockerKeepsAScriptAgentOnItsRuntime(t *testing.T) {
 // failure is an omp provider transport stall. A plain network error is not a
 // fact about one provider, so a different model cannot fix it.
 func TestNetworkOutageAdvancesThePoolOnlyForAProviderStall(t *testing.T) {
-	stall := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
-		poolReviewRequest("job-stall", "claude-reviewer"),
+	stall := runBlockerOnRunningReview(t, runtime.OmpRuntime,
+		poolReviewRequest("job-stall", "omp-reviewer"),
 		errors.New("omp turn failed (stopReason error): Provider stream stalled while waiting for the next event"))
-	if stall.Model != "sentinel/router-a" || stall.RuntimeOverride != runtime.OmpRuntime {
-		t.Fatalf("provider stall: model=%q runtime=%q, want the pool head on omp", stall.Model, stall.RuntimeOverride)
+	if stall.Model != "sentinel/router-a" {
+		t.Fatalf("provider stall: model=%q, want the pool head", stall.Model)
 	}
 
-	generic := runBlockerOnRunningReview(t, runtime.ClaudeRuntime,
-		poolReviewRequest("job-net", "claude-reviewer"),
+	generic := runBlockerOnRunningReview(t, runtime.OmpRuntime,
+		poolReviewRequest("job-net", "omp-reviewer"),
 		errors.New("dial tcp: lookup api.github.com: i/o timeout"))
 	if generic.Model != "" || generic.RuntimeOverride != "" {
 		t.Fatalf("generic network outage advanced the pool: model=%q runtime=%q", generic.Model, generic.RuntimeOverride)

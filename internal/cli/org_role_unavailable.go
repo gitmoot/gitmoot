@@ -2,143 +2,31 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/events"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-const orgRoleUnavailableReasonQuota = "quota"
-
-type quotaRoleUnavailableHooks struct {
-	store *db.Store
-	home  string
-}
-
-func newQuotaRoleUnavailableHooks(store *db.Store, home string) quotaRoleUnavailableHooks {
-	return quotaRoleUnavailableHooks{store: store, home: home}
-}
-
-func (w jobWorker) quotaRoleUnavailableHooks() quotaRoleUnavailableHooks {
-	return newQuotaRoleUnavailableHooks(w.Store, w.ConfigHome)
-}
-
-// classifyRuntimeRoleUnavailable is the provider-specific edge around the
-// shared operational-blocker classifier. Phase 1 recognizes Claude only; the
-// switch deliberately leaves an obvious extension point for Codex/Kimi without
-// duplicating quota parsing or durable incident handling.
-func classifyRuntimeRoleUnavailable(runtimeName string, cause error, now time.Time) (blockerClassification, bool) {
-	switch strings.TrimSpace(runtimeName) {
-	case runtime.ClaudeRuntime:
-		classification, ok := classifyOperationalBlocker(cause, now)
-		return classification, ok && classification.Class == blockerClassRuntimeQuota
-	default:
-		return blockerClassification{}, false
-	}
-}
-
-// recordRuntimeOutcome applies the same role-availability transition at every
-// delivery seam: a Claude quota failure records/escalates the incident, while a
-// successful attributed job on that same runtime is the definitive signal that
-// clears it.
-func (h quotaRoleUnavailableHooks) recordRuntimeOutcome(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runErr error, now time.Time) error {
-	if runErr == nil {
-		return h.clearOnSuccess(ctx, payload.ActingOrgRole, agent.Runtime)
-	}
-	return h.captureFailure(ctx, job, payload, agent, runErr, now)
-}
-
-// captureFailure records a Claude quota wall even if parent configuration is
-// unavailable. Claiming the incident's notification and enqueuing its mail are
-// atomic; their failure never replaces the
-// job's original outcome.
-func (h quotaRoleUnavailableHooks) captureFailure(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, cause error, now time.Time) error {
-	role := strings.ToLower(strings.TrimSpace(payload.ActingOrgRole))
-	if role == "" || h.store == nil {
-		return nil
-	}
-	classification, ok := classifyRuntimeRoleUnavailable(agent.Runtime, cause, now)
-	if !ok {
-		return nil
-	}
-	until := classification.QuotaResetAt
-	if until.IsZero() {
-		until = now.UTC().Add(quotaBlockerFallbackDelay)
-	}
-	incident := db.OrgRoleUnavailable{
-		Role: role, Runtime: agent.Runtime, Reason: orgRoleUnavailableReasonQuota,
-		Until:     until.UTC().Format(db.BlockedEpisodeTimeLayout),
-		UpdatedAt: now.UTC().Format(db.BlockedEpisodeTimeLayout),
-	}
-	notice, noticeErr := h.notificationForParent(job, payload, incident, classification.QuotaResetParsed, classification.QuotaResetMentioned)
-	if err := h.store.RecordOrgRoleUnavailableWithNotification(ctx, role, agent.Runtime, orgRoleUnavailableReasonQuota, until, now, notice); err != nil {
-		return errors.Join(noticeErr, fmt.Errorf("record org role %q unavailable with parent notification: %w", role, err))
-	}
-	return noticeErr
-}
-
-func (h quotaRoleUnavailableHooks) clearOnSuccess(ctx context.Context, role, runtimeName string) error {
+// clearRoleUnavailableOnSuccess clears a role's per-runtime unavailability
+// incident after a job attributed to role succeeds on runtimeName: that success
+// is the definitive signal that the runtime is available to the role again.
+//
+// Incidents used to be opened by a Claude-only quota classifier at the delivery
+// seams. #2587 removed the Claude job runtime, so nothing opens an incident any
+// more; detecting omp quota walls is follow-up #2625. Reading, refusing on and
+// clearing incidents stay, so any incident already on disk keeps its meaning
+// and still clears.
+func clearRoleUnavailableOnSuccess(ctx context.Context, store *db.Store, role, runtimeName string) error {
 	role = strings.TrimSpace(role)
 	runtimeName = strings.TrimSpace(runtimeName)
-	if role == "" || runtimeName == "" || h.store == nil {
+	if role == "" || runtimeName == "" || store == nil {
 		return nil
 	}
-	return h.store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
-}
-
-// Parent mail is durable even when its seat is offline or has a draft.
-func (h quotaRoleUnavailableHooks) notificationForParent(job db.Job, payload workflow.JobPayload, incident db.OrgRoleUnavailable, resetParsed, resetMentioned bool) (*db.Message, error) {
-	paths, err := pathsFromFlag(h.home)
-	if err != nil {
-		return nil, fmt.Errorf("resolve quota notification config: %w", err)
-	}
-	cfg, err := config.LoadOrg(paths)
-	if err != nil {
-		return nil, fmt.Errorf("load quota notification registry: %w", err)
-	}
-	source, ok := cfg.Role(incident.Role)
-	if !ok || strings.TrimSpace(source.Parent) == "" {
-		return nil, nil
-	}
-	targetName := strings.TrimSpace(source.Parent)
-	if _, ok := cfg.Role(targetName); !ok {
-		return nil, fmt.Errorf("quota notification parent %q is not configured", targetName)
-	}
-	resetSource := "provider reset"
-	if !resetParsed && resetMentioned {
-		resetSource = "bounded fallback; provider reset hint was not parseable"
-	} else if !resetParsed {
-		resetSource = "bounded fallback; provider supplied no reset hint"
-	}
-	prompt := fmt.Sprintf(
-		"Gitmoot quota escalation: org role %s is UNAVAILABLE (reason=quota) until %s (%s) after job %s for %s.",
-		incident.Role, formatOrgRoleUnavailableUntil(incident.Until), resetSource, job.ID, payload.Repo,
-	)
-	sourcePayload, err := json.Marshal(messageEventSource{
-		Event: events.Event{
-			SchemaVersion: events.SchemaVersion,
-			Type:          events.EventJobNeedsAttention, Repo: payload.Repo, JobID: job.ID,
-			Status: "blocked", Cause: "role_quota_unavailable",
-			Timestamp: incident.UpdatedAt,
-		},
-		TargetRole: targetName,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &db.Message{
-		WorkflowID: payload.WorkflowID, Kind: "notification", Recipient: targetName,
-		Body:          prompt,
-		SourceID:      fmt.Sprintf("quota:%s:%s:%s:%s", incident.Role, incident.Runtime, job.ID, incident.UpdatedAt),
-		SourcePayload: string(sourcePayload),
-	}, nil
+	return store.ClearOrgRoleUnavailableForRuntime(ctx, role, runtimeName)
 }
 
 func unavailableRoleDispatchError(incident db.OrgRoleUnavailable) error {
@@ -171,17 +59,27 @@ func knownRuntimeName(name string) bool {
 //     corrupt value: UpsertOrgRoleUnavailable still writes "", and the runtime
 //     column was added by ALTER TABLE ... DEFAULT ” (#1490), so every row
 //     predating runtime attribution is legitimately unattributed.
-//   - An unrecognized stored runtime is corrupt, and corruption is not permission
-//     to dispatch.
 //   - An empty or unrecognized SELECTED runtime means the caller could not say
 //     what this job will run as, so it cannot claim to be a different runtime.
+//     This is checked first, before any exemption.
+//   - A runtime gitmoot REMOVED (#2587: claude, codex, kimi) is not corrupt: it
+//     is a recognized historical identity. Its incident bars only dispatches on
+//     that same runtime, which no longer exist, so it never refuses a known
+//     selected runtime.
+//   - Any other unrecognized stored runtime is corrupt, and corruption is not
+//     permission to dispatch.
 func orgRoleUnavailableRefusesRuntime(incident db.OrgRoleUnavailable, selectedRuntime string) bool {
 	stored := strings.ToLower(strings.TrimSpace(incident.Runtime))
-	if !knownRuntimeName(stored) {
-		return true
-	}
 	selected := strings.ToLower(strings.TrimSpace(selectedRuntime))
 	if !knownRuntimeName(selected) {
+		return true
+	}
+	if runtime.IsRemovedRuntime(stored) {
+		// A removed runtime can never be the selected one (selected is known
+		// above), so its historical incident refuses nothing.
+		return false
+	}
+	if !knownRuntimeName(stored) {
 		return true
 	}
 	return stored == selected

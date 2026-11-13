@@ -456,7 +456,7 @@ func TestValidateAgentResultRejectsArtifactsWithoutBody(t *testing.T) {
 func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
 	output := `{"gitmoot_result":{"decision":"implemented","summary":"fan out",` +
 		`"delegations":[` +
-		`{"id":"worker","ephemeral":{"runtime":"codex","model":"gpt-5.4","effort":"high","autonomy_policy":"workspace-write"},"action":"review","prompt":"hi","effort":"xhigh"}` +
+		`{"id":"worker","ephemeral":{"runtime":"omp","model":"gpt-5.4","effort":"high","autonomy_policy":"workspace-write"},"action":"review","prompt":"hi","effort":"xhigh"}` +
 		`]}}`
 
 	result, err := ExtractAgentResult(output)
@@ -470,7 +470,7 @@ func TestValidateAgentResultAcceptsEphemeralDelegation(t *testing.T) {
 	if spec == nil {
 		t.Fatalf("ephemeral spec was not parsed: %+v", result.Delegations[0])
 	}
-	if spec.Runtime != "codex" || spec.Model != "gpt-5.4" || spec.Effort != "high" {
+	if spec.Runtime != "omp" || spec.Model != "gpt-5.4" || spec.Effort != "high" {
 		t.Fatalf("ephemeral spec = %+v", spec)
 	}
 	if result.Delegations[0].Effort != "xhigh" {
@@ -486,7 +486,7 @@ func TestValidateAgentResultRejectsBothAgentAndEphemeral(t *testing.T) {
 		Decision: "implemented",
 		Summary:  "x",
 		Delegations: []Delegation{
-			{ID: "d", Agent: "impl", Ephemeral: &EphemeralSpec{Runtime: "codex"}, Action: "review", Prompt: "go"},
+			{ID: "d", Agent: "impl", Ephemeral: &EphemeralSpec{Runtime: "omp"}, Action: "review", Prompt: "go"},
 		},
 	}
 	err := validateAgentResult(result)
@@ -548,7 +548,7 @@ func TestValidateAgentResultRejectsInvalidEphemeralAutonomyPolicy(t *testing.T) 
 		Decision: "implemented",
 		Summary:  "x",
 		Delegations: []Delegation{
-			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "codex", AutonomyPolicy: "writable"}, Action: "ask", Prompt: "go"},
+			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", AutonomyPolicy: "writable"}, Action: "ask", Prompt: "go"},
 		},
 	}
 	err := validateAgentResult(result)
@@ -573,7 +573,7 @@ func TestValidateAgentResultRejectsEphemeralImplementWithoutWritePolicy(t *testi
 			Decision: "implemented",
 			Summary:  "x",
 			Delegations: []Delegation{
-				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "codex", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
+				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
 			},
 		}
 		err := validateAgentResult(result)
@@ -591,7 +591,7 @@ func TestValidateAgentResultRejectsEphemeralImplementWithoutWritePolicy(t *testi
 			Decision: "implemented",
 			Summary:  "x",
 			Delegations: []Delegation{
-				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "codex", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
+				{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", Capabilities: []string{"implement"}, AutonomyPolicy: policy}, Action: "ask", Prompt: "go"},
 			},
 		}
 		if err := validateAgentResult(result); err != nil {
@@ -604,7 +604,7 @@ func TestValidateAgentResultRejectsEphemeralImplementWithoutWritePolicy(t *testi
 		Decision: "implemented",
 		Summary:  "x",
 		Delegations: []Delegation{
-			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "codex", AutonomyPolicy: "auto"}, Action: "ask", Prompt: "go"},
+			{ID: "d", Ephemeral: &EphemeralSpec{Runtime: "omp", AutonomyPolicy: "auto"}, Action: "ask", Prompt: "go"},
 		},
 	}
 	if err := validateAgentResult(askResult); err != nil {

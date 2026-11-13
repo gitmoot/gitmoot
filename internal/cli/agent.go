@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
 	"os"
 	"os/signal"
@@ -16,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/github"
 
 	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
@@ -88,7 +89,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime codex|claude|kimi|omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent run <name> \"message\" [--repo owner/repo] [--pr number] [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action ask|review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
@@ -97,8 +98,8 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
 	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json] [--record [--repo owner/repo] [--type ask|review|implement]]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime codex|claude|kimi|omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
-	fmt.Fprintln(w, "    Codex sessions may use a UUID, thread name, or last. Claude sessions may use a UUID or last. Kimi sessions may use a Kimi session id. Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
+	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
+	fmt.Fprintln(w, "    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
 	fmt.Fprintln(w, "  gitmoot agent repos <name>")
@@ -1339,7 +1340,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime codex|claude|kimi|omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -1482,7 +1483,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or omp")
+	runtimeName := fs.String("runtime", "", "agent runtime: omp")
 	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent type")
 	effort := fs.String("effort", "", "default reasoning effort for this agent type")
@@ -1535,7 +1536,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: managed agent types support codex, claude, kimi, or omp")
+		fmt.Fprintln(stderr, "invalid runtime: managed agent types support omp")
 		return 2
 	}
 	if strings.TrimSpace(*templateID) != "" {
@@ -1695,7 +1696,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, or omp")
+	runtimeName := fs.String("runtime", "", "agent runtime: omp")
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
@@ -1871,7 +1872,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent subscribe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: codex, claude, kimi, omp, or shell")
+	runtimeName := fs.String("runtime", "", "agent runtime: omp, or shell for no-LLM tests")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
 	templateID := fs.String("template", "", "agent template")
@@ -2102,17 +2103,14 @@ func agentStartupPrompt(agent runtime.Agent, cachedTemplate db.AgentTemplate) st
 
 func runtimeStartAdapter(factory runtime.Factory, runtimeName string, checkout string) (runtime.Adapter, error) {
 	switch runtimeName {
-	case runtime.CodexRuntime:
-		return runtime.CodexAdapter{Runner: factory.Runner, Dir: checkout}, nil
-	case runtime.ClaudeRuntime:
-		return runtime.ClaudeAdapter{Runner: factory.Runner, Dir: checkout}, nil
-	case runtime.KimiRuntime:
-		return runtime.KimiAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.OmpRuntime:
 		return runtime.OmpAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	case runtime.ShellRuntime:
 		return runtime.ShellAdapter{Runner: factory.Runner, Dir: checkout}, nil
 	default:
+		if runtime.IsRemovedRuntime(runtimeName) {
+			return nil, runtime.RemovedRuntimeError(runtimeName)
+		}
 		return nil, fmt.Errorf("unsupported runtime: %s", runtimeName)
 	}
 }
@@ -2199,6 +2197,15 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "%-16s %-8s %-12s %-20s %s\n", agent.Name, agent.Runtime, agent.Role, strings.Join(agentRepos[agent.Name], ","), strings.Join(agent.Capabilities, ","))
 	}
+	// Agents on a removed runtime stay listed (their rows are data the operator
+	// converts), and each is named on stderr so the table stays parseable.
+	var types map[string]config.AgentType
+	if paths, err := pathsFromFlag(*home); err == nil {
+		types, _ = config.LoadAgentTypes(paths)
+	}
+	for _, message := range unsupportedAgentRuntimes(agents, types) {
+		fmt.Fprintf(stderr, "warning: %s\n", message)
+	}
 	return 0
 }
 
@@ -2211,18 +2218,16 @@ func isEphemeralAgentName(name string) bool {
 }
 
 type agentShowOutput struct {
-	Name                        string   `json:"name"`
-	Runtime                     string   `json:"runtime"`
-	RuntimeRef                  string   `json:"runtime_ref"`
-	RuntimeRefPinned            bool     `json:"runtime_ref_pinned"`
-	RuntimeRefLastSuccessfulUse string   `json:"runtime_ref_last_successful_use,omitempty"`
-	Role                        string   `json:"role"`
-	Capabilities                []string `json:"capabilities"`
-	Policy                      string   `json:"policy"`
-	TemplateID                  string   `json:"template_id,omitempty"`
-	HealthStatus                string   `json:"health_status"`
-	RepoScope                   string   `json:"repo_scope,omitempty"`
-	AllowedRepos                []string `json:"allowed_repos"`
+	Name         string   `json:"name"`
+	Runtime      string   `json:"runtime"`
+	RuntimeRef   string   `json:"runtime_ref"`
+	Role         string   `json:"role"`
+	Capabilities []string `json:"capabilities"`
+	Policy       string   `json:"policy"`
+	TemplateID   string   `json:"template_id,omitempty"`
+	HealthStatus string   `json:"health_status"`
+	RepoScope    string   `json:"repo_scope,omitempty"`
+	AllowedRepos []string `json:"allowed_repos"`
 }
 
 // runAgentPolicy updates a REGISTERED agent's autonomy policy in place (#2132).
@@ -2419,35 +2424,17 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		pinned := isPinnedRuntimeRef(agent.Runtime, agent.RuntimeRef)
-		lastSuccessfulUse := ""
-		if pinned {
-			usedAt, found, err := store.LatestSuccessfulRuntimeSessionUse(context.Background(), agent.Name, agent.Runtime, agent.RuntimeRef)
-			if err != nil {
-				return err
-			}
-			switch {
-			case !found:
-				lastSuccessfulUse = "never"
-			case usedAt.IsZero():
-				lastSuccessfulUse = "unknown"
-			default:
-				lastSuccessfulUse = formatRuntimeRefAge(time.Now().UTC(), usedAt)
-			}
-		}
 		output = agentShowOutput{
-			Name:                        agent.Name,
-			Runtime:                     agent.Runtime,
-			RuntimeRef:                  agent.RuntimeRef,
-			RuntimeRefPinned:            pinned,
-			RuntimeRefLastSuccessfulUse: lastSuccessfulUse,
-			Role:                        agent.Role,
-			Capabilities:                agent.Capabilities,
-			Policy:                      runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
-			TemplateID:                  agent.TemplateID,
-			HealthStatus:                agent.HealthStatus,
-			RepoScope:                   agent.RepoScope,
-			AllowedRepos:                repos,
+			Name:         agent.Name,
+			Runtime:      agent.Runtime,
+			RuntimeRef:   agent.RuntimeRef,
+			Role:         agent.Role,
+			Capabilities: agent.Capabilities,
+			Policy:       runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
+			TemplateID:   agent.TemplateID,
+			HealthStatus: agent.HealthStatus,
+			RepoScope:    agent.RepoScope,
+			AllowedRepos: repos,
 		}
 		return nil
 	}); err != nil {
@@ -2464,9 +2451,6 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "name: %s", output.Name)
 	writeLine(stdout, "runtime: %s", output.Runtime)
 	writeLine(stdout, "runtime_ref: %s", output.RuntimeRef)
-	if output.RuntimeRefPinned {
-		writeLine(stdout, "runtime_session: pinned (last successful use: %s)", output.RuntimeRefLastSuccessfulUse)
-	}
 	writeLine(stdout, "role: %s", output.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(output.Capabilities, ","))
 	writeLine(stdout, "policy: %s", output.Policy)
@@ -2475,33 +2459,6 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "repo_scope: %s", emptyText(output.RepoScope))
 	writeLine(stdout, "allowed_repos: %s", strings.Join(output.AllowedRepos, ","))
 	return 0
-}
-
-func isPinnedRuntimeRef(runtimeName, ref string) bool {
-	switch strings.TrimSpace(runtimeName) {
-	case runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime:
-	default:
-		return false
-	}
-	ref = strings.TrimSpace(ref)
-	return ref != "" && ref != runtime.LastRef && !runtime.IsFreshRef(ref)
-}
-
-func formatRuntimeRefAge(now, usedAt time.Time) string {
-	age := now.UTC().Sub(usedAt.UTC())
-	if age < 0 {
-		age = 0
-	}
-	switch {
-	case age < time.Minute:
-		return "<1m ago"
-	case age < time.Hour:
-		return fmt.Sprintf("%dm ago", int(age/time.Minute))
-	case age < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(age/time.Hour))
-	default:
-		return fmt.Sprintf("%dd ago", int(age/(24*time.Hour)))
-	}
 }
 
 func runAgentAllow(args []string, stdout, stderr io.Writer) int {
@@ -2771,7 +2728,6 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("agent doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	live := fs.Bool("live", false, "run an explicit live Claude print-mode smoke check")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -2811,78 +2767,7 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
 		return 1
 	}
-	if rtAgent.Runtime == runtime.ClaudeRuntime {
-		auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
-		status := "ok"
-		if !auth.Ready() {
-			status = "warn"
-		} else if auth.Warning() != "" {
-			status = "warn"
-		}
-		detail := auth.MaskedDetail()
-		if warning := auth.Warning(); warning != "" {
-			detail += "; " + warning
-		}
-		fmt.Fprintf(stdout, "claude-auth-env %s %s\n", status, detail)
-		if !auth.Ready() && !*live {
-			// Env not Ready does not mean auth is broken: foreground Claude may
-			// authenticate fine via cached ~/.claude credentials. Probe the real
-			// dependency (claude -p) instead of false-failing on the env check.
-			// A probe failure escalates to failed/1; an OK or unavailable probe
-			// reports warn/0 (degraded-but-serving) with the background-token
-			// caveat — never a new false-fail.
-			if err := runtime.ClaudeLiveCheck(context.Background(), agentDoctorRunner, ""); err != nil {
-				if runtime.ClaudeProbeUnavailable(err) {
-					fmt.Fprintf(stdout, "claude-live warn probe unavailable: %s\n", err)
-					if perr := persistAgentHealth(*home, name, "warn"); perr != nil {
-						fmt.Fprintf(stderr, "update agent health: %v\n", perr)
-						return 1
-					}
-					fmt.Fprintf(stdout, "agent %s warn %s\n", rtAgent.Name, runtime.ClaudeBackgroundTokenMessage)
-					return 0
-				}
-				_ = persistAgentHealth(*home, name, "failed")
-				fmt.Fprintf(stdout, "claude-live fail %s\n", err)
-				fmt.Fprintf(stderr, "agent %s health failed: %s: %v\n", rtAgent.Name, runtime.ClaudeSessionAuthFailedMessage, err)
-				return 1
-			}
-			fmt.Fprintln(stdout, "claude-live ok live Claude print-mode check succeeded")
-			if perr := persistAgentHealth(*home, name, "warn"); perr != nil {
-				fmt.Fprintf(stderr, "update agent health: %v\n", perr)
-				return 1
-			}
-			fmt.Fprintf(stdout, "agent %s warn %s\n", rtAgent.Name, runtime.ClaudeBackgroundTokenMessage)
-			return 0
-		}
-		if *live {
-			if err := runtime.ClaudeLiveCheck(context.Background(), agentDoctorRunner, ""); err != nil {
-				_ = persistAgentHealth(*home, name, "failed")
-				fmt.Fprintf(stdout, "claude-live fail %s\n", err)
-				fmt.Fprintf(stderr, "agent %s health failed: %s: %v\n", rtAgent.Name, runtime.ClaudeSessionAuthFailedMessage, err)
-				return 1
-			}
-			fmt.Fprintln(stdout, "claude-live ok live Claude print-mode check succeeded")
-		}
-		if err := persistAgentHealth(*home, name, "ok"); err != nil {
-			fmt.Fprintf(stderr, "update agent health: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
-		return 0
-	}
-	// #1856 report-only detector, caller 1 of 2: runAgentDoctor's Health path runs
-	// the runtime CLI through the PLAIN runner with no seat sandbox and no staged
-	// profile, so a kimi child here reads the LIVE profile. Bracket it.
-	//
-	// `agent doctor` is a command, not a job, so there is no job row to attach an
-	// event to and the observation is reported on stderr beside the health result.
-	// The daemon's non-seat delivery path records the same observation as a job
-	// event; this one names the command instead.
-	credentialBefore, credentialObserved := observeKimiDoctorCredential(rtAgent)
 	healthErr := adapter.Health(context.Background(), rtAgent)
-	if degraded := kimiCredentialDegradationSinceDoctor(rtAgent, credentialBefore, credentialObserved); degraded != "" {
-		fmt.Fprintf(stderr, "agent %s %s (observed across `gitmoot agent doctor`)\n", rtAgent.Name, degraded)
-	}
 	if healthErr != nil {
 		_ = persistAgentHealth(*home, name, "failed")
 		fmt.Fprintf(stderr, "agent %s health failed: %v\n", rtAgent.Name, healthErr)
@@ -2894,30 +2779,6 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
 	return 0
-}
-
-// observeKimiDoctorCredential reads the live kimi credential a doctor Health
-// check is about to exercise. Non-kimi runtimes and an unresolvable profile
-// return observed=false, so nothing is claimed about them.
-func observeKimiDoctorCredential(agent runtime.Agent) (runtime.KimiCredentialObservation, bool) {
-	if agent.Runtime != runtime.KimiRuntime {
-		return runtime.KimiCredentialObservation{}, false
-	}
-	dir, err := resolveRuntimeConfigDir(runtime.KimiRuntime, agent.RuntimeConfigDir)
-	if err != nil {
-		return runtime.KimiCredentialObservation{}, false
-	}
-	return runtime.ObserveKimiCredential(dir)
-}
-
-// kimiCredentialDegradationSinceDoctor re-reads the same credential after the
-// check and reports only a degradation.
-func kimiCredentialDegradationSinceDoctor(agent runtime.Agent, before runtime.KimiCredentialObservation, observed bool) string {
-	if !observed {
-		return ""
-	}
-	after, ok := observeKimiDoctorCredential(agent)
-	return runtime.KimiCredentialDegradation(before, after, ok)
 }
 
 func persistAgentHealth(home, name, status string) error {

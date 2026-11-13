@@ -235,7 +235,7 @@ func TestRemoteReviewAdmissionRefusesBeforeReservationAndProvider(t *testing.T) 
 	})
 
 	t.Run("unsupported", func(t *testing.T) {
-		f := newRemoteReviewAdmissionFixture(t, runtime.ClaudeRuntime)
+		f := newRemoteReviewAdmissionFixture(t, "claude")
 		f.run(t)
 		f.assertRefusedBeforeProvision(t, remoteReviewAvoidedUnsupported, 0)
 	})

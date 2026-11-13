@@ -1460,6 +1460,6 @@ func (e Engine) delegationAgentHint(ctx context.Context, repo string) string {
 	} else {
 		fmt.Fprintf(&b, "No agents are registered for %s. ", repo)
 	}
-	b.WriteString(`To run an unregistered worker, use an inline ephemeral spec ({runtime: "codex|claude|kimi"}).`)
+	b.WriteString(`To run an unregistered worker, use an inline ephemeral spec ({runtime: "` + strings.Join(EphemeralRuntimes, "|") + `"}).`)
 	return b.String()
 }

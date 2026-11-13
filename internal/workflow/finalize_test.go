@@ -32,9 +32,9 @@ func TestEngineBackstopTripEnqueuesFinalizeContinuation(t *testing.T) {
 	insertCompletedJob(t, store, db.Job{ID: "wide", Agent: "coord", Type: "ask"}, JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
 		// A coordinator running under a per-job runtime override (#531): the
-		// finalize continuation must stay on the override, never revert to (and
-		// resume) the agent's default-runtime session.
-		RuntimeOverride: runtime.ClaudeRuntime, RuntimeOverrideRef: freshRef,
+		// finalize continuation must stay on the override, never revert to the
+		// agent's default runtime.
+		RuntimeOverride: runtime.OmpRuntime, RuntimeOverrideRef: freshRef,
 		Result: &AgentResult{Decision: "approved", Summary: "too wide", Delegations: dels},
 	})
 	if err := engine.AdvanceJob(ctx, "wide"); err != nil {
@@ -50,7 +50,7 @@ func TestEngineBackstopTripEnqueuesFinalizeContinuation(t *testing.T) {
 	if !cont.DelegationFinalize {
 		t.Fatalf("finalize continuation must carry DelegationFinalize: %+v", cont)
 	}
-	if cont.RuntimeOverride != runtime.ClaudeRuntime || cont.RuntimeOverrideRef != freshRef {
+	if cont.RuntimeOverride != runtime.OmpRuntime || cont.RuntimeOverrideRef != freshRef {
 		t.Fatalf("finalize continuation must stay on the per-job runtime override (#531), got %q/%q", cont.RuntimeOverride, cont.RuntimeOverrideRef)
 	}
 	if got := countJobEvents(t, store, "wide", "delegation_finalize_enqueued"); got != 1 {

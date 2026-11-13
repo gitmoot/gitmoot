@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/gitmoot/internal/execbackend"
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -18,11 +19,9 @@ import (
 // on the remote (E2B) backend by default, and the agent that asked for it is
 // told. Three pieces live here:
 //
-//   - diskGuardRemoteRoutePlan decides whether a queued review CAN run
-//     remotely and with what runtime and model. A review on a runtime that
-//     cannot run remotely (codex) runs as omp with the SAME model; it is never
-//     given a different model. Anything else that cannot run remotely is
-//     refused with a reason.
+//   - diskGuardRemoteRouteCheck decides whether a queued review CAN run
+//     remotely. A review on a runtime or model that cannot run remotely is
+//     refused with a reason; it is never given a different runtime or model.
 //   - diskGuardReviewBandDispatch is the review-only trigger: below
 //     [disk_guard] remote_reviews_below_bytes but above the dispatch floor,
 //     reviews move to the remote backend (or wait, with an alert) while every
@@ -34,8 +33,6 @@ const (
 	// diskGuardReviewHeldEventKind marks a review that is held off this host
 	// for capacity and cannot run remotely; its alert is sent once.
 	diskGuardReviewHeldEventKind = "disk_guard_review_held"
-	// diskGuardRuntimeChangedEventKind records a codex->omp switch.
-	diskGuardRuntimeChangedEventKind = "disk_guard_runtime_changed"
 	// diskGuardRoutedAlertEventKind marks that the requester was told about a
 	// remote route; it keeps the alert to one per job across daemon passes.
 	diskGuardRoutedAlertEventKind = "disk_guard_route_alerted"
@@ -44,79 +41,43 @@ const (
 	diskGuardRouteUndoneAlertEventKind = "disk_guard_route_undone_alerted"
 )
 
-// diskGuardRoutePlan is how a queued review would run remotely.
-type diskGuardRoutePlan struct {
-	// runtimeOverride and model are set only when the review's own runtime
-	// cannot run remotely and is replaced by omp with the same model.
-	runtimeOverride string
-	model           string
-	// fromRuntime names the runtime that was replaced, for the event/alert.
-	fromRuntime string
-}
-
-// diskGuardOmpModelFor maps a codex model to the same model under omp. omp
-// names codex-served models "openai-codex/<model>"; a model that already names
-// a provider is kept as is. An empty model has no known identity to keep, so
-// it is refused rather than guessed.
-func diskGuardOmpModelFor(codexModel string) (string, error) {
-	model := strings.TrimSpace(codexModel)
-	if model == "" {
-		return "", fmt.Errorf("the review names no model, so it cannot be moved to omp with the same model; re-request it with --runtime omp --model <provider/model>")
-	}
-	if !strings.Contains(model, "/") {
-		model = "openai-codex/" + model
-	}
-	if !remoteOmpModelAuthenticates(model) {
-		provider, _, _ := strings.Cut(model, "/")
-		return "", fmt.Errorf("model %q is not available to omp in the remote sandbox (provider %q has no credential route there); no other model is substituted", model, provider)
-	}
-	return model, nil
-}
-
-// diskGuardRemoteRoutePlan reports how a local review can run remotely, or
-// why it cannot. Exact pull-request head, no ephemeral agent, no earlier
-// cloud attempt (remote admission allows one), and a runtime that runs
-// remotely, possibly after the codex->omp switch.
-func diskGuardRemoteRoutePlan(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) (diskGuardRoutePlan, error) {
+// diskGuardRemoteRouteCheck reports why a local review cannot run remotely, or
+// nil when it can. Exact pull-request head, no ephemeral agent, no earlier
+// cloud attempt (remote admission allows one), and a runtime and model that
+// run remotely.
+func diskGuardRemoteRouteCheck(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) error {
 	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
 	if payload.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil {
-		return diskGuardRoutePlan{}, fmt.Errorf("the review has no exact pull-request head, which a remote run requires")
+		return fmt.Errorf("the review has no exact pull-request head, which a remote run requires")
 	}
 	if payload.Ephemeral != nil {
-		return diskGuardRoutePlan{}, fmt.Errorf("an ephemeral reviewer cannot run remotely")
+		return fmt.Errorf("an ephemeral reviewer cannot run remotely")
 	}
 	if payload.ReviewNoExecution {
-		return diskGuardRoutePlan{}, fmt.Errorf("a no-execution review runs only on the local backend (#2364)")
+		return fmt.Errorf("a no-execution review runs only on the local backend (#2364)")
 	}
 	attempts, err := store.ListExecBackendAttemptsForJob(ctx, job.ID)
 	if err != nil {
-		return diskGuardRoutePlan{}, fmt.Errorf("read earlier cloud attempts: %w", err)
+		return fmt.Errorf("read earlier cloud attempts: %w", err)
 	}
 	if len(attempts) > 0 {
-		return diskGuardRoutePlan{}, fmt.Errorf("the review already had a cloud attempt; remote admission allows one")
+		return fmt.Errorf("the review already had a cloud attempt; remote admission allows one")
 	}
 	runtimeName := strings.TrimSpace(payload.RuntimeOverride)
 	if runtimeName == "" {
 		agent, err := store.GetAgent(ctx, job.Agent)
 		if err != nil {
-			return diskGuardRoutePlan{}, fmt.Errorf("read reviewer agent %q: %w", job.Agent, err)
+			return fmt.Errorf("read reviewer agent %q: %w", job.Agent, err)
 		}
 		runtimeName = agent.Runtime
 	}
-	if remoteCapableRuntime(runtimeName) {
-		if runtimeName == runtime.OmpRuntime && !remoteOmpModelAuthenticates(payload.Model) {
-			return diskGuardRoutePlan{}, fmt.Errorf("model %q is not available to omp in the remote sandbox", payload.Model)
-		}
-		return diskGuardRoutePlan{}, nil
+	if !remoteCapableRuntime(runtimeName) {
+		return fmt.Errorf("runtime %q cannot run remotely (remote runtimes: %s)", runtimeName, remoteCapableRuntimeNames())
 	}
-	if runtimeName != runtime.CodexRuntime {
-		return diskGuardRoutePlan{}, fmt.Errorf("runtime %q cannot run remotely (remote runtimes: %s) and has no same-model omp equivalent", runtimeName, remoteCapableRuntimeNames())
+	if runtimeName == runtime.OmpRuntime && !remoteOmpModelAuthenticates(payload.Model) {
+		return fmt.Errorf("model %q is not available to omp in the remote sandbox", payload.Model)
 	}
-	model, err := diskGuardOmpModelFor(payload.Model)
-	if err != nil {
-		return diskGuardRoutePlan{}, err
-	}
-	return diskGuardRoutePlan{runtimeOverride: runtime.OmpRuntime, model: model, fromRuntime: runtimeName}, nil
+	return nil
 }
 
 // diskGuardAlertRecipient is the role told about a capacity move or hold: the
@@ -224,12 +185,8 @@ func diskGuardHoldReview(ctx context.Context, worker jobWorker, job db.Job, payl
 }
 
 // diskGuardRoutedAlertText describes a remote move for the requester.
-func diskGuardRoutedAlertText(reason string, plan diskGuardRoutePlan) string {
-	text := "moved to the remote (E2B) backend because it cannot run on this host now: " + reason + "."
-	if plan.runtimeOverride != "" {
-		text += fmt.Sprintf(" Runtime changed %s -> %s with the same model %s.", plan.fromRuntime, plan.runtimeOverride, plan.model)
-	}
-	return text
+func diskGuardRoutedAlertText(reason string) string {
+	return "moved to the remote (E2B) backend because it cannot run on this host now: " + reason + "."
 }
 
 // diskGuardRemoteAvailable reports whether the remote (E2B) backend is

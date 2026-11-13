@@ -1,11 +1,9 @@
 package cli
 
 import (
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
@@ -23,26 +21,16 @@ func redactEnvNames(env []string) []string {
 
 // Every runner shape used by the daemon must receive the same curated BaseEnv.
 // In particular, the default CuratedGroupRunner and execbackend InstanceRunner
-// must both carry the auth overlay and drop ambient GitHub credentials.
+// must both drop ambient GitHub credentials.
 func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
-	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-shape-token-value"
 	home := t.TempDir()
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(runtimeAuthFilePath(paths.Home), []byte(overlay+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	readOnlySeatOmpBrokerEnv(t)
 	// An ambient GH_TOKEN must never reach a read-only seat: gh prefers it over
 	// the redirected GH_CONFIG_DIR, so inheriting it hands a review a live
 	// GitHub credential.
 	t.Setenv("GH_TOKEN", "ambient-github-token")
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
 
 	for name, runner := range map[string]subprocess.Runner{
 		"nil runner":                    nil,
@@ -53,7 +41,7 @@ func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
 		"env injecting over group":      subprocess.EnvInjectingRunner{Inner: subprocess.GroupRunner{}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.ClaudeAdapter{Runner: runner})
+			wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", runtime.OmpAdapter{Runner: runner})
 			if err != nil {
 				t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
 			}
@@ -62,74 +50,17 @@ func TestWrapReadOnlySandboxAdapterCuratesEveryRunnerShape(t *testing.T) {
 				t.Fatalf("wrapped adapter %T, want readOnlyRuntimeAdapter", wrapped)
 			}
 			t.Cleanup(func() { _ = seat.cleanup() })
-			inner, ok := seat.Adapter.(runtime.ClaudeAdapter)
+			inner, ok := seat.Adapter.(runtime.OmpAdapter)
 			if !ok {
-				t.Fatalf("inner adapter %T, want runtime.ClaudeAdapter", seat.Adapter)
+				t.Fatalf("inner adapter %T, want runtime.OmpAdapter", seat.Adapter)
 			}
-			sandboxEnv, baseEnv := seatRunnerEnvironments(t, inner.Runner)
-			if !containsEnv(sandboxEnv, overlay) {
-				t.Fatalf("sandbox env lacks the overlay: %v", redactEnvNames(sandboxEnv))
-			}
-			if !containsEnv(baseEnv, overlay) {
-				t.Fatalf("runner base env lacks the overlay: %v", redactEnvNames(baseEnv))
-			}
+			_, baseEnv := seatRunnerEnvironments(t, inner.Runner)
 			for _, entry := range baseEnv {
 				if strings.HasPrefix(entry, "GH_TOKEN=") {
 					t.Fatalf("seat base env inherited GH_TOKEN: %v", redactEnvNames(baseEnv))
 				}
 			}
 		})
-	}
-}
-
-// Gateway mode holds the credential itself, so the seat is deliberately given
-// no overlay: injecting one would hand the sandboxed child a real token the
-// gateway exists to withhold.
-func TestWrapReadOnlySandboxAdapterWithholdsAuthInGatewayMode(t *testing.T) {
-	home := t.TempDir()
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(runtimeAuthFilePath(paths.Home),
-		[]byte("CLAUDE_CODE_OAUTH_TOKEN=gateway-withheld-token\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	gatewayRunner := &credgw.Runner{Inner: subprocess.CuratedGroupRunner{}}
-	adapter := modelGatewayRuntimeAdapter{
-		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
-		runner:  gatewayRunner,
-	}
-	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
-
-	wrapped, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "", adapter)
-	if err != nil {
-		t.Fatalf("wrapReadOnlySandboxAdapter: %v", err)
-	}
-	seat, ok := wrapped.(readOnlyRuntimeAdapter)
-	if !ok {
-		t.Fatalf("wrapped adapter %T, want readOnlyRuntimeAdapter", wrapped)
-	}
-	t.Cleanup(func() { _ = seat.cleanup() })
-	gateway, ok := seat.Adapter.(modelGatewayRuntimeAdapter)
-	if !ok {
-		t.Fatalf("inner adapter %T, want modelGatewayRuntimeAdapter", seat.Adapter)
-	}
-	claude, ok := gateway.Adapter.(runtime.ClaudeAdapter)
-	if !ok {
-		t.Fatalf("gateway inner adapter %T, want runtime.ClaudeAdapter", gateway.Adapter)
-	}
-	sandboxEnv, baseEnv := seatRunnerEnvironments(t, claude.Runner)
-	for _, env := range [][]string{sandboxEnv, baseEnv} {
-		for _, entry := range env {
-			if strings.HasPrefix(entry, "CLAUDE_CODE_OAUTH_TOKEN=") && !strings.HasSuffix(entry, "=") {
-				t.Fatalf("gateway seat received a real token: %v", redactEnvNames(env))
-			}
-		}
 	}
 }
 
@@ -156,8 +87,6 @@ func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv 
 		case *subprocess.EnvInjectingRunner:
 			sandboxEnv = append(sandboxEnv, r.Env...)
 			runner = r.Inner
-		case *credgw.Runner:
-			runner = r.Inner
 		case subprocess.CuratedGroupRunner:
 			return sandboxEnv, r.BaseEnv
 		case *subprocess.CuratedGroupRunner:
@@ -175,7 +104,7 @@ func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv 
 
 // #1810 review F5: the cockpit log tee REBUILT the adapter from the worker's
 // execution runner and assigned over the composed one, discarding the whole
-// read-only seat wrapper - no Landlock, no isolated state dir, no auth overlay -
+// read-only seat wrapper - no Landlock, no isolated state dir -
 // and with produce grants already applied the rebuilt job would even receive a
 // WRITE grant on the operator's live credential dir.
 //
@@ -185,22 +114,12 @@ func seatRunnerEnvironments(t *testing.T, runner subprocess.Runner) (sandboxEnv 
 // the composed adapter. If that ever rebuilds instead, a seat loses its sandbox
 // the same way, and this test fails the same way.
 func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
-	const overlay = "CLAUDE_CODE_OAUTH_TOKEN=seat-transcript-token-value"
 	home := t.TempDir()
-	paths, err := pathsFromFlag(home)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(paths.Home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(runtimeAuthFilePath(paths.Home), []byte(overlay+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	readOnlySeatOmpBrokerEnv(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	agent := runtime.Agent{Runtime: runtime.ClaudeRuntime, ReadOnlySeat: true}
+	agent := runtime.Agent{Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
 	seatAdapter, _, err := wrapReadOnlySandboxAdapter(home, agent, checkout, "",
-		runtime.ClaudeAdapter{Runner: subprocess.CuratedGroupRunner{}})
+		runtime.OmpAdapter{Runner: subprocess.CuratedGroupRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +129,7 @@ func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = seat.cleanup() })
 
-	logFile, err := openRetainedTranscriptLog(home, "seat-transcript-job", "review", "codex", 0, nil)
+	logFile, err := openRetainedTranscriptLog(home, "seat-transcript-job", "review", runtime.OmpRuntime, 0, nil)
 	if err != nil {
 		t.Fatalf("openRetainedTranscriptLog: %v", err)
 	}
@@ -227,16 +146,12 @@ func TestTranscriptOutputKeepsTheReadOnlySeatSandbox(t *testing.T) {
 	if !ok {
 		t.Fatalf("attaching transcript output discarded the read-only seat wrapper: %T", teed)
 	}
-	inner, ok := teedSeat.Adapter.(runtime.ClaudeAdapter)
+	inner, ok := teedSeat.Adapter.(runtime.OmpAdapter)
 	if !ok {
-		t.Fatalf("teed inner adapter %T, want runtime.ClaudeAdapter", teedSeat.Adapter)
+		t.Fatalf("teed inner adapter %T, want runtime.OmpAdapter", teedSeat.Adapter)
 	}
-	sandboxEnv, baseEnv := seatRunnerEnvironments(t, inner.Runner)
-	if !containsEnv(sandboxEnv, overlay) || !containsEnv(baseEnv, overlay) {
-		t.Fatalf("attaching transcript output dropped the seat auth overlay: sandbox=%v base=%v",
-			redactEnvNames(sandboxEnv), redactEnvNames(baseEnv))
-	}
-	if !containsEnvPrefix(sandboxEnv, "CLAUDE_CONFIG_DIR=") {
+	sandboxEnv, _ := seatRunnerEnvironments(t, inner.Runner)
+	if !containsEnvPrefix(sandboxEnv, "PI_CODING_AGENT_DIR=") {
 		t.Fatalf("attaching transcript output dropped the isolated runtime state dir: %v", redactEnvNames(sandboxEnv))
 	}
 }

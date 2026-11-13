@@ -6,10 +6,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/gitmoot/gitmoot/internal/github"
 	"io"
-	"os"
 	"strings"
+
+	"github.com/gitmoot/gitmoot/internal/github"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -126,7 +126,6 @@ func writeSetupReadiness(stdout io.Writer, agent runtime.Agent, repoFullName str
 			writeLine(stdout, "  [warn] daemon: started WITHOUT --watch-issues; it will NOT answer issue tags")
 			writeLine(stdout, "         re-run with --watch-issues, or: gitmoot daemon restart --repo %s --watch-issues", repoFullName)
 		}
-		writeSetupDaemonAuthNote(stdout, agent)
 	} else {
 		if watchIssues {
 			writeLine(stdout, "  [next] daemon not started; run from a shell that holds the runtime token:")
@@ -141,25 +140,6 @@ func writeSetupReadiness(stdout io.Writer, agent runtime.Agent, repoFullName str
 		writeLine(stdout, "  @%s ask <your question>", agent.Name)
 		writeLine(stdout, "note: on issues only the `ask` action is acted on (review/implement apply to PRs).")
 	}
-}
-
-// writeSetupDaemonAuthNote surfaces a fail-open daemon runtime-auth note. The
-// authoritative daemon-aware auth check is tracked in #427 (a sibling PR); to
-// keep this flow independently mergeable we only inspect the current shell's
-// env for the claude runtime and never fail setup on it — the daemon inherits
-// the env of the shell that (re)started it, which is the common footgun.
-func writeSetupDaemonAuthNote(stdout io.Writer, agent runtime.Agent) {
-	if !strings.EqualFold(strings.TrimSpace(agent.Runtime), "claude") {
-		return
-	}
-	env := runtime.InspectClaudeAuthEnv(os.LookupEnv)
-	if env.Ready() {
-		writeLine(stdout, "  [ok] daemon runtime auth: claude credentials present in this shell (%s)", env.MaskedDetail())
-		return
-	}
-	writeLine(stdout, "  [warn] daemon runtime auth: no claude credentials in this shell; the daemon inherits this env.")
-	writeLine(stdout, "         %s", env.Warning())
-	writeLine(stdout, "         (daemon-aware auth validation is tracked in #427)")
 }
 
 func existingCompatibleAgent(ctx context.Context, store *db.Store, agent runtime.Agent) (bool, error) {

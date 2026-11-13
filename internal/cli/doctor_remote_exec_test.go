@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 func TestRemoteExecDoctorCheck(t *testing.T) {
@@ -84,7 +83,7 @@ func TestDoctorHomeSelectsRemoteExecConfig(t *testing.T) {
 		t.Fatalf("create ambient config trap: %v", err)
 	}
 	t.Setenv("HOME", ambientHome)
-	// Make the live Claude probe fail unavailable without consulting host tools.
+	// Keep doctor's tool probes off host binaries.
 	t.Setenv("PATH", t.TempDir())
 
 	explicitHome := t.TempDir()
@@ -94,24 +93,6 @@ local_uid = 1
 local_gid = 1
 local_root = "/tmp/gitmoot-explicit-home"
 `)
-	if err := writeRuntimeAuthFile(runtimeAuthFilePath(explicitPaths.Home), map[string]string{
-		runtime.ClaudeOAuthTokenEnv: testOAuthToken,
-	}); err != nil {
-		t.Fatalf("write explicit runtime auth: %v", err)
-	}
-	oldLookup, oldLogf := runtimeAuthEnvLookup, runtimeAuthLogf
-	runtimeAuthEnvLookup = func(name string) (string, bool) {
-		if name == runtime.AnthropicAPIKeyEnv {
-			return testAPIKey, true
-		}
-		return "", false
-	}
-	runtimeAuthLogf = func(string, ...any) {}
-	t.Cleanup(func() {
-		runtimeAuthEnvLookup = oldLookup
-		runtimeAuthLogf = oldLogf
-	})
-
 	var stdout, stderr bytes.Buffer
 	Run([]string{"doctor", "--home", explicitHome, "--json", "--repo", t.TempDir()}, &stdout, &stderr)
 	if strings.Contains(stderr.String(), "flag provided but not defined") {
@@ -131,23 +112,6 @@ local_root = "/tmp/gitmoot-explicit-home"
 	}
 	if detail, _ := check["detail"].(string); strings.Contains(detail, ambientPaths.ConfigFile) {
 		t.Fatalf("doctor read ambient config %s: %q", ambientPaths.ConfigFile, detail)
-	}
-	authCheck, ok := doctorJSONCheckByName(checks, "claude auth")
-	if !ok {
-		t.Fatal("doctor --home omitted claude auth check")
-	}
-	authDetail, _ := authCheck["detail"].(string)
-	for _, want := range []string{
-		runtimeAuthFileName,
-		runtime.ClaudeOAuthTokenEnv + "=set",
-		runtime.AnthropicAPIKeyEnv + "=unset",
-	} {
-		if !strings.Contains(authDetail, want) {
-			t.Fatalf("claude auth detail = %q, want %q from explicit home", authDetail, want)
-		}
-	}
-	if _, err := os.Stat(runtimeAuthFilePath(ambientPaths.Home)); !os.IsNotExist(err) {
-		t.Fatalf("doctor --home accessed ambient runtime auth at %s: %v", runtimeAuthFilePath(ambientPaths.Home), err)
 	}
 }
 

@@ -17,10 +17,10 @@ func TestDefaultAdmissionPolicyAllOff(t *testing.T) {
 	if policy.Enabled() {
 		t.Fatalf("default policy must be disabled (both caps 0)")
 	}
-	// Priors are present so the memory gate has a per-runtime estimate when an
-	// operator turns it on without setting each runtime explicitly.
-	if policy.CodexMemoryGB != 0.2 || policy.ClaudeMemoryGB != 0.85 || policy.KimiMemoryGB != 0.5 || policy.DefaultMemoryGB != 0.5 {
-		t.Fatalf("unexpected default priors: %+v", policy)
+	// The prior is present so the memory gate has an estimate when an operator
+	// turns it on without setting default_memory_gb.
+	if policy.DefaultMemoryGB != 0.5 {
+		t.Fatalf("unexpected default prior: %+v", policy)
 	}
 }
 
@@ -69,8 +69,10 @@ default_memory_gb = 0.7
 	if policy.MaxMemoryGB != 4.5 {
 		t.Fatalf("MaxMemoryGB = %v, want 4.5", policy.MaxMemoryGB)
 	}
-	if policy.CodexMemoryGB != 0.1 || policy.ClaudeMemoryGB != 1.2 || policy.KimiMemoryGB != 0.4 || policy.DefaultMemoryGB != 0.7 {
-		t.Fatalf("per-runtime estimates = %+v", policy)
+	// The removed per-runtime keys (codex/claude/kimi_memory_gb, #2587) are
+	// ignored rather than failing an old config.
+	if policy.DefaultMemoryGB != 0.7 {
+		t.Fatalf("default_memory_gb = %+v", policy)
 	}
 	if !policy.Enabled() {
 		t.Fatalf("policy with caps set must report Enabled()")
@@ -100,12 +102,12 @@ max_memory_gb = -2.5
 			wantErr: "max_memory_gb must be 0",
 		},
 		{
-			name: "codex_memory_gb",
+			name: "default_memory_gb",
 			body: `
 [admission]
-codex_memory_gb = -0.1
+default_memory_gb = -0.1
 `,
-			wantErr: "admission.codex_memory_gb must be 0 or positive",
+			wantErr: "admission.default_memory_gb must be 0 or positive",
 		},
 	}
 	for _, tt := range tests {

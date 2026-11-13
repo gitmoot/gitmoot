@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
@@ -10,14 +9,21 @@ import (
 	"sync"
 	"time"
 	"unicode"
+)
 
-	"github.com/gitmoot/gitmoot/internal/runtime"
+// The Anthropic credential names runtime-auth.env may hold. The remote model
+// gateway reads them when [credentials] names no model_gateway_key, so an omp
+// review in a sandbox reaches Anthropic models without the raw key entering it.
+const (
+	anthropicAPIKeyEnv    = "ANTHROPIC_API_KEY"
+	anthropicAuthTokenEnv = "ANTHROPIC_AUTH_TOKEN"
+	claudeOAuthTokenEnv   = "CLAUDE_CODE_OAUTH_TOKEN"
 )
 
 var runtimeAuthEnvVars = []string{
-	runtime.ClaudeOAuthTokenEnv,
-	runtime.AnthropicAPIKeyEnv,
-	runtime.AnthropicAuthTokenEnv,
+	claudeOAuthTokenEnv,
+	anthropicAPIKeyEnv,
+	anthropicAuthTokenEnv,
 }
 
 const (
@@ -299,74 +305,4 @@ func loadLegacyRuntimeAuthFile(path string) (map[string]string, bool, error) {
 		values[name] = value
 	}
 	return values, true, nil
-}
-
-// runtimeAuthInjectionEnv implements the blank-out rule. Once the authoritative
-// file selects at least one managed variable, all three names are appended; any
-// absent variable is explicitly empty so ambient Claude auth cannot outrank it.
-func runtimeAuthInjectionEnv(state runtimeAuthFile) []string {
-	if !state.Exists || len(state.Values) == 0 {
-		return nil
-	}
-	env := make([]string, 0, len(runtimeAuthEnvVars))
-	for _, name := range runtimeAuthEnvVars {
-		env = append(env, name+"="+state.Values[name])
-	}
-	return env
-}
-
-func runtimeAuthSource(state runtimeAuthFile, lookup func(string) (string, bool)) string {
-	if state.Exists && len(state.Values) > 0 {
-		return runtimeAuthFileName
-	}
-	ambient := collectRuntimeAuthEnv(lookup)
-	if len(ambient) > 0 {
-		if state.Exists {
-			return "ambient environment (runtime-auth.env explicitly empty)"
-		}
-		return "ambient environment"
-	}
-	if state.Exists {
-		return "Claude credential store (runtime-auth.env explicitly empty)"
-	}
-	return "Claude credential store"
-}
-
-func runtimeAuthEffectiveLookup(state runtimeAuthFile, ambient func(string) (string, bool)) func(string) (string, bool) {
-	if state.Exists && len(state.Values) > 0 {
-		return func(name string) (string, bool) {
-			value, ok := state.Values[name]
-			return value, ok
-		}
-	}
-	if ambient == nil {
-		return func(string) (string, bool) { return "", false }
-	}
-	return ambient
-}
-
-func warnRuntimeAuthConflicts(state runtimeAuthFile, lookup func(string) (string, bool), logf func(string, ...any)) {
-	if !state.Exists || len(state.Values) == 0 || lookup == nil || logf == nil {
-		return
-	}
-	var conflicts []string
-	for _, name := range runtimeAuthEnvVars {
-		fileValue, fileOK := state.Values[name]
-		ambientValue, ambientOK := lookup(name)
-		if fileOK && ambientOK && strings.TrimSpace(ambientValue) != "" && fileValue != ambientValue {
-			conflicts = append(conflicts, fmt.Sprintf("%s file=%s ambient=%s", name, maskedAuthFingerprint(fileValue), maskedAuthFingerprint(ambientValue)))
-		}
-	}
-	if len(conflicts) > 0 {
-		logf("WARNING: %s wins over conflicting ambient Claude auth: %s", runtimeAuthFileName, strings.Join(conflicts, "; "))
-	}
-}
-
-func maskedAuthFingerprint(value string) string {
-	runes := []rune(value)
-	if len(runes) > 12 {
-		return string(runes[:8]) + "..." + string(runes[len(runes)-4:])
-	}
-	sum := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("short(len=%d,sha256=%x)", len(runes), sum[:4])
 }

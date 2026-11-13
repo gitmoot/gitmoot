@@ -94,33 +94,9 @@ func TestReviewThresholdMovesReviewsRemoteButKeepsOtherJobsLocal(t *testing.T) {
 	}
 }
 
-// TestCodexReviewMovesToOmpWithTheSameModelAndAlertsOnce: the codex review
-// runs remotely as omp with the identical model, an event records the switch,
-// and the requester gets exactly one message across repeated daemon passes.
-func TestCodexReviewMovesToOmpWithTheSameModelAndAlertsOnce(t *testing.T) {
-	ctx, store, worker := fallbackFixture(t, 20)
-	queueDiskGuardJob(t, ctx, store, "codex-review", "rev-codex", "review", `,"model":"gpt-6-astra","review_requester":"usmle-app"`)
-	for pass := 0; pass < 3; pass++ {
-		pendingIDs(t, ctx, worker)
-	}
-	p := storedPayload(t, ctx, store, "codex-review")
-	if b, _ := p.ExecBackendOverride(); b != "remote" {
-		t.Fatalf("codex review backend %q, want remote", b)
-	}
-	if p.RuntimeOverride != "omp" || p.Model != "openai-codex/gpt-6-astra" {
-		t.Fatalf("runtime=%q model=%q, want omp with the same model openai-codex/gpt-6-astra", p.RuntimeOverride, p.Model)
-	}
-	if !slices.Contains(eventKinds(t, ctx, store, "codex-review"), diskGuardRuntimeChangedEventKind) {
-		t.Fatalf("no %s event", diskGuardRuntimeChangedEventKind)
-	}
-	msgs := messagesTo(t, ctx, store, "usmle-app")
-	if len(msgs) != 1 || !strings.Contains(msgs[0].Body, "codex -> omp") || !strings.Contains(msgs[0].Body, "codex-review") {
-		t.Fatalf("messages to requester = %+v, want exactly one naming the job and the runtime change", msgs)
-	}
-}
-
-// TestReviewThatCannotRunRemotelyWaitsAndAlertsWithReason: an unknown model
-// is never replaced; the review waits here and the requester is told why.
+// TestReviewThatCannotRunRemotelyWaitsAndAlertsWithReason: a review on a
+// runtime that cannot run remotely (codex, a removed runtime) is never given a
+// different runtime; it waits here and the requester is told why.
 func TestReviewThatCannotRunRemotelyWaitsAndAlertsWithReason(t *testing.T) {
 	ctx, store, worker := fallbackFixture(t, 20)
 	queueDiskGuardJob(t, ctx, store, "codex-nomodel", "rev-codex", "review", `,"review_requester":"usmle-app"`)
@@ -142,29 +118,29 @@ func TestReviewThatCannotRunRemotelyWaitsAndAlertsWithReason(t *testing.T) {
 	}
 }
 
-// TestUndoneRemoteRouteRestoresTheReviewsOwnRuntimeAndModel: the codex -> omp
-// switch is only for the remote run. When E2B refuses the run, the review goes
-// back to waiting locally exactly as requested, and the requester is told once.
+// TestUndoneRemoteRouteRestoresTheReviewsOwnRuntimeAndModel: the remote route
+// is only for the remote run. When E2B refuses the run, the review goes back
+// to waiting locally exactly as requested, and the requester is told once.
 func TestUndoneRemoteRouteRestoresTheReviewsOwnRuntimeAndModel(t *testing.T) {
 	ctx, store, worker := fallbackFixture(t, 20)
-	queueDiskGuardJob(t, ctx, store, "codex-review", "rev-codex", "review", `,"model":"gpt-6-astra","review_requester":"usmle-app"`)
+	queueDiskGuardJob(t, ctx, store, "omp-review", "rev-omp", "review", `,"model":"anthropic/claude-sonnet-5-5","review_requester":"usmle-app"`)
 	pendingIDs(t, ctx, worker)
-	if p := storedPayload(t, ctx, store, "codex-review"); p.RuntimeOverride != "omp" {
-		t.Fatalf("precondition: review not switched to omp (runtime %q)", p.RuntimeOverride)
+	if b, _ := storedPayload(t, ctx, store, "omp-review").ExecBackendOverride(); b != "remote" {
+		t.Fatalf("precondition: review not routed remote (backend %q)", b)
 	}
-	job, err := store.GetJob(ctx, "codex-review")
+	job, err := store.GetJob(ctx, "omp-review")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		worker.undoDiskGuardRoute(ctx, job, workflow.JobFailed, false, errors.New("e2b refused the sandbox"))
 	}
-	p := storedPayload(t, ctx, store, "codex-review")
+	p := storedPayload(t, ctx, store, "omp-review")
 	if b, _ := p.ExecBackendOverride(); b == "remote" {
 		t.Fatalf("still routed remote after undo")
 	}
-	if p.RuntimeOverride != "" || p.Model != "gpt-6-astra" || p.DiskGuardRuntimeSwitched {
-		t.Fatalf("after undo runtime=%q model=%q switched=%v, want the review's own (no override, gpt-6-astra)", p.RuntimeOverride, p.Model, p.DiskGuardRuntimeSwitched)
+	if p.RuntimeOverride != "" || p.Model != "anthropic/claude-sonnet-5-5" {
+		t.Fatalf("after undo runtime=%q model=%q, want the review's own (no override, anthropic/claude-sonnet-5-5)", p.RuntimeOverride, p.Model)
 	}
 	undo := 0
 	for _, m := range messagesTo(t, ctx, store, "usmle-app") {

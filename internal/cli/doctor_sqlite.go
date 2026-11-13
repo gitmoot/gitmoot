@@ -52,7 +52,7 @@ func buildSQLiteAutoVacuumDoctorCheck(databasePath string, mode int) doctor.Chec
 	}
 	command := fmt.Sprintf(
 		"sqlite3 %s 'PRAGMA auto_vacuum=INCREMENTAL; VACUUM;'",
-		shellQuote(databasePath, "posix"),
+		posixQuote(databasePath),
 	)
 	return doctor.Check{
 		Name:     "sqlite vacuum",

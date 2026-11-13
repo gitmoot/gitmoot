@@ -77,7 +77,7 @@ var DelegationSynthesisRules = []string{"summary", "vote", "quorum", "verify"}
 
 // EphemeralRuntimes are the allowed values of EphemeralSpec.Runtime. They are a
 // subset of the registered runtimes: an ephemeral worker is never a raw shell.
-var EphemeralRuntimes = []string{runtime.CodexRuntime, runtime.ClaudeRuntime, runtime.KimiRuntime}
+var EphemeralRuntimes = []string{runtime.OmpRuntime}
 
 // allowedSet returns a lookup set for the given allowed-value slice.
 func allowedSet(values []string) map[string]struct{} {
@@ -93,8 +93,7 @@ func allowedSet(values []string) map[string]struct{} {
 // builds the worker from this spec (default sandbox read-only); the workflow
 // engine treats a delegation carrying a spec as inheriting the coordinator's
 // allowed repo scope, so it bypasses the registered-agent existence, repo-access,
-// and capability checks. Runtime is REQUIRED and must be one of codex/claude/kimi
-// — never shell.
+// and capability checks. Runtime is REQUIRED and must be omp — never shell.
 type EphemeralSpec struct {
 	Runtime        string   `json:"runtime"`
 	Model          string   `json:"model,omitempty"`
@@ -1037,9 +1036,8 @@ func validateDelegationLifecycle(d Delegation) error {
 // pre-registered agent or an inline ephemeral worker spec. A delegation with both
 // is ambiguous (which identity owns the branch lock and repo scope?), and one with
 // neither has no executor at all; both are rejected at result-parse time before any
-// side effects. When an ephemeral spec is present, its runtime must be one of
-// codex/claude/kimi (never shell or empty) because the daemon materializes a real
-// runtime worker from it.
+// side effects. When an ephemeral spec is present, its runtime must be omp (never
+// shell or empty) because the daemon materializes a real runtime worker from it.
 func validateDelegationTarget(d Delegation) error {
 	hasAgent := strings.TrimSpace(d.Agent) != ""
 	hasEphemeral := d.Ephemeral != nil
@@ -1058,8 +1056,8 @@ func validateDelegationTarget(d Delegation) error {
 }
 
 // validateEphemeralSpec validates the inline worker spec on a delegation: the
-// runtime is required and must be a real agent runtime (codex/claude/kimi); shell
-// and unknown runtimes are rejected so an ephemeral worker is never a raw shell.
+// runtime is required and must be a real agent runtime (omp); shell and unknown
+// runtimes are rejected so an ephemeral worker is never a raw shell.
 //
 // action is the delegation's action: an ephemeral implement worker (action
 // "implement" or an explicit "implement" capability on the spec) whose
@@ -1076,7 +1074,7 @@ func validateEphemeralSpec(delegationID string, action string, spec *EphemeralSp
 		return fmt.Errorf("delegation %q ephemeral runtime is required", delegationID)
 	default:
 		if _, ok := allowedSet(EphemeralRuntimes)[rt]; !ok {
-			return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of codex/claude/kimi", delegationID, spec.Runtime)
+			return fmt.Errorf("delegation %q ephemeral runtime %q is invalid; expected one of %s", delegationID, spec.Runtime, strings.Join(EphemeralRuntimes, "/"))
 		}
 	}
 	// Reject an unknown autonomy_policy at parse time: an unrecognized value

@@ -33,7 +33,6 @@ var rootCommands = []command{
 	{name: "config", summary: "show local Gitmoot config paths", run: runConfig},
 	{name: "org", summary: "org registry, attribution, and brief/chart/status (RFC #1042)", run: runOrg},
 	{name: "message", summary: "send, read and reply to durable fleet messages", run: runMessage},
-	{name: "auth", summary: "manage runtime authentication", run: runAuth},
 	{name: "key", summary: "manage keycard registry metadata", run: runKey},
 	{name: "update", summary: "check for and apply Gitmoot releases", run: runUpdate},
 	{name: "setup", summary: "register a repo and initial agent", run: runSetup},
@@ -142,14 +141,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	// The one-shot `gitmoot doctor` opts into the live claude probe (LiveProbe)
-	// so a cached-creds box is reported accurately rather than false-warned. The
-	// dashboard leaves LiveProbe false so refreshes never spawn claude.
-	// Resolve paths best-effort so the daemon-aware claude auth check (#427) can
-	// locate the running daemon. A failure here (no initialized home) just leaves
-	// Paths zero, which skips the daemon check and keeps the shell-local one —
-	// but the error is no longer DISCARDED (#1643 round 11, codex): a zero
-	// Paths reached every check's empty-database absent branch, so a resolution
+	// Resolve paths best-effort. A failure here (no initialized home) leaves
+	// Paths zero, but the error is not DISCARDED (#1643 round 11): a zero Paths
+	// reached every check's empty-database absent branch, so a resolution
 	// FAILURE manufactured what reads as absence-by-configuration. The archive
 	// mirror check receives the error and reports UNKNOWN instead of vanishing.
 	paths, pathsErr := pathsFromFlag(*home)
@@ -157,34 +151,24 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	stuckStatus := stuckJobsStatus(paths)
 	servingStatus := runtimeServingStatus(paths)
 	logStatus := daemonLogStatus(paths)
-	probeRunner, authState, authSource, authErr := runtimeJobRunnerWithAuth(*home, runtime.ClaudeRuntime, nil)
 	contractResults := make([]runtime.RuntimeContractResult, 0, len(runtime.BuiltinRuntimeRegistry().All()))
 	for _, meta := range runtime.BuiltinRuntimeRegistry().All() {
 		contractResults = append(contractResults, runtime.DefaultRuntimeContractChecker().Inspect(context.Background(), meta.Name))
 	}
 	checker := doctor.Checker{
-		Dir:               *repoDir,
-		LiveProbe:         true,
-		Paths:             paths,
-		ClaudeProbeRunner: probeRunner,
-		ClaudeAuthLookup:  runtimeAuthEffectiveLookup(authState, runtimeAuthEnvLookup),
-		ClaudeAuthSource:  authSource,
-		ClaudeAuthError:   authErr,
-		SkipDaemonAuth:    true,
-		Build:             &buildStatus,
-		StuckJobs:         stuckStatus,
-		RuntimeServing:    servingStatus,
-		LogStatus:         &logStatus,
-		RuntimeContracts:  contractResults,
+		Dir:              *repoDir,
+		Paths:            paths,
+		Build:            &buildStatus,
+		StuckJobs:        stuckStatus,
+		RuntimeServing:   servingStatus,
+		LogStatus:        &logStatus,
+		RuntimeContracts: contractResults,
 	}
 	checks := checker.Run(context.Background())
 	if check, ok := remoteExecDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
-	// The checks above measure the AMBIENT claude credential; a read-only seat
-	// authenticates with a staged snapshot, and reporting only the ambient one is
-	// the false green this outage ran on (#1810 review).
-	if check, ok := seatCredentialDoctorCheck(paths); ok {
+	if check, ok := unsupportedAgentRuntimeDoctorCheck(paths); ok {
 		checks = append(checks, check)
 	}
 	// #631: surface a stale backlog of blocked jobs (each paused awaiting a human)

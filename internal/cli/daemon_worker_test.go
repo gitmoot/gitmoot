@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -26,36 +25,11 @@ func (a *timeoutCaptureAdapter) Deliver(ctx context.Context, _ runtime.Agent, _ 
 	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
 }
 
-func TestTempWorkerEligibleAllowsWritableImplementWithTaskWorktree(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	worktree := t.TempDir()
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.CodexRuntime, "session-1", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-	if err := store.UpsertTask(ctx, db.Task{ID: "task-a", RepoFullName: "owner/repo", State: string(workflow.TaskImplementing), Branch: "task-a", WorktreePath: worktree}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "lead", Action: "implement", Repo: "owner/repo", Branch: "task-a", TaskID: "task-a"})
-	job, err := store.GetJob(ctx, "job-a")
-	if err != nil {
-		t.Fatalf("GetJob returned error: %v", err)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("daemonJobPayload returned error: %v", err)
-	}
-
-	got := tempWorkerEligible(ctx, store, job, payload, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
-
-	if !got.Eligible {
-		t.Fatalf("tempWorkerEligible = %+v, want eligible", got)
-	}
-}
-
 func TestTempWorkerEligibleRejectsQueuePolicy(t *testing.T) {
 	policy := config.DefaultParallelSessionPolicy()
 	policy.SameSession = config.ParallelSessionQueue
 
-	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime}, policy, time.Now().UTC())
+	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.OmpRuntime}, policy, time.Now().UTC())
 
 	if got.Eligible || !strings.Contains(got.Reason, "same_session is queue") {
 		t.Fatalf("tempWorkerEligible = %+v, want queue policy rejection", got)
@@ -63,7 +37,7 @@ func TestTempWorkerEligibleRejectsQueuePolicy(t *testing.T) {
 }
 
 func TestTempWorkerEligibleRejectsAlreadyDelegatedJob(t *testing.T) {
-	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{DelegationReason: "runtime_session_busy"}, runtime.Agent{Name: "lead-temp-job-a", Runtime: runtime.CodexRuntime}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
+	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{DelegationReason: "runtime_session_busy"}, runtime.Agent{Name: "lead-temp-job-a", Runtime: runtime.OmpRuntime}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
 
 	if got.Eligible || !strings.Contains(got.Reason, "delegated temp worker waits") {
 		t.Fatalf("tempWorkerEligible = %+v, want delegated job rejection", got)
@@ -102,96 +76,6 @@ func TestJobWorkerParallelSessionPolicyLoadsExplicitHome(t *testing.T) {
 
 	if got.SameSession != config.ParallelSessionQueue {
 		t.Fatalf("same_session = %q, want explicit queue config", got.SameSession)
-	}
-}
-
-func TestTempWorkerEligibleRejectsReadOnlyImplementation(t *testing.T) {
-	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "implement"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyReadOnly}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
-
-	if got.Eligible || !strings.Contains(got.Reason, "writable agent policy") {
-		t.Fatalf("tempWorkerEligible = %+v, want read-only implementation rejection", got)
-	}
-}
-
-func TestTempWorkerEligibleRejectsImplementationWithoutTaskWorktree(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-
-	got := tempWorkerEligible(ctx, store, db.Job{ID: "job-a", Type: "implement"}, workflow.JobPayload{Repo: "owner/repo", TaskID: "task-a"}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyWorkspaceWrite}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
-
-	if got.Eligible || !strings.Contains(got.Reason, "task worktree") {
-		t.Fatalf("tempWorkerEligible = %+v, want missing worktree rejection", got)
-	}
-}
-
-func TestTempWorkerEligibleRejectsMaxTempWorkers(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	now := time.Now().UTC()
-	for i := 0; i < 4; i++ {
-		if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
-			Name:           fmt.Sprintf("lead-temp-%d", i),
-			Type:           tempWorkerAgentType("lead"),
-			Runtime:        runtime.CodexRuntime,
-			RuntimeRef:     fmt.Sprintf("session-%d", i),
-			RepoFullName:   "owner/repo",
-			Role:           "worker",
-			AutonomyPolicy: runtime.AutonomyPolicyAuto,
-			State:          "idle",
-			CreatedAt:      now.Format(time.RFC3339),
-			LastUsedAt:     now.Format(time.RFC3339),
-			ExpiresAt:      now.Add(time.Hour).Format(time.RFC3339),
-		}); err != nil {
-			t.Fatalf("UpsertAgentInstance %d returned error: %v", i, err)
-		}
-	}
-
-	got := tempWorkerEligible(ctx, store, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.CodexRuntime, AutonomyPolicy: runtime.AutonomyPolicyAuto}, config.DefaultParallelSessionPolicy(), now)
-
-	if got.Eligible || !strings.Contains(got.Reason, "max temp workers reached") {
-		t.Fatalf("tempWorkerEligible = %+v, want cap rejection", got)
-	}
-}
-
-// TestPerJobAdmissionEstimate maps each session runtime to its configured RAM
-// estimate (and marks it session-counted), and a non-session runtime (shell, or a
-// session runtime with no ref) to 0 RAM AND not session-counted.
-func TestPerJobAdmissionEstimate(t *testing.T) {
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "codex-agent", runtime.CodexRuntime, "ref-1", []string{"ask"}, "owner/repo")
-	seedDaemonWorkerAgent(t, store, "claude-agent", runtime.ClaudeRuntime, "ref-2", []string{"ask"}, "owner/repo")
-	seedDaemonWorkerAgent(t, store, "kimi-agent", runtime.KimiRuntime, "ref-3", []string{"ask"}, "owner/repo")
-	// A shell agent has no resumable runtime session key ⇒ contributes 0 and is not
-	// session-counted (matches its exemption from the runtime session lock).
-	seedDaemonWorkerAgent(t, store, "shell-agent", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
-	// A codex agent with an empty runtime ref also has no session key ⇒ 0 / not counted.
-	seedDaemonWorkerAgent(t, store, "codex-no-ref", runtime.CodexRuntime, "", []string{"ask"}, "owner/repo")
-
-	policy := config.AdmissionPolicy{CodexMemoryGB: 0.2, ClaudeMemoryGB: 0.85, KimiMemoryGB: 0.5, DefaultMemoryGB: 0.7}
-	cases := []struct {
-		agent       string
-		wantMemGB   float64
-		wantSession bool
-	}{
-		{"codex-agent", 0.2, true},
-		{"claude-agent", 0.85, true},
-		{"kimi-agent", 0.5, true},
-		{"shell-agent", 0, false},
-		{"codex-no-ref", 0, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.agent, func(t *testing.T) {
-			job := db.Job{ID: "job-" + tc.agent, Agent: tc.agent}
-			got := perJobAdmissionEstimate(ctx, store, job, policy)
-			if got.memGB != tc.wantMemGB {
-				t.Fatalf("perJobAdmissionEstimate(%s).memGB = %v, want %v", tc.agent, got.memGB, tc.wantMemGB)
-			}
-			if got.session != tc.wantSession {
-				t.Fatalf("perJobAdmissionEstimate(%s).session = %v, want %v", tc.agent, got.session, tc.wantSession)
-			}
-		})
 	}
 }
 

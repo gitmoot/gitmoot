@@ -34,13 +34,11 @@ var toolCacheEnvSubdirs = []struct{ env, subdir string }{
 //
 // Scope: isolated jobs only (payload.WorktreePath != "") — a non-isolated job
 // uses the persistent registered checkout, which does not duplicate caches per
-// job. Widening WritablePaths reaches codex (its sandbox is always on and reads
-// the agent value fresh at Deliver time, so this is what actually makes the
-// cache dir writable there) and read-only seats (whose Landlock grant is
-// computed from this same field in readOnlyRuntimeSandboxGrants). Other
-// claude/kimi and shell runtimes run unsandboxed already, so widening
-// WritablePaths for them is a harmless no-op — nothing reads it — and the env
-// vars alone suffice to redirect their cache.
+// job. Widening WritablePaths reaches read-only seats (whose Landlock grant is
+// computed from this same field in readOnlyRuntimeSandboxGrants). Non-seat omp
+// and shell jobs run unsandboxed already, so widening WritablePaths for them is
+// a harmless no-op — nothing reads it — and the env vars alone suffice to
+// redirect their cache.
 //
 // Read-only seats are the exception: each worktree receives its own cache root,
 // because an untrusted review or ask must not poison state consumed by another
@@ -49,16 +47,6 @@ func applyIsolatedToolCacheGrants(paths config.Paths, payload workflow.JobPayloa
 	worktree := strings.TrimSpace(payload.WorktreePath)
 	if worktree == "" {
 		return nil, nil
-	}
-	if agent.Runtime == runtime.CodexRuntime {
-		if !agent.ReadOnlySeat {
-			switch runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy) {
-			case runtime.AutonomyPolicyWorkspaceWrite, runtime.AutonomyPolicyDangerFullAccess:
-				// proceeds below
-			default:
-				return nil, nil
-			}
-		}
 	}
 	policy, err := config.LoadToolCache(paths)
 	if err != nil {
@@ -112,17 +100,6 @@ func injectDeliveryAdapterEnv(adapter workflow.DeliveryAdapter, env []string) (w
 		return adapter, nil
 	}
 	switch a := adapter.(type) {
-	case modelGatewayRuntimeAdapter:
-		inner, err := injectDeliveryAdapterEnv(a.Adapter, env)
-		if err != nil {
-			return nil, err
-		}
-		runtimeAdapter, ok := inner.(runtime.Adapter)
-		if !ok {
-			return nil, fmt.Errorf("tool cache env inject returned incompatible %T model-gateway adapter", inner)
-		}
-		a.Adapter = runtimeAdapter
-		return a, nil
 	case readOnlyRuntimeAdapter:
 		inner, err := injectDeliveryAdapterEnv(a.Adapter, env)
 		if err != nil {
@@ -133,24 +110,6 @@ func injectDeliveryAdapterEnv(adapter workflow.DeliveryAdapter, env []string) (w
 			return nil, fmt.Errorf("tool cache env inject returned incompatible %T read-only adapter", inner)
 		}
 		a.Adapter = runtimeAdapter
-		return a, nil
-	case runtime.CodexAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case *runtime.CodexAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case runtime.ClaudeAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case *runtime.ClaudeAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case runtime.KimiAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
-		return a, nil
-	case *runtime.KimiAdapter:
-		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}
 		return a, nil
 	case runtime.OmpAdapter:
 		a.Runner = subprocess.EnvInjectingRunner{Inner: a.Runner, Env: env}

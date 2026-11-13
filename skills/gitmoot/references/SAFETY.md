@@ -142,31 +142,26 @@ gitmoot lock show owner/repo <branch>
 
 ## Autonomy Policy And Headless Write Permission
 
-An agent's autonomy policy maps to a Claude Code `--permission-mode` (Codex uses
-the equivalent `--sandbox`). It governs what the headless `claude -p` / `codex
-exec` run is allowed to do:
+An agent's autonomy policy maps to an omp `--approval-mode`. It governs what the
+headless `omp -p` run is allowed to do:
 
-| Policy | Claude `--permission-mode` | Headless write capability |
+| Policy | omp `--approval-mode` | Headless write capability |
 |---|---|---|
-| `read-only` | `plan` | no writes (inspect/report only) |
-| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash |
-| `danger-full-access` | `bypassPermissions` | full: file writes plus `go`/`git`/`gh` via Bash |
-| `auto` (the default) / unset | *(no flag emitted)* | non-deterministic — inherited from ambient Claude config |
+| `read-only` | `always-ask` | no writes (inspect/report only) |
+| `workspace-write` | `write` | in-directory file edits only — shell commands and writes outside the working directory are refused |
+| `danger-full-access` | `yolo` | full: file writes plus `go`/`git`/`gh` via shell |
+| `auto` (the default) / unset | `yolo` | widened to full access |
 
 Two consequences matter for implementation jobs:
 
-- **`auto` is non-deterministic, not "always denied".** With `auto` (or an unset
-  policy) Gitmoot emits no `--permission-mode`, so the headless run inherits its
-  write capability from whatever ambient Claude config exists on the host
-  (settings.json allow rules / `defaultMode` / prior directory trust). It writes
-  where permissive settings exist and silently denies where they don't — a
-  hidden, environment-dependent dependency on a job-critical decision.
-- **`workspace-write` (`acceptEdits`) auto-accepts file edits but does NOT unblock
-  Bash.** An implement job needs `go build`/`go test`, `git`, and `gh`; those run
-  through Bash, which `acceptEdits` still gates. Use `danger-full-access`
-  (`bypassPermissions`) for full headless implementation. `bypassPermissions`
-  stays gated strictly behind explicit `danger-full-access`; a git worktree is not
-  a sandbox, so Bash there still reaches the whole machine.
+- **`auto` widens.** The flag is always emitted for determinism (omitting it
+  would inherit the host's `tools.approvalMode`), and `auto` maps to `yolo`, so
+  the instrumentation records it as `widened`. A kernel-enforced read-only seat
+  also passes `yolo`, with Landlock as the write boundary.
+- **`workspace-write` (`write`) permits file edits but does NOT unblock the
+  shell.** An implement job needs `go build`/`go test`, `git`, and `gh`; use
+  `danger-full-access` for full headless implementation. A git worktree is not
+  a sandbox, so a shell there still reaches the whole machine.
 
 ### Runtime contract preflight
 
@@ -187,10 +182,7 @@ That refusal lands before any job row or worktree exists, and it leaves the
 backends, and present binaries stay dispatchable. Unknown binary probes use a
 60-second cache TTL; successful probes cache by resolved path, size, and mtime
 without a TTL.
-Claude 2.1.223 refuses Gitmoot's exact `--permission-mode bypassPermissions`
-prompt invocation under effective uid 0, while misleadingly reporting the
-failure as `--dangerously-skip-permissions`; the precondition changes no argv
-and attempts no escape. Doctor uses the foreground process's `PATH`, so compare
+Doctor uses the foreground process's `PATH`, so compare
 its reported `resolved_path` with the daemon EnvironmentFile's `PATH` when they
 may resolve different binaries.
 
@@ -238,8 +230,8 @@ An operator-authored shell command is accepted as an explicit daemon-permission
 risk: the `shell` adapter has no policy flag to apply, and the command runs with
 the daemon's host permissions. Its warning records this dated acceptance. That
 acceptance is provenance-specific, not a blanket exemption for the `shell`
-label: a shell session that invokes a model CLI such as `claude -p` or `codex
-exec` remains `not-applied` without the acceptance reference.
+label: a shell session that invokes a model CLI such as `omp -p` remains
+`not-applied` without the acceptance reference.
 
 ### Fail-closed implement guard
 
@@ -269,7 +261,7 @@ Redact secrets from GitHub comments, job summaries, raw examples, and copied
 command output.
 
 Read-only seats never receive recursive read access to an operator runtime or Go
-installation. Gitmoot copies the selected Claude, Kimi, or Codex artifact and a
+installation. Gitmoot copies the selected omp artifact and a
 Go installation selected from the daemon's `PATH` to satisfy the effective
 `go.work` and checkout-root `go.mod`. Only daemon-owned copies are granted;
 an external selected workfile receives a file-only read grant. Missing,
@@ -277,28 +269,8 @@ unsatisfying, or unstageable commands are shadowed by engine-owned exit-126
 commands; inherited `PATH` remains available for ordinary system tools but
 cannot fall through to an ungranted host runtime.
 
-Claude runtime credentials live only in the owner-readable (mode `0600`)
-`~/.gitmoot/runtime-auth.env`. Write them with `gitmoot auth set claude`, which
-reads stdin and replaces the file atomically; rotate without restarting the
-daemon. `gitmoot auth status` prints masked fingerprints only. To clear auth,
-use `gitmoot auth unset claude`: it writes an explicit empty file so bootstrap
-cannot resurrect a legacy or ambient token. When one managed variable is
-selected, Gitmoot injects all three Claude auth names and blanks the absent
-ones, preventing ambient API-key precedence from changing the selection.
-
-An opt-in `[credentials] model_gateway = true` routes Claude through a
-daemon-owned `127.0.0.1` reverse model gateway. Each delivery gets a random,
-job-scoped placeholder; the daemon snapshots the real `runtime-auth.env`
-credential, attaches it only on the allowlisted upstream request, and revokes
-the placeholder when delivery returns. Unknown/revoked placeholders fail with
-`401`, and an unavailable gateway or unallowlisted upstream fails the delivery
-without direct-auth fallback. The child is also pointed at a credential-free
-`CLAUDE_CONFIG_DIR` (a per-home mirror of the real Claude config minus
-`.credentials.json`), because Claude Code otherwise prefers its cached
-credential over the placeholder and the gateway would `401` every job (#936).
-It is off by default and does not cover Codex or Kimi.
-
-For remote shell jobs, the same opt-in can issue an ephemeral mTLS client
+An opt-in `[credentials] model_gateway = true` makes broker material available
+to remote jobs. For remote shell jobs it can issue an ephemeral mTLS client
 identity and capability bound to the sandbox id, runtime, allowlist, and lease
 expiry. Only a curl-config path enters the environment; the upstream key is
 resolved on the host after authentication and never enters the sandbox.
@@ -322,18 +294,12 @@ disables interactive prompts. `github = "inherit"` explicitly restores ambient
 GitHub environment inheritance. See `CLI.md` for the exact base allowlist,
 runtime exceptions, and `env_passthrough` syntax.
 
-The gateway has two explicit limits:
+The gateway has one explicit limit: env-var routing is cooperative, not a hard
+egress boundary — a malicious agent can unset it. This buys credential
+custody/policy/attribution against a prompt-injected or misbehaving agent, not
+enforcement against one that actively evades.
 
-1. env-var routing is cooperative, not a hard egress boundary — a malicious
-   agent can unset `ANTHROPIC_BASE_URL`, or point `CLAUDE_CONFIG_DIR` back at
-   the real `~/.claude` to read the cached credential. This buys credential
-   custody/policy/attribution against a prompt-injected or misbehaving agent,
-   not enforcement against one that actively evades.
-2. The strong "agents never hold real credentials" claim also requires
-   Landlock read-rules for `runtime-auth.env` and `~/.claude/.credentials.json`
-   (same-UID read is currently possible) — that is P3.
-
-Codex/Kimi custody, Landlock read rules, MITM CA support, corporate
+Landlock read rules, MITM CA support, corporate
 proxy/`NO_PROXY` interoperability, and hard egress enforcement remain P3.
 
 ## External Contracts
@@ -370,10 +336,8 @@ cannot recurse or fan out forever:
   tree under one root is bounded by cumulative token usage (input + output across
   every job in the tree). A coordinator that tries to fan out after the tree has
   already used at least the budget is refused with a `delegation_cost_exceeded`
-  event. Token capture is **best-effort per runtime** (Claude reports usage; Kimi
-  reports it if its stream emits it; Codex reads usage from its `codex exec --json`
-  JSONL stream — a resumed session's usage is session-cumulative, so it records only
-  the per-session delta (#661) — falling back to `0` on an older CLI), so the budget can under-count
+  event. Token capture is **best-effort per runtime** (omp sums its NDJSON
+  `message_end` usage across the run; `shell` reports none), so the budget can under-count
   but never over-counts. Leaving the knob at `0` skips the check entirely.
 - Per-root **dollar-cost** budget `[orchestrate].max_delegation_cost_usd`,
   **off by default** (`0` = unlimited): the cost analogue of the token budget
@@ -622,12 +586,7 @@ enabled = false` to opt out, or `[cache] dir = "/absolute/path"` to relocate it
 swept by worktree teardown. Non-isolated jobs (the persistent registered
 checkout) are unaffected — they do not duplicate caches per job.
 
-Codex is always sandboxed, so this also widens its `--add-dir` writable-path
-allowlist to the shared cache directory. Claude/Kimi and `shell` runtime jobs
-outside read-only seats already run unsandboxed, so only the env redirect applies
-to them.
-
-A codex job gets neither the grant nor the env when its sandbox mode cannot
-reach the shared directory: a read-only/`auto`/unrecognized autonomy policy
-(codex never emits `--add-dir` there). Those jobs keep the pre-#1113 behavior —
-no redirect, no in-worktree cache reuse.
+Read-only seats run inside Landlock, so this also widens their writable-path
+grant to a per-worktree cache root (an untrusted review or ask must not poison
+state another job consumes). Non-seat omp and `shell` runtime jobs already run
+unsandboxed, so only the env redirect applies to them.

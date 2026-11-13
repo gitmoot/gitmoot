@@ -7,7 +7,7 @@ decides the next step? `gitmoot orchestrate` makes GITMOOT the manager — a
 coordinator agent JOB returns `delegations[]` and the engine executes the tree
 with its guardrails (dependency ordering, retries, timeouts, failure policies,
 synthesis, tree token budgets, kill scope). `--workflow <label>` makes an
-EXTERNAL coordinator the manager — a Claude/Codex session, a script, or a human
+EXTERNAL coordinator the manager — a Claude Code, Codex or omp session, a script, or a human
 drives independent jobs, judging results between steps; the label plus the
 `workflow note` journal make that project visible (workflow list/show, Galaxy
 hubs, `/workflows/<label>`) and the journal keeps its body verbatim.
@@ -82,17 +82,18 @@ The supported one-liner is `gitmoot setup`, which registers the repo and an
 agent in one command (`--watch-issues` defaults on, so the daemon comes up
 tagging-ready). `--repo`, `--agent`, `--runtime`, and `--session` are all
 **required** (setup exits with an error if any is missing); `--session` takes a
-runtime session reference, `last`, or a shell command:
+runtime session reference (for omp a session UUID or `fresh:<suffix>`, never
+`last`) or a shell command:
 
 ```sh
-gitmoot setup --repo owner/repo --agent reviewer --runtime codex --session last --start-daemon
+gitmoot setup --repo owner/repo --agent reviewer --runtime omp --session fresh:reviewer --start-daemon
 ```
 
 Or the manual path:
 
 1. Confirm the repo identity and GitHub auth.
-2. Run `gitmoot doctor` to validate `gh auth` and runtime credentials before
-   anything can stall on them.
+2. Run `gitmoot doctor` to validate `gh auth`, the required `omp` runtime, and
+   registered agent runtimes before anything can stall on them.
 3. Start the daemon.
 4. Start or subscribe at least one agent.
 5. Verify the agent is healthy before asking PR comments to route jobs.
@@ -102,7 +103,7 @@ gh repo view --json nameWithOwner
 gh auth status
 gitmoot doctor
 gitmoot daemon start
-gitmoot agent start reviewer --runtime codex --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
+gitmoot agent start reviewer --runtime omp --repo owner/repo --role reviewer --capability ask --capability review --start-daemon
 gitmoot agent doctor reviewer
 ```
 
@@ -159,7 +160,7 @@ Use the thermo template for strict review-only work. It should not implement cod
 or request implementation capability.
 
 ```sh
-gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
+gitmoot agent start thermo-review --runtime omp --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
 
 PR comment:
@@ -178,7 +179,7 @@ confirms it is installed before an agent references it.
 ```sh
 gitmoot agent template list --tag review
 gitmoot agent start frontend-reviewer \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --template frontend-reviewer \
   --role reviewer \
@@ -191,7 +192,8 @@ was edited keeps the prompt it was created with; only later jobs see the change.
 
 ## Current-Chat Planner
 
-Use the same `planner` template in the current Codex or Claude chat when the
+Use the same `planner` template in the current chat (a Claude Code or Codex
+session with the Gitmoot plugin, or an omp session) when the
 user wants a fast implementation plan and the current session already has the
 repo context. Load the prompt with `gitmoot agent prompt planner` when it is
 cached, or read the packaged `agent-templates/planner.md` instructions from the
@@ -207,7 +209,7 @@ Use the Gitmoot planner here. Write a task-by-task implementation plan for this 
 
 Gate implementation on an approved plan when the change is non-trivial. The
 gate composes existing primitives — an ask job, a workflow note, an org
-directive — so it works unchanged on Codex, Claude, and Kimi seats, and the
+directive — so it works unchanged on any seat, and the
 approval survives restarts because every step is durable state rather than
 conversation.
 
@@ -284,7 +286,7 @@ run as a tracked Gitmoot background agent job.
 
 ```sh
 gitmoot agent start project-planner \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --path . \
   --template planner \
@@ -297,7 +299,7 @@ Ask from a PR comment:
 /gitmoot project-planner ask Write a task-by-task implementation plan for this feature.
 ```
 
-Ask directly from a local Codex or Claude Code chat by having the runtime call
+Ask directly from a local Claude Code or Codex chat (with the Gitmoot plugin) by having the session call
 the Gitmoot CLI when the user explicitly wants a registered background-capable
 agent path:
 
@@ -336,15 +338,13 @@ through a runtime adapter.
 Background jobs are scheduled against three distinct resources:
 
 - repo checkout mutexes for daemon ticks that use the same local checkout;
-- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for Codex,
-  Claude, and Kimi delivery;
+- runtime session locks keyed as `runtime:<runtime>:<runtime_ref>` for
+  resumable-session delivery (omp runs a fresh session per job, so it takes none);
 - branch locks for implementation ownership and merge safety.
 
 Delivery is self-healing — a job whose events show one of these errors and then
 a success is working as designed, not flaky:
 
-- **Dead pinned session (#443):** when a Claude `--resume` target no longer
-  exists, delivery retries on a fresh session and re-pins the agent to it.
 - **Transient auth errors (#487/#509):** a transient 401 ("socket connection
   closed unexpectedly") under concurrency is retried with backoff; the old
   session is not abandoned.
@@ -445,8 +445,8 @@ than one, or forkable temporary workers. By default `[parallel_sessions]` uses
 `same_session = "fork_temp_session"`, `merge_back = "summary"`,
 `max_temp_sessions_per_agent = 4`, and
 `eligible_actions = ["ask", "review", "implement"]`. Same-checkout work remains
-serialized; same-runtime Codex/Claude jobs can fork only when the action is
-eligible and implementation jobs have a safe task worktree.
+serialized; temp-session forking applies only to resumable-session runtimes, so
+omp jobs (fresh session per job) never fork.
 
 ### Running one agent's jobs in parallel
 
@@ -461,8 +461,8 @@ jobs, where two mechanisms spin extra sessions for you:
    4`: when a registered agent's session is busy and another **eligible**
    background job (`ask`/`review`/`implement`) is queued for it, the daemon forks
    a throwaway temp worker from that agent so the jobs run in parallel. Same
-   runtime only (Codex/Claude/Kimi); same-checkout work stays serialized; an
-   `implement` fork needs a safe task worktree. Nothing to configure.
+   resumable-session runtime only, so it never applies to omp; same-checkout
+   work stays serialized; an `implement` fork needs a safe task worktree.
 2. **Managed agent types (`max_background`).** `gitmoot agent type set <type>
    --max-background N` defines a *pool* of named, reusable managed instances.
    Dispatch to the type with `gitmoot agent run <type> --type <type>
@@ -503,17 +503,17 @@ parallel or in dependency order, and a finale (continuation) reconvenes and
 synthesizes the results. This is how you orchestrate an orchestra of agents
 across different runtimes.
 
-A coordinator agent can fan work out to other agents running on different
-runtimes by returning a `delegations` array in its `gitmoot_result`. Gitmoot
+A coordinator agent can fan work out to other agents by returning a
+`delegations` array in its `gitmoot_result`. Gitmoot
 enqueues one child job per delegation, records a `delegation_enqueued` event on
 the coordinator job, and runs the children in the daemon. Start a coordinator
-and two workers on different runtimes so each delegation lands on the best model
-for the job:
+and two workers pinned to different omp models so each delegation lands on the
+best model for the job:
 
 ```sh
-gitmoot agent start coordinator --runtime codex --repo owner/repo --role planner --capability ask --start-daemon
-gitmoot agent start ui-worker --runtime claude --repo owner/repo --role reviewer --capability ask --capability review
-gitmoot agent start api-worker --runtime kimi --repo owner/repo --role reviewer --capability ask --capability review
+gitmoot agent start coordinator --runtime omp --model openai-codex/gpt-5.5 --repo owner/repo --role planner --capability ask --start-daemon
+gitmoot agent start ui-worker --runtime omp --model anthropic/claude-sonnet-4-5 --repo owner/repo --role reviewer --capability ask --capability review
+gitmoot agent start api-worker --runtime omp --model kimi-code/k3 --repo owner/repo --role reviewer --capability ask --capability review
 ```
 
 Queue the coordinator as background work so the daemon runs it and dispatches
@@ -577,7 +577,7 @@ These detached worktrees do **not** contain gitignored
 paths (e.g. vendored clones under `repos/**`) or any uncommitted working-tree
 changes, so an analysis/research leg cannot see the operator's live working tree
 there. Committed-tip ask/delegation isolation carries a note with the canonical
-base-checkout absolute path so a worker whose sandbox can read it (e.g. codex)
+base-checkout absolute path so a worker whose sandbox can read it
 reaches the real tree instead of reporting a working-tree feature as absent.
 Review deliberately keeps its exact-head binding and does not add that
 committed-tip context note. For whole-working-tree ask analysis, use a foreground

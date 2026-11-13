@@ -77,10 +77,10 @@ func TestSeatSetupReportsWhenTheSeatsOwnRuntimeIsPublishedUnavailable(t *testing
 
 	t.Run("own runtime unavailable is reported with its cause", func(t *testing.T) {
 		hostBin := t.TempDir()
-		writeRuntimeFixture(t, hostBin, "claude", unstageableRuntimeFixture)
+		writeRuntimeFixture(t, hostBin, runtime.OmpRuntime, unstageableRuntimeFixture)
 		prependRuntimeFixturePath(t, hostBin)
 
-		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.ClaudeRuntime), checkout, "gitmoot/gitmoot", true)
+		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.OmpRuntime), checkout, "gitmoot/gitmoot")
 		if err != nil {
 			t.Fatalf("seat setup returned an error rather than reporting the capability: %v", err)
 		}
@@ -89,17 +89,17 @@ func TestSeatSetupReportsWhenTheSeatsOwnRuntimeIsPublishedUnavailable(t *testing
 		}
 		// The CAUSE is the only part that tells an operator what to repair. The
 		// exit-126 stderr line the seat produces today carries none of it.
-		if !strings.Contains(grants.runtimeUnavailable, "claude") || !strings.Contains(grants.runtimeUnavailable, "absent-interpreter-1817") {
+		if !strings.Contains(grants.runtimeUnavailable, runtime.OmpRuntime) || !strings.Contains(grants.runtimeUnavailable, "absent-interpreter-1817") {
 			t.Errorf("cause %q does not name the runtime and the staging failure", grants.runtimeUnavailable)
 		}
 	})
 
 	t.Run("own runtime stages so nothing is reported", func(t *testing.T) {
 		hostBin := t.TempDir()
-		writeRuntimeFixture(t, hostBin, "claude", stageableRuntimeFixture)
+		writeRuntimeFixture(t, hostBin, runtime.OmpRuntime, stageableRuntimeFixture)
 		prependRuntimeFixturePath(t, hostBin)
 
-		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.ClaudeRuntime), checkout, "gitmoot/gitmoot", true)
+		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.OmpRuntime), checkout, "gitmoot/gitmoot")
 		if err != nil {
 			t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 		}
@@ -109,49 +109,48 @@ func TestSeatSetupReportsWhenTheSeatsOwnRuntimeIsPublishedUnavailable(t *testing
 	})
 
 	t.Run("a sibling runtime being unavailable reports nothing for this seat", func(t *testing.T) {
-		// SCOPE CONTROL. Every seat stages all three runtime classes, so a host
-		// missing kimi would report every claude seat unavailable if the
+		// SCOPE CONTROL. Every seat stages the sibling provider CLIs too, so a
+		// host missing kimi would report every omp seat unavailable if the
 		// predicate keyed on the staging pass rather than on the seat's own
 		// runtime.
 		hostBin := t.TempDir()
-		writeRuntimeFixture(t, hostBin, "claude", stageableRuntimeFixture)
+		writeRuntimeFixture(t, hostBin, runtime.OmpRuntime, stageableRuntimeFixture)
 		writeRuntimeFixture(t, hostBin, "kimi", unstageableRuntimeFixture)
 		prependRuntimeFixturePath(t, hostBin)
 
-		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.ClaudeRuntime), checkout, "gitmoot/gitmoot", true)
+		grants, err := readOnlyRuntimeSandboxGrants(t.TempDir(), seat(runtime.OmpRuntime), checkout, "gitmoot/gitmoot")
 		if err != nil {
 			t.Fatalf("readOnlyRuntimeSandboxGrants: %v", err)
 		}
 		if grants.runtimeUnavailable != "" {
-			t.Fatalf("an unavailable SIBLING runtime was reported against a claude seat: %q", grants.runtimeUnavailable)
+			t.Fatalf("an unavailable SIBLING runtime was reported against an omp seat: %q", grants.runtimeUnavailable)
 		}
 	})
 }
 
+// supportedOmpSeatPreflight answers the runtime contract probe for the fixture
+// omp, which is a stub rather than a real omp, so the job reaches seat setup.
+func supportedOmpSeatPreflight(context.Context, runtime.Agent, runtime.RuntimeContractRequest) runtime.RuntimeContractResult {
+	return runtime.RuntimeContractResult{Runtime: runtime.OmpRuntime, Binary: "omp", Version: "omp/18.18.6", State: runtime.RuntimeContractSupported}
+}
+
 // seedUnavailableRuntimeSeatJob builds the worker-route fixture shared by the
-// two arms below: a claude review seat on a host whose claude cannot be staged.
+// two arms below: an omp review seat on a host whose omp cannot be staged.
 func seedUnavailableRuntimeSeatJob(t *testing.T, jobID string) (*db.Store, string, string) {
 	t.Helper()
 	hostBin := t.TempDir()
-	writeRuntimeFixture(t, hostBin, "claude", unstageableRuntimeFixture)
+	writeRuntimeFixture(t, hostBin, runtime.OmpRuntime, unstageableRuntimeFixture)
 	prependRuntimeFixturePath(t, hostBin)
+	readOnlySeatOmpBrokerEnv(t)
 
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// The seat stages its credential from this directory. It has to exist, or
-	// setup fails on the credential before it ever reaches the capability
-	// question and the test would prove nothing.
-	sourceDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"),
-		[]byte(`{"claudeAiOauth":{"accessToken":"fixture-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "gm-review-opus", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "gm-review-opus", runtime.OmpRuntime,
+		"", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "gm-review-opus", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	return store, home, checkout
 }
@@ -173,6 +172,7 @@ func TestSeatRuntimeUnavailableEndsARealAdapterJobBlockedNotFailed(t *testing.T)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
+	worker.RuntimePreflight = supportedOmpSeatPreflight
 	job, err := store.GetJob(ctx, "seat-runtime-unavailable")
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +204,7 @@ func TestSeatRuntimeUnavailableEndsARealAdapterJobBlockedNotFailed(t *testing.T)
 	// Each field earns its assertion: the AGENT is who a coordinator must
 	// re-dispatch away from, the RUNTIME is the capability that is absent, and
 	// the CAUSE is what an operator repairs.
-	for _, want := range []string{"gm-review-opus", runtime.ClaudeRuntime, "absent-interpreter-1817"} {
+	for _, want := range []string{"gm-review-opus", runtime.OmpRuntime, "absent-interpreter-1817"} {
 		if !strings.Contains(refusal, want) {
 			t.Errorf("%q event %q does not name %q", seatRuntimeUnavailableEvent, refusal, want)
 		}
@@ -218,7 +218,7 @@ func TestSeatRuntimeUnavailableEndsARealAdapterJobBlockedNotFailed(t *testing.T)
 // An injected adapter never execs the runtime's declared binary, so an absent
 // one is not its precondition. A refusal keyed on absence alone rather than on
 // the real-adapter discriminator refused work that would have run: measured, it
-// failed five existing tests on this host, and it would refuse every claude
+// failed five existing tests on this host, and it would refuse every omp
 // seat in CI, where no runtime CLI is installed at all.
 func TestSeatRuntimeUnavailableDoesNotRefuseAnInjectedAdapter(t *testing.T) {
 	ctx := context.Background()
@@ -230,11 +230,12 @@ func TestSeatRuntimeUnavailableDoesNotRefuseAnInjectedAdapter(t *testing.T) {
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
+	worker.RuntimePreflight = supportedOmpSeatPreflight
 	// Assigning AdapterFactory directly withdraws the real-adapter declaration,
 	// which is exactly what ~22 fixtures in this package already do.
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 		launched = true
-		return runtime.ClaudeAdapter{Runner: runner}, nil
+		return runtime.OmpAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, "seat-runtime-injected")
 	if err != nil {
@@ -265,19 +266,19 @@ func TestSeatRuntimeUnavailableDoesNotRefuseAnInjectedAdapter(t *testing.T) {
 func TestSeatRuntimeUnavailableIgnoresAnUnrelatedPublishedRoot(t *testing.T) {
 	const root = "/home/.gitmoot/runtimes"
 	staged := []string{
-		filepath.Join(root, "claude-ba7128fd22b1bc20", ".bin", "claude"),
+		filepath.Join(root, "omp-ba7128fd22b1bc20", ".bin", "omp"),
 		filepath.Join(root, "kimi"+toolchain.UnavailableRuntimeSuffix, ".bin", "kimi"),
 	}
-	if cause := seatRuntimeUnavailable(runtime.ClaudeRuntime, staged, nil); cause != "" {
-		t.Errorf("a content-addressed claude root was read as unavailable: %q", cause)
+	if cause := seatRuntimeUnavailable(runtime.OmpRuntime, staged, nil); cause != "" {
+		t.Errorf("a content-addressed omp root was read as unavailable: %q", cause)
 	}
-	if cause := seatRuntimeUnavailable(runtime.KimiRuntime, staged, nil); cause == "" {
+	if cause := seatRuntimeUnavailable("kimi", staged, nil); cause == "" {
 		t.Errorf("a published-unavailable kimi root was read as available")
 	}
 	// An absent executable produces no staging diagnostic at all, so the shim
 	// alone has to be enough of a fact, and it must not borrow another
 	// runtime's diagnostic.
-	cause := seatRuntimeUnavailable(runtime.KimiRuntime, staged, []string{"runtime codex could not be staged: unrelated"})
+	cause := seatRuntimeUnavailable("kimi", staged, []string{"runtime codex could not be staged: unrelated"})
 	if !strings.Contains(cause, "kimi") || strings.Contains(cause, "codex") {
 		t.Errorf("cause %q borrowed another runtime's diagnostic or lost the runtime name", cause)
 	}
@@ -314,11 +315,12 @@ func seedUnavailableToolchainReviewSeat(t *testing.T, jobID string, action strin
 func seedToolchainReviewSeat(t *testing.T, jobID string, action string, goModule bool) (*db.Store, string, string) {
 	t.Helper()
 	hostBin := t.TempDir()
-	// The POSITIVE CONTROL rides inside the fixture: claude stages, so a
+	// The POSITIVE CONTROL rides inside the fixture: omp stages, so a
 	// failure here can only come from the toolchain predicate.
-	writeRuntimeFixture(t, hostBin, "claude", stageableRuntimeFixture)
+	writeRuntimeFixture(t, hostBin, runtime.OmpRuntime, stageableRuntimeFixture)
 	writeRuntimeFixture(t, hostBin, "go", unstageableGoFixture)
 	prependRuntimeFixturePath(t, hostBin)
+	readOnlySeatOmpBrokerEnv(t)
 
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
@@ -340,16 +342,11 @@ func seedToolchainReviewSeat(t *testing.T, jobID string, action string, goModule
 		runGit(t, checkout, "commit", "-m", "require a Go release no host has")
 	}
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	sourceDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"),
-		[]byte(`{"claudeAiOauth":{"accessToken":"fixture-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "gm-review-opus", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440000", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "gm-review-opus", runtime.OmpRuntime,
+		"", []string{"review", "ask"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "gm-review-opus", Action: action, Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	return store, home, checkout
 }
@@ -363,6 +360,7 @@ func runUnavailableToolchainSeatJob(t *testing.T, store *db.Store, home string, 
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
+	worker.RuntimePreflight = supportedOmpSeatPreflight
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +397,7 @@ func TestSeatToolchainUnavailableEndsAReviewBlockedNotVerdicted(t *testing.T) {
 			refusal = event.Message
 		}
 		// The sibling arm must stay silent, or this test would pass on the
-		// wrong predicate: the fixture's claude stages successfully.
+		// wrong predicate: the fixture's omp stages successfully.
 		if event.Kind == seatRuntimeUnavailableEvent {
 			t.Fatalf("%q fired on a seat whose own runtime staged: %s", seatRuntimeUnavailableEvent, event.Message)
 		}
@@ -444,7 +442,7 @@ func TestSeatToolchainUnavailableDoesNotRefuseANonReviewSeat(t *testing.T) {
 func TestSeatToolchainUnavailableDoesNotRefuseANonGoReview(t *testing.T) {
 	t.Setenv("GOWORK", "off")
 	store, home, checkout := seedToolchainReviewSeat(t, "seat-toolchain-non-go", "review", false)
-	// No Go anywhere: only the fixture dir (claude, unstageable go) and the
+	// No Go anywhere: only the fixture dir (omp, unstageable go) and the
 	// system dirs git needs.
 	var kept []string
 	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {

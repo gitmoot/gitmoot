@@ -23,7 +23,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/presence"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
@@ -588,7 +587,6 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 		} else {
 			writeLine(stdout, "build: unknown")
 		}
-		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
 	writeLine(stdout, "%s", daemonDiskGuardLine(paths))
@@ -742,24 +740,6 @@ func daemonAdmissionLine(paths config.Paths) string {
 		memory = fmt.Sprintf("%gGB", policy.MaxMemoryGB)
 	}
 	return fmt.Sprintf("admission budget: max_concurrent_sessions=%s max_memory_gb=%s", sessions, memory)
-}
-
-// daemonClaudeAuthLine reports the authoritative per-delivery Claude auth source.
-// It never inspects the daemon process environment because adapter builds reload
-// runtime-auth.env independently of daemon lifetime.
-func daemonClaudeAuthLine(paths config.Paths) string {
-	state, err := loadRuntimeAuthFile(paths.Home)
-	if err != nil {
-		return "claude auth: warn (" + err.Error() + ")"
-	}
-	if state.Exists && len(state.Values) > 0 {
-		auth := runtime.InspectClaudeAuthEnv(runtimeAuthEffectiveLookup(state, nil))
-		return "claude auth: configured via " + runtimeAuthFileName + " (" + auth.MaskedDetail() + ")"
-	}
-	if state.Exists {
-		return "claude auth: fallback (runtime-auth.env explicitly empty); verify with `gitmoot auth probe claude`"
-	}
-	return "claude auth: fallback (runtime-auth.env missing); configure with `gitmoot auth set claude`"
 }
 
 func runDaemonLogs(args []string, stdout, stderr io.Writer) int {

@@ -2940,10 +2940,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 	for _, row := range unavailableRows {
 		unavailableRoles[row.Role] = row
 	}
-	var probeCache authProbeCache
-	if forDispatch {
-		probeCache = authProbeCache{}
-	}
 	pending := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
@@ -2974,16 +2970,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 					continue
 				}
 			}
-		}
-		// Auth-probe gate (#532 slice B): once a runtime_auth deferral's coarse hold
-		// elapses, only re-dispatch when a live doctor-style probe says the credential
-		// is VALID again — an Invalid verdict extends the hold (re-probe next cadence,
-		// no attempt burned). Non-auth deferrals and jobs with no probe wired pass
-		// straight through (coarse cadence only, byte-identical to slice A). The live
-		// probe runs ONLY for a dispatching caller (forDispatch); the warning-count
-		// path skips it so it never spawns a subprocess or mutates the payload.
-		if forDispatch && !authProbeAllowsRedispatch(ctx, worker, job, time.Now().UTC(), probeCache) {
-			continue
 		}
 		pending = append(pending, job)
 	}

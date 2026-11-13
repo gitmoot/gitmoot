@@ -1,2 +1,0 @@
-{"role":"assistant","type":"message","content":"Implemented the renderer."}
-{"role":"meta","type":"session.resume_hint","session_id":"session_sanitized","command":"kimi -r session_sanitized","content":"To resume this session: kimi -r session_sanitized"}

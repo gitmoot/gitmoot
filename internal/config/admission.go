@@ -27,16 +27,11 @@ type AdmissionPolicy struct {
 	// MaxMemoryGB caps the sum of the per-runtime RAM estimates of all in-flight
 	// session jobs. 0 (the default) means off — the memory gate is not applied.
 	MaxMemoryGB float64
-	// CodexMemoryGB / ClaudeMemoryGB / KimiMemoryGB are the per-runtime steady-state
-	// RAM priors (in GB) used by the memory gate, keyed by runtime name. The defaults
-	// reflect gitmoot's measured per-session spread (codex ~0.1-0.2, claude ~0.3-0.85,
-	// kimi in-between). They are operator-tunable.
-	CodexMemoryGB  float64
-	ClaudeMemoryGB float64
-	KimiMemoryGB   float64
-	// DefaultMemoryGB is the fallback RAM estimate (in GB) for a session runtime not
-	// otherwise mapped. A job whose runtime has no resumable session (the runtime
-	// session lock is also skipped for it) contributes 0 and is not session-counted.
+	// DefaultMemoryGB is the RAM estimate (in GB) for a session job. A job whose
+	// runtime has no resumable session (the runtime session lock is also skipped
+	// for it) contributes 0 and is not session-counted. The per-runtime
+	// codex/claude/kimi priors went with those runtimes (#2587); their keys are
+	// ignored if an old config still sets them.
 	DefaultMemoryGB float64
 }
 
@@ -46,9 +41,6 @@ func DefaultAdmissionPolicy() AdmissionPolicy {
 	return AdmissionPolicy{
 		MaxConcurrentSessions: 0,
 		MaxMemoryGB:           0,
-		CodexMemoryGB:         0.2,
-		ClaudeMemoryGB:        0.85,
-		KimiMemoryGB:          0.5,
 		DefaultMemoryGB:       0.5,
 	}
 }
@@ -107,18 +99,6 @@ func applyAdmissionPolicyField(policy *AdmissionPolicy, key string, value string
 		parsed, err := strconv.ParseFloat(value, 64)
 		policy.MaxMemoryGB = parsed
 		return err
-	case "codex_memory_gb":
-		parsed, err := strconv.ParseFloat(value, 64)
-		policy.CodexMemoryGB = parsed
-		return err
-	case "claude_memory_gb":
-		parsed, err := strconv.ParseFloat(value, 64)
-		policy.ClaudeMemoryGB = parsed
-		return err
-	case "kimi_memory_gb":
-		parsed, err := strconv.ParseFloat(value, 64)
-		policy.KimiMemoryGB = parsed
-		return err
 	case "default_memory_gb":
 		parsed, err := strconv.ParseFloat(value, 64)
 		policy.DefaultMemoryGB = parsed
@@ -135,15 +115,8 @@ func validateAdmissionPolicy(policy AdmissionPolicy) error {
 	if policy.MaxMemoryGB < 0 {
 		return fmt.Errorf("admission.max_memory_gb must be 0 (off) or positive")
 	}
-	for name, value := range map[string]float64{
-		"codex_memory_gb":   policy.CodexMemoryGB,
-		"claude_memory_gb":  policy.ClaudeMemoryGB,
-		"kimi_memory_gb":    policy.KimiMemoryGB,
-		"default_memory_gb": policy.DefaultMemoryGB,
-	} {
-		if value < 0 {
-			return fmt.Errorf("admission.%s must be 0 or positive", name)
-		}
+	if policy.DefaultMemoryGB < 0 {
+		return fmt.Errorf("admission.default_memory_gb must be 0 or positive")
 	}
 	return nil
 }

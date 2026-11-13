@@ -20,8 +20,10 @@ gh auth status
 ```
 
 `gitmoot doctor` is the environment preflight: it validates `gh auth` (with an
-actionable remediation hint) and live-probes the Claude credential selected by
-`runtime-auth.env`, so a bad credential is caught before jobs stall. Run it
+actionable remediation hint) and requires the `omp` job runtime, so a missing
+runtime is caught before jobs stall. Its `agent runtimes` check names any agent
+still registered on the removed `codex`, `claude`, or `kimi` runtimes (re-register
+those with `--runtime omp`). Run it
 after install and before starting the daemon. It also reports delegation
 worktree count and logical disk size, warning at 10 stale worktrees or 1 GB and
 distinguishing aged-final reclaimable owners from pinned non-final owners. A
@@ -76,7 +78,7 @@ still holds an older snapshot, the checkpoint does not wait; it retries a minute
 later.
 
 One-shot onboarding: `gitmoot setup` registers the repo and an agent in one
-command (`--repo owner/repo --agent <name> --runtime codex|claude|shell
+command (`--repo owner/repo --agent <name> --runtime omp|shell
 --session <ref> [--role <role>] [--path .] [--start-daemon]`). `--repo`,
 `--agent`, `--runtime`, and `--session` are all **required** — setup errors out
 if any is missing; `--session` takes a runtime session reference, `last`, or a
@@ -111,21 +113,15 @@ gitmoot plugin path codex
 gitmoot plugin path claude
 gitmoot plugin doctor codex
 gitmoot plugin doctor claude
-gitmoot plugin codex-launch --repo .
-gitmoot plugin codex-launch --config-snippet
 ```
 
 Claude scopes are supported with `--scope user|project|local`. Codex ignores
 `--scope` because the current Codex plugin install command does not use it.
-Use `plugin codex-launch` when Codex needs sandbox access to the resolved
-Gitmoot home on Linux, macOS, or Windows. It prints a `codex-face --cd ...
---add-dir ... -s workspace-write` launch command, or a persistent config
-snippet with `--config-snippet`.
 
 ## Runtime Metadata Registry
 
-Gitmoot drives five built-in runtimes (`codex`, `claude`, `kimi`, `omp`, plus the
-subscribe-only `shell`). Each carries
+Gitmoot drives two built-in runtimes: `omp`, the only job runtime, plus the
+subscribe-only `shell` for no-LLM tests. Each carries
 declarative metadata — advertised capabilities, a default model, an advisory list
 of known-valid models, and a descriptor of where token usage is read from. Inspect
 the resolved registry:
@@ -156,24 +152,21 @@ recorded metadata **without recompiling** — for example to retarget its defaul
 model/effort or record its known models:
 
 ```toml
-[runtimes.codex]
-default_model = "gpt-5.5-codex"
+[runtimes.omp]
+default_model = "anthropic/claude-sonnet-4-5"
 default_effort = "high"
-models = ["gpt-5.5-codex", "gpt-5.4-codex"]
+models = ["anthropic/claude-sonnet-4-5", "openai-codex/gpt-5.5"]
 capabilities = ["review", "implement", "ask"]
-usage_source = "codex exec --json turn.completed usage"
 ```
 
 Two fields are **behavioral**. `default_model` is the model fallback when neither
 the agent nor the job pins `--model`: agent/job `--model`, then `default_model`,
 then the runtime CLI's own default. `default_effort` follows the same precedence
-after job/agent `--effort`; for Codex, Gitmoot emits
-`-c model_reasoning_effort=<value>`, and for omp it becomes `--thinking <level>`
+after job/agent `--effort`; for omp it becomes `--thinking <level>`
 whenever the resolved value is one of omp's accepted levels
 (`off|minimal|low|medium|high|xhigh|max|auto`) — anything else is **dropped**, so
 a typo falls back to omp's own default instead of silently downgrading the seat.
-Claude and Kimi do not expose a reasoning
-effort argument, so the resolved value is a no-op for those adapters. Every other
+Every other
 field is **inspection-only**, surfaced by `gitmoot runtime list`
 but changing nothing at runtime: `models` is **advisory** (Gitmoot never rejects a
 `--model` based on it), and `capabilities` gates nothing at dispatch. Adapter
@@ -217,30 +210,6 @@ a daemon log line and refuses nothing.
 
 ## Runtime Ambient Credential Hygiene
 
-Claude runtime auth has one authoritative source:
-`~/.gitmoot/runtime-auth.env` (mode `0600`). Manage it without putting secrets
-on argv:
-
-```sh
-claude setup-token
-gitmoot auth set claude             # reads the token from stdin
-gitmoot auth status                 # local, masked, no paid runtime call
-gitmoot auth probe claude           # paid fresh-session liveness check
-gitmoot auth unset claude           # writes an explicit empty file
-```
-
-`auth set claude --var ANTHROPIC_API_KEY` and `--var
-ANTHROPIC_AUTH_TOKEN` select another managed variable. `--from-env` atomically
-copies currently set managed variables. The file is re-read for every Claude
-adapter build, so rotation takes effect on the next foreground or daemon
-delivery without a restart. If the file selects any managed variable, Gitmoot
-injects all three names and explicitly blanks absent ones; this prevents an
-ambient API key from outranking a file-selected OAuth token. An explicitly
-empty file injects nothing and allows Claude's normal ambient/credential-store
-fallback. The first adapter build imports legacy `daemon-runtime.env` when the
-new file is absent, otherwise it seeds from ambient managed variables once;
-existing authoritative files are never overwritten.
-
 Shared named keys use a separate operator-owned keychain file, defaulting to
 `<base-home>/.config/gitmoot/keychain.env` (override with
 `[credentials] keychain_path`). The CLI manages names, modes, and proxy
@@ -276,13 +245,10 @@ model_gateway_allow_hosts = ["api.anthropic.com"]
 # keychain_path = "/absolute/operator/path/keychain.env"
 ```
 
-Set `model_gateway = true` to opt local Claude into the daemon-owned loopback
-model gateway and to make broker material available to remote shell and OMP
-jobs. Each local Claude delivery receives a random job-scoped placeholder and
-`ANTHROPIC_BASE_URL`; only the gateway holds the snapshotted real credential and
-it forwards only to an exact allowlisted hostname. Gateway startup, credential,
-and allowlist failures are fail-closed. The option is off by default and does
-not enable standalone Codex, Claude, or Kimi runtimes on `remote`. Remote shells
+Set `model_gateway = true` to make broker material available to remote shell
+and OMP jobs. Gateway startup, credential, and allowlist failures are
+fail-closed, and the gateway forwards only to an exact allowlisted hostname.
+The option is off by default. Remote shells
 get `GITMOOT_CREDENTIAL_GATEWAY_CURL_CONFIG` with a lease-bounded mTLS identity
 and capability. Remote OMP uses an instance-local forwarder and a job-scoped
 model catalog for the `openai-codex`, `xai-oauth`, `kimi-code` and `devin`
@@ -291,7 +257,7 @@ providers (for example `openai-codex/gpt-6-sol`, `xai-oauth/grok-4.7`,
 credentials remain host-side.
 
 Those remote OMP models require `[credentials].model_gateway_key` to
-point to a proxied host key for the host OMP auth-gateway, with Codex, xAI and
+point to a proxied host key for the host OMP auth-gateway, with `openai-codex`, xAI and
 Devin credentials in its broker. The default Anthropic upstream does not
 serve `/v1/pi/stream`. Allowlist the upstream host; a loopback route also
 requires `model_gateway_allow_loopback_upstream = true`.
@@ -304,9 +270,7 @@ daemon environment exactly as before. With it enabled, the base allowlist is:
 `GOTOOLCHAIN`, `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`,
 `GIT_COMMITTER_EMAIL`, and `GITMOOT_HOME`.
 
-Codex additionally receives `CODEX_HOME`. Claude receives `CLAUDE_CONFIG_DIR`;
-its three managed auth names are then resolved from `runtime-auth.env` at the
-adapter seam described above. omp receives **routing plumbing only** —
+omp receives **routing plumbing only** —
 `OMP_PROFILE`, `PI_PROFILE`, `PI_CODING_AGENT_DIR`, `PI_SMOL_MODEL`,
 `PI_SLOW_MODEL`, `PI_PLAN_MODEL`, `OMP_AUTH_BROKER_URL`, and
 `OMP_AUTH_BROKER_TOKEN` — and **no** raw provider key, so under curation a
@@ -316,7 +280,7 @@ explicit `env_passthrough` entry. Two caveats: the broker URL/token pair is
 dropping only the token turns an inherited URL into a hard failure), and
 `--profile` selects omp's auth/state store without isolating process
 environment, so a passed-through key is visible to every omp profile this daemon
-runs. Kimi and shell add nothing.
+runs. shell adds nothing.
 Gitmoot-owned relay variables are appended after the base and remain available.
 
 `env_passthrough` accepts exact names or a single trailing-`*` prefix glob.
@@ -332,12 +296,9 @@ With curation enabled, `github = "deny"` is the default. All ambient `GH_*` and
 cancellation. `github = "inherit"` is the explicit opt-out: ambient `GH_*` and
 `GITHUB_*` variables pass through and Gitmoot adds neither GitHub variable.
 
-Two limits apply: env-var routing is cooperative, not a hard egress boundary —
+One limit applies: env-var routing is cooperative, not a hard egress boundary —
 a malicious agent can unset it; this buys credential custody/policy/attribution,
-not enforcement. The strong "agents never hold real credentials" claim also
-requires Landlock read-rules for `runtime-auth.env` (same-UID read is currently
-possible) — that is P3. Codex/Kimi custody and hard egress enforcement also
-remain P3.
+not enforcement. Hard egress enforcement remains P3.
 
 ## Execution Backend
 
@@ -423,20 +384,20 @@ excluded. Gitmoot validates paired, non-zero numeric IDs but cannot portably
 verify host group exclusivity. Omitting uid/gid preserves the daemon identity.
 
 The runtime executable must be traversable by the configured uid too. If a
-root daemon resolves `claude` or `codex` below `/root`, install the runtime at
+root daemon resolves `omp` below `/root`, install the runtime at
 an accessible location and put it first in the daemon's `PATH`; do not loosen
 `/root` permissions. An inaccessible executable fails startup with no root
 fallback.
 
 For daemon jobs that own an execution-backend lifecycle, runtime contract
 preflight evaluates UID-dependent requirements against configured `local_uid`.
-This lets a root daemon dispatch Claude with `danger-full-access` to a non-root
-local backend without weakening Claude's root refusal. Host-only paths such as
+This lets a root daemon dispatch a runtime whose contract refuses root to a
+non-root local backend without weakening that refusal. Host-only paths such as
 `gitmoot job run` do not provision that lifecycle and still evaluate the host
 process identity. When `local_uid` is absent, daemon jobs do the same.
 
 To prove a parallel local wave, use an isolated `--home`, one distinct
-`fresh:<suffix>` session per Claude leg, and a daemon started with `--parallel
+`fresh:<suffix>` session per leg, and a daemon started with `--parallel
 N`. Dispatch all legs together with `--background` and
 `--skip-native-review-fanout`. Each parsed `gitmoot_result` should report UID,
 GID, workspace, start/end timestamps, and visible markers. The gate passes only
@@ -800,11 +761,6 @@ remote_reviews_below_bytes = 20000000000
 restores normal routing. Setting `min_free_percent = 0` removes the separate
 percentage floor. Unknown or invalid measurements still fail closed.
 
-- **Runtime:** a review whose runtime cannot run remotely (codex) runs as omp
-  with the **same model** (event `disk_guard_runtime_changed`). If omp cannot
-  reach that model in the sandbox, the review is not moved and keeps waiting.
-  A different model is never substituted. If the remote run then does not
-  start, the review goes back to its own runtime and model.
 - **CI:** a moved review is admitted when the repository reports **no checks at
   all**. Failing or still-running checks keep blocking it, and a repository
   with `remote_require_ci_green = true` keeps requiring green CI.
@@ -902,18 +858,12 @@ this pass. Before this the reason reached daemon stdout only, so
 one about to start. The event is throttled to one row per job per distinct reason
 every five minutes, matching the log line it accompanies.
 
-Claude runtime auth is independent of daemon restarts. Use `gitmoot auth set
-claude` to rotate the owner-only `runtime-auth.env`; the next delivery observes
-it. Use `gitmoot auth unset claude` to write the explicit-empty state. Do not
-delete the file to unset auth, because a missing file is eligible for one-time
-legacy/environment bootstrap.
-
 An opt-in, off-by-default `[admission]` config section adds a host-global
 concurrency budget the daemon applies **before** starting each agent session,
 on top of `--workers`/pool and the per-repo locks (#365):
 `max_concurrent_sessions` caps total in-flight sessions across all repos, and
-`max_memory_gb` caps the summed per-runtime RAM estimate (tunable priors:
-`codex_memory_gb`, `claude_memory_gb`, `kimi_memory_gb`, `default_memory_gb`).
+`max_memory_gb` caps the summed per-runtime RAM estimate (tunable prior:
+`default_memory_gb`).
 With both caps `0` (the default) it is disabled. A job that does not fit is
 left **queued** and retried next tick — never failed — so on a small host
 "jobs stay queued" can mean the admission budget is holding them. The budget is
@@ -924,7 +874,7 @@ backoff** over the `gh`/API calls gitmoot issues **from the daemon process** —
 polling, comments, merges, status (#683). It is enforced **per daemon process**
 (like the admission budget), so it does not reach separate foreground processes (a
 foreground `gitmoot orchestrate`/`pool`/`review`/`pr comment`) or the `gh` calls a
-codex/claude runtime subprocess makes on its own. GitHub's **secondary**
+runtime subprocess makes on its own. GitHub's **secondary**
 (abuse-detection) rate limit fires on burstiness/concurrency — not total volume —
 so a busy daemon plus concurrent in-process calls can trip it (HTTP 403 "secondary
 rate limit") and freeze all GitHub ops even while the primary quota is fine. The limiter smooths bursts and, on a
@@ -1543,20 +1493,21 @@ Start a new runtime session managed by Gitmoot:
 
 ```sh
 gitmoot agent start reviewer \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --path . \
   --role reviewer \
   --capability ask \
   --capability review \
-  --model gpt-5-codex \
+  --model anthropic/claude-sonnet-4-5 \
   --effort high \
   --start-daemon
 ```
 
-`--runtime` accepts `codex`, `claude`, `kimi`, or `omp`. `kimi` is
-the current Kimi Code CLI. Run `kimi login` first and restart
-the Gitmoot daemon so it inherits the session. `agent subscribe` additionally
+`--runtime` accepts `omp`, the only job runtime. Agents registered on the
+removed `codex`, `claude`, or `kimi` runtimes still load, but `agent list` warns
+about them, `gitmoot doctor` names them, and their jobs are refused; re-register
+them with `--runtime omp`. `agent subscribe` additionally
 accepts `--runtime shell`, the deterministic no-LLM adapter whose `--session`
 is a **command** (the job prompt arrives as `$1`; stdout must carry the
 `gitmoot_result` envelope) — the workhorse for deterministic E2E tests.
@@ -1596,10 +1547,10 @@ an omp seat:
 - **OMP runtime-family diversity uses runtime-reported upstream-provider
   evidence.** A successful delivery whose final runtime message identifies its
   provider and model records that provider in the append-only event ledger; the
-  OMP wrapper remains `effective_runtime=omp`. Providers shared with native
-  adapters compare as the same family: `openai` and `openai-codex` map to
-  Codex, `anthropic` maps to Claude, and `kimi-code` maps to Kimi. Providers
-  without a native adapter stay namespaced, for example `omp:devin`. Different
+  OMP wrapper remains `effective_runtime=omp`. Well-known providers collapse to
+  fixed family labels: `openai` and `openai-codex` map to `codex`, `anthropic`
+  maps to `claude`, and `kimi-code` maps to `kimi`. Other providers stay
+  namespaced, for example `omp:devin`. Different
   models and agent names on one provider remain the same family. The comparison
   is advisory, not an independence gate: same-family comparisons emit
   `merge_gate_family_advisory`, while unresolved comparisons retain the
@@ -1628,8 +1579,8 @@ an omp seat:
 
 `agent start`, `agent subscribe`, and `agent type set` accept an optional
 `--model <name>` flag that sets the agent's default runtime model. It is a
-free-form, runtime-scoped string (a Codex, Claude Code, Kimi Code, or omp
-model name) with no allow-list; both `--model X` and `--model=X` are accepted.
+free-form, runtime-scoped string (an omp `provider/model` name such as
+`anthropic/claude-sonnet-4-5`) with no allow-list; both `--model X` and `--model=X` are accepted.
 A per-job `--model` (or a delegation's `model` field) overrides this default,
 and an omitted model preserves the runtime's own default. The same default can
 be set in config under `[agents.<type>].model`.
@@ -1638,20 +1589,19 @@ The same commands accept `--effort <value>` as the agent's default reasoning
 effort, and `agent run`, `ask`, `review`, and `orchestrate` accept it
 as a per-job override. The resolution order mirrors model selection: job effort,
 agent effort, `[runtimes.<runtime>].default_effort`, then no explicit override.
-Values are free-form pass-through strings. Codex receives
-`-c model_reasoning_effort=<value>`; omp receives `--thinking <level>` when the
+Values are free-form pass-through strings. omp receives `--thinking <level>` when the
 resolved value is one of `off|minimal|low|medium|high|xhigh|max|auto` and no flag
-at all otherwise; Claude and Kimi ignore the setting.
+at all otherwise.
 
 `agent start` and `agent subscribe` accept `--policy` (default `auto`). The policy
 maps to the runtime permission mode and decides what a headless job may do:
 
-| `--policy` | Claude `--permission-mode` | Headless capability |
+| `--policy` | omp `--approval-mode` | Headless capability |
 |---|---|---|
-| `read-only` | `plan` | inspect/report only, no writes |
-| `workspace-write` | `acceptEdits` | file edits only — does NOT unblock Bash (`go`/`git`/`gh`) |
-| `danger-full-access` | `bypassPermissions` | full implementation: file writes plus Bash |
-| `auto` (default) | *(no flag)* | non-deterministic — inherited from ambient Claude config |
+| `read-only` | `always-ask` | inspect/report only, no writes (a kernel-enforced read-only seat passes `yolo` inside Landlock) |
+| `workspace-write` | `write` | in-directory file edits only — shell commands are refused |
+| `danger-full-access` | `yolo` | full implementation: file writes plus shell |
+| `auto` (default) | `yolo` | widened to full access |
 
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability
@@ -1664,26 +1614,19 @@ blocked). See `references/SAFETY.md` for the full mapping and rationale.
 Implement jobs own the commit contract: Gitmoot commits and delivers the
 worktree's changes after the job finishes, and every rendered implement prompt
 carries one deterministic sentence telling the worker not to run `git commit`
-or `git push`. Ask and review prompts are unchanged. On the Codex runtime, a
-`workspace-write` job whose checkout is a linked `git worktree` also gets the
-worktree's resolved git directory (`<main-repo>/.git/worktrees/<name>`) added
-to the sandbox writable roots via `--add-dir`, so routine git metadata writes
-(an index refresh from `git status`, or `git add`) work inside the sandbox.
-The grant is additive and leaves operator-configured `writable_roots` intact;
-read-only and danger-full-access sandboxes and primary (non-worktree)
-checkouts are unchanged.
+or `git push`. Ask and review prompts are unchanged.
 
 Subscribe an existing runtime session:
 
 ```sh
 gitmoot agent subscribe reviewer \
-  --runtime codex \
-  --session <session-id-or-last> \
+  --runtime omp \
+  --session fresh:reviewer \
   --repo owner/repo \
   --role reviewer \
   --capability ask \
   --capability review \
-  --model gpt-5-codex \
+  --model anthropic/claude-sonnet-4-5 \
   --effort high
 
 # Deterministic shell runtime: the session is a command, not a session id.
@@ -1784,7 +1727,7 @@ gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this P
 gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --model gpt-5-codex "Review this PR."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --model openai-codex/gpt-5.5 "Review this PR."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --effort xhigh "Review this PR."
 gitmoot job watch <job-id>
 ```
@@ -1965,21 +1908,21 @@ the stale name.
 `gitmoot agent run`, `ask`, and `review` (and `orchestrate`) accept
 an optional `--model <name>` flag that pins the runtime model for that one job,
 overriding the agent's configured default. It is a free-form, runtime-scoped
-string (a Codex, Claude Code, Kimi Code, or omp model name) with no allow-list;
+string (an omp `provider/model` name) with no allow-list;
 an omitted `--model` leaves the agent's default model in effect. Both `--model X`
 and `--model=X` are accepted.
 
 `--effort <value>` and `--effort=<value>` select reasoning effort for one job
 with the same job-over-agent-over-registry precedence. Gitmoot does not validate
-an allow-list; Codex validates the forwarded value.
+an allow-list; a value outside omp's accepted `--thinking` levels emits no flag.
 
 The same commands accept an optional per-job `--runtime
-codex|claude|kimi|omp|shell` override: that ONE job runs through the
+omp|shell` override: that ONE job runs through the
 named runtime while the agent's registered default runtime stays untouched
 (`agent show` is unchanged afterwards). An overridden job never resumes — and
 never writes back to — the agent's default-runtime session: it runs on a fresh
-session of the override runtime, or on an explicit `--session <ref>` (a
-Codex/Claude session id, a Kimi session id, an omp session UUID or
+session of the override runtime, or on an explicit `--session <ref>` (an omp
+session UUID or
 `fresh:<suffix>`, or — required for `shell` — a command; `last` is rejected
 because it resumes whichever session is most
 recent rather than a concrete one), and its runtime-session lock names the
@@ -1996,9 +1939,8 @@ so an `orchestrate --runtime` tree stays on the override runtime across
 generations:
 
 ```sh
-# Retry a hard review through Claude without re-registering the reviewer:
-gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --runtime claude
-gitmoot agent ask reviewer "Compare the approaches." --repo owner/repo --runtime kimi --model kimi-k2
+# Run one job on a different omp model without re-registering the reviewer:
+gitmoot agent review reviewer --repo owner/repo --pr 123 "Re-review this PR." --runtime omp --model anthropic/claude-opus-4-6
 
 # Route one job through omp's router; --effort becomes omp's --thinking level:
 gitmoot agent ask reviewer "Summarize the risk in this diff." --repo owner/repo --runtime omp --effort high
@@ -2046,7 +1988,7 @@ Start an orchestra of agents with `gitmoot orchestrate`:
 
 ```sh
 gitmoot orchestrate project-planner "Plan and split this work across agents." --repo owner/repo
-gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model gpt-5-codex
+gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --model openai-codex/gpt-5.5
 gitmoot orchestrate project-planner "Plan and split this work." --repo owner/repo --effort high
 ```
 
@@ -2106,8 +2048,8 @@ Configure managed background agent types:
 ```sh
 gitmoot agent type list
 gitmoot agent type show planner
-gitmoot agent type set planner --runtime codex --template planner --max-background 2 --idle-timeout 20m
-gitmoot agent type set planner --model gpt-5-codex
+gitmoot agent type set planner --runtime omp --template planner --max-background 2 --idle-timeout 20m
+gitmoot agent type set planner --model anthropic/claude-sonnet-4-5
 gitmoot agent type set planner --effort high
 gitmoot agent gc
 ```
@@ -2151,7 +2093,7 @@ the current version, content hash, source commit, promotion state, and content.
 Discover templates by metadata:
 
 ```sh
-gitmoot agent template list --runtime codex --output plan
+gitmoot agent template list --runtime omp --output plan
 gitmoot agent template list --tag review --capability ask
 gitmoot agent template show frontend-reviewer
 ```
@@ -2160,7 +2102,7 @@ Start an agent against an installed template:
 
 ```sh
 gitmoot agent start thermo-review \
-  --runtime codex \
+  --runtime omp \
   --repo owner/repo \
   --template thermo-nuclear-code-quality-review \
   --start-daemon
@@ -2376,24 +2318,20 @@ resolved with `gitmoot message resolve`, using an answer or a linked journal not
 for peer conversation, check the inbox on startup/resume, retain message IDs in
 handoffs, and distinguish queueing from reading or completion.
 
-For Claude-runtime jobs attributed with `ActingOrgRole`, an explicit provider
-weekly-quota rejection marks that role `unavailable` until the provider's
-stated reset time. `org status` prints `⚠ UNAVAILABLE`, `reason=quota`, and the
-UTC reset instant in the role detail; `org chart` appends the same warning, and
-their JSON rows expose `provider_state: "unavailable"`,
-`unavailable_reason`, and `unavailable_until`. Enforcement is scoped to the runtime that hit the
-wall (#1641): new operator dispatches to the role are refused, and already-queued
-jobs for it stay held, only when the job's selected runtime is the walled one, so
-a Claude wall never blocks the role's Codex or Kimi work. A per-job `--runtime`
-override decides this, in both directions. An incident with no recorded runtime
-(written before per-runtime attribution) still holds the whole role, and an
-unrecognized recorded or selected runtime refuses rather than dispatches. The incident sends
-one best-effort direct wake to the role's configured parent, then clears at the
-reset instant or on that role's first subsequent successful Claude-runtime job,
-whichever happens first. Success on another runtime cannot clear the Claude
-wall. If Claude supplies no parseable reset, Gitmoot uses the existing bounded
-15-minute quota fallback. Codex and Kimi quota-message detection are not part of
-this phase.
+An org role can be marked `unavailable` after an explicit provider
+weekly-quota rejection on a job attributed with `ActingOrgRole`, until the
+provider's stated reset time. Detection recognized only the removed `claude`
+runtime, so no current runtime opens a new incident (#2587); the incident
+store, display and clearing paths remain. `org status` prints `⚠ UNAVAILABLE`,
+`reason=quota`, and the UTC reset instant in the role detail; `org chart`
+appends the same warning, and their JSON rows expose
+`provider_state: "unavailable"`, `unavailable_reason`, and `unavailable_until`.
+Enforcement is scoped to the runtime recorded on the incident (#1641): new
+operator dispatches to the role are refused, and already-queued jobs for it stay
+held, only when the job's selected runtime is that runtime. An incident with no
+recorded runtime, or one recorded on a runtime that is no longer supported,
+holds the whole role. An incident clears at its reset instant or on that role's
+first subsequent successful job on the recorded runtime, whichever happens first.
 
 Archived seats (herdrup#173, #1635): when Herdr archives an agent
 (`herdr agent archive`), the daemon's org lane observes the `archived` block on
@@ -3180,8 +3118,8 @@ gitmoot job list --repo owner/repo   # add --json for machine-readable rows
 gitmoot job list --killed            # only deliveries a signal killed, which nothing requeues
 gitmoot job show <job-id>            # add --json for the full job + operational detail
 gitmoot job watch <job-id>
-gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime codex|claude|kimi|omp|shell]
-gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime codex|claude|kimi|omp|shell]
+gitmoot job watch <job-id> --transcript [--log-path <path>] [--runtime omp|shell]
+gitmoot job transcript <job-id> --export md|jsonl [--output <path>] [--log-path <path>] [--runtime omp|shell]
 gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output <path>]
 gitmoot job events <job-id>
 gitmoot job retry <job-id>
@@ -3291,7 +3229,7 @@ The existing `list` and operator-only `reopen` commands keep their contracts.
 A delivery killed by a signal records a `delivery_signal_killed` event naming
 the signal and which evidence identified it. Both renderings count: a
 direct-child runtime reports `signal: terminated`, while a wrapped CLI such as
-claude or omp reports `exit status 143` and the signal NAME is lost, so a
+omp reports `exit status 143` and the signal NAME is lost, so a
 consumer matching only the first would miss most review deaths. A timeout is
 excluded twice over, by its own deadline error and by its `job_timeout` event,
 because a timeout burned its whole wall rather than being abandoned.
@@ -3369,9 +3307,8 @@ run CONCURRENTLY, so their durations do not partition anything:
   events and re-delivers the same job id, so one job id can hold several
   profiles; this field is the attempt boundary.
 - `coverage` — **read this before the buckets.** `decomposed` means the runtime
-  emits per-tool events (codex, kimi, omp). `opaque_runtime` means it does not:
-  Claude reports a single final envelope and no tool events, so an opaque row
-  has zero commands however long the job took. An opaque profile is a blind
+  emits per-tool events (omp). `opaque_runtime` means it does not, so an
+  opaque row has zero commands however long the job took. An opaque profile is a blind
   spot, NOT a measurement that the job spent all its time outside commands -
   exclude those rows from any decomposition rather than averaging them in.
 - `trace` — `traced` once the runtime's tool stream was actually read (at least
@@ -3382,8 +3319,7 @@ Alongside the profile, a review that ran shell commands records one
 `review_command_trace` event: each command (redacted, cut to 300 bytes plus a
 `…` marker), its exit code (omp reports one; the `exit_code` key is absent
 when none is known, e.g. a command still `in_flight`),
-status (omp: `ok`, `error`, `in_flight`; codex and kimi report their own status
-text, e.g. `completed (exit 0)`), start/end time and a redacted output tail cut
+status (omp: `ok`, `error`, `in_flight`), start/end time and a redacted output tail cut
 to 400 bytes plus a `…` marker. At most 120 commands are listed; later ones are
 counted in `omitted`. An omp end event with a `result` that cannot be decoded
 (a scalar, an array, or an object whose fields conflict) is kept raw, so its shell call
@@ -3510,8 +3446,8 @@ Classification reads EVERY segment of a command, not the leading token:
 `test`, `cd repo && go test ./...` and `time go test ./...` are `test` (the
 prefix is plumbing), `go test ./... | grep FAIL` is `test` (a pipeline consumer
 is a filter, not a phase), and `git commit -m "go test is slow"` is `vcs`. A
-tool payload may be a bare command or JSON (`{"command":"go test ./..."}`),
-which kimi uses; both are read.
+tool payload may be a bare command or JSON (`{"command":"go test ./..."}`);
+both are read.
 
 Two confounders to hold fixed when comparing profiles, both measured: jobs whose
 id does not begin `local-review-` include `workflow-*` rows that run an order of
@@ -3550,16 +3486,14 @@ normal event watcher. `--log-path` and `--runtime` are primarily internal wiring
 flags, but remain usable for diagnosis. When `--runtime` is omitted, the job's
 runtime override wins over the registered agent runtime.
 
-Fidelity follows each runtime's actual output contract: Codex JSONL renders
-live; Kimi stream-json is turn-buffered and kimi-code 0.19.2 reports no usage;
-Claude emits only its final JSON envelope, so its transcript remains quiet until
-completion; shell output passes through as redacted raw lines. omp's NDJSON is
+Fidelity follows each runtime's actual output contract: shell output passes
+through as redacted raw lines, and a retained log from a job recorded on a
+removed runtime (`codex`, `claude`, `kimi`) renders verbatim. omp's NDJSON is
 retained verbatim and currently passes through **undecoded** — every row carries
 the transcript kind `raw`, and omp's own `type` discriminator survives only
 inside each row's raw JSON text, so an export offers no per-event kinds; a
 translator that lifts tool calls and usage out of the stream is a named
-follow-up. Usage is labeled
-`latest reported usage` because resumed Codex counts can be session-cumulative.
+follow-up. Usage is labeled `latest reported usage`.
 Malformed or unknown lines degrade individually to redacted capped raw output
 without stopping later lines.
 
@@ -3576,8 +3510,7 @@ JSONL export redacts every text-bearing event field with Gitmoot's best-effort
 credential masker and has no raw bypass. The source log remains unredacted and
 mode `0600`; best-effort export masking is not a vault.
 
-Verified Codex command/file-change events and Kimi function tool calls/results
-render as typed compact lines; unrecognized shapes keep the generic/raw
+Unrecognized event shapes keep the generic/raw
 fail-open path. Render-time redaction is a per-line best-effort defense in depth:
 a secret split across physical lines may be only partially masked, and the raw
 tee log plus the external `tail -F` fallback remain unredacted.
@@ -3737,7 +3670,7 @@ and the daemon stops starting queued children of that root. See
 For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a
 `next_retry_at:`) line explaining what the job is waiting on — e.g. `waiting on
-runtime session lock runtime:codex:<ref> (held by job <id>)`, `blocked: awaiting
+runtime session lock runtime:<runtime>:<ref> (held by job <id>)`, `blocked: awaiting
 human`, `auth failing: …`, `throttled: …`, `retrying: …`, or a
 `blocked-operational: <class>` deferral. The reason is derived from the most
 authoritative existing signal (the latest reason-bearing `job events` entry plus
@@ -3745,7 +3678,7 @@ the owning resource lock's lease); a healthy job's output is unchanged. When a
 deferral usually needs a human (a dirty or wrong-head checkout), the row/`job
 show` also carries a `suggested_action` naming the concrete fix. `gitmoot doctor`
 proactively validates `gh auth` (with an actionable remediation hint) and the
-Claude runtime token so a bad credential is caught before a job stalls on it.
+required `omp` runtime so a missing runtime is caught before a job stalls on it.
 
 A `queued` job whose reason is already recorded no longer renders as a bare
 `queued` row (#1887), and **which form you see depends on whether a
@@ -3877,8 +3810,8 @@ and a retried job clears the previous run's crash report. Terminal `failed`
 events embed the same bounded, redacted stderr tail for durable triage.
 
 `delivery_error` is what distinguishes faults the row otherwise collapses into
-one identical `phase: streaming, exit_code: 1` — a model/CLI mismatch (`400
-invalid_request_error: The '<model>' model requires a newer version of Codex.`)
+one identical `phase: streaming, exit_code: 1` — a model/CLI mismatch (a `400
+invalid_request_error` saying the model requires a newer client version)
 and a compaction-endpoint `404`, say, need different remedies but used to look
 the same on the job row because the runtime's real error existed only in
 `journalctl --user -u gitmoot-daemon`. It is a **different source** from

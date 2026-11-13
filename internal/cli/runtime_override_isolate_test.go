@@ -60,11 +60,11 @@ func TestIsolatedShellStageRuntimeSessionKey(t *testing.T) {
 		t.Fatalf("non-isolated identical commands must share the command-hash key, got %q / %q", sharedA, sharedB)
 	}
 
-	// A resumable-runtime override with a worktree must NOT be job-scoped here:
-	// only shell overrides get the treatment (codex keeps its session identity).
-	codexIso := workflow.JobPayload{Repo: "owner/repo", RuntimeOverride: runtime.CodexRuntime, RuntimeOverrideRef: "abc", ReadOnlyWorktree: true, WorktreePath: "/wt/c"}
-	if _, ok := isolatedShellStageRuntimeSessionKey(codexIso, "job-c"); ok {
-		t.Fatal("a resumable-runtime override must not be treated as an isolated shell stage")
+	// A non-shell override with a worktree must NOT be job-scoped here: only
+	// shell overrides get the treatment.
+	ompIso := workflow.JobPayload{Repo: "owner/repo", RuntimeOverride: runtime.OmpRuntime, RuntimeOverrideRef: "abc", ReadOnlyWorktree: true, WorktreePath: "/wt/c"}
+	if _, ok := isolatedShellStageRuntimeSessionKey(ompIso, "job-c"); ok {
+		t.Fatal("a non-shell override must not be treated as an isolated shell stage")
 	}
 
 	// COLLISION INVARIANT (#531): the job-scoped shell key still names the shell

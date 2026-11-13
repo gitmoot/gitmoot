@@ -37,9 +37,9 @@ func TestRemoteCapableRuntimeIsTheOnlyAllowlist(t *testing.T) {
 	runtimes := []string{
 		runtime.ShellRuntime,
 		runtime.OmpRuntime,
-		runtime.ClaudeRuntime,
-		runtime.CodexRuntime,
-		runtime.KimiRuntime,
+		"claude",
+		"codex",
+		"kimi",
 		"",
 		"  ",
 		"not-a-runtime",
@@ -84,7 +84,7 @@ func TestRemoteCapableRuntimeIsTheOnlyAllowlist(t *testing.T) {
 func TestRemoteCapableRuntimeRefusalNamesTheSupportedSet(t *testing.T) {
 	t.Parallel()
 
-	err := validateRuntimeExecutionBackend(runtime.ClaudeRuntime, execbackend.Remote)
+	err := validateRuntimeExecutionBackend("claude", execbackend.Remote)
 	if err == nil {
 		t.Fatal("expected claude to be refused on the remote backend")
 	}
@@ -101,7 +101,7 @@ func TestRemoteCapableRuntimeRefusalNamesTheSupportedSet(t *testing.T) {
 	if !strings.Contains(err.Error(), rendered) {
 		t.Fatalf("refusal %q does not include canonical supported set %q", err.Error(), rendered)
 	}
-	if !strings.Contains(err.Error(), runtime.ClaudeRuntime) {
+	if !strings.Contains(err.Error(), "claude") {
 		t.Fatalf("refusal %q does not name the refused runtime, so the operator cannot tell which job it applies to", err.Error())
 	}
 }

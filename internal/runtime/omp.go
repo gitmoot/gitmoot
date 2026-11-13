@@ -807,7 +807,10 @@ func ompAttachedPromptPointer() string {
 
 // ompUsage holds the token counts extracted from an omp NDJSON stream. Counts
 // default to 0 when the stream reports no usage at all.
-type ompUsage = StreamUsage
+type ompUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+}
 
 // ompLoadBearingEventTypes is the CLOSED set of event types parseOmpStreamJSON
 // actually READS. It exists so rule 6 can tell a row this parser depends on from a

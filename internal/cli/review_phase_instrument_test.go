@@ -124,29 +124,50 @@ func TestExtractToolCommandReadsJSONAndBarePayloads(t *testing.T) {
 	}
 }
 
-// codexToolLines returns the started and completed lines separately so a test
-// can put REAL elapsed time between them, and can INTERLEAVE two tools to
-// reproduce the overlap that broke arrival-order pairing.
-func codexToolLines(callID, command string) (string, string) {
-	wrapped := fmt.Sprintf("/bin/bash -lc %q", command)
-	line := func(kind, status string, exit any) string {
-		encoded, _ := json.Marshal(map[string]any{
-			"type": kind,
-			"item": map[string]any{
-				"id": callID, "type": "command_execution", "command": wrapped,
-				"aggregated_output": "", "exit_code": exit, "status": status,
-			},
-		})
-		return string(encoded) + "\n"
+// ompEventLine renders one omp `--mode=json` tool event. A struct, not a map,
+// because omp writes "type" FIRST and the translator keys on that prefix.
+func ompEventLine(kind, callID, toolName string, args any) string {
+	event := struct {
+		Type       string `json:"type"`
+		ToolCallID string `json:"toolCallId"`
+		ToolName   string `json:"toolName"`
+		Args       any    `json:"args,omitempty"`
+		Result     any    `json:"result,omitempty"`
+		IsError    bool   `json:"isError"`
+	}{Type: kind, ToolCallID: callID, ToolName: toolName, Args: args}
+	if kind == "tool_execution_end" {
+		event.Args = nil
+		event.Result = map[string]any{"content": []any{map[string]any{"type": "text", "text": "done"}}}
 	}
-	return line("item.started", "in_progress", nil), line("item.completed", "completed", 0)
+	encoded, _ := json.Marshal(event)
+	return string(encoded) + "\n"
+}
+
+// ompToolLines returns an omp bash exchange's start and end lines separately
+// so a test can put REAL elapsed time between them, and can INTERLEAVE two
+// tools to reproduce the overlap that broke arrival-order pairing. omp sends
+// the command as a BARE string inside JSON args - no outer double-quote
+// wrapper - which is the path on which the UNQUOTED half of the grammar
+// boundary is reachable.
+func ompToolLines(callID, command string) (string, string) {
+	args := map[string]any{"command": command}
+	return ompEventLine("tool_execution_start", callID, "bash", args),
+		ompEventLine("tool_execution_end", callID, "bash", nil)
+}
+
+// wrappedOmpToolLines is the same exchange for a command the agent itself
+// wrapped in `/bin/bash -lc` with Go's %q escaping, so the classifier sees the
+// in-double-quotes arm of the grammar boundary. Bare and wrapped disagree about
+// escaping, so a defect that hides behind one shows through the other.
+func wrappedOmpToolLines(callID, command string) (string, string) {
+	return ompToolLines(callID, fmt.Sprintf("/bin/bash -lc %q", command))
 }
 
 // openInstrumentedTranscript opens the transcript THE WAY THE WORKER DOES.
 //
 // It used to pass the runtime name straight through, which meant every
 // production-path test in this file exercised the translators but BYPASSED
-// CALLER ROUTING - so a mutant routing codex and kimi transcripts as claude
+// CALLER ROUTING - so a mutant routing omp transcripts as an opaque runtime
 // left the whole suite green (#1930 round-19 F3). daemon_worker.go:800 and
 // :3168 call openRetainedTranscriptLog with effectiveTranscriptRuntime(payload,
 // agent), so the runtime is now derived here the same way, from the seeded job
@@ -353,11 +374,11 @@ func assertProfileIdentities(t *testing.T, profile phaseProfile) {
 func TestPhaseInstrumentPairsOverlappingCommandsByToolID(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "overlap", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "overlap", "codex", store)
+	store := seedInstrumentJob(t, paths, "overlap", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "overlap", "omp", store)
 
-	longStart, longEnd := codexToolLines("long", "go test ./...")
-	shortStart, shortEnd := codexToolLines("short", "git status --porcelain")
+	longStart, longEnd := wrappedOmpToolLines("long", "go test ./...")
+	shortStart, shortEnd := wrappedOmpToolLines("short", "git status --porcelain")
 
 	// long opens first and closes LAST; short opens second and closes FIRST.
 	if _, err := handle.Write([]byte(longStart)); err != nil {
@@ -409,12 +430,12 @@ func TestPhaseInstrumentPairsOverlappingCommandsByToolID(t *testing.T) {
 func TestPhaseInstrumentNeverAltersTheTranscriptBytes(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "instrumented", "codex-reviewer", "codex")
+	store := seedInstrumentJob(t, paths, "instrumented", "omp-reviewer", "omp")
 
-	start, end := codexToolLines("c1", "go test ./...")
+	start, end := wrappedOmpToolLines("c1", "go test ./...")
 	stream := start + end + "a trailing line with no newline"
 
-	handle := openInstrumentedTranscript(t, home, "instrumented", "codex", store)
+	handle := openInstrumentedTranscript(t, home, "instrumented", "omp", store)
 	// Awkward chunk boundaries: a split inside a JSON line is the case a naive
 	// per-Write parser corrupts.
 	for i := 0; i < len(stream); i += 7 {
@@ -471,11 +492,11 @@ func (w *truncatingWriter) Write(p []byte) (int, error) {
 // command whose bytes are not in the transcript - describing a run that was
 // never recorded.
 func TestPhaseInstrumentObservesOnlyPersistedBytes(t *testing.T) {
-	translator, err := transcript.NewTranslator("codex")
+	translator, err := transcript.NewTranslator("omp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	start, end := codexToolLines("c1", "go test ./...")
+	start, end := wrappedOmpToolLines("c1", "go test ./...")
 	sink := &truncatingWriter{limit: len(start)}
 	handle := &retainedTranscript{
 		sink: sink, translator: translator, started: time.Now(),
@@ -507,10 +528,10 @@ func TestPhaseInstrumentObservesOnlyPersistedBytes(t *testing.T) {
 func TestPhaseInstrumentCountsACommandWhoseStreamEndsWithoutANewline(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "unterminated", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "unterminated", "codex", store)
+	store := seedInstrumentJob(t, paths, "unterminated", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "unterminated", "omp", store)
 
-	start, end := codexToolLines("c1", "go test ./...")
+	start, end := wrappedOmpToolLines("c1", "go test ./...")
 	if _, err := handle.Write([]byte(start)); err != nil {
 		t.Fatal(err)
 	}
@@ -567,11 +588,11 @@ func TestPhaseInstrumentTagsAnOpaqueRuntimeRatherThanReportingZeroCommands(t *te
 func TestPhaseInstrumentPartitionsWallTimeExactly(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "decomposed", "codex-reviewer", "codex")
+	store := seedInstrumentJob(t, paths, "decomposed", "omp-reviewer", "omp")
 
-	handle := openInstrumentedTranscript(t, home, "decomposed", "codex", store)
+	handle := openInstrumentedTranscript(t, home, "decomposed", "omp", store)
 	for i, command := range []string{"go test ./internal/cli/", `git commit -m "go test"`} {
-		start, end := codexToolLines(fmt.Sprintf("c%d", i), command)
+		start, end := wrappedOmpToolLines(fmt.Sprintf("c%d", i), command)
 		if _, err := handle.Write([]byte(start)); err != nil {
 			t.Fatal(err)
 		}
@@ -611,23 +632,14 @@ func TestPhaseInstrumentPartitionsWallTimeExactly(t *testing.T) {
 func TestPhaseInstrumentSeparatesNonShellToolsFromCommands(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "tools", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "tools", "codex", store)
+	store := seedInstrumentJob(t, paths, "tools", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "tools", "omp", store)
 
-	fileChange := func(kind, status string) string {
-		encoded, _ := json.Marshal(map[string]any{
-			"type": kind,
-			"item": map[string]any{
-				"id": "f1", "type": "file_change", "status": status,
-				"changes": []any{map[string]any{"path": "x.go", "kind": "modify"}},
-			},
-		})
-		return string(encoded) + "\n"
-	}
-	if _, err := handle.Write([]byte(fileChange("item.started", "in_progress"))); err != nil {
+	editArgs := map[string]any{"path": "x.go"}
+	if _, err := handle.Write([]byte(ompEventLine("tool_execution_start", "f1", "edit", editArgs))); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := handle.Write([]byte(fileChange("item.completed", "completed"))); err != nil {
+	if _, err := handle.Write([]byte(ompEventLine("tool_execution_end", "f1", "edit", nil))); err != nil {
 		t.Fatal(err)
 	}
 	if err := handle.Close(); err != nil {
@@ -651,14 +663,14 @@ func TestPhaseInstrumentSeparatesNonShellToolsFromCommands(t *testing.T) {
 func TestPhaseInstrumentTagsEachAttemptSeparately(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "retried", "codex-reviewer", "codex")
+	store := seedInstrumentJob(t, paths, "retried", "omp-reviewer", "omp")
 
 	for attempt := int64(1); attempt <= 2; attempt++ {
-		handle, err := openRetainedTranscriptLog(home, "retried", "review", "codex", attempt, store)
+		handle, err := openRetainedTranscriptLog(home, "retried", "review", "omp", attempt, store)
 		if err != nil {
 			t.Fatalf("open attempt %d: %v", attempt, err)
 		}
-		start, end := codexToolLines(fmt.Sprintf("a%d", attempt), "go test ./...")
+		start, end := wrappedOmpToolLines(fmt.Sprintf("a%d", attempt), "go test ./...")
 		if _, err := handle.Write([]byte(start + end)); err != nil {
 			t.Fatal(err)
 		}
@@ -680,7 +692,7 @@ func TestPhaseInstrumentTagsEachAttemptSeparately(t *testing.T) {
 // itself, which the storeless path cannot reach.
 func TestPhaseInstrumentCloseWithoutAStoreDoesNotPanic(t *testing.T) {
 	handle := &retainedTranscript{
-		jobID: "no-store", runtime: "codex", translator: opaqueTranslator{}, started: time.Now(),
+		jobID: "no-store", runtime: "omp", translator: opaqueTranslator{}, started: time.Now(),
 		pending: map[string]pendingCommand{}, nonShellCalls: map[string]struct{}{}, bucketNS: map[string]int64{}, bucketCount: map[string]int{},
 	}
 	if err := handle.Close(); err != nil {
@@ -694,7 +706,7 @@ func TestPhaseInstrumentWithoutAStoreWritesNoEventAndStillRetains(t *testing.T) 
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 
-	handle := openInstrumentedTranscript(t, home, "storeless", "codex", nil)
+	handle := openInstrumentedTranscript(t, home, "storeless", "omp", nil)
 	if _, err := handle.Write([]byte("stdout stream\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -755,7 +767,7 @@ func TestEffectiveTranscriptRuntimePrefersThePayloadOverride(t *testing.T) {
 // BenchmarkRetainedTranscriptWrite measures the instrument's cost on the write
 // path, which is the only hot path it touches.
 func BenchmarkRetainedTranscriptWrite(b *testing.B) {
-	start, end := codexToolLines("bench", "go test ./internal/cli/")
+	start, end := wrappedOmpToolLines("bench", "go test ./internal/cli/")
 	payload := []byte(start + end)
 	for _, tc := range []struct {
 		name       string
@@ -787,7 +799,7 @@ func BenchmarkRetainedTranscriptWrite(b *testing.B) {
 
 func mustBenchTranslator(b *testing.B) transcript.Translator {
 	b.Helper()
-	translator, err := transcript.NewTranslator("codex")
+	translator, err := transcript.NewTranslator("omp")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -807,11 +819,11 @@ func mustBenchTranslator(b *testing.B) transcript.Translator {
 func TestPhaseInstrumentKeepsTheFirstCallOnAToolIDCollision(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "collision", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "collision", "codex", store)
+	store := seedInstrumentJob(t, paths, "collision", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "collision", "omp", store)
 
-	firstStart, firstEnd := codexToolLines("dup", "go test ./...")
-	secondStart, secondEnd := codexToolLines("dup", "git status --porcelain")
+	firstStart, firstEnd := wrappedOmpToolLines("dup", "go test ./...")
+	secondStart, secondEnd := wrappedOmpToolLines("dup", "git status --porcelain")
 	if _, err := handle.Write([]byte(firstStart)); err != nil {
 		t.Fatal(err)
 	}
@@ -848,10 +860,10 @@ func TestPhaseInstrumentKeepsTheFirstCallOnAToolIDCollision(t *testing.T) {
 func TestPhaseInstrumentCountsCommandsStillRunningAtClose(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "inflight", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "inflight", "codex", store)
+	store := seedInstrumentJob(t, paths, "inflight", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "inflight", "omp", store)
 
-	start, _ := codexToolLines("never", "go test ./...")
+	start, _ := wrappedOmpToolLines("never", "go test ./...")
 	if _, err := handle.Write([]byte(start)); err != nil {
 		t.Fatal(err)
 	}
@@ -883,8 +895,8 @@ func TestPhaseInstrumentCountsCommandsStillRunningAtClose(t *testing.T) {
 func TestPhaseInstrumentCapsAnUnterminatedLine(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "flood", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "flood", "codex", store)
+	store := seedInstrumentJob(t, paths, "flood", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "flood", "omp", store)
 
 	chunk := []byte(strings.Repeat("x", 64*1024))
 	for range 24 {
@@ -914,24 +926,20 @@ func TestPhaseInstrumentCapsAnUnterminatedLine(t *testing.T) {
 }
 
 // TestPhaseInstrumentReportsAResultWhoseCallWasNeverSeenAsUnpaired is #1824
-// review F9. Kimi names a result whose call it never saw "tool", so a
-// shell-ness test taken BEFORE the id lookup filed a genuinely lost pairing as
-// ordinary tool activity and left unpaired at zero - contradicting what both
-// the payload and the documentation say those fields mean.
+// review F9. A shell-ness test taken BEFORE the id lookup filed a genuinely
+// lost pairing as ordinary tool activity and left unpaired at zero -
+// contradicting what both the payload and the documentation say those fields
+// mean. The orphan below carries a NON-shell tool name, so only an id-first
+// decision reports it as unpaired.
 func TestPhaseInstrumentReportsAResultWhoseCallWasNeverSeenAsUnpaired(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "orphan", "kimi-reviewer", "kimi")
-	handle := openInstrumentedTranscript(t, home, "orphan", "kimi", store)
+	store := seedInstrumentJob(t, paths, "orphan", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "orphan", "omp", store)
 
-	// A kimi tool result with no preceding assistant tool_call.
-	orphan, err := json.Marshal(map[string]any{
-		"role": "tool", "tool_call_id": "call_never_opened", "content": "done",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := handle.Write(append(orphan, '\n')); err != nil {
+	// An omp tool result with no preceding tool_execution_start.
+	orphan := ompEventLine("tool_execution_end", "call_never_opened", "read", nil)
+	if _, err := handle.Write([]byte(orphan)); err != nil {
 		t.Fatal(err)
 	}
 	if err := handle.Close(); err != nil {
@@ -989,8 +997,8 @@ func TestPhaseProfileMillisecondsIsExactOnDeterministicInput(t *testing.T) {
 func TestPhaseInstrumentResyncsAfterDroppingAnOverLongLine(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
-	store := seedInstrumentJob(t, paths, "resync", "codex-reviewer", "codex")
-	handle := openInstrumentedTranscript(t, home, "resync", "codex", store)
+	store := seedInstrumentJob(t, paths, "resync", "omp-reviewer", "omp")
+	handle := openInstrumentedTranscript(t, home, "resync", "omp", store)
 
 	// A run-on line that trips the cap, then its own terminator, then a real
 	// command exchange.
@@ -1009,7 +1017,7 @@ func TestPhaseInstrumentResyncsAfterDroppingAnOverLongLine(t *testing.T) {
 	if handle.skipToNewline {
 		t.Fatal("still skipping after the dropped line ended")
 	}
-	start, end := codexToolLines("after", "go test ./...")
+	start, end := wrappedOmpToolLines("after", "go test ./...")
 	if _, err := handle.Write([]byte(start)); err != nil {
 		t.Fatal(err)
 	}
@@ -1069,7 +1077,7 @@ func TestShellFieldsKeepsQuotedValuesWhole(t *testing.T) {
 // TestClassifyPhaseCommandClassifiesEverySegment calls classifyPhaseCommand
 // directly on raw text. Production never does. The real path is
 // retainedTranscript.Write -> translator -> consume -> classifyPhaseCommand,
-// and Codex wraps every command in an outer `/bin/bash -lc "..."` whose inner
+// and a command wrapped in an outer `/bin/bash -lc "..."` has inner
 // quotes arrive BACKSLASH-ESCAPED. Every case below passed the raw table while
 // failing through this wrapper, so the table was green on input production
 // does not produce.
@@ -1108,13 +1116,13 @@ func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
 		{"substitution inside double quotes", `go test -run "$NAME"`, phaseBucketUnknown},
 		// SUPPORTED CASES MUST RETAIN THEIR BUCKETS - a boundary that swallowed
 		// ordinary commands would be a demotion of the signal, not a refusal.
-		// A CONSEQUENCE WORTH STATING RATHER THAN HIDING: Codex wraps every
+		// A CONSEQUENCE WORTH STATING RATHER THAN HIDING: the wrapper puts every
 		// command in DOUBLE quotes, where expansions are live, so a '$'
-		// anywhere in a Codex command refuses - even one that a real shell
+		// anywhere in a wrapped command refuses - even one that a real shell
 		// would treat as literal because no valid expansion follows it.
 		// Deciding that would require implementing expansion grammar, which is
 		// exactly what ruling 123815 forbids, so the lexer refuses instead.
-		{"dollar refuses under the codex wrapper", `go test ./... -run 'TestA$'`, phaseBucketUnknown},
+		{"dollar refuses under the bash -lc wrapper", `go test ./... -run 'TestA$'`, phaseBucketUnknown},
 		{"parens inside single quotes stay classifiable", `git commit -m 'fix (again)'`, phaseBucketVCS},
 		// And the operators must still work through the same wrapper.
 		// A backslash inside SINGLE quotes is literal data in POSIX shells, not
@@ -1135,12 +1143,12 @@ func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "prodpath", "codex-reviewer", "codex")
-			handle := openInstrumentedTranscript(t, home, "prodpath", "codex", store)
+			store := seedInstrumentJob(t, paths, "prodpath", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "prodpath", "omp", store)
 
-			// codexToolLines wraps the command exactly as Codex does, with
+			// wrappedOmpToolLines wraps the command in /bin/bash -lc with
 			// %q's backslash-escaped inner quotes - the wrapper is the point.
-			start, end := codexToolLines("p1", tc.command)
+			start, end := wrappedOmpToolLines("p1", tc.command)
 			if _, err := handle.Write([]byte(start)); err != nil {
 				t.Fatal(err)
 			}
@@ -1165,31 +1173,11 @@ func TestPhaseInstrumentClassifiesThroughTheProductionPath(t *testing.T) {
 	}
 }
 
-// kimiToolLines renders a kimi exchange, whose Bash arguments arrive as JSON
-// with the command as a BARE string - no outer double-quote wrapper. That is
-// the production path on which the UNQUOTED half of the grammar boundary is
-// reachable at all: Codex double-quotes everything, so its fixture can only
-// exercise the in-double-quotes arm.
-func kimiToolLines(callID, command string) (string, string) {
-	args, _ := json.Marshal(map[string]any{"command": command})
-	call, _ := json.Marshal(map[string]any{
-		"role": "assistant",
-		"tool_calls": []any{map[string]any{
-			"id": callID, "type": "function",
-			"function": map[string]any{"name": "bash", "arguments": string(args)},
-		}},
-	})
-	result, _ := json.Marshal(map[string]any{
-		"role": "tool", "tool_call_id": callID, "content": "done",
-	})
-	return string(call) + "\n", string(result) + "\n"
-}
-
-// TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload closes the one
-// gap the Codex fixture cannot reach. Kimi sends the command unquoted inside
-// JSON, so an unquoted substitution is seen by the boundary's unquoted arm -
-// and a mutant that stops flagging it survives every Codex-wrapped case.
-func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T) {
+// TestPhaseInstrumentRefusesUnsupportedSyntaxOnABarePayload closes the one
+// gap the wrapped fixture cannot reach. A bare payload carries the command
+// unquoted inside JSON, so an unquoted substitution is seen by the boundary's
+// unquoted arm - and a mutant that stops flagging it survives every wrapped case.
+func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABarePayload(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		command string
@@ -1198,7 +1186,7 @@ func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T)
 		{"unquoted command substitution refuses", "go test $(go list ./...)", phaseBucketUnknown},
 		{"unquoted parameter expansion refuses", "${TOOL} test ./...", phaseBucketUnknown},
 		{"plain command still classifies", "go test ./internal/cli/", phaseBucketTest},
-		// REAL NEWLINES arrive here: kimi sends the command as a JSON string,
+		// REAL NEWLINES arrive here: omp sends the command as a JSON string,
 		// so a comment ends at the newline and the next line is another
 		// command - exactly what bash does with an unescaped newline.
 		{"comment ends at a real newline", "# note\ngo test ./...", phaseBucketTest},
@@ -1209,10 +1197,10 @@ func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T)
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "kimipath", "kimi-reviewer", "kimi")
-			handle := openInstrumentedTranscript(t, home, "kimipath", "kimi", store)
+			store := seedInstrumentJob(t, paths, "barepath", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "barepath", "omp", store)
 
-			start, end := kimiToolLines("k1", tc.command)
+			start, end := ompToolLines("k1", tc.command)
 			if _, err := handle.Write([]byte(start)); err != nil {
 				t.Fatal(err)
 			}
@@ -1224,10 +1212,10 @@ func TestPhaseInstrumentRefusesUnsupportedSyntaxOnABareKimiPayload(t *testing.T)
 				t.Fatalf("close: %v", err)
 			}
 
-			profile := readPhaseProfile(t, store, "kimipath")
+			profile := readPhaseProfile(t, store, "barepath")
 			assertProfileIdentities(t, profile)
 			if profile.BucketCount[tc.want] != 1 {
-				t.Fatalf("bare kimi payload %q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
+				t.Fatalf("bare payload %q landed in %v, want %s", tc.command, profile.BucketCount, tc.want)
 			}
 		})
 	}
@@ -1259,9 +1247,9 @@ func TestPhaseInstrumentRefusesUnrecognisedCompoundCommands(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "compound", "codex-reviewer", "codex")
-			handle := openInstrumentedTranscript(t, home, "compound", "codex", store)
-			start, end := codexToolLines("c1", tc.command)
+			store := seedInstrumentJob(t, paths, "compound", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "compound", "omp", store)
+			start, end := wrappedOmpToolLines("c1", tc.command)
 			if _, err := handle.Write([]byte(start + end)); err != nil {
 				t.Fatal(err)
 			}
@@ -1291,15 +1279,15 @@ func TestPhaseInstrumentKeepsTruthfulBucketsInsideTheBoundary(t *testing.T) {
 		{"redirect between command and argument", "go >out.log test ./...", phaseBucketTest},
 		{"leading input redirect", "<input.txt go test ./...", phaseBucketTest},
 		{"appending redirect", ">>out.log go build ./...", phaseBucketBuild},
-		// COMMENTS UNDER THE CODEX WRAPPER, verified against real bash rather
-		// than assumed. Codex builds its command with Go's %q, which escapes a
+		// COMMENTS UNDER THE BASH -LC WRAPPER, verified against real bash rather
+		// than assumed. The wrapper is built with Go's %q, which escapes a
 		// newline as the two characters backslash-n, and inside double quotes
 		// bash treats that as literal text - so the comment swallows the rest
 		// of the line and only the first command runs. Measured:
 		//   bash -lc "echo RAN-GO # first\ngit status"  -> prints RAN-GO only
 		//   bash -lc $'echo RAN-GO # first\necho RAN-GIT' -> prints both
 		// The reviewer's counterexamples describe the REAL-newline form, which
-		// reaches production through kimi's bare payload and is asserted there.
+		// reaches production through omp's bare payload and is asserted there.
 		{"trailing comment swallows an escaped newline", "go test ./... # first\ngit status", phaseBucketTest},
 		{"comment-only command has no phase", "# note\ngo test ./...", phaseBucketOther},
 		// An empty quoted command word runs nothing at all.
@@ -1308,9 +1296,9 @@ func TestPhaseInstrumentKeepsTruthfulBucketsInsideTheBoundary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "boundary", "codex-reviewer", "codex")
-			handle := openInstrumentedTranscript(t, home, "boundary", "codex", store)
-			start, end := codexToolLines("b1", tc.command)
+			store := seedInstrumentJob(t, paths, "boundary", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "boundary", "omp", store)
+			start, end := wrappedOmpToolLines("b1", tc.command)
 			if _, err := handle.Write([]byte(start)); err != nil {
 				t.Fatal(err)
 			}
@@ -1350,9 +1338,9 @@ func TestPhaseInstrumentRefusesUnimplementedRedirectAndExpansionForms(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "unimpl", "codex-reviewer", "codex")
-			handle := openInstrumentedTranscript(t, home, "unimpl", "codex", store)
-			start, end := codexToolLines("u1", tc.command)
+			store := seedInstrumentJob(t, paths, "unimpl", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "unimpl", "omp", store)
+			start, end := wrappedOmpToolLines("u1", tc.command)
 			if _, err := handle.Write([]byte(start + end)); err != nil {
 				t.Fatal(err)
 			}
@@ -1405,9 +1393,9 @@ func TestPhaseInstrumentHonoursQuoteProvenance(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			paths := config.PathsForHome(home)
-			store := seedInstrumentJob(t, paths, "provenance", "codex-reviewer", "codex")
-			handle := openInstrumentedTranscript(t, home, "provenance", "codex", store)
-			start, end := codexToolLines("p1", tc.command)
+			store := seedInstrumentJob(t, paths, "provenance", "omp-reviewer", "omp")
+			handle := openInstrumentedTranscript(t, home, "provenance", "omp", store)
+			start, end := wrappedOmpToolLines("p1", tc.command)
 			if _, err := handle.Write([]byte(start)); err != nil {
 				t.Fatal(err)
 			}
@@ -1428,8 +1416,8 @@ func TestPhaseInstrumentHonoursQuoteProvenance(t *testing.T) {
 }
 
 // classifyThroughBothProductionPaths drives one command through the REAL
-// production path for BOTH runtimes and asserts the same bucket: Codex wraps in
-// /bin/bash -lc with %q escaping, Kimi sends the command bare inside JSON. The
+// production path for BOTH command shapes and asserts the same bucket: one
+// wrapped in /bin/bash -lc with %q escaping, one sent bare inside JSON. The
 // two disagree about escaping, so a defect that hides behind one wrapper shows
 // through the other - which is why 124392 requires both.
 func classifyThroughBothProductionPaths(t *testing.T, command, want string) {
@@ -1440,8 +1428,8 @@ func classifyThroughBothProductionPaths(t *testing.T, command, want string) {
 		agent   string
 		lines   func(string, string) (string, string)
 	}{
-		{"codex", "codex", "codex-reviewer", codexToolLines},
-		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
+		{"wrapped", "omp", "omp-reviewer", wrappedOmpToolLines},
+		{"bare", "omp", "omp-reviewer", ompToolLines},
 	} {
 		t.Run(path.name, func(t *testing.T) {
 			home, store := instrumentFixture(t)
@@ -1535,18 +1523,18 @@ func TestPhaseInstrumentConsumesEnvAssignments(t *testing.T) {
 	}
 }
 
-// TestPhaseInstrumentLineContinuationDiffersByRuntime pins the one round-10
+// TestPhaseInstrumentLineContinuationDiffersByWrapping pins the one round-10
 // case whose CORRECT answer differs between the two production paths, measured
 // with bash rather than assumed:
 //
-//	raw (kimi sends this)      bash -lc $'echo RAN-te\<newline>st' -> RAN-test
-//	%q-wrapped (codex sends)   bash -lc "echo RAN-te\\\nst"      -> RAN-te\nst
+//	bare                       bash -lc $'echo RAN-te\<newline>st' -> RAN-test
+//	%q-wrapped                 bash -lc "echo RAN-te\\\nst"      -> RAN-te\nst
 //
-// So the continuation JOINS on the kimi path and does not survive Codex's
+// So the continuation JOINS on the bare path and does not survive the %q
 // escaping, where the argument is literally te\nst. Reporting `test` for the
-// Codex form would be a false measurement of a command that never ran, and
-// reporting `other` for the kimi form would lose a real one.
-func TestPhaseInstrumentLineContinuationDiffersByRuntime(t *testing.T) {
+// wrapped form would be a false measurement of a command that never ran, and
+// reporting `other` for the bare form would lose a real one.
+func TestPhaseInstrumentLineContinuationDiffersByWrapping(t *testing.T) {
 	const command = "go te\\\nst ./..."
 	for _, tc := range []struct {
 		name    string
@@ -1555,8 +1543,8 @@ func TestPhaseInstrumentLineContinuationDiffersByRuntime(t *testing.T) {
 		lines   func(string, string) (string, string)
 		want    string
 	}{
-		{"kimi joins the continuation", "kimi", "kimi-reviewer", kimiToolLines, phaseBucketTest},
-		{"codex sends a different command", "codex", "codex-reviewer", codexToolLines, phaseBucketOther},
+		{"a bare command joins the continuation", "omp", "omp-reviewer", ompToolLines, phaseBucketTest},
+		{"a wrapped command is a different command", "omp", "omp-reviewer", wrappedOmpToolLines, phaseBucketOther},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
@@ -1857,8 +1845,8 @@ func classifyThroughSplitWrites(t *testing.T, command, want string) {
 		agent   string
 		lines   func(string, string) (string, string)
 	}{
-		{"codex", "codex", "codex-reviewer", codexToolLines},
-		{"kimi", "kimi", "kimi-reviewer", kimiToolLines},
+		{"wrapped", "omp", "omp-reviewer", wrappedOmpToolLines},
+		{"bare", "omp", "omp-reviewer", ompToolLines},
 	} {
 		t.Run(path.name, func(t *testing.T) {
 			home, store := instrumentFixture(t)

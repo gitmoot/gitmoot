@@ -604,13 +604,13 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		// unless the operator names another. The escape matters because a pinned
 		// runtime with no override is refused outright whenever an availability
 		// hold is written for that runtime (#2181), with nothing to fall back to.
-		Runtime:        reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
-		ActingOrgRole:  opts.role,
-		OperatorOrigin: true,
-		Home:           opts.home,
-		PullRequest:    opts.pr,
-		HeadSHA:        head,
-		Branch:         branch,
+		Runtime:               reviewRequestRuntime(opts.runtime, selectedRuntime, reviewer.Runtime),
+		ActingOrgRole:         opts.role,
+		OperatorOrigin:        true,
+		Home:                  opts.home,
+		PullRequest:           opts.pr,
+		HeadSHA:               head,
+		Branch:                branch,
 		PostMergeReview:       opts.postMerge,
 		ReviewNoExecution:     noExecution,
 		ReviewPart:            opts.part,

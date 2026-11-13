@@ -16,23 +16,15 @@ import (
 //
 //	runtime-auth.env    daemon_runtime_auth.go, runtimeAuthFileName
 //	daemon-runtime.env  daemon_runtime_auth.go, legacyRuntimeAuthFileName
-//	.credentials.json   daemon_worker.go (claude staging), readonly_seat_credential.go
-//	auth.json           daemon_worker.go (codex staging)
-//	kimi-code.json      daemon_worker.go (kimi staging)
 //	keychain.env        pipeline/env_runtime.go, ResolveKeychainPath
 //	bridge.token        removed `gitmoot bridge` (#2582); live homes may still hold one
 //
-// The first five were the list this guard shipped with, and it was INCOMPLETE:
-// the review measured keychain.env and bridge.token resolving through the same
-// class of code with neither an ignore rule nor a guard entry. The enumeration
-// is now derived by searching every credential-adjacent filename literal in
-// internal/ and cmd/, not by recalling the ones already known.
+// The enumeration is derived by searching every credential-adjacent filename
+// literal in internal/ and cmd/, not by recalling the ones already known. The
+// codex, claude and kimi credential files left with their staging (#2587).
 var credentialOverlayFileNames = []string{
 	runtimeAuthFileName,
 	legacyRuntimeAuthFileName,
-	claudeCredentialsFile,
-	"auth.json",
-	"kimi-code.json",
 	"keychain.env",
 	"bridge.token",
 }
@@ -111,26 +103,21 @@ func TestCredentialWritersRefuseANonAbsoluteHome(t *testing.T) {
 	}
 }
 
-// THE THIRD WRITER. prepareReadOnlyRuntimeState stages three of the seven
-// overlay names by joining onto cacheRoot, and it was the one writer the
-// previous head left unguarded: driven with a relative cacheRoot it returned a
-// relative stateDir and wrote auth.json there. The cacheRoot must EXIST, or the
-// test would pass on a later mkdir failure rather than on the guard.
+// THE THIRD WRITER. prepareReadOnlyRuntimeState creates the seat's state dir by
+// joining onto cacheRoot; driven with a relative cacheRoot it would write
+// relative to the working directory. The cacheRoot must EXIST, or the test
+// would pass on a later mkdir failure rather than on the guard.
 func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
 	t.Chdir(t.TempDir())
 	const relative = "relative-cache"
 	if err := os.MkdirAll(relative, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	source := t.TempDir()
-	if err := os.WriteFile(filepath.Join(source, "auth.json"), []byte(`{"tokens":{"access":"placeholder-not-a-token"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.CodexRuntime, ReadOnlySeat: true, RuntimeConfigDir: source}
+	agent := runtime.Agent{Name: "reviewer", Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
 
-	stateDir, env, _, err := prepareReadOnlyRuntimeState(agent, relative, false)
+	stateDir, env, err := prepareReadOnlyRuntimeState(agent, relative)
 	if err == nil {
-		t.Fatalf("a relative cacheRoot was accepted: stateDir=%q env=%v; credentials would be staged inside the working directory", stateDir, env)
+		t.Fatalf("a relative cacheRoot was accepted: stateDir=%q env=%v; state would be created inside the working directory", stateDir, env)
 	}
 	if stateDir != "" {
 		t.Fatalf("stateDir = %q on refusal, want empty", stateDir)
@@ -138,7 +125,7 @@ func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
 	// Nothing may have been created under the relative root.
 	var created []string
 	_ = filepath.Walk(relative, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr == nil && info != nil && !info.IsDir() {
+		if walkErr == nil && info != nil && path != relative {
 			created = append(created, path)
 		}
 		return nil
@@ -147,22 +134,22 @@ func TestPrepareReadOnlyRuntimeStateRefusesARelativeCacheRoot(t *testing.T) {
 		t.Fatalf("the refused call still wrote %v under the relative cacheRoot", created)
 	}
 
-	// An ABSOLUTE cacheRoot must still stage and inject: the guard is a
-	// precondition, not a feature removal.
+	// An ABSOLUTE cacheRoot must still create and inject the state dir: the
+	// guard is a precondition, not a feature removal.
 	absolute := t.TempDir()
-	stateDir, env, _, err = prepareReadOnlyRuntimeState(agent, absolute, false)
+	stateDir, env, err = prepareReadOnlyRuntimeState(agent, absolute)
 	if err != nil {
 		t.Fatalf("absolute cacheRoot rejected: %v", err)
 	}
 	if !filepath.IsAbs(stateDir) || !strings.HasPrefix(stateDir, absolute) {
 		t.Fatalf("stateDir = %q, want an absolute path under %q", stateDir, absolute)
 	}
-	if _, statErr := os.Stat(filepath.Join(stateDir, "auth.json")); statErr != nil {
-		t.Fatalf("absolute cacheRoot did not stage the credential: %v", statErr)
+	if info, statErr := os.Stat(stateDir); statErr != nil || !info.IsDir() {
+		t.Fatalf("absolute cacheRoot did not create the state dir: %v", statErr)
 	}
 	var injected bool
 	for _, entry := range env {
-		if strings.HasPrefix(entry, "CODEX_HOME=") {
+		if entry == "PI_CODING_AGENT_DIR="+stateDir {
 			injected = true
 		}
 	}

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/github/githubtest"
@@ -62,12 +62,13 @@ func (r *repairStateRunner) Run(context.Context, string, string, ...string) (sub
 
 func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
 	r.calls++
-	stateDir := envValue(env, "CLAUDE_CONFIG_DIR")
+	stateDir := envValue(env, "PI_CODING_AGENT_DIR")
 	if stateDir == "" {
-		return subprocess.Result{}, errors.New("missing isolated CLAUDE_CONFIG_DIR")
+		return subprocess.Result{}, errors.New("missing isolated PI_CODING_AGENT_DIR")
 	}
-	credential := filepath.Join(stateDir, ".credentials.json")
-	if _, err := os.ReadFile(credential); err != nil {
+	// The job-scoped broker route is written into the isolated state before
+	// every delivery; a repair turn that lost the state would lose it too.
+	if _, err := os.ReadFile(filepath.Join(stateDir, "config.yml")); err != nil {
 		return subprocess.Result{}, err
 	}
 	if cache := envValue(env, "GOCACHE"); strings.Contains(cache, filepath.Join("cache", "tools", "read-only")) {
@@ -80,7 +81,7 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 		if err := os.WriteFile(marker, []byte("first-delivery"), 0o600); err != nil {
 			return subprocess.Result{}, err
 		}
-		return subprocess.Result{Command: command, Args: args, Stdout: `{"result":"review complete, no json"}`}, nil
+		return subprocess.Result{Command: command, Args: args, Stdout: readOnlySeatOmpStdout("review complete, no json")}, nil
 	case 2:
 		if stateDir != r.stateDir {
 			return subprocess.Result{}, errors.New("repair delivery changed isolated state directory")
@@ -90,54 +91,13 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 			return subprocess.Result{}, errors.New("repair delivery lost first-delivery state")
 		}
 		r.repairStateObserved = true
-		return subprocess.Result{Command: command, Args: args, Stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"clean after repair\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`}, nil
+		return subprocess.Result{Command: command, Args: args, Stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)}, nil
 	default:
 		return subprocess.Result{}, errors.New("unexpected extra repair delivery")
 	}
 }
 
 func (r *repairStateRunner) LookPath(file string) (string, error) { return file, nil }
-
-type kimiHomeStateRunner struct {
-	home                string
-	credentialObserved  bool
-	modelConfigObserved bool
-}
-
-func (r *kimiHomeStateRunner) Run(context.Context, string, string, ...string) (subprocess.Result, error) {
-	return subprocess.Result{}, errors.New("kimi-home runner requires explicit environment")
-}
-
-func (r *kimiHomeStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
-	r.home = envValue(env, "HOME")
-	if r.home == "" {
-		return subprocess.Result{}, errors.New("missing isolated HOME")
-	}
-	credential := filepath.Join(r.home, ".kimi-code", "credentials", "kimi-code.json")
-	if _, err := os.ReadFile(credential); err != nil {
-		return subprocess.Result{}, fmt.Errorf("read Kimi credential under HOME: %w", err)
-	}
-	r.credentialObserved = true
-	// Kimi reads default_model plus its provider and model blocks from
-	// config.toml. Staging only the credential produced a seat that
-	// authenticated and then refused with "No model configured" behind an auth
-	// message, so this runner reads what the real runtime reads at startup.
-	modelConfig, err := os.ReadFile(filepath.Join(r.home, ".kimi-code", "config.toml"))
-	if err != nil {
-		return subprocess.Result{}, fmt.Errorf("read Kimi config.toml under HOME: %w", err)
-	}
-	if !strings.Contains(string(modelConfig), "default_model") {
-		return subprocess.Result{}, errors.New("staged Kimi config.toml carries no default_model")
-	}
-	r.modelConfigObserved = true
-	return subprocess.Result{
-		Command: command,
-		Args:    args,
-		Stdout:  `{"role":"assistant","content":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Kimi profile observed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}` + "\n",
-	}, nil
-}
-
-func (r *kimiHomeStateRunner) LookPath(file string) (string, error) { return file, nil }
 
 type renameRuntimeStateRunner struct {
 	savedState string
@@ -148,11 +108,12 @@ func (r *renameRuntimeStateRunner) Run(context.Context, string, string, ...strin
 }
 
 func (r *renameRuntimeStateRunner) RunEnv(_ context.Context, _ string, env []string, command string, args ...string) (subprocess.Result, error) {
-	stateDir := envValue(env, "CLAUDE_CONFIG_DIR")
+	stateDir := envValue(env, "PI_CODING_AGENT_DIR")
 	if stateDir == "" {
-		return subprocess.Result{}, errors.New("missing isolated CLAUDE_CONFIG_DIR")
+		return subprocess.Result{}, errors.New("missing isolated PI_CODING_AGENT_DIR")
 	}
-	stateRoot := filepath.Dir(stateDir)
+	// <cache root>/runtime-state/.omp/agent: move the whole runtime-state tree.
+	stateRoot := filepath.Dir(filepath.Dir(stateDir))
 	cacheRoot := filepath.Dir(stateRoot)
 	r.savedState = filepath.Join(cacheRoot, "saved-runtime-state")
 	if err := os.Rename(stateRoot, r.savedState); err != nil {
@@ -161,37 +122,64 @@ func (r *renameRuntimeStateRunner) RunEnv(_ context.Context, _ string, env []str
 	return subprocess.Result{
 		Command: command,
 		Args:    args,
-		Stdout:  `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"state moved\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`,
+		Stdout:  readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"state moved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`),
 	}, nil
 }
 
 func (r *renameRuntimeStateRunner) LookPath(file string) (string, error) { return file, nil }
 
+// ompStreamStdout renders text as the final assistant message of an omp
+// --mode=json stream, the wire format OmpAdapter parses.
+func readOnlySeatOmpStdout(text string) string {
+	encoded, err := json.Marshal(text)
+	if err != nil {
+		panic(err)
+	}
+	return `{"type":"session","version":3,"id":"01920000-0000-7000-8000-000000000152","timestamp":"2026-08-15T00:00:00.000Z","cwd":"/repo"}` + "\n" +
+		`{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":` + string(encoded) + `}],"usage":{"input":1,"output":1,"totalTokens":2},"stopReason":"stop"}}` + "\n" +
+		`{"type":"agent_end","messages":[],"isTerminal":true}` + "\n"
+}
+
+// readOnlySeatOmpBrokerEnv configures the credential broker an omp read-only
+// seat requires before any staging, so seat setup reaches what a test checks.
+func readOnlySeatOmpBrokerEnv(t *testing.T) {
+	t.Helper()
+	tokenFile := filepath.Join(t.TempDir(), "broker-token")
+	if err := os.WriteFile(tokenFile, []byte("seat-broker-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OMP_AUTH_BROKER_URL", "http://127.0.0.1:8765")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN", "")
+	t.Setenv("OMP_AUTH_BROKER_TOKEN_FILE", tokenFile)
+}
+
+// readOnlySeatOmpModel is a provider-qualified model, which an omp seat needs
+// to scope its broker.
+const readOnlySeatOmpModel = "anthropic/claude-sonnet-4-5"
+
 func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.T) {
 	configHome := t.TempDir()
 	checkout := filepath.Join(t.TempDir(), "review-worktree")
-	stateDir := filepath.Join(t.TempDir(), "claude-state")
+	hostProfile := filepath.Join(t.TempDir(), "omp-profile")
 	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+	if err := os.MkdirAll(hostProfile, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"must-stay-hidden"}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(hostProfile, "settings.json"), []byte(`{"env":{"UNRELATED_SECRET":"must-not-copy"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(stateDir, "settings.json"), []byte(`{"env":{"UNRELATED_SECRET":"must-not-copy"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	readOnlySeatOmpBrokerEnv(t)
 	t.Setenv("GH_TOKEN", "must-not-reach-review")
 	t.Setenv("OPENAI_API_KEY", "must-not-reach-review")
 	agent := runtime.Agent{
-		Runtime:          runtime.ClaudeRuntime,
+		Runtime:          runtime.OmpRuntime,
 		AutonomyPolicy:   runtime.AutonomyPolicyReadOnly,
 		ReadOnlySeat:     true,
-		RuntimeConfigDir: stateDir,
+		RuntimeConfigDir: hostProfile,
 	}
-	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, "", runtime.ClaudeAdapter{Runner: subprocess.GroupRunner{}})
+	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, "", runtime.OmpAdapter{Runner: subprocess.GroupRunner{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,20 +187,14 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if !ok {
 		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
 	}
-	stagedPath := filepath.Join(stateAdapter.cleanupRoot, "runtime-state", ".claude", ".credentials.json")
-	stagedCredential, err := os.ReadFile(stagedPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(stagedCredential), "mcpOAuth") || strings.Contains(string(stagedCredential), "must-stay-hidden") {
-		t.Fatalf("isolated Claude credential leaked unrelated profile credentials: %s", stagedCredential)
-	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(stagedPath), "settings.json")); !errors.Is(err, os.ErrNotExist) {
+	t.Cleanup(func() { _ = stateAdapter.cleanup() })
+	stagedState := filepath.Join(stateAdapter.cleanupRoot, "runtime-state", ".omp", "agent")
+	if _, err := os.Stat(filepath.Join(stagedState, "settings.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("isolated profile copied host settings: %v", err)
 	}
-	adapter, ok := stateAdapter.Adapter.(runtime.ClaudeAdapter)
+	adapter, ok := stateAdapter.Adapter.(runtime.OmpAdapter)
 	if !ok {
-		t.Fatalf("inner adapter = %T, want runtime.ClaudeAdapter", stateAdapter.Adapter)
+		t.Fatalf("inner adapter = %T, want runtime.OmpAdapter", stateAdapter.Adapter)
 	}
 	runner, ok := adapter.Runner.(subprocess.WrappingRunner)
 	if !ok {
@@ -224,16 +206,16 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	if !containsPath(runner.ReadablePaths, checkout) || !containsPath(runner.ReadablePaths, filepath.Join(checkout, ".git")) {
 		t.Fatalf("explicit reads %v do not include checkout and git metadata", runner.ReadablePaths)
 	}
-	if containsPath(runner.ReadablePaths, "/") || containsPath(runner.ReadablePaths, stateDir) {
+	if containsPath(runner.ReadablePaths, "/") || containsPath(runner.ReadablePaths, hostProfile) {
 		t.Fatalf("explicit reads %v expose the host root or source profile", runner.ReadablePaths)
 	}
-	if len(runner.WritablePaths) == 0 || runner.WritablePaths[0] == stateDir || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
+	if len(runner.WritablePaths) == 0 || runner.WritablePaths[0] == hostProfile || !strings.Contains(runner.WritablePaths[0], string(filepath.Separator)+"read-only"+string(filepath.Separator)) {
 		t.Fatalf("writes = %v, want the per-worktree cache first and no source profile", runner.WritablePaths)
 	}
 	assertSeatTempDirGrant(t, runner.WritablePaths, stateAdapter.cleanupTemp, runner.Env)
-	configEnv := envValue(runner.Env, "CLAUDE_CONFIG_DIR")
-	if configEnv == "" || configEnv == stateDir || !strings.HasPrefix(configEnv, runner.WritablePaths[0]+string(filepath.Separator)) {
-		t.Fatalf("CLAUDE_CONFIG_DIR = %q, want isolated state under %q", configEnv, runner.WritablePaths[0])
+	configEnv := envValue(runner.Env, "PI_CODING_AGENT_DIR")
+	if configEnv == "" || configEnv == hostProfile || !strings.HasPrefix(configEnv, runner.WritablePaths[0]+string(filepath.Separator)) {
+		t.Fatalf("PI_CODING_AGENT_DIR = %q, want isolated state under %q", configEnv, runner.WritablePaths[0])
 	}
 	if !containsEnvPrefix(runner.Env, "GOCACHE=") || !containsEnvPrefix(runner.Env, "TMPDIR=") {
 		t.Fatalf("read-only env %v lacks Go cache or temp grants", runner.Env)
@@ -247,86 +229,30 @@ func TestWrapReadOnlySandboxAdapterUsesExplicitReadsAndIsolatedState(t *testing.
 	}
 }
 
-func TestWrapReadOnlySandboxAdapterKeepsModelGatewayCredentialFree(t *testing.T) {
-	checkout := filepath.Join(t.TempDir(), "review-worktree")
-	sourceState := filepath.Join(t.TempDir(), "claude-state")
-	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(sourceState, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sourceState, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"must-not-copy"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	gatewayRunner := &credgw.Runner{Inner: subprocess.GroupRunner{}}
-	adapter := modelGatewayRuntimeAdapter{
-		Adapter: runtime.ClaudeAdapter{Runner: gatewayRunner},
-		runner:  gatewayRunner,
-	}
-	wrapped, _, err := wrapReadOnlySandboxAdapter(t.TempDir(), runtime.Agent{
-		Runtime:          runtime.ClaudeRuntime,
-		ReadOnlySeat:     true,
-		RuntimeConfigDir: sourceState,
-	}, checkout, "", adapter)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stateAdapter, ok := wrapped.(readOnlyRuntimeAdapter)
-	if !ok {
-		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
-	}
-	gatewayAdapter, ok := stateAdapter.Adapter.(modelGatewayRuntimeAdapter)
-	if !ok {
-		t.Fatalf("inner adapter = %T, want modelGatewayRuntimeAdapter", stateAdapter.Adapter)
-	}
-	if gatewayAdapter.runner.ChildConfigDir == "" || gatewayAdapter.runner.ChildConfigDir == sourceState {
-		t.Fatalf("gateway ChildConfigDir = %q, want isolated credential-free state", gatewayAdapter.runner.ChildConfigDir)
-	}
-	if _, err := os.Stat(filepath.Join(gatewayAdapter.runner.ChildConfigDir, ".credentials.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("gateway child profile contains a credential: %v", err)
-	}
-	claude, ok := gatewayAdapter.Adapter.(runtime.ClaudeAdapter)
-	if !ok {
-		t.Fatalf("gateway inner adapter = %T", gatewayAdapter.Adapter)
-	}
-	shim, ok := claude.Runner.(subprocess.WrappingRunner)
-	if !ok {
-		t.Fatalf("gateway sandbox runner = %T", claude.Runner)
-	}
-	gateway, ok := shim.Inner.(*credgw.Runner)
-	if !ok {
-		t.Fatalf("sandbox inner = %T, want credential gateway", shim.Inner)
-	}
-	if _, ok := gateway.Inner.(subprocess.CuratedGroupRunner); !ok {
-		t.Fatalf("gateway inner base = %T, want curated environment", gateway.Inner)
-	}
-}
-
 func TestReadOnlyRuntimeStateSurvivesRepairDeliveries(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), "runtime-state")
 	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	credential := filepath.Join(stateRoot, "credential")
-	if err := os.WriteFile(credential, []byte("secret"), 0o600); err != nil {
+	stateFile := filepath.Join(stateRoot, "state")
+	if err := os.WriteFile(stateFile, []byte("secret"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`}
+	runner := &sandboxAdapterCaptureRunner{stdout: `done`}
 	adapter := readOnlyRuntimeAdapter{
-		Adapter:     runtime.ClaudeAdapter{Runner: runner},
+		Adapter:     runtime.ShellAdapter{Runner: runner},
 		cleanupRoot: stateRoot,
 	}
 	agent := runtime.Agent{
-		Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
-		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
+		Name: "reviewer", Role: "reviewer", Runtime: runtime.ShellRuntime,
+		RuntimeRef: "true", RepoScope: "owner/repo",
 		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
 	}
 	for delivery := 1; delivery <= 2; delivery++ {
 		if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "review"}); err != nil {
 			t.Fatalf("delivery %d: %v", delivery, err)
 		}
-		if data, err := os.ReadFile(credential); err != nil || string(data) != "secret" {
+		if data, err := os.ReadFile(stateFile); err != nil || string(data) != "secret" {
 			t.Fatalf("delivery %d lost repair state: data=%q err=%v", delivery, data, err)
 		}
 	}
@@ -343,28 +269,20 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	sourceDir := t.TempDir()
-	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	readOnlySeatOmpBrokerEnv(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.OmpRuntime,
+		"", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "repair-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true,
+		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	runner := &repairStateRunner{}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil
 	}
-	worker.AdapterFactory = func(agent runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
-		if agent.RuntimeConfigDir != sourceDir {
-			t.Fatalf("worker runtime config dir = %q, want configured profile %q", agent.RuntimeConfigDir, sourceDir)
-		}
-		return runtime.ClaudeAdapter{Runner: runner}, nil
+	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
+		return runtime.OmpAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, "repair-review")
 	if err != nil {
@@ -380,65 +298,8 @@ func TestWorkerReadOnlyRuntimeStateSurvivesMailboxRepair(t *testing.T) {
 	if stored.State != string(workflow.JobSucceeded) || runner.calls != 2 || !runner.repairStateObserved {
 		t.Fatalf("repair job state=%q calls=%d stateObserved=%v payload=%s", stored.State, runner.calls, runner.repairStateObserved, stored.Payload)
 	}
-	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared credential changed to %q, err=%v", data, err)
-	}
 	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("isolated runtime state survived job boundary: %v", err)
-	}
-}
-
-func TestWorkerKimiReadOnlySeatStagesProfileUnderEffectiveHome(t *testing.T) {
-	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	sourceDir := t.TempDir()
-	credentialDir := filepath.Join(sourceDir, "credentials")
-	if err := os.MkdirAll(credentialDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	const sourceCredential = `{"access_token":"host"}`
-	if err := os.WriteFile(filepath.Join(credentialDir, "kimi-code.json"), []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	const sourceModelConfig = "default_model = \"kimi-code/k3\"\n\n[providers.\"managed:kimi-code\"]\ntype = \"kimi\"\n"
-	if err := os.WriteFile(filepath.Join(sourceDir, "config.toml"), []byte(sourceModelConfig), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "kimi-reviewer", runtime.KimiRuntime,
-		"session_550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: "kimi-review", Agent: "kimi-reviewer", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
-	})
-	runner := &kimiHomeStateRunner{}
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return checkout, nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return runtime.KimiAdapter{Runner: runner, Dir: checkout}, nil
-	}
-	job, err := store.GetJob(ctx, "kimi-review")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatal(err)
-	}
-	stored, err := store.GetJob(ctx, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.State != string(workflow.JobSucceeded) || !runner.credentialObserved || !runner.modelConfigObserved {
-		t.Fatalf("Kimi job state=%q credentialObserved=%v modelConfigObserved=%v payload=%s", stored.State, runner.credentialObserved, runner.modelConfigObserved, stored.Payload)
-	}
-	if data, err := os.ReadFile(filepath.Join(credentialDir, "kimi-code.json")); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared Kimi credential changed to %q, err=%v", data, err)
-	}
-	if _, err := os.Stat(filepath.Dir(runner.home)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Kimi job-private cache survived job boundary: %v", err)
 	}
 }
 
@@ -447,16 +308,12 @@ func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	sourceDir := t.TempDir()
-	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	readOnlySeatOmpBrokerEnv(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.OmpRuntime,
+		"", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "rename-state-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	runner := &renameRuntimeStateRunner{}
 	worker := defaultJobWorker(store, io.Discard, home)
@@ -464,7 +321,7 @@ func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
 		return checkout, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return runtime.ClaudeAdapter{Runner: runner}, nil
+		return runtime.OmpAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, "rename-state-review")
 	if err != nil {
@@ -482,9 +339,6 @@ func TestWorkerReadOnlyCleanupRemovesRenamedRuntimeState(t *testing.T) {
 	}
 	if _, err := os.Stat(runner.savedState); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("renamed runtime state survived job boundary: %v", err)
-	}
-	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
 }
 
@@ -546,19 +400,16 @@ func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	sourceDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"host"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	readOnlySeatOmpBrokerEnv(t)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.OmpRuntime,
+		"", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	const jobID = "read-only-rewrap-review"
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		WorktreePath: checkout, ReadOnlySeat: true, RuntimeConfigDir: sourceDir,
+		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	runner := &streamingReviewRunner{
-		stdout: `{"result":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"reviewer adapter rewrap probe\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}`,
+		stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"reviewer adapter rewrap probe","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`),
 	}
 	var workerOutput bytes.Buffer
 	worker := defaultJobWorker(store, &workerOutput, home)
@@ -566,7 +417,7 @@ func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
 		return checkout, nil
 	}
 	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
-		return runtime.ClaudeAdapter{Runner: runner}, nil
+		return runtime.OmpAdapter{Runner: runner}, nil
 	}
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
@@ -602,23 +453,17 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	store, home := blockerE2EHome(t)
 	checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ClaudeRuntime,
-		"550e8400-e29b-41d4-a716-446655440002", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.OmpRuntime,
+		"", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 	seedDaemonWorkerAgentWithPolicy(t, store, "implementer", runtime.ShellRuntime,
 		"true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyWorkspaceWrite)
-
-	sourceDir := t.TempDir()
-	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"}}`
-	if err := os.WriteFile(filepath.Join(sourceDir, ".credentials.json"), []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
+	readOnlySeatOmpBrokerEnv(t)
 	head := readonlyWorktreeHead(t, checkout)
 	runner := &repairStateRunner{}
 
 	previousAdapterFactory := localAgentDispatchRuntimeAdapterFor
 	localAgentDispatchRuntimeAdapterFor = func(configHome string, agent runtime.Agent, deliveryCheckout string) (runtime.Adapter, error) {
-		delivery, _, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, "", runtime.ClaudeAdapter{Runner: runner})
+		delivery, _, err := wrapReadOnlySandboxAdapter(configHome, agent, deliveryCheckout, "", runtime.OmpAdapter{Runner: runner})
 		if err != nil {
 			return nil, err
 		}
@@ -636,7 +481,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "reviewer",
 		Action: "review", Instructions: "Review the exact head.", PullRequest: 7,
-		Branch: "main", HeadSHA: head, Home: home,
+		Branch: "main", HeadSHA: head, Home: home, Model: readOnlySeatOmpModel,
 	})
 	if err != nil {
 		t.Fatalf("foreground review: %v", err)
@@ -652,89 +497,8 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	if runner.calls != 2 || !runner.repairStateObserved || !runner.toolCacheObserved {
 		t.Fatalf("foreground repair calls=%d stateObserved=%v toolCacheObserved=%v", runner.calls, runner.repairStateObserved, runner.toolCacheObserved)
 	}
-	if data, err := os.ReadFile(filepath.Join(sourceDir, ".credentials.json")); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared credential changed to %q, err=%v", data, err)
-	}
 	if _, err := os.Stat(filepath.Dir(runner.stateDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("foreground isolated runtime state survived job boundary: %v", err)
-	}
-}
-
-func TestReadOnlyRuntimeAdapterNeverPersistsStagedCredential(t *testing.T) {
-	configHome := t.TempDir()
-	checkout := filepath.Join(t.TempDir(), "review-worktree")
-	if err := os.MkdirAll(filepath.Join(checkout, ".git"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sourceDir := t.TempDir()
-	source := filepath.Join(sourceDir, ".credentials.json")
-	const sourceCredential = `{"claudeAiOauth":{"accessToken":"host"},"mcpOAuth":{"secret":"preserve"}}`
-	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	agent := runtime.Agent{
-		Name: "reviewer", Role: "reviewer", Runtime: runtime.ClaudeRuntime,
-		RuntimeRef: "550e8400-e29b-41d4-a716-446655440002", RepoScope: "owner/repo",
-		AutonomyPolicy: runtime.AutonomyPolicyReadOnly, ReadOnlySeat: true,
-		RuntimeConfigDir: sourceDir,
-	}
-	wrapped, _, err := wrapReadOnlySandboxAdapter(configHome, agent, checkout, "", runtime.ClaudeAdapter{
-		Runner: &sandboxAdapterCaptureRunner{stdout: `{"result":"done"}`},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	adapter, ok := wrapped.(readOnlyRuntimeAdapter)
-	if !ok {
-		t.Fatalf("wrapped adapter = %T, want readOnlyRuntimeAdapter", wrapped)
-	}
-	staged := filepath.Join(adapter.cleanupRoot, "runtime-state", ".claude", ".credentials.json")
-	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"attacker-controlled"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := adapter.Deliver(context.Background(), agent, runtime.Job{Prompt: "review"}); err != nil {
-		t.Fatal(err)
-	}
-	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared credential changed to %q, err=%v", data, err)
-	}
-	if _, err := os.Stat(adapter.cleanupRoot); err != nil {
-		t.Fatalf("staged runtime state removed before job boundary: %v", err)
-	}
-	if err := adapter.cleanup(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(adapter.cleanupRoot); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("staged runtime state survived job cleanup: %v", err)
-	}
-}
-
-func TestStageReadOnlyRuntimeCredentialCopiesOnlyProviderSection(t *testing.T) {
-	dir := t.TempDir()
-	source := filepath.Join(dir, ".credentials.json")
-	staged := filepath.Join(dir, "isolated", ".credentials.json")
-	const sourceCredential = `{"claudeAiOauth":{"accessToken":"old"},"mcpOAuth":{"secret":"preserve"}}`
-	if err := os.WriteFile(source, []byte(sourceCredential), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := stageReadOnlyRuntimeCredential(source, staged, "claudeAiOauth", nil); err != nil {
-		t.Fatal(err)
-	}
-	stagedData, err := os.ReadFile(staged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(stagedData), "mcpOAuth") || strings.Contains(string(stagedData), "preserve") {
-		t.Fatalf("staged credential leaked unrelated provider state: %s", stagedData)
-	}
-	if !strings.Contains(string(stagedData), "claudeAiOauth") {
-		t.Fatalf("staged credential lacks Claude OAuth state: %s", stagedData)
-	}
-	if err := os.WriteFile(staged, []byte(`{"claudeAiOauth":{"accessToken":"attacker-controlled"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if data, err := os.ReadFile(source); err != nil || string(data) != sourceCredential {
-		t.Fatalf("shared credential changed to %q, err=%v", data, err)
 	}
 }
 
@@ -925,13 +689,6 @@ func TestApplyReadOnlySeatClearsInheritedGrants(t *testing.T) {
 				t.Fatalf("read-only seat retained configured grants: writes=%v readDirs=%v readFiles=%v", agent.WritablePaths, agent.ReadablePaths, agent.ReadableFiles)
 			}
 		})
-	}
-}
-
-func TestSelectedRuntimeConfigDirCapturesClaudeDispatchProfile(t *testing.T) {
-	t.Setenv("CLAUDE_CONFIG_DIR", "/profiles/reviewer")
-	if got := selectedRuntimeConfigDir(runtime.ClaudeRuntime); got != "/profiles/reviewer" {
-		t.Fatalf("selectedRuntimeConfigDir = %q, want /profiles/reviewer", got)
 	}
 }
 

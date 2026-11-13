@@ -16,7 +16,7 @@ import (
 // TestWorkerEnforcesRepositoryNoExecutionPolicy: a repository declaring
 // execution = "none" makes EVERY review of it a no-execution review, whatever
 // queued the job, so a review that cannot run under that contract (here a
-// claude reviewer) is failed before any runtime launches. A review of the same
+// shell reviewer) is failed before any runtime launches. A review of the same
 // shape with no declaration, or with an unreadable one, shows both sides of
 // the decision.
 func TestWorkerEnforcesRepositoryNoExecutionPolicy(t *testing.T) {
@@ -27,7 +27,7 @@ func TestWorkerEnforcesRepositoryNoExecutionPolicy(t *testing.T) {
 		wantFailure  string
 	}{
 		{name: "undeclared runs", config: "", wantLaunched: true},
-		{name: "declared none refuses a non-omp reviewer", config: "[repos.\"owner/repo\".review]\nexecution = \"none\"\n", wantFailure: "not supported on runtime \"claude\""},
+		{name: "declared none refuses a non-omp reviewer", config: "[repos.\"owner/repo\".review]\nexecution = \"none\"\n", wantFailure: "not supported on runtime \"shell\""},
 		{name: "unreadable declaration refuses", config: "[repos.\"owner/repo\".review]\nexecution = \"sometimes\"\n", wantFailure: "review execution policy is unreadable"},
 	}
 	for _, tc := range cases {
@@ -49,10 +49,10 @@ func TestWorkerEnforcesRepositoryNoExecutionPolicy(t *testing.T) {
 			}
 			checkout := readonlyWorktreeGitCheckout(t, "owner/repo")
 			seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-			seedDaemonWorkerAgentWithPolicy(t, store, "claude-reviewer", runtime.ClaudeRuntime,
-				"550e8400-e29b-41d4-a716-446655440000", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
+			seedDaemonWorkerAgentWithPolicy(t, store, "shell-reviewer", runtime.ShellRuntime,
+				"true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
 			enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-				ID: "policy-review", Agent: "claude-reviewer", Action: "review", Repo: "owner/repo",
+				ID: "policy-review", Agent: "shell-reviewer", Action: "review", Repo: "owner/repo",
 				WorktreePath: checkout, ReadOnlySeat: true,
 			})
 			launched := false
@@ -62,7 +62,7 @@ func TestWorkerEnforcesRepositoryNoExecutionPolicy(t *testing.T) {
 			}
 			worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) {
 				launched = true
-				return runtime.ClaudeAdapter{Runner: &repairStateRunner{}}, nil
+				return &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"reviewed","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
 			}
 			job, err := store.GetJob(ctx, "policy-review")
 			if err != nil {

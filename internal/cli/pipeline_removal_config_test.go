@@ -24,11 +24,11 @@ path = "pipelines"
 ingest_sweep = "24h"
 groom_propose = "24h"
 
-[runtimes.codex]
+[runtimes.omp]
 capabilities = ["review", "implement", "ask", "produce"]
 
 [agents.appshots-writer]
-runtime = "codex"
+runtime = "omp"
 role = "implementer"
 capabilities = ["produce"]
 autonomy_policy = "workspace-write"
@@ -60,12 +60,12 @@ func TestConfigWithRetiredPipelineKeysStillLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRuntimeRegistry with a legacy produce capability: %v", err)
 	}
-	codex, ok := registry.Metadata(runtime.CodexRuntime)
+	omp, ok := registry.Metadata(runtime.OmpRuntime)
 	if !ok {
-		t.Fatal("codex runtime missing from the resolved registry")
+		t.Fatal("omp runtime missing from the resolved registry")
 	}
-	if want := []string{"review", "implement", "ask"}; !reflect.DeepEqual(codex.Capabilities, want) {
-		t.Fatalf("codex capabilities = %v, want %v (the retired produce entry dropped)", codex.Capabilities, want)
+	if want := []string{"review", "implement", "ask"}; !reflect.DeepEqual(omp.Capabilities, want) {
+		t.Fatalf("omp capabilities = %v, want %v (the retired produce entry dropped)", omp.Capabilities, want)
 	}
 
 	types, err := config.LoadAgentTypes(paths)

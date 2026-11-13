@@ -498,7 +498,7 @@ func TestConcurrentReviewBackendSelectionIsolation(t *testing.T) {
 	localOutput, failure := runReviewRequestJSON(t,
 		"--repo", "owner/repo", "--pr", "13", "--head", head,
 		"--branch", "feature/local", "--role", "joltra", "--home", home,
-		"--runtime", runtime.ClaudeRuntime, "--json",
+		"--runtime", runtime.OmpRuntime, "--json",
 	)
 	if failure != "" {
 		t.Fatal(failure)
@@ -569,9 +569,9 @@ func TestReviewRequestRefusesUnsupportedRuntimeBackendBeforeEnqueue(t *testing.T
 	_, failure := runReviewRequestJSON(t,
 		"--repo", "owner/repo", "--pr", "12", "--head", head,
 		"--branch", "feature/review", "--role", "joltra", "--home", home,
-		"--runtime", runtime.ClaudeRuntime, "--exec-backend", "remote", "--json",
+		"--runtime", "claude", "--exec-backend", "remote", "--json",
 	)
-	if !strings.Contains(failure, runtime.ClaudeRuntime) || !strings.Contains(failure, "remote") {
+	if !strings.Contains(failure, "claude") || !strings.Contains(failure, "remote") {
 		t.Fatalf("failure = %q, want both runtime and backend operands", failure)
 	}
 	after, err := store.ListJobs(context.Background())
@@ -2827,25 +2827,25 @@ func TestExplicitRuntimeOverridesThePinOnBothVerbs(t *testing.T) {
 
 	routed, failure := runReviewRequestJSON(t, "--repo", "owner/repo", "--pr", "12", "--head", head,
 		"--branch", "feature/review", "--role", "joltra", "--home", home,
-		"--runtime", runtime.ClaudeRuntime, "--json")
+		"--runtime", runtime.ShellRuntime, "--session", "true", "--json")
 	if failure != "" {
 		t.Fatal(failure)
 	}
-	if got := dispatchedRuntime(t, store, routed.JobID, runtime.ShellRuntime); got != runtime.ClaudeRuntime {
-		t.Fatalf("review request --runtime ignored: runtime = %q, want %q", got, runtime.ClaudeRuntime)
+	if got := dispatchedRuntime(t, store, routed.JobID, runtime.OmpRuntime); got != runtime.ShellRuntime {
+		t.Fatalf("review request --runtime ignored: runtime = %q, want %q", got, runtime.ShellRuntime)
 	}
 
 	direct, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 13, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", Runtime: runtime.ClaudeRuntime,
+		ActingOrgRole: "joltra", Runtime: runtime.OmpRuntime,
 	})
 	if err != nil {
 		t.Fatalf("agent review dispatch: %v", err)
 	}
-	if got := dispatchedRuntime(t, store, direct.JobID, runtime.ShellRuntime); got != runtime.ClaudeRuntime {
-		t.Fatalf("agent review --runtime ignored: runtime = %q, want %q", got, runtime.ClaudeRuntime)
+	if got := dispatchedRuntime(t, store, direct.JobID, runtime.ShellRuntime); got != runtime.OmpRuntime {
+		t.Fatalf("agent review --runtime ignored: runtime = %q, want %q", got, runtime.OmpRuntime)
 	}
 }
 
@@ -2918,22 +2918,15 @@ exit 1`, []string{"review"}, "owner/repo")
 	}
 }
 
-// The owner's fallback decision itself (2026-09-14): a quota-blocked review on
-// a model-driven runtime retries on omp with the next pool model, rather than
-// on the runtime that just refused it. A pool entry is an OMP provider/model
-// name, so retrying a claude or codex job with it swaps one guaranteed failure
-// for another.
-//
-// Asserted on the predicate because the alternative needs a live claude/codex
-// delivery; the e2e above covers the excluded case on a real worker.
+// The owner's fallback decision itself (2026-09-14): a quota-blocked review
+// retries with the next pool model; neither current runtime is moved. An omp
+// review is already on omp, and a shell agent's command is what executes, so
+// switching it would replace the operator's script with a model.
 func TestReviewFallbackRuntimeSwitchScope(t *testing.T) {
 	for _, tc := range []struct {
 		effectiveRuntime string
 		want             bool
 	}{
-		{runtime.ClaudeRuntime, true},
-		{"codex", true},
-		{"kimi", true},
 		{runtime.OmpRuntime, false},
 		{runtime.ShellRuntime, false},
 		{"", false},

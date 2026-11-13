@@ -50,7 +50,7 @@ func TestRemoteCredentialGatewaySuccessfulCallAndAllTeardownRevocation(t *testin
 	if err := os.WriteFile(keyFile, []byte("e2b-control-key-test"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(paths.Home, runtimeAuthFileName), []byte(runtime.AnthropicAPIKeyEnv+"="+remoteBrokerTestKey+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(paths.Home, runtimeAuthFileName), []byte(anthropicAPIKeyEnv+"="+remoteBrokerTestKey+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	listenAddress := unusedLoopbackAddress(t)
@@ -295,7 +295,7 @@ func TestRemoteModelRuntimeRefusesBeforeProviderSpend(t *testing.T) {
 		factoryCalls.Add(1)
 		return nil, errors.New("must not construct")
 	}}
-	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), runtime.ClaudeRuntime, db.Job{ID: "job-no-fallback"}, time.Minute, "/checkout")
+	_, instance, lease, env, err := worker.provisionExecutionBackend(context.Background(), execbackend.Remote, executionBackendConfigForTest(t, worker), "claude", db.Job{ID: "job-no-fallback"}, time.Minute, "/checkout")
 	if err == nil || !strings.Contains(err.Error(), `runtime "claude" is not supported`) || !strings.Contains(err.Error(), "supported runtimes are shell and omp") || instance != nil || lease != nil || len(env) != 0 || factoryCalls.Load() != 0 {
 		t.Fatalf("refusal instance=%+v lease=%v env=%v factory=%d err=%v", instance, lease, env, factoryCalls.Load(), err)
 	}

@@ -162,43 +162,6 @@ func runPoolConcurrencyScenario(t *testing.T, repoB string) int {
 	return tracker.peak()
 }
 
-// runAdmissionConcurrencyScenario enqueues two jobs that would otherwise run in
-// parallel (distinct repos ⇒ distinct checkout keys; distinct codex sessions ⇒
-// distinct runtime keys, so neither the checkout nor the runtime lock serializes
-// them) and runs them under the barrier or pool scheduler with the given
-// admission budget attached. It returns the observed peak concurrent deliveries.
-func runAdmissionConcurrencyScenario(t *testing.T, usePool bool, budget *admissionBudget) int {
-	t.Helper()
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo-a", t.TempDir())
-	seedDaemonWorkerRepo(t, store, "owner/repo-b", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "audit-a", runtime.CodexRuntime, "session-a", []string{"ask"}, "owner/repo-a")
-	seedDaemonWorkerAgent(t, store, "audit-b", runtime.CodexRuntime, "session-b", []string{"ask"}, "owner/repo-b")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-a", Agent: "audit-a", Action: "ask", Repo: "owner/repo-a", Branch: "main", PullRequest: 1})
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-b", Agent: "audit-b", Action: "ask", Repo: "owner/repo-b", Branch: "main", PullRequest: 2})
-
-	tracker := &poolConcurrencyTracker{}
-	adapter := &cliWorkerFakeAdapter{output: poolSchedulerAskResult}
-	adapter.onDeliver = tracker.span
-	worker := poolSchedulerWorker(t, store, adapter, usePool)
-	worker.Admission = budget
-
-	if err := runQueuedJobsForRepo(ctx, worker, 2, "", ""); err != nil {
-		t.Fatalf("runQueuedJobsForRepo(usePool=%v): %v", usePool, err)
-	}
-	for _, id := range []string{"job-a", "job-b"} {
-		job, err := store.GetJob(ctx, id)
-		if err != nil {
-			t.Fatalf("GetJob %s: %v", id, err)
-		}
-		if job.State != string(workflow.JobSucceeded) {
-			t.Fatalf("%s state = %q, want succeeded (a deferred job must still run, never drop)", id, job.State)
-		}
-	}
-	return tracker.peak()
-}
-
 // blockedTTLTestStore builds a fresh store on a retained home so the blocked_ttl
 // sweep tests can backdate a blocked job's updated_at through a second raw
 // connection (there is no store setter for updated_at; the blocked transition
@@ -758,42 +721,6 @@ func (a *cliWorkerDelegationAdapter) Capabilities(context.Context) ([]string, er
 }
 
 // --- #444: same-repo parallel-job discoverability ---
-
-// queuePolicyBusyRuntimeStore builds a worker whose parallel-session policy is
-// "queue" (so a runtime-busy job bounces errRuntimeSessionBusy instead of forking a
-// temp worker) with the codex "audit" agent's runtime session runtime:codex:session-1
-// already externally locked. Each returned dispatch attempt bounces busy. Used by
-// the #598 spin/dedup tests.
-func queuePolicyBusyRuntimeStore(t *testing.T) (*db.Store, jobWorker, *int64) {
-	t.Helper()
-	store := daemonWorkerStore(t)
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatalf("Initialize returned error: %v", err)
-	}
-	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
-	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile config returned error: %v", err)
-	}
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "audit", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
-	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-		ResourceKey: "runtime:codex:session-1",
-		OwnerJobID:  "other-job",
-		OwnerToken:  "other-token",
-		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
-	}, time.Now().UTC()); err != nil || !acquired {
-		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
-	}
-	var attempts int64
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		atomic.AddInt64(&attempts, 1)
-		return t.TempDir(), nil
-	}
-	return store, worker, &attempts
-}
 
 // resetRuntimeLockWaitEpisodes clears the #598 runtime_lock_wait dedup state. Test-
 // only (it mutates the package-global map), which is why it lives here rather than in

@@ -16,6 +16,7 @@ import (
 // same dispatch with Background forced on (so the job is queued without runtime
 // delivery) and reports the orchestrate execution path.
 func TestRunOrchestrateForwardsToBackgroundRun(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -28,7 +29,7 @@ func TestRunOrchestrateForwardsToBackgroundRun(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "conductor",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440099",
 		"--role", "planner",
 		"--repo", "owner/repo",
@@ -117,6 +118,7 @@ func TestRunOrchestrateRequiresAgentAndMessage(t *testing.T) {
 // with review keywords but no --pr still enqueues a background coordinator
 // (action "ask") rather than erroring the way `agent run` would.
 func TestRunOrchestrateIgnoresMessageKeywords(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -127,7 +129,7 @@ func TestRunOrchestrateIgnoresMessageKeywords(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{
-		"agent", "subscribe", "conductor", "--home", home, "--runtime", "codex",
+		"agent", "subscribe", "conductor", "--home", home, "--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440099", "--role", "planner",
 		"--repo", "owner/repo", "--capability", "ask",
 	}, &stdout, &stderr); code != 0 {

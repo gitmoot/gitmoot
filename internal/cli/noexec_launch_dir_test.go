@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/credgw"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -322,7 +321,6 @@ func TestGraftRuntimeBaseRunnerSetsLaunchDirOnTheInstanceRunner(t *testing.T) {
 		"wrapping": func() subprocess.Runner {
 			return subprocess.WrappingRunner{Inner: execbackend.InstanceRunner{Instance: instance}}
 		},
-		"credential gw": func() subprocess.Runner { return &credgw.Runner{Inner: execbackend.InstanceRunner{Instance: instance}} },
 		"tee env nested": func() subprocess.Runner {
 			return subprocess.TeeRunner{Inner: subprocess.EnvInjectingRunner{Inner: execbackend.InstanceRunner{Instance: instance}}}
 		},
@@ -355,8 +353,6 @@ func instanceRunnerLaunchDir(runner subprocess.Runner) (string, []string) {
 	case *subprocess.EnvInjectingRunner:
 		return instanceRunnerLaunchDir(r.Inner)
 	case subprocess.WrappingRunner:
-		return instanceRunnerLaunchDir(r.Inner)
-	case *credgw.Runner:
 		return instanceRunnerLaunchDir(r.Inner)
 	default:
 		return "", nil

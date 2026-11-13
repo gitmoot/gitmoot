@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -33,7 +32,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "audit",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--role", "reviewer",
 		"--repo", "gitmoot/gitmoot",
@@ -61,7 +60,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 	code = Run([]string{
 		"agent", "subscribe", "audit",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--role", "reviewer",
 		"--repo", "gitmoot/gitmoot",
@@ -106,7 +105,7 @@ func TestRunAgentShow(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "audit",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--role", "reviewer",
 		"--repo", "gitmoot/gitmoot",
@@ -125,9 +124,8 @@ func TestRunAgentShow(t *testing.T) {
 	}
 	for _, want := range []string{
 		"name: audit",
-		"runtime: codex",
+		"runtime: omp",
 		"runtime_ref: 550e8400-e29b-41d4-a716-446655440001\n",
-		"runtime_session: pinned (last successful use: never)\n",
 		"role: reviewer",
 		"capabilities: review",
 		"policy: workspace-write",
@@ -148,101 +146,8 @@ func TestRunAgentShow(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
 		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
 	}
-	if decoded.Name != "audit" || decoded.RuntimeRef != "550e8400-e29b-41d4-a716-446655440001" || !decoded.RuntimeRefPinned || decoded.RuntimeRefLastSuccessfulUse != "never" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
+	if decoded.Name != "audit" || decoded.RuntimeRef != "550e8400-e29b-41d4-a716-446655440001" || decoded.Policy != runtime.AutonomyPolicyWorkspaceWrite || strings.Join(decoded.AllowedRepos, ",") != "gitmoot/gitmoot" {
 		t.Fatalf("decoded = %+v", decoded)
-	}
-}
-
-func TestRunAgentShowPinnedRuntimeRefLastSuccessfulUseFromMatchingRuntimeEvent(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	ctx := context.Background()
-	const pin = "550e8400-e29b-41d4-a716-446655440021"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name: "pinned-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
-		RuntimeRef: pin, RepoScope: "owner/repo", Capabilities: []string{"review"},
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	seedCLIJob(t, store, db.Job{
-		ID: "matching-success", Agent: "pinned-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
-	}, "succeeded")
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID: "matching-success", Kind: effectiveRuntimeEventKind,
-		Message: "job runs on runtime codex (agent default codex); session lock runtime:codex:" + pin,
-	}); err != nil {
-		t.Fatalf("AddJobEvent: %v", err)
-	}
-	store.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "show", "pinned-user", "--home", home}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
-	}
-	for _, want := range []string{
-		"runtime_ref: " + pin + "\n",
-		"runtime_session: pinned (last successful use: <1m ago)\n",
-	} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
-		}
-	}
-}
-
-func TestRunAgentShowPinnedRuntimeRefIgnoresDifferentRuntime(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	ctx := context.Background()
-	const pin = "550e8400-e29b-41d4-a716-446655440022"
-	if err := store.UpsertAgent(ctx, db.Agent{
-		Name: "codex-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
-		RuntimeRef: pin, RepoScope: "owner/repo", Capabilities: []string{"review"},
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	seedCLIJob(t, store, db.Job{
-		ID: "claude-success", Agent: "codex-user", Type: "review", State: string(workflow.JobSucceeded), Payload: `{}`,
-	}, "succeeded")
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID: "claude-success", Kind: runtimeOverrideEventKind,
-		Message: "job runs on runtime claude (agent default codex); session lock runtime:claude:" + pin,
-	}); err != nil {
-		t.Fatalf("AddJobEvent: %v", err)
-	}
-	store.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "show", "codex-user", "--home", home}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if want := "runtime_session: pinned (last successful use: never)\n"; !strings.Contains(stdout.String(), want) {
-		t.Fatalf("agent show output missing %q:\n%s", want, stdout.String())
-	}
-}
-
-func TestRunAgentShowLastRuntimeRefHasNoStaleness(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name: "last-user", Role: "reviewer", Runtime: runtime.CodexRuntime,
-		RuntimeRef: runtime.LastRef, RepoScope: "owner/repo", Capabilities: []string{"review"},
-	}); err != nil {
-		t.Fatalf("UpsertAgent: %v", err)
-	}
-	store.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "show", "last-user", "--home", home}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "runtime_ref: last\n") {
-		t.Fatalf("agent show output does not render last as unpinned:\n%s", stdout.String())
-	}
-	if strings.Contains(stdout.String(), "runtime_session:") {
-		t.Fatalf("last runtime ref grew a runtime session field:\n%s", stdout.String())
 	}
 }
 
@@ -253,7 +158,7 @@ func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "audit",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--role", "reviewer",
 		"--repo", "gitmoot/gitmoot",
@@ -279,7 +184,7 @@ func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
 	code = Run([]string{
 		"agent", "subscribe", "badpolicy",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440002",
 		"--role", "reviewer",
 		"--repo", "gitmoot/gitmoot",
@@ -300,7 +205,7 @@ func TestRunAgentAccessCommands(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "audit",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--role", "reviewer",
 		"--capability", "review",
@@ -347,13 +252,13 @@ func TestRunAgentAccessCommands(t *testing.T) {
 	}
 }
 
-func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
+func TestRunAgentStartCreatesOmpSessionAndStoresAgent(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440011"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440011", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -361,7 +266,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "lead",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--policy", "workspace-write",
@@ -370,7 +275,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 		t.Fatalf("start exit code = %d, stderr=%s", code, stderr.String())
 	}
 	for _, want := range []string{
-		"started lead (codex) for owner/repo",
+		"started lead (omp) for owner/repo",
 		"session: 550e8400-e29b-41d4-a716-446655440011",
 		"invoke: /gitmoot lead review",
 		"next: cd " + repoDir,
@@ -380,7 +285,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 			t.Fatalf("start output missing %q:\n%s", want, stdout.String())
 		}
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
+	runner.want(t, 0, repoDir, "omp", "-p", "--mode=json")
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
@@ -388,7 +293,7 @@ func TestRunAgentStartCreatesCodexSessionAndStoresAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAgent returned error: %v", err)
 	}
-	if agent.Runtime != "codex" || agent.RuntimeRef != "550e8400-e29b-41d4-a716-446655440011" || agent.Role != "agent" || strings.Join(agent.Capabilities, ",") != "ask,review,implement" {
+	if agent.Runtime != runtime.OmpRuntime || agent.RuntimeRef != "550e8400-e29b-41d4-a716-446655440011" || agent.Role != "agent" || strings.Join(agent.Capabilities, ",") != "ask,review,implement" {
 		t.Fatalf("agent = %+v", agent)
 	}
 	if _, err := store.GetRepo(context.Background(), "owner/repo"); err != nil {
@@ -412,7 +317,7 @@ func TestRunAgentStartAppliesInstalledTemplateDefaults(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	seedThermoTemplate(t, home)
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440012"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440012", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -420,7 +325,7 @@ func TestRunAgentStartAppliesInstalledTemplateDefaults(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "thermo-review",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "thermo-nuclear-code-quality-review",
@@ -454,7 +359,7 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
 	installLocalTemplate(t, home, "frontend-reviewer", testLocalTemplateContent("frontend-reviewer", "Review frontend behavior.\n"))
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440022"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440022", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -463,7 +368,7 @@ func TestRunAgentStartUsesInstalledCustomTemplate(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "frontend-reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "frontend-reviewer",
@@ -494,7 +399,7 @@ func TestRunAgentStartAppliesPlannerTemplateDefaults(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	seedPlannerTemplate(t, home)
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440032"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440032", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -502,7 +407,7 @@ func TestRunAgentStartAppliesPlannerTemplateDefaults(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "planner",
@@ -532,7 +437,7 @@ func TestRunAgentStartAllowsImplementForPlannerTemplate(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	seedPlannerTemplate(t, home)
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440033"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440033", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -540,7 +445,7 @@ func TestRunAgentStartAllowsImplementForPlannerTemplate(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "planner",
@@ -577,8 +482,8 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "planner",
 		"--home", home,
-		"--runtime", "codex",
-		"--session", "550e8400-e29b-41d4-a716-446655440021",
+		"--runtime", "shell",
+		"--session", "cat",
 		"--repo", "owner/repo",
 		"--template", "planner",
 	}, &stdout, &stderr); code != 0 {
@@ -628,7 +533,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 			t.Fatalf("ask output missing %q:\n%s", want, stdout.String())
 		}
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--json", "resume", "550e8400-e29b-41d4-a716-446655440021", "--")
+	runner.want(t, 0, repoDir, "sh", "-c", "cat", "gitmoot")
 	if !strings.Contains(runner.calls[0].args[len(runner.calls[0].args)-1], "Write a plan") {
 		t.Fatalf("ask prompt missing message:\n%s", runner.calls[0].args[len(runner.calls[0].args)-1])
 	}
@@ -1145,6 +1050,7 @@ func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
 }
 
 func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1157,7 +1063,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440022",
 		"--role", "planner",
 		"--repo", "owner/repo",
@@ -1212,6 +1118,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 }
 
 func TestRunAgentAskBackgroundJSON(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1224,7 +1131,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440023",
 		"--role", "planner",
 		"--repo", "owner/repo",
@@ -1262,7 +1169,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--role", "planner",
 		"--policy", "workspace-write",
 		"--max-background", "1",
@@ -1282,7 +1189,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("agent type list exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "planner\tcodex\t\t1") {
+	if !strings.Contains(stdout.String(), "planner\tomp\t\t1") {
 		t.Fatalf("agent type list output = %q", stdout.String())
 	}
 	stdout.Reset()
@@ -1296,7 +1203,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	}
 
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440111"}` + "\n"},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440111", "ready")},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1313,7 +1220,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if len(runner.calls) != 1 {
 		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
+	runner.want(t, 0, repoDir, "omp", "-p", "--mode=json", "--approval-mode=write")
 
 	stdout.Reset()
 	stderr.Reset()
@@ -1349,58 +1256,6 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	}
 }
 
-func TestDispatchManagedSyncUsesJobTimeoutForRuntimeLock(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "codex",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	runner := &managedSyncLockRunner{
-		t:          t,
-		store:      store,
-		runtimeKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440222",
-		minTTL:     44 * time.Minute,
-	}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:         "owner/repo",
-		Agent:            "planner",
-		Action:           "ask",
-		Instructions:     "Check the managed sync lock timeout.",
-		Type:             "planner",
-		Home:             home,
-		AllowManagedSync: true,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-	if output.Result == nil || output.Result.Decision != "implemented" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	if !runner.checked {
-		t.Fatal("runner did not inspect runtime lock during resume")
-	}
-}
-
 // TestDispatchForegroundAskToManagedTypeSpinsInstance covers #395: a plain
 // foreground ask whose name resolves to a configured managed agent type (no
 // --type, no AllowManagedSync) must dispatch synchronously to the managed type
@@ -1417,7 +1272,7 @@ func TestDispatchForegroundAskToManagedTypeSpinsInstance(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--idle-timeout", "20m",
 		"--job-timeout", "45m",
@@ -1428,12 +1283,10 @@ func TestDispatchForegroundAskToManagedTypeSpinsInstance(t *testing.T) {
 	}
 	store := openCLIJobStore(t, home)
 	defer store.Close()
-	runner := &managedSyncLockRunner{
-		t:          t,
-		store:      store,
-		runtimeKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440222",
-		minTTL:     44 * time.Minute,
-	}
+	runner := &agentStartRunner{results: []subprocess.Result{
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440222", "ready")},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440223", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)},
+	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -1484,7 +1337,7 @@ func TestDispatchForegroundReviewToManagedTypeStillErrors(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--idle-timeout", "20m",
 		"--job-timeout", "45m",
@@ -1618,7 +1471,7 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--capability", "ask",
 		"--policy", "read-only",
@@ -1627,8 +1480,8 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 		t.Fatalf("agent type set read-only exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440411"}` + "\n"},
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440412"}` + "\n"},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440411", "ready")},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440412", "ready")},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1639,14 +1492,14 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	if code != 0 {
 		t.Fatalf("first managed ask exit code = %d, stderr=%s", code, stderr.String())
 	}
-	runner.want(t, 0, repoDir, "codex", "exec", "--sandbox", "read-only", "--json", "--")
+	runner.want(t, 0, repoDir, "omp", "-p", "--mode=json", "--approval-mode=always-ask")
 
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--capability", "ask",
 		"--policy", "workspace-write",
@@ -1663,7 +1516,7 @@ func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) 
 	if len(runner.calls) != 2 {
 		t.Fatalf("runtime start calls = %+v, want two", runner.calls)
 	}
-	runner.want(t, 1, repoDir, "codex", "exec", "--sandbox", "workspace-write", "--json", "--")
+	runner.want(t, 1, repoDir, "omp", "-p", "--mode=json", "--approval-mode=write")
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
@@ -1692,7 +1545,7 @@ func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testi
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "2",
 		"--idle-timeout", "20m",
 		"--job-timeout", "45m",
@@ -1708,7 +1561,7 @@ func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testi
 		t.Fatalf("UpsertRepo returned error: %v", err)
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440333"}` + "\n"},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440333", "ready")},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1755,12 +1608,27 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "managed agent types support codex, claude, kimi, or omp") {
+	if !strings.Contains(stderr.String(), "managed agent types support omp") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{
+		"agent", "type", "set", "codex-planner",
+		"--home", home,
+		"--runtime", "codex",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("agent type set codex exit code = %d, want 2", code)
+	}
+	if !strings.Contains(stderr.String(), `runtime "codex" is no longer supported; gitmoot requires omp for jobs`) {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 
 func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1773,7 +1641,7 @@ func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "2",
 		"--capability", "ask",
 	}, &stdout, &stderr)
@@ -1781,8 +1649,8 @@ func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
 		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440121"}` + "\n"},
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440122"}` + "\n"},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440121", "ready")},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440122", "ready")},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1801,6 +1669,7 @@ func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1824,7 +1693,7 @@ func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
 	code = Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--capability", "ask",
 	}, &stdout, &stderr)
@@ -1832,7 +1701,7 @@ func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
 		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440123"}` + "\n"},
+		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440123", "ready")},
 	}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
@@ -1858,6 +1727,7 @@ func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1870,7 +1740,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--capability", "ask",
 	}, &stdout, &stderr)
@@ -1883,7 +1753,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
 		Name:         "planner-bg-expired",
 		Type:         "planner",
-		Runtime:      "codex",
+		Runtime:      "omp",
 		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440131",
 		RepoFullName: "owner/repo",
 		Role:         "planner",
@@ -1898,7 +1768,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
 		Name:         "planner-bg-active",
 		Type:         "planner",
-		Runtime:      "codex",
+		Runtime:      "omp",
 		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440132",
 		RepoFullName: "owner/repo",
 		Role:         "planner",
@@ -1950,6 +1820,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1962,7 +1833,7 @@ func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--max-background", "1",
 		"--capability", "ask",
 	}, &stdout, &stderr)
@@ -1975,7 +1846,7 @@ func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
 	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
 		Name:         "planner-bg-expired",
 		Type:         "planner",
-		Runtime:      "codex",
+		Runtime:      "omp",
 		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440141",
 		RepoFullName: "owner/repo",
 		Role:         "planner",
@@ -2029,7 +1900,7 @@ func TestRunAgentTypeSetValidatesTemplate(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--template", "missing-template",
 	}, &stdout, &stderr)
 	if code != 1 {
@@ -2061,7 +1932,7 @@ func TestManagedAgentAskRejectsRetiredCachedTemplate(t *testing.T) {
 	configContent = append(configContent, []byte(`
 
 [agents.legacy-planner]
-runtime = "codex"
+runtime = "omp"
 template = "`+retiredID+`"
 role = "planner"
 capabilities = ["ask"]
@@ -2111,7 +1982,7 @@ func TestRunAgentTypeSetRejectsConfigUnsafeName(t *testing.T) {
 	code := Run([]string{
 		"agent", "type", "set", "bad#name",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 	}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("agent type set unsafe name exit code = %d, want 2", code)
@@ -2137,7 +2008,7 @@ func TestRunAgentTypeSetRejectsNonPositiveTimeouts(t *testing.T) {
 			code := Run([]string{
 				"agent", "type", "set", "planner",
 				"--home", home,
-				"--runtime", "codex",
+				"--runtime", "omp",
 				tc.flag, "0s",
 			}, &stdout, &stderr)
 			if code != 2 {
@@ -2157,7 +2028,7 @@ func TestRunAgentGCRemovesExpiredManagedInstances(t *testing.T) {
 	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
 		Name:         "planner-bg-expired",
 		Type:         "planner",
-		Runtime:      "codex",
+		Runtime:      "omp",
 		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440112",
 		RepoFullName: "owner/repo",
 		Role:         "planner",
@@ -2213,7 +2084,7 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440031",
 		"--role", "reviewer",
 		"--repo", "owner/repo",
@@ -2236,7 +2107,7 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "outsider",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440032",
 		"--role", "planner",
 		"--repo", "owner/other",
@@ -2252,74 +2123,6 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `agent "outsider" is not allowed on "owner/repo"`) {
 		t.Fatalf("disallowed repo stderr = %q", stderr.String())
-	}
-}
-
-func TestRunAgentAskCancelsQueuedJobWhenRuntimeSessionBusy(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{
-		"agent", "subscribe", "planner",
-		"--home", home,
-		"--runtime", "codex",
-		"--session", "550e8400-e29b-41d4-a716-446655440041",
-		"--role", "planner",
-		"--repo", "owner/repo",
-		"--capability", "ask",
-	}, &stdout, &stderr); code != 0 {
-		t.Fatalf("subscribe planner exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-		ResourceKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440041",
-		OwnerJobID:  "other-job",
-		OwnerToken:  "other-token",
-		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
-	}, time.Now().UTC()); err != nil || !acquired {
-		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
-	}
-	store.Close()
-
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code := Run([]string{"agent", "ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("busy ask exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "runtime session runtime:codex:550e8400-e29b-41d4-a716-446655440041 is busy") {
-		t.Fatalf("busy ask stderr = %q", stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime calls = %+v, want none", runner.calls)
-	}
-	store = openCLIJobStore(t, home)
-	defer store.Close()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("jobs = %+v, want one cancelled job", jobs)
-	}
-	if jobs[0].State != string(workflow.JobCancelled) {
-		t.Fatalf("job state = %q, want cancelled", jobs[0].State)
-	}
-	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !hasCLIJobEvent(events, string(workflow.JobCancelled)) || !hasCLIJobEvent(events, "runtime_lock_wait") {
-		t.Fatalf("events = %+v, want cancellation and runtime_lock_wait", events)
 	}
 }
 
@@ -2345,7 +2148,7 @@ func TestRunAgentStartRejectsMissingTemplateBeforeRuntime(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "thermo-review",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "thermo-nuclear-code-quality-review",
@@ -2375,7 +2178,7 @@ func TestRunAgentStartRejectsMissingCustomTemplateBeforeRuntime(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "frontend-reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--template", "frontend-reviewer",
@@ -2399,7 +2202,7 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "subscribe", "lead", "--home", home, "--runtime", "codex", "--session", "last", "--role", "lead", "--repo", "owner/repo", "--capability", "ask"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"agent", "subscribe", "lead", "--home", home, "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440097", "--role", "lead", "--repo", "owner/repo", "--capability", "ask"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{}
@@ -2408,7 +2211,7 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "start", "lead", "--home", home, "--runtime", "codex", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}, &stdout, &stderr)
+	code := Run([]string{"agent", "start", "lead", "--home", home, "--runtime", "omp", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
@@ -2428,7 +2231,7 @@ func TestRunAgentStartPreservesExistingAgentType(t *testing.T) {
 	}
 	configured := config.DefaultConfig(paths) + `
 [agents.preserved-agent]
-runtime = "claude"
+runtime = "omp"
 template = "preserved-template"
 model = "preserved-model"
 effort = "high"
@@ -2456,7 +2259,7 @@ job_timeout = "17m"
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "preserved-agent", "--home", home, "--runtime", "codex",
+		"agent", "start", "preserved-agent", "--home", home, "--runtime", "omp",
 		"--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -2474,7 +2277,7 @@ job_timeout = "17m"
 		t.Fatal(err)
 	}
 	entry := entries["preserved-agent"]
-	if entry.Runtime != "claude" || entry.Template != "preserved-template" || entry.Model != "preserved-model" ||
+	if entry.Runtime != "omp" || entry.Template != "preserved-template" || entry.Model != "preserved-model" ||
 		entry.Effort != "high" || entry.Role != "preserved-role" || !reflect.DeepEqual(entry.Capabilities, []string{"review"}) ||
 		entry.AutonomyPolicy != "read-only" || entry.MaxBackground != 4 || entry.IdleTimeout != "41m" || entry.JobTimeout != "17m" {
 		t.Fatalf("pre-existing type was clobbered: %+v", entry)
@@ -2487,7 +2290,7 @@ func TestRunAgentStartRejectsConfigUnsafeNameBeforeRuntime(t *testing.T) {
 	agentStartAdapterFor = func(_ string, _ string, _ string) (runtime.Adapter, error) { return fake, nil }
 	t.Cleanup(func() { agentStartAdapterFor = previous })
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "start", "unsafe.name", "--runtime", "codex", "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"agent", "start", "unsafe.name", "--runtime", "omp", "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 2 || fake.calls() != 0 || !strings.Contains(stderr.String(), "invalid agent name") {
 		t.Fatalf("code=%d calls=%d stderr=%s", code, fake.calls(), stderr.String())
 	}
@@ -2529,6 +2332,35 @@ func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 	}
 }
 
+func TestRunAgentStartRefusesRemovedRuntime(t *testing.T) {
+	home := t.TempDir()
+	repoDir := t.TempDir()
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
+	runner := &agentStartRunner{}
+	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
+	defer restoreFactory()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"agent", "start", "legacy",
+		"--home", home,
+		"--runtime", "codex",
+		"--repo", "owner/repo",
+		"--path", repoDir,
+		"--capability", "ask",
+	}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("start exit code = %d, want 2 (stderr=%q)", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `runtime "codex" is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the agent with --runtime omp`) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runtime was started for a removed runtime: %+v", runner.calls)
+	}
+}
+
 func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -2559,7 +2391,7 @@ func TestRunAgentSubscribeAppliesInstalledTemplateDefaults(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "thermo-review",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "thermo-nuclear-code-quality-review",
@@ -2594,7 +2426,7 @@ func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	code := Run([]string{
 		"agent", "subscribe", "frontend-reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "frontend-reviewer",
@@ -2612,7 +2444,7 @@ func TestRunAgentSubscribeUsesInstalledCustomTemplate(t *testing.T) {
 	code = Run([]string{
 		"agent", "subscribe", "frontend-reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "frontend-reviewer",
@@ -2641,7 +2473,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	code := Run([]string{
 		"agent", "subscribe", "frontend-reviewer",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "frontend-reviewer",
@@ -2659,7 +2491,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	code = Run([]string{
 		"agent", "subscribe", "thermo-review",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "thermo-nuclear-code-quality-review",
@@ -2701,7 +2533,7 @@ func TestRunAgentSubscribeRejectsMissingTemplateAndImplementCapability(t *testin
 	code = Run([]string{
 		"agent", "subscribe", "thermo-review",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
 		"--repo", "gitmoot/gitmoot",
 		"--template", "thermo-nuclear-code-quality-review",
@@ -2727,7 +2559,7 @@ func TestRunAgentStartRefusesImplementWithNonWritePolicy(t *testing.T) {
 		args := []string{
 			"agent", "start", "shipper",
 			"--home", home,
-			"--runtime", "codex",
+			"--runtime", "omp",
 			"--repo", "owner/repo",
 			"--path", repoDir,
 			"--capability", "implement",
@@ -2759,7 +2591,7 @@ func TestRunAgentStartAllowsImplementWithWritePolicy(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440044"}` + "\n"}}}
+	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440044", "ready")}}}
 	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 	defer restoreFactory()
 
@@ -2767,7 +2599,7 @@ func TestRunAgentStartAllowsImplementWithWritePolicy(t *testing.T) {
 	code := Run([]string{
 		"agent", "start", "shipper",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--repo", "owner/repo",
 		"--path", repoDir,
 		"--capability", "implement",
@@ -2784,7 +2616,7 @@ func TestRunAgentSubscribeRefusesImplementWithNonWritePolicy(t *testing.T) {
 		args := []string{
 			"agent", "subscribe", "shipper",
 			"--home", home,
-			"--runtime", "codex",
+			"--runtime", "omp",
 			"--session", "550e8400-e29b-41d4-a716-446655440001",
 			"--repo", "owner/repo",
 			"--role", "shipper",
@@ -2808,7 +2640,7 @@ func TestRunAgentSubscribeRefusesImplementWithNonWritePolicy(t *testing.T) {
 
 func TestRunAgentSubscribeValidatesInput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "subscribe", "bad name", "--runtime", "codex", "--session", "s", "--role", "reviewer", "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
+	code := Run([]string{"agent", "subscribe", "bad name", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440001", "--role", "reviewer", "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
 
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
@@ -2853,258 +2685,6 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 	}
 	if agent.HealthStatus != "ok" {
 		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
-	}
-}
-
-func TestRunAgentDoctorClaudeReportsMaskedAuthEnv(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-ok")
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-ok", "--home", home}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-auth-env ok") {
-		t.Fatalf("stdout missing claude auth status:\n%s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), runtime.ClaudeOAuthTokenEnv+"=set") || strings.Contains(stdout.String(), "secret-token") {
-		t.Fatalf("stdout leaked or missed masked auth detail:\n%s", stdout.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-ok")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "ok" {
-		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
-	}
-}
-
-// (A) env-missing but the live probe authenticates fine → the env check is not
-// a failure; report warn/0 with the background-token caveat (NOT failed, NOT a
-// dead-session message). This is the false-negative the live-probe fallback fixes.
-func TestRunAgentDoctorClaudeAuthEnvMissingProbeOKWarns(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-probe-ok")
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"result":"OK"}`}}}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-probe-ok", "--home", home}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-auth-env warn") {
-		t.Fatalf("stdout missing claude-auth-env warn:\n%s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("stdout missing background-token caveat:\n%s", stdout.String())
-	}
-	if strings.Contains(stdout.String(), runtime.ClaudeSessionAuthFailedMessage) ||
-		strings.Contains(stderr.String(), runtime.ClaudeSessionAuthFailedMessage) {
-		t.Fatalf("output should NOT mention a dead-session message on probe-ok:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
-	}
-	// The probe must actually be invoked even without --live.
-	runner.want(t, 0, "", "claude", "-p", "--output-format", "json", "--", runtime.ClaudeLiveCheckPrompt)
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-probe-ok")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "warn" {
-		t.Fatalf("health status = %q, want warn", agent.HealthStatus)
-	}
-}
-
-// (B) env-missing and the live probe returns an auth-classified failure → escalate
-// to failed/1 with the SESSION-failure message (refresh/rebind), not just "set up
-// a token".
-func TestRunAgentDoctorClaudeAuthEnvMissingProbeFailsSession(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-probe-fail")
-	runner := &agentStartRunner{
-		results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
-		errs:    []error{errors.New("exit 1")},
-	}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-probe-fail", "--home", home}, &stdout, &stderr)
-
-	if code != 1 {
-		t.Fatalf("doctor exit code = %d, want 1; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-live fail") {
-		t.Fatalf("stdout missing classified probe failure:\n%s", stdout.String())
-	}
-	if !strings.Contains(stderr.String(), runtime.ClaudeSessionAuthFailedMessage) {
-		t.Fatalf("stderr missing session-failure message:\n%s", stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-probe-fail")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "failed" {
-		t.Fatalf("health status = %q, want failed", agent.HealthStatus)
-	}
-}
-
-// (C) env-missing and the probe is unavailable (binary missing / exec error) →
-// warn/0 with the caveat; never a NEW false-fail just because the CLI is absent.
-func TestRunAgentDoctorClaudeAuthEnvMissingProbeUnavailableWarns(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-probe-unavail")
-	runner := &agentStartRunner{
-		errs: []error{&exec.Error{Name: "claude", Err: exec.ErrNotFound}},
-	}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-probe-unavail", "--home", home}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-live warn probe unavailable") {
-		t.Fatalf("stdout missing probe-unavailable warn line:\n%s", stdout.String())
-	}
-	if !strings.Contains(stdout.String(), runtime.ClaudeBackgroundTokenMessage) {
-		t.Fatalf("stdout missing background-token caveat:\n%s", stdout.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-probe-unavail")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "warn" {
-		t.Fatalf("health status = %q, want warn", agent.HealthStatus)
-	}
-}
-
-// (D) env token present → ok/0, the runner is NOT consulted (env-Ready boxes stay
-// instant; no probe).
-func TestRunAgentDoctorClaudeAuthEnvPresentSkipsProbe(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-env-ok")
-	runner := &agentStartRunner{}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-env-ok", "--home", home}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("doctor exit code = %d, want 0; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-auth-env ok") {
-		t.Fatalf("stdout missing claude-auth-env ok:\n%s", stdout.String())
-	}
-	runner.mu.Lock()
-	calls := len(runner.calls)
-	runner.mu.Unlock()
-	if calls != 0 {
-		t.Fatalf("runner consulted %d times, want 0 (env-Ready must not probe)", calls)
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-env-ok")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "ok" {
-		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
-	}
-}
-
-func TestRunAgentDoctorClaudeLiveRunsSmoke(t *testing.T) {
-	withClaudeAuthEnv(t, nil)
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-live")
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"result":"OK"}`}}}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-live", "--home", home, "--live"}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("doctor exit code = %d, stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-auth-env warn") || !strings.Contains(stdout.String(), "claude-live ok") {
-		t.Fatalf("stdout missing live smoke result:\n%s", stdout.String())
-	}
-	runner.want(t, 0, "", "claude", "-p", "--output-format", "json", "--", runtime.ClaudeLiveCheckPrompt)
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-live")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "ok" {
-		t.Fatalf("health status = %q, want ok", agent.HealthStatus)
-	}
-}
-
-func TestRunAgentDoctorClaudeLiveClassifiesAuthFailure(t *testing.T) {
-	withClaudeAuthEnv(t, map[string]string{runtime.ClaudeOAuthTokenEnv: "secret-token"})
-	home := t.TempDir()
-	subscribeClaudeAgent(t, home, "claude-live-fail")
-	runner := &agentStartRunner{
-		results: []subprocess.Result{{Stderr: "401 Invalid authentication credentials"}},
-		errs:    []error{errors.New("exit 1")},
-	}
-	restoreRunner := replaceAgentDoctorRunner(runner)
-	defer restoreRunner()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "doctor", "claude-live-fail", "--home", home, "--live"}, &stdout, &stderr)
-
-	if code != 1 {
-		t.Fatalf("doctor exit code = %d, want 1; stderr=%s\nstdout=%s", code, stderr.String(), stdout.String())
-	}
-	if !strings.Contains(stdout.String(), "claude-live fail") || !strings.Contains(stderr.String(), "claude setup-token") {
-		t.Fatalf("doctor output missing classified live failure:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	agent, err := store.GetAgent(context.Background(), "claude-live-fail")
-	if err != nil {
-		t.Fatalf("GetAgent returned error: %v", err)
-	}
-	if agent.HealthStatus != "failed" {
-		t.Fatalf("health status = %q, want failed", agent.HealthStatus)
-	}
-}
-
-func subscribeClaudeAgent(t *testing.T, home string, name string) {
-	t.Helper()
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "subscribe", name,
-		"--home", home,
-		"--runtime", "claude",
-		"--session", "550e8400-e29b-41d4-a716-446655440099",
-		"--role", "reviewer",
-		"--repo", "gitmoot/gitmoot",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
 }
 
@@ -3179,49 +2759,20 @@ type agentStartCall struct {
 	args    []string
 }
 
-type managedSyncLockRunner struct {
-	t          *testing.T
-	store      *db.Store
-	runtimeKey string
-	minTTL     time.Duration
-	checked    bool
-}
-
-func (r *managedSyncLockRunner) Run(ctx context.Context, _ string, command string, args ...string) (subprocess.Result, error) {
-	isResume := false
-	for _, arg := range args {
-		if arg == "resume" {
-			isResume = true
-			break
-		}
-	}
-	if !isResume {
-		return subprocess.Result{Command: command, Args: args, Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440222"}` + "\n"}, nil
-	}
-	lock, err := r.store.GetResourceLock(ctx, r.runtimeKey)
+// ompStreamStdout is the NDJSON stream a fake runner returns for one omp run:
+// the session header (the runtime_ref agent start stores) followed by a final
+// assistant message carrying text.
+func ompStreamStdout(sessionID string, text string) string {
+	message, err := json.Marshal(map[string]any{"type": "message_end", "message": map[string]any{
+		"role": "assistant", "content": []any{map[string]any{"type": "text", "text": text}},
+		"usage": map[string]any{"input": 1, "output": 1, "totalTokens": 2}, "stopReason": "stop",
+	}})
 	if err != nil {
-		r.t.Fatalf("GetResourceLock during resume returned error: %v", err)
+		panic(err)
 	}
-	acquiredAt, err := time.Parse(time.RFC3339Nano, lock.AcquiredAt)
-	if err != nil {
-		r.t.Fatalf("parse acquired_at %q: %v", lock.AcquiredAt, err)
-	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, lock.ExpiresAt)
-	if err != nil {
-		r.t.Fatalf("parse expires_at %q: %v", lock.ExpiresAt, err)
-	}
-	if ttl := expiresAt.Sub(acquiredAt); ttl < r.minTTL {
-		r.t.Fatalf("runtime lock ttl = %s, want at least %s", ttl, r.minTTL)
-	}
-	r.checked = true
-	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"}, nil
-}
-
-func (r *managedSyncLockRunner) LookPath(file string) (string, error) {
-	if file == "" {
-		return "", errors.New("empty file")
-	}
-	return "/usr/bin/" + file, nil
+	return `{"type":"session","version":3,"id":"` + sessionID + `","timestamp":"2026-11-10T00:00:00.000Z","cwd":"/repo"}` + "\n" +
+		string(message) + "\n" +
+		`{"type":"agent_end","messages":[],"isTerminal":true}` + "\n"
 }
 
 func (r *agentStartRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
@@ -3263,48 +2814,6 @@ func (r *agentStartRunner) want(t *testing.T, index int, dir string, command str
 	}
 	if len(call.args) < len(wantPrefix) || !reflect.DeepEqual(call.args[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("call %d args = %s\nwant prefix %s", index, strings.Join(call.args, " "), strings.Join(wantPrefix, " "))
-	}
-}
-
-func withClaudeAuthEnv(t *testing.T, values map[string]string) {
-	t.Helper()
-	names := []string{
-		runtime.ClaudeOAuthTokenEnv,
-		runtime.AnthropicAPIKeyEnv,
-		runtime.AnthropicAuthTokenEnv,
-	}
-	previous := make(map[string]string, len(names))
-	present := make(map[string]bool, len(names))
-	for _, name := range names {
-		if value, ok := os.LookupEnv(name); ok {
-			previous[name] = value
-			present[name] = true
-		}
-		if err := os.Unsetenv(name); err != nil {
-			t.Fatalf("unset %s: %v", name, err)
-		}
-	}
-	for name, value := range values {
-		if err := os.Setenv(name, value); err != nil {
-			t.Fatalf("set %s: %v", name, err)
-		}
-	}
-	t.Cleanup(func() {
-		for _, name := range names {
-			if present[name] {
-				_ = os.Setenv(name, previous[name])
-			} else {
-				_ = os.Unsetenv(name)
-			}
-		}
-	})
-}
-
-func replaceAgentDoctorRunner(runner subprocess.Runner) func() {
-	original := agentDoctorRunner
-	agentDoctorRunner = runner
-	return func() {
-		agentDoctorRunner = original
 	}
 }
 
@@ -3436,6 +2945,7 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 // loadInstalledTemplate's not-installed error at dispatch time, rather than
 // silently queueing a job with no recipe prompt.
 func TestRunOrchestrateRejectsUninstalledRecipe(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -3447,7 +2957,7 @@ func TestRunOrchestrateRejectsUninstalledRecipe(t *testing.T) {
 	if code := Run([]string{
 		"agent", "subscribe", "planner",
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440099",
 		"--role", "planner",
 		"--repo", "owner/repo",
@@ -3558,7 +3068,7 @@ func TestDispatchAgentCommandMapsEffortOntoRequest(t *testing.T) {
 func TestAgentModelRoundTripsThroughStorageMapping(t *testing.T) {
 	original := runtime.Agent{
 		Name:           "planner",
-		Runtime:        runtime.ClaudeRuntime,
+		Runtime:        runtime.OmpRuntime,
 		RepoScope:      "owner/repo",
 		Model:          "opus",
 		Effort:         "high",
@@ -3626,7 +3136,7 @@ func registerPolicyTestAgent(t *testing.T, home, name, policy string) {
 	code := Run([]string{
 		"agent", "subscribe", name,
 		"--home", home,
-		"--runtime", "codex",
+		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440099",
 		"--role", "worker",
 		"--repo", "gitmoot/gitmoot",
@@ -3728,7 +3238,7 @@ func TestAgentTypeShowSurfacesPolicyDivergence(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"agent", "type", "set", "split", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr)
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -3764,7 +3274,7 @@ func TestAgentTypeShowStaysQuietWhenPlanesAgree(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "agree", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "agree", "workspace-write")
@@ -3796,7 +3306,7 @@ func TestAgentPolicySyncsTheConfigPlaneWhenOneExists(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "twoplanes", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "twoplanes", "workspace-write")
@@ -3846,7 +3356,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenConfigIsUnwritable(t *testing.T
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "locked", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "locked", "read-only")
@@ -3898,7 +3408,7 @@ func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "rcsplit", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "rcsplit", "danger-full-access")
@@ -3917,7 +3427,7 @@ func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	if code := Run([]string{"agent", "type", "set", "lonely", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d", code)
 	}
 	stdout.Reset()
@@ -3940,7 +3450,7 @@ func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "unreadable", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "unreadable", "danger-full-access")
@@ -3989,7 +3499,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenTheRowCannotBeWritten(t *testin
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{"agent", "type", "set", "blocked", "--home", home,
-		"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
 	registerPolicyTestAgent(t, home, "blocked", "read-only")
@@ -4065,7 +3575,7 @@ func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
 		home := t.TempDir()
 		var stdout, stderr bytes.Buffer
 		if code := Run([]string{"agent", "type", "set", "widened", "--home", home,
-			"--runtime", "codex", "--role", "worker", "--policy", "danger-full-access"}, &stdout, &stderr); code != 0 {
+			"--runtime", "omp", "--role", "worker", "--policy", "danger-full-access"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 		}
 		// The state after a successful barrier: config already carries the new
@@ -4091,7 +3601,7 @@ func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
 		home := t.TempDir()
 		var stdout, stderr bytes.Buffer
 		if code := Run([]string{"agent", "type", "set", "untouched", "--home", home,
-			"--runtime", "codex", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+			"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("agent type set exit = %d", code)
 		}
 		barrierErr := fmt.Errorf("%w: unwritable", db.ErrAgentPolicyBarrier)

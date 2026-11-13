@@ -52,9 +52,9 @@ func (r *contractProbeRunner) Run(ctx context.Context, _ string, command string,
 		case strings.Contains(mode, "omp-without-plan"):
 			return subprocess.Result{Stdout: "Usage: omp [options]\n  -p, --print\n  --mode=<value>\n  --approval-mode=<value>\n  --no-session\n"}, nil
 		case strings.Contains(mode, "unsupported"):
-			return subprocess.Result{Stdout: "Usage: kimi [options]\n  --prompt\n  --output-format\n"}, nil
+			return subprocess.Result{Stdout: "Usage: stub [options]\n  --prompt\n  --output-format\n"}, nil
 		default:
-			return subprocess.Result{Stdout: "Usage: kimi [options]\n  --print\n  -p, --prompt\n  --output-format\n"}, nil
+			return subprocess.Result{Stdout: "Usage: stub [options]\n  --print\n  -p, --prompt\n  --output-format\n"}, nil
 		}
 	}
 	return subprocess.Result{}, errors.New("unexpected probe")
@@ -68,18 +68,38 @@ func (r *contractProbeRunner) calls() int {
 
 func newContractCheckerForTest(t *testing.T, content string) (*RuntimeContractChecker, *contractProbeRunner, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "kimi")
+	path := filepath.Join(t.TempDir(), "stub")
 	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	runner := &contractProbeRunner{path: path}
-	checker := NewRuntimeContractChecker(runner, BuiltinRuntimeRegistry())
+	checker := NewRuntimeContractChecker(runner, builtinRegistryWithStubForTest())
 	return checker, runner, path
+}
+
+// stubRuntime is a test-only runtime whose declared contract the probe fixture
+// answers, so the generic preflight states are exercised without depending on
+// one production runtime's flag list.
+const stubRuntime = "stub"
+
+var stubRuntimeContract = RuntimeContract{
+	Binary: "stub",
+	Requirements: []RuntimeRequirement{
+		{Kind: RuntimeRequirementFlag, Name: "flag -p", Flag: "-p", Source: "internal/runtime/stub.go::StubAdapter.Deliver", Remedy: "install a stub CLI that lists -p"},
+		{Kind: RuntimeRequirementFlag, Name: "flag --output-format", Flag: "--output-format", Source: "internal/runtime/stub.go::StubAdapter.Deliver", Remedy: "install a stub CLI that lists --output-format"},
+	},
+}
+
+func builtinRegistryWithStubForTest() Registry {
+	reg := BuiltinRuntimeRegistry()
+	reg.order = append(reg.order, stubRuntime)
+	reg.entries[stubRuntime] = RuntimeMetadata{Name: stubRuntime, Dispatchable: true, Contract: stubRuntimeContract}
+	return reg
 }
 
 func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unparseable")
-	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: stubRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnknown {
 		t.Fatalf("state = %q, want unknown", result.State)
@@ -91,7 +111,7 @@ func TestRuntimePreflightUnknownNeverBlocks(t *testing.T) {
 
 func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "unsupported")
-	agent := Agent{Name: "seat", Runtime: KimiRuntime, AutonomyPolicy: AutonomyPolicyAuto}
+	agent := Agent{Name: "seat", Runtime: stubRuntime, AutonomyPolicy: AutonomyPolicyAuto}
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnsupported {
 		t.Fatalf("state = %q, want unsupported", result.State)
@@ -100,7 +120,7 @@ func TestRuntimePreflightUnsupportedErrorNamesRequiredFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("unsupported preflight did not block")
 	}
-	for _, want := range []string{"kimi", "flag -p", "stub 1.2.3", "remedy", "KimiAdapter.Deliver"} {
+	for _, want := range []string{stubRuntime, "flag -p", "stub 1.2.3", "remedy", "StubAdapter.Deliver"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error %q does not contain %q", err, want)
 		}
@@ -133,7 +153,7 @@ func TestRuntimePreflightScopesOmpPlanFlagsToPlanJobs(t *testing.T) {
 
 func TestRuntimePreflightReprobesChangedBinaryIdentity(t *testing.T) {
 	checker, runner, path := newContractCheckerForTest(t, "supported")
-	agent := Agent{Name: "seat", Runtime: KimiRuntime}
+	agent := Agent{Name: "seat", Runtime: stubRuntime}
 	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractSupported {
 		t.Fatalf("initial state = %q, want supported", got)
 	}
@@ -156,7 +176,7 @@ func TestRuntimePreflightCachesUnchangedBinaryIdentity(t *testing.T) {
 	checker, runner, _ := newContractCheckerForTest(t, "supported")
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
-	agent := Agent{Name: "seat", Runtime: KimiRuntime}
+	agent := Agent{Name: "seat", Runtime: stubRuntime}
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractSupported || result.Instrument != "binary-help" {
 		t.Fatalf("first result = %#v, want supported from binary-help", result)
@@ -177,7 +197,7 @@ func TestRuntimePreflightCachesUnknownProbeUntilTTL(t *testing.T) {
 	checker.Timeout = time.Millisecond
 	now := time.Unix(1_700_000_000, 0)
 	checker.now = func() time.Time { return now }
-	agent := Agent{Name: "seat", Runtime: KimiRuntime}
+	agent := Agent{Name: "seat", Runtime: stubRuntime}
 	if got := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{}).State; got != RuntimeContractUnknown {
 		t.Fatalf("first state = %q, want unknown", got)
 	}
@@ -200,17 +220,16 @@ func TestRuntimePreflightCachesUnknownProbeUntilTTL(t *testing.T) {
 func TestRuntimePreflightHonorsDeclaredPrecondition(t *testing.T) {
 	checker, _, _ := newContractCheckerForTest(t, "supported")
 	checker.EffectiveUID = func() (int, bool) { return 0, true }
-	// Point the shared-binary fixture at Claude metadata; its help is parseable and
-	// lists --permission-mode for this test.
-	checker.Registry = registryWithContractForTest(ClaudeRuntime, RuntimeContract{
-		Binary: "claude",
+	// Point the shared-binary fixture at a precondition-only contract.
+	checker.Registry = registryWithContractForTest(stubRuntime, RuntimeContract{
+		Binary: "stub",
 		Requirements: []RuntimeRequirement{{
 			Kind: RuntimeRequirementNonRootEUID, Name: "precondition effective uid != 0 for --permission-mode bypassPermissions",
-			Flag: "--permission-mode bypassPermissions", Source: "internal/runtime/adapter.go::claudePermissionArgs",
+			Flag: "--permission-mode bypassPermissions", Source: "internal/runtime/stub.go::stubPermissionArgs",
 			Remedy: "run as non-root", Policies: []string{AutonomyPolicyDangerFullAccess}, Instrument: "effective-uid",
 		}},
 	})
-	agent := Agent{Name: "root-claude", Runtime: ClaudeRuntime, AutonomyPolicy: AutonomyPolicyDangerFullAccess}
+	agent := Agent{Name: "root-stub", Runtime: stubRuntime, AutonomyPolicy: AutonomyPolicyDangerFullAccess}
 	result := checker.CheckRequest(context.Background(), agent, RuntimeContractRequest{})
 	if result.State != RuntimeContractUnsupported || result.Instrument != "effective-uid" {
 		t.Fatalf("precondition result = %#v, want unsupported from effective-uid", result)

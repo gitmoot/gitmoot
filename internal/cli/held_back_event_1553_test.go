@@ -42,8 +42,10 @@ func TestHeldBackJobRecordsItsReasonInJobEvents(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-big", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
+	seedDaemonWorkerAgent(t, store, "coder", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
+	// A shell runtime override gives the job a runtime-session key, so admission
+	// prices it at default_memory_gb rather than as a free session-less job.
+	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-big", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, RuntimeOverride: runtime.ShellRuntime, RuntimeOverrideRef: "true"})
 
 	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
 	// Cap below the smallest estimate: the job is refused, and stays queued.
@@ -84,7 +86,7 @@ func TestDispatchedJobRecordsNoHeldBackEvent(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
 	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
+	seedDaemonWorkerAgent(t, store, "coder", runtime.ShellRuntime, "unused", []string{"ask"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-ok", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
 
 	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)

@@ -88,7 +88,7 @@ artifact_blobs = %q
 # require_workflow = false # opt out (default is true)
 # require_workflow_mode = "auto" # auto | strict
 
-# [cache] gives isolated-worktree jobs (codex is always sandboxed; read-only
+# [cache] gives isolated-worktree jobs (read-only
 # review seats are Landlock-sandboxed) a shared, host-level tool-cache
 # directory instead of each job re-materializing its own uv/go/npm/pip caches
 # inside its worktree. Enabled by default; the shared dir is created on first
@@ -218,17 +218,14 @@ default_repair_timeout = ""
 # 0 (the default, below) it is DISABLED and scheduling is byte-identical to a
 # config with no [admission] section. Set max_concurrent_sessions to cap total
 # in-flight sessions across all repos in the daemon process; set max_memory_gb to
-# cap the summed per-runtime RAM estimate of in-flight sessions (a job is admitted
-# only if it fits BOTH). A job that does not fit is left queued and retried next
-# tick — never failed. The per-runtime *_memory_gb values are operator-tunable
-# RAM priors; a non-session runtime contributes 0. Note: the budget is enforced
+# cap the summed RAM estimate of in-flight sessions (a job is admitted only if
+# it fits BOTH). A job that does not fit is left queued and retried next tick —
+# never failed. default_memory_gb is the operator-tunable RAM prior for a session
+# job; a non-session runtime contributes 0. Note: the budget is enforced
 # per daemon process (host-global for the normal single-daemon deployment).
 # [admission]
 # max_concurrent_sessions = 0
 # max_memory_gb = 0
-# codex_memory_gb = 0.2
-# claude_memory_gb = 0.85
-# kimi_memory_gb = 0.5
 # default_memory_gb = 0.5
 
 # [github] tunes the PROCESS-WIDE GitHub call budget + secondary-rate-limit backoff
@@ -259,16 +256,16 @@ default_repair_timeout = ""
 # calls_per_hour_warn = 0      # off; daemon-local approximate count when enabled
 
 # [runtimes.<name>] is the OPTIONAL config-driven runtime metadata registry
-# (issue #652). Gitmoot ships built-in metadata for each compiled runtime (codex,
-# claude, kimi, omp, shell) — capabilities, default model/effort, known models, and where
+# (issue #652). Gitmoot ships built-in metadata for each compiled runtime (omp,
+# and shell for no-LLM tests) — capabilities, default model/effort, known models, and where
 # token usage is read from — that reproduces today's behavior. A [runtimes.<name>]
 # section OVERRIDES that recorded metadata for a BUILT-IN runtime WITHOUT a
 # recompile: retarget the default model, record which models a runtime accepts, or
 # adjust its advertised capabilities. Two fields are BEHAVIORAL: default_model is
 # consulted at job DELIVERY (#652) as the model fallback when NEITHER the agent
 # NOR the job pins a --model; default_effort follows the same precedence after
-# job/agent --effort and is forwarded to Codex as model_reasoning_effort. Claude
-# and Kimi ignore effort. Every other field is inspection-only, surfaced by
+# job/agent --effort and is forwarded to the runtime. Every other field is
+# inspection-only, surfaced by
 # 'gitmoot runtime list' but changing nothing at runtime: models is advisory
 # (Gitmoot never REJECTS a --model based on it), and capabilities gates nothing at
 # dispatch (agent capabilities do). Adapter behavior (auth, sandbox, session resume,
@@ -280,10 +277,10 @@ default_repair_timeout = ""
 # are surfaced by 'runtime list' AND used as delivery fallbacks; models is the
 # advisory known-valid list; capabilities is a subset of review/implement/ask;
 # usage_source is a human-readable descriptor.
-# [runtimes.codex]
-# default_model = "gpt-5.5-codex"
+# [runtimes.omp]
+# default_model = "anthropic/claude-sonnet-4-5"
 # default_effort = "high"
-# models = ["gpt-5.5-codex", "gpt-5.4-codex"]
+# models = ["anthropic/claude-sonnet-4-5", "openai/gpt-5.5"]
 # capabilities = ["review", "implement", "ask"]
 
 # [review] controls native PR review scheduling. Native fanout is disabled by

@@ -236,7 +236,7 @@ func TestSandboxdLinuxProviderRoutesToItsGatewayWithItsOwnCap(t *testing.T) {
 // the registry for this test's home.
 func installSandboxdPairGateway(t *testing.T, pair sandboxdPairHome, upstream string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(pair.paths.Home, runtimeAuthFileName), []byte(runtime.AnthropicAPIKeyEnv+"="+remoteBrokerTestKey+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(pair.paths.Home, runtimeAuthFileName), []byte(anthropicAPIKeyEnv+"="+remoteBrokerTestKey+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	originalRegistry := credgw.DefaultRegistry

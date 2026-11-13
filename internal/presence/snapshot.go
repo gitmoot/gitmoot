@@ -12,7 +12,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -110,104 +109,6 @@ func BuildSnapshot(ctx context.Context, paths config.Paths, repoFullName string)
 		})
 	}
 	return snapshot, nil
-}
-
-// DaemonAuthSnapshot reports the running daemon's Claude auth env, best-effort.
-// The signal that actually matters for background Claude jobs is the daemon's own
-// environment (not the shell that ran `gitmoot doctor`), so this reads the live
-// daemon process's environment. It is fail-open and OS-gated: outside Linux, or
-// when /proc is unreadable, Detected is false and callers fall back to the
-// shell-local check (issue #427).
-type DaemonAuthSnapshot struct {
-	// Running reports whether a daemon process was located at all.
-	Running bool
-	// PID is the daemon process id when Running.
-	PID int
-	// Detected reports whether the daemon's environment could be read. When false,
-	// Auth is zero and callers must not treat it as "daemon has no token".
-	Detected bool
-	// Auth is the daemon's Claude auth env (only meaningful when Detected).
-	Auth runtime.ClaudeAuthEnv
-}
-
-// InspectDaemonClaudeAuth locates the running daemon and reports its Claude auth
-// environment, best-effort. It never returns an error: a missing daemon,
-// unreadable /proc, or non-Linux host all degrade to Detected=false so the
-// caller can fall back to the shell-local check. Secrets are never returned —
-// only the presence/absence booleans on ClaudeAuthEnv.
-func InspectDaemonClaudeAuth(paths config.Paths) DaemonAuthSnapshot {
-	daemon := InspectDaemon(paths)
-	snapshot := DaemonAuthSnapshot{
-		PID:     daemon.PID,
-		Running: daemon.State == DaemonRunning,
-	}
-	if !snapshot.Running || daemon.PID <= 0 {
-		return snapshot
-	}
-	lookup, ok := readProcessEnviron(daemon.PID)
-	if !ok {
-		return snapshot
-	}
-	snapshot.Detected = true
-	snapshot.Auth = runtime.InspectClaudeAuthEnv(lookup)
-	return snapshot
-}
-
-// DaemonClaudeCredEnv returns the env entries needed to validate the token the
-// running daemon will ACTUALLY use, for injecting into a live probe so the doctor
-// checks the daemon's credential rather than the doctor process's own. It returns
-// the daemon's set Claude credential VALUES as KEY=VALUE entries AND, critically,
-// NAME= (empty) for each Claude credential var the daemon does NOT set — so when
-// the entries are appended onto the doctor process's environment (RunEnv), they
-// NEUTRALIZE any competing credential the doctor shell carries but the daemon
-// lacks (claude treats empty as unset). Without this, a doctor-shell
-// ANTHROPIC_API_KEY (which outranks OAuth) could validate the WRONG credential and
-// mask a bad daemon token (#486). Unlike DaemonAuthSnapshot (set/unset booleans
-// only) this returns secret VALUES — callers must use them solely as subprocess
-// env and never print or persist them. It is best-effort and fail-open: a missing
-// daemon, unreadable /proc, or non-Linux host yields (nil, false); a detected
-// daemon with no Claude credential at all also yields (nil, false) so the caller
-// falls back to the presence-only report.
-func DaemonClaudeCredEnv(paths config.Paths) ([]string, bool) {
-	daemon := InspectDaemon(paths)
-	if daemon.State != DaemonRunning || daemon.PID <= 0 {
-		return nil, false
-	}
-	lookup, ok := readProcessEnviron(daemon.PID)
-	if !ok {
-		return nil, false
-	}
-	return claudeCredEnvFromLookup(lookup)
-}
-
-// claudeCredEnvFromLookup builds the isolated Claude credential env from a
-// lookup func (split out from DaemonClaudeCredEnv so the neutralization contract
-// is testable without a live daemon / readable /proc). Returns (nil, false) when
-// the lookup carries no non-empty Claude credential.
-func claudeCredEnvFromLookup(lookup func(string) (string, bool)) ([]string, bool) {
-	if lookup == nil {
-		return nil, false
-	}
-	hasCred := false
-	env := make([]string, 0, 3)
-	for _, name := range []string{
-		runtime.ClaudeOAuthTokenEnv,
-		runtime.AnthropicAPIKeyEnv,
-		runtime.AnthropicAuthTokenEnv,
-	} {
-		if value, present := lookup(name); present && strings.TrimSpace(value) != "" {
-			env = append(env, name+"="+value)
-			hasCred = true
-			continue
-		}
-		// The daemon does not set this credential: neutralize the doctor's own value
-		// so it cannot leak into the probe and validate the wrong credential.
-		env = append(env, name+"=")
-	}
-	if !hasCred {
-		return nil, false
-	}
-	return env, true
 }
 
 func InspectDaemon(paths config.Paths) DaemonSnapshot {

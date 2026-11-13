@@ -138,9 +138,11 @@ func unavailableSeatToolchain(paths config.Paths, diagnostic string) (string, []
 }
 
 // seatRuntimeNames are the provider CLIs every read-only seat may need as a
-// sibling runtime. OMP is different: it is a routing harness capable of
-// launching more agents, so it is staged only when OMP is the selected runtime.
-var seatRuntimeNames = []string{runtime.ClaudeRuntime, runtime.KimiRuntime, runtime.CodexRuntime}
+// sibling command. They are no longer job runtimes (omp is, #2587), but a seat's
+// prompt may still invoke them. OMP is different: it is a routing harness
+// capable of launching more agents, so it is staged only when OMP is the
+// selected runtime.
+var seatRuntimeNames = []string{"claude", "kimi", "codex"}
 
 // stageSeatRuntimes materialises engine-owned commands for the provider runtime
 // set and, when selected, OMP. Each installed runtime becomes a copied artifact;

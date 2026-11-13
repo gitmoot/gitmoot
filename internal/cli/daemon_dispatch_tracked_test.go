@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -379,42 +378,6 @@ func TestTrackedDispatchLogsHeldBackJobs(t *testing.T) {
 	}
 }
 
-// TestTrackedDispatchLogsAdmissionNeverFit pins the admission half of the #562
-// observability slice: a queued job whose RAM estimate alone exceeds the
-// configured [admission] cap can NEVER be admitted — previously a silent
-// skip-forever — and now logs a throttled NEVER-fit line naming the cap.
-func TestTrackedDispatchLogsAdmissionNeverFit(t *testing.T) {
-	resetHeldBackWarnState()
-	ctx := context.Background()
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", t.TempDir())
-	// A codex agent is session-counted with a 0.2 GB default estimate.
-	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "session-1", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-big", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1})
-
-	stdout := &syncBuffer{}
-	worker := poolSchedulerWorker(t, store, &cliWorkerFakeAdapter{output: poolSchedulerAskResult}, false)
-	worker.Stdout = stdout
-	// Cap below the smallest estimate: the job can never fit.
-	worker.Admission = newAdmissionBudget(config.AdmissionPolicy{MaxMemoryGB: 0.1})
-	tracker := newInflightJobTracker(ctx)
-
-	if err := dispatchQueuedJobsTracked(ctx, worker, 2, 2, "owner/repo", "", tracker); err != nil {
-		t.Fatalf("dispatchQueuedJobsTracked: %v", err)
-	}
-	out := stdout.String()
-	if !strings.Contains(out, "job job-big held back:") || !strings.Contains(out, "NEVER fit") {
-		t.Fatalf("never-fit admission skip not logged; output=%q", out)
-	}
-	job, err := store.GetJob(ctx, "job-big")
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job-big state = %q, want queued (admission skip must leave it queued)", job.State)
-	}
-}
-
 // TestTrackedDispatchBoundsHostTotalAcrossRepos pins the #562 review fix for
 // registered-repo mode: every enabled repo shares ONE tracker, and dispatch is
 // clamped by the HOST-global in-flight count, so --workers bounds total
@@ -466,124 +429,6 @@ func TestTrackedDispatchBoundsHostTotalAcrossRepos(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestTrackedPoolIsolationHonorsSamePassRuntimeSibling pins the #562 review fix
-// for the pool's isolation loop: the loop must consult the LIVE in-flight maps,
-// not just the per-pass seed-union copies. A same-runtime-session sibling
-// dispatched moments earlier IN THE SAME PASS is invisible in the stale copies
-// (and its DB session lock may not be acquired yet), so before the fix the
-// contended no-worktree job could be isolation-dispatched beside it — the loser
-// of the session-lock race then bounced busy with its payload rewritten to an
-// isolation worktree that reap() deletes. Here: while job-wt (session sess-1)
-// is in flight, job-iso (same session, blocked on the externally-held shared
-// checkout) must stay queued with an untouched payload; once job-wt finishes,
-// job-iso must run — via an isolation worktree, since the shared checkout stays
-// held — proving the fix holds it back without starving it.
-func TestTrackedPoolIsolationHonorsSamePassRuntimeSibling(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	store := daemonWorkerStore(t)
-	home := t.TempDir()
-	// READY BARRIER (ruling 122694): seat staging copies the pinned toolchain and
-	// one artifact per runtime class ONCE PER HOME. Paying that inside the
-	// 10-second completion assertion below made this test fail on staging cost
-	// rather than on the scheduling property it measures. The deadline is
-	// unchanged; the copy simply happens before the window.
-	warmSeatStaging(t, home)
-	checkout := createDaemonWorkerGitCheckout(t, "main")
-	seedDaemonWorkerRepo(t, store, "owner/repo", checkout)
-	// ONE codex agent with a session ref: both jobs share runtime key
-	// "runtime:codex:550e8400-e29b-41d4-a716-446655440055".
-	seedDaemonWorkerAgent(t, store, "coder", runtime.CodexRuntime, "550e8400-e29b-41d4-a716-446655440055", []string{"ask"}, "owner/repo")
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-wt", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 1, WorktreePath: filepath.Join(t.TempDir(), "wt-job-wt")})
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-iso", Agent: "coder", Action: "ask", Repo: "owner/repo", Branch: "main", PullRequest: 2})
-
-	adapter := newWedgeBlockingAdapter("job-wt")
-	worker := poolSchedulerWorker(t, store, adapter, true)
-	worker.ConfigHome = home // enable pool isolation worktrees
-	worker.CheckoutValidator = func(_ context.Context, _ db.Job, payload workflow.JobPayload, _ runtime.Agent) (string, error) {
-		if isolated := strings.TrimSpace(payload.WorktreePath); payload.ReadOnlySeat && isolated != "" {
-			return isolated, nil
-		}
-		return checkout, nil
-	}
-	codexTranscript := `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440055"}` + "\n" +
-		`{"type":"turn.started"}` + "\n" +
-		`{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":` + strconv.Quote(poolSchedulerAskResult) + `}}` + "\n" +
-		`{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}`
-	worker.AdapterFactory = func(_ runtime.Agent, deliveryCheckout string) (workflow.DeliveryAdapter, error) {
-		if sameCheckoutPath(deliveryCheckout, checkout) {
-			return adapter, nil
-		}
-		return runtime.CodexAdapter{Runner: &sandboxAdapterCaptureRunner{stdout: codexTranscript}, Dir: deliveryCheckout}, nil
-	}
-	tracker := newInflightJobTracker(ctx)
-	// An external in-flight job holds the shared checkout for the whole test, so
-	// job-iso is always checkout-contended (isolation is its only way to run).
-	if !tracker.beginWithin(0, "external-hold", "owner/repo", "repo:owner/repo", "") {
-		t.Fatalf("begin(external-hold) refused on a fresh tracker")
-	}
-	errCh := make(chan error, 1)
-	go func() { errCh <- runQueuedJobsForRepoPoolTracked(ctx, worker, 2, 8, "owner/repo", "", tracker) }()
-
-	if !waitForCondition(t, 5*time.Second, adapter.stillBlocked) {
-		t.Fatalf("job-wt never started delivering; delivered=%v", adapter.deliveredJobs())
-	}
-	// While the same-session sibling is in flight, job-iso must NOT be
-	// isolation-dispatched: still queued, payload untouched, never delivered.
-	time.Sleep(250 * time.Millisecond)
-	job, err := store.GetJob(ctx, "job-iso")
-	if err != nil {
-		t.Fatalf("GetJob job-iso: %v", err)
-	}
-	if job.State != string(workflow.JobQueued) {
-		t.Fatalf("job-iso state = %q while its same-session sibling runs, want queued", job.State)
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		t.Fatalf("payload job-iso: %v", err)
-	}
-	if payload.WorktreePath != "" {
-		t.Fatalf("job-iso payload was rewritten to isolation worktree %q beside a live same-session sibling (stale-seed isolation dispatch)", payload.WorktreePath)
-	}
-	if delivered := adapter.deliveredJobs(); len(delivered) != 1 || delivered[0] != "job-wt" {
-		t.Fatalf("delivered = %v, want only job-wt while it holds runtime session sess-1", delivered)
-	}
-
-	// Sibling finishes -> the session frees -> job-iso must now run via an
-	// isolation worktree (the shared checkout is STILL externally held).
-	close(adapter.release)
-	if got := waitForJobState(t, store, "job-wt", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
-		t.Fatalf("job-wt state = %q after release, want succeeded", got)
-	}
-	if got := waitForJobState(t, store, "job-iso", string(workflow.JobSucceeded), 10*time.Second); got != string(workflow.JobSucceeded) {
-		events, _ := store.ListJobEvents(ctx, "job-iso")
-		t.Fatalf("job-iso state = %q after the session freed, want succeeded (held back forever instead of isolated); events=%+v", got, events)
-	}
-	job, err = store.GetJob(ctx, "job-iso")
-	if err != nil {
-		t.Fatalf("GetJob job-iso (final): %v", err)
-	}
-	if payload, err = daemonJobPayload(job); err != nil || payload.WorktreePath == "" {
-		t.Fatalf("job-iso final payload worktree = %q err=%v, want an isolation worktree (must have run beside the held shared checkout)", payload.WorktreePath, err)
-	}
-	// #739: the reactive isolation success is now OBSERVABLE — a
-	// pool_isolation_worktree_allocated event was emitted when job-iso was
-	// dispatched into its worktree (it used to be silent both ways).
-	if n := countCLIJobEvents(t, store, "job-iso", "pool_isolation_worktree_allocated"); n != 1 {
-		t.Fatalf("pool_isolation_worktree_allocated event count = %d, want 1 (#739 observability)", n)
-	}
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("pool pass returned error: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("pool pass did not return after the queue drained")
-	}
-	tracker.end("external-hold")
-	tracker.drain(io.Discard, 5*time.Second)
 }
 
 // TestTrackedTickMaintenanceNotStarvedByInFlightJobs pins the #562 review fix

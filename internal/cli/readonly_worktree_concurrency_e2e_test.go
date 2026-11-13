@@ -172,11 +172,11 @@ func loopbackRendezvousSeatScript(address, self, okResult string) string {
 	probe := `import socket,sys; host,port=sys.argv[1].rsplit(":",1); s=socket.create_connection((host,int(port)),5); s.settimeout(None); s.sendall(sys.argv[2].encode()); ok=s.recv(1); s.close(); sys.exit(0 if ok else 1)`
 	return fmt.Sprintf(
 		"if python3 -c %s %s %s; then sleep 0.3; printf '%%s' %s; else printf '%%s' %s; fi",
-		shellQuote(probe, "posix"),
-		shellQuote(address, "posix"),
-		shellQuote(self, "posix"),
-		shellQuote(okResult, "posix"),
-		shellQuote(failResult, "posix"),
+		posixQuote(probe),
+		posixQuote(address),
+		posixQuote(self),
+		posixQuote(okResult),
+		posixQuote(failResult),
 	)
 }
 

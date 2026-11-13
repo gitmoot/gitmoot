@@ -120,6 +120,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2585: upgrades a database seeded with heartbeat_state rows through the
 	// real Open path.
 	realPathTests["TestHeartbeatRemovalMigrationOnPreviousSchema"] = true
+	// #2587: drops runtime_session_usage while upgrading a database built from
+	// the migrations before it, through the real Open path.
+	realPathTests["TestRuntimeSessionUsageRemovalMigrationUpgradesThroughOpen"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

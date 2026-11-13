@@ -120,7 +120,7 @@ func TestWorkerSweepReachesTheSelectorOnRepoBehindABusyRepo(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		agent := fmt.Sprintf("lead-%d-%s", i, uniq)
 		task := fmt.Sprintf("task-%d-%s", i, uniq)
-		seedDaemonWorkerAgent(t, store, agent, runtime.CodexRuntime, "session-shared", []string{"implement"}, "owner/zzz-free")
+		seedDaemonWorkerAgent(t, store, agent, runtime.OmpRuntime, "fresh:session-shared", []string{"implement"}, "owner/zzz-free")
 		if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/zzz-free", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
 			t.Fatalf("UpsertTask: %v", err)
 		}
@@ -191,7 +191,7 @@ func TestWorkerSweepDefersTheForcedTurnToTheEnd(t *testing.T) {
 	uniq := t.Name()
 	agent := "lead-" + uniq
 	task := "task-" + uniq
-	seedDaemonWorkerAgent(t, store, agent, runtime.CodexRuntime, "session-"+uniq, []string{"implement"}, "owner/zzz-free")
+	seedDaemonWorkerAgent(t, store, agent, runtime.OmpRuntime, "fresh:session-"+uniq, []string{"implement"}, "owner/zzz-free")
 	if err := store.UpsertTask(ctx, db.Task{ID: task, RepoFullName: "owner/zzz-free", State: string(workflow.TaskImplementing), Branch: task, WorktreePath: "/tmp/gitmoot/" + task}); err != nil {
 		t.Fatalf("UpsertTask: %v", err)
 	}

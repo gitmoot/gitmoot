@@ -62,9 +62,9 @@ func TestSeatGrantsCoverTheInterpreterAScriptRuntimeExecs(t *testing.T) {
 	stageScriptRuntimeFixture(t, "codex")
 	checkout := seatFixtureCheckout(t)
 	home := t.TempDir()
-	agent := runtime.Agent{Name: "gm-review-codex", Runtime: runtime.CodexRuntime, ReadOnlySeat: true}
+	agent := runtime.Agent{Name: "gm-review", Runtime: runtime.OmpRuntime, ReadOnlySeat: true}
 
-	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot", true)
+	grants, err := readOnlyRuntimeSandboxGrants(home, agent, checkout, "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("seat setup: %v", err)
 	}
@@ -178,8 +178,8 @@ func TestSeatGrantsCoverATRANSITIVEInterpreterChain(t *testing.T) {
 
 	home := t.TempDir()
 	grants, err := readOnlyRuntimeSandboxGrants(home, runtime.Agent{
-		Name: "gm-review-codex", Runtime: runtime.CodexRuntime, ReadOnlySeat: true,
-	}, seatFixtureCheckout(t), "gitmoot/gitmoot", true)
+		Name: "gm-review", Runtime: runtime.OmpRuntime, ReadOnlySeat: true,
+	}, seatFixtureCheckout(t), "gitmoot/gitmoot")
 	if err != nil {
 		t.Fatalf("seat setup: %v", err)
 	}
