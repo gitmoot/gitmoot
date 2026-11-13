@@ -52,7 +52,7 @@ func TestRemoteReviewWorkerExitSettlesItsClaimedRun(t *testing.T) {
 			ctx := context.Background()
 			t.Setenv("HERDR_BIN", filepath.Join(t.TempDir(), "herdr-must-not-run"))
 			harness := newRemoteLifecycleHarness(t)
-			home, paths, store := heartbeatLoopE2EHome(t)
+			home, paths, store := daemonE2EHome(t)
 			writeRemoteLifecycleConfig(t, paths, harness.control.URL)
 			checkout := createDaemonWorkerGitCheckout(t, "main")
 			makeReviewFixOriginFetchable(t, checkout, "main")
