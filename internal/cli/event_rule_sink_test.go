@@ -762,25 +762,25 @@ pane="w1:p3"
 	verdict := func(jobID, repo string) events.Event {
 		return events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict, JobID: jobID, Repo: repo, PullRequest: 72, ReviewDecision: "changes_requested"}
 	}
-	// Checked on the addressing Emit applies before rule evaluation: the pre-fix
-	// sink left the unattributed verdict unaddressed.
+	// Driven through Emit and checked on the durable wake recipients it persists:
+	// the pre-fix sink left the unattributed verdict unaddressed, so the
+	// addressed-scope rules woke nobody. Outbox rows accumulate, so the cases
+	// that must wake nobody run first.
 	sink := &eventRuleSink{store: store, home: home}
-	emitted := func(jobID, repo string) events.Event {
-		t.Helper()
-		sink.Emit(ctx, verdict(jobID, repo))
-		return sink.addressUnownedVerdictEvent(ctx, verdict(jobID, repo))
-	}
 
-	if got := emitted("unattributed", "acme/docus"); got.WakeTargetRole != "app" || !reflect.DeepEqual(got.WakeTargetRoles, []string{"app"}) {
-		t.Fatalf("unattributed verdict addressed %q %v, want the repo owner app", got.WakeTargetRole, got.WakeTargetRoles)
+	sink.Emit(ctx, verdict("tied", "acme/other"))
+	if got := pendingWakeTargetRoles(t, store); len(got) != 0 {
+		t.Fatalf("tied repo verdict woke %v, want no guess", got)
 	}
 	// The engine emptied this target because the real requester holds a durable
 	// subscription; the repo owner must not be woken in its place.
-	if got := emitted("attributed", "acme/docus"); got.WakeTargetRole != "" || len(got.WakeTargetRoles) != 0 {
-		t.Fatalf("attributed verdict re-addressed to %q %v, want engine addressing kept", got.WakeTargetRole, got.WakeTargetRoles)
+	sink.Emit(ctx, verdict("attributed", "acme/docus"))
+	if got := pendingWakeTargetRoles(t, store); len(got) != 0 {
+		t.Fatalf("attributed verdict re-addressed to %v, want engine addressing kept", got)
 	}
-	if got := emitted("tied", "acme/other"); got.WakeTargetRole != "" || len(got.WakeTargetRoles) != 0 {
-		t.Fatalf("tied repo verdict addressed %q %v, want no guess", got.WakeTargetRole, got.WakeTargetRoles)
+	sink.Emit(ctx, verdict("unattributed", "acme/docus"))
+	if got := pendingWakeTargetRoles(t, store); !reflect.DeepEqual(got, []string{"app"}) {
+		t.Fatalf("unattributed verdict woke %v, want the repo owner app", got)
 	}
 }
 
