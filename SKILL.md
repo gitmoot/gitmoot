@@ -96,7 +96,7 @@ asks for that action.
 5. Prefer read-only status commands and answer directly before mutating Gitmoot
    state or pointing the user to live monitoring.
 6. Use `gitmoot --help` and subcommand help for version-sensitive features such
-   as `memory`, `router`, `runtime`, dashboard web,
+   as `memory`, `runtime`, dashboard web,
    session jobs, and heartbeats.
 
 ## Install And Update
