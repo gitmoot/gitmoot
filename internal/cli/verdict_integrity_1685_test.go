@@ -25,17 +25,12 @@ func seedVerdictIntegrityAgent(t *testing.T, store *db.Store, name, role string,
 	return agent
 }
 
-// #1685. A coordinator in a review slot is the SHIPPED review-panel flow, so
-// dispatch must allow it. An earlier version of this file pinned the opposite —
-// it refused role=coordinator outright — which made the product refuse its own
+// #1685. A coordinator in a review slot is the review-panel recipe, so dispatch
+// must allow it. An earlier version of this file pinned the opposite - it
+// refused role=coordinator outright - which made the product refuse its own
 // documented recipe (skills/gitmoot/agent-templates/review-panel.md declares
-// capabilities [ask, review] and outputs [delegations]).
-//
-// The defect was never that a coordinator PRODUCES a fan-out; it was that
-// consumers COUNTED one as a verdict. That is fixed where the counting happens:
-// TestPolicyMergeGateRefusesUndispatchedFanOutRow and its siblings in
-// internal/workflow, the pipeline auto-merge gate, allRequiredReviewersApproved,
-// the proof projector, and the verdict wake.
+// capabilities [ask, review]). Reviews can no longer return delegations (#2588),
+// so a coordinator's review result is judged like any other verdict.
 func TestEnsureLocalAgentAccessAllowsCoordinatorInReviewSlot(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)

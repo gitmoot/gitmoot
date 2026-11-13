@@ -68,16 +68,8 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	// artifacts (#2588), so it is no longer offered to agents.
 	"artifact_body":   {},
 	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
-	// fan_out is PRODUCT-OWNED and deliberately carries neither an example nor
-	// help: agents are never asked for it, so advertising it in the prompt would
-	// invite a value the product owns. It records that a result WAS a
-	// coordinator fan-out, even on a stored row whose executable delegations[]
-	// are absent (#1685). The empty entry still satisfies the
-	// generator's every-field-accounted-for check, so a future rename cannot
-	// silently drop it.
-	"fan_out": {},
-	// superseded_pull_request_closed is PRODUCT-OWNED for the same reason as fan_out,
-	// so it carries neither an example nor help: no agent is ever asked for it. The
+	// superseded_pull_request_closed is PRODUCT-OWNED, so it carries neither an
+	// example nor help: no agent is ever asked for it. The
 	// closed-PR sweep sets it on the SYNTHETIC result it mints for a delegation child
 	// whose pull request is no longer open, and the retry actuator reads it to know a
 	// delivery-checkout preflight can never validate for that child (#1673). It lives

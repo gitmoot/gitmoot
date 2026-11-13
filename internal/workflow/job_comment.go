@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -71,43 +70,11 @@ func RenderJobResultComment(comment JobResultComment) string {
 	if summary == "" {
 		summary = "No summary provided."
 	}
-	// A FAN-OUT ANNOUNCEMENT IS NOT A VERDICT, AND THE PUBLISHED RECORD MUST SAY
-	// SO (#1963). Every surface that ACTS on a decision already discounts this
-	// row through the one shared rule - the merge gate's candidate and objection
-	// scans, the proof projector, and
-	// db.SucceededReviewVerdicts, which mirrors it because workflow cannot be
-	// imported there. This renderer did not, so the one surface a human reads
-	// asserted the opposite of what the engine believed: measured on 70
-	// PR-attached rows across 27 pull requests, 62 of them with an empty
-	// tests_run, and every single one of them rendered "approved" because a
-	// fan-out that carries a terminal verdict has never once carried
-	// "changes_requested".
-	//
-	// The announced value stays visible rather than being suppressed: the record
-	// has to remain auditable, and what was wrong was the field ASSERTING a
-	// verdict, not the value being disclosed.
-	if ResultIsFanOut(comment.Result) {
-		note := "`fan-out` (coordinator announcement, not a verdict: announced `" +
-			markdownInline(decision) + "`"
-		// COUNT THE DECLARED DELEGATIONS, not the agent names: a delegation may
-		// name a role rather than an agent, and a stored row may carry FanOut
-		// without its delegations[], so a name-derived count reads zero for rows
-		// that fanned out to three children.
-		if declared := len(comment.Result.Delegations); declared > 0 {
-			note += ", evidence comes from the " + strconv.Itoa(declared) + " delegated child job(s) below"
-		} else {
-			note += ", evidence comes from its delegated child jobs"
-		}
-		writeScalar(&builder, "Decision", note+")")
-	} else {
-		writeScalar(&builder, "Decision", "`"+markdownInline(decision)+"`")
-	}
+	writeScalar(&builder, "Decision", "`"+markdownInline(decision)+"`")
 	writeScalar(&builder, "Summary", limitCommentText(summary))
 	if comment.Result != nil && strings.TrimSpace(comment.Result.Severity) != "" {
 		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
 	}
-	// The renderer folds the payload, not the bare result, so fan-out exclusion
-	// holds here regardless of the caller.
 	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
 		effective := effectiveReviewDecisionForPayload(commentReviewPayload(comment), comment.ReviewBlockingSeverity)
 		rawDecision := strings.TrimSpace(comment.Result.Decision)

@@ -31,13 +31,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		"> Runtime: `codex`",
 		"> Template: `thermo-nuclear-code-quality-review`",
 		"> Job: `job-123`",
-		// This kitchen-sink fixture declares delegations alongside a terminal
-		// verdict, which is a coordinator ANNOUNCEMENT by the engine's shared rule
-		// (ResultIsFanOut), so the headline scalar names the dispatch rather than
-		// asserting a verdict (#1963). Only the stable prefix is pinned here; the
-		// announced value and the wording are pinned by the dedicated fan-out test.
-		"**Decision:** `fan-out`",
-		"announced `changes_requested`",
+		"**Decision:** `changes_requested`",
 		"**Summary:** fix the edge case",
 		"**Findings**",
 		"- **bad branch** (high)",

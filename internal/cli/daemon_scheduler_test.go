@@ -494,12 +494,7 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 		"> Agent: `audit`",
 		"> Runtime: `shell`",
 		"> Job: `job-comment`",
-		// The fixture declares a delegation alongside a terminal verdict, which
-		// makes it a coordinator ANNOUNCEMENT by workflow.ResultIsFanOut, so the
-		// headline scalar names the dispatch instead of asserting a verdict
-		// (#1963). The announced value stays in the record.
-		"**Decision:** `fan-out`",
-		"announced `approved`",
+		"**Decision:** `approved`",
 		"**Summary:** done with token=[REDACTED]",
 		"**Findings**",
 		"**Changes Made**",

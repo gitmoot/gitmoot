@@ -624,3 +624,13 @@ func TestSucceededReviewVerdictsFiltersCanonicalRows(t *testing.T) {
 		t.Fatalf("denormalized-column verdict = %+v", got[2])
 	}
 }
+
+func awaitedFactState(t *testing.T, store *Store, id int64) string {
+	t.Helper()
+	var state string
+	if err := store.db.QueryRowContext(context.Background(),
+		`SELECT state FROM awaited_facts WHERE id = ?`, id).Scan(&state); err != nil {
+		t.Fatalf("read awaited fact %d: %v", id, err)
+	}
+	return state
+}

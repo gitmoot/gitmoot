@@ -41,14 +41,6 @@ func TestAgentCannotForgeTheSupersessionFlag(t *testing.T) {
 	if _, ok := AllowedAgentResultFields()["superseded_pull_request_closed"]; ok {
 		t.Fatal("superseded_pull_request_closed is still in the agent-accepted field roster")
 	}
-
-	// AND fan_out REMAINS ACCEPTED. It is product-owned too, but an agent that sets it
-	// can only REMOVE its own authority (it marks a row as a fan-out), so rejecting it
-	// would be a bound that refuses valid input. The distinction this fix draws is
-	// authority-granting, not product-owned.
-	if _, ok := AllowedAgentResultFields()["fan_out"]; !ok {
-		t.Fatal("fan_out was removed from the accepted roster: the fix over-reached")
-	}
 }
 
 // TestSyntheticSupersessionResultStaysReadable is the other half: the closed-PR sweep's

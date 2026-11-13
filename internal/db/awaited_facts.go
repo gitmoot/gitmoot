@@ -104,10 +104,9 @@ func (s *Store) HasReviewSubscription(ctx context.Context, role, repo string, pr
 // parseReviewVerdictSubjectKey is the exact inverse of the two constructors
 // above: it accepts the bare repo#pr@head key and the purpose-scoped
 // repo#pr@head|purpose key the review router subscribes with.
-// ParseReviewVerdictSubjectKey exposes the subject a claim is keyed to, so the
-// router can check that a verdict it finds while walking a delegation tree
-// actually answers THIS question (#2176). Purpose is read separately with
-// ReviewVerdictKeyPurpose because the bare key carries none.
+// ParseReviewVerdictSubjectKey exposes the subject a key names, so a reader
+// can render it without re-deriving the key format. Purpose is read separately
+// with ReviewVerdictKeyPurpose because the bare key carries none.
 func ParseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	return parseReviewVerdictSubjectKey(key)
 }
@@ -369,12 +368,9 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			// returns a bare false, so a row skipped for want of a head is
 			// indistinguishable there from malformed junk. It is deliberately not
 			// loosened: its job is to decide whether a row IS a verdict.
-			//
-			// This uses the package's own decode and isFanOut rather than
-			// re-stating their conditions, so it adds no second copy of that rule.
 			var decoded reviewVerdictPayload
 			if err := json.Unmarshal([]byte(payload), &decoded); err == nil &&
-				decoded.Result != nil && !decoded.isFanOut() &&
+				decoded.Result != nil &&
 				decoded.Repo != "" && decoded.PullRequest > 0 &&
 				strings.TrimSpace(decoded.HeadSHA) == "" {
 				skipped = append(skipped, HeadlessReviewSkip{JobID: jobID, ExternallyDriven: externallyDriven})
@@ -450,13 +446,6 @@ type reviewVerdictPayload struct {
 	Result        *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
-		// Delegations and FanOut are the canonical fan-out classification, decoded
-		// here for the same reason every other consumer reads it: a coordinator
-		// announcement carries decision "approved" and is not a verdict (#1685).
-		// Both are needed — a stored row may record FanOut without its
-		// executable delegations.
-		Delegations []json.RawMessage `json:"delegations"`
-		FanOut      bool              `json:"fan_out,omitempty"`
 		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
 		// woken seat learns what the verdict rests on without a second lookup.
 		Findings []reviewVerdictFinding `json:"findings"`
@@ -470,21 +459,6 @@ type reviewVerdictPayload struct {
 	// PostMergeReview marks a review of an already-merged head (#2265); it
 	// answers only post-merge waiters for its purpose.
 	PostMergeReview bool `json:"post_merge_review"`
-}
-
-// isFanOut reports whether a decoded review result is a coordinator announcement
-// rather than a verdict. It mirrors workflow.ResultIsFanOut, which cannot be
-// imported here because workflow depends on db and never the reverse.
-func (p reviewVerdictPayload) isFanOut() bool {
-	if p.Result == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(p.Result.Decision)) {
-	case "approved", "changes_requested":
-	default:
-		return false
-	}
-	return len(p.Result.Delegations) > 0 || p.Result.FanOut
 }
 
 type SucceededReviewVerdict struct {
@@ -630,12 +604,6 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
 			continue
 		}
-		if decoded.isFanOut() {
-			// A coordinator announcement is not a verdict, so it must not enter
-			// same-head verdict history: doing so let a fan-out suppress the
-			// legitimate retry that would have produced a real one (#1685).
-			continue
-		}
 		decision := strings.ToLower(strings.TrimSpace(decoded.Result.Decision))
 		if decision != "approved" && decision != "changes_requested" {
 			continue
@@ -724,12 +692,6 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	}
 	var decoded reviewVerdictPayload
 	if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
-		return reviewVerdictObservation{}, false
-	}
-	if decoded.isFanOut() {
-		// Waking a waiter with "review verdict approved" because a coordinator
-		// announced a panel reports an answer nobody gave (#1685). The panel's own
-		// synthesized leaf verdict satisfies the fact when it lands.
 		return reviewVerdictObservation{}, false
 	}
 	decoded.Repo = strings.ToLower(strings.TrimSpace(decoded.Repo))
@@ -877,7 +839,7 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 		strings.TrimSpace(jobID), state,
 	)
 	if decoded.Result != nil {
-		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" && !decoded.isFanOut() {
+		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" {
 			detail = fmt.Sprintf(
 				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot job show %s",
 				strings.TrimSpace(jobID), state, decision, decoded.HeadSHA, strings.TrimSpace(jobID),

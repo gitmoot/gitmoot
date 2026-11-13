@@ -964,40 +964,6 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	implementerAttribution := collectGateImplementerAttribution(jobs, current, implementRan)
 	implementingAgents := implementerAttribution.agents
 	missingImplementerReason := implementerAttribution.failureReason()
-	// One row per (parent, delegation): the LATEST attempt, exactly as continuation
-	// synthesis selects it (childDelegationJobs). Evaluating every attempt let an
-	// obsolete FAILED original outlive an approved retry and block its panel
-	// forever — the retry can never clear a row that is already terminal, so only
-	// a new head could. Ties break on job id so ListJobs ordering never decides.
-	latestAttempt := make(map[string]db.Job)
-	latestAttemptCount := make(map[string]int)
-	for _, job := range jobs {
-		if !isDelegationChild(job) {
-			continue
-		}
-		key := strings.TrimSpace(job.ParentJobID) + "\x00" + strings.TrimSpace(job.DelegationID)
-		attempt := delegationJobRetryCount(job)
-		if held, ok := latestAttempt[key]; ok {
-			if attempt < latestAttemptCount[key] {
-				continue
-			}
-			if attempt == latestAttemptCount[key] && job.ID <= held.ID {
-				continue
-			}
-		}
-		latestAttempt[key] = job
-		latestAttemptCount[key] = attempt
-	}
-	delegationChildrenByParent := make(map[string][]db.Job)
-	for _, job := range latestAttempt {
-		parentID := strings.TrimSpace(job.ParentJobID)
-		delegationChildrenByParent[parentID] = append(delegationChildrenByParent[parentID], job)
-	}
-	for parentID := range delegationChildrenByParent {
-		sort.Slice(delegationChildrenByParent[parentID], func(i, j int) bool {
-			return delegationChildrenByParent[parentID][i].ID < delegationChildrenByParent[parentID][j].ID
-		})
-	}
 	// A round can order remediation, but it must not hide a blocking verdict or
 	// an unfinished reviewer slot captured at the head currently being evaluated.
 	type taskReview struct {
@@ -1166,23 +1132,6 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if review.payload.Result == nil {
 			continue
 		}
-		// #1685: a review row that declares delegations is a coordinator FAN-OUT,
-		// not a verdict about this head. The engine dispatches a result's
-		// delegations AFTER the result is stored, so the panel such a row announces
-		// cannot have reported at the moment it was written. An announcement
-		// neither answers for the head nor vetoes it, so it is excluded from the
-		// verdict population here and decided on its CHILDREN below — the only
-		// evidence a fan-out ever produces.
-		//
-		// The first version of this guard BLOCKED instead, and that wedged the
-		// head: supersession is same-agent-only and a coordinator's own
-		// continuation is dispatched as an "ask", so no row at that head could ever
-		// clear the block — not even a legitimate independent verdict from another
-		// reviewer. Excluding the row costs nothing, because a skipped row cannot
-		// satisfy the gate either.
-		if reviewRowIsFanOut(review.payload.Result) {
-			continue
-		}
 		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
 			// Named through the resolver: a role-authored objection rendered
@@ -1209,7 +1158,6 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	// the tests, because a gate that blocks valid merges is its own defect:
 	//   - HEADLESS: a row bound to a head is owned by the strict population above.
 	//     An objection rendered against a DIFFERENT head must still merge.
-	//   - ORDINARY: a fan-out announces a panel and is never a verdict (#1685).
 	//   - SUCCEEDED with a result: a queued, crashed or abstaining row is not an
 	//     objection, and the arms above already speak for rows at this head.
 	//   - UNSUPERSEDED: a strictly later terminal verdict from the SAME reviewer
@@ -1218,8 +1166,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	//   - APPLICABLE, and it takes FOUR exclusions, because a naive "ordinary
 	//     headless changes_requested" predicate deadlocks legitimate merges in three
 	//     distinct ways. sameCorrelatedTask already filtered by repo/PR/branch. Then:
-	//     a DELEGATION CHILD is headless by engine design and is judged through its
-	//     parent's fan-out evidence; an INTEGRATION-WORKTREE row has its head
+	//     a DELEGATION CHILD is headless by engine design and is never a verdict
+	//     about this head; an INTEGRATION-WORKTREE row has its head
 	//     cleared so it can validate an isolated tree; and an ENGINE-INSERTED
 	//     roundless row is an unattributable delegation remnant. That last test is
 	//     on ORIGIN, never on roundlessness: an EXTERNALLY DRIVEN session review
@@ -1237,7 +1185,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			continue
 		}
 		// THIRD POPULATION, SHARED CORE (#1950 P1-B). This scan used to hand-compose
-		// succeeded, non-nil, non-fan-out and provenance inline, one clause at a
+		// succeeded, non-nil and provenance inline, one clause at a
 		// time, which is how the candidate and objection sides drifted apart in the
 		// first place. Both candidate loops and this objection scan now ask the same
 		// one-row question, and a census test asserts the call-site COUNT so the
@@ -1250,17 +1198,18 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		}
 		// NOT APPLICABLE, FIRST DEADLOCK SHAPE, and it is only visible to the FULL
 		// package: a DELEGATION CHILD is headless because the engine clears a child's
-		// inherited HeadSHA, and its verdict is accounted through its parent's
-		// fan-out evidence (ensureDelegatedReviewEvidence), never as a standalone
-		// verdict about this head. isRoundHistoryDuplicate above is NOT enough - it
+		// inherited HeadSHA, so its verdict is never a standalone verdict about this
+		// head. isRoundHistoryDuplicate above is NOT enough - it
 		// only covers a child whose PARENT is itself a task review row, so a child of
 		// any other parent survived it.
 		//
 		// Found by execution rather than reading: a version of this block carrying
 		// only the superseded and integration exclusions passed every scoped headless
-		// test AND both ordering mutants, then failed
-		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration/H04_CHANGES_REQUESTED
-		// in the full package. A green scoped run is precisely what hides this class.
+		// test AND both ordering mutants, then failed a delegated-review
+		// enumeration case in the full package (today's arm is "not applicable: a
+		// delegation child whose parent is not a review row" in
+		// TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply). A green
+		// scoped run is precisely what hides this class.
 		if isDelegationChild(review.job) {
 			continue
 		}
@@ -1277,9 +1226,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		// excluding it left #1933's bypass reachable while the ledger claimed a fix.
 		//
 		// What must still be ignored is the UNATTRIBUTABLE DELEGATION REMNANT: a child
-		// whose linkage columns were never written, which
-		// TestPolicyMergeGateDelegatedReviewEvidenceEnumeration's PARENT_ONLY and
-		// NEITHER_PARENT variants assert as wantExcluded. The discriminator is ORIGIN:
+		// whose linkage columns were never written, which the "not applicable:
+		// neither head nor round is an unattributable remnant" arm of
+		// TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply asserts as
+		// not blocking. The discriminator is ORIGIN:
 		// db.Job.ExternallyDriven is set only by CreateExternallyDrivenJobWithEvent and
 		// every other insert leaves it at its default 0
 		// (internal/db/store_jobs.go:184), so a session review is positively
@@ -1387,10 +1337,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	}
 	if len(activeAtHead) > 0 {
 		var authorship reviewAuthorshipAssessment
-		var undispatchedFanOuts []string
 		var partApprovals []string
 		satisfied := false
-		var acceptedApprovals []delegatedReviewApproval
+		var acceptedApprovals []taskReview
 		for _, review := range activeAtHead {
 			// THE THIRD SITE OF THE SAME IDENTITY RULE (#1950 F4, ruling 126350).
 			// Reading job.Agent alone classified a ROLE-AUTHORED approval as
@@ -1405,24 +1354,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
 			decision := effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity)
-			fanOut := reviewRowIsFanOut(review.payload.Result)
-			if fanOut {
-				children := delegationChildrenByParent[review.job.ID]
-				if len(children) == 0 {
-					// Announced and never dispatched: there is nothing to judge, so this
-					// slot stays UNFILLED rather than blocking. An independent verdict at
-					// this same head must still be able to decide the PR, and the row is
-					// named below if nothing else answers.
-					undispatchedFanOuts = append(undispatchedFanOuts, fmt.Sprintf(
-						"%s (job %s, %d declared)", reviewer, review.job.ID, len(review.payload.Result.Delegations)))
-					continue
-				}
-				// Fall through as "approved" so the single evidence call in the arm
-				// below decides this slot on the children. The fan-out's own decision
-				// never was an answer, whichever way it pointed.
-				decision = "approved"
-			}
-			if decision == "approved" && !fanOut && reviewPartOf(review.payload) != "" {
+			if decision == "approved" && reviewPartOf(review.payload) != "" {
 				// A part of a split review (#2372) reviewed a slice of this head,
 				// not the head: it can never approve the merge. Its objections
 				// still block (the case below), so it can only make the gate
@@ -1432,29 +1364,13 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			switch decision {
 			case "approved":
-				approvals, err := ensureDelegatedReviewEvidence(
-					review.job, delegationChildrenByParent, review.payload.Result.Delegations, request.ReviewBlockingSeverity,
-				)
+				satisfied = true
+				acceptedApprovals = append(acceptedApprovals, review)
+				assessment, err := g.assessReviewAuthor(ctx, review.job, review.payload, implementingAgents, missingImplementerReason)
 				if err != nil {
 					return err
 				}
-				if !fanOut {
-					approvals = []delegatedReviewApproval{{job: review.job, payload: review.payload}}
-				}
-				approvals = withoutPartApprovals(approvals)
-				if len(approvals) == 0 {
-					partApprovals = append(partApprovals, fmt.Sprintf("%s (fan-out of part reviews, job %s)", reviewer, review.job.ID))
-					continue
-				}
-				satisfied = true
-				acceptedApprovals = append(acceptedApprovals, approvals...)
-				for _, approval := range approvals {
-					assessment, err := g.assessReviewAuthor(ctx, approval.job, approval.payload, implementingAgents, missingImplementerReason)
-					if err != nil {
-						return err
-					}
-					authorship.absorb(assessment)
-				}
+				authorship.absorb(assessment)
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
 			default:
@@ -1464,21 +1380,15 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if reason := authorship.failureReason(); reason != "" {
 			return errors.New(reason)
 		}
-		if !satisfied && len(partApprovals) > 0 {
+		if !satisfied {
+			// Every other row returned above, so only part approvals are left.
 			return fmt.Errorf(
 				"no whole-head review approval at evaluated head: only parts of a split review approved (%s); a part covers a slice of the head, so dispatch a review without --part to approve the merge",
 				strings.Join(partApprovals, ", "))
 		}
-		if !satisfied {
-			// Every reviewer slot at this head was an undispatched fan-out. Returning
-			// nil here would merge on an announcement, which is the #1685 defect.
-			return fmt.Errorf(
-				"no review verdict at evaluated head: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
-				strings.Join(undispatchedFanOuts, ", "))
-		}
 		// AFTER every refusal, never inside the loop: an approval the gate then
-		// rejects (self-approval, unknown implementer, an undispatched fan-out)
-		// must not leave a record saying it authorised anything.
+		// rejects (self-approval, unknown implementer) must not leave a record
+		// saying it authorised anything.
 		for _, approval := range acceptedApprovals {
 			g.recordApprovalEvidence(ctx, approval.job, approval.payload)
 		}
@@ -1503,9 +1413,8 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		return errors.New("no approval is bound to the current head. Remedy: dispatch one independent review")
 	}
 	approved := false
-	var acceptedApprovals []delegatedReviewApproval
+	var acceptedApprovals []taskReview
 	var authorship reviewAuthorshipAssessment
-	var undispatchedFanOuts []string
 	var roundPartApprovals []string
 	type eligibleReview struct {
 		job     db.Job
@@ -1525,8 +1434,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" &&
-			!reviewRowIsFanOut(payload.Result) {
+		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
 			assessment, err := g.assessReviewAuthor(ctx, job, payload, implementingAgents, missingImplementerReason)
 			if err != nil {
 				return err
@@ -1547,48 +1455,16 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			return err
 		}
-		decision := effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity)
-		fanOut := reviewRowIsFanOut(payload.Result)
-		if fanOut {
-			// Same rule as the head-bound population above: an announcement is not a
-			// verdict, and its delegates are the only evidence it produces.
-			children := delegationChildrenByParent[job.ID]
-			if len(children) == 0 {
-				undispatchedFanOuts = append(undispatchedFanOuts, fmt.Sprintf(
-					"%s (job %s, %d declared)", effectiveReviewerIdentityName(job, payload), job.ID, len(payload.Result.Delegations)))
-				continue
-			}
-			// Decided as "approved" by the single evidence call in the arm below.
-			decision = "approved"
-		}
-		switch decision {
+		switch effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) {
 		case "approved":
-			approvals, err := ensureDelegatedReviewEvidence(
-				job, delegationChildrenByParent, payload.Result.Delegations, request.ReviewBlockingSeverity,
-			)
-			if err != nil {
-				return err
-			}
-			if fanOut {
-				for _, approval := range approvals {
-					assessment, err := g.assessReviewAuthor(ctx, approval.job, approval.payload, implementingAgents, missingImplementerReason)
-					if err != nil {
-						return err
-					}
-					authorship.absorb(assessment)
-				}
-			} else {
-				// Direct approvals were assessed while eligibility was built above.
-				approvals = []delegatedReviewApproval{{job: job, payload: payload}}
-			}
 			// A part of a split review (#2372) can never approve the head.
-			approvals = withoutPartApprovals(approvals)
-			if len(approvals) == 0 {
+			if reviewPartOf(payload) != "" {
 				roundPartApprovals = append(roundPartApprovals, fmt.Sprintf("%s (part %s, job %s)", effectiveReviewerIdentityName(job, payload), reviewPartOf(payload), job.ID))
 				continue
 			}
+			// Approvals were assessed while eligibility was built above.
 			approved = true
-			acceptedApprovals = append(acceptedApprovals, approvals...)
+			acceptedApprovals = append(acceptedApprovals, taskReview{job: job, payload: payload})
 		case "changes_requested", "blocked", "failed":
 			// A captured blocking review is an authoritative template-quality rejection
 			// (mergeBlocked), distinct from the transient/process review errors below
@@ -1606,11 +1482,6 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				"no whole-head review approval in the latest round: only parts of a split review approved (%s); a part covers a slice of the head, so dispatch a review without --part to approve the merge",
 				strings.Join(roundPartApprovals, ", "))
 		}
-		if len(undispatchedFanOuts) > 0 {
-			return fmt.Errorf(
-				"no review verdict in the latest round: %s declared delegations that never reported; a fan-out is a coordinator continuation, not a verdict",
-				strings.Join(undispatchedFanOuts, ", "))
-		}
 		return errors.New("required reviewer approval is missing")
 	}
 	// AFTER every refusal: see the same call on the other acceptance path.
@@ -1620,265 +1491,10 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 	return nil
 }
 
-// reviewRowIsFanOut reports whether a stored review result is a coordinator
-// FAN-OUT rather than a verdict about the code. The engine dispatches a result's
-// delegations after the result is stored, so a terminal review decision that
-// declares delegations was produced before any delegate could report: it
-// announces a panel, it does not answer for the head (#1685).
-//
-// "blocked" and "failed" are excluded deliberately. They are self-describing
-// non-answers that already block on their own terms, and reclassifying them as
-// announcements would report the wrong cause for a row that was never mistaken
-// for an approval.
-func reviewRowIsFanOut(result *AgentResult) bool {
-	return ResultIsFanOut(result)
-}
-
-// ResultIsFanOut is the package-crossing form of the same rule, for the
-// consumers outside this package that read a review decision and act on it
-// (the proof projector). Every surface that
-// treats "approved" as an answer has to agree on what an answer IS, or the
-// defect simply moves to whichever surface was not updated (#1685).
-func ResultIsFanOut(result *AgentResult) bool {
-	if result == nil || !isTerminalReviewVerdict(result.Decision) {
-		return false
-	}
-	// Either the declared panel is still visible, or the stored row records
-	// that it was there even though its delegations[] are absent. Reading only
-	// delegations[] would make every consumer blind to such a row.
-	return len(result.Delegations) > 0 || result.FanOut
-}
-
-type delegatedReviewApproval struct {
-	job     db.Job
-	payload JobPayload
-}
-
 // reviewPartOf is the normalized part of a split review (#2372), "" for a
 // review of the whole head.
 func reviewPartOf(payload JobPayload) string {
 	return db.NormalizeReviewPart(payload.ReviewPart)
-}
-
-// withoutPartApprovals drops approvals that review only a part of the head.
-// A part approval never authorizes a merge; part objections still block.
-func withoutPartApprovals(approvals []delegatedReviewApproval) []delegatedReviewApproval {
-	kept := approvals[:0:0]
-	for _, approval := range approvals {
-		if reviewPartOf(approval.payload) == "" {
-			kept = append(kept, approval)
-		}
-	}
-	return kept
-}
-
-// ensureDelegatedReviewEvidence decides a delegation tree on its LEAF verdicts,
-// which are the only evidence any fan-out produces. declared is the current
-// parent's own delegations[]: a delegation that was announced but has no child
-// row has not reported, and counting any nested announcement as reported would
-// reintroduce the same announcement-as-verdict defect one level down.
-//
-// A successful result returns every leaf whose verdict actually approved so
-// callers apply identity, family, and audit policy to verdict authors rather
-// than to any coordinator announcement.
-func ensureDelegatedReviewEvidence(parent db.Job, childrenByParent map[string][]db.Job, declared []Delegation, blockingSeverity string) ([]delegatedReviewApproval, error) {
-	children := childrenByParent[parent.ID]
-	if len(children) == 0 {
-		return nil, nil
-	}
-	approvals := make([]delegatedReviewApproval, 0, len(children))
-	var blocking []string
-	var active []string
-	var crashed []string
-	// #1799: cancelled children are reported separately from crashed ones. A
-	// reader deciding whether to retry, re-dispatch or leave a slot alone needs
-	// the distinction; folding them together sent operators to the wrong remedy.
-	var cancelled []string
-	var abstaining []string
-	var parked []string
-	var unrecognized []string
-	ancestors := make(map[string]struct{})
-	var collect func(db.Job, []Delegation)
-	collect = func(current db.Job, currentDeclared []Delegation) {
-		currentID := strings.TrimSpace(current.ID)
-		if _, cycle := ancestors[currentID]; cycle {
-			unrecognized = append(unrecognized, fmt.Sprintf("%s (delegation cycle)", currentID))
-			return
-		}
-		ancestors[currentID] = struct{}{}
-		defer delete(ancestors, currentID)
-
-		currentChildren := childrenByParent[current.ID]
-		if len(currentChildren) == 0 {
-			if len(currentDeclared) == 0 {
-				active = append(active, fmt.Sprintf("%s (fan-out, no child jobs)", currentID))
-				return
-			}
-			for _, delegation := range currentDeclared {
-				id := strings.TrimSpace(delegation.ID)
-				if id != "" {
-					active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
-				}
-			}
-			return
-		}
-
-		reported := make(map[string]struct{}, len(currentChildren))
-		for _, child := range currentChildren {
-			if id := strings.TrimSpace(child.DelegationID); id != "" {
-				reported[id] = struct{}{}
-			}
-		}
-		for _, delegation := range currentDeclared {
-			id := strings.TrimSpace(delegation.ID)
-			if id == "" {
-				continue
-			}
-			if _, ok := reported[id]; !ok {
-				// Dispatch happened (children exist) but this delegate produced no row,
-				// so its evidence is still outstanding rather than absent.
-				active = append(active, fmt.Sprintf("%s/%s (declared, no job)", currentID, id))
-			}
-		}
-		for _, child := range currentChildren {
-			childID := strings.TrimSpace(child.ID)
-			switch JobState(child.State) {
-			case JobQueued, JobRunning:
-				active = append(active, fmt.Sprintf("%s (%s)", childID, child.State))
-			case JobSucceeded:
-				payload, err := unmarshalPayload(child.Payload)
-				if err != nil {
-					unrecognized = append(unrecognized, fmt.Sprintf("%s (malformed result)", childID))
-					continue
-				}
-				if payload.Result == nil {
-					unrecognized = append(unrecognized, fmt.Sprintf("%s (nil result)", childID))
-					continue
-				}
-				if ResultIsFanOut(payload.Result) {
-					collect(child, payload.Result.Delegations)
-					continue
-				}
-				decision := effectiveDelegationDecision(payload.Result, child.Type, "", blockingSeverity)
-				switch decision {
-				case "approved":
-					approvals = append(approvals, delegatedReviewApproval{job: child, payload: payload})
-				case "changes_requested", "blocked", "failed":
-					blocking = append(blocking, fmt.Sprintf("%s (%s)", childID, decision))
-				case "skipped", "implemented":
-					abstaining = append(abstaining, fmt.Sprintf("%s (%s)", childID, decision))
-				default:
-					unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized decision %q)", childID, decision))
-				}
-			case JobCancelled:
-				// #1799: a cancelled lens child is not a crashed one. Same bucket-mixing
-				// as the slot classification above, in the fan-out summary a reader uses
-				// to decide what to do next.
-				cancelled = append(cancelled, fmt.Sprintf("%s (%s)", childID, child.State))
-			case JobFailed:
-				crashed = append(crashed, fmt.Sprintf("%s (%s)", childID, child.State))
-			case JobBlocked:
-				parked = append(parked, fmt.Sprintf("%s (%s)", childID, child.State))
-			default:
-				unrecognized = append(unrecognized, fmt.Sprintf("%s (unrecognized state %q)", childID, child.State))
-			}
-		}
-	}
-	collect(parent, declared)
-	sort.Strings(blocking)
-	sort.Strings(active)
-	sort.Strings(crashed)
-	sort.Strings(cancelled)
-	sort.Strings(abstaining)
-	sort.Strings(parked)
-	sort.Strings(unrecognized)
-	details := make([]string, 0, 6)
-	if len(blocking) > 0 {
-		details = append(details, "blocking children: "+strings.Join(blocking, ", "))
-	}
-	if len(unrecognized) > 0 {
-		details = append(details, "unrecognized children: "+strings.Join(unrecognized, ", "))
-	}
-	if len(active) > 0 {
-		details = append(details, "active children: "+strings.Join(active, ", "))
-	}
-	if len(crashed) > 0 {
-		details = append(details, "crashed children: "+strings.Join(crashed, ", "))
-	}
-	if len(cancelled) > 0 {
-		details = append(details, "cancelled children: "+strings.Join(cancelled, ", "))
-	}
-	if len(abstaining) > 0 {
-		details = append(details, "abstaining children: "+strings.Join(abstaining, ", "))
-	}
-	if len(parked) > 0 {
-		details = append(details, "parked children: "+strings.Join(parked, ", "))
-	}
-	reasonDetails := strings.Join(details, "; ")
-	// The first matching class decides the outcome; reasonDetails retains every
-	// lower-priority obligation so a winning class cannot hide its siblings.
-	if len(blocking) > 0 {
-		return nil, mergeBlocked{reason: fmt.Sprintf(
-			"delegated review parent %s has blocking delegation evidence (%s)",
-			parent.ID,
-			reasonDetails,
-		)}
-	}
-	if len(unrecognized) > 0 {
-		return nil, fmt.Errorf(
-			"delegated review parent %s has unrecognized delegation evidence (%s); rerun or repair the delegated review",
-			parent.ID,
-			reasonDetails,
-		)
-	}
-	if len(active) > 0 {
-		return nil, mergePending{reason: fmt.Sprintf(
-			"waiting for delegated review parent %s to produce surviving evidence (%s)",
-			parent.ID,
-			reasonDetails,
-		)}
-	}
-	if len(crashed) > 0 {
-		return nil, fmt.Errorf(
-			"delegated review parent %s has crashed delegation children (%s); rerun or repair the delegated review",
-			parent.ID,
-			reasonDetails,
-		)
-	}
-	// #1799: BEHAVIOUR-PRESERVING BY CONSTRUCTION. Before this change a cancelled
-	// child sat in `crashed`, so a fan-out of only-cancelled children refused
-	// here. Splitting the bucket without this arm would have let that case fall
-	// through to `abstaining` - or past every arm - and stop refusing, which is a
-	// gate weakening dressed as a message fix. It still refuses; only the
-	// diagnosis and the remedy differ.
-	if len(cancelled) > 0 {
-		return nil, fmt.Errorf(
-			"delegated review parent %s has CANCELLED delegation children (%s); a cancellation is not a verdict and not a crash, so decide whether those slots should be re-dispatched rather than repaired",
-			parent.ID,
-			reasonDetails,
-		)
-	}
-	if len(abstaining) > 0 {
-		return nil, fmt.Errorf(
-			"delegated review parent %s has no surviving delegation evidence: abstaining delegation children (%s); rerun or repair the delegated review",
-			parent.ID,
-			reasonDetails,
-		)
-	}
-	if len(parked) > 0 {
-		return nil, fmt.Errorf(
-			"delegated review parent %s has no surviving delegation evidence (%s); rerun or repair the delegated review",
-			parent.ID,
-			reasonDetails,
-		)
-	}
-	if len(approvals) > 0 {
-		return approvals, nil
-	}
-	return nil, fmt.Errorf(
-		"delegated review parent %s has no surviving delegation evidence; rerun or repair the delegated review",
-		parent.ID,
-	)
 }
 
 const (
@@ -2177,10 +1793,9 @@ func isSettledNonVerdictReview(job db.Job, payload JobPayload) bool {
 }
 
 // isRoundHistoryDuplicate reports whether a delegated review row is a SUB-REVIEW
-// of another review job for the same task. Those rows are round-history
-// duplicates of their parent (#1737: a lens child's id is its parent's id plus a
-// suffix, and its verdict is already validated as the parent's evidence by
-// ensureDelegatedReviewEvidence), so they must not compete for the latest round.
+// of another review job for the same task. Those historical rows are
+// round-history duplicates of their parent (#1737: a lens child's id is its
+// parent's id plus a suffix), so they must not compete for the latest round.
 //
 // A delegated review whose parent is NOT a review job for this task is the
 // gate's own required review, not a duplicate of one. A #332 integration-worktree
@@ -2452,8 +2067,8 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(ctx context.Context, request Me
 //   - SUCCEEDED: a blocked or failed row is not a verdict, and it is itself absent
 //     from the blocking population, so admitting it retires an objection and
 //     leaves nothing behind to block.
-//   - a non-nil, NON-FAN-OUT result: #1685 excludes an announcement as a verdict
-//     for exactly the same reason.
+//   - a non-nil result: a row without one is not a verdict and cannot answer an
+//     objection.
 //   - HEAD APPLICABILITY, empty-or-equal: a row naming a different head describes
 //     different code (#1950 F5). Empty is admitted deliberately, because a headless
 //     replacement is the same class as a headless objection and must be able to
@@ -2477,7 +2092,7 @@ func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA strin
 	if JobState(job.State) != JobSucceeded {
 		return false
 	}
-	if payload.Result == nil || reviewRowIsFanOut(payload.Result) {
+	if payload.Result == nil {
 		return false
 	}
 	if head := strings.TrimSpace(payload.HeadSHA); head != "" && head != headSHA {
@@ -2508,9 +2123,8 @@ func reviewRowCanRetireAnObjection(job db.Job, payload JobPayload, headSHA strin
 		return false
 	}
 	// LINKAGE, AND THIS IS THE CLAUSE MY OWN ROUND-9 PROBE TALKED ME OUT OF (#1950
-	// F6). A delegation child's verdict is accounted through its PARENT's fan-out
-	// evidence (ensureDelegatedReviewEvidence), never as a standalone verdict about
-	// this head - which is exactly why the objection scan already excludes it. Not
+	// F6). A delegation child's verdict is never a standalone verdict about this
+	// head - which is exactly why the objection scan already excludes it. Not
 	// excluding it HERE made the two sides asymmetric: such a row was admitted as a
 	// superseding candidate, retired a live session objection, and was then absent
 	// from the blocking population, so it cleared a block it could never impose and
