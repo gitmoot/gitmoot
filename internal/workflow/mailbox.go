@@ -1503,11 +1503,33 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 	state := stateForDecision(result.Decision)
-	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {
-		return AgentResult{}, err
+	message := fmt.Sprintf("job %s", state)
+	if err := m.finishWithPayload(ctx, job.ID, state, message, payload); err != nil {
+		return AgentResult{}, &ResultNotRecordedError{
+			JobID: job.ID, Generation: job.LifecycleGeneration, State: state, Message: message, Payload: payload, Err: err,
+		}
 	}
 	return result, nil
 }
+
+// ResultNotRecordedError reports that the runtime returned a result but its
+// terminal write failed, so the row is most likely still running without it.
+// It carries everything needed to repeat that write: see
+// Engine.RecordUnrecordedResult.
+type ResultNotRecordedError struct {
+	JobID      string
+	Generation int64
+	State      JobState
+	Message    string
+	Payload    JobPayload
+	Err        error
+}
+
+func (e *ResultNotRecordedError) Error() string {
+	return fmt.Sprintf("job %s result (%s) produced but not recorded: %v", e.JobID, e.State, e.Err)
+}
+
+func (e *ResultNotRecordedError) Unwrap() error { return e.Err }
 
 func jobExecutionBackend(agent runtime.Agent) (execbackend.Backend, error) {
 	if strings.TrimSpace(agent.ExecBackend) == "" {
@@ -1771,6 +1793,19 @@ func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message str
 func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobState, message string, payload JobPayload) error {
 	writeCtx, cancel := terminalWriteContext(ctx)
 	defer cancel()
+	return m.writeTerminalPayload(writeCtx, jobID, state, message, payload, nil)
+}
+
+// claimAnchor pins a terminal write to one claimed run: still running at
+// generation, under runner's claim.
+type claimAnchor struct {
+	generation int64
+	runner     db.JobRunner
+}
+
+// writeTerminalPayload is finishWithPayload's write on the caller's writeCtx.
+// A nil anchor keeps the historical unanchored running->state transition.
+func (m Mailbox) writeTerminalPayload(writeCtx context.Context, jobID string, state JobState, message string, payload JobPayload, anchor *claimAnchor) error {
 	clearRuntimeIdentity(&payload)
 	// THE STAGED PREFLIGHT CONTRACT IS ENFORCED HERE, AT INGESTION, BECAUSE THIS
 	// IS WHERE A RESULT BECOMES CONSUMABLE (#2029 round four, P1).
@@ -1800,15 +1835,14 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 	if err != nil {
 		return err
 	}
-	transitioned, err := m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, db.JobEvent{
-		JobID:   jobID,
-		Kind:    string(state),
-		Message: message,
-	}, db.JobEvent{
-		JobID:   jobID,
-		Kind:    "advance_started",
-		Message: "workflow advancement started",
-	})
+	terminal := db.JobEvent{JobID: jobID, Kind: string(state), Message: message}
+	advance := db.JobEvent{JobID: jobID, Kind: "advance_started", Message: "workflow advancement started"}
+	var transitioned bool
+	if anchor == nil {
+		transitioned, err = m.store.TransitionJobStatePayloadWithEvent(writeCtx, jobID, string(JobRunning), string(state), encoded, terminal, advance)
+	} else {
+		transitioned, err = m.store.TransitionClaimedRunningJobPayloadWithEvent(writeCtx, jobID, anchor.generation, anchor.runner, string(state), encoded, terminal, advance)
+	}
 	if err != nil {
 		return err
 	}
@@ -1816,6 +1850,9 @@ func (m Mailbox) finishWithPayload(ctx context.Context, jobID string, state JobS
 		latest, getErr := m.store.GetJob(writeCtx, jobID)
 		if getErr != nil {
 			return getErr
+		}
+		if anchor != nil {
+			return fmt.Errorf("job %q is %s at lifecycle generation %d, no longer the run claimed at generation %d", jobID, latest.State, latest.LifecycleGeneration, anchor.generation)
 		}
 		return fmt.Errorf("job %q is %s, not running", jobID, latest.State)
 	}
@@ -1875,9 +1912,20 @@ func (m Mailbox) ensureRunning(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// JobNotClaimedError reports that Mailbox.Run did not claim the job because it
+// was not queued. The caller therefore owns no running claim on it.
+type JobNotClaimedError struct {
+	JobID string
+	State string
+}
+
+func (e JobNotClaimedError) Error() string {
+	return fmt.Sprintf("job %q is %s, not queued", e.JobID, e.State)
+}
+
 func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 	if job.State != string(JobQueued) {
-		return fmt.Errorf("job %q is %s, not queued", job.ID, job.State)
+		return JobNotClaimedError{JobID: job.ID, State: job.State}
 	}
 	// Stamp the claiming process's identity in the SAME atomic queued->running
 	// UPDATE (#651): runner_boot_id (db.BootID) is the cross-boot liveness signal
@@ -1897,7 +1945,7 @@ func (m Mailbox) claim(ctx context.Context, job db.Job) error {
 		if getErr != nil {
 			return getErr
 		}
-		return fmt.Errorf("job %q is %s, not queued", job.ID, latest.State)
+		return JobNotClaimedError{JobID: job.ID, State: latest.State}
 	}
 	return nil
 }

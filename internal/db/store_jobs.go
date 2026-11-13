@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
@@ -1043,6 +1044,32 @@ func (s *Store) TransitionJobStateWithEventAtGeneration(ctx context.Context, id 
 // TransitionJobStateWithEventAtGeneration, a stale run loses the compare-and-swap
 // instead of rewriting the result of a newer lifecycle.
 func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, to string, payload string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
+	return s.transitionJobStatePayloadAtGeneration(ctx, id, from, fromGeneration, nil, to, payload, event, additionalEvents...)
+}
+
+// JobRunner identifies the process that claimed a running job: the runner_pid
+// and runner_boot_id ClaimRunningJob stamps into the claim.
+type JobRunner struct {
+	PID    int
+	BootID string
+}
+
+// CurrentJobRunner is the identity this process stamps when it claims a job
+// (os.Getpid(), BootID()), so a settlement can be anchored to its own claims.
+func CurrentJobRunner() JobRunner {
+	return JobRunner{PID: os.Getpid(), BootID: BootID()}
+}
+
+// TransitionClaimedRunningJobPayloadWithEvent settles a running job only while
+// it is still the run that runner claimed at generation. It is the
+// compare-and-swap of TransitionJobStatePayloadWithEventAtGeneration from
+// running, plus the claiming process's identity, so a row that a different
+// process claimed, or that was re-queued and claimed again, does not match.
+func (s *Store) TransitionClaimedRunningJobPayloadWithEvent(ctx context.Context, id string, generation int64, runner JobRunner, to string, payload string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
+	return s.transitionJobStatePayloadAtGeneration(ctx, id, "running", generation, &runner, to, payload, event, additionalEvents...)
+}
+
+func (s *Store) transitionJobStatePayloadAtGeneration(ctx context.Context, id string, from string, fromGeneration int64, runner *JobRunner, to string, payload string, event JobEvent, additionalEvents ...JobEvent) (bool, error) {
 	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
 	if fenceErr != nil {
 		return false, fenceErr
@@ -1055,9 +1082,14 @@ func (s *Store) TransitionJobStatePayloadWithEventAtGeneration(ctx context.Conte
 	defer tx.Rollback()
 
 	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET state = ?, `+bumpLifecycleGenerationSQL+`, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ? AND workflow_id = ?`,
-		to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
-		projection.BlockerSuggestedAction, id, from, fromGeneration, projection.WorkflowID)
+	query := `UPDATE jobs SET state = ?, ` + bumpLifecycleGenerationSQL + `, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND state = ? AND lifecycle_generation = ? AND workflow_id = ?`
+	args := []any{to, to, payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest, projection.BlockerRetryAt,
+		projection.BlockerSuggestedAction, id, from, fromGeneration, projection.WorkflowID}
+	if runner != nil {
+		query += ` AND runner_pid = ? AND runner_boot_id = ?`
+		args = append(args, runner.PID, strings.TrimSpace(runner.BootID))
+	}
+	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return false, err
 	}
@@ -1174,6 +1206,20 @@ func (s *Store) ListRunningJobIDsFromForeignBoot(ctx context.Context, currentBoo
 		ids = append(ids, id)
 	}
 	return ids, rows.Err()
+}
+
+// ListRunningJobsClaimedBy returns the engine-driven running jobs whose claim
+// carries runner's identity. Session jobs are excluded: they are externally
+// driven, so no daemon worker ever claims them. The literal 'running' keeps the
+// partial index idx_jobs_running_updated_at usable (see ListRunningJobsUpdatedBefore).
+func (s *Store) ListRunningJobsClaimedBy(ctx context.Context, runner JobRunner) ([]Job, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+jobColumns+` FROM jobs
+		WHERE state = 'running' AND externally_driven = 0 AND runner_pid = ? AND runner_boot_id = ?
+		ORDER BY updated_at`, runner.PID, strings.TrimSpace(runner.BootID))
+	if err != nil {
+		return nil, err
+	}
+	return scanJobs(rows)
 }
 
 // ErrSupersedeAdvanceOwned is returned when a retry loses the ownership predicate:

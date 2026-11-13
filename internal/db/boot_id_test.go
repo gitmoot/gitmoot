@@ -310,3 +310,109 @@ func TestAcquireResourceLockPersistsOwnerBootID(t *testing.T) {
 		t.Fatalf("ResourceLockOwnerBootID(absent) = (%q, %v), want (\"\", nil)", boot, err)
 	}
 }
+
+// #2618: a worker's exit settlement may fail only the run it claimed. The
+// compare-and-swap must refuse a row another process claimed, and a row that
+// was re-queued and claimed again (even by this same process) at a newer
+// generation.
+func TestTransitionClaimedRunningJobSettlesOnlyTheClaimedRun(t *testing.T) {
+	ctx := context.Background()
+	store := openBootTestStore(t)
+	self := JobRunner{PID: 4321, BootID: "boot-A"}
+	settle := func(id string, generation int64, runner JobRunner) bool {
+		t.Helper()
+		ok, err := store.TransitionClaimedRunningJobPayloadWithEvent(ctx, id, generation, runner, "failed", `{"repo":"owner/repo"}`,
+			JobEvent{Kind: "job_recovery_failed", Message: "settled"}, JobEvent{Kind: "advance_started"})
+		if err != nil {
+			t.Fatalf("settle %s: %v", id, err)
+		}
+		return ok
+	}
+	assertState := func(id, state string, generation int64, events int) {
+		t.Helper()
+		job, err := store.GetJob(ctx, id)
+		if err != nil || job.State != state || job.LifecycleGeneration != generation {
+			t.Fatalf("%s = (%s, gen %d, err %v), want (%s, gen %d)", id, job.State, job.LifecycleGeneration, err, state, generation)
+		}
+		got, err := store.ListJobEvents(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		settled := 0
+		for _, event := range got {
+			if event.Kind == "job_recovery_failed" || event.Kind == "advance_started" {
+				settled++
+			}
+		}
+		if settled != events {
+			t.Fatalf("%s settlement events = %d, want %d: %+v", id, settled, events, got)
+		}
+	}
+
+	// Its own claim at the claimed generation settles, with every event.
+	seedBootQueuedJob(t, store, "own")
+	if ok, err := store.ClaimRunningJob(ctx, "own", "queued", "running", JobEvent{Kind: "running"}, self.PID, self.BootID); err != nil || !ok {
+		t.Fatalf("claim own: %v %v", ok, err)
+	}
+	if !settle("own", 0, self) {
+		t.Fatal("own claimed run was not settled")
+	}
+	assertState("own", "failed", 0, 2)
+	if settle("own", 0, self) {
+		t.Fatal("a settled run settled again")
+	}
+
+	// Another process's claim (other pid, or same pid on another boot) is left alone.
+	seedBootQueuedJob(t, store, "foreign")
+	if ok, err := store.ClaimRunningJob(ctx, "foreign", "queued", "running", JobEvent{Kind: "running"}, 9999, self.BootID); err != nil || !ok {
+		t.Fatalf("claim foreign: %v %v", ok, err)
+	}
+	if settle("foreign", 0, self) || settle("foreign", 0, JobRunner{PID: 9999, BootID: "boot-B"}) {
+		t.Fatal("settled a run another process claimed")
+	}
+	assertState("foreign", "running", 0, 0)
+
+	// Re-queued and claimed again by this same process: the old generation's
+	// settlement must not touch the new run.
+	seedBootQueuedJob(t, store, "reclaimed")
+	if ok, err := store.ClaimRunningJob(ctx, "reclaimed", "queued", "running", JobEvent{Kind: "running"}, self.PID, self.BootID); err != nil || !ok {
+		t.Fatalf("claim reclaimed: %v %v", ok, err)
+	}
+	if ok, err := store.TransitionJobStateWithEvent(ctx, "reclaimed", "running", "queued", JobEvent{Kind: "retry_queued"}); err != nil || !ok {
+		t.Fatalf("requeue: %v %v", ok, err)
+	}
+	if settle("reclaimed", 0, self) {
+		t.Fatal("settled a queued row")
+	}
+	if ok, err := store.ClaimRunningJob(ctx, "reclaimed", "queued", "running", JobEvent{Kind: "running"}, self.PID, self.BootID); err != nil || !ok {
+		t.Fatalf("reclaim: %v %v", ok, err)
+	}
+	if settle("reclaimed", 0, self) {
+		t.Fatal("generation-0 settlement failed the generation-1 run")
+	}
+	assertState("reclaimed", "running", 1, 0)
+	if !settle("reclaimed", 1, self) {
+		t.Fatal("generation-1 run was not settled by its own claim")
+	}
+	assertState("reclaimed", "failed", 1, 2)
+}
+
+func TestListRunningJobsClaimedBy(t *testing.T) {
+	ctx := context.Background()
+	store := openBootTestStore(t)
+	self := JobRunner{PID: 4321, BootID: "boot-A"}
+	for id, runner := range map[string]JobRunner{"mine": self, "other-pid": {PID: 1, BootID: "boot-A"}, "other-boot": {PID: 4321, BootID: "boot-B"}} {
+		seedBootQueuedJob(t, store, id)
+		if ok, err := store.ClaimRunningJob(ctx, id, "queued", "running", JobEvent{Kind: "running"}, runner.PID, runner.BootID); err != nil || !ok {
+			t.Fatalf("claim %s: %v %v", id, ok, err)
+		}
+	}
+	seedBootQueuedJob(t, store, "queued-mine")
+	jobs, err := store.ListRunningJobsClaimedBy(ctx, self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "mine" {
+		t.Fatalf("ListRunningJobsClaimedBy = %+v, want only mine", jobs)
+	}
+}

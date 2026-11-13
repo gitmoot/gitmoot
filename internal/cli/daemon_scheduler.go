@@ -900,6 +900,18 @@ func isSessionRecordedJob(job db.Job) bool {
 // time in both the payload and loud audit event, clears stale process identity,
 // releases locks, and refuses to touch externally recorded session jobs.
 func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, cause string) (bool, error) {
+	return failRunningJob(ctx, store, stdout, now, job, nil, cause)
+}
+
+// failClaimedRunningJob is failRecoveredRunningJob for a run THIS process
+// claimed: the write lands only while the row is still running at
+// job.LifecycleGeneration under runner's claim, so a re-queued and reclaimed
+// row, or one another process claimed, is left alone.
+func failClaimedRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, runner db.JobRunner, cause string) (bool, error) {
+	return failRunningJob(ctx, store, stdout, now, job, &runner, cause)
+}
+
+func failRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job, claimedBy *db.JobRunner, cause string) (bool, error) {
 	if job.State != string(workflow.JobRunning) || isSessionRecordedJob(job) {
 		return false, nil
 	}
@@ -926,9 +938,14 @@ func failRecoveredRunningJob(ctx context.Context, store *db.Store, stdout io.Wri
 			encoded = string(b)
 		}
 	}
-	transitioned, err := store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), encoded, db.JobEvent{
-		JobID: job.ID, Kind: jobRecoveryFailedEvent, Message: message,
-	})
+	event := db.JobEvent{JobID: job.ID, Kind: jobRecoveryFailedEvent, Message: message}
+	var transitioned bool
+	var err error
+	if claimedBy == nil {
+		transitioned, err = store.TransitionJobStatePayloadWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobFailed), encoded, event)
+	} else {
+		transitioned, err = store.TransitionClaimedRunningJobPayloadWithEvent(ctx, job.ID, job.LifecycleGeneration, *claimedBy, string(workflow.JobFailed), encoded, event)
+	}
 	if err != nil {
 		return false, err
 	}
@@ -2265,6 +2282,7 @@ func runDaemonWorkerTickTracked(ctx context.Context, store *db.Store, worker job
 	if err := liveness.sweepRunningJobLiveness(ctx, store, stdout, paths, now, staleAfter, quietAfter, repoFilter, rootFilter); err != nil {
 		return err
 	}
+	tracker.orphanedClaimSweep().sweep(ctx, store, stdout, now)
 	if err := recoverExpiredRuntimeSessionLocksSkipping(ctx, store, stdout, now, inflightIDs); err != nil {
 		return err
 	}

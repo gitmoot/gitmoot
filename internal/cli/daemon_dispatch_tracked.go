@@ -136,6 +136,7 @@ type inflightJobTracker struct {
 	wakeOutboxHealthLogged     bool
 	jobEvents                  jobEventCandidateCache
 	liveness                   *daemonLivenessSweep
+	orphanedClaims             orphanedClaimSweep
 	// remoteCap (#2470) is the remote lane's ceiling: [remote_exec]
 	// cost_max_concurrent, refreshed each tick. A job whose payload pins the
 	// remote backend uses this lane instead of the host --workers cap, because
@@ -686,6 +687,16 @@ func (t *inflightJobTracker) jobEventCandidateCache() *jobEventCandidateCache {
 		return nil
 	}
 	return &t.jobEvents
+}
+
+// orphanedClaimSweep returns the supervisor's #2618 orphaned-claim sweep. A nil
+// tracker returns nil, whose sweep is a no-op: only a supervisor outlives the
+// workers whose claims it would settle.
+func (t *inflightJobTracker) orphanedClaimSweep() *orphanedClaimSweep {
+	if t == nil {
+		return nil
+	}
+	return &t.orphanedClaims
 }
 
 // holderOf returns the job ID currently holding checkoutKey, if any.
