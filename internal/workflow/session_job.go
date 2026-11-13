@@ -266,10 +266,8 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 	}
 	// A session review job never runs AdvanceJob, so the durable outcome event that
 	// path writes would never exist for it. The merge gate folds its sub-threshold
-	// verdict into an approval regardless, while proof/project.go keys its
-	// review.approved claim on this event — so without it the two surfaces disagree
-	// about the same verdict and `gitmoot proof` renders "0 approved" for a PR the
-	// gate is willing to merge.
+	// verdict into an approval regardless — so without the event the job's durable
+	// history disagrees with the gate about the same verdict.
 	//
 	// Built BEFORE the transition and carried in extraEvents so it is ATOMIC with
 	// terminalization. Writing it as a second statement after the commit left a

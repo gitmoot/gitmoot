@@ -1287,11 +1287,10 @@ func TestEngineAdvanceReviewSubthresholdEventIsIdempotentAfterMergeError(t *test
 	}
 }
 
-// proof/project.go keys the review approval claim on the durable
-// review_approved_with_notes event, so a sub-threshold review that advances once
-// the task has ALREADY reached ready_to_merge must still record it. Writing it on
-// the far side of the approval replay guard drops it silently and leaves
-// `gitmoot proof` contradicting the PR comment for the same job.
+// A sub-threshold review that advances once the task has ALREADY reached
+// ready_to_merge must still record the durable review_approved_with_notes event.
+// Writing it on the far side of the approval replay guard drops it silently and
+// leaves the job's event history contradicting the PR comment for the same job.
 func TestEngineAdvanceReviewSubthresholdRecordsOutcomeAfterTaskReadyToMerge(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

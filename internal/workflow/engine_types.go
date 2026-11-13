@@ -168,8 +168,8 @@ func (e Engine) mailbox() Mailbox {
 	// Session review jobs close through the Mailbox and never run AdvanceJob, so
 	// they need the same repository policy the advancement path uses in order to
 	// record the folded outcome (#1685-adjacent): without it the merge gate folds
-	// their sub-threshold verdict into an approval while gitmoot proof, which keys
-	// its claim on the durable event, renders "0 approved".
+	// their sub-threshold verdict into an approval while the durable event history
+	// shows no approval.
 	mb.reviewBlockingSeverity = e.reviewBlockingSeverity
 	if e.EventSink == nil {
 		return mb

@@ -2558,13 +2558,9 @@ func effectiveReviewerIdentity(job db.Job, payload JobPayload) (string, bool) {
 // fields, exported so consumers outside this package resolve an identity the
 // same way instead of keeping a third copy (#2008).
 //
-// It exists because the comment above this function already named two consumers
-// that were deliberately left on bare job.Agent for routing: review_loop.go's
-// FindRepeatedReviewers, which could not see a role because db.SucceededReviewVerdict
-// carried only Agent, and internal/proof, which had zero ActingOrgRole references
-// and therefore reported a role-authored review as not comparable. Both now call
-// this, so the count in that comment is no longer two and is deliberately not
-// restated here - quoting a count is the habit #1950 F5 ended.
+// Routing-sensitive consumers such as review_loop.go's FindRepeatedReviewers
+// call this instead of comparing bare job.Agent, so a role-authored review
+// (empty agent, recorded acting role) is attributed to its normalized role.
 //
 // The db layer does NOT call this and must not: workflow depends on db and never
 // the reverse, so db.SucceededReviewVerdict carries the role RAW and the folding

@@ -198,10 +198,9 @@ func TestCloseExternalJobRequiresSeverityForChangesRequestedReview(t *testing.T)
 
 // A session review job closes here and never runs AdvanceJob, so the durable
 // review_approved_with_notes event that path writes has to be written here too.
-// The merge gate folds a sub-threshold verdict into an approval either way, while
-// proof/project.go keys its review.approved claim on this event — so without it
-// the two surfaces disagree about the same verdict and `gitmoot proof` renders
-// "0 approved" for a PR the gate will merge.
+// The merge gate folds a sub-threshold verdict into an approval either way — so
+// without the event the job's durable history disagrees with the gate about the
+// same verdict.
 func TestCloseExternalJobRecordsApprovedWithNotesForSubthresholdReview(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

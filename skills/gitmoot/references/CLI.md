@@ -1534,8 +1534,6 @@ Every surface that reads a review decision applies the same rule:
   review-verdict facts** all skip fan-outs, so an announcement neither satisfies
   a reviewer slot nor wakes a waiter nor suppresses the retry that would produce
   a real verdict;
-- the **proof projector** mints no approval claim for a fan-out, and the
-  rendered proof shows `no verdict` rather than counting it as approved;
 - `blocked` and `failed` reviews are never fan-outs. They already refuse on their
   own terms and keep reporting their own cause.
 
@@ -3687,39 +3685,7 @@ id does not begin `local-review-` include `workflow-*` rows that run an order of
 magnitude shorter and will halve an aggregate median, and concurrency-at-start
 alone moves p50 by roughly 2.6x.
 
-### Evidence-graded proof manifests
-
-```sh
-gitmoot proof <root-id>
-gitmoot proof --json <root-id>
-# As with other Go-flag commands, place --home before the positional root id:
-gitmoot proof --home /tmp/isolated-home <root-id>
-```
-
-`gitmoot proof` is a **read-only**, structured-store projection of the complete
-job tree under `<root-id>`. The default output is a graded tree of sessions,
-delegation lineage and synthesis rules, reported tests, reviews, commits, and PR
-receipts. Missing evidence renders as `-`; `tests_run` claims remain
-**reported** with an explicit CI-verification gap. Read-only means the command
-opens SQLite in `mode=ro`, runs no migrations, and never changes store data.
-SQLite may still create or refresh `-wal`/`-shm` bookkeeping sidecars while it
-reads a live WAL database; immutable mode is deliberately not used because it
-can observe a torn live snapshot.
-
-`--json` emits the canonical content-addressed manifest. Every node uses a
-`sha256:<hex>` content id, parents refer to children by hash, and the root hash
-is the proof id. Re-projecting unchanged store records is byte-identical. Core
-grading is store-only: content hashes, DAG consistency, and `result_hash` column
-consistency can be **verified**, while independent review jobs, job events, and
-daemon PR receipts are **observed**. This is internal consistency, not
-cryptographic tamper-proofing against someone who can edit the database; signing
-is future work. The headline grade tally excludes `integrity.*` meta-claims and
-reports those separately on the `integrity:` line. The command never parses
-transcripts, contacts GitHub, or mutates store data.
-
-See [RESULT_CONTRACT.md](RESULT_CONTRACT.md)
-for the structured result and delegation inputs, and [SAFETY.md](SAFETY.md) for
-the read-only and bounded-DAG safety contracts.
+### Job model and transcripts
 
 `gitmoot job show` reports the model selected when the job was enqueued: an
 explicit per-job/delegation model first, then the agent model, then the effective

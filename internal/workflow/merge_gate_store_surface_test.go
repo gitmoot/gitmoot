@@ -6,8 +6,6 @@ import (
 	"go/token"
 	"reflect"
 	"sort"
-	"strconv"
-	"strings"
 	"testing"
 )
 
@@ -96,8 +94,6 @@ func TestMergeGateStoreAccessSurface(t *testing.T) {
 			t.Fatalf("merge gate reads forbidden display plane %s through Store.%s", plane, method)
 		}
 	}
-	assertNoMergeGateImport(t, mergeGate, "github.com/gitmoot/gitmoot/internal/proof")
-	assertNoMergeGateImport(t, routing, "github.com/gitmoot/gitmoot/internal/proof")
 }
 
 func parseGoFile(t *testing.T, name string) *ast.File {
@@ -150,17 +146,4 @@ func uniqueSorted(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func assertNoMergeGateImport(t *testing.T, file *ast.File, forbidden string) {
-	t.Helper()
-	for _, spec := range file.Imports {
-		path, err := strconv.Unquote(spec.Path.Value)
-		if err != nil {
-			t.Fatalf("unquote import %s: %v", spec.Path.Value, err)
-		}
-		if strings.TrimSpace(path) == forbidden {
-			t.Fatalf("merge gate imports forbidden proof package %q", forbidden)
-		}
-	}
 }
