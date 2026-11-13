@@ -169,8 +169,6 @@ More: **[Install](https://gitmoot.io/docs/getting-started/install)** ·
 - **Orchestration.** A coordinator fans work out to several agents and merges
   the answers: `gitmoot orchestrate lead "Review PR #123 from three angles." --recipe review-panel`.
 - **PR comments.** `/gitmoot <agent> ask …` on a PR or issue routes to a named agent.
-- **Proof.** `gitmoot proof` builds an evidence-graded manifest of what a job
-  tree actually did.
 - **Dashboard.** `gitmoot dashboard` in the terminal, or a read-only web view.
 
 ## Documentation

@@ -1534,8 +1534,6 @@ Every surface that reads a review decision applies the same rule:
   review-verdict facts** all skip fan-outs, so an announcement neither satisfies
   a reviewer slot nor wakes a waiter nor suppresses the retry that would produce
   a real verdict;
-- the **proof projector** mints no approval claim for a fan-out, and the
-  rendered proof shows `no verdict` rather than counting it as approved;
 - `blocked` and `failed` reviews are never fan-outs. They already refuse on their
   own terms and keep reporting their own cause.
 
@@ -3686,6 +3684,70 @@ Two confounders to hold fixed when comparing profiles, both measured: jobs whose
 id does not begin `local-review-` include `workflow-*` rows that run an order of
 magnitude shorter and will halve an aggregate median, and concurrency-at-start
 alone moves p50 by roughly 2.6x.
+
+### Job model and transcripts
+
+`gitmoot job show` reports the model selected when the job was enqueued: an
+explicit per-job/delegation model first, then the agent model, then the effective
+runtime's configured default model. Text output prints `model: -` when no model
+was known; `--json` carries the same durable value on the job row. This is the
+enqueue-time selection Gitmoot knew (P1), not a later runtime-reported effective
+model; runtime-reported truth is reserved for P2.
+
+When standard output is an interactive terminal (and `NO_COLOR` is unset),
+the transcript renders styled: agent turns get blank-line spacing and keep
+their line breaks plus lightweight heading/list/inline-code treatment. Tool
+calls use type-specific icons; shell output previews its last five lines while
+read/search output previews its first 10-15 lines, with exact omitted-line
+counts. Tool and turn durations render dim, cancelled tools render yellow,
+completed machinery and usage render dim, and failed tool results render red.
+Piped or redirected output always uses the plain byte-stable format.
+
+Every transcript opens with an orientation header — job action, agent,
+runtime/model (per-job override first, then the agent default), workflow label,
+and the redacted, length-capped prompt — so a pane or saved transcript is
+self-describing.
+
+`job watch --transcript` follows a runtime tee log from offset zero and renders
+redacted, bounded human-readable runtime output until the job settles, then
+drains the file to EOF. It is incompatible with `--json`. Without `--log-path`,
+Gitmoot derives the job-mode path under `<home>/logs/jobs/`; if that file is not
+available, it prints `transcript unavailable; showing job events` and uses the
+normal event watcher. `--log-path` and `--runtime` are primarily internal wiring
+flags, but remain usable for diagnosis. When `--runtime` is omitted, the job's
+runtime override wins over the registered agent runtime.
+
+Fidelity follows each runtime's actual output contract: Codex JSONL renders
+live; Kimi stream-json is turn-buffered and kimi-code 0.19.2 reports no usage;
+Claude emits only its final JSON envelope, so its transcript remains quiet until
+completion; shell output passes through as redacted raw lines. omp's NDJSON is
+retained verbatim and currently passes through **undecoded** — every row carries
+the transcript kind `raw`, and omp's own `type` discriminator survives only
+inside each row's raw JSON text, so an export offers no per-event kinds; a
+translator that lifts tool calls and usage out of the stream is a named
+follow-up. Usage is labeled
+`latest reported usage` because resumed Codex counts can be session-cumulative.
+Malformed or unknown lines degrade individually to redacted capped raw output
+without stopping later lines.
+
+`job transcript <job-id> --export md` remains the deterministic, ANSI-free
+Markdown snapshot. `--export jsonl` emits schema-versioned, self-contained
+trajectory rows for every normalized event. Bulk export requires the explicit
+`--all` guard; `--state` and `--since` filter the created-time-then-id ordered
+stream. Bulk mode skips pre-retention or GC-missing logs and reports counts on
+stderr, while explicit single-job absence is an error. `--output <path>` uses a
+mode-`0600` temporary file plus atomic rename. Oversized runtime lines become
+marked truncated raw steps instead of aborting the export.
+
+JSONL export redacts every text-bearing event field with Gitmoot's best-effort
+credential masker and has no raw bypass. The source log remains unredacted and
+mode `0600`; best-effort export masking is not a vault.
+
+Verified Codex command/file-change events and Kimi function tool calls/results
+render as typed compact lines; unrecognized shapes keep the generic/raw
+fail-open path. Render-time redaction is a per-line best-effort defense in depth:
+a secret split across physical lines may be only partially masked, and the raw
+tee log plus the external `tail -F` fallback remain unredacted.
 
 ### Resumable gates (make `blocked` + `needs` actionable)
 

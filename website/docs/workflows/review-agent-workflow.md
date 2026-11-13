@@ -68,9 +68,8 @@ entire applied review policy, restoring `P3` with native fanout and risk tiers
 off.
 
 The resolved outcome is recorded on
-the review job as a `review_approved_with_notes` event, which is what
-`gitmoot proof` reads for its approval claim and what the `review_verdict`
-awaited fact reports when it wakes a waiting role.
+the review job as a `review_approved_with_notes` event, which is what the
+`review_verdict` awaited fact reports when it wakes a waiting role.
 
 ### Risk-Tiered Adaptive Review
 
