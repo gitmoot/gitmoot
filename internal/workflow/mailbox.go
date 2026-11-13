@@ -1354,11 +1354,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		// #1726: classify a SIGNALLED death beside the failure so the abandoned
 		// population is findable. Recording only; nothing requeues.
 		m.recordDeliverySignalKill(ctx, job.ID, firstErr)
-		// Record an advisory failure observation (#530) so a runtime/model that
-		// repeatedly crashes at the ADAPTER level (never reaching a parsed decision)
-		// still counts against its success rate — otherwise it contributes zero rows
-		// and its recorded SuccessRate stays artificially high. Only reached on the
-		// TERMINAL m.fail path; the tryDeferBlocker re-queue above returns first.
 		// Typed DeliveryError: this error is FROM the delivery seam (not about the
 		// agent's output), the precondition for #532 operational classification.
 		return AgentResult{}, deliveryErr
@@ -1437,9 +1432,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 				m.storeFailureDiagnostics(ctx, job.ID, &payload, repairDiag)
 				_ = m.fail(ctx, job.ID, fmt.Sprintf("repair delivery failed: %v", repairErr))
 				m.recordDeliverySignalKill(ctx, job.ID, repairErr)
-				// Advisory failure observation (#530): a hard adapter error during repair
-				// is still a runtime-level failure — count it so flaky runtimes are not
-				// over-recommended by the coordinator context block.
 				return AgentResult{}, deliveryErr
 			}
 			// Same #531 override + #665 ephemeral guard as the first delivery: never
@@ -1500,9 +1492,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 			lastDiag.Phase = FailurePhaseResultParse
 			m.storeFailureDiagnostics(ctx, job.ID, &payload, lastDiag)
 			_ = m.fail(ctx, job.ID, fmt.Sprintf("repair output malformed: %v", parseErr))
-			// Advisory failure observation (#530): output that stays malformed after all
-			// repair attempts is a runtime/model failure to honor the contract — count it
-			// so it lowers the recorded success rate instead of being invisible.
 			return AgentResult{}, parseErr
 		}
 	}
@@ -1619,9 +1608,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err := m.finishWithPayload(ctx, job.ID, state, fmt.Sprintf("job %s", state), payload); err != nil {
 		return AgentResult{}, err
 	}
-	// Record advisory routing telemetry (#530) at the settled terminal state.
-	// Best-effort and fail-safe: it swallows every error internally, so a telemetry
-	// write can never turn a successfully-finished job into a failure.
 	return result, nil
 }
 
