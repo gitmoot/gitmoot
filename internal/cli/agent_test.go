@@ -1050,6 +1050,7 @@ func TestPrepareLocalReviewTaskMintsIdentityWhenNoTaskOwnsBranch(t *testing.T) {
 }
 
 func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1117,6 +1118,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 }
 
 func TestRunAgentAskBackgroundJSON(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1626,6 +1628,7 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1666,6 +1669,7 @@ func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1723,6 +1727,7 @@ func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -1815,6 +1820,7 @@ func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
 }
 
 func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")
@@ -2939,6 +2945,7 @@ func TestParseAgentRunOptionsCapturesRecipe(t *testing.T) {
 // loadInstalledTemplate's not-installed error at dispatch time, rather than
 // silently queueing a job with no recipe prompt.
 func TestRunOrchestrateRejectsUninstalledRecipe(t *testing.T) {
+	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
 	runGit(t, repoDir, "init")

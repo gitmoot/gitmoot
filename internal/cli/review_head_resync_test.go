@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -10,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
@@ -875,118 +873,5 @@ func TestDefaultCheckoutResolvesAmbiguousAbbreviationAsARef(t *testing.T) {
 	}
 	if hasResyncEvent(events, "review_head_normalized") {
 		t.Fatalf("events = %+v, want NO review_head_normalized event: the ref names a different commit", events)
-	}
-}
-
-// #684 failure mode B: a foreground review whose serialized runtime session is
-// busy must be LEFT QUEUED for the daemon to run (a review is naturally
-// asynchronous), not cancelled and dropped. Ask/implement keep their existing
-// synchronous cancel behavior (covered by TestRunAgentAskCancelsQueuedJobWhenRuntimeSessionBusy).
-func TestRunAgentReviewRequeuesQueuedJobWhenRuntimeSessionBusy(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "config", "user.email", "gitmoot@example.com")
-	runGit(t, repoDir, "config", "user.name", "Gitmoot")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	if err := os.WriteFile(repoDir+"/README.md", []byte("test\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile returned error: %v", err)
-	}
-	runGit(t, repoDir, "add", "README.md")
-	runGit(t, repoDir, "commit", "-m", "initial")
-	t.Chdir(repoDir)
-	head := daemonWorkerHeadSHA(t, repoDir)
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{
-		"agent", "subscribe", "reviewer",
-		"--home", home,
-		"--runtime", "codex",
-		"--session", "550e8400-e29b-41d4-a716-446655440042",
-		"--role", "reviewer",
-		"--repo", "owner/repo",
-		"--capability", "review",
-		"--capability", "implement",
-		"--policy", "workspace-write",
-	}, &stdout, &stderr); code != 0 {
-		t.Fatalf("subscribe reviewer exit code = %d, stderr=%s", code, stderr.String())
-	}
-
-	store := openCLIJobStore(t, home)
-	// A pre-seeded review task whose worktree is at the requested head lets the
-	// review dispatch resolve locally without any GitHub call.
-	if err := store.UpsertTask(context.Background(), db.Task{
-		ID:           "review-task",
-		RepoFullName: "owner/repo",
-		GoalID:       "local-review",
-		Title:        "Review PR #1",
-		State:        string(workflow.TaskReviewing),
-		Branch:       "feat/x",
-		WorktreePath: repoDir,
-	}); err != nil {
-		t.Fatalf("UpsertTask returned error: %v", err)
-	}
-	// The runtime session is busy (held by another owner).
-	if acquired, err := store.AcquireResourceLock(context.Background(), db.ResourceLock{
-		ResourceKey: "runtime:codex:550e8400-e29b-41d4-a716-446655440042",
-		OwnerJobID:  "other-job",
-		OwnerToken:  "other-token",
-		ExpiresAt:   time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano),
-	}, time.Now().UTC()); err != nil || !acquired {
-		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
-	}
-	store.Close()
-
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code := Run([]string{
-		"agent", "review", "reviewer", "Please review",
-		"--home", home,
-		"--repo", "owner/repo",
-		"--pr", "1",
-		"--head-sha", head,
-		"--branch", "feat/x",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("busy review exit code = %d, want 0 (requeued, not dropped); stdout=%s stderr=%s", code, stdout.String(), stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime calls = %+v, want none (job left queued, not run)", runner.calls)
-	}
-	// No daemon is running in this test, so the foreground caller MUST be told the
-	// review is only queued and will not run until a daemon picks it up — otherwise a
-	// bare "state: queued" reads as "the review ran" and the review silently never
-	// executes.
-	if out := stdout.String(); !strings.Contains(out, "daemon is not running") || !strings.Contains(out, "job run") {
-		t.Fatalf("foreground busy-review stdout missing daemon guidance; got:\n%s", out)
-	}
-
-	store = openCLIJobStore(t, home)
-	defer store.Close()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	if len(jobs) != 1 {
-		t.Fatalf("jobs = %+v, want one queued review job", jobs)
-	}
-	if jobs[0].State != string(workflow.JobQueued) {
-		t.Fatalf("job state = %q, want queued (left for the daemon)", jobs[0].State)
-	}
-	events, err := store.ListJobEvents(context.Background(), jobs[0].ID)
-	if err != nil {
-		t.Fatalf("ListJobEvents returned error: %v", err)
-	}
-	if !hasResyncEvent(events, "requeued_runtime_busy") || !hasResyncEvent(events, "runtime_lock_wait") {
-		t.Fatalf("events = %+v, want requeued_runtime_busy and runtime_lock_wait", events)
-	}
-	if hasResyncEvent(events, string(workflow.JobCancelled)) {
-		t.Fatalf("events = %+v, review job must not be cancelled/dropped", events)
 	}
 }

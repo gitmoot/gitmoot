@@ -92,8 +92,8 @@ var hostRunnerAllowlist = map[string]hostRunnerAllowance{
 		reason:      "daemon wake drain sends owner alerts as a host-local Herdr Gram (owner decision 2026-10-08); never job work — jobWorker.OwnerGram is an injectable sender tests replace, wired to the real binary only by the daemon supervisors",
 	},
 	"internal/cli/plugin.go:<package>": {
-		execRunners: 2,
-		reason:      "operator plugin install and doctor commands use replaceable host runner seams",
+		execRunners: 1,
+		reason:      "operator plugin install command uses a replaceable host runner seam",
 	},
 	"internal/cli/remote_review_source.go:resolveReviewSourceCredential": {
 		rawCommands: 1,

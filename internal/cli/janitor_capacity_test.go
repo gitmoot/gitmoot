@@ -276,7 +276,7 @@ func TestJanitorPressureDoesNotStartAColdManagedInstance(t *testing.T) {
 	seedGitHead(t, repoDir)
 	t.Chdir(repoDir)
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "planner", "--home", home, "--runtime", "codex", "--role", "planner",
+	if code := Run([]string{"agent", "type", "set", "planner", "--home", home, "--runtime", "omp", "--role", "planner",
 		"--policy", "workspace-write", "--max-background", "1", "--idle-timeout", "20m", "--job-timeout", "5m", "--capability", "ask"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set = %d: %s", code, stderr.String())
 	}
