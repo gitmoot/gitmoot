@@ -161,13 +161,6 @@ type Engine struct {
 	// maxInlineArtifactTotalBytes aggregate budget (no new knob). With the flag
 	// off the enqueued prompt is byte-identical to before this field existed.
 	InjectUpstreamDepContext bool
-	// RouterContextEnabled, when true, appends the bounded (<=12 line) advisory
-	// observed-performance table (#530) to a TOP-LEVEL coordinator job's prompt so
-	// the coordinator can weigh which runtime/model/template has done well on this
-	// repo. It is opt-in via [router] context_enabled (default false); with the flag
-	// off no telemetry query runs and prompt assembly is byte-identical. Routing
-	// stays advisory in v1 — the block never forces a route.
-	RouterContextEnabled bool
 	// supersedeAdvance pins an AdvanceJob pass to ONE child lifecycle (#1673). It is
 	// set only by the closed-PR supersession recovery, on a COPY of the engine, so
 	// every other caller keeps the nil default and the delegation path is unchanged.

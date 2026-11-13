@@ -187,17 +187,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 	})
 
-	t.Run("router", func(t *testing.T) {
-		paths := writeGateConfig(t, "[router]\ncontext_enabled = false\n[router\ncontext_enabled = true\n")
-		settings, err := LoadRouterSettings(paths)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if settings.ContextEnabled {
-			t.Fatal("context_enabled = true after a malformed header was misattributed to [router]")
-		}
-	})
-
 	t.Run("daemon", func(t *testing.T) {
 		cfg, err := LoadDaemonRuntimeConfig(writeGateConfig(t, "[daemon]\nworkers = 2\n[daemon\nworkers = 99\n"))
 		if err != nil {
@@ -273,13 +262,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 		}
 		if got := LoadTranscriptsConfig(writeGateConfig(t, "[transcripts]\nenabled = true\n")); !got.Enabled {
 			t.Error("transcripts enabled = true was not applied")
-		}
-		settings, err := LoadRouterSettings(writeGateConfig(t, "[router]\ncontext_enabled = true\n"))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if !settings.ContextEnabled {
-			t.Error("router context_enabled = true was not applied")
 		}
 	})
 }

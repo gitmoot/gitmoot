@@ -151,7 +151,6 @@ func (e Engine) mailbox() Mailbox {
 	}
 	mb.ReviewModelPool = e.ReviewModelPool
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
-	mb.routerContextEnabled = e.RouterContextEnabled
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
 	// A supersession recovery's advance runs on a COPY of the engine carrying its
 	// ownership lease. Every mailbox this engine builds inherits it, so the insert

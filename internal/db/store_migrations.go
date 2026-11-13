@@ -3290,4 +3290,11 @@ DROP TABLE IF EXISTS keychain_grants;
 DELETE FROM agent_repos WHERE agent_name IN (SELECT name FROM agents WHERE role = 'pipeline-runner');
 DELETE FROM agents WHERE role = 'pipeline-runner';
 	`,
+	// #2584 retires routing telemetry: the per-job writer, the `gitmoot router`
+	// command, and the [router] context_enabled prompt block are deleted in the
+	// same change, so nothing reads or writes this table any more. Dropping the
+	// table drops its three indexes with it.
+	`
+DROP TABLE IF EXISTS routing_telemetry;
+	`,
 }

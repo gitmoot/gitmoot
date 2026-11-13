@@ -110,6 +110,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2574: upgrades a database built from the migrations before the
 	// deferral-notice column through the real Open path.
 	realPathTests["TestMessageDeferralNoticeMigrationUpgradesThroughOpen"] = true
+	// #2584: upgrades a database built from the migrations before the
+	// routing-telemetry table drop through the real Open path.
+	realPathTests["TestRouterRemovalMigrationOnPreviousSchema"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

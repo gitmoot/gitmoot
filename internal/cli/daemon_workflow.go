@@ -90,13 +90,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		PayloadRefresher: func(ctx context.Context, job db.Job, payload workflow.JobPayload) (workflow.JobPayload, error) {
 			return refreshDaemonJobPayloadForRunner(ctx, store, checkout, job, payload, runner)
 		},
-		// Off-by-default #530 coordinator routing-context injection: when [router]
-		// context_enabled is set, the engine's Mailbox appends a bounded advisory
-		// observed-performance table to a top-level coordinator job's prompt.
-		// routerContextEnabled returns false with no config (or any load error), so
-		// with no config NO telemetry query runs during a job and prompt assembly is
-		// byte-identical. Capture (routing_telemetry rows) is always on and additive.
-		RouterContextEnabled: routerContextEnabled(home),
 	}
 	// Opt-in risk-tiered adaptive review (#650): copy the [review] policy onto the
 	// engine. Off by default (RiskTiersEnabled false), so the review fan-out is
