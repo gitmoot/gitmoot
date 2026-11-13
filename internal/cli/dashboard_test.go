@@ -113,100 +113,28 @@ func TestDashboardLockStale(t *testing.T) {
 	}
 }
 
-func TestDashboardWatchRejectsInvalidCombos(t *testing.T) {
-	// ASSERT THE REASON, NOT ONLY THE CODE. Two of these cases used to pass the
-	// removed --answer/--value/--dismiss flags and "passed" on exit 2 from the
-	// flag parser, never reaching the combination check they were named for
-	// (#1787 review N1). Exit code alone cannot tell those apart, so every case
-	// now names the message it expects.
+func TestDashboardRejectsPositionalArguments(t *testing.T) {
 	home := dashboardTestHome(t)
-	for _, tc := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{
-			name: "watch with json",
-			args: []string{"dashboard", "--home", home, "--watch", "--json"},
-			want: "dashboard --watch cannot be combined with --json",
-		},
-		{
-			name: "watch without a terminal",
-			args: []string{"dashboard", "--home", home, "--watch"},
-			want: "dashboard --watch requires a terminal",
-		},
-
-		{
-			name: "positional argument",
-			args: []string{"dashboard", "--home", home, "extra"},
-			want: "dashboard does not accept positional arguments",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-			code := Run(tc.args, &stdout, &stderr)
-			if code != 2 {
-				t.Fatalf("Run(%v) = %d, want 2; stderr=%s", tc.args, code, stderr.String())
-			}
-			if strings.Contains(stderr.String(), "flag provided but not defined") {
-				t.Fatalf("Run(%v) exited 2 from the FLAG PARSER, not from the check this case names: %s", tc.args, stderr.String())
-			}
-			if !strings.Contains(stderr.String(), tc.want) {
-				t.Fatalf("Run(%v) stderr = %q, want it to contain %q", tc.args, stderr.String(), tc.want)
-			}
-		})
+	var stdout, stderr bytes.Buffer
+	args := []string{"dashboard", "--home", home, "extra"}
+	if code := Run(args, &stdout, &stderr); code != 2 {
+		t.Fatalf("Run(%v) = %d, want 2; stderr=%s", args, code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "dashboard does not accept positional arguments") {
+		t.Fatalf("Run(%v) stderr = %q, want the positional-argument message", args, stderr.String())
 	}
 }
 
-// The interval guard sits BEHIND the terminal guard, so a bytes.Buffer stdout
-// can never reach it: style.IsTerminal is false for any writer without Stat(),
-// so runDashboard exits at "requires a terminal" first. The previous version of
-// this case lived in the combos table with the loose want "dashboard --watch",
-// which the TERMINAL message also contains - so it passed green while measuring
-// the wrong guard, which is precisely the class that round claimed to close
-// (#1787 review F1).
-//
-// Reaching the interval guard needs a stdout that satisfies IsTerminal. This
-// case USED TO open /dev/null for that, relying on the #1838 weakness it names.
-// With that weakness fixed, /dev/null no longer passes and the old version
-// would have SILENTLY SKIPPED - still green, testing nothing. It now uses a
-// genuine terminal instead, so it exercises the same production ordering
-// without depending on a defect.
-func TestDashboardWatchRejectsANonPositiveInterval(t *testing.T) {
-	home := dashboardTestHome(t)
-	tty := openTerminalForTest(t)
-	if !style.IsTerminal(tty) {
-		t.Fatal("openTerminalForTest did not return a terminal, so the terminal guard cannot be passed here")
-	}
-	original := runDashboardWatchFn
-	t.Cleanup(func() { runDashboardWatchFn = original })
-	started := 0
-	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
-		started++
-		return 0
-	}
-	var stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--watch", "--interval", "0s"}, tty, &stderr)
-	if started != 0 {
-		t.Fatal("the watch loop started with a non-positive interval")
-	}
-	if code != 2 {
-		t.Fatalf("Run = %d, want 2; stderr=%q", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "dashboard --interval must be greater than zero") {
-		t.Fatalf("stderr = %q, want the INTERVAL guard's own message: a substring that the terminal message also matches proves nothing", stderr.String())
-	}
-}
-
-// The flags deleted with the TUI must still be REJECTED, and that is a separate
-// property from the combination checks above - conflating them is what let two
-// combination cases pass on a parse error.
-func TestDashboardRejectsFlagsRemovedWithTheTUI(t *testing.T) {
+// Removed flags must still be REJECTED by the parser rather than silently
+// ignored: the TUI flags (--answer/--value/--dismiss) and the terminal
+// --watch/--interval redraw loop (#2593).
+func TestDashboardRejectsRemovedFlags(t *testing.T) {
 	home := dashboardTestHome(t)
 	for _, args := range [][]string{
 		{"dashboard", "--home", home, "--answer", "p1", "--value", "x"},
 		{"dashboard", "--home", home, "--dismiss", "p1"},
-		{"dashboard", "--home", home, "--watch", "--answer", "p1"},
+		{"dashboard", "--home", home, "--watch"},
+		{"dashboard", "--home", home, "--interval", "2s"},
 	} {
 		var stdout, stderr bytes.Buffer
 		if code := Run(args, &stdout, &stderr); code != 2 {
@@ -215,30 +143,6 @@ func TestDashboardRejectsFlagsRemovedWithTheTUI(t *testing.T) {
 		if !strings.Contains(stderr.String(), "flag provided but not defined") {
 			t.Fatalf("Run(%v) stderr = %q, want the parser to reject the removed flag", args, stderr.String())
 		}
-	}
-}
-
-// The --watch terminal guard must be observable WITHOUT running the watch loop.
-// Before the seam, deleting the guard did not fail this suite cleanly: the test
-// reached the blocking loop and the package died on its 10m timeout, naming
-// whichever test the panic landed in (#1787 review N3). Now the guard's absence
-// fails here, in seconds, with the right name on it.
-func TestDashboardWatchNeverStartsWithoutATerminal(t *testing.T) {
-	home := dashboardTestHome(t)
-	original := runDashboardWatchFn
-	t.Cleanup(func() { runDashboardWatchFn = original })
-	started := 0
-	runDashboardWatchFn = func(io.Writer, string, bool, time.Duration) int {
-		started++
-		return 0
-	}
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"dashboard", "--home", home, "--watch"}, &stdout, &stderr)
-	if started != 0 {
-		t.Fatalf("the watch loop STARTED with a non-terminal stdout; on a real run it would block until interrupted")
-	}
-	if code != 2 || !strings.Contains(stderr.String(), "requires a terminal") {
-		t.Fatalf("Run = %d stderr=%q, want exit 2 naming the terminal requirement", code, stderr.String())
 	}
 }
 
@@ -270,21 +174,6 @@ func TestDashboardWebReturnsBeforeTheSnapshot(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("the one-shot snapshot ran anyway and wrote %d bytes", stdout.Len())
-	}
-}
-
-func TestDashboardWatchFrame(t *testing.T) {
-	body := []byte("home: /h\n")
-	first := dashboardWatchFrame(body, true)
-	if !bytes.HasPrefix(first, []byte("\x1b[2J\x1b[H\x1b[0J")) || !bytes.Contains(first, body) {
-		t.Fatalf("first frame = %q", first)
-	}
-	next := dashboardWatchFrame(body, false)
-	if bytes.Contains(next, []byte("\x1b[2J")) {
-		t.Fatalf("non-first frame should not clear the whole screen: %q", next)
-	}
-	if !bytes.HasPrefix(next, []byte("\x1b[H\x1b[0J")) || !bytes.Contains(next, body) {
-		t.Fatalf("next frame = %q", next)
 	}
 }
 

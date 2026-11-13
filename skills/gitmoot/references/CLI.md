@@ -982,8 +982,6 @@ locks. It prints the same snapshot everywhere: terminal, pipe, or CI.
 gitmoot dashboard                  # styled one-shot snapshot
 gitmoot dashboard --json
 gitmoot dashboard --all
-gitmoot dashboard --watch          # redraw until Ctrl-C (terminal only)
-gitmoot dashboard --watch --interval 2s
 gitmoot dashboard --web [--addr 127.0.0.1:8080]
 ```
 
@@ -1007,8 +1005,7 @@ itself; use `gitmoot message resolve` from the CLI.
 
 The styled output leads with a "needs attention" block, colors and truncates
 long lists, and groups near-identical runtime sessions; `--all` shows
-everything. `--watch` redraws on an interval (default 5s) and cannot be
-combined with `--json`.
+everything.
 
 ## Event Stream (Webhooks)
 

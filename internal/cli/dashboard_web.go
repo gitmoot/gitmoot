@@ -34,7 +34,7 @@ import (
 // UI backed by a dashboard.DataSource over the local store. It is strictly
 // read-only (it never mutates workflow state) and is never invoked from the
 // daemon path — it is a foreground `gitmoot dashboard --web` server that blocks
-// until interrupted, mirroring the --watch loop's signal handling.
+// until interrupted (SIGINT/SIGTERM).
 func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 	if _, err := initializedPaths(home); err != nil {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)

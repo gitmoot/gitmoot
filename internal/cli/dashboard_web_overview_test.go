@@ -331,7 +331,8 @@ func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	for _, task := range []db.Task{
-		{ID: "task-1", RepoFullName: "acme/app", Title: "Implement", State: "implementing"},
+		{ID: "task-1", RepoFullName: "acme/app", Title: "Review", State: "reviewing"},
+		{ID: "task-implementing", RepoFullName: "acme/app", Title: "Implement", State: "implementing"},
 		{ID: "task-planned", RepoFullName: "acme/app", Title: "Plan", State: "planned"},
 		{ID: "task-unknown", RepoFullName: "acme/app", Title: "Future", State: "future_state"},
 	} {
@@ -350,7 +351,7 @@ func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &tasks); err != nil {
 		t.Fatalf("decode tasks: %v", err)
 	}
-	if len(tasks) != 1 || tasks[0].ID != "task-1" || tasks[0].State != "implementing" || tasks[0].UpdatedAt == 0 {
+	if len(tasks) != 1 || tasks[0].ID != "task-1" || tasks[0].State != "pr_open" || tasks[0].UpdatedAt == 0 {
 		t.Fatalf("tasks round trip = %+v", tasks)
 	}
 }
@@ -363,7 +364,7 @@ func TestDashboardTaskStateFiltersUnsupportedStates(t *testing.T) {
 		{internal: "planned"},
 		{internal: "dismissed"},
 		{internal: "future_state"},
-		{internal: "implementing", state: "implementing", ok: true},
+		{internal: "implementing"},
 		{internal: "pr_open", state: "pr_open", ok: true},
 		{internal: "reviewing", state: "pr_open", ok: true},
 		{internal: "changes_requested", state: "pr_open", ok: true},

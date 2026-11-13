@@ -98,10 +98,8 @@ func dashboardTasks(ctx context.Context, store *db.Store, now time.Time) ([]dash
 
 func dashboardTaskState(state string) (stateName, blockedReason string, ok bool) {
 	switch strings.TrimSpace(state) {
-	case "planned", "dismissed":
+	case "planned", "implementing", "dismissed":
 		return "", "", false
-	case "implementing":
-		return "implementing", "", true
 	case "pr_open", "reviewing", "changes_requested", "ready_to_merge":
 		return "pr_open", "", true
 	case "blocked":
@@ -119,16 +117,14 @@ func dashboardTaskState(state string) (stateName, blockedReason string, ok bool)
 
 func dashboardTaskStateRank(state string) int {
 	switch state {
-	case "implementing":
-		return 0
 	case "pr_open":
-		return 1
+		return 0
 	case "blocked":
-		return 2
+		return 1
 	case "merged":
-		return 3
+		return 2
 	default:
-		return 4
+		return 3
 	}
 }
 

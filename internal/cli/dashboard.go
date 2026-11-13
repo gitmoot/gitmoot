@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,10 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/gitmoot/gitmoot/internal/cli/style"
@@ -154,22 +151,12 @@ type dashboardBranchLock struct {
 // early-return invariant can be observed without starting a blocking server.
 var runDashboardWebFn = runDashboardWeb
 
-// runDashboardWatchFn is the --watch entry point, replaceable for the same
-// reason as the web one: it blocks until interrupted, so a test that reaches it
-// HANGS instead of failing. A hang is killed by the package timeout, which
-// names whichever test the panic lands in - the #1549 misattribution shape this
-// repo's ci.yml documents. With the seam, a missing terminal guard fails fast
-// and in the right test (#1787 review N3).
-var runDashboardWatchFn = runDashboardWatch
-
 func runDashboard(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "write the snapshot as JSON")
 	all := fs.Bool("all", false, "show full lists without truncation or grouping")
-	watch := fs.Bool("watch", false, "refresh the snapshot on an interval until interrupted (terminal only)")
-	interval := fs.Duration("interval", 5*time.Second, "refresh interval for --watch")
 	web := fs.Bool("web", false, "serve the read-only web dashboard (live orchestration graph) until interrupted")
 	webAddr := fs.String("addr", "127.0.0.1:8080", "address for --web to listen on")
 	if err := fs.Parse(args); err != nil {
@@ -182,23 +169,8 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "dashboard does not accept positional arguments")
 		return 2
 	}
-	if *watch {
-		if *jsonOutput {
-			fmt.Fprintln(stderr, "dashboard --watch cannot be combined with --json")
-			return 2
-		}
-		if !style.IsTerminal(stdout) {
-			fmt.Fprintln(stderr, "dashboard --watch requires a terminal")
-			return 2
-		}
-		if *interval <= 0 {
-			fmt.Fprintln(stderr, "dashboard --interval must be greater than zero")
-			return 2
-		}
-		return runDashboardWatchFn(stdout, *home, *all, *interval)
-	}
 	// The web dashboard is a separate read-only HTTP server (never the daemon
-	// path); branch out before the one-shot snapshot, mirroring --watch.
+	// path); branch out before the one-shot snapshot.
 	//
 	// The indirection is a TEST SEAM, not indirection for its own sake: --web
 	// blocks until interrupted, so the early return cannot be pinned by calling
@@ -229,48 +201,6 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	}
 	printDashboardSnapshot(stdout, style.For(stdout), snapshot, *home, *all)
 	return 0
-}
-
-// runDashboardWatch redraws the dashboard every interval until interrupted. Each
-// frame is rendered to a buffer and written once (after a cursor-home + clear)
-// to avoid flicker; transient store errors are shown in the frame rather than
-// ending the loop.
-func runDashboardWatch(stdout io.Writer, home string, all bool, interval time.Duration) int {
-	st := style.For(stdout)
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	first := true
-	for {
-		var body bytes.Buffer
-		if paths, err := initializedPaths(home); err != nil {
-			fmt.Fprintf(&body, "dashboard: %v\n", err)
-		} else if snapshot, err := buildDashboardSnapshot(home, paths); err != nil {
-			fmt.Fprintf(&body, "dashboard: %v\n", err)
-		} else {
-			printDashboardSnapshot(&body, st, snapshot, home, all)
-		}
-		_, _ = stdout.Write(dashboardWatchFrame(body.Bytes(), first))
-		first = false
-		select {
-		case <-ctx.Done():
-			fmt.Fprintln(stdout)
-			return 0
-		case <-time.After(interval):
-		}
-	}
-}
-
-// dashboardWatchFrame wraps a rendered snapshot body with the terminal control
-// codes for an in-place redraw: clear-screen on the first frame, then
-// cursor-home + clear-below on every frame.
-func dashboardWatchFrame(body []byte, first bool) []byte {
-	var frame bytes.Buffer
-	if first {
-		frame.WriteString("\x1b[2J")
-	}
-	frame.WriteString("\x1b[H\x1b[0J")
-	frame.Write(body)
-	return frame.Bytes()
 }
 
 // buildDashboardDaemonDetail reads the persisted daemon meta (flags, workdir,

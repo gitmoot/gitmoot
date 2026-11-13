@@ -406,12 +406,6 @@ func (d *webDataSource) attentionJSON(ctx context.Context) ([]byte, error) {
 	if attention.Gates == nil {
 		attention.Gates = []dashboard.AttentionGate{}
 	}
-	if attention.SynthItems == nil {
-		attention.SynthItems = []dashboard.AttentionSynthItem{}
-	}
-	if attention.Candidates == nil {
-		attention.Candidates = []dashboard.AttentionCandidate{}
-	}
 	return marshalDashboardJSON(attention)
 }
 
@@ -468,18 +462,14 @@ func (d *webDataSource) tasksJSON(ctx context.Context) ([]byte, error) {
 
 func dashboardWireTaskStateRank(state string) int {
 	switch state {
-	case "planned":
-		return 0
-	case "implementing":
-		return 1
 	case "pr_open":
-		return 2
+		return 0
 	case "blocked":
-		return 3
+		return 1
 	case "merged":
-		return 4
+		return 2
 	default:
-		return 5
+		return 3
 	}
 }
 

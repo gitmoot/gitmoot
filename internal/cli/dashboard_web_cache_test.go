@@ -369,7 +369,7 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustCreateJob(t, store, db.Job{ID: "malformed", Agent: "builder", Type: "ask", State: "failed", Payload: `{"instructions":`}, "failed", "bad payload")
-	if err := store.UpsertTask(context.Background(), db.Task{ID: "cache-task", RepoFullName: "acme/cache", Title: "Cache tier two", State: "implementing", Branch: "feat/cache"}); err != nil {
+	if err := store.UpsertTask(context.Background(), db.Task{ID: "cache-task", RepoFullName: "acme/cache", Title: "Cache tier two", State: "reviewing", Branch: "feat/cache"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.InsertWorkflowNote(context.Background(), db.WorkflowNote{WorkflowID: "cache/tier-two", Author: "lead", Body: "byte parity"}); err != nil {
@@ -663,12 +663,12 @@ func TestDashboardTierTwoCachesUncoveredWritesUseHardMax(t *testing.T) {
 		{
 			name: "task upsert", path: "/api/tasks", maxAge: dashboardTasksCachePolicy.maxAge,
 			seed: func(t *testing.T, store *db.Store) {
-				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "before", State: "implementing"}); err != nil {
+				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "before", State: "reviewing"}); err != nil {
 					t.Fatal(err)
 				}
 			},
 			mutate: func(t *testing.T, store *db.Store) {
-				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "after", State: "implementing"}); err != nil {
+				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "after", State: "reviewing"}); err != nil {
 					t.Fatal(err)
 				}
 			},
