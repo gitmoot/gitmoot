@@ -646,25 +646,6 @@ func gitRefLockRace(err error) bool {
 		(strings.Contains(message, ".lock") && strings.Contains(message, "File exists"))
 }
 
-func executionChangeSetCollector(lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance, liveBackend execbackend.Backend, liveJobID string) func(context.Context, execbackend.Backend, string) (*execbackend.ChangeSet, error) {
-	if lifecycle == nil || instance == nil {
-		return nil
-	}
-	return func(ctx context.Context, requestedBackend execbackend.Backend, requestedJobID string) (*execbackend.ChangeSet, error) {
-		if requestedBackend != liveBackend {
-			return nil, fmt.Errorf("collect changeset backend %q does not match live instance backend %q", requestedBackend, liveBackend)
-		}
-		if requestedJobID != liveJobID {
-			return nil, fmt.Errorf("collect changeset job %q does not own live instance for job %q", requestedJobID, liveJobID)
-		}
-		changes, err := lifecycle.Collect(ctx, instance)
-		if err != nil {
-			return nil, err
-		}
-		return &changes, nil
-	}
-}
-
 func (w jobWorker) destroyExecutionBackend(jobID string, lifecycle execbackend.ExecutionBackend, instance *execbackend.Instance) {
 	if lifecycle == nil || instance == nil {
 		return

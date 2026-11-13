@@ -69,7 +69,7 @@ func TestMailboxRefusesExecutedClaimFromNoExecutionReviewInEveryMode(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			store := openTestStore(t)
-			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksOff}
+			mailbox := Mailbox{store: store, resultCheckMode: ResultChecksOff}
 			id := fmt.Sprintf("job-noexec-%d", i)
 			if _, err := mailbox.Enqueue(ctx, JobRequest{ID: id, Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot", ReviewNoExecution: tc.requested}); err != nil {
 				t.Fatalf("Enqueue: %v", err)

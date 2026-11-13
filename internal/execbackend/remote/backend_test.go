@@ -368,10 +368,6 @@ func TestRemoteSyncInShipsExactHeadAndReviewBase(t *testing.T) {
 			t.Fatalf("workspace archive entry %q carries the host credential", name)
 		}
 	}
-	changes, err := backend.Collect(context.Background(), instance)
-	if err != nil || len(changes.Patch) != 0 || len(changes.Manifest) != 0 {
-		t.Fatalf("Collect on an untouched review workspace = %+v, %v; want no changes", changes, err)
-	}
 }
 
 // A workspace that did not land on the exact host commit is refused rather
@@ -390,70 +386,6 @@ func TestRemoteSyncInRefusesWorkspaceOffExactHead(t *testing.T) {
 	}
 	if _, err := backend.Exec(context.Background(), instance, execbackend.Command{Name: "true", Dir: workspacePath}); err == nil || !strings.Contains(err.Error(), "has not been synced") {
 		t.Fatal("Exec ran in a workspace whose sync was refused")
-	}
-}
-
-// GITMOOT-IMPL: kills MG, removal of the sandbox-created commit guard.
-func TestRemoteCollectRefusesSandboxCreatedCommit(t *testing.T) {
-	harness := newProviderHarness(t)
-	backend := harness.backend(t)
-	instance := provisionAndSync(t, backend, testSourceRepo(t))
-	testWriteFile(t, harness.workspace, "committed-by-agent.txt", []byte("committed\n"), 0o644)
-	testGit(t, harness.workspace, "add", "committed-by-agent.txt")
-	testGit(t, harness.workspace, "commit", "-q", "-m", "agent commit")
-
-	changes, err := backend.Collect(context.Background(), instance)
-	if err == nil || !strings.Contains(err.Error(), "sandbox-created commits are forbidden") {
-		t.Fatalf("Collect after sandbox commit = %+v, %v; want refusal", changes, err)
-	}
-}
-
-// GITMOOT-IMPL: kills MH, removal of the remote patch-size check.
-func TestRemoteCollectRejectsOversizedPatch(t *testing.T) {
-	harness := newProviderHarness(t)
-	backend := harness.backend(t)
-	instance := provisionAndSync(t, backend, testSourceRepo(t))
-	testWriteFile(t, harness.workspace, "oversized.txt", bytes.Repeat([]byte("x"), execbackend.MaxChangeSetPatchBytes+1024), 0o644)
-
-	changes, err := backend.Collect(context.Background(), instance)
-	if err == nil || !strings.Contains(err.Error(), "remote execution patch is larger than limit") {
-		t.Fatalf("Collect oversized patch = %+v, %v; want size refusal", changes, err)
-	}
-}
-
-func TestRemoteCollectMaterializesSameTreeAsLocalCollect(t *testing.T) {
-	ctx := context.Background()
-	source := testSourceRepo(t)
-	harness := newProviderHarness(t)
-	remoteBackend := harness.backend(t)
-	remoteInstance := provisionAndSync(t, remoteBackend, source)
-
-	localBackend, err := execbackend.NewLocalBackend(filepath.Join(t.TempDir(), "local-instances"), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	localInstance, err := localBackend.Provision(ctx, execbackend.JobScope{JobID: "local"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := localBackend.SyncIn(ctx, localInstance, execbackend.Materials{SourceWorktree: source}); err != nil {
-		t.Fatal(err)
-	}
-
-	applyCollectionCorpus(t, localInstance.Workspace)
-	applyCollectionCorpus(t, harness.workspace)
-	localChanges, err := localBackend.Collect(ctx, localInstance)
-	if err != nil {
-		t.Fatalf("local Collect: %v", err)
-	}
-	remoteChanges, err := remoteBackend.Collect(ctx, remoteInstance)
-	if err != nil {
-		t.Fatalf("remote Collect: %v", err)
-	}
-	localTree := materializedTree(t, source, localChanges)
-	remoteTree := materializedTree(t, source, remoteChanges)
-	if !reflect.DeepEqual(remoteTree, localTree) {
-		t.Fatalf("materialized tree mismatch\nlocal: %#v\nremote: %#v", localTree, remoteTree)
 	}
 }
 
@@ -490,82 +422,6 @@ func testSourceRepo(t *testing.T) string {
 	testWriteFile(t, root, "input.txt", []byte("host input change\n"), 0o644)
 	testWriteFile(t, root, "input-untracked.txt", []byte("host untracked input\n"), 0o644)
 	return root
-}
-
-func applyCollectionCorpus(t *testing.T, root string) {
-	t.Helper()
-	testWriteFile(t, root, "tracked.txt", []byte("changed\n"), 0o644)
-	if err := os.Remove(filepath.Join(root, "deleted.txt")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(filepath.Join(root, "script.sh"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(filepath.Join(root, "tracked-link")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("tracked.txt", filepath.Join(root, "tracked-link")); err != nil {
-		t.Fatal(err)
-	}
-	testWriteFile(t, root, "nested/untracked.bin", []byte{'n', 'e', 'w', 0, 0xff, '\n'}, 0o644)
-	testWriteFile(t, root, "staged-new.txt", []byte("staged by agent\n"), 0o644)
-	testGit(t, root, "add", "staged-new.txt")
-	if err := os.Symlink("untracked.bin", filepath.Join(root, "nested", "untracked-link")); err != nil {
-		t.Fatal(err)
-	}
-	invalidName := "invalid-\xff-name.txt"
-	testWriteFile(t, root, invalidName, []byte("byte-exact\n"), 0o644)
-}
-
-type testTreeEntry struct {
-	Mode    os.FileMode
-	Content []byte
-	Target  string
-}
-
-func materializedTree(t *testing.T, source string, changes execbackend.ChangeSet) map[string]testTreeEntry {
-	t.Helper()
-	target := filepath.Join(t.TempDir(), "materialized")
-	testGit(t, filepath.Dir(target), "clone", "-q", "--no-hardlinks", source, target)
-	if err := execbackend.ImportChangeSet(context.Background(), target, changes); err != nil {
-		t.Fatalf("materialize ChangeSet: %v", err)
-	}
-
-	tree := make(map[string]testTreeEntry)
-	err := filepath.WalkDir(target, func(filePath string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		relative, err := filepath.Rel(target, filePath)
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			if relative == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		item := testTreeEntry{Mode: info.Mode() & (os.ModeType | os.ModePerm)}
-		if info.Mode()&os.ModeSymlink != 0 {
-			item.Target, err = os.Readlink(filePath)
-		} else {
-			item.Content, err = os.ReadFile(filePath)
-		}
-		if err != nil {
-			return err
-		}
-		tree[filepath.ToSlash(relative)] = item
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("snapshot materialized tree: %v", err)
-	}
-	return tree
 }
 
 func testWriteFile(t *testing.T, root, name string, data []byte, mode os.FileMode) {

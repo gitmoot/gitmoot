@@ -12,37 +12,23 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
-	"github.com/gitmoot/gitmoot/internal/execbackend"
 	"github.com/gitmoot/gitmoot/internal/github"
 )
 
 type Engine struct {
 	Store *db.Store
-	// ResolveDeliveryWorktree is the injected CLI-owned checkout-resolution seam
-	// used after an implement delivery. The workflow package must not import cli;
-	// daemonWorkflowEngine wires the effective checkout selected by the worker.
-	ResolveDeliveryWorktree DeliveryWorktreeResolver
-	// CollectChangeSet is wired only on an engine that owns a live job-scoped
-	// execution-backend instance. Keeping it nil everywhere else prevents a
-	// backend-less job from reaching the transactional importer.
-	CollectChangeSet func(ctx context.Context, backend execbackend.Backend, jobID string) (*execbackend.ChangeSet, error)
-	// ApplyChangeSet is the optional host materializer test seam. Production
-	// leaves it nil and Mailbox selects execbackend.ImportChangeSet.
-	ApplyChangeSet func(ctx context.Context, worktree string, changes execbackend.ChangeSet) error
 	// RequireWorkflowPolicy is passed to every mailbox the engine creates so
 	// continuations and delegation enqueue share the same home-aware policy.
 	RequireWorkflowPolicy func(repo string) RequireWorkflowPolicy
 	// OrgPolicy is passed to every mailbox the engine creates. Descendant jobs are
 	// exempt from the gate but preserve their initiating role as provenance.
-	OrgPolicy               func(repo string) OrgEnforcement
-	RequiredReviewers       []string
-	MergeGate               MergeGate
-	JobID                   func(JobRequest) string
-	PayloadRefresher        func(context.Context, db.Job, JobPayload) (JobPayload, error)
-	ImplementationFinalizer ImplementationFinalizer
-	// EscalationNotifier is the injected, best-effort seam (mirroring
-	// ImplementationFinalizer) the engine calls when a delegation fails under the
-	// escalate_human failure_policy and the tree pauses awaiting a human (#340).
+	OrgPolicy         func(repo string) OrgEnforcement
+	RequiredReviewers []string
+	MergeGate         MergeGate
+	JobID             func(JobRequest) string
+	// EscalationNotifier is the injected, best-effort seam the engine calls when
+	// a delegation fails under the escalate_human failure_policy and the tree
+	// pauses awaiting a human (#340).
 	// The daemon implements it to @-tag the human in a PR/issue comment with the
 	// resume instructions. It is optional: when nil the pause still happens (the
 	// dashboard "Attention" section and the recorded event remain), only the

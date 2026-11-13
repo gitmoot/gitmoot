@@ -580,7 +580,7 @@ func TestCleanupRevalidatesConsumerEnqueueAfterLifecycleFence(t *testing.T) {
 		if _, err := engine.ApplyProducerCleanup(contended, world.job.ID, inspection.ResourceID, inspection.EligibilityToken, workflow.CleanupPolicy{}); !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("cleanup crossed an active enqueue lifecycle: %v", err)
 		}
-		mailbox := workflow.NewMailbox(world.store, nil)
+		mailbox := workflow.NewMailbox(world.store)
 		if _, err := mailbox.Enqueue(writerCtx, workflow.JobRequest{
 			ID: "late-consumer", Agent: "consumer", Action: "ask", Repo: "owner/repo",
 			ParentJobID: world.job.ID, WorktreePath: world.path,

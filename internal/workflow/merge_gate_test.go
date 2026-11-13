@@ -5720,7 +5720,7 @@ func TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound(t *
 		id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 	})
 
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
 		ID:          "session-review-objection",
 		Agent:       "session-reviewer",
@@ -5787,7 +5787,7 @@ func TestPolicyMergeGateBlocksASessionReviewObjectionWithNeitherHeadNorRound(t *
 // what #1950 F2 turned on.
 func openSessionReviewObjection(t *testing.T, store *db.Store, id, agent, actingRole, decision string, severity string) {
 	t.Helper()
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.OpenExternalJob(context.Background(), JobRequest{
 		ID:            id,
 		Agent:         agent,
@@ -6324,7 +6324,7 @@ func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, stat
 func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision, headSHA string, delegations []Delegation) db.Job {
 	t.Helper()
 	ctx := context.Background()
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: id, Agent: agent, Action: "review", Repo: "gitmoot/gitmoot", Branch: "task-9",
 		TaskID: "task-9", PullRequest: 9, HeadSHA: headSHA, Instructions: "review",
@@ -6382,7 +6382,7 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
-		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		mailbox := Mailbox{store: store}
 		// #2004: the gate resolves a runtime family for this reviewer.
 		seedMergeGateFixtureAgent(t, store, "returning-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
@@ -6516,7 +6516,7 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 		})
-		mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+		mailbox := Mailbox{store: store}
 		// #2004: the gate resolves a runtime family for this reviewer.
 		seedMergeGateFixtureAgent(t, store, "asym-reviewer")
 		if _, err := mailbox.OpenExternalJob(ctx, JobRequest{
@@ -6663,7 +6663,7 @@ func TestPolicyMergeGateProvenanceScopeMatrix(t *testing.T) {
 			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
 				id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
 			})
-			mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+			mailbox := Mailbox{store: store}
 			// #2004: the gate resolves a runtime family for this reviewer.
 			seedMergeGateFixtureAgent(t, store, "matrix-reviewer")
 			if _, err := mailbox.OpenExternalJob(ctx, JobRequest{

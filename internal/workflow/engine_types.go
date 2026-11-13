@@ -112,29 +112,12 @@ func (e Engine) now() time.Time {
 // so the daemon held a home-aware resolver and discarded it. Enumerated
 // forwarding is the defect: the next home-aware field is forgotten at the same
 // site the same way. One call site, no field list, exhaustive by construction.
-func (e Engine) EnqueueMailbox(delivery DeliveryWorktreeResolver) Mailbox {
-	mb := e.mailbox()
-	// The delivery resolver is a DELIBERATE parameter rather than an inherited
-	// field (#2186 round 5). The daemon's comment producer previously built its
-	// mailbox with UnavailableDeliveryWorktreeResolver, which ERRORS LOUDLY if an
-	// implement delivery ever reaches that context. Handing it the engine's
-	// mailbox wholesale replaced that sentinel with the engine's REAL resolver
-	// and its change-set machinery, so a context that refused delivery loudly
-	// would have started carrying the means to perform it.
-	//
-	// Config-bearing resolvers must be inherited; a capability sentinel must not.
-	if delivery != nil {
-		mb.resolveDeliveryWorktree = delivery
-		mb.CollectChangeSet = nil
-		mb.ApplyChangeSet = nil
-	}
-	return mb
+func (e Engine) EnqueueMailbox() Mailbox {
+	return e.mailbox()
 }
 
 func (e Engine) mailbox() Mailbox {
-	mb := NewMailbox(e.Store, e.ResolveDeliveryWorktree)
-	mb.CollectChangeSet = e.CollectChangeSet
-	mb.ApplyChangeSet = e.ApplyChangeSet
+	mb := NewMailbox(e.Store)
 	mb.RequireWorkflowPolicy = e.RequireWorkflowPolicy
 	mb.OrgPolicy = e.OrgPolicy
 	mb.deferBlocker = e.BlockerDeferrer
@@ -474,10 +457,6 @@ const (
 
 type MergeGate interface {
 	Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error)
-}
-
-type ImplementationFinalizer interface {
-	FinalizeImplementation(ctx context.Context, job db.Job, payload JobPayload) (JobPayload, error)
 }
 
 // EscalationRequest carries the context the EscalationNotifier needs to notify a

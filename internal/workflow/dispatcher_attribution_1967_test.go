@@ -114,7 +114,7 @@ func TestDispatcherSurvivesEveryJobReadBack(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
-	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := NewMailbox(store)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:           "readback-review",
@@ -163,7 +163,7 @@ func TestEnqueueResolvesTheDispatcherFromTheMostSpecificSourceAvailable(t *testi
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
-	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := NewMailbox(store)
 
 	for _, tc := range []struct {
 		name    string
@@ -232,7 +232,7 @@ func TestRecordingTheDispatcherDoesNotSynthesizeADelegationParent(t *testing.T) 
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "reviewer", []string{"review"}, "gitmoot/gitmoot")
-	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := NewMailbox(store)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:           "attribution-only",

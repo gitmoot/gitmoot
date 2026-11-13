@@ -8,11 +8,13 @@ import (
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
-// vagueImplementResult is a deliberately deficient implement result: it claims
-// "implemented" but lists no changes_made and no tests_run, so it fails both
-// implement checks. It parses cleanly (valid contract), so only the #526 audit
-// catches it — the perfect deterministic, no-LLM fixture.
+// vagueImplementResult is an implement result with no listed changes or tests.
+// Implement result checks were removed (#2586), so it must audit clean.
 const vagueImplementResult = `{"gitmoot_result":{"decision":"implemented","summary":"did the work","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+
+// degenerateAskResult parses cleanly (valid contract) but its one-character
+// answer fails ask-answer-actionable, so only the #526 audit catches it.
+const degenerateAskResult = `{"gitmoot_result":{"decision":"approved","summary":"s","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
 
 func shellAgent() runtime.Agent {
 	return runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
@@ -22,7 +24,7 @@ func TestMailboxRunResultChecksOffIsByteIdentical(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	// Off (the zero value): no audit runs at all.
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksOff}
+	mailbox := Mailbox{store: store, resultCheckMode: ResultChecksOff}
 	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-off", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
@@ -69,18 +71,18 @@ func TestMailboxRunResultChecksOffIsByteIdentical(t *testing.T) {
 func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksWarn}
-	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
+	mailbox := Mailbox{store: store, resultCheckMode: ResultChecksWarn}
+	adapter := &fakeDelivery{outputs: []string{degenerateAskResult}}
 
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-warn", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-warn", Agent: "audit", Action: "ask", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	result, err := mailbox.Run(ctx, "job-warn", shellAgent(), adapter)
 	if err != nil {
 		t.Fatalf("Run must NOT error in warn mode: %v", err)
 	}
-	if result.Decision != "implemented" {
-		t.Fatalf("decision = %q, want implemented (warn does not change the outcome)", result.Decision)
+	if result.Decision != "approved" {
+		t.Fatalf("decision = %q, want approved (warn does not change the outcome)", result.Decision)
 	}
 	// Job still succeeded on its own decision.
 	job, err := store.GetJob(ctx, "job-warn")
@@ -109,8 +111,8 @@ func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshalPayload: %v", err)
 	}
-	if len(payload.ResultChecks) != 2 {
-		t.Fatalf("warn payload.ResultChecks = %+v, want the two failed implement checks", payload.ResultChecks)
+	if len(payload.ResultChecks) != 1 {
+		t.Fatalf("warn payload.ResultChecks = %+v, want the failed ask check", payload.ResultChecks)
 	}
 	for _, c := range payload.ResultChecks {
 		if c.Pass || c.Explanation == "" {
@@ -122,10 +124,10 @@ func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListResultCheckFailures: %v", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("warn mode must write 2 feed-forward rows, got %+v", rows)
+	if len(rows) != 1 {
+		t.Fatalf("warn mode must write 1 feed-forward row, got %+v", rows)
 	}
-	if rows[0].Action != "implement" || rows[0].CheckID == "" {
+	if rows[0].Action != "ask" || rows[0].CheckID != "ask-answer-actionable" {
 		t.Fatalf("feed-forward row missing context: %+v", rows[0])
 	}
 }
@@ -133,10 +135,10 @@ func TestMailboxRunResultChecksWarnSurfacesButSucceeds(t *testing.T) {
 func TestMailboxRunResultChecksBlockFailsLikeContractViolation(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksBlock}
-	adapter := &fakeDelivery{outputs: []string{vagueImplementResult}}
+	mailbox := Mailbox{store: store, resultCheckMode: ResultChecksBlock}
+	adapter := &fakeDelivery{outputs: []string{degenerateAskResult}}
 
-	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-block", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
+	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-block", Agent: "audit", Action: "ask", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	_, err := mailbox.Run(ctx, "job-block", shellAgent(), adapter)
@@ -147,8 +149,8 @@ func TestMailboxRunResultChecksBlockFailsLikeContractViolation(t *testing.T) {
 	if !errors.As(err, &checksErr) {
 		t.Fatalf("expected a *ResultChecksError, got %T: %v", err, err)
 	}
-	if len(checksErr.Failed) != 2 {
-		t.Fatalf("block error should carry the 2 failed checks, got %+v", checksErr.Failed)
+	if len(checksErr.Failed) != 1 {
+		t.Fatalf("block error should carry the failed check, got %+v", checksErr.Failed)
 	}
 	// The job is terminally failed (the contract-violation path), NOT succeeded.
 	job, err := store.GetJob(ctx, "job-block")
@@ -163,8 +165,8 @@ func TestMailboxRunResultChecksBlockFailsLikeContractViolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unmarshalPayload: %v", err)
 	}
-	if len(payload.ResultChecks) != 2 {
-		t.Fatalf("block payload must carry the failed checks, got %+v", payload.ResultChecks)
+	if len(payload.ResultChecks) != 1 {
+		t.Fatalf("block payload must carry the failed check, got %+v", payload.ResultChecks)
 	}
 	events, err := store.ListJobEvents(ctx, "job-block")
 	if err != nil {
@@ -189,7 +191,7 @@ func TestMailboxRunResultChecksWarnCleanResultIsQuiet(t *testing.T) {
 	// audit only fires on genuine failures, not on every job.
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), resultCheckMode: ResultChecksWarn}
+	mailbox := Mailbox{store: store, resultCheckMode: ResultChecksWarn}
 	clean := `{"gitmoot_result":{"decision":"implemented","summary":"implemented X","findings":[],"changes_made":["added foo.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
 	adapter := &fakeDelivery{outputs: []string{clean}}
 

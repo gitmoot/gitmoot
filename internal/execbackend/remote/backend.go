@@ -72,10 +72,6 @@ cd ..
 rm -rf .gitmoot-sync .gitmoot-sync.tar.gz
 git -C workspace rev-parse HEAD`
 
-const collectPatchScript = `set -eu
-git add -A
-git diff --binary --full-index --no-ext-diff --no-renames --cached HEAD --`
-
 // Options configures a remote Backend. TemplateID is required. Envd is copied
 // into each sandbox-scoped data-plane client.
 type Options struct {
@@ -109,12 +105,11 @@ type Backend struct {
 type sandboxState struct {
 	mu sync.Mutex
 
-	sandbox      e2b.Sandbox
-	envd         *e2b.Envd
-	jobID        string
-	generation   int64
-	hostWorktree string
-	hostBase     string
+	sandbox    e2b.Sandbox
+	envd       *e2b.Envd
+	jobID      string
+	generation int64
+	hostBase   string
 
 	// stopKeepalive ends the TTL refresh loop. Nil when no refresh is running,
 	// which is the case whenever the requested TTL fits inside the provider's
@@ -507,7 +502,6 @@ func (b *Backend) SyncIn(ctx context.Context, instance *execbackend.Instance, ma
 	if remoteHead := strings.TrimSpace(result.Stdout); remoteHead != hostBase {
 		return fmt.Errorf("initialize remote execution workspace: HEAD %q is not the exact host HEAD %s", remoteHead, hostBase)
 	}
-	state.hostWorktree = hostWorktree
 	state.hostBase = hostBase
 	instance.BaseHEAD = hostBase
 	return nil
@@ -658,61 +652,6 @@ func (b *Backend) Exec(ctx context.Context, instance *execbackend.Instance, comm
 		return nil, fmt.Errorf("start remote execution command: %w", err)
 	}
 	return stream, nil
-}
-
-func (b *Backend) Collect(ctx context.Context, instance *execbackend.Instance) (execbackend.ChangeSet, error) {
-	state, err := b.stateFor(instance)
-	if err != nil {
-		return execbackend.ChangeSet{}, err
-	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.hostBase == "" || state.hostWorktree == "" {
-		return execbackend.ChangeSet{}, errors.New("remote execution instance has no synced base HEAD")
-	}
-	head, err := runEnvd(ctx, state.envd, e2b.StartRequest{
-		Name:           "git",
-		Args:           []string{"rev-parse", "HEAD"},
-		Dir:            workspacePath,
-		MaxOutputBytes: 256,
-	})
-	if err != nil {
-		return execbackend.ChangeSet{}, fmt.Errorf("read remote execution HEAD: %w", err)
-	}
-	if got := strings.TrimSpace(head.Stdout); got != state.hostBase {
-		return execbackend.ChangeSet{}, fmt.Errorf("sandbox-created commits are forbidden: sandbox HEAD %s, expected base %s", got, state.hostBase)
-	}
-	patchResult, err := runEnvd(ctx, state.envd, e2b.StartRequest{
-		Name:           "sh",
-		Args:           []string{"-c", collectPatchScript},
-		Dir:            workspacePath,
-		MaxOutputBytes: execbackend.MaxChangeSetPatchBytes + 1,
-	})
-	if err != nil {
-		return execbackend.ChangeSet{}, fmt.Errorf("capture remote execution patch: %w", err)
-	}
-	patch := []byte(patchResult.Stdout)
-	if len(patch) > execbackend.MaxChangeSetPatchBytes {
-		return execbackend.ChangeSet{}, fmt.Errorf("remote execution patch is larger than limit %d", execbackend.MaxChangeSetPatchBytes)
-	}
-
-	var changes execbackend.ChangeSet
-	err = execbackend.StageAt(ctx, state.hostWorktree, state.hostBase, func(stage string) error {
-		if len(patch) > 0 {
-			cmd := exec.CommandContext(ctx, "git", "-C", stage, "apply", "--binary", "--whitespace=nowarn", "-")
-			cmd.Stdin = strings.NewReader(string(patch))
-			if output, applyErr := cmd.CombinedOutput(); applyErr != nil {
-				return fmt.Errorf("apply remote execution patch: %w: %s", applyErr, strings.TrimSpace(string(output)))
-			}
-		}
-		var buildErr error
-		changes, buildErr = execbackend.BuildChangeSet(ctx, stage, state.hostBase)
-		return buildErr
-	})
-	if err != nil {
-		return execbackend.ChangeSet{}, fmt.Errorf("collect remote execution changes: %w", err)
-	}
-	return changes, nil
 }
 
 func (b *Backend) Cancel(ctx context.Context, instance *execbackend.Instance) error {

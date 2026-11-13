@@ -1463,18 +1463,3 @@ func (e Engine) delegationAgentHint(ctx context.Context, repo string) string {
 	b.WriteString(`To run an unregistered worker, use an inline ephemeral spec ({runtime: "codex|claude|kimi"}).`)
 	return b.String()
 }
-
-func (e Engine) implementationNeedsFinalizer(ctx context.Context, payload JobPayload) bool {
-	if e.ImplementationFinalizer == nil {
-		return false
-	}
-	taskID := strings.TrimSpace(payload.TaskID)
-	if taskID == "" {
-		return false
-	}
-	task, err := e.Store.GetTask(ctx, taskID)
-	if err != nil {
-		return false
-	}
-	return strings.TrimSpace(task.WorktreePath) != ""
-}

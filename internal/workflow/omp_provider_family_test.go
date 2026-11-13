@@ -19,7 +19,7 @@ const approvedProviderTestResult = `{"gitmoot_result":{"decision":"approved","su
 func TestMailboxPersistsSuccessfulOmpProviderEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "omp-review", Agent: "reviewer", Action: "review", Repo: "gitmoot/gitmoot", Model: "kimi-code/k3",
 	}); err != nil {
@@ -64,7 +64,7 @@ func TestOmpProviderEvidenceProductionPath(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "omp-production-review", Agent: "reviewer", Action: "review",
 		Repo: "gitmoot/gitmoot", Model: "devin/swe-2",
@@ -87,7 +87,7 @@ func TestOmpProviderEvidenceProductionPath(t *testing.T) {
 func TestMailboxPersistsMissingOmpProviderAsFailClosedEvidence(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "omp-review-missing-provider", Agent: "reviewer", Action: "review", Repo: "gitmoot/gitmoot",
 	}); err != nil {

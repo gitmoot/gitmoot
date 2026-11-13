@@ -12,7 +12,7 @@ import (
 func TestMailboxRequireWorkflow(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "auto"} }}
+	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "auto"} }}
 	job, err := mb.Enqueue(ctx, JobRequest{ID: "auto", Agent: "A_bad name", Action: "ask", Repo: "owner/repo", Sender: "local"})
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestMailboxRequireWorkflow(t *testing.T) {
 func TestMailboxRequireWorkflowStrictRejectsBeforeCreation(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
+	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	_, err := mb.Enqueue(ctx, JobRequest{ID: "strict", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local"})
 	if err == nil || !strings.Contains(err.Error(), "pass --workflow") {
 		t.Fatalf("err=%v", err)
@@ -65,7 +65,7 @@ func TestMailboxRequireWorkflowConfigCompatibility(t *testing.T) {
 			}
 			ctx := context.Background()
 			store := openTestStore(t)
-			mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(repo string) RequireWorkflowPolicy {
+			mb := Mailbox{store: store, RequireWorkflowPolicy: func(repo string) RequireWorkflowPolicy {
 				policy := cfg.For(repo)
 				return RequireWorkflowPolicy{Enabled: policy.Enabled, Mode: policy.Mode}
 			}}
@@ -93,7 +93,7 @@ func TestMailboxRequireWorkflowConfigCompatibility(t *testing.T) {
 func TestMailboxRequireWorkflowExcludesInternalProducers(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
+	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	for _, request := range []JobRequest{
 		{ID: "heartbeat", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "heartbeat"},
 		{ID: "child", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "a", ParentJobID: "parent"},
@@ -108,7 +108,7 @@ func TestMailboxRequireWorkflowExcludesInternalProducers(t *testing.T) {
 func TestMailboxRequireWorkflowPolicyExemptions(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree"), RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
+	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	for _, request := range []JobRequest{
 		{ID: "engine", Agent: "a", Action: "review", Repo: "owner/repo", Sender: "lead", PolicyExempt: "exempt"},
 		{ID: "comment", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "operator", PolicyExempt: "auto-only"},

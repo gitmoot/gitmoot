@@ -44,7 +44,7 @@ func TestPostMergeReviewFilesFollowUpsWithoutReviewLifecycle(t *testing.T) {
 			}
 			insertCompletedJob(t, store, db.Job{ID: "post-merge-review", Agent: "audit", Type: "review"}, JobPayload{
 				Repo: "jerryfane/joltra", Branch: "task-5", PullRequest: 5, HeadSHA: "head5", TaskID: "task-5",
-				WorkflowID: "wf-post-merge", ReviewRequester: "deimos", NoFixTarget: true, PostMergeReview: true,
+				WorkflowID: "wf-post-merge", ReviewRequester: "deimos", PostMergeReview: true,
 				Result: &AgentResult{Decision: decision, Summary: "post-merge verdict", Findings: []json.RawMessage{
 					rawPostMergeFinding(t, map[string]any{"severity": "P1", "title": "Retry can no longer restart a stuck pass", "detail": "the retry path returns early", "file": "src/retry.ts", "line": 12}),
 					rawPostMergeFinding(t, map[string]any{"severity": "P2", "title": "Playhead desyncs on collapsed cuts", "detail": "offset is not projected", "file": "src/player.ts", "line": 40}),
@@ -105,7 +105,7 @@ func TestPostMergeReviewRecordsUnwiredIssueHook(t *testing.T) {
 	store := openEngineStore(t)
 	engine := testEngine(store)
 	insertCompletedJob(t, store, db.Job{ID: "post-merge-unwired", Agent: "audit", Type: "review"}, JobPayload{
-		Repo: "jerryfane/joltra", PullRequest: 6, HeadSHA: "head6", PostMergeReview: true, NoFixTarget: true,
+		Repo: "jerryfane/joltra", PullRequest: 6, HeadSHA: "head6", PostMergeReview: true,
 		Result: &AgentResult{Decision: "changes_requested", Findings: []json.RawMessage{
 			rawPostMergeFinding(t, map[string]any{"severity": "P2", "title": "Needs a follow-up"}),
 		}},

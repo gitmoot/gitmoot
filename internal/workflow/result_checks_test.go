@@ -15,50 +15,6 @@ func failedIDs(in ResultCheckInput) map[string]ResultCheck {
 	return out
 }
 
-func TestRunResultChecksImplementIncomplete(t *testing.T) {
-	// An implement job claiming "implemented" with no changes and no tests fails
-	// both implement checks.
-	failed := failedIDs(ResultCheckInput{
-		Action: "implement",
-		Result: AgentResult{Decision: "implemented", Summary: "did the thing"},
-	})
-	for _, id := range []string{"implement-changes-listed", "implement-tests-listed"} {
-		if c, ok := failed[id]; !ok {
-			t.Fatalf("expected %s to fail; failed=%v", id, keys(failed))
-		} else if c.Pass || c.Explanation == "" {
-			t.Fatalf("%s should be a failed check with an explanation: %+v", id, c)
-		}
-	}
-}
-
-func TestRunResultChecksImplementClean(t *testing.T) {
-	// A complete implement result passes every check.
-	failed := failedIDs(ResultCheckInput{
-		Action: "implement",
-		Result: AgentResult{
-			Decision:    "implemented",
-			Summary:     "implemented feature X",
-			ChangesMade: []string{"added foo.go"},
-			TestsRun:    []string{"go test ./..."},
-		},
-	})
-	if len(failed) != 0 {
-		t.Fatalf("clean implement result should pass all checks; failed=%v", keys(failed))
-	}
-}
-
-func TestRunResultChecksImplementNonImplementedDecisionSkipsChecks(t *testing.T) {
-	// The implement checks only apply to a decision of "implemented"; a blocked
-	// implement job is audited by the blocked check instead.
-	failed := failedIDs(ResultCheckInput{
-		Action: "implement",
-		Result: AgentResult{Decision: "blocked", Summary: "cannot proceed", Needs: []string{"need creds"}},
-	})
-	if _, ok := failed["implement-changes-listed"]; ok {
-		t.Fatalf("implement checks must not fire on a non-implemented decision; failed=%v", keys(failed))
-	}
-}
-
 func TestRunResultChecksReviewChangesRequestedNeedsEvidence(t *testing.T) {
 	// changes_requested with no findings fails; with findings passes.
 	failed := failedIDs(ResultCheckInput{

@@ -232,7 +232,7 @@ func TestUnreadableRouterConfigAdvisoryLandsOnTheReviewJob(t *testing.T) {
 	seedDaemonWorkerAgent(t, store, "script-reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-class-advisory", Agent: "script-reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40), NoFixTarget: true,
+		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 		ReviewPurpose: "code",
 	})
 

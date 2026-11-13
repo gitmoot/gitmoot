@@ -570,8 +570,8 @@ per-repo override. `repo list` renders the sentinel as `inherit`.
 inheritance, and `--all` applies either value to every registered repo.
 A changes-requested review reports its verdict to the requester and never
 creates an implement job: Gitmoot does not dispatch implementation (#2203).
-The seat named by `--lead` (or the requester's own session) does the fix work
-and records it with `gitmoot job record --type implement`.
+The requester's own session does the fix work and records it with
+`gitmoot job record --type implement`.
 `repo doctor owner/repo` checks a single repo's checkout/config health. If the
 registered checkout is missing or is no longer a Git worktree, Gitmoot verifies
 the recorded primary checkout, repairs the registration, and reports the
@@ -1044,8 +1044,8 @@ beside it, which is why the router's machinery went unused: measured 2026-09-16,
 687 of 688 reviews on one box came through `agent review`, so exact-head dedup,
 the delta baseline, availability-aware runtime choice and the verdict wake were
 reachable in principle and unused in practice. The lower-level form keeps its
-own surface — it NAMES a reviewer, carries a review message, and takes
-`--lead` — and those inputs are forwarded rather than discarded. `--json` no
+own surface — it NAMES a reviewer and carries a review message — and those
+inputs are forwarded rather than discarded. `--json` no
 longer forces the direct path: `agent review --json` routes too and prints the
 router's JSON object described below.
 
@@ -1053,15 +1053,15 @@ router's JSON object described below.
 gitmoot review request --pr 2170 [--repo owner/repo] [--purpose code|security|ui|architecture] \
     [--head <40-hex>] [--branch <name>] [--role <org-role>] [--ttl 12h] [--reviewer <agent>] \
     [--runtime <name>] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model <provider/model>] \
-    [--effort <level>] [--workflow <id>] [--session <ref>] [--lead <implementer> | --no-fix-target] \
+    [--effort <level>] [--workflow <id>] [--session <ref>] \
     [--full] [--post-merge] [--no-execution] [--evidence-manifest <abs-path>] [--related-pr N]... [--part NAME] [--supersede JOB --reason TEXT] [--allow-prompt-head-mismatch] [--background] [--json] \
     [-- "review instructions"]
 gitmoot review status --pr 2170 [--repo owner/repo] [--json]
 gitmoot review level --repo owner/repo --pr 2170 [--json]
 ```
 
-`--lead` names the implementer a changes-requested verdict routes to; with no
-`--lead` the request dispatches with no fix target and says so. The positional
+A review never routes a fix: a changes-requested verdict reports to the
+requesting role, which owns the follow-up (#2586). The positional
 message is appended to the router's own brief under a labelled header, so a
 reviewer can tell operator instructions from generated framing — pass it after
 `--` if it starts with a dash.
@@ -1123,7 +1123,7 @@ a merge.
 Scripts should use `gitmoot review request ... --json` to get the job id:
 
 ```sh
-gitmoot review request --pr 2170 --repo owner/repo --head <40-hex> --role <org-role> --no-fix-target --json
+gitmoot review request --pr 2170 --repo owner/repo --head <40-hex> --role <org-role> --json
 ```
 
 The JSON object has the keys `agent review --json` prints — `job_id`, `repo`,
@@ -1133,11 +1133,11 @@ The JSON object has the keys `agent review --json` prints — `job_id`, `repo`,
 (`dispatched`, `attached` or `verdict_exists`); the job's own state, such as
 `queued`, is in `job_state`.
 
-`--head-sha`, `--org-role`, `--no-fix-target` and `--background` are the
-`agent review` spellings and are accepted here, so a script can switch commands
-without renaming flags. `--no-fix-target` is what a request without `--lead`
-already does, and is refused together with `--lead`. `--background` changes
-nothing: the router always queues the review for the daemon.
+`--head-sha`, `--org-role` and `--background` are the `agent review` spellings
+and are accepted here, so a script can switch commands without renaming flags.
+`--background` changes nothing: the router always queues the review for the
+daemon. `--no-fix-target` is still accepted and ignored on both commands, so
+existing review commands keep working; `--lead` is gone (#2586).
 
 `--exec-backend local|remote` selects where this review's runtime executes. It
 is persisted on the job before enqueue and affects no other queued or future
@@ -1197,17 +1197,15 @@ the requesting role instead of blocking anything. The verdict still wakes the ro
 - **P3:** no follow-up.
 
 Job events record `post_merge_followups_done`, or `post_merge_followup_error`
-if a follow-up could not be filed. `--post-merge` refuses `--lead`. Through
-`agent review` it needs the router path: `--org-role` and `--no-fix-target`,
-without `--foreground`.
+if a follow-up could not be filed. Through `agent review` it needs the router
+path: `--org-role`, without `--foreground`.
 
 Three things `agent review` reports that are easy to miss:
 
 - **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
   router requires a verdict recipient), `--foreground`, or any flag the router
-  cannot express (`--type`, `--recipe`, `--skip-native-review-fanout`, an
-  `--action` other than `review`, `--no-fix-target` together with `--lead`, or
-  neither `--lead` nor `--no-fix-target`) keeps the direct path and writes a
+  cannot express (`--type`, `--recipe`, `--skip-native-review-fanout`, or an
+  `--action` other than `review`) keeps the direct path and writes a
   `router_bypassed` job event
   naming the reason — read it months later with `gitmoot job events <id>` (NOT
   `job show`, which prints the row and its payload and never lists events). The
@@ -1229,7 +1227,7 @@ Three things `agent review` reports that are easy to miss:
 - **An ATTACHING request is told what it lost.** A second request at a head that
   already holds a claim attaches to the running review rather than spending a
   second reviewer — and prints which of your `--reviewer`, instructions,
-  `--lead`, `--model` or `--runtime` were discarded, because a caller told only
+  `--model` or `--runtime` were discarded, because a caller told only
   that it is "awaiting a verdict" would wait on a review it never commissioned.
 
 `--runtime` overrides the omp pin. The router pins omp because it SELECTS the
@@ -1276,7 +1274,7 @@ What one request does, in order:
 3. Selects a registered agent with the `review` capability, WITHOUT `implement`,
    scoped to the repository (omp-native agents first, then by name), or the
    `--reviewer` you name. The job runs as a background review-only job on `omp`
-   with a fresh per-job session, `--no-fix-target` semantics, and the first
+   with a fresh per-job session and the first
    model of the purpose's pool; merge-gate independence rules apply unchanged.
    Selection is PURPOSE-SCOPED: an agent holding a verdict of a different
    purpose at this head is still eligible, and the refusal fires only when every
@@ -1337,7 +1335,7 @@ A remote E2B review can receive exact private files (logs, screenshots) that
 the reviewer could not otherwise reach:
 
 ```sh
-gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target \
+gitmoot review request --pr N --head <40-hex> --role <role> \
   --exec-backend remote --evidence-manifest /abs/path/manifest.json
 ```
 
@@ -1372,7 +1370,7 @@ A review can see the exact head of another pull request in the same
 repository, for example a sibling PR a cross-PR schema check depends on:
 
 ```sh
-gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target \
+gitmoot review request --pr N --head <40-hex> --role <role> \
   --related-pr M [--related-pr K ...]
 ```
 
@@ -1422,7 +1420,7 @@ running anything. Use it when a reviewer must not execute the pull request's
 code.
 
 ```sh
-gitmoot review request --pr N --head <40-hex> --role <role> --no-fix-target --no-execution
+gitmoot review request --pr N --head <40-hex> --role <role> --no-execution
 ```
 
 A repository can require it for every review:
@@ -1685,9 +1683,8 @@ maps to the runtime permission mode and decides what a headless job may do:
 
 Because of this, an agent that carries the `implement` capability **must** be
 started/subscribed with a write policy. Gitmoot fails closed: `--capability
-implement` with `auto`/empty or `read-only` is refused at `agent start`, at
-`agent subscribe`, and when `--lead` names that agent on a review dispatch,
-each with an actionable message. Set
+implement` with `auto`/empty or `read-only` is refused at `agent start` and at
+`agent subscribe`, each with an actionable message. Set
 `--policy danger-full-access` for full headless implementation (file writes plus
 `go`/`git`/`gh`), or `--policy workspace-write` for edits-only (Bash stays
 blocked). See `references/SAFETY.md` for the full mapping and rationale.
@@ -1811,8 +1808,8 @@ Delegate to a registered agent from the current local chat:
 
 ```sh
 gitmoot agent run project-planner --repo owner/repo "Return the plan status."
-gitmoot agent run reviewer --repo owner/repo --pr 12 --lead lead --background "Review this PR."
-gitmoot agent review reviewer --repo owner/repo --pr 12 --lead lead "Review this PR."
+gitmoot agent run reviewer --repo owner/repo --pr 12 --background "Review this PR."
+gitmoot agent review reviewer --repo owner/repo --pr 12 "Review this PR."
 gitmoot agent ask project-planner --repo owner/repo "Return the plan status."
 gitmoot agent ask project-planner --repo owner/repo --background "Write the implementation plan."
 gitmoot agent run reviewer --repo owner/repo --pr 12 --model gpt-5-codex "Review this PR."
@@ -1842,8 +1839,8 @@ gitmoot job record --agent lead --repo owner/repo --type implement \
   --title "Fix the findings on #12" --summary "What changed and why."
 ```
 
-A `changes_requested` verdict therefore reports to the requester and to the
-`--lead` seat; it never mints a fix job.
+A `changes_requested` verdict therefore reports to the requester; it never
+mints a fix job.
 
 `agent review` and review-resolved `agent run` with `--org-role` queue the job
 for daemon ownership by default. This keeps a review running if the calling
@@ -1950,50 +1947,17 @@ the review-loop and reviewer-identity refusals, so those still name their own
 preconditions first, and before the review task is upserted, so a refused
 dispatch leaves no durable state behind.
 
-`--no-fix-target` dispatches a REVIEW-ONLY review: the reviewer need not be able
-to implement and no `--lead` is required. The lead exists so a
-`changes_requested` verdict has an implementer to route to, so declining one is
-a decision, and it is recorded as a `review_no_fix_target` job event stating
-that the dispatching operator owns the follow-up. An UNSTATED absence still
-refuses, and `--no-fix-target` with `--lead` is refused as mutually exclusive.
-
 This exact `(repo, PR, head_sha, decision)` evidence key is intentional: the
 #1419 review panel rejected round counters and other instruments, so this guard
 does not infer a loop from a numeric threshold. Direct PR-comment review ingress
 is unchanged here and remains advance-time guarded until #1433; cached-verdict
 serving remains out of scope for #1415/#1423.
-Local review dispatches accept `--lead <implementer>` on `agent review` and on
-`agent run` when it resolves to review. A `changes_requested` verdict routes its
-fix WORK to that lead, not to the reviewer: Gitmoot wakes the lead's org role
-and never mints a fix job (#2203). Before creating a review job or
-starting its runtime session, Gitmoot loads the lead from the agents database
-and requires that it exist, can access the repository, has `implement`
-capability, and uses a write-granting policy (`workspace-write` or
-`danger-full-access`). Without `--lead`, the reviewer is the fallback lead and
-must pass the same checks. Managed-type review dispatches also require an
-explicit DB-backed lead. `--lead` is rejected whenever `agent run` resolves to
-anything but review, and is not accepted by `orchestrate`.
-
-A strict review-only agent therefore needs either an explicit implementer or
-`--no-fix-target`, which declares that this review has NO fix target and the
-dispatching operator owns the follow-up. That declaration is carried on the job
-payload, not only as an event, so the ledger records who owns an open
-`changes_requested` finding: Gitmoot dispatches no fix either way (#2203), and a
-review with no lead has no org role to wake, which is exactly what the operator
-is taking on. `--no-fix-target` is rejected outside review and is mutually
-exclusive with `--lead`.
-
-This dispatch-time lead validation applies only to local CLI reviews started by
-`gitmoot agent review` or review-resolved `gitmoot agent run`. Reviews routed
-from PR comments continue to validate their fix target when the workflow
-advances until [gitmoot#1433](https://github.com/gitmoot/gitmoot/issues/1433)
-adds the corresponding ingress preflight.
 
 When an engine review returns `changes_requested`, Gitmoot persists the verdict
 and wakes the requester's org role without creating an implement job. That is
 the terminal behaviour, not a default: there is no per-PR opt-in that converts a
 verdict into a fix dispatch, and no writable fix clone is allocated (#2203).
-The lead implements in its own session and records the work with `gitmoot job
+The requester implements in its own session and records the work with `gitmoot job
 record --type implement` — the rows the merge gate's implementer attribution
 and reviewer-independence check read.
 
@@ -3910,21 +3874,6 @@ same detail as `process_active: worktree still has an active process`; their
 JSON forms carry `process_active: true`. The badge is omitted when no live
 process is observed, when local process liveness is unavailable, or while the
 job is still non-terminal.
-
-For an `implement` job, `job show` and `job list --json` expose Gitmoot's own
-post-agent delivery verdict as `delivery_status`: `delivered` means the job's
-result decision was `implemented` and either a completion marker is paired
-with a persisted non-zero pull request, or the job has no advance events at
-all and already carries a persisted non-zero pull request; `pending` means
-delivery is in flight or scheduled for retry, and `blocked` means the latest
-delivery attempt blocked. A completed advancement alone (e.g. an implemented
-result that produced no PR, or a non-`implemented` decision) does NOT count as
-delivered — the field is omitted in that case, never a false `delivered`. The
-field is derived at read time
-from the existing `advance_*` job events and pull-request payload; it is omitted
-for non-implement jobs and legacy/unknown states. This field, not the agent's
-free-text result summary, is authoritative about commit/push/PR delivery because
-Gitmoot performs that step after the agent turn ends.
 
 For a `running` job dispatched through a PID-aware runtime runner, the payload
 records `runtime_pid` plus a process-start identity. `job list --json` and `job

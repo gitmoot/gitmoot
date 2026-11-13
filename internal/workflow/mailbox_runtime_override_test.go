@@ -20,7 +20,7 @@ import (
 func TestMailboxRunSkipsRefreshedRefPersistForRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	defaultRef := "codex-default-session"
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:       "shipper",
@@ -79,7 +79,7 @@ func TestMailboxRunSkipsRefreshedRefPersistForRuntimeOverride(t *testing.T) {
 func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	job, err := mailbox.Enqueue(ctx, JobRequest{
 		ID:                 "job-override",
@@ -107,7 +107,7 @@ func TestMailboxEnqueuePersistsRuntimeOverride(t *testing.T) {
 func TestMailboxEnqueueRejectsInvalidRuntimeOverride(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	freshRef, err := runtime.NewFreshRef()
 	if err != nil {
 		t.Fatalf("NewFreshRef returned error: %v", err)

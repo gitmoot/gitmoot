@@ -106,7 +106,6 @@ func (b *Backend) syncRemoteReview(ctx context.Context, instance *execbackend.In
 		return errors.New("remote review source did not establish the exact requested head")
 	}
 	state.hostBase = source.Head
-	state.hostWorktree = "" // No host source exists; changeset import is not a review operation.
 	instance.BaseHEAD = source.Head
 	return nil
 }

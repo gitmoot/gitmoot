@@ -341,8 +341,8 @@ func TestReviewRequestJSONWithAgentReviewFlagsRoutesTheReview(t *testing.T) {
 	if payload.Model != "sentinel/router-a" {
 		t.Fatalf("model = %q, want the router's pool head sentinel/router-a", payload.Model)
 	}
-	if !payload.NoFixTarget || payload.HeadSHA != head || payload.ReviewRequester != "joltra" {
-		t.Fatalf("payload no_fix_target=%v head=%q requester=%q, want true/%s/joltra", payload.NoFixTarget, payload.HeadSHA, payload.ReviewRequester, head)
+	if payload.HeadSHA != head || payload.ReviewRequester != "joltra" {
+		t.Fatalf("payload head=%q requester=%q, want %s/joltra", payload.HeadSHA, payload.ReviewRequester, head)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {
@@ -362,8 +362,7 @@ func TestReviewRequestJSONWithAgentReviewFlagsRoutesTheReview(t *testing.T) {
 	}
 }
 
-// --no-fix-target and --lead contradict each other; the router refuses the pair
-// the way the direct path does, and refuses a --head-sha that disagrees with --head.
+// The router refuses a --head-sha that disagrees with --head.
 func TestReviewRequestRefusesContradictoryAgentReviewFlags(t *testing.T) {
 	home, _, head := reviewRouterHome(t)
 	for _, testCase := range []struct {
@@ -371,7 +370,6 @@ func TestReviewRequestRefusesContradictoryAgentReviewFlags(t *testing.T) {
 		args []string
 		want string
 	}{
-		{"lead and no fix target", []string{"--head", head, "--lead", "implementer", "--no-fix-target"}, "mutually exclusive"},
 		{"two different heads", []string{"--head", head, "--head-sha", strings.Repeat("a", 40)}, "disagree"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -615,8 +613,8 @@ func TestReviewRequestDeduplicatesOnExactHead(t *testing.T) {
 	}
 	if payload.RuntimeOverride != runtime.OmpRuntime || payload.Model != "sentinel/router-a" ||
 		strings.Join(payload.ReviewModelPool, ",") != "sentinel/router-a,sentinel/router-b" ||
-		payload.ReviewRequester != "joltra" || !payload.NoFixTarget || payload.HeadSHA != head {
-		t.Fatalf("routed payload = %+v, want omp override, pool, requester, no fix target and exact head", payload)
+		payload.ReviewRequester != "joltra" || payload.HeadSHA != head {
+		t.Fatalf("routed payload = %+v, want omp override, pool, requester and exact head", payload)
 	}
 
 	second, failure := runReviewRequestJSON(t, base...)
@@ -866,7 +864,7 @@ func TestReviewClaimReleaseOnlyFreesAnUnenqueuedJob(t *testing.T) {
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-enqueued", Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "feature/review", PullRequest: 12, HeadSHA: head, NoFixTarget: true,
+		Branch: "feature/review", PullRequest: 12, HeadSHA: head,
 	})
 	releaseUnenqueuedReviewClaim(ctx, store, subject, "job-enqueued")
 	if current, err := store.GetReviewRequest(ctx, subject); err != nil || current.JobID != "job-enqueued" {
@@ -1058,7 +1056,7 @@ func TestReviewVerdictRequiresASucceededJob(t *testing.T) {
 	}
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-failed-with-verdict", Agent: "reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "feature/review", PullRequest: 12, HeadSHA: head, NoFixTarget: true,
+		Branch: "feature/review", PullRequest: 12, HeadSHA: head,
 	})
 	payload, err := workflow.ParseJobPayload(mustGetJob(t, store, "job-failed-with-verdict").Payload)
 	if err != nil {
@@ -1133,7 +1131,7 @@ exit 1`, countFile, countFile)
 	seedDaemonWorkerAgent(t, store, "router-reviewer", runtime.ShellRuntime, script, []string{"review"}, "owner/repo")
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-pool", Agent: "router-reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40), NoFixTarget: true,
+		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 		Model: "sentinel/router-a", ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"}, ReviewPurpose: "code",
 	})
 	worker := blockerE2EWorker(store, home, checkout)
@@ -2752,7 +2750,7 @@ func TestBothReviewVerbsResolveTheSamePoolAndKeepTheirRuntimes(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 12, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatalf("agent review dispatch: %v", err)
@@ -2841,7 +2839,7 @@ func TestExplicitRuntimeOverridesThePinOnBothVerbs(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 13, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true, Runtime: runtime.ClaudeRuntime,
+		ActingOrgRole: "joltra", Runtime: runtime.ClaudeRuntime,
 	})
 	if err != nil {
 		t.Fatalf("agent review dispatch: %v", err)
@@ -2867,7 +2865,7 @@ func TestSharedResolverPreservesACallerSuppliedPool(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 12, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 		ReviewPurpose: "code", ReviewModelPool: chosen, Model: chosen[0],
 	})
 	if err != nil {
@@ -2901,7 +2899,7 @@ exit 1`, []string{"review"}, "owner/repo")
 	// No Model: the `agent review` shape, whose pool #2180 now resolves.
 	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
 		ID: "job-script", Agent: "script-reviewer", Action: "review", Repo: "owner/repo",
-		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("b", 40), NoFixTarget: true,
+		Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("b", 40),
 		ReviewModelPool: []string{"sentinel/router-a", "sentinel/router-b"}, ReviewPurpose: "code",
 	})
 	worker := blockerE2EWorker(store, home, checkout)

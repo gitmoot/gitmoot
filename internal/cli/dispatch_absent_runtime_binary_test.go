@@ -117,7 +117,7 @@ func TestProductionBackgroundReviewRefusesAbsentBinaryBeforeRowOrWorktree(t *tes
 
 	var stdout, stderr bytes.Buffer
 	_, code := dispatchAgentCommand(agentRunOptions{
-		repo: "owner/repo", agent: "responder", lead: "lead", message: "review it",
+		repo: "owner/repo", agent: "responder", message: "review it",
 		prNumber: 1926, background: true, home: home,
 	}, "review", "", "", &stdout, &stderr)
 

@@ -60,33 +60,7 @@ func TestLocalBackendSyncInUsesIndependentGitMetadataAndExistingChangeTransport(
 	}
 }
 
-func TestLocalBackendCollectRoundTripsByteIdentically(t *testing.T) {
-	host, _, _ := changeSetRepoPair(t)
-	backend := newTestLocalBackend(t)
-	instance, err := backend.Provision(context.Background(), JobScope{JobID: "roundtrip"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = backend.Destroy(context.Background(), instance) })
-	if err := backend.SyncIn(context.Background(), instance, Materials{SourceWorktree: host}); err != nil {
-		t.Fatal(err)
-	}
-	writeChangeSetFile(t, instance.Workspace, "tracked.txt", "backend produced\x00bytes\n", 0o755)
-	writeChangeSetFile(t, instance.Workspace, "new.bin", "\x00\x01\x02\xff", 0o644)
-
-	changes, err := backend.Collect(context.Background(), instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
-		t.Fatal(err)
-	}
-	if want, got := changeSetSnapshot(t, instance.Workspace), changeSetSnapshot(t, host); got != want {
-		t.Fatalf("collected host tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
-	}
-}
-
-func TestLocalBackendExecDropsPrivilegesAndImportNormalizesOwnership(t *testing.T) {
+func TestLocalBackendExecDropsPrivileges(t *testing.T) {
 	identity := testUnprivilegedIdentities(t, 1)[0]
 	host, _, _ := changeSetRepoPair(t)
 	backend := newPrivilegedTestLocalBackend(t, identity)
@@ -124,39 +98,6 @@ func TestLocalBackendExecDropsPrivilegesAndImportNormalizesOwnership(t *testing.
 	}
 	if uid, gid := pathOwnership(t, filepath.Join(instance.Workspace, "new.bin")); uid != identity.UID || gid != identity.GID {
 		t.Fatalf("agent-created ownership = %d:%d, want %d:%d", uid, gid, identity.UID, identity.GID)
-	}
-
-	changes, err := backend.Collect(context.Background(), instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repairStream, err := backend.Exec(context.Background(), instance, Command{
-		Dir:  instance.Workspace,
-		Name: "/bin/sh",
-		Args: []string{"-c", `set -e; id -u; printf 'repair' > .repair-write; rm .repair-write`},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	repairResult, err := repairStream.Wait()
-	if err != nil {
-		t.Fatalf("post-collection non-root Exec: %v", err)
-	}
-	if got, want := strings.TrimSpace(repairResult.Stdout), strconv.FormatUint(uint64(identity.UID), 10); got != want {
-		t.Fatalf("post-collection command-reported euid = %q, want %s", got, want)
-	}
-	if err := ImportChangeSet(context.Background(), host, changes); err != nil {
-		t.Fatal(err)
-	}
-	// changeSetSnapshot invokes Git as the daemon uid; reclaim the already-
-	// collected test workspace so the byte-for-byte P2a assertion itself is not
-	// blocked by Git's cross-uid safe.directory policy.
-	chownTree(t, instance.Workspace, LocalIdentity{UID: uint32(os.Geteuid()), GID: uint32(os.Getegid())})
-	if want, got := changeSetSnapshot(t, instance.Workspace), changeSetSnapshot(t, host); got != want {
-		t.Fatalf("non-root collected host tree is not byte-identical\nwant:\n%s\ngot:\n%s", want, got)
-	}
-	if uid, gid := pathOwnership(t, filepath.Join(host, "new.bin")); uid != uint32(os.Geteuid()) || gid != uint32(os.Getegid()) {
-		t.Fatalf("imported ownership = %d:%d, want daemon %d:%d", uid, gid, os.Geteuid(), os.Getegid())
 	}
 }
 

@@ -138,7 +138,7 @@ func TestDispatchReviewAllocatesDistinctExactHeadWorktrees(t *testing.T) {
 
 	dispatch := func(head string) (db.Job, workflow.JobPayload) {
 		out, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-			RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
+			RepoFlag: "owner/repo", Agent: "reviewer",
 			Action: "review", Instructions: "Review this exact head.", Background: true,
 			PullRequest: 12, Branch: "feature/review", HeadSHA: head, Home: home,
 		})
@@ -422,7 +422,7 @@ func seedReviewDispatchFixture(t *testing.T, store *db.Store, checkout string) {
 
 func reviewDispatchRequest(home, head string) localAgentDispatchRequest {
 	return localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
+		RepoFlag: "owner/repo", Agent: "reviewer",
 		Action: "review", Instructions: "Review this exact head.", Background: true,
 		PullRequest: 12, Branch: "feature/review", HeadSHA: head, Home: home,
 	}

@@ -120,7 +120,7 @@ func TestInheritedEvidenceAbsentFromAnOrdinaryPayload(t *testing.T) {
 func TestEnqueueCarriesTheStagedMarkerAndCeilingIntoThePayload(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	if _, err := mailbox.Enqueue(ctx, JobRequest{
 		ID: "preflight", Agent: "preflight", Action: "review", Repo: "owner/repo",
 		StagedReviewVerdictAgent: "gm-review-opus",
@@ -237,7 +237,7 @@ func TestStagedCeilingStopsAtTheVerdictChild(t *testing.T) {
 func TestMailboxRunClampsAStagedVerdict(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "verdict", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "owner/repo", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"looks fine","evidence":"executed",` +
@@ -290,7 +290,7 @@ func TestMailboxRunClampsAStagedVerdict(t *testing.T) {
 func TestMailboxRunLeavesAnUnstagedVerdictAlone(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "verdict", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "owner/repo", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		`{"gitmoot_result":{"decision":"approved","summary":"ran it","evidence":"executed",` +

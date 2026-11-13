@@ -404,10 +404,6 @@ type localAgentDispatchRequest struct {
 	Branch           string
 	GoalID           string
 	TaskTitle        string
-	LeadAgent        string
-	// NoFixTarget states that this review has NO implementer to route a
-	// changes_requested verdict to (#2054). It is the review-only dispatch.
-	NoFixTarget bool
 	// PostMergeReview reviews an already-merged head (#2265 level 2); its
 	// findings become follow-ups instead of blocking a merge.
 	PostMergeReview bool
@@ -682,14 +678,8 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
-	// A review that may return changes_requested must name a fix target that can
-	// actually implement before Gitmoot spends a review session. Validate the
-	// agents-table row here, before repo/task/worktree mutation, managed-agent
-	// provisioning, enqueue, or runtime delivery. The workflow preflight remains
-	// the universal defense for later policy changes.
 	if request.Action == "review" {
-		request, err = validateLocalReviewLeadAtDispatch(ctx, store, request, repo.FullName())
-		if err != nil {
+		if err := validateLocalReviewTypeAtDispatch(request); err != nil {
 			return localAgentJobOutput{}, err
 		}
 	}
@@ -1173,7 +1163,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if request.Action == "review" {
 		requiredEvents = append(requiredEvents, db.JobEvent{Kind: "review_backend_route_selected", Message: request.ReviewRouteReason})
 	}
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("local agent enqueue"))
+	mailbox := workflow.NewMailbox(store)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 	mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
@@ -1190,11 +1180,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		GoalID:           request.GoalID,
 		TaskID:           request.TaskID,
 		TaskTitle:        request.TaskTitle,
-		// #2054: a review-only dispatch must NOT fall back to the reviewer here.
-		// firstNonEmpty restored agent.Name after validation had cleared it, which
-		// would route a changes_requested fix to the reviewer that produced it -
-		// the exact independence violation the lead requirement exists to prevent.
-		LeadAgent:                reviewLeadForEnqueue(request, agent.Name),
+		LeadAgent:                localDispatchLeadAgent(request.Action, agent.Name),
 		Reviewers:                request.Reviewers,
 		Sender:                   "local",
 		ActingOrgRole:            request.ActingOrgRole,
@@ -1216,7 +1202,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		EffectiveRuntime:         effectiveRuntimeAtEnqueue,
 		RequiredEvents:           requiredEvents,
 		SkipNativeReviewFanout:   request.SkipNativeReviewFanout,
-		NoFixTarget:              request.NoFixTarget,
 		PostMergeReview:          request.PostMergeReview,
 		ReviewNoExecution:        request.ReviewNoExecution,
 		ReviewPart:               request.ReviewPart,
@@ -1282,14 +1267,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		if request.DispatchWarning != nil {
 			request.DispatchWarning(warning)
 		}
-	}
-	if request.NoFixTarget {
-		// The absence of a fix target is a DECISION, so it is on the record next
-		// to the route rather than inferable from an empty lead field (#2054). A
-		// changes_requested verdict on this job has nowhere to route by design,
-		// and whoever reads it later needs to see that it was chosen.
-		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "review_no_fix_target",
-			Message: "dispatched --no-fix-target: this review has no implementer for a changes_requested verdict; the dispatching operator owns the follow-up"})
 	}
 	if reason := strings.TrimSpace(request.RouterBypassReason); reason != "" {
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "router_bypassed", Message: "dispatched WITHOUT the review router: " + reason + " cannot be expressed by `review request`"}); err != nil {
@@ -1467,7 +1444,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		// Wire the home-aware registry defaults so a foreground ask with no
 		// agent/job model or effort pin honors the runtime's defaults too.
 		// Fail-open/empty by default; an agent/job pin wins.
-		mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("foreground ask delivery"))
+		mailbox := workflow.NewMailbox(store)
 		mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 		mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
@@ -1622,7 +1599,7 @@ func buildLocalAgentJobOutput(latest db.Job, request localAgentDispatchRequest) 
 }
 
 func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, defaultBranch string, agentName string, overrideRuntime string, overrideRef string, orgPolicy func(string) workflow.OrgEnforcement) (localAgentJobOutput, error) {
-	mailbox := workflow.NewMailbox(store, workflow.UnavailableDeliveryWorktreeResolver("permission-blocked local agent enqueue"))
+	mailbox := workflow.NewMailbox(store)
 	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(request.Home)
 	mailbox.ReviewModelPool = reviewModelPoolResolver(request.Home)
 	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(request.Home)
@@ -1638,7 +1615,6 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 		GoalID:         request.GoalID,
 		TaskID:         request.TaskID,
 		TaskTitle:      request.TaskTitle,
-		LeadAgent:      request.LeadAgent,
 		Reviewers:      request.Reviewers,
 		Sender:         "local",
 		ActingOrgRole:  request.ActingOrgRole,
@@ -1704,6 +1680,17 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 	return message
 }
 
+// localDispatchLeadAgent resolves the lead recorded on a local job payload. A
+// review records none: engine fix routing is gone (#2203, #2586), and restoring
+// the reviewer would attribute a changes_requested follow-up to the agent that
+// produced the verdict. Other actions keep the dispatching agent, as before.
+func localDispatchLeadAgent(action, agentName string) string {
+	if action == "review" {
+		return ""
+	}
+	return agentName
+}
+
 // dispatchHeadSHAError rejects a head that cannot be compared to a pull
 // request's head without resolving it (#2054).
 //
@@ -1715,20 +1702,6 @@ func routeSelectedMessage(request localAgentDispatchRequest) string {
 // The message names the expected length and echoes the value, because the
 // operator's next action is to re-run with the full sha and "invalid head sha"
 // does not say how long it should be.
-// reviewLeadForEnqueue resolves the lead recorded on the job payload.
-//
-// The default is the dispatching agent, which is what firstNonEmpty gave for
-// every job before #2054. A review-only dispatch is the exception and must
-// resolve to EMPTY: its validation deliberately cleared the lead, and restoring
-// the reviewer here would make a changes_requested verdict route its fix to the
-// agent that produced the verdict.
-func reviewLeadForEnqueue(request localAgentDispatchRequest, agentName string) string {
-	if request.NoFixTarget {
-		return ""
-	}
-	return firstNonEmpty(request.LeadAgent, agentName)
-}
-
 func dispatchHeadSHAError(headSHA string) error {
 	head := strings.TrimSpace(headSHA)
 	if head == "" {
@@ -1760,74 +1733,21 @@ func isHexString(value string) bool {
 	return true
 }
 
-func validateLocalReviewLeadAtDispatch(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string) (localAgentDispatchRequest, error) {
+// validateLocalReviewTypeAtDispatch refuses a review forced onto a managed
+// agent type that does not exist, before any repo/task mutation or enqueue.
+func validateLocalReviewTypeAtDispatch(request localAgentDispatchRequest) error {
 	typeName := strings.TrimSpace(request.Type)
-	if typeName != "" {
-		exists, err := managedAgentTypeExists(request.Home, typeName)
-		if err != nil {
-			return localAgentDispatchRequest{}, err
-		}
-		if !exists {
-			return localAgentDispatchRequest{}, forcedManagedAgentTypeNotFoundError(typeName)
-		}
+	if typeName == "" {
+		return nil
 	}
-	// #2054: A REVIEW-ONLY DISPATCH HAS NO FIX TARGET, AND SAYS SO.
-	//
-	// The lead exists so a changes_requested verdict has somewhere to go, which
-	// is why it must be able to implement. But requiring one made a review-only
-	// dispatch impossible: `gitmoot agent review <reviewer>` refuses when the
-	// reviewer cannot implement, and the documented fallback - `agent ask` - has
-	// no --head-sha, so it cannot bind a verdict to a head at all. On
-	// 2026-09-08 that pair sent every seat needing an exact-head review onto
-	// ask, where one dispatch bound to a DIFFERENT pull request's merge commit.
-	//
-	// So the requirement is kept and made STATEABLE rather than removed: with
-	// --no-fix-target the operator declares they own the follow-up, and the
-	// choice is recorded on the job so a later changes_requested is attributable
-	// to a decision instead of looking like a missing lead. An unstated absence
-	// still refuses.
-	if request.PostMergeReview && strings.TrimSpace(request.LeadAgent) != "" {
-		return localAgentDispatchRequest{}, errors.New("--post-merge and --lead are mutually exclusive: a post-merge review has no implementer to route a fix to")
-	}
-	if request.NoFixTarget {
-		if strings.TrimSpace(request.LeadAgent) != "" {
-			return localAgentDispatchRequest{}, errors.New("--no-fix-target and --lead are mutually exclusive: one declares there is no implementer for a changes_requested verdict, the other names it")
-		}
-		request.LeadAgent = ""
-		return request, nil
-	}
-	leadName := strings.TrimSpace(request.LeadAgent)
-	if leadName == "" {
-		if typeName != "" {
-			return localAgentDispatchRequest{}, fmt.Errorf("review dispatch through managed type %q requires --lead naming a registered implementer", typeName)
-		}
-		leadName = strings.TrimSpace(request.Agent)
-	}
-	lead, err := store.GetAgent(ctx, leadName)
+	exists, err := managedAgentTypeExists(request.Home, typeName)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			if strings.TrimSpace(request.LeadAgent) == "" {
-				return localAgentDispatchRequest{}, fmt.Errorf("agent %q not found; review dispatch requires --lead naming a registered implementer", leadName)
-			}
-			return localAgentDispatchRequest{}, fmt.Errorf("review lead %q is not subscribed; --lead must name a registered implementer", leadName)
-		}
-		return localAgentDispatchRequest{}, err
+		return err
 	}
-	allowed, err := store.AgentCanAccessRepo(ctx, lead.Name, repo)
-	if err != nil {
-		return localAgentDispatchRequest{}, err
+	if !exists {
+		return forcedManagedAgentTypeNotFoundError(typeName)
 	}
-	if !allowed {
-		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q is not allowed on %q", lead.Name, repo)
-	}
-	if !agentHasCapability(lead.Capabilities, "implement") {
-		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q lacks implement capability; --lead must name an implementation-capable agent", lead.Name)
-	}
-	if err := runtime.ImplementWritePolicyError(lead.Capabilities, lead.AutonomyPolicy); err != nil {
-		return localAgentDispatchRequest{}, fmt.Errorf("review lead %q: %w", lead.Name, err)
-	}
-	request.LeadAgent = lead.Name
-	return request, nil
+	return nil
 }
 
 func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {

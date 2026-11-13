@@ -531,8 +531,8 @@ the single enqueue chokepoint from the most specific source available, in order:
 an explicit dispatcher supplied by the dispatch site, then `delegated_by`, then
 the acting org role, then the dispatch channel (`local`, `github`,
 `heartbeat`). It never falls back to the job's own agent or to
-`lead_agent`, because on a CLI review dispatch `lead_agent` defaults to the
-reviewer itself.
+`lead_agent`: the job's own agent is the reviewer on a review, and
+`lead_agent` is the dispatching agent on other CLI dispatches.
 
 `dispatched_by` is attribution only, deliberately not `parent_job_id`: nothing
 in the scheduler reads it, so recording it cannot change delegation depth, the
@@ -740,33 +740,9 @@ removed earlier on the same terms.
 
 ## Reporting Rules
 
-- An implement agent's `summary` describes only what the agent observed during
-  its own turn. It is **not authoritative** about whether Gitmoot committed,
-  pushed, or opened a PR: that delivery step runs after the agent turn ends. A
-  coordinator deciding whether work was delivered must check `delivery_status`
-  from `gitmoot job show` / `job list --json`, the `advance_*` job events, or a
-  non-zero `pull_request` instead of trusting the agent's prose on this question.
-  For a fix-pass job, `delivery_status` and the latest advancement marker take
-  precedence over a pull-request number inherited when the job was dispatched.
-  An omitted `delivery_status` means unknown or not applicable, not "not
-  delivered."
 - Do not claim tests were run unless they were actually run.
 - Do not claim files were changed unless they were actually changed. Name
-  repo-relative file paths in each `changes_made` entry. At result persistence,
-  an ordinary engine-run implement job resolves the effective checkout selected
-  by the worker and records `payload.result_observation`: the files in
-  `git diff HEAD` plus untracked files, each claim's path binding, claimed-only
-  paths, and diff files no claim mentions. A worktree-less delegation child is
-  deliberately not graded against the shared registered checkout; it records a
-  typed observation whose source is
-  `excluded_worktree_less_delegation_child`, rather than omitting the field. A
-  claim that names a repo-relative path is graded `observed` only
-  when both its claimed path and per-change observation bind to that exact
-  normalized path in `touched_files`. If capture membership is absent or
-  indeterminate, the grade remains `reported`. A unique-basename match may
-  assist an unqualified filename (one with no directory separator), but that
-  binding also remains `reported`. Even an exact match is not `verified`:
-  Gitmoot observed the path in the diff but did not prove the prose semantics.
+  repo-relative file paths in each `changes_made` entry.
 - Use `needs` for missing credentials, unclear scope, unavailable tools, failing
   external services, or required human decisions.
 - Use `delegations` when another named Gitmoot agent should be invoked.

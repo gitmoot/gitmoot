@@ -634,7 +634,7 @@ func TestForegroundReviewRuntimeStateSurvivesRepairAndCleansAtBoundary(t *testin
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
 
 	output, err := dispatchLocalAgentJob(ctx, store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", LeadAgent: "implementer",
+		RepoFlag: "owner/repo", Agent: "reviewer",
 		Action: "review", Instructions: "Review the exact head.", PullRequest: 7,
 		Branch: "main", HeadSHA: head, Home: home,
 	})

@@ -183,7 +183,7 @@ func TestAgentReviewChoosesItsRuntimeWithoutAnyFlag(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 12, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 		// NO Runtime: the router decides.
 	})
 	if err != nil {
@@ -211,7 +211,7 @@ func TestAgentReviewReroutesOffAHeldRegisteredRuntimeWithoutAnyFlag(t *testing.T
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 15, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatalf("flagless agent review under a claude hold: %v", err)
@@ -233,7 +233,7 @@ func TestAgentReviewRoutesAroundAHoldWithoutAnyFlag(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 13, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatalf("flagless agent review under an omp hold: %v", err)
@@ -282,7 +282,7 @@ func TestShellRegisteredReviewAgentIsNotRerouted(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "script-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 14, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatalf("flagless shell review: %v", err)
@@ -406,8 +406,8 @@ func TestExplicitRuntimeIsNotReroutedUnderAHold(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 16, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
-		Runtime: runtime.ClaudeRuntime, // deliberate, onto the held runtime
+		ActingOrgRole: "joltra",
+		Runtime:       runtime.ClaudeRuntime, // deliberate, onto the held runtime
 	})
 	// The operator named a runtime that is HELD. The router must not quietly
 	// move them off it: the dispatch refuses, exactly as it would have before
@@ -436,7 +436,7 @@ func TestHeldScriptAgentRefusesRatherThanRunningAModel(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "script-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 17, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err == nil {
 		t.Fatal("a shell-held script agent was dispatched anyway: it would run a model under the script's identity")
@@ -458,8 +458,8 @@ func TestOperatorModelIsNotCarriedThroughAReroute(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "opus-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 18, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
-		Model: "anthropic/claude-fable-5", // scoped to claude, which is held
+		ActingOrgRole: "joltra",
+		Model:         "anthropic/claude-fable-5", // scoped to claude, which is held
 	})
 	if err == nil {
 		t.Fatal("a claude-scoped model was carried onto omp: the job would die at delivery")
@@ -491,7 +491,7 @@ func TestBothVerbsAgreeOnAShellOnlyFleetUnderAnOmpHold(t *testing.T) {
 		RepoFlag: "owner/repo", Agent: "script-reviewer", Action: "review",
 		Instructions: "review this", Background: true, Home: home,
 		PullRequest: 19, HeadSHA: head, Branch: "feature/review",
-		ActingOrgRole: "joltra", NoFixTarget: true,
+		ActingOrgRole: "joltra",
 	})
 	if err != nil {
 		t.Fatalf("agent review: %v", err)

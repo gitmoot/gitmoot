@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gitmoot/gitmoot/internal/github"
+	"slices"
 	"strings"
 	"time"
 
@@ -851,8 +852,34 @@ func (w jobWorker) jobAdvanceBlocked(ctx context.Context, jobID string) (bool, e
 	if err != nil {
 		return false, err
 	}
-	latest, ok := latestDeliveryStatusEvent(events)
+	latest, ok := latestAdvancementEvent(events)
 	return ok && latest.Kind == "advance_blocked", nil
+}
+
+// advancementEventKinds contains every advancement marker that can supersede an
+// older one. jobAdvanceBlocked reads only the latest of them, so a block that a
+// later retry, completion, or loop detection superseded no longer counts.
+var advancementEventKinds = []string{
+	"advance_started",
+	"advance_retry",
+	"advance_completed",
+	"advance_blocked",
+	"advance_retried",
+	"advance_retry_skipped",
+	"advance_awaiting_human",
+	"retry_queued",
+	workflow.ReviewLoopDetectedEventKind,
+}
+
+func latestAdvancementEvent(events []db.JobEvent) (db.JobEvent, bool) {
+	var latest db.JobEvent
+	var found bool
+	for _, event := range events {
+		if slices.Contains(advancementEventKinds, event.Kind) {
+			latest, found = event, true
+		}
+	}
+	return latest, found
 }
 
 func daemonWorkerJobPayload(ctx context.Context, store *db.Store, jobID string) (db.Job, workflow.JobPayload, error) {

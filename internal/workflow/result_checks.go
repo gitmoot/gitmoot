@@ -100,16 +100,13 @@ type ResultCheck struct {
 }
 
 // ResultCheckInput carries the minimal job context the deterministic checks need
-// beyond the parsed result: the job action, whether the job is a coordinator
-// finalize continuation (payload.DelegationFinalize), and the engine's persisted
-// observation of an implement worktree when one was available. Keeping this a
-// small value type makes the check set trivially unit-testable without a store or
-// a job row.
+// beyond the parsed result: the job action and whether the job is a coordinator
+// finalize continuation (payload.DelegationFinalize). Keeping this a small value
+// type makes the check set trivially unit-testable without a store or a job row.
 type ResultCheckInput struct {
-	Action      string
-	IsFinalize  bool
-	Result      AgentResult
-	Observation *ResultObservation
+	Action     string
+	IsFinalize bool
+	Result     AgentResult
 }
 
 // minActionableAnswerChars is the floor below which an ask/finalize answer is
@@ -146,48 +143,6 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 	}
 
 	switch action {
-	case "implement":
-		// A job that claims it implemented changes must enumerate them, and must
-		// list the tests it ran, so a human/continuation can see what actually
-		// happened rather than trusting the summary prose.
-		if r.Decision == "implemented" {
-			// Same content test the needs gate uses: two gates disagreeing
-			// about the same input is the defect, not the leniency. Before
-			// this, the {} that the needs gate rejects satisfied these.
-			madePass := hasActionableEntries(r.ChangesMade)
-			checks = append(checks, ResultCheck{
-				ID:          "implement-changes-listed",
-				Action:      "implement",
-				Question:    "Did the implement job list the concrete changes it made?",
-				Pass:        madePass,
-				Explanation: explain(madePass, "the implement job reports decision \"implemented\" but changes_made[] is empty"),
-			})
-			if in.Observation != nil && in.Observation.Source == ResultObservationSourceWorktreeDiff && in.Observation.Error == "" {
-				invalidBindings := invalidCapturedBindingClaims(in.Observation.Changes, in.Observation.TouchedFiles)
-				consistent := len(in.Observation.ClaimedOnlyFiles) == 0 && len(in.Observation.UnclaimedFiles) == 0 && len(in.Observation.UnboundClaims) == 0 && len(invalidBindings) == 0
-				checks = append(checks, ResultCheck{
-					ID:       "implement-changes-observed",
-					Action:   "implement",
-					Question: "Do the reported changes_made files match the files observed in the worktree diff?",
-					Pass:     consistent,
-					Explanation: explain(consistent, fmt.Sprintf(
-						"work may be missing: claimed changes_made files absent from the diff: %s; diff files absent from changes_made: %s; claims without a touched-file path binding: %s; invalid captured path bindings: %s",
-						displayPaths(in.Observation.ClaimedOnlyFiles),
-						displayPaths(in.Observation.UnclaimedFiles),
-						displayPaths(in.Observation.UnboundClaims),
-						displayPaths(invalidBindings),
-					)),
-				})
-			}
-			testsPass := hasActionableEntries(r.TestsRun)
-			checks = append(checks, ResultCheck{
-				ID:          "implement-tests-listed",
-				Action:      "implement",
-				Question:    "Did the implement job list the tests it ran?",
-				Pass:        testsPass,
-				Explanation: explain(testsPass, "the implement job reports decision \"implemented\" but tests_run[] is empty"),
-			})
-		}
 	case "review":
 		// A changes-requested review must carry findings — the concrete, evidence-
 		// bearing objections the author is expected to address. A bare
@@ -303,13 +258,6 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 	}
 
 	return checks
-}
-
-func displayPaths(paths []string) string {
-	if len(paths) == 0 {
-		return "none"
-	}
-	return strings.Join(paths, ", ")
 }
 
 // FailedResultChecks runs the audit and returns only the checks that failed, in

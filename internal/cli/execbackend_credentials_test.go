@@ -461,9 +461,6 @@ func (b *credentialTestBackend) Exec(_ context.Context, _ *execbackend.Instance,
 	b.execCalls = append(b.execCalls, command)
 	return credentialTestStream{result: execbackend.ExecResult{Stdout: "123\n"}}, nil
 }
-func (*credentialTestBackend) Collect(context.Context, *execbackend.Instance) (execbackend.ChangeSet, error) {
-	return execbackend.ChangeSet{}, nil
-}
 func (b *credentialTestBackend) Cancel(context.Context, *execbackend.Instance) error {
 	return b.destroyErr
 }

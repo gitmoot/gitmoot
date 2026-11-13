@@ -26,8 +26,8 @@ import (
 // ExecutionBackend is the job-scoped lifecycle contract decided in #1535.
 // One instance is provisioned for one job run and remains attached across all
 // Mailbox delivery/repair turns. SyncIn transports checkout state but never
-// credentials; Exec must stream while it runs; Collect returns the existing
-// bounded ChangeSet transport; Cancel and Destroy are idempotent.
+// credentials; Exec must stream while it runs; Cancel and Destroy are
+// idempotent.
 type ExecutionBackend interface {
 	Name() Backend
 	Provision(context.Context, JobScope) (*Instance, error)
@@ -36,7 +36,6 @@ type ExecutionBackend interface {
 	Attach(context.Context, string) (*Instance, error)
 	SyncIn(context.Context, *Instance, Materials) error
 	Exec(context.Context, *Instance, Command) (Stream, error)
-	Collect(context.Context, *Instance) (ChangeSet, error)
 	Cancel(context.Context, *Instance) error
 	Destroy(context.Context, *Instance) error
 }
@@ -588,30 +587,6 @@ func chownLocalWorkspace(workspace string, uid, gid uint32) error {
 		}
 		return os.Lchown(path, int(uid), int(gid))
 	})
-}
-
-func (b *LocalBackend) Collect(ctx context.Context, instance *Instance) (ChangeSet, error) {
-	if err := b.validateInstance(instance); err != nil {
-		return ChangeSet{}, err
-	}
-	if strings.TrimSpace(instance.BaseHEAD) == "" {
-		return ChangeSet{}, errors.New("local execution instance has no synced base HEAD")
-	}
-	if b.identity == nil {
-		return BuildChangeSet(ctx, instance.Workspace, instance.BaseHEAD)
-	}
-	// Git refuses to inspect a repository owned by another uid even when the
-	// daemon is root. Reclaim ownership only for host-side collection, then hand
-	// it back so a later Mailbox repair delivery can reuse the same instance.
-	if err := chownLocalWorkspace(instance.Workspace, uint32(os.Geteuid()), uint32(os.Getegid())); err != nil {
-		return ChangeSet{}, fmt.Errorf("reclaim local execution workspace for collection: %w", err)
-	}
-	changes, collectErr := BuildChangeSet(ctx, instance.Workspace, instance.BaseHEAD)
-	handoffErr := b.handoffWorkspace(instance)
-	if collectErr != nil || handoffErr != nil {
-		return ChangeSet{}, errors.Join(collectErr, handoffErr)
-	}
-	return changes, nil
 }
 
 func (b *LocalBackend) Cancel(ctx context.Context, instance *Instance) error {

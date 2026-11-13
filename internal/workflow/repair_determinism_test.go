@@ -19,7 +19,7 @@ const cleanReviewEnvelope = `{"gitmoot_result":{"decision":"approved","summary":
 func repairTestMailbox(t *testing.T) (*Mailbox, context.Context, runtime.Agent) {
 	t.Helper()
 	store := openTestStore(t)
-	mailbox := &Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := &Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	return mailbox, context.Background(), agent
 }

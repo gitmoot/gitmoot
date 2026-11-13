@@ -46,7 +46,7 @@ func presetJobPayload(t *testing.T) string {
 func TestPresetDeliveryAlwaysInlinesFullPreset(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 
 	// Two deliveries on the SAME session: the deleted modes shortened the second
 	// one once the first had "loaded" the preset, so repeating the delivery is what

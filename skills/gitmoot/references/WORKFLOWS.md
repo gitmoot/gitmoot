@@ -162,18 +162,6 @@ or request implementation capability.
 gitmoot agent start thermo-review --runtime codex --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
 ```
 
-For a local dispatch, pair that reviewer with the registered implementer that
-should own a `changes_requested` fix:
-
-```sh
-gitmoot agent review thermo-review --repo owner/repo --pr 12 --lead lead "Review this PR."
-```
-
-Gitmoot refuses the dispatch before creating a review job when the lead is
-missing, cannot access the repo, lacks `implement`, or has a non-write policy.
-Do not grant `implement` to the reviewer merely to satisfy this check; keep the
-reviewer read-only and name the separate implementer with `--lead`.
-
 PR comment:
 
 ```text
@@ -437,8 +425,8 @@ otherwise-stuck `implementing` task. Implemented success without a PR records
 fixes, continuations, or pending advancement remain under their existing owner.
 
 **PR-bound fix pass:** there is no dispatch for one. A `changes_requested`
-verdict reports to the requester and to the `--lead` seat and stops there; the
-lead reopens its own checkout on the PR branch, pushes the fix, and records it
+verdict reports to the requester and stops there; the requester reopens its own
+checkout on the PR branch, pushes the fix, and records it
 with `gitmoot job record --type implement --pr <number> --head-sha <sha>`.
 Those rows are what the merge gate's implementer attribution and
 reviewer-independence check read, so recording is not bookkeeping — it is how

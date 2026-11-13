@@ -55,7 +55,7 @@ func newProducerReviewFixture(t *testing.T, runtimeName, checksConfig string, re
 		request.Branch = "remote-review-admission"
 		request.ReviewPurpose = db.DefaultReviewPurpose
 	}
-	job, err := workflow.NewMailbox(base.store, workflow.UnavailableDeliveryWorktreeResolver("producer enqueue")).Enqueue(base.ctx, request)
+	job, err := workflow.NewMailbox(base.store).Enqueue(base.ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}

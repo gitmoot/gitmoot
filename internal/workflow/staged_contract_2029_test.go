@@ -425,7 +425,7 @@ func TestMarkedPreflightVerdictIsNotConsumableAtTheTerminalChokepoint(t *testing
 			ctx := context.Background()
 			store := openEngineStore(t)
 			seedAgent(t, store, "preflight", []string{"review"}, "gitmoot/gitmoot")
-			mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+			mailbox := NewMailbox(store)
 
 			payload := JobPayload{
 				Repo: "gitmoot/gitmoot", Branch: "task-2029", PullRequest: 2029,
@@ -483,7 +483,7 @@ func TestUnmarkedReviewIsUntouchedByTheStagedChokepoint(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "auditor", []string{"review"}, "gitmoot/gitmoot")
-	mailbox := NewMailbox(store, UnavailableDeliveryWorktreeResolver("test"))
+	mailbox := NewMailbox(store)
 
 	payload := JobPayload{
 		Repo: "gitmoot/gitmoot", Branch: "task-plain", PullRequest: 2030,

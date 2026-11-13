@@ -37,7 +37,7 @@ func largeReview(t *testing.T, extra string) string {
 func TestMailboxRepairPromptCarriesTheWholeLargeResult(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	mailbox := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mailbox := Mailbox{store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "reviewer"}
 	withExtraKey := largeReview(t, `"head_sha":"0123456789abcdef0123456789abcdef01234567"`)
 	if len(withExtraKey) <= 12000 {

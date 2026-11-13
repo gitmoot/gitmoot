@@ -63,7 +63,7 @@ scope = ["owner/repo"]
 
 	args := []string{
 		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--home", home,
 	}
 	var stdout, stderr bytes.Buffer
@@ -501,7 +501,7 @@ func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *test
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousFactory })
 
 	_, err = dispatchLocalAgentJob(ctx, fixture.store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "ghost-reviewer", LeadAgent: "reviewer", Action: "review", PullRequest: 227,
+		RepoFlag: "owner/repo", Agent: "ghost-reviewer", Action: "review", PullRequest: 227,
 		Branch: "main", HeadSHA: "same-head", Instructions: "Review unchanged head.", Home: fixture.home,
 	})
 	if err == nil || !strings.Contains(err.Error(), `agent "ghost-reviewer" not found`) {
@@ -600,85 +600,6 @@ func TestCLIReviewLoopHerdres227Shape(t *testing.T) {
 	if got := countCLIJobEvents(t, fixture.store, "herdres-227-first", workflow.ReviewLoopDetectedEventKind); got != 1 {
 		t.Fatalf("review_loop_detected events = %d, want one after 318 refusals", got)
 	}
-}
-
-// Kills parser mutants that omit either --lead form, accept a blank value, or
-// parse the flag without threading it into localAgentDispatchRequest.
-func TestParseAgentRunOptionsCapturesLeadForReviewAndRun(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		command string
-		args    []string
-	}{
-		{name: "review spaced", command: "review", args: []string{"reviewer", "Review it.", "--pr", "7", "--lead", "implementer"}},
-		{name: "review inline", command: "review", args: []string{"reviewer", "Review it.", "--pr=7", "--lead=implementer"}},
-		{name: "run spaced", command: "run", args: []string{"reviewer", "Review it.", "--action", "review", "--pr", "7", "--lead", "implementer"}},
-		{name: "run inline", command: "run", args: []string{"reviewer", "Review it.", "--action=review", "--pr=7", "--lead=implementer"}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			var stderr bytes.Buffer
-			options, ok := parseAgentRunOptions(test.command, test.args, &stderr)
-			if !ok {
-				t.Fatalf("parseAgentRunOptions failed: %s", stderr.String())
-			}
-			if options.lead != "implementer" {
-				t.Fatalf("lead = %q, want implementer", options.lead)
-			}
-			request := localAgentDispatchRequestFromOptions(options, "review", "test", "test")
-			if request.LeadAgent != "implementer" {
-				t.Fatalf("request LeadAgent = %q, want implementer", request.LeadAgent)
-			}
-		})
-	}
-
-	for _, args := range [][]string{
-		{"reviewer", "Review it.", "--pr", "7", "--lead", "   "},
-		{"reviewer", "Review it.", "--pr=7", "--lead="},
-	} {
-		var stderr bytes.Buffer
-		if _, ok := parseAgentRunOptions("review", args, &stderr); ok || !strings.Contains(stderr.String(), "--lead requires a non-blank value") {
-			t.Fatalf("blank --lead args=%v ok=%v stderr=%q", args, ok, stderr.String())
-		}
-	}
-}
-
-// Kills the scope mutant that silently persists review routing metadata on
-// ask, implement, or orchestrate dispatches.
-func TestAgentLeadRejectedOutsideReviewDispatch(t *testing.T) {
-	for _, command := range []string{"implement", "orchestrate"} {
-		var stderr bytes.Buffer
-		_, ok := parseAgentRunOptions(command, []string{"worker", "Do it.", "--lead", "implementer"}, &stderr)
-		if ok || !strings.Contains(stderr.String(), "--lead is only supported for agent review and agent run") {
-			t.Fatalf("command=%s ok=%v stderr=%q", command, ok, stderr.String())
-		}
-	}
-
-	for _, action := range []string{"ask", "implement"} {
-		options := agentRunOptions{home: t.TempDir(), agent: "worker", message: "Do it.", lead: "implementer"}
-		var stdout, stderr bytes.Buffer
-		_, exit := dispatchAgentCommand(options, action, "test", "agent_run", &stdout, &stderr)
-		if exit != 2 || !strings.Contains(stderr.String(), "--lead is only supported when routing to review") {
-			t.Fatalf("action=%s exit=%d stderr=%q", action, exit, stderr.String())
-		}
-	}
-}
-
-// PRE-FIX RED: the review ran and only the later fix advance blocked. This kills
-// validation limited to explicit --lead and validation delayed until advance.
-func TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7,
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "reviewer" lacks implement capability`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
 }
 
 // TestDispatchReviewRejectsAbbreviatedHeadSHABeforeEnqueue is #2054 defect 1.
@@ -782,198 +703,11 @@ func TestDispatchReviewAcceptsFullHeadSHA(t *testing.T) {
 	installReviewLeadTestAdapter(t, "")
 
 	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
+		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7,
 		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, Background: true,
 	})
 	if err != nil && strings.Contains(err.Error(), "head") {
 		t.Fatalf("a full 40-character head sha was refused by the head guard: %v", err)
-	}
-}
-
-// TestDispatchReviewOnlyNeedsNoImplementCapableLead is #2054 defect 2.
-//
-// `agent review <reviewer>` refused when the reviewer could not implement,
-// because a changes_requested verdict needs somewhere to go. The documented
-// fallback, `agent ask`, has no --head-sha and cannot bind a verdict to a head
-// at all - so on 2026-09-08 that pair sent every seat needing an exact-head
-// review onto ask, and one dispatch bound to a DIFFERENT pull request's merge
-// commit.
-//
-// The requirement is kept and made stateable: --no-fix-target declares the
-// operator owns the follow-up. An UNSTATED absence must still refuse, which
-// TestDispatchReviewWithoutLeadRejectsReviewOnlyAgentBeforeEnqueue pins.
-func TestDispatchReviewOnlyNeedsNoImplementCapableLead(t *testing.T) {
-	ctx := context.Background()
-	checkout, _, _, head, _ := promptHeadBindingCheckout(t)
-	store, home := blockerE2EHome(t)
-	seedReviewDispatchFixture(t, store, checkout)
-
-	request := reviewDispatchRequest(home, head)
-	// The reviewer cannot implement, and no lead is named: exactly the dispatch
-	// that refused all day and pushed every seat onto `agent ask`.
-	request.LeadAgent = ""
-	request.NoFixTarget = true
-
-	out, err := dispatchLocalAgentJob(ctx, store, request)
-	if err != nil {
-		t.Fatalf("a review-only dispatch was refused: %v", err)
-	}
-	// THE DECISION MUST REACH THE PAYLOAD, not only a job event. Review found
-	// that clearing the lead was not enough: enqueue restored the reviewer
-	// through firstNonEmpty, so a changes_requested verdict would have routed
-	// its fix to the agent that produced the verdict, and advancement had no
-	// field to read the declaration from.
-	job, err := store.GetJob(ctx, out.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !payload.NoFixTarget {
-		t.Fatalf("payload.NoFixTarget = false; advancement cannot honour a declaration it cannot read: %s", job.Payload)
-	}
-	if strings.TrimSpace(payload.LeadAgent) != "" {
-		t.Fatalf("payload.LeadAgent = %q, want empty: a review-only dispatch must not fall back to the reviewer", payload.LeadAgent)
-	}
-	events, err := store.ListJobEvents(ctx, out.JobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, event := range events {
-		if event.Kind == "review_no_fix_target" {
-			return
-		}
-	}
-	t.Fatalf("no review_no_fix_target event: %+v", events)
-}
-
-// --no-fix-target and --lead answer the same question in opposite directions, so
-// accepting both would leave which one wins undefined.
-func TestDispatchReviewOnlyRejectsAnExplicitLead(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home, NoFixTarget: true,
-	})
-	// This refusal must precede the capacity and worktree work, like the other
-	// lead refusals, which is why it stays on the refusal fixture.
-	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("dispatch error = %v, want a mutual-exclusion refusal", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-}
-
-// Kills a missing-existence-check mutant and a mutant that silently falls back
-// to the reviewer when an explicit lead does not exist.
-func TestDispatchReviewRejectsUnknownLeadBeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "missing",
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "missing" is not subscribed`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-}
-
-// Kills existence-only validation that never checks the lead's DB capability.
-func TestDispatchReviewRejectsLeadWithoutImplementBeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"ask", "review"}, "owner/repo", runtime.AutonomyPolicyDangerFullAccess)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "lead" lacks implement capability`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-}
-
-// The lead exists only in the DB fixture. This kills capability-only validation,
-// checking the reviewer's policy, and config.toml-based policy lookup.
-func TestDispatchReviewRejectsReadOnlyLeadBeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "lead": autonomy policy "read-only" grants no write permission`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-}
-
-// Kills validation that accepts a lead which the later fix dispatch cannot use
-// on the review's repository.
-func TestDispatchReviewRejectsLeadWithoutRepoAccessBeforeEnqueue(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	seedDaemonWorkerAgentWithPolicy(t, store, "lead", runtime.ShellRuntime, "true", []string{"implement"}, "other/repo", runtime.AutonomyPolicyWorkspaceWrite)
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Action: "review", PullRequest: 7, LeadAgent: "lead",
-		HeadSHA: fixture.head, Branch: "feature/review", Home: fixture.home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `review lead "lead" is not allowed on "owner/repo"`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-}
-
-// Kills the managed-type mutant that provisions a runtime before a concrete,
-// DB-backed fix target can be validated. The configured type pins error
-// precedence: only an existing managed type reaches the requires-lead refusal.
-func TestDispatchReviewManagedTypeRequiresExplicitLeadBeforeProvisioning(t *testing.T) {
-	fixture := reviewLeadRefusalStore(t)
-	store := fixture.store
-	home := fixture.home
-	paths := config.PathsForHome(home)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatalf("Initialize returned error: %v", err)
-	}
-	if err := config.SaveAgentType(paths, config.AgentType{
-		Name: "reviewer-type", Runtime: runtime.CodexRuntime,
-		Capabilities: []string{"review"}, AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
-	}); err != nil {
-		t.Fatalf("SaveAgentType returned error: %v", err)
-	}
-	adapter := installReviewLeadTestAdapter(t, "")
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag: "owner/repo", Agent: "reviewer", Type: "reviewer-type", Action: "review", PullRequest: 7,
-		HeadSHA: fixture.head, Branch: "feature/review", Home: home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `managed type "reviewer-type" requires --lead`) {
-		t.Fatalf("dispatch error = %v", err)
-	}
-	assertReviewLeadHardRefusal(t, store, fixture.checkout, adapter)
-	instances, listErr := store.ListAgentInstances(context.Background())
-	if listErr != nil || len(instances) != 0 {
-		t.Fatalf("managed instances = %+v, err=%v; want none", instances, listErr)
 	}
 }
 
@@ -1025,34 +759,6 @@ func installReviewLeadTestAdapter(t *testing.T, output string) *cliWorkerFakeAda
 	return adapter
 }
 
-func assertReviewLeadHardRefusal(t *testing.T, store *db.Store, checkout string, adapter *cliWorkerFakeAdapter) {
-	t.Helper()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	if len(jobs) != 0 {
-		t.Fatalf("jobs = %+v, want zero after hard refusal", jobs)
-	}
-	tasks, err := store.ListTasks(context.Background())
-	if err != nil {
-		t.Fatalf("ListTasks returned error: %v", err)
-	}
-	if len(tasks) != 0 {
-		t.Fatalf("tasks = %+v, want zero after hard refusal", tasks)
-	}
-	entries, err := os.ReadDir(filepath.Join(checkout, ".git", "worktrees"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read git worktree registry: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("git worktree registry entries = %+v, want none after hard refusal", entries)
-	}
-	if adapter.calls != 0 {
-		t.Fatalf("adapter calls = %d, want zero after hard refusal", adapter.calls)
-	}
-}
-
 // #2194: `agent review` must subscribe the acting role to the verdict, the way
 // `review request` always has. Measured 2026-09-16: 687 of 688 reviews on this
 // box were dispatched by this command, so in practice no review subscribed
@@ -1098,7 +804,7 @@ scope = ["owner/repo"]
 
 	args := []string{
 		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--home", home,
 	}
 	var stdout, stderr bytes.Buffer
@@ -1234,7 +940,7 @@ func TestAgentReviewReportsWhenNoVerdictWaitCanBeAttached(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := runAgentReview([]string{
 		"reviewer", "Review this exact head.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--foreground", "--home", home,
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -1386,7 +1092,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := runAgentReview([]string{
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--model", "openai-codex/gpt-5.6-sol", "--workflow", "release/queue",
 		"--effort", "high", "--home", home,
 		"--exec-backend", "remote",
@@ -1435,11 +1141,6 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	// 3. THE CALLER'S MESSAGE SURVIVES, verbatim.
 	if !strings.Contains(payload.Instructions, message) {
 		t.Fatalf("instructions dropped the caller's message: %q", payload.Instructions)
-	}
-	// 4. THE FIX TARGET SURVIVES: a named lead means a changes-requested verdict
-	// has somewhere to route, which the router's own requests never have.
-	if payload.LeadAgent != "implementer" {
-		t.Fatalf("lead = %q, want implementer carried through", payload.LeadAgent)
 	}
 	// 5. THE MODEL POOL is attached by the router.
 	if len(payload.ReviewModelPool) == 0 {
@@ -1524,7 +1225,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	var stdout2, stderr2 bytes.Buffer
 	if code := runAgentReview([]string{
 		"dual-reviewer", message, "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--home", home,
 	}, &stdout2, &stderr2); code != 0 {
 		t.Fatalf("second review exit stderr=%q", stderr2.String())
@@ -1543,7 +1244,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	var stdout3, stderr3 bytes.Buffer
 	if code := runAgentReview([]string{
 		"reviewer", "a DIFFERENT instruction", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--home", home,
 	}, &stdout3, &stderr3); code != 0 {
 		t.Fatalf("third review exit stderr=%q", stderr3.String())
@@ -1598,7 +1299,7 @@ func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if code := runAgentReview([]string{
 		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--skip-native-review-fanout", "--home", home,
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("review exit stdout=%q stderr=%q", stdout.String(), stderr.String())
@@ -1618,59 +1319,10 @@ func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
 	}
 }
 
-// #2196 review (P1): THE FIX FOR A MISSED FLAG IS NOT A LONGER HAND LIST.
-// Inspection found the message and --lead and missed at least eight others;
-// adding those by hand leaves the flag someone adds NEXT MONTH in exactly the
-// same position - silently dropped by a wrapper nobody re-audits.
-//
-// So this test enumerates `agent review`'s ACCEPTED FLAGS FROM ITS OWN PARSER
-// SOURCE and asserts every one is either FORWARDED to `review request` or
-// EXPLICITLY REJECTED into the direct path. A new flag that is neither fails
-// here, which turns a silent degradation into a build break. Same move as
-// deriving an expected method name from the method expression rather than
-// typing it (#2188): the list stops being a second copy of the truth.
-func TestAgentReviewWithoutLeadKeepsTheRefusalPath(t *testing.T) {
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.OpenFile(paths.ConfigFile, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := file.WriteString("\n[org]\nenforce = \"warn\"\n[org.roles.\"owner\"]\nscope = [\"*\"]\n[org.roles.\"joltra\"]\nparent = \"owner\"\nscope = [\"owner/repo\"]\n"); err != nil {
-		file.Close()
-		t.Fatal(err)
-	}
-	file.Close()
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	checkout, _, head := readonlyReviewWorktreeGitCheckout(t)
-	seedReviewDispatchFixture(t, store, checkout)
-	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
-		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
-	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
-	previousGitHubFactory := newAgentDispatchGitHubClient
-	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
-	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
-
-	var stdout, stderr bytes.Buffer
-	runAgentReview([]string{
-		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review",
-		"--org-role", "joltra", "--home", home,
-	}, &stdout, &stderr)
-	if !strings.Contains(stderr.String(), "absent --lead with no --no-fix-target") {
-		t.Fatalf("stderr = %q, want the absent-lead reason named: delegation must not silently convert #2054's refusal into a review-only dispatch", stderr.String())
-	}
-}
-
 // #2196 review (P2): AN ATTACHING REQUEST MUST BE TOLD WHAT IT DID NOT GET.
 // A second dispatch at a claimed head attaches to the running review - correct,
 // and the dedup the router exists for - but the caller's own reviewer, message,
-// lead and model are discarded. Without saying so, the caller is told it is
+// and model are discarded. Without saying so, the caller is told it is
 // awaiting a verdict and waits on a review it believes it commissioned. That is
 // this campaign's central defect at the dispatch surface.
 func TestAttachingRequestIsToldWhatWasDiscarded(t *testing.T) {
@@ -1681,7 +1333,6 @@ func TestAttachingRequestIsToldWhatWasDiscarded(t *testing.T) {
 	}{
 		{"a different reviewer", reviewRequestOptions{reviewer: "my-reviewer"}, "--reviewer my-reviewer was NOT used"},
 		{"instructions", reviewRequestOptions{message: "check the precedence table"}, "instructions were NOT sent"},
-		{"a lead", reviewRequestOptions{lead: "my-implementer"}, "--lead my-implementer was NOT applied"},
 		{"a model", reviewRequestOptions{model: "anthropic/claude-opus-5"}, "--model anthropic/claude-opus-5 was NOT used"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -1782,7 +1433,7 @@ func TestReviewRequestHonorsTheForwardedSession(t *testing.T) {
 func TestDelegatedMessageMayStartWithADash(t *testing.T) {
 	args := reviewRequestArgsFromAgentReview(agentRunOptions{
 		repo: "owner/repo", prNumber: 12, headSHA: "0bd967c5ba8e506607bd3a9999a94a4db5b881b4",
-		orgRole: "joltra", agent: "reviewer", lead: "implementer",
+		orgRole: "joltra", agent: "reviewer",
 		message: "-check the diff",
 	})
 	// The terminator must precede the message, and nothing may follow it.
@@ -1799,7 +1450,7 @@ func TestDelegatedMessageMayStartWithADash(t *testing.T) {
 	fs.SetOutput(io.Discard)
 	var pr int
 	fs.IntVar(&pr, "pr", 0, "")
-	for _, name := range []string{"repo", "head", "branch", "role", "reviewer", "lead", "home", "model", "effort", "workflow", "session", "runtime", "purpose"} {
+	for _, name := range []string{"repo", "head", "branch", "role", "reviewer", "home", "model", "effort", "workflow", "session", "runtime", "purpose"} {
 		fs.String(name, "", "")
 	}
 	if err := fs.Parse(args); err != nil {
@@ -1859,7 +1510,7 @@ func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
 
 			args := append([]string{
 				"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-				"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+				"--head-sha", head, "--branch", "feature/review",
 				"--home", home,
 			}, testCase.extra...)
 			var stdout, stderr bytes.Buffer
@@ -1954,7 +1605,7 @@ func TestRoutedDispatchRecordsNoBypassAndForegroundRecordsOne(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		if code := runAgentReview([]string{
 			"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-			"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+			"--head-sha", head, "--branch", "feature/review",
 			"--org-role", "joltra", "--home", home,
 		}, &stdout, &stderr); code != 0 {
 			t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
@@ -1970,7 +1621,7 @@ func TestRoutedDispatchRecordsNoBypassAndForegroundRecordsOne(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		if code := runAgentReview([]string{
 			"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-			"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+			"--head-sha", head, "--branch", "feature/review",
 			"--org-role", "joltra", "--foreground", "--home", home,
 		}, &stdout, &stderr); code != 0 {
 			t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())
@@ -2093,7 +1744,7 @@ func TestAgentReviewJSONStillBypassesForAnUnexpressibleFlagAndNamesOnlyIt(t *tes
 	var stdout, stderr bytes.Buffer
 	if code := runAgentReview([]string{
 		"reviewer", "Review this.", "--repo", "owner/repo", "--pr", "12",
-		"--head-sha", head, "--branch", "feature/review", "--lead", "implementer",
+		"--head-sha", head, "--branch", "feature/review",
 		"--org-role", "joltra", "--skip-native-review-fanout", "--home", home, "--json",
 	}, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit stdout=%q stderr=%q", stdout.String(), stderr.String())

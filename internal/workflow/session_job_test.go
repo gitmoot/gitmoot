@@ -21,7 +21,7 @@ func TestOpenExternalJobCreatesRunningNoQueue(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"ask"}, "gitmoot/gitmoot")
 
-	job, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).OpenExternalJob(ctx, JobRequest{
+	job, err := (Mailbox{store: store}).OpenExternalJob(ctx, JobRequest{
 		ID:      "session-ask-lead-1",
 		Agent:   "lead",
 		Action:  "ask",
@@ -266,7 +266,7 @@ func TestCloseExternalJobRecordsPRAndBranch(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
 
-	if _, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).OpenExternalJob(ctx, JobRequest{
+	if _, err := (Mailbox{store: store}).OpenExternalJob(ctx, JobRequest{
 		ID:     "session-review",
 		Agent:  "lead",
 		Action: "review",
@@ -274,7 +274,7 @@ func TestCloseExternalJobRecordsPRAndBranch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
-	closed, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).CloseExternalJobWithUsage(ctx, "session-review", AgentResult{
+	closed, err := (Mailbox{store: store}).CloseExternalJobWithUsage(ctx, "session-review", AgentResult{
 		Decision: "approved",
 		Summary:  "reviewed",
 	}, 42, "reviewed-head", "feat/x", ExternalJobUsage{})
@@ -302,7 +302,7 @@ func TestCloseExternalReviewPersistsReportedGrade(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"review"}, "gitmoot/gitmoot")
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mb := Mailbox{store: store}
 
 	if _, err := mb.OpenExternalJob(ctx, JobRequest{
 		ID:     "session-review-grade",
@@ -335,7 +335,7 @@ func TestCloseExternalJobErrors(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"ask"}, "gitmoot/gitmoot")
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mb := Mailbox{store: store}
 
 	// Unknown id.
 	if _, err := mb.CloseExternalJobWithUsage(ctx, "nope", AgentResult{Decision: "approved"}, 0, "", "", ExternalJobUsage{}); err == nil {
@@ -375,7 +375,7 @@ func TestCloseExternalJobAfterGhostReaperReturnsCleanAlreadyClosedError(t *testi
 	ctx := context.Background()
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"ask"}, "gitmoot/gitmoot")
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mb := Mailbox{store: store}
 	if _, err := mb.OpenExternalJob(ctx, JobRequest{
 		ID:         "session-race",
 		Agent:      "lead",
@@ -422,7 +422,7 @@ func TestRetryJobRefusesSessionJob(t *testing.T) {
 	store := openEngineStore(t)
 	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
 
-	mb := Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}
+	mb := Mailbox{store: store}
 	if _, err := mb.OpenExternalJob(ctx, JobRequest{ID: "sess-retry", Agent: "lead", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("OpenExternalJob returned error: %v", err)
 	}
@@ -469,7 +469,7 @@ func hasEventKind(events []db.JobEvent, kind string) bool {
 // which point that arm stops being merely defensive and needs a real fixture.
 func TestOpenExternalJobRefusesAReviewWithNeitherAgentNorActingRole(t *testing.T) {
 	store := openEngineStore(t)
-	_, err := (Mailbox{store: store, resolveDeliveryWorktree: ExcludedDeliveryWorktreeResolver("test_explicit_no_worktree")}).
+	_, err := (Mailbox{store: store}).
 		OpenExternalJob(context.Background(), JobRequest{
 			ID:          "session-no-identity",
 			Action:      "review",
