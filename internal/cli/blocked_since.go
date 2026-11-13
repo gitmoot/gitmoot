@@ -155,7 +155,7 @@ func (d directiveTTLDependencies) sweepWindow(ctx context.Context, store *db.Sto
 }
 
 // enabledBlockedSinceEventSink preserves the blocked-since path's stricter
-// off-by-default contract: a configured webhook alone is not enough; at least
+// off-by-default contract: at least
 // one enabled organization event rule must exist before either evaluator does
 // any episode work or emits a synthesized event.
 func enabledBlockedSinceEventSink(ctx context.Context, store *db.Store, home string) (events.Sink, error) {

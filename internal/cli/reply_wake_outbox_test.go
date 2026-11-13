@@ -1271,7 +1271,6 @@ func installReplyWakeProductionSink(t *testing.T, worker jobWorker, sink *eventR
 		} else {
 			delete(eventSinkCache.rules, key)
 		}
-		delete(eventSinkCache.webhooks, home)
 		eventSinkCache.Unlock()
 	})
 }

@@ -113,9 +113,8 @@ type jobWorker struct {
 	// it is a shared pointer across all per-repo dispatch passes so the cap is
 	// process-global (host-global for the normal single-daemon deployment).
 	Admission *admissionBudget
-	// EventSinkOverride lets a test inject a recording events.Sink (#446) without
-	// a config file / webhook. When nil (production), eventSink() resolves the
-	// shared process-global webhook sink from [events] config instead.
+	// EventSinkOverride lets a test inject a recording events.Sink (#446). When
+	// nil (production), eventSink() resolves the shared event-rule sink.
 	EventSinkOverride events.Sink
 	// AuthProbe is the injected doctor-style live credential probe (#532 slice B).
 	// It gates re-dispatch of a runtime_auth deferral: once the coarse hold elapses
@@ -139,12 +138,12 @@ type jobWorker struct {
 }
 
 // eventSink resolves the best-effort outbound event Sink (#446) for the
-// worker's home, or nil when [events] is OFF (the default). It is the seam
+// worker's home, or nil when there is no store. It is the seam
 // finishQueuedJob / handleRunJobError use to emit the DAEMON-owned terminal
 // cases (pre-flight queued->failed/blocked and permission-blocked
 // running->blocked) that never pass through the engine's Mailbox chokepoint. The
-// underlying webhook sink is a process-global singleton, so this is a cheap
-// cache hit on the hot path. A test override short-circuits config resolution.
+// underlying event-rule sink is cached per home, so this is a cheap cache hit
+// on the hot path. A test override short-circuits resolution.
 func (w jobWorker) eventSink() events.Sink {
 	if w.EventSinkOverride != nil {
 		return w.EventSinkOverride
@@ -627,7 +626,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		// Mailbox chokepoint), exactly like the MID-RUN permission block in
 		// handleRunJobError which already emits job.blocked. Emit here too so both
 		// halves of the permission-blocked terminal case are covered; gated on the
-		// genuine transition above, nil-safe when [events] is OFF. The following
+		// genuine transition above, nil-safe when no event rule is enabled. The following
 		// finalizePreflightDelegationChild only attaches a synthetic result
 		// (savePayload, no transition), so it never re-emits.
 		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
@@ -1242,7 +1241,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	// worker (not the WorkflowFactory-captured copy) so it observes this worker's
 	// EventSink for the first-class job.deferred emit. When a delivery-seam failure
 	// classifies as a retryable operational blocker the mailbox re-queues the job
-	// BEFORE the terminal transition, so no job.failed reaches the [events] sink.
+	// BEFORE the terminal transition, so no job.failed reaches the event sink.
 	engine.BlockerDeferrer = w.deferOperationalBlockerPreTerminal
 	if !remoteReviewAdmitted {
 		runCtx, stopRun = w.runningJobContext(ctx, job.ID)

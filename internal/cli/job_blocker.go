@@ -895,9 +895,9 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	if transitioned {
 		// PRE-TERMINAL (#532 slice E): m.fail was never called, so NO job.failed was
 		// emitted for this run. Emit the additive job.deferred as the FIRST-CLASS
-		// terminal-set transition for this run — the [events] stream sees the deferral
+		// terminal-set transition for this run — the event stream sees the deferral
 		// directly, with no preceding failed→deferred flap. Best-effort and nil-safe
-		// when [events] is OFF, mirroring the daemon's other emits.
+		// when no event rule is enabled, mirroring the daemon's other emits.
 		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, jobID, daemonTerminalDeferred, string(workflow.JobQueued), message)
 	}
 	return transitioned, nil

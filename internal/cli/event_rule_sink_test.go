@@ -193,14 +193,13 @@ func TestBlockedWakeTargetsRecordedOrResolvedOwnerPlusObservers(t *testing.T) {
 		repo           string
 		jobRole        string
 		wantRoles      []string
-		wantTarget     string
 		useTerminal    bool
 		archiveJobRole bool
 	}{
-		{name: "terminal uses current recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
-		{name: "terminal falls back from removed workflow role", repo: "gitmoot/gitmoot", jobRole: "retired", useTerminal: true, wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
-		{name: "terminal falls back from archived workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, archiveJobRole: true, wantRoles: []string{"jarvis", "owner"}, wantTarget: "owner"},
-		{name: "blocked-since resolves repo owner", repo: "gitmoot/gitmoot", wantRoles: []string{"jarvis", "lane"}, wantTarget: "lane"},
+		{name: "terminal uses current recorded workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, wantRoles: []string{"jarvis", "lane"}},
+		{name: "terminal falls back from removed workflow role", repo: "gitmoot/gitmoot", jobRole: "retired", useTerminal: true, wantRoles: []string{"jarvis", "lane"}},
+		{name: "terminal falls back from archived workflow role", repo: "gitmoot/gitmoot", jobRole: "lane", useTerminal: true, archiveJobRole: true, wantRoles: []string{"jarvis", "owner"}},
+		{name: "blocked-since resolves repo owner", repo: "gitmoot/gitmoot", wantRoles: []string{"jarvis", "lane"}},
 		{name: "repo without owner is observers only", repo: "unknown/repo", wantRoles: []string{"jarvis"}},
 	}
 	for _, test := range tests {
@@ -246,8 +245,7 @@ pane="w1:p4"
 					t.Fatal(err)
 				}
 			}
-			recorded := &recordingSink{}
-			sink := &eventRuleSink{inner: recorded, store: store, home: home}
+			sink := &eventRuleSink{store: store, home: home}
 			if test.archiveJobRole {
 				if err := store.UpsertOrgRoleArchived(ctx, db.OrgRoleArchived{
 					Role: test.jobRole, ArchivedAt: "2026-08-31T00:00:00Z",
@@ -269,10 +267,6 @@ pane="w1:p4"
 			}
 			if got := pendingWakeTargetRoles(t, store); !reflect.DeepEqual(got, test.wantRoles) {
 				t.Fatalf("blocked wake targets = %v, want %v", got, test.wantRoles)
-			}
-			gotEvents := recorded.byType(events.EventJobBlocked)
-			if len(gotEvents) != 1 || gotEvents[0].WakeTargetRole != test.wantTarget {
-				t.Fatalf("blocked event target = %+v, want %q", gotEvents, test.wantTarget)
 			}
 		})
 	}
@@ -330,8 +324,7 @@ pane="w1:p4"
 	}); err != nil {
 		t.Fatal(err)
 	}
-	recorded := &recordingSink{}
-	sink := &eventRuleSink{inner: recorded, store: store, home: home}
+	sink := &eventRuleSink{store: store, home: home}
 	for range 2 {
 		emitDaemonTerminalEvent(ctx, sink, store, "docus-review", daemonTerminalBlocked, string(workflow.JobBlocked), "blocked")
 	}
@@ -339,11 +332,6 @@ pane="w1:p4"
 	for _, row := range mustListWakeOutbox(t, store) {
 		if row.TargetRole == "deimos" || row.TargetRole == "jarvis" {
 			t.Fatalf("tied global role %q was woken for an unowned repo", row.TargetRole)
-		}
-	}
-	for _, event := range recorded.byType(events.EventJobBlocked) {
-		if event.WakeTargetRole != "" {
-			t.Fatalf("blocked event addressed %q, want no guessed owner", event.WakeTargetRole)
 		}
 	}
 	jobEvents, err := store.ListJobEvents(ctx, "docus-review")
@@ -774,19 +762,13 @@ pane="w1:p3"
 	verdict := func(jobID, repo string) events.Event {
 		return events.Event{Type: events.EventJobFinished, Cause: events.EventCauseReviewVerdict, JobID: jobID, Repo: repo, PullRequest: 72, ReviewDecision: "changes_requested"}
 	}
-	// Driven through Emit, which old code also has, and checked on what was
-	// forwarded: the pre-fix sink passed the unattributed verdict on unaddressed.
-	recorded := &recordingSink{}
-	sink := &eventRuleSink{inner: recorded, store: store, home: home}
+	// Checked on the addressing Emit applies before rule evaluation: the pre-fix
+	// sink left the unattributed verdict unaddressed.
+	sink := &eventRuleSink{store: store, home: home}
 	emitted := func(jobID, repo string) events.Event {
 		t.Helper()
-		before := len(recorded.byType(events.EventJobFinished))
 		sink.Emit(ctx, verdict(jobID, repo))
-		all := recorded.byType(events.EventJobFinished)
-		if len(all) != before+1 {
-			t.Fatalf("verdict for %s was not forwarded", jobID)
-		}
-		return all[len(all)-1]
+		return sink.addressUnownedVerdictEvent(ctx, verdict(jobID, repo))
 	}
 
 	if got := emitted("unattributed", "acme/docus"); got.WakeTargetRole != "app" || !reflect.DeepEqual(got.WakeTargetRoles, []string{"app"}) {

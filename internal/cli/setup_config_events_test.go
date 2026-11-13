@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func TestRunConfigPathAndShow(t *testing.T) {
@@ -176,34 +175,6 @@ func TestRunSetupPreservesExistingAgentRepoAccess(t *testing.T) {
 		}
 		if !allowed {
 			t.Fatalf("lead lost access to %s", repo)
-		}
-	}
-}
-
-func TestRunEventsListsRepoJobAndLockEvents(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	seedCLIJob(t, store, db.Job{
-		ID:      "job-1",
-		Agent:   "lead",
-		Type:    "review",
-		State:   string(workflow.JobQueued),
-		Payload: mustJobPayload(t, workflow.JobPayload{Repo: "owner/repo", Branch: "task-1", PullRequest: 1}),
-	}, "queued")
-	acquireCLILock(t, store, db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"})
-	if _, err := store.ReleaseLockWithEvent(context.Background(), db.BranchLock{RepoFullName: "owner/repo", Branch: "task-1", Owner: "lead"}, db.BranchLockEvent{Kind: "released", Message: "done"}); err != nil {
-		t.Fatalf("ReleaseLockWithEvent returned error: %v", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"events", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("events exit code = %d, stderr=%s", code, stderr.String())
-	}
-	for _, want := range []string{"job\tjob-1\tqueued\tqueued\tqueued", "lock\ttask-1\tlead\treleased\tdone"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("events output missing %q:\n%s", want, stdout.String())
 		}
 	}
 }

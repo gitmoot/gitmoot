@@ -91,7 +91,7 @@ func (w jobWorker) afterQueuedJobTransition(ctx context.Context, jobID string, s
 		// transition (queued->failed|blocked) — this never reaches the engine's
 		// Mailbox.finishWithPayload chokepoint, so the daemon owns its emit. Gated
 		// on transitioned==true so it fires exactly once per genuine transition;
-		// nil-safe when [events] is OFF. The subsequent finalizePreflightDelegationChild
+		// nil-safe when no event rule is enabled. The subsequent finalizePreflightDelegationChild
 		// only attaches a synthetic result via savePayload (no further transition),
 		// so it does not double-emit.
 		if eventKind, ok := daemonTerminalEventKind(state); ok {
