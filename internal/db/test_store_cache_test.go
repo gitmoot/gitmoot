@@ -56,7 +56,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestCleanupObligationsRebuildPreservesLegacyRows":                       true,
 		"TestMigrationsUpgradeFromBeforeAutoFixRetirement":                       true,
 		"TestMessageInboxUpgradeIsAtomicAndNeverReplaysHistory":                  true,
-		"TestSkillOptRemovalMigrationReconcilesCandidateAndCanaryRows":           true,
 		"TestPresetDeliveryRemovalMigrationOnFreshHome":                          true,
 		"TestPipelineRemovalMigrationOnPreviousSchema":                           true,
 		"TestObservabilityRemovalMigrationOnPreviousSchema":                      true,
@@ -73,7 +72,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestMigrateAppendsTaskWorktreePath":                                     true,
 		"TestMigrateBackfillsRootID":                                             true,
 		"TestMigrationAddsRunnerAndOwnerBootColumns":                             true,
-		"TestMigrationCopiesPresetsToAgentTemplates":                             true,
 		"TestMigrationDeduplicatesExistingTaskBranches":                          true,
 		"TestOpenConfiguresSQLiteContentionPragmas":                              true,
 		"TestOpenConfiguresSynchronousNormal":                                    true,
@@ -87,6 +85,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	}
 	realPathTests["TestMigrateExecBackendAttemptsLifecycleGenerationNotNullPreservesRows"] = true
 	realPathTests["TestChatRemovalMigrationDropsTablesAndPendingChatWakes"] = true
+	// #2589: upgrades a database built from the migrations before the template
+	// table drop, then reopens the same file through the real Open path.
+	realPathTests["TestAgentTemplatesRemovalMigrationOnPreviousSchema"] = true
 	// #1753's table-drop migration: both arms need a real on-disk database,
 	// because the upgrade arm builds the PREVIOUS release's schema first and
 	// then reopens the same file to run the migration over it.

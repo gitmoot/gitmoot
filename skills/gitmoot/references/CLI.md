@@ -1791,10 +1791,7 @@ legitimately discuss historical commits. Hex strings that do not resolve to a
 commit, including mutation-hygiene SHA-256 restore hashes, do not warn.
 
 **The scan covers the instructions you pass on the command line, and nothing
-else.** Text contributed by the selected
-agent's own template is not scanned, so a stale commit cited inside a template
-body dispatches with no warning. If you drive dispatches through templates,
-treat this warning as covering your instructions only.
+else.**
 
 A PR the forge reports as a DRAFT is an author-controlled hold: it does not move
 its task to `awaiting_human_merge`, because no human merge decision has been
@@ -1885,7 +1882,7 @@ frees (a `requeued_runtime_busy` event is recorded) instead of being cancelled a
 dropped; `agent ask` stays synchronous and keeps its existing
 busy-session cancel behavior.
 
-This uses the same agent registry, repo access grants, cached template snapshot,
+This uses the same agent registry, repo access grants,
 runtime adapter, and local job history as PR-comment jobs. `agent review`
 keeps branch, worktree, and workflow lifecycle
 inside Gitmoot. `agent ask` is for analysis, planning, and questions only; it is
@@ -1901,7 +1898,7 @@ Configure managed background agent types:
 ```sh
 gitmoot agent type list
 gitmoot agent type show planner
-gitmoot agent type set planner --runtime omp --template planner --max-background 2 --idle-timeout 20m
+gitmoot agent type set planner --runtime omp --max-background 2 --idle-timeout 20m
 gitmoot agent type set planner --model anthropic/claude-sonnet-4-5
 gitmoot agent type set planner --effort high
 gitmoot agent gc
@@ -1920,95 +1917,6 @@ instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
 (the `ask` action) dispatches to the managed type synchronously; background
 `run`/`review` to a type and `[parallel_sessions]` temp-session
 forking use the **background** path. See WORKFLOWS.md → "Running one agent's jobs in parallel".
-
-## Agent Templates
-
-Agent templates are **read-only installed data** (#2204). Gitmoot inspects them
-and reads an installed row's content into a job payload so it reaches the
-agent's prompt. It cannot author, update, or distribute one: there is no
-`draft`, `validate`, `add`, `export`, `publish`, `pull`, `remote`, `diff`,
-`revert`, or `update` verb, and no template-remote config section. A
-template that must change is edited or re-seeded directly in its
-`agent_templates` store row. That is the accepted trade, not an oversight.
-
-The two surviving verbs are read-only inspection:
-
-```sh
-gitmoot agent template list [--capability <cap>] [--runtime <runtime>] [--tag <tag>] [--output <output>]
-gitmoot agent template show <template-id>
-```
-
-`list` prints every built-in definition and every installed row: `available`
-means a built-in is registered but has no store row, `installed@<commit>` means
-a row exists. `show` prints the definition and its metadata and, when installed,
-the current version, content hash, source commit, promotion state, and content.
-
-Discover templates by metadata:
-
-```sh
-gitmoot agent template list --runtime omp --output plan
-gitmoot agent template list --tag review --capability ask
-gitmoot agent template show frontend-reviewer
-```
-
-Start an agent against an installed template:
-
-```sh
-gitmoot agent start thermo-review \
-  --runtime omp \
-  --repo owner/repo \
-  --template thermo-nuclear-code-quality-review \
-  --start-daemon
-```
-
-Templates are versioned in the store. An agent uses the current version by
-default, or a pinned version when configured with a reference such as
-`--template frontend-reviewer@v1`. Queued jobs keep the exact template content
-snapshot they were created with. The dashboard's Agents page shows a template's
-version history.
-
-For fast current-chat planning, use the Gitmoot skill with the same packaged
-`agent-templates/planner.md` instructions instead of starting a background job:
-
-```text
-Use the Gitmoot planner here. Write the implementation plan.
-```
-
-The current chat can also import any installed agent or template prompt:
-
-```sh
-gitmoot agent prompt frontend-reviewer
-gitmoot agent prompt frontend-reviewer --json
-```
-
-This prints the prompt content for the current chat to apply locally. It does
-not create a job, start a daemon, resume a runtime session, or post a PR
-comment — a free read-only peek.
-
-To track the here-method work by default, add `--record`: it opens a session
-job on import (see "Session jobs" below) and returns the prompt with a header
-line naming the job id, so the imported work shows in `job list` / the dashboard
-once you clock out:
-
-```sh
-gitmoot agent prompt frontend-reviewer --record [--repo owner/repo] [--type ask|review|implement] [--json]
-# prints:  [gitmoot session job <id> — when this work is complete, run:
-#           gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."]
-# followed by the prompt body.
-```
-
-`--record` accepts either a **registered agent** or a bare **template id**:
-
-- Registered agent: the repo comes from `--repo`, else the agent's `repo_scope`
-  (error if neither is set); the session job records the agent name.
-- Bare template (no agent of that name registered, e.g. the packaged `planner`):
-  `--repo owner/repo` is **required** — a template has no `repo_scope` to fall
-  back on — and the session job records the **template id** as its agent identity
-  (#673). The repo must be tracked (`gitmoot repo add owner/repo` first).
-
-`--type` defaults to `implement`. When the imported work is done, close the job
-with `gitmoot job close <id> --decision …`. `--json` includes the opened
-`job_id`. Without `--record`, behavior is unchanged (no job).
 
 ## Organization registry and scoped dispatch
 
@@ -3370,9 +3278,9 @@ no gates and is byte-identical to before this feature.
 
 ### Session jobs (record "here"-method work)
 
-The "here" method — importing an agent's prompt into your calling session with
-`gitmoot agent prompt <agent>` — does the real work in your session but creates
-**no gitmoot job**, so the dashboard / `job list` / event stream never reflect it.
+"Here"-method work — an agent doing the real work directly in your calling
+session — creates **no gitmoot job** on its own, so the dashboard / `job list` /
+event stream never reflect it.
 Session jobs record that work as a first-class tracked job **without gitmoot
 spawning a runtime** — a clock-in / clock-out pair (plus a one-shot recorder):
 
@@ -3480,16 +3388,12 @@ daemon-valued `jobs.runner_pid`, job timestamps, and event age do not decide thi
 status. This is observation only: it does not cancel, retry, reclaim, or feed the
 merge gate.
 
-**Make in-chat / "here" work show on the dashboard.** The one-step default is
-`gitmoot agent prompt <agent-or-template> --record`: it opens the session job *as
-you import the prompt* and prints a header naming the job id (see the `agent
-prompt` section above). It works for a registered agent (repo defaults to its
-scope) and for a bare template id with an explicit `--repo` (the template id is
-recorded as the identity, #673). Apply the prompt, do the work, then clock out with
-`gitmoot job close <id> --decision …`. That is all it takes for otherwise-invisible
-current-chat ("here") work to appear in `job list`, the dashboard, and the event
-stream — no daemon, no runtime, no PR comment. Use plain `agent prompt` (no
-`--record`) only when you just want to read a prompt without tracking it.
+**Make in-chat / "here" work show on the dashboard.** Clock in with
+`gitmoot job open --agent <agent> --repo owner/repo --type ask|review|implement`,
+do the work, then clock out with `gitmoot job close <id> --decision …`. That is
+all it takes for otherwise-invisible current-chat ("here") work to appear in
+`job list`, the dashboard, and the event stream — no daemon, no runtime, no PR
+comment.
 
 For a `queued` or `blocked` job, `gitmoot job list` appends a `WHY:` column and
 `gitmoot job show` prints a `why_stuck:` (and, when a lease applies, a

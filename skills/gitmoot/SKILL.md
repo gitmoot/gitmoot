@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, agent-templates, custom prompt agents, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, custom prompt agents, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
 metadata:
@@ -14,37 +14,24 @@ Gitmoot is a local-first coordinator for AI agents working across repositories,
 reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins, structured
-implementation plans, agent template workflows, custom
+implementation plans, custom
 prompt agents, or job status.
 
-For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
-<agent> here" means import the agent's prompt into this current chat and apply
-it. This is prompt import, not true system-prompt injection. The natural phrase
-"use the Gitmoot planner here" maps to the same `planner` template used by
-managed planner agents. If the planner template is not cached, read and apply
-the packaged `agent-templates/planner.md` instructions directly. Do not route a
-"here" request through a background `gitmoot agent ask` unless the user
-explicitly asks for background execution, PR-comment routing, or job tracking.
+For "use <agent> here" or "use Gitmoot agent <agent> here" requests, do the
+work directly in this current chat. "Use the Gitmoot planner here" means plan
+directly in this chat. Do not route a "here" request through a background
+`gitmoot agent ask` unless the user explicitly asks for background execution,
+PR-comment routing, or job tracking by the daemon.
 
-By DEFAULT, the "here" flow tracks the work: run
-`gitmoot agent prompt <agent> --record [--repo owner/repo]`, which opens a
-session job on import and returns the prompt with a header line naming its job
-id. Apply the prompt, do the work, then — this is REQUIRED — clock out with
+By DEFAULT, the "here" flow tracks the work as a session job: clock in with
+`gitmoot job open --agent <agent> --repo owner/repo --type ask|review|implement`
+(use `--type ask` for advisory work such as planning or research), do the work,
+then — this is REQUIRED — clock out with
 `gitmoot job close <id> --decision <approved|changes_requested|implemented|blocked|failed|skipped> --summary "..."`
 so the work shows in `job list`, the dashboard, and the event stream just like
 an engine-run job (no runtime is spawned; gitmoot is only the record-keeper).
-`--record` works for both a **registered agent** (repo defaults to its repo scope)
-and a bare **template** (e.g. the packaged `planner` above, when no `planner` agent
-exists): a template has no repo scope, so pass `--repo owner/repo` and the session
-job records the **template id** as its agent identity (#673). Omitting `--repo` for
-a bare template is a clear error.
-`--record` also defaults the job `--type` to `implement` — pass `--type ask` for
-advisory "here" work (planning, research) so it is not mislabeled.
-For a plain read-only peek — "just show me the prompt" — use
-`gitmoot agent prompt <agent>` WITHOUT `--record`, which opens no job. You can
-also clock in/out manually with `gitmoot job open` / `gitmoot job close`, or log
-already-finished work in one shot with `gitmoot job record` (see
-`references/CLI.md` → Session jobs).
+You can also log already-finished work in one shot with `gitmoot job record`
+(see `references/CLI.md` → Session jobs).
 
 For an in-session PR review, clock in with `--type review --pr <n> --head-sha
 <sha> --workflow <label>` and journal progress with `gitmoot workflow note
@@ -60,14 +47,6 @@ uses the verified daemon's descendant process tree instead: a runtime descendant
 owning that worktree is `in_progress`, while its conclusive sampled absence is
 `stalled`. That system observation is graded `observed` but remains explicitly
 `non_authoritative`; it triggers no cancellation or recovery policy.
-
-Agent templates are READ-ONLY installed data (#2204). Gitmoot can inspect and
-read them — `gitmoot agent template list`, `gitmoot agent template show <id>`,
-and `gitmoot agent prompt <agent-or-template>` to reuse an installed template in
-the current chat — but it cannot author, update, or distribute one. There is no
-draft, validate, add, export, publish, pull, remote, diff, revert, or update
-verb. A template that must change is edited or re-seeded in the
-`agent_templates` store row by hand. See CLI.md § Agent Templates.
 
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
@@ -92,8 +71,8 @@ snapshot when it is present and sufficient. If more detail is needed, run the
 relevant read-only Gitmoot CLI checks and answer directly from the results.
 Mention `gitmoot dashboard` (or `gitmoot dashboard --web` for a browser view of
 a running job tree) only after that answer, as a live monitoring
-follow-up. Do not start daemons, create agents, change subscriptions, update
-templates, or release locks unless the user asks for that action.
+follow-up. Do not start daemons, create agents, change subscriptions,
+or release locks unless the user asks for that action.
 
 ## Before Acting
 
@@ -102,7 +81,7 @@ templates, or release locks unless the user asks for that action.
    workflows or remote GitHub actions.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
-4. Do not start daemons, create agents, update agent templates, or change
+4. Do not start daemons, create agents, or change
    subscriptions, or release locks unless the user asks or the current task
    clearly requires it.
 5. Prefer the SessionStart snapshot and read-only status commands, then answer
@@ -128,8 +107,6 @@ from an unavailable Herdr source. Do not use nonexistent commands such as
 `gitmoot task show`. Use `gitmoot org events rule add|list|set-scope|rm` to manage opt-in
 organization event wakes; add validates the event kind, target org role, and
 `addressed` (default) or `observer` scope. Use
-`gitmoot agent prompt <agent-or-template>` to import an
-agent prompt into the current chat. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. To get an independent review of a pull
 request, use `gitmoot review request --pr <number>` and let Gitmoot choose the

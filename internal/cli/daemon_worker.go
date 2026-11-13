@@ -3075,14 +3075,6 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 	// A temp worker's session is started for this one job and disposed after it
 	// — single-use, so session-cumulative usage (codex, #658) is the job's cost.
 	tempAgent.SingleUseSession = true
-	var cachedTemplate db.AgentTemplate
-	if tempAgent.TemplateID != "" {
-		var err error
-		cachedTemplate, err = loadInstalledTemplate(ctx, w.Store, tempAgent.TemplateID)
-		if err != nil {
-			return tempWorkerStartResult{}, err
-		}
-	}
 	now := time.Now().UTC()
 	reserved := db.AgentInstance{
 		Name:           tempAgent.Name,
@@ -3091,7 +3083,6 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 		RuntimeRef:     "starting:" + tempAgent.Name,
 		RepoFullName:   payload.Repo,
 		Role:           tempAgent.Role,
-		TemplateID:     tempAgent.TemplateID,
 		Model:          tempAgent.Model,
 		Effort:         tempAgent.Effort,
 		Capabilities:   tempAgent.Capabilities,
@@ -3109,7 +3100,7 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
 		return tempWorkerStartResult{}, err
 	}
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: tempAgent, Prompt: agentStartupPrompt(tempAgent, cachedTemplate)})
+	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: tempAgent, Prompt: agentStartupPrompt(tempAgent)})
 	if err != nil {
 		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
 		return tempWorkerStartResult{}, err

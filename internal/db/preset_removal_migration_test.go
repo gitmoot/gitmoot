@@ -146,7 +146,11 @@ func TestPresetDeliveryRemovalMigrationOnPreChangeHome(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetAgent(%s) after upgrade: %v", name, err)
 		}
-		if agent.TemplateID != "thermo" || agent.Runtime != "codex" || agent.Role != "reviewer" {
+		var templateID string
+		if err := upgraded.db.QueryRowContext(ctx, `SELECT template_id FROM agents WHERE name = ?`, name).Scan(&templateID); err != nil {
+			t.Fatalf("read %s template_id after upgrade: %v", name, err)
+		}
+		if templateID != "thermo" || agent.Runtime != "codex" || agent.Role != "reviewer" {
 			t.Fatalf("agent %s lost fields across the upgrade: %+v", name, agent)
 		}
 	}

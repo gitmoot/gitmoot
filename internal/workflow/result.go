@@ -47,8 +47,7 @@ var ChecksBlockedKinds = []string{
 }
 
 // SessionJobActions is the set of job types a session job may be opened,
-// recorded or closed as (`gitmoot job open|close|record`, `agent prompt
-// --record`). It keeps "implement" because a seat that implements in its own
+// recorded or closed as (`gitmoot job open|close|record`). It keeps "implement" because a seat that implements in its own
 // session records that work as an implement job — the live traffic this surface
 // carries — even though nothing in Gitmoot dispatches one.
 var SessionJobActions = []string{"ask", "review", "implement"}

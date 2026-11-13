@@ -291,12 +291,11 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - `internal/keychain/` — resolves, validates and reads the operator keychain
   file (`keychain.env`) for `gitmoot key`, the review-level classifier key and
   the model-gateway credential.
-- Other notable `internal/` packages: `agenttemplate`, `report` (bug reports),
+- Other notable `internal/` packages: `report` (bug reports),
   `presence`, `memory`, `doctor`, `cockpit` (the herdr wake client + org
   provider), `plugin*`.
 - `skills/gitmoot/` — the packaged Agent Skill: `SKILL.md` + `references/`
-  (`CLI.md`, `WORKFLOWS.md`, `RESULT_CONTRACT.md`, `SAFETY.md`, …) +
-  `agent-templates/`.
+  (`CLI.md`, `WORKFLOWS.md`, `RESULT_CONTRACT.md`, `SAFETY.md`, …).
 - `scripts/` — repo scripts.
 
 ## Documentation — the skill ships with code
@@ -341,11 +340,7 @@ portable code behavior.
 - In E2E set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
   or panes leak to the prod Telegram group.
 - Global flags like `--home` use Go flag parsing, so they must precede positional
-  args (e.g. `agent template --home /tmp/h show <id>`, not after the id).
-- Agent templates are read-only installed data after #2204: gitmoot cannot
-  author, update, or distribute one, so seed or edit the `agent_templates` store
-  row directly. `agent template list` / `agent template show <id>` inspect what
-  is installed.
+  args (e.g. `job show --home /tmp/h <id>`, not after the id).
 - Killing a foreground `agent ask` strands a runtime-session resource lock;
   clear the lock to recover.
 - Agent permission policies gate the shell: `--policy workspace-write` (omp

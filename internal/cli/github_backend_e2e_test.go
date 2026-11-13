@@ -20,7 +20,7 @@ import (
 // fakeGitHubBackend is a SINGLE faithful in-memory "GitHub" sitting at the gh
 // wire boundary (a subprocess.Runner). The pipeline remote round-trip E2E shares
 // it across the write path (github.GhClient Upsert/Delete/Create) and the read
-// path (agenttemplate.GHFetcher ResolveRef/FetchFile/ListDir), so bytes a
+// path (ResolveRef/FetchFile/ListDir), so bytes a
 // publisher PUTs are EXACTLY the bytes a pull GETs back. Everything above the
 // wire is the real CLI code. If publish and pull disagreed on the path or the
 // encoding, the GET would 404 or decode to different bytes, and the byte-exact

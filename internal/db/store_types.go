@@ -22,49 +22,11 @@ type Agent struct {
 	Runtime        string
 	RuntimeRef     string
 	RepoScope      string
-	TemplateID     string
 	Model          string
 	Effort         string
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
-}
-
-type AgentTemplate struct {
-	ID             string
-	Name           string
-	Description    string
-	SourceRepo     string
-	SourceRef      string
-	SourcePath     string
-	ResolvedCommit string
-	Content        string
-	MetadataJSON   string
-	VersionID      string
-	VersionNumber  int
-	VersionState   string
-	ContentHash    string
-	CreatedAt      string
-	UpdatedAt      string
-}
-
-type AgentTemplateVersion struct {
-	ID             string
-	TemplateID     string
-	VersionNumber  int
-	State          string
-	Name           string
-	Description    string
-	SourceRepo     string
-	SourceRef      string
-	SourcePath     string
-	ResolvedCommit string
-	ContentHash    string
-	Content        string
-	MetadataJSON   string
-	CreatedAt      string
-	UpdatedAt      string
-	PromotedAt     string
 }
 
 type AgentRepo struct {
@@ -79,7 +41,6 @@ type AgentInstance struct {
 	RuntimeRef     string
 	RepoFullName   string
 	Role           string
-	TemplateID     string
 	Model          string
 	Effort         string
 	Capabilities   []string

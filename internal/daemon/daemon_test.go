@@ -20,24 +20,12 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	repo := github.Repository{Owner: "gitmoot", Name: "gitmoot"}
-	if err := store.UpsertAgentTemplate(ctx, db.AgentTemplate{
-		ID:             "thermo-nuclear-code-quality-review",
-		Name:           "Thermo-Nuclear Code Quality Review",
-		SourceRepo:     "cursor/plugins",
-		SourceRef:      "main",
-		SourcePath:     "cursor-team-kit/skills/thermo-nuclear-code-quality-review/SKILL.md",
-		ResolvedCommit: "abc123",
-		Content:        "Review deeply.",
-	}); err != nil {
-		t.Fatalf("UpsertAgentTemplate returned error: %v", err)
-	}
 	if err := store.UpsertAgent(ctx, db.Agent{
 		Name:           "audit",
 		Role:           "reviewer",
 		Runtime:        "codex",
 		RuntimeRef:     "last",
 		RepoScope:      repo.FullName(),
-		TemplateID:     "thermo-nuclear-code-quality-review",
 		Capabilities:   []string{"review"},
 		AutonomyPolicy: "auto",
 		HealthStatus:   "ok",
@@ -90,9 +78,6 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	}
 	if !strings.HasPrefix(payload.WorkflowID, "adhoc/") {
 		t.Fatalf("strict comment dispatch workflow=%q, want auto label", payload.WorkflowID)
-	}
-	if payload.TemplateID != "thermo-nuclear-code-quality-review" || payload.TemplateResolvedCommit != "abc123" || payload.TemplateContent != "Review deeply." {
-		t.Fatalf("payload template snapshot = %+v", payload)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
 	if err != nil {

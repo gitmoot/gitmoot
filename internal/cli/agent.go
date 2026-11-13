@@ -16,11 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/github"
-
-	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/github"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -52,10 +50,6 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentReview(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
-	case "template":
-		return runAgentTemplate(args[1:], stdout, stderr)
-	case "prompt":
-		return runAgentPrompt(args[1:], stdout, stderr)
 	case "gc":
 		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
@@ -87,13 +81,11 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--template <template-id>] [--model model] [--effort effort] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
-	fmt.Fprintln(w, "  gitmoot agent template list|show|add|draft|validate|update|diff ...")
-	fmt.Fprintln(w, "  gitmoot agent prompt <agent-or-template> [--json] [--record [--repo owner/repo] [--type ask|review|implement]]")
 	fmt.Fprintln(w, "  gitmoot agent gc")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
 	fmt.Fprintln(w, "    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
@@ -1132,7 +1124,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --template <template-id> --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -1161,7 +1153,7 @@ func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
 	sort.Strings(names)
 	for _, name := range names {
 		entry := types[name]
-		fmt.Fprintf(stdout, "%s\t%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.Template, entry.MaxBackground)
+		fmt.Fprintf(stdout, "%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.MaxBackground)
 	}
 	return 0
 }
@@ -1276,7 +1268,6 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	runtimeName := fs.String("runtime", "", "agent runtime: omp")
-	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent type")
 	effort := fs.String("effort", "", "default reasoning effort for this agent type")
 	role := fs.String("role", "", "agent role")
@@ -1331,9 +1322,6 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "invalid runtime: managed agent types support omp")
 		return 2
 	}
-	if strings.TrimSpace(*templateID) != "" {
-		entry.Template = strings.TrimSpace(*templateID)
-	}
 	if strings.TrimSpace(*model) != "" {
 		entry.Model = strings.TrimSpace(*model)
 	}
@@ -1385,22 +1373,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	if len(capabilities) > 0 {
 		entry.Capabilities = compactValues(capabilities)
 	}
-	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(entry.Template, entry.Role, entry.Capabilities, name, []string{"ask"})
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid template: %v\n", err)
-		return 2
-	}
-	entry.Role = resolvedRole
-	entry.Capabilities = resolvedCapabilities
-	if entry.Template != "" {
-		if err := withStore(*home, func(store *db.Store) error {
-			_, err := loadInstalledTemplate(context.Background(), store, entry.Template)
-			return err
-		}); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
-			return 1
-		}
-	}
+	entry.Role, entry.Capabilities = resolveAgentDefaults(entry.Role, entry.Capabilities, name, []string{"ask"})
 	if err := config.SaveAgentType(paths, entry); err != nil {
 		fmt.Fprintf(stderr, "agent type set: %v\n", err)
 		return 1
@@ -1470,7 +1443,6 @@ func loadAgentTypeConfigWithPaths(home string) (config.Paths, map[string]config.
 func printAgentType(stdout io.Writer, entry config.AgentType) {
 	writeLine(stdout, "name: %s", entry.Name)
 	writeLine(stdout, "runtime: %s", entry.Runtime)
-	writeLine(stdout, "template: %s", entry.Template)
 	writeLine(stdout, "role: %s", entry.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(entry.Capabilities, ","))
 	writeLine(stdout, "policy: %s", runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy))
@@ -1492,7 +1464,6 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
 	role := fs.String("role", "", "agent role")
-	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent")
 	effort := fs.String("effort", "", "default reasoning effort for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
@@ -1545,17 +1516,12 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
 	}
-	resolvedRole, resolvedCapabilities, err := resolveAgentDefaults(*templateID, *role, capabilities, "agent", []string{"ask", "review", "implement"})
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid template: %v\n", err)
-		return 2
-	}
+	resolvedRole, resolvedCapabilities := resolveAgentDefaults(*role, capabilities, "agent", []string{"ask", "review", "implement"})
 	agent := runtime.Agent{
 		Name:           name,
 		Role:           resolvedRole,
 		Runtime:        strings.TrimSpace(*runtimeName),
 		RepoScope:      repo.FullName(),
-		TemplateID:     strings.TrimSpace(*templateID),
 		Model:          strings.TrimSpace(*model),
 		Effort:         strings.TrimSpace(*effort),
 		Capabilities:   resolvedCapabilities,
@@ -1574,31 +1540,18 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "start runtime: shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
 		return 1
 	}
-	var cachedTemplate db.AgentTemplate
 	if err := withStore(*home, func(store *db.Store) error {
 		if _, err := store.GetAgent(context.Background(), agent.Name); err == nil {
 			return fmt.Errorf("agent %s already exists", agent.Name)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if agent.TemplateID == "" {
-			return nil
-		}
-		installed, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID)
-		if err != nil {
-			return err
-		}
-		cachedTemplate = installed
 		return nil
 	}); err != nil {
-		if strings.HasPrefix(err.Error(), "agent template ") {
-			fmt.Fprintf(stderr, "%v\n", err)
-		} else {
-			fmt.Fprintf(stderr, "agent start: %v\n", err)
-		}
+		fmt.Fprintf(stderr, "agent start: %v\n", err)
 		return 1
 	}
-	prompt := agentStartupPrompt(agent, cachedTemplate)
+	prompt := agentStartupPrompt(agent)
 	adapter, err := agentStartAdapterFor(*home, agent.Runtime, record.CheckoutPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "load adapter: %v\n", err)
@@ -1636,7 +1589,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	persistType := !exists
 	if !exists {
 		entry = config.AgentType{
-			Name: agent.Name, Runtime: agent.Runtime, Template: agent.TemplateID,
+			Name: agent.Name, Runtime: agent.Runtime,
 			Model: agent.Model, Effort: agent.Effort, Role: agent.Role,
 			Capabilities:   append([]string(nil), agent.Capabilities...),
 			AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
@@ -1667,7 +1620,6 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	runtimeName := fs.String("runtime", "", "agent runtime: omp, or shell for no-LLM tests")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
 	role := fs.String("role", "", "agent role")
-	templateID := fs.String("template", "", "agent template")
 	model := fs.String("model", "", "default runtime model for this agent")
 	effort := fs.String("effort", "", "default reasoning effort for this agent")
 	policy := fs.String("policy", "auto", "autonomy policy")
@@ -1704,34 +1656,13 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	if len(normalizedRepos) > 0 {
 		repoScope = normalizedRepos[0]
 	}
-	trimmedTemplateID := strings.TrimSpace(*templateID)
-	if trimmedTemplateID != "" {
-		if _, ok := agenttemplate.Lookup(trimmedTemplateID); !ok {
-			if err := withStore(*home, func(store *db.Store) error {
-				_, err := loadInstalledTemplate(context.Background(), store, trimmedTemplateID)
-				return err
-			}); err != nil {
-				if strings.HasPrefix(err.Error(), "agent template ") {
-					fmt.Fprintf(stderr, "%v\n", err)
-				} else {
-					fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
-				}
-				return 1
-			}
-		}
-	}
-	resolvedRole, resolvedCapabilities, err := resolveTemplateDefaults(*templateID, *role, capabilities)
-	if err != nil {
-		fmt.Fprintf(stderr, "invalid template: %v\n", err)
-		return 2
-	}
+	resolvedRole, resolvedCapabilities := resolveAgentDefaults(*role, capabilities, "", nil)
 	agent := runtime.Agent{
 		Name:           name,
 		Role:           resolvedRole,
 		Runtime:        *runtimeName,
 		RuntimeRef:     *session,
 		RepoScope:      repoScope,
-		TemplateID:     strings.TrimSpace(*templateID),
 		Model:          strings.TrimSpace(*model),
 		Effort:         strings.TrimSpace(*effort),
 		Capabilities:   resolvedCapabilities,
@@ -1747,18 +1678,9 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
-		if agent.TemplateID != "" {
-			if _, err := loadInstalledTemplate(context.Background(), store, agent.TemplateID); err != nil {
-				return err
-			}
-		}
 		return persistAgentSubscription(context.Background(), store, agent, normalizedRepos)
 	}); err != nil {
-		if strings.HasPrefix(err.Error(), "agent template ") {
-			fmt.Fprintf(stderr, "%v\n", err)
-		} else {
-			fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
-		}
+		fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
 		return 1
 	}
 	if len(normalizedRepos) == 0 {
@@ -1769,68 +1691,16 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func resolveTemplateDefaults(templateID string, role string, capabilities []string) (string, []string, error) {
-	return resolveAgentDefaults(templateID, role, capabilities, "", nil)
-}
-
-func resolveAgentDefaults(templateID string, role string, capabilities []string, fallbackRole string, fallbackCapabilities []string) (string, []string, error) {
-	templateID = strings.TrimSpace(templateID)
+func resolveAgentDefaults(role string, capabilities []string, fallbackRole string, fallbackCapabilities []string) (string, []string) {
 	role = strings.TrimSpace(role)
-	resolvedCapabilities := compactValues(capabilities)
-	if templateID == "" {
-		if role == "" {
-			role = fallbackRole
-		}
-		if len(resolvedCapabilities) == 0 {
-			resolvedCapabilities = append([]string{}, fallbackCapabilities...)
-		}
-		return role, resolvedCapabilities, nil
-	}
-	logicalTemplateID, _ := db.SplitAgentTemplateReference(templateID)
-	definition, ok := agenttemplate.Lookup(logicalTemplateID)
-	if !ok {
-		if err := agenttemplate.ValidateID(logicalTemplateID); err != nil {
-			return "", nil, err
-		}
-		if role == "" {
-			if fallbackRole == "" {
-				return "", nil, fmt.Errorf("agent template %s does not define a default role; pass --role", templateID)
-			}
-			role = fallbackRole
-		}
-		if len(resolvedCapabilities) == 0 {
-			if len(fallbackCapabilities) == 0 {
-				return "", nil, fmt.Errorf("agent template %s does not define default capabilities; pass --capability", templateID)
-			}
-			resolvedCapabilities = append([]string{}, fallbackCapabilities...)
-		}
-		return role, resolvedCapabilities, nil
-	}
 	if role == "" {
-		role = definition.DefaultRole
+		role = fallbackRole
 	}
+	resolvedCapabilities := compactValues(capabilities)
 	if len(resolvedCapabilities) == 0 {
-		resolvedCapabilities = append([]string{}, definition.DefaultCapabilities...)
+		resolvedCapabilities = append([]string{}, fallbackCapabilities...)
 	}
-	if !definition.Mutation && containsValue(resolvedCapabilities, "implement") {
-		return "", nil, fmt.Errorf("agent template %s does not allow implement capability", definition.ID)
-	}
-	return role, resolvedCapabilities, nil
-}
-
-func loadInstalledTemplate(ctx context.Context, store *db.Store, templateID string) (db.AgentTemplate, error) {
-	logicalTemplateID, _ := db.SplitAgentTemplateReference(templateID)
-	if agenttemplate.IsRetired(logicalTemplateID) {
-		return db.AgentTemplate{}, retiredAgentTemplateError(logicalTemplateID)
-	}
-	cached, err := store.GetAgentTemplateReference(ctx, templateID)
-	if errors.Is(err, sql.ErrNoRows) {
-		// #2204 removed every authoring verb, so there is no command to point at:
-		// templates are read-only installed data and a missing row is installed by
-		// seeding it directly.
-		return db.AgentTemplate{}, fmt.Errorf("agent template %s is not installed; seed the agent_templates row for it first", logicalTemplateID)
-	}
-	return cached, err
+	return role, resolvedCapabilities
 }
 
 func persistAgentSubscription(ctx context.Context, store *db.Store, agent runtime.Agent, repos []string) error {
@@ -1844,7 +1714,7 @@ func persistAgentSubscription(ctx context.Context, store *db.Store, agent runtim
 // session — the shared body behind the dashboard's create-agent form. The agent
 // becomes addressable for jobs; a runtime session starts lazily when work is
 // delivered.
-func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, templateID, repoFullName string) error {
+func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, repoFullName string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("agent name is required")
@@ -1854,10 +1724,9 @@ func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, 
 		return errors.New("agent runtime is required")
 	}
 	agent := runtime.Agent{
-		Name:       name,
-		Runtime:    runtimeName,
-		TemplateID: strings.TrimSpace(templateID),
-		RepoScope:  strings.TrimSpace(repoFullName),
+		Name:      name,
+		Runtime:   runtimeName,
+		RepoScope: strings.TrimSpace(repoFullName),
 	}
 	repos := []string{}
 	if agent.RepoScope != "" {
@@ -1873,22 +1742,13 @@ func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, 
 	return persistAgentSubscription(ctx, store, agent, repos)
 }
 
-func agentStartupPrompt(agent runtime.Agent, cachedTemplate db.AgentTemplate) string {
+func agentStartupPrompt(agent runtime.Agent) string {
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "You are a Gitmoot-managed agent named %s.\n", agent.Name)
 	fmt.Fprintf(&builder, "Runtime: %s\n", agent.Runtime)
 	fmt.Fprintf(&builder, "Allowed repo: %s\n", agent.RepoScope)
 	fmt.Fprintf(&builder, "Role: %s\n", agent.Role)
 	fmt.Fprintf(&builder, "Capabilities: %s\n", strings.Join(agent.Capabilities, ","))
-	if agent.TemplateID != "" {
-		fmt.Fprintf(&builder, "Template: %s", agent.TemplateID)
-		if cachedTemplate.ResolvedCommit != "" {
-			fmt.Fprintf(&builder, " @ %s", cachedTemplate.ResolvedCommit)
-		}
-		builder.WriteString("\n\nTemplate instructions:\n")
-		builder.WriteString(strings.TrimRight(agenttemplate.InstructionsForContent(cachedTemplate.Content), "\n"))
-		builder.WriteString("\n\n")
-	}
 	builder.WriteString("Initialize this session for future Gitmoot jobs. Do not edit files, run long tasks, create commits, or open pull requests now. Reply with a short readiness acknowledgment only.")
 	return builder.String()
 }
@@ -2016,7 +1876,6 @@ type agentShowOutput struct {
 	Role         string   `json:"role"`
 	Capabilities []string `json:"capabilities"`
 	Policy       string   `json:"policy"`
-	TemplateID   string   `json:"template_id,omitempty"`
 	HealthStatus string   `json:"health_status"`
 	RepoScope    string   `json:"repo_scope,omitempty"`
 	AllowedRepos []string `json:"allowed_repos"`
@@ -2223,7 +2082,6 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 			Role:         agent.Role,
 			Capabilities: agent.Capabilities,
 			Policy:       runtime.NormalizeStoredAutonomyPolicy(agent.AutonomyPolicy),
-			TemplateID:   agent.TemplateID,
 			HealthStatus: agent.HealthStatus,
 			RepoScope:    agent.RepoScope,
 			AllowedRepos: repos,
@@ -2246,7 +2104,6 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 	writeLine(stdout, "role: %s", output.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(output.Capabilities, ","))
 	writeLine(stdout, "policy: %s", output.Policy)
-	writeLine(stdout, "template: %s", emptyText(output.TemplateID))
 	writeLine(stdout, "health: %s", output.HealthStatus)
 	writeLine(stdout, "repo_scope: %s", emptyText(output.RepoScope))
 	writeLine(stdout, "allowed_repos: %s", strings.Join(output.AllowedRepos, ","))
@@ -2426,7 +2283,6 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 	var (
 		existing db.Agent
 		record   db.Repo
-		cached   db.AgentTemplate
 	)
 	// Load + busy pre-flight: resolve the existing agent and its checkout, and
 	// refuse an agent with queued/running jobs BEFORE calling adapter.Start so a
@@ -2474,12 +2330,6 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
-		if existing.TemplateID != "" {
-			cached, err = loadInstalledTemplate(context.Background(), store, existing.TemplateID)
-			if err != nil {
-				return err
-			}
-		}
 		return nil
 	}); err != nil {
 		fmt.Fprintf(stderr, "agent restart: %v\n", err)
@@ -2493,7 +2343,7 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 	}
 	started, err := adapter.Start(context.Background(), runtime.StartRequest{
 		Agent:  runtimeAgent(existing),
-		Prompt: agentStartupPrompt(runtimeAgent(existing), cached),
+		Prompt: agentStartupPrompt(runtimeAgent(existing)),
 	})
 	if err != nil {
 		// adapter.Start failed: write NOTHING — runtime_ref + metadata stay as loaded.
@@ -2584,6 +2434,25 @@ func persistAgentHealth(home, name, status string) error {
 	})
 }
 
+func withReadOnlyStore(home string, fn func(*db.Store) error) error {
+	paths, err := pathsFromFlag(home)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(paths.Database); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("Gitmoot state is not initialized at %s; run gitmoot init first", paths.Home)
+		}
+		return fmt.Errorf("stat database: %w", err)
+	}
+	store, err := db.OpenReadOnly(paths.Database)
+	if err != nil {
+		return fmt.Errorf("open database read-only: %w", err)
+	}
+	defer store.Close()
+	return fn(store)
+}
+
 func withStore(home string, fn func(*db.Store) error) error {
 	return withStoreAndPaths(home, func(_ config.Paths, store *db.Store) error {
 		return fn(store)
@@ -2626,7 +2495,6 @@ func dbAgent(agent runtime.Agent) db.Agent {
 		Runtime:        agent.Runtime,
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
-		TemplateID:     agent.TemplateID,
 		Model:          agent.Model,
 		Effort:         agent.Effort,
 		Capabilities:   agent.Capabilities,
@@ -2643,7 +2511,6 @@ func runtimeAgent(agent db.Agent) runtime.Agent {
 		Runtime:        agent.Runtime,
 		RuntimeRef:     agent.RuntimeRef,
 		RepoScope:      agent.RepoScope,
-		TemplateID:     agent.TemplateID,
 		Model:          agent.Model,
 		Effort:         agent.Effort,
 		Capabilities:   agent.Capabilities,
