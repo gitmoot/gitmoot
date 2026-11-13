@@ -11,10 +11,10 @@ import (
 
 // The dead-tables migration (#2594) upgrades a populated database at the
 // previous schema through the real Open path: the groom verdict tables and
-// goals are gone, and tasks keep their goal_id.
+// goals and created_repos are gone, and tasks keep their goal_id.
 func TestDeadTablesMigrationDropsPopulatedTablesThroughOpen(t *testing.T) {
 	ctx := context.Background()
-	dropped := []string{"groom_llm_verdicts", "groom_quality_verdicts", "groom_stale_verdicts", "goals"}
+	dropped := []string{"groom_llm_verdicts", "groom_quality_verdicts", "groom_stale_verdicts", "goals", "created_repos"}
 	released := migrationsBefore(t, "DROP TABLE IF EXISTS groom_llm_verdicts")
 	path := filepath.Join(t.TempDir(), "previous.db")
 	raw, err := sql.Open("sqlite", path)
@@ -32,6 +32,7 @@ func TestDeadTablesMigrationDropsPopulatedTablesThroughOpen(t *testing.T) {
 		`INSERT INTO groom_quality_verdicts(content_hash, verdict, confidence) VALUES ('h2', 'keep', 0.9)`,
 		`INSERT INTO groom_stale_verdicts(content_hash, verdict) VALUES ('h3', 'stale')`,
 		`INSERT INTO goals(id, title) VALUES ('goal-1', 'planned goal')`,
+		`INSERT INTO created_repos(repo, purpose, session_id) VALUES ('owner/test-repo', 'train', 'train-1')`,
 	}
 	for _, statement := range seed {
 		if _, err := raw.ExecContext(ctx, statement); err != nil {
