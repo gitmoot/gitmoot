@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
@@ -21,7 +20,7 @@ import (
 //	auth.json           daemon_worker.go (codex staging)
 //	kimi-code.json      daemon_worker.go (kimi staging)
 //	keychain.env        pipeline/env_runtime.go, ResolveKeychainPath
-//	bridge.token        bridge.go, bridgeTokenName
+//	bridge.token        removed `gitmoot bridge` (#2582); live homes may still hold one
 //
 // The first five were the list this guard shipped with, and it was INCOMPLETE:
 // the review measured keychain.env and bridge.token resolving through the same
@@ -35,7 +34,7 @@ var credentialOverlayFileNames = []string{
 	"auth.json",
 	"kimi-code.json",
 	"keychain.env",
-	bridgeTokenName,
+	"bridge.token",
 }
 
 // This guard enters through the REAL REPOSITORY INDEX, because the index is
@@ -88,18 +87,15 @@ func TestNoCredentialOverlayFileIsTracked(t *testing.T) {
 // The ignore rules and the tracked-file guard stop a credential reaching the
 // INDEX. This asserts the property one level earlier, at the WRITERS: a
 // credential must never be placed relative to the working directory in the
-// first place. bridge.token had no such guard when #1810 was reviewed.
+// first place.
 func TestCredentialWritersRefuseANonAbsoluteHome(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, home := range []string{"", "   ", "relative/home", "."} {
-		if err := requireAbsoluteCredentialHome(home, "bridge.token"); err == nil {
+		if err := requireAbsoluteCredentialHome(home, runtimeAuthFileName); err == nil {
 			t.Fatalf("requireAbsoluteCredentialHome(%q) accepted a non-absolute home", home)
-		}
-		if _, err := ensureBridgeToken(config.Paths{Home: home}, false); err == nil {
-			t.Fatalf("ensureBridgeToken accepted home %q; a token would be written relative to the working directory", home)
 		}
 	}
 	// Nothing may have been created beside the package source while proving it.
@@ -110,13 +106,8 @@ func TestCredentialWritersRefuseANonAbsoluteHome(t *testing.T) {
 		}
 	}
 	// An absolute home still works: the guard must not break the feature.
-	paths := config.Paths{Home: t.TempDir()}
-	tokenPath, err := ensureBridgeToken(paths, false)
-	if err != nil {
-		t.Fatalf("ensureBridgeToken with an absolute home: %v", err)
-	}
-	if !filepath.IsAbs(tokenPath) || filepath.Dir(tokenPath) != paths.Home {
-		t.Fatalf("token path %q is not inside the absolute home %q", tokenPath, paths.Home)
+	if err := requireAbsoluteCredentialHome(t.TempDir(), runtimeAuthFileName); err != nil {
+		t.Fatalf("requireAbsoluteCredentialHome rejected an absolute home: %v", err)
 	}
 }
 
