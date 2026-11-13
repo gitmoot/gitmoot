@@ -21,7 +21,7 @@ control plane.
 
 ```sh
 curl -fsSL https://gitmoot.io/install.sh | sh
-gitmoot setup --repo owner/repo --path . --start-daemon
+gitmoot setup --repo owner/repo --path . --agent reviewer --runtime omp --session fresh:reviewer --start-daemon
 gitmoot doctor
 ```
 
