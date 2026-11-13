@@ -128,7 +128,6 @@ gitmoot plugin doctor
 
 ```sh
 gitmoot status --repo owner/repo
-gitmoot events --repo owner/repo
 gitmoot daemon start --poll 30s
 gitmoot daemon start --session <root-job-id>
 gitmoot daemon start
