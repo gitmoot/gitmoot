@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,17 +46,26 @@ pane = "w1:p2"
 	return home, paths
 }
 
-func TestCaptureQuotaRoleUnavailableOpensNoIncident(t *testing.T) {
-	store := daemonWorkerStore(t)
-	worker := jobWorker{Store: store}
-	now := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
-	cause := workflow.DeliveryError{Err: errors.New("You've hit your weekly limit - resets Jul 28, 1am (Europe/Berlin)")}
-	payload := workflow.JobPayload{ActingOrgRole: "review"}
-	if err := worker.quotaRoleUnavailableHooks().captureFailure(context.Background(), db.Job{ID: "omp-job"}, payload, runtime.Agent{Runtime: runtime.OmpRuntime}, cause, now); err != nil {
-		t.Fatal(err)
+// A quota incident persisted before #2587 against a runtime gitmoot has since
+// removed is a recognized historical identity, not corrupt data: it must not
+// refuse the role's omp or shell jobs. Unknown runtimes still fail closed.
+func TestRemovedRuntimeIncidentDoesNotRefuseOmpOrShell(t *testing.T) {
+	for _, removed := range []string{"claude", "codex", "kimi"} {
+		incident := db.OrgRoleUnavailable{Role: "review", Runtime: removed}
+		for _, selected := range []string{runtime.OmpRuntime, runtime.ShellRuntime} {
+			if orgRoleUnavailableRefusesRuntime(incident, selected) {
+				t.Fatalf("incident on removed runtime %q refused a %s dispatch", removed, selected)
+			}
+		}
 	}
-	if rows, err := store.ListActiveOrgRolesUnavailable(context.Background(), now); err != nil || len(rows) != 0 {
-		t.Fatalf("quota incidents = %+v err=%v", rows, err)
+	if !orgRoleUnavailableRefusesRuntime(db.OrgRoleUnavailable{Role: "review", Runtime: "not-a-runtime"}, runtime.OmpRuntime) {
+		t.Fatal("incident with an unrecognized runtime must still refuse (fail closed)")
+	}
+	if !orgRoleUnavailableRefusesRuntime(db.OrgRoleUnavailable{Role: "review", Runtime: ""}, runtime.OmpRuntime) {
+		t.Fatal("an unattributed incident keeps its whole-role meaning")
+	}
+	if !orgRoleUnavailableRefusesRuntime(db.OrgRoleUnavailable{Role: "review", Runtime: runtime.OmpRuntime}, runtime.OmpRuntime) {
+		t.Fatal("an omp incident must refuse an omp dispatch")
 	}
 }
 
@@ -100,9 +108,7 @@ func TestSuccessfulJobOnlyClearsQuotaRoleUnavailableForSameRuntime(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := worker.quotaRoleUnavailableHooks().recordRuntimeOutcome(
-		context.Background(), job, payload, runtime.Agent{Runtime: runtime.OmpRuntime}, nil, now,
-	); err != nil {
+	if err := worker.quotaRoleUnavailableHooks().clearOnSuccess(context.Background(), payload.ActingOrgRole, runtime.OmpRuntime); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, err := store.GetActiveOrgRoleUnavailable(context.Background(), "review", now); err != nil || found {

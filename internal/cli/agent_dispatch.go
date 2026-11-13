@@ -1425,11 +1425,11 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: jobRuntimeEventKind(overrideRuntime != ""), Message: jobRuntimeOverrideEventMessage(agent.Runtime, effectiveAgent, lockKey), Runtime: effectiveAgent.Runtime}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	quotaHooks := newQuotaRoleUnavailableHooks(store, request.Home)
-	recordRuntimeOutcome := func(runErr error) {
+	quotaHooks := newQuotaRoleUnavailableHooks(store)
+	clearRoleUnavailable := func() {
 		// Availability bookkeeping is deliberately best-effort here, as it is in
 		// the daemon worker: it must never replace the foreground job's outcome.
-		_ = quotaHooks.recordRuntimeOutcome(ctx, job, payload, effectiveAgent, runErr, time.Now().UTC())
+		_ = quotaHooks.clearOnSuccess(ctx, payload.ActingOrgRole, effectiveAgent.Runtime)
 	}
 	if request.Action == "ask" {
 		// Wire the home-aware registry defaults so a foreground ask with no
@@ -1441,10 +1441,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		mailbox.RuntimeDefaultEffort = runtimeDefaultEffortResolver(request.Home)
 		_, runErr := mailbox.Run(runCtx, job.ID, effectiveAgent, adapter)
 		if runErr != nil {
-			recordRuntimeOutcome(runErr)
 			return localAgentJobOutput{}, foregroundAskTimeoutError(runCtx, jobTimeout, runErr)
 		}
-		recordRuntimeOutcome(nil)
+		clearRoleUnavailable()
 		if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed", Message: "workflow advancement completed"}); err != nil {
 			return localAgentJobOutput{}, err
 		}
@@ -1457,13 +1456,12 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		_, runErr := engine.RunJob(runCtx, job.ID, effectiveAgent, adapter)
 		if runErr != nil {
 			if out, ok, _ := recoverAdvanceErrorOutput(ctx, store, job.ID, request, runErr); ok {
-				recordRuntimeOutcome(nil)
+				clearRoleUnavailable()
 				return out, nil
 			}
-			recordRuntimeOutcome(runErr)
 			return localAgentJobOutput{}, runErr
 		}
-		recordRuntimeOutcome(nil)
+		clearRoleUnavailable()
 	}
 	latest, err := store.GetJob(ctx, job.ID)
 	if err != nil {

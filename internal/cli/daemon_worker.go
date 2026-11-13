@@ -1233,9 +1233,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		readOnlyStateCleaned = true
 	}
 	if err != nil {
-		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, job, payload, agent, err, time.Now().UTC()); quotaErr != nil {
-			writeLine(w.Stdout, "job %s org-role quota unavailability capture failed: %v", job.ID, quotaErr)
-		}
 		// Operational-blocker deferral (#532 slice E): a run whose delivery failed on
 		// a classified OPERATIONAL blocker (runtime auth rejected, rate limit/quota,
 		// network/GitHub outage) is re-queued PRE-terminally by the mailbox's injected
@@ -1287,7 +1284,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		writeLine(w.Stdout, "job %s failed: %v", job.ID, err)
 		return nil
 	}
-	if clearErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, job, payload, agent, nil, time.Now().UTC()); clearErr != nil {
+	if clearErr := w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, payload.ActingOrgRole, agent.Runtime); clearErr != nil {
 		writeLine(w.Stdout, "job %s org-role quota unavailability clear failed: %v", job.ID, clearErr)
 	}
 	if err := engine.ReconcileTerminalDrivingJob(ctx, job.ID); err != nil {
@@ -2990,9 +2987,6 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 	err = w.recordUnrecordedResult(ctx, engine, err)
 	stopKillPending()
 	if err != nil {
-		if quotaErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, delegatedJob, payload, started.Agent, err, time.Now().UTC()); quotaErr != nil {
-			writeLine(w.Stdout, "job %s org-role quota unavailability capture failed: %v", delegatedJob.ID, quotaErr)
-		}
 		var markErr error
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			markErr = w.handleRunJobError(ctx, delegatedJob.ID, observedJobLifecycle(delegatedJob), context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
@@ -3013,7 +3007,7 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
 		return nil
 	}
-	if clearErr := w.quotaRoleUnavailableHooks().recordRuntimeOutcome(ctx, delegatedJob, payload, started.Agent, nil, time.Now().UTC()); clearErr != nil {
+	if clearErr := w.quotaRoleUnavailableHooks().clearOnSuccess(ctx, payload.ActingOrgRole, started.Agent.Runtime); clearErr != nil {
 		writeLine(w.Stdout, "job %s org-role quota unavailability clear failed: %v", delegatedJob.ID, clearErr)
 	}
 	if policy.MergeBack == config.ParallelSessionMergeBackSummary {
