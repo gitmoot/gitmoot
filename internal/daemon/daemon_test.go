@@ -3827,6 +3827,11 @@ func (f *fakeGitHub) BaseRequiresUpToDateHead(context.Context, github.Repository
 	return false, false, nil
 }
 
+func (f *fakeGitHub) RequiredStatusCheckContexts(context.Context, github.Repository, string) ([]string, bool, error) {
+	// Undetermined: the merge gate fails closed on action_required checks.
+	return nil, false, nil
+}
+
 func (f *fakeGitHub) GetPullRequest(_ context.Context, _ github.Repository, number int64) (github.PullRequest, error) {
 	f.getPullRequestCalls = append(f.getPullRequestCalls, number)
 	if f.getPullRequestErr != nil {

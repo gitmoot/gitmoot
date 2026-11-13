@@ -105,6 +105,12 @@ func (NoopClient) BaseRequiresUpToDateHead(context.Context, github.Repository, s
 	return false, false, nil
 }
 
+// RequiredStatusCheckContexts reports UNDETERMINED, which makes the merge gate
+// fail closed and keep blocking on an action_required check (#2605).
+func (NoopClient) RequiredStatusCheckContexts(context.Context, github.Repository, string) ([]string, bool, error) {
+	return nil, false, nil
+}
+
 func (NoopClient) GetCombinedStatus(context.Context, github.Repository, string) (github.CombinedStatus, error) {
 	return github.CombinedStatus{}, errors.ErrUnsupported
 }

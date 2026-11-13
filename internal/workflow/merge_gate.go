@@ -67,6 +67,7 @@ type MergeGateGitHub interface {
 	ListPullRequestChecks(ctx context.Context, repo github.Repository, number int64) ([]github.PullRequestCheck, error)
 	CreateCommitStatus(ctx context.Context, input github.CommitStatusInput) (github.CommitStatus, error)
 	BaseRequiresUpToDateHead(ctx context.Context, repo github.Repository, branch string) (required bool, known bool, err error)
+	RequiredStatusCheckContexts(ctx context.Context, repo github.Repository, branch string) (contexts []string, known bool, err error)
 	MergePullRequest(ctx context.Context, input github.MergePullRequestInput) (github.MergeResult, error)
 }
 
@@ -355,7 +356,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 		return g.gateMiss(reason), nil
 	}
 	if !pullRequestMerged(pr) && strings.TrimSpace(pr.State) != "closed" {
-		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, headSHA)
+		pendingDecision, isPending, reason, err := g.reviewAndCIGateMiss(ctx, repo, request, pr.BaseRef, headSHA)
 		if err != nil {
 			return MergeDecision{}, err
 		}
@@ -576,8 +577,9 @@ func (g PolicyMergeGate) gateMiss(reason MergeReason) MergeDecision {
 // policy miss; the caller must return pendingDecision as-is without escalating.
 // A non-empty reason with isPending=false means review and/or CI were evaluated
 // to completion and at least one is missing, stale, or failed - the caller
-// escalates. Both zero-value means the gate is clean.
-func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, headSHA string) (pendingDecision MergeDecision, isPending bool, reason MergeReason, err error) {
+// escalates. Both zero-value means the gate is clean. baseRef is the pull
+// request's base branch; evaluateStatuses consults its protection (#2605).
+func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Repository, request MergeRequest, baseRef string, headSHA string) (pendingDecision MergeDecision, isPending bool, reason MergeReason, err error) {
 	var miss MergeReason
 	if reviewErr := g.ensureFinalReviewCaptured(ctx, request, headSHA); reviewErr != nil {
 		var pending mergePending
@@ -591,7 +593,7 @@ func (g PolicyMergeGate) reviewAndCIGateMiss(ctx context.Context, repo github.Re
 			return MergeDecision{}, false, MergeReason{}, missErr
 		}
 	}
-	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), headSHA); ciErr != nil {
+	if ciErr := g.ensureStatuses(ctx, repo, int64(request.PullRequest), baseRef, headSHA); ciErr != nil {
 		var pending mergePending
 		if errors.As(ciErr, &pending) {
 			decision, dErr := g.pending(ctx, request, headSHA, pending.reason)
@@ -2579,8 +2581,8 @@ func isIntegrationWorktreeReview(payload JobPayload) bool {
 	return strings.TrimSpace(payload.DelegationID) != "" && strings.TrimSpace(payload.WorktreePath) != ""
 }
 
-func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) error {
-	externalCount, err := g.evaluateStatuses(ctx, repo, pullRequest, headSHA)
+func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Repository, pullRequest int64, baseRef string, headSHA string) error {
+	externalCount, err := g.evaluateStatuses(ctx, repo, pullRequest, baseRef, headSHA)
 	if err != nil {
 		return err
 	}
@@ -2593,13 +2595,30 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 // evaluateStatuses applies the native merge gate's explicit state semantics and
 // returns the total external status/check count. The caller chooses its
 // zero-signal policy: the native gate uses its bounded no-CI machinery.
-func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repository, pullRequest int64, headSHA string) (int, error) {
+//
+// #2605: a check run whose state is action_required and whose name is NOT a
+// required status-check context of the protection on baseRef is ignored
+// entirely (neither counted nor blocking). That needs the protection to be
+// KNOWN; an unknown protection, an empty baseRef or a lookup error keeps the
+// old fail-closed block. The lookup runs lazily, only when such a check is
+// seen and at most once per evaluation. Every other check still counts: a
+// pending non-required check holds the gate and a failed one blocks it,
+// because either can still be the real verdict on the head.
+//
+// A skipped check still means the head REPORTED CI, so it counts toward the
+// returned total and can never send the caller down the no-CI path. And once
+// a check was skipped, every required context other than the gate's own must
+// have reported as a check run or a commit status; a required context that
+// has not reported holds the gate pending, never success (#2605 review).
+func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repository, pullRequest int64, baseRef string, headSHA string) (int, error) {
 	status, err := g.GitHub.GetCombinedStatus(ctx, repo, headSHA)
 	if err != nil {
 		return 0, err
 	}
 	externalStatusCount := 0
+	reported := make(map[string]bool, len(status.Statuses))
 	for _, item := range status.Statuses {
+		reported[strings.TrimSpace(item.Context)] = true
 		if strings.HasPrefix(item.Context, "gitmoot/") {
 			if item.Context == GitmootMergeGateContext {
 				continue
@@ -2626,10 +2645,27 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 		return 0, err
 	}
 	externalCheckCount := 0
+	skippedCount := 0
+	var (
+		requiredLoaded bool
+		requiredKnown  bool
+		required       map[string]bool
+	)
 	for _, check := range checks {
 		name := strings.TrimSpace(check.Name)
+		reported[name] = true
 		if name == GitmootMergeGateContext {
 			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(check.State), "action_required") {
+			if !requiredLoaded {
+				requiredLoaded = true
+				requiredKnown, required = g.requiredStatusCheckContexts(ctx, repo, baseRef)
+			}
+			if requiredKnown && name != "" && !required[name] {
+				skippedCount++
+				continue
+			}
 		}
 		externalCheckCount++
 		if checkPending(check) {
@@ -2645,7 +2681,39 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			return 0, mergeBlocked{reason: fmt.Sprintf("external CI check %q is not successful", name)}
 		}
 	}
-	return externalCheckCount + externalStatusCount, nil
+	if skippedCount > 0 {
+		var missing []string
+		for name := range required {
+			if name != "" && name != GitmootMergeGateContext && !reported[name] {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return 0, mergePending{reason: fmt.Sprintf("required status check %q has not reported", missing[0])}
+		}
+	}
+	return externalCheckCount + externalStatusCount + skippedCount, nil
+}
+
+// requiredStatusCheckContexts loads the required status-check contexts of the
+// protection on baseRef as a set. known=false for an empty baseRef, an
+// undetermined protection or a lookup error, so evaluateStatuses fails closed
+// (#2605).
+func (g PolicyMergeGate) requiredStatusCheckContexts(ctx context.Context, repo github.Repository, baseRef string) (bool, map[string]bool) {
+	baseRef = strings.TrimSpace(baseRef)
+	if baseRef == "" {
+		return false, nil
+	}
+	contexts, known, err := g.GitHub.RequiredStatusCheckContexts(ctx, repo, baseRef)
+	if err != nil || !known {
+		return false, nil
+	}
+	required := make(map[string]bool, len(contexts))
+	for _, name := range contexts {
+		required[strings.TrimSpace(name)] = true
+	}
+	return true, required
 }
 
 // concludeNoExternalCI is the layered defense for the #596 no-CI race. When a

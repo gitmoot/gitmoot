@@ -4156,10 +4156,13 @@ disables it (a negative value is rejected). Unlike `[orchestrate].escalation_ttl
 `blocked_ttl` dismisses a *single* blocked job and is off by default.
 
 Native task auto-merge is enabled by default only behind an exact-head approved
-review and green SHA-scoped commit statuses/check-runs. A gate miss parks the
-task as `awaiting_human_merge` and records an org escalation. It selects the
-repo's single owner and addresses that role's nearest live chart ancestor. With
-no single owner, including roles tied on scope and depth, it addresses a live
+review and green SHA-scoped commit statuses/check-runs. A check-run in
+`action_required` is ignored when the base branch's protection is known and does
+not require that check; any other non-passing check still holds or blocks. A gate
+miss parks the task as `awaiting_human_merge` and records an org escalation. It
+is sent from the PR's recorded owner role when that role is live, otherwise from
+the repo's single owner, and addresses that role's nearest live chart ancestor.
+With no single owner, including roles tied on scope and depth, it addresses a live
 `owner`; a root match addresses itself. With no live upward recipient, the gate
 fails closed without journaling an addressed note. Archive filtering does not
 predict delivery; `org validate` reports missing wake routes and pane bindings.

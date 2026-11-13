@@ -806,6 +806,9 @@ func mergeRuleRefusal(home, actingRole string) (bool, string) {
 // escalateMergeGateMiss writes the durable, operator-read escalation note. It is a DELIVERY
 // site, so it takes the MergeReason VALUE and performs the single Render itself -- the caller
 // never holds prose it could append to (#1381, site 7 of the append class).
+//
+// The escalation is from the pull request's recorded owner role when there is
+// one, not from whichever role owns the repo (#2605; mergeGateEscalationSender).
 func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request workflow.MergeRequest, reason workflow.MergeReason) error {
 	// Never escalate an empty operator instruction. FormatOrgEscalateNote renders a
 	// blank body as a valid header-only note, so a zero reason reaching here becomes a
@@ -832,7 +835,10 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 	}
 	cfg, _ := loadMergeGateOrgConfig(g.Home)
 	roster := loadOrgRoster(ctx, g.Store, cfg)
-	from, fromDeclared := mergeGateEscalationFrom(roster, cfg, request.Repo)
+	from, fromDeclared, err := g.mergeGateEscalationSender(ctx, roster, cfg, request)
+	if err != nil {
+		return err
+	}
 	// A miss the seat itself must fix goes back to that seat, not up the chart
 	// (owner decision 2026-10-08): the owner cannot record another seat's work,
 	// and escalating it only parked the PR in the owner's inbox. The escalation
@@ -851,6 +857,28 @@ func (g daemonMergeGate) escalateMergeGateMiss(ctx context.Context, request work
 		return errors.New("resolve merge-gate escalation recipient: no live org role is available on the upward route")
 	}
 	return g.journalMergeGateEscalation(ctx, request, label, from, to, reason)
+}
+
+// mergeGateEscalationSender picks the role a merge-gate escalation is from.
+// The pull request's recorded owner (implement-job acting role, then branch
+// lock, then implementer) wins when it is a live roster member; the resolver
+// can fall back to a bare agent name, which is not a role, so anything else
+// uses the repo owner (mergeGateEscalationFrom).
+//
+// #2605: repo ownership alone picked the deepest role whose scope listed the
+// repo, so a PR implemented by herdr-app escalated as its child herdrup-video,
+// a role that never touched it, and reached herdr-app instead of herdr-app's
+// own parent.
+func (g daemonMergeGate) mergeGateEscalationSender(ctx context.Context, roster orgRoster, cfg config.OrgConfig, request workflow.MergeRequest) (string, bool, error) {
+	owner, err := g.Store.ResolvePullRequestOwner(ctx, request.Repo, request.Branch, request.PullRequest, request.TaskID)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve merge-gate escalation sender: %w", err)
+	}
+	if owner = strings.TrimSpace(owner); orgRosterHasMember(roster, owner) {
+		return owner, true, nil
+	}
+	from, declared := mergeGateEscalationFrom(roster, cfg, request.Repo)
+	return from, declared, nil
 }
 
 // mergeGateSeatEscalationAuthor authors an escalation sent back to the seat

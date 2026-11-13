@@ -1343,3 +1343,84 @@ func TestMergeGateAttributionGapEscalatesToTheSeatNotTheOwner(t *testing.T) {
 		t.Fatalf("owner escalation = %q, want only the human-merge miss", byTo["owner"])
 	}
 }
+
+// #2605: themartianapp/herdrup PR #673 was implemented by herdr-app, but the CI
+// escalation was sent from=herdrup-video, a deeper child sharing the exact repo
+// scope that never touched the PR, so it reached herdr-app instead of jarvis.
+// The PR's recorded owner role is the sender; the repo owner is only the
+// fallback when no owner role is recorded.
+func TestMergeGateEscalationIsFromThePullRequestOwnerRole(t *testing.T) {
+	paths := config.PathsForHome(t.TempDir())
+	if err := config.Initialize(paths); err != nil {
+		t.Fatal(err)
+	}
+	content := config.DefaultConfig(paths) + `
+[org.roles."owner"]
+scope = ["*"]
+[org.roles."jarvis"]
+parent = "owner"
+scope = ["*"]
+[org.roles."herdr-app"]
+parent = "jarvis"
+scope = ["themartianapp/herdrup"]
+[org.roles."herdrup-video"]
+parent = "herdr-app"
+scope = ["themartianapp/herdrup"]
+`
+	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadOrg(paths); err != nil {
+		t.Fatalf("LoadOrg: %v", err)
+	}
+	const repo = "themartianapp/herdrup"
+	const head = "e52eb9630000000000000000000000000000beef"
+	ctx := context.Background()
+	store := daemonWorkerStore(t)
+	addImplement := func(id string, pullRequest int, actingRole string) {
+		payload, err := json.Marshal(map[string]any{
+			"repo": repo, "pull_request": pullRequest, "acting_org_role": actingRole,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CreateJob(ctx, db.Job{ID: id, Agent: "codex", Type: "implement", State: "succeeded", Payload: string(payload)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addImplement("session-implement-herdr-app-673", 673, "herdr-app")
+	// The resolver falls back to the implementing agent's bare name, which is
+	// not a role; that must not become the sender.
+	addImplement("implement-no-role-674", 674, "")
+	reason, err := workflow.GateMissReason("CI gate", `external CI check "mac-evidence/org-ios-sim-script-v1/ipad-script" is not successful`, head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := daemonMergeGate{Store: store, Home: paths.Home}
+
+	for _, tc := range []struct {
+		name        string
+		pullRequest int
+		wantFrom    string
+		wantTo      string
+	}{
+		{name: "owner role recorded", pullRequest: 673, wantFrom: "herdr-app", wantTo: "jarvis"},
+		{name: "agent name only falls back to repo owner", pullRequest: 674, wantFrom: "herdrup-video", wantTo: "herdr-app"},
+		{name: "no owner falls back to repo owner", pullRequest: 675, wantFrom: "herdrup-video", wantTo: "herdr-app"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workflowID := fmt.Sprintf("wf-%d", tc.pullRequest)
+			if err := gate.escalateMergeGateMiss(ctx, workflow.MergeRequest{Repo: repo, PullRequest: tc.pullRequest, WorkflowID: workflowID}, reason); err != nil {
+				t.Fatal(err)
+			}
+			notes, err := store.ListWorkflowNotes(ctx, workflowID, 0)
+			if err != nil || len(notes) != 1 {
+				t.Fatalf("notes = %+v err=%v, want one escalation", notes, err)
+			}
+			from, to, _, _, ok := workflow.ParseOrgEscalateNote(notes[0].Body)
+			if !ok || from != tc.wantFrom || to != tc.wantTo {
+				t.Fatalf("escalation from=%q to=%q, want %s -> %s", from, to, tc.wantFrom, tc.wantTo)
+			}
+		})
+	}
+}

@@ -5055,6 +5055,10 @@ type fakeMergeGateGitHub struct {
 	mergeQueueRule     github.MergeQueueRule
 	mergeQueueRequired bool
 	mergeQueueKnown    bool
+	requiredContexts   []string
+	requiredKnown      bool
+	requiredCalls      int
+	requiredBranches   []string
 }
 
 func (f *fakeMergeGateGitHub) GetPullRequest(context.Context, github.Repository, int64) (github.PullRequest, error) {
@@ -5109,6 +5113,11 @@ func (f *fakeMergeGateGitHub) BaseRequiresUpToDateHead(_ context.Context, _ gith
 		return false, false, f.strictErr
 	}
 	return f.strictBase, f.strictKnown, nil
+}
+func (f *fakeMergeGateGitHub) RequiredStatusCheckContexts(_ context.Context, _ github.Repository, branch string) ([]string, bool, error) {
+	f.requiredCalls++
+	f.requiredBranches = append(f.requiredBranches, branch)
+	return f.requiredContexts, f.requiredKnown, nil
 }
 func (f *fakeMergeGateGitHub) BaseMergeQueueRule(context.Context, github.Repository, string) (github.MergeQueueRule, bool, bool, error) {
 	return f.mergeQueueRule, f.mergeQueueRequired, f.mergeQueueKnown, nil
