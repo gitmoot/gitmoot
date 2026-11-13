@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/github"
@@ -24,9 +25,8 @@ func actionRequiredGateClient(checks ...github.PullRequestCheck) *fakeMergeGateG
 	}
 }
 
-func evaluateActionRequiredGate(t *testing.T, gh *fakeMergeGateGitHub) MergeDecision {
+func newActionRequiredGate(t *testing.T, gh *fakeMergeGateGitHub) PolicyMergeGate {
 	t.Helper()
-	ctx := context.Background()
 	store := openEngineStore(t)
 	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-job", Agent: "audit", Type: "review"}, JobPayload{
 		Repo:        "gitmoot/gitmoot",
@@ -36,12 +36,21 @@ func evaluateActionRequiredGate(t *testing.T, gh *fakeMergeGateGitHub) MergeDeci
 		ReviewRound: "review-1",
 		Result:      &AgentResult{Decision: "approved", Summary: "ready"},
 	})
-	gate := PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir()}
-	decision, err := gate.Evaluate(ctx, MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"})
+	return PolicyMergeGate{AutoMerge: true, Store: store, GitHub: gh, Git: &fakeMergeGateGit{clean: true}, CheckoutPath: t.TempDir()}
+}
+
+func evaluateActionRequiredGateWith(t *testing.T, gate PolicyMergeGate) MergeDecision {
+	t.Helper()
+	decision, err := gate.Evaluate(context.Background(), MergeRequest{Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", Reviewer: "audit"})
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
 	return decision
+}
+
+func evaluateActionRequiredGate(t *testing.T, gh *fakeMergeGateGitHub) MergeDecision {
+	t.Helper()
+	return evaluateActionRequiredGateWith(t, newActionRequiredGate(t, gh))
 }
 
 func TestMergeGateIgnoresNonRequiredActionRequiredCheck(t *testing.T) {
@@ -49,6 +58,8 @@ func TestMergeGateIgnoresNonRequiredActionRequiredCheck(t *testing.T) {
 		github.PullRequestCheck{Name: "HerdrKit and SwiftTerm (Linux)", State: "success"},
 		github.PullRequestCheck{Name: actionRequiredShard, State: "ACTION_REQUIRED"},
 	)
+	// A required context may report as a commit status rather than a check run.
+	gh.status.Statuses = []github.CommitStatus{{Context: "mac-evidence/org-ios-sim-build-v1", State: "success"}}
 	gh.requiredKnown = true
 	gh.requiredContexts = []string{"HerdrKit and SwiftTerm (Linux)", "mac-evidence/org-ios-sim-build-v1"}
 
@@ -62,6 +73,45 @@ func TestMergeGateIgnoresNonRequiredActionRequiredCheck(t *testing.T) {
 	}
 	if gh.requiredCalls != 1 || len(gh.requiredBranches) != 1 || gh.requiredBranches[0] != "main" {
 		t.Fatalf("protection lookups = %d %v, want exactly one for base main", gh.requiredCalls, gh.requiredBranches)
+	}
+}
+
+// #2605 review: once the only observed check is a skipped non-required
+// action_required check, the head must neither be read as "no CI" (which the
+// #596 machinery concludes as success after the grace window) nor pass while
+// a known required context has never reported.
+func TestMergeGateSkippedActionRequiredCheckNeverConcludesNoCI(t *testing.T) {
+	gh := actionRequiredGateClient(
+		github.PullRequestCheck{Name: actionRequiredShard, State: "action_required"},
+	)
+	gh.requiredKnown = true
+	gh.requiredContexts = []string{"required-ci"}
+	now := time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
+	gate := newActionRequiredGate(t, gh)
+	gate.Clock = func() time.Time { return now }
+
+	var reasons []string
+	for i, at := range []time.Duration{0, 11 * time.Minute} {
+		now = now.Add(at)
+		decision := evaluateActionRequiredGateWith(t, gate)
+		// Ready with a reason is the pending retry; only Merged is success.
+		if decision.Merged {
+			t.Fatalf("evaluation %d: decision = %+v, want no success while required-ci has not reported", i, decision)
+		}
+		reasons = append(reasons, decision.Reason.Render())
+	}
+	if len(gh.merges) != 0 {
+		t.Fatalf("merge inputs = %+v, want none", gh.merges)
+	}
+	for _, status := range gh.statuses {
+		if status.State == "success" {
+			t.Fatalf("statuses = %+v, want no success stamp", gh.statuses)
+		}
+	}
+	for i, reason := range reasons {
+		if !strings.Contains(reason, "required-ci") {
+			t.Fatalf("evaluation %d: reason = %q, want the unreported required check named", i, reason)
+		}
 	}
 }
 

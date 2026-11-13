@@ -1179,11 +1179,10 @@ func (c *GhClient) RequiredStatusCheckContexts(ctx context.Context, repo Reposit
 			contexts = append(contexts, check.Context)
 		}
 	}
-	rulesResult, runErr := c.run(ctx, false, "api", endpoint(repo, "rules", "branches", escaped)+"?per_page=100")
-	if runErr != nil {
-		return nil, false, nil
-	}
-	var rules []struct {
+	// Every page of the applicable rules is read (gh api --paginate); a
+	// required_status_checks rule on a later page must not be missed, and any
+	// failing page leaves the set UNDETERMINED (#2605 review).
+	type branchRule struct {
 		Type       string `json:"type"`
 		Parameters struct {
 			RequiredStatusChecks []struct {
@@ -1191,7 +1190,8 @@ func (c *GhClient) RequiredStatusCheckContexts(ctx context.Context, repo Reposit
 			} `json:"required_status_checks"`
 		} `json:"parameters"`
 	}
-	if json.Unmarshal([]byte(rulesResult.Stdout), &rules) != nil {
+	rules, rulesErr := apiPaginatedJSON[branchRule](ctx, c, endpoint(repo, "rules", "branches", escaped)+"?per_page=100")
+	if rulesErr != nil {
 		return nil, false, nil
 	}
 	for _, rule := range rules {

@@ -40,6 +40,25 @@ func TestRequiredStatusCheckContexts(t *testing.T) {
 		}
 	})
 
+	// #2605 review: gh api --paginate prints one JSON array per page. A
+	// required check that only appears on page 2 must still be returned.
+	t.Run("every rulesets page is read", func(t *testing.T) {
+		pages := `[{"type":"pull_request","parameters":{}}]` + "\n" +
+			`[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"page-two-check"}]}}]`
+		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{}`}, {Stdout: pages}}}
+		client := GhClient{Runner: runner}
+		contexts, known, err := client.RequiredStatusCheckContexts(context.Background(), repo, "main")
+		if err != nil || !known {
+			t.Fatalf("known=%v err=%v, want known/nil", known, err)
+		}
+		if !reflect.DeepEqual(contexts, []string{"page-two-check"}) {
+			t.Fatalf("contexts = %q, want the page-2 required check", contexts)
+		}
+		if args := strings.Join(runner.calls[1], " "); !strings.Contains(args, "--paginate") {
+			t.Fatalf("rules call = %q, want every page requested", args)
+		}
+	})
+
 	t.Run("protection without required checks is known and empty", func(t *testing.T) {
 		runner := &fakeRunner{results: []subprocess.Result{{Stdout: `{"enforce_admins":{"enabled":false}}`}, {Stdout: "[]"}}}
 		client := GhClient{Runner: runner}

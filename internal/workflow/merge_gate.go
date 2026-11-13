@@ -2608,13 +2608,21 @@ func (g PolicyMergeGate) ensureStatuses(ctx context.Context, repo github.Reposit
 // seen and at most once per evaluation. Every other check still counts: a
 // pending non-required check holds the gate and a failed one blocks it,
 // because either can still be the real verdict on the head.
+//
+// A skipped check still means the head REPORTED CI, so it counts toward the
+// returned total and can never send the caller down the no-CI path. And once
+// a check was skipped, every required context other than the gate's own must
+// have reported as a check run or a commit status; a required context that
+// has not reported holds the gate pending, never success (#2605 review).
 func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repository, pullRequest int64, baseRef string, headSHA string) (int, error) {
 	status, err := g.GitHub.GetCombinedStatus(ctx, repo, headSHA)
 	if err != nil {
 		return 0, err
 	}
 	externalStatusCount := 0
+	reported := make(map[string]bool, len(status.Statuses))
 	for _, item := range status.Statuses {
+		reported[strings.TrimSpace(item.Context)] = true
 		if strings.HasPrefix(item.Context, "gitmoot/") {
 			if item.Context == GitmootMergeGateContext {
 				continue
@@ -2641,6 +2649,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 		return 0, err
 	}
 	externalCheckCount := 0
+	skippedCount := 0
 	var (
 		requiredLoaded bool
 		requiredKnown  bool
@@ -2648,6 +2657,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 	)
 	for _, check := range checks {
 		name := strings.TrimSpace(check.Name)
+		reported[name] = true
 		if name == GitmootMergeGateContext {
 			continue
 		}
@@ -2657,6 +2667,7 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 				requiredKnown, required = g.requiredStatusCheckContexts(ctx, repo, baseRef)
 			}
 			if requiredKnown && name != "" && !required[name] {
+				skippedCount++
 				continue
 			}
 		}
@@ -2674,7 +2685,19 @@ func (g PolicyMergeGate) evaluateStatuses(ctx context.Context, repo github.Repos
 			return 0, mergeBlocked{reason: fmt.Sprintf("external CI check %q is not successful", name)}
 		}
 	}
-	return externalCheckCount + externalStatusCount, nil
+	if skippedCount > 0 {
+		var missing []string
+		for name := range required {
+			if name != "" && name != GitmootMergeGateContext && !reported[name] {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return 0, mergePending{reason: fmt.Sprintf("required status check %q has not reported", missing[0])}
+		}
+	}
+	return externalCheckCount + externalStatusCount + skippedCount, nil
 }
 
 // requiredStatusCheckContexts loads the required status-check contexts of the
