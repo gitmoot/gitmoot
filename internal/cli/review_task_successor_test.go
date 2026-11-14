@@ -14,7 +14,7 @@ import (
 
 // #2277: a stranded review task on a still-open PR must be able to get a new
 // exact-head review. Before the fix dispatch demanded a successor task that no
-// command could create. Now `gitmoot task successor` creates it and dispatch
+// command could create. Now `gitmoot pr successor` creates it and dispatch
 // binds the review to it, without resurrecting the stranded row.
 func TestStrandedReviewTaskGetsANewReviewThroughItsSuccessor(t *testing.T) {
 	repo := github.Repository{Owner: "jerryfane", Name: "numbra"}
@@ -50,11 +50,11 @@ func TestStrandedReviewTaskGetsANewReviewThroughItsSuccessor(t *testing.T) {
 
 			var stdout, stderr bytes.Buffer
 			if code := runTask([]string{"successor", strandedID, "--home", home, "--reason", "PR still open"}, &stdout, &stderr); code != 0 {
-				t.Fatalf("task successor exit %d: %s", code, stderr.String())
+				t.Fatalf("pr successor exit %d: %s", code, stderr.String())
 			}
 			successorID := strandedID + "-successor-2"
 			if !strings.Contains(stdout.String(), successorID) {
-				t.Fatalf("task successor output %q, want %s", stdout.String(), successorID)
+				t.Fatalf("pr successor output %q, want %s", stdout.String(), successorID)
 			}
 
 			bound, err := prepareLocalReviewTask(ctx, store, repo, request)

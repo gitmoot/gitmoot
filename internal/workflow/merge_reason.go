@@ -133,20 +133,25 @@ func (r MergeReason) SplitSeatActionable() (seat, rest MergeReason) {
 }
 
 // ImplementerAttributionGapReason is the review-gate cause recorded when no
-// implement work is attributed to the task.
+// implement work is attributed to the pr.
 const ImplementerAttributionGapReason = noImplementJobAttributionReason
 
 // IsSeatActionableGateCause reports a gate-miss cause whose remedy is an action
 // by the seat that wrote the change, not a decision for anyone above it. Today
-// that is the implementer-attribution gap: the remedy is `gitmoot job record`
-// by the implementing seat.
+// that is the implementer-attribution gap: the remedy is `gitmoot run record`
+// by the implementing seat. The pre-#2600 wording still matches.
 func IsSeatActionableGateCause(cause string) bool {
-	return strings.HasPrefix(strings.TrimSpace(cause), noImplementJobAttributionReason)
+	cause = strings.TrimSpace(cause)
+	return strings.HasPrefix(cause, noImplementJobAttributionReason) ||
+		strings.HasPrefix(cause, legacyNoImplementJobAttributionReason)
 }
 
 // IsImplementerAttributionGap reports whether operator text carries the
 // implementer-attribution gap, wherever it appears in the text. Owner-facing
-// renderers use it to replace the procedure with a plain explanation.
+// renderers use it to replace the procedure with a plain explanation. Stored
+// notes and wakes written before #2600 carry the old wording, so it matches
+// both.
 func IsImplementerAttributionGap(text string) bool {
-	return strings.Contains(text, noImplementJobAttributionReason)
+	return strings.Contains(text, noImplementJobAttributionReason) ||
+		strings.Contains(text, legacyNoImplementJobAttributionReason)
 }

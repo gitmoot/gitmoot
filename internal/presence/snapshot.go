@@ -126,7 +126,7 @@ func FormatSnapshot(snapshot Snapshot) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, "Current snapshot")
 	fmt.Fprintf(&b, "- daemon: %s\n", formatDaemon(snapshot.Daemon))
-	fmt.Fprintf(&b, "- tasks: %d%s\n", snapshot.Tasks, formatCounts(snapshot.TaskStates))
+	fmt.Fprintf(&b, "- prs: %d%s\n", snapshot.Tasks, formatCounts(snapshot.TaskStates))
 	fmt.Fprintf(&b, "- jobs: %d%s\n", snapshot.Jobs, formatCounts(snapshot.JobStates))
 	return strings.TrimRight(b.String(), "\n")
 }

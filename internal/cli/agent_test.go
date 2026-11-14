@@ -703,7 +703,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is dismissed", "create a successor"},
+			wantError: []string{"is dismissed", "gitmoot pr successor"},
 		},
 		{
 			// #1530: the rebind-on-divergence must NOT precede the disposal
@@ -714,7 +714,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 				request.Branch = "feature/review"
 				request.HeadSHA = strings.Repeat("0", 40)
 			},
-			wantError: []string{"is dismissed", "create a successor"},
+			wantError: []string{"is dismissed", "gitmoot pr successor"},
 		},
 		{
 			name: "requested task upsert",
@@ -722,7 +722,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
-			wantError: []string{"is dismissed", "create a successor"},
+			wantError: []string{"is dismissed", "gitmoot pr successor"},
 		},
 		{
 			name: "superseded matching branch",
@@ -730,7 +730,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is superseded", "create a successor with `gitmoot pr successor"},
+			wantError: []string{"is superseded", "gitmoot pr successor"},
 		},
 		{
 			name: "stranded requested task",
@@ -738,7 +738,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "stranded-by-id"
 			},
-			wantError: []string{"is stranded", "create a successor with `gitmoot pr successor"},
+			wantError: []string{"is stranded", "gitmoot pr successor"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -765,7 +765,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			test.setRequest(&request)
 			_, err = prepareLocalReviewTask(ctx, store,
 				github.Repository{Owner: "owner", Name: "repo"}, request)
-			if err == nil || !strings.Contains(err.Error(), "pr "+test.task.ID) {
+			if err == nil || !strings.Contains(err.Error(), "PR "+test.task.ID) {
 				t.Fatalf("prepareLocalReviewTask error = %v", err)
 			}
 			for _, fragment := range test.wantError {

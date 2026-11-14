@@ -36,6 +36,8 @@ var commandAliases = []commandAlias{
 	{old: []string{"agent"}, new: []string{"reviewer"}},
 	{old: []string{"agent", "ask"}, new: []string{"ask"}},
 	{old: []string{"agent", "review"}, new: []string{"reviewer", "review"}, notice: "review request --reviewer <name> --message <msg>"},
+	// #2600
+	{old: []string{"task"}, new: []string{"pr"}},
 }
 
 // aliasWarned records which old names already warned in this process.

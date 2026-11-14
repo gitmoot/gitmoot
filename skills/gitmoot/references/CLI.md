@@ -85,6 +85,10 @@ disagrees, trust its live `--help`.
 - [gitmoot plugin install omp](#gitmoot-plugin-install-omp)
 - [gitmoot plugin path](#gitmoot-plugin-path)
 - [gitmoot plugin path omp](#gitmoot-plugin-path-omp)
+- [gitmoot pr](#gitmoot-pr)
+- [gitmoot pr events](#gitmoot-pr-events)
+- [gitmoot pr list](#gitmoot-pr-list)
+- [gitmoot pr show](#gitmoot-pr-show)
 - [gitmoot repo](#gitmoot-repo)
 - [gitmoot repo add](#gitmoot-repo-add)
 - [gitmoot repo collisions](#gitmoot-repo-collisions)
@@ -118,9 +122,6 @@ disagrees, trust its live `--help`.
 - [gitmoot sandbox](#gitmoot-sandbox)
 - [gitmoot setup](#gitmoot-setup)
 - [gitmoot status](#gitmoot-status)
-- [gitmoot task](#gitmoot-task)
-- [gitmoot task events](#gitmoot-task-events)
-- [gitmoot task list](#gitmoot-task-list)
 - [gitmoot update](#gitmoot-update)
 - [gitmoot version](#gitmoot-version)
 - [gitmoot workflow](#gitmoot-workflow)
@@ -155,8 +156,8 @@ Commands:
   runtime    inspect runtime metadata (models, capabilities, usage)
   sandbox    probe kernel-enforced runtime sandbox support
   plugin     build and inspect Gitmoot agent plugins
-  status     show local workflow status
-  task       inspect review-cycle tasks
+  status     show local reviewer, pr and run counts
+  pr         inspect pull requests and their review state
   job        inspect and recover jobs
   findings   report the review findings ledger per repository
   workflow   inspect external-coordinator workflow groups and notes
@@ -402,9 +403,9 @@ Usage:
   gitmoot job gates clear <id> --need "<text>"|--all
   gitmoot job cancel <id>
   gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]
-  gitmoot job open --agent name --repo owner/repo --type ask|review|implement [--title ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]
+  gitmoot job open --agent name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]
   gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
-  gitmoot job record (--agent name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--task id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
+  gitmoot job record (--agent name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
 ```
 
 ## gitmoot job cleanup
@@ -543,10 +544,10 @@ Usage of job open:
     	optional existing parent job id
   -pr int
     	optional pull request number
+  -pr-id string
+    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
   -repo string
     	repo scope as owner/repo (must be tracked)
-  -task string
-    	optional task id to associate
   -title string
     	optional human title for the job
   -type string
@@ -583,14 +584,14 @@ Usage of job record:
     	optional existing parent job id
   -pr int
     	optional pull request number
+  -pr-id string
+    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
   -repo string
     	repo scope as owner/repo (must be tracked)
   -severity string
     	review severity: P0|P1|P2|P3
   -summary string
     	optional result summary
-  -task string
-    	optional task id to associate
   -title string
     	optional human title for the job
   -type string
@@ -1161,6 +1162,57 @@ Usage of plugin path omp:
     	home directory to use instead of the current user's home
 ```
 
+## gitmoot pr
+
+```text
+Usage:
+  gitmoot pr events <pr> [--repo owner/repo] [--json]
+  gitmoot pr list [--repo owner/repo] [--state state] [--json]
+  gitmoot pr show <pr> [--repo owner/repo] [--json]
+  gitmoot pr successor <id> [--reason text] [--json]
+
+<pr> is a pr id (review-pr-N-...), owner/repo#N, or N with --repo.
+pr list puts rows that have no pull request (old adhoc-/task- rows) last.
+```
+
+## gitmoot pr events
+
+```text
+Usage of pr events:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print pr events as JSON
+  -repo string
+    	repo for a bare pull request number
+```
+
+## gitmoot pr list
+
+```text
+Usage of pr list:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print prs as JSON
+  -repo string
+    	repo scope as owner/repo
+  -state string
+    	pr state filter (review state; GitHub state for a pr with no review)
+```
+
+## gitmoot pr show
+
+```text
+Usage of pr show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the pr as JSON
+  -repo string
+    	repo for a bare pull request number
+```
+
 ## gitmoot repo
 
 ```text
@@ -1633,39 +1685,6 @@ Usage of status:
     	home directory to use instead of the current user's home
   -repo string
     	filter pull requests by owner/repo
-```
-
-## gitmoot task
-
-```text
-Usage:
-  gitmoot task events <id> [--json]
-  gitmoot task list [--repo owner/repo] [--state state] [--json]
-  gitmoot task successor <id> [--reason text] [--json]
-```
-
-## gitmoot task events
-
-```text
-Usage of task events:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print task events as JSON
-```
-
-## gitmoot task list
-
-```text
-Usage of task list:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print tasks as JSON
-  -repo string
-    	repo scope as owner/repo
-  -state string
-    	task state filter
 ```
 
 ## gitmoot update

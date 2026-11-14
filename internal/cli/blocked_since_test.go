@@ -130,7 +130,7 @@ func TestEvaluateBlockedTaskEpisodesDigestsDueTasksAndMarksEachEpisode(t *testin
 		t.Fatalf("digest event = %+v", ev)
 	}
 	wantSince := tasks[1].blockedSince.UTC().Format(time.RFC3339) // task-oldest, the digest anchor
-	for _, want := range []string{"3 tasks blocked", "oldest 4h0m0s", "(since " + wantSince + ")", "task-oldest", "(+2 more)"} {
+	for _, want := range []string{"3 PRs blocked", "oldest 4h0m0s", "(since " + wantSince + ")", "task-oldest", "(+2 more)"} {
 		if !strings.Contains(ev.Detail, want) {
 			t.Fatalf("digest detail %q missing %q", ev.Detail, want)
 		}
@@ -180,7 +180,7 @@ func TestEvaluateBlockedTaskEpisodesSingleTaskUsesOneItemDigest(t *testing.T) {
 		t.Fatalf("job.blocked events = %d, want 1", len(blocked))
 	}
 	wantSince := now.Add(-2 * time.Hour).UTC().Format(time.RFC3339)
-	wantDetail := "1 tasks blocked — oldest 2h0m0s (since " + wantSince + ") — task-only"
+	wantDetail := "1 PRs blocked — oldest 2h0m0s (since " + wantSince + ") — task-only"
 	if ev := blocked[0]; ev.Detail != wantDetail || strings.Contains(ev.Detail, "(+") {
 		t.Fatalf("one-item digest detail = %q, want %q", ev.Detail, wantDetail)
 	}
@@ -556,7 +556,7 @@ func TestBlockedSinceReNudgesOncePerIntervalWhileStillBlocked(t *testing.T) {
 	}
 	blocked := sink.byType(events.EventJobBlocked)
 	for _, ev := range blocked {
-		if !strings.Contains(ev.Detail, "1 tasks blocked — oldest") || strings.Contains(ev.Detail, "(+") {
+		if !strings.Contains(ev.Detail, "1 PRs blocked — oldest") || strings.Contains(ev.Detail, "(+") {
 			t.Fatalf("re-nudge event is not a one-item digest: %q", ev.Detail)
 		}
 	}

@@ -49,7 +49,7 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 		{"workflow-describe", func(h string) []string { return []string{"workflow", "describe", "wf-1", h} }, "workflow describe"},
 		{"workflow-register", func(h string) []string { return []string{"workflow", "register", "wf-1", h} }, "workflow register"},
 		{"workflow-close", func(h string) []string { return []string{"workflow", "close", "wf-1", "--reason", h} }, "workflow close"},
-		{"task-successor", func(h string) []string { return []string{"task", "successor", "t-1", "--reason", h} }, "task successor"},
+		{"pr-successor", func(h string) []string { return []string{"pr", "successor", "t-1", "--reason", h} }, "pr successor"},
 		{"job-open", func(h string) []string {
 			return []string{"job", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", h}
 		}, "job open"},
@@ -100,7 +100,7 @@ func TestFreeTextCommandsRefuseFlagLikeText(t *testing.T) {
 		{"workflow", "describe", "wf-1", "-x"},
 		{"workflow", "register", "wf-1", "-x"},
 		{"workflow", "close", "wf-1", "--reason", "-x"},
-		{"task", "successor", "t-1", "--reason", "-x"},
+		{"pr", "successor", "t-1", "--reason", "-x"},
 		{"job", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
 		{"job", "close", "job-1", "--decision", "approve", "--summary", "-x"},
 		{"job", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", "-x"},

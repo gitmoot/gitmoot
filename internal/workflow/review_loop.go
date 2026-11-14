@@ -600,7 +600,7 @@ func sortedUniqueStrings(values []string) []string {
 
 func scopedReviewInstructions(event PullRequestEvent, scope *ReviewScope) string {
 	var instructions strings.Builder
-	fmt.Fprintf(&instructions, "Review pull request #%d as a scoped follow-up for task %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle))
+	fmt.Fprintf(&instructions, "Review pull request #%d as a scoped follow-up for PR record %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle))
 	instructions.WriteString(ReviewScopeInstructions(event.HeadSHA, scope))
 	return instructions.String()
 }

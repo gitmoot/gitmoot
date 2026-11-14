@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -29,7 +30,7 @@ func TestRunStatusIncludesUnscopedTasks(t *testing.T) {
 		t.Fatalf("status exit code = %d, stderr=%s", code, stderr.String())
 	}
 	output := stdout.String()
-	for _, want := range []string{"tasks: 1", "  planned: 1"} {
+	for _, want := range []string{"prs: 1", "  planned: 1"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("status output missing %q:\n%s", want, output)
 		}
@@ -66,23 +67,23 @@ func TestRunTaskList(t *testing.T) {
 	store.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"task", "list", "--home", home, "--repo", "gitmoot/gitmoot", "--state", "reviewing"}, &stdout, &stderr)
+	code := Run([]string{"pr", "list", "--home", home, "--repo", "gitmoot/gitmoot", "--state", "reviewing"}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("task list exit code = %d, stderr=%s", code, stderr.String())
+		t.Fatalf("pr list exit code = %d, stderr=%s", code, stderr.String())
 	}
 	output := stdout.String()
-	if !strings.Contains(output, "review-pr-12-3f3a1026\treviewing\tgitmoot/gitmoot\tfix/twelve\t/tmp/gitmoot/worktrees/gitmoot--gitmoot/review-pr-12\tReview PR #12") {
-		t.Fatalf("task list output = %q", output)
+	if !strings.Contains(output, "review-pr-12-3f3a1026\treviewing\tgitmoot/gitmoot#12\tfix/twelve\t/tmp/gitmoot/worktrees/gitmoot--gitmoot/review-pr-12\tReview PR #12") {
+		t.Fatalf("pr list output = %q", output)
 	}
 	if strings.Contains(output, "review-pr-13") {
-		t.Fatalf("task list did not apply state filter:\n%s", output)
+		t.Fatalf("pr list did not apply state filter:\n%s", output)
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"task", "list", "--home", home, "--repo", "gitmoot/gitmoot", "--json"}, &stdout, &stderr)
+	code = Run([]string{"pr", "list", "--home", home, "--repo", "gitmoot/gitmoot", "--json"}, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("task list --json exit code = %d, stderr=%s", code, stderr.String())
+		t.Fatalf("pr list --json exit code = %d, stderr=%s", code, stderr.String())
 	}
 	var decoded []taskListOutput
 	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
@@ -90,6 +91,116 @@ func TestRunTaskList(t *testing.T) {
 	}
 	if len(decoded) != 2 || decoded[0].ID != "review-pr-12-3f3a1026" || decoded[0].WorktreePath == "" {
 		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
+// TestPRListAndShowJoinTasksAndPullRequests pins #2600: a pr is one record read
+// from both tables. The review record (tasks) and the GitHub record
+// (pull_requests) join by the number in the id or by repo+branch; a pull
+// request never reviewed is listed with no id, and an old row with no pull
+// request is listed last under its own heading.
+func TestPRListAndShowJoinTasksAndPullRequests(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	for _, task := range []db.Task{
+		{ID: "review-pr-7-aa11bb22", RepoFullName: "o/r", GoalID: "local-review", Title: "Review PR #7", State: "dismissed", Branch: "feat/seven"},
+		{ID: "review-pr-7-aa11bb22-s1", RepoFullName: "o/r", GoalID: "local-review", Title: "Review PR #7", State: "ready_to_merge"},
+		{ID: "adhoc-old", RepoFullName: "o/r", Title: "old adhoc", State: "merged", Branch: "adhoc/old"},
+		{ID: "task-branchbound", RepoFullName: "o/r", Title: "branch bound", State: "pr_open", Branch: "feat/nine"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
+		}
+	}
+	for _, pr := range []db.PullRequest{
+		{RepoFullName: "o/r", Number: 7, URL: "https://github.com/o/r/pull/7", HeadBranch: "feat/seven", BaseBranch: "main", HeadSHA: "sha7", State: "open"},
+		{RepoFullName: "o/r", Number: 8, URL: "https://github.com/o/r/pull/8", HeadBranch: "feat/eight", BaseBranch: "main", HeadSHA: "sha8", State: "closed"},
+		{RepoFullName: "o/r", Number: 9, URL: "https://github.com/o/r/pull/9", HeadBranch: "feat/nine", BaseBranch: "main", HeadSHA: "sha9", State: "open"},
+	} {
+		if err := store.UpsertPullRequest(ctx, pr); err != nil {
+			t.Fatalf("UpsertPullRequest(%d): %v", pr.Number, err)
+		}
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pr", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr list exit = %d, stderr=%s", code, stderr.String())
+	}
+	var listed []taskListOutput
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatalf("decode: %v\n%s", err, stdout.String())
+	}
+	var got []string
+	for _, record := range listed {
+		got = append(got, fmt.Sprintf("%s|%d|%s|%s", record.ID, record.Number, record.State, record.GitHubState))
+	}
+	want := []string{
+		"review-pr-7-aa11bb22|7|dismissed|open",
+		"review-pr-7-aa11bb22-s1|7|ready_to_merge|open",
+		"|8||closed",
+		"task-branchbound|9|pr_open|open",
+		"adhoc-old|0|merged|",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("pr list records =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+
+	stdout.Reset()
+	if code := Run([]string{"pr", "list", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr list exit = %d, stderr=%s", code, stderr.String())
+	}
+	text := stdout.String()
+	heading := strings.Index(text, "# rows without a pull request")
+	if heading < 0 || heading > strings.Index(text, "adhoc-old") || heading < strings.Index(text, "task-branchbound") {
+		t.Fatalf("pr list text must list rows without a pull request last, under a heading:\n%s", text)
+	}
+
+	stdout.Reset()
+	if code := Run([]string{"pr", "show", "o/r#7", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr show exit = %d, stderr=%s", code, stderr.String())
+	}
+	var shown taskListOutput
+	if err := json.Unmarshal(stdout.Bytes(), &shown); err != nil {
+		t.Fatalf("decode: %v\n%s", err, stdout.String())
+	}
+	if shown.ID != "review-pr-7-aa11bb22-s1" || shown.State != "ready_to_merge" || shown.URL != "https://github.com/o/r/pull/7" ||
+		shown.HeadSHA != "sha7" || shown.BaseBranch != "main" || len(shown.OtherIDs) != 1 || shown.OtherIDs[0] != "review-pr-7-aa11bb22" {
+		t.Fatalf("pr show = %+v, want the live successor joined to PR #7 with the disposed record listed", shown)
+	}
+
+	stdout.Reset()
+	if code := Run([]string{"pr", "show", "8", "--repo", "o/r", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr show 8 exit = %d, stderr=%s", code, stderr.String())
+	}
+	for _, line := range []string{"pr: o/r#8\n", "id: -\n", "github_state: closed\n", "url: https://github.com/o/r/pull/8\n"} {
+		if !strings.Contains(stdout.String(), line) {
+			t.Fatalf("pr show 8 missing %q:\n%s", line, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pr", "events", "o/r#8", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "never reviewed") {
+		t.Fatalf("pr events on an unreviewed pr: code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+// TestTaskCommandAliasStillWorks pins the one-release transition alias.
+func TestTaskCommandAliasStillWorks(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	if err := store.UpsertTask(context.Background(), db.Task{ID: "review-pr-3-ab", RepoFullName: "o/r", State: "reviewing"}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	store.Close()
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"task", "list", "--home", home}, &stdout, &stderr); code != 0 {
+		t.Fatalf("task list alias exit = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "review-pr-3-ab") || !strings.Contains(stderr.String(), `"task" is now "pr"`) {
+		t.Fatalf("task alias: stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
 }
 

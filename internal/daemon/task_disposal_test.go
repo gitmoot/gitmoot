@@ -60,7 +60,7 @@ func TestTaskDisposalEvidenceTiers(t *testing.T) {
 				seedTaskDisposalJob(t, store, "job-successor", "task-successor", repo.FullName(), "feature/successor", 52, "Fix issue #1344")
 				setTaskUpdatedAt(t, store, "task-successor", time.Now().UTC().Add(time.Hour))
 			},
-			wantState: workflow.TaskSuperseded, wantTier: taskDisposalTierSuccessorMerged, wantReason: "successor task task-successor",
+			wantState: workflow.TaskSuperseded, wantTier: taskDisposalTierSuccessorMerged, wantReason: "successor PR task-successor",
 		},
 		{
 			name: "tier3 referenced subject closed",

@@ -218,7 +218,7 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	requests := make([]JobRequest, 0, len(reviewers))
 	for _, reviewer := range reviewers {
 		instructions := fmt.Sprintf(
-			"Review pull request #%d for task %s.",
+			"Review pull request #%d for PR record %s.",
 			event.PullRequest,
 			taskLabel(event.TaskID, event.TaskTitle),
 		)

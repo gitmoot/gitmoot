@@ -261,7 +261,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 			ttl:          plannedTTL,
 			states:       []string{string(workflow.TaskPlanned)},
 			eventKind:    "task_dismissed_planned_ttl",
-			reasonPrefix: "planned task auto-dismissed",
+			reasonPrefix: "planned PR record auto-dismissed",
 			logLabel:     "planned task reconciler",
 		}); err != nil {
 			return err
@@ -280,7 +280,7 @@ func (d Daemon) reconcileStaleTasks(ctx context.Context, openBranches map[string
 		ttl:          staleTTL,
 		states:       []string{string(workflow.TaskImplementing)},
 		eventKind:    "task_dismissed_auto",
-		reasonPrefix: "stale task auto-dismissed",
+		reasonPrefix: "stale PR record auto-dismissed",
 		logLabel:     "stale task reconciler",
 	})
 }
@@ -958,7 +958,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 				// must still resolve into the authoritative merged state.
 				if _, _, recoverErr := d.Store.RecoverClaimedTaskState(ctx, canonicalTask.ID,
 					string(workflow.TaskMerged), "pull_request_merged",
-					fmt.Sprintf("recovered merged pull request #%d from retained branchless task claim", group.number)); recoverErr != nil {
+					fmt.Sprintf("recovered merged pull request #%d from retained branchless PR-state claim", group.number)); recoverErr != nil {
 					if firstErr == nil {
 						firstErr = recoverErr
 					}
@@ -1089,7 +1089,7 @@ func (d Daemon) selectCanonicalMergedTask(ctx context.Context, tasks []db.Task) 
 // reconcileAdditionalMergedTask advances an additional local identity without
 // replaying per-PR cleanup, harvesting, detached legs, or continuation.
 func (d Daemon) reconcileAdditionalMergedTask(ctx context.Context, task db.Task, canonicalTaskID string, number int64) error {
-	reason := fmt.Sprintf("reconciled merged pull request #%d; canonical terminal effects owned by task %s", number, canonicalTaskID)
+	reason := fmt.Sprintf("reconciled merged pull request #%d; canonical terminal effects owned by PR record %s", number, canonicalTaskID)
 	changed, current, err := d.Store.RecoverClaimedTaskState(ctx, task.ID,
 		string(workflow.TaskMerged), "pull_request_merged", reason)
 	if err != nil {
@@ -2998,12 +2998,12 @@ func (d Daemon) handleStatusCommand(ctx context.Context, pull github.PullRequest
 	lines := []string{fmt.Sprintf("Gitmoot status for PR #%d:", pull.Number)}
 	if task, err := d.Store.GetTask(ctx, ref.id); err == nil {
 		statusTaskID = task.ID
-		lines = append(lines, fmt.Sprintf("- task: `%s` `%s`", task.ID, task.State))
+		lines = append(lines, fmt.Sprintf("- pr: `%s` `%s`", task.ID, task.State))
 		if strings.TrimSpace(task.Branch) != "" {
 			lines = append(lines, fmt.Sprintf("- branch: `%s`", task.Branch))
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
-		lines = append(lines, fmt.Sprintf("- task: `%s` not registered", ref.id))
+		lines = append(lines, fmt.Sprintf("- pr: `%s` not registered", ref.id))
 	} else {
 		return err
 	}
@@ -3090,12 +3090,12 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 	task, err := d.lookupMergeCommandTask(ctx, pull)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a task.", pull.Number, pull.HeadRef))
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because branch `%s` is not registered as a PR.", pull.Number, pull.HeadRef))
 		}
 		var ambiguous *ambiguousMergeCommandTasksError
 		if errors.As(err, &ambiguous) {
 			return d.ack(ctx, pull.Number, fmt.Sprintf(
-				"Gitmoot cannot merge PR #%d because multiple branchless tasks match it: `%s`. Gitmoot cannot pick which task owns the pull request, so merge PR #%d from GitHub.",
+				"Gitmoot cannot merge PR #%d because multiple branchless PR records match it: `%s`. Gitmoot cannot pick which record owns the pull request, so merge PR #%d from GitHub.",
 				pull.Number, strings.Join(ambiguous.taskIDs, "`, `"), pull.Number))
 		}
 		return err
@@ -3104,7 +3104,7 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot merged PR #%d.", pull.Number))
 	}
 	if task.State != string(workflow.TaskReadyToMerge) && task.State != string(workflow.TaskAwaitingHumanMerge) {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s` or `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge))
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because PR `%s` is `%s`, not `%s` or `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge, workflow.TaskAwaitingHumanMerge))
 	}
 	// merge_rule is enforced against the PR implementer's recorded acting role
 	// (`gitmoot job record --acting-role`); an unattributed PR stays allowed.
@@ -3156,7 +3156,7 @@ func (d Daemon) mergeCommandRefusal(pullRequest int64, reason string, taskBlocke
 	}
 	summary := fmt.Sprintf("Gitmoot did not merge PR #%d.", pullRequest)
 	if taskBlocked {
-		summary = fmt.Sprintf("Gitmoot did not merge PR #%d; the task is now `blocked`.", pullRequest)
+		summary = fmt.Sprintf("Gitmoot did not merge PR #%d; the PR is now `blocked`.", pullRequest)
 	}
 	message := fmt.Sprintf("%s\n\nCause: %s.", summary, reason)
 	if d.AutoMergeEnabled != nil && !d.AutoMergeEnabled(d.Repo.FullName()) {
