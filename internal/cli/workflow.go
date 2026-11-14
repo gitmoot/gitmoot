@@ -324,10 +324,11 @@ type prRecordKey struct {
 
 // prRecords joins review records to pull requests: by the number in the
 // record id, else by repo and head branch (the newest pull request wins, as in
-// GetPullRequestByRepoBranch). withUnreviewed adds the pull requests no review
-// record matched. Records with a pull request sort by repo and number; rows
-// without one come last.
-func prRecords(tasks []db.Task, prs []db.PullRequest, withUnreviewed bool) []taskListOutput {
+// GetPullRequestByRepoBranch), and adds the pull requests no review record
+// matched. Records with a pull request sort by repo and number; rows without
+// one come last. `pr list`, `pr show` and `pr events` all join through here so
+// they agree on which pull request a record belongs to.
+func prRecords(tasks []db.Task, prs []db.PullRequest) []taskListOutput {
 	byNumber := make(map[prRecordKey]db.PullRequest, len(prs))
 	byBranch := make(map[[2]string]db.PullRequest, len(prs))
 	for _, pr := range prs {
@@ -357,11 +358,9 @@ func prRecords(tasks []db.Task, prs []db.PullRequest, withUnreviewed bool) []tas
 		}
 		records = append(records, record)
 	}
-	if withUnreviewed {
-		for _, pr := range prs {
-			if !reviewed[prRecordKey{pr.RepoFullName, pr.Number}] {
-				records = append(records, prRecordFromPullRequest(pr))
-			}
+	for _, pr := range prs {
+		if !reviewed[prRecordKey{pr.RepoFullName, pr.Number}] {
+			records = append(records, prRecordFromPullRequest(pr))
 		}
 	}
 	sort.SliceStable(records, func(i, j int) bool {
@@ -404,9 +403,11 @@ func prRecordForTask(ctx context.Context, store *db.Store, task db.Task) (taskLi
 }
 
 // resolvePRRecord resolves a <pr> argument: a pr id (review-pr-N-...),
-// owner/repo#N, or N with repo. When several review records belong to the pull
-// request (a successor chain), the newest live one is the record and the
-// others are listed in OtherIDs.
+// owner/repo#N, or N with repo. A repo-qualified <pr> joins the repo's records
+// and pull requests exactly as `pr list` does, then keeps the records of that
+// repo and number; records with no repo never match one. When several review
+// records belong to the pull request (a successor chain), the record is the
+// newest of its chain, live preferred, and the others are listed in OtherIDs.
 func resolvePRRecord(ctx context.Context, store *db.Store, ref string, repo string) (taskListOutput, error) {
 	ref = strings.TrimSpace(ref)
 	repoPart, numberPart, hasHash := strings.Cut(ref, "#")
@@ -438,29 +439,22 @@ func resolvePRRecord(ctx context.Context, store *db.Store, ref string, repo stri
 	if err != nil {
 		return taskListOutput{}, err
 	}
-	prs := []db.PullRequest{}
-	pr, err := store.GetPullRequest(ctx, fullName, number)
-	switch {
-	case err == nil:
-		prs = append(prs, pr)
-	case !errors.Is(err, sql.ErrNoRows):
+	prs, err := store.ListPullRequests(ctx, fullName)
+	if err != nil {
 		return taskListOutput{}, err
 	}
 	var matches []taskListOutput
-	for _, record := range prRecords(tasks, prs, true) {
-		if record.Number == number {
+	for _, record := range prRecords(tasks, prs) {
+		if record.Repo == fullName && record.Number == number {
 			matches = append(matches, record)
 		}
 	}
 	if len(matches) == 0 {
 		return taskListOutput{}, fmt.Errorf("pr %s#%d not found", fullName, number)
 	}
-	primary := len(matches) - 1
-	for i := len(matches) - 1; i >= 0; i-- {
-		if !workflow.IsDisposedTaskState(matches[i].State) {
-			primary = i
-			break
-		}
+	primary, err := primaryPRRecord(ctx, store, matches)
+	if err != nil {
+		return taskListOutput{}, err
 	}
 	record := matches[primary]
 	for i, other := range matches {
@@ -469,6 +463,36 @@ func resolvePRRecord(ctx context.Context, store *db.Store, ref string, repo stri
 		}
 	}
 	return record, nil
+}
+
+// primaryPRRecord picks which of one pull request's records `pr show` and
+// `pr events` present. Only the newest record of a successor chain (by the
+// chain the successor command records, not by id order, since -successor-10
+// sorts before -successor-9) is a candidate; a live candidate wins over a
+// disposed one.
+func primaryPRRecord(ctx context.Context, store *db.Store, matches []taskListOutput) (int, error) {
+	candidates := make([]int, 0, len(matches))
+	for i, record := range matches {
+		if record.ID == "" {
+			continue
+		}
+		latest, err := store.LatestTaskInChain(ctx, record.ID)
+		if err != nil {
+			return 0, err
+		}
+		if latest.ID == record.ID {
+			candidates = append(candidates, i)
+		}
+	}
+	if len(candidates) == 0 {
+		return len(matches) - 1, nil
+	}
+	for i := len(candidates) - 1; i >= 0; i-- {
+		if !workflow.IsDisposedTaskState(matches[candidates[i]].State) {
+			return candidates[i], nil
+		}
+	}
+	return candidates[len(candidates)-1], nil
 }
 
 func runTaskList(args []string, stdout, stderr io.Writer) int {
@@ -515,7 +539,7 @@ func runTaskList(args []string, stdout, stderr io.Writer) int {
 	}
 	outputs := []taskListOutput{}
 	stateFilter := strings.TrimSpace(*state)
-	for _, record := range prRecords(tasks, prs, true) {
+	for _, record := range prRecords(tasks, prs) {
 		if stateFilter != "" && record.displayState() != stateFilter {
 			continue
 		}

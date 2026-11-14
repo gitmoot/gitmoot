@@ -9,8 +9,10 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/gitmoot/internal/db"
+	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
 func TestRunStatusIncludesUnscopedTasks(t *testing.T) {
@@ -268,5 +270,162 @@ func writeFile(t *testing.T, path string, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// runPRJSON runs a pr subcommand with --json and decodes one record.
+func runPRJSON(t *testing.T, args ...string) (taskListOutput, int, string) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := Run(append(args, "--json"), &stdout, &stderr)
+	var record taskListOutput
+	if code == 0 {
+		if err := json.Unmarshal(stdout.Bytes(), &record); err != nil {
+			t.Fatalf("%v: decode %v\n%s", args, err, stdout.String())
+		}
+	}
+	return record, code, stderr.String()
+}
+
+// TestPRShowAndEventsJoinReusedBranchLikeList pins that `pr show` and
+// `pr events` join a branch-bound record to the same pull request `pr list`
+// does: when two pull requests share a head branch, the newest one owns it,
+// so the older pull request has no review record of its own.
+func TestPRShowAndEventsJoinReusedBranchLikeList(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	if err := store.UpsertTask(ctx, db.Task{ID: "task-reused", RepoFullName: "o/r", Title: "reused", State: "pr_open", Branch: "feat/reused"}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.AddTaskEvent(ctx, db.TaskEvent{TaskID: "task-reused", Kind: "note", Reason: "event of the record on #12"}); err != nil {
+		t.Fatalf("AddTaskEvent: %v", err)
+	}
+	for _, pr := range []db.PullRequest{
+		{RepoFullName: "o/r", Number: 11, HeadBranch: "feat/reused", BaseBranch: "main", HeadSHA: "sha11", State: "closed"},
+		{RepoFullName: "o/r", Number: 12, HeadBranch: "feat/reused", BaseBranch: "main", HeadSHA: "sha12", State: "open"},
+	} {
+		if err := store.UpsertPullRequest(ctx, pr); err != nil {
+			t.Fatalf("UpsertPullRequest(%d): %v", pr.Number, err)
+		}
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pr", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr list exit = %d, stderr=%s", code, stderr.String())
+	}
+	var listed []taskListOutput
+	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
+		t.Fatalf("decode: %v\n%s", err, stdout.String())
+	}
+	for _, record := range listed {
+		if record.ID == "task-reused" && record.Number != 12 {
+			t.Fatalf("pr list joined task-reused to #%d, want #12 (newest pull request on the branch)", record.Number)
+		}
+	}
+
+	if shown, code, errText := runPRJSON(t, "pr", "show", "o/r#12", "--home", home); code != 0 || shown.ID != "task-reused" {
+		t.Fatalf("pr show o/r#12 = %+v code=%d stderr=%s, want task-reused", shown, code, errText)
+	}
+	if shown, code, errText := runPRJSON(t, "pr", "show", "o/r#11", "--home", home); code != 0 || shown.ID != "" || shown.GitHubState != "closed" {
+		t.Fatalf("pr show o/r#11 = %+v code=%d stderr=%s, want the unreviewed closed pull request (list gives task-reused to #12)", shown, code, errText)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pr", "events", "o/r#11", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "never reviewed") {
+		t.Fatalf("pr events o/r#11: code=%d stdout=%q stderr=%q, want never reviewed (not #12's events)", code, stdout.String(), stderr.String())
+	}
+}
+
+// TestPRShowRepoQualifiedIgnoresUnscopedRecords pins that a record with no
+// repo never answers an owner/repo#N lookup: it is listed, but it neither
+// invents a pull request nor outranks the repo's own record.
+func TestPRShowRepoQualifiedIgnoresUnscopedRecords(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	for _, task := range []db.Task{
+		{ID: "review-pr-20-unscoped", Title: "unscoped twenty", State: "reviewing"},
+		{ID: "review-pr-21-unscoped", Title: "unscoped twenty-one", State: "reviewing"},
+		{ID: "review-pr-21-own", RepoFullName: "o/r", Title: "own twenty-one", State: "dismissed", Branch: "feat/twenty-one"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
+		}
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "o/r", Number: 21, HeadBranch: "feat/twenty-one", BaseBranch: "main", State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	store.Close()
+
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pr", "list", "--home", home, "--repo", "o/r"}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "review-pr-20-unscoped") {
+		t.Fatalf("pr list --repo must still list unscoped rows: code=%d\n%s", code, stdout.String())
+	}
+	if shown, code, _ := runPRJSON(t, "pr", "show", "o/r#20", "--home", home); code != 1 {
+		t.Fatalf("pr show o/r#20 = %+v code=%d, want not found (the only #20 record has no repo)", shown, code)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"pr", "events", "20", "--repo", "o/r", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "not found") {
+		t.Fatalf("pr events o/r#20: code=%d stderr=%q, want not found", code, stderr.String())
+	}
+	shown, code, errText := runPRJSON(t, "pr", "show", "o/r#21", "--home", home)
+	if code != 0 || shown.ID != "review-pr-21-own" || shown.Repo != "o/r" || len(shown.OtherIDs) != 0 {
+		t.Fatalf("pr show o/r#21 = %+v code=%d stderr=%s, want the repo's own (disposed) record, no unscoped one", shown, code, errText)
+	}
+}
+
+// TestPRShowPicksNewestSuccessorGeneration pins that when every record of a
+// successor chain is disposed, `pr show` and `pr events` present the newest
+// generation the successor command recorded, not the lexically last id
+// (-successor-9 sorts after -successor-10).
+func TestPRShowPicksNewestSuccessorGeneration(t *testing.T) {
+	home := t.TempDir()
+	store := openCLIJobStore(t, home)
+	ctx := context.Background()
+	disposed := []string{string(workflow.TaskDismissed), string(workflow.TaskSuperseded), string(workflow.TaskStranded)}
+	root := "review-pr-40-abc"
+	if err := store.UpsertTask(ctx, db.Task{ID: root, RepoFullName: "o/r", GoalID: "local-review", Title: "Review PR #40", State: string(workflow.TaskReviewing), Branch: "feat/forty"}); err != nil {
+		t.Fatalf("UpsertTask: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{RepoFullName: "o/r", Number: 40, HeadBranch: "feat/forty", BaseBranch: "main", State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	latest := root
+	from := string(workflow.TaskReviewing)
+	for {
+		if ok, _, err := store.DisposeTask(ctx, latest, []string{from}, string(workflow.TaskDismissed), "test", "test disposal", "", "", time.Now().UTC()); err != nil || !ok {
+			t.Fatalf("DisposeTask(%s): ok=%v err=%v", latest, ok, err)
+		}
+		if latest == root+"-successor-10" {
+			break
+		}
+		successor, created, err := store.CreateTaskSuccessor(ctx, root, disposed, string(workflow.TaskPlanned), "test")
+		if err != nil || !created {
+			t.Fatalf("CreateTaskSuccessor after %s: created=%v err=%v", latest, created, err)
+		}
+		latest, from = successor.ID, string(workflow.TaskPlanned)
+	}
+	store.Close()
+
+	newest := root + "-successor-10"
+	shown, code, errText := runPRJSON(t, "pr", "show", "o/r#40", "--home", home)
+	if code != 0 || shown.ID != newest || len(shown.OtherIDs) != 9 {
+		t.Fatalf("pr show o/r#40 = id %q others %v code=%d stderr=%s, want %s with 9 others", shown.ID, shown.OtherIDs, code, errText, newest)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"pr", "events", "o/r#40", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr events exit = %d, stderr=%s", code, stderr.String())
+	}
+	var events []prEventOutput
+	if err := json.Unmarshal(stdout.Bytes(), &events); err != nil || len(events) == 0 {
+		t.Fatalf("decode events: %v\n%s", err, stdout.String())
+	}
+	for _, event := range events {
+		if event.TaskID != newest {
+			t.Fatalf("pr events read %s's events, want %s's", event.TaskID, newest)
+		}
 	}
 }
