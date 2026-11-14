@@ -57,7 +57,7 @@ subcommand fails with `unknown command "--home"`. `gitmoot version --home H`
 prints the `config:` and `database:` paths of that home. Put a positional name
 or id right after the subcommand words and flags after it
 (`gitmoot job show <job-id> --home H`,
-`gitmoot agent subscribe <name> --runtime ...`); the other order fails with
+`gitmoot reviewer subscribe <name> --runtime ...`); the other order fails with
 "requires exactly one id/name". Two exceptions take every flag, `--home`
 included, before the positional:
 `message escalate --to <role> "question"` and
@@ -75,7 +75,7 @@ gitmoot job record --agent <seat> --repo owner/repo --type implement --decision 
 ```
 
 Use `--acting-role <role>` instead of `--agent` when the seat that wrote the
-change is an org role, not a registered agent (every seat created with
+change is an org role, not a registered reviewer (every seat created with
 `gitmoot org seat add` is a role; `--agent` with a role name fails `agent
 "<name>" not found`). The record then prints an empty
 `agent:` and keeps the role as the job's acting role, which is what the gate
@@ -91,7 +91,7 @@ Then request the review at the exact head you pushed:
 gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <your-role>
 ```
 
-- Gitmoot picks a review-capable agent and model; use `--reviewer <agent>` only
+- Gitmoot picks a review-capable reviewer and model; use `--reviewer <name>` only
   to name one. `--purpose code|security|ui|architecture` (default `code`)
   requests a different kind of review; each purpose is its own review.
 - One review per head and purpose. Asking again for the same head attaches to
@@ -101,8 +101,8 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
   `failed` or `cancelled` has no verdict, so asking again starts a new review
   of that head: that is how to retry one. To replace a saved verdict at the
   same head, pass `--supersede <job-id> --reason "why"`.
-- The output names the job (`job:`), the reviewer, any `hold:` lines, and a
-  `watch:` command. Add `--json` for `job_id`, `reviewer`, `awaited_fact_id`
+- The output names the run (`run:`), the reviewer, any `hold:` lines, and a
+  `watch:` command. Add `--json` for `run_id`, `reviewer`, `awaited_fact_id`
   and `holds`. Every request, `verdict_exists` included, registers a wake-up
   (`notify: ... awaited fact N`) and reports the daemon hold.
 - Your role is woken when the verdict is saved; you do not need to poll.
@@ -111,9 +111,8 @@ gitmoot review request --repo owner/repo --pr <n> --head <40-hex-sha> --role <yo
   start` starts the daemon``: start it (`gitmoot daemon start`) or run the job
   once in the foreground with `gitmoot job run <job-id>`.
 
-`gitmoot agent review <agent> "instructions" --repo owner/repo --pr <n>` names
-a reviewer directly and goes through the same request path; prefer
-`review request`.
+Pass review instructions with `--message "instructions"`. Ask a reviewer a
+read-only question with `gitmoot ask <reviewer> "question" --repo owner/repo`.
 
 **Review level.** `gitmoot review level --repo owner/repo --pr <n>` decides how
 much review the head needs, posts it as the `gitmoot/review-level` commit

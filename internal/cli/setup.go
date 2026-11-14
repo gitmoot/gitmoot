@@ -21,18 +21,18 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repoFlag := fs.String("repo", "", "repo scope as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
-	agentName := fs.String("agent", "", "agent name to subscribe")
+	agentName := fs.String("reviewer", "", "reviewer name to subscribe")
 	// Enumerated from the adapter registry (as printAgentRuntimeOverrideHelp does),
 	// never hard-coded: the literal list here had already gone stale before #1428.
-	runtimeName := fs.String("runtime", "", fmt.Sprintf("agent runtime: %s", strings.Join(runtime.SupportedRuntimes(), "|")))
+	runtimeName := fs.String("runtime", "", fmt.Sprintf("reviewer runtime: %s", strings.Join(runtime.SupportedRuntimes(), "|")))
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
-	role := fs.String("role", "agent", "agent role")
+	role := fs.String("role", "agent", "reviewer role")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
-	watchIssues := fs.Bool("watch-issues", true, "watch open issues and route @<agent> ask comments to jobs (#389); on by default so the daemon is tagging-ready")
+	watchIssues := fs.Bool("watch-issues", true, "watch open issues and route @<reviewer> ask comments to runs (#389); on by default so the daemon is tagging-ready")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "agent", New: "reviewer"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -43,7 +43,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if strings.TrimSpace(*repoFlag) == "" || strings.TrimSpace(*agentName) == "" || strings.TrimSpace(*runtimeName) == "" || strings.TrimSpace(*session) == "" {
-		fmt.Fprintln(stderr, "setup requires --repo, --agent, --runtime, and --session")
+		fmt.Fprintln(stderr, "setup requires --repo, --reviewer, --runtime, and --session")
 		return 2
 	}
 	repo, err := github.ParseRepository(*repoFlag)
@@ -67,13 +67,13 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateAgent(agent); err != nil {
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 2
 	}
 
 	writeLine(stdout, "step: initialize local state")
 	writeLine(stdout, "step: register repo %s at %s", record.FullName(), record.CheckoutPath)
-	writeLine(stdout, "step: subscribe agent %s (%s)", agent.Name, agent.Runtime)
+	writeLine(stdout, "step: subscribe reviewer %s (%s)", agent.Name, agent.Runtime)
 	if err := withStore(*home, func(store *db.Store) error {
 		exists, err := existingCompatibleAgent(context.Background(), store, agent)
 		if err != nil {
@@ -92,7 +92,7 @@ func runSetup(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "setup: %v\n", err)
 		return 1
 	}
-	writeLine(stdout, "configured %s with agent %s", repo.FullName(), agent.Name)
+	writeLine(stdout, "configured %s with reviewer %s", repo.FullName(), agent.Name)
 	if *startDaemon {
 		writeLine(stdout, "step: start background daemon")
 		daemonArgs := []string{"--home", *home, "--repo", repo.FullName()}
@@ -118,7 +118,7 @@ func writeSetupReadiness(stdout io.Writer, agent runtime.Agent, repoFullName str
 	writeLine(stdout, "")
 	writeLine(stdout, "readiness:")
 	writeLine(stdout, "  [ok] repo registered: %s", repoFullName)
-	writeLine(stdout, "  [ok] agent access: %s -> %s", agent.Name, repoFullName)
+	writeLine(stdout, "  [ok] reviewer access: %s -> %s", agent.Name, repoFullName)
 	if daemonStarted {
 		if watchIssues {
 			writeLine(stdout, "  [ok] daemon: started with --watch-issues (answers issue tags)")
@@ -136,7 +136,7 @@ func writeSetupReadiness(stdout io.Writer, agent runtime.Agent, repoFullName str
 	}
 	if watchIssues {
 		writeLine(stdout, "")
-		writeLine(stdout, "to tag the agent, post this as the FIRST token of a line in a %s issue/PR comment:", repoFullName)
+		writeLine(stdout, "to tag the reviewer, post this as the FIRST token of a line in a %s issue/PR comment:", repoFullName)
 		writeLine(stdout, "  @%s ask <your question>", agent.Name)
 		writeLine(stdout, "note: on issues only the `ask` action is acted on (review/implement apply to PRs).")
 	}
@@ -151,7 +151,7 @@ func existingCompatibleAgent(ctx context.Context, store *db.Store, agent runtime
 		return false, err
 	}
 	if existing.Runtime != agent.Runtime || existing.RuntimeRef != agent.RuntimeRef {
-		return false, fmt.Errorf("agent %s already exists with runtime %s session %s", existing.Name, existing.Runtime, existing.RuntimeRef)
+		return false, fmt.Errorf("reviewer %s already exists with runtime %s session %s", existing.Name, existing.Runtime, existing.RuntimeRef)
 	}
 	return true, nil
 }

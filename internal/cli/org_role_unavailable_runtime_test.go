@@ -314,7 +314,7 @@ func subscribeShellAskAgent(t *testing.T, home, name, repo string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "subscribe", name,
+		"reviewer", "subscribe", name,
 		"--home", home,
 		"--runtime", "shell",
 		"--session", unavailableRuntimeShellScript,
@@ -368,7 +368,7 @@ func TestLocalAgentDispatchScopesRoleUnavailabilityToTheSelectedRuntime(t *testi
 		home, _ := setup(t, "claude")
 		var stdout, stderr bytes.Buffer
 		code := Run([]string{
-			"agent", "ask", "asker", "what is the state of the repo?",
+			"ask", "asker", "what is the state of the repo?",
 			"--home", home, "--repo", "gitmoot/gitmoot", "--org-role", "review", "--json",
 		}, &stdout, &stderr)
 		if code != 0 {
@@ -390,7 +390,7 @@ func TestLocalAgentDispatchScopesRoleUnavailabilityToTheSelectedRuntime(t *testi
 		home, paths := setup(t, runtime.ShellRuntime)
 		var stdout, stderr bytes.Buffer
 		code := Run([]string{
-			"agent", "ask", "asker", "what is the state of the repo?",
+			"ask", "asker", "what is the state of the repo?",
 			"--home", home, "--repo", "gitmoot/gitmoot", "--org-role", "review", "--json",
 		}, &stdout, &stderr)
 		if code == 0 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||

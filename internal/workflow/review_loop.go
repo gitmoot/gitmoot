@@ -43,7 +43,7 @@ func (m ReviewLoopMatch) Reason() string {
 		return fmt.Sprintf("review loop detected for %s pull request #%d: requested head SHA is empty after succeeded review job %s (%s); supply the current head SHA before retrying",
 			m.Repo, m.PullRequest, m.JobID, m.Decision)
 	}
-	return fmt.Sprintf("review loop detected for %s pull request #%d at head %s: agent %s already holds the stable %s decision at this head for this purpose (succeeded review job %s); dispatch a different agent, ask a different purpose, or push a new head before retrying",
+	return fmt.Sprintf("review loop detected for %s pull request #%d at head %s: reviewer %s already holds the stable %s decision at this head for this purpose (succeeded review job %s); dispatch a different reviewer, ask a different purpose, or push a new head before retrying",
 		m.Repo, m.PullRequest, m.HeadSHA, m.Agent, m.Decision, m.JobID)
 }
 

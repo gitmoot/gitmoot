@@ -11,24 +11,7 @@ disagrees, trust its live `--help`.
 ## Commands
 
 - [gitmoot](#gitmoot)
-- [gitmoot agent](#gitmoot-agent)
-- [gitmoot agent allow](#gitmoot-agent-allow)
-- [gitmoot agent ask](#gitmoot-agent-ask)
-- [gitmoot agent deny](#gitmoot-agent-deny)
-- [gitmoot agent doctor](#gitmoot-agent-doctor)
-- [gitmoot agent list](#gitmoot-agent-list)
-- [gitmoot agent policy](#gitmoot-agent-policy)
-- [gitmoot agent remove](#gitmoot-agent-remove)
-- [gitmoot agent repos](#gitmoot-agent-repos)
-- [gitmoot agent restart](#gitmoot-agent-restart)
-- [gitmoot agent review](#gitmoot-agent-review)
-- [gitmoot agent show](#gitmoot-agent-show)
-- [gitmoot agent start](#gitmoot-agent-start)
-- [gitmoot agent subscribe](#gitmoot-agent-subscribe)
-- [gitmoot agent type](#gitmoot-agent-type)
-- [gitmoot agent type list](#gitmoot-agent-type-list)
-- [gitmoot agent type set](#gitmoot-agent-type-set)
-- [gitmoot agent type show](#gitmoot-agent-type-show)
+- [gitmoot ask](#gitmoot-ask)
 - [gitmoot config](#gitmoot-config)
 - [gitmoot config path](#gitmoot-config-path)
 - [gitmoot config show](#gitmoot-config-show)
@@ -113,6 +96,22 @@ disagrees, trust its live `--help`.
 - [gitmoot review level](#gitmoot-review-level)
 - [gitmoot review request](#gitmoot-review-request)
 - [gitmoot review status](#gitmoot-review-status)
+- [gitmoot reviewer](#gitmoot-reviewer)
+- [gitmoot reviewer allow](#gitmoot-reviewer-allow)
+- [gitmoot reviewer deny](#gitmoot-reviewer-deny)
+- [gitmoot reviewer doctor](#gitmoot-reviewer-doctor)
+- [gitmoot reviewer list](#gitmoot-reviewer-list)
+- [gitmoot reviewer policy](#gitmoot-reviewer-policy)
+- [gitmoot reviewer remove](#gitmoot-reviewer-remove)
+- [gitmoot reviewer repos](#gitmoot-reviewer-repos)
+- [gitmoot reviewer restart](#gitmoot-reviewer-restart)
+- [gitmoot reviewer show](#gitmoot-reviewer-show)
+- [gitmoot reviewer start](#gitmoot-reviewer-start)
+- [gitmoot reviewer subscribe](#gitmoot-reviewer-subscribe)
+- [gitmoot reviewer type](#gitmoot-reviewer-type)
+- [gitmoot reviewer type list](#gitmoot-reviewer-type-list)
+- [gitmoot reviewer type set](#gitmoot-reviewer-type-set)
+- [gitmoot reviewer type show](#gitmoot-reviewer-type-show)
 - [gitmoot runtime](#gitmoot-runtime)
 - [gitmoot runtime list](#gitmoot-runtime-list)
 - [gitmoot runtime prune](#gitmoot-runtime-prune)
@@ -147,10 +146,11 @@ Commands:
   message    send, read and reply to durable fleet messages
   key        manage keycard registry metadata
   update     check for and apply Gitmoot releases
-  setup      register a repo and initial agent
+  setup      register a repo and initial reviewer
   repo       manage watched repositories
   daemon     run the local PR watcher
-  agent      manage registered agents
+  reviewer   manage registered reviewers
+  ask        ask a registered reviewer a read-only question
   review     request a routed independent review and follow its verdict
   runtime    inspect runtime metadata (models, capabilities, usage)
   sandbox    probe kernel-enforced runtime sandbox support
@@ -163,238 +163,19 @@ Commands:
   dashboard  show a snapshot of local Gitmoot state
 ```
 
-## gitmoot agent
+## gitmoot ask
 
 ```text
 Usage:
-  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]
-  gitmoot agent ask <name> "message" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]
-  gitmoot agent review <name> "message" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]
-  --runtime omp|shell runs THIS job on the named runtime; the agent's registered default runtime is unchanged.
-    The overridden job never resumes the agent's default-runtime session: it runs on a fresh session of the
+  gitmoot ask <reviewer> "question" [--repo owner/repo] [--background] [--action ask] [--model model] [--effort effort] [--campaign label] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]
+  --runtime omp|shell runs THIS run on the named runtime; the reviewer's registered default runtime is unchanged.
+    The overridden run never resumes the reviewer's default-runtime session: it runs on a fresh session of the
     override runtime, or on --session <ref> (an explicit session id, or — required for shell — a command;
     "last" is rejected because it resumes whichever session is most recent).
-    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the job uses the
-    override runtime's default model (the agent's configured default model is never applied to another runtime).
-    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the job uses the
-    override runtime's default effort (the agent's configured default effort is never applied to another runtime).
-  gitmoot agent type list|show|set ...
-  gitmoot agent subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>
-    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.
-  gitmoot agent allow <name> --repo owner/repo
-  gitmoot agent deny <name> --repo owner/repo
-  gitmoot agent repos <name>
-  gitmoot agent show <name> [--json]
-  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]
-  gitmoot agent list
-  gitmoot agent remove <name>
-  gitmoot agent restart <name>      # abandon + replace the runtime session (finish in-flight asks first)
-  gitmoot agent doctor <name>
-```
-
-## gitmoot agent allow
-
-```text
-Usage of agent allow:
-  -home string
-    	home directory to use instead of the current user's home
-  -repo string
-    	repo scope as owner/repo
-```
-
-## gitmoot agent ask
-
-```text
-Usage:
-  gitmoot agent ask <name> "message" [--repo owner/repo] [--background] [--action ask] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]
-  --runtime omp|shell runs THIS job on the named runtime; the agent's registered default runtime is unchanged.
-    The overridden job never resumes the agent's default-runtime session: it runs on a fresh session of the
-    override runtime, or on --session <ref> (an explicit session id, or — required for shell — a command;
-    "last" is rejected because it resumes whichever session is most recent).
-    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the job uses the
-    override runtime's default model (the agent's configured default model is never applied to another runtime).
-    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the job uses the
-    override runtime's default effort (the agent's configured default effort is never applied to another runtime).
-```
-
-## gitmoot agent deny
-
-```text
-Usage of agent deny:
-  -home string
-    	home directory to use instead of the current user's home
-  -repo string
-    	repo scope as owner/repo
-```
-
-## gitmoot agent doctor
-
-```text
-Usage of agent doctor:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent list
-
-```text
-Usage of agent list:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent policy
-
-```text
-Usage:
-  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]
-```
-
-## gitmoot agent remove
-
-```text
-Usage of agent remove:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent repos
-
-```text
-Usage of agent repos:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent restart
-
-```text
-Usage of agent restart:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent review
-
-```text
-Usage:
-  gitmoot agent review <name> "message" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]
-  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.
-  --runtime omp|shell runs THIS job on the named runtime; the agent's registered default runtime is unchanged.
-    The overridden job never resumes the agent's default-runtime session: it runs on a fresh session of the
-    override runtime, or on --session <ref> (an explicit session id, or — required for shell — a command;
-    "last" is rejected because it resumes whichever session is most recent).
-    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the job uses the
-    override runtime's default model (the agent's configured default model is never applied to another runtime).
-    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the job uses the
-    override runtime's default effort (the agent's configured default effort is never applied to another runtime).
-```
-
-## gitmoot agent show
-
-```text
-Usage of agent show:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print agent as JSON
-```
-
-## gitmoot agent start
-
-```text
-Usage of agent start:
-  -capability value
-    	agent capability, repeatable
-  -effort string
-    	default reasoning effort for this agent
-  -home string
-    	home directory to use instead of the current user's home
-  -model string
-    	default runtime model for this agent
-  -path string
-    	local checkout path (default ".")
-  -policy string
-    	autonomy policy (default "auto")
-  -repo string
-    	allowed repo as owner/repo
-  -role string
-    	agent role
-  -runtime string
-    	agent runtime: omp
-  -start-daemon
-    	start the background daemon after setup
-```
-
-## gitmoot agent subscribe
-
-```text
-Usage of agent subscribe:
-  -capability value
-    	agent capability, repeatable
-  -effort string
-    	default reasoning effort for this agent
-  -home string
-    	home directory to use instead of the current user's home
-  -model string
-    	default runtime model for this agent
-  -policy string
-    	autonomy policy (default "auto")
-  -repo value
-    	allowed repo as owner/repo, repeatable
-  -role string
-    	agent role
-  -runtime string
-    	agent runtime: omp, or shell for no-LLM tests
-  -session string
-    	runtime session reference, last, or shell command
-```
-
-## gitmoot agent type
-
-```text
-Usage:
-  gitmoot agent type list
-  gitmoot agent type show <type>
-  gitmoot agent type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write
-```
-
-## gitmoot agent type list
-
-```text
-Usage of agent type list:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot agent type set
-
-```text
-Usage of agent type set:
-  -capability value
-    	agent capability, repeatable
-  -effort string
-    	default reasoning effort for this agent type
-  -home string
-    	home directory to use instead of the current user's home
-  -job-timeout string
-    	managed job timeout
-  -model string
-    	default runtime model for this agent type
-  -policy string
-    	agent autonomy policy: auto, read-only, workspace-write, or danger-full-access
-  -role string
-    	agent role
-  -runtime string
-    	agent runtime: omp
-```
-
-## gitmoot agent type show
-
-```text
-Usage of agent type show:
-  -home string
-    	home directory to use instead of the current user's home
+    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the run uses the
+    override runtime's default model (the reviewer's configured default model is never applied to another runtime).
+    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the run uses the
+    override runtime's default effort (the reviewer's configured default effort is never applied to another runtime).
 ```
 
 ## gitmoot config
@@ -476,7 +257,7 @@ Usage of daemon restart:
   -session string
     	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<agent> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to jobs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -504,7 +285,7 @@ Usage of daemon run:
   -session string
     	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<agent> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to jobs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -528,7 +309,7 @@ Usage of daemon start:
   -session string
     	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<agent> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to jobs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -1459,12 +1240,12 @@ Usage of repo set-interval:
 
 ```text
 Usage:
-  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- "review instructions"]
+  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- "review instructions"]
   gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]
   gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]
 
 request routes one independent review of the pull request's current (or --head) commit.
-Gitmoot picks a review-capable agent, runs it on omp with the [review_router] model pool
+Gitmoot picks a review-capable reviewer (or --reviewer), runs it on omp with the [review_router] model pool
 for the purpose, falls back to the next model on a provider quota/auth failure, and
 wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for
 the same head attaches to the running review or to its saved verdict; it never spends
@@ -1491,10 +1272,12 @@ Usage of review level:
 Usage of review request:
   -allow-prompt-head-mismatch
     	dispatch even when a carried finding cites a commit outside this pull request's history
-  -background agent review
-    	accepted for parity with agent review: the router always queues the review for the daemon
+  -background
+    	accepted for compatibility: the router always queues the review for the daemon
   -branch string
     	pull request head branch (defaults to the pull request's branch)
+  -campaign string
+    	campaign the review run is filed under
   -effort string
     	reasoning effort for runtimes that accept one
   -evidence-manifest string
@@ -1513,6 +1296,8 @@ Usage of review request:
     	home directory to use instead of the current user's home
   -json
     	print the request as JSON
+  -message string
+    	review instructions passed verbatim to the reviewer (same as a trailing positional)
   -model string
     	provider/model the review runs on, overriding the pool head
   -no-execution
@@ -1530,13 +1315,13 @@ Usage of review request:
   -purpose string
     	review purpose: code, security, ui, or architecture (default "code")
   -reason string
-    	why --supersede re-reviews the part; recorded on both jobs
+    	why --supersede re-reviews the part; recorded on both runs
   -related-pr value
     	same-repository pull request whose exact head tree the reviewer gets read-only at .gitmoot-related/pr-N; repeatable; the daemon fetches refs/pull/N/head on this host and pins its head now
   -repo string
     	repository in owner/repo form (defaults to the current checkout)
   -reviewer string
-    	registered review agent to use instead of the router's choice
+    	registered reviewer to use instead of the router's choice
   -role string
     	requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)
   -runtime string
@@ -1544,11 +1329,9 @@ Usage of review request:
   -session string
     	runtime session the review reuses
   -supersede string
-    	re-review at the same head: the settled blocking review job (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason
+    	re-review at the same head: the settled blocking review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason
   -ttl duration
     	how long the requester waits before the wait expires to its parent (default 12h0m0s)
-  -workflow string
-    	workflow the review job is filed under
 ```
 
 ## gitmoot review status
@@ -1563,6 +1346,208 @@ Usage of review status:
     	pull request number
   -repo string
     	repository in owner/repo form (defaults to the current checkout)
+```
+
+## gitmoot reviewer
+
+```text
+Usage:
+  gitmoot reviewer start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]
+  gitmoot ask <reviewer> "question" [--repo owner/repo] [--background] [--model model] [--effort effort] [--campaign label] [--runtime rt] [--session ref] [--home path] [--json]
+  --runtime omp|shell runs THIS run on the named runtime; the reviewer's registered default runtime is unchanged.
+    The overridden run never resumes the reviewer's default-runtime session: it runs on a fresh session of the
+    override runtime, or on --session <ref> (an explicit session id, or — required for shell — a command;
+    "last" is rejected because it resumes whichever session is most recent).
+    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the run uses the
+    override runtime's default model (the reviewer's configured default model is never applied to another runtime).
+    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the run uses the
+    override runtime's default effort (the reviewer's configured default effort is never applied to another runtime).
+  gitmoot reviewer type list|show|set ...
+  gitmoot reviewer subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>
+    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.
+  gitmoot reviewer allow <name> --repo owner/repo
+  gitmoot reviewer deny <name> --repo owner/repo
+  gitmoot reviewer repos <name>
+  gitmoot reviewer show <name> [--json]
+  gitmoot reviewer policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]
+  gitmoot reviewer list
+  gitmoot reviewer remove <name>
+  gitmoot reviewer restart <name>      # abandon + replace the runtime session (finish in-flight asks first)
+  gitmoot reviewer doctor <name>
+```
+
+## gitmoot reviewer allow
+
+```text
+Usage of reviewer allow:
+  -home string
+    	home directory to use instead of the current user's home
+  -repo string
+    	repo scope as owner/repo
+```
+
+## gitmoot reviewer deny
+
+```text
+Usage of reviewer deny:
+  -home string
+    	home directory to use instead of the current user's home
+  -repo string
+    	repo scope as owner/repo
+```
+
+## gitmoot reviewer doctor
+
+```text
+Usage of reviewer doctor:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer list
+
+```text
+Usage of reviewer list:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer policy
+
+```text
+Usage:
+  gitmoot reviewer policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]
+```
+
+## gitmoot reviewer remove
+
+```text
+Usage of reviewer remove:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer repos
+
+```text
+Usage of reviewer repos:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer restart
+
+```text
+Usage of reviewer restart:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer show
+
+```text
+Usage of reviewer show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print reviewer as JSON
+```
+
+## gitmoot reviewer start
+
+```text
+Usage of reviewer start:
+  -capability value
+    	reviewer capability, repeatable
+  -effort string
+    	default reasoning effort for this reviewer
+  -home string
+    	home directory to use instead of the current user's home
+  -model string
+    	default runtime model for this reviewer
+  -path string
+    	local checkout path (default ".")
+  -policy string
+    	autonomy policy (default "auto")
+  -repo string
+    	allowed repo as owner/repo
+  -role string
+    	reviewer role
+  -runtime string
+    	reviewer runtime: omp
+  -start-daemon
+    	start the background daemon after setup
+```
+
+## gitmoot reviewer subscribe
+
+```text
+Usage of reviewer subscribe:
+  -capability value
+    	reviewer capability, repeatable
+  -effort string
+    	default reasoning effort for this reviewer
+  -home string
+    	home directory to use instead of the current user's home
+  -model string
+    	default runtime model for this reviewer
+  -policy string
+    	autonomy policy (default "auto")
+  -repo value
+    	allowed repo as owner/repo, repeatable
+  -role string
+    	reviewer role
+  -runtime string
+    	reviewer runtime: omp, or shell for no-LLM tests
+  -session string
+    	runtime session reference, last, or shell command
+```
+
+## gitmoot reviewer type
+
+```text
+Usage:
+  gitmoot reviewer type list
+  gitmoot reviewer type show <type>
+  gitmoot reviewer type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write [--run-timeout duration]
+```
+
+## gitmoot reviewer type list
+
+```text
+Usage of reviewer type list:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot reviewer type set
+
+```text
+Usage of reviewer type set:
+  -capability value
+    	reviewer capability, repeatable
+  -effort string
+    	default reasoning effort for this reviewer type
+  -home string
+    	home directory to use instead of the current user's home
+  -model string
+    	default runtime model for this reviewer type
+  -policy string
+    	reviewer autonomy policy: auto, read-only, workspace-write, or danger-full-access
+  -role string
+    	reviewer role
+  -run-timeout string
+    	managed run timeout
+  -runtime string
+    	reviewer runtime: omp
+```
+
+## gitmoot reviewer type show
+
+```text
+Usage of reviewer type show:
+  -home string
+    	home directory to use instead of the current user's home
 ```
 
 ## gitmoot runtime
@@ -1620,24 +1605,24 @@ and the reason and exits 1.
 
 ```text
 Usage of setup:
-  -agent string
-    	agent name to subscribe
   -home string
     	home directory to use instead of the current user's home
   -path string
     	local checkout path (default ".")
   -repo string
     	repo scope as owner/repo
+  -reviewer string
+    	reviewer name to subscribe
   -role string
-    	agent role (default "agent")
+    	reviewer role (default "agent")
   -runtime string
-    	agent runtime: omp|shell
+    	reviewer runtime: omp|shell
   -session string
     	runtime session reference, last, or shell command
   -start-daemon
     	start the background daemon after setup
   -watch-issues
-    	watch open issues and route @<agent> ask comments to jobs (#389); on by default so the daemon is tagging-ready (default true)
+    	watch open issues and route @<reviewer> ask comments to runs (#389); on by default so the daemon is tagging-ready (default true)
 ```
 
 ## gitmoot status

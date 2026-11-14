@@ -59,7 +59,7 @@ func execBackendDispatchAsk(t *testing.T, home string) string {
 	t.Helper()
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "exec backend probe",
+		"ask", "shell-asker", "exec backend probe",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--background",
@@ -196,7 +196,7 @@ func TestExecBackendUnknownFailsLoudDaemonE2E(t *testing.T) {
 
 			var out, errBuf bytes.Buffer
 			code := Run([]string{
-				"agent", "ask", "shell-asker", "exec backend background probe",
+				"ask", "shell-asker", "exec backend background probe",
 				"--home", home,
 				"--repo", "owner/repo",
 				"--background",
@@ -242,7 +242,7 @@ func TestExecBackendUnknownFailsLoudForegroundE2E(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "exec backend foreground probe",
+		"ask", "shell-asker", "exec backend foreground probe",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--json",
@@ -281,7 +281,7 @@ func TestExecBackendResolvedNonLocalCannotRunLocallyForegroundE2E(t *testing.T) 
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "resolved backend foreground probe",
+		"ask", "shell-asker", "resolved backend foreground probe",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--json",

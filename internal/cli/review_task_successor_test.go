@@ -43,7 +43,7 @@ func TestStrandedReviewTaskGetsANewReviewThroughItsSuccessor(t *testing.T) {
 			request := localAgentDispatchRequest{Home: home, PullRequest: 46, HeadSHA: head, Branch: test.branch}
 
 			_, err := prepareLocalReviewTask(ctx, store, repo, request)
-			want := "gitmoot task successor " + strandedID
+			want := "gitmoot pr successor " + strandedID
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("dispatch before a successor: err=%v, want it to name %q", err, want)
 			}

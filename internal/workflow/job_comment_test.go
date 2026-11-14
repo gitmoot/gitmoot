@@ -25,7 +25,7 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"> Agent: `audit`",
+		"> Reviewer: `audit`",
 		"> Runtime: `codex`",
 		"> Job: `job-123`",
 		"**Decision:** `changes_requested`",

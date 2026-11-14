@@ -30,7 +30,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "subscribe", "audit",
+		"reviewer", "subscribe", "audit",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -46,7 +46,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "list", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "list", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -58,7 +58,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{
-		"agent", "subscribe", "audit",
+		"reviewer", "subscribe", "audit",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -72,7 +72,7 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "list", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "list", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("list after resubscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -83,14 +83,14 @@ func TestRunAgentSubscribeListRemove(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "remove", "audit", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "remove", "audit", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("remove exit code = %d, stderr=%s", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "list", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "list", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("second list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -103,7 +103,7 @@ func TestRunAgentShow(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "subscribe", "audit",
+		"reviewer", "subscribe", "audit",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -118,7 +118,7 @@ func TestRunAgentShow(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "show", "audit", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "show", "audit", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent show exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -138,7 +138,7 @@ func TestRunAgentShow(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "show", "audit", "--home", home, "--json"}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "show", "audit", "--home", home, "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent show --json exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -156,7 +156,7 @@ func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := Run([]string{
-		"agent", "subscribe", "audit",
+		"reviewer", "subscribe", "audit",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -182,7 +182,7 @@ func TestRunAgentSubscribeValidatesAutonomyPolicy(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{
-		"agent", "subscribe", "badpolicy",
+		"reviewer", "subscribe", "badpolicy",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440002",
@@ -203,7 +203,7 @@ func TestRunAgentAccessCommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := Run([]string{
-		"agent", "subscribe", "audit",
+		"reviewer", "subscribe", "audit",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -216,7 +216,7 @@ func TestRunAgentAccessCommands(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "allow", "audit", "--home", home, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "allow", "audit", "--home", home, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("allow exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -226,7 +226,7 @@ func TestRunAgentAccessCommands(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "repos", "audit", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "repos", "audit", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("repos exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -236,14 +236,14 @@ func TestRunAgentAccessCommands(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "deny", "audit", "--home", home, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "deny", "audit", "--home", home, "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("deny exit code = %d, stderr=%s", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "repos", "audit", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "repos", "audit", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("repos after deny exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -264,7 +264,7 @@ func TestRunAgentStartCreatesOmpSessionAndStoresAgent(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "lead",
+		"reviewer", "start", "lead",
 		"--home", home,
 		"--runtime", "omp",
 		"--repo", "owner/repo",
@@ -324,7 +324,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if code := Run([]string{
-		"agent", "subscribe", "planner",
+		"reviewer", "subscribe", "planner",
 		"--home", home,
 		"--runtime", "shell",
 		"--session", "cat",
@@ -337,10 +337,10 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "ask", "planner", "use the isolated state", "--home", otherHome, "--repo", "owner/repo"}, &stdout, &stderr); code != 1 {
+	if code := Run([]string{"ask", "planner", "use the isolated state", "--home", otherHome, "--repo", "owner/repo"}, &stdout, &stderr); code != 1 {
 		t.Fatalf("ask with other home exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), `agent "planner" not found`) {
+	if !strings.Contains(stderr.String(), `reviewer "planner" not found`) {
 		t.Fatalf("ask with other home stderr = %q", stderr.String())
 	}
 
@@ -353,15 +353,15 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("ask exit code = %d, stderr=%s", code, stderr.String())
 	}
 	for _, want := range []string{
-		"job: local-ask-planner-",
+		"run: local-ask-planner-",
 		"state: succeeded",
 		"repo: owner/repo",
-		"agent: planner",
+		"reviewer: planner",
 		"action: ask",
 		"decision: approved",
 		"summary: plan ready",
@@ -442,7 +442,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 	runGit(t, repoDir, "switch", "-c", "feature/local-ask")
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "- Write JSON", "--home", home, "--json"}, &stdout, &stderr)
+	code = Run([]string{"ask", "planner", "- Write JSON", "--home", home, "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("ask --json exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -472,7 +472,7 @@ func TestRunAgentAskDispatchesAndStoresResult(t *testing.T) {
 func TestRunAgentAskWarnsButDoesNotBlockOrchestration(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "ask", "planner", "create branch, commit, push, and open PR", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code := Run([]string{"ask", "planner", "create branch, commit, push, and open PR", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	// The guard must not hard-block (rc 2). It falls through to dispatch and
 	// then fails downstream because the agent does not exist (rc 1). Asserting
 	// rc 1 *and* the "agent ask:" dispatch-error prefix positively confirms it
@@ -483,7 +483,7 @@ func TestRunAgentAskWarnsButDoesNotBlockOrchestration(t *testing.T) {
 	if !strings.Contains(stderr.String(), "read-only") {
 		t.Fatalf("stderr = %q, want the read-only warning", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "agent ask:") {
+	if !strings.Contains(stderr.String(), "ask:") {
 		t.Fatalf("stderr = %q, want the dispatch-error prefix confirming dispatch was reached", stderr.String())
 	}
 }
@@ -703,7 +703,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "create a successor"},
 		},
 		{
 			// #1530: the rebind-on-divergence must NOT precede the disposal
@@ -714,7 +714,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 				request.Branch = "feature/review"
 				request.HeadSHA = strings.Repeat("0", 40)
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "create a successor"},
 		},
 		{
 			name: "requested task upsert",
@@ -722,7 +722,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "dismissed-by-id"
 			},
-			wantError: []string{"is dismissed", "create a successor task"},
+			wantError: []string{"is dismissed", "create a successor"},
 		},
 		{
 			name: "superseded matching branch",
@@ -730,7 +730,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.Branch = "feature/review"
 			},
-			wantError: []string{"is superseded", "successor task"},
+			wantError: []string{"is superseded", "create a successor with `gitmoot pr successor"},
 		},
 		{
 			name: "stranded requested task",
@@ -738,7 +738,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			setRequest: func(request *localAgentDispatchRequest) {
 				request.TaskID = "stranded-by-id"
 			},
-			wantError: []string{"is stranded", "successor task"},
+			wantError: []string{"is stranded", "create a successor with `gitmoot pr successor"},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -765,7 +765,7 @@ func TestPrepareLocalReviewTaskRejectsDisposedTask(t *testing.T) {
 			test.setRequest(&request)
 			_, err = prepareLocalReviewTask(ctx, store,
 				github.Repository{Owner: "owner", Name: "repo"}, request)
-			if err == nil || !strings.Contains(err.Error(), "task "+test.task.ID) {
+			if err == nil || !strings.Contains(err.Error(), "pr "+test.task.ID) {
 				t.Fatalf("prepareLocalReviewTask error = %v", err)
 			}
 			for _, fragment := range test.wantError {
@@ -874,7 +874,7 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{
-		"agent", "subscribe", "planner",
+		"reviewer", "subscribe", "planner",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440022",
@@ -890,20 +890,20 @@ func TestRunAgentAskBackgroundQueuesWithoutRuntimeDelivery(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
+	code := Run([]string{"ask", "planner", "Write a plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("background ask exit code = %d, stderr=%s", code, stderr.String())
 	}
 	for _, want := range []string{
-		"job: local-ask-planner-",
+		"run: local-ask-planner-",
 		"state: queued",
 		"repo: owner/repo",
-		"agent: planner",
+		"reviewer: planner",
 		"action: ask",
-		"next: gitmoot job watch local-ask-planner-",
+		"next: gitmoot run watch local-ask-planner-",
 		"queued: daemon is not running",
 		"process: gitmoot daemon start",
-		"or: gitmoot job run local-ask-planner-",
+		"or: gitmoot run start local-ask-planner-",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("background ask output missing %q:\n%s", want, stdout.String())
@@ -942,7 +942,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if code := Run([]string{
-		"agent", "subscribe", "planner",
+		"reviewer", "subscribe", "planner",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440023",
@@ -955,7 +955,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "ask", "planner", "Write JSON", "--home", home, "--repo", "owner/repo", "--background", "--json"}, &stdout, &stderr)
+	code := Run([]string{"ask", "planner", "Write JSON", "--home", home, "--repo", "owner/repo", "--background", "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("background ask --json exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -980,23 +980,23 @@ func TestRunAgentTypeSetListShow(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "type", "set", "planner",
+		"reviewer", "type", "set", "planner",
 		"--home", home,
 		"--runtime", "omp",
 		"--role", "planner",
 		"--policy", "workspace-write",
-		"--job-timeout", "5m",
+		"--run-timeout", "5m",
 		"--capability", "ask",
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "configured agent type planner") {
+	if !strings.Contains(stdout.String(), "configured reviewer type planner") {
 		t.Fatalf("agent type set output = %q", stdout.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "type", "list", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "type", "list", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent type list exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -1005,7 +1005,7 @@ func TestRunAgentTypeSetListShow(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "type", "show", "planner", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "type", "show", "planner", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent type show exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -1040,8 +1040,8 @@ func TestDispatchForegroundAskUnknownNameStillErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("dispatchLocalAgentJob returned nil error, want not found")
 	}
-	if !strings.Contains(err.Error(), `agent "ghost" not found`) {
-		t.Fatalf("error = %q, want agent not found", err.Error())
+	if !strings.Contains(err.Error(), `reviewer "ghost" not found`) {
+		t.Fatalf("error = %q, want reviewer not found", err.Error())
 	}
 }
 
@@ -1050,21 +1050,21 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := Run([]string{
-		"agent", "type", "set", "shell-planner",
+		"reviewer", "type", "set", "shell-planner",
 		"--home", home,
 		"--runtime", "shell",
 	}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "agent types support omp") {
+	if !strings.Contains(stderr.String(), "reviewer types support omp") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	code = Run([]string{
-		"agent", "type", "set", "codex-planner",
+		"reviewer", "type", "set", "codex-planner",
 		"--home", home,
 		"--runtime", "codex",
 	}, &stdout, &stderr)
@@ -1081,14 +1081,14 @@ func TestRunAgentTypeSetRejectsConfigUnsafeName(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := Run([]string{
-		"agent", "type", "set", "bad#name",
+		"reviewer", "type", "set", "bad#name",
 		"--home", home,
 		"--runtime", "omp",
 	}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("agent type set unsafe name exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid agent type") {
+	if !strings.Contains(stderr.String(), "invalid reviewer type") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
@@ -1099,14 +1099,14 @@ func TestRunAgentTypeSetRejectsNonPositiveTimeouts(t *testing.T) {
 		flag string
 		want string
 	}{
-		{name: "job", flag: "--job-timeout", want: "job timeout must be positive"},
+		{name: "run", flag: "--run-timeout", want: "run timeout must be positive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
 			var stdout, stderr bytes.Buffer
 
 			code := Run([]string{
-				"agent", "type", "set", "planner",
+				"reviewer", "type", "set", "planner",
 				"--home", home,
 				"--runtime", "omp",
 				tc.flag, "0s",
@@ -1130,28 +1130,28 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	t.Chdir(repoDir)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "ask", "planner", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"ask", "planner", "--home", home}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("missing message exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "agent ask requires exactly one agent and one message") {
+	if !strings.Contains(stderr.String(), "ask requires exactly one reviewer and one message") {
 		t.Fatalf("missing message stderr = %q", stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "ask", "missing", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code = Run([]string{"ask", "missing", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("missing agent exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), `agent "missing" not found`) {
+	if !strings.Contains(stderr.String(), `reviewer "missing" not found`) {
 		t.Fatalf("missing agent stderr = %q", stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	if code := Run([]string{
-		"agent", "subscribe", "reviewer",
+		"reviewer", "subscribe", "reviewer",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440031",
@@ -1163,18 +1163,18 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "ask", "reviewer", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code = Run([]string{"ask", "reviewer", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("missing ask capability exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), `agent "reviewer" lacks ask capability`) {
+	if !strings.Contains(stderr.String(), `reviewer "reviewer" lacks ask capability`) {
 		t.Fatalf("missing ask capability stderr = %q", stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
 	if code := Run([]string{
-		"agent", "subscribe", "outsider",
+		"reviewer", "subscribe", "outsider",
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440032",
@@ -1186,11 +1186,11 @@ func TestRunAgentAskValidatesInputAndAccess(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "ask", "outsider", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
+	code = Run([]string{"ask", "outsider", "hello", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("disallowed repo exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), `agent "outsider" is not allowed on "owner/repo"`) {
+	if !strings.Contains(stderr.String(), `reviewer "outsider" is not allowed on "owner/repo"`) {
 		t.Fatalf("disallowed repo stderr = %q", stderr.String())
 	}
 }
@@ -1210,7 +1210,7 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "subscribe", "lead", "--home", home, "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440097", "--role", "lead", "--repo", "owner/repo", "--capability", "ask"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "subscribe", "lead", "--home", home, "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440097", "--role", "lead", "--repo", "owner/repo", "--capability", "ask"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("subscribe exit code = %d, stderr=%s", code, stderr.String())
 	}
 	runner := &agentStartRunner{}
@@ -1219,11 +1219,11 @@ func TestRunAgentStartRejectsExistingAgentBeforeRuntime(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "start", "lead", "--home", home, "--runtime", "omp", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "start", "lead", "--home", home, "--runtime", "omp", "--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write"}, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1", code)
 	}
-	if !strings.Contains(stderr.String(), "agent lead already exists") {
+	if !strings.Contains(stderr.String(), "reviewer lead already exists") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 	if len(runner.calls) != 0 {
@@ -1264,7 +1264,7 @@ job_timeout = "17m"
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "preserved-agent", "--home", home, "--runtime", "omp",
+		"reviewer", "start", "preserved-agent", "--home", home, "--runtime", "omp",
 		"--repo", "owner/repo", "--path", repoDir, "--policy", "workspace-write",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -1295,8 +1295,8 @@ func TestRunAgentStartRejectsConfigUnsafeNameBeforeRuntime(t *testing.T) {
 	agentStartAdapterFor = func(_ string, _ string, _ string) (runtime.Adapter, error) { return fake, nil }
 	t.Cleanup(func() { agentStartAdapterFor = previous })
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "start", "unsafe.name", "--runtime", "omp", "--repo", "owner/repo"}, &stdout, &stderr)
-	if code != 2 || fake.calls() != 0 || !strings.Contains(stderr.String(), "invalid agent name") {
+	code := Run([]string{"reviewer", "start", "unsafe.name", "--runtime", "omp", "--repo", "owner/repo"}, &stdout, &stderr)
+	if code != 2 || fake.calls() != 0 || !strings.Contains(stderr.String(), "invalid reviewer name") {
 		t.Fatalf("code=%d calls=%d stderr=%s", code, fake.calls(), stderr.String())
 	}
 }
@@ -1312,7 +1312,7 @@ func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "shell-agent",
+		"reviewer", "start", "shell-agent",
 		"--home", home,
 		"--runtime", "shell",
 		"--repo", "owner/repo",
@@ -1329,7 +1329,7 @@ func TestRunAgentStartRejectsShellRuntimeBeforeStartingRuntime(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("start exit code = %d, want 1 (stderr=%q)", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "shell runtime does not support agent start") {
+	if !strings.Contains(stderr.String(), "shell runtime does not support reviewer start") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 	if len(runner.calls) != 0 {
@@ -1348,7 +1348,7 @@ func TestRunAgentStartRefusesRemovedRuntime(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "legacy",
+		"reviewer", "start", "legacy",
 		"--home", home,
 		"--runtime", "codex",
 		"--repo", "owner/repo",
@@ -1358,7 +1358,7 @@ func TestRunAgentStartRefusesRemovedRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("start exit code = %d, want 2 (stderr=%q)", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), `runtime "codex" is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the agent with --runtime omp`) {
+	if !strings.Contains(stderr.String(), `runtime "codex" is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the reviewer with --runtime omp`) {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 	if len(runner.calls) != 0 {
@@ -1376,7 +1376,7 @@ func TestRunAgentStartRefusesImplementWithNonWritePolicy(t *testing.T) {
 		restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
 
 		args := []string{
-			"agent", "start", "shipper",
+			"reviewer", "start", "shipper",
 			"--home", home,
 			"--runtime", "omp",
 			"--repo", "owner/repo",
@@ -1416,7 +1416,7 @@ func TestRunAgentStartAllowsImplementWithWritePolicy(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "start", "shipper",
+		"reviewer", "start", "shipper",
 		"--home", home,
 		"--runtime", "omp",
 		"--repo", "owner/repo",
@@ -1433,7 +1433,7 @@ func TestRunAgentSubscribeRefusesImplementWithNonWritePolicy(t *testing.T) {
 	for _, policy := range []string{"", "read-only"} {
 		home := t.TempDir()
 		args := []string{
-			"agent", "subscribe", "shipper",
+			"reviewer", "subscribe", "shipper",
 			"--home", home,
 			"--runtime", "omp",
 			"--session", "550e8400-e29b-41d4-a716-446655440001",
@@ -1459,12 +1459,12 @@ func TestRunAgentSubscribeRefusesImplementWithNonWritePolicy(t *testing.T) {
 
 func TestRunAgentSubscribeValidatesInput(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "subscribe", "bad name", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440001", "--role", "reviewer", "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "subscribe", "bad name", "--runtime", "omp", "--session", "550e8400-e29b-41d4-a716-446655440001", "--role", "reviewer", "--repo", "gitmoot/gitmoot"}, &stdout, &stderr)
 
 	if code != 2 {
 		t.Fatalf("exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "invalid agent") {
+	if !strings.Contains(stderr.String(), "invalid reviewer") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 
@@ -1475,7 +1475,7 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
 	code := Run([]string{
-		"agent", "subscribe", "shell",
+		"reviewer", "subscribe", "shell",
 		"--home", home,
 		"--runtime", "shell",
 		"--session", "printf ok",
@@ -1488,7 +1488,7 @@ func TestRunAgentDoctorPersistsHealth(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"agent", "doctor", "shell", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"reviewer", "doctor", "shell", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doctor exit code = %d, stderr=%s", code, stderr.String())
 	}
@@ -1811,7 +1811,7 @@ func registerPolicyTestAgent(t *testing.T, home, name, policy string) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "subscribe", name,
+		"reviewer", "subscribe", name,
 		"--home", home,
 		"--runtime", "omp",
 		"--session", "550e8400-e29b-41d4-a716-446655440099",
@@ -1828,7 +1828,7 @@ func registerPolicyTestAgent(t *testing.T, home, name, policy string) {
 func agentShowPolicy(t *testing.T, home, name string) string {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "show", name, "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "show", name, "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent show %s exit = %d, stderr=%s", name, code, stderr.String())
 	}
 	for _, line := range strings.Split(stdout.String(), "\n") {
@@ -1856,7 +1856,7 @@ func TestAgentPolicyUpdatesTheRowDispatchReads(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "policy", "rowonly", "--home", home, "--policy", "danger-full-access"}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "policy", "rowonly", "--home", home, "--policy", "danger-full-access"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent policy exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -1881,7 +1881,7 @@ func TestAgentPolicyRejectsUnknownAgentAndPolicy(t *testing.T) {
 	registerPolicyTestAgent(t, home, "known", "auto")
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "policy", "nosuch", "--home", home, "--policy", "auto"}, &stdout, &stderr); code == 0 {
+	if code := Run([]string{"reviewer", "policy", "nosuch", "--home", home, "--policy", "auto"}, &stdout, &stderr); code == 0 {
 		t.Error("agent policy accepted an unregistered agent")
 	}
 	if msg := stderr.String(); !strings.Contains(msg, "is not registered") {
@@ -1890,14 +1890,14 @@ func TestAgentPolicyRejectsUnknownAgentAndPolicy(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "policy", "known", "--home", home, "--policy", "not-a-policy"}, &stdout, &stderr); code == 0 {
+	if code := Run([]string{"reviewer", "policy", "known", "--home", home, "--policy", "not-a-policy"}, &stdout, &stderr); code == 0 {
 		t.Error("agent policy accepted an invalid policy")
 	}
 	// Control: the valid policy that the invalid one is adjacent to still works,
 	// so this cannot pass against a verb that rejects everything.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "policy", "known", "--home", home, "--policy", "read-only"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "policy", "known", "--home", home, "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Errorf("agent policy rejected a valid policy: %s", stderr.String())
 	}
 }
@@ -1914,7 +1914,7 @@ func TestAgentTypeShowSurfacesPolicyDivergence(t *testing.T) {
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "type", "set", "split", "--home", home,
+	code := Run([]string{"reviewer", "type", "set", "split", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
@@ -1930,7 +1930,7 @@ func TestAgentTypeShowSurfacesPolicyDivergence(t *testing.T) {
 	// TestAgentTypeShowIsNonZeroOnDivergence owns that assertion. Re-pinned
 	// rather than deleted, because the stdout and stderr content below is still
 	// the property this test was written for.
-	if code := Run([]string{"agent", "type", "show", "split", "--home", home}, &stdout, &stderr); code == 0 {
+	if code := Run([]string{"reviewer", "type", "show", "split", "--home", home}, &stdout, &stderr); code == 0 {
 		t.Fatalf("agent type show returned 0 on a known divergence")
 	}
 	if out := stdout.String(); !strings.Contains(out, "policy_effective: danger-full-access") {
@@ -1950,7 +1950,7 @@ func TestAgentTypeShowStaysQuietWhenPlanesAgree(t *testing.T) {
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "agree", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "agree", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -1958,7 +1958,7 @@ func TestAgentTypeShowStaysQuietWhenPlanesAgree(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "show", "agree", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "type", "show", "agree", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type show exit = %d", code)
 	}
 	if strings.Contains(stdout.String(), "policy_effective") || strings.Contains(stderr.String(), "differs between planes") {
@@ -1982,7 +1982,7 @@ func TestAgentPolicySyncsTheConfigPlaneWhenOneExists(t *testing.T) {
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "twoplanes", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "twoplanes", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "workspace-write"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -1990,7 +1990,7 @@ func TestAgentPolicySyncsTheConfigPlaneWhenOneExists(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "policy", "twoplanes", "--home", home,
+	if code := Run([]string{"reviewer", "policy", "twoplanes", "--home", home,
 		"--policy", "danger-full-access"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent policy exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -2008,7 +2008,7 @@ func TestAgentPolicySyncsTheConfigPlaneWhenOneExists(t *testing.T) {
 	// firing here would be a symptom rather than a pass.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "show", "twoplanes", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "type", "show", "twoplanes", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type show exit = %d", code)
 	}
 	if out := stdout.String(); !strings.Contains(out, "policy: danger-full-access") {
@@ -2032,7 +2032,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenConfigIsUnwritable(t *testing.T
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "locked", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "locked", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -2056,7 +2056,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenConfigIsUnwritable(t *testing.T
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "policy", "locked", "--home", home, "--policy", "danger-full-access"}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "policy", "locked", "--home", home, "--policy", "danger-full-access"}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("agent policy succeeded with an unwritable config plane: %s", stdout.String())
 	}
@@ -2084,7 +2084,7 @@ func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "rcsplit", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "rcsplit", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -2092,7 +2092,7 @@ func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "show", "rcsplit", "--home", home}, &stdout, &stderr); code == 0 {
+	if code := Run([]string{"reviewer", "type", "show", "rcsplit", "--home", home}, &stdout, &stderr); code == 0 {
 		t.Error("agent type show returned 0 on a KNOWN divergence, so an exit-status gate is still fooled")
 	}
 	if out := stdout.String(); !strings.Contains(out, "policy_effective: danger-full-access") {
@@ -2103,13 +2103,13 @@ func TestAgentTypeShowIsNonZeroOnDivergence(t *testing.T) {
 	// breaks the verb for the majority case it exists to serve.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "set", "lonely", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "lonely", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d", code)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "type", "show", "lonely", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "type", "show", "lonely", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Errorf("agent type show on a type with no registered agent = %d, want 0", code)
 	}
 }
@@ -2126,7 +2126,7 @@ func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "unreadable", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "unreadable", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -2150,7 +2150,7 @@ func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := Run([]string{"agent", "type", "show", "unreadable", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "type", "show", "unreadable", "--home", home}, &stdout, &stderr)
 	if code == 0 {
 		t.Errorf("agent type show returned 0 with an unreadable store: stdout=%q", stdout.String())
 	}
@@ -2175,7 +2175,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenTheRowCannotBeWritten(t *testin
 	home := t.TempDir()
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "blocked", "--home", home,
+	if code := Run([]string{"reviewer", "type", "set", "blocked", "--home", home,
 		"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -2203,7 +2203,7 @@ func TestAgentPolicyLeavesBothPlanesUntouchedWhenTheRowCannotBeWritten(t *testin
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"agent", "policy", "blocked", "--home", home,
+	if code := Run([]string{"reviewer", "policy", "blocked", "--home", home,
 		"--policy", "danger-full-access"}, &stdout, &stderr); code == 0 {
 		t.Fatalf("agent policy returned 0 with an unwritable row: stdout=%q", stdout.String())
 	}
@@ -2251,7 +2251,7 @@ func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
 	t.Run("commit failure restores the config plane", func(t *testing.T) {
 		home := t.TempDir()
 		var stdout, stderr bytes.Buffer
-		if code := Run([]string{"agent", "type", "set", "widened", "--home", home,
+		if code := Run([]string{"reviewer", "type", "set", "widened", "--home", home,
 			"--runtime", "omp", "--role", "worker", "--policy", "danger-full-access"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("agent type set exit = %d, stderr=%s", code, stderr.String())
 		}
@@ -2277,7 +2277,7 @@ func TestCompensatePolicyWriteFailureRollsConfigBack(t *testing.T) {
 	t.Run("barrier failure reports no change and touches nothing", func(t *testing.T) {
 		home := t.TempDir()
 		var stdout, stderr bytes.Buffer
-		if code := Run([]string{"agent", "type", "set", "untouched", "--home", home,
+		if code := Run([]string{"reviewer", "type", "set", "untouched", "--home", home,
 			"--runtime", "omp", "--role", "worker", "--policy", "read-only"}, &stdout, &stderr); code != 0 {
 			t.Fatalf("agent type set exit = %d", code)
 		}
@@ -2316,8 +2316,10 @@ func TestReviewExecutionModeRejectsConflictingFlags(t *testing.T) {
 
 func TestAgentHelpAdvertisesReviewForegroundModes(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := runAgent([]string{"--help"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("agent help exit=%d stderr=%q", code, stderr.String())
+	// `agent review` is the hidden transition path (#2599); its own usage
+	// still advertises both execution modes.
+	if code := runAgent([]string{"review", "--help"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("reviewer review help exit=%d stderr=%q", code, stderr.String())
 	}
 	for _, command := range []string{"agent review"} {
 		line := ""
@@ -2350,14 +2352,14 @@ func TestAgentImplementVerbIsRefused(t *testing.T) {
 		if code != 2 {
 			t.Fatalf("runAgent(%v) exit = %d, want 2", args, code)
 		}
-		if !strings.Contains(stderr.String(), `unknown agent command "implement"`) {
+		if !strings.Contains(stderr.String(), `unknown reviewer command "implement"`) {
 			t.Fatalf("runAgent(%v) stderr = %q, want it to name the removed verb", args, stderr.String())
 		}
 	}
 	// Control: a SURVIVING verb must not be refused, or this test would pass
 	// by rejecting everything.
 	var stdout, stderr bytes.Buffer
-	if code := runAgent([]string{"review"}, &stdout, &stderr); code == 2 && strings.Contains(stderr.String(), "unknown agent command") {
+	if code := runAgent([]string{"review"}, &stdout, &stderr); code == 2 && strings.Contains(stderr.String(), "unknown reviewer command") {
 		t.Fatalf("runAgent(review) was refused as unknown; the refusal is too broad: %q", stderr.String())
 	}
 }

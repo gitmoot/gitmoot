@@ -318,23 +318,23 @@ func TestReviewRequestJSONWithAgentReviewFlagsRoutesTheReview(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &printed); err != nil {
 		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
 	}
-	jobID, _ := printed["job_id"].(string)
+	jobID, _ := printed["run_id"].(string)
 	if jobID == "" {
-		t.Fatalf("job_id missing from %s", stdout.String())
+		t.Fatalf("run_id missing from %s", stdout.String())
 	}
 	for key, want := range map[string]any{"state": reviewRequestDispatched, "repo": "owner/repo", "action": "review", "head_sha": head} {
 		if printed[key] != want {
 			t.Fatalf("%s = %v, want %v in %s", key, printed[key], want, stdout.String())
 		}
 	}
-	if agent, _ := printed["agent"].(string); agent == "" {
-		t.Fatalf("agent missing from %s", stdout.String())
+	if reviewer, _ := printed["reviewer"].(string); reviewer == "" {
+		t.Fatalf("reviewer missing from %s", stdout.String())
 	}
 	if fact, _ := printed["awaited_fact_id"].(float64); fact <= 0 {
 		t.Fatalf("awaited_fact_id = %v, want the requester's verdict wait in %s", printed["awaited_fact_id"], stdout.String())
 	}
-	if printed["job_state"] != "queued" {
-		t.Fatalf("job_state = %v, want queued", printed["job_state"])
+	if printed["run_state"] != "queued" {
+		t.Fatalf("run_state = %v, want queued", printed["run_state"])
 	}
 
 	payload := dispatchedReviewPayload(t, store, jobID)

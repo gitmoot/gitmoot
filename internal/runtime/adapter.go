@@ -333,13 +333,13 @@ func IsRemovedRuntime(name string) bool {
 // RemovedRuntimeError is the refusal for a removed runtime; it says omp is
 // required so the operator knows how to re-register the agent.
 func RemovedRuntimeError(name string) error {
-	return fmt.Errorf("%w: runtime %q is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the agent with --runtime omp", ErrRemovedRuntime, strings.TrimSpace(name))
+	return fmt.Errorf("%w: runtime %q is no longer supported; gitmoot requires omp for jobs (shell only for no-LLM tests): re-register the reviewer with --runtime omp", ErrRemovedRuntime, strings.TrimSpace(name))
 }
 
 // UnsupportedAgentRuntimeError names the agent whose registration still points
 // at a removed runtime, for agent list, doctor, the daemon log and job refusal.
 func UnsupportedAgentRuntimeError(agentName, runtimeName string) error {
-	return fmt.Errorf("agent %s: %w", agentName, RemovedRuntimeError(runtimeName))
+	return fmt.Errorf("reviewer %s: %w", agentName, RemovedRuntimeError(runtimeName))
 }
 
 // SupportedRuntimes enumerates every runtime name the adapter Factory can
@@ -430,7 +430,7 @@ func validateStartRequest(agent Agent, runtimeName string, prompt string) error 
 		return err
 	}
 	if agent.Runtime != runtimeName {
-		return fmt.Errorf("agent runtime %q does not match adapter %q", agent.Runtime, runtimeName)
+		return fmt.Errorf("reviewer runtime %q does not match adapter %q", agent.Runtime, runtimeName)
 	}
 	if strings.TrimSpace(prompt) == "" {
 		return errors.New("start prompt is required")
@@ -444,17 +444,17 @@ func validateAgentFields(agent Agent, requireRuntimeRef bool) error {
 	}
 	switch {
 	case strings.TrimSpace(agent.Name) == "":
-		return errors.New("agent name is required")
+		return errors.New("reviewer name is required")
 	case strings.ContainsAny(agent.Name, " \t\n/"):
-		return fmt.Errorf("agent name %q cannot contain whitespace or slash", agent.Name)
+		return fmt.Errorf("reviewer name %q cannot contain whitespace or slash", agent.Name)
 	case strings.TrimSpace(agent.Role) == "":
-		return errors.New("agent role is required")
+		return errors.New("reviewer role is required")
 	case strings.TrimSpace(agent.Runtime) == "":
-		return errors.New("agent runtime is required")
+		return errors.New("reviewer runtime is required")
 	case requireRuntimeRef && strings.TrimSpace(agent.RuntimeRef) == "":
-		return errors.New("agent runtime reference is required")
+		return errors.New("reviewer runtime reference is required")
 	case strings.TrimSpace(agent.RepoScope) != "" && !validRepoScope(agent.RepoScope):
-		return fmt.Errorf("agent repo scope %q must be owner/repo", agent.RepoScope)
+		return fmt.Errorf("reviewer repo scope %q must be owner/repo", agent.RepoScope)
 	}
 	if _, err := (Factory{}).Adapter(agent.Runtime); err != nil {
 		return err
@@ -665,7 +665,7 @@ func (a ShellAdapter) Start(ctx context.Context, request StartRequest) (StartRes
 	if err := validateStartRequest(request.Agent, a.Name(), request.Prompt); err != nil {
 		return StartResult{}, err
 	}
-	return StartResult{}, errors.New("shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
+	return StartResult{}, errors.New("shell runtime does not support reviewer start; use gitmoot reviewer subscribe --runtime shell --session <command>")
 }
 
 func (a ShellAdapter) Validate(_ context.Context, agent Agent) error {
@@ -755,7 +755,7 @@ func validateRuntime(agent Agent, runtimeName string) error {
 		return err
 	}
 	if agent.Runtime != runtimeName {
-		return fmt.Errorf("agent runtime %q does not match adapter %q", agent.Runtime, runtimeName)
+		return fmt.Errorf("reviewer runtime %q does not match adapter %q", agent.Runtime, runtimeName)
 	}
 	return nil
 }

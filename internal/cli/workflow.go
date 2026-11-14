@@ -96,7 +96,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "scope: %s\n", repoFullName)
 	}
 	fmt.Fprintf(stdout, "repos: %d\n", countRepos(repos, repoFullName))
-	fmt.Fprintf(stdout, "agents: %d\n", len(agents))
+	fmt.Fprintf(stdout, "reviewers: %d\n", len(agents))
 	for _, agent := range agents {
 		fmt.Fprintf(stdout, "  %s: %s %s\n", agent.Name, agent.Runtime, strings.Join(agent.Capabilities, ","))
 	}

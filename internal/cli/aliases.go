@@ -20,6 +20,10 @@ import (
 type commandAlias struct {
 	old []string
 	new []string
+	// notice, when set, is the form the stderr notice names instead of new:
+	// for an old command that dispatches through a hidden path while its
+	// documented replacement has a different shape.
+	notice string
 }
 
 // commandAliases is the hidden command alias table. A rename PR adds a row:
@@ -27,7 +31,12 @@ type commandAlias struct {
 //	{old: []string{"workflow", "note"}, new: []string{"note", "add"}},
 //
 // Longer (two-word) prefixes take precedence over one-word prefixes.
-var commandAliases = []commandAlias{}
+var commandAliases = []commandAlias{
+	// #2599: agents become reviewers.
+	{old: []string{"agent"}, new: []string{"reviewer"}},
+	{old: []string{"agent", "ask"}, new: []string{"ask"}},
+	{old: []string{"agent", "review"}, new: []string{"reviewer", "review"}, notice: "review request --reviewer <name> --message <msg>"},
+}
 
 // aliasWarned records which old names already warned in this process.
 var aliasWarned sync.Map
@@ -56,7 +65,11 @@ func rewriteCommandAlias(args []string, stderr io.Writer) []string {
 	if best == nil {
 		return args
 	}
-	warnRenamed(stderr, strings.Join(best.old, " "), strings.Join(best.new, " "))
+	notice := best.notice
+	if notice == "" {
+		notice = strings.Join(best.new, " ")
+	}
+	warnRenamed(stderr, strings.Join(best.old, " "), notice)
 	rewritten := make([]string, 0, len(best.new)+len(args)-len(best.old))
 	rewritten = append(rewritten, best.new...)
 	return append(rewritten, args[len(best.old):]...)

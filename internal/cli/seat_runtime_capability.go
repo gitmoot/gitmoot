@@ -50,7 +50,7 @@ func (e *seatRuntimeCapabilityError) Error() string {
 		cause = "no daemon-staged artifact exists"
 	}
 	return fmt.Sprintf(
-		"read-only seat capability preflight blocked agent %q: runtime %q is published unavailable to seats, so every command this job dispatches would exit 126 without running (%s); remedy: restore the daemon-staged %s artifact, or dispatch this job to an agent whose runtime stages",
+		"read-only seat capability preflight blocked reviewer %q: runtime %q is published unavailable to seats, so every command this job dispatches would exit 126 without running (%s); remedy: restore the daemon-staged %s artifact, or dispatch this job to a reviewer whose runtime stages",
 		e.agentName, e.runtimeName, cause, e.runtimeName,
 	)
 }
@@ -81,7 +81,7 @@ func (e *seatToolchainCapabilityError) Error() string {
 		cause = "no daemon-staged Go toolchain exists"
 	}
 	return fmt.Sprintf(
-		"read-only seat capability preflight blocked review agent %q: the seat's Go toolchain is published unavailable, so `go build`, `go vet` and `go test` would each exit 126 without running (%s); a verdict from this seat could not have executed the repository's gate; remedy: restore the daemon-staged Go artifact, or dispatch this review to a host whose toolchain stages",
+		"read-only seat capability preflight blocked reviewer %q: the seat's Go toolchain is published unavailable, so `go build`, `go vet` and `go test` would each exit 126 without running (%s); a verdict from this seat could not have executed the repository's gate; remedy: restore the daemon-staged Go artifact, or dispatch this review to a host whose toolchain stages",
 		e.agentName, cause,
 	)
 }

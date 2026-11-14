@@ -2721,7 +2721,7 @@ func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment 
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not find subscribed agent `%s` for this repository.", command.Agent))
+			return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot could not find subscribed reviewer `%s` for this repository.", command.Agent))
 		}
 		return err
 	}
@@ -2730,10 +2730,10 @@ func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment 
 		return err
 	}
 	if !allowed {
-		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot agent `%s` is not allowed on `%s`.", agent.Name, d.Repo.FullName()))
+		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot reviewer `%s` is not allowed on `%s`.", agent.Name, d.Repo.FullName()))
 	}
 	if !hasCapability(agent.Capabilities, command.Action) {
-		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot agent `%s` does not advertise `%s` capability.", agent.Name, command.Action))
+		return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot reviewer `%s` does not advertise `%s` capability.", agent.Name, command.Action))
 	}
 
 	job, created, err := d.enqueueJob(ctx, workflow.JobRequest{
@@ -2857,7 +2857,7 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 	agent, err := d.Store.GetAgent(ctx, command.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not find subscribed agent `%s` for this repository.", command.Agent))
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot could not find subscribed reviewer `%s` for this repository.", command.Agent))
 		}
 		return err
 	}
@@ -2866,10 +2866,10 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 		return err
 	}
 	if !allowed {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` is not allowed on `%s`.", agent.Name, d.Repo.FullName()))
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot reviewer `%s` is not allowed on `%s`.", agent.Name, d.Repo.FullName()))
 	}
 	if !hasCapability(agent.Capabilities, command.Action) {
-		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot agent `%s` does not advertise `%s` capability.", agent.Name, command.Action))
+		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot reviewer `%s` does not advertise `%s` capability.", agent.Name, command.Action))
 	}
 
 	ref, err := d.commentTaskRef(ctx, pull, comment)
@@ -2940,11 +2940,11 @@ func (d Daemon) handleHelpCommand(ctx context.Context, pull github.PullRequest) 
 		allowed = append(allowed, fmt.Sprintf("- `%s`: %s", agent.Name, caps))
 	}
 	if len(allowed) == 0 {
-		lines = append(lines, "- agents: none allowed for this repo")
+		lines = append(lines, "- reviewers: none allowed for this repo")
 	} else {
-		lines = append(lines, "- agents:")
+		lines = append(lines, "- reviewers:")
 		lines = append(lines, allowed...)
-		lines = append(lines, "- agent command: `/gitmoot <agent> <review|ask> <instructions>`")
+		lines = append(lines, "- reviewer command: `/gitmoot <reviewer> <review|ask> <instructions>`")
 	}
 	return d.ack(ctx, pull.Number, strings.Join(lines, "\n"))
 }

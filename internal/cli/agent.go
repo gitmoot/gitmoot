@@ -44,9 +44,11 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "start":
 		return runAgentStart(args[1:], stdout, stderr)
-	case "ask":
-		return runAgentAsk(args[1:], stdout, stderr)
 	case "review":
+		// Hidden: reached only through the `agent review` transition alias
+		// (#2599). `review request --reviewer <name> --message <msg>` is the
+		// documented path; this keeps --foreground, --action and
+		// --skip-native-review-fanout working for one release.
 		return runAgentReview(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
@@ -71,7 +73,7 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 	case "repos":
 		return runAgentRepos(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown agent command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown reviewer command %q\n\n", args[0])
 		printAgentUsage(stderr)
 		return 2
 	}
@@ -79,22 +81,21 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 
 func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot reviewer start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]")
+	fmt.Fprintln(w, "  gitmoot ask <reviewer> \"question\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--campaign label] [--runtime rt] [--session ref] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
-	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
-	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
+	fmt.Fprintln(w, "  gitmoot reviewer type list|show|set ...")
+	fmt.Fprintln(w, "  gitmoot reviewer subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
 	fmt.Fprintln(w, "    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
-	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
-	fmt.Fprintln(w, "  gitmoot agent deny <name> --repo owner/repo")
-	fmt.Fprintln(w, "  gitmoot agent repos <name>")
-	fmt.Fprintln(w, "  gitmoot agent show <name> [--json]")
-	fmt.Fprintln(w, "  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
-	fmt.Fprintln(w, "  gitmoot agent list")
-	fmt.Fprintln(w, "  gitmoot agent remove <name>")
-	fmt.Fprintln(w, "  gitmoot agent restart <name>      # abandon + replace the runtime session (finish in-flight asks first)")
-	fmt.Fprintln(w, "  gitmoot agent doctor <name>")
+	fmt.Fprintln(w, "  gitmoot reviewer allow <name> --repo owner/repo")
+	fmt.Fprintln(w, "  gitmoot reviewer deny <name> --repo owner/repo")
+	fmt.Fprintln(w, "  gitmoot reviewer repos <name>")
+	fmt.Fprintln(w, "  gitmoot reviewer show <name> [--json]")
+	fmt.Fprintln(w, "  gitmoot reviewer policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
+	fmt.Fprintln(w, "  gitmoot reviewer list")
+	fmt.Fprintln(w, "  gitmoot reviewer remove <name>")
+	fmt.Fprintln(w, "  gitmoot reviewer restart <name>      # abandon + replace the runtime session (finish in-flight asks first)")
+	fmt.Fprintln(w, "  gitmoot reviewer doctor <name>")
 }
 
 type agentAskOptions struct {
@@ -124,12 +125,12 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 	if !ok {
 		return 2
 	}
-	if !resolveAgentOrgRole(&options.orgRole, options.home, "agent ask", stderr) {
+	if !resolveAgentOrgRole(&options.orgRole, options.home, "ask", stderr) {
 		return 2
 	}
 	if !options.force && looksLikeWorkflowOrchestration(options.message) {
-		fmt.Fprintln(stderr, "note: this reads like implementation workflow orchestration, but `agent ask` is read-only and will only answer/analyze.")
-		fmt.Fprintln(stderr, "Gitmoot does not dispatch implementation (#2203): implement in your own session and record it with `gitmoot job record --type implement`.")
+		fmt.Fprintln(stderr, "note: this reads like implementation orchestration, but `gitmoot ask` is read-only and will only answer/analyze.")
+		fmt.Fprintln(stderr, "Gitmoot does not dispatch implementation (#2203): implement in your own session and record it with `gitmoot run record --type implement`.")
 	}
 	var output localAgentJobOutput
 	if err := withStore(options.home, func(store *db.Store) error {
@@ -152,26 +153,26 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			SelectedActionReason: "explicit agent ask",
 			ExecutionPath:        "agent_ask",
 			DispatchWarning: func(warning string) {
-				fmt.Fprintf(stderr, "agent ask: warning: %s\n", warning)
+				fmt.Fprintf(stderr, "ask: warning: %s\n", warning)
 			},
 		})
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent ask: %v\n", err)
+		fmt.Fprintf(stderr, "ask: %v\n", err)
 		return 1
 	}
 	if options.background {
 		output.WatchCommand = jobWatchCommand(output.JobID, options.home)
 		running, err := daemonIsRunning(options.home)
 		if err != nil {
-			fmt.Fprintf(stderr, "agent ask: %v\n", err)
+			fmt.Fprintf(stderr, "ask: %v\n", err)
 			return 1
 		}
 		output.DaemonRunning = running
 	}
 	if options.jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "agent ask: %v\n", err)
+			fmt.Fprintf(stderr, "ask: %v\n", err)
 			return 1
 		}
 		return 0
@@ -189,7 +190,7 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 	if len(args) == 0 || helpRequested(args) {
 		printAgentAskUsage(stderr)
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent ask requires exactly one agent and one message")
+			fmt.Fprintln(stderr, "ask requires exactly one reviewer and one message")
 		}
 		return agentAskOptions{}, false
 	}
@@ -197,6 +198,9 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 	positionals := []string{}
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
+		if arg == "--workflow" || strings.HasPrefix(arg, "--workflow=") {
+			arg = renameFlagToken(arg, stderr, FlagAlias{Old: "workflow", New: "campaign"})
+		}
 		switch {
 		case arg == "--background":
 			options.background = true
@@ -204,14 +208,14 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.force = true
 		case arg == "--action":
 			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --action")
+				fmt.Fprintln(stderr, "ask requires a value for --action")
 				return agentAskOptions{}, false
 			}
 			index++
 			options.action = strings.TrimSpace(args[index])
 		case arg == "--model":
 			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --model")
+				fmt.Fprintln(stderr, "ask requires a value for --model")
 				return agentAskOptions{}, false
 			}
 			index++
@@ -220,16 +224,16 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
 		case arg == "--effort":
 			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --effort")
+				fmt.Fprintln(stderr, "ask requires a value for --effort")
 				return agentAskOptions{}, false
 			}
 			index++
 			options.effort = strings.TrimSpace(args[index])
 		case strings.HasPrefix(arg, "--effort="):
 			options.effort = strings.TrimSpace(strings.TrimPrefix(arg, "--effort="))
-		case arg == "--workflow":
+		case arg == "--campaign":
 			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --workflow")
+				fmt.Fprintln(stderr, "ask requires a value for --campaign")
 				return agentAskOptions{}, false
 			}
 			index++
@@ -237,19 +241,19 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.workflowID = strings.TrimSpace(args[index])
 		case arg == "--org-role":
 			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --org-role")
+				fmt.Fprintln(stderr, "ask requires a value for --org-role")
 				return agentAskOptions{}, false
 			}
 			index++
 			options.orgRole = strings.TrimSpace(args[index])
-		case strings.HasPrefix(arg, "--workflow="):
+		case strings.HasPrefix(arg, "--campaign="):
 			options.workflowSet = true
-			options.workflowID = strings.TrimSpace(strings.TrimPrefix(arg, "--workflow="))
+			options.workflowID = strings.TrimSpace(strings.TrimPrefix(arg, "--campaign="))
 		case strings.HasPrefix(arg, "--org-role="):
 			options.orgRole = strings.TrimSpace(strings.TrimPrefix(arg, "--org-role="))
 		case arg == "--runtime" || arg == "--session":
 			if index+1 >= len(args) {
-				fmt.Fprintf(stderr, "agent ask requires a value for %s\n", arg)
+				fmt.Fprintf(stderr, "ask requires a value for %s\n", arg)
 				return agentAskOptions{}, false
 			}
 			index++
@@ -266,7 +270,7 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.jsonOutput = true
 		case arg == "--repo" || arg == "--home":
 			if index+1 >= len(args) {
-				fmt.Fprintf(stderr, "agent ask requires a value for %s\n", arg)
+				fmt.Fprintf(stderr, "ask requires a value for %s\n", arg)
 				return agentAskOptions{}, false
 			}
 			index++
@@ -282,38 +286,38 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 		case strings.HasPrefix(arg, "--action="):
 			options.action = strings.TrimSpace(strings.TrimPrefix(arg, "--action="))
 		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
-			fmt.Fprintf(stderr, "unknown agent ask flag %q\n", arg)
+			fmt.Fprintf(stderr, "unknown ask flag %q\n", arg)
 			return agentAskOptions{}, false
 		default:
 			positionals = append(positionals, arg)
 		}
 	}
 	if len(positionals) != 2 {
-		fmt.Fprintln(stderr, "agent ask requires exactly one agent and one message")
+		fmt.Fprintln(stderr, "ask requires exactly one reviewer and one message")
 		return agentAskOptions{}, false
 	}
 	options.agent = strings.TrimSpace(positionals[0])
 	options.message = strings.TrimSpace(positionals[1])
-	if refuseFlagLikeText("agent ask", options.message, stderr) {
+	if refuseFlagLikeText("ask", options.message, stderr) {
 		return agentAskOptions{}, false
 	}
 	if options.orgRole == "" {
 		options.orgRole = strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE"))
 	}
 	if options.agent == "" || options.message == "" {
-		fmt.Fprintln(stderr, "agent ask requires exactly one agent and one message")
+		fmt.Fprintln(stderr, "ask requires exactly one reviewer and one message")
 		return agentAskOptions{}, false
 	}
 	if options.action != "" && options.action != "ask" {
-		fmt.Fprintf(stderr, "agent ask: --action must be ask; use agent run to choose ask or review\n")
+		fmt.Fprintf(stderr, "ask: --action must be ask; request a review with `gitmoot review request`\n")
 		return agentAskOptions{}, false
 	}
 	if options.workflowSet && options.workflowID == "" {
-		fmt.Fprintln(stderr, "agent ask: --workflow requires a non-blank value")
+		fmt.Fprintln(stderr, "ask: --campaign requires a non-blank value")
 		return agentAskOptions{}, false
 	}
 	if err := workflow.ValidateWorkflowID(options.workflowID); err != nil {
-		fmt.Fprintf(stderr, "agent ask: %v\n", err)
+		fmt.Fprintf(stderr, "ask: %v\n", err)
 		return agentAskOptions{}, false
 	}
 	return options, true
@@ -321,7 +325,7 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--action ask] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]")
+	fmt.Fprintln(w, "  gitmoot ask <reviewer> \"question\" [--repo owner/repo] [--background] [--action ask] [--model model] [--effort effort] [--campaign label] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]")
 	printAgentRuntimeOverrideHelp(w)
 }
 
@@ -329,14 +333,14 @@ func printAgentAskUsage(w io.Writer) {
 // (#531) shared by agent ask/run/review and orchestrate. The valid
 // runtime values are enumerated from the adapter registry, never hard-coded.
 func printAgentRuntimeOverrideHelp(w io.Writer) {
-	fmt.Fprintf(w, "  --runtime %s runs THIS job on the named runtime; the agent's registered default runtime is unchanged.\n", strings.Join(runtime.SupportedRuntimes(), "|"))
-	fmt.Fprintln(w, "    The overridden job never resumes the agent's default-runtime session: it runs on a fresh session of the")
+	fmt.Fprintf(w, "  --runtime %s runs THIS run on the named runtime; the reviewer's registered default runtime is unchanged.\n", strings.Join(runtime.SupportedRuntimes(), "|"))
+	fmt.Fprintln(w, "    The overridden run never resumes the reviewer's default-runtime session: it runs on a fresh session of the")
 	fmt.Fprintln(w, "    override runtime, or on --session <ref> (an explicit session id, or — required for shell — a command;")
 	fmt.Fprintln(w, "    \"last\" is rejected because it resumes whichever session is most recent).")
-	fmt.Fprintln(w, "    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the job uses the")
-	fmt.Fprintln(w, "    override runtime's default model (the agent's configured default model is never applied to another runtime).")
-	fmt.Fprintln(w, "    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the job uses the")
-	fmt.Fprintln(w, "    override runtime's default effort (the agent's configured default effort is never applied to another runtime).")
+	fmt.Fprintln(w, "    Model rule: --model with --runtime is interpreted for the OVERRIDE runtime; without --model the run uses the")
+	fmt.Fprintln(w, "    override runtime's default model (the reviewer's configured default model is never applied to another runtime).")
+	fmt.Fprintln(w, "    Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the run uses the")
+	fmt.Fprintln(w, "    override runtime's default effort (the reviewer's configured default effort is never applied to another runtime).")
 }
 
 type agentRunOptions struct {
@@ -598,7 +602,7 @@ func reviewRequestArgsFromAgentReview(options agentRunOptions) []string {
 		{"--repo", options.repo},
 		{"--model", options.model},
 		{"--effort", options.effort},
-		{"--workflow", options.workflowID},
+		{"--campaign", options.workflowID},
 		{"--session", options.session},
 		{"--head", options.headSHA},
 		{"--branch", options.branch},
@@ -757,7 +761,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 	if len(args) == 0 || helpRequested(args) {
 		printAgentRunUsage(stderr, command)
 		if len(args) == 0 {
-			fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
+			fmt.Fprintf(stderr, "%s requires exactly one reviewer and one message\n", label)
 		}
 		return agentRunOptions{}, false
 	}
@@ -851,7 +855,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		}
 	}
 	if len(positionals) != 2 {
-		fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
+		fmt.Fprintf(stderr, "%s requires exactly one reviewer and one message\n", label)
 		return agentRunOptions{}, false
 	}
 	options.agent = strings.TrimSpace(positionals[0])
@@ -863,7 +867,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 		options.orgRole = strings.TrimSpace(os.Getenv("GITMOOT_ORG_ROLE"))
 	}
 	if options.agent == "" || options.message == "" {
-		fmt.Fprintf(stderr, "%s requires exactly one agent and one message\n", label)
+		fmt.Fprintf(stderr, "%s requires exactly one reviewer and one message\n", label)
 		return agentRunOptions{}, false
 	}
 	if options.background && options.foreground {
@@ -1057,7 +1061,7 @@ func daemonIsRunning(home string) (bool, error) {
 }
 
 func jobWatchCommand(jobID string, home string) string {
-	args := []string{"gitmoot", "job", "watch", jobID}
+	args := []string{"gitmoot", "run", "watch", jobID}
 	if strings.TrimSpace(home) != "" {
 		args = append(args, "--home", home)
 	}
@@ -1065,7 +1069,7 @@ func jobWatchCommand(jobID string, home string) string {
 }
 
 func jobRunCommand(jobID string, home string) string {
-	args := []string{"gitmoot", "job", "run", jobID}
+	args := []string{"gitmoot", "run", "start", jobID}
 	if strings.TrimSpace(home) != "" {
 		args = append(args, "--home", home)
 	}
@@ -1093,7 +1097,7 @@ func runAgentType(args []string, stdout, stderr io.Writer) int {
 	case "set":
 		return runAgentTypeSet(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown agent type command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown reviewer type command %q\n\n", args[0])
 		printAgentTypeUsage(stderr)
 		return 2
 	}
@@ -1101,13 +1105,13 @@ func runAgentType(args []string, stdout, stderr io.Writer) int {
 
 func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent type list")
-	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write")
+	fmt.Fprintln(w, "  gitmoot reviewer type list")
+	fmt.Fprintln(w, "  gitmoot reviewer type show <type>")
+	fmt.Fprintln(w, "  gitmoot reviewer type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write [--run-timeout duration]")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent type list", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer type list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if err := fs.Parse(args); err != nil {
@@ -1117,12 +1121,12 @@ func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent type list does not accept positional arguments")
+		fmt.Fprintln(stderr, "reviewer type list does not accept positional arguments")
 		return 2
 	}
 	types, err := loadAgentTypeConfig(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent type list: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer type list: %v\n", err)
 		return 1
 	}
 	names := make([]string, 0, len(types))
@@ -1138,13 +1142,13 @@ func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
 }
 
 func runAgentTypeShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent type show", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer type show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent type show requires exactly one type")
+			fmt.Fprintln(stderr, "reviewer type show requires exactly one type")
 			return 2
 		}
 		return 0
@@ -1157,17 +1161,17 @@ func runAgentTypeShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent type show requires exactly one type")
+		fmt.Fprintln(stderr, "reviewer type show requires exactly one type")
 		return 2
 	}
 	types, err := loadAgentTypeConfig(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent type show: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer type show: %v\n", err)
 		return 1
 	}
 	entry, ok := types[strings.TrimSpace(name)]
 	if !ok {
-		fmt.Fprintf(stderr, "agent type %q not found\n", name)
+		fmt.Fprintf(stderr, "reviewer type %q not found\n", name)
 		return 1
 	}
 	printAgentType(stdout, entry)
@@ -1220,10 +1224,10 @@ func warnAgentTypePolicyDivergence(stdout, stderr io.Writer, home, name string, 
 			return nil
 		}
 		writeLine(stdout, "policy_effective: %s", rowPolicy)
-		fmt.Fprintf(stderr, "error: agent %q is REGISTERED and its policy differs between planes: "+
+		fmt.Fprintf(stderr, "error: reviewer %q is REGISTERED and its policy differs between planes: "+
 			"this config type says %q, the agents row says %q. DISPATCH READS THE ROW, so the "+
-			"effective policy is %q. Use `gitmoot agent policy %s --policy <value>` to change the "+
-			"row in place, or `gitmoot agent show %s` to read it directly (#2132).\n",
+			"effective policy is %q. Use `gitmoot reviewer policy %s --policy <value>` to change the "+
+			"row in place, or `gitmoot reviewer show %s` to read it directly (#2132).\n",
 			name, configPolicy, rowPolicy, rowPolicy, name, name)
 		status = 1
 		return nil
@@ -1234,7 +1238,7 @@ func warnAgentTypePolicyDivergence(stdout, stderr io.Writer, home, name string, 
 		// by another route. "I could not determine it" and "they agree" must
 		// never render identically.
 		writeLine(stdout, "policy_effective: unknown")
-		fmt.Fprintf(stderr, "error: cannot determine agent %q's effective policy, so the %q above "+
+		fmt.Fprintf(stderr, "error: cannot determine reviewer %q's effective policy, so the %q above "+
 			"is the CONFIG plane only and may not be what dispatch reads: %v\n",
 			name, configPolicy, err)
 		status = 1
@@ -1243,43 +1247,43 @@ func warnAgentTypePolicyDivergence(stdout, stderr io.Writer, home, name string, 
 }
 
 func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent type set", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer type set", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: omp")
-	model := fs.String("model", "", "default runtime model for this agent type")
-	effort := fs.String("effort", "", "default reasoning effort for this agent type")
-	role := fs.String("role", "", "agent role")
-	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
-	jobTimeout := fs.String("job-timeout", "", "managed job timeout")
+	runtimeName := fs.String("runtime", "", "reviewer runtime: omp")
+	model := fs.String("model", "", "default runtime model for this reviewer type")
+	effort := fs.String("effort", "", "default reasoning effort for this reviewer type")
+	role := fs.String("role", "", "reviewer role")
+	policy := fs.String("policy", "", "reviewer autonomy policy: auto, read-only, workspace-write, or danger-full-access")
+	jobTimeout := fs.String("run-timeout", "", "managed run timeout")
 	var capabilities repeatedFlag
-	fs.Var(&capabilities, "capability", "agent capability, repeatable")
+	fs.Var(&capabilities, "capability", "reviewer capability, repeatable")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent type set requires exactly one type")
+			fmt.Fprintln(stderr, "reviewer type set requires exactly one type")
 			return 2
 		}
 		return 0
 	}
 	name := strings.TrimSpace(args[0])
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := parseWithFlagAliases(fs, args[1:], stderr, FlagAlias{Old: "job-timeout", New: "run-timeout"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent type set requires exactly one type")
+		fmt.Fprintln(stderr, "reviewer type set requires exactly one type")
 		return 2
 	}
 	if !validAgentTypeName(name) {
-		fmt.Fprintf(stderr, "invalid agent type %q\n", name)
+		fmt.Fprintf(stderr, "invalid reviewer type %q\n", name)
 		return 2
 	}
 	paths, types, err := loadAgentTypeConfigWithPaths(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent type set: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer type set: %v\n", err)
 		return 1
 	}
 	entry := types[name]
@@ -1288,7 +1292,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		entry.Runtime = strings.TrimSpace(*runtimeName)
 	}
 	if strings.TrimSpace(entry.Runtime) == "" {
-		fmt.Fprintln(stderr, "agent type set requires --runtime for new types")
+		fmt.Fprintln(stderr, "reviewer type set requires --runtime for new types")
 		return 2
 	}
 	if _, err := (runtime.Factory{}).Adapter(entry.Runtime); err != nil {
@@ -1296,7 +1300,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: agent types support omp")
+		fmt.Fprintln(stderr, "invalid runtime: reviewer types support omp")
 		return 2
 	}
 	if strings.TrimSpace(*model) != "" {
@@ -1319,11 +1323,11 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(*jobTimeout) != "" {
 		parsed, err := time.ParseDuration(*jobTimeout)
 		if err != nil {
-			fmt.Fprintf(stderr, "invalid job timeout: %v\n", err)
+			fmt.Fprintf(stderr, "invalid run timeout: %v\n", err)
 			return 2
 		}
 		if parsed <= 0 {
-			fmt.Fprintln(stderr, "job timeout must be positive")
+			fmt.Fprintln(stderr, "run timeout must be positive")
 			return 2
 		}
 		entry.JobTimeout = strings.TrimSpace(*jobTimeout)
@@ -1333,10 +1337,10 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	}
 	entry.Role, entry.Capabilities = resolveAgentDefaults(entry.Role, entry.Capabilities, name, []string{"ask"})
 	if err := config.SaveAgentType(paths, entry); err != nil {
-		fmt.Fprintf(stderr, "agent type set: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer type set: %v\n", err)
 		return 1
 	}
-	writeLine(stdout, "configured agent type %s", name)
+	writeLine(stdout, "configured reviewer type %s", name)
 	return 0
 }
 
@@ -1386,25 +1390,25 @@ func printAgentType(stdout io.Writer, entry config.AgentType) {
 var agentStartAdapterFor = runtimeAdapterFor
 
 func runAgentStart(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent start", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: omp")
+	runtimeName := fs.String("runtime", "", "reviewer runtime: omp")
 	repoFlag := fs.String("repo", "", "allowed repo as owner/repo")
 	path := fs.String("path", ".", "local checkout path")
-	role := fs.String("role", "", "agent role")
-	model := fs.String("model", "", "default runtime model for this agent")
-	effort := fs.String("effort", "", "default reasoning effort for this agent")
+	role := fs.String("role", "", "reviewer role")
+	model := fs.String("model", "", "default runtime model for this reviewer")
+	effort := fs.String("effort", "", "default reasoning effort for this reviewer")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	startDaemon := fs.Bool("start-daemon", false, "start the background daemon after setup")
 	var capabilities repeatedFlag
-	fs.Var(&capabilities, "capability", "agent capability, repeatable")
+	fs.Var(&capabilities, "capability", "reviewer capability, repeatable")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
 	if len(args) == 0 {
 		fs.Usage()
-		fmt.Fprintln(stderr, "agent start requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer start requires exactly one name")
 		return 2
 	}
 	name := args[0]
@@ -1415,24 +1419,24 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent start requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer start requires exactly one name")
 		return 2
 	}
 	if !validAgentTypeName(name) {
-		fmt.Fprintf(stderr, "invalid agent name %q for config enrollment\n", name)
+		fmt.Fprintf(stderr, "invalid reviewer name %q for config enrollment\n", name)
 		return 2
 	}
 	if strings.TrimSpace(*runtimeName) == "" {
-		fmt.Fprintln(stderr, "agent start requires --runtime")
+		fmt.Fprintln(stderr, "reviewer start requires --runtime")
 		return 2
 	}
 	if strings.TrimSpace(*repoFlag) == "" {
-		fmt.Fprintln(stderr, "agent start requires --repo")
+		fmt.Fprintln(stderr, "reviewer start requires --repo")
 		return 2
 	}
 	paths, err := initializedPaths(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer start: %v\n", err)
 		return 1
 	}
 	repo, err := github.ParseRepository(*repoFlag)
@@ -1442,7 +1446,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	}
 	record, err := repoRecordFromStablePath(context.Background(), repo, *path)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer start: %v\n", err)
 		return 1
 	}
 	resolvedRole, resolvedCapabilities := resolveAgentDefaults(*role, capabilities, "agent", []string{"ask", "review", "implement"})
@@ -1458,26 +1462,26 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateStartRequest(runtime.StartRequest{Agent: agent, Prompt: "preflight"}); err != nil {
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 2
 	}
 	if err := runtime.ImplementWritePolicyError(agent.Capabilities, agent.AutonomyPolicy); err != nil {
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 2
 	}
 	if agent.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "start runtime: shell runtime does not support agent start; use gitmoot agent subscribe --runtime shell --session <command>")
+		fmt.Fprintln(stderr, "start runtime: shell runtime does not support reviewer start; use gitmoot reviewer subscribe --runtime shell --session <command>")
 		return 1
 	}
 	if err := withStore(*home, func(store *db.Store) error {
 		if _, err := store.GetAgent(context.Background(), agent.Name); err == nil {
-			return fmt.Errorf("agent %s already exists", agent.Name)
+			return fmt.Errorf("reviewer %s already exists", agent.Name)
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer start: %v\n", err)
 		return 1
 	}
 	prompt := agentStartupPrompt(agent)
@@ -1493,7 +1497,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	}
 	agent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
 	if err := runtime.ValidateAgent(agent); err != nil {
-		fmt.Fprintf(stderr, "invalid started agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid started reviewer: %v\n", err)
 		return 1
 	}
 	if err := withStore(*home, func(store *db.Store) error {
@@ -1502,7 +1506,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 		}
 		return persistAgentSubscription(context.Background(), store, agent, []string{repo.FullName()})
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer start: %v\n", err)
 		return 1
 	}
 	// The [agents.<name>] config block is the daemon's agent-type registry. A
@@ -1511,7 +1515,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	// new type is written, recording the complete started-agent shape.
 	types, err := config.LoadAgentTypes(paths)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent start: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer start: %v\n", err)
 		return 1
 	}
 	entry, exists := types[agent.Name]
@@ -1526,7 +1530,7 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if persistType {
 		if err := config.SaveAgentType(paths, entry); err != nil {
-			fmt.Fprintf(stderr, "agent start: persist agent type: %v\n", err)
+			fmt.Fprintf(stderr, "reviewer start: persist reviewer type: %v\n", err)
 			return 1
 		}
 	}
@@ -1543,25 +1547,25 @@ func runAgentStart(args []string, stdout, stderr io.Writer) int {
 }
 
 func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent subscribe", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer subscribe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	runtimeName := fs.String("runtime", "", "agent runtime: omp, or shell for no-LLM tests")
+	runtimeName := fs.String("runtime", "", "reviewer runtime: omp, or shell for no-LLM tests")
 	session := fs.String("session", "", "runtime session reference, last, or shell command")
-	role := fs.String("role", "", "agent role")
-	model := fs.String("model", "", "default runtime model for this agent")
-	effort := fs.String("effort", "", "default reasoning effort for this agent")
+	role := fs.String("role", "", "reviewer role")
+	model := fs.String("model", "", "default runtime model for this reviewer")
+	effort := fs.String("effort", "", "default reasoning effort for this reviewer")
 	policy := fs.String("policy", "auto", "autonomy policy")
 	var repos repeatedFlag
 	var capabilities repeatedFlag
 	fs.Var(&repos, "repo", "allowed repo as owner/repo, repeatable")
-	fs.Var(&capabilities, "capability", "agent capability, repeatable")
+	fs.Var(&capabilities, "capability", "reviewer capability, repeatable")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
 	if len(args) == 0 {
 		fs.Usage()
-		fmt.Fprintln(stderr, "agent subscribe requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer subscribe requires exactly one name")
 		return 2
 	}
 	name := args[0]
@@ -1572,7 +1576,7 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent subscribe requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer subscribe requires exactly one name")
 		return 2
 	}
 
@@ -1599,17 +1603,17 @@ func runAgentSubscribe(args []string, stdout, stderr io.Writer) int {
 		HealthStatus:   "unknown",
 	}
 	if err := runtime.ValidateAgent(agent); err != nil {
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 2
 	}
 	if err := runtime.ImplementWritePolicyError(agent.Capabilities, agent.AutonomyPolicy); err != nil {
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
 		return persistAgentSubscription(context.Background(), store, agent, normalizedRepos)
 	}); err != nil {
-		fmt.Fprintf(stderr, "subscribe agent: %v\n", err)
+		fmt.Fprintf(stderr, "subscribe reviewer: %v\n", err)
 		return 1
 	}
 	if len(normalizedRepos) == 0 {
@@ -1646,11 +1650,11 @@ func persistAgentSubscription(ctx context.Context, store *db.Store, agent runtim
 func registerAgentOnly(ctx context.Context, store *db.Store, name, runtimeName, repoFullName string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return errors.New("agent name is required")
+		return errors.New("reviewer name is required")
 	}
 	runtimeName = strings.TrimSpace(runtimeName)
 	if runtimeName == "" {
-		return errors.New("agent runtime is required")
+		return errors.New("reviewer runtime is required")
 	}
 	agent := runtime.Agent{
 		Name:      name,
@@ -1743,7 +1747,7 @@ func containsValue(values []string, target string) bool {
 }
 
 func runAgentList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent list", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if err := fs.Parse(args); err != nil {
@@ -1769,7 +1773,7 @@ func runAgentList(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "list agents: %v\n", err)
+		fmt.Fprintf(stderr, "list reviewers: %v\n", err)
 		return 1
 	}
 	for _, agent := range agents {
@@ -1827,15 +1831,15 @@ type agentShowOutput struct {
 // one transaction with the config write as its barrier, so a failure cannot
 // leave one plane granting what another refuses.
 func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent policy", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer policy", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
+	policy := fs.String("policy", "", "reviewer autonomy policy: auto, read-only, workspace-write, or danger-full-access")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fmt.Fprintln(stderr, "Usage:")
-		fmt.Fprintln(stderr, "  gitmoot agent policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
+		fmt.Fprintln(stderr, "  gitmoot reviewer policy <name> --policy auto|read-only|workspace-write|danger-full-access [--home path]")
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent policy requires exactly one agent")
+			fmt.Fprintln(stderr, "reviewer policy requires exactly one reviewer")
 			return 2
 		}
 		return 0
@@ -1848,11 +1852,11 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || name == "" {
-		fmt.Fprintln(stderr, "agent policy requires exactly one agent")
+		fmt.Fprintln(stderr, "reviewer policy requires exactly one reviewer")
 		return 2
 	}
 	if strings.TrimSpace(*policy) == "" {
-		fmt.Fprintln(stderr, "agent policy requires --policy")
+		fmt.Fprintln(stderr, "reviewer policy requires --policy")
 		return 2
 	}
 	normalized, err := runtime.NormalizeAutonomyPolicy(*policy)
@@ -1870,7 +1874,7 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 			// mistake. UpdateAgentAutonomyPolicy already phrases this correctly,
 			// so match it rather than inventing a second wording.
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("agent %q is not registered", name)
+				return fmt.Errorf("reviewer %q is not registered", name)
 			}
 			return err
 		}
@@ -1907,7 +1911,7 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 		if err != nil {
 			return err
 		}
-		writeLine(stdout, "agent: %s", after.Name)
+		writeLine(stdout, "reviewer: %s", after.Name)
 		writeLine(stdout, "policy: %s -> %s",
 			runtime.NormalizeStoredAutonomyPolicy(before.AutonomyPolicy),
 			runtime.NormalizeStoredAutonomyPolicy(after.AutonomyPolicy))
@@ -1925,7 +1929,7 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 		writeLine(stdout, "config_type: %s", agentTypePolicyState(*home, name, normalized))
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent policy: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer policy: %v\n", err)
 		return 1
 	}
 	return 0
@@ -1961,7 +1965,7 @@ func agentTypePolicyState(home, name, policy string) string {
 	}
 	entry, ok := types[name]
 	if !ok {
-		return "none (registry-only agent; nothing to keep in step)"
+		return "none (registry-only reviewer; nothing to keep in step)"
 	}
 	if got := runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy); got != policy {
 		return "STALE: " + got
@@ -1970,14 +1974,14 @@ func agentTypePolicyState(home, name, policy string) string {
 }
 
 func runAgentShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent show", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOutput := fs.Bool("json", false, "print agent as JSON")
+	jsonOutput := fs.Bool("json", false, "print reviewer as JSON")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent show requires exactly one name")
+			fmt.Fprintln(stderr, "reviewer show requires exactly one name")
 			return 2
 		}
 		return 0
@@ -1990,7 +1994,7 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent show requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer show requires exactly one name")
 		return 2
 	}
 
@@ -2017,12 +2021,12 @@ func runAgentShow(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent show: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer show: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "agent show: %v\n", err)
+			fmt.Fprintf(stderr, "reviewer show: %v\n", err)
 			return 1
 		}
 		return 0
@@ -2048,14 +2052,14 @@ func runAgentDeny(args []string, stdout, stderr io.Writer) int {
 }
 
 func runAgentAccessChange(action string, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent "+action, flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer "+action, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repoFlag := fs.String("repo", "", "repo scope as owner/repo")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintf(stderr, "agent %s requires exactly one name\n", action)
+			fmt.Fprintf(stderr, "reviewer %s requires exactly one name\n", action)
 			return 2
 		}
 		return 0
@@ -2068,7 +2072,7 @@ func runAgentAccessChange(action string, args []string, stdout, stderr io.Writer
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintf(stderr, "agent %s requires exactly one name\n", action)
+		fmt.Fprintf(stderr, "reviewer %s requires exactly one name\n", action)
 		return 2
 	}
 	repo, err := normalizeRepoFlag(*repoFlag)
@@ -2086,7 +2090,7 @@ func runAgentAccessChange(action string, args []string, stdout, stderr io.Writer
 		_, err := store.DenyAgentRepo(context.Background(), name, repo)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent %s: %v\n", action, err)
+		fmt.Fprintf(stderr, "reviewer %s: %v\n", action, err)
 		return 1
 	}
 	if action == "allow" {
@@ -2098,13 +2102,13 @@ func runAgentAccessChange(action string, args []string, stdout, stderr io.Writer
 }
 
 func runAgentRepos(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent repos", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer repos", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent repos requires exactly one name")
+			fmt.Fprintln(stderr, "reviewer repos requires exactly one name")
 			return 2
 		}
 		return 0
@@ -2117,7 +2121,7 @@ func runAgentRepos(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent repos requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer repos requires exactly one name")
 		return 2
 	}
 	var repos []string
@@ -2129,7 +2133,7 @@ func runAgentRepos(args []string, stdout, stderr io.Writer) int {
 		repos, err = store.ListAgentRepos(context.Background(), name)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent repos: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer repos: %v\n", err)
 		return 1
 	}
 	for _, repo := range repos {
@@ -2139,13 +2143,13 @@ func runAgentRepos(args []string, stdout, stderr io.Writer) int {
 }
 
 func runAgentRemove(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent remove", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer remove", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent remove requires exactly one name")
+			fmt.Fprintln(stderr, "reviewer remove requires exactly one name")
 			return 2
 		}
 		return 0
@@ -2158,7 +2162,7 @@ func runAgentRemove(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent remove requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer remove requires exactly one name")
 		return 2
 	}
 	var removed bool
@@ -2167,11 +2171,11 @@ func runAgentRemove(args []string, stdout, stderr io.Writer) int {
 		removed, err = store.RemoveAgent(context.Background(), name)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "remove agent: %v\n", err)
+		fmt.Fprintf(stderr, "remove reviewer: %v\n", err)
 		return 1
 	}
 	if !removed {
-		fmt.Fprintf(stderr, "agent %q not found\n", name)
+		fmt.Fprintf(stderr, "reviewer %q not found\n", name)
 		return 1
 	}
 	fmt.Fprintf(stdout, "removed %s\n", name)
@@ -2186,13 +2190,13 @@ func runAgentRemove(args []string, stdout, stderr io.Writer) int {
 // rebuild-from-flags. The old session is abandoned, not torn down (the
 // runtime_ref is a local resume handle).
 func runAgentRestart(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent restart", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer restart", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent restart requires exactly one name")
+			fmt.Fprintln(stderr, "reviewer restart requires exactly one name")
 			return 2
 		}
 		return 0
@@ -2205,7 +2209,7 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent restart requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer restart requires exactly one name")
 		return 2
 	}
 
@@ -2225,20 +2229,20 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		var err error
 		existing, err = store.GetAgent(context.Background(), name)
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("agent %q not found; use agent start to create it", name)
+			return fmt.Errorf("reviewer %q not found; use reviewer start to create it", name)
 		}
 		if err != nil {
 			return err
 		}
 		if existing.Runtime == runtime.ShellRuntime {
-			return fmt.Errorf("agent %q uses the shell runtime, which has no startable session", name)
+			return fmt.Errorf("reviewer %q uses the shell runtime, which has no startable session", name)
 		}
 		active, err := store.AgentActiveJobCount(context.Background(), name)
 		if err != nil {
 			return err
 		}
 		if active > 0 {
-			return fmt.Errorf("agent %s has %d queued or running job(s); cancel them first: %w", name, active, db.ErrAgentHasActiveJobs)
+			return fmt.Errorf("reviewer %s has %d queued or running run(s); cancel them first: %w", name, active, db.ErrAgentHasActiveJobs)
 		}
 		// Functional session-lock guard (#425): a live foreground `agent ask` holds
 		// the runtime:<rt>:<ref> session lock WITHOUT a DB job, so the jobs-busy
@@ -2261,7 +2265,7 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent restart: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer restart: %v\n", err)
 		return 1
 	}
 
@@ -2287,22 +2291,22 @@ func runAgentRestart(args []string, stdout, stderr io.Writer) int {
 	if err := withStore(*home, func(store *db.Store) error {
 		return store.UpsertAgent(context.Background(), existing)
 	}); err != nil {
-		fmt.Fprintf(stderr, "agent restart: %v\n", err)
+		fmt.Fprintf(stderr, "reviewer restart: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "restarted %s (%s); session: %s\n", existing.Name, existing.Runtime, existing.RuntimeRef)
-	fmt.Fprintf(stdout, "note: this abandons and replaces %s's current runtime session; restart refuses while a live foreground `agent ask` holds it, but recovers a stranded one\n", existing.Name)
+	fmt.Fprintf(stdout, "note: this abandons and replaces %s's current runtime session; restart refuses while a live foreground `gitmoot ask` holds it, but recovers a stranded one\n", existing.Name)
 	return 0
 }
 
 func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent doctor", flag.ContinueOnError)
+	fs := flag.NewFlagSet("reviewer doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "agent doctor requires exactly one name")
+			fmt.Fprintln(stderr, "reviewer doctor requires exactly one name")
 			return 2
 		}
 		return 0
@@ -2315,7 +2319,7 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent doctor requires exactly one name")
+		fmt.Fprintln(stderr, "reviewer doctor requires exactly one name")
 		return 2
 	}
 	var agent db.Agent
@@ -2324,7 +2328,7 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 		agent, err = store.GetAgent(context.Background(), name)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "load agent: %v\n", err)
+		fmt.Fprintf(stderr, "load reviewer: %v\n", err)
 		return 1
 	}
 	rtAgent := runtimeAgent(agent)
@@ -2335,20 +2339,20 @@ func runAgentDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := adapter.Validate(context.Background(), rtAgent); err != nil {
 		_ = persistAgentHealth(*home, name, "failed")
-		fmt.Fprintf(stderr, "invalid agent: %v\n", err)
+		fmt.Fprintf(stderr, "invalid reviewer: %v\n", err)
 		return 1
 	}
 	healthErr := adapter.Health(context.Background(), rtAgent)
 	if healthErr != nil {
 		_ = persistAgentHealth(*home, name, "failed")
-		fmt.Fprintf(stderr, "agent %s health failed: %v\n", rtAgent.Name, healthErr)
+		fmt.Fprintf(stderr, "reviewer %s health failed: %v\n", rtAgent.Name, healthErr)
 		return 1
 	}
 	if err := persistAgentHealth(*home, name, "ok"); err != nil {
-		fmt.Fprintf(stderr, "update agent health: %v\n", err)
+		fmt.Fprintf(stderr, "update reviewer health: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "agent %s ok\n", rtAgent.Name)
+	fmt.Fprintf(stdout, "reviewer %s ok\n", rtAgent.Name)
 	return 0
 }
 

@@ -138,7 +138,7 @@ func TestRunAgentRestartPreservesMetadataAndRebindsSession(t *testing.T) {
 	replaceRuntimeStartAdapter(t, fake)
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("restart exit code = %d, stderr=%s", code, stderr.String())
 	}
 	if fake.calls() != 1 {
@@ -181,7 +181,7 @@ func TestRunAgentRestartRejectsBusyAgent(t *testing.T) {
 	replaceRuntimeStartAdapter(t, fake)
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"reviewer", "restart", "rebind-me", "--home", home}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("restart exit code = 0, want non-zero; stdout=%s", stdout.String())
 	}
@@ -203,10 +203,10 @@ func TestRunAgentRestartRejectsMissingAgent(t *testing.T) {
 	replaceRuntimeStartAdapter(t, fake)
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "restart", "ghost", "--home", home}, &stdout, &stderr); code != 1 {
+	if code := Run([]string{"reviewer", "restart", "ghost", "--home", home}, &stdout, &stderr); code != 1 {
 		t.Fatalf("restart exit code = %d, want 1; stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "not found; use agent start to create it") {
+	if !strings.Contains(stderr.String(), "not found; use reviewer start to create it") {
 		t.Fatalf("stderr = %q, want not-found hint", stderr.String())
 	}
 	if fake.calls() != 0 {
@@ -232,7 +232,7 @@ func TestRunAgentRestartRejectsShellRuntime(t *testing.T) {
 	replaceRuntimeStartAdapter(t, fake)
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "restart", "sheller", "--home", home}, &stdout, &stderr); code != 1 {
+	if code := Run([]string{"reviewer", "restart", "sheller", "--home", home}, &stdout, &stderr); code != 1 {
 		t.Fatalf("restart exit code = %d, want 1; stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "shell runtime") {
@@ -255,7 +255,7 @@ func TestRunAgentRestartStartFailsLeavesNoPartialWrite(t *testing.T) {
 	replaceRuntimeStartAdapter(t, fake)
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 1 {
+	if code := Run([]string{"reviewer", "restart", "rebind-me", "--home", home}, &stdout, &stderr); code != 1 {
 		t.Fatalf("restart exit code = %d, want 1; stderr=%s", code, stderr.String())
 	}
 	if fake.calls() != 1 {

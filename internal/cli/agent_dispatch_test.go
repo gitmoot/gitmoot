@@ -82,7 +82,7 @@ scope = ["owner/repo"]
 	// is the router's. The property defended is unchanged and asserted on the job
 	// row above: a daemon-owned QUEUED review, not an in-process run. The old
 	// strings pinned the previous command's wording rather than the behaviour.
-	for _, want := range []string{"(queued)", "watch: gitmoot job watch"} {
+	for _, want := range []string{"(queued)", "watch: gitmoot run watch"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("stdout = %q, want %q", stdout.String(), want)
 		}
@@ -455,7 +455,7 @@ func TestCLIReviewLoopUnresolvableReviewerFailsClosedBeforeIdentityGuard(t *test
 		RepoFlag: "owner/repo", Agent: "ghost-reviewer", Action: "review", PullRequest: 227,
 		Branch: "main", HeadSHA: "same-head", Instructions: "Review unchanged head.", Home: fixture.home,
 	})
-	if err == nil || !strings.Contains(err.Error(), `agent "ghost-reviewer" not found`) {
+	if err == nil || !strings.Contains(err.Error(), `reviewer "ghost-reviewer" not found`) {
 		t.Fatalf("dispatch error = %v, want fail-closed unregistered reviewer refusal", err)
 	}
 
@@ -1654,8 +1654,8 @@ func TestAgentReviewJSONRoutesAndKeepsTheNamedReviewer(t *testing.T) {
 		t.Fatalf("stderr = %q: --json alone must not bypass the router", stderr.String())
 	}
 	var printed struct {
-		JobID         string `json:"job_id"`
-		Agent         string `json:"agent"`
+		JobID         string `json:"run_id"`
+		Agent         string `json:"reviewer"`
 		Repo          string `json:"repo"`
 		AwaitedFactID int64  `json:"awaited_fact_id"`
 		ExecutionPath string `json:"execution_path"`

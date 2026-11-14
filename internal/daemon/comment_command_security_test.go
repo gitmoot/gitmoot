@@ -188,7 +188,7 @@ func TestHandleCommentDistinguishesProseFromMalformedCommand(t *testing.T) {
 	if err := daemon.handleComment(ctx, pull, malformed); err != nil {
 		t.Fatalf("handleComment(malformed) returned error: %v", err)
 	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "malformed agent mention command") {
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "malformed reviewer mention command") {
 		t.Fatalf("malformed command replies = %+v, want one visible parse error", client.posted)
 	}
 	if seen, err := store.HasCommentSeen(ctx, repo.FullName(), malformed.ID); err != nil || !seen {

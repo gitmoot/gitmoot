@@ -1123,9 +1123,9 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			// because "retry the crashed job" and "this slot was cancelled on purpose,
 			// so decide whether it should be re-dispatched at all" are different
 			// operator actions.
-			return fmt.Errorf("cancelled review slot for reviewer %s at evaluated head (job %s was cancelled, not crashed); a cancellation is not a verdict, so decide whether this slot should be re-dispatched at that head or superseded by a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID)
+			return fmt.Errorf("cancelled review slot for reviewer %s at evaluated head (job %s was cancelled, not crashed); a cancellation is not a verdict, so decide whether this slot should be re-dispatched at that head or superseded by a new head. Reassigning the review to a different reviewer cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID)
 		case JobFailed:
-			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different agent cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)
+			return fmt.Errorf("crashed reviewer %s at evaluated head (job %s is %s); retry or settle that same job, or push a new head. Reassigning the review to a different reviewer cannot clear this reviewer's slot", effectiveReviewerIdentityName(review.job, review.payload), review.job.ID, review.job.State)
 		}
 	}
 	for _, review := range activeAtHead {
@@ -1351,7 +1351,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 				return fmt.Errorf("reviewer %s at evaluated head has unusable job state %s (job %s)", reviewer, review.job.State, review.job.ID)
 			}
 			if review.payload.Result == nil {
-				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same reviewer at this head, or push a new head. Reassigning to a different reviewer cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
 			decision := effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity)
 			if decision == "approved" && reviewPartOf(review.payload) != "" {
@@ -1374,7 +1374,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			case "changes_requested", "blocked", "failed":
 				return mergeBlocked{reason: fmt.Sprintf("review at evaluated head has blocking result from %s", reviewer)}
 			default:
-				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.payload.Result.Decision, review.job.ID)
+				return fmt.Errorf("abstaining reviewer %s at evaluated head returned unrecognized decision %q (job %s); dispatch a fresh review for that same reviewer at this head, or push a new head. Reassigning to a different reviewer cannot clear this reviewer's slot", reviewer, review.payload.Result.Decision, review.job.ID)
 			}
 		}
 		if reason := authorship.failureReason(); reason != "" {

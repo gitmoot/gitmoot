@@ -47,7 +47,7 @@ func TestRunSetupRegistersRepoAndAgent(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("setup exit code = %d, stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{"step: initialize local state", "step: register repo owner/repo", "step: subscribe agent lead", "next: gitmoot daemon start --repo owner/repo"} {
+	for _, want := range []string{"step: initialize local state", "step: register repo owner/repo", "step: subscribe reviewer lead", "next: gitmoot daemon start --repo owner/repo"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("setup output missing %q:\n%s", want, stdout.String())
 		}
@@ -90,7 +90,7 @@ func TestRunSetupPrintsTaggingReadinessByDefault(t *testing.T) {
 	for _, want := range []string{
 		"readiness:",
 		"repo registered: owner/repo",
-		"agent access: lead -> owner/repo",
+		"reviewer access: lead -> owner/repo",
 		"gitmoot daemon start --repo owner/repo --watch-issues",
 		"@lead ask <your question>",
 		"only the `ask` action is acted on",

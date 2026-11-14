@@ -233,7 +233,7 @@ func (a OmpAdapter) Validate(_ context.Context, agent Agent) error {
 		return err
 	}
 	if agent.Runtime != a.Name() {
-		return fmt.Errorf("agent runtime %q does not match adapter %q", agent.Runtime, a.Name())
+		return fmt.Errorf("reviewer runtime %q does not match adapter %q", agent.Runtime, a.Name())
 	}
 	if err := ompAgentFieldChecks(agent); err != nil {
 		return err
@@ -252,13 +252,13 @@ func (a OmpAdapter) Validate(_ context.Context, agent Agent) error {
 func ompAgentFieldChecks(agent Agent) error {
 	switch {
 	case strings.TrimSpace(agent.Name) == "":
-		return errors.New("agent name is required")
+		return errors.New("reviewer name is required")
 	case strings.ContainsAny(agent.Name, " \t\n/"):
-		return fmt.Errorf("agent name %q cannot contain whitespace or slash", agent.Name)
+		return fmt.Errorf("reviewer name %q cannot contain whitespace or slash", agent.Name)
 	case strings.TrimSpace(agent.Role) == "":
-		return errors.New("agent role is required")
+		return errors.New("reviewer role is required")
 	case strings.TrimSpace(agent.RepoScope) != "" && !validRepoScope(agent.RepoScope):
-		return fmt.Errorf("agent repo scope %q must be owner/repo", agent.RepoScope)
+		return fmt.Errorf("reviewer repo scope %q must be owner/repo", agent.RepoScope)
 	}
 	return nil
 }

@@ -99,7 +99,7 @@ func TestRuntimeConstructionSwitchesCoverEverySupportedRuntime(t *testing.T) {
 // dump, which is what an operator actually sees) rather than re-deriving the
 // string, so replacing the derivation with any literal fails here.
 func TestSetupRuntimeFlagHelpIsDerivedFromRegistry(t *testing.T) {
-	want := "agent runtime: " + strings.Join(runtime.SupportedRuntimes(), "|")
+	want := "reviewer runtime: " + strings.Join(runtime.SupportedRuntimes(), "|")
 	if !strings.Contains(want, runtime.OmpRuntime) {
 		t.Fatalf("expected usage %q to enumerate omp; SupportedRuntimes = %v", want, runtime.SupportedRuntimes())
 	}

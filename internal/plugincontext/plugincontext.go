@@ -134,7 +134,7 @@ func Build(ctx context.Context, opts BuildOptions) (string, error) {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Guardrails")
 	fmt.Fprintln(&b, "- This hook provides read-only startup context only.")
-	fmt.Fprintln(&b, "- Do not call GitHub, check `gh auth status`, start daemons, inspect remote PRs, poll jobs or locks automatically, create or subscribe agents, update templates, release locks, or mutate state unless the user explicitly asks.")
+	fmt.Fprintln(&b, "- Do not call GitHub, check `gh auth status`, start daemons, inspect remote PRs, poll jobs or locks automatically, create or subscribe reviewers, update templates, release locks, or mutate state unless the user explicitly asks.")
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 

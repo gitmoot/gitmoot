@@ -54,8 +54,8 @@ type reviewRequestOutput struct {
 	HeadSHA     string   `json:"head_sha"`
 	Purpose     string   `json:"purpose"`
 	Requester   string   `json:"requester"`
-	JobID       string   `json:"job_id"`
-	JobState    string   `json:"job_state,omitempty"`
+	JobID       string   `json:"run_id"`
+	JobState    string   `json:"run_state,omitempty"`
 	Reviewer    string   `json:"reviewer,omitempty"`
 	Model       string   `json:"model,omitempty"`
 	ModelPool   []string `json:"model_pool,omitempty"`
@@ -79,8 +79,7 @@ type reviewRequestOutput struct {
 	// The fields below repeat the names `agent review --json` prints, so a
 	// caller that parsed that object reads the same keys here (#2314). `state`
 	// above keeps its router meaning (dispatched, attached, verdict_exists);
-	// the job's own state is `job_state`.
-	Agent                string   `json:"agent"`
+	// the run's own state is `run_state`.
 	Action               string   `json:"action"`
 	SelectedAction       string   `json:"selected_action,omitempty"`
 	SelectedActionReason string   `json:"selected_action_reason,omitempty"`
@@ -111,12 +110,12 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 
 func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer AGENT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--workflow ID] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede JOB --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
+	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "request routes one independent review of the pull request's current (or --head) commit.")
-	fmt.Fprintln(w, "Gitmoot picks a review-capable agent, runs it on omp with the [review_router] model pool")
+	fmt.Fprintln(w, "Gitmoot picks a review-capable reviewer (or --reviewer), runs it on omp with the [review_router] model pool")
 	fmt.Fprintln(w, "for the purpose, falls back to the next model on a provider quota/auth failure, and")
 	fmt.Fprintln(w, "wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for")
 	fmt.Fprintln(w, "the same head attaches to the running review or to its saved verdict; it never spends")
@@ -198,10 +197,10 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.purpose, "purpose", "code", "review purpose: code, security, ui, or architecture")
 	fs.StringVar(&opts.role, "role", "", "requesting organization role notified with the verdict (defaults to GITMOOT_ORG_ROLE)")
 	fs.DurationVar(&opts.ttl, "ttl", defaultReviewRequestTTL, "how long the requester waits before the wait expires to its parent")
-	fs.StringVar(&opts.reviewer, "reviewer", "", "registered review agent to use instead of the router's choice")
+	fs.StringVar(&opts.reviewer, "reviewer", "", "registered reviewer to use instead of the router's choice")
 	fs.StringVar(&opts.model, "model", "", "provider/model the review runs on, overriding the pool head")
 	fs.StringVar(&opts.effort, "effort", "", "reasoning effort for runtimes that accept one")
-	fs.StringVar(&opts.workflowID, "workflow", "", "workflow the review job is filed under")
+	fs.StringVar(&opts.workflowID, "campaign", "", "campaign the review run is filed under")
 	fs.StringVar(&opts.session, "session", "", "runtime session the review reuses")
 	fs.StringVar(&opts.runtime, "runtime", "", "override the runtime this review dispatches on (default omp)")
 	fs.BoolVar(&opts.allowPromptHeadMismatch, "allow-prompt-head-mismatch", false, "dispatch even when a carried finding cites a commit outside this pull request's history")
@@ -210,8 +209,8 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&opts.full, "full", false, "review the full diff against the PR base even when a prior verdict at an ancestor head could bound the review")
 	fs.BoolVar(&opts.postMerge, "post-merge", false, "review an already-merged head; findings become follow-ups instead of blocking a merge")
 	fs.StringVar(&opts.part, "part", "", "one part of a split review of the same head: a slug of letters, digits and dashes (e.g. mm-12-mm-15)")
-	fs.StringVar(&opts.supersede, "supersede", "", "re-review at the same head: the settled blocking review job (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason")
-	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both jobs")
+	fs.StringVar(&opts.supersede, "supersede", "", "re-review at the same head: the settled blocking review (of this --part, or the whole-head review without --part) whose verdict this request replaces once it lands; requires --reason")
+	fs.StringVar(&opts.supersedeReason, "reason", "", "why --supersede re-reviews the part; recorded on both runs")
 	fs.BoolVar(&opts.noExecution, "no-execution", false, "review by reading code and the exact-head CI evidence only; the reviewer seat cannot run any program (omp, local backend, linux/amd64)")
 	fs.StringVar(&opts.evidenceManifest, "evidence-manifest", "", "absolute path of a JSON manifest (schema_version 1, head_sha, files[{path,bytes,sha256}]) of private files to install read-only into this remote E2B review's sandbox; every file is hash-verified now and again inside the sandbox; requires --exec-backend remote")
 	fs.Func("related-pr", "same-repository pull request whose exact head tree the reviewer gets read-only at .gitmoot-related/pr-N; repeatable; the daemon fetches refs/pull/N/head on this host and pins its head now", func(value string) error {
@@ -231,11 +230,13 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 	// --no-fix-target is accepted and ignored (#2586): fix-target routing is
 	// gone, and every seat's review command still passes the flag.
 	fs.Bool("no-fix-target", false, "accepted for compatibility and ignored: a review never routes a fix")
-	fs.Bool("background", false, "accepted for parity with `agent review`: the router always queues the review for the daemon")
+	fs.Bool("background", false, "accepted for compatibility: the router always queues the review for the daemon")
+	var message string
+	fs.StringVar(&message, "message", "", "review instructions passed verbatim to the reviewer (same as a trailing positional)")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -247,7 +248,13 @@ func runReviewRequest(args []string, stdout, stderr io.Writer) int {
 		}
 	})
 	if fs.NArg() == 1 {
+		if strings.TrimSpace(message) != "" {
+			fmt.Fprintln(stderr, "review request: pass the review instructions once, as --message or as a trailing positional")
+			return 2
+		}
 		opts.message = strings.TrimSpace(fs.Arg(0))
+	} else {
+		opts.message = strings.TrimSpace(message)
 	}
 	if fs.NArg() > 1 || opts.pr <= 0 {
 		fmt.Fprintln(stderr, "review request requires --pr NUMBER")
@@ -551,7 +558,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 				}
 				attach, takeover, err := resolveLostReviewClaim(ctx, store, current, time.Now().UTC())
 				if err != nil || takeover {
-					return reviewRequestOutput{}, fmt.Errorf("review request for %s is contended: the claim moved to job %s while this request was resolving; re-run it", subjectKey, current.JobID)
+					return reviewRequestOutput{}, fmt.Errorf("review request for %s is contended: the claim moved to review %s while this request was resolving; re-run it", subjectKey, current.JobID)
 				}
 				return finishReviewAttach(ctx, store, output, attach, current, opts)
 			}
@@ -567,7 +574,7 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 		oldIdentity, _ := workflow.ReviewerIdentity(supersededJob.Agent, supersededPayloadRole(supersededJob))
 		if newIdentity == "" || newIdentity != oldIdentity {
 			abandonClaim()
-			return reviewRequestOutput{}, fmt.Errorf("review request --supersede: reviewer identity %q differs from the superseded job's %q; the merge gate would never let it replace that verdict", newIdentity, oldIdentity)
+			return reviewRequestOutput{}, fmt.Errorf("review request --supersede: reviewer identity %q differs from the superseded review's %q; the merge gate would never let it replace that verdict", newIdentity, oldIdentity)
 		}
 	}
 	effectiveRuntime := effectiveReviewRuntime(opts.runtime, selectedRuntime)
@@ -669,7 +676,6 @@ func requestReview(ctx context.Context, store *db.Store, opts reviewRequestOptio
 	output.JobID = dispatched.JobID
 	output.JobState = dispatched.State
 	output.Reviewer = reviewer.Name
-	output.Agent = reviewer.Name
 	// THE DISPATCHED VALUES, NOT THE POOL HEAD. output.Model was pool[0], which
 	// misreports an explicit --model and made a working override look dropped
 	// (#2196 review). request.Model and request.Runtime are what the job carries.
@@ -790,29 +796,29 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 		return db.Job{}, err
 	}
 	if claim.JobID != opts.supersede {
-		return db.Job{}, fmt.Errorf("review request --supersede: %s at head %s is held by job %s, not %s", supersedeScope(opts.part), head, claim.JobID, opts.supersede)
+		return db.Job{}, fmt.Errorf("review request --supersede: %s at head %s is held by review %s, not %s", supersedeScope(opts.part), head, claim.JobID, opts.supersede)
 	}
 	job, err := store.GetJob(ctx, opts.supersede)
 	if err != nil {
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s: %w", opts.supersede, err)
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s: %w", opts.supersede, err)
 	}
 	payload, err := workflow.DecodeJobPayload(job)
 	if err != nil {
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s payload: %w", job.ID, err)
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s payload: %w", job.ID, err)
 	}
 	// The claim key already binds repo, PR, head, purpose and part; checking the
 	// job's own fields as well refuses a claim row that does not match its job.
 	if !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), head) || payload.ReviewPart != strings.ToLower(strings.TrimSpace(opts.part)) || payload.PullRequest != opts.pr {
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s reviewed PR %d part %q at head %s, not PR %d part %q at %s", job.ID, payload.PullRequest, payload.ReviewPart, payload.HeadSHA, opts.pr, opts.part, head)
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s reviewed PR %d part %q at head %s, not PR %d part %q at %s", job.ID, payload.PullRequest, payload.ReviewPart, payload.HeadSHA, opts.pr, opts.part, head)
 	}
 	switch workflow.JobState(job.State) {
 	case workflow.JobSucceeded, workflow.JobFailed, workflow.JobCancelled:
 	case workflow.JobBlocked:
 		if strings.TrimSpace(payload.BlockerRetryAt) != "" {
-			return db.Job{}, fmt.Errorf("review request --supersede: job %s is blocked with an automatic retry scheduled at %s; it is not settled", job.ID, payload.BlockerRetryAt)
+			return db.Job{}, fmt.Errorf("review request --supersede: review %s is blocked with an automatic retry scheduled at %s; it is not settled", job.ID, payload.BlockerRetryAt)
 		}
 	default:
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s is %s; only a settled review can be superseded", job.ID, job.State)
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s is %s; only a settled review can be superseded", job.ID, job.State)
 	}
 	decision := ""
 	if payload.Result != nil {
@@ -821,9 +827,9 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	switch decision {
 	case "changes_requested", "blocked", "failed":
 	case "approved":
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s approved %s; an approval blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part))
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s approved %s; an approval blocks nothing, so there is nothing to supersede", job.ID, supersedeScope(opts.part))
 	default:
-		return db.Job{}, fmt.Errorf("review request --supersede: job %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)
+		return db.Job{}, fmt.Errorf("review request --supersede: review %s carries no blocking verdict (decision %q); request it without --supersede", job.ID, decision)
 	}
 	if explicit := strings.TrimSpace(opts.reviewer); explicit != "" && explicit != job.Agent {
 		return db.Job{}, fmt.Errorf("review request --supersede: --reviewer %s differs from %s, who reviewed %s; the merge gate retires an objection only with the same reviewer's later verdict", explicit, job.Agent, supersedeScope(opts.part))
@@ -833,7 +839,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 		return db.Job{}, err
 	}
 	if !moved {
-		return db.Job{}, fmt.Errorf("review request --supersede: the claim for %s moved away from job %s while this request ran (another re-review won); nothing was dispatched", supersedeScope(opts.part), job.ID)
+		return db.Job{}, fmt.Errorf("review request --supersede: the claim for %s moved away from review %s while this request ran (another re-review won); nothing was dispatched", supersedeScope(opts.part), job.ID)
 	}
 	return job, nil
 }
@@ -961,7 +967,6 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	output.JobID = firstNonEmpty(job.ID, claim.JobID)
 	output.JobState = job.State
 	output.Reviewer = job.Agent
-	output.Agent = job.Agent
 	output.Model = job.Model
 	output.Runtime = job.Runtime
 	output.WatchCommand = jobWatchCommand(output.JobID, opts.home)
@@ -1069,7 +1074,7 @@ func subscribeRoleToReviewVerdict(ctx context.Context, store *db.Store, role str
 	// Say so at request time instead (#2130 makes this shape common).
 	var holds []string
 	for _, skip := range skipped {
-		hold := fmt.Sprintf("review job %s recorded no head, so it cannot satisfy this exact-head wait", skip.JobID)
+		hold := fmt.Sprintf("review %s recorded no head, so it cannot satisfy this exact-head wait", skip.JobID)
 		if skip.ExternallyDriven {
 			hold += " (externally driven: its attribution row is not head-bound)"
 		}
@@ -1245,7 +1250,7 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		}
 	}
 	if len(candidates) == 0 {
-		return db.Agent{}, "", fmt.Errorf("no review-only agent is registered for %s; register one with `gitmoot agent subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
+		return db.Agent{}, "", fmt.Errorf("no review-only reviewer is registered for %s; register one with `gitmoot reviewer subscribe <name> --runtime omp --session fresh:<suffix> --role reviewer --repo %s --capability review` or pass --reviewer", repo, repo)
 	}
 	// A SECOND PURPOSE AT THE SAME HEAD MUST NOT BE REFUSED AS A LOOP (#2172
 	// review rounds 2-4). "Answered" is scoped to the PURPOSE being requested,
@@ -1287,7 +1292,7 @@ func selectReviewRouterAgent(ctx context.Context, store *db.Store, repo string, 
 		return candidates[i].Name < candidates[j].Name
 	})
 	if answered[strings.ToLower(candidates[0].Name)] {
-		return db.Agent{}, "", fmt.Errorf("every review-only agent for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only agent, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
+		return db.Agent{}, "", fmt.Errorf("every review-only reviewer for %s already holds a %s verdict at head %s, so a repeat of the same purpose would be refused as a review loop; register another review-only reviewer, ask a different purpose, or pass --reviewer", repo, wantPurpose, headSHA)
 	}
 	// ROUTE AROUND THE HOLD RATHER THAN REFUSE AT DISPATCH. Candidates are
 	// already ordered by the loop guard and the omp preference, so a hold
@@ -1309,7 +1314,7 @@ func unavailableReviewRuntimeError(role string, incident db.OrgRoleUnavailable) 
 	if scope == "" {
 		scope = "every runtime"
 	}
-	return fmt.Errorf("no available runtime for role %q: its %s hold (%s) lasts until %s, and no review-capable agent offers another runtime; wait, pass --runtime, or clear the hold",
+	return fmt.Errorf("no available runtime for role %q: its %s hold (%s) lasts until %s, and no review-capable reviewer offers another runtime; wait, pass --runtime, or clear the hold",
 		role, scope, strings.TrimSpace(incident.Reason), strings.TrimSpace(incident.Until))
 }
 
@@ -1539,7 +1544,7 @@ func reviewRouterInstructions(purpose, repo string, pullRequest int, head string
 func printReviewRequestOutput(w io.Writer, output reviewRequestOutput) {
 	fmt.Fprintf(w, "state: %s\n", output.State)
 	fmt.Fprintf(w, "repo: %s#%d head: %s purpose: %s\n", output.Repo, output.PullRequest, output.HeadSHA, output.Purpose)
-	fmt.Fprintf(w, "job: %s", output.JobID)
+	fmt.Fprintf(w, "run: %s", output.JobID)
 	if output.JobState != "" {
 		fmt.Fprintf(w, " (%s)", output.JobState)
 	}
@@ -1614,7 +1619,7 @@ type reviewStatusOutput struct {
 }
 
 type reviewStatusEntry struct {
-	JobID   string `json:"job_id"`
+	JobID   string `json:"run_id"`
 	State   string `json:"state"`
 	HeadSHA string `json:"head_sha"`
 	Purpose string `json:"purpose,omitempty"`
@@ -1705,7 +1710,7 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "%s#%d: %d review job(s)\ngate: %s\n", output.Repo, output.PullRequest, len(output.Requests), output.Gate)
+	fmt.Fprintf(stdout, "%s#%d: %d review(s)\ngate: %s\n", output.Repo, output.PullRequest, len(output.Requests), output.Gate)
 	for _, entry := range output.Requests {
 		line := fmt.Sprintf("  %s %s head=%s reviewer=%s", entry.JobID, entry.State, shortReviewHead(entry.HeadSHA), entry.Reviewer)
 		if entry.Model != "" {

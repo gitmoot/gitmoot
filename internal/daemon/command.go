@@ -107,7 +107,7 @@ func malformedCommentCommand(line string) error {
 	if len(fields) > 0 && fields[0] == "/gitmoot" {
 		return errors.New("malformed /gitmoot command")
 	}
-	return errors.New("malformed agent mention command")
+	return errors.New("malformed reviewer mention command")
 }
 
 func isCommandAddressedLine(line string) bool {
@@ -290,7 +290,7 @@ func (c Command) Validate() error {
 		return fmt.Errorf("command %q requires a job id", c.Action)
 	}
 	if c.Action != "status" && c.Action != "merge" && c.Action != "retry" && c.Action != "cancel" && c.Action != "help" && c.Agent == "" {
-		return fmt.Errorf("command %q requires an agent", c.Action)
+		return fmt.Errorf("command %q requires a reviewer", c.Action)
 	}
 	return nil
 }
