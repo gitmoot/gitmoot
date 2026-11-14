@@ -427,10 +427,12 @@ type JobPayload struct {
 	DiskGuardRouteDeclined bool `json:"disk_guard_route_declined,omitempty"`
 	execBackendPresent     bool
 	unknownJSONFields      map[string]json.RawMessage
-	// announcedDecision is the stored decision of a historical review
-	// announcement that DecodeJobPayload replaced with HistoricalFanOutDecision.
-	// MarshalJSON writes it back, so a decoded row never persists the rewrite.
-	announcedDecision string
+	// announcedResult is the stored result object of a historical review
+	// announcement whose decision DecodeJobPayload replaced. MarshalJSON
+	// writes it back verbatim: AgentResult no longer models fan_out, so
+	// re-encoding the decoded result would drop the mark that makes the row
+	// an announcement and turn it back into an approval.
+	announcedResult json.RawMessage
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
@@ -2075,19 +2077,23 @@ func DecodeJobPayload(job db.Job) (JobPayload, error) {
 		return payload, nil
 	}
 	var marks struct {
-		Result struct {
-			Delegations []json.RawMessage `json:"delegations"`
-			FanOut      bool              `json:"fan_out"`
-		} `json:"result"`
+		Result json.RawMessage `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(job.Payload), &marks); err != nil {
+		return JobPayload{}, fmt.Errorf("parse job payload result: %w", err)
+	}
+	var announced struct {
+		Delegations []json.RawMessage `json:"delegations"`
+		FanOut      bool              `json:"fan_out"`
+	}
+	if err := json.Unmarshal(marks.Result, &announced); err != nil {
 		return JobPayload{}, fmt.Errorf("parse job payload result marks: %w", err)
 	}
-	if len(marks.Result.Delegations) > 0 || marks.Result.FanOut {
+	if len(announced.Delegations) > 0 || announced.FanOut {
 		result := *payload.Result
-		payload.announcedDecision = result.Decision
 		result.Decision = HistoricalFanOutDecision
 		payload.Result = &result
+		payload.announcedResult = marks.Result
 	}
 	return payload, nil
 }
