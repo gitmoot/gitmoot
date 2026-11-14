@@ -15,9 +15,9 @@ single static Go binary plus a background daemon; workflow state lives in local
 SQLite (the **modernc pure-Go** driver — no cgo). The single static binary with
 **zero runtime dependencies** is a core invariant.
 
-Jobs run on `omp`, which is required. `shell` is a subscribe-only command
+Runs execute on `omp`, which is required. `shell` is a subscribe-only command
 runtime used mainly to drive engine-feature E2Es with no LLM. The codex, claude
-and kimi job runtimes were removed (#2587); the Claude and Codex plugins stay.
+and kimi runtimes were removed (#2587); the Claude and Codex plugins stay.
 
 ## Build, test, and verify (the gate)
 
@@ -82,7 +82,7 @@ When a seat's plain `go` returns 126, no usable toolchain was staged. The comman
 is an engine-owned failure stub, never a fallthrough to the operator's `go`.
 An absent `go` on the daemon `PATH` is silent; an unpinned source, copy failure,
 or unsafe path prints `gitmoot: read-only seat toolchain:` on daemon stderr,
-never in job events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
+never in run events. `/opt`, `/usr/local`, `/nix/store`, `/snap`, and profile
 installations all take the same daemon-owned copy path; none retains a recursive
 host-root grant. A candidate counts as a Go installation only if `bin/go` is an
 executable real file and `VERSION` (a real file, not a symlink) names a Go release.
@@ -276,13 +276,13 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 ## Repository layout
 
 - `cmd/gitmoot/` — CLI entrypoint.
-- `internal/cli/` — the command surface (agent, template, memory,
+- `internal/cli/` — the command surface (reviewer, review, run, pr, campaign, org,
   dashboard) **and the `daemon` command wiring / worker loop**.
 - `internal/daemon/` — the PR-watcher daemon package (poll/resume/revert logic).
 - Pipelines were retired in #2542; they live in
   [stagehand](https://github.com/gitmoot/stagehand). There is no
   `internal/pipeline/` package and no `gitmoot pipeline` command.
-- `internal/workflow/` — the job engine, mailbox, memory controller,
+- `internal/workflow/` — the run engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
 - `internal/runtime/` — the omp/shell adapters.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
@@ -340,22 +340,22 @@ portable code behavior.
 - In E2E set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
   or panes leak to the prod Telegram group.
 - Global flags like `--home` use Go flag parsing, so they must precede positional
-  args (e.g. `job show --home /tmp/h <id>`, not after the id).
-- Killing a foreground `agent ask` strands a runtime-session resource lock;
+  args (e.g. `run show --home /tmp/h <id>`, not after the id).
+- Killing a foreground `ask` strands a runtime-session resource lock;
   clear the lock to recover.
-- Agent permission policies gate the shell: `--policy workspace-write` (omp
+- Reviewer permission policies gate the shell: `--policy workspace-write` (omp
   `--approval-mode=write`) permits **file edits only** and does **not** unblock
   shell commands (`go`/`git`/`gh`). A full implement/push agent needs
   `danger-full-access`; workspace-write alone is edits-only.
 - The single static binary is sacred: no cgo, no runtime deps (modernc pure-Go
   SQLite).
 
-## Agent jobs & the result contract
+## Runs & the result contract
 
-gitmoot runs agents through registered runtimes — **omp** for every job
-(`gitmoot agent start --runtime omp`), plus subscribe-only `shell` for no-LLM tests.
+gitmoot runs reviewers through registered runtimes — **omp** for every run
+(`gitmoot reviewer start --runtime omp`), plus subscribe-only `shell` for no-LLM tests.
 Reviews and asks run as throwaway sessions that return one `gitmoot_result`
-JSON object; gitmoot records it and the job ends. There is no fan-out, no
+JSON object; gitmoot records it and the run ends. There is no fan-out, no
 coordinator continuation, and no `orchestrate` / `agent run`: a result carrying
 `delegations` or `human_questions` is refused. Contracts:
 
@@ -423,30 +423,30 @@ coordinator continuation, and no `orchestrate` / `agent run`: a result carrying
    mv /root/.local/bin/gitmoot-dashboard-web.new /root/.local/bin/gitmoot-dashboard-web
    ```
 
-4. Restart when no **engine-dispatched** job is running; queued jobs may
+4. Restart when no **engine-dispatched** run is running; queued runs may
    remain (owner standing decision 2026-11-01, record
    `/root/fleet-tools/state/gitmoot-deploy/owner-restart-with-queued-standing-20261101.json`).
-   Session-recorded jobs (`session-ask-*`/`session-implement-*`, #657) run
+   Session-recorded runs (`session-ask-*`/`session-implement-*`, #657) run
    entirely outside the daemon process — no subprocess, no lease — and may
    legitimately stay `running` for hours, so they don't belong in this check.
-   #1125's reaper keeps genuinely abandoned session jobs from piling up
+   #1125's reaper keeps genuinely abandoned session runs from piling up
    forever, but on an hours-to-a-day timescale; that is a background-hygiene
    guarantee, not a substitute for checking right now.
 
    With a non-empty queue the daemon claims new work every second, so an
-   empty running list is not stable on its own: a job claimed between the
+   empty running list is not stable on its own: a run claimed between the
    check and the restart is killed by the restart and is not requeued. Drain
-   first, which stops claiming and leaves queued jobs queued:
+   first, which stops claiming and leaves queued runs queued:
 
    ```sh
    # Restart ONLY if drain exits 0 (nothing engine-dispatched running). Exit 1
    # means work is still in flight or drain itself failed: do not restart; rerun
    # drain later (the marker stays on, nothing new is claimed meanwhile).
    # Every step is a simple command (no pipelines): /bin/sh here has no
-   # pipefail, so a failing `gitmoot job list` inside a pipe would not stop it.
+   # pipefail, so a failing `gitmoot run list` inside a pipe would not stop it.
    gitmoot daemon drain --timeout 60m &&
-     gitmoot job list --killed --json > killed-before-restart.json &&
-     gitmoot job list --state queued --json > queued-before-restart.json &&
+     gitmoot run list --killed --json > killed-before-restart.json &&
+     gitmoot run list --state queued --json > queued-before-restart.json &&
      jq -es 'length == 1 and (.[0] | type) == "array"' killed-before-restart.json > /dev/null &&
      jq -es 'length == 1 and (.[0] | type) == "array"' queued-before-restart.json > /dev/null &&
      systemctl --user restart gitmoot-daemon gitmoot-dashboard-web &&
@@ -454,8 +454,8 @@ coordinator continuation, and no `orchestrate` / `agent run`: a result carrying
    ```
 
    Afterwards confirm every non-`session-` id in `queued-before-restart.json`
-   still exists (`gitmoot job show <id>`, any state), and that
-   `gitmoot job list --killed --json` lists no id that was not already in
+   still exists (`gitmoot run show <id>`, any state), and that
+   `gitmoot run list --killed --json` lists no id that was not already in
    `killed-before-restart.json`; a new id there is a delivery the restart killed.
 5. Config-only changes (e.g. `[admission]`) usually need no restart
    (re-read per tick / warm-reloaded on SIGHUP).
@@ -496,7 +496,7 @@ pre-merge re-read - the two that caught a verdict which executed nothing and
 every head that moved under a review. One review is sufficient; another model
 family is preferred when available but never a gate. `/gitmoot merge` enforces
 the acting role's `merge_rule` from the PR implementer's recorded acting role
-(`job record --acting-role`): `"owner"` refuses
+(`run record --acting-role`): `"owner"` refuses
 a non-root acting role, while `"none"` refuses every acting role; each refusal
 names the remedy. Other merge paths
 remain advisory: **an armed engine merge gate may merge on its own
@@ -522,14 +522,14 @@ self-merge conditional on all six checks below:
 
 1. The PR is OPEN, MERGEABLE, and CLEAN. Every check has succeeded; none is
    pending or failing.
-2. A review job has succeeded with `decision=approved` at the current PR head.
+2. A review has succeeded with `decision=approved` at the current PR head.
 3. The verdict has non-empty `tests_run`; an evidence-free approval does not
    qualify.
 4. The reviewer is neither the implementer nor the lead. One independent
    review is enough; same-family review is valid when reported as such.
 5. Immediately before merging, re-read the head and every check. Abort if the
    head moved or any check is not successful.
-6. In-session work with no implement job is an **attribution gap**. Name it in
+6. In-session work with no implement run is an **attribution gap**. Name it in
    the merge note; do not report it as an independence failure or skip it
    silently.
 
@@ -748,7 +748,7 @@ remains valid and needs no re-post - the #1840 DRAIN-to-THROUGHPUT record at
 A DRAIN decision freezes new admissions at `decided_at`; the previously active
 mode remains active while DRAIN prerequisites are installed. The transition
 wave is the non-terminal implementation assignments accepted before
-`decided_at` plus review jobs created before it that were queued or running
+`decided_at` plus reviews created before it that were queued or running
 then. DRAIN becomes active only at `effective_at`, which is the `mergedAt` of the
 reconciled marker PR after its prerequisites are installed - not a note's
 `created_at`, per the resolution above. The remaining note-sourced case is the
@@ -820,7 +820,7 @@ escalations, and an armed merge gate then merged the PR without them.
   it again; never replace a completed transition-wave item with new work.
 - After activation, cap the `gitmoot/*` scope at **two active implementers and
   one running reviewer**. An active implementer is a persistent seat currently
-  changing code or a running engine implementation job.
+  changing code or a running engine implementation run.
 - A DRAIN decision freezes admission immediately, but DRAIN is not active until
   the coordinator configures the shared daemon with `[daemon] workers = 1`;
   every active `[repos."gitmoot/*"].max_parallel` override must be absent, zero,
@@ -831,9 +831,9 @@ escalations, and an armed merge gate then merged the PR without them.
   For a note source, finish them before posting the separate activation marker.
 - Before DRAIN activates, every foreground or persistent-seat review already in
   progress must reach a terminal handoff; those reviews cannot be grandfathered.
-  All DRAIN reviews then run as background engine jobs. Never bypass the shared
+  All DRAIN reviews then run as background engine runs. Never bypass the shared
   gate with a foreground or persistent-seat reviewer.
-- Before DRAIN activates, allow exactly one review-capable agent on each active
+- Before DRAIN activates, allow exactly one review-capable reviewer on each active
   `gitmoot/*` repository. The native PR watcher does not fan out reviews, so the
   coordinator enqueues each PR's single manual review.
 - Prioritize merge-ready work and merge-gate integrity, then serial dependency

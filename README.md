@@ -6,14 +6,14 @@
 Gitmoot runs a fleet of coding agents like a team. It gives each agent session
 a **seat** (role, parent, repository scope, merge authority), carries durable
 **messages and directives** between seats, and sends pull requests to a
-**different agent** for an independent review bound to the exact head commit,
+**different reviewer** for an independent review bound to the exact head commit,
 holding the merge until the verdict lands. It runs on your machine: one static
 binary, one SQLite file, a daemon that polls GitHub as your `gh` user, no hosted
 control plane.
 
 ## Requirements
 
-- **omp is required.** Review jobs run on omp; the `shell` runtime exists for
+- **omp is required.** Reviews run on omp; the `shell` runtime exists for
   no-LLM tests.
 - `gh` authenticated against the repositories you register.
 

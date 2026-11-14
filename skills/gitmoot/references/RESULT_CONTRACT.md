@@ -1,6 +1,6 @@
 # Gitmoot Review Result
 
-A review job ends when the reviewer prints one `gitmoot_result` JSON object.
+A review ends when the reviewer prints one `gitmoot_result` JSON object.
 Gitmoot finds it in the reviewer's output, validates it, and stores it as the
 verdict (`payload.result` in `gitmoot run show <run-id>`). Keep it concise,
 truthful, and tied to work that actually happened.
@@ -30,12 +30,12 @@ one of the four listed under Decision below.
 - `approved`: no blocking issues at this head.
 - `changes_requested`: issues to fix before merge. Requires `severity`.
 - `blocked`: the review cannot finish without a human or an outside change.
-  The job ends `blocked`; its `needs` say what would unblock it.
-- `failed`: the review errored or could not complete. The job ends `failed`.
+  The run ends `blocked`; its `needs` say what would unblock it.
+- `failed`: the review errored or could not complete. The run ends `failed`.
 
-`implemented` is not a review decision, and `skipped` means the job had no work
+`implemented` is not a review decision, and `skipped` means the run had no work
 to do; never use `skipped` for "nothing to flag" (that is `approved`). Any
-decision other than `blocked` or `failed` ends the job `succeeded`.
+decision other than `blocked` or `failed` ends the run `succeeded`.
 
 ## Severity
 
@@ -68,7 +68,7 @@ static-only review that says plainly what it read is a legitimate verdict; a
 mislabelled one is not, because a merge decision cannot tell the difference
 afterwards. Omitting the field records `static_only`; an unknown value is
 rejected. A review requested with `--no-execution` must return `static_only`
-with an empty `tests_run`, or the job fails.
+with an empty `tests_run`, or the run fails.
 
 Two result checks read this field: `review-verdict-has-evidence` (does the
 verdict account for itself at all?) and `review-executed-claim-is-substantiated`
@@ -76,7 +76,7 @@ verdict account for itself at all?) and `review-executed-claim-is-substantiated`
 first with any finding, a `tests_run` or `changes_made` entry that names a
 command, path or target, or a `summary` of at least 40 characters saying what
 was examined; `"summary": "ok"` with nothing else fails it. A failed check is
-recorded in `payload.result_checks` and as a `result_checks_failed` job event.
+recorded in `payload.result_checks` and as a `result_checks_failed` run event.
 
 ## checks_blocked
 
@@ -88,8 +88,9 @@ unknown value is rejected.
 
 A check the environment cannot run (its platform toolchain is missing, for
 example Xcode on Linux) may be satisfied by a green CI run at the exact
-reviewed head that the reviewer verifies itself: the run's head SHA equals the
-reviewed head, the job succeeded, and it builds or tests the changed paths.
+reviewed head that the reviewer verifies itself: the CI run's head SHA equals
+the reviewed head, its GitHub Actions job succeeded, and it builds or tests the
+changed paths.
 Record it as its own `tests_run` entry,
 `CI-verified: <check> -> success; run <run id> job <job id>`, and name the
 reason in `checks_blocked`. A `CI-verified:` entry is not a check the review
@@ -114,7 +115,7 @@ Each object finding of a completed review is also recorded in the findings
 ledger (`gitmoot findings`) at the reviewed head, under a UID such as
 `owner/repo#42-f1`. To be recorded it needs a `severity` (`P0` to `P3`) and a
 concern: a `title` or `detail` (or a `rationale` together with a `file`); a
-finding without them is refused and reported against the job. A reported
+finding without them is refused and reported against the run. A reported
 finding is `open`.
 
 A later review closes or continues a finding with these finding keys:
@@ -152,16 +153,16 @@ schema. Keys inside a finding object, such as `continues_uid` and `state`, are
 free-form and not checked here. A top-level field gitmoot does not know,
 including any an older prompt asked for, fails validation with
 `unsupported gitmoot_result field "<name>"`. The reviewer gets a repair turn
-to return the same result without it; if no repair validates, the job fails.
+to return the same result without it; if no repair validates, the run fails.
 
 ## Attribution
 
 Gitmoot records who asked for a review in `dispatched_by`, resolved from the
 dispatcher the request names, then the acting org role (`--role` or
 `GITMOOT_ORG_ROLE`), then the dispatch channel (`local`, `github`). Neither the
-job's own agent nor `lead_agent` is an attribution fallback: on a review the
-job's agent is the reviewer, and a CLI review dispatch records no `lead_agent`
-at all. Who wrote the change comes only from the implement job a seat records
+run's own reviewer nor `lead_agent` is an attribution fallback: the reviewer
+only reviewed, and a CLI review dispatch records no `lead_agent` at all. Who
+wrote the change comes only from the implement run a seat records
 with `gitmoot run record`.
 
 ## Reporting rules
