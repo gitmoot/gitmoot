@@ -100,7 +100,7 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 	t.Cleanup(func() { jobWorktreeLiveness = previous })
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list --json exit = %d, stderr=%s", code, stderr.String())
 	}
 	var entries []jobListEntry
@@ -124,7 +124,7 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
 	}
 	lines := map[string]string{}
@@ -148,7 +148,7 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "live-terminal", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "live-terminal", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("live job show --json exit = %d, stderr=%s", code, stderr.String())
 	}
 	var shown jobShowOutput
@@ -161,7 +161,7 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "inactive-terminal", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "inactive-terminal", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("inactive job show --json exit = %d, stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stdout.String(), "process_active") {
@@ -170,7 +170,7 @@ func TestRunJobListShowSurfaceWorktreeProcessBadge(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "live-terminal", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "live-terminal", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("live job show exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "process_active: worktree still has an active process") {

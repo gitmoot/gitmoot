@@ -73,7 +73,7 @@ func TestJobListKilledShowsOnlyAbandonedDeliveries(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "list", "--home", home, "--killed", "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--killed", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list --killed exit = %d, stderr=%s", code, stderr.String())
 	}
 	var entries []map[string]json.RawMessage
@@ -98,7 +98,7 @@ func TestJobListKilledShowsOnlyAbandonedDeliveries(t *testing.T) {
 	// changed the default rather than added a view.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
 	}
 	var all []map[string]json.RawMessage
@@ -126,7 +126,7 @@ func TestJobListKilledOnAnEmptyStoreListsNothing(t *testing.T) {
 	}, "failed")
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "list", "--home", home, "--killed"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--killed"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list --killed exit = %d, stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stdout.String(), "ordinary") {

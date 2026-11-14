@@ -47,9 +47,9 @@ func watchUntil(t *testing.T, home, jobID, want string, jsonOutput bool) (string
 	t.Helper()
 	out := &syncBuffer{}
 	var stderr syncBuffer
-	args := []string{"job", "watch", jobID, "--home", home, "--poll", "20ms"}
+	args := []string{"run", "watch", jobID, "--home", home, "--poll", "20ms"}
 	if jsonOutput {
-		args = []string{"job", "watch", jobID, "--home", home, "--poll", "20ms", "--json"}
+		args = []string{"run", "watch", jobID, "--home", home, "--poll", "20ms", "--json"}
 	}
 	done := make(chan int, 1)
 	go func() { done <- Run(args, out, &stderr) }()
@@ -159,7 +159,7 @@ func TestJobWatchDoesNotRepeatAnUnchangedHold(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-repeat", "--home", home, "--poll", "20ms"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-repeat", "--home", home, "--poll", "20ms"}, out, &stderr)
 	}()
 	deadline := time.Now().Add(15 * time.Second)
 	for !strings.Contains(out.String(), "HOLD:") {
@@ -199,7 +199,7 @@ func TestJobWatchJSONCarriesTheObservedHold(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-json", "--home", home, "--poll", "20ms", "--json"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-json", "--home", home, "--poll", "20ms", "--json"}, out, &stderr)
 	}()
 	time.Sleep(300 * time.Millisecond)
 	settleWatchedJob(t, home, "watch-json")
@@ -236,7 +236,7 @@ func TestJobWatchOrdinaryQueuedJobPrintsNoHold(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-plain", "--home", home, "--poll", "20ms"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-plain", "--home", home, "--poll", "20ms"}, out, &stderr)
 	}()
 	// give the loop many intervals in which it could have printed a spurious hold
 	time.Sleep(400 * time.Millisecond)
@@ -287,7 +287,7 @@ func TestJobWatchTranscriptSurfacesHoldWithAnExistingLog(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-transcript-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-transcript-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
 	}()
 	deadline := time.Now().Add(15 * time.Second)
 	for !strings.Contains(out.String(), "HOLD:") {
@@ -343,7 +343,7 @@ func TestJobWatchTranscriptSurfacesHoldThatBeginsAfterStartup(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-late-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-late-hold", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
 	}()
 	// let the watch attach and take its one pre-Follow look while nothing is held
 	time.Sleep(200 * time.Millisecond)
@@ -409,7 +409,7 @@ func TestJobWatchDoesNotRestateAReplayedDeferralEvent(t *testing.T) {
 	var stderr syncBuffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run([]string{"job", "watch", "watch-replayed", "--home", home, "--poll", "20ms"}, out, &stderr)
+		done <- Run([]string{"run", "watch", "watch-replayed", "--home", home, "--poll", "20ms"}, out, &stderr)
 	}()
 	deadline := time.Now().Add(15 * time.Second)
 	for !strings.Contains(out.String(), "blocker_deferred") {
@@ -558,7 +558,7 @@ func TestJobWatchTranscriptNoLogDelegatesAndInheritsSuppression(t *testing.T) {
 			var stderr syncBuffer
 			done := make(chan int, 1)
 			go func() {
-				done <- Run([]string{"job", "watch", "no-log-job", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
+				done <- Run([]string{"run", "watch", "no-log-job", "--home", home, "--transcript", "--poll", "20ms"}, out, &stderr)
 			}()
 			deadline := time.Now().Add(15 * time.Second)
 			for !strings.Contains(out.String(), "transcript unavailable") {

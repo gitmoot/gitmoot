@@ -35,8 +35,8 @@ func runJobGates(args []string, stdout, stderr io.Writer) int {
 
 func printJobGatesUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot job gates <id> [--json]")
-	fmt.Fprintln(w, "  gitmoot job gates clear <id> --need \"<text>\"|--all")
+	fmt.Fprintln(w, "  gitmoot run gates <id> [--json]")
+	fmt.Fprintln(w, "  gitmoot run gates clear <id> --need \"<text>\"|--all")
 }
 
 // jobGateEntry is the JSON shape for `job gates <id> --json`.
@@ -48,11 +48,11 @@ type jobGateEntry struct {
 }
 
 func runJobGatesList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job gates", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run gates", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print gates as JSON")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job gates")
+	jobID, ok := parseSingleJobID(fs, args, stderr, "run gates")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -60,7 +60,7 @@ func runJobGatesList(args []string, stdout, stderr io.Writer) int {
 	if err := withStore(*home, func(store *db.Store) error {
 		if _, err := store.GetJob(context.Background(), jobID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("job %q not found", jobID)
+				return fmt.Errorf("run %q not found", jobID)
 			}
 			return err
 		}
@@ -68,7 +68,7 @@ func runJobGatesList(args []string, stdout, stderr io.Writer) int {
 		gates, err = store.ListJobGates(context.Background(), jobID)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job gates: %v\n", err)
+		fmt.Fprintf(stderr, "run gates: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
@@ -77,13 +77,13 @@ func runJobGatesList(args []string, stdout, stderr io.Writer) int {
 			entries = append(entries, jobGateEntry{Need: g.Need, Satisfied: g.Satisfied, CreatedAt: g.CreatedAt, SatisfiedAt: g.SatisfiedAt})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
-			fmt.Fprintf(stderr, "job gates: %v\n", err)
+			fmt.Fprintf(stderr, "run gates: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	if len(gates) == 0 {
-		fmt.Fprintln(stdout, "no gates recorded for this job")
+		fmt.Fprintln(stdout, "no gates recorded for this run")
 		return 0
 	}
 	open := 0
@@ -101,7 +101,7 @@ func runJobGatesList(args []string, stdout, stderr io.Writer) int {
 }
 
 func runJobGatesClear(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job gates clear", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run gates clear", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { printJobGatesUsage(stderr) }
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -111,7 +111,7 @@ func runJobGatesClear(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "job gates clear requires exactly one id")
+			fmt.Fprintln(stderr, "run gates clear requires exactly one id")
 			return 2
 		}
 		return 0
@@ -121,12 +121,12 @@ func runJobGatesClear(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job gates clear requires exactly one id")
+		fmt.Fprintln(stderr, "run gates clear requires exactly one id")
 		return 2
 	}
 	needText := strings.TrimSpace(*need)
 	if (*all && needText != "") || (!*all && needText == "") {
-		fmt.Fprintln(stderr, "job gates clear requires exactly one of --need \"<text>\" or --all")
+		fmt.Fprintln(stderr, "run gates clear requires exactly one of --need \"<text>\" or --all")
 		return 2
 	}
 
@@ -138,7 +138,7 @@ func runJobGatesClear(args []string, stdout, stderr io.Writer) int {
 	if err := withStore(*home, func(store *db.Store) error {
 		if _, err := store.GetJob(context.Background(), jobID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("job %q not found", jobID)
+				return fmt.Errorf("run %q not found", jobID)
 			}
 			return err
 		}
@@ -163,17 +163,17 @@ func runJobGatesClear(args []string, stdout, stderr io.Writer) int {
 		outcome, err = workflow.MaybeResumeOnGatesCleared(context.Background(), store, jobID)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job gates clear: %v\n", err)
+		fmt.Fprintf(stderr, "run gates clear: %v\n", err)
 		return 1
 	}
 	if unknown {
-		fmt.Fprintf(stderr, "job gates clear: no open gate with need %q on job %s\n", needText, jobID)
+		fmt.Fprintf(stderr, "run gates clear: no open gate with need %q on run %s\n", needText, jobID)
 		return 1
 	}
 	if *all {
-		fmt.Fprintf(stdout, "cleared %d gate(s) on job %s\n", matched, jobID)
+		fmt.Fprintf(stdout, "cleared %d gate(s) on run %s\n", matched, jobID)
 	} else {
-		fmt.Fprintf(stdout, "cleared gate %q on job %s\n", needText, jobID)
+		fmt.Fprintf(stdout, "cleared gate %q on run %s\n", needText, jobID)
 	}
 	if outcome.Resumed {
 		fmt.Fprintf(stdout, "resumed: %s\n", outcome.Reason)

@@ -300,7 +300,7 @@ func printUnrecordedFindings(out io.Writer, unrecorded []workflow.UnrecordedLedg
 		}
 	}
 	fmt.Fprintf(out, "%d reported finding(s) were NOT recorded to the ledger, so they are not listed here; "+
-		"see `gitmoot job events <id>` for: %s\n", len(unrecorded), strings.Join(jobs, ", "))
+		"see `gitmoot run events <id>` for: %s\n", len(unrecorded), strings.Join(jobs, ", "))
 }
 
 // findingsObligation is the printable form of one obligation the merge gate

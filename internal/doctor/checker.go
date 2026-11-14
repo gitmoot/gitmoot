@@ -183,10 +183,10 @@ func CheckRuntimeContract(result runtime.RuntimeContractResult) Check {
 // produces a finding.
 func CheckStuckJobs(status StuckJobsStatus) Check {
 	check := Check{
-		Name:     "stuck jobs",
+		Name:     "stuck runs",
 		OK:       true,
 		Required: true,
-		Detail:   "no running jobs with a dead recorded runtime process",
+		Detail:   "no active runs with a dead recorded runtime process",
 	}
 	var dead []string
 	for _, job := range status.Jobs {
@@ -199,7 +199,7 @@ func CheckStuckJobs(status StuckJobsStatus) Check {
 		return check
 	}
 	check.OK = false
-	check.Detail = fmt.Sprintf("%d running job(s) have a dead recorded runtime process: %s", len(dead), strings.Join(dead, ", "))
+	check.Detail = fmt.Sprintf("%d active run(s) have a dead recorded runtime process: %s", len(dead), strings.Join(dead, ", "))
 	return check
 }
 

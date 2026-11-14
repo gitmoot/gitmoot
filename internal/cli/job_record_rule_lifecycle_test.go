@@ -91,7 +91,7 @@ func TestJobRecordPersistsNotificationBeforeReleasingStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--decision", "approved", "--summary", "durable producer result", "--json"}, &stdout, &stderr)
+	code := Run([]string{"run", "record", "--home", home, "--agent", "lead", "--repo", "owner/repo", "--type", "review", "--decision", "approved", "--summary", "durable producer result", "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job record exit=%d: %s", code, stderr.String())
 	}

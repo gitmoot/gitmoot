@@ -38,7 +38,7 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 		return runJobWatch(args[1:], stdout, stderr)
 	case "transcript":
 		return runJobTranscript(args[1:], stdout, stderr)
-	case "run":
+	case "start":
 		return runJobRun(args[1:], stdout, stderr)
 	case "retry":
 		return runJobRetry(args[1:], stdout, stderr)
@@ -55,7 +55,7 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 	case "record":
 		return runJobRecord(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown job command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown run command %q\n\n", args[0])
 		printJobUsage(stderr)
 		return 2
 	}
@@ -63,36 +63,42 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 
 func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot job list [--repo owner/repo] [--state state] [--workflow label] [--json]")
-	fmt.Fprintln(w, "  gitmoot job show <id> [--json]")
-	fmt.Fprintln(w, "  gitmoot job events <id>")
-	fmt.Fprintln(w, "  gitmoot job watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
-	fmt.Fprintln(w, "  gitmoot job transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]")
-	fmt.Fprintln(w, "  gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]")
-	fmt.Fprintln(w, "  gitmoot job run <id>")
-	fmt.Fprintln(w, "  gitmoot job retry <id>")
-	fmt.Fprintln(w, "  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]")
-	fmt.Fprintln(w, "  gitmoot job cleanup reopen <resource-id>")
-	fmt.Fprintln(w, "  gitmoot job gates <id> [--json]")
-	fmt.Fprintln(w, "  gitmoot job gates clear <id> --need \"<text>\"|--all")
-	fmt.Fprintln(w, "  gitmoot job cancel <id>")
-	fmt.Fprintln(w, "  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]")
-	fmt.Fprintf(w, "  gitmoot job open --agent name --repo owner/repo --type %s [--title ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
-	fmt.Fprintf(w, "  gitmoot job close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
-	fmt.Fprintf(w, "  gitmoot job record (--agent name | --acting-role role) --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
+	fmt.Fprintln(w, "  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]")
+	fmt.Fprintln(w, "  gitmoot run show <id> [--json]")
+	fmt.Fprintln(w, "  gitmoot run events <id>")
+	fmt.Fprintln(w, "  gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
+	fmt.Fprintln(w, "  gitmoot run transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]")
+	fmt.Fprintln(w, "  gitmoot run transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]")
+	fmt.Fprintln(w, "  gitmoot run start <id>")
+	fmt.Fprintln(w, "  gitmoot run retry <id>")
+	fmt.Fprintln(w, "  gitmoot run cleanup list [--state pending|retryable|removed|quarantined] [--json]")
+	fmt.Fprintln(w, "  gitmoot run cleanup reopen <resource-id>")
+	fmt.Fprintln(w, "  gitmoot run gates <id> [--json]")
+	fmt.Fprintln(w, "  gitmoot run gates clear <id> --need \"<text>\"|--all")
+	fmt.Fprintln(w, "  gitmoot run cancel <id>")
+	fmt.Fprintln(w, "  gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]")
+	fmt.Fprintf(w, "  gitmoot run open --implementer name --repo owner/repo --type %s [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
+	fmt.Fprintf(w, "  gitmoot run close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
+	fmt.Fprintf(w, "  gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
 }
 
 func runJobList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job list", flag.ContinueOnError)
+	return listRuns(args, stdout, stderr, "run list", "")
+}
+
+// listRuns backs `run list` and `review list`; a non-empty onlyType keeps only
+// runs of that type.
+func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repo := fs.String("repo", "", "repo scope as owner/repo")
-	state := fs.String("state", "", "job state filter")
+	state := fs.String("state", "", "run state filter")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
 	// #1726: the abandoned population is otherwise reachable only by grepping
 	// failure messages for two different renderings of the same fact.
-	killed := fs.Bool("killed", false, "only jobs whose delivery was killed by a signal and which nothing requeued")
-	jsonOutput := fs.Bool("json", false, "print jobs (with operational detail) as JSON")
+	killed := fs.Bool("killed", false, "only runs whose delivery was killed by a signal and which nothing requeued")
+	jsonOutput := fs.Bool("json", false, "print runs (with operational detail) as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -100,15 +106,15 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job list does not accept positional arguments")
+		fmt.Fprintln(stderr, "run list does not accept positional arguments")
 		return 2
 	}
 	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
-		fmt.Fprintln(stderr, "job list: --workflow requires a non-blank value")
+		fmt.Fprintln(stderr, "run list: --workflow requires a non-blank value")
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
-		fmt.Fprintf(stderr, "job list: %v\n", err)
+		fmt.Fprintf(stderr, "run list: %v\n", err)
 		return 2
 	}
 	var jobs []db.Job
@@ -154,17 +160,17 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		reviewStatuses = deriveReviewStatuses(context.Background(), store, jobs, time.Now().UTC())
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job list: %v\n", err)
+		fmt.Fprintf(stderr, "run list: %v\n", err)
 		return 1
 	}
 	if *killed {
 		if killedErr != nil {
-			fmt.Fprintf(stderr, "job list: --killed could not read signal-kill evidence: %v\n", killedErr)
+			fmt.Fprintf(stderr, "run list: --killed could not read signal-kill evidence: %v\n", killedErr)
 			return 1
 		}
 		jobs = retainJobsWithID(jobs, signalKilled)
 	}
-	filtered := filterJobs(jobs, *repo, *state)
+	filtered := filterJobs(jobs, *repo, *state, onlyType)
 	for jobID, status := range deriveDispatchedReviewStatuses(paths, filtered) {
 		reviewStatuses[jobID] = status
 	}
@@ -201,7 +207,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 			})
 		}
 		if err := writeJSON(stdout, entries); err != nil {
-			fmt.Fprintf(stderr, "job list: %v\n", err)
+			fmt.Fprintf(stderr, "run list: %v\n", err)
 			return 1
 		}
 		return 0
@@ -210,7 +216,7 @@ func runJobList(args []string, stdout, stderr io.Writer) int {
 		payload, _ := jobListPayload(job)
 		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t#%d", job.ID, job.State, job.Type, job.Agent, payload.Repo, payload.PullRequest)
 		if job.WorkflowID != "" {
-			fmt.Fprintf(stdout, "\tworkflow=%s", job.WorkflowID)
+			fmt.Fprintf(stdout, "\tcampaign=%s", job.WorkflowID)
 		}
 		if headSHA := firstNonEmpty(reviewStatuses[job.ID].HeadSHA, payload.HeadSHA); headSHA != "" {
 			fmt.Fprintf(stdout, "\thead=%s", headSHA)
@@ -257,11 +263,11 @@ type jobListEntry struct {
 	ID                            string         `json:"id"`
 	State                         string         `json:"state"`
 	Type                          string         `json:"type"`
-	Agent                         string         `json:"agent"`
+	Agent                         string         `json:"reviewer"`
 	Repo                          string         `json:"repo"`
 	PullRequest                   int            `json:"pull_request"`
 	HeadSHA                       string         `json:"head_sha,omitempty"`
-	WorkflowID                    string         `json:"workflow_id,omitempty"`
+	WorkflowID                    string         `json:"campaign,omitempty"`
 	ReviewStatus                  string         `json:"review_status,omitempty"`
 	ReviewStatusGrade             evidence.Grade `json:"review_status_grade,omitempty"`
 	ReviewStatusAuthority         string         `json:"review_status_authority,omitempty"`
@@ -277,11 +283,17 @@ type jobListEntry struct {
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job show", flag.ContinueOnError)
+	return showRun(args, stdout, stderr, "run show", "")
+}
+
+// showRun backs `run show` and `review show`; a non-empty onlyType refuses a
+// run of any other type, checked on the same run the command prints.
+func showRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOutput := fs.Bool("json", false, "print the job (with operational detail) as JSON")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job show")
+	jsonOutput := fs.Bool("json", false, "print the run (with operational detail) as JSON")
+	jobID, ok := parseSingleJobID(fs, args, stderr, command)
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -294,8 +306,11 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		job, err = store.GetJob(context.Background(), jobID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("job %q not found", jobID)
+				return fmt.Errorf("run %q not found", jobID)
 			}
+			return err
+		}
+		if err := checkRunType(job, onlyType, command); err != nil {
 			return err
 		}
 		payload, err = daemonJobPayload(job)
@@ -306,14 +321,14 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		reviewStatus = deriveReviewStatus(context.Background(), store, job, time.Now().UTC())
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job show: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
 	processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 	runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 	if *jsonOutput {
 		out := jobShowOutput{
-			Job:                           job,
+			Job:                           newRunJSON(job),
 			Payload:                       payload,
 			HeadSHA:                       firstNonEmpty(reviewStatus.HeadSHA, payload.HeadSHA),
 			ReviewStatus:                  reviewStatus.Status,
@@ -329,7 +344,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 			ReadOnlyWorktreeDiffError:     payload.ReadOnlyWorktreeDiffError,
 		}
 		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "job show: %v\n", err)
+			fmt.Fprintf(stderr, "%s: %v\n", command, err)
 			return 1
 		}
 		return 0
@@ -342,7 +357,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 // payload, and additive operational detail (#552, #1132). Zero-value detail is
 // omitted so a healthy job's JSON is unchanged in spirit.
 type jobShowOutput struct {
-	Job                           db.Job              `json:"job"`
+	Job                           runJSON             `json:"run"`
 	Payload                       workflow.JobPayload `json:"payload"`
 	HeadSHA                       string              `json:"head_sha,omitempty"`
 	ReviewStatus                  string              `json:"review_status,omitempty"`
@@ -393,10 +408,10 @@ func latestReasonEvent(events []db.JobEvent) (db.JobEvent, bool) {
 }
 
 func runJobEvents(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job events", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run events", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job events")
+	jobID, ok := parseSingleJobID(fs, args, stderr, "run events")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -409,7 +424,7 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 		events, err = store.ListJobEvents(context.Background(), jobID)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job events: %v\n", err)
+		fmt.Fprintf(stderr, "run events: %v\n", err)
 		return 1
 	}
 	for _, event := range events {
@@ -419,8 +434,8 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 }
 
 type jobWatchOutput struct {
-	Job    db.Job        `json:"job"`
-	Events []db.JobEvent `json:"events"`
+	Job    runJSON        `json:"run"`
+	Events []runEventJSON `json:"events"`
 	// Held* describe the LAST HOLD OBSERVED WHILE WATCHING, not the settled state
 	// (#1887). Named for that distinction deliberately: by the time this object is
 	// emitted the job has settled, so a field called why_stuck would assert a
@@ -431,33 +446,39 @@ type jobWatchOutput struct {
 }
 
 func runJobWatch(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job watch", flag.ContinueOnError)
+	return watchRun(args, stdout, stderr, "run watch", "")
+}
+
+// watchRun backs `run watch` and `review watch`; a non-empty onlyType refuses
+// a run of any other type, checked on the same run the watch loads.
+func watchRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	poll := fs.Duration("poll", time.Second, "poll interval")
-	jsonOutput := fs.Bool("json", false, "print final job and events as JSON")
+	jsonOutput := fs.Bool("json", false, "print final run and events as JSON")
 	transcriptOutput := fs.Bool("transcript", false, "render the retained runtime log as a human-readable transcript")
 	logPath := fs.String("log-path", "", "transcript log path override")
 	runtimeName := fs.String("runtime", "", "runtime used to render the transcript")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job watch")
+	jobID, ok := parseSingleJobID(fs, args, stderr, command)
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
 	if *poll <= 0 {
-		fmt.Fprintln(stderr, "job watch poll interval must be positive")
+		fmt.Fprintf(stderr, "%s poll interval must be positive\n", command)
 		return 2
 	}
 	if *transcriptOutput && *jsonOutput {
-		fmt.Fprintln(stderr, "job watch: --transcript is incompatible with --json")
+		fmt.Fprintf(stderr, "%s: --transcript is incompatible with --json\n", command)
 		return 2
 	}
 	if *transcriptOutput {
-		return runJobTranscriptWatch(jobID, *home, *logPath, *runtimeName, *poll, stdout, stderr)
+		return runJobTranscriptWatch(jobID, *home, *logPath, *runtimeName, *poll, command, onlyType, stdout, stderr)
 	}
-	return runJobEventWatch(jobID, *home, *poll, *jsonOutput, stdout, stderr)
+	return runJobEventWatch(jobID, *home, *poll, *jsonOutput, command, onlyType, stdout, stderr)
 }
 
-func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, stdout, stderr io.Writer) int {
+func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, command, onlyType string, stdout, stderr io.Writer) int {
 	var output jobWatchOutput
 	if err := withStore(home, func(store *db.Store) error {
 		nextEvent := 0
@@ -482,8 +503,11 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			job, err := store.GetJob(context.Background(), jobID)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					return fmt.Errorf("job %q not found", jobID)
+					return fmt.Errorf("run %q not found", jobID)
 				}
+				return err
+			}
+			if err := checkRunType(job, onlyType, command); err != nil {
 				return err
 			}
 			events, err := store.ListJobEvents(context.Background(), jobID)
@@ -529,8 +553,8 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			}
 			if workflow.IsSettledJobState(job.State) {
 				output = jobWatchOutput{
-					Job:                 job,
-					Events:              events,
+					Job:                 newRunJSON(job),
+					Events:              newRunEventsJSON(events),
 					HeldReason:          held.Reason,
 					HeldNextRetryAt:     held.NextRetryAt,
 					HeldSuggestedAction: held.SuggestedAction,
@@ -573,12 +597,12 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			time.Sleep(poll)
 		}
 	}); err != nil {
-		fmt.Fprintf(stderr, "job watch: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
 	if jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "job watch: %v\n", err)
+			fmt.Fprintf(stderr, "%s: %v\n", command, err)
 			return 1
 		}
 		return 0
@@ -602,21 +626,21 @@ func holdLine(reason stuckReason) string {
 	return line
 }
 
-func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, stdout, stderr io.Writer) int {
+func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, command, onlyType string, stdout, stderr io.Writer) int {
 	logPath := strings.TrimSpace(requestedLogPath)
 	if logPath == "" {
 		paths, err := pathsFromFlag(home)
 		if err != nil {
-			fmt.Fprintf(stderr, "job watch transcript: %v\n", err)
+			fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 			return 1
 		}
 		logPath = transcript.ResolveJobLogPath(paths.Logs, jobID)
 		if _, err := os.Stat(logPath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				fmt.Fprintln(stdout, "transcript unavailable; showing job events")
-				return runJobEventWatch(jobID, home, poll, false, stdout, stderr)
+				fmt.Fprintln(stdout, "transcript unavailable; showing run events")
+				return runJobEventWatch(jobID, home, poll, false, command, onlyType, stdout, stderr)
 			}
-			fmt.Fprintf(stderr, "job watch transcript: stat log: %v\n", err)
+			fmt.Fprintf(stderr, "%s transcript: stat log: %v\n", command, err)
 			return 1
 		}
 	}
@@ -630,8 +654,11 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		job, err := store.GetJob(context.Background(), jobID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("job %q not found", jobID)
+				return fmt.Errorf("run %q not found", jobID)
 			}
+			return err
+		}
+		if err := checkRunType(job, onlyType, command); err != nil {
 			return err
 		}
 		payload, err := daemonJobPayload(job)
@@ -683,27 +710,27 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		})
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "job watch transcript: %v\n", err)
+		fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 		return 1
 	}
 	if err := renderer.Render(translator.Flush()...); err != nil {
-		fmt.Fprintf(stderr, "job watch transcript: %v\n", err)
+		fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 		return 1
 	}
 	return 0
 }
 
 func runJobTranscript(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job transcript", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run transcript", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	exportFormat := fs.String("export", "", "export format (md or jsonl)")
 	outputPath := fs.String("output", "", "write export to this file instead of stdout")
 	logPathFlag := fs.String("log-path", "", "transcript log path override")
 	runtimeNameFlag := fs.String("runtime", "", "runtime used to render the transcript")
-	all := fs.Bool("all", false, "export every job matching the bulk filters")
-	stateFilter := fs.String("state", "", "bulk mode: comma-separated job states")
-	sinceValue := fs.String("since", "", "bulk mode: jobs created within this duration")
+	all := fs.Bool("all", false, "export every run matching the bulk filters")
+	stateFilter := fs.String("state", "", "bulk mode: comma-separated run states")
+	sinceValue := fs.String("since", "", "bulk mode: runs created within this duration")
 	jobID := ""
 	parseArgs := args
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -717,32 +744,32 @@ func runJobTranscript(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job transcript accepts one id or --all")
+		fmt.Fprintln(stderr, "run transcript accepts one id or --all")
 		return 2
 	}
 	if jobID == "" && !*all {
-		fmt.Fprintln(stderr, "job transcript: provide one id or use --all for bulk export")
+		fmt.Fprintln(stderr, "run transcript: provide one id or use --all for bulk export")
 		return 2
 	}
 	if jobID != "" && *all {
-		fmt.Fprintln(stderr, "job transcript: an id and --all are mutually exclusive")
+		fmt.Fprintln(stderr, "run transcript: an id and --all are mutually exclusive")
 		return 2
 	}
 	format := strings.TrimSpace(*exportFormat)
 	if format != "md" && format != "jsonl" {
-		fmt.Fprintln(stderr, "job transcript: --export md or --export jsonl is required")
+		fmt.Fprintln(stderr, "run transcript: --export md or --export jsonl is required")
 		return 2
 	}
 	if *all && format != "jsonl" {
-		fmt.Fprintln(stderr, "job transcript: --all requires --export jsonl")
+		fmt.Fprintln(stderr, "run transcript: --all requires --export jsonl")
 		return 2
 	}
 	if !*all && (strings.TrimSpace(*stateFilter) != "" || strings.TrimSpace(*sinceValue) != "") {
-		fmt.Fprintln(stderr, "job transcript: --state and --since require --all")
+		fmt.Fprintln(stderr, "run transcript: --state and --since require --all")
 		return 2
 	}
 	if *all && (strings.TrimSpace(*logPathFlag) != "" || strings.TrimSpace(*runtimeNameFlag) != "") {
-		fmt.Fprintln(stderr, "job transcript: --log-path and --runtime are single-job options")
+		fmt.Fprintln(stderr, "run transcript: --log-path and --runtime are single-job options")
 		return 2
 	}
 
@@ -765,11 +792,11 @@ func runJobTranscript(args []string, stdout, stderr io.Writer) int {
 		err = render(stdout)
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "job transcript: %v\n", err)
+		fmt.Fprintf(stderr, "run transcript: %v\n", err)
 		return 1
 	}
 	if *all {
-		fmt.Fprintf(stderr, "job transcript: exported %d jobs; skipped %d missing logs\n", bulkExported, bulkMissing)
+		fmt.Fprintf(stderr, "run transcript: exported %d runs; skipped %d missing logs\n", bulkExported, bulkMissing)
 	}
 	return 0
 }
@@ -778,7 +805,7 @@ func exportOneJobTranscript(ctx context.Context, store *db.Store, home, jobID, f
 	job, err := store.GetJob(ctx, jobID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("job %q not found", jobID)
+			return fmt.Errorf("run %q not found", jobID)
 		}
 		return err
 	}
@@ -1013,16 +1040,16 @@ func resolveTranscriptRuntime(ctx context.Context, store *db.Store, job db.Job, 
 		}
 	}
 	if err != nil {
-		return "", fmt.Errorf("resolve runtime for agent %q: %w", job.Agent, err)
+		return "", fmt.Errorf("resolve runtime for reviewer %q: %w", job.Agent, err)
 	}
-	return "", fmt.Errorf("resolve runtime for agent %q: runtime is empty", job.Agent)
+	return "", fmt.Errorf("resolve runtime for reviewer %q: runtime is empty", job.Agent)
 }
 
 func runJobRun(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job run", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job run")
+	jobID, ok := parseSingleJobID(fs, args, stderr, "run start")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -1033,7 +1060,7 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if job.State != string(workflow.JobQueued) {
-			return fmt.Errorf("job %s is %s; run requires queued", job.ID, job.State)
+			return fmt.Errorf("run %s is %s; start requires queued", job.ID, job.State)
 		}
 		payload, err := daemonJobPayload(job)
 		if err != nil {
@@ -1064,18 +1091,18 @@ func runJobRun(args []string, stdout, stderr io.Writer) int {
 		latest, err = store.GetJob(context.Background(), jobID)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job run: %v\n", err)
+		fmt.Fprintf(stderr, "run start: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "ran job %s: %s\n", latest.ID, latest.State)
+	fmt.Fprintf(stdout, "run %s: %s\n", latest.ID, latest.State)
 	return 0
 }
 
 func runJobRetry(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job retry", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run retry", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "job retry")
+	jobID, ok := parseSingleJobID(fs, args, stderr, "run retry")
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -1085,10 +1112,10 @@ func runJobRetry(args []string, stdout, stderr io.Writer) int {
 		job, err = workflow.RetryJob(context.Background(), store, jobID)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job retry: %v\n", err)
+		fmt.Fprintf(stderr, "run retry: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "queued retry for job %s\n", job.ID)
+	fmt.Fprintf(stdout, "queued retry for run %s\n", job.ID)
 	return 0
 }
 
@@ -1103,14 +1130,21 @@ func runJobRetry(args []string, stdout, stderr io.Writer) int {
 // exclusive with it. The bulk sub-filters (--older-than/--repo/--agent) require
 // --state. Bulk mode is a DRY-RUN by default (prints the selection); --yes commits.
 func runJobCancel(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job cancel", flag.ContinueOnError)
+	return cancelRun(args, stdout, stderr, "run cancel", "")
+}
+
+// cancelRun backs `run cancel` and `review cancel`; a non-empty onlyType
+// refuses a single run of any other type (checked on the run it cancels) and
+// limits the bulk selection to that type.
+func cancelRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { printJobUsage(stderr) }
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	state := fs.String("state", "", "bulk mode: cancel every job in this state (only \"blocked\" is supported)")
-	olderThan := fs.String("older-than", "", "bulk mode: only jobs at least this old (Go duration like 168h, or a <N>d days suffix)")
-	repo := fs.String("repo", "", "bulk mode: only jobs whose payload repo is owner/repo")
-	agent := fs.String("agent", "", "bulk mode: only jobs for this agent")
+	state := fs.String("state", "", "bulk mode: cancel every run in this state (only \"blocked\" is supported)")
+	olderThan := fs.String("older-than", "", "bulk mode: only runs at least this old (Go duration like 168h, or a <N>d days suffix)")
+	repo := fs.String("repo", "", "bulk mode: only runs whose payload repo is owner/repo")
+	agent := fs.String("reviewer", "", "bulk mode: only runs for this reviewer")
 	yes := fs.Bool("yes", false, "bulk mode: actually cancel the selection (default is a dry-run preview)")
 
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
@@ -1127,7 +1161,7 @@ func runJobCancel(args []string, stdout, stderr io.Writer) int {
 		positional = args[0]
 		parseArgs = args[1:]
 	}
-	if err := fs.Parse(parseArgs); err != nil {
+	if err := parseWithFlagAliases(fs, parseArgs, stderr, FlagAlias{Old: "agent", New: "reviewer"}); err != nil {
 		return 2
 	}
 	extra := fs.Args()
@@ -1136,39 +1170,51 @@ func runJobCancel(args []string, stdout, stderr io.Writer) int {
 		extra = extra[1:]
 	}
 	if len(extra) > 0 {
-		fmt.Fprintf(stderr, "job cancel: unexpected argument %q\n", extra[0])
+		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", command, extra[0])
 		printJobUsage(stderr)
 		return 2
 	}
 
 	if strings.TrimSpace(*state) != "" {
 		if strings.TrimSpace(positional) != "" {
-			fmt.Fprintln(stderr, "job cancel: <id> and --state are mutually exclusive (bulk mode cancels a selection, not one job)")
+			fmt.Fprintf(stderr, "%s: <id> and --state are mutually exclusive (bulk mode cancels a selection, not one run)\n", command)
 			return 2
 		}
-		return runJobCancelBulk(*home, *state, *olderThan, *repo, *agent, *yes, stdout, stderr)
+		return runJobCancelBulk(*home, *state, *olderThan, *repo, *agent, onlyType, *yes, stdout, stderr)
 	}
 
 	// Single form. The bulk sub-filters only make sense alongside --state.
 	if strings.TrimSpace(*olderThan) != "" || strings.TrimSpace(*repo) != "" || strings.TrimSpace(*agent) != "" {
-		fmt.Fprintln(stderr, "job cancel: --older-than, --repo, and --agent require --state")
+		fmt.Fprintf(stderr, "%s: --older-than, --repo, and --reviewer require --state\n", command)
 		return 2
 	}
 	if strings.TrimSpace(positional) == "" {
-		fmt.Fprintln(stderr, "job cancel requires exactly one id (or --state for bulk mode)")
+		fmt.Fprintf(stderr, "%s requires exactly one id (or --state for bulk mode)\n", command)
 		printJobUsage(stderr)
 		return 2
 	}
 	var job db.Job
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
+		if onlyType != "" {
+			found, err := store.GetJob(context.Background(), positional)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("run %q not found", positional)
+			}
+			if err != nil {
+				return err
+			}
+			if err := checkRunType(found, onlyType, command); err != nil {
+				return err
+			}
+		}
 		job, err = workflow.CancelJob(context.Background(), store, positional)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job cancel: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "cancelled job %s\n", job.ID)
+	fmt.Fprintf(stdout, "cancelled run %s\n", job.ID)
 	return 0
 }
 
@@ -1177,10 +1223,10 @@ func runJobCancel(args []string, stdout, stderr io.Writer) int {
 // Only "blocked" is accepted for --state: a blocked job is paused awaiting a
 // human, so a stale backlog of them is the intended abandon target; other states
 // have their own verbs (queued/running -> single cancel, terminal -> retry).
-func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter string, apply bool, stdout, stderr io.Writer) int {
+func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter, onlyType string, apply bool, stdout, stderr io.Writer) int {
 	stateFilter = strings.TrimSpace(stateFilter)
 	if !strings.EqualFold(stateFilter, string(workflow.JobBlocked)) {
-		fmt.Fprintf(stderr, "job cancel: --state %q is not supported; only \"blocked\" jobs can be bulk-cancelled (blocked = paused awaiting a human)\n", stateFilter)
+		fmt.Fprintf(stderr, "run cancel: --state %q is not supported; only \"blocked\" runs can be bulk-cancelled (blocked = paused awaiting a human)\n", stateFilter)
 		return 2
 	}
 	var (
@@ -1191,7 +1237,7 @@ func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter s
 	if arg := strings.TrimSpace(olderThanArg); arg != "" {
 		age, err := parseOlderThanDuration(arg)
 		if err != nil {
-			fmt.Fprintf(stderr, "job cancel: invalid --older-than %q: %v\n", arg, err)
+			fmt.Fprintf(stderr, "run cancel: invalid --older-than %q: %v\n", arg, err)
 			return 2
 		}
 		if age > 0 {
@@ -1211,7 +1257,7 @@ func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter s
 		if err != nil {
 			return err
 		}
-		selected = selectBlockedJobsForCancel(jobs, repoFilter, agentFilter, filterByAge, cutoffMillis)
+		selected = selectBlockedJobsForCancel(jobs, repoFilter, agentFilter, onlyType, filterByAge, cutoffMillis)
 		if apply {
 			for _, job := range selected {
 				_, cerr := workflow.CancelJob(context.Background(), store, job.ID)
@@ -1220,22 +1266,22 @@ func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter s
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job cancel: %v\n", err)
+		fmt.Fprintf(stderr, "run cancel: %v\n", err)
 		return 1
 	}
 
 	if len(selected) == 0 {
-		fmt.Fprintln(stdout, "no blocked jobs match the filter")
+		fmt.Fprintln(stdout, "no blocked runs match the filter")
 		return 0
 	}
 
 	if !apply {
-		fmt.Fprintln(stdout, "ID\tAGENT\tREPO\tAGE")
+		fmt.Fprintln(stdout, "ID\tREVIEWER\tREPO\tAGE")
 		for _, job := range selected {
 			payload, _ := workflow.DecodeJobPayload(job)
 			fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", job.ID, job.Agent, payload.Repo, humanizeJobAge(job, now))
 		}
-		fmt.Fprintf(stdout, "run again with --yes to cancel %d jobs\n", len(selected))
+		fmt.Fprintf(stdout, "run again with --yes to cancel %d runs\n", len(selected))
 		return 0
 	}
 
@@ -1267,10 +1313,13 @@ type jobCancelResult struct {
 // cutoffMillis, ordered oldest-first with an id tie-break for a deterministic
 // preview and cancel order. Age falls back to created_at when updated_at is
 // absent; a job with no parseable timestamp is excluded once an age filter is set.
-func selectBlockedJobsForCancel(jobs []db.Job, repoFilter, agentFilter string, filterByAge bool, cutoffMillis int64) []db.Job {
+func selectBlockedJobsForCancel(jobs []db.Job, repoFilter, agentFilter, onlyType string, filterByAge bool, cutoffMillis int64) []db.Job {
 	selected := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if job.State != string(workflow.JobBlocked) {
+			continue
+		}
+		if onlyType != "" && job.Type != onlyType {
 			continue
 		}
 		if agentFilter != "" && job.Agent != agentFilter {
@@ -1400,12 +1449,16 @@ func retainJobsWithID(jobs []db.Job, keep map[string]string) []db.Job {
 	return retained
 }
 
-func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
+// filterJobs keeps the jobs matching every non-empty filter, sorted by id.
+func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string) []db.Job {
 	repoFilter = strings.TrimSpace(repoFilter)
 	stateFilter = strings.TrimSpace(stateFilter)
 	filtered := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if stateFilter != "" && job.State != stateFilter {
+			continue
+		}
+		if typeFilter != "" && job.Type != typeFilter {
 			continue
 		}
 		if repoFilter != "" {
@@ -1454,14 +1507,14 @@ func printJob(stdout io.Writer, job db.Job, payload workflow.JobPayload, reason 
 		fmt.Fprintln(stdout, "review_status_authority: non_authoritative")
 	}
 	fmt.Fprintf(stdout, "type: %s\n", job.Type)
-	fmt.Fprintf(stdout, "agent: %s\n", job.Agent)
+	fmt.Fprintf(stdout, "reviewer: %s\n", job.Agent)
 	model := strings.TrimSpace(job.Model)
 	if model == "" {
 		model = "-"
 	}
 	fmt.Fprintf(stdout, "model: %s\n", model)
 	if payload.WorkflowID != "" {
-		fmt.Fprintf(stdout, "workflow: %s\n", payload.WorkflowID)
+		fmt.Fprintf(stdout, "campaign: %s\n", payload.WorkflowID)
 	}
 	fmt.Fprintf(stdout, "repo: %s\n", payload.Repo)
 	fmt.Fprintf(stdout, "branch: %s\n", payload.Branch)
