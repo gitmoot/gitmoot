@@ -127,6 +127,12 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2590: upgrades a database seeded with agent_instances rows, built from
 	// the migrations before the table drop, through the real Open path.
 	realPathTests["TestAgentInstancesRemovalMigrationOnPreviousSchema"] = true
+	// #2639: adds the dashboard jobs indexes to a populated database built from
+	// the migrations before them, through the real Open path.
+	realPathTests["TestDashboardIndexesMigrationUpgradesThroughOpen"] = true
+	// #2639: a second opener must wait for another connection's write lock
+	// during migration; needs a real file shared by two connections.
+	realPathTests["TestOpenWaitsForAnotherWriterDuringMigration"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

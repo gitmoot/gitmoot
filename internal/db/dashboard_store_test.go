@@ -128,6 +128,75 @@ func TestListDashboardTasksOwnerAgreesWithPullRequestActingRole(t *testing.T) {
 	}
 }
 
+// The bulk owner is resolved once per distinct in-scope PR (#2639). Pin that it
+// still equals PullRequestActingRole for every task: a PR whose implement jobs
+// carry no acting role, the same PR number in another repo, and tasks with no
+// PR, which must stay unattributed even when an implement job with
+// pull_request 0 carries a role.
+func TestListDashboardTasksOwnerPerPullRequestMatchesActingRole(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	tasks := []Task{
+		{ID: "a-feat-1", RepoFullName: "acme/a", Branch: "feat", State: "pr_open"},
+		{ID: "a-quiet", RepoFullName: "acme/a", Branch: "quiet", State: "pr_open"},
+		{ID: "b-feat", RepoFullName: "acme/b", Branch: "feat", State: "pr_open"},
+		{ID: "a-nopr", RepoFullName: "acme/a", Branch: "nopr", State: "implementing"},
+		{ID: "norepo", State: "implementing"},
+	}
+	for _, task := range tasks {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
+		}
+	}
+	for _, pr := range []PullRequest{
+		{RepoFullName: "acme/a", Number: 5, HeadBranch: "feat", State: "open"},
+		{RepoFullName: "acme/a", Number: 6, HeadBranch: "quiet", State: "open"},
+		{RepoFullName: "acme/b", Number: 5, HeadBranch: "feat", State: "open"},
+	} {
+		if err := store.UpsertPullRequest(ctx, pr); err != nil {
+			t.Fatalf("UpsertPullRequest: %v", err)
+		}
+	}
+	for _, job := range []Job{
+		{ID: "a5-impl", Type: "implement", Payload: `{"repo":"acme/a","pull_request":5,"acting_org_role":" builder "}`},
+		{ID: "a6-impl", Type: "implement", Payload: `{"repo":"acme/a","pull_request":6}`},
+		{ID: "b5-impl", Type: "implement", Payload: `{"repo":"acme/b","pull_request":5,"acting_org_role":"other"}`},
+		{ID: "a0-impl", Type: "implement", Payload: `{"repo":"acme/a","acting_org_role":"stray"}`},
+	} {
+		job.Agent, job.State = "worker", "succeeded"
+		if err := store.CreateJob(ctx, job); err != nil {
+			t.Fatalf("CreateJob(%s): %v", job.ID, err)
+		}
+	}
+
+	rows, err := store.ListDashboardTasks(ctx, "2000-01-01 00:00:00")
+	if err != nil {
+		t.Fatalf("ListDashboardTasks: %v", err)
+	}
+	if len(rows) != len(tasks) {
+		t.Fatalf("ListDashboardTasks = %d rows, want %d: %+v", len(rows), len(tasks), rows)
+	}
+	want := map[string]struct {
+		owner string
+		pr    int
+	}{
+		"a-feat-1": {"builder", 5}, "a-quiet": {"", 6},
+		"b-feat": {"other", 5}, "a-nopr": {"", 0}, "norepo": {"", 0},
+	}
+	for _, row := range rows {
+		role, err := store.PullRequestActingRole(ctx, row.Repo, row.PRNumber)
+		if err != nil {
+			t.Fatalf("PullRequestActingRole(%s#%d): %v", row.Repo, row.PRNumber, err)
+		}
+		if row.Agent != role {
+			t.Fatalf("%s owner = %q, PullRequestActingRole = %q; the bulk read must agree", row.ID, row.Agent, role)
+		}
+		if w := want[row.ID]; row.Agent != w.owner || row.PRNumber != w.pr {
+			t.Fatalf("%s = owner %q PR %d, want owner %q PR %d", row.ID, row.Agent, row.PRNumber, w.owner, w.pr)
+		}
+	}
+}
+
 func TestListDashboardUnlabeledJobsIsWindowedAndLabelFiltered(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

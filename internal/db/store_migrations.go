@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -56,26 +57,42 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// applyMigration applies one numbered migration unless it is already recorded.
+//
+// A concurrent opener (the daemon restarting while the dashboard or a CLI
+// command opens the same file) must WAIT for another process's migration rather
+// than fail. The applied check therefore runs outside any transaction, and the
+// apply transaction's first statement is a write, so it takes the write lock
+// from no transaction at all, where SQLite's busy handler waits out
+// busy_timeout. The previous shape read schema_migrations inside a deferred
+// transaction and then wrote; a read transaction cannot wait to upgrade, so the
+// second opener got SQLITE_BUSY at once (#2639: every dashboard request during
+// migration 173's index build answered "apply migration 173: database is
+// locked"). The check is repeated under the lock because the other process may
+// have applied the migration while this one waited.
 func (s *Store) applyMigration(ctx context.Context, version int, migration string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version INTEGER PRIMARY KEY,
 		applied_at TEXT NOT NULL
 	)`); err != nil {
 		return err
 	}
-
-	var exists int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&exists); err != nil {
+	if applied, err := migrationApplied(ctx, s.db, version); err != nil || applied {
 		return err
 	}
-	if exists > 0 {
-		return tx.Commit()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Takes the write lock (version 0 is never a migration, so nothing is
+	// deleted) before anything is read in this transaction.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM schema_migrations WHERE version = 0`); err != nil {
+		return fmt.Errorf("apply migration %d: take write lock: %w", version, err)
+	}
+	if applied, err := migrationApplied(ctx, tx, version); err != nil || applied {
+		return err
 	}
 
 	if _, err := tx.ExecContext(ctx, migration); err != nil {
@@ -90,6 +107,16 @@ func (s *Store) applyMigration(ctx context.Context, version int, migration strin
 		return err
 	}
 	return tx.Commit()
+}
+
+func migrationApplied(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, version int) (bool, error) {
+	var exists int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, version).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists > 0, nil
 }
 
 // backfillJobRootID populates the denormalized root_id column for any pre-#420
@@ -3369,5 +3396,28 @@ DROP TABLE IF EXISTS agent_templates;
 	// resource_locks stays: it still serializes a runtime session.
 	`
 DROP TABLE IF EXISTS agent_instances;
+	`,
+	// #2639 makes the web dashboard's jobs reads index-bound on a large store
+	// (29.7k jobs, 363 MB of payload; payload sits before every column below, so
+	// any table read walks a large row's overflow chain).
+	//   - idx_jobs_implement_repo_pr_created serves pullRequestActingRoleSelector
+	//     (dashboard tasks/overview owner, daemon PullRequestActingRole): the
+	//     earliest implement job for repo + PR becomes an index seek instead of a
+	//     scan of every job in the repo.
+	//   - idx_jobs_terminal_state_updated_at covers the overview's terminal
+	//     buckets and notable jobs and health's recent failures. It is partial
+	//     over the terminal states so it never competes with the queued,
+	//     running and blocked partial indexes the daemon's queue reads use.
+	//   - idx_jobs_agent_state_created covers the fleet strip's per-agent counts
+	//     and health's per-state totals.
+	//   - idx_jobs_workflow_id keeps its name, because the workflow queries pin it
+	//     with INDEXED BY, and gains the columns the workflow summary and repo
+	//     rollups read so they no longer touch the table.
+	`
+CREATE INDEX IF NOT EXISTS idx_jobs_implement_repo_pr_created ON jobs(repo, pull_request, created_at, id) WHERE type = 'implement';
+CREATE INDEX IF NOT EXISTS idx_jobs_terminal_state_updated_at ON jobs(state, updated_at, id, input_tokens, output_tokens) WHERE state IN ('succeeded', 'failed', 'cancelled');
+CREATE INDEX IF NOT EXISTS idx_jobs_agent_state_created ON jobs(agent, state, created_at);
+DROP INDEX IF EXISTS idx_jobs_workflow_id;
+CREATE INDEX idx_jobs_workflow_id ON jobs(workflow_id, state, created_at, updated_at, input_tokens, output_tokens, repo) WHERE workflow_id != '';
 	`,
 }

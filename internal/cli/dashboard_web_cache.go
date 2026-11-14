@@ -13,6 +13,8 @@ import (
 	"time"
 
 	dashboard "github.com/gitmoot/gitmoot-dashboard"
+
+	"github.com/gitmoot/gitmoot/internal/db"
 )
 
 const (
@@ -46,6 +48,9 @@ var dashboardCachePolicies = []dashboardCachePolicy{
 	// tables that are not cursor components still become visible within 15s.
 	{endpoint: "org", keyKind: "full-cursor", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
 	{endpoint: "org-role", keyKind: "full-cursor+role", retain: true, minRecompute: time.Second, maxAge: 15 * time.Second},
+	// #2639: the galaxy graph, per repo filter. maxAge also bounds how long the
+	// trailing window can lag when no job event moves the cursor.
+	{endpoint: "graph", keyKind: "job-event-id+repo", retain: true, minRecompute: 5 * time.Second, maxAge: 60 * time.Second},
 }
 
 var (
@@ -59,6 +64,7 @@ var (
 	dashboardWorkflowsCachePolicy = dashboardCachePolicies[7]
 	dashboardOrgCachePolicy       = dashboardCachePolicies[8]
 	dashboardOrgRoleCachePolicy   = dashboardCachePolicies[9]
+	dashboardGraphCachePolicy     = dashboardCachePolicies[10]
 )
 
 type dashboardCacheEntry struct {
@@ -341,6 +347,44 @@ func (d *webDataSource) handleCharts(w http.ResponseWriter, r *http.Request) {
 			charts.Repos = []dashboard.ChartRepo{}
 		}
 		return marshalDashboardJSON(charts)
+	})
+	d.writeCachedDashboardJSON(w, outcome, body, err)
+}
+
+// handleGraph shadows the module's /api/graph with the same body (the module
+// marshals the DataSource Graph identically) cached on the job-event cursor,
+// like /api/jobs (#2639). Keys are per repo filter; a filter naming no job's
+// repo is computed through the single-flight but never retained, so arbitrary
+// ?repo= values cannot grow the cache.
+func (d *webDataSource) handleGraph(w http.ResponseWriter, r *http.Request) {
+	repo := strings.TrimSpace(r.URL.Query().Get("repo"))
+	cursor, err := d.jobEventCursor(r.Context())
+	if err != nil {
+		w.Header().Set(dashboardCacheHeader, "miss")
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	policy := dashboardGraphCachePolicy
+	if repo != "" {
+		var known bool
+		err := withStore(d.home, func(store *db.Store) error {
+			var err error
+			known, err = store.DashboardJobRepoExists(r.Context(), repo)
+			return err
+		})
+		if err != nil {
+			w.Header().Set(dashboardCacheHeader, "miss")
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		policy.retain = known
+	}
+	body, outcome, err := d.cacheForDashboard().get(r.Context(), "graph:"+repo, cursor, policy, func(ctx context.Context) ([]byte, error) {
+		graph, err := d.Graph(ctx, repo)
+		if err != nil {
+			return nil, err
+		}
+		return marshalDashboardJSON(graph)
 	})
 	d.writeCachedDashboardJSON(w, outcome, body, err)
 }

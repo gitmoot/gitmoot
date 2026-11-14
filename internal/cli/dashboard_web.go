@@ -40,6 +40,13 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "dashboard: %v\n", err)
 		return 1
 	}
+	// Open (and so migrate) the store once before listening, so no request or
+	// background worktree inspection races this process's own schema upgrade
+	// (#2639).
+	if err := withStore(home, func(*db.Store) error { return nil }); err != nil {
+		fmt.Fprintf(stderr, "dashboard: %v\n", err)
+		return 1
+	}
 	ds := &webDataSource{home: home, responseCache: newDashboardJSONCache(stderr)}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -49,6 +56,10 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 	srv := &http.Server{Handler: newDashboardWebHandler(ds)}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// /api/health serves the worktree-usage block from this background
+	// inspection; it lives exactly as long as the server.
+	ds.startWorktreeRefresher()
+	defer ds.stopWorktreeRefresher()
 
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
@@ -83,6 +94,8 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
 	mux.HandleFunc("GET /api/charts", ds.handleCharts)
 	mux.HandleFunc("GET /api/health", ds.handleHealth)
+	// #2639: cached shadow of the module's galaxy route.
+	mux.HandleFunc("GET /api/graph", ds.handleGraph)
 	mux.HandleFunc("GET /api/overview", ds.handleOverview)
 	mux.HandleFunc("GET /api/attention", ds.handleAttention)
 	mux.HandleFunc("GET /api/agents", ds.handleAgents)
@@ -293,6 +306,11 @@ type webDataSource struct {
 	updateResult    *dashboard.HealthUpdate
 	updateFetchedAt time.Time
 	updateOK        bool
+
+	// worktrees computes /api/health's worktree-usage block in the background
+	// (started and stopped by runDashboardWeb). Nil means it never runs, so
+	// health reports the explicit pending value.
+	worktrees *dashboardWorktreeRefresher
 }
 
 type dashboardServerBuild struct {
@@ -307,9 +325,19 @@ type dashboardHealthDaemon struct {
 
 type dashboardHealthResponse struct {
 	dashboard.Health
-	Daemon    dashboardHealthDaemon   `json:"daemon"`
-	Server    dashboardServerBuild    `json:"server"`
-	Worktrees delegationWorktreeUsage `json:"worktrees"`
+	Daemon dashboardHealthDaemon `json:"daemon"`
+	Server dashboardServerBuild  `json:"server"`
+	// Worktrees is the last background inspection's result (#2639), never
+	// computed on the request path. WorktreesStatus is "pending" until the first
+	// inspection completes (Worktrees is then an empty value and
+	// WorktreesComputedAt is 0) and "ready" afterwards. WorktreesComputedAt is
+	// the epoch-ms time of that inspection, so a reader can judge its age.
+	// WorktreesError is the latest run's failure; a failed run keeps the
+	// previous value.
+	Worktrees           delegationWorktreeUsage `json:"worktrees"`
+	WorktreesStatus     string                  `json:"worktreesStatus"`
+	WorktreesComputedAt int64                   `json:"worktreesComputedAt"`
+	WorktreesError      string                  `json:"worktreesError,omitempty"`
 }
 
 // handleHealth shadows the module's /api/health to add the build of the process
@@ -339,23 +367,7 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 	if health.RecentFailures == nil {
 		health.RecentFailures = []dashboard.HealthFailure{}
 	}
-	paths, err := initializedPaths(d.home)
-	if err != nil {
-		return nil, err
-	}
-	ttl, err := config.LoadDelegationWorktreeTTL(paths)
-	if err != nil {
-		return nil, err
-	}
-	var worktrees delegationWorktreeUsage
-	err = withStore(d.home, func(store *db.Store) error {
-		var inspectErr error
-		worktrees, inspectErr = inspectDelegationWorktreeUsage(ctx, paths, store, time.Now().UTC(), ttl)
-		return inspectErr
-	})
-	if err != nil {
-		return nil, err
-	}
+	worktrees := d.worktreeHealth()
 	build := buildinfo.Current()
 	versionSource := "unknown"
 	if health.Daemon.Version != "" {
@@ -367,8 +379,11 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 			HealthDaemon:  health.Daemon,
 			VersionSource: versionSource,
 		},
-		Server:    dashboardServerBuild{Version: build.Version, Commit: build.Commit},
-		Worktrees: worktrees,
+		Server:              dashboardServerBuild{Version: build.Version, Commit: build.Commit},
+		Worktrees:           worktrees.usage,
+		WorktreesStatus:     worktrees.status,
+		WorktreesComputedAt: worktrees.computedAt,
+		WorktreesError:      worktrees.err,
 	}
 	return marshalDashboardJSON(response)
 }
@@ -963,37 +978,49 @@ func resolveJobRuntime(job db.Job, payload workflow.JobPayload, runtimeByAgent m
 	return rt
 }
 
-// Graph returns the whole-history "galaxy" graph: a union of every job across
-// every run in the store, plus synthetic repo/agent hub nodes that cluster the
-// jobs. Links are delegation parentage, a per-parent-group sibling mesh (the
-// density lever, capped so one huge fan-out can't dominate), and job->repo /
-// job->agent spokes. A non-empty repo scopes the visible jobs (and their hubs)
-// to that repository; Repos always lists the full distinct-repo set so the UI
-// filter dropdown stays complete. Read-only; output is sorted for determinism.
+// dashboardGalaxyWindow bounds the galaxy graph to jobs created in the trailing
+// 30 days. The full history (29.7k jobs on the live store in #2639) made the
+// response 21 MB and the request 11-15 s; the window keeps both proportional to
+// recent activity instead of to the store's age.
+const dashboardGalaxyWindow = 30 * 24 * time.Hour
+
+// Graph returns the "galaxy" graph: a union of every job created within
+// dashboardGalaxyWindow across every run, plus synthetic repo/agent hub nodes
+// that cluster the jobs. Links are delegation parentage, a per-parent-group
+// sibling mesh (the density lever, capped so one huge fan-out can't dominate),
+// and job->repo / job->agent spokes. A non-empty repo scopes the visible jobs
+// (and their hubs) to that repository; Repos always lists every repo in the
+// window so the UI filter dropdown stays complete. Jobs are read without their
+// payload: repo is the denormalized column and the title fields are projected
+// in SQL. Read-only; output is sorted for determinism.
 func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph, error) {
 	out := dashboard.Graph{Nodes: []dashboard.GraphNode{}, Links: []dashboard.GraphLink{}, Repos: []string{}}
 	filter := strings.TrimSpace(repo)
+	since := dashboardSQLiteTime(time.Now().Add(-dashboardGalaxyWindow))
 	err := withStore(d.home, func(store *db.Store) error {
-		jobs, err := store.ListJobs(ctx)
+		rows, err := store.ListDashboardGraphJobs(ctx, since)
 		if err != nil {
 			return err
 		}
-		if len(jobs) == 0 {
+		if len(rows) == 0 {
 			return nil
 		}
-		jobByID := make(map[string]db.Job, len(jobs))
-		for _, j := range jobs {
-			jobByID[j.ID] = j
-		}
-
-		// Parse each job's payload once and record its repo/root.
-		payloadByID := make(map[string]workflow.JobPayload, len(jobs))
-		repoByID := make(map[string]string, len(jobs))
+		jobs := make([]db.Job, 0, len(rows))
+		jobByID := make(map[string]db.Job, len(rows))
+		// The two payload fields a title can use, and each job's repo.
+		payloadByID := make(map[string]workflow.JobPayload, len(rows))
+		repoByID := make(map[string]string, len(rows))
 		allRepos := map[string]bool{}
-		for _, j := range jobs {
-			p, _ := workflow.DecodeJobPayload(j)
-			payloadByID[j.ID] = p
-			r := strings.TrimSpace(p.Repo)
+		for _, row := range rows {
+			j := db.Job{
+				ID: row.ID, Agent: row.Agent, Type: row.Type, State: row.State,
+				ParentJobID: row.ParentJobID, DelegationID: row.DelegationID, WorkflowID: row.WorkflowID,
+				Repo: row.Repo, InputTokens: row.InputTokens, OutputTokens: row.OutputTokens,
+			}
+			jobs = append(jobs, j)
+			jobByID[j.ID] = j
+			payloadByID[j.ID] = workflow.JobPayload{TaskTitle: row.TaskTitle, Instructions: row.Instructions}
+			r := strings.TrimSpace(row.Repo)
 			repoByID[j.ID] = r
 			if r != "" {
 				allRepos[r] = true
@@ -1009,8 +1036,8 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 		}
 
 		// Job nodes + collect the hubs referenced by visible jobs. Workflow
-		// rollups are accumulated in this same ListJobs pass so the galaxy never
-		// performs a second global jobs scan.
+		// rollups are accumulated in this same pass so the galaxy never
+		// performs a second jobs scan.
 		repoHubs := map[string]bool{}
 		agentHubs := map[string]bool{}
 		type workflowRollup struct {
@@ -1024,11 +1051,12 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 			p := payloadByID[j.ID]
 			r := repoByID[j.ID]
 			agent := strings.TrimSpace(j.Agent)
-			// Run points at the job's root. Under an active repo filter that root
-			// may belong to a different repo and thus be absent from Nodes; fall
-			// back to self-root so no node attribute references a missing node.
+			// Run points at the job's root. That root may be older than the
+			// galaxy window, or under an active repo filter belong to a different
+			// repo, and thus be absent from Nodes; fall back to self-root so no
+			// node attribute references a missing node.
 			run := jobRootID(jobByID, j.ID)
-			if filter != "" && !visible(run) {
+			if _, inWindow := jobByID[run]; !inWindow || (filter != "" && !visible(run)) {
 				run = j.ID
 			}
 			out.Nodes = append(out.Nodes, dashboard.GraphNode{
@@ -1378,10 +1406,15 @@ func utcDayStart(t time.Time) time.Time {
 // treats it as wedged (blocked jobs are surfaced regardless of age).
 const stuckQueuedThreshold = 10 * time.Minute
 
+// dashboardHealthRecentFailures is the number of newest failed jobs the Health
+// page lists (the module's "last 10 failed, newest first").
+const dashboardHealthRecentFailures = 10
+
 // Health returns the daemon liveness, fleet totals, held resource locks, wedged jobs and
 // recent failures behind the Health page. The daemon block mirrors
 // buildDashboardSnapshot (currentDaemonPID + daemon.json meta over d.home);
-// everything else is a single read-only ListJobs pass plus the resource lock listing.
+// everything else is bounded store reads (state counts, the blocked/queued rows,
+// the newest failures) plus the resource lock listing.
 // Stuck reasons reuse loadStuckReason/deriveStuckReason unchanged.
 func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 	out := dashboard.Health{
@@ -1438,10 +1471,31 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 		updateInfo = d.checkUpdate(ctx, executable)
 	}()
 
+	// Every jobs read below is bounded (#2639): totals are one GROUP BY, the
+	// stuck candidates are the blocked/queued rows, and recent failures are the
+	// newest dashboardHealthRecentFailures failed rows with their title projected
+	// in SQL. Only the stuck rows, which the response returns, have their payload
+	// decoded; the terminal backlog is never read.
 	err = withStore(d.home, func(store *db.Store) error {
-		jobs, err := store.ListJobs(ctx)
+		counts, err := store.CountDashboardJobsByState(ctx)
 		if err != nil {
 			return err
+		}
+		for state, count := range counts {
+			switch mapNodeState(state) {
+			case "queued":
+				out.Totals.Queued += count
+			case "running":
+				out.Totals.Running += count
+			case "blocked":
+				out.Totals.Blocked += count
+			case "succeeded":
+				out.Totals.Succeeded += count
+			case "failed":
+				out.Totals.Failed += count
+			case "cancelled":
+				out.Totals.Cancelled += count
+			}
 		}
 
 		// Resource locks (runtime sessions etc.) are listed ONCE and
@@ -1454,60 +1508,40 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 			return err
 		}
 
+		// Only blocked and queued rows (an empty state maps to queued) can be
+		// stuck; healthStuckSince applies the queued threshold.
+		var candidates []db.Job
+		for _, state := range []string{"blocked", "queued", ""} {
+			jobs, err := store.ListJobsByState(ctx, state)
+			if err != nil {
+				return err
+			}
+			candidates = append(candidates, jobs...)
+		}
 		cutoff := time.Now().UTC().Add(-stuckQueuedThreshold).UnixMilli()
 		var stuck []dashboard.HealthStuckJob
-		var failures []dashboard.HealthFailure
-		for _, j := range jobs {
-			ns := mapNodeState(j.State)
-			switch ns {
-			case "queued":
-				out.Totals.Queued++
-			case "running":
-				out.Totals.Running++
-			case "blocked":
-				out.Totals.Blocked++
-			case "succeeded":
-				out.Totals.Succeeded++
-			case "failed":
-				out.Totals.Failed++
-			case "cancelled":
-				out.Totals.Cancelled++
+		for _, j := range candidates {
+			since, isStuck := healthStuckSince(j, cutoff)
+			if !isStuck {
+				continue
 			}
-
-			if since, isStuck := healthStuckSince(j, cutoff); isStuck {
-				payload, _ := workflow.DecodeJobPayload(j)
-				// Mirror loadStuckReason but reuse the preloaded resource locks
-				// (per-job events are inherently per-job and stay).
-				reason := ""
-				if events, eerr := store.ListJobEvents(ctx, j.ID); eerr == nil {
-					ev, ok := latestReasonEvent(events)
-					reason = deriveStuckReason(j, ev, ok, resourceLocks).Reason
-				}
-				stuck = append(stuck, dashboard.HealthStuckJob{
-					ID:     j.ID,
-					Title:  jobTitle(payload, j),
-					Agent:  strings.TrimSpace(j.Agent),
-					Repo:   strings.TrimSpace(payload.Repo),
-					State:  string(ns),
-					Reason: reason,
-					Since:  since,
-				})
+			payload, _ := workflow.DecodeJobPayload(j)
+			// Mirror loadStuckReason but reuse the preloaded resource locks
+			// (per-job events are inherently per-job and stay).
+			reason := ""
+			if events, eerr := store.ListJobEvents(ctx, j.ID); eerr == nil {
+				ev, ok := latestReasonEvent(events)
+				reason = deriveStuckReason(j, ev, ok, resourceLocks).Reason
 			}
-
-			if ns == "failed" {
-				payload, _ := workflow.DecodeJobPayload(j)
-				at := parseJobTimeMillis(j.UpdatedAt)
-				if at == 0 {
-					at = parseJobTimeMillis(j.CreatedAt)
-				}
-				failures = append(failures, dashboard.HealthFailure{
-					ID:    j.ID,
-					Title: jobTitle(payload, j),
-					Agent: strings.TrimSpace(j.Agent),
-					Repo:  strings.TrimSpace(payload.Repo),
-					At:    at,
-				})
-			}
+			stuck = append(stuck, dashboard.HealthStuckJob{
+				ID:     j.ID,
+				Title:  jobTitle(payload, j),
+				Agent:  strings.TrimSpace(j.Agent),
+				Repo:   strings.TrimSpace(payload.Repo),
+				State:  string(mapNodeState(j.State)),
+				Reason: reason,
+				Since:  since,
+			})
 		}
 
 		// Wedged jobs oldest-first (id tie-break).
@@ -1519,20 +1553,31 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 		})
 		out.Stuck = stuck
 
-		// Recent failures newest-first (id tie-break), capped at 10.
-		sort.SliceStable(failures, func(i, j int) bool {
-			if failures[i].At != failures[j].At {
-				return failures[i].At > failures[j].At
+		// Recent failures newest-first (id tie-break), capped. The store orders
+		// by the stored timestamp text, which is the same order as its parsed
+		// time because every jobs timestamp is CURRENT_TIMESTAMP-formatted.
+		failedRows, err := store.ListDashboardRecentFailures(ctx, dashboardHealthRecentFailures)
+		if err != nil {
+			return err
+		}
+		failures := make([]dashboard.HealthFailure, 0, len(failedRows))
+		for _, row := range failedRows {
+			at := parseJobTimeMillis(row.UpdatedAt)
+			if at == 0 {
+				at = parseJobTimeMillis(row.CreatedAt)
 			}
-			return failures[i].ID > failures[j].ID
-		})
-		if len(failures) > 10 {
-			failures = failures[:10]
+			failures = append(failures, dashboard.HealthFailure{
+				ID:    row.ID,
+				Title: jobTitle(workflow.JobPayload{Instructions: row.Instructions}, db.Job{ID: row.ID}),
+				Agent: strings.TrimSpace(row.Agent),
+				Repo:  strings.TrimSpace(row.Repo),
+				At:    at,
+			})
 		}
 		out.RecentFailures = failures
 
 		// Non-branch resource locks (runtime sessions etc.), oldest acquisition
-		// first — mapped from the slice preloaded before the jobs loop.
+		// first — mapped from the slice preloaded before the stuck-job loop.
 		rlocks := make([]dashboard.HealthResourceLock, 0, len(resourceLocks))
 		for _, l := range resourceLocks {
 			rlocks = append(rlocks, dashboard.HealthResourceLock{
