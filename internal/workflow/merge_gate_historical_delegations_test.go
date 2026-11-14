@@ -117,3 +117,66 @@ func TestDecodeJobPayloadMarksOnlyReviewAnnouncements(t *testing.T) {
 		})
 	}
 }
+
+// TestHistoricalAnnouncementRetryStoresTheFreshVerdict pins round-4 P2: the
+// verbatim write-back belongs to the decoded announcement only. A manual retry
+// clears the result, and the retried run's fresh verdict must be what gets
+// stored, not the old announcement it replaced.
+func TestHistoricalAnnouncementRetryStoresTheFreshVerdict(t *testing.T) {
+	for _, panel := range []struct{ name, json string }{
+		{"declared", `,"delegations":[{"id":"lens-a","agent":"lens-a","action":"review","prompt":"look"}]`},
+		{"stripped", `,"fan_out":true`},
+	} {
+		t.Run(panel.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := openTestStore(t)
+			stored := fmt.Sprintf(`{"repo":"gitmoot/gitmoot","pull_request":9,"head_sha":"head123","result":{"decision":"approved","summary":"stale"%s}}`, panel.json)
+			if err := store.CreateJobWithEvent(ctx, db.Job{
+				ID: "review-historical", Agent: "audit", Type: "review", State: string(JobFailed), Payload: stored,
+			}, db.JobEvent{Kind: string(JobFailed), Message: "failed"}); err != nil {
+				t.Fatalf("CreateJobWithEvent returned error: %v", err)
+			}
+
+			job, err := RetryJob(ctx, store, "review-historical")
+			if err != nil {
+				t.Fatalf("RetryJob returned error: %v", err)
+			}
+			if strings.Contains(job.Payload, `"result"`) {
+				t.Fatalf("payload after retry = %s, want the historical result cleared", job.Payload)
+			}
+
+			// The retried run decodes the queued row and stores its fresh
+			// result through the same encoder the mailbox uses.
+			payload, err := DecodeJobPayload(job)
+			if err != nil {
+				t.Fatalf("DecodeJobPayload returned error: %v", err)
+			}
+			payload.Result = &AgentResult{Decision: "changes_requested", Summary: "fresh review"}
+			if err := (Mailbox{store: store}).savePayload(ctx, job.ID, payload); err != nil {
+				t.Fatalf("savePayload returned error: %v", err)
+			}
+			after, err := store.GetJob(ctx, job.ID)
+			if err != nil {
+				t.Fatalf("GetJob returned error: %v", err)
+			}
+			if !strings.Contains(after.Payload, `"decision":"changes_requested"`) || strings.Contains(after.Payload, "stale") {
+				t.Fatalf("stored payload = %s, want the fresh verdict", after.Payload)
+			}
+
+			// And a fresh verdict assigned over a still-decoded announcement
+			// (no retry in between) is stored too.
+			original, err := DecodeJobPayload(db.Job{ID: "j", Type: "review", Payload: stored})
+			if err != nil {
+				t.Fatalf("DecodeJobPayload returned error: %v", err)
+			}
+			original.Result = &AgentResult{Decision: "changes_requested", Summary: "fresh review"}
+			encoded, err := marshalPayload(original)
+			if err != nil {
+				t.Fatalf("marshalPayload returned error: %v", err)
+			}
+			if !strings.Contains(encoded, `"decision":"changes_requested"`) || strings.Contains(encoded, "stale") {
+				t.Fatalf("encoded = %s, want the fresh verdict over the decoded announcement", encoded)
+			}
+		})
+	}
+}

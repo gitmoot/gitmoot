@@ -428,11 +428,14 @@ type JobPayload struct {
 	execBackendPresent     bool
 	unknownJSONFields      map[string]json.RawMessage
 	// announcedResult is the stored result object of a historical review
-	// announcement whose decision DecodeJobPayload replaced. MarshalJSON
-	// writes it back verbatim: AgentResult no longer models fan_out, so
-	// re-encoding the decoded result would drop the mark that makes the row
-	// an announcement and turn it back into an approval.
+	// announcement whose decision DecodeJobPayload replaced, and announcedFor
+	// is the decoded result it stands for. While Result is still exactly that
+	// decoded result, MarshalJSON writes the stored object back verbatim:
+	// AgentResult no longer models fan_out, so re-encoding would drop the mark
+	// that makes the row an announcement. A caller that clears, replaces or
+	// re-decides Result (a retry, a fresh run) is encoded normally.
 	announcedResult json.RawMessage
+	announcedFor    *AgentResult
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
@@ -2094,6 +2097,7 @@ func DecodeJobPayload(job db.Job) (JobPayload, error) {
 		result.Decision = HistoricalFanOutDecision
 		payload.Result = &result
 		payload.announcedResult = marks.Result
+		payload.announcedFor = payload.Result
 	}
 	return payload, nil
 }

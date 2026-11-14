@@ -80,10 +80,11 @@ func (p *JobPayload) UnmarshalJSON(data []byte) error {
 // established field order and byte-for-byte serialization.
 func (p JobPayload) MarshalJSON() ([]byte, error) {
 	extra := make(map[string]json.RawMessage, len(p.unknownJSONFields)+2)
-	if len(p.announcedResult) != 0 {
-		// A historical announcement's stored result is history: write the
-		// recorded object back byte for byte, marks included, never the
-		// decoded form (see DecodeJobPayload).
+	if len(p.announcedResult) != 0 && p.Result != nil && p.Result == p.announcedFor &&
+		p.Result.Decision == HistoricalFanOutDecision {
+		// The decoded historical announcement is being written back
+		// unchanged: keep the recorded object byte for byte, marks included
+		// (see DecodeJobPayload).
 		p.Result = nil
 		extra["result"] = p.announcedResult
 	}
