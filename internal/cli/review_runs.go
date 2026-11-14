@@ -1,9 +1,6 @@
 package cli
 
 import (
-	"context"
-	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -13,7 +10,9 @@ import (
 
 // The `review list|show|watch|cancel` commands are the `run` commands limited
 // to runs of type review (#2601): the thing a seat looks up after
-// `review request`.
+// `review request`. Each one runs the shared run handler with a type
+// restriction, so the flags are parsed once and the type is checked on the
+// same run, in the same home, that the handler prints or cancels.
 
 const reviewRunType = "review"
 
@@ -22,75 +21,23 @@ func runReviewList(args []string, stdout, stderr io.Writer) int {
 }
 
 func runReviewShow(args []string, stdout, stderr io.Writer) int {
-	if code, ok := requireReviewRun(args, "review show", stderr); !ok {
-		return code
-	}
-	return runJobShow(args, stdout, stderr)
+	return showRun(args, stdout, stderr, "review show", reviewRunType)
 }
 
 func runReviewWatch(args []string, stdout, stderr io.Writer) int {
-	if code, ok := requireReviewRun(args, "review watch", stderr); !ok {
-		return code
-	}
-	return runJobWatch(args, stdout, stderr)
+	return watchRun(args, stdout, stderr, "review watch", reviewRunType)
 }
 
 func runReviewCancel(args []string, stdout, stderr io.Writer) int {
-	if code, ok := requireReviewRun(args, "review cancel", stderr); !ok {
-		return code
-	}
-	return runJobCancel(args, stdout, stderr)
+	return cancelRun(args, stdout, stderr, "review cancel", reviewRunType)
 }
 
-// retainJobsOfType keeps only the jobs of jobType, preserving input order.
-func retainJobsOfType(jobs []db.Job, jobType string) []db.Job {
-	kept := jobs[:0:0]
-	for _, job := range jobs {
-		if job.Type == jobType {
-			kept = append(kept, job)
-		}
+// checkRunType refuses a run whose type is not onlyType; an empty onlyType
+// accepts every type.
+func checkRunType(job db.Job, onlyType, command string) error {
+	if onlyType == "" || job.Type == onlyType {
+		return nil
 	}
-	return kept
-}
-
-// requireReviewRun checks that the leading <id> in args names a review run
-// before a review command hands args to the matching run command. Help and
-// argument errors pass through to the run command, which reports them.
-func requireReviewRun(args []string, command string, stderr io.Writer) (int, bool) {
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
-			return 0, true
-		}
-		fmt.Fprintf(stderr, "%s requires exactly one review id\n", command)
-		return 2, false
-	}
-	id := args[0]
-	home := ""
-	for i := 1; i < len(args); i++ {
-		name, value, hasValue := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
-		if !strings.HasPrefix(args[i], "-") || name != "home" {
-			continue
-		}
-		if !hasValue && i+1 < len(args) {
-			value = args[i+1]
-		}
-		home = value
-	}
-	var job db.Job
-	if err := withStore(home, func(store *db.Store) error {
-		var err error
-		job, err = store.GetJob(context.Background(), id)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("review %q not found", id)
-		}
-		return err
-	}); err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", command, err)
-		return 1, false
-	}
-	if job.Type != reviewRunType {
-		fmt.Fprintf(stderr, "%s: %s is a %s run, not a review; use gitmoot run %s\n", command, id, job.Type, strings.TrimPrefix(command, "review "))
-		return 1, false
-	}
-	return 0, true
+	verb := command[strings.LastIndexByte(command, ' ')+1:]
+	return fmt.Errorf("%s is a %s run, not a %s; use gitmoot run %s", job.ID, job.Type, onlyType, verb)
 }

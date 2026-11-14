@@ -170,10 +170,7 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 		}
 		jobs = retainJobsWithID(jobs, signalKilled)
 	}
-	if onlyType != "" {
-		jobs = retainJobsOfType(jobs, onlyType)
-	}
-	filtered := filterJobs(jobs, *repo, *state)
+	filtered := filterJobs(jobs, *repo, *state, onlyType)
 	for jobID, status := range deriveDispatchedReviewStatuses(paths, filtered) {
 		reviewStatuses[jobID] = status
 	}
@@ -286,11 +283,17 @@ type jobListEntry struct {
 }
 
 func runJobShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("run show", flag.ContinueOnError)
+	return showRun(args, stdout, stderr, "run show", "")
+}
+
+// showRun backs `run show` and `review show`; a non-empty onlyType refuses a
+// run of any other type, checked on the same run the command prints.
+func showRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the run (with operational detail) as JSON")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "run show")
+	jobID, ok := parseSingleJobID(fs, args, stderr, command)
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
@@ -307,6 +310,9 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 			}
 			return err
 		}
+		if err := checkRunType(job, onlyType, command); err != nil {
+			return err
+		}
 		payload, err = daemonJobPayload(job)
 		if err != nil {
 			return err
@@ -315,14 +321,14 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 		reviewStatus = deriveReviewStatus(context.Background(), store, job, time.Now().UTC())
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "run show: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
 	processActive := deriveWorktreeProcessActive(job, jobWorktreeLiveness)
 	runtimeProcessActive := deriveRuntimeProcessActive(job, jobRuntimeProcessLiveness)
 	if *jsonOutput {
 		out := jobShowOutput{
-			Job:                           job,
+			Job:                           newRunJSON(job),
 			Payload:                       payload,
 			HeadSHA:                       firstNonEmpty(reviewStatus.HeadSHA, payload.HeadSHA),
 			ReviewStatus:                  reviewStatus.Status,
@@ -338,7 +344,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 			ReadOnlyWorktreeDiffError:     payload.ReadOnlyWorktreeDiffError,
 		}
 		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "run show: %v\n", err)
+			fmt.Fprintf(stderr, "%s: %v\n", command, err)
 			return 1
 		}
 		return 0
@@ -351,7 +357,7 @@ func runJobShow(args []string, stdout, stderr io.Writer) int {
 // payload, and additive operational detail (#552, #1132). Zero-value detail is
 // omitted so a healthy job's JSON is unchanged in spirit.
 type jobShowOutput struct {
-	Job                           db.Job              `json:"run"`
+	Job                           runJSON             `json:"run"`
 	Payload                       workflow.JobPayload `json:"payload"`
 	HeadSHA                       string              `json:"head_sha,omitempty"`
 	ReviewStatus                  string              `json:"review_status,omitempty"`
@@ -428,8 +434,8 @@ func runJobEvents(args []string, stdout, stderr io.Writer) int {
 }
 
 type jobWatchOutput struct {
-	Job    db.Job        `json:"run"`
-	Events []db.JobEvent `json:"events"`
+	Job    runJSON        `json:"run"`
+	Events []runEventJSON `json:"events"`
 	// Held* describe the LAST HOLD OBSERVED WHILE WATCHING, not the settled state
 	// (#1887). Named for that distinction deliberately: by the time this object is
 	// emitted the job has settled, so a field called why_stuck would assert a
@@ -440,7 +446,13 @@ type jobWatchOutput struct {
 }
 
 func runJobWatch(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("run watch", flag.ContinueOnError)
+	return watchRun(args, stdout, stderr, "run watch", "")
+}
+
+// watchRun backs `run watch` and `review watch`; a non-empty onlyType refuses
+// a run of any other type, checked on the same run the watch loads.
+func watchRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	poll := fs.Duration("poll", time.Second, "poll interval")
@@ -448,25 +460,25 @@ func runJobWatch(args []string, stdout, stderr io.Writer) int {
 	transcriptOutput := fs.Bool("transcript", false, "render the retained runtime log as a human-readable transcript")
 	logPath := fs.String("log-path", "", "transcript log path override")
 	runtimeName := fs.String("runtime", "", "runtime used to render the transcript")
-	jobID, ok := parseSingleJobID(fs, args, stderr, "run watch")
+	jobID, ok := parseSingleJobID(fs, args, stderr, command)
 	if !ok {
 		return parseSingleJobIDExitCode(args)
 	}
 	if *poll <= 0 {
-		fmt.Fprintln(stderr, "run watch poll interval must be positive")
+		fmt.Fprintf(stderr, "%s poll interval must be positive\n", command)
 		return 2
 	}
 	if *transcriptOutput && *jsonOutput {
-		fmt.Fprintln(stderr, "run watch: --transcript is incompatible with --json")
+		fmt.Fprintf(stderr, "%s: --transcript is incompatible with --json\n", command)
 		return 2
 	}
 	if *transcriptOutput {
-		return runJobTranscriptWatch(jobID, *home, *logPath, *runtimeName, *poll, stdout, stderr)
+		return runJobTranscriptWatch(jobID, *home, *logPath, *runtimeName, *poll, command, onlyType, stdout, stderr)
 	}
-	return runJobEventWatch(jobID, *home, *poll, *jsonOutput, stdout, stderr)
+	return runJobEventWatch(jobID, *home, *poll, *jsonOutput, command, onlyType, stdout, stderr)
 }
 
-func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, stdout, stderr io.Writer) int {
+func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, command, onlyType string, stdout, stderr io.Writer) int {
 	var output jobWatchOutput
 	if err := withStore(home, func(store *db.Store) error {
 		nextEvent := 0
@@ -493,6 +505,9 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 				if errors.Is(err, sql.ErrNoRows) {
 					return fmt.Errorf("run %q not found", jobID)
 				}
+				return err
+			}
+			if err := checkRunType(job, onlyType, command); err != nil {
 				return err
 			}
 			events, err := store.ListJobEvents(context.Background(), jobID)
@@ -538,8 +553,8 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			}
 			if workflow.IsSettledJobState(job.State) {
 				output = jobWatchOutput{
-					Job:                 job,
-					Events:              events,
+					Job:                 newRunJSON(job),
+					Events:              newRunEventsJSON(events),
 					HeldReason:          held.Reason,
 					HeldNextRetryAt:     held.NextRetryAt,
 					HeldSuggestedAction: held.SuggestedAction,
@@ -582,12 +597,12 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, s
 			time.Sleep(poll)
 		}
 	}); err != nil {
-		fmt.Fprintf(stderr, "run watch: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
 	if jsonOutput {
 		if err := writeJSON(stdout, output); err != nil {
-			fmt.Fprintf(stderr, "run watch: %v\n", err)
+			fmt.Fprintf(stderr, "%s: %v\n", command, err)
 			return 1
 		}
 		return 0
@@ -611,21 +626,21 @@ func holdLine(reason stuckReason) string {
 	return line
 }
 
-func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, stdout, stderr io.Writer) int {
+func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime string, poll time.Duration, command, onlyType string, stdout, stderr io.Writer) int {
 	logPath := strings.TrimSpace(requestedLogPath)
 	if logPath == "" {
 		paths, err := pathsFromFlag(home)
 		if err != nil {
-			fmt.Fprintf(stderr, "run watch transcript: %v\n", err)
+			fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 			return 1
 		}
 		logPath = transcript.ResolveJobLogPath(paths.Logs, jobID)
 		if _, err := os.Stat(logPath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				fmt.Fprintln(stdout, "transcript unavailable; showing run events")
-				return runJobEventWatch(jobID, home, poll, false, stdout, stderr)
+				return runJobEventWatch(jobID, home, poll, false, command, onlyType, stdout, stderr)
 			}
-			fmt.Fprintf(stderr, "run watch transcript: stat log: %v\n", err)
+			fmt.Fprintf(stderr, "%s transcript: stat log: %v\n", command, err)
 			return 1
 		}
 	}
@@ -641,6 +656,9 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("run %q not found", jobID)
 			}
+			return err
+		}
+		if err := checkRunType(job, onlyType, command); err != nil {
 			return err
 		}
 		payload, err := daemonJobPayload(job)
@@ -692,11 +710,11 @@ func runJobTranscriptWatch(jobID, home, requestedLogPath, requestedRuntime strin
 		})
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "run watch transcript: %v\n", err)
+		fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 		return 1
 	}
 	if err := renderer.Render(translator.Flush()...); err != nil {
-		fmt.Fprintf(stderr, "run watch transcript: %v\n", err)
+		fmt.Fprintf(stderr, "%s transcript: %v\n", command, err)
 		return 1
 	}
 	return 0
@@ -1112,7 +1130,14 @@ func runJobRetry(args []string, stdout, stderr io.Writer) int {
 // exclusive with it. The bulk sub-filters (--older-than/--repo/--agent) require
 // --state. Bulk mode is a DRY-RUN by default (prints the selection); --yes commits.
 func runJobCancel(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("run cancel", flag.ContinueOnError)
+	return cancelRun(args, stdout, stderr, "run cancel", "")
+}
+
+// cancelRun backs `run cancel` and `review cancel`; a non-empty onlyType
+// refuses a single run of any other type (checked on the run it cancels) and
+// limits the bulk selection to that type.
+func cancelRun(args []string, stdout, stderr io.Writer, command, onlyType string) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { printJobUsage(stderr) }
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
@@ -1145,36 +1170,48 @@ func runJobCancel(args []string, stdout, stderr io.Writer) int {
 		extra = extra[1:]
 	}
 	if len(extra) > 0 {
-		fmt.Fprintf(stderr, "run cancel: unexpected argument %q\n", extra[0])
+		fmt.Fprintf(stderr, "%s: unexpected argument %q\n", command, extra[0])
 		printJobUsage(stderr)
 		return 2
 	}
 
 	if strings.TrimSpace(*state) != "" {
 		if strings.TrimSpace(positional) != "" {
-			fmt.Fprintln(stderr, "run cancel: <id> and --state are mutually exclusive (bulk mode cancels a selection, not one run)")
+			fmt.Fprintf(stderr, "%s: <id> and --state are mutually exclusive (bulk mode cancels a selection, not one run)\n", command)
 			return 2
 		}
-		return runJobCancelBulk(*home, *state, *olderThan, *repo, *agent, *yes, stdout, stderr)
+		return runJobCancelBulk(*home, *state, *olderThan, *repo, *agent, onlyType, *yes, stdout, stderr)
 	}
 
 	// Single form. The bulk sub-filters only make sense alongside --state.
 	if strings.TrimSpace(*olderThan) != "" || strings.TrimSpace(*repo) != "" || strings.TrimSpace(*agent) != "" {
-		fmt.Fprintln(stderr, "run cancel: --older-than, --repo, and --reviewer require --state")
+		fmt.Fprintf(stderr, "%s: --older-than, --repo, and --reviewer require --state\n", command)
 		return 2
 	}
 	if strings.TrimSpace(positional) == "" {
-		fmt.Fprintln(stderr, "run cancel requires exactly one id (or --state for bulk mode)")
+		fmt.Fprintf(stderr, "%s requires exactly one id (or --state for bulk mode)\n", command)
 		printJobUsage(stderr)
 		return 2
 	}
 	var job db.Job
 	if err := withStore(*home, func(store *db.Store) error {
 		var err error
+		if onlyType != "" {
+			found, err := store.GetJob(context.Background(), positional)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("run %q not found", positional)
+			}
+			if err != nil {
+				return err
+			}
+			if err := checkRunType(found, onlyType, command); err != nil {
+				return err
+			}
+		}
 		job, err = workflow.CancelJob(context.Background(), store, positional)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "run cancel: %v\n", err)
+		fmt.Fprintf(stderr, "%s: %v\n", command, err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "cancelled run %s\n", job.ID)
@@ -1186,7 +1223,7 @@ func runJobCancel(args []string, stdout, stderr io.Writer) int {
 // Only "blocked" is accepted for --state: a blocked job is paused awaiting a
 // human, so a stale backlog of them is the intended abandon target; other states
 // have their own verbs (queued/running -> single cancel, terminal -> retry).
-func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter string, apply bool, stdout, stderr io.Writer) int {
+func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter, onlyType string, apply bool, stdout, stderr io.Writer) int {
 	stateFilter = strings.TrimSpace(stateFilter)
 	if !strings.EqualFold(stateFilter, string(workflow.JobBlocked)) {
 		fmt.Fprintf(stderr, "run cancel: --state %q is not supported; only \"blocked\" runs can be bulk-cancelled (blocked = paused awaiting a human)\n", stateFilter)
@@ -1220,7 +1257,7 @@ func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter s
 		if err != nil {
 			return err
 		}
-		selected = selectBlockedJobsForCancel(jobs, repoFilter, agentFilter, filterByAge, cutoffMillis)
+		selected = selectBlockedJobsForCancel(jobs, repoFilter, agentFilter, onlyType, filterByAge, cutoffMillis)
 		if apply {
 			for _, job := range selected {
 				_, cerr := workflow.CancelJob(context.Background(), store, job.ID)
@@ -1276,10 +1313,13 @@ type jobCancelResult struct {
 // cutoffMillis, ordered oldest-first with an id tie-break for a deterministic
 // preview and cancel order. Age falls back to created_at when updated_at is
 // absent; a job with no parseable timestamp is excluded once an age filter is set.
-func selectBlockedJobsForCancel(jobs []db.Job, repoFilter, agentFilter string, filterByAge bool, cutoffMillis int64) []db.Job {
+func selectBlockedJobsForCancel(jobs []db.Job, repoFilter, agentFilter, onlyType string, filterByAge bool, cutoffMillis int64) []db.Job {
 	selected := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if job.State != string(workflow.JobBlocked) {
+			continue
+		}
+		if onlyType != "" && job.Type != onlyType {
 			continue
 		}
 		if agentFilter != "" && job.Agent != agentFilter {
@@ -1409,12 +1449,16 @@ func retainJobsWithID(jobs []db.Job, keep map[string]string) []db.Job {
 	return retained
 }
 
-func filterJobs(jobs []db.Job, repoFilter string, stateFilter string) []db.Job {
+// filterJobs keeps the jobs matching every non-empty filter, sorted by id.
+func filterJobs(jobs []db.Job, repoFilter, stateFilter, typeFilter string) []db.Job {
 	repoFilter = strings.TrimSpace(repoFilter)
 	stateFilter = strings.TrimSpace(stateFilter)
 	filtered := make([]db.Job, 0, len(jobs))
 	for _, job := range jobs {
 		if stateFilter != "" && job.State != stateFilter {
+			continue
+		}
+		if typeFilter != "" && job.Type != typeFilter {
 			continue
 		}
 		if repoFilter != "" {

@@ -1024,6 +1024,7 @@ Usage:
   gitmoot review show <id> [--json]
   gitmoot review watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
   gitmoot review cancel <id>
+  gitmoot review cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
 
 request routes one independent review of the pull request's current (or --head) commit.
 Gitmoot picks a review-capable reviewer (or --reviewer), runs it on omp with the [review_router] model pool
@@ -1159,7 +1160,7 @@ Usage of review request:
 ## gitmoot review show
 
 ```text
-Usage of run show:
+Usage of review show:
   -home string
     	home directory to use instead of the current user's home
   -json
@@ -1183,7 +1184,7 @@ Usage of review status:
 ## gitmoot review watch
 
 ```text
-Usage of run watch:
+Usage of review watch:
   -home string
     	home directory to use instead of the current user's home
   -json
