@@ -46,7 +46,7 @@ var rootCommands = []command{
 	{name: "plugin", summary: "build and inspect Gitmoot agent plugins", run: runPlugin},
 	{name: "status", summary: "show local reviewer, pr and run counts", run: runStatus},
 	{name: "pr", summary: "inspect pull requests and their review state", run: runTask},
-	{name: "job", summary: "inspect and recover jobs", run: runJob},
+	{name: "run", summary: "inspect and recover runs (reviews, asks, implementation records)", run: runJob},
 	{name: "findings", summary: "report the review findings ledger per repository", run: runFindings},
 	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},

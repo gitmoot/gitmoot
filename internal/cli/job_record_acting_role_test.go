@@ -66,7 +66,7 @@ func TestJobRecordAcceptsAnActingRole(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"job", "record", "--home", home,
+		"run", "record", "--home", home,
 		"--acting-role", "gitmoot",
 		"--repo", "owner/repo",
 		"--type", "implement",
@@ -127,7 +127,7 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 			name:     "an org role is still refused as an agent",
 			args:     []string{"--agent", "gitmoot"},
 			wantExit: 1,
-			wantErr:  `agent "gitmoot" not found`,
+			wantErr:  `reviewer "gitmoot" not found`,
 		},
 		{
 			name:     "both actors at once",
@@ -139,7 +139,7 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 			name:     "no actor at all",
 			args:     []string{},
 			wantExit: 2,
-			wantErr:  "requires --agent or --acting-role",
+			wantErr:  "requires --implementer or --acting-role",
 		},
 		{
 			name:     "an unregistered role",
@@ -156,7 +156,7 @@ func TestJobRecordActorFlagsAreExclusiveAndValidated(t *testing.T) {
 			seedConfiguredRole(t, home, "gitmoot", "lead-role")
 
 			args := append([]string{
-				"job", "record", "--home", home,
+				"run", "record", "--home", home,
 				"--repo", "owner/repo", "--type", "implement", "--decision", "implemented",
 			}, tc.args...)
 			var stdout, stderr bytes.Buffer
@@ -184,7 +184,7 @@ func TestJobRecordRoleValidationUsesTheConfiguredRegistry(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		if code := Run([]string{
-			"job", "record", "--home", home, "--acting-role", "fresh-role",
+			"run", "record", "--home", home, "--acting-role", "fresh-role",
 			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented", "--json",
 		}, &stdout, &stderr); code != 0 {
 			t.Fatalf("exit = %d, want 0: a configured role must not wait for a presence row (stderr=%s)", code, stderr.String())
@@ -201,7 +201,7 @@ func TestJobRecordRoleValidationUsesTheConfiguredRegistry(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		code := Run([]string{
-			"job", "record", "--home", home, "--acting-role", "removed-role",
+			"run", "record", "--home", home, "--acting-role", "removed-role",
 			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented",
 		}, &stdout, &stderr)
 		if code == 0 {
@@ -220,7 +220,7 @@ func TestJobRecordRoleValidationUsesTheConfiguredRegistry(t *testing.T) {
 
 		var stdout, stderr bytes.Buffer
 		code := Run([]string{
-			"job", "record", "--home", home, "--acting-role", "any-role",
+			"run", "record", "--home", home, "--acting-role", "any-role",
 			"--repo", "owner/repo", "--type", "implement", "--decision", "implemented",
 		}, &stdout, &stderr)
 		if code == 0 {

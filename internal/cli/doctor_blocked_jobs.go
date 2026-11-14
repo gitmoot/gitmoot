@@ -59,11 +59,11 @@ func buildBlockedBacklogCheck(jobs []db.Job, now time.Time, threshold time.Durat
 		}
 	}
 	if count == 0 {
-		return doctor.Check{Name: "blocked jobs", OK: true, Required: false, Detail: "no blocked jobs older than 30d"}
+		return doctor.Check{Name: "blocked runs", OK: true, Required: false, Detail: "no blocked runs older than 30d"}
 	}
 	return doctor.Check{
-		Name:     "blocked jobs",
+		Name:     "blocked runs",
 		Required: false,
-		Detail:   fmt.Sprintf("%d blocked jobs older than 30d — dismiss with: gitmoot job cancel --state blocked --older-than 30d --yes", count),
+		Detail:   fmt.Sprintf("%d blocked runs older than 30d — dismiss with: gitmoot run cancel --state blocked --older-than 30d --yes", count),
 	}
 }

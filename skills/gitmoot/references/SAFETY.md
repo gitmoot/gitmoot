@@ -46,7 +46,7 @@ What gitmoot enforces today, and what a seat must not work around.
 - It never updates a reviewed branch: if the base has moved in a way that needs
   an update, it holds and asks for an update plus a new review.
 - It never counts the implementer's own review. Who implemented comes from the
-  implement job a seat records with `gitmoot job record`; record only the agent
+  implement job a seat records with `gitmoot run record`; record only the agent
   or role that really wrote the change.
 - It holds a pull request with a dirty local checkout, a draft, or an open P0 to
   P2 finding at the head.

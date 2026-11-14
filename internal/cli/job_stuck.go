@@ -125,7 +125,7 @@ func deriveStuckReason(job db.Job, reasonEvent db.JobEvent, hasReasonEvent bool,
 			reason += " " + key
 			if lock, ok := findResourceLock(locks, key); ok {
 				if owner := strings.TrimSpace(lock.OwnerJobID); owner != "" && owner != job.ID {
-					reason += fmt.Sprintf(" (held by job %s)", owner)
+					reason += fmt.Sprintf(" (held by run %s)", owner)
 				}
 				next = strings.TrimSpace(lock.ExpiresAt)
 			}

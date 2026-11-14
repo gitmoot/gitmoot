@@ -57,7 +57,7 @@ func TestPollOnceCreatesJobAndAcknowledgement(t *testing.T) {
 	if len(client.posted) != 1 {
 		t.Fatalf("posted acknowledgements = %+v, want 1", client.posted)
 	}
-	if !strings.Contains(client.posted[0].body, "queued `review` job") || !strings.Contains(client.posted[0].body, "`audit`") {
+	if !strings.Contains(client.posted[0].body, "queued `review` run") || !strings.Contains(client.posted[0].body, "`audit`") {
 		t.Fatalf("ack body = %q", client.posted[0].body)
 	}
 
@@ -2398,7 +2398,7 @@ func TestPollIssuesOnceRoutesAskAndDedupes(t *testing.T) {
 	if len(client.posted) != 1 || client.posted[0].issueNumber != 42 {
 		t.Fatalf("posted acknowledgements = %+v, want 1 on issue 42", client.posted)
 	}
-	if !strings.Contains(client.posted[0].body, "queued `ask` job") || !strings.Contains(client.posted[0].body, "`researcher`") {
+	if !strings.Contains(client.posted[0].body, "queued `ask` run") || !strings.Contains(client.posted[0].body, "`researcher`") {
 		t.Fatalf("ack body = %q", client.posted[0].body)
 	}
 
@@ -2642,7 +2642,7 @@ func TestHandleIssueCommentRoutesMentionForm(t *testing.T) {
 	if len(client.posted) != 1 || client.posted[0].issueNumber != 1 {
 		t.Fatalf("posted = %+v, want 1 ack on issue 1", client.posted)
 	}
-	if !strings.Contains(client.posted[0].body, "queued `ask` job") || !strings.Contains(client.posted[0].body, "`helper`") {
+	if !strings.Contains(client.posted[0].body, "queued `ask` run") || !strings.Contains(client.posted[0].body, "`helper`") {
 		t.Fatalf("ack body = %q", client.posted[0].body)
 	}
 

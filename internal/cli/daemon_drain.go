@@ -257,7 +257,7 @@ func recordDrainDeadlineExceeded(configHome string, jobs []db.Job, timeout time.
 				Message: fmt.Sprintf(
 					"still in flight when a %s drain deadline elapsed; NOT parked and NOT killed - "+
 						"drain remains active so nothing new is claimed, and this job was left to finish. "+
-						"Stopping it is an explicit operator decision (gitmoot job cancel), never a timeout's.",
+						"Stopping it is an explicit operator decision (gitmoot run cancel), never a timeout's.",
 					timeout),
 			}); err != nil {
 				return err

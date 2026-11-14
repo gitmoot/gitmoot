@@ -798,7 +798,7 @@ func TestPaneInputPendingRuleObservationWakesAndTracksDelivery(t *testing.T) {
 	if err := evaluateInputPendingRoleEpisodes(context.Background(), store, sink, snapshot, wakeAfter, io.Discard, now); err != nil {
 		t.Fatal(err)
 	}
-	if wake.promptCalls != 1 || wake.pane != "w1:p1" || !strings.Contains(wake.prompt, "pane_input_pending event for job org-input-pending:owner") {
+	if wake.promptCalls != 1 || wake.pane != "w1:p1" || !strings.Contains(wake.prompt, "pane_input_pending event for org-input-pending:owner") {
 		t.Fatalf("input-pending wake = %+v", wake)
 	}
 	misses, err := store.ListRoleMissedWakes(context.Background())

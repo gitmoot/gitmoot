@@ -29,7 +29,7 @@ func TestRunJobGatesListAndClearAutoResumes(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "gates", "job-blocked", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"run", "gates", "job-blocked", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("job gates exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -40,7 +40,7 @@ func TestRunJobGatesListAndClearAutoResumes(t *testing.T) {
 	// Clear one -> still blocked, not resumed.
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "gates", "clear", "job-blocked", "--need", "API key", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "gates", "clear", "job-blocked", "--need", "API key", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("clear one exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -54,7 +54,7 @@ func TestRunJobGatesListAndClearAutoResumes(t *testing.T) {
 	// Clear the rest -> auto-resume.
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"job", "gates", "clear", "job-blocked", "--all", "--home", home}, &stdout, &stderr)
+	code = Run([]string{"run", "gates", "clear", "job-blocked", "--all", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("clear all exit = %d, stderr=%s", code, stderr.String())
 	}
@@ -84,12 +84,12 @@ func TestRunJobGatesClearRequiresNeedOrAll(t *testing.T) {
 	}, "blocked")
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "gates", "clear", "job-blocked", "--home", home}, &stdout, &stderr); code != 2 {
+	if code := Run([]string{"run", "gates", "clear", "job-blocked", "--home", home}, &stdout, &stderr); code != 2 {
 		t.Fatalf("clear with neither flag exit = %d, want 2; stderr=%s", code, stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "gates", "clear", "job-blocked", "--all", "--need", "x", "--home", home}, &stdout, &stderr); code != 2 {
+	if code := Run([]string{"run", "gates", "clear", "job-blocked", "--all", "--need", "x", "--home", home}, &stdout, &stderr); code != 2 {
 		t.Fatalf("clear with both flags exit = %d, want 2; stderr=%s", code, stderr.String())
 	}
 }
@@ -108,7 +108,7 @@ func TestRunJobGatesListNoGates(t *testing.T) {
 	}, "failed")
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "gates", "job-plain", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "gates", "job-plain", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job gates exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "no gates recorded") {

@@ -67,7 +67,7 @@ func TestJobRunDispatchesWhenAnotherRuntimeIsWalled(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "run", "job-cross-runtime", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "start", "job-cross-runtime", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("claude wall refused a shell dispatch: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	job, err := store.GetJob(context.Background(), "job-cross-runtime")
@@ -96,7 +96,7 @@ func TestJobRunStillRefusesTheWalledRuntime(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := Run([]string{"job", "run", "job-same-runtime", "--home", home}, &stdout, &stderr)
+	code := Run([]string{"run", "start", "job-same-runtime", "--home", home}, &stdout, &stderr)
 	if code != 1 || !strings.Contains(stderr.String(), `org role "review" is unavailable`) ||
 		!strings.Contains(stderr.String(), "reason=quota") || !strings.Contains(stderr.String(), "dispatch refused") {
 		t.Fatalf("same-runtime refusal: code=%d stderr=%q", code, stderr.String())
@@ -139,7 +139,7 @@ func TestJobRunFailsClosedOnUnusableStoredRuntime(t *testing.T) {
 				t.Fatal(err)
 			}
 			var stdout, stderr bytes.Buffer
-			code := Run([]string{"job", "run", "job-fail-closed", "--home", home}, &stdout, &stderr)
+			code := Run([]string{"run", "start", "job-fail-closed", "--home", home}, &stdout, &stderr)
 			if code != 1 || !strings.Contains(stderr.String(), "dispatch refused") {
 				t.Fatalf("fail-closed refusal: code=%d stderr=%q", code, stderr.String())
 			}
@@ -163,7 +163,7 @@ func TestJobRunHonoursRuntimeOverrideInBothDirections(t *testing.T) {
 			t.Fatal(err)
 		}
 		var stdout, stderr bytes.Buffer
-		code := Run([]string{"job", "run", "job-override-into", "--home", home}, &stdout, &stderr)
+		code := Run([]string{"run", "start", "job-override-into", "--home", home}, &stdout, &stderr)
 		if code != 1 || !strings.Contains(stderr.String(), "dispatch refused") {
 			t.Fatalf("override into walled runtime: code=%d stderr=%q", code, stderr.String())
 		}
@@ -187,7 +187,7 @@ func TestJobRunHonoursRuntimeOverrideInBothDirections(t *testing.T) {
 			t.Fatal(err)
 		}
 		var stdout, stderr bytes.Buffer
-		code := Run([]string{"job", "run", "job-override-away", "--home", home}, &stdout, &stderr)
+		code := Run([]string{"run", "start", "job-override-away", "--home", home}, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("override away from walled runtime: code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 		}
@@ -298,7 +298,7 @@ func TestRefuseUnavailableOrgRoleClearsAnExpiredRowWhateverTheRuntime(t *testing
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "run", "job-expired", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "start", "job-expired", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("expired row refused: code=%d stderr=%q", code, stderr.String())
 	}
 	rows, err := store.ListActiveOrgRolesUnavailable(context.Background(), time.Now().UTC())

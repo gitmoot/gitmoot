@@ -1218,7 +1218,7 @@ type orgStatusOutput struct {
 	Scope       []string `json:"scope"`
 	MergeRule   string   `json:"merge_rule"`
 	Model       string   `json:"model"`
-	ActiveJobs  int      `json:"active_jobs,omitempty"`
+	ActiveJobs  int      `json:"active_runs,omitempty"`
 	LastSeenAt  string   `json:"last_seen_at,omitempty"`
 	LastSeenAge string   `json:"last_seen_age,omitempty"`
 	// LastTurn is the provider's last completed turn counter (#1702). A POINTER

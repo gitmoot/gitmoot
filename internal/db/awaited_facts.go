@@ -740,7 +740,7 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 		!reviewseverity.Blocks(strings.ToUpper(strings.TrimSpace(decoded.Result.Severity)), blockingSeverity(decoded.Repo)) {
 		decision = "approved"
 	}
-	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s; findings=%d executed_checks=%d evidence=%s; inspect with gitmoot job show %s",
+	detail := fmt.Sprintf("review verdict %s from %s job %s at head %s; findings=%d executed_checks=%d evidence=%s; inspect with gitmoot run show %s",
 		decision, strings.TrimSpace(agent), strings.TrimSpace(jobID), decoded.HeadSHA,
 		len(decoded.Result.Findings), len(decoded.Result.TestsRun), firstNonEmptyString(strings.TrimSpace(decoded.Result.Evidence), "undeclared"), strings.TrimSpace(jobID))
 	return reviewVerdictObservation{repo: decoded.Repo, pullRequest: decoded.PullRequest, headSHA: decoded.HeadSHA, detail: detail, decision: decision}, true
@@ -877,7 +877,7 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 	if decoded.Result != nil {
 		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" && !decoded.isFanOut() {
 			detail = fmt.Sprintf(
-				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot job show %s",
+				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot run show %s",
 				strings.TrimSpace(jobID), state, decision, decoded.HeadSHA, strings.TrimSpace(jobID),
 			)
 		}

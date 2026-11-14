@@ -2,7 +2,7 @@
 
 A review job ends when the reviewer prints one `gitmoot_result` JSON object.
 Gitmoot finds it in the reviewer's output, validates it, and stores it as the
-verdict (`payload.result` in `gitmoot job show <job-id>`). Keep it concise,
+verdict (`payload.result` in `gitmoot run show <run-id>`). Keep it concise,
 truthful, and tied to work that actually happened.
 
 `decision` and `summary` are required. The parser accepts any `"decision"` of
@@ -52,7 +52,7 @@ approved-with-notes; the original verdict and findings are still stored.
 Separately, the merge gate holds on any open P0, P1 or P2 finding at the head.
 P3 findings never hold a merge; after merge they go to the design-notes issue.
 
-When a seat records its own review with `gitmoot job record --type review`, a
+When a seat records its own review with `gitmoot run record --type review`, a
 `changes_requested` decision needs `--severity P0|P1|P2|P3` too.
 
 ## Evidence
@@ -162,7 +162,7 @@ dispatcher the request names, then the acting org role (`--role` or
 job's own agent nor `lead_agent` is an attribution fallback: on a review the
 job's agent is the reviewer, and a CLI review dispatch records no `lead_agent`
 at all. Who wrote the change comes only from the implement job a seat records
-with `gitmoot job record`.
+with `gitmoot run record`.
 
 ## Reporting rules
 

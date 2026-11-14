@@ -688,7 +688,7 @@ func TestReviewRequestDeduplicatesOnExactHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fact.State != db.AwaitedFactStateSatisfied || !strings.Contains(fact.ResolutionDetail, "executed_checks=1") || !strings.Contains(fact.ResolutionDetail, "gitmoot job show "+third.JobID) {
+	if fact.State != db.AwaitedFactStateSatisfied || !strings.Contains(fact.ResolutionDetail, "executed_checks=1") || !strings.Contains(fact.ResolutionDetail, "gitmoot run show "+third.JobID) {
 		t.Fatalf("requester fact = %+v, want it satisfied by the saved verdict with executed-check evidence", fact)
 	}
 }

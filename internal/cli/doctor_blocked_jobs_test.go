@@ -25,10 +25,10 @@ func TestDoctorBlockedBacklogCheckClassifies(t *testing.T) {
 			{ID: "failed-old", State: string(workflow.JobFailed), UpdatedAt: at(90 * 24 * time.Hour)},
 		}
 		check := buildBlockedBacklogCheck(jobs, now, blockedBacklogDoctorThreshold)
-		if check.Name != "blocked jobs" || !check.OK || check.Required {
-			t.Fatalf("check = %+v, want optional ok 'blocked jobs'", check)
+		if check.Name != "blocked runs" || !check.OK || check.Required {
+			t.Fatalf("check = %+v, want optional ok 'blocked runs'", check)
 		}
-		if check.Detail != "no blocked jobs older than 30d" {
+		if check.Detail != "no blocked runs older than 30d" {
 			t.Fatalf("ok detail = %q", check.Detail)
 		}
 	})
@@ -44,10 +44,10 @@ func TestDoctorBlockedBacklogCheckClassifies(t *testing.T) {
 		if check.OK || check.Required {
 			t.Fatalf("check = %+v, want a non-required warn", check)
 		}
-		if !strings.Contains(check.Detail, "2 blocked jobs older than 30d") {
+		if !strings.Contains(check.Detail, "2 blocked runs older than 30d") {
 			t.Fatalf("warn detail = %q, want the stale count", check.Detail)
 		}
-		if !strings.Contains(check.Detail, "gitmoot job cancel --state blocked --older-than 30d --yes") {
+		if !strings.Contains(check.Detail, "gitmoot run cancel --state blocked --older-than 30d --yes") {
 			t.Fatalf("warn detail = %q, want the bulk-dismiss command", check.Detail)
 		}
 	})
@@ -88,7 +88,7 @@ func TestDoctorBlockedBacklogCheckReadsStore(t *testing.T) {
 	if check.OK || check.Required {
 		t.Fatalf("check = %+v, want a non-required warn for one stale blocked job", check)
 	}
-	if !strings.Contains(check.Detail, "1 blocked jobs older than 30d") {
+	if !strings.Contains(check.Detail, "1 blocked runs older than 30d") {
 		t.Fatalf("warn detail = %q, want exactly the stale count", check.Detail)
 	}
 

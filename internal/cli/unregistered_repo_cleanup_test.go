@@ -265,14 +265,19 @@ func TestJobCleanupInspectWorksForUnregisteredRepo(t *testing.T) {
 		if code := runJobCleanupResource("inspect", []string{"--home", home, "--json", id}, &stdout, &stderr); code != 0 {
 			t.Fatalf("inspect %s exit = %d stderr=%q", id, code, stderr.String())
 		}
-		var decision workflow.CleanupInspection
+		// The engine shape plus the CLI key: an inspect that still emitted
+		// owner_job_id would fill the embedded OwnerJobID (#2601).
+		var decision struct {
+			workflow.CleanupInspection
+			OwnerRunID string `json:"owner_run_id"`
+		}
 		if err := json.Unmarshal(stdout.Bytes(), &decision); err != nil {
 			t.Fatalf("decode inspect %s: %v\n%s", id, err, stdout.String())
 		}
-		if decision.OwnerJobID != id || decision.Repo != unregisteredCleanupRepo || decision.ResourceID == "" {
-			t.Fatalf("inspect %s = %+v", id, decision)
+		if decision.OwnerRunID != id || decision.OwnerJobID != "" || decision.Repo != unregisteredCleanupRepo || decision.ResourceID == "" {
+			t.Fatalf("inspect %s = %+v, want owner_run_id and no owner_job_id\n%s", id, decision, stdout.String())
 		}
-		return decision
+		return decision.CleanupInspection
 	}
 	// The present worktree is inspected through its owning checkout: git
 	// there proves it, so no checkout or git identity refusal.

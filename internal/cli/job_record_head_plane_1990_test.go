@@ -44,7 +44,7 @@ func TestJobRecordReportsTheStoredRowRatherThanItsOwnFlags(t *testing.T) {
 	const claimedHead = "c1ca9824cf3ab0be2eb1a4d0a6e6cb2a5b40e0f1"
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"job", "record", "--home", home,
+		"run", "record", "--home", home,
 		"--acting-role", "gm-staged",
 		"--repo", "owner/repo",
 		"--type", "review",
@@ -148,7 +148,7 @@ func TestJobRecordOmitsTheHeadPlaneWhenNoHeadWasSupplied(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"job", "record", "--home", home,
+		"run", "record", "--home", home,
 		"--acting-role", "gm-staged",
 		"--repo", "owner/repo",
 		"--type", "review",

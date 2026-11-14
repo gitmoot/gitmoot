@@ -1297,11 +1297,14 @@ recycle_after = "1ns"
 			t.Fatalf("status[%s] recycle=%q after=%q, want %q/%q", row.Role, row.RecycleStatus, row.RecycleAfter, expected.status, expected.after)
 		}
 		if row.ActiveJobs != expected.activeJobs {
-			t.Fatalf("status[%s] active_jobs=%d, want %d", row.Role, row.ActiveJobs, expected.activeJobs)
+			t.Fatalf("status[%s] active_runs=%d, want %d", row.Role, row.ActiveJobs, expected.activeJobs)
 		}
-		_, hasActiveJobs := rawByRole[row.Role]["active_jobs"]
+		_, hasActiveJobs := rawByRole[row.Role]["active_runs"]
 		if hasActiveJobs != (expected.activeJobs > 0) {
-			t.Fatalf("status[%s] active_jobs JSON presence=%v, want %v", row.Role, hasActiveJobs, expected.activeJobs > 0)
+			t.Fatalf("status[%s] active_runs JSON presence=%v, want %v", row.Role, hasActiveJobs, expected.activeJobs > 0)
+		}
+		if _, hasOld := rawByRole[row.Role]["active_jobs"]; hasOld {
+			t.Fatalf("status[%s] still has active_jobs: %s", row.Role, stdout.String())
 		}
 		delete(want, row.Role)
 	}

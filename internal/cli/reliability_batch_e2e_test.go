@@ -110,7 +110,7 @@ func TestResumableGatesFullChainE2E(t *testing.T) {
 
 	// --- `job gates <id>` lists them (real CLI dispatcher) -------------------
 	var listOut, listErr bytes.Buffer
-	if code := Run([]string{"job", "gates", jobID, "--home", home}, &listOut, &listErr); code != 0 {
+	if code := Run([]string{"run", "gates", jobID, "--home", home}, &listOut, &listErr); code != 0 {
 		t.Fatalf("job gates list exit = %d, stderr=%s", code, listErr.String())
 	}
 	if !strings.Contains(listOut.String(), "open\tAPI key") || !strings.Contains(listOut.String(), "2 gate(s), 2 open") {
@@ -119,7 +119,7 @@ func TestResumableGatesFullChainE2E(t *testing.T) {
 
 	// --- clear ONE need -> still blocked, not resumed (real CLI) -------------
 	var clearOut, clearErr bytes.Buffer
-	if code := Run([]string{"job", "gates", "clear", jobID, "--need", "API key", "--home", home}, &clearOut, &clearErr); code != 0 {
+	if code := Run([]string{"run", "gates", "clear", jobID, "--need", "API key", "--home", home}, &clearOut, &clearErr); code != 0 {
 		t.Fatalf("clear one exit = %d, stderr=%s", code, clearErr.String())
 	}
 	if !strings.Contains(clearOut.String(), "not resumed") {
@@ -137,7 +137,7 @@ func TestResumableGatesFullChainE2E(t *testing.T) {
 	// --- clear ALL -> auto-requeued through the REAL resume path -------------
 	clearOut.Reset()
 	clearErr.Reset()
-	if code := Run([]string{"job", "gates", "clear", jobID, "--all", "--home", home}, &clearOut, &clearErr); code != 0 {
+	if code := Run([]string{"run", "gates", "clear", jobID, "--all", "--home", home}, &clearOut, &clearErr); code != 0 {
 		t.Fatalf("clear all exit = %d, stderr=%s", code, clearErr.String())
 	}
 	if !strings.Contains(clearOut.String(), "resumed:") {
@@ -189,7 +189,7 @@ func TestResumableGatesDoNotResumeSessionJobE2E(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "gates", "clear", "sess-blocked", "--all", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "gates", "clear", "sess-blocked", "--all", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("clear all exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "not resumed") || !strings.Contains(stdout.String(), "session job") {
@@ -225,7 +225,7 @@ func TestResumableGatesDoNotBypassAwaitingHumanE2E(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "gates", "clear", "human-blocked", "--all", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "gates", "clear", "human-blocked", "--all", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("clear all exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "not resumed") || !strings.Contains(stdout.String(), "awaiting a human") {

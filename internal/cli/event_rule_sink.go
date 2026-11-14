@@ -698,7 +698,7 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 	if strings.EqualFold(strings.TrimSpace(kind), eventRuleKindReviewVerdict) {
 		detail := truncateForWake(strings.TrimSpace(event.Detail), 320)
 		prompt := fmt.Sprintf(
-			"gitmoot review verdict %s for %s#%d from job %s",
+			"gitmoot review verdict %s for %s#%d from review %s",
 			event.ReviewDecision, event.Repo, event.PullRequest, event.JobID,
 		)
 		if detail != "" {
@@ -762,7 +762,7 @@ func eventRuleWakePrompt(kind string, event events.Event) string {
 	if !strings.EqualFold(strings.TrimSpace(kind), db.WakeOutboxKindReply) {
 		detail = truncateForWake(detail, 320)
 	}
-	prompt := fmt.Sprintf("gitmoot %s event for job %s", kind, event.JobID)
+	prompt := fmt.Sprintf("gitmoot %s event for %s", kind, event.JobID)
 	if detail != "" {
 		prompt += ": " + detail
 	}

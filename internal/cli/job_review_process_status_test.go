@@ -92,7 +92,7 @@ func TestRunJobListDistinguishesLiveAndDeadDispatchedReviews(t *testing.T) {
 	})
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list --json exit = %d, stderr=%s", code, stderr.String())
 	}
 	var entries []jobListEntry
@@ -111,7 +111,7 @@ func TestRunJobListDistinguishesLiveAndDeadDispatchedReviews(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "list", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
 	}
 	for _, want := range []string{

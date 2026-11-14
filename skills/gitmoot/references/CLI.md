@@ -27,23 +27,6 @@ disagrees, trust its live `--help`.
 - [gitmoot doctor](#gitmoot-doctor)
 - [gitmoot findings](#gitmoot-findings)
 - [gitmoot init](#gitmoot-init)
-- [gitmoot job](#gitmoot-job)
-- [gitmoot job cleanup](#gitmoot-job-cleanup)
-- [gitmoot job cleanup apply](#gitmoot-job-cleanup-apply)
-- [gitmoot job cleanup inspect](#gitmoot-job-cleanup-inspect)
-- [gitmoot job cleanup list](#gitmoot-job-cleanup-list)
-- [gitmoot job cleanup reopen](#gitmoot-job-cleanup-reopen)
-- [gitmoot job close](#gitmoot-job-close)
-- [gitmoot job events](#gitmoot-job-events)
-- [gitmoot job gates](#gitmoot-job-gates)
-- [gitmoot job list](#gitmoot-job-list)
-- [gitmoot job open](#gitmoot-job-open)
-- [gitmoot job record](#gitmoot-job-record)
-- [gitmoot job retry](#gitmoot-job-retry)
-- [gitmoot job run](#gitmoot-job-run)
-- [gitmoot job show](#gitmoot-job-show)
-- [gitmoot job transcript](#gitmoot-job-transcript)
-- [gitmoot job watch](#gitmoot-job-watch)
 - [gitmoot key](#gitmoot-key)
 - [gitmoot key list](#gitmoot-key-list)
 - [gitmoot key path](#gitmoot-key-path)
@@ -97,9 +80,13 @@ disagrees, trust its live `--help`.
 - [gitmoot repo remove](#gitmoot-repo-remove)
 - [gitmoot repo set-interval](#gitmoot-repo-set-interval)
 - [gitmoot review](#gitmoot-review)
+- [gitmoot review cancel](#gitmoot-review-cancel)
 - [gitmoot review level](#gitmoot-review-level)
+- [gitmoot review list](#gitmoot-review-list)
 - [gitmoot review request](#gitmoot-review-request)
+- [gitmoot review show](#gitmoot-review-show)
 - [gitmoot review status](#gitmoot-review-status)
+- [gitmoot review watch](#gitmoot-review-watch)
 - [gitmoot reviewer](#gitmoot-reviewer)
 - [gitmoot reviewer allow](#gitmoot-reviewer-allow)
 - [gitmoot reviewer deny](#gitmoot-reviewer-deny)
@@ -116,6 +103,23 @@ disagrees, trust its live `--help`.
 - [gitmoot reviewer type list](#gitmoot-reviewer-type-list)
 - [gitmoot reviewer type set](#gitmoot-reviewer-type-set)
 - [gitmoot reviewer type show](#gitmoot-reviewer-type-show)
+- [gitmoot run](#gitmoot-run)
+- [gitmoot run cleanup](#gitmoot-run-cleanup)
+- [gitmoot run cleanup apply](#gitmoot-run-cleanup-apply)
+- [gitmoot run cleanup inspect](#gitmoot-run-cleanup-inspect)
+- [gitmoot run cleanup list](#gitmoot-run-cleanup-list)
+- [gitmoot run cleanup reopen](#gitmoot-run-cleanup-reopen)
+- [gitmoot run close](#gitmoot-run-close)
+- [gitmoot run events](#gitmoot-run-events)
+- [gitmoot run gates](#gitmoot-run-gates)
+- [gitmoot run list](#gitmoot-run-list)
+- [gitmoot run open](#gitmoot-run-open)
+- [gitmoot run record](#gitmoot-run-record)
+- [gitmoot run retry](#gitmoot-run-retry)
+- [gitmoot run show](#gitmoot-run-show)
+- [gitmoot run start](#gitmoot-run-start)
+- [gitmoot run transcript](#gitmoot-run-transcript)
+- [gitmoot run watch](#gitmoot-run-watch)
 - [gitmoot runtime](#gitmoot-runtime)
 - [gitmoot runtime list](#gitmoot-runtime-list)
 - [gitmoot runtime prune](#gitmoot-runtime-prune)
@@ -158,7 +162,7 @@ Commands:
   plugin     build and inspect Gitmoot agent plugins
   status     show local reviewer, pr and run counts
   pr         inspect pull requests and their review state
-  job        inspect and recover jobs
+  run        inspect and recover runs (reviews, asks, implementation records)
   findings   report the review findings ledger per repository
   workflow   inspect external-coordinator workflow groups and notes
   dashboard  show a snapshot of local Gitmoot state
@@ -383,285 +387,6 @@ Usage of findings:
 Usage of init:
   -home string
     	home directory to use instead of the current user's home
-```
-
-## gitmoot job
-
-```text
-Usage:
-  gitmoot job list [--repo owner/repo] [--state state] [--workflow label] [--json]
-  gitmoot job show <id> [--json]
-  gitmoot job events <id>
-  gitmoot job watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
-  gitmoot job transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]
-  gitmoot job transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]
-  gitmoot job run <id>
-  gitmoot job retry <id>
-  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]
-  gitmoot job cleanup reopen <resource-id>
-  gitmoot job gates <id> [--json]
-  gitmoot job gates clear <id> --need "<text>"|--all
-  gitmoot job cancel <id>
-  gitmoot job cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--agent name] [--yes]
-  gitmoot job open --agent name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--workflow label] [--json]
-  gitmoot job close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
-  gitmoot job record (--agent name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-job-id id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
-```
-
-## gitmoot job cleanup
-
-```text
-Usage:
-  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]
-  gitmoot job cleanup reopen <resource-id>
-  gitmoot job cleanup inspect [--json] <job-id>
-  gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> [--json] <job-id>
-```
-
-## gitmoot job cleanup apply
-
-```text
-Usage of job cleanup apply:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the versioned producer cleanup decision
-  -resource string
-    	producer-derived resource identity from inspect
-  -token string
-    	eligibility token from inspect
-```
-
-## gitmoot job cleanup inspect
-
-```text
-Usage of job cleanup inspect:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the versioned producer cleanup decision
-  -resource string
-    	producer-derived resource identity from inspect
-  -token string
-    	eligibility token from inspect
-```
-
-## gitmoot job cleanup list
-
-```text
-Usage of job cleanup list:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print cleanup obligations as JSON
-  -state string
-    	cleanup state filter
-```
-
-## gitmoot job cleanup reopen
-
-```text
-Usage of job cleanup reopen:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot job close
-
-```text
-Usage of job close:
-  -branch string
-    	optional branch to record
-  -decision string
-    	result decision: approved|changes_requested|blocked|implemented|failed|skipped
-  -head-sha string
-    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)
-  -home string
-    	home directory to use instead of the current user's home
-  -input-tokens int
-    	input tokens used by the session work
-  -json
-    	print the closed job as JSON
-  -model string
-    	optional model used for the session work
-  -output-tokens int
-    	output tokens used by the session work
-  -pr int
-    	optional pull request number to record
-  -severity string
-    	review severity: P0|P1|P2|P3
-  -summary string
-    	optional result summary
-```
-
-## gitmoot job events
-
-```text
-Usage of job events:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot job gates
-
-```text
-Usage:
-  gitmoot job gates <id> [--json]
-  gitmoot job gates clear <id> --need "<text>"|--all
-```
-
-## gitmoot job list
-
-```text
-Usage of job list:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print jobs (with operational detail) as JSON
-  -killed
-    	only jobs whose delivery was killed by a signal and which nothing requeued
-  -repo string
-    	repo scope as owner/repo
-  -state string
-    	job state filter
-  -workflow string
-    	external-coordinator workflow label
-```
-
-## gitmoot job open
-
-```text
-Usage of job open:
-  -agent string
-    	agent that performs the session work (must exist)
-  -head-sha string
-    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the created job as JSON
-  -parent-job-id string
-    	optional existing parent job id
-  -pr int
-    	optional pull request number
-  -pr-id string
-    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
-  -repo string
-    	repo scope as owner/repo (must be tracked)
-  -title string
-    	optional human title for the job
-  -type string
-    	job type: ask|review|implement
-  -workflow string
-    	external-coordinator workflow label
-```
-
-## gitmoot job record
-
-```text
-Usage of job record:
-  -acting-role string
-    	org role that performed the session work in place of an agent (must exist)
-  -agent string
-    	agent that performed the session work (must exist)
-  -branch string
-    	optional branch to record
-  -decision string
-    	result decision: approved|changes_requested|blocked|implemented|failed|skipped
-  -head-sha string
-    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)
-  -home string
-    	home directory to use instead of the current user's home
-  -input-tokens int
-    	input tokens used by the session work
-  -json
-    	print the recorded job as JSON
-  -model string
-    	optional model used for the session work
-  -output-tokens int
-    	output tokens used by the session work
-  -parent-job-id string
-    	optional existing parent job id
-  -pr int
-    	optional pull request number
-  -pr-id string
-    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
-  -repo string
-    	repo scope as owner/repo (must be tracked)
-  -severity string
-    	review severity: P0|P1|P2|P3
-  -summary string
-    	optional result summary
-  -title string
-    	optional human title for the job
-  -type string
-    	job type: ask|review|implement
-```
-
-## gitmoot job retry
-
-```text
-Usage of job retry:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot job run
-
-```text
-Usage of job run:
-  -home string
-    	home directory to use instead of the current user's home
-```
-
-## gitmoot job show
-
-```text
-Usage of job show:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the job (with operational detail) as JSON
-```
-
-## gitmoot job transcript
-
-```text
-Usage of job transcript:
-  -all
-    	export every job matching the bulk filters
-  -export string
-    	export format (md or jsonl)
-  -home string
-    	home directory to use instead of the current user's home
-  -log-path string
-    	transcript log path override
-  -output string
-    	write export to this file instead of stdout
-  -runtime string
-    	runtime used to render the transcript
-  -since string
-    	bulk mode: jobs created within this duration
-  -state string
-    	bulk mode: comma-separated job states
-```
-
-## gitmoot job watch
-
-```text
-Usage of job watch:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print final job and events as JSON
-  -log-path string
-    	transcript log path override
-  -poll duration
-    	poll interval (default 1s)
-  -runtime string
-    	runtime used to render the transcript
-  -transcript
-    	render the retained runtime log as a human-readable transcript
 ```
 
 ## gitmoot key
@@ -1295,6 +1020,11 @@ Usage:
   gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- "review instructions"]
   gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]
   gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]
+  gitmoot review list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot review show <id> [--json]
+  gitmoot review watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
+  gitmoot review cancel <id>
+  gitmoot review cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
 
 request routes one independent review of the pull request's current (or --head) commit.
 Gitmoot picks a review-capable reviewer (or --reviewer), runs it on omp with the [review_router] model pool
@@ -1302,6 +1032,29 @@ for the purpose, falls back to the next model on a provider quota/auth failure, 
 wakes --role (default $GITMOOT_ORG_ROLE) when the verdict is saved. A second request for
 the same head attaches to the running review or to its saved verdict; it never spends
 another reviewer. No verdict ever triggers a model change.
+```
+
+## gitmoot review cancel
+
+```text
+Usage:
+  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot run show <id> [--json]
+  gitmoot run events <id>
+  gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
+  gitmoot run transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]
+  gitmoot run transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]
+  gitmoot run start <id>
+  gitmoot run retry <id>
+  gitmoot run cleanup list [--state pending|retryable|removed|quarantined] [--json]
+  gitmoot run cleanup reopen <resource-id>
+  gitmoot run gates <id> [--json]
+  gitmoot run gates clear <id> --need "<text>"|--all
+  gitmoot run cancel <id>
+  gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
+  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]
+  gitmoot run close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
+  gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
 ```
 
 ## gitmoot review level
@@ -1316,6 +1069,24 @@ Usage of review level:
     	pull request number
   -repo string
     	OWNER/REPO
+```
+
+## gitmoot review list
+
+```text
+Usage of review list:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print runs (with operational detail) as JSON
+  -killed
+    	only runs whose delivery was killed by a signal and which nothing requeued
+  -repo string
+    	repo scope as owner/repo
+  -state string
+    	run state filter
+  -workflow string
+    	external-coordinator workflow label
 ```
 
 ## gitmoot review request
@@ -1386,6 +1157,16 @@ Usage of review request:
     	how long the requester waits before the wait expires to its parent (default 12h0m0s)
 ```
 
+## gitmoot review show
+
+```text
+Usage of review show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the run (with operational detail) as JSON
+```
+
 ## gitmoot review status
 
 ```text
@@ -1398,6 +1179,24 @@ Usage of review status:
     	pull request number
   -repo string
     	repository in owner/repo form (defaults to the current checkout)
+```
+
+## gitmoot review watch
+
+```text
+Usage of review watch:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print final run and events as JSON
+  -log-path string
+    	transcript log path override
+  -poll duration
+    	poll interval (default 1s)
+  -runtime string
+    	runtime used to render the transcript
+  -transcript
+    	render the retained runtime log as a human-readable transcript
 ```
 
 ## gitmoot reviewer
@@ -1600,6 +1399,285 @@ Usage of reviewer type set:
 Usage of reviewer type show:
   -home string
     	home directory to use instead of the current user's home
+```
+
+## gitmoot run
+
+```text
+Usage:
+  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot run show <id> [--json]
+  gitmoot run events <id>
+  gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
+  gitmoot run transcript <id> --export md|jsonl [--output path] [--log-path path] [--runtime runtime]
+  gitmoot run transcript --all [--state succeeded,failed] [--since 720h] --export jsonl [--output path]
+  gitmoot run start <id>
+  gitmoot run retry <id>
+  gitmoot run cleanup list [--state pending|retryable|removed|quarantined] [--json]
+  gitmoot run cleanup reopen <resource-id>
+  gitmoot run gates <id> [--json]
+  gitmoot run gates clear <id> --need "<text>"|--all
+  gitmoot run cancel <id>
+  gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
+  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]
+  gitmoot run close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
+  gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
+```
+
+## gitmoot run cleanup
+
+```text
+Usage:
+  gitmoot run cleanup list [--state pending|retryable|removed|quarantined] [--json]
+  gitmoot run cleanup reopen <resource-id>
+  gitmoot run cleanup inspect [--json] <run-id>
+  gitmoot run cleanup apply --resource <resource-id> --token <eligibility-token> [--json] <run-id>
+```
+
+## gitmoot run cleanup apply
+
+```text
+Usage of run cleanup apply:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the versioned producer cleanup decision
+  -resource string
+    	producer-derived resource identity from inspect
+  -token string
+    	eligibility token from inspect
+```
+
+## gitmoot run cleanup inspect
+
+```text
+Usage of run cleanup inspect:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the versioned producer cleanup decision
+  -resource string
+    	producer-derived resource identity from inspect
+  -token string
+    	eligibility token from inspect
+```
+
+## gitmoot run cleanup list
+
+```text
+Usage of run cleanup list:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print cleanup obligations as JSON
+  -state string
+    	cleanup state filter
+```
+
+## gitmoot run cleanup reopen
+
+```text
+Usage of run cleanup reopen:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot run close
+
+```text
+Usage of run close:
+  -branch string
+    	optional branch to record
+  -decision string
+    	result decision: approved|changes_requested|blocked|implemented|failed|skipped
+  -head-sha string
+    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)
+  -home string
+    	home directory to use instead of the current user's home
+  -input-tokens int
+    	input tokens used by the session work
+  -json
+    	print the closed run as JSON
+  -model string
+    	optional model used for the session work
+  -output-tokens int
+    	output tokens used by the session work
+  -pr int
+    	optional pull request number to record
+  -severity string
+    	review severity: P0|P1|P2|P3
+  -summary string
+    	optional result summary
+```
+
+## gitmoot run events
+
+```text
+Usage of run events:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot run gates
+
+```text
+Usage:
+  gitmoot run gates <id> [--json]
+  gitmoot run gates clear <id> --need "<text>"|--all
+```
+
+## gitmoot run list
+
+```text
+Usage of run list:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print runs (with operational detail) as JSON
+  -killed
+    	only runs whose delivery was killed by a signal and which nothing requeued
+  -repo string
+    	repo scope as owner/repo
+  -state string
+    	run state filter
+  -workflow string
+    	external-coordinator workflow label
+```
+
+## gitmoot run open
+
+```text
+Usage of run open:
+  -head-sha string
+    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)
+  -home string
+    	home directory to use instead of the current user's home
+  -implementer string
+    	registered reviewer that performs the session work (must exist)
+  -json
+    	print the created run as JSON
+  -parent-run string
+    	optional existing parent run id
+  -pr int
+    	optional pull request number
+  -pr-id string
+    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
+  -repo string
+    	repo scope as owner/repo (must be tracked)
+  -title string
+    	optional human title for the run
+  -type string
+    	run type: ask|review|implement
+  -workflow string
+    	external-coordinator workflow label
+```
+
+## gitmoot run record
+
+```text
+Usage of run record:
+  -acting-role string
+    	org role that performed the session work in place of a registered reviewer (must exist)
+  -branch string
+    	optional branch to record
+  -decision string
+    	result decision: approved|changes_requested|blocked|implemented|failed|skipped
+  -head-sha string
+    	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)
+  -home string
+    	home directory to use instead of the current user's home
+  -implementer string
+    	registered reviewer that performed the session work (must exist)
+  -input-tokens int
+    	input tokens used by the session work
+  -json
+    	print the recorded run as JSON
+  -model string
+    	optional model used for the session work
+  -output-tokens int
+    	output tokens used by the session work
+  -parent-run string
+    	optional existing parent run id
+  -pr int
+    	optional pull request number
+  -pr-id string
+    	optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr
+  -repo string
+    	repo scope as owner/repo (must be tracked)
+  -severity string
+    	review severity: P0|P1|P2|P3
+  -summary string
+    	optional result summary
+  -title string
+    	optional human title for the run
+  -type string
+    	run type: ask|review|implement
+```
+
+## gitmoot run retry
+
+```text
+Usage of run retry:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot run show
+
+```text
+Usage of run show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the run (with operational detail) as JSON
+```
+
+## gitmoot run start
+
+```text
+Usage of run start:
+  -home string
+    	home directory to use instead of the current user's home
+```
+
+## gitmoot run transcript
+
+```text
+Usage of run transcript:
+  -all
+    	export every run matching the bulk filters
+  -export string
+    	export format (md or jsonl)
+  -home string
+    	home directory to use instead of the current user's home
+  -log-path string
+    	transcript log path override
+  -output string
+    	write export to this file instead of stdout
+  -runtime string
+    	runtime used to render the transcript
+  -since string
+    	bulk mode: runs created within this duration
+  -state string
+    	bulk mode: comma-separated run states
+```
+
+## gitmoot run watch
+
+```text
+Usage of run watch:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print final run and events as JSON
+  -log-path string
+    	transcript log path override
+  -poll duration
+    	poll interval (default 1s)
+  -runtime string
+    	runtime used to render the transcript
+  -transcript
+    	render the retained runtime log as a human-readable transcript
 ```
 
 ## gitmoot runtime
