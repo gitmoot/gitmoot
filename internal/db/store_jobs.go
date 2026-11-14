@@ -213,6 +213,23 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
+// pullRequestActingRoleSelector is the one SQL rule for "who implemented this
+// PR": the trimmed acting_org_role on the earliest (created_at, id) implement job
+// for acting_scope.repo + acting_scope.pull_request whose payload carries a
+// non-empty acting_org_role. It is a correlated scalar subquery (NULL when
+// unattributed), so callers must expose an `acting_scope` row with `repo` and
+// `pull_request` columns. PullRequestActingRole binds a single scope;
+// ListDashboardTasks evaluates it per task in one bulk read.
+const pullRequestActingRoleSelector = `(SELECT trim(json_extract(ar.payload, '$.acting_org_role'))
+	FROM jobs ar
+	WHERE ar.repo = acting_scope.repo AND ar.pull_request = acting_scope.pull_request
+		AND ar.type = 'implement'
+		AND json_valid(ar.payload)
+		AND json_type(ar.payload, '$.acting_org_role') = 'text'
+		AND trim(json_extract(ar.payload, '$.acting_org_role')) != ''
+	ORDER BY ar.created_at, ar.id
+	LIMIT 1)`
+
 // PullRequestActingRole returns the acting org role recorded on the earliest
 // (created_at, id) implement job for repo + pull request whose payload carries
 // acting_org_role (written by `gitmoot job record --acting-role`). It is keyed
@@ -224,19 +241,8 @@ func (s *Store) PullRequestActingRole(ctx context.Context, repo string, pullRequ
 		return "", nil
 	}
 	var role string
-	err := s.db.QueryRowContext(ctx, `
-SELECT trim(json_extract(payload, '$.acting_org_role'))
-FROM jobs
-WHERE repo = ? AND pull_request = ?
-	AND type = 'implement'
-	AND json_valid(payload)
-	AND json_type(payload, '$.acting_org_role') = 'text'
-	AND trim(json_extract(payload, '$.acting_org_role')) != ''
-ORDER BY created_at, id
-LIMIT 1`, repo, pullRequest).Scan(&role)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(`+pullRequestActingRoleSelector+`, '')
+FROM (SELECT ? AS repo, ? AS pull_request) acting_scope`, repo, pullRequest).Scan(&role)
 	if err != nil {
 		return "", err
 	}

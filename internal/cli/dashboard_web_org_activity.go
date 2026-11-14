@@ -483,7 +483,7 @@ func dashboardDocumentPath(requestPath string) bool {
 	if requestPath == "/" {
 		return true
 	}
-	if requestPath == "/events" || strings.HasPrefix(requestPath, "/api/") || strings.HasPrefix(requestPath, "/receipts/") {
+	if strings.HasPrefix(requestPath, "/api/") || strings.HasPrefix(requestPath, "/receipts/") {
 		return false
 	}
 	return path.Ext(requestPath) == ""

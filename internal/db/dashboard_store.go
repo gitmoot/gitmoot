@@ -129,25 +129,23 @@ func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSu
 	return out, rows.Err()
 }
 
+// ListDashboardTasks reads every visible task with its latest PR number and the
+// PR implementer's acting org role in one query. The owner column is the same
+// pullRequestActingRoleSelector that PullRequestActingRole runs, evaluated per
+// task over the acting_scope derived table.
 func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]DashboardTaskRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.id, t.title, t.repo_full_name, t.state,
-		COALESCE((SELECT trim(json_extract(j.payload, '$.acting_org_role')) FROM jobs j
-			WHERE j.repo = t.repo_full_name AND j.type = 'implement'
-				AND j.pull_request = (SELECT pr.number FROM pull_requests pr
-					WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
-					ORDER BY pr.number DESC LIMIT 1)
-				AND json_valid(j.payload)
-				AND json_type(j.payload, '$.acting_org_role') = 'text'
-				AND trim(json_extract(j.payload, '$.acting_org_role')) != ''
-			ORDER BY j.created_at, j.id LIMIT 1), ''),
-		COALESCE((SELECT pr.number FROM pull_requests pr
-			WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
-			ORDER BY pr.number DESC LIMIT 1), 0),
-		t.updated_at
-	FROM tasks t
-	WHERE t.state != 'dismissed'
-		AND (t.state != 'merged' OR julianday(t.updated_at) >= julianday(?))
-	ORDER BY t.id`, mergedSince)
+	rows, err := s.db.QueryContext(ctx, `SELECT acting_scope.id, acting_scope.title, acting_scope.repo, acting_scope.state,
+		COALESCE(`+pullRequestActingRoleSelector+`, ''),
+		COALESCE(acting_scope.pull_request, 0),
+		acting_scope.updated_at
+	FROM (SELECT t.id, t.title, t.repo_full_name AS repo, t.state, t.updated_at,
+			(SELECT pr.number FROM pull_requests pr
+				WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
+				ORDER BY pr.number DESC LIMIT 1) AS pull_request
+		FROM tasks t
+		WHERE t.state != 'dismissed'
+			AND (t.state != 'merged' OR julianday(t.updated_at) >= julianday(?))) acting_scope
+	ORDER BY acting_scope.id`, mergedSince)
 	if err != nil {
 		return nil, err
 	}

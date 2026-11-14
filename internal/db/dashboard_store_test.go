@@ -72,6 +72,62 @@ func TestListDashboardTasksExcludesDismissed(t *testing.T) {
 	}
 }
 
+// TestListDashboardTasksOwnerAgreesWithPullRequestActingRole pins the shared
+// pullRequestActingRoleSelector: the dashboard's bulk task owner and
+// PullRequestActingRole pick the same implement job (earliest created_at, not
+// lowest id), ignore other job types, and leave a PR-less task unattributed.
+func TestListDashboardTasksOwnerAgreesWithPullRequestActingRole(t *testing.T) {
+	store := openWorkflowTestStore(t)
+	ctx := context.Background()
+	const repo = "acme/widget"
+	for _, task := range []Task{
+		{ID: "with-pr", RepoFullName: repo, Branch: "feat", State: "pr_open"},
+		{ID: "no-pr", RepoFullName: repo, Branch: "other", State: "implementing"},
+	} {
+		if err := store.UpsertTask(ctx, task); err != nil {
+			t.Fatalf("UpsertTask(%s): %v", task.ID, err)
+		}
+	}
+	if err := store.UpsertPullRequest(ctx, PullRequest{RepoFullName: repo, Number: 12, HeadBranch: "feat", State: "open"}); err != nil {
+		t.Fatalf("UpsertPullRequest: %v", err)
+	}
+	jobs := []struct {
+		id, typ, payload, createdAt string
+	}{
+		{"impl-a", "implement", `{"repo":"acme/widget","pull_request":12,"acting_org_role":"second"}`, "2026-11-01 10:05:00"},
+		{"impl-b", "implement", `{"repo":"acme/widget","pull_request":12,"acting_org_role":"first"}`, "2026-11-01 10:00:00"},
+		{"review-0", "review", `{"repo":"acme/widget","pull_request":12,"acting_org_role":"reviewer"}`, "2026-11-01 09:00:00"},
+		{"impl-nopr", "implement", `{"repo":"acme/widget","acting_org_role":"stray"}`, "2026-11-01 08:00:00"},
+	}
+	for _, j := range jobs {
+		if err := store.CreateJob(ctx, Job{ID: j.id, Agent: "worker", Type: j.typ, State: "succeeded", Payload: j.payload}); err != nil {
+			t.Fatalf("CreateJob(%s): %v", j.id, err)
+		}
+		if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET created_at = ? WHERE id = ?`, j.createdAt, j.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	role, err := store.PullRequestActingRole(ctx, repo, 12)
+	if err != nil || role != "first" {
+		t.Fatalf("PullRequestActingRole = %q, err=%v, want first (earliest implement job)", role, err)
+	}
+	tasks, err := store.ListDashboardTasks(ctx, "2000-01-01 00:00:00")
+	if err != nil {
+		t.Fatalf("ListDashboardTasks: %v", err)
+	}
+	byID := map[string]DashboardTaskRow{}
+	for _, task := range tasks {
+		byID[task.ID] = task
+	}
+	if got := byID["with-pr"]; got.Agent != role || got.PRNumber != 12 {
+		t.Fatalf("with-pr row = %+v, want owner %q on PR 12", got, role)
+	}
+	if got := byID["no-pr"]; got.Agent != "" || got.PRNumber != 0 {
+		t.Fatalf("no-pr row = %+v, want no owner and no PR", got)
+	}
+}
+
 func TestListDashboardUnlabeledJobsIsWindowedAndLabelFiltered(t *testing.T) {
 	store := openWorkflowTestStore(t)
 	ctx := context.Background()

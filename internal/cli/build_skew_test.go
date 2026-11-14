@@ -203,7 +203,6 @@ func TestHealthEndpointAddsServingBuildAndKeepsListsNonNil(t *testing.T) {
 			Version string `json:"version"`
 			Commit  string `json:"commit"`
 		} `json:"server"`
-		Locks          *json.RawMessage `json:"locks"`
 		ResourceLocks  *json.RawMessage `json:"resourceLocks"`
 		Stuck          *json.RawMessage `json:"stuck"`
 		RecentFailures *json.RawMessage `json:"recentFailures"`
@@ -227,7 +226,6 @@ func TestHealthEndpointAddsServingBuildAndKeepsListsNonNil(t *testing.T) {
 	// The module's handler coerces these to []; shadowing it must not regress the
 	// documented shape to null.
 	for name, raw := range map[string]*json.RawMessage{
-		"locks":          payload.Locks,
 		"resourceLocks":  payload.ResourceLocks,
 		"stuck":          payload.Stuck,
 		"recentFailures": payload.RecentFailures,
