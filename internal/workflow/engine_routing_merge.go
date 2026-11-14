@@ -44,7 +44,7 @@ func (e Engine) jobPayload(ctx context.Context, jobID string) (db.Job, JobPayloa
 		}
 		return db.Job{}, JobPayload{}, err
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return db.Job{}, JobPayload{}, err
 	}
@@ -118,7 +118,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if job.Type != "review" {
 			continue
 		}
-		jobPayload, err := unmarshalPayload(job.Payload)
+		jobPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, err
 		}
@@ -282,7 +282,7 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		if job.Type != "review" || job.State != "succeeded" {
 			continue
 		}
-		jobPayload, err := unmarshalPayload(job.Payload)
+		jobPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, "", false, err
 		}
@@ -329,7 +329,7 @@ func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (stri
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return "", err
 		}
@@ -454,7 +454,7 @@ func (e Engine) existingJobMatchesRequest(ctx context.Context, request JobReques
 	if job.Type != request.Action {
 		return false, nil
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return false, err
 	}

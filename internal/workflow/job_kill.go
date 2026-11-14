@@ -46,7 +46,7 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 	// coordinator does not. The engine/daemon only consult the root's flag, so we
 	// must mark the root even when the operator passes a descendant id.
 	root := target
-	if payload, perr := unmarshalPayload(target.Payload); perr == nil {
+	if payload, perr := DecodeJobPayload(target); perr == nil {
 		if r := strings.TrimSpace(payload.RootJobID); r != "" && r != target.ID {
 			root, err = store.GetJob(ctx, r)
 			if err != nil {
@@ -79,7 +79,7 @@ func KillDelegationTree(ctx context.Context, store *db.Store, jobID string) (db.
 			// child legs are cancelled. The from=queued transition is idempotent: a
 			// re-kill or a leg that raced to running simply does not match.
 			if j.State == string(JobQueued) {
-				if p, perr := unmarshalPayload(j.Payload); perr == nil {
+				if p, perr := DecodeJobPayload(j); perr == nil {
 					rootID := strings.TrimSpace(p.RootJobID)
 					if rootID != "" && rootID != j.ID && strings.TrimSpace(p.DelegationID) != "" {
 						_, _ = store.TransitionJobStateWithEvent(ctx, j.ID, string(JobQueued), string(JobCancelled), db.JobEvent{

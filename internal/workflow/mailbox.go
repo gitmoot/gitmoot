@@ -427,6 +427,10 @@ type JobPayload struct {
 	DiskGuardRouteDeclined bool `json:"disk_guard_route_declined,omitempty"`
 	execBackendPresent     bool
 	unknownJSONFields      map[string]json.RawMessage
+	// announcedDecision is the stored decision of a historical review
+	// announcement that DecodeJobPayload replaced with HistoricalFanOutDecision.
+	// MarshalJSON writes it back, so a decoded row never persists the rewrite.
+	announcedDecision string
 	// EffectiveRuntime is the runtime selected before delivery, persisted by the
 	// dispatch/worker for EVERY job (#1528) — not only --runtime overrides — so
 	// succeeded-job consumers (the review-loop family resolver, and later the
@@ -669,7 +673,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	pullRequestReady := request.PullRequestReady
 	if (!skipNativeReviewFanout || !pullRequestReady) && strings.TrimSpace(request.ParentJobID) != "" {
 		if parent, parentErr := m.store.GetJob(ctx, strings.TrimSpace(request.ParentJobID)); parentErr == nil {
-			if parentPayload, parseErr := unmarshalPayload(parent.Payload); parseErr == nil {
+			if parentPayload, parseErr := DecodeJobPayload(parent); parseErr == nil {
 				if parentPayload.SkipNativeReviewFanout {
 					skipNativeReviewFanout = true
 				}
@@ -1156,7 +1160,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if job.Agent != agent.Name {
 		return AgentResult{}, fmt.Errorf("job %q is assigned to %q, not %q", job.ID, job.Agent, agent.Name)
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return AgentResult{}, err
 	}
@@ -1643,7 +1647,7 @@ func (m Mailbox) finish(ctx context.Context, jobID string, state JobState, messa
 	var transitioned bool
 	var err error
 	if job, loadErr := m.store.GetJob(writeCtx, jobID); loadErr == nil {
-		if payload, payloadErr := unmarshalPayload(job.Payload); payloadErr == nil {
+		if payload, payloadErr := DecodeJobPayload(job); payloadErr == nil {
 			clearRuntimeIdentity(&payload)
 			message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
 			if encoded, encodeErr := marshalPayload(payload); encodeErr == nil {
@@ -1697,7 +1701,7 @@ func (m Mailbox) loadTerminalEmitPayload(ctx context.Context, jobID, message str
 	if err != nil {
 		return JobPayload{Result: &AgentResult{Summary: strings.TrimSpace(message)}}
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return JobPayload{Result: &AgentResult{Summary: strings.TrimSpace(message)}}
 	}
@@ -2046,10 +2050,46 @@ func marshalPayload(payload JobPayload) (string, error) {
 }
 
 // ParseJobPayload decodes a stored job payload (the same form the mailbox
-// writes), tolerating the legacy preset_* keys. Read-only callers — e.g. the
-// dashboard's job detail — use this to surface the request and result.
+// writes), tolerating the legacy preset_* keys. It does not know the job's
+// type; a reader that acts on a review decision uses DecodeJobPayload.
 func ParseJobPayload(value string) (JobPayload, error) {
 	return unmarshalPayload(value)
+}
+
+// DecodeJobPayload decodes a stored job's payload with the job's own type as
+// context. A stored #1685 review announcement (a review result that carries
+// delegations[] or fan_out:true) said "approved" or "changes_requested" about a
+// panel it only dispatched; it is not a verdict. Its decision is replaced with
+// HistoricalFanOutDecision, so the merge gate, required-reviewer slots,
+// objection supersession, verdict claims and comments treat the row as an
+// abstention. No new result carries either mark (#2588). Only review rows are
+// touched: an ask or implement result with delegations keeps its decision.
+func DecodeJobPayload(job db.Job) (JobPayload, error) {
+	payload, err := unmarshalPayload(job.Payload)
+	if err != nil || payload.Result == nil || !strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+		return payload, err
+	}
+	switch strings.ToLower(strings.TrimSpace(payload.Result.Decision)) {
+	case "approved", "changes_requested":
+	default:
+		return payload, nil
+	}
+	var marks struct {
+		Result struct {
+			Delegations []json.RawMessage `json:"delegations"`
+			FanOut      bool              `json:"fan_out"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(job.Payload), &marks); err != nil {
+		return JobPayload{}, fmt.Errorf("parse job payload result marks: %w", err)
+	}
+	if len(marks.Result.Delegations) > 0 || marks.Result.FanOut {
+		result := *payload.Result
+		payload.announcedDecision = result.Decision
+		result.Decision = HistoricalFanOutDecision
+		payload.Result = &result
+	}
+	return payload, nil
 }
 
 func unmarshalPayload(value string) (JobPayload, error) {
@@ -2061,28 +2101,9 @@ func unmarshalPayload(value string) (JobPayload, error) {
 		PresetID             string `json:"preset_id"`
 		PresetResolvedCommit string `json:"preset_resolved_commit"`
 		PresetContent        string `json:"preset_content"`
-		// Result carries the #1685 coordinator-announcement marks. No new
-		// result carries either (#2588), but stored review rows still do,
-		// sometimes fan_out without the delegations.
-		Result *struct {
-			Delegations []json.RawMessage `json:"delegations"`
-			FanOut      bool              `json:"fan_out"`
-		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(value), &legacy); err != nil {
 		return JobPayload{}, fmt.Errorf("parse legacy job payload: %w", err)
-	}
-	// A stored coordinator announcement says "approved" (or
-	// "changes_requested") about a panel it only dispatched; it is not a
-	// verdict. Every reader decodes stored rows here, so the decision is
-	// replaced with HistoricalFanOutDecision once, at this boundary: the merge
-	// gate, required-reviewer slots, objection supersession and verdict history
-	// then treat the row as an abstention instead of an answer.
-	if payload.Result != nil && legacy.Result != nil && (len(legacy.Result.Delegations) > 0 || legacy.Result.FanOut) {
-		switch strings.ToLower(strings.TrimSpace(payload.Result.Decision)) {
-		case "approved", "changes_requested":
-			payload.Result.Decision = HistoricalFanOutDecision
-		}
 	}
 	if payload.TemplateID == "" {
 		payload.TemplateID = legacy.PresetID

@@ -456,7 +456,7 @@ func (d *webDataSource) State(ctx context.Context, runID string) (dashboard.Stat
 				continue
 			}
 			tree = append(tree, j)
-			p, _ := workflow.ParseJobPayload(j.Payload)
+			p, _ := workflow.DecodeJobPayload(j)
 			payloadByID[j.ID] = p
 			if pj := strings.TrimSpace(j.ParentJobID); pj != "" {
 				childrenByParent[pj] = append(childrenByParent[pj], j)
@@ -629,7 +629,7 @@ func buildDashboardWorkflowRuns(jobs []db.Job, runtimeByAgent map[string]string,
 	byRoot := map[string][]db.Job{}
 	var rootOrder []string
 	for _, job := range jobs {
-		payload, _ := workflow.ParseJobPayload(job.Payload)
+		payload, _ := workflow.DecodeJobPayload(job)
 		payloadByID[job.ID] = payload
 		jobByID[job.ID] = job
 		parentID := strings.TrimSpace(job.ParentJobID)
@@ -756,7 +756,7 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 			}
 			return err
 		}
-		payload, _ := workflow.ParseJobPayload(job.Payload)
+		payload, _ := workflow.DecodeJobPayload(job)
 		events, _ := store.ListJobEvents(ctx, jobID)
 		runtimeByAgent := agentRuntimeMap(ctx, store)
 
@@ -764,7 +764,7 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 		var action string
 		if pj := strings.TrimSpace(job.ParentJobID); pj != "" && strings.TrimSpace(job.DelegationID) != "" {
 			if parent, perr := store.GetJob(ctx, pj); perr == nil {
-				pp, _ := workflow.ParseJobPayload(parent.Payload)
+				pp, _ := workflow.DecodeJobPayload(parent)
 				meta := parentDelegMeta(pp)[job.DelegationID]
 				action = meta.action
 				if siblings, serr := store.ListJobsByParent(ctx, pj); serr == nil {
@@ -1184,7 +1184,7 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 		repoByID := make(map[string]string, len(jobs))
 		allRepos := map[string]bool{}
 		for _, j := range jobs {
-			p, _ := workflow.ParseJobPayload(j.Payload)
+			p, _ := workflow.DecodeJobPayload(j)
 			payloadByID[j.ID] = p
 			r := strings.TrimSpace(p.Repo)
 			repoByID[j.ID] = r
@@ -1464,7 +1464,7 @@ func buildCharts(jobs []db.Job, days int, now time.Time, runtimeByAgent map[stri
 			continue
 		}
 		j := jd.job
-		payload, _ := workflow.ParseJobPayload(j.Payload)
+		payload, _ := workflow.DecodeJobPayload(j)
 
 		key := jd.day.Format("2006-01-02")
 		b := dayBuckets[key]
@@ -1671,7 +1671,7 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 			}
 
 			if since, isStuck := healthStuckSince(j, cutoff); isStuck {
-				payload, _ := workflow.ParseJobPayload(j.Payload)
+				payload, _ := workflow.DecodeJobPayload(j)
 				// Mirror loadStuckReason but reuse the preloaded resource locks
 				// (per-job events are inherently per-job and stay).
 				reason := ""
@@ -1691,7 +1691,7 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 			}
 
 			if ns == "failed" {
-				payload, _ := workflow.ParseJobPayload(j.Payload)
+				payload, _ := workflow.DecodeJobPayload(j)
 				at := parseJobTimeMillis(j.UpdatedAt)
 				if at == 0 {
 					at = parseJobTimeMillis(j.CreatedAt)
@@ -2294,7 +2294,7 @@ func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
 	out := make([]dashboard.RunSummary, 0, len(order))
 	for _, root := range order {
 		a := byRoot[root]
-		payload, _ := workflow.ParseJobPayload(a.root.Payload)
+		payload, _ := workflow.DecodeJobPayload(a.root)
 		nodeCount := len(a.states)
 		// An orchestration is a genuine delegation tree: a coordinator delegated to
 		// children, so some job sits below the root (DelegationDepth > 0). Native

@@ -161,7 +161,7 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		if err != nil {
 			return err
 		}
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err != nil {
 			return err
 		}

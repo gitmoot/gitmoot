@@ -1355,7 +1355,7 @@ func (e Engine) cleanupConsumedImplementLegWorktrees(ctx context.Context, payloa
 		if !ok {
 			continue
 		}
-		legPayload, err := unmarshalPayload(legJob.Payload)
+		legPayload, err := DecodeJobPayload(legJob)
 		if err != nil {
 			cleanupErr = errors.Join(cleanupErr, err)
 			continue

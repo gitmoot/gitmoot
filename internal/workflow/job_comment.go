@@ -23,16 +23,6 @@ type JobResultComment struct {
 	Diagnostic             string
 }
 
-// commentReviewPayload adapts a render request to the stored-payload shape the
-// folding authority takes. Result is threaded from the comment because callers
-// pass an OUTWARD result (delivery-blocked results are redacted) that can differ
-// from the one embedded in Payload.
-func commentReviewPayload(comment JobResultComment) JobPayload {
-	payload := comment.Payload
-	payload.Result = comment.Result
-	return payload
-}
-
 func RenderJobResultComment(comment JobResultComment) string {
 	var builder strings.Builder
 	builder.WriteString("> Agent: `")
@@ -76,7 +66,9 @@ func RenderJobResultComment(comment JobResultComment) string {
 		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
 	}
 	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
-		effective := effectiveReviewDecision(commentReviewPayload(comment).Result, comment.ReviewBlockingSeverity)
+		// comment.Result, not comment.Payload.Result: callers pass the OUTWARD
+		// result (delivery-blocked results are redacted).
+		effective := effectiveReviewDecision(comment.Result, comment.ReviewBlockingSeverity)
 		rawDecision := strings.TrimSpace(comment.Result.Decision)
 		if strings.EqualFold(rawDecision, "changes_requested") &&
 			strings.EqualFold(strings.TrimSpace(effective), "approved") {

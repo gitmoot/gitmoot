@@ -584,7 +584,7 @@ func (e Engine) resolveIntegrationDeps(ctx context.Context, job db.Job, payload 
 			result.unresolvedDeps = append(result.unresolvedDeps, dep)
 			continue
 		}
-		legPayload, err := unmarshalPayload(legJob.Payload)
+		legPayload, err := DecodeJobPayload(legJob)
 		if err != nil {
 			result.unresolvedDeps = append(result.unresolvedDeps, dep)
 			continue

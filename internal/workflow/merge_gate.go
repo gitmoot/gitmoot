@@ -976,7 +976,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return err
 		}
@@ -1607,7 +1607,7 @@ func collectImplementerAttributionMatching(jobs []db.Job, current JobPayload,
 		if !implementLegRan(job, ran) {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			evidence.sawMalformedPayload = true
 			continue

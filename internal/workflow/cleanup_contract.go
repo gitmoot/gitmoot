@@ -462,7 +462,7 @@ func (e Engine) inspectCleanupConsumers(ctx context.Context, payload JobPayload,
 		if child.ID == d.OwnerJobID {
 			continue
 		}
-		p, err := unmarshalPayload(child.Payload)
+		p, err := DecodeJobPayload(child)
 		if err != nil {
 			return "consumer_graph_unknown", nil
 		}

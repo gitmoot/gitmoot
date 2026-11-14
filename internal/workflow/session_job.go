@@ -239,7 +239,7 @@ func (m Mailbox) CloseExternalJobWithUsage(ctx context.Context, jobID string, re
 		return db.Job{}, err
 	}
 
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return db.Job{}, err
 	}

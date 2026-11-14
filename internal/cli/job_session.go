@@ -209,7 +209,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		// #1990: same rule as `job record` above - report the STORED row, never
 		// the flags. `job close` had the identical echo, and leaving one verb
 		// honest and its sibling lying is how the defect comes back.
-		payload, _ := workflow.ParseJobPayload(job.Payload)
+		payload, _ := workflow.DecodeJobPayload(job)
 		out = jobSessionOutput{
 			JobID:            job.ID,
 			State:            job.State,
@@ -355,7 +355,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		// all printed from the FLAG values too, so any normalisation or refusal
 		// applied between here and the store would have been invisible in exactly
 		// the same way. Every field below now comes from the stored row.
-		payload, _ := workflow.ParseJobPayload(job.Payload)
+		payload, _ := workflow.DecodeJobPayload(job)
 		storedDecision, storedSeverity, storedSummary := "", "", ""
 		if payload.Result != nil {
 			storedDecision = payload.Result.Decision

@@ -79,6 +79,13 @@ func (p *JobPayload) UnmarshalJSON(data []byte) error {
 // Payloads without unknown fields use the alias bytes verbatim, preserving the
 // established field order and byte-for-byte serialization.
 func (p JobPayload) MarshalJSON() ([]byte, error) {
+	if p.announcedDecision != "" && p.Result != nil {
+		// DecodeJobPayload rewrote a historical announcement's decision for
+		// readers; storage keeps what the job recorded.
+		result := *p.Result
+		result.Decision = p.announcedDecision
+		p.Result = &result
+	}
 	encoded, err := json.Marshal(jobPayloadJSON(p))
 	if err != nil {
 		return nil, err

@@ -228,7 +228,7 @@ func buildEnrichedManifestEntry(d Delegation, children, dedupWinners map[string]
 	if !ok || child.State != string(JobSucceeded) {
 		return entry
 	}
-	payload, err := unmarshalPayload(child.Payload)
+	payload, err := DecodeJobPayload(child)
 	if err != nil {
 		return entry
 	}

@@ -697,7 +697,7 @@ func reviewJobStillAnswers(job db.Job) bool {
 	case string(workflow.JobQueued), string(workflow.JobRunning), string(workflow.JobBlocked):
 		return true
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
+	payload, err := workflow.DecodeJobPayload(job)
 	if err != nil {
 		return false
 	}
@@ -796,7 +796,7 @@ func takeSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey, h
 	if err != nil {
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s: %w", opts.supersede, err)
 	}
-	payload, err := workflow.ParseJobPayload(job.Payload)
+	payload, err := workflow.DecodeJobPayload(job)
 	if err != nil {
 		return db.Job{}, fmt.Errorf("review request --supersede: job %s payload: %w", job.ID, err)
 	}
@@ -852,7 +852,7 @@ func restoreSupersededPartClaim(ctx context.Context, store *db.Store, subjectKey
 // supersededPayloadRole is the acting org role stored on a review job, the
 // second input of its reviewer identity.
 func supersededPayloadRole(job db.Job) string {
-	payload, err := workflow.ParseJobPayload(job.Payload)
+	payload, err := workflow.DecodeJobPayload(job)
 	if err != nil {
 		return ""
 	}
@@ -950,7 +950,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 	// attach is honest only when the running review already carries exactly
 	// the requested pull requests at the same heads.
 	var existingRelated []workflow.ReviewRelatedPR
-	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil && job.ID != "" {
+	if payload, err := workflow.DecodeJobPayload(job); err == nil && job.ID != "" {
 		existingRelated = payload.ReviewRelatedPRs
 	}
 	if len(output.RelatedPRs) > 0 && !sameReviewRelatedPRs(output.RelatedPRs, existingRelated) {
@@ -970,7 +970,7 @@ func finishReviewAttach(ctx context.Context, store *db.Store, output reviewReque
 		// it is simply not insertable-and-readable yet.
 		output.JobState = "dispatching"
 	}
-	if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
+	if payload, err := workflow.DecodeJobPayload(job); err == nil {
 		if decision := reviewVerdictDecision(job, payload); decision != "" {
 			output.State = reviewRequestVerdictExists
 			output.Verdict = decision
@@ -1461,7 +1461,7 @@ func resolveDeltaReviewScopeUsing(ctx context.Context, store *db.Store, git revi
 		if err != nil {
 			return nil, "scope unavailable: " + err.Error()
 		}
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err != nil {
 			return nil, "scope unavailable: " + err.Error()
 		}
@@ -1671,7 +1671,7 @@ func runReviewStatus(args []string, stdout, stderr io.Writer) int {
 		output = reviewStatusOutput{Repo: repo.FullName(), PullRequest: *pr, Gate: reviewGateState(*home, repo.FullName()), Requests: make([]reviewStatusEntry, 0, len(jobs))}
 		for _, job := range jobs {
 			entry := reviewStatusEntry{JobID: job.ID, State: job.State, Reviewer: job.Agent, Model: job.Model, UpdatedAt: job.UpdatedAt}
-			if payload, err := workflow.ParseJobPayload(job.Payload); err == nil {
+			if payload, err := workflow.DecodeJobPayload(job); err == nil {
 				entry.HeadSHA = payload.HeadSHA
 				entry.Purpose = payload.ReviewPurpose
 				entry.Requester = payload.ReviewRequester

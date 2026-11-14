@@ -51,27 +51,40 @@ func TestPolicyMergeGateHistoricalDelegationsWithoutVerdictNeverApprove(t *testi
 	}
 }
 
-// TestUnmarshalPayloadKeepsOrdinaryVerdictDecisions is the control for the
-// boundary above: only rows carrying the announcement marks lose their decision.
-func TestUnmarshalPayloadKeepsOrdinaryVerdictDecisions(t *testing.T) {
+// TestDecodeJobPayloadMarksOnlyReviewAnnouncements is the control for the
+// boundary above. Only a REVIEW row carrying the announcement marks loses its
+// decision: an ask or implement result with delegations is a real answer and
+// keeps it (round-2 P2), and re-encoding a marked row writes back the stored
+// decision, so a read-modify-write never persists the rewrite.
+func TestDecodeJobPayloadMarksOnlyReviewAnnouncements(t *testing.T) {
 	for _, tc := range []struct {
-		name, panel, decision, want string
+		name, jobType, panel, decision, want string
 	}{
-		{"ordinary approved", ``, "approved", "approved"},
-		{"ordinary changes_requested", ``, "changes_requested", "changes_requested"},
-		{"empty delegations", `,"delegations":[]`, "approved", "approved"},
-		{"fan_out false", `,"fan_out":false`, "approved", "approved"},
-		{"declared panel", `,"delegations":[{"id":"a"}]`, "approved", HistoricalFanOutDecision},
-		{"stripped panel", `,"fan_out":true`, "changes_requested", HistoricalFanOutDecision},
-		{"announcement blocked", `,"fan_out":true`, "blocked", "blocked"},
+		{"ordinary approved", "review", ``, "approved", "approved"},
+		{"ordinary changes_requested", "review", ``, "changes_requested", "changes_requested"},
+		{"empty delegations", "review", `,"delegations":[]`, "approved", "approved"},
+		{"fan_out false", "review", `,"fan_out":false`, "approved", "approved"},
+		{"declared panel", "review", `,"delegations":[{"id":"a"}]`, "approved", HistoricalFanOutDecision},
+		{"stripped panel", "review", `,"fan_out":true`, "changes_requested", HistoricalFanOutDecision},
+		{"announcement blocked", "review", `,"fan_out":true`, "blocked", "blocked"},
+		{"ask with delegations", "ask", `,"delegations":[{"id":"a"}]`, "approved", "approved"},
+		{"implement with delegations", "implement", `,"delegations":[{"id":"a"}]`, "implemented", "implemented"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			payload, err := unmarshalPayload(fmt.Sprintf(`{"result":{"decision":%q,"summary":"s"%s}}`, tc.decision, tc.panel))
+			stored := fmt.Sprintf(`{"result":{"decision":%q,"summary":"s"%s}}`, tc.decision, tc.panel)
+			payload, err := DecodeJobPayload(db.Job{ID: "j", Type: tc.jobType, Payload: stored})
 			if err != nil {
-				t.Fatalf("unmarshalPayload returned error: %v", err)
+				t.Fatalf("DecodeJobPayload returned error: %v", err)
 			}
 			if payload.Result == nil || payload.Result.Decision != tc.want {
 				t.Fatalf("decision = %+v, want %q", payload.Result, tc.want)
+			}
+			encoded, err := marshalPayload(payload)
+			if err != nil {
+				t.Fatalf("marshalPayload returned error: %v", err)
+			}
+			if !strings.Contains(encoded, fmt.Sprintf(`"decision":%q`, tc.decision)) {
+				t.Fatalf("re-encoded payload %s does not keep the stored decision %q", encoded, tc.decision)
 			}
 		})
 	}

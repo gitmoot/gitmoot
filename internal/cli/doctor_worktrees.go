@@ -89,7 +89,7 @@ func inspectDelegationWorktreeUsage(ctx context.Context, paths config.Paths, sto
 
 	owned := map[string]delegationWorktreeClass{}
 	for _, job := range jobs {
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err != nil || strings.TrimSpace(payload.WorktreePath) == "" {
 			continue
 		}

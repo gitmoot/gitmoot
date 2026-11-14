@@ -909,7 +909,7 @@ func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
 // empty/whitespace yields "" so the builders omit the Original goal header.
 func (e Engine) originalGoal(ctx context.Context, rootJobID, fallback string) string {
 	if root, err := e.Store.GetJob(ctx, rootJobID); err == nil {
-		if payload, err := unmarshalPayload(root.Payload); err == nil {
+		if payload, err := DecodeJobPayload(root); err == nil {
 			if goal := strings.TrimSpace(payload.Instructions); goal != "" {
 				return goal
 			}
@@ -1457,7 +1457,7 @@ func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID stri
 	// present, instead of a per-leg delegationFingerprintSeen query.
 	existingFingerprints := make(map[string]struct{})
 	for _, child := range children {
-		childPayload, err := unmarshalPayload(child.Payload)
+		childPayload, err := DecodeJobPayload(child)
 		if err != nil {
 			return 0, err
 		}

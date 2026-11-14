@@ -257,7 +257,7 @@ func buildTaskDisposalEvidence(repo string, tasks []db.Task, jobs []db.Job) map[
 		}
 	}
 	for _, job := range jobs {
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err != nil {
 			continue
 		}

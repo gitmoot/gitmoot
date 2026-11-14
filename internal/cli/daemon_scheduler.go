@@ -276,7 +276,7 @@ func delegationCleanupContended(err error) bool {
 }
 
 func delegationCleanupTargetContained(worker jobWorker, job db.Job, obligation db.CleanupObligation) error {
-	payload, err := workflow.ParseJobPayload(job.Payload)
+	payload, err := workflow.DecodeJobPayload(job)
 	if err != nil {
 		return fmt.Errorf("parse cleanup owner payload: %w", err)
 	}
