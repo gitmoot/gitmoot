@@ -59,7 +59,7 @@ func TestSkillFrontmatterFollowsTheSpec(t *testing.T) {
 // is for after the #2578 scope reduction, and keeps removed features out of it.
 func TestSkillDocumentsOnlyTheReducedScope(t *testing.T) {
 	frontmatter := strings.ToLower(parseFrontmatter(t, readSkillFile(t, "SKILL.md")))
-	for _, want := range []string{"review", "verdict", "merge gate", "message", "org chart", "escalate", "job cancel", "doctor", "daemon drain", "design-notes", "dashboard", "omp"} {
+	for _, want := range []string{"review", "verdict", "merge gate", "message", "org chart", "escalate", "run cancel", "doctor", "daemon drain", "design-notes", "dashboard", "omp"} {
 		if !strings.Contains(frontmatter, want) {
 			t.Errorf("frontmatter does not mention %q", want)
 		}
@@ -144,7 +144,7 @@ func TestCLIReferenceIsGenerated(t *testing.T) {
 // review dispatch records no lead_agent.
 func TestResultContractCarriesTheAttributionFix(t *testing.T) {
 	text := strings.Join(strings.Fields(readSkillFile(t, "references/RESULT_CONTRACT.md")), " ")
-	for _, want := range []string{"Neither the job's own agent nor `lead_agent` is an attribution fallback", "a CLI review dispatch records no `lead_agent`"} {
+	for _, want := range []string{"Neither the run's own reviewer nor `lead_agent` is an attribution fallback", "a CLI review dispatch records no `lead_agent`"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("RESULT_CONTRACT.md missing %q", want)
 		}
