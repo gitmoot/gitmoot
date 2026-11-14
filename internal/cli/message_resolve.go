@@ -19,7 +19,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory")
 	roleFlag := fs.String("role", "", "acting requester or addressed coordinator")
 	answer := fs.String("answer", "", "decision or answer to record in the thread")
-	answerID := fs.Int64("note", 0, "existing answer note in the same workflow")
+	answerID := fs.Int64("note", 0, "existing answer note in the same campaign")
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	if helpRequested(args) {
 		printMessageActionUsage(stdout, "resolve")
@@ -68,7 +68,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return err
 			}
-			return writeJSON(stdout, message)
+			return writeJSON(stdout, newMessageJSON(message))
 		}
 		fmt.Fprintf(stdout, "resolved escalation message %d; receipt message %d; requester notification queued\n", id, note.ID)
 		return nil

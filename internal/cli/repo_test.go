@@ -385,7 +385,7 @@ func TestRepoCheckoutDoctorWorkflowDisciplineIsAdvisoryAndCapped(t *testing.T) {
 	checks := repoCheckoutDoctorChecks(config.PathsForHome(home))
 	var discipline *doctor.Check
 	for i := range checks {
-		if checks[i].Name == "workflow discipline" {
+		if checks[i].Name == "campaign discipline" {
 			discipline = &checks[i]
 			break
 		}

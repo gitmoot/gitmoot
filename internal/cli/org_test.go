@@ -1471,7 +1471,7 @@ func TestRunOrgRecycleProviderFailureKeepsHandoff(t *testing.T) {
 		recycle:  func(context.Context, org.RecycleRequest) error { return errors.New("pane is not at shell") },
 	})
 	var stdout, stderr bytes.Buffer
-	if code := runOrgRecycle([]string{"owner", "--kind", "codex", "--handoff", "Safe to resume.", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "handoff journaled in workflow org/owner") {
+	if code := runOrgRecycle([]string{"owner", "--kind", "codex", "--handoff", "Safe to resume.", "--home", home}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "handoff journaled in campaign org/owner") {
 		t.Fatalf("code/stderr = %d/%q", code, stderr.String())
 	}
 	store, err := dbtest.Open(t, paths.Database)

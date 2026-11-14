@@ -13,20 +13,20 @@ import (
 )
 
 func runWorkflowRegister(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow register", flag.ContinueOnError)
+	fs := flag.NewFlagSet("campaign register", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory")
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	if helpRequested(args) {
-		fmt.Fprintln(stdout, "usage: workflow register LABEL DESCRIPTION [--home DIR] [--json]")
+		fmt.Fprintln(stdout, "usage: campaign register LABEL DESCRIPTION [--home DIR] [--json]")
 		return 0
 	}
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "usage: workflow register LABEL DESCRIPTION [--home DIR] [--json]")
+		fmt.Fprintln(stderr, "usage: campaign register LABEL DESCRIPTION [--home DIR] [--json]")
 		return 2
 	}
 	label, description := strings.TrimSpace(args[0]), strings.TrimSpace(args[1])
-	if refuseFlagLikeText("workflow register", description, stderr) {
+	if refuseFlagLikeText("campaign register", description, stderr) {
 		return 2
 	}
 	if err := fs.Parse(args[2:]); err != nil {
@@ -36,7 +36,7 @@ func runWorkflowRegister(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || description == "" || len(description) > workflowSummaryMax {
-		fmt.Fprintln(stderr, "workflow register requires one label and non-empty description")
+		fmt.Fprintln(stderr, "campaign register requires one label and non-empty description")
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(label); err != nil {
@@ -53,16 +53,16 @@ func runWorkflowRegister(args []string, stdout, stderr io.Writer) int {
 		return err
 	})
 	if err != nil {
-		fmt.Fprintln(stderr, "workflow register:", err)
+		fmt.Fprintln(stderr, "campaign register:", err)
 		return 1
 	}
 	if *jsonOutput {
-		if err := writeJSON(stdout, summary); err != nil {
+		if err := writeJSON(stdout, newCampaignSummaryJSON(summary)); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "registered workflow %s; no job or notification created\n", label)
+	fmt.Fprintf(stdout, "registered campaign %s; no run or notification created\n", label)
 	return 0
 }
