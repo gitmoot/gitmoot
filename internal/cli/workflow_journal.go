@@ -186,6 +186,8 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "workflow show requires a label")
 			return 2
 		}
+		fmt.Fprintln(stderr, "Usage: gitmoot workflow show <label> [--json] [--limit N] [--home DIR]")
+		fs.PrintDefaults()
 		return 0
 	}
 	label := strings.TrimSpace(args[0])

@@ -108,11 +108,22 @@ jobs:
       - name: Generated contract is current
         # The gitmoot_result reply contract is single-sourced from the workflow
         # result structs and regenerated into internal/prompts/contract_generated.go
-        # by `go generate ./...`. Fail if the checked-in artifact is stale so a
-        # struct change can never silently drift the prompt agents are given.
+        # by `go generate ./...`, and the skill's CLI reference
+        # (skills/gitmoot/references/CLI.md) is regenerated from the binary's own
+        # --help output (#2595). Fail if either checked-in artifact is stale so a
+        # struct or flag change can never silently drift what agents are given.
         run: |
           go generate ./...
           git diff --exit-code
+
+      - name: Agent Skill is valid (skills-ref)
+        # The reference validator named by https://agentskills.io/specification,
+        # pinned. Its 0.1.1 console script is `agentskills`; the module entry
+        # point is version-independent.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/skills-ref"
+          "$RUNNER_TEMP/skills-ref/bin/pip" install --quiet skills-ref==0.1.1
+          "$RUNNER_TEMP/skills-ref/bin/python" -m skills_ref.cli validate skills/gitmoot
 
       - name: Vet
         run: go vet ./...

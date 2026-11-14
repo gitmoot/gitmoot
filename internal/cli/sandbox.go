@@ -11,10 +11,25 @@ import (
 	"github.com/gitmoot/gitmoot/internal/sandbox"
 )
 
+func printSandboxUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot sandbox probe")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "probe reports whether this kernel enforces the runtime sandbox (Landlock):")
+	fmt.Fprintln(w, "it prints \"supported (Landlock ABI vN)\" and exits 0, or \"unsupported\"")
+	fmt.Fprintln(w, "and the reason and exits 1.")
+}
+
+func isSandboxHelpArg(arg string) bool { return arg == "-h" || arg == "--help" }
+
 func runSandbox(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "sandbox requires a subcommand: probe")
 		return 2
+	}
+	if isSandboxHelpArg(args[0]) || (args[0] == "probe" && len(args) == 2 && isSandboxHelpArg(args[1])) {
+		printSandboxUsage(stdout)
+		return 0
 	}
 	switch args[0] {
 	case "probe":

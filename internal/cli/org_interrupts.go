@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -71,6 +72,9 @@ func runOrgInterrupts(args []string, stdout, stderr io.Writer) int {
 	window := fs.String("window", "7d", "window to report over, for example 24h or 7d; 0 reports every recorded wake")
 	jsonOutput := fs.Bool("json", false, "emit the report as JSON")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintf(stderr, "org interrupts: %v\n", err)
 		return 2
 	}

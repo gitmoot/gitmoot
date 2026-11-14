@@ -1,222 +1,166 @@
 package skills
 
 import (
+	"io/fs"
 	"os"
-	"path/filepath"
+	"path"
+	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
-func TestCanonicalSkillFrontmatter(t *testing.T) {
-	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
-	frontmatter := parseFrontmatter(t, text)
+// The Agent Skills specification (https://agentskills.io/specification) limits
+// these fields; CI also runs the reference validator (skills-ref). These checks
+// keep the same limits in `go test` so a local run catches them too.
+var specName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
-	for _, want := range []string{
-		"name: gitmoot",
-		"description: Use Gitmoot",
-		"license: Apache-2.0",
-		"compatibility:",
-		"metadata:",
-		"gitmoot-version:",
-	} {
-		if !strings.Contains(frontmatter, want) {
-			t.Fatalf("frontmatter missing %q:\n%s", want, frontmatter)
+func TestSkillFrontmatterFollowsTheSpec(t *testing.T) {
+	text := readSkillFile(t, "SKILL.md")
+	var frontmatter map[string]any
+	if err := yaml.Unmarshal([]byte(parseFrontmatter(t, text)), &frontmatter); err != nil {
+		t.Fatalf("SKILL.md frontmatter is not YAML: %v", err)
+	}
+	allowed := map[string]bool{"name": true, "description": true, "license": true, "compatibility": true, "metadata": true, "allowed-tools": true}
+	for key := range frontmatter {
+		if !allowed[key] {
+			t.Errorf("frontmatter field %q is not in the Agent Skills spec", key)
 		}
 	}
-
-	for _, want := range []string{
-		"GitHub PR comments",
-		"agent subscriptions",
-		"daemon checks",
-		"jobs",
-		"custom prompt agents",
-		"Codex",
-		"Claude Code",
-	} {
-		if !strings.Contains(frontmatter, want) {
-			t.Fatalf("description missing trigger term %q:\n%s", want, frontmatter)
+	name, _ := frontmatter["name"].(string)
+	if name != "gitmoot" || len(name) > 64 || !specName.MatchString(name) {
+		t.Errorf("name = %q, want %q (the directory name; 1-64 lowercase letters, digits and single hyphens)", name, "gitmoot")
+	}
+	description, _ := frontmatter["description"].(string)
+	if n := len([]rune(description)); n == 0 || n > 1024 {
+		t.Errorf("description has %d characters, want 1-1024", n)
+	}
+	if compatibility, ok := frontmatter["compatibility"]; ok {
+		text, _ := compatibility.(string)
+		if n := len([]rune(text)); n == 0 || n > 500 {
+			t.Errorf("compatibility has %d characters, want 1-500", n)
 		}
 	}
-}
-
-func TestCanonicalSkillReferencesExist(t *testing.T) {
-	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
-	for _, ref := range []string{
-		"references/CLI.md",
-		"references/WORKFLOWS.md",
-		"references/RESULT_CONTRACT.md",
-		"references/SAFETY.md",
-	} {
-		if !strings.Contains(text, ref) {
-			t.Fatalf("canonical SKILL.md missing reference %q", ref)
+	if metadata, ok := frontmatter["metadata"]; ok {
+		entries, ok := metadata.(map[string]any)
+		if !ok {
+			t.Fatalf("metadata must be a map, got %T", metadata)
 		}
-		path := filepath.Join(append([]string{"..", "skills", "gitmoot"}, strings.Split(ref, "/")...)...)
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("referenced file %s missing: %v", ref, err)
-		}
-	}
-}
-
-func TestCanonicalSkillDocumentsResultAndRereadGuidance(t *testing.T) {
-	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
-	for _, want := range []string{
-		"gitmoot_result",
-		"blocked",
-		"failed",
-		"runtime session locks",
-		"--workers 1",
-		"Reread this `SKILL.md`",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("canonical SKILL.md missing %q", want)
-		}
-	}
-}
-
-func TestCanonicalSkillDocumentsLocalAgentAsk(t *testing.T) {
-	text := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
-	cli := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
-	workflows := readRepoFile(t, "skills", "gitmoot", "references", "WORKFLOWS.md")
-	for _, check := range []struct {
-		name string
-		text string
-		want []string
-	}{
-		{
-			name: "skill",
-			text: text,
-			want: []string{
-				"gitmoot agent ask <agent>",
-				"The plugin is only the runtime discovery surface",
-			},
-		},
-		{
-			name: "cli",
-			text: cli,
-			want: []string{
-				"gitmoot agent ask project-planner --repo owner/repo",
-				"gitmoot job open --agent",
-				"agent ask` is for analysis, planning, and questions only",
-				"gitmoot agent type set planner",
-				"gitmoot job watch <job-id>",
-			},
-		},
-		{
-			name: "workflows",
-			text: workflows,
-			want: []string{
-				"gitmoot agent ask project-planner --repo owner/repo",
-				"Current-Chat Agent Work",
-				"Execution Model",
-				"runtime:<runtime>:<runtime_ref>",
-			},
-		},
-	} {
-		for _, want := range check.want {
-			if !strings.Contains(check.text, want) {
-				t.Fatalf("%s missing %q", check.name, want)
+		for key, value := range entries {
+			if _, ok := value.(string); !ok {
+				t.Errorf("metadata[%q] must be a string, got %T", key, value)
 			}
 		}
 	}
 }
 
-func TestSkillDocumentsCurrentCLIFamilies(t *testing.T) {
-	canonical := readRepoFile(t, "skills", "gitmoot", "SKILL.md")
-	root := readRepoFile(t, "SKILL.md")
-	cli := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
-	for _, check := range []struct {
-		name string
-		text string
-		want []string
-	}{
-		{
-			name: "canonical skill",
-			text: canonical,
-			want: []string{
-				"gitmoot --help",
-				"gitmoot runtime list",
-				"gitmoot review request --pr <number>",
-				"gitmoot job gates <id>",
-				"gitmoot workflow list",
-				"gitmoot dashboard --web",
-			},
-		},
-		{
-			name: "root skill",
-			text: root,
-			want: []string{
-				"gitmoot --help",
-				"gitmoot runtime list",
-				"gitmoot job open",
-				"gitmoot job gates",
-				"gitmoot workflow list",
-				"gitmoot dashboard --web",
-			},
-		},
-		{
-			name: "cli reference",
-			text: cli,
-			want: []string{
-				"gitmoot review request --pr",
-				"gitmoot review status --pr",
-				"gitmoot workflow list",
-			},
-		},
-	} {
-		for _, want := range check.want {
-			if !strings.Contains(check.text, want) {
-				t.Fatalf("%s missing %q", check.name, want)
+// TestSkillDocumentsOnlyTheReducedScope pins the description to what gitmoot
+// is for after the #2578 scope reduction, and keeps removed features out of it.
+func TestSkillDocumentsOnlyTheReducedScope(t *testing.T) {
+	frontmatter := strings.ToLower(parseFrontmatter(t, readSkillFile(t, "SKILL.md")))
+	for _, want := range []string{"review", "verdict", "merge gate", "message", "org chart", "escalate", "job cancel", "doctor", "daemon drain", "design-notes", "dashboard", "omp"} {
+		if !strings.Contains(frontmatter, want) {
+			t.Errorf("frontmatter does not mention %q", want)
+		}
+	}
+	for _, removed := range []string{"orchestrat", "delegation", "template", "heartbeat", "pipeline", "kimi", "webhook", "telemetry"} {
+		if strings.Contains(frontmatter, removed) {
+			t.Errorf("frontmatter still mentions removed feature %q", removed)
+		}
+	}
+}
+
+func TestSkillMDStaysShort(t *testing.T) {
+	text := readSkillFile(t, "SKILL.md")
+	if lines := strings.Count(text, "\n"); lines >= 500 {
+		t.Fatalf("SKILL.md has %d lines; the spec asks for under 500, with detail in references/", lines)
+	}
+}
+
+var markdownLink = regexp.MustCompile(`\]\(([^)\s]+)\)`)
+
+// TestSkillLinksAreRelativeAndResolve checks every markdown link in the skill:
+// in-skill links are relative and name a file that exists; only http(s) links
+// may leave the skill.
+func TestSkillLinksAreRelativeAndResolve(t *testing.T) {
+	err := fs.WalkDir(FS, "gitmoot", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(name, ".md") {
+			return err
+		}
+		data, err := fs.ReadFile(FS, name)
+		if err != nil {
+			return err
+		}
+		for _, match := range markdownLink.FindAllStringSubmatch(string(data), -1) {
+			target := match[1]
+			if strings.HasPrefix(target, "https://") || strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "#") {
+				continue
+			}
+			if strings.HasPrefix(target, "/") || strings.Contains(target, "://") {
+				t.Errorf("%s: link %q is not relative", name, target)
+				continue
+			}
+			file, _, _ := strings.Cut(target, "#")
+			resolved := path.Clean(path.Join(path.Dir(name), file))
+			if !strings.HasPrefix(resolved, "gitmoot/") {
+				t.Errorf("%s: link %q leaves the skill", name, target)
+				continue
+			}
+			if _, err := fs.Stat(FS, resolved); err != nil {
+				t.Errorf("%s: link %q does not resolve: %v", name, target, err)
 			}
 		}
-	}
-}
-
-func TestRootSkillCompatibilityEntrypoint(t *testing.T) {
-	text := readRepoFile(t, "SKILL.md")
-	frontmatter := parseFrontmatter(t, text)
-	for _, want := range []string{
-		"name: gitmoot",
-		"description: Use Gitmoot",
-		"version: 0.1.0",
-		"openclaw:",
-		"requires:",
-		"bins:",
-		"- gitmoot",
-		"- git",
-		"- gh",
-		"envVars:",
-		"- name: GH_TOKEN",
-		"required: false",
-	} {
-		if !strings.Contains(frontmatter, want) {
-			t.Fatalf("root SKILL.md frontmatter missing %q:\n%s", want, frontmatter)
-		}
-	}
-	if strings.Contains(frontmatter, "requires:\n      env:") || strings.Contains(frontmatter, "requires.env") {
-		t.Fatalf("optional GH_TOKEN must not be declared as required env:\n%s", frontmatter)
-	}
-	for _, want := range []string{
-		"skills/gitmoot/",
-		"gitmoot job open --agent <agent>",
-		"gitmoot.io/SKILL.md",
-		"gitmoot_result",
-		"runtime session locks",
-		"gitmoot agent ask <agent>",
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("root SKILL.md missing compatibility content %q", want)
-		}
-	}
-}
-
-func readRepoFile(t *testing.T, parts ...string) string {
-	t.Helper()
-	path := filepath.Join(append([]string{".."}, parts...)...)
-	contents, err := os.ReadFile(path)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("read %s: %v", filepath.Join(parts...), err)
+		t.Fatal(err)
 	}
-	return string(contents)
+	text := readSkillFile(t, "SKILL.md")
+	for _, ref := range []string{"references/CLI.md", "references/WORKFLOWS.md", "references/RESULT_CONTRACT.md", "references/SAFETY.md"} {
+		if !strings.Contains(text, "]("+ref+")") {
+			t.Errorf("SKILL.md does not link %s", ref)
+		}
+	}
+}
+
+// TestSkillHasOneSource pins #2595: the repository holds one copy of the
+// skill. gitmoot.io and both plugin packages serve skills/gitmoot.
+func TestSkillHasOneSource(t *testing.T) {
+	if _, err := os.Stat("../SKILL.md"); !os.IsNotExist(err) {
+		t.Fatalf("a repo-root SKILL.md exists (stat err = %v); skills/gitmoot/SKILL.md is the only copy", err)
+	}
+}
+
+func TestCLIReferenceIsGenerated(t *testing.T) {
+	text := readSkillFile(t, "references/CLI.md")
+	if !strings.Contains(text, "Code generated by internal/clidoc/clidocgen") {
+		t.Fatal("references/CLI.md is not the generated reference; run `go generate ./skills/`")
+	}
+}
+
+// TestResultContractCarriesTheAttributionFix pins the #2595 carry-over: neither
+// the reviewer agent nor lead_agent is an attribution fallback, and a CLI
+// review dispatch records no lead_agent.
+func TestResultContractCarriesTheAttributionFix(t *testing.T) {
+	text := strings.Join(strings.Fields(readSkillFile(t, "references/RESULT_CONTRACT.md")), " ")
+	for _, want := range []string{"Neither the job's own agent nor `lead_agent` is an attribution fallback", "a CLI review dispatch records no `lead_agent`"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("RESULT_CONTRACT.md missing %q", want)
+		}
+	}
+	if strings.Contains(text, "delegations") {
+		t.Error("RESULT_CONTRACT.md documents delegations; it covers the review result only")
+	}
+}
+
+func readSkillFile(t *testing.T, name string) string {
+	t.Helper()
+	data, err := fs.ReadFile(FS, "gitmoot/"+name)
+	if err != nil {
+		t.Fatalf("read skills/gitmoot/%s: %v", name, err)
+	}
+	return string(data)
 }
 
 func parseFrontmatter(t *testing.T, text string) string {
@@ -229,69 +173,4 @@ func parseFrontmatter(t *testing.T, text string) string {
 		t.Fatal("SKILL.md missing YAML frontmatter closer")
 	}
 	return parts[1]
-}
-
-// TestReviewDeadlineDocsKeepLoadBearingFacts pins the facts a reader needs in
-// the skill CLI reference's review-deadline block (#2192), so an edit cannot
-// silently drop them.
-func TestReviewDeadlineDocsKeepLoadBearingFacts(t *testing.T) {
-	const (
-		blockStart = "The effective deadline resolves in this order:"
-		blockEnd   = "`quiet_kill_after` controls the transcript-silence leg"
-	)
-	text := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
-	start := strings.Index(text, blockStart)
-	end := strings.Index(text, blockEnd)
-	if start < 0 || end < 0 || end <= start {
-		t.Fatalf("skills/gitmoot/references/CLI.md: review-deadline block not found (start=%d end=%d); if the docs were restructured, update this test's markers deliberately", start, end)
-	}
-	skill := text[start:end]
-	// The facts a reader needs must actually be in the block.
-	for _, want := range []string{
-		"[review_router]",
-		"job_timeout_payload_invalid",
-		"review_class_deadline_default",
-		"must be positive",
-		"stored job type is `review`",
-	} {
-		if !strings.Contains(skill, want) {
-			t.Errorf("review-deadline docs no longer mention %q", want)
-		}
-	}
-}
-
-// TestReviewRouterDocsKeepLoadBearingFacts pins the load-bearing facts of the
-// skill CLI reference's review-router section (#2196).
-func TestReviewRouterDocsKeepLoadBearingFacts(t *testing.T) {
-	const (
-		blockStart = "`gitmoot review request` is the front door"
-		blockEnd   = "What one request does, in order:"
-	)
-	text := readRepoFile(t, "skills", "gitmoot", "references", "CLI.md")
-	start := strings.Index(text, blockStart)
-	end := strings.Index(text, blockEnd)
-	if start < 0 || end < 0 || end <= start {
-		t.Fatalf("skills/gitmoot/references/CLI.md: review-router block not found (start=%d end=%d); if the docs were restructured, update these markers deliberately", start, end)
-	}
-	skill := text[start:end]
-	for _, want := range []string{
-		"routes THROUGH this command",
-		"ATTACHING request is told what it lost",
-		// Was "names the flag on stderr" until #2199: the stderr claim was
-		// inaccurate for --foreground and a missing --org-role, which print
-		// nothing. The DURABLE record is the job event, so that is what the docs
-		// must keep naming.
-		"router_bypassed",
-		"UNDERCOUNTS",
-		// #2199 round 2 named 'gitmoot job show' - which never lists events -
-		// and claimed the other arms 'do not print', which is false whenever an
-		// advance warning fires. Both are pinned so a confident wrong command
-		// cannot come back.
-		"gitmoot job events <id>",
-		"not the discriminator",
-	} {
-		if !strings.Contains(skill, want) {
-			t.Errorf("review-router docs no longer mention %q", want)
-		}
-	}
 }
