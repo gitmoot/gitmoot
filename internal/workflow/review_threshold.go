@@ -46,11 +46,10 @@ func effectiveReviewDecision(result *AgentResult, blockingSeverity string) strin
 	return decision
 }
 
-// effectiveReviewDecisionForPayload is the single authority for turning a stored
-// review payload into the decision gitmoot acts on.
-func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity string) string {
-	return effectiveReviewDecision(payload.Result, blockingSeverity)
-}
+// HistoricalFanOutDecision replaces the decision of a stored #1685 coordinator
+// announcement when unmarshalPayload decodes it. It is not a verdict, so every
+// decision reader treats the row as an abstention.
+const HistoricalFanOutDecision = "fan-out"
 
 // recordsApprovedWithNotes reports whether a stored review earns the durable
 // ReviewApprovedWithNotesEventKind outcome: a raw changes_requested verdict
@@ -61,7 +60,7 @@ func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity stri
 func recordsApprovedWithNotes(payload JobPayload, blockingSeverity string) bool {
 	return payload.Result != nil && payload.Result.Decision == "changes_requested" &&
 		reviewPartOf(payload) == "" &&
-		effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved"
+		effectiveReviewDecision(payload.Result, blockingSeverity) == "approved"
 }
 
 // effectiveDelegationDecision applies repository review policy only to

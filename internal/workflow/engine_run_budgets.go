@@ -274,8 +274,8 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 // event history contradicting those surfaces.
 //
 // It is called once at the TOP of AdvanceJob rather than at any point inside it.
-// Fan-out reviews are excluded for free: effectiveReviewDecisionForPayload
-// keeps their verdict raw, so they never reach "approved" here. blocked/failed are
+// Historical fan-out announcements are excluded for free: unmarshalPayload
+// replaces their decision with HistoricalFanOutDecision, so they never reach "approved" here. blocked/failed are
 // excluded by the changes_requested test, and a part verdict by
 // recordsApprovedWithNotes (#2373). AddJobEventIfAbsent makes every replay,
 // re-advance and stale round idempotent.
@@ -635,7 +635,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		}
 		// Folding through the payload authority keeps fan-out exclusion and the
 		// severity bar in one place.
-		effectiveDecision = effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+		effectiveDecision = effectiveReviewDecision(payload.Result, e.reviewBlockingSeverity(payload.Repo))
 		// THE #1822 LEDGER'S PRODUCTION WRITER (#1850 review F1). This is the only
 		// place a review's findings become ledger observations, and without it the
 		// entire feature was inert at runtime: every guard passed against a table

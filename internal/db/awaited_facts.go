@@ -368,9 +368,12 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 			// returns a bare false, so a row skipped for want of a head is
 			// indistinguishable there from malformed junk. It is deliberately not
 			// loosened: its job is to decide whether a row IS a verdict.
+			//
+			// This uses the package's own decode and isFanOut rather than
+			// re-stating their conditions, so it adds no second copy of that rule.
 			var decoded reviewVerdictPayload
 			if err := json.Unmarshal([]byte(payload), &decoded); err == nil &&
-				decoded.Result != nil &&
+				decoded.Result != nil && !decoded.isFanOut() &&
 				decoded.Repo != "" && decoded.PullRequest > 0 &&
 				strings.TrimSpace(decoded.HeadSHA) == "" {
 				skipped = append(skipped, HeadlessReviewSkip{JobID: jobID, ExternallyDriven: externallyDriven})
@@ -446,6 +449,12 @@ type reviewVerdictPayload struct {
 	Result        *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
+		// Delegations and FanOut mark a stored coordinator announcement (#1685,
+		// retired by #2588): it carries decision "approved" and is not a verdict.
+		// No new result carries either, but stored rows still do, sometimes
+		// FanOut without the delegations.
+		Delegations []json.RawMessage `json:"delegations"`
+		FanOut      bool              `json:"fan_out,omitempty"`
 		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
 		// woken seat learns what the verdict rests on without a second lookup.
 		Findings []reviewVerdictFinding `json:"findings"`
@@ -459,6 +468,22 @@ type reviewVerdictPayload struct {
 	// PostMergeReview marks a review of an already-merged head (#2265); it
 	// answers only post-merge waiters for its purpose.
 	PostMergeReview bool `json:"post_merge_review"`
+}
+
+// isFanOut reports whether a stored review result is a historical coordinator
+// announcement rather than a verdict. workflow.unmarshalPayload applies the same
+// rule at its own decode boundary; it cannot be shared because workflow depends
+// on db and never the reverse.
+func (p reviewVerdictPayload) isFanOut() bool {
+	if p.Result == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Result.Decision)) {
+	case "approved", "changes_requested":
+	default:
+		return false
+	}
+	return len(p.Result.Delegations) > 0 || p.Result.FanOut
 }
 
 type SucceededReviewVerdict struct {
@@ -604,6 +629,12 @@ ORDER BY updated_at DESC, id DESC`, repo, pullRequest)
 		if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
 			continue
 		}
+		if decoded.isFanOut() {
+			// A coordinator announcement is not a verdict, so it must not enter
+			// same-head verdict history: doing so let a fan-out suppress the
+			// legitimate retry that would have produced a real one (#1685).
+			continue
+		}
 		decision := strings.ToLower(strings.TrimSpace(decoded.Result.Decision))
 		if decision != "approved" && decision != "changes_requested" {
 			continue
@@ -692,6 +723,11 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	}
 	var decoded reviewVerdictPayload
 	if err := json.Unmarshal([]byte(payload), &decoded); err != nil || decoded.Result == nil {
+		return reviewVerdictObservation{}, false
+	}
+	if decoded.isFanOut() {
+		// Waking a waiter with "review verdict approved" because a coordinator
+		// announced a panel reports an answer nobody gave (#1685).
 		return reviewVerdictObservation{}, false
 	}
 	decoded.Repo = strings.ToLower(strings.TrimSpace(decoded.Repo))
@@ -839,7 +875,7 @@ ORDER BY id`, append([]any{AwaitedFactSubjectReviewVerdict}, keys...)...)
 		strings.TrimSpace(jobID), state,
 	)
 	if decoded.Result != nil {
-		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" {
+		if decision := strings.TrimSpace(decoded.Result.Decision); decision != "" && !decoded.isFanOut() {
 			detail = fmt.Sprintf(
 				"review job %s %s carrying verdict %s at head %s; the awaited fact remains unresolved because the job did not reach succeeded — inspect with gitmoot job show %s",
 				strings.TrimSpace(jobID), state, decision, decoded.HeadSHA, strings.TrimSpace(jobID),

@@ -2061,9 +2061,28 @@ func unmarshalPayload(value string) (JobPayload, error) {
 		PresetID             string `json:"preset_id"`
 		PresetResolvedCommit string `json:"preset_resolved_commit"`
 		PresetContent        string `json:"preset_content"`
+		// Result carries the #1685 coordinator-announcement marks. No new
+		// result carries either (#2588), but stored review rows still do,
+		// sometimes fan_out without the delegations.
+		Result *struct {
+			Delegations []json.RawMessage `json:"delegations"`
+			FanOut      bool              `json:"fan_out"`
+		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(value), &legacy); err != nil {
 		return JobPayload{}, fmt.Errorf("parse legacy job payload: %w", err)
+	}
+	// A stored coordinator announcement says "approved" (or
+	// "changes_requested") about a panel it only dispatched; it is not a
+	// verdict. Every reader decodes stored rows here, so the decision is
+	// replaced with HistoricalFanOutDecision once, at this boundary: the merge
+	// gate, required-reviewer slots, objection supersession and verdict history
+	// then treat the row as an abstention instead of an answer.
+	if payload.Result != nil && legacy.Result != nil && (len(legacy.Result.Delegations) > 0 || legacy.Result.FanOut) {
+		switch strings.ToLower(strings.TrimSpace(payload.Result.Decision)) {
+		case "approved", "changes_requested":
+			payload.Result.Decision = HistoricalFanOutDecision
+		}
 	}
 	if payload.TemplateID == "" {
 		payload.TemplateID = legacy.PresetID

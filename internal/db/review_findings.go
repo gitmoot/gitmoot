@@ -156,7 +156,7 @@ var (
 	//
 	// REFUSING DOES NOT DROP A BLOCK, which is the property that makes refusal
 	// safe for a P0 (PHOBOS's condition on this slice). The merge gate blocks on
-	// the review's VERDICT - effectiveReviewDecisionForPayload reads
+	// the review's VERDICT - effectiveReviewDecision reads
 	// Result.Decision and Result.Severity - not on ledger rows, so a
 	// changes_requested P0 review whose every finding was refused still refuses
 	// the head. Measured by probe: the gate returned "review at evaluated head has

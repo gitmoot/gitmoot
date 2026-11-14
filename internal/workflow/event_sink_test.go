@@ -257,7 +257,7 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 // IT NOW ASSERTS BOTH HALVES, which is what the old version could not
 // distinguish and why the defect hid behind it:
 //   - the GATE transform is unchanged. A sub-threshold changes_requested still
-//     resolves to "approved" through effectiveReviewDecisionForPayload, because
+//     resolves to "approved" through effectiveReviewDecision, because
 //     a below-bar finding must not block a merge. That is correct and untouched
 //     by #1945; review_threshold.go is not modified.
 //   - the WAKE announces the RECORDED reviewer decision, because a human
@@ -291,7 +291,7 @@ func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) 
 
 	// HALF ONE, the gate: still folds below the bar. If this ever stops being
 	// "approved" the merge gate's behaviour changed, which is NOT this issue.
-	if got := effectiveReviewDecisionForPayload(payload, reviewseverity.P1); got != "approved" {
+	if got := effectiveReviewDecision(payload.Result, reviewseverity.P1); got != "approved" {
 		t.Fatalf("gate decision for a sub-threshold verdict = %q, want approved; review_threshold.go must be unchanged by #1945", got)
 	}
 

@@ -125,7 +125,7 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {
+		if effectiveReviewDecision(jobPayload.Result, blockingSeverity) == "approved" {
 			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
 	}
@@ -289,7 +289,7 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		if !sameTask(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) != "changes_requested" {
+		if effectiveReviewDecision(jobPayload.Result, blockingSeverity) != "changes_requested" {
 			continue
 		}
 		// Only an objection AT THE CURRENT HEAD can block: by here the approving

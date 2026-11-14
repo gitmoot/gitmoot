@@ -184,7 +184,7 @@ func (e Engine) mailbox() Mailbox {
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
 			job, jobErr := e.Store.GetJob(ctx, jobID)
 			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
-				decision := effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+				decision := effectiveReviewDecision(payload.Result, e.reviewBlockingSeverity(payload.Repo))
 				if decision == "approved" || decision == "changes_requested" {
 					owner := ""
 					resolved, resolveErr := e.Store.ResolvePullRequestOwner(

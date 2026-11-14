@@ -1132,7 +1132,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if review.payload.Result == nil {
 			continue
 		}
-		switch effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) {
+		switch effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity) {
 		case "changes_requested", "blocked", "failed":
 			// Named through the resolver: a role-authored objection rendered
 			// "blocking result from " with no author, which is the line an operator
@@ -1253,7 +1253,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if isIntegrationWorktreeReview(review.payload) {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity) != "changes_requested" {
+		if effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity) != "changes_requested" {
 			continue
 		}
 		// IDENTITY IS AGENT-OR-ROLE, NOT AGENT ALONE, and reading it from job.Agent
@@ -1353,7 +1353,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			if review.payload.Result == nil {
 				return fmt.Errorf("abstaining reviewer %s at evaluated head has no recognized decision (job %s); dispatch a fresh review for that same agent at this head, or push a new head. Reassigning to a different agent cannot clear this reviewer's slot", reviewer, review.job.ID)
 			}
-			decision := effectiveReviewDecisionForPayload(review.payload, request.ReviewBlockingSeverity)
+			decision := effectiveReviewDecision(review.payload.Result, request.ReviewBlockingSeverity)
 			if decision == "approved" && reviewPartOf(review.payload) != "" {
 				// A part of a split review (#2372) reviewed a slice of this head,
 				// not the head: it can never approve the merge. Its objections
@@ -1434,7 +1434,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 		if _, superseded := supersededReviewIDs[job.ID]; superseded {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
+		if effectiveReviewDecision(payload.Result, request.ReviewBlockingSeverity) == "approved" {
 			assessment, err := g.assessReviewAuthor(ctx, job, payload, implementingAgents, missingImplementerReason)
 			if err != nil {
 				return err
@@ -1455,7 +1455,7 @@ func (g PolicyMergeGate) ensureFinalReviewCaptured(ctx context.Context, request 
 			}
 			return err
 		}
-		switch effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) {
+		switch effectiveReviewDecision(payload.Result, request.ReviewBlockingSeverity) {
 		case "approved":
 			// A part of a split review (#2372) can never approve the head.
 			if reviewPartOf(payload) != "" {
@@ -1992,7 +1992,7 @@ func (g PolicyMergeGate) ensureReviewMatchesHead(ctx context.Context, request Me
 		return nil
 	}
 	if reviewHead != "" {
-		if g.GitHub != nil && effectiveReviewDecisionForPayload(payload, request.ReviewBlockingSeverity) == "approved" {
+		if g.GitHub != nil && effectiveReviewDecision(payload.Result, request.ReviewBlockingSeverity) == "approved" {
 			if repo, err := parseRepoFullName(request.Repo); err == nil {
 				if comparison, compareErr := g.GitHub.CompareCommits(ctx, repo, reviewHead, headSHA); compareErr == nil && strings.EqualFold(strings.TrimSpace(comparison.Status), "ahead") {
 					return fmt.Errorf(

@@ -76,7 +76,7 @@ func RenderJobResultComment(comment JobResultComment) string {
 		writeScalar(&builder, "Severity", "`"+markdownInline(comment.Result.Severity)+"`")
 	}
 	if comment.Result != nil && strings.EqualFold(strings.TrimSpace(comment.JobType), "review") {
-		effective := effectiveReviewDecisionForPayload(commentReviewPayload(comment), comment.ReviewBlockingSeverity)
+		effective := effectiveReviewDecision(commentReviewPayload(comment).Result, comment.ReviewBlockingSeverity)
 		rawDecision := strings.TrimSpace(comment.Result.Decision)
 		if strings.EqualFold(rawDecision, "changes_requested") &&
 			strings.EqualFold(strings.TrimSpace(effective), "approved") {

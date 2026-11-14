@@ -16,7 +16,7 @@ import (
 // costs the itemised obligation and NOT the merge block.
 //
 // It is safe, and this is why: the merge gate reads the review's VERDICT, not
-// the ledger. effectiveReviewDecisionForPayload takes Result.Decision and
+// the ledger. effectiveReviewDecision takes Result.Decision and
 // Result.Severity, so a changes_requested P0 review whose every finding was
 // refused still refuses the head. This test exists because that is an invariant
 // of a DIFFERENT file than the one #1968 changes, so nothing else would notice
