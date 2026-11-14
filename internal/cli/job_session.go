@@ -58,12 +58,12 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	parentJobID := fs.String("parent-run", "", "optional existing parent run id")
 	pr := fs.Int("pr", 0, "optional pull request number")
 	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)")
-	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
+	workflowID := fs.String("campaign", "", "campaign label")
 	jsonOutput := fs.Bool("json", false, "print the created run as JSON")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -81,8 +81,8 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "run open requires --implementer and --repo")
 		return 2
 	}
-	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
-		fmt.Fprintln(stderr, "run open: --workflow requires a non-blank value")
+	if flagWasSupplied(fs, "campaign") && strings.TrimSpace(*workflowID) == "" {
+		fmt.Fprintln(stderr, "run open: --campaign requires a non-blank value")
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {

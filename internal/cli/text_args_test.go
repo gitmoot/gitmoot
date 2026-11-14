@@ -45,10 +45,10 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 		args func(help string) []string
 		want string
 	}{
-		{"workflow-note", func(h string) []string { return []string{"workflow", "note", "wf-1", h} }, "workflow note"},
-		{"workflow-describe", func(h string) []string { return []string{"workflow", "describe", "wf-1", h} }, "workflow describe"},
-		{"workflow-register", func(h string) []string { return []string{"workflow", "register", "wf-1", h} }, "workflow register"},
-		{"workflow-close", func(h string) []string { return []string{"workflow", "close", "wf-1", "--reason", h} }, "workflow close"},
+		{"note-add", func(h string) []string { return []string{"note", "add", "wf-1", h} }, "note add"},
+		{"campaign-describe", func(h string) []string { return []string{"campaign", "describe", "wf-1", h} }, "campaign describe"},
+		{"campaign-register", func(h string) []string { return []string{"campaign", "register", "wf-1", h} }, "campaign register"},
+		{"campaign-close", func(h string) []string { return []string{"campaign", "close", "wf-1", "--reason", h} }, "campaign close"},
 		{"pr-successor", func(h string) []string { return []string{"pr", "successor", "t-1", "--reason", h} }, "pr successor"},
 		{"job-open", func(h string) []string {
 			return []string{"run", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", h}
@@ -95,11 +95,11 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 // it is refused before anything is stored.
 func TestFreeTextCommandsRefuseFlagLikeText(t *testing.T) {
 	for _, args := range [][]string{
-		{"workflow", "note", "wf-1", "-x"},
-		{"workflow", "note", "wf-1", "checked the build", "--summary", "--urgent"},
-		{"workflow", "describe", "wf-1", "-x"},
-		{"workflow", "register", "wf-1", "-x"},
-		{"workflow", "close", "wf-1", "--reason", "-x"},
+		{"note", "add", "wf-1", "-x"},
+		{"note", "add", "wf-1", "checked the build", "--summary", "--urgent"},
+		{"campaign", "describe", "wf-1", "-x"},
+		{"campaign", "register", "wf-1", "-x"},
+		{"campaign", "close", "wf-1", "--reason", "-x"},
 		{"pr", "successor", "t-1", "--reason", "-x"},
 		{"run", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
 		{"run", "close", "job-1", "--decision", "approve", "--summary", "-x"},

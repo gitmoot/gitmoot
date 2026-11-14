@@ -104,7 +104,7 @@ func TestWorkflowFlagParsesOnAllAgentVerbs(t *testing.T) {
 		},
 	} {
 		var stderr bytes.Buffer
-		if parse(&stderr) || !strings.Contains(stderr.String(), "invalid workflow id") {
+		if parse(&stderr) || !strings.Contains(stderr.String(), "invalid campaign label") {
 			t.Fatalf("invalid workflow parse: %q", stderr.String())
 		}
 	}
@@ -137,7 +137,7 @@ func TestMergeWorkflowTimelineDeterministicKindAndIDTieBreak(t *testing.T) {
 	jobs := []db.Job{{ID: "b", CreatedAt: "2026-01-01 00:00:00"}, {ID: "a", CreatedAt: "2026-01-01 00:00:00"}}
 	notes := []db.WorkflowNote{{ID: 10, CreatedAt: "2026-01-01 00:00:00"}, {ID: 9, CreatedAt: "2026-01-01 00:00:00"}}
 	entries := mergeWorkflowTimeline(jobs, notes)
-	want := []string{"job:a", "job:b", "note:9", "note:10"}
+	want := []string{"run:a", "run:b", "note:9", "note:10"}
 	for i, entry := range entries {
 		if got := entry.Kind + ":" + entry.ID; got != want[i] {
 			t.Fatalf("entries[%d] = %q, want %q", i, got, want[i])
@@ -230,7 +230,7 @@ func TestLoadWorkflowShowNotFoundWinsWhenWorkflowCreatedMidCall(t *testing.T) {
 	wrapped := &workflowShowMidCallCreateStore{Store: store}
 
 	_, err := loadWorkflowShow(ctx, wrapped, workflowID, 4)
-	if err == nil || err.Error() != `workflow "release/mid-call" not found` {
+	if err == nil || err.Error() != `campaign "release/mid-call" not found` {
 		t.Fatalf("loadWorkflowShow error = %v, want clean not-found error", err)
 	}
 	if !wrapped.created {
@@ -334,7 +334,7 @@ func TestWorkflowShowClampsStaleSummaryTotalAfterPostSummaryInsert(t *testing.T)
 	if got := strings.Count(text, "\tnote\t"); got != 2 {
 		t.Fatalf("shown note rows = %d, want 2; output=%q", got, text)
 	}
-	wantNotice := "workflow show: showing the latest 2 of 3 entries (0 jobs, 3 notes); pass --limit 0 for all or a larger --limit N\n"
+	wantNotice := "campaign show: showing the latest 2 of 3 entries (0 runs, 3 notes); pass --limit 0 for all or a larger --limit N\n"
 	if notice != wantNotice {
 		t.Fatalf("stale-summary truncation notice = %q, want %q", notice, wantNotice)
 	}
@@ -419,14 +419,14 @@ func TestWorkflowShowKeepsNewestEntriesAndReportsTextTruncation(t *testing.T) {
 		t.Fatalf("workflow show exit=%d stderr=%q", code, stderr.String())
 	}
 	text := stdout.String()
-	if strings.Contains(text, "\tjob\tjob-oldest\t") || strings.Contains(text, "\toperator\tnote-oldest\n") {
+	if strings.Contains(text, "\trun\tjob-oldest\t") || strings.Contains(text, "\toperator\tnote-oldest\n") {
 		t.Fatalf("oldest entries were not truncated: %q", text)
 	}
 	if !strings.Contains(text, "\tnote\t") || !strings.Contains(text, "note-latest") ||
-		!strings.Contains(text, "jobs: 3\nnotes: 3\n") {
+		!strings.Contains(text, "runs: 3\nnotes: 3\n") {
 		t.Fatalf("newest entry or summary counts missing: %q", text)
 	}
-	if got := stderr.String(); !strings.Contains(got, "showing the latest 3 of 6 entries (3 jobs, 3 notes)") ||
+	if got := stderr.String(); !strings.Contains(got, "showing the latest 3 of 6 entries (3 runs, 3 notes)") ||
 		!strings.Contains(got, "pass --limit 0 for all") {
 		t.Fatalf("truncation notice = %q", got)
 	}
@@ -436,7 +436,7 @@ func TestWorkflowShowKeepsNewestEntriesAndReportsTextTruncation(t *testing.T) {
 	if code := runWorkflowShow([]string{"release-recency", "--home", home, "--limit", "0"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("workflow show --limit 0 exit=%d stderr=%q", code, stderr.String())
 	}
-	if got := strings.Count(stdout.String(), "\tjob\t") + strings.Count(stdout.String(), "\tnote\t"); got != 6 {
+	if got := strings.Count(stdout.String(), "\trun\t") + strings.Count(stdout.String(), "\tnote\t"); got != 6 {
 		t.Fatalf("--limit 0 row count = %d, want 6; output=%q", got, stdout.String())
 	}
 	if stderr.Len() != 0 {
@@ -470,7 +470,7 @@ func TestWorkflowShowJSONAnnouncesOnlyActualTruncation(t *testing.T) {
 		t.Fatalf("decode truncated JSON: %v raw=%s", err, stdout.String())
 	}
 	if !out.Truncated || len(out.Entries) != 3 ||
-		out.Summary.JobCount+out.Summary.NoteCount != 6 {
+		out.Summary.RunCount+out.Summary.NoteCount != 6 {
 		t.Fatalf("truncated JSON = %+v", out)
 	}
 	var raw map[string]json.RawMessage
@@ -570,15 +570,15 @@ func TestWorkflowShowDefaultLimitWithAsymmetricSources(t *testing.T) {
 		t.Fatalf("decode JSON: %v raw=%s", err, stdout.String())
 	}
 	if !out.Truncated || len(out.Entries) != 100 ||
-		out.Summary.JobCount != 105 || out.Summary.NoteCount != 3 {
+		out.Summary.RunCount != 105 || out.Summary.NoteCount != 3 {
 		t.Fatalf("asymmetric output: truncated=%v entries=%d summary=%+v", out.Truncated, len(out.Entries), out.Summary)
 	}
 	seen := make(map[string]bool, len(out.Entries))
 	for _, entry := range out.Entries {
 		seen[entry.Kind+":"+entry.ID] = true
 	}
-	if seen["job:job-007"] || !seen["job:job-008"] {
-		t.Fatalf("wrong job recency boundary: job-007=%v job-008=%v", seen["job:job-007"], seen["job:job-008"])
+	if seen["run:job-007"] || !seen["run:job-008"] {
+		t.Fatalf("wrong job recency boundary: job-007=%v job-008=%v", seen["run:job-007"], seen["run:job-008"])
 	}
 	for i, id := range noteIDs {
 		if !seen["note:"+fmt.Sprintf("%d", id)] {
@@ -594,8 +594,8 @@ func TestWorkflowNotePersistsNamespacedCoordinatorMetadata(t *testing.T) {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := runWorkflowJournal([]string{
-		"note", "fable/dashboard-redesign", "Coordinator handoff.",
+	code := runNote([]string{
+		"add", "fable/dashboard-redesign", "Coordinator handoff.",
 		"--author", "fable", "--pane", "wave-2", "--session", "session-123",
 		"--workdir", "/work/dashboard", "--home", home,
 	}, &stdout, &stderr)
@@ -626,7 +626,7 @@ func TestWorkflowNoteAutoDetectsHerdrCoordinatorIdentity(t *testing.T) {
 	t.Setenv("HERDR_SOCKET_PATH", "")
 
 	var stdout, stderr bytes.Buffer
-	code := runWorkflowJournal([]string{"note", "fable/auto", "Coordinator detected.", "--home", home}, &stdout, &stderr)
+	code := runNote([]string{"add", "fable/auto", "Coordinator detected.", "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
 	}
@@ -683,10 +683,10 @@ func TestWorkflowNoteExplicitCoordinatorFlagsWinAndNoAutoSkips(t *testing.T) {
 			logPath := installWorkflowHerdrStub(t, workflowHerdrJSON("auto-pane", "pane-id", "/auto", "", workflowCoordinatorTestSession), 0, "")
 			t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
 			t.Setenv("HERDR_ENV", "")
-			args := []string{"note", "fable/override", "Explicit metadata.", "--home", home}
+			args := []string{"add", "fable/override", "Explicit metadata.", "--home", home}
 			args = append(args, tc.extra...)
 			var stdout, stderr bytes.Buffer
-			if code := runWorkflowJournal(args, &stdout, &stderr); code != 0 {
+			if code := runNote(args, &stdout, &stderr); code != 0 {
 				t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
 			}
 			meta, err := store.GetWorkflowMeta(ctx, "fable/override")
@@ -734,7 +734,7 @@ func TestWorkflowNoteHerdrDetectionFailsOpen(t *testing.T) {
 			}
 			t.Setenv("HERDR_ENV", "")
 			var stdout, stderr bytes.Buffer
-			if code := runWorkflowJournal([]string{"note", "fable/fail-open", "Still succeeds.", "--home", home}, &stdout, &stderr); code != 0 {
+			if code := runNote([]string{"add", "fable/fail-open", "Still succeeds.", "--home", home}, &stdout, &stderr); code != 0 {
 				t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
 			}
 			meta, err := store.GetWorkflowMeta(ctx, "fable/fail-open")
@@ -760,7 +760,7 @@ func TestWorkflowNoteHerdrDetectionTimeoutIsBounded(t *testing.T) {
 
 	started := time.Now()
 	var stdout, stderr bytes.Buffer
-	if code := runWorkflowJournal([]string{"note", "fable/timeout", "Timeout is fail-open.", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := runNote([]string{"add", "fable/timeout", "Timeout is fail-open.", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
 	}
 	if elapsed := time.Since(started); elapsed > workflowHerdrLookupTimeout+1500*time.Millisecond {
@@ -830,19 +830,19 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 	if err := store.CreateJob(ctx, db.Job{ID: "summary-job", Agent: "coord", Type: "ask", State: "running", Payload: `{"repo":"acme/widget","workflow_id":"fable/dashboard-redesign"}`}); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
-	runNote := func(body string, extra ...string) int {
+	addNote := func(body string, extra ...string) int {
 		t.Helper()
-		args := []string{"note", workflowID, body, "--author", "coord", "--home", home}
+		args := []string{"add", workflowID, body, "--author", "coord", "--home", home}
 		args = append(args, extra...)
 		var stdout, stderr bytes.Buffer
-		code := runWorkflowJournal(args, &stdout, &stderr)
+		code := runNote(args, &stdout, &stderr)
 		if code != 0 {
 			t.Fatalf("workflow note %q exit=%d stderr=%q", body, code, stderr.String())
 		}
 		return code
 	}
 
-	runNote("kickoff", "--summary", "Ship the dashboard redesign.", "--status", "active")
+	addNote("kickoff", "--summary", "Ship the dashboard redesign.", "--status", "active")
 	meta, err := store.GetWorkflowMeta(ctx, workflowID)
 	if err != nil || meta.Summary != "Ship the dashboard redesign." || meta.Description != meta.Summary || meta.Status != "active" {
 		t.Fatalf("metadata after set = %+v, err=%v", meta, err)
@@ -857,13 +857,13 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 		t.Fatalf("workflow show missing metadata headers: %q", stdout.String())
 	}
 
-	runNote("progress")
+	addNote("progress")
 	meta, err = store.GetWorkflowMeta(ctx, workflowID)
 	if err != nil || meta.Description != "Ship the dashboard redesign." || meta.Status != "active" {
 		t.Fatalf("metadata after absent flags = %+v, err=%v", meta, err)
 	}
 
-	runNote("clear", "--summary", "", "--status", "")
+	addNote("clear", "--summary", "", "--status", "")
 	meta, err = store.GetWorkflowMeta(ctx, workflowID)
 	if err != nil || meta.Summary != "" || meta.Description != "" || meta.Status != "" {
 		t.Fatalf("metadata after clear = %+v, err=%v", meta, err)
@@ -871,26 +871,26 @@ func TestWorkflowNoteDescriptionStatusSetPreserveClearAndLimit(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code := runWorkflowJournal([]string{
-		"note", workflowID, "too long", "--summary", strings.Repeat("x", workflowSummaryMax+1), "--home", home,
+	code := runNote([]string{
+		"add", workflowID, "too long", "--summary", strings.Repeat("x", workflowSummaryMax+1), "--home", home,
 	}, &stdout, &stderr)
-	if code != 2 || !strings.Contains(stderr.String(), "workflow note summary must be at most 300 bytes") {
+	if code != 2 || !strings.Contains(stderr.String(), "note summary must be at most 300 bytes") {
 		t.Fatalf("over-length summary exit=%d stderr=%q", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = runWorkflowJournal([]string{
-		"note", workflowID, "too long", "--status", strings.Repeat("x", workflowSummaryMax+1), "--home", home,
+	code = runNote([]string{
+		"add", workflowID, "too long", "--status", strings.Repeat("x", workflowSummaryMax+1), "--home", home,
 	}, &stdout, &stderr)
-	if code != 2 || !strings.Contains(stderr.String(), "workflow note status must be at most 300 bytes") {
+	if code != 2 || !strings.Contains(stderr.String(), "note status must be at most 300 bytes") {
 		t.Fatalf("over-length status exit=%d stderr=%q", code, stderr.String())
 	}
 
 	stdout.Reset()
 	stderr.Reset()
-	code = runWorkflowJournal([]string{
-		"note", workflowID, "bad status", "--status", "Implementation started", "--home", home,
+	code = runNote([]string{
+		"add", workflowID, "bad status", "--status", "Implementation started", "--home", home,
 	}, &stdout, &stderr)
 	if code != 2 || !strings.Contains(stderr.String(), "active, blocked, ready_to_merge, done, settled, parked") {
 		t.Fatalf("invalid status exit=%d stderr=%q", code, stderr.String())
@@ -926,7 +926,7 @@ func TestWorkflowCloseReasonJSONAndUnknownLabel(t *testing.T) {
 	stdout.Reset()
 	stderr.Reset()
 	code = runWorkflowJournal([]string{"close", "release/missing", "--home", home}, &stdout, &stderr)
-	if code != 1 || !strings.Contains(stderr.String(), `workflow "release/missing" not found`) {
+	if code != 1 || !strings.Contains(stderr.String(), `campaign "release/missing" not found`) {
 		t.Fatalf("unknown close exit=%d stderr=%q", code, stderr.String())
 	}
 }
@@ -947,8 +947,8 @@ func TestWorkflowNoteExplicitStatusBypassesReopen(t *testing.T) {
 		t.Fatalf("seed settled: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := runWorkflowJournal([]string{
-		"note", label, "operator block", "--status", "blocked", "--no-auto", "--home", home,
+	code := runNote([]string{
+		"add", label, "operator block", "--status", "blocked", "--no-auto", "--home", home,
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
@@ -985,8 +985,8 @@ func TestWorkflowNoteWithoutStatusReopensDoneWorkflow(t *testing.T) {
 	}
 	const body = "follow-up note\nkept verbatim"
 	var stdout, stderr bytes.Buffer
-	code := runWorkflowJournal([]string{
-		"note", label, body, "--author", "operator", "--no-auto", "--home", home,
+	code := runNote([]string{
+		"add", label, body, "--author", "operator", "--no-auto", "--home", home,
 	}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("workflow note exit=%d stderr=%q", code, stderr.String())
@@ -1044,7 +1044,7 @@ func TestJobListWorkflowFilterUsesGroupMembership(t *testing.T) {
 		}
 	}
 	var stdout, stderr bytes.Buffer
-	if code := runJobList([]string{"--home", home, "--workflow", "release-42", "--repo", "acme/widget", "--json"}, &stdout, &stderr); code != 0 {
+	if code := runJobList([]string{"--home", home, "--campaign", "release-42", "--repo", "acme/widget", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit=%d stderr=%q", code, stderr.String())
 	}
 	var entries []jobListEntry
@@ -1065,7 +1065,7 @@ func TestWorkflowJobListBlockedProjectionKeepsReasonDetail(t *testing.T) {
 		t.Fatalf("AddJobEvent: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := runJobList([]string{"--home", home, "--workflow", "release-42", "--json"}, &stdout, &stderr); code != 0 {
+	if code := runJobList([]string{"--home", home, "--campaign", "release-42", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit=%d stderr=%q", code, stderr.String())
 	}
 	var entries []jobListEntry
@@ -1110,7 +1110,7 @@ func TestWorkflowShowTextSanitizesButJSONStaysVerbatim(t *testing.T) {
 	var got *db.WorkflowNote
 	for _, entry := range out.Entries {
 		if entry.Note != nil {
-			got = entry.Note
+			got = &entry.Note.WorkflowNote
 		}
 	}
 	if got == nil || got.Author != author || got.Body != body {
@@ -1159,7 +1159,7 @@ func TestWorkflowShowNotePrintsTheWholeBody(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := runWorkflowJournal([]string{"show-note", fmt.Sprint(note.ID), "--home", home}, &stdout, &stderr)
+	code := runNote([]string{"show", fmt.Sprint(note.ID), "--home", home}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("plain show-note code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
@@ -1181,7 +1181,7 @@ func TestWorkflowShowNotePrintsTheWholeBody(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := runWorkflowJournal([]string{"show-note", fmt.Sprint(unsafe.ID), "--home", home}, &stdout, &stderr); code != 0 {
+	if code := runNote([]string{"show", fmt.Sprint(unsafe.ID), "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("scrub show-note code=%d err=%q", code, stderr.String())
 	}
 	if strings.ContainsRune(stdout.String(), 0x1b) || strings.ContainsRune(stdout.String(), 0x07) {
@@ -1195,7 +1195,7 @@ func TestWorkflowShowNotePrintsTheWholeBody(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	code = runWorkflowJournal([]string{"show-note", fmt.Sprint(note.ID), "--home", home, "--json"}, &stdout, &stderr)
+	code = runNote([]string{"show", fmt.Sprint(note.ID), "--home", home, "--json"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("JSON show-note code=%d out=%q err=%q", code, stdout.String(), stderr.String())
 	}
@@ -1231,8 +1231,8 @@ func TestWorkflowNoteRepoColumnScopesTheGateWindow(t *testing.T) {
 	// property to pin is REACHABILITY under a differently-cased query, not a
 	// canonical form. An earlier draft of this test asserted lowercasing, which
 	// would have contradicted the store's own design.
-	code := runWorkflowJournal([]string{
-		"note", "acme/mode", "[operating-mode focus] repo=acme/widget",
+	code := runNote([]string{
+		"add", "acme/mode", "[operating-mode focus] repo=acme/widget",
 		"--author", "coord", "--repo", "ACME/Widget", "--home", home,
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -1258,8 +1258,8 @@ func TestWorkflowNoteRepoColumnScopesTheGateWindow(t *testing.T) {
 	// sits in neither window.
 	stdout.Reset()
 	stderr.Reset()
-	if code := runWorkflowJournal([]string{
-		"note", "acme/mode", "second note", "--author", "coord", "--repo", "not-a-repo", "--home", home,
+	if code := runNote([]string{
+		"add", "acme/mode", "second note", "--author", "coord", "--repo", "not-a-repo", "--home", home,
 	}, &stdout, &stderr); code != 2 {
 		t.Fatalf("malformed --repo exit=%d, want 2; stderr=%q", code, stderr.String())
 	}

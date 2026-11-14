@@ -160,16 +160,16 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
+	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued runs). Omit to supervise ALL enabled registered repos")
 	var session string
-	fs.StringVar(&session, "session", "", "scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)")
+	fs.StringVar(&session, "session", "", "scope the daemon worker to one run id (and runs whose payload names it as root_job_id)")
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
 	dryRun := fs.Bool("dry-run", false, "run without mutating external systems")
-	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to jobs (#389)")
-	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
-	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
+	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to runs (#389)")
+	scheduler := fs.String("scheduler", "barrier", "queued-run scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
+	parallel := fs.Int("parallel", 0, "process runs in parallel: sets --workers N and --scheduler pool together (#444)")
 	pprofAddr := fs.String("pprof-addr", "", "off by default; if set (use a loopback addr, e.g. 127.0.0.1:6060) serve net/http/pprof on it for live diagnostics (#1111)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -807,15 +807,15 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos")
+	repoFlag := fs.String("repo", "", "GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued runs). Omit to supervise ALL enabled registered repos")
 	var session string
-	fs.StringVar(&session, "session", "", "scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)")
+	fs.StringVar(&session, "session", "", "scope the daemon worker to one run id (and runs whose payload names it as root_job_id)")
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
-	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to jobs (#389)")
-	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
-	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
+	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to runs (#389)")
+	scheduler := fs.String("scheduler", "barrier", "queued-run scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
+	parallel := fs.Int("parallel", 0, "process runs in parallel: sets --workers N and --scheduler pool together (#444)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return daemonStartConfig{}, daemonHelp

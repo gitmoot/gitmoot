@@ -63,7 +63,7 @@ func runJob(args []string, stdout, stderr io.Writer) int {
 
 func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]")
+	fmt.Fprintln(w, "  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]")
 	fmt.Fprintln(w, "  gitmoot run show <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot run events <id>")
 	fmt.Fprintln(w, "  gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
@@ -77,7 +77,7 @@ func printJobUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot run gates clear <id> --need \"<text>\"|--all")
 	fmt.Fprintln(w, "  gitmoot run cancel <id>")
 	fmt.Fprintln(w, "  gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]")
-	fmt.Fprintf(w, "  gitmoot run open --implementer name --repo owner/repo --type %s [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
+	fmt.Fprintf(w, "  gitmoot run open --implementer name --repo owner/repo --type %s [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--campaign label] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
 	fmt.Fprintf(w, "  gitmoot run close <id> --decision %s [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.ResultDecisions, "|"))
 	fmt.Fprintf(w, "  gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type %s --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]\n", strings.Join(workflow.SessionJobActions, "|"))
 }
@@ -94,12 +94,12 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	state := fs.String("state", "", "run state filter")
-	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
+	workflowID := fs.String("campaign", "", "campaign label")
 	// #1726: the abandoned population is otherwise reachable only by grepping
 	// failure messages for two different renderings of the same fact.
 	killed := fs.Bool("killed", false, "only runs whose delivery was killed by a signal and which nothing requeued")
 	jsonOutput := fs.Bool("json", false, "print runs (with operational detail) as JSON")
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -109,8 +109,8 @@ func listRuns(args []string, stdout, stderr io.Writer, command, onlyType string)
 		fmt.Fprintln(stderr, "run list does not accept positional arguments")
 		return 2
 	}
-	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
-		fmt.Fprintln(stderr, "run list: --workflow requires a non-blank value")
+	if flagWasSupplied(fs, "campaign") && strings.TrimSpace(*workflowID) == "" {
+		fmt.Fprintln(stderr, "run list: --campaign requires a non-blank value")
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {

@@ -18,7 +18,7 @@ type UnknownWorkflowError struct {
 }
 
 func (e UnknownWorkflowError) Error() string {
-	return fmt.Sprintf("workflow %q not found", e.Label)
+	return fmt.Sprintf("campaign %q not found", e.Label)
 }
 
 // CloseWorkflowResult describes an explicit terminal transition.
