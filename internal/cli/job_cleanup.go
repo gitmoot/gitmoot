@@ -71,12 +71,9 @@ func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if *jsonOutput {
-		if obligations == nil {
-			obligations = []db.CleanupObligation{}
-		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(obligations); err != nil {
+		if err := enc.Encode(newCleanupObligationsJSON(obligations)); err != nil {
 			fmt.Fprintf(stderr, "run cleanup list: %v\n", err)
 			return 1
 		}
@@ -185,13 +182,15 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		return err
 	})
 	if *jsonOutput {
-		var value any = decision
-		if operation == "apply" {
-			value = result
-		}
 		encoder := json.NewEncoder(stdout)
 		encoder.SetIndent("", "  ")
-		if encodeErr := encoder.Encode(value); encodeErr != nil {
+		var encodeErr error
+		if operation == "apply" {
+			encodeErr = encoder.Encode(newCleanupApplyResultJSON(result))
+		} else {
+			encodeErr = encoder.Encode(newCleanupInspectionJSON(decision))
+		}
+		if encodeErr != nil {
 			err = errors.Join(err, encodeErr)
 		}
 	} else if operation == "inspect" {

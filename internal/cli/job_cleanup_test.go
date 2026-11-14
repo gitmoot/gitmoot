@@ -29,12 +29,17 @@ func TestJobCleanupListAndReopen(t *testing.T) {
 	if code := runJobCleanup([]string{"list", "--home", home, "--state", "quarantined", "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("list code=%d stderr=%s", code, stderr.String())
 	}
-	var listed []db.CleanupObligation
+	// Decoded through the stored shape plus the CLI key: a list that still
+	// emitted owner_job_id would fill the embedded OwnerJobID (#2601).
+	var listed []struct {
+		db.CleanupObligation
+		OwnerRunID string `json:"owner_run_id"`
+	}
 	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
-	if len(listed) != 1 || listed[0].OwnerJobID != "operator-job" || listed[0].ExpectedPath != path {
-		t.Fatalf("listed obligations = %+v", listed)
+	if len(listed) != 1 || listed[0].OwnerRunID != "operator-job" || listed[0].OwnerJobID != "" || listed[0].ExpectedPath != path {
+		t.Fatalf("listed obligations = %+v, want owner_run_id and no owner_job_id\n%s", listed, stdout.String())
 	}
 
 	stdout.Reset()

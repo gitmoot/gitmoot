@@ -479,14 +479,15 @@ func watchRun(args []string, stdout, stderr io.Writer, command, onlyType string)
 }
 
 func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, command, onlyType string, stdout, stderr io.Writer) int {
-	var output jobWatchOutput
+	var settled db.Job
+	var settledEvents []db.JobEvent
+	var held stuckReason
 	if err := withStore(home, func(store *db.Store) error {
 		nextEvent := 0
 		// lastHold suppresses repetition: this loop polls every interval, so an
 		// unconditional print would emit the same line for the whole life of a
 		// deferral. Only a CHANGE is news.
 		lastHold := ""
-		var held stuckReason
 		// pendingClass/pendingAttempt name the deferral this loop has ALREADY
 		// rendered as HOLD, and they are CONSUMED by the one event that deferral
 		// pairs with. Two earlier shapes were wrong in opposite directions and each
@@ -552,13 +553,7 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, c
 				}
 			}
 			if workflow.IsSettledJobState(job.State) {
-				output = jobWatchOutput{
-					Job:                 newRunJSON(job),
-					Events:              newRunEventsJSON(events),
-					HeldReason:          held.Reason,
-					HeldNextRetryAt:     held.NextRetryAt,
-					HeldSuggestedAction: held.SuggestedAction,
-				}
+				settled, settledEvents = job, events
 				return nil
 			}
 			// A DEFERRED JOB NEVER SETTLES, SO THIS LOOP IS WHERE AN OPERATOR SITS
@@ -601,13 +596,20 @@ func runJobEventWatch(jobID, home string, poll time.Duration, jsonOutput bool, c
 		return 1
 	}
 	if jsonOutput {
+		output := jobWatchOutput{
+			Job:                 newRunJSON(settled),
+			Events:              newRunEventsJSON(settledEvents),
+			HeldReason:          held.Reason,
+			HeldNextRetryAt:     held.NextRetryAt,
+			HeldSuggestedAction: held.SuggestedAction,
+		}
 		if err := writeJSON(stdout, output); err != nil {
 			fmt.Fprintf(stderr, "%s: %v\n", command, err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "state: %s\n", output.Job.State)
+	fmt.Fprintf(stdout, "state: %s\n", settled.State)
 	return 0
 }
 
