@@ -1,4 +1,4 @@
-# Gitmoot Workflows
+# Gitmoot walkthroughs
 
 Three end-to-end walkthroughs. Every command is in
 [CLI.md](CLI.md) with its full flags.
@@ -28,7 +28,7 @@ directly.
 
 The reviewer needs the `review` capability and must not also have `implement`.
 An omp reviewer's `--session` is a UUID or `fresh:<suffix>`; omp starts a fresh
-session for every job. The daemon picks queued reviews up; `gitmoot daemon
+session for every run. The daemon picks queued reviews up; `gitmoot daemon
 status` shows that it is running.
 
 ## A seat's pull request, from push to merge
@@ -60,7 +60,7 @@ status` shows that it is running.
 ## A review with no model, on a throwaway home
 
 To check the flow without spending a model, register a `shell` reviewer whose
-command prints a verdict, and run the job in the foreground. It needs no
+command prints a verdict, and run the review in the foreground. It needs no
 GitHub login, no Herdr and no omp, and touches nothing outside `/tmp/gm-demo`.
 `--home $H` keeps all state in `$H/.gitmoot`; `HOME` is exported too because
 `git` reads it, and so does any `gitmoot` command run without `--home`.
@@ -111,24 +111,26 @@ gitmoot run show <run-id> --home $H
 ```
 
 - `me` was created by `org seat add`, so it is an org role, not a registered
-  agent: record it with `--acting-role me`. `--agent me` fails with
-  `agent "me" not found`.
+  reviewer: record it with `--acting-role me`. `--implementer me` fails with
+  `reviewer "me" not found`.
 - Name the shell reviewer with `--reviewer`. A reviewer the router picks
   itself runs on omp, not on its shell command.
 - The shell session runs sandboxed in a read-only checkout of the head: it can
   read the checkout (`cat a.txt` works) but not other paths (`cat
-  /tmp/verdict.json` fails `Permission denied` and the job ends `failed`).
+  /tmp/verdict.json` fails `Permission denied` and the run ends `failed`).
   Print the verdict inline with `echo`. Re-running `reviewer subscribe` with a
   new `--session` replaces the command.
 - Pass both `--head` and `--branch` so the request does not need to read the
   pull request from GitHub.
 - The request prints ``hold: daemon not running: the review stays queued
   until `gitmoot daemon start` starts the daemon``; `run start` runs it anyway.
-- Read `run start` by its last line, `started run <id>: <state>`: that is the job's
-  state. An approval may print a line before it such as `job <id> failed: workflow advance failed:
-  ...` is about what happens after the verdict is stored (posting it to the
-  pull request, binding an approval to the head GitHub reports), and needs
-  GitHub. Without it you see a `gh` login or `GH_TOKEN` error, or
+- Read `run start` by its last line, `run <id>: <state>`: that is the run's
+  state. Before it, an approval may print `job <id> failed: workflow advance
+  failed: ...`; this log line keeps the old words "job" and "workflow", and it
+  does not mean the review failed. It is about what happens after the verdict
+  is stored (posting it to the pull request, binding an approval to the head
+  GitHub reports), and needs GitHub. Without it you see a `gh` login or
+  `GH_TOKEN` error, or
   `review approval held: no observed pull request row records a current head`
   (no daemon has observed PR 1, so the gate will not count the approval).
   Both are expected here; the verdict is stored, `review status` shows it,
