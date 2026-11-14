@@ -183,12 +183,8 @@ func (e Engine) mailbox() Mailbox {
 		wakeTargetRole := requesterRole
 		if state == JobSucceeded && payload.PullRequest > 0 && payload.Result != nil && e.Store != nil {
 			job, jobErr := e.Store.GetJob(ctx, jobID)
-			// A fan-out is excluded: EventCauseReviewVerdict tells the PR owner a
-			// verdict landed, and waking them with ReviewDecision=approved because a
-			// coordinator announced a panel reports an answer nobody gave (#1685).
-			// The delegates' own terminal events carry the real verdicts.
-			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") && !ResultIsFanOut(payload.Result) {
-				decision := effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+			if jobErr == nil && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
+				decision := effectiveReviewDecision(payload.Result, e.reviewBlockingSeverity(payload.Repo))
 				if decision == "approved" || decision == "changes_requested" {
 					owner := ""
 					resolved, resolveErr := e.Store.ResolvePullRequestOwner(
@@ -229,10 +225,10 @@ func (e Engine) mailbox() Mailbox {
 					// TestReviewVerdictWakeVocabularyStaysTwoWords pins that rather
 					// than a defensive branch that no mutant could kill.
 					//
-					// #1685's fan-out exclusion is a DIFFERENT mechanism and is
-					// untouched: it suppresses the wake at the guard above because a
-					// coordinator's dispatch record is not an inspection. This line
-					// runs only for payloads that guard already admitted.
+					// A review result carrying delegations never reaches this
+					// line: since #2588 the mailbox refuses such a result with
+					// the review-delegates-nothing check and fails the job, so
+					// only payloads the guard above admitted are announced.
 					event.ReviewDecision = strings.TrimSpace(payload.Result.Decision)
 					if decision == "changes_requested" {
 						// Sender is a transport or agent identity, not necessarily a

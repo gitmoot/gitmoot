@@ -274,8 +274,8 @@ func (e Engine) recordImplementNoPRAdvance(ctx context.Context, jobID, decision 
 // event history contradicting those surfaces.
 //
 // It is called once at the TOP of AdvanceJob rather than at any point inside it.
-// Fan-out reviews are excluded for free: effectiveReviewDecisionForPayload
-// keeps their verdict raw, so they never reach "approved" here. blocked/failed are
+// Historical fan-out announcements are excluded for free: unmarshalPayload
+// replaces their decision with HistoricalFanOutDecision, so they never reach "approved" here. blocked/failed are
 // excluded by the changes_requested test, and a part verdict by
 // recordsApprovedWithNotes (#2373). AddJobEventIfAbsent makes every replay,
 // re-advance and stale round idempotent.
@@ -635,7 +635,7 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		}
 		// Folding through the payload authority keeps fan-out exclusion and the
 		// severity bar in one place.
-		effectiveDecision = effectiveReviewDecisionForPayload(payload, e.reviewBlockingSeverity(payload.Repo))
+		effectiveDecision = effectiveReviewDecision(payload.Result, e.reviewBlockingSeverity(payload.Repo))
 		// THE #1822 LEDGER'S PRODUCTION WRITER (#1850 review F1). This is the only
 		// place a review's findings become ledger observations, and without it the
 		// entire feature was inert at runtime: every guard passed against a table
@@ -909,7 +909,7 @@ func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
 // empty/whitespace yields "" so the builders omit the Original goal header.
 func (e Engine) originalGoal(ctx context.Context, rootJobID, fallback string) string {
 	if root, err := e.Store.GetJob(ctx, rootJobID); err == nil {
-		if payload, err := unmarshalPayload(root.Payload); err == nil {
+		if payload, err := DecodeJobPayload(root); err == nil {
 			if goal := strings.TrimSpace(payload.Instructions); goal != "" {
 				return goal
 			}
@@ -1457,7 +1457,7 @@ func (e Engine) projectedNewDelegationJobs(ctx context.Context, parentJobID stri
 	// present, instead of a per-leg delegationFingerprintSeen query.
 	existingFingerprints := make(map[string]struct{})
 	for _, child := range children {
-		childPayload, err := unmarshalPayload(child.Payload)
+		childPayload, err := DecodeJobPayload(child)
 		if err != nil {
 			return 0, err
 		}

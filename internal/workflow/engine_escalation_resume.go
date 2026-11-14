@@ -1613,7 +1613,7 @@ func (e Engine) AutoFinalizeExpiredEscalations(ctx context.Context, ttl time.Dur
 		if now.Sub(pausedAt) < ttl {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return finalized, err
 		}

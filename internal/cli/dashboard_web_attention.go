@@ -55,7 +55,7 @@ func (d *webDataSource) Attention(ctx context.Context) (dashboard.Attention, err
 			if !ok || strings.TrimSpace(job.State) != string(workflow.JobBlocked) {
 				continue
 			}
-			payload, _ := workflow.ParseJobPayload(job.Payload)
+			payload, _ := workflow.DecodeJobPayload(job)
 			out.Gates = append(out.Gates, dashboard.AttentionGate{
 				JobID:     g.JobID,
 				Need:      g.Need,

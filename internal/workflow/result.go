@@ -355,16 +355,6 @@ type AgentResult struct {
 	// and consumes zero compute until the human answers via the `answer` resume
 	// verb. The same escalation TTL backstop auto-finalizes an unanswered ask.
 	HumanQuestions []HumanQuestion `json:"human_questions,omitempty"`
-	// FanOut records that this result WAS a coordinator fan-out, for consumers
-	// that cannot see the executable delegations[]. Stored rows may carry it
-	// without their delegations, and an approved announcement must never reach
-	// a merge decision indistinguishable from a real leaf approval (#1685).
-	//
-	// The product owns this field; agents are never asked for it. An agent that
-	// sets it anyway can only REMOVE its own verdict's authority, never add any:
-	// ResultIsFanOut ORs it with the delegations it can see, so `fan_out: false`
-	// beside a declared panel is still a fan-out.
-	FanOut bool `json:"fan_out,omitempty"`
 	// Evidence declares whether this verdict's claims were EXECUTED or are
 	// STATIC-ONLY, so a merge decision can tell a review that ran the gate from
 	// one that read the diff and could not run anything.
@@ -485,11 +475,11 @@ func EvidenceWasDeclared(r AgentResult) bool {
 // authorityGrantingResultFields are AgentResult fields an agent may NEVER supply,
 // because setting them GRANTS the job authority it would not otherwise have (#1673).
 //
-// The distinction is not "product-owned". FanOut is product-owned too and is safe to
-// accept, because an agent that sets it can only REMOVE its own authority - it marks a
-// row as a fan-out. SupersededPullRequestClosed is the opposite: it tells the retry
-// actuator that this child's pull request is gone, which authorizes a route that SKIPS
-// the delivery-checkout preflight. An agent that could set it could bypass a safety
+// The distinction is not "product-owned". EvidenceDeclared is product-owned too and is
+// safe to accept, because normalization overwrites whatever an agent supplies.
+// SupersededPullRequestClosed is the opposite: it tells the retry actuator that this
+// child's pull request is gone, which authorizes a route that SKIPS the
+// delivery-checkout preflight. An agent that could set it could bypass a safety
 // boundary by asserting a lifecycle fact about itself.
 //
 // Excluding a field from the PROMPT does not stop this. A prompt omission stops a

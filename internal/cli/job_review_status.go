@@ -65,7 +65,7 @@ func deriveReviewStatus(ctx context.Context, store *db.Store, job db.Job, now ti
 	}
 	display := reviewStatusDisplay{HeadSHA: loadSessionJobDisplayHeadSHA(ctx, store, job.ID)}
 	if job.State != string(workflow.JobRunning) {
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err == nil && payload.ReviewStatusGrade != "" {
 			display.Grade = payload.ReviewStatusGrade
 			display.Authority = reviewStatusAuthorityNonAuthoritative

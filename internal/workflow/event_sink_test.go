@@ -257,7 +257,7 @@ func TestEngineReturnsChangesRequestedToRequesterWithoutDefaultAutoFix(t *testin
 // IT NOW ASSERTS BOTH HALVES, which is what the old version could not
 // distinguish and why the defect hid behind it:
 //   - the GATE transform is unchanged. A sub-threshold changes_requested still
-//     resolves to "approved" through effectiveReviewDecisionForPayload, because
+//     resolves to "approved" through effectiveReviewDecision, because
 //     a below-bar finding must not block a merge. That is correct and untouched
 //     by #1945; review_threshold.go is not modified.
 //   - the WAKE announces the RECORDED reviewer decision, because a human
@@ -291,7 +291,7 @@ func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) 
 
 	// HALF ONE, the gate: still folds below the bar. If this ever stops being
 	// "approved" the merge gate's behaviour changed, which is NOT this issue.
-	if got := effectiveReviewDecisionForPayload(payload, reviewseverity.P1); got != "approved" {
+	if got := effectiveReviewDecision(payload.Result, reviewseverity.P1); got != "approved" {
 		t.Fatalf("gate decision for a sub-threshold verdict = %q, want approved; review_threshold.go must be unchanged by #1945", got)
 	}
 
@@ -304,50 +304,6 @@ func TestEngineEmitsSubthresholdReviewVerdictWithRecordedDecision(t *testing.T) 
 	// HALF TWO, the wake: announces what the reviewer recorded.
 	if got := finished[0].ReviewDecision; got != "changes_requested" {
 		t.Fatalf("sub-threshold wake decision = %q, want changes_requested: the notification must carry the RECORDED verdict (#1945)", got)
-	}
-}
-
-// #1685. EventCauseReviewVerdict tells the PR owner that a verdict landed. A
-// coordinator fan-out is an announcement, so waking them with
-// ReviewDecision=approved reports an answer nobody gave. The delegates' own
-// terminal events carry the real verdicts.
-func TestEngineDoesNotEmitReviewVerdictForFanOut(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	if err := store.CreateJob(ctx, db.Job{
-		ID: "review-47", Agent: "audit", Type: "review", State: string(JobSucceeded), Payload: "{}",
-	}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
-	sink := &recordingSink{}
-	engine := testEngine(store)
-	engine.EventSink = sink
-	engine.ReviewBlockingSeverity = func(string) string { return reviewseverity.P1 }
-
-	engine.mailbox().emitTerminal(ctx, "review-47", JobSucceeded, JobPayload{
-		Repo:        "gitmoot/gitmoot",
-		Branch:      "task-47",
-		PullRequest: 47,
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "Convening a three-reviewer panel",
-			Delegations: []Delegation{
-				{ID: "lens-a", Agent: "r1", Action: "review"},
-			},
-		},
-	})
-
-	finished := sink.byType(events.EventJobFinished)
-	if len(finished) != 1 {
-		t.Fatalf("job.finished emissions = %d, want 1; all=%+v", len(finished), sink.snapshot())
-	}
-	// The terminal event still fires — the job did finish. What must not appear is
-	// the verdict CLAIM riding on it.
-	if got := finished[0].ReviewDecision; got != "" {
-		t.Fatalf("fan-out emitted review decision %q, want none", got)
-	}
-	if got := finished[0].Cause; got == events.EventCauseReviewVerdict {
-		t.Fatalf("fan-out emitted cause %q, want no verdict cause", got)
 	}
 }
 

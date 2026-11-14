@@ -105,7 +105,7 @@ func RetryJob(ctx context.Context, store *db.Store, jobID string) (db.Job, error
 	// the terminal-to-queued transition below — BOTH arms — rather than being read
 	// here, because a recovery pass can take ownership between a pre-check and the
 	// write.
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return db.Job{}, err
 	}
@@ -293,7 +293,7 @@ func MaybeResumeOnGatesCleared(ctx context.Context, store *db.Store, jobID strin
 // to `blocked` (not awaiting_human) with no escalation, so this returns false and
 // the stage auto-resumes.
 func blockedJobAwaitingHuman(ctx context.Context, store *db.Store, job db.Job) (bool, error) {
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err == nil {
 		if taskID := strings.TrimSpace(payload.TaskID); taskID != "" {
 			task, terr := store.GetTask(ctx, taskID)
@@ -500,7 +500,7 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 			return true, err
 		}
 	}
-	payload, perr := unmarshalPayload(job.Payload)
+	payload, perr := DecodeJobPayload(job)
 	if perr != nil {
 		return true, nil
 	}
@@ -523,7 +523,7 @@ func releaseSupersededJobResourcesAtGeneration(ctx context.Context, store *db.St
 // Each step carries its own atomic predicate, and no generation anchor is needed
 // because there is no poll-long gap between the decision and these writes.
 func releaseAbortedJobSideResources(ctx context.Context, store *db.Store, job db.Job, cause abortCause) {
-	payload, perr := unmarshalPayload(job.Payload)
+	payload, perr := DecodeJobPayload(job)
 	if perr != nil {
 		return
 	}
@@ -597,7 +597,7 @@ func SupersedeStaleHeadJob(ctx context.Context, store *db.Store, jobID string, r
 	// Defensive symmetry with CancelJob: a superseded job that carried a #739
 	// dispatch-time read-only worktree must not leak it (no-op for the review jobs
 	// this path targets today, which run in a per-PR task worktree, not a #739 seat).
-	if payload, perr := unmarshalPayload(job.Payload); perr == nil {
+	if payload, perr := DecodeJobPayload(job); perr == nil {
 		recordReadOnlyWorktreeReclaimOnAbort(ctx, store, job, payload)
 	}
 	updated, err := store.GetJob(ctx, job.ID)
@@ -740,7 +740,7 @@ func (e Engine) FinalizeClosedPullRequestDelegationChild(ctx context.Context, ob
 	if strings.TrimSpace(observed.ID) == "" {
 		return false, fmt.Errorf("observed job id is required")
 	}
-	payload, err := unmarshalPayload(observed.Payload)
+	payload, err := DecodeJobPayload(observed)
 	if err != nil {
 		return false, err
 	}
@@ -1098,7 +1098,7 @@ func completeSupersedeFinalization(ctx context.Context, engine *Engine, store *d
 	if engine == nil {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}
-	payload, perr := unmarshalPayload(current.Payload)
+	payload, perr := DecodeJobPayload(current)
 	if perr != nil || strings.TrimSpace(payload.ParentJobID) == "" {
 		return recordSupersedeFinalizationCompleted(ctx, store, job.ID, reason, generation, nil)
 	}

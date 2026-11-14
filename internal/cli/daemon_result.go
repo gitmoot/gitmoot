@@ -542,7 +542,7 @@ func (w jobWorker) recordDeliveryFailureDiagnostics(ctx context.Context, jobID s
 	// ParseJobPayload, not daemonJobPayload: this is a read-MODIFY-write, and the
 	// legacy-tolerant decoder is what keeps a payload still carrying the legacy
 	// preset_* keys from losing them on the way back out.
-	payload, err := workflow.ParseJobPayload(latest.Payload)
+	payload, err := workflow.DecodeJobPayload(latest)
 	if err != nil {
 		w.reportDeliveryDiagnosticsLoss(jobID, cause, err)
 		return

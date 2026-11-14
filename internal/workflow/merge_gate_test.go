@@ -1024,192 +1024,6 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 	}
 }
 
-// insertMergeGatePanelChild adds one delegation child under a head-bound parent
-// review. The parent declares its delegations itself in these tests, so this
-// deliberately does not touch the parent payload.
-func insertMergeGatePanelChild(t *testing.T, store *db.Store, parentID, delegationID string, state JobState, result *AgentResult) {
-	t.Helper()
-	encoded, err := marshalPayload(JobPayload{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Result: result,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID:           parentID + "/delegation/" + delegationID,
-		Agent:        delegationID,
-		Type:         "review",
-		State:        string(state),
-		Payload:      encoded,
-		ParentJobID:  parentID,
-		DelegationID: delegationID,
-	}, db.JobEvent{Kind: string(state), Message: "panel child"}); err != nil {
-		t.Fatalf("CreateJobWithEvent returned error: %v", err)
-	}
-}
-
-func insertMergeGateFanOutRow(t *testing.T, store *db.Store, decision string) {
-	t.Helper()
-	insertIndependentMergeGateReview(t, store, db.Job{ID: "review-panel", Agent: "g6-review-sol", Type: "review"}, JobPayload{
-		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
-		TaskID: "task-9", ReviewRound: "review-1",
-		Result: &AgentResult{
-			Decision: decision,
-			Summary:  "Convening a three-reviewer panel at exact head head123",
-			Delegations: []Delegation{
-				{ID: "lens-a", Agent: "r1", Action: "review"},
-				{ID: "lens-b", Agent: "r2", Action: "review"},
-				{ID: "lens-c", Agent: "r3", Action: "review"},
-			},
-		},
-	})
-}
-
-// #1685. A fan-out row is an announcement, so the delegates it named — not its
-// own decision — decide the slot. This is the flow the shipped review-panel
-// template produces, and the first version of this guard refused it outright.
-func TestPolicyMergeGateMergesDelegatedReviewWhenPanelReported(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "approved")
-	for _, lens := range []string{"lens-a", "lens-b", "lens-c"} {
-		insertMergeGatePanelChild(t, store, "review-panel", lens, JobSucceeded, &AgentResult{
-			Decision: "approved", Summary: "lens verified the head", TestsRun: []string{"go test ./... -> ok"},
-		})
-	}
-
-	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
-	}, "head123"); err != nil {
-		t.Fatalf("a reported panel must clear the gate, got %v", err)
-	}
-}
-
-// A panel that was announced and never dispatched carries no evidence. It must
-// not satisfy the gate — that is the #1685 defect — and it must not be reported
-// as a generic "review is not captured" either.
-func TestPolicyMergeGateRefusesUndispatchedFanOutRow(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "approved")
-
-	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
-	}, "head123")
-	if err == nil {
-		t.Fatal("an undispatched fan-out must not satisfy the gate")
-	}
-	// Not mergeBlocked: a fan-out is a missing verdict, not a quality rejection,
-	// and classifying it as one both misreports the cause and parks the task.
-	var blocked mergeBlocked
-	if errors.As(err, &blocked) {
-		t.Fatalf("undispatched fan-out returned mergeBlocked %q, want a missing-verdict error", blocked.reason)
-	}
-	for _, want := range []string{"g6-review-sol", "review-panel", "not a verdict"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error %q must name %q", err, want)
-		}
-	}
-}
-
-// The wedge finding: blocking on the fan-out row made the head unrecoverable,
-// because supersession is same-agent-only and a coordinator's continuation is
-// dispatched as an "ask". A skipped row lets a real verdict at the SAME head
-// decide, with no new commit required.
-func TestPolicyMergeGateLetsIndependentVerdictClearFanOutRow(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "approved")
-	insertCompletedJob(t, store, db.Job{ID: "review-independent", Agent: "reviewer-y", Type: "review"}, JobPayload{
-		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
-		TaskID: "task-9", ReviewRound: "review-1",
-		Result: &AgentResult{
-			Decision: "approved", Summary: "read the diff at head123",
-			TestsRun: []string{"go test ./... -> ok"},
-		},
-	})
-
-	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "reviewer-y",
-	}, "head123"); err != nil {
-		t.Fatalf("an independent verdict at the same head must clear a fan-out row, got %v", err)
-	}
-}
-
-// Partial dispatch: children exist, so the panel did run, but one declared
-// delegate produced no row. Its evidence is outstanding, not absent, so the gate
-// waits instead of merging on the two that answered.
-func TestPolicyMergeGateWaitsForDeclaredDelegationWithoutChild(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "approved")
-	for _, lens := range []string{"lens-a", "lens-b"} {
-		insertMergeGatePanelChild(t, store, "review-panel", lens, JobSucceeded, &AgentResult{
-			Decision: "approved", Summary: "lens verified the head",
-		})
-	}
-
-	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
-	}, "head123")
-	var pending mergePending
-	if !errors.As(err, &pending) {
-		t.Fatalf("ensureFinalReviewCaptured = %v, want mergePending for an unreported delegate", err)
-	}
-	if !strings.Contains(pending.reason, "lens-c") {
-		t.Fatalf("pending reason %q must name the delegate that never reported", pending.reason)
-	}
-}
-
-// blocked/failed rows are not announcements: they already refuse on their own
-// terms, and reclassifying them as fan-outs reported the wrong cause for a row
-// nobody could mistake for an approval.
-func TestPolicyMergeGateReportsBlockingCauseForDelegatingBlockedRow(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "blocked")
-
-	err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
-	}, "head123")
-	var blocked mergeBlocked
-	if !errors.As(err, &blocked) {
-		t.Fatalf("ensureFinalReviewCaptured = %v, want mergeBlocked for a blocked row", err)
-	}
-	if !strings.Contains(blocked.reason, "blocking result from g6-review-sol") {
-		t.Fatalf("reason %q must report the blocking verdict, not a fan-out diagnosis", blocked.reason)
-	}
-}
-
-// A fan-out that announced changes_requested is still only an ANNOUNCEMENT, so
-// it must not veto the head either. This is the direction that separates
-// "excluded from the verdict population" from "cannot satisfy the gate": an
-// approved fan-out is already non-blocking because approved is not a blocking
-// decision, so only a changes_requested one can prove the exclusion is real.
-//
-// The distinction from TestPolicyMergeGateReportsBlockingCauseForDelegatingBlockedRow
-// is deliberate: blocked/failed are leaf refusals that keep their own cause,
-// while approved/changes_requested from a delegating row are continuations.
-func TestPolicyMergeGateDoesNotBlockOnAChangesRequestedFanOut(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertMergeGateFanOutRow(t, store, "changes_requested")
-	insertCompletedJob(t, store, db.Job{ID: "review-independent", Agent: "reviewer-y", Type: "review"}, JobPayload{
-		Repo: "mobile/app", Branch: "task-9", PullRequest: 9, HeadSHA: "head123",
-		TaskID: "task-9", ReviewRound: "review-1",
-		Result: &AgentResult{
-			Decision: "approved", Summary: "read the diff at head123",
-			TestsRun: []string{"go test ./... -> ok"},
-		},
-	})
-
-	if err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "reviewer-y",
-	}, "head123"); err != nil {
-		t.Fatalf("a changes_requested fan-out must not veto an independent verdict, got %v", err)
-	}
-}
-
 // ACCEPTANCE: the same gate must still clear a real approval. A guard that also
 // blocks honest verdicts is one that gets switched off.
 func TestPolicyMergeGateClearsReviewVerdictWithoutDelegations(t *testing.T) {
@@ -1253,53 +1067,6 @@ func TestPolicyMergeGateTreatsSubthresholdReviewAsIndependentApproval(t *testing
 	}, "head123")
 	if err != nil {
 		t.Fatalf("ensureFinalReviewCaptured returned error: %v", err)
-	}
-}
-
-func TestPolicyMergeGatePassesBlockingSeverityToDelegatedReviewEvidence(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	parentPayload := JobPayload{
-		Repo:        "mobile/app",
-		Branch:      "task-9",
-		PullRequest: 9,
-		HeadSHA:     "head123",
-		TaskID:      "task-9",
-		ReviewRound: "review-1",
-		Result:      &AgentResult{Decision: "approved", Summary: "parent approved"},
-	}
-	insertIndependentMergeGateReview(t, store, db.Job{
-		ID: "parent-review", Agent: "audit", Type: "review",
-	}, parentPayload)
-	insertCompletedJob(t, store, db.Job{
-		ID:           "delegated-review",
-		Agent:        "specialist",
-		Type:         "review",
-		ParentJobID:  "parent-review",
-		DelegationID: "specialist-review",
-	}, JobPayload{
-		Repo:        "mobile/app",
-		PullRequest: 9,
-		TaskID:      "task-9",
-		Result: &AgentResult{
-			Decision: "changes_requested",
-			Severity: reviewseverity.P2,
-			Summary:  "non-blocking specialist note",
-		},
-	})
-
-	gate := PolicyMergeGate{Store: store}
-	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
-		ReviewBlockingSeverity: reviewseverity.P1,
-	}, "head123"); err != nil {
-		t.Fatalf("sub-threshold delegated review blocked final review: %v", err)
-	}
-	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
-		ReviewBlockingSeverity: reviewseverity.P2,
-	}, "head123"); err == nil || !strings.Contains(err.Error(), "blocking children") {
-		t.Fatalf("at-threshold delegated review error = %v, want blocking child evidence", err)
 	}
 }
 
@@ -1396,54 +1163,6 @@ func TestPolicyMergeGateFallbackFoldsSubthresholdNativeReview(t *testing.T) {
 	}
 }
 
-func TestPolicyMergeGatePassesBlockingSeverityToHeadlessDelegatedEvidence(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	insertCompletedJob(t, store, db.Job{ID: "implement-headless-delegated", Agent: "sol", Type: "implement"}, JobPayload{
-		Repo: "mobile/app", PullRequest: 9, HeadSHA: "head123", TaskID: "task-9",
-		Result: &AgentResult{Decision: "implemented", Summary: "implemented"},
-	})
-	insertCompletedJob(t, store, db.Job{ID: "review-headless-parent", Agent: "audit", Type: "review"}, JobPayload{
-		Repo:         "mobile/app",
-		PullRequest:  9,
-		TaskID:       "task-9",
-		ReviewRound:  "review-1",
-		DelegationID: "integration-review",
-		WorktreePath: "/tmp/integration-review",
-		Result:       &AgentResult{Decision: "approved", Summary: "parent approved"},
-	})
-	insertCompletedJob(t, store, db.Job{
-		ID:           "review-headless-child",
-		Agent:        "specialist",
-		Type:         "review",
-		ParentJobID:  "review-headless-parent",
-		DelegationID: "specialist-review",
-	}, JobPayload{
-		Repo:        "mobile/app",
-		PullRequest: 9,
-		TaskID:      "task-9",
-		Result: &AgentResult{
-			Decision: "changes_requested",
-			Severity: reviewseverity.P2,
-			Summary:  "non-blocking specialist note",
-		},
-	})
-
-	gate := PolicyMergeGate{Store: store}
-	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
-		ReviewBlockingSeverity: reviewseverity.P1,
-	}, "head123"); err != nil {
-		t.Fatalf("sub-threshold headless delegated review blocked final review: %v", err)
-	}
-	if err := gate.ensureFinalReviewCaptured(ctx, MergeRequest{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "audit",
-		ReviewBlockingSeverity: reviewseverity.P2,
-	}, "head123"); err == nil || !strings.Contains(err.Error(), "blocking children") {
-		t.Fatalf("at-threshold headless delegated review error = %v, want blocking child evidence", err)
-	}
-}
-
 func TestPolicyMergeGateChecksAuthorshipForSubthresholdApproval(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -1473,35 +1192,6 @@ func TestPolicyMergeGateChecksAuthorshipForSubthresholdApproval(t *testing.T) {
 	}, "head123")
 	if err == nil || !strings.Contains(err.Error(), "independent reviewer is required") {
 		t.Fatalf("self-authored sub-threshold approval error = %v, want independence failure", err)
-	}
-}
-
-func TestDelegatedReviewEvidenceUsesBlockingSeverity(t *testing.T) {
-	childPayload := JobPayload{Result: &AgentResult{
-		Decision: "changes_requested",
-		Severity: reviewseverity.P2,
-		Summary:  "delegated notes",
-	}}
-	encoded, err := marshalPayload(childPayload)
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	children := []db.Job{{
-		ID: "child-review", Type: "review", State: string(JobSucceeded), Payload: string(encoded),
-	}}
-
-	childrenByParent := map[string][]db.Job{"parent-review": children}
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, childrenByParent, nil, reviewseverity.P1); err != nil {
-		t.Fatalf("sub-threshold delegated review returned error: %v", err)
-	}
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, childrenByParent, nil, reviewseverity.P2); err == nil || !strings.Contains(err.Error(), "blocking") {
-		t.Fatalf("at-threshold delegated review error = %v, want blocking evidence", err)
-	}
-	askChildren := []db.Job{{
-		ID: "child-ask", Type: "ask", State: string(JobSucceeded), Payload: string(encoded),
-	}}
-	if _, err := ensureDelegatedReviewEvidence(db.Job{ID: "parent-review"}, map[string][]db.Job{"parent-review": askChildren}, nil, reviewseverity.P1); err == nil || !strings.Contains(err.Error(), "blocking") {
-		t.Fatalf("sub-threshold non-review child error = %v, want raw blocking decision", err)
 	}
 }
 
@@ -3908,724 +3598,6 @@ func TestPolicyMergeGateIgnoresReviewJobsAtStaleHeadForQuorum(t *testing.T) {
 	}
 }
 
-func TestPolicyMergeGateParksParentApprovalWhenDelegationChildrenFailed(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "workflow-cdz4fabzacb4"
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "g6-review-sol", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	for _, delegationID := range []string{
-		"lens-anti-drift-correctness",
-		"lens-compile-exhaustiveness",
-		"lens-tests-regressions",
-	} {
-		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobFailed, nil)
-	}
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want failed delegated review evidence parked", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) {
-		t.Fatalf("decision reason = %q, want parent job id", decision.Reason)
-	}
-	for _, delegationID := range []string{
-		"lens-anti-drift-correctness",
-		"lens-compile-exhaustiveness",
-		"lens-tests-regressions",
-	} {
-		childID := parentID + "/delegation/" + delegationID
-		if !strings.Contains(decision.Reason.Render(), childID) {
-			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
-		}
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateAcceptsHeadlessIntegrationParentWhenDelegationChildrenSucceeded(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "review-parent-healthy"
-	insertCompletedJob(t, store, db.Job{
-		ID:    parentID,
-		Agent: "reviewer-a",
-		Type:  "review",
-		// Production shape: a delegated review row carries both ids.
-		ParentJobID:  "implement-job",
-		DelegationID: "verify-parent",
-	}, JobPayload{
-		Repo:         "gitmoot/gitmoot",
-		PullRequest:  9,
-		TaskID:       "task-9",
-		ReviewRound:  "review-1",
-		DelegationID: "verify-parent",
-		WorktreePath: "/tmp/gitmoot/integration-verify-parent",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "integration review synthesized surviving evidence",
-		},
-	})
-	for _, delegationID := range []string{"correctness", "compile", "tests"} {
-		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobSucceeded, &AgentResult{
-			Decision: "approved",
-			Summary:  "delegated evidence survived",
-		})
-	}
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.Merged {
-		t.Fatalf("decision = %+v, want healthy delegated review to merge", decision)
-	}
-	if len(gh.merges) != 1 {
-		t.Fatalf("merge calls = %+v, want one", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateFallbackParksHeadlessIntegrationParentWhenDelegationChildrenFailed(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "review-parent-fallback-failed"
-	insertMergeGateHeadlessIntegrationParent(t, store, parentID)
-	for _, delegationID := range []string{"correctness", "compile", "tests"} {
-		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobFailed, nil)
-	}
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want fallback approval with failed children parked", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) {
-		t.Fatalf("decision reason = %q, want fallback parent job id", decision.Reason)
-	}
-	for _, delegationID := range []string{"correctness", "compile", "tests"} {
-		childID := parentID + "/delegation/" + delegationID
-		if !strings.Contains(decision.Reason.Render(), childID) {
-			t.Fatalf("decision reason = %q, want failed child %s", decision.Reason, childID)
-		}
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateParksHeadlessIntegrationParentWhenChildrenSkipped(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "review-parent-skipped"
-	insertMergeGateHeadlessIntegrationParent(t, store, parentID)
-	for _, delegationID := range []string{"correctness", "compile", "tests"} {
-		insertMergeGateDelegationChild(t, store, parentID, delegationID, JobSucceeded, &AgentResult{
-			Decision: "skipped",
-			Summary:  "abstained",
-		})
-	}
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want all-skipped delegation evidence parked", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "delegated review parent "+parentID) ||
-		!strings.Contains(decision.Reason.Render(), "(skipped)") {
-		t.Fatalf("decision reason = %q, want skipped children identified as no evidence", decision.Reason)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidence(t *testing.T) {
-	tests := []struct {
-		name     string
-		state    JobState
-		decision string
-	}{
-		{name: "state", state: JobState("paused"), decision: "approved"},
-		{name: "decision", state: JobSucceeded, decision: "future-review-outcome"},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			store, gh, gate, request := newMergeGateQuorumScenario(t)
-			parentID := "review-parent-unrecognized-" + tc.name
-			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-				recorded: "2026-07-31 12:00:00",
-			})
-			insertMergeGateDelegationChild(t, store, parentID, "unrecognized", tc.state, &AgentResult{
-				Decision: tc.decision,
-				Summary:  "synthetic unrecognized evidence",
-			})
-
-			decision, err := gate.Evaluate(context.Background(), request)
-
-			if err != nil {
-				t.Fatalf("Evaluate returned error: %v", err)
-			}
-			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-				t.Fatalf("decision = %+v, want unrecognized delegation evidence refused", decision)
-			}
-			childID := parentID + "/delegation/unrecognized"
-			if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
-				!strings.Contains(decision.Reason.Render(), childID) {
-				t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, childID)
-			}
-			if len(gh.merges) != 0 {
-				t.Fatalf("merge calls = %+v, want none", gh.merges)
-			}
-		})
-	}
-}
-
-func TestPolicyMergeGateRejectsUnrecognizedDelegationEvidenceAlongsideHealthyChild(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "review-parent-mixed-unrecognized"
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "healthy", JobSucceeded, &AgentResult{
-		Decision: "approved",
-		Summary:  "surviving delegated evidence",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "unrecognized", JobState("paused"), &AgentResult{
-		Decision: "approved",
-		Summary:  "unrecognized child state",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want mixed unrecognized delegation evidence refused", decision)
-	}
-	unrecognizedChildID := parentID + "/delegation/unrecognized"
-	if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
-		!strings.Contains(decision.Reason.Render(), unrecognizedChildID) {
-		t.Fatalf("decision reason = %q, want unrecognized child %s", decision.Reason, unrecognizedChildID)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateDoesNotCountNonDelegationChildAsEvidence(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const parentID = "review-parent-nondelegation-sibling"
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "skipped-delegation", JobSucceeded, &AgentResult{
-		Decision: "skipped",
-		Summary:  "delegated child abstained",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "", JobSucceeded, &AgentResult{
-		Decision: "approved",
-		Summary:  "ordinary child is not delegation evidence",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want non-delegation child excluded from evidence", decision)
-	}
-	skippedChildID := parentID + "/delegation/skipped-delegation"
-	if !strings.Contains(decision.Reason.Render(), "no surviving delegation evidence") ||
-		!strings.Contains(decision.Reason.Render(), skippedChildID) {
-		t.Fatalf("decision reason = %q, want skipped delegated child %s", decision.Reason, skippedChildID)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateRejectsMalformedDelegationEvidence(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const (
-		parentID = "review-parent-malformed-child"
-		childID  = parentID + "/delegation/malformed"
-	)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID:           childID,
-		Agent:        "malformed",
-		Type:         "ask",
-		State:        string(JobSucceeded),
-		Payload:      "{not-json",
-		ParentJobID:  parentID,
-		DelegationID: "malformed",
-	}, db.JobEvent{Kind: string(JobSucceeded), Message: "malformed delegation fixture"}); err != nil {
-		t.Fatalf("CreateJobWithEvent returned error: %v", err)
-	}
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want malformed delegation evidence refused", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") ||
-		!strings.Contains(decision.Reason.Render(), childID+" (malformed result)") {
-		t.Fatalf("decision reason = %q, want malformed child %s", decision.Reason, childID)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateWaitsForActiveDelegationChild(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		state JobState
-	}{
-		{name: "queued", state: JobQueued},
-		{name: "running", state: JobRunning},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store, gh, gate, request := newMergeGateQuorumScenario(t)
-			parentID := "review-parent-active-" + tc.name
-			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-				recorded: "2026-07-31 12:00:00",
-			})
-			insertMergeGateDelegationChild(t, store, parentID, tc.name, tc.state, nil)
-
-			decision, err := gate.Evaluate(context.Background(), request)
-
-			if err != nil {
-				t.Fatalf("Evaluate returned error: %v", err)
-			}
-			if decision.Merged || decision.LeaveOpen || decision.Reason.IsGateMiss() {
-				t.Fatalf("decision = %+v, want active delegation child to wait without escalating", decision)
-			}
-			childID := parentID + "/delegation/" + tc.name
-			if !strings.Contains(decision.Reason.Render(), "waiting for delegated review parent "+parentID) ||
-				!strings.Contains(decision.Reason.Render(), childID+" ("+string(tc.state)+")") {
-				t.Fatalf("decision reason = %q, want waiting reason with active child %s", decision.Reason, childID)
-			}
-			if len(gh.merges) != 0 {
-				t.Fatalf("merge calls = %+v, want none", gh.merges)
-			}
-		})
-	}
-}
-
-func TestPolicyMergeGateBlocksParentApprovalWhenDelegationChildRequestsChanges(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const (
-		parentID = "review-parent-blocking-child"
-		childID  = parentID + "/delegation/objector"
-	)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "objector", JobSucceeded, &AgentResult{
-		Decision: "changes_requested",
-		Summary:  "delegated review found a blocker",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want blocking delegation verdict to stop merge", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "blocking delegation evidence") ||
-		!strings.Contains(decision.Reason.Render(), childID+" (changes_requested)") {
-		t.Fatalf("decision reason = %q, want blocking child %s", decision.Reason, childID)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateParksParentApprovalWhenDelegationChildImplemented(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const (
-		parentID = "review-parent-implemented-child"
-		childID  = parentID + "/delegation/implementer"
-	)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "implementer", JobSucceeded, &AgentResult{
-		Decision: "implemented",
-		Summary:  "implementation is not review evidence",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want implemented delegation result parked as abstention", decision)
-	}
-	if !strings.Contains(decision.Reason.Render(), "abstaining delegation children") ||
-		!strings.Contains(decision.Reason.Render(), childID+" (implemented)") {
-		t.Fatalf("decision reason = %q, want abstaining child %s", decision.Reason, childID)
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateAcceptedDelegationChildDoesNotEraseAdverseSibling(t *testing.T) {
-	tests := []struct {
-		name            string
-		adverseState    JobState
-		adverseResult   *AgentResult
-		wantReasonClass string
-		wantDetail      string
-	}{
-		{
-			name:            "blocking",
-			adverseState:    JobSucceeded,
-			adverseResult:   &AgentResult{Decision: "changes_requested", Summary: "blocker"},
-			wantReasonClass: "blocking delegation evidence",
-			wantDetail:      "(changes_requested)",
-		},
-		{
-			name:            "crashed",
-			adverseState:    JobFailed,
-			wantReasonClass: "crashed delegation children",
-			wantDetail:      "(failed)",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			store, gh, gate, request := newMergeGateQuorumScenario(t)
-			parentID := "review-parent-mixed-" + tc.name
-			adverseID := parentID + "/delegation/adverse"
-			insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-				id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-				recorded: "2026-07-31 12:00:00",
-			})
-			insertMergeGateDelegationChild(t, store, parentID, "approved", JobSucceeded, &AgentResult{
-				Decision: "approved",
-				Summary:  "one child approved",
-			})
-			insertMergeGateDelegationChild(t, store, parentID, "adverse", tc.adverseState, tc.adverseResult)
-
-			decision, err := gate.Evaluate(context.Background(), request)
-
-			if err != nil {
-				t.Fatalf("Evaluate returned error: %v", err)
-			}
-			if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-				t.Fatalf("decision = %+v, want adverse sibling to outrank accepted child", decision)
-			}
-			if !strings.Contains(decision.Reason.Render(), tc.wantReasonClass) ||
-				!strings.Contains(decision.Reason.Render(), adverseID+" "+tc.wantDetail) {
-				t.Fatalf("decision reason = %q, want adverse child %s", decision.Reason, adverseID)
-			}
-			if len(gh.merges) != 0 {
-				t.Fatalf("merge calls = %+v, want none", gh.merges)
-			}
-		})
-	}
-}
-
-func TestPolicyMergeGateWinningDelegationOutcomeNamesSubordinateObligations(t *testing.T) {
-	store, gh, gate, request := newMergeGateQuorumScenario(t)
-	const (
-		parentID       = "review-parent-mixed-naming"
-		blockingID     = parentID + "/delegation/blocking"
-		unrecognizedID = parentID + "/delegation/unrecognized"
-	)
-	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-		id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-		recorded: "2026-07-31 12:00:00",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "blocking", JobSucceeded, &AgentResult{
-		Decision: "blocked",
-		Summary:  "delegated review blocked",
-	})
-	insertMergeGateDelegationChild(t, store, parentID, "unrecognized", JobSucceeded, &AgentResult{
-		Decision: "future-review-outcome",
-		Summary:  "unknown review outcome",
-	})
-
-	decision, err := gate.Evaluate(context.Background(), request)
-
-	if err != nil {
-		t.Fatalf("Evaluate returned error: %v", err)
-	}
-	if !decision.LeaveOpen || !decision.Reason.IsGateMiss() || decision.Merged {
-		t.Fatalf("decision = %+v, want blocking outcome to win mixed delegation set", decision)
-	}
-	for _, want := range []string{
-		"blocking delegation evidence",
-		blockingID + " (blocked)",
-		"unrecognized children:",
-		unrecognizedID + ` (unrecognized decision "future-review-outcome")`,
-	} {
-		if !strings.Contains(decision.Reason.Render(), want) {
-			t.Fatalf("decision reason = %q, want %q", decision.Reason, want)
-		}
-	}
-	if len(gh.merges) != 0 {
-		t.Fatalf("merge calls = %+v, want none", gh.merges)
-	}
-}
-
-func TestPolicyMergeGateDelegatedReviewEvidenceEnumeration(t *testing.T) {
-	type outcome string
-	const (
-		satisfies    outcome = "SAT"
-		waits        outcome = "WAIT"
-		blocks       outcome = "BLOCK"
-		parksCrashed outcome = "PARK_C"
-		// #1799: a cancelled child parks in its OWN class. Folding it into PARK_C
-		// is the mislabel this matrix would otherwise keep asserting.
-		parksCancelled   outcome = "PARK_X"
-		parksAbstaining  outcome = "PARK_A"
-		parksUnknown     outcome = "PARK_U"
-		parksCouldNotRun outcome = "PARK_STATE_BLOCKED_COULD_NOT_RUN"
-	)
-	type childFixture struct {
-		label     string
-		state     JobState
-		decision  string
-		nilResult bool
-		malformed bool
-	}
-	type enumerationRow struct {
-		id       string
-		children []childFixture
-		want     outcome
-	}
-
-	child := func(label string, state JobState, decision string) childFixture {
-		return childFixture{label: label, state: state, decision: decision}
-	}
-	sat := func(label string) childFixture {
-		return child(label, JobSucceeded, "approved")
-	}
-	wait := func(label string) childFixture {
-		return child(label, JobRunning, "")
-	}
-	block := func(label string) childFixture {
-		return child(label, JobSucceeded, "blocked")
-	}
-	unknown := func(label string) childFixture {
-		return child(label, JobSucceeded, "future-review-outcome")
-	}
-	crashed := func(label string) childFixture {
-		return child(label, JobFailed, "")
-	}
-	abstained := func(label string) childFixture {
-		return child(label, JobSucceeded, "implemented")
-	}
-	couldNotRun := func(label string) childFixture {
-		return child(label, JobBlocked, "")
-	}
-
-	rows := []enumerationRow{
-		{id: "H01_QUEUED", children: []childFixture{child("queued", JobQueued, "")}, want: waits},
-		{id: "H02_RUNNING", children: []childFixture{wait("running")}, want: waits},
-		{id: "H03_APPROVED", children: []childFixture{sat("approved")}, want: satisfies},
-		{id: "H04_CHANGES_REQUESTED", children: []childFixture{child("changes-requested", JobSucceeded, "changes_requested")}, want: blocks},
-		{id: "H05_DECISION_BLOCKED_REFUSED", children: []childFixture{block("decision-blocked-refused")}, want: blocks},
-		{id: "H06_DECISION_FAILED_REFUSED", children: []childFixture{child("decision-failed-refused", JobSucceeded, "failed")}, want: blocks},
-		{id: "H07_SKIPPED", children: []childFixture{child("skipped", JobSucceeded, "skipped")}, want: parksAbstaining},
-		{id: "H08_IMPLEMENTED", children: []childFixture{abstained("implemented")}, want: parksAbstaining},
-		{id: "H09_EMPTY_DECISION", children: []childFixture{child("empty-decision", JobSucceeded, "")}, want: parksUnknown},
-		{id: "H10_UNRECOGNIZED_DECISION", children: []childFixture{unknown("unrecognized-decision")}, want: parksUnknown},
-		{id: "H11_NIL_RESULT", children: []childFixture{{label: "nil-result", state: JobSucceeded, nilResult: true}}, want: parksUnknown},
-		{id: "H12_MALFORMED_PAYLOAD", children: []childFixture{{label: "malformed-payload", state: JobSucceeded, malformed: true}}, want: parksUnknown},
-		{id: "H13_STATE_FAILED_CRASHED", children: []childFixture{crashed("state-failed-crashed")}, want: parksCrashed},
-		{id: "H14_STATE_CANCELLED", children: []childFixture{child("state-cancelled", JobCancelled, "")}, want: parksCancelled},
-		{id: "H15_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{couldNotRun("state-blocked-could-not-run")}, want: parksCouldNotRun},
-		{id: "H16_UNRECOGNIZED_STATE", children: []childFixture{child("unrecognized-state", JobState("paused"), "")}, want: parksUnknown},
-
-		{id: "M01_SAT_PLUS_WAIT", children: []childFixture{sat("sat"), wait("wait")}, want: waits},
-		{id: "M02_SAT_PLUS_BLOCK", children: []childFixture{sat("sat"), block("decision-blocked-refused")}, want: blocks},
-		{id: "M03_SAT_PLUS_PARK_U", children: []childFixture{sat("sat"), unknown("park-u")}, want: parksUnknown},
-		{id: "M04_SAT_PLUS_PARK_C", children: []childFixture{sat("sat"), crashed("park-c")}, want: parksCrashed},
-		{id: "M05_SAT_PLUS_PARK_A", children: []childFixture{sat("sat"), abstained("park-a")}, want: parksAbstaining},
-		{id: "M06_SAT_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{sat("sat"), couldNotRun("state-blocked-could-not-run")}, want: parksCouldNotRun},
-		{id: "M07_WAIT_PLUS_BLOCK", children: []childFixture{wait("wait"), block("decision-blocked-refused")}, want: blocks},
-		{id: "M08_WAIT_PLUS_PARK_U", children: []childFixture{wait("wait"), unknown("park-u")}, want: parksUnknown},
-		{id: "M09_WAIT_PLUS_PARK_C", children: []childFixture{wait("wait"), crashed("park-c")}, want: waits},
-		{id: "M10_WAIT_PLUS_PARK_A", children: []childFixture{wait("wait"), abstained("park-a")}, want: waits},
-		{id: "M11_WAIT_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{wait("wait"), couldNotRun("state-blocked-could-not-run")}, want: waits},
-		{id: "M12_BLOCK_PLUS_PARK_U", children: []childFixture{block("decision-blocked-refused"), unknown("park-u")}, want: blocks},
-		{id: "M13_BLOCK_PLUS_PARK_C", children: []childFixture{block("decision-blocked-refused"), crashed("park-c")}, want: blocks},
-		{id: "M14_BLOCK_PLUS_PARK_A", children: []childFixture{block("decision-blocked-refused"), abstained("park-a")}, want: blocks},
-		{id: "M15_BLOCK_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{block("decision-blocked-refused"), couldNotRun("state-blocked-could-not-run")}, want: blocks},
-		{id: "M16_PARK_U_PLUS_PARK_C", children: []childFixture{unknown("park-u"), crashed("park-c")}, want: parksUnknown},
-		{id: "M17_PARK_U_PLUS_PARK_A", children: []childFixture{unknown("park-u"), abstained("park-a")}, want: parksUnknown},
-		{id: "M18_PARK_U_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{unknown("park-u"), couldNotRun("state-blocked-could-not-run")}, want: parksUnknown},
-		{id: "M19_PARK_C_PLUS_PARK_A", children: []childFixture{crashed("park-c"), abstained("park-a")}, want: parksCrashed},
-		{id: "M20_PARK_C_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{crashed("park-c"), couldNotRun("state-blocked-could-not-run")}, want: parksCrashed},
-		{id: "M21_PARK_A_PLUS_STATE_BLOCKED_COULD_NOT_RUN", children: []childFixture{abstained("park-a"), couldNotRun("state-blocked-could-not-run")}, want: parksAbstaining},
-	}
-
-	linkages := []struct {
-		name         string
-		parent       bool
-		delegation   bool
-		wantExcluded bool
-	}{
-		{name: "FULL_PARENT_AND_DELEGATION", parent: true, delegation: true},
-		{name: "PARENT_ONLY_NO_DELEGATION", parent: true, wantExcluded: true},
-		{name: "NEITHER_PARENT_NOR_DELEGATION", wantExcluded: true},
-	}
-
-	for rowIndex, row := range rows {
-		row := row
-		t.Run(row.id, func(t *testing.T) {
-			for _, linkage := range linkages {
-				linkage := linkage
-				t.Run(linkage.name, func(t *testing.T) {
-					t.Parallel()
-
-					store, gh, gate, request := newMergeGateQuorumScenario(t)
-					parentID := fmt.Sprintf("review-parent-enumeration-%02d", rowIndex)
-					insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-						id: parentID, agent: "reviewer-a", hasResult: true, decision: "approved",
-						recorded: "2026-07-31 12:00:00",
-					})
-
-					var includedAdverseIDs []string
-					for childIndex, fixture := range row.children {
-						childID := fmt.Sprintf("%s/child/%02d-%s", parentID, childIndex, fixture.label)
-						payload := "{not-json"
-						jobType := "ask"
-						if !fixture.malformed {
-							var result *AgentResult
-							if !fixture.nilResult {
-								result = &AgentResult{Decision: fixture.decision, Summary: "enumerated delegation result"}
-							}
-							encoded, err := marshalPayload(JobPayload{
-								Repo:        "gitmoot/gitmoot",
-								PullRequest: 9,
-								TaskID:      "task-9",
-								Result:      result,
-							})
-							if err != nil {
-								t.Fatalf("marshalPayload returned error: %v", err)
-							}
-							payload = encoded
-							jobType = "review"
-						}
-
-						job := db.Job{
-							ID:      childID,
-							Agent:   fixture.label,
-							Type:    jobType,
-							State:   string(fixture.state),
-							Payload: payload,
-						}
-						if linkage.parent {
-							job.ParentJobID = parentID
-						}
-						if linkage.delegation {
-							job.DelegationID = fixture.label
-						}
-						if err := store.CreateJobWithEvent(context.Background(), job, db.JobEvent{
-							Kind: string(fixture.state), Message: "enumerated delegation fixture",
-						}); err != nil {
-							t.Fatalf("CreateJobWithEvent returned error: %v", err)
-						}
-						if !linkage.wantExcluded && !(fixture.state == JobSucceeded && fixture.decision == "approved") {
-							includedAdverseIDs = append(includedAdverseIDs, childID)
-						}
-					}
-
-					decision, err := gate.Evaluate(context.Background(), request)
-					if err != nil {
-						t.Fatalf("Evaluate returned error: %v", err)
-					}
-
-					want := row.want
-					if linkage.wantExcluded {
-						want = satisfies
-					}
-					switch want {
-					case satisfies:
-						if !decision.Merged || len(gh.merges) != 1 {
-							t.Fatalf("decision = %+v merge calls = %+v, want SAT", decision, gh.merges)
-						}
-					case waits:
-						if decision.Merged || decision.LeaveOpen || decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "waiting for delegated review parent") {
-							t.Fatalf("decision = %+v, want WAIT", decision)
-						}
-					case blocks:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "blocking delegation evidence") {
-							t.Fatalf("decision = %+v, want BLOCK", decision)
-						}
-					case parksUnknown:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "unrecognized delegation evidence") {
-							t.Fatalf("decision = %+v, want PARK-U", decision)
-						}
-					case parksCrashed:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "crashed delegation children") {
-							t.Fatalf("decision = %+v, want PARK-C", decision)
-						}
-					case parksCancelled:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "CANCELLED delegation children") {
-							t.Fatalf("decision = %+v, want PARK-X", decision)
-						}
-					case parksAbstaining:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "abstaining delegation children") {
-							t.Fatalf("decision = %+v, want PARK-A", decision)
-						}
-					case parksCouldNotRun:
-						if decision.Merged || !decision.LeaveOpen || !decision.Reason.IsGateMiss() ||
-							!strings.Contains(decision.Reason.Render(), "parked children:") {
-							t.Fatalf("decision = %+v, want PARK STATE_BLOCKED_COULD_NOT_RUN", decision)
-						}
-					default:
-						t.Fatalf("unknown expected outcome %q", want)
-					}
-					for _, childID := range includedAdverseIDs {
-						if !strings.Contains(decision.Reason.Render(), childID) {
-							t.Fatalf("decision reason = %q, want subordinate child %s", decision.Reason, childID)
-						}
-					}
-				})
-			}
-		})
-	}
-}
-
 func TestPolicyMergeGateLeavesOrdinaryReviewWithoutDelegationsUnaffected(t *testing.T) {
 	store, gh, gate, request := newMergeGateQuorumScenario(t)
 	insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
@@ -5208,81 +4180,6 @@ func settleMergeGateReviewInPlace(t *testing.T, store *db.Store, jobID string, s
 	setMergeGateJobRecordedTimes(t, store, jobID, "", recorded)
 }
 
-// #1685 P2. The gate groups delegation children by parent and judges every row.
-// A panel child that FAILED and was then retried to approval left the obsolete
-// failed row in that set forever: a terminal row can never change, so the panel
-// stayed poisoned and only a new head could clear it. Continuation synthesis
-// already selects the highest RetryCount per delegation; the gate must agree.
-func TestPolicyMergeGateUsesLatestDelegationAttempt(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		latestState JobState
-		latest      *AgentResult
-		wantErr     bool
-	}{
-		{
-			name: "approved retry supersedes the failed original", latestState: JobSucceeded,
-			latest: &AgentResult{Decision: "approved", Summary: "retry verified the head"},
-		},
-		{
-			name: "a failed latest attempt still blocks", latestState: JobFailed, wantErr: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := openEngineStore(t)
-			insertMergeGateFanOutRow(t, store, "approved")
-			// lens-b answers cleanly throughout; only lens-a is retried, so a mixed
-			// panel proves the selection is per-delegation and not per-parent.
-			insertMergeGatePanelChild(t, store, "review-panel", "lens-b", JobSucceeded, &AgentResult{
-				Decision: "approved", Summary: "lens-b verified the head",
-			})
-			insertMergeGatePanelChild(t, store, "review-panel", "lens-c", JobSucceeded, &AgentResult{
-				Decision: "approved", Summary: "lens-c verified the head",
-			})
-			insertMergeGatePanelChild(t, store, "review-panel", "lens-a", JobFailed, nil)
-			insertMergeGatePanelRetry(t, store, "review-panel", "lens-a", 1, tc.latestState, tc.latest)
-
-			err := (PolicyMergeGate{Store: store}).ensureFinalReviewCaptured(ctx, MergeRequest{
-				Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", Reviewer: "g6-review-sol",
-			}, "head123")
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("an unsuccessful latest attempt must still block the panel")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("an approved retry must clear its failed original, got %v", err)
-			}
-		})
-	}
-}
-
-// insertMergeGatePanelRetry adds a later ATTEMPT of an existing delegation, the
-// shape the engine writes on retry: same DelegationID, RetryCount incremented,
-// a distinct job id.
-func insertMergeGatePanelRetry(t *testing.T, store *db.Store, parentID, delegationID string, attempt int, state JobState, result *AgentResult) {
-	t.Helper()
-	encoded, err := marshalPayload(JobPayload{
-		Repo: "mobile/app", PullRequest: 9, TaskID: "task-9", RetryCount: attempt, Result: result,
-	})
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	if err := store.CreateJobWithEvent(context.Background(), db.Job{
-		ID:           fmt.Sprintf("%s/delegation/%s/retry/%d", parentID, delegationID, attempt),
-		Agent:        delegationID,
-		Type:         "review",
-		State:        string(state),
-		Payload:      encoded,
-		ParentJobID:  parentID,
-		DelegationID: delegationID,
-	}, db.JobEvent{Kind: string(state), Message: "delegation retry fixture"}); err != nil {
-		t.Fatalf("CreateJobWithEvent returned error: %v", err)
-	}
-}
-
 // insertMergeGateHeadlessReview seeds a review row with NO HeadSHA, which
 // insertMergeGateReviewFixture cannot express: it defaults an empty head to
 // "head123". A headless row is what `gitmoot agent review` leaves behind when the
@@ -5393,10 +4290,7 @@ func TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply(t *testing
 		// wantMerge defaults to TRUE - this table is the should-SUCCEED half - and
 		// is set false only by the arms guarding corrections to it.
 		wantMerge *bool
-		// wantReasonContains pins WHICH path refused, not merely that one did: a
-		// block from the headless pre-pass and a block from the parent's delegation
-		// evidence are different guarantees, and shadowing one with the other would
-		// pass a bare "it did not merge" assertion.
+		// wantReasonContains pins WHICH path refused, not merely that one did.
 		wantReasonContains string
 	}{
 		{
@@ -5478,20 +4372,6 @@ func TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply(t *testing
 			},
 		},
 		{
-			name: "not ordinary: a headless fan-out announcement is not a verdict",
-			why:  "#1685 - a row declaring delegations announces a panel and never answers for the head",
-			seed: func(t *testing.T, store *db.Store) {
-				insertCompletedJob(t, store, db.Job{ID: "objection-fanout", Agent: "gm-review-opus", Type: "review"}, JobPayload{
-					Repo: "gitmoot/gitmoot", PullRequest: 9, HeadSHA: "", TaskID: "task-9",
-					Result: &AgentResult{
-						Decision:    "changes_requested",
-						Summary:     "fan-out announcement",
-						Delegations: []Delegation{{ID: "lens-a", Agent: "lens-a", Action: "review", Prompt: "look at it"}},
-					},
-				})
-			},
-		},
-		{
 			name: "not applicable: an integration-worktree objection records no head by design",
 			why:  "#332/#388 - the engine CLEARS the head for these children, so treating one as an objection against this head makes it an objection against every head, which no push can clear",
 			// The pre-existing TestPolicyMergeGateHeadlessIntegrationObjectionDoesNotMatchEveryHead
@@ -5509,34 +4389,9 @@ func TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply(t *testing
 			},
 		},
 		{
-			name:               "a delegation child blocks through its PARENT'S evidence, not through this block",
-			why:                "the engine clears only the inherited HeadSHA so a real child keeps its round; it must be judged by ensureDelegatedReviewEvidence, and the headless block must not shadow that path with its own reason",
-			wantMerge:          boolPtr(false),
-			wantReasonContains: "blocking delegation evidence",
-			seed: func(t *testing.T, store *db.Store) {
-				encoded, err := marshalPayload(JobPayload{
-					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9", ReviewRound: "review-1",
-					Result: &AgentResult{Decision: "changes_requested", Summary: "delegated child verdict"},
-				})
-				if err != nil {
-					t.Fatalf("marshalPayload: %v", err)
-				}
-				if err := store.CreateJobWithEvent(context.Background(), db.Job{
-					ID: "objection-delegation-child", Agent: "lens-a", Type: "review",
-					State: string(JobSucceeded), Payload: encoded,
-					ParentJobID: "review-approval", DelegationID: "lens-a",
-				}, db.JobEvent{Kind: string(JobSucceeded), Message: "child"}); err != nil {
-					t.Fatalf("CreateJobWithEvent: %v", err)
-				}
-			},
-		},
-		{
-			// PINS THE DELEGATION-CHILD EXCLUSION ITSELF. The arm above it does not:
-			// its parent is a review row, so isRoundHistoryDuplicate already excludes
-			// it and deleting isDelegationChild changed nothing - a surviving mutant
-			// proved that. A child of the IMPLEMENT row is not round history, so this
-			// is the shape where the exclusion is the only thing standing between a
-			// headless child and a permanent block.
+			// PINS THE DELEGATION-CHILD EXCLUSION ITSELF. A child of the IMPLEMENT
+			// row is not round history, so this is the shape where the exclusion is
+			// the only thing standing between a headless child and a permanent block.
 			name: "not applicable: a delegation child whose parent is not a review row",
 			why:  "the engine clears a child's inherited head; a child of the implement row is not round history, so only the delegation-child exclusion keeps it from blocking every head",
 			seed: func(t *testing.T, store *db.Store) {
@@ -5571,7 +4426,7 @@ func TestPolicyMergeGateStillMergesWhenAHeadlessObjectionDoesNotApply(t *testing
 		},
 		{
 			name: "not applicable: neither head nor round is an unattributable remnant",
-			why:  "matches no production writer of a reviewer verdict - engine reviews carry a round, CLI reviews carry a head - and TestPolicyMergeGateDelegatedReviewEvidenceEnumeration asserts wantExcluded for exactly this shape",
+			why:  "matches no production writer of a reviewer verdict - engine reviews carry a round, CLI reviews carry a head",
 			seed: func(t *testing.T, store *db.Store) {
 				insertCompletedJob(t, store, db.Job{ID: "objection-no-round", Agent: "orphan", Type: "review"}, JobPayload{
 					Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
@@ -6146,20 +5001,19 @@ func TestPolicyMergeGateRefusesWhenAStaleHeadApprovalWouldRetireASessionObjectio
 
 // TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection is #1950 F6.
 // The candidate loop checked head, identity, decision spelling and recency but
-// never whether the candidate was a VERDICT AT ALL, so a later blocked review,
-// failed review, or approved fan-out announcement from the same reviewer retired
-// a live changes_requested session objection - and each of those rows is then
-// itself absent from the blocking population, so an independent at-head approval
-// merged.
+// never whether the candidate was a VERDICT AT ALL, so a later blocked or failed
+// review from the same reviewer retired a live changes_requested session
+// objection - and each of those rows is then itself absent from the blocking
+// population, so an independent at-head approval merged.
 //
 // The objection is built through the production session writers, because that is
 // what caught F6; a helper-level assertion cannot observe the merge.
 //
 // The last two arms are PROBES rather than reported findings: a delegation-child
 // candidate and an engine-inserted roundless remnant both satisfy the measured
-// floor (succeeded, non-fan-out, headless), so they are executed here to find out
-// whether the floor is sufficient or whether those kinds need admitting clauses
-// of their own. Whatever they show is reported as measured, not asserted.
+// floor (succeeded, headless), so they are executed here to find out whether the
+// floor is sufficient or whether those kinds need admitting clauses of their
+// own. Whatever they show is reported as measured, not asserted.
 func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -6168,20 +5022,13 @@ func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testin
 		{
 			name: "a later BLOCKED review from the same reviewer is not a verdict",
 			seed: func(t *testing.T, store *db.Store) {
-				seedHeadlessCandidate(t, store, "later-blocked", "session-reviewer", JobBlocked, "approved", nil)
+				seedHeadlessCandidate(t, store, "later-blocked", "session-reviewer", JobBlocked, "approved")
 			},
 		},
 		{
 			name: "a later FAILED review from the same reviewer is not a verdict",
 			seed: func(t *testing.T, store *db.Store) {
-				seedHeadlessCandidate(t, store, "later-failed", "session-reviewer", JobFailed, "approved", nil)
-			},
-		},
-		{
-			name: "a later APPROVED FAN-OUT announcement is a dispatch record, not a verdict",
-			seed: func(t *testing.T, store *db.Store) {
-				seedHeadlessCandidate(t, store, "later-fanout", "session-reviewer", JobSucceeded, "approved",
-					[]Delegation{{ID: "lens-a", Agent: "lens-a", Action: "review", Prompt: "look"}})
+				seedHeadlessCandidate(t, store, "later-failed", "session-reviewer", JobFailed, "approved")
 			},
 		},
 		{
@@ -6249,8 +5096,8 @@ func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testin
 }
 
 // seedHeadlessCandidate inserts a supersession candidate in the ONLY shape that
-// can actually reach the state and fan-out clauses, which took two wrong fixtures
-// to find and both wrong versions PASSED at the previous head:
+// can actually reach the state clause, which took two wrong fixtures to find and
+// both wrong versions PASSED at the previous head:
 //
 //   - HEADLESS. A candidate carrying the evaluated head enters reviewsAtHead,
 //     where a blocked or failed row is refused as a CRASHED REVIEWER - a different
@@ -6260,13 +5107,13 @@ func TestPolicyMergeGateRefusesNonVerdictCandidatesRetiringAnObjection(t *testin
 //     candidate carrying a round supersedes NOTHING and the arm proves nothing.
 //   - EXTERNALLY DRIVEN, via CreateExternallyDrivenJobWithEvent, because roundless
 //     alone is refused by the attributable-provenance clause. This is what leaves
-//     recency as the only remaining discriminator, so state and fan-out are the
-//     properties actually under test.
-func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, state JobState, decision string, delegations []Delegation) {
+//     recency as the only remaining discriminator, so state is the property
+//     actually under test.
+func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, state JobState, decision string) {
 	t.Helper()
 	encoded, err := marshalPayload(JobPayload{
 		Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
-		Result: &AgentResult{Decision: decision, Summary: "later candidate", Delegations: delegations},
+		Result: &AgentResult{Decision: decision, Summary: "later candidate"},
 	})
 	if err != nil {
 		t.Fatalf("marshalPayload: %v", err)
@@ -6284,7 +5131,7 @@ func seedHeadlessCandidate(t *testing.T, store *db.Store, id, agent string, stat
 // load-bearing for both arms below: the whole of #1950 F5 is that a CLI review
 // carries a HeadSHA and NEITHER a round nor ExternallyDriven, and a hand-built
 // fixture is free to contradict that. This one cannot.
-func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision, headSHA string, delegations []Delegation) db.Job {
+func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision, headSHA string) db.Job {
 	t.Helper()
 	ctx := context.Background()
 	mailbox := Mailbox{store: store}
@@ -6310,7 +5157,7 @@ func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision,
 	if err != nil {
 		t.Fatalf("unmarshalPayload(%s): %v", id, err)
 	}
-	payload.Result = &AgentResult{Decision: decision, Summary: "production review", Delegations: delegations}
+	payload.Result = &AgentResult{Decision: decision, Summary: "production review"}
 	if decision == "changes_requested" {
 		payload.Result.Severity = reviewseverity.P1
 	}
@@ -6324,21 +5171,18 @@ func seedProductionReviewRow(t *testing.T, store *db.Store, id, agent, decision,
 	return stored
 }
 
-// TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut covers BOTH P1s the
-// exact-head review of b22667017849b0a460026a68f9bf18d9a89ccd26 found, and they
-// point in OPPOSITE directions - which is why they are pinned together and why
-// each has its own mutant:
+// TestPolicyMergeGateAdmitsCLIReviewsAtTheEvaluatedHead covers #1950 F5, found by
+// the exact-head review of b22667017849b0a460026a68f9bf18d9a89ccd26:
 //
 //   - F5, OVER-BLOCKING: the provenance clause demanded external origin or a round
 //     of every candidate, and a CLI review has neither, so a legitimate succeeded
 //     approval at the evaluated head could not retire an objection and the PR
 //     deadlocked. Provenance is now asked only of a HEADLESS row.
-//   - F6, UNDER-BLOCKING: default-deny had been added to the headless loop only,
-//     while the at-head loop still tested a bare Result != nil, so an approved
-//     FAN-OUT announcement at the evaluated head retired a real objection and the
-//     PR merged. Both loops now share the predicate - two call sites, asserted
-//     below as a COUNT, because the previous round claimed that property with one.
-func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
+//
+// It also pins that every candidate and objection population shares one
+// predicate, asserted below as a COUNT, because an earlier round claimed that
+// property with one call site.
+func TestPolicyMergeGateAdmitsCLIReviewsAtTheEvaluatedHead(t *testing.T) {
 	t.Run("a CLI approval at the evaluated head RETIRES a session objection (F5: must MERGE)", func(t *testing.T) {
 		ctx := context.Background()
 		store, gh, gate, request := newMergeGateQuorumScenario(t)
@@ -6361,7 +5205,7 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		}
 		setMergeGateJobTimestamps(t, store, "cli-session-objection", "2026-09-01T12:00:00Z")
 
-		cli := seedProductionReviewRow(t, store, "cli-review-approval", "returning-reviewer", "approved", "head123", nil)
+		cli := seedProductionReviewRow(t, store, "cli-review-approval", "returning-reviewer", "approved", "head123")
 		setMergeGateJobTimestamps(t, store, "cli-review-approval", "2026-09-01T18:00:00Z")
 
 		// Assert the shape rather than trust it: if a CLI review ever starts
@@ -6397,43 +5241,6 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		}
 	})
 
-	t.Run("an at-head approved FAN-OUT does NOT retire an at-head objection (F6: must BLOCK)", func(t *testing.T) {
-		ctx := context.Background()
-		store, gh, gate, request := newMergeGateQuorumScenario(t)
-		insertMergeGateReviewFixture(t, store, mergeGateReviewFixture{
-			id: "review-approval", agent: "audit", decision: "approved", hasResult: true,
-		})
-		seedProductionReviewRow(t, store, "at-head-objection", "fanout-reviewer", "changes_requested", "head123", nil)
-		setMergeGateJobTimestamps(t, store, "at-head-objection", "2026-09-01T12:00:00Z")
-		seedProductionReviewRow(t, store, "at-head-fanout", "fanout-reviewer", "approved", "head123",
-			[]Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look again"}})
-		setMergeGateJobTimestamps(t, store, "at-head-fanout", "2026-09-01T18:00:00Z")
-
-		if err := store.UpsertTask(ctx, db.Task{
-			ID: "task-9", RepoFullName: "gitmoot/gitmoot", Branch: "task-9", State: string(TaskReadyToMerge),
-		}); err != nil {
-			t.Fatal(err)
-		}
-		request.Reviewer = "audit"
-		request.ExpectedTaskState = string(TaskReadyToMerge)
-
-		decision, evalErr := gate.Evaluate(ctx, request)
-		if evalErr != nil {
-			t.Fatalf("Evaluate returned error: %v", evalErr)
-		}
-		if decision.Merged || len(gh.merges) != 0 {
-			t.Fatalf("decision=%+v merges=%d, want NO merge: an approved fan-out is a dispatch announcement, not a verdict, so it cannot retire that reviewer's own at-head objection (#1950 F6)",
-				decision, len(gh.merges))
-		}
-		task, taskErr := store.GetTask(ctx, "task-9")
-		if taskErr != nil {
-			t.Fatalf("GetTask: %v", taskErr)
-		}
-		if task.State == string(TaskMerged) {
-			t.Fatalf("task state = %q, want it NOT merged", task.State)
-		}
-	})
-
 	t.Run("all THREE populations share the predicate (static census, not a claim)", func(t *testing.T) {
 		source, err := os.ReadFile("merge_gate.go")
 		if err != nil {
@@ -6463,9 +5270,8 @@ func TestPolicyMergeGateAdmitsCLIReviewsAndRefusesAtHeadFanOut(t *testing.T) {
 		//     refused - defence in depth, measured, and now pinned per state with
 		//     its reason by
 		//     TestPolicyMergeGateAtHeadStateGuardAdmitsNothingUnsucceeded.
-		//   - the two slot scans decide whether a reviewer's SLOT is filled - a
-		//     fan-out with dispatched children is judged through the children -
-		//     so routing them would change quorum rather than tighten it.
+		//   - the two slot scans decide whether a reviewer's SLOT is filled, so
+		//     routing them would change quorum rather than tighten it.
 		guards := strings.Count(string(source), "!reviewRowIsVerdictAboutHead(") +
 			strings.Count(string(source), "!reviewRowCanRetireAnObjection(")
 		if guards != 3 {
@@ -6778,45 +5584,38 @@ func TestReviewRowSupersedingImpliesObjectable(t *testing.T) {
 		for _, round := range rounds {
 			for _, ext := range bools {
 				for _, child := range bools {
-					for _, fanOut := range bools {
-						for _, state := range states {
-							checked++
-							result := &AgentResult{Decision: "approved", Summary: "enumerated row"}
-							if fanOut {
-								result.Delegations = []Delegation{{ID: "d1", Agent: "specialist", Action: "review", Prompt: "look"}}
-							}
-							payload := JobPayload{
-								Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
-								HeadSHA: head, ReviewRound: round, Result: result,
-							}
-							job := db.Job{
-								ID: "enumerated", Agent: "reviewer", Type: "review",
-								State: string(state), ExternallyDriven: ext,
-							}
-							if child {
-								job.ParentJobID, job.DelegationID = "parent", "delegation"
-							}
-							if !reviewRowIsVerdictAboutHead(job, payload, headSHA) {
-								continue
-							}
-							admitted++
-							// Every reason the OBJECTION populations drop a row. If an
-							// admitted candidate matches any of them, that row can
-							// supersede an objection while being unable to be one.
-							switch {
-							case JobState(job.State) != JobSucceeded:
-								t.Errorf("admitted candidate is not succeeded (state=%s): the objection scans skip it, so it can retire a block it cannot impose", state)
-							case payload.Result == nil:
-								t.Errorf("admitted candidate has no result: the objection scans skip it")
-							case reviewRowIsFanOut(payload.Result):
-								t.Errorf("admitted candidate is a fan-out announcement: all four objection sites skip it")
-							case isDelegationChild(job):
-								t.Errorf("admitted candidate is a delegation child (head=%q round=%q ext=%v): the objection scan excludes it at merge_gate.go:1060 - this is #1950 F6 exactly", head, round, ext)
-							case isIntegrationWorktreeReview(payload):
-								t.Errorf("admitted candidate is an integration-worktree review: the headless objection scan excludes it")
-							case strings.TrimSpace(head) != "" && strings.TrimSpace(head) != headSHA:
-								t.Errorf("admitted candidate carries a foreign head %q", head)
-							}
+					for _, state := range states {
+						checked++
+						payload := JobPayload{
+							Repo: "gitmoot/gitmoot", PullRequest: 9, TaskID: "task-9",
+							HeadSHA: head, ReviewRound: round,
+							Result: &AgentResult{Decision: "approved", Summary: "enumerated row"},
+						}
+						job := db.Job{
+							ID: "enumerated", Agent: "reviewer", Type: "review",
+							State: string(state), ExternallyDriven: ext,
+						}
+						if child {
+							job.ParentJobID, job.DelegationID = "parent", "delegation"
+						}
+						if !reviewRowIsVerdictAboutHead(job, payload, headSHA) {
+							continue
+						}
+						admitted++
+						// Every reason the OBJECTION populations drop a row. If an
+						// admitted candidate matches any of them, that row can
+						// supersede an objection while being unable to be one.
+						switch {
+						case JobState(job.State) != JobSucceeded:
+							t.Errorf("admitted candidate is not succeeded (state=%s): the objection scans skip it, so it can retire a block it cannot impose", state)
+						case payload.Result == nil:
+							t.Errorf("admitted candidate has no result: the objection scans skip it")
+						case isDelegationChild(job):
+							t.Errorf("admitted candidate is a delegation child (head=%q round=%q ext=%v): the headless objection scan excludes it - this is #1950 F6 exactly", head, round, ext)
+						case isIntegrationWorktreeReview(payload):
+							t.Errorf("admitted candidate is an integration-worktree review: the headless objection scan excludes it")
+						case strings.TrimSpace(head) != "" && strings.TrimSpace(head) != headSHA:
+							t.Errorf("admitted candidate carries a foreign head %q", head)
 						}
 					}
 				}

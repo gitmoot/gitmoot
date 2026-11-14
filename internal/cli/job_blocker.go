@@ -739,13 +739,11 @@ func (w jobWorker) deferOperationalBlockerPreTerminal(ctx context.Context, jobID
 	// outputs proving side effects. This path re-runs NOTHING, so none of those
 	// hazards apply to it.
 	//
-	// A delegation child in particular MUST reach this branch. A child that
-	// cannot execute its runtime is precisely the staged-review failure #1823
-	// names, and a blocked child lands in the merge gate's parked arm, where
-	// ensureDelegatedReviewEvidence already refuses the parent. That is the
-	// non-fallback clause - strong reviewer unavailable must never degrade to
-	// cheap reviewer approved - enforced by the row's STATE rather than by a
-	// rule anyone has to remember.
+	// A delegation child in particular MUST reach this branch: a child that
+	// cannot execute its runtime is a capability refusal like any other, and a
+	// BLOCKED row is never a verdict, so strong reviewer unavailable never
+	// degrades to cheap reviewer approved - enforced by the row's STATE rather
+	// than by a rule anyone has to remember.
 	//
 	// The one guard that does apply is a stored Result: if the agent answered,
 	// this is a product outcome and the runtime plainly executed, whatever the

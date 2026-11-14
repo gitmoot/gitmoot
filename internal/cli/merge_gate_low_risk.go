@@ -225,7 +225,7 @@ func approvingReviewRole(ctx context.Context, store *db.Store, repo string, pr i
 		return "", err
 	}
 	for _, job := range jobs {
-		payload, err := workflow.ParseJobPayload(job.Payload)
+		payload, err := workflow.DecodeJobPayload(job)
 		if err != nil || payload.PostMergeReview || !strings.EqualFold(strings.TrimSpace(payload.HeadSHA), head) {
 			continue
 		}

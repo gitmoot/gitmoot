@@ -763,7 +763,7 @@ func (e Engine) mergeGateReviewRequired(ctx context.Context, payload JobPayload)
 		if job.Type != "review" {
 			continue
 		}
-		jobPayload, err := unmarshalPayload(job.Payload)
+		jobPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, err
 		}
@@ -891,7 +891,7 @@ func (e Engine) nextReviewRound(ctx context.Context, event PullRequestEvent) (st
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return "", nil, err
 		}

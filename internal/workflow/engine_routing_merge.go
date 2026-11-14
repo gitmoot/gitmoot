@@ -44,7 +44,7 @@ func (e Engine) jobPayload(ctx context.Context, jobID string) (db.Job, JobPayloa
 		}
 		return db.Job{}, JobPayload{}, err
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return db.Job{}, JobPayload{}, err
 	}
@@ -105,12 +105,8 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 	blockingSeverity := e.reviewBlockingSeverity(payload.Repo)
 	approved := map[string]bool{}
 	// The seed credits the reviewer whose job is being advanced right now, whose
-	// own row the loop below has not read yet. #1351/#1417/#1557: seeding it
-	// UNCONDITIONALLY let a fan-out coordinator satisfy its own required-reviewer
-	// slot, which is the one boundary the loop's own ResultIsFanOut skip cannot
-	// reach - the skip only stops OTHER stored fan-out rows. A coordinator that
-	// announces a panel has approved nothing, including on its own behalf.
-	if currentReviewer != "" && !ResultIsFanOut(payload.Result) {
+	// own row the loop below has not read yet.
+	if currentReviewer != "" {
 		approved[currentReviewer] = true
 	}
 
@@ -122,21 +118,14 @@ func (e Engine) allRequiredReviewersApproved(ctx context.Context, currentReviewe
 		if job.Type != "review" {
 			continue
 		}
-		jobPayload, err := unmarshalPayload(job.Payload)
+		jobPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, err
 		}
 		if !sameTask(payload, jobPayload) || !sameReviewRound(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		// A fan-out announces a panel; it does not approve. Counting it here would
-		// let a coordinator satisfy a required-reviewer slot without any delegate
-		// having reported (#1685). The panel's children carry their own rows and
-		// are counted on their own agents.
-		if ResultIsFanOut(jobPayload.Result) {
-			continue
-		}
-		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) == "approved" {
+		if effectiveReviewDecision(jobPayload.Result, blockingSeverity) == "approved" {
 			approved[reviewDecisionAgent(job, jobPayload)] = true
 		}
 	}
@@ -293,14 +282,14 @@ func (e Engine) approvalSupersedesChangesRequested(ctx context.Context, payload 
 		if job.Type != "review" || job.State != "succeeded" {
 			continue
 		}
-		jobPayload, err := unmarshalPayload(job.Payload)
+		jobPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, "", false, err
 		}
-		if !sameTask(payload, jobPayload) || jobPayload.Result == nil || ResultIsFanOut(jobPayload.Result) {
+		if !sameTask(payload, jobPayload) || jobPayload.Result == nil {
 			continue
 		}
-		if effectiveReviewDecisionForPayload(jobPayload, blockingSeverity) != "changes_requested" {
+		if effectiveReviewDecision(jobPayload.Result, blockingSeverity) != "changes_requested" {
 			continue
 		}
 		// Only an objection AT THE CURRENT HEAD can block: by here the approving
@@ -340,7 +329,7 @@ func (e Engine) latestReviewRound(ctx context.Context, current JobPayload) (stri
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return "", err
 		}
@@ -465,7 +454,7 @@ func (e Engine) existingJobMatchesRequest(ctx context.Context, request JobReques
 	if job.Type != request.Action {
 		return false, nil
 	}
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return false, err
 	}

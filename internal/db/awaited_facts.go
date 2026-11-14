@@ -104,10 +104,9 @@ func (s *Store) HasReviewSubscription(ctx context.Context, role, repo string, pr
 // parseReviewVerdictSubjectKey is the exact inverse of the two constructors
 // above: it accepts the bare repo#pr@head key and the purpose-scoped
 // repo#pr@head|purpose key the review router subscribes with.
-// ParseReviewVerdictSubjectKey exposes the subject a claim is keyed to, so the
-// router can check that a verdict it finds while walking a delegation tree
-// actually answers THIS question (#2176). Purpose is read separately with
-// ReviewVerdictKeyPurpose because the bare key carries none.
+// ParseReviewVerdictSubjectKey exposes the subject a key names, so a reader
+// can render it without re-deriving the key format. Purpose is read separately
+// with ReviewVerdictKeyPurpose because the bare key carries none.
 func ParseReviewVerdictSubjectKey(key string) (repo string, pullRequest int, headSHA string, err error) {
 	return parseReviewVerdictSubjectKey(key)
 }
@@ -450,11 +449,10 @@ type reviewVerdictPayload struct {
 	Result        *struct {
 		Decision string `json:"decision"`
 		Severity string `json:"severity,omitempty"`
-		// Delegations and FanOut are the canonical fan-out classification, decoded
-		// here for the same reason every other consumer reads it: a coordinator
-		// announcement carries decision "approved" and is not a verdict (#1685).
-		// Both are needed — a stored row may record FanOut without its
-		// executable delegations.
+		// Delegations and FanOut mark a stored coordinator announcement (#1685,
+		// retired by #2588): it carries decision "approved" and is not a verdict.
+		// No new result carries either, but stored rows still do, sometimes
+		// FanOut without the delegations.
 		Delegations []json.RawMessage `json:"delegations"`
 		FanOut      bool              `json:"fan_out,omitempty"`
 		// Findings, TestsRun and Evidence feed the requester's wake (#2171) so a
@@ -472,9 +470,10 @@ type reviewVerdictPayload struct {
 	PostMergeReview bool `json:"post_merge_review"`
 }
 
-// isFanOut reports whether a decoded review result is a coordinator announcement
-// rather than a verdict. It mirrors workflow.ResultIsFanOut, which cannot be
-// imported here because workflow depends on db and never the reverse.
+// isFanOut reports whether a stored review result is a historical coordinator
+// announcement rather than a verdict. workflow.unmarshalPayload applies the same
+// rule at its own decode boundary; it cannot be shared because workflow depends
+// on db and never the reverse.
 func (p reviewVerdictPayload) isFanOut() bool {
 	if p.Result == nil {
 		return false
@@ -728,8 +727,7 @@ func reviewVerdictFact(jobID, agent, state, payload string, blockingSeverity fun
 	}
 	if decoded.isFanOut() {
 		// Waking a waiter with "review verdict approved" because a coordinator
-		// announced a panel reports an answer nobody gave (#1685). The panel's own
-		// synthesized leaf verdict satisfies the fact when it lands.
+		// announced a panel reports an answer nobody gave (#1685).
 		return reviewVerdictObservation{}, false
 	}
 	decoded.Repo = strings.ToLower(strings.TrimSpace(decoded.Repo))

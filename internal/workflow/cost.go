@@ -109,7 +109,7 @@ func (e Engine) sumRootDelegationCost(ctx context.Context, rootID string) (float
 	}
 	total := 0.0
 	for _, job := range jobs {
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return 0, err
 		}

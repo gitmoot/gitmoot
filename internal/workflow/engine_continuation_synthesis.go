@@ -55,7 +55,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 
 	childPayloads := make(map[string]JobPayload, len(children))
 	for id, child := range children {
-		childPayload, err := unmarshalPayload(child.Payload)
+		childPayload, err := DecodeJobPayload(child)
 		if err != nil {
 			return err
 		}
@@ -407,7 +407,7 @@ func (e Engine) childDelegationJobs(ctx context.Context, parentJobID string) (ma
 // delegationJobRetryCount reads a child job's RetryCount from its payload,
 // returning 0 when the payload is missing or cannot be parsed.
 func delegationJobRetryCount(job db.Job) int {
-	payload, err := unmarshalPayload(job.Payload)
+	payload, err := DecodeJobPayload(job)
 	if err != nil {
 		return 0
 	}
@@ -435,7 +435,7 @@ func (e Engine) delegationFingerprintSeen(ctx context.Context, parentJobID, skip
 		if job.DelegationID == skipDelegationID {
 			continue
 		}
-		childPayload, err := unmarshalPayload(job.Payload)
+		childPayload, err := DecodeJobPayload(job)
 		if err != nil {
 			return false, err
 		}
@@ -684,7 +684,7 @@ func (e Engine) delegationRetryPending(ctx context.Context, parentJobID, delegat
 }
 
 func childFailureReason(child db.Job) string {
-	payload, err := unmarshalPayload(child.Payload)
+	payload, err := DecodeJobPayload(child)
 	if err == nil && payload.Result != nil && strings.TrimSpace(payload.Result.Summary) != "" {
 		return payload.Result.Summary
 	}
@@ -879,7 +879,7 @@ func (e Engine) buildUpstreamDepBlock(d Delegation, children map[string]db.Job, 
 			// dependent only enqueues once depsSatisfied, so this is defensive).
 			continue
 		}
-		depPayload, err := unmarshalPayload(depJob.Payload)
+		depPayload, err := DecodeJobPayload(depJob)
 		if err != nil {
 			continue
 		}
@@ -1278,7 +1278,7 @@ func (e Engine) highRiskLensQuorumMet(ctx context.Context, childPayload JobPaylo
 		}
 		return false, err
 	}
-	coordPayload, err := unmarshalPayload(coord.Payload)
+	coordPayload, err := DecodeJobPayload(coord)
 	if err != nil {
 		return false, err
 	}
@@ -1291,7 +1291,7 @@ func (e Engine) highRiskLensQuorumMet(ctx context.Context, childPayload JobPaylo
 	}
 	childPayloads := make(map[string]JobPayload, len(children))
 	for id, child := range children {
-		payload, err := unmarshalPayload(child.Payload)
+		payload, err := DecodeJobPayload(child)
 		if err != nil {
 			return false, err
 		}

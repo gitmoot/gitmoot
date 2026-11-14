@@ -1337,7 +1337,7 @@ func runJobCancelBulk(home, stateFilter, olderThanArg, repoFilter, agentFilter s
 	if !apply {
 		fmt.Fprintln(stdout, "ID\tAGENT\tREPO\tAGE")
 		for _, job := range selected {
-			payload, _ := workflow.ParseJobPayload(job.Payload)
+			payload, _ := workflow.DecodeJobPayload(job)
 			fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\n", job.ID, job.Agent, payload.Repo, humanizeJobAge(job, now))
 		}
 		fmt.Fprintf(stdout, "run again with --yes to cancel %d jobs\n", len(selected))
@@ -1382,7 +1382,7 @@ func selectBlockedJobsForCancel(jobs []db.Job, repoFilter, agentFilter string, f
 			continue
 		}
 		if repoFilter != "" {
-			payload, err := workflow.ParseJobPayload(job.Payload)
+			payload, err := workflow.DecodeJobPayload(job)
 			if err != nil || payload.Repo != repoFilter {
 				continue
 			}

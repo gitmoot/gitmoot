@@ -35,14 +35,6 @@ func (e Engine) reviewBlockingSeverity(repo string) string {
 // effectiveReviewDecision converts only a sub-threshold changes-requested
 // result into an engine-level approval. The stored AgentResult remains unchanged
 // so its summary and findings remain available to comment/rendering surfaces.
-//
-// INVARIANT: this takes a bare *AgentResult and therefore CANNOT see whether a
-// stored review is a fan-out, so it must never be called directly on a stored
-// review payload — it would fold a coordinator's dispatch record into an
-// approval. Its only two callers are effectiveReviewDecisionForPayload (stored
-// review payloads) and effectiveDelegationDecision (delegation children).
-// Adding a third caller reintroduces that bug; route it through the payload
-// form instead.
 func effectiveReviewDecision(result *AgentResult, blockingSeverity string) string {
 	if result == nil {
 		return ""
@@ -54,30 +46,10 @@ func effectiveReviewDecision(result *AgentResult, blockingSeverity string) strin
 	return decision
 }
 
-// effectiveReviewDecisionForPayload is the single authority for turning a stored
-// review payload into the decision gitmoot acts on.
-func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity string) string {
-	if payload.Result == nil {
-		return ""
-	}
-	// Phantom-verdict class #1351/#1417/#1557. A FAN-OUT is a coordinator's
-	// dispatch record, not an answer about the code, so there is nothing to
-	// discount: folding its below-bar severity to "approved" grants a panel the
-	// credit for an inspection none of its lenses has reported. Measured on
-	// #1910, where a parent announcing three lenses - two of which never ran -
-	// was rendered `approved-with-notes` on the PR.
-	//
-	// The raw decision is returned rather than a refusal so the row keeps
-	// describing itself; every consumer that already classifies fan-out (the
-	// merge gate, the wake path, required-reviewer credit) is unaffected, and
-	// the three that did not now inherit the exclusion instead of re-deriving
-	// it. The severity BAR is untouched: an ordinary below-bar review still
-	// folds, which TestDelegatedReviewEvidenceUsesBlockingSeverity pins.
-	if ResultIsFanOut(payload.Result) {
-		return strings.TrimSpace(payload.Result.Decision)
-	}
-	return effectiveReviewDecision(payload.Result, blockingSeverity)
-}
+// HistoricalFanOutDecision replaces the decision of a stored #1685 coordinator
+// announcement when unmarshalPayload decodes it. It is not a verdict, so every
+// decision reader treats the row as an abstention.
+const HistoricalFanOutDecision = "fan-out"
 
 // recordsApprovedWithNotes reports whether a stored review earns the durable
 // ReviewApprovedWithNotesEventKind outcome: a raw changes_requested verdict
@@ -88,7 +60,7 @@ func effectiveReviewDecisionForPayload(payload JobPayload, blockingSeverity stri
 func recordsApprovedWithNotes(payload JobPayload, blockingSeverity string) bool {
 	return payload.Result != nil && payload.Result.Decision == "changes_requested" &&
 		reviewPartOf(payload) == "" &&
-		effectiveReviewDecisionForPayload(payload, blockingSeverity) == "approved"
+		effectiveReviewDecision(payload.Result, blockingSeverity) == "approved"
 }
 
 // effectiveDelegationDecision applies repository review policy only to
@@ -102,12 +74,6 @@ func effectiveDelegationDecision(result *AgentResult, childType string, action s
 		strings.EqualFold(strings.TrimSpace(childType), "review")
 	if !isReview {
 		return strings.TrimSpace(result.Decision)
-	}
-	// A review child that delegates is still a coordinator announcement. Callers
-	// capable of traversing the tree inspect its descendants; flat consumers must
-	// not promote the announcement to an approval of its parent's work.
-	if ResultIsFanOut(result) {
-		return ""
 	}
 	return effectiveReviewDecision(result, blockingSeverity)
 }

@@ -331,7 +331,7 @@ func (e Engine) reviewLegsAtHead(ctx context.Context, jobs []db.Job, event PullR
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			// An unparseable payload cannot prove a leg exists; the enqueue path stays
 			// authoritative for it.
@@ -456,7 +456,7 @@ func (e Engine) followUpReviewScopes(ctx context.Context, event PullRequestEvent
 		if job.Type != "review" {
 			continue
 		}
-		payload, err := unmarshalPayload(job.Payload)
+		payload, err := DecodeJobPayload(job)
 		if err != nil {
 			return nil, err
 		}
