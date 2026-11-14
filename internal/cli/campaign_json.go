@@ -43,6 +43,24 @@ func newCampaignNoteJSONPtr(n *db.WorkflowNote) *campaignNoteJSON {
 	return &out
 }
 
+type messageJSON struct {
+	Campaign string `json:"campaign,omitempty"`
+	db.Message
+	HiddenWorkflow string `json:"workflow,omitempty"`
+}
+
+func newMessageJSON(m db.Message) messageJSON {
+	return messageJSON{Campaign: m.WorkflowID, Message: m}
+}
+
+func newMessagesJSON(messages []db.Message) []messageJSON {
+	out := make([]messageJSON, len(messages))
+	for i, m := range messages {
+		out[i] = newMessageJSON(m)
+	}
+	return out
+}
+
 type campaignCloseJSON struct {
 	Campaign        string            `json:"campaign"`
 	Status          db.WorkflowStatus `json:"status"`

@@ -252,7 +252,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			if *jsonOutput {
-				return writeJSON(stdout, messages)
+				return writeJSON(stdout, newMessagesJSON(messages))
 			}
 			for _, message := range messages {
 				printInboxMessage(stdout, message)
@@ -268,7 +268,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			if *jsonOutput {
-				return writeJSON(stdout, messages)
+				return writeJSON(stdout, newMessagesJSON(messages))
 			}
 			if len(messages) == 0 {
 				fmt.Fprintln(stdout, "No messages.")
@@ -314,7 +314,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if *jsonOutput {
-			return writeJSON(stdout, message)
+			return writeJSON(stdout, newMessageJSON(message))
 		}
 		if action != "show" {
 			fmt.Fprintf(stdout, "saved message %d from %s to %s; notification=%s; no acknowledgment required\n", message.ID, message.Sender, message.Recipient, message.Status)

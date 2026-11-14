@@ -68,7 +68,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 			if err != nil {
 				return err
 			}
-			return writeJSON(stdout, message)
+			return writeJSON(stdout, newMessageJSON(message))
 		}
 		fmt.Fprintf(stdout, "resolved escalation message %d; receipt message %d; requester notification queued\n", id, note.ID)
 		return nil

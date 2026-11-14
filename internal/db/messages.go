@@ -17,7 +17,7 @@ type Message struct {
 	Sender             string `json:"from"`
 	Recipient          string `json:"to"`
 	Body               string `json:"message"`
-	WorkflowID         string `json:"campaign,omitempty"`
+	WorkflowID         string `json:"workflow,omitempty"`
 	CreatedAt          string `json:"created_at"`
 	Status             string `json:"notification_status"`
 	Kind               string `json:"kind"`
