@@ -32,7 +32,7 @@ go test ./...
 git diff --check
 ```
 
-Job-execution code in `internal/cli`, `internal/workflow`, and
+Run-execution code in `internal/cli`, `internal/workflow`, and
 `internal/daemon` must pass its resolved subprocess runner instead of creating a
 host `subprocess.ExecRunner`, constructing an `exec.Cmd`, or calling
 `exec.Command` or `exec.CommandContext` directly. Deliberate host-side exceptions
@@ -83,7 +83,7 @@ any user-facing change.
 
 - Prefer existing repo patterns over new abstractions.
 - Keep user-facing command examples runnable.
-- Put full flag matrices in the skill's `references/CLI.md`, not every workflow page.
+- Put full flag matrices in the skill's `references/CLI.md`, not every walkthrough.
 - Do not commit caches, local state, logs, generated reports, secrets,
   downloaded release artifacts, or runtime transcripts.
 - Do not paste tokens into issues, PRs, docs, or logs.
@@ -97,6 +97,6 @@ Open focused PRs with:
 - checks run
 - skipped checks or residual risk
 
-For Gitmoot-managed task work, include the raw final
+For pull request work Gitmoot manages, include the raw final
 `codex exec review --uncommitted` output in the PR body when that workflow is
 used.
