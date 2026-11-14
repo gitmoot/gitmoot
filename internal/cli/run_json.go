@@ -70,9 +70,10 @@ type cleanupConsumerJSON struct {
 
 type cleanupInspectionJSON struct {
 	workflow.CleanupInspection
-	OwnerRunID string                `json:"owner_run_id"`
-	Consumers  []cleanupConsumerJSON `json:"consumers"`
-	Receipt    *cleanupReceiptJSON   `json:"receipt,omitempty"`
+	OwnerRunID string                 `json:"owner_run_id"`
+	Consumers  []cleanupConsumerJSON  `json:"consumers"`
+	Receipt    *cleanupReceiptJSON    `json:"receipt,omitempty"`
+	Obligation *cleanupObligationJSON `json:"obligation,omitempty"`
 
 	OwnerJobID string `json:"owner_job_id,omitempty"`
 }
@@ -85,12 +86,17 @@ func newCleanupInspectionJSON(inspection workflow.CleanupInspection) cleanupInsp
 	for i, consumer := range inspection.Consumers {
 		consumers[i] = cleanupConsumerJSON{CleanupConsumer: consumer, RunID: consumer.JobID}
 	}
-	return cleanupInspectionJSON{
+	out := cleanupInspectionJSON{
 		CleanupInspection: inspection,
 		OwnerRunID:        inspection.OwnerJobID,
 		Consumers:         consumers,
 		Receipt:           newCleanupReceiptJSON(inspection.Receipt),
 	}
+	if inspection.Obligation != nil {
+		obligation := cleanupObligationJSON{CleanupObligation: *inspection.Obligation, OwnerRunID: inspection.Obligation.OwnerJobID}
+		out.Obligation = &obligation
+	}
+	return out
 }
 
 type cleanupReceiptJSON struct {
