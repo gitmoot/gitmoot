@@ -48,7 +48,8 @@ var rootCommands = []command{
 	{name: "pr", summary: "inspect pull requests and their review state", run: runTask},
 	{name: "run", summary: "inspect and recover runs (reviews, asks, implementation records)", run: runJob},
 	{name: "findings", summary: "report the review findings ledger per repository", run: runFindings},
-	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
+	{name: "campaign", summary: "inspect campaigns: sets of runs and notes that belong together", run: runWorkflowJournal},
+	{name: "note", summary: "add and read campaign notes", run: runNote},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 }
 
@@ -319,7 +320,7 @@ func repoCheckoutDoctorChecks(paths config.Paths) []doctor.Check {
 		if more > 0 {
 			detail += fmt.Sprintf(" +%d more", more)
 		}
-		checks = append(checks, doctor.Check{Name: "workflow discipline", Required: false, Detail: detail})
+		checks = append(checks, doctor.Check{Name: "campaign discipline", Required: false, Detail: detail})
 	}
 	return checks
 }

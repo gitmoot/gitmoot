@@ -810,7 +810,7 @@ func directiveWakeBody(body, directiveID string) string {
 		cut = space
 	}
 	return fmt.Sprintf(
-		"%s [%d of %d characters omitted; read the whole directive with: gitmoot workflow show-note %s --json]",
+		"%s [%d of %d characters omitted; read the whole directive with: gitmoot note show %s --json]",
 		strings.TrimRight(body[:cut], " \t\n"), len(body)-cut, len(body), directiveID,
 	)
 }

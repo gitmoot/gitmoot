@@ -695,7 +695,7 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	var advisory []db.JobEvent
 	if autolabeled {
 		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "workflow_autolabeled",
-			Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --workflow to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))})
+			Message: fmt.Sprintf("auto-filed under %s (require_workflow=auto for %s; pass --campaign to name your initiative)", strings.TrimSpace(request.WorkflowID), strings.TrimSpace(request.Repo))})
 	}
 	if orgWarning != "" {
 		advisory = append(advisory, db.JobEvent{JobID: job.ID, Kind: "org_scope_violation", Message: orgWarning})
@@ -861,7 +861,7 @@ func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
 		return false, nil
 	}
 	if p.Mode == "strict" && request.PolicyExempt != "auto-only" {
-		return false, fmt.Errorf("repo %s has require_workflow=strict: pass --workflow <namespace>/<campaign>", strings.TrimSpace(request.Repo))
+		return false, fmt.Errorf("repo %s has require_workflow=strict: pass --campaign <namespace>/<campaign>", strings.TrimSpace(request.Repo))
 	}
 	request.WorkflowID = adhocWorkflowID(request.Agent, time.Now().UTC())
 	return true, nil
@@ -1852,10 +1852,10 @@ func ValidateWorkflowID(value string) error {
 		return nil
 	}
 	if len(value) > 64 {
-		return errors.New("workflow id must be at most 64 characters")
+		return errors.New("campaign label must be at most 64 characters")
 	}
 	if !workflowIDRe.MatchString(value) {
-		return fmt.Errorf("invalid workflow id %q: use lowercase letters, digits, and single hyphens, with at most one slash between namespace and campaign", value)
+		return fmt.Errorf("invalid campaign label %q: use lowercase letters, digits, and single hyphens, with at most one slash between namespace and campaign", value)
 	}
 	return nil
 }

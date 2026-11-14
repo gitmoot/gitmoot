@@ -21,7 +21,7 @@ type messageTestResult struct {
 	Sender     string `json:"from"`
 	Recipient  string `json:"to"`
 	Body       string `json:"message"`
-	WorkflowID string `json:"workflow"`
+	WorkflowID string `json:"campaign"`
 	Status     string `json:"notification_status"`
 }
 

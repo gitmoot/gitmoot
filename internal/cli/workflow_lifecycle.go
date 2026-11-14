@@ -35,11 +35,11 @@ func runWorkflowAutoSettleOnce(ctx context.Context, paths config.Paths, store *d
 		}
 		settled, err := store.SettleWorkflowIfEligible(ctx, candidate.WorkflowID, now, policy.AutoSettleAfter)
 		if err != nil {
-			writeLine(stdout, "workflow auto-settle %s error: %s", candidate.WorkflowID, err)
+			writeLine(stdout, "campaign auto-settle %s error: %s", candidate.WorkflowID, err)
 			continue
 		}
 		if settled {
-			writeLine(stdout, "auto-settled workflow %s", candidate.WorkflowID)
+			writeLine(stdout, "auto-settled campaign %s", candidate.WorkflowID)
 		}
 	}
 	return nil

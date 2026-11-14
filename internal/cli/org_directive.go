@@ -41,7 +41,7 @@ func runOrgDirective(args []string, stdout, stderr io.Writer) int {
 
 func printOrgDirectiveUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot message directive send --to ROLE [--workflow LABEL] [--role ROLE] [--json] [--home DIR] (--stdin | -F FILE | TEXT)")
+	fmt.Fprintln(w, "  gitmoot message directive send --to ROLE [--campaign LABEL] [--role ROLE] [--json] [--home DIR] (--stdin | -F FILE | TEXT)")
 	fmt.Fprintln(w, "  gitmoot message directive ack ID [--role ROLE] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot message directive cancel ID [--role ROLE] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot message directive done ID [--role ROLE] [--json] [--home DIR]")
@@ -59,7 +59,7 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	toFlag := fs.String("to", "", "descendant organization role receiving the directive")
-	workflowID := fs.String("workflow", "", "workflow label for the directive note")
+	workflowID := fs.String("campaign", "", "campaign label for the directive note")
 	roleFlag := fs.String("role", "", "acting issuer role")
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	stdin := fs.Bool("stdin", false, "read directive body from stdin")
@@ -68,7 +68,7 @@ func runOrgDirectiveSend(args []string, stdout, stderr io.Writer) int {
 		printOrgDirectiveUsage(stdout)
 		return 0
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -277,7 +277,7 @@ func runOrgDirectiveReceipt(kind string, args []string, stdout, stderr io.Writer
 	if *jsonOutput {
 		return writeMessageResult(*home, directiveID, issuer, stdout, stderr)
 	}
-	fmt.Fprintf(stdout, "%s directive %d in workflow %s\n", orgDirectiveReceiptPastTense(kind), directiveID, workflowID)
+	fmt.Fprintf(stdout, "%s directive %d in campaign %s\n", orgDirectiveReceiptPastTense(kind), directiveID, workflowID)
 	return 0
 }
 

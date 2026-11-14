@@ -128,7 +128,7 @@ func runRuntimePrune(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	dryRun := fs.Bool("dry-run", false, "report what would be removed without removing anything")
-	minIdle := fs.Duration("min-idle", toolchain.DefaultRuntimeMinIdle, "remove only copies no job staged for at least this long")
+	minIdle := fs.Duration("min-idle", toolchain.DefaultRuntimeMinIdle, "remove only copies no run staged for at least this long")
 	jsonOutput := fs.Bool("json", false, "print the report as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

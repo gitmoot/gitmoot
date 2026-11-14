@@ -586,7 +586,7 @@ END`); err != nil {
 		t.Fatalf("decode job open JSON: %v (%s)", err, stdout.String())
 	}
 	if code := Run([]string{
-		"workflow", "note", "review/display-only", "reported progress",
+		"note", "add", "review/display-only", "reported progress",
 		"--home", home, "--no-auto",
 	}, &bytes.Buffer{}, &stderr); code != 0 {
 		t.Fatalf("workflow note exit = %d, stderr=%s", code, stderr.String())

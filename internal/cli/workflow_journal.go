@@ -34,41 +34,62 @@ func runWorkflowJournal(args []string, stdout, stderr io.Writer) int {
 		return runWorkflowList(args[1:], stdout, stderr)
 	case "show":
 		return runWorkflowShow(args[1:], stdout, stderr)
-	case "show-note":
-		return runWorkflowNoteShow(args[1:], stdout, stderr)
 	case "describe":
 		return runWorkflowDescribe(args[1:], stdout, stderr)
 	case "register":
 		return runWorkflowRegister(args[1:], stdout, stderr)
-	case "note":
-		return runWorkflowNote(args[1:], stdout, stderr)
 	case "close":
 		return runWorkflowClose(args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown workflow command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown campaign command %q\n\n", args[0])
 		printWorkflowJournalUsage(stderr)
 		return 2
 	}
 }
 
 func printWorkflowJournalUsage(w io.Writer) {
-	fmt.Fprintln(w, "External-coordinator workflow groups and journal.")
+	fmt.Fprintln(w, "Campaigns: sets of runs and notes that belong together.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot workflow list [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow show-note <id> [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow show <label> [--json] [--limit N]")
-	fmt.Fprintln(w, "  gitmoot workflow describe <label> \"<text>\" [--json]")
-	fmt.Fprintln(w, "  gitmoot workflow register <label> \"<description>\" [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot workflow note <label> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]")
-	fmt.Fprintln(w, "  gitmoot workflow close <label> [--reason R] [--json]")
+	fmt.Fprintln(w, "  gitmoot campaign list [--json]")
+	fmt.Fprintln(w, "  gitmoot campaign show <label> [--json] [--limit N]")
+	fmt.Fprintln(w, "  gitmoot campaign describe <label> \"<text>\" [--json]")
+	fmt.Fprintln(w, "  gitmoot campaign register <label> \"<description>\" [--json] [--home DIR]")
+	fmt.Fprintln(w, "  gitmoot campaign close <label> [--reason R] [--json]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Notes on a campaign: see gitmoot note --help.")
+}
+
+func runNote(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
+		printNoteUsage(stdout)
+		return 0
+	}
+	switch args[0] {
+	case "add":
+		return runWorkflowNote(args[1:], stdout, stderr)
+	case "show":
+		return runWorkflowNoteShow(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown note command %q\n\n", args[0])
+		printNoteUsage(stderr)
+		return 2
+	}
+}
+
+func printNoteUsage(w io.Writer) {
+	fmt.Fprintln(w, "Campaign notes: the durable journal of directives, decisions and receipts.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  gitmoot note add <campaign> \"<body>\" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]")
+	fmt.Fprintln(w, "  gitmoot note show <id> [--json]")
 }
 
 func runWorkflowList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow list", flag.ContinueOnError)
+	fs := flag.NewFlagSet("campaign list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOutput := fs.Bool("json", false, "print workflow summaries as JSON")
+	jsonOutput := fs.Bool("json", false, "print campaign summaries as JSON")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -76,7 +97,7 @@ func runWorkflowList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "workflow list does not accept positional arguments")
+		fmt.Fprintln(stderr, "campaign list does not accept positional arguments")
 		return 2
 	}
 	var summaries []db.WorkflowSummary
@@ -85,18 +106,22 @@ func runWorkflowList(args []string, stdout, stderr io.Writer) int {
 		summaries, err = store.ListWorkflowSummaries(context.Background())
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "workflow list: %v\n", err)
+		fmt.Fprintf(stderr, "campaign list: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
-		if err := writeJSON(stdout, summaries); err != nil {
-			fmt.Fprintf(stderr, "workflow list: %v\n", err)
+		out := make([]campaignSummaryJSON, 0, len(summaries))
+		for _, item := range summaries {
+			out = append(out, newCampaignSummaryJSON(item))
+		}
+		if err := writeJSON(stdout, out); err != nil {
+			fmt.Fprintf(stderr, "campaign list: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	for _, item := range summaries {
-		fmt.Fprintf(stdout, "%s\tjobs=%d queued=%d running=%d succeeded=%d failed=%d blocked=%d cancelled=%d\tnotes=%d\ttokens(best-effort)=%d/%d\tfirst=%s\tlast=%s\n",
+		fmt.Fprintf(stdout, "%s\truns=%d queued=%d running=%d succeeded=%d failed=%d blocked=%d cancelled=%d\tnotes=%d\ttokens(best-effort)=%d/%d\tfirst=%s\tlast=%s\n",
 			item.WorkflowID, item.JobCount, item.Queued, item.Running, item.Succeeded,
 			item.Failed, item.Blocked, item.Cancelled, item.NoteCount,
 			item.InputTokens, item.OutputTokens, item.FirstAt, item.LastAt)
@@ -105,16 +130,16 @@ func runWorkflowList(args []string, stdout, stderr io.Writer) int {
 }
 
 type workflowTimelineEntry struct {
-	Kind      string           `json:"kind"`
-	ID        string           `json:"id"`
-	CreatedAt string           `json:"created_at"`
-	Job       *workflowJobJSON `json:"job,omitempty"`
-	Note      *db.WorkflowNote `json:"note,omitempty"`
+	Kind      string            `json:"kind"`
+	ID        string            `json:"id"`
+	CreatedAt string            `json:"created_at"`
+	Job       *workflowJobJSON  `json:"run,omitempty"`
+	Note      *campaignNoteJSON `json:"note,omitempty"`
 }
 
 type workflowJobJSON struct {
 	ID           string `json:"id"`
-	Agent        string `json:"agent"`
+	Agent        string `json:"reviewer"`
 	Type         string `json:"type"`
 	State        string `json:"state"`
 	Repo         string `json:"repo"`
@@ -126,8 +151,8 @@ type workflowJobJSON struct {
 }
 
 type workflowShowJSON struct {
-	Summary   db.WorkflowSummary      `json:"summary"`
-	Meta      db.WorkflowMeta         `json:"meta"`
+	Summary   campaignSummaryJSON     `json:"summary"`
+	Meta      campaignMetaJSON        `json:"meta"`
 	Entries   []workflowTimelineEntry `json:"entries"`
 	Truncated bool                    `json:"truncated,omitempty"`
 }
@@ -154,7 +179,7 @@ func loadWorkflowShow(ctx context.Context, store workflowShowStore, label string
 	data.summary, err = store.WorkflowSummary(ctx, label)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return workflowShowData{}, fmt.Errorf("workflow %q not found", label)
+			return workflowShowData{}, fmt.Errorf("campaign %q not found", label)
 		}
 		return workflowShowData{}, err
 	}
@@ -176,23 +201,23 @@ func loadWorkflowShow(ctx context.Context, store workflowShowStore, label string
 var workflowShowLoader = loadWorkflowShow
 
 func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow show", flag.ContinueOnError)
+	fs := flag.NewFlagSet("campaign show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	jsonOutput := fs.Bool("json", false, "print the workflow timeline as JSON")
+	jsonOutput := fs.Bool("json", false, "print the campaign timeline as JSON")
 	limit := fs.Int("limit", 100, "maximum merged timeline entries (0 means all)")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		if len(args) == 0 {
-			fmt.Fprintln(stderr, "workflow show requires a label")
+			fmt.Fprintln(stderr, "campaign show requires a label")
 			return 2
 		}
-		fmt.Fprintln(stderr, "Usage: gitmoot workflow show <label> [--json] [--limit N] [--home DIR]")
+		fmt.Fprintln(stderr, "Usage: gitmoot campaign show <label> [--json] [--limit N] [--home DIR]")
 		fs.PrintDefaults()
 		return 0
 	}
 	label := strings.TrimSpace(args[0])
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "workflow show: %v\n", err)
+		fmt.Fprintf(stderr, "campaign show: %v\n", err)
 		return 2
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -202,7 +227,7 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || *limit < 0 {
-		fmt.Fprintln(stderr, "workflow show requires one label and --limit >= 0")
+		fmt.Fprintln(stderr, "campaign show requires one label and --limit >= 0")
 		return 2
 	}
 	fetchLimit := *limit
@@ -215,7 +240,7 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 		data, err = workflowShowLoader(context.Background(), store, label, fetchLimit)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "workflow show: %v\n", err)
+		fmt.Fprintf(stderr, "campaign show: %v\n", err)
 		return 1
 	}
 	summary, meta, jobs, notes := data.summary, data.meta, data.jobs, data.notes
@@ -227,31 +252,31 @@ func runWorkflowShow(args []string, stdout, stderr io.Writer) int {
 	displayJobCount := max(summary.JobCount, len(jobs))
 	displayNoteCount := max(summary.NoteCount, len(notes))
 	totalEntries := displayJobCount + displayNoteCount
-	out := workflowShowJSON{Summary: summary, Meta: meta, Entries: entries, Truncated: truncated}
+	out := workflowShowJSON{Summary: newCampaignSummaryJSON(summary), Meta: campaignMetaJSON{Campaign: meta.WorkflowID, WorkflowMeta: meta}, Entries: entries, Truncated: truncated}
 	out.Meta.Description = workflowDisplayDescription(summary.WorkflowID, out.Meta.Description)
 	if *jsonOutput {
 		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "workflow show: %v\n", err)
+			fmt.Fprintf(stderr, "campaign show: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "workflow: %s\n", summary.WorkflowID)
+	fmt.Fprintf(stdout, "campaign: %s\n", summary.WorkflowID)
 	fmt.Fprintf(stdout, "description: %s\n", terminalSafeWorkflowText(out.Meta.Description))
 	fmt.Fprintf(stdout, "status: %s\n", terminalSafeWorkflowText(meta.Status))
 	if meta.Summary != "" {
 		fmt.Fprintf(stdout, "summary: %s\n", terminalSafeWorkflowText(meta.Summary))
 	}
-	fmt.Fprintf(stdout, "jobs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
+	fmt.Fprintf(stdout, "runs: %d\nnotes: %d\ntokens(best-effort): input=%d output=%d\nfirst: %s\nlast: %s\n",
 		summary.JobCount, summary.NoteCount, summary.InputTokens,
 		summary.OutputTokens, summary.FirstAt, summary.LastAt)
 	if truncated {
-		fmt.Fprintf(stderr, "workflow show: showing the latest %d of %d entries (%d jobs, %d notes); pass --limit 0 for all or a larger --limit N\n",
+		fmt.Fprintf(stderr, "campaign show: showing the latest %d of %d entries (%d runs, %d notes); pass --limit 0 for all or a larger --limit N\n",
 			len(entries), totalEntries, displayJobCount, displayNoteCount)
 	}
 	for _, entry := range entries {
 		if entry.Job != nil {
-			fmt.Fprintf(stdout, "%s\tjob\t%s\t%s\t%s\t%s\n", entry.CreatedAt, entry.Job.ID, entry.Job.State, entry.Job.Type, entry.Job.Agent)
+			fmt.Fprintf(stdout, "%s\trun\t%s\t%s\t%s\t%s\n", entry.CreatedAt, entry.Job.ID, entry.Job.State, entry.Job.Type, entry.Job.Agent)
 		} else {
 			fmt.Fprintf(stdout, "%s\tnote\t%s\t%s\t%s\n", entry.CreatedAt, entry.ID,
 				terminalSafeWorkflowText(entry.Note.Author), terminalSafeWorkflowText(entry.Note.Body))
@@ -272,12 +297,12 @@ func workflowDisplayDescription(label, description string) string {
 }
 
 type workflowDescribeOutput struct {
-	WorkflowID  string `json:"workflow_id"`
+	WorkflowID  string `json:"campaign"`
 	Description string `json:"description"`
 }
 
 func runWorkflowDescribe(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow describe", flag.ContinueOnError)
+	fs := flag.NewFlagSet("campaign describe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the updated description as JSON")
@@ -286,15 +311,15 @@ func runWorkflowDescribe(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "workflow describe requires a label and text")
+		fmt.Fprintln(stderr, "campaign describe requires a label and text")
 		return 2
 	}
 	label, description := strings.TrimSpace(args[0]), strings.TrimSpace(args[1])
-	if refuseFlagLikeText("workflow describe", description, stderr) {
+	if refuseFlagLikeText("campaign describe", description, stderr) {
 		return 2
 	}
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "workflow describe: %v\n", err)
+		fmt.Fprintf(stderr, "campaign describe: %v\n", err)
 		return 2
 	}
 	if err := fs.Parse(args[2:]); err != nil {
@@ -304,51 +329,51 @@ func runWorkflowDescribe(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || description == "" || len(description) > workflowSummaryMax {
-		fmt.Fprintf(stderr, "workflow describe requires one label and non-empty text of at most %d bytes\n", workflowSummaryMax)
+		fmt.Fprintf(stderr, "campaign describe requires one label and non-empty text of at most %d bytes\n", workflowSummaryMax)
 		return 2
 	}
 	if err := withStore(*home, func(store *db.Store) error {
 		ctx := context.Background()
 		if _, err := store.WorkflowSummary(ctx, label); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("workflow %q not found", label)
+				return fmt.Errorf("campaign %q not found", label)
 			}
 			return err
 		}
 		return store.SetWorkflowDescription(ctx, label, description)
 	}); err != nil {
-		fmt.Fprintf(stderr, "workflow describe: %v\n", err)
+		fmt.Fprintf(stderr, "campaign describe: %v\n", err)
 		return 1
 	}
 	out := workflowDescribeOutput{WorkflowID: label, Description: description}
 	if *jsonOutput {
 		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "workflow describe: %v\n", err)
+			fmt.Fprintf(stderr, "campaign describe: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "described workflow %s\n", label)
+	fmt.Fprintf(stdout, "described campaign %s\n", label)
 	return 0
 }
 
 func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow close", flag.ContinueOnError)
+	fs := flag.NewFlagSet("campaign close", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	reason := fs.String("reason", "", "reason for closing the workflow")
+	reason := fs.String("reason", "", "reason for closing the campaign")
 	jsonOutput := fs.Bool("json", false, "print the close result as JSON")
 	if helpRequested(args) {
 		printWorkflowJournalUsage(stdout)
 		return 0
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "workflow close requires a label")
+		fmt.Fprintln(stderr, "campaign close requires a label")
 		return 2
 	}
 	label := strings.TrimSpace(args[0])
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "workflow close: %v\n", err)
+		fmt.Fprintf(stderr, "campaign close: %v\n", err)
 		return 2
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -358,10 +383,10 @@ func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "workflow close accepts one label")
+		fmt.Fprintln(stderr, "campaign close accepts one label")
 		return 2
 	}
-	if refuseFlagLikeText("workflow close", *reason, stderr) {
+	if refuseFlagLikeText("campaign close", *reason, stderr) {
 		return 2
 	}
 	reasonText := strings.TrimSpace(*reason)
@@ -370,7 +395,7 @@ func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
 		closeNoteLen += 1 + len(reasonText)
 	}
 	if closeNoteLen > workflowNoteBodyMax {
-		fmt.Fprintf(stderr, "workflow close reason must produce a note of at most %d bytes\n", workflowNoteBodyMax)
+		fmt.Fprintf(stderr, "campaign close reason must produce a note of at most %d bytes\n", workflowNoteBodyMax)
 		return 2
 	}
 	var result db.CloseWorkflowResult
@@ -379,21 +404,22 @@ func runWorkflowClose(args []string, stdout, stderr io.Writer) int {
 		result, err = store.CloseWorkflow(context.Background(), label, *reason)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "workflow close: %v\n", err)
+		fmt.Fprintf(stderr, "campaign close: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
-		if err := writeJSON(stdout, result); err != nil {
-			fmt.Fprintf(stderr, "workflow close: %v\n", err)
+		out := campaignCloseJSON{Campaign: result.WorkflowID, Status: result.Status, AlreadyTerminal: result.AlreadyTerminal, Note: newCampaignNoteJSONPtr(result.Note)}
+		if err := writeJSON(stdout, out); err != nil {
+			fmt.Fprintf(stderr, "campaign close: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	if result.AlreadyTerminal {
-		fmt.Fprintf(stdout, "workflow %s already terminal (%s)\n", label, result.Status)
+		fmt.Fprintf(stdout, "campaign %s already terminal (%s)\n", label, result.Status)
 		return 0
 	}
-	fmt.Fprintf(stdout, "closed workflow %s\n", label)
+	fmt.Fprintf(stdout, "closed campaign %s\n", label)
 	return 0
 }
 
@@ -475,18 +501,18 @@ func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTim
 		item := workflowJobJSON{ID: job.ID, Agent: job.Agent, Type: job.Type, State: job.State, Repo: job.Repo, PullRequest: job.PullRequest,
 			InputTokens: job.InputTokens, OutputTokens: job.OutputTokens,
 			CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt}
-		entries = append(entries, workflowTimelineEntry{Kind: "job", ID: job.ID, CreatedAt: job.CreatedAt, Job: &item})
+		entries = append(entries, workflowTimelineEntry{Kind: "run", ID: job.ID, CreatedAt: job.CreatedAt, Job: &item})
 	}
 	for i := range notes {
 		note := notes[i]
-		entries = append(entries, workflowTimelineEntry{Kind: "note", ID: fmt.Sprintf("%d", note.ID), CreatedAt: note.CreatedAt, Note: &note})
+		entries = append(entries, workflowTimelineEntry{Kind: "note", ID: fmt.Sprintf("%d", note.ID), CreatedAt: note.CreatedAt, Note: newCampaignNoteJSONPtr(&note)})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].CreatedAt != entries[j].CreatedAt {
 			return entries[i].CreatedAt < entries[j].CreatedAt
 		}
 		if entries[i].Kind != entries[j].Kind {
-			return entries[i].Kind < entries[j].Kind
+			return entries[i].Kind == "run"
 		}
 		if entries[i].Kind == "note" {
 			return entries[i].Note.ID < entries[j].Note.ID
@@ -497,17 +523,21 @@ func mergeWorkflowTimeline(jobs []db.Job, notes []db.WorkflowNote) []workflowTim
 }
 
 type workflowNoteOutput struct {
-	Note db.WorkflowNote `json:"note"`
+	Note db.WorkflowNote
+}
+
+type campaignNoteAddJSON struct {
+	Note campaignNoteJSON `json:"note"`
 }
 
 func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow show-note", flag.ContinueOnError)
+	fs := flag.NewFlagSet("note show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
 	parsedArgs, err := reorderFlagArgs(args, map[string]struct{}{"home": {}}, map[string]struct{}{"json": {}})
 	if err != nil {
-		fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+		fmt.Fprintf(stderr, "note show: %v\n", err)
 		return 2
 	}
 	if err := fs.Parse(parsedArgs); err != nil {
@@ -517,12 +547,12 @@ func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 1 {
-		fmt.Fprintln(stderr, "workflow show-note requires exactly one note id")
+		fmt.Fprintln(stderr, "note show requires exactly one note id")
 		return 2
 	}
 	noteID, err := strconv.ParseInt(strings.TrimSpace(fs.Arg(0)), 10, 64)
 	if err != nil || noteID <= 0 {
-		fmt.Fprintf(stderr, "workflow show-note: invalid note id %q\n", fs.Arg(0))
+		fmt.Fprintf(stderr, "note show: invalid note id %q\n", fs.Arg(0))
 		return 2
 	}
 	var note db.WorkflowNote
@@ -532,21 +562,21 @@ func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
 		return err
 	}); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			fmt.Fprintf(stderr, "workflow note %d not found\n", noteID)
+			fmt.Fprintf(stderr, "note %d not found\n", noteID)
 			return 1
 		}
-		fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+		fmt.Fprintf(stderr, "note show: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
-		if err := writeJSON(stdout, note); err != nil {
-			fmt.Fprintf(stderr, "workflow show-note: %v\n", err)
+		if err := writeJSON(stdout, newCampaignNoteJSON(note)); err != nil {
+			fmt.Fprintf(stderr, "note show: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	writeLine(stdout, "note: %d", note.ID)
-	writeLine(stdout, "workflow: %s", note.WorkflowID)
+	writeLine(stdout, "campaign: %s", note.WorkflowID)
 	writeLine(stdout, "author: %s", terminalSafeWorkflowText(note.Author))
 	if note.Repo != "" {
 		writeLine(stdout, "repo: %s", terminalSafeWorkflowText(note.Repo))
@@ -557,7 +587,7 @@ func runWorkflowNoteShow(args []string, stdout, stderr io.Writer) int {
 }
 
 func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("workflow note", flag.ContinueOnError)
+	fs := flag.NewFlagSet("note add", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	author := fs.String("author", "", "verbatim journal author")
@@ -565,8 +595,8 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	sessionID := fs.String("session", "", "coordinator runtime session id")
 	workdir := fs.String("workdir", "", "coordinator working directory")
 	noAuto := fs.Bool("no-auto", false, "disable Herdr coordinator identity detection")
-	summary := fs.String("summary", "", "legacy alias for the stable workflow description")
-	status := fs.String("status", "", "live workflow status escape hatch")
+	summary := fs.String("summary", "", "legacy alias for the stable campaign description")
+	status := fs.String("status", "", "live campaign status escape hatch")
 	// --repo sets the note row's repo COLUMN and nothing else. It existed before
 	// #2202 only in the company of --remember, which is why removing the memory
 	// surface took it too; review found that regressed something unrelated.
@@ -579,23 +609,23 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo binding recorded on the note row, as owner/repo")
 	jsonOutput := fs.Bool("json", false, "print the stored note as JSON")
 	if helpRequested(args) {
-		printWorkflowJournalUsage(stdout)
+		printNoteUsage(stdout)
 		return 0
 	}
 	if len(args) < 2 {
-		fmt.Fprintln(stderr, "workflow note requires a label and body")
+		fmt.Fprintln(stderr, "note add requires a campaign and body")
 		return 2
 	}
 	label, body := strings.TrimSpace(args[0]), args[1]
 	if err := workflowpkg.ValidateWorkflowID(label); err != nil {
-		fmt.Fprintf(stderr, "workflow note: %v\n", err)
+		fmt.Fprintf(stderr, "note add: %v\n", err)
 		return 2
 	}
 	if body == "" || len(body) > workflowNoteBodyMax {
-		fmt.Fprintf(stderr, "workflow note body must be non-empty and at most %d bytes\n", workflowNoteBodyMax)
+		fmt.Fprintf(stderr, "note body must be non-empty and at most %d bytes\n", workflowNoteBodyMax)
 		return 2
 	}
-	if refuseFlagLikeText("workflow note", body, stderr) {
+	if refuseFlagLikeText("note add", body, stderr) {
 		return 2
 	}
 	if err := fs.Parse(args[2:]); err != nil {
@@ -605,7 +635,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 || len(*author) > workflowNoteAuthorMax {
-		fmt.Fprintf(stderr, "workflow note accepts one label and body; author must be at most %d bytes\n", workflowNoteAuthorMax)
+		fmt.Fprintf(stderr, "note add accepts one campaign and body; author must be at most %d bytes\n", workflowNoteAuthorMax)
 		return 2
 	}
 	summarySet := false
@@ -640,19 +670,19 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	if len(*summary) > workflowSummaryMax {
-		fmt.Fprintf(stderr, "workflow note summary must be at most %d bytes\n", workflowSummaryMax)
+		fmt.Fprintf(stderr, "note summary must be at most %d bytes\n", workflowSummaryMax)
 		return 2
 	}
-	if refuseFlagLikeText("workflow note", *summary, stderr) {
+	if refuseFlagLikeText("note add", *summary, stderr) {
 		return 2
 	}
 	if len(*status) > workflowSummaryMax {
-		fmt.Fprintf(stderr, "workflow note status must be at most %d bytes\n", workflowSummaryMax)
+		fmt.Fprintf(stderr, "note status must be at most %d bytes\n", workflowSummaryMax)
 		return 2
 	}
 	if statusSet {
 		if err := db.ValidateWorkflowStatus(*status); err != nil {
-			fmt.Fprintf(stderr, "workflow note: %v\n", err)
+			fmt.Fprintf(stderr, "note add: %v\n", err)
 			return 2
 		}
 	}
@@ -660,7 +690,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 	if noteRepo != "" {
 		parsed, err := github.ParseRepository(noteRepo)
 		if err != nil {
-			fmt.Fprintf(stderr, "workflow note: --repo %v\n", err)
+			fmt.Fprintf(stderr, "note add: --repo %v\n", err)
 			return 2
 		}
 		// Store the canonical owner/repo: the scoped read window matches this
@@ -676,7 +706,7 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if !exists {
-			return fmt.Errorf("workflow %q is not registered; use workflow register first", label)
+			return fmt.Errorf("campaign %q is not registered; use campaign register first", label)
 		}
 		note := db.WorkflowNote{WorkflowID: label, Author: *author, Body: body, Repo: noteRepo}
 		meta := db.WorkflowMeta{
@@ -696,16 +726,16 @@ func runWorkflowNote(args []string, stdout, stderr io.Writer) int {
 		return err
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "workflow note: %v\n", err)
+		fmt.Fprintf(stderr, "note add: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
-		if err := writeJSON(stdout, out); err != nil {
-			fmt.Fprintf(stderr, "workflow note: %v\n", err)
+		if err := writeJSON(stdout, campaignNoteAddJSON{Note: newCampaignNoteJSON(out.Note)}); err != nil {
+			fmt.Fprintf(stderr, "note add: %v\n", err)
 			return 1
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "saved workflow %s as entry %d; journal only, no notification queued\n", label, out.Note.ID)
+	fmt.Fprintf(stdout, "saved note to campaign %s as entry %d; journal only, no notification queued\n", label, out.Note.ID)
 	return 0
 }
