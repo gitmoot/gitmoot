@@ -1,6 +1,9 @@
 package db
 
-import "context"
+import (
+	"context"
+	"strconv"
+)
 
 // DashboardTaskRow is the task-list projection consumed by the web dashboard.
 // CI is deliberately absent: Gitmoot does not persist a current CI conclusion,
@@ -131,21 +134,33 @@ func (s *Store) ListDashboardJobSummaries(ctx context.Context) ([]DashboardJobSu
 
 // ListDashboardTasks reads every visible task with its latest PR number and the
 // PR implementer's acting org role in one query. The owner column is the same
-// pullRequestActingRoleSelector that PullRequestActingRole runs, evaluated per
-// task over the acting_scope derived table.
+// pullRequestActingRoleSelector that PullRequestActingRole runs, evaluated once
+// per distinct in-scope (repo, PR) rather than per task: a task without a PR is
+// never looked up, and the PR-number subquery is materialized before the
+// selector runs, so the planner cannot re-evaluate it for every candidate job
+// (#2639: 847k jobs row visits and ~30 s per request on the live store).
 func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]DashboardTaskRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT acting_scope.id, acting_scope.title, acting_scope.repo, acting_scope.state,
-		COALESCE(`+pullRequestActingRoleSelector+`, ''),
-		COALESCE(acting_scope.pull_request, 0),
-		acting_scope.updated_at
-	FROM (SELECT t.id, t.title, t.repo_full_name AS repo, t.state, t.updated_at,
+	rows, err := s.db.QueryContext(ctx, `WITH task_scope AS MATERIALIZED (
+		SELECT t.id, t.title, t.repo_full_name AS repo, t.state, t.updated_at,
 			(SELECT pr.number FROM pull_requests pr
 				WHERE pr.repo_full_name = t.repo_full_name AND pr.head_branch = t.branch
 				ORDER BY pr.number DESC LIMIT 1) AS pull_request
 		FROM tasks t
 		WHERE t.state != 'dismissed'
-			AND (t.state != 'merged' OR julianday(t.updated_at) >= julianday(?))) acting_scope
-	ORDER BY acting_scope.id`, mergedSince)
+			AND (t.state != 'merged' OR julianday(t.updated_at) >= julianday(?))
+	), pr_owner AS MATERIALIZED (
+		SELECT acting_scope.repo, acting_scope.pull_request,
+			`+pullRequestActingRoleSelector+` AS owner
+		FROM (SELECT DISTINCT repo, pull_request FROM task_scope
+			WHERE pull_request IS NOT NULL) acting_scope
+	)
+	SELECT task_scope.id, task_scope.title, task_scope.repo, task_scope.state,
+		COALESCE(pr_owner.owner, ''),
+		COALESCE(task_scope.pull_request, 0),
+		task_scope.updated_at
+	FROM task_scope LEFT JOIN pr_owner
+		ON pr_owner.repo = task_scope.repo AND pr_owner.pull_request = task_scope.pull_request
+	ORDER BY task_scope.id`, mergedSince)
 	if err != nil {
 		return nil, err
 	}
@@ -161,9 +176,16 @@ func (s *Store) ListDashboardTasks(ctx context.Context, mergedSince string) ([]D
 	return out, rows.Err()
 }
 
+// ListDashboardActiveJobs reads the queued and running jobs oldest first. Each
+// state is its own arm so the queued and running partial indexes bound the
+// read; a single IN predicate matches neither and scans every job (#2639).
 func (s *Store) ListDashboardActiveJobs(ctx context.Context) ([]DashboardJobRow, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, state, workflow_id, repo, created_at, updated_at
-	FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at, id`)
+	FROM jobs WHERE state = 'queued'
+	UNION ALL
+	SELECT id, agent, state, workflow_id, repo, created_at, updated_at
+	FROM jobs WHERE state = 'running'
+	ORDER BY created_at, id`)
 	if err != nil {
 		return nil, err
 	}
@@ -237,13 +259,20 @@ func (s *Store) ListDashboardBlockedJobs(ctx context.Context) ([]DashboardJobRow
 	return emptyIfNil(out), err
 }
 
+// ListDashboardTerminalBuckets aggregates terminal jobs per state and trailing
+// hour. The window predicates here and in the notable/fleet reads below compare
+// text: jobs.created_at and jobs.updated_at are always written as SQLite
+// CURRENT_TIMESTAMP ("YYYY-MM-DD HH:MM:SS"), the format the dashboard binds, so
+// the order is the one julianday() gives, but idx_jobs_terminal_state_updated_at
+// and idx_jobs_agent_state_created can serve them instead of a full jobs scan
+// (#2639).
 func (s *Store) ListDashboardTerminalBuckets(ctx context.Context, since, now string) ([]DashboardTerminalBucket, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT state,
 		CAST((julianday(?) - julianday(updated_at)) * 24 AS INTEGER) AS age_hours,
 		COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
 	FROM jobs
 	WHERE state IN ('succeeded', 'failed', 'cancelled')
-		AND julianday(updated_at) >= julianday(?) AND julianday(updated_at) <= julianday(?)
+		AND updated_at >= ? AND updated_at <= ?
 	GROUP BY state, age_hours ORDER BY age_hours DESC, state`, now, since, now)
 	if err != nil {
 		return nil, err
@@ -264,10 +293,15 @@ func (s *Store) ListDashboardNotableJobs(ctx context.Context, since string, limi
 	if limit <= 0 {
 		return []DashboardJobRow{}, nil
 	}
+	// The inner select picks the newest ids from the covering state index; only
+	// those rows are read from the table, so the payload of every other job in
+	// the window is never materialized.
 	rows, err := s.db.QueryContext(ctx, `SELECT id, agent, state, payload, created_at, updated_at
 	FROM jobs
-	WHERE state IN ('succeeded', 'failed', 'cancelled') AND julianday(updated_at) >= julianday(?)
-	ORDER BY updated_at DESC, id DESC LIMIT ?`, since, limit)
+	WHERE id IN (SELECT id FROM jobs
+		WHERE state IN ('succeeded', 'failed', 'cancelled') AND updated_at >= ?
+		ORDER BY updated_at DESC, id DESC LIMIT ?)
+	ORDER BY updated_at DESC, id DESC`, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -286,7 +320,7 @@ func (s *Store) ListDashboardNotableJobs(ctx context.Context, since string, limi
 func (s *Store) ListDashboardFleetCounts(ctx context.Context, since string) ([]DashboardFleetCount, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT agent,
 		SUM(CASE WHEN state = 'running' THEN 1 ELSE 0 END),
-		SUM(CASE WHEN julianday(created_at) >= julianday(?) THEN 1 ELSE 0 END)
+		SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END)
 	FROM jobs WHERE agent != '' GROUP BY agent ORDER BY agent`, since)
 	if err != nil {
 		return nil, err
@@ -301,4 +335,126 @@ func (s *Store) ListDashboardFleetCounts(ctx context.Context, since string) ([]D
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// dashboardPayloadTextSQL projects one top-level text field of jobs.payload, or
+// the empty string when the payload is not valid JSON or the field is absent or
+// not text.
+// modernc SQLite rejects json_extract over malformed JSON, which the Go payload
+// decoder tolerated by returning an empty payload, so every extract is guarded.
+func dashboardPayloadTextSQL(field string) string {
+	return `CASE WHEN json_valid(payload) AND json_type(payload, '$.` + field + `') = 'text'
+		THEN json_extract(payload, '$.` + field + `') ELSE '' END`
+}
+
+// dashboardInstructionsPrefixRunes bounds the instructions text the dashboard
+// reads per job. Titles are only the first non-empty line capped at 60 runes,
+// so the prefix after leading ASCII whitespace is enough, and the rest of a
+// multi-kilobyte prompt never crosses into Go.
+const dashboardInstructionsPrefixRunes = 1024
+
+var dashboardInstructionsPrefixSQL = `substr(ltrim(` + dashboardPayloadTextSQL("instructions") + `, ' ' || char(9, 10, 11, 12, 13)), 1, ` + strconv.Itoa(dashboardInstructionsPrefixRunes) + `)`
+
+// CountDashboardJobsByState returns the job count per raw state in one
+// aggregate over a covering index (idx_jobs_agent_state_created); no row or
+// payload is read.
+func (s *Store) CountDashboardJobsByState(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM jobs GROUP BY state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var state string
+		var count int
+		if err := rows.Scan(&state, &count); err != nil {
+			return nil, err
+		}
+		out[state] += count
+	}
+	return out, rows.Err()
+}
+
+// DashboardJobTitleRow is a payload-free job projection for dashboard lists:
+// Instructions is only the leading dashboardInstructionsPrefixRunes of the
+// prompt, enough for a title. Repo is the denormalized column, falling back to
+// the payload repo for rows written before the column existed.
+type DashboardJobTitleRow struct {
+	ID           string
+	Agent        string
+	Repo         string
+	Instructions string
+	UpdatedAt    string
+	CreatedAt    string
+}
+
+// ListDashboardRecentFailures returns the newest limit failed jobs by
+// (updated_at, id) descending, read backwards along
+// idx_jobs_terminal_state_updated_at, so only the returned rows touch the table.
+// The redundant IN term is that partial index's WHERE clause, which SQLite
+// only uses when the query repeats it.
+func (s *Store) ListDashboardRecentFailures(ctx context.Context, limit int) ([]DashboardJobTitleRow, error) {
+	if limit <= 0 {
+		return []DashboardJobTitleRow{}, nil
+	}
+	out, err := queryList(ctx, s.db, `SELECT id, agent,
+		COALESCE(NULLIF(repo, ''), `+dashboardPayloadTextSQL("repo")+`),
+		`+dashboardInstructionsPrefixSQL+`,
+		updated_at, created_at
+	FROM jobs WHERE state = 'failed' AND state IN ('succeeded', 'failed', 'cancelled')
+	ORDER BY updated_at DESC, id DESC LIMIT ?`, []any{limit},
+		func(row rowScanner) (DashboardJobTitleRow, error) {
+			var item DashboardJobTitleRow
+			err := row.Scan(&item.ID, &item.Agent, &item.Repo, &item.Instructions, &item.UpdatedAt, &item.CreatedAt)
+			return item, err
+		})
+	return emptyIfNil(out), err
+}
+
+// DashboardGraphJobRow is the galaxy graph's per-job projection: scalar columns
+// plus the two payload fields a node title can use. It never carries the
+// payload itself.
+type DashboardGraphJobRow struct {
+	ID           string
+	Agent        string
+	Type         string
+	State        string
+	ParentJobID  string
+	DelegationID string
+	WorkflowID   string
+	Repo         string
+	InputTokens  int
+	OutputTokens int
+	TaskTitle    string
+	Instructions string
+}
+
+// ListDashboardGraphJobs returns every job created at or after since (a
+// "YYYY-MM-DD HH:MM:SS" bound, compared as text), in (created_at, id) order so
+// idx_jobs_created_at_repo bounds the read to the window; an id-ordered scan
+// would read every row's created_at past its payload. Titles come from
+// json_extract in SQL rather than a Go payload decode (#2639).
+func (s *Store) ListDashboardGraphJobs(ctx context.Context, since string) ([]DashboardGraphJobRow, error) {
+	out, err := queryList(ctx, s.db, `SELECT id, agent, type, state, parent_job_id, delegation_id,
+		workflow_id, repo, input_tokens, output_tokens,
+		`+dashboardPayloadTextSQL("task_title")+`,
+		`+dashboardInstructionsPrefixSQL+`
+	FROM jobs WHERE created_at >= ?
+	ORDER BY created_at, id`, []any{since},
+		func(row rowScanner) (DashboardGraphJobRow, error) {
+			var item DashboardGraphJobRow
+			err := row.Scan(&item.ID, &item.Agent, &item.Type, &item.State, &item.ParentJobID, &item.DelegationID,
+				&item.WorkflowID, &item.Repo, &item.InputTokens, &item.OutputTokens, &item.TaskTitle, &item.Instructions)
+			return item, err
+		})
+	return emptyIfNil(out), err
+}
+
+// DashboardJobRepoExists reports whether any job's denormalized repo is repo,
+// one seek on idx_jobs_repo.
+func (s *Store) DashboardJobRepoExists(ctx context.Context, repo string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE repo = ?)`, repo).Scan(&exists)
+	return exists, err
 }

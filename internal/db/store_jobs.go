@@ -219,7 +219,7 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 // non-empty acting_org_role. It is a correlated scalar subquery (NULL when
 // unattributed), so callers must expose an `acting_scope` row with `repo` and
 // `pull_request` columns. PullRequestActingRole binds a single scope;
-// ListDashboardTasks evaluates it per task in one bulk read.
+// ListDashboardTasks evaluates it once per distinct in-scope PR in one bulk read.
 const pullRequestActingRoleSelector = `(SELECT trim(json_extract(ar.payload, '$.acting_org_role'))
 	FROM jobs ar
 	WHERE ar.repo = acting_scope.repo AND ar.pull_request = acting_scope.pull_request

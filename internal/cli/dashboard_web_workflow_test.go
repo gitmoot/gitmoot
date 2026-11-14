@@ -248,7 +248,9 @@ func TestWebDashboardUnlabelledLegacyHTTPGolden(t *testing.T) {
 	}
 	mustCreateJob(t, store, db.Job{ID: "legacy", Type: "ask", State: "running", Payload: `{"task_title":"legacy","workflow_id":""}`}, "", "")
 	store.Close()
-	setJobTimes(t, home, "legacy", "2026-01-02 03:04:05", "2026-01-02 03:04:05")
+	// Inside the galaxy window (#2639); the graph JSON carries no timestamps.
+	recent := dashboardSQLiteTime(time.Now().Add(-time.Hour))
+	setJobTimes(t, home, "legacy", recent, recent)
 
 	handler := dashboard.Serve(&webDataSource{home: home})
 	assertDashboardHTTPGolden(t, handler, "/api/graph", legacyUnlabelledGraphGolden)

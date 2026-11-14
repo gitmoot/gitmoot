@@ -123,8 +123,9 @@ func TestEngineReviewVerdictResolverErrorDoesNotFallbackToLead(t *testing.T) {
 	}
 	defer raw.Close()
 	// The owner resolver filters jobs by pull_request; removing the column makes
-	// it fail while GetJob (which never selects it) still succeeds.
-	if _, err := raw.ExecContext(ctx, `ALTER TABLE jobs DROP COLUMN pull_request`); err != nil {
+	// it fail while GetJob (which never selects it) still succeeds. The #2639
+	// acting-role index names the column, so it goes first.
+	if _, err := raw.ExecContext(ctx, `DROP INDEX idx_jobs_implement_repo_pr_created; ALTER TABLE jobs DROP COLUMN pull_request`); err != nil {
 		t.Fatalf("drop jobs.pull_request: %v", err)
 	}
 
