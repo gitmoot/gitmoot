@@ -39,7 +39,7 @@ func TestDeriveStuckReason(t *testing.T) {
 			job:        queued,
 			event:      db.JobEvent{Kind: "runtime_lock_wait", Message: "runtime session runtime:codex:agent-x is busy"},
 			hasEvent:   true,
-			wantReason: "waiting on runtime session lock runtime:codex:agent-x (held by job other-job)",
+			wantReason: "waiting on runtime session lock runtime:codex:agent-x (held by run other-job)",
 			wantNext:   "2026-07-01T03:00:00Z",
 		},
 		{
@@ -190,7 +190,7 @@ func TestRunJobListShowSurfaceWhyStuck(t *testing.T) {
 	}, "queued")
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"job", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "list", "--home", home, "--repo", "owner/repo"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job list exit = %d, stderr=%s", code, stderr.String())
 	}
 	var stuckLine, healthyLine string
@@ -208,7 +208,7 @@ func TestRunJobListShowSurfaceWhyStuck(t *testing.T) {
 	if !strings.Contains(stuckLine, "WHY: waiting on runtime session lock runtime:codex:agent-x") {
 		t.Fatalf("stuck line missing WHY column: %q", stuckLine)
 	}
-	if !strings.Contains(stuckLine, "held by job other-running-job") || !strings.Contains(stuckLine, "next retry") {
+	if !strings.Contains(stuckLine, "held by run other-running-job") || !strings.Contains(stuckLine, "next retry") {
 		t.Fatalf("stuck line missing lock owner / next retry: %q", stuckLine)
 	}
 	if strings.Contains(healthyLine, "WHY:") {
@@ -221,7 +221,7 @@ func TestRunJobListShowSurfaceWhyStuck(t *testing.T) {
 	// job show surfaces the reason as a detail line.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "stuck-job", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "stuck-job", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job show exit = %d, stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "why_stuck: waiting on runtime session lock") {
@@ -234,7 +234,7 @@ func TestRunJobListShowSurfaceWhyStuck(t *testing.T) {
 	// A healthy job's show output carries no why_stuck line.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "healthy-job", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "healthy-job", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job show exit = %d, stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stdout.String(), "why_stuck:") {
@@ -244,7 +244,7 @@ func TestRunJobListShowSurfaceWhyStuck(t *testing.T) {
 	// --json carries the fields for the stuck job and omits them for the healthy one.
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"job", "show", "stuck-job", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"run", "show", "stuck-job", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("job show --json exit = %d, stderr=%s", code, stderr.String())
 	}
 	var decoded jobShowOutput

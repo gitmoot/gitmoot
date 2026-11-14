@@ -26,9 +26,9 @@ var sessionJobActions = workflow.SessionJobActions
 // close`, and `job record` (#657). Decision/summary/PR fields are omitted when
 // empty so an `open` result (no decision yet) is clean.
 type jobSessionOutput struct {
-	JobID            string `json:"job_id"`
+	JobID            string `json:"run_id"`
 	State            string `json:"state"`
-	Agent            string `json:"agent"`
+	Agent            string `json:"implementer"`
 	Type             string `json:"type"`
 	Repo             string `json:"repo"`
 	ExternallyDriven bool   `json:"externally_driven"`
@@ -47,30 +47,30 @@ type jobSessionOutput struct {
 }
 
 func runJobOpen(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job open", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run open", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	agent := fs.String("agent", "", "agent that performs the session work (must exist)")
+	agent := fs.String("implementer", "", "registered reviewer that performs the session work (must exist)")
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
-	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.SessionJobActions, "|"))
-	title := fs.String("title", "", "optional human title for the job")
+	typeName := fs.String("type", "", "run type: "+strings.Join(workflow.SessionJobActions, "|"))
+	title := fs.String("title", "", "optional human title for the run")
 	task := fs.String("pr-id", "", "optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr")
-	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
+	parentJobID := fs.String("parent-run", "", "optional existing parent run id")
 	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)")
 	workflowID := fs.String("workflow", "", "external-coordinator workflow label")
-	jsonOutput := fs.Bool("json", false, "print the created job as JSON")
+	jsonOutput := fs.Bool("json", false, "print the created run as JSON")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}); err != nil { // #2600
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job open does not accept positional arguments")
+		fmt.Fprintln(stderr, "run open does not accept positional arguments")
 		return 2
 	}
 	action, ok := validateSessionAction(*typeName, stderr)
@@ -78,18 +78,18 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if strings.TrimSpace(*agent) == "" || strings.TrimSpace(*repo) == "" {
-		fmt.Fprintln(stderr, "job open requires --agent and --repo")
+		fmt.Fprintln(stderr, "run open requires --implementer and --repo")
 		return 2
 	}
 	if flagWasSupplied(fs, "workflow") && strings.TrimSpace(*workflowID) == "" {
-		fmt.Fprintln(stderr, "job open: --workflow requires a non-blank value")
+		fmt.Fprintln(stderr, "run open: --workflow requires a non-blank value")
 		return 2
 	}
 	if err := workflow.ValidateWorkflowID(*workflowID); err != nil {
-		fmt.Fprintf(stderr, "job open: %v\n", err)
+		fmt.Fprintf(stderr, "run open: %v\n", err)
 		return 2
 	}
-	if refuseFlagLikeText("job open", *title, stderr) {
+	if refuseFlagLikeText("run open", *title, stderr) {
 		return 2
 	}
 
@@ -131,7 +131,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job open: %v\n", err)
+		fmt.Fprintf(stderr, "run open: %v\n", err)
 		return 1
 	}
 	printJobSessionOutput(stdout, out, *jsonOutput)
@@ -139,19 +139,19 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 }
 
 func runJobClose(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job close", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run close", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
 	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	summary := fs.String("summary", "", "optional result summary")
 	pr := fs.Int("pr", 0, "optional pull request number to record")
-	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)")
 	branch := fs.String("branch", "", "optional branch to record")
 	model := fs.String("model", "", "optional model used for the session work")
 	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
 	outputTokens := fs.Int("output-tokens", 0, "output tokens used by the session work")
-	jsonOutput := fs.Bool("json", false, "print the closed job as JSON")
+	jsonOutput := fs.Bool("json", false, "print the closed run as JSON")
 	// The job id is positional and precedes the flags (`job close <id> --decision
 	// …`), so pull it off args[0] before flag.Parse (which stops at the first
 	// non-flag token).
@@ -159,12 +159,12 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		return printFlagSetHelp(fs, stdout)
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "job close requires a job id")
+		fmt.Fprintln(stderr, "run close requires a run id")
 		return 2
 	}
 	jobID := strings.TrimSpace(args[0])
 	if jobID == "" || strings.HasPrefix(jobID, "-") {
-		fmt.Fprintln(stderr, "job close requires a job id as the first argument")
+		fmt.Fprintln(stderr, "run close requires a run id as the first argument")
 		return 2
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -174,10 +174,10 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job close accepts exactly one job id")
+		fmt.Fprintln(stderr, "run close accepts exactly one run id")
 		return 2
 	}
-	if refuseFlagLikeText("job close", *summary, stderr) {
+	if refuseFlagLikeText("run close", *summary, stderr) {
 		return 2
 	}
 	if !validateSessionDecision(*decision, stderr) {
@@ -187,7 +187,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *inputTokens < 0 || *outputTokens < 0 {
-		fmt.Fprintln(stderr, "job close: --input-tokens and --output-tokens must be non-negative")
+		fmt.Fprintln(stderr, "run close: --input-tokens and --output-tokens must be non-negative")
 		return 2
 	}
 
@@ -230,7 +230,7 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 		}
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job close: %v\n", err)
+		fmt.Fprintf(stderr, "run close: %v\n", err)
 		return 1
 	}
 	printJobSessionOutput(stdout, out, *jsonOutput)
@@ -238,40 +238,40 @@ func runJobClose(args []string, stdout, stderr io.Writer) int {
 }
 
 func runJobRecord(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job record", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run record", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	agent := fs.String("agent", "", "agent that performed the session work (must exist)")
-	actingRole := fs.String("acting-role", "", "org role that performed the session work in place of an agent (must exist)")
+	agent := fs.String("implementer", "", "registered reviewer that performed the session work (must exist)")
+	actingRole := fs.String("acting-role", "", "org role that performed the session work in place of a registered reviewer (must exist)")
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
-	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.SessionJobActions, "|"))
+	typeName := fs.String("type", "", "run type: "+strings.Join(workflow.SessionJobActions, "|"))
 	decision := fs.String("decision", "", "result decision: "+strings.Join(workflow.ResultDecisions, "|"))
 	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
-	title := fs.String("title", "", "optional human title for the job")
+	title := fs.String("title", "", "optional human title for the run")
 	summary := fs.String("summary", "", "optional result summary")
 	task := fs.String("pr-id", "", "optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr")
-	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
+	parentJobID := fs.String("parent-run", "", "optional existing parent run id")
 	pr := fs.Int("pr", 0, "optional pull request number")
-	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
+	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)")
 	branch := fs.String("branch", "", "optional branch to record")
 	model := fs.String("model", "", "optional model used for the session work")
 	inputTokens := fs.Int("input-tokens", 0, "input tokens used by the session work")
 	outputTokens := fs.Int("output-tokens", 0, "output tokens used by the session work")
-	jsonOutput := fs.Bool("json", false, "print the recorded job as JSON")
+	jsonOutput := fs.Bool("json", false, "print the recorded run as JSON")
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}); err != nil { // #2600
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}, FlagAlias{Old: "agent", New: "implementer"}, FlagAlias{Old: "parent-job-id", New: "parent-run"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job record does not accept positional arguments")
+		fmt.Fprintln(stderr, "run record does not accept positional arguments")
 		return 2
 	}
-	if refuseFlagLikeText("job record", *title, stderr) || refuseFlagLikeText("job record", *summary, stderr) {
+	if refuseFlagLikeText("run record", *title, stderr) || refuseFlagLikeText("run record", *summary, stderr) {
 		return 2
 	}
 	action, ok := validateSessionAction(*typeName, stderr)
@@ -287,10 +287,10 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	hasRole := strings.TrimSpace(*actingRole) != ""
 	switch {
 	case hasAgent && hasRole:
-		fmt.Fprintln(stderr, "job record accepts --agent or --acting-role, not both: one job has one implementer")
+		fmt.Fprintln(stderr, "run record accepts --implementer or --acting-role, not both: one run has one implementer")
 		return 2
 	case !hasAgent && !hasRole, strings.TrimSpace(*repo) == "":
-		fmt.Fprintln(stderr, "job record requires --agent or --acting-role, and --repo")
+		fmt.Fprintln(stderr, "run record requires --implementer or --acting-role, and --repo")
 		return 2
 	}
 	if !validateSessionDecision(*decision, stderr) {
@@ -300,7 +300,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if *inputTokens < 0 || *outputTokens < 0 {
-		fmt.Fprintln(stderr, "job record: --input-tokens and --output-tokens must be non-negative")
+		fmt.Fprintln(stderr, "run record: --input-tokens and --output-tokens must be non-negative")
 		return 2
 	}
 
@@ -385,7 +385,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 		// The daemon owns later delivery after this producer closes its store.
 		return nil
 	}); err != nil {
-		fmt.Fprintf(stderr, "job record: %v\n", err)
+		fmt.Fprintf(stderr, "run record: %v\n", err)
 		return 1
 	}
 	printJobSessionOutput(stdout, out, *jsonOutput)
@@ -458,7 +458,7 @@ func validateSessionSeverity(action, decision, value string, stderr io.Writer) b
 func validateSessionAgentRepo(ctx context.Context, store *db.Store, agentName, repoFlag string) (string, error) {
 	if _, err := store.GetAgent(ctx, strings.TrimSpace(agentName)); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", fmt.Errorf("agent %q not found", agentName)
+			return "", fmt.Errorf("reviewer %q not found", agentName)
 		}
 		return "", err
 	}
@@ -518,7 +518,7 @@ func validateSessionParentJob(ctx context.Context, store *db.Store, parentJobID 
 	}
 	if _, err := store.GetJob(ctx, parentJobID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("parent job %q not found", parentJobID)
+			return fmt.Errorf("parent run %q not found", parentJobID)
 		}
 		return err
 	}
@@ -557,9 +557,9 @@ func printJobSessionOutput(stdout io.Writer, out jobSessionOutput, jsonOutput bo
 		_ = writeJSON(stdout, out)
 		return
 	}
-	writeLine(stdout, "job: %s", out.JobID)
+	writeLine(stdout, "run: %s", out.JobID)
 	writeLine(stdout, "state: %s", out.State)
-	writeLine(stdout, "agent: %s", out.Agent)
+	writeLine(stdout, "implementer: %s", out.Agent)
 	writeLine(stdout, "type: %s", out.Type)
 	writeLine(stdout, "repo: %s", out.Repo)
 	if out.Decision != "" {

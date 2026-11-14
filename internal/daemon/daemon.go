@@ -2751,7 +2751,7 @@ func (d Daemon) handleIssueAsk(ctx context.Context, issue github.Issue, comment 
 			return err
 		}
 	}
-	return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot queued `%s` job `%s` for `%s`.", command.Action, job.ID, agent.Name))
+	return d.ack(ctx, issue.Number, fmt.Sprintf("Gitmoot queued `%s` run `%s` for `%s`.", command.Action, job.ID, agent.Name))
 }
 
 func (d Daemon) handleRecoveryComment(ctx context.Context, pull github.PullRequest, comment github.IssueComment) error {
@@ -2894,7 +2894,7 @@ func (d Daemon) handleCommand(ctx context.Context, pull github.PullRequest, comm
 			return err
 		}
 	}
-	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued `%s` job `%s` for `%s`.", command.Action, job.ID, agent.Name))
+	return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot queued `%s` run `%s` for `%s`.", command.Action, job.ID, agent.Name))
 }
 
 func (d Daemon) handleHelpCommand(ctx context.Context, pull github.PullRequest) error {

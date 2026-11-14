@@ -27,7 +27,7 @@ func runJobCleanup(args []string, stdout, stderr io.Writer) int {
 	case "inspect", "apply":
 		return runJobCleanupResource(args[0], args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "unknown job cleanup command %q\n\n", args[0])
+		fmt.Fprintf(stderr, "unknown run cleanup command %q\n\n", args[0])
 		printJobCleanupUsage(stderr)
 		return 2
 	}
@@ -35,14 +35,14 @@ func runJobCleanup(args []string, stdout, stderr io.Writer) int {
 
 func printJobCleanupUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot job cleanup list [--state pending|retryable|removed|quarantined] [--json]")
-	fmt.Fprintln(w, "  gitmoot job cleanup reopen <resource-id>")
-	fmt.Fprintln(w, "  gitmoot job cleanup inspect [--json] <job-id>")
-	fmt.Fprintln(w, "  gitmoot job cleanup apply --resource <resource-id> --token <eligibility-token> [--json] <job-id>")
+	fmt.Fprintln(w, "  gitmoot run cleanup list [--state pending|retryable|removed|quarantined] [--json]")
+	fmt.Fprintln(w, "  gitmoot run cleanup reopen <resource-id>")
+	fmt.Fprintln(w, "  gitmoot run cleanup inspect [--json] <run-id>")
+	fmt.Fprintln(w, "  gitmoot run cleanup apply --resource <resource-id> --token <eligibility-token> [--json] <run-id>")
 }
 
 func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job cleanup list", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run cleanup list", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	state := fs.String("state", "", "cleanup state filter")
@@ -54,11 +54,11 @@ func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "job cleanup list does not accept positional arguments")
+		fmt.Fprintln(stderr, "run cleanup list does not accept positional arguments")
 		return 2
 	}
 	if value := strings.TrimSpace(*state); value != "" && value != db.CleanupObligationPending && value != db.CleanupObligationRetryable && value != db.CleanupObligationRemoved && value != db.CleanupObligationQuarantined {
-		fmt.Fprintf(stderr, "job cleanup list: invalid state %q\n", value)
+		fmt.Fprintf(stderr, "run cleanup list: invalid state %q\n", value)
 		return 2
 	}
 	var obligations []db.CleanupObligation
@@ -67,7 +67,7 @@ func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
 		obligations, err = store.ListCleanupObligations(context.Background(), *state)
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job cleanup list: %v\n", err)
+		fmt.Fprintf(stderr, "run cleanup list: %v\n", err)
 		return 1
 	}
 	if *jsonOutput {
@@ -77,13 +77,13 @@ func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		if err := enc.Encode(obligations); err != nil {
-			fmt.Fprintf(stderr, "job cleanup list: %v\n", err)
+			fmt.Fprintf(stderr, "run cleanup list: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 	for _, obligation := range obligations {
-		fmt.Fprintf(stdout, "%s  %-11s attempts=%d job=%s path=%s reason=%s next=%s\n",
+		fmt.Fprintf(stdout, "%s  %-11s attempts=%d run=%s path=%s reason=%s next=%s\n",
 			obligation.ResourceID, obligation.State, obligation.AttemptCount,
 			obligation.OwnerJobID, obligation.ExpectedPath, obligation.Reason,
 			obligation.NextAttemptAt)
@@ -92,7 +92,7 @@ func runJobCleanupList(args []string, stdout, stderr io.Writer) int {
 }
 
 func runJobCleanupReopen(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job cleanup reopen", flag.ContinueOnError)
+	fs := flag.NewFlagSet("run cleanup reopen", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	if err := fs.Parse(args); err != nil {
@@ -102,7 +102,7 @@ func runJobCleanupReopen(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
-		fmt.Fprintln(stderr, "job cleanup reopen requires exactly one resource id")
+		fmt.Fprintln(stderr, "run cleanup reopen requires exactly one resource id")
 		return 2
 	}
 	resourceID := strings.TrimSpace(fs.Arg(0))
@@ -112,15 +112,15 @@ func runJobCleanupReopen(args []string, stdout, stderr io.Writer) int {
 		obligation, err = store.ReopenCleanupObligation(context.Background(), resourceID, time.Now().UTC())
 		return err
 	}); err != nil {
-		fmt.Fprintf(stderr, "job cleanup reopen: %v\n", err)
+		fmt.Fprintf(stderr, "run cleanup reopen: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "reopened cleanup obligation %s for job %s\n", obligation.ResourceID, obligation.OwnerJobID)
+	fmt.Fprintf(stdout, "reopened cleanup obligation %s for run %s\n", obligation.ResourceID, obligation.OwnerJobID)
 	return 0
 }
 
 func runJobCleanupResource(operation string, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("job cleanup "+operation, flag.ContinueOnError)
+	fs := flag.NewFlagSet("run cleanup "+operation, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "print the versioned producer cleanup decision")
@@ -133,20 +133,20 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		return 2
 	}
 	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
-		fmt.Fprintln(stderr, "job cleanup "+operation+" requires exactly one job id")
+		fmt.Fprintln(stderr, "run cleanup "+operation+" requires exactly one run id")
 		return 2
 	}
 	if operation == "apply" && (strings.TrimSpace(*resourceID) == "" || strings.TrimSpace(*token) == "") {
-		fmt.Fprintln(stderr, "job cleanup apply requires --resource and --token from inspect")
+		fmt.Fprintln(stderr, "run cleanup apply requires --resource and --token from inspect")
 		return 2
 	}
 	if operation == "inspect" && (*resourceID != "" || *token != "") {
-		fmt.Fprintln(stderr, "job cleanup inspect derives the resource; --resource and --token are apply-only")
+		fmt.Fprintln(stderr, "run cleanup inspect derives the resource; --resource and --token are apply-only")
 		return 2
 	}
 	paths, err := pathsFromFlag(*home)
 	if err != nil {
-		fmt.Fprintf(stderr, "job cleanup %s: %v\n", operation, err)
+		fmt.Fprintf(stderr, "run cleanup %s: %v\n", operation, err)
 		return 1
 	}
 	ctx := context.Background()
@@ -195,7 +195,7 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 			err = errors.Join(err, encodeErr)
 		}
 	} else if operation == "inspect" {
-		fmt.Fprintf(stdout, "resource=%s job=%s generation=%d eligible=%t reasons=%s token=%s\n",
+		fmt.Fprintf(stdout, "resource=%s run=%s generation=%d eligible=%t reasons=%s token=%s\n",
 			decision.ResourceID, decision.OwnerJobID, decision.LifecycleGeneration,
 			decision.Eligible, strings.Join(decision.ReasonCodes, ","), decision.EligibilityToken)
 	} else {
@@ -206,7 +206,7 @@ func runJobCleanupResource(operation string, args []string, stdout, stderr io.Wr
 		}
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "job cleanup %s: %v\n", operation, err)
+		fmt.Fprintf(stderr, "run cleanup %s: %v\n", operation, err)
 		return 1
 	}
 	if operation == "apply" && result.State != "removed" && result.State != "already_removed" {
