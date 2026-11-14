@@ -1506,17 +1506,17 @@ func daemonMetaWithCurrentBuild(meta daemonMeta) daemonMeta {
 	return meta
 }
 
-// daemonRunStartupReconcile performs the two #505 startup steps for a directly
+// daemonRunStartupReconcile performs the #505 startup steps for a directly
 // launched `daemon run`: it self-registers THIS process's pid/meta so `daemon
-// status` and the dashboard recognize it (gap 3), and it reconciles phantom
-// "running" runtime sessions a previously-crashed daemon left behind (gap 2).
-// Both are best-effort — a failure never blocks the daemon. It returns a cleanup
+// status` and the dashboard recognize it (gap 3), and it sweeps read-only seat
+// temp dirs a previously-crashed daemon left behind (#2314). Both are
+// best-effort — a failure never blocks the daemon. It returns a cleanup
 // func (never nil) the caller defers: it deregisters this process's state on exit
 // only when this process actually self-registered (so a `daemon start`-spawned
 // child, whose parent already owns the pid, is a no-op). Keeping the logic here —
 // rather than inline in runDaemonRun — lets a test bind the regression to the
-// integration point (status flips to "running", an orphaned row resets to idle),
-// not just the leaf helpers it calls.
+// integration point (status flips to "running"), not just the leaf helpers it
+// calls.
 func daemonRunStartupReconcile(ctx context.Context, home string, argv []string, stdout io.Writer) func() {
 	cleanup := func() {}
 	paths, err := initializedPaths(home)
@@ -1528,12 +1528,6 @@ func daemonRunStartupReconcile(ctx context.Context, home string, argv []string, 
 	if registered, regErr := registerDaemonRunState(state, argv, workDir); regErr == nil && registered {
 		cleanup = func() { deregisterDaemonRunState(state) }
 	}
-	_ = withStore(home, func(store *db.Store) error {
-		if n, err := store.ReconcileOrphanedRunningInstances(ctx, time.Now().UTC()); err == nil && n > 0 {
-			writeLine(stdout, "reconciled %d orphaned running runtime session(s)", n)
-		}
-		return nil
-	})
 	// A daemon that crashed mid-review never ran its seats' cleanup. Remove
 	// the private temp dirs whose owner process is gone (#2314).
 	if n, err := sweepStaleSeatTempDirs(paths.Home); n > 0 || err != nil {

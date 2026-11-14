@@ -2651,11 +2651,7 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 			}
 		}
 		listed = false
-		policy, err := worker.parallelSessionPolicy()
-		if err != nil {
-			policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
-		}
-		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, worker.Store, pending, limit, policy)
+		queued, remaining := selectRunnableQueuedJobs(ctx, worker.Store, pending, limit)
 		if len(queued) == 0 {
 			return nil
 		}
@@ -3026,11 +3022,6 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 	if limit <= 0 {
 		return nil
 	}
-	policy, perr := worker.parallelSessionPolicy()
-	if perr != nil {
-		policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
-	}
-
 	// ctx is the SIGNAL context and governs this pass's own accept/requery loop:
 	// on shutdown it must stop selecting, querying and dispatching promptly.
 	//
@@ -3254,7 +3245,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					seedCheckouts = unionStringSets(inflightCheckouts, trackerCheckouts)
 					seedRuntimes = unionStringSets(inflightRuntimes, trackerRuntimes)
 				}
-				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, policy, seedCheckouts, seedRuntimes)
+				queued, remaining := selectRunnableByLane(ctx, worker.Store, pending, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes)
 				for _, job := range queued {
 					job := job
 					// Host-global admission gate (#365): reserve a session slot + RAM
@@ -3335,7 +3326,7 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 					}
 					runtimeKey := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
 					if runtimeKey != "" && (inflightRuntimes[runtimeKey] || seedRuntimes[runtimeKey] || runtimeResourceLocked(ctx, worker.Store, runtimeKey)) {
-						continue // also runtime-contended; leave it to the runtime/temp-worker path
+						continue // also runtime-contended; leave it to the runtime-lock path
 					}
 					// Host-global admission gate (#365): reserve before creating the
 					// isolation worktree so a deferred job leaves no orphan worktree behind.
@@ -3448,9 +3439,8 @@ func runQueuedJobsForRepoPoolTracked(ctx context.Context, worker jobWorker, limi
 			// running job's remaining lifetime (measured: 22m42s and 27m40s waits
 			// for a 3-second stage), and no replacement pass can cover for it
 			// because this one still holds poolRuns[repo] via tryBeginPool while
-			// the `running == 0` return above keeps it alive. Worse, it made the
-			// owner-configured per-agent max_background unreachable for a second
-			// same-repo job. So wake on a completion OR the re-query bound,
+			// the `running == 0` return above keeps it alive. So wake on a
+			// completion OR the re-query bound,
 			// whichever comes first, and let the top of the loop re-query.
 			//
 			// Single-flight is untouched: the same dispatcher goroutine simply
@@ -3605,23 +3595,21 @@ func (w jobWorker) allocatePoolIsolationWorktree(ctx context.Context, job db.Job
 }
 
 type queuedJobResourceSelector struct {
-	limit            int
-	policy           config.ParallelSessionPolicy
-	checkouts        map[string]bool
-	runtimes         map[string]bool
-	tempReservations map[string]int
+	limit     int
+	checkouts map[string]bool
+	runtimes  map[string]bool
 }
 
-func selectRunnableQueuedJobsWithPolicy(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy) ([]db.Job, []db.Job) {
-	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, policy, nil, nil)
+func selectRunnableQueuedJobs(ctx context.Context, store *db.Store, pending []db.Job, limit int) ([]db.Job, []db.Job) {
+	return selectRunnableQueuedJobsSeeded(ctx, store, pending, limit, nil, nil)
 }
 
-// selectRunnableQueuedJobsSeeded is selectRunnableQueuedJobsWithPolicy with the
+// selectRunnableQueuedJobsSeeded is selectRunnableQueuedJobs with the
 // checkout/runtime resource sets pre-seeded from already-running jobs. The
 // barrier path passes nil seeds (empty, == the original behavior); the pool path
 // (#394) seeds the live in-flight keys so a job whose checkout key is already
 // held by a running job is not selected. The seed maps are copied, never mutated.
-func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, policy config.ParallelSessionPolicy, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pending []db.Job, limit int, seedCheckouts map[string]bool, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if limit <= 0 {
 		// A FOURTH DECLINE POINT, outside selects and not in the issue's list: with
 		// no slots every queued job is declined and nothing recorded why. A repo
@@ -3632,11 +3620,9 @@ func selectRunnableQueuedJobsSeeded(ctx context.Context, store *db.Store, pendin
 		return nil, pending
 	}
 	selector := queuedJobResourceSelector{
-		limit:            limit,
-		policy:           policy,
-		checkouts:        copyStringSet(seedCheckouts),
-		runtimes:         copyStringSet(seedRuntimes),
-		tempReservations: map[string]int{},
+		limit:     limit,
+		checkouts: copyStringSet(seedCheckouts),
+		runtimes:  copyStringSet(seedRuntimes),
 	}
 	queued := make([]db.Job, 0, min(limit, len(pending)))
 	remaining := make([]db.Job, 0, len(pending))
@@ -3721,12 +3707,8 @@ func (s queuedJobResourceSelector) selects(ctx context.Context, store *db.Store,
 	if s.checkouts[checkoutKey] {
 		return false, "checkout", fmt.Sprintf("checkout already taken this pass: checkout=%s", checkoutKey)
 	}
-	runtimeAlreadySelected := runtimeKey != "" && s.runtimes[runtimeKey]
-	runtimeAlreadyLocked := runtimeKey != "" && !runtimeAlreadySelected && runtimeResourceLocked(ctx, store, runtimeKey)
-	if runtimeAlreadySelected || runtimeAlreadyLocked {
-		if ok, tempDetail := s.canUseTempWorker(ctx, store, job); !ok && runtimeAlreadySelected {
-			return false, "runtime", fmt.Sprintf("runtime already taken this pass and no temp session: runtime=%s; %s", runtimeKey, tempDetail)
-		}
+	if runtimeKey != "" && s.runtimes[runtimeKey] {
+		return false, "runtime", fmt.Sprintf("runtime already taken this pass: runtime=%s", runtimeKey)
 	}
 	s.checkouts[checkoutKey] = true
 	if runtimeKey != "" {
@@ -3741,38 +3723,6 @@ func runtimeResourceLocked(ctx context.Context, store *db.Store, runtimeKey stri
 	}
 	_, err := store.GetResourceLock(ctx, runtimeKey)
 	return err == nil
-}
-
-// canUseTempWorker reports eligibility and, when refused, WHY - including the
-// temp-session numerator it tested (#2117). Behaviour is unchanged: every refusal
-// returns false exactly where it did before.
-func (s queuedJobResourceSelector) canUseTempWorker(ctx context.Context, store *db.Store, job db.Job) (bool, string) {
-	if store == nil {
-		return false, "temp session unavailable: no store"
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		return false, fmt.Sprintf("temp session unavailable: unreadable payload: %v", err)
-	}
-	dbAgent, err := store.GetAgent(ctx, job.Agent)
-	if err != nil {
-		return false, fmt.Sprintf("temp session unavailable: agent %q not readable: %v", job.Agent, err)
-	}
-	agent := runtimeAgent(dbAgent)
-	typ := tempWorkerAgentType(agent.Name)
-	count, err := store.CountActiveAgentInstances(ctx, typ, agent.AutonomyPolicy, time.Now().UTC())
-	if err != nil {
-		return false, fmt.Sprintf("temp session unavailable: count active instances for %q: %v", typ, err)
-	}
-	if count+s.tempReservations[typ] >= s.policy.MaxTempSessionsPerAgent {
-		return false, fmt.Sprintf("temp sessions exhausted: type=%s active=%d reserved=%d cap=%d", typ, count, s.tempReservations[typ], s.policy.MaxTempSessionsPerAgent)
-	}
-	eligible := tempWorkerEligible(ctx, store, job, payload, agent, s.policy, time.Now().UTC())
-	if !eligible.Eligible {
-		return false, fmt.Sprintf("temp session ineligible: type=%s reason=%s", typ, eligible.Reason)
-	}
-	s.tempReservations[typ]++
-	return true, ""
 }
 
 func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
@@ -3876,43 +3826,6 @@ func queuedJobRuntimeResourceKey(ctx context.Context, store *db.Store, job db.Jo
 		}
 		key, ok := overrideRuntimeSessionResourceKey(applyJobRuntimeOverride(runtime.Agent{}, payload))
 		if !ok {
-			return ""
-		}
-		return key
-	}
-	// #1952: an EPHEMERAL job has no agents-table session to schedule under — the
-	// worker materializes the spec and starts a FRESH session, so no row exists
-	// pre-materialization and a stale same-name row yields the wrong key. Either
-	// way this returned "", and admission then read a real session as
-	// not-session-counted (perJobAdmissionEstimate treats "" as no session).
-	//
-	// This key is a SERIALIZATION key — runtimeResourceLocked, inflightRuntimes —
-	// so what it must satisfy is worth stating exactly, because an earlier version
-	// of this comment claimed something FALSE: that the key is byte-identical to
-	// the lock the worker takes. MEASURED, it is not. The gate produces
-	// runtime:<rt>:fresh:job:<hash> while jobWorker.run's journalled lock reads
-	// runtime:<rt>:<the ref adapter.Start returned>. scopeRegisteredFreshRefForJob
-	// only rewrites a ref that IsFreshRef, and a materialized ephemeral agent
-	// carries the live session ref, so it is left alone.
-	//
-	// That gap is inherent and harmless: an ephemeral session does not EXIST until
-	// Start returns, so no pre-dispatch value can name it. What the key must be is
-	// non-empty (so admission counts a real session rather than pricing it free),
-	// job-unique (so two ephemeral jobs never serialize against each other), and
-	// never shaped like a live session ref (so it cannot collide with a real
-	// lock) — which the fresh: prefix guarantees. A fresh ephemeral session
-	// contends with nothing at gate time, so claiming no existing lock is correct
-	// rather than merely convenient.
-	if payload, err := daemonJobPayload(job); err == nil && payload.Ephemeral != nil {
-		agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
-		if !ok {
-			return ""
-		}
-		agent.RuntimeRef = runtime.FreshRefForJob(job.ID)
-		key, keyed := runtimeSessionResourceKey(agent)
-		if !keyed {
-			// A non-resumable spec runtime (shell) takes no session lock, exactly
-			// as a non-resumable registered agent does not.
 			return ""
 		}
 		return key

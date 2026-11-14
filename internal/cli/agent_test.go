@@ -968,7 +968,7 @@ func TestRunAgentAskBackgroundJSON(t *testing.T) {
 	}
 }
 
-func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
+func TestRunAgentTypeSetListShow(t *testing.T) {
 	declareNoRealAdapterExec(t)
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -985,8 +985,6 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 		"--runtime", "omp",
 		"--role", "planner",
 		"--policy", "workspace-write",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
 		"--job-timeout", "5m",
 		"--capability", "ask",
 	}, &stdout, &stderr)
@@ -1002,7 +1000,7 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("agent type list exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "planner\tomp\t1") {
+	if !strings.Contains(stdout.String(), "planner\tomp\n") {
 		t.Fatalf("agent type list output = %q", stdout.String())
 	}
 	stdout.Reset()
@@ -1011,236 +1009,13 @@ func TestRunAgentTypeSetListShowAndManagedBackgroundAsk(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("agent type show exit code = %d, stderr=%s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "max_background: 1") || !strings.Contains(stdout.String(), "capabilities: ask") || !strings.Contains(stdout.String(), "policy: workspace-write") {
+	if !strings.Contains(stdout.String(), "capabilities: ask") || !strings.Contains(stdout.String(), "policy: workspace-write") || strings.Contains(stdout.String(), "max_background") {
 		t.Fatalf("agent type show output = %q", stdout.String())
 	}
-
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440111", "ready")},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "First plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "state: queued") {
-		t.Fatalf("managed background ask output = %q", stdout.String())
-	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
-	}
-	runner.want(t, 0, repoDir, "omp", "-p", "--mode=json", "--approval-mode=write")
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "Second plan", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("second managed background ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("runtime start calls after reuse = %+v, want one", runner.calls)
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatalf("ListAgentInstances returned error: %v", err)
-	}
-	if len(instances) != 1 || instances[0].Type != "planner" || instances[0].RuntimeRef != "550e8400-e29b-41d4-a716-446655440111" || instances[0].AutonomyPolicy != runtime.AutonomyPolicyWorkspaceWrite {
-		t.Fatalf("instances = %+v", instances)
-	}
-	config, err := (jobWorker{Store: store, ConfigHome: home}).managedJobConfig(context.Background(), instances[0].Name)
-	if err != nil {
-		t.Fatalf("managedJobConfig returned error: %v", err)
-	}
-	if !config.OK || config.JobTimeout != 5*time.Minute || config.IdleTimeout != 20*time.Minute {
-		t.Fatalf("managedJobConfig = %+v; want 5m job and 20m idle", config)
-	}
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	if len(jobs) != 2 || jobs[0].Agent != instances[0].Name || jobs[1].Agent != instances[0].Name {
-		t.Fatalf("jobs = %+v, instance = %+v", jobs, instances[0])
-	}
 }
 
-// TestDispatchForegroundAskToManagedTypeSpinsInstance covers #395: a plain
-// foreground ask whose name resolves to a configured managed agent type (no
-// --type, no AllowManagedSync) must dispatch synchronously to the managed type
-// instead of erroring "agent not found".
-func TestDispatchForegroundAskToManagedTypeSpinsInstance(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440222", "ready")},
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440223", `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`)},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	// No Type, no AllowManagedSync: this is the plain foreground ask the issue
-	// targets. Before #395 this returned `agent "planner" not found`.
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:     "owner/repo",
-		Agent:        "planner",
-		Action:       "ask",
-		Instructions: "Plan the work foreground.",
-		Home:         home,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-	if output.Result == nil || output.Result.Decision != "implemented" {
-		t.Fatalf("dispatch output = %+v", output)
-	}
-	// Reaching ensureManagedAgentInstance must have spun a managed instance of
-	// the type, proving the synchronous managed path was taken.
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatalf("ListAgentInstances returned error: %v", err)
-	}
-	if len(instances) != 1 || instances[0].Type != "planner" {
-		t.Fatalf("instances = %+v, want one planner managed instance", instances)
-	}
-	if output.Agent != instances[0].Name {
-		t.Fatalf("job agent = %q, want managed instance %q", output.Agent, instances[0].Name)
-	}
-}
-
-// TestDispatchForegroundReviewToManagedTypeStillErrors pins the #395 scoping
-// decision: the foreground managed-type fall-through is limited to the `ask`
-// action. A foreground `review` whose name resolves to a configured managed
-// type must NOT spin a managed instance (review carries required params the
-// foreground path has not validated here) — it stays the historical not-found
-// error, so a heuristic-selected `run`->`review` can't spin-then-fail downstream.
-func TestDispatchForegroundReviewToManagedTypeStillErrors(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-
-	_, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:     "owner/repo",
-		Agent:        "planner",
-		Action:       "review",
-		PullRequest:  7,
-		Instructions: "Review the PR foreground.",
-		Home:         home,
-	})
-	if err == nil || !strings.Contains(err.Error(), `agent "planner" not found`) {
-		t.Fatalf("review-to-type dispatch err = %v, want \"agent not found\"", err)
-	}
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatalf("ListAgentInstances returned error: %v", err)
-	}
-	if len(instances) != 0 {
-		t.Fatalf("instances = %+v, want zero (review must not spin a managed instance)", instances)
-	}
-}
-
-// TestDispatchForegroundAskSingleInstanceUnchanged confirms a name that
-// resolves to a registered single agent still dispatches to that instance and
-// does not spin a managed instance, preserving single-instance-shadows-type.
-func TestDispatchForegroundAskSingleInstanceUnchanged(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	if err := store.UpsertRepo(context.Background(), db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}); err != nil {
-		t.Fatalf("UpsertRepo returned error: %v", err)
-	}
-	if err := store.UpsertAgent(context.Background(), db.Agent{
-		Name:           "solo",
-		Role:           "planner",
-		Runtime:        runtime.ShellRuntime,
-		RuntimeRef:     "echo",
-		RepoScope:      "owner/repo",
-		Capabilities:   []string{"ask"},
-		AutonomyPolicy: runtime.AutonomyPolicyReadOnly,
-		HealthStatus:   "ok",
-	}); err != nil {
-		t.Fatalf("UpsertAgent returned error: %v", err)
-	}
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}` + "\n"},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	output, err := dispatchLocalAgentJob(context.Background(), store, localAgentDispatchRequest{
-		RepoFlag:     "owner/repo",
-		Agent:        "solo",
-		Action:       "ask",
-		Instructions: "Use the single instance.",
-		Home:         home,
-	})
-	if err != nil {
-		t.Fatalf("dispatchLocalAgentJob returned error: %v", err)
-	}
-	if output.Agent != "solo" {
-		t.Fatalf("job agent = %q, want solo", output.Agent)
-	}
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatalf("ListAgentInstances returned error: %v", err)
-	}
-	if len(instances) != 0 {
-		t.Fatalf("instances = %+v, want no managed instances for a single agent", instances)
-	}
-}
-
-// TestDispatchForegroundAskUnknownNameStillErrors confirms requirement #3: a
-// name resolving to neither a single agent nor a managed type still returns the
-// historical `agent "<name>" not found` error in the foreground.
+// TestDispatchForegroundAskUnknownNameStillErrors confirms a name that is not a
+// registered agent returns `agent "<name>" not found` in the foreground.
 func TestDispatchForegroundAskUnknownNameStillErrors(t *testing.T) {
 	home := t.TempDir()
 	repoDir := t.TempDir()
@@ -1270,145 +1045,6 @@ func TestDispatchForegroundAskUnknownNameStillErrors(t *testing.T) {
 	}
 }
 
-func TestDispatchManagedAgentStartsFreshInstanceWhenPolicyChanges(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--capability", "ask",
-		"--policy", "read-only",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set read-only exit code = %d, stderr=%s", code, stderr.String())
-	}
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440411", "ready")},
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440412", "ready")},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "First", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("first managed ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	runner.want(t, 0, repoDir, "omp", "-p", "--mode=json", "--approval-mode=always-ask")
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--capability", "ask",
-		"--policy", "workspace-write",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set workspace-write exit code = %d, stderr=%s", code, stderr.String())
-	}
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("second managed ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("runtime start calls = %+v, want two", runner.calls)
-	}
-	runner.want(t, 1, repoDir, "omp", "-p", "--mode=json", "--approval-mode=write")
-
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatalf("ListAgentInstances returned error: %v", err)
-	}
-	policies := map[string]int{}
-	for _, instance := range instances {
-		policies[instance.AutonomyPolicy]++
-	}
-	if policies[runtime.AutonomyPolicyReadOnly] != 1 || policies[runtime.AutonomyPolicyWorkspaceWrite] != 1 {
-		t.Fatalf("instances = %+v, want one read-only and one workspace-write", instances)
-	}
-}
-
-func TestEnsureManagedAgentInstanceKeepsNewInstanceReservedUntilRelease(t *testing.T) {
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "2",
-		"--idle-timeout", "20m",
-		"--job-timeout", "45m",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	record := db.Repo{Owner: "owner", Name: "repo", CheckoutPath: repoDir, DefaultBranch: "main", PollInterval: "30s"}
-	if err := store.UpsertRepo(context.Background(), record); err != nil {
-		t.Fatalf("UpsertRepo returned error: %v", err)
-	}
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440333", "ready")},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	agent, release, err := resolveLocalDispatchAgent(context.Background(), store, localAgentDispatchRequest{Home: home, Type: "planner", Background: true}, "owner/repo", record)
-	if err != nil {
-		t.Fatalf("ensureManagedAgentInstance returned error: %v", err)
-	}
-	instance, err := store.GetAgentInstance(context.Background(), agent.Name)
-	if err != nil {
-		t.Fatalf("GetAgentInstance returned error: %v", err)
-	}
-	if instance.State != "starting" || instance.RuntimeRef != "550e8400-e29b-41d4-a716-446655440333" {
-		t.Fatalf("instance before release = %+v", instance)
-	}
-	reusable, ok, err := store.FindReusableAgentInstance(context.Background(), "planner", "owner/repo", "auto", time.Now().UTC())
-	if err != nil {
-		t.Fatalf("FindReusableAgentInstance returned error: %v", err)
-	}
-	if ok {
-		t.Fatalf("new managed instance is reusable before release: %+v", reusable)
-	}
-	if err := release(context.Background()); err != nil {
-		t.Fatalf("release returned error: %v", err)
-	}
-	instance, err = store.GetAgentInstance(context.Background(), agent.Name)
-	if err != nil {
-		t.Fatalf("GetAgentInstance after release returned error: %v", err)
-	}
-	if instance.State != "idle" {
-		t.Fatalf("instance state after release = %s, want idle", instance.State)
-	}
-}
-
 func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -1421,7 +1057,7 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("agent type set shell exit code = %d, want 2", code)
 	}
-	if !strings.Contains(stderr.String(), "managed agent types support omp") {
+	if !strings.Contains(stderr.String(), "agent types support omp") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 
@@ -1437,272 +1073,6 @@ func TestRunAgentTypeSetRejectsNonStartableRuntime(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `runtime "codex" is no longer supported; gitmoot requires omp for jobs`) {
 		t.Fatalf("stderr = %q", stderr.String())
-	}
-}
-
-func TestRunAgentTypeSetMaxBackgroundCreatesSecondBusyInstance(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "2",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440121", "ready")},
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440122", "ready")},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	for _, prompt := range []string{"First", "Second"} {
-		stdout.Reset()
-		stderr.Reset()
-		code = Run([]string{"agent", "ask", "planner", prompt, "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-		if code != 0 {
-			t.Fatalf("managed background ask %q exit code = %d, stderr=%s", prompt, code, stderr.String())
-		}
-	}
-	if len(runner.calls) != 2 {
-		t.Fatalf("runtime start calls = %+v, want two", runner.calls)
-	}
-}
-
-func TestRunAgentTypeSetMaxBackgroundCapsAcrossRepos(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	otherRepoDir := t.TempDir()
-	runGit(t, otherRepoDir, "init")
-	runGit(t, otherRepoDir, "branch", "-m", "main")
-	runGit(t, otherRepoDir, "remote", "add", "origin", "https://github.com/owner/other.git")
-	seedGitHead(t, otherRepoDir)
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"repo", "add", "owner/other", "--home", home, "--path", otherRepoDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("repo add exit code = %d, stderr=%s", code, stderr.String())
-	}
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-	runner := &agentStartRunner{results: []subprocess.Result{
-		{Stdout: ompStreamStdout("550e8400-e29b-41d4-a716-446655440123", "ready")},
-	}}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "First", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("first managed background ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/other", "--background"}, &stdout, &stderr)
-	if code != 1 {
-		t.Fatalf("second repo managed background ask exit code = %d, want 1; stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "reached max_background") {
-		t.Fatalf("stderr = %q", stderr.String())
-	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("runtime start calls = %+v, want one", runner.calls)
-	}
-}
-
-func TestRunAgentTypeSetMaxBackgroundUsesOnlyActiveFallback(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-
-	now := time.Now().UTC()
-	store := openCLIJobStore(t, home)
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:         "planner-bg-expired",
-		Type:         "planner",
-		Runtime:      "omp",
-		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440131",
-		RepoFullName: "owner/repo",
-		Role:         "planner",
-		Capabilities: []string{"ask"},
-		State:        "idle",
-		CreatedAt:    now.Add(-time.Hour).Format(time.RFC3339Nano),
-		LastUsedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
-		ExpiresAt:    now.Add(-time.Minute).Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance expired returned error: %v", err)
-	}
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:         "planner-bg-active",
-		Type:         "planner",
-		Runtime:      "omp",
-		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440132",
-		RepoFullName: "owner/repo",
-		Role:         "planner",
-		Capabilities: []string{"ask"},
-		State:        "idle",
-		CreatedAt:    now.Format(time.RFC3339Nano),
-		LastUsedAt:   now.Format(time.RFC3339Nano),
-		ExpiresAt:    now.Add(time.Hour).Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance active returned error: %v", err)
-	}
-	if err := store.CreateJob(context.Background(), db.Job{ID: "queued-for-active", Agent: "planner-bg-active", Type: "ask", State: "queued", Payload: "{}"}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
-	store.Close()
-
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "Third", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime start calls = %+v, want none", runner.calls)
-	}
-	store = openCLIJobStore(t, home)
-	defer store.Close()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	activeJobs := 0
-	expiredJobs := 0
-	for _, job := range jobs {
-		if job.Agent == "planner-bg-active" {
-			activeJobs++
-		}
-		if job.Agent == "planner-bg-expired" {
-			expiredJobs++
-		}
-	}
-	if len(jobs) != 2 || activeJobs != 2 || expiredJobs != 0 {
-		t.Fatalf("jobs = %+v, want all jobs assigned to active instance", jobs)
-	}
-}
-
-func TestRunAgentTypeSetMaxBackgroundCountsQueuedExpiredInstance(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	t.Chdir(repoDir)
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{
-		"agent", "type", "set", "planner",
-		"--home", home,
-		"--runtime", "omp",
-		"--max-background", "1",
-		"--capability", "ask",
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent type set exit code = %d, stderr=%s", code, stderr.String())
-	}
-
-	now := time.Now().UTC()
-	store := openCLIJobStore(t, home)
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:         "planner-bg-expired",
-		Type:         "planner",
-		Runtime:      "omp",
-		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440141",
-		RepoFullName: "owner/repo",
-		Role:         "planner",
-		Capabilities: []string{"ask"},
-		State:        "idle",
-		CreatedAt:    now.Add(-time.Hour).Format(time.RFC3339Nano),
-		LastUsedAt:   now.Add(-time.Hour).Format(time.RFC3339Nano),
-		ExpiresAt:    now.Add(-time.Minute).Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance returned error: %v", err)
-	}
-	if err := store.CreateJob(context.Background(), db.Job{ID: "queued-for-expired", Agent: "planner-bg-expired", Type: "ask", State: "queued", Payload: "{}"}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
-	store.Close()
-
-	runner := &agentStartRunner{}
-	restoreFactory := replaceRuntimeFactory(runtime.Factory{Runner: runner})
-	defer restoreFactory()
-
-	stdout.Reset()
-	stderr.Reset()
-	code = Run([]string{"agent", "ask", "planner", "Second", "--home", home, "--repo", "owner/repo", "--background"}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("managed background ask exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime start calls = %+v, want none", runner.calls)
-	}
-	store = openCLIJobStore(t, home)
-	defer store.Close()
-	jobs, err := store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	expiredJobs := 0
-	for _, job := range jobs {
-		if job.Agent == "planner-bg-expired" {
-			expiredJobs++
-		}
-	}
-	if len(jobs) != 2 || expiredJobs != 2 {
-		t.Fatalf("jobs = %+v, want queued expired instance to retain max slot", jobs)
 	}
 }
 
@@ -1729,7 +1099,6 @@ func TestRunAgentTypeSetRejectsNonPositiveTimeouts(t *testing.T) {
 		flag string
 		want string
 	}{
-		{name: "idle", flag: "--idle-timeout", want: "idle timeout must be positive"},
 		{name: "job", flag: "--job-timeout", want: "job timeout must be positive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1749,37 +1118,6 @@ func TestRunAgentTypeSetRejectsNonPositiveTimeouts(t *testing.T) {
 				t.Fatalf("stderr = %q, want %q", stderr.String(), tc.want)
 			}
 		})
-	}
-}
-
-func TestRunAgentGCRemovesExpiredManagedInstances(t *testing.T) {
-	home := t.TempDir()
-	store := openCLIJobStore(t, home)
-	now := time.Now().UTC().Add(-time.Hour)
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:         "planner-bg-expired",
-		Type:         "planner",
-		Runtime:      "omp",
-		RuntimeRef:   "550e8400-e29b-41d4-a716-446655440112",
-		RepoFullName: "owner/repo",
-		Role:         "planner",
-		Capabilities: []string{"ask"},
-		State:        "idle",
-		CreatedAt:    now.Format(time.RFC3339Nano),
-		LastUsedAt:   now.Format(time.RFC3339Nano),
-		ExpiresAt:    now.Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance returned error: %v", err)
-	}
-	store.Close()
-
-	var stdout, stderr bytes.Buffer
-	code := Run([]string{"agent", "gc", "--home", home}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent gc exit code = %d, stderr=%s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "removed 1 expired agent instances") {
-		t.Fatalf("agent gc output = %q", stdout.String())
 	}
 }
 
@@ -1907,8 +1245,6 @@ effort = "high"
 role = "preserved-role"
 capabilities = ["review"]
 autonomy_policy = "read-only"
-max_background = 4
-idle_timeout = "41m"
 job_timeout = "17m"
 `
 	if err := os.WriteFile(paths.ConfigFile, []byte(configured), 0o600); err != nil {
@@ -1948,7 +1284,7 @@ job_timeout = "17m"
 	entry := entries["preserved-agent"]
 	if entry.Runtime != "omp" || entry.Model != "preserved-model" ||
 		entry.Effort != "high" || entry.Role != "preserved-role" || !reflect.DeepEqual(entry.Capabilities, []string{"review"}) ||
-		entry.AutonomyPolicy != "read-only" || entry.MaxBackground != 4 || entry.IdleTimeout != "41m" || entry.JobTimeout != "17m" {
+		entry.AutonomyPolicy != "read-only" || entry.JobTimeout != "17m" {
 		t.Fatalf("pre-existing type was clobbered: %+v", entry)
 	}
 }
@@ -2830,8 +2166,8 @@ func TestAgentTypeShowReportsUnknownWhenTheStoreCannotBeRead(t *testing.T) {
 // review probe that disproved round two's F1 fix, kept as a regression test.
 //
 // Round two proved the config plane writable and then moved the row, on the
-// premise that the row is the only dispatch authority. It is not: explicit
-// managed-type routing never calls GetAgent and builds the runtime agent from
+// premise that the row is the only dispatch authority. It was not: managed-type
+// routing (removed in #2590) never called GetAgent and built the runtime agent from
 // config, so a command that failed at the row had ALREADY widened a live
 // grant. Under that code this test observes rc=1 with config sitting at
 // danger-full-access; under the held transaction nothing moves at all.

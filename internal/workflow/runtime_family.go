@@ -21,7 +21,7 @@ const ompProviderVerifiedEventKind = "omp_provider_verified"
 // Precedence: a runtime recorded on the job itself (payload effective_runtime)
 // wins over the agent registry default, so an override-run job attributes
 // correctly even after the agent's registered default later changes. The
-// registry default (agents.runtime, with GetAgent's agent_instances fallback)
+// registry default (agents.runtime)
 // covers jobs that predate the #1528 recording.
 //
 // ok is false when no trusted source can name a family: an absent/unregistered
@@ -135,8 +135,9 @@ func resolveRuntimeNameDirect(ctx context.Context, store *db.Store, jobID string
 // a cycle in parent_job_id terminate instead of hanging the caller.
 const maxSyntheticParentHops = 4
 
-// tempAgentInfix and ephemeralAgentInfix are the two synthetic shapes.
-// daemon_worker.go mints `<parent-agent>-temp-<parent-job-id>`, so the parent
+// tempAgentInfix and ephemeralAgentInfix are the two synthetic shapes, both
+// HISTORY now. The retired temp-worker fork (#2590) minted
+// `<parent-agent>-temp-<parent-job-id>`, so the parent
 // AGENT is the prefix and needs no store read. Historical ephemeral rows (the
 // retired delegation engine minted them as
 // `<slug(delegation-id)>-ephemeral-<shortHash(parent-job+delegation)>`) HASH

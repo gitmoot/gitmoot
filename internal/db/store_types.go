@@ -34,23 +34,6 @@ type AgentRepo struct {
 	RepoFullName string
 }
 
-type AgentInstance struct {
-	Name           string
-	Type           string
-	Runtime        string
-	RuntimeRef     string
-	RepoFullName   string
-	Role           string
-	Model          string
-	Effort         string
-	Capabilities   []string
-	AutonomyPolicy string
-	State          string
-	CreatedAt      string
-	LastUsedAt     string
-	ExpiresAt      string
-}
-
 type Task struct {
 	ID                     string
 	RepoFullName           string

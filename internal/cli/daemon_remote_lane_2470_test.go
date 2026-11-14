@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/runtime"
 	"github.com/gitmoot/gitmoot/internal/workflow"
@@ -64,7 +63,7 @@ func TestRemoteLaneAdmitsE2BJobsWhileHostIsFull(t *testing.T) {
 	if local != 0 || remoteRoom != 2 || !laneOn {
 		t.Fatalf("budgets local=%d remote=%d laneOn=%v, want 0/2/true", local, remoteRoom, laneOn)
 	}
-	queued, _ := selectRunnableByLane(ctx, store, pending, local, remoteRoom, laneOn, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, nil, nil)
+	queued, _ := selectRunnableByLane(ctx, store, pending, local, remoteRoom, laneOn, nil, nil)
 	var ids []string
 	for _, job := range queued {
 		ids = append(ids, job.ID)

@@ -123,15 +123,15 @@ private_token = "` + secret + `"
 		t.Fatalf("agents = %+v, want one worker", snapshot.Agents)
 	}
 	agent := snapshot.Agents[0]
-	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || agent.MaxBackground != 9 {
+	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || agent.MaxBackground != 0 {
 		t.Fatalf("worker config = %+v", agent)
 	}
 	if !reflect.DeepEqual(agent.Capabilities, []string{"ask", "implement"}) || agent.AutonomyPolicy != "workspace-write" {
 		t.Fatalf("worker behavior config = %+v", agent)
 	}
 
-	if !containsString(snapshot.UnknownKeys, "experimental.private_token") {
-		t.Fatalf("unknown keys = %v, want experimental.private_token", snapshot.UnknownKeys)
+	if !containsString(snapshot.UnknownKeys, "experimental.private_token") || !containsString(snapshot.UnknownKeys, "agents.worker.max_background") {
+		t.Fatalf("unknown keys = %v, want experimental.private_token and the retired agents.worker.max_background", snapshot.UnknownKeys)
 	}
 	encoded, err := json.Marshal(snapshot)
 	if err != nil {

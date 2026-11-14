@@ -13,7 +13,7 @@ import (
 // SetConfigScalar replaces the value of an existing scalar key in the config
 // file, preserving comments, key order, and formatting (tomledit edits the
 // lossless AST). keyPath is the full dotted path, e.g.
-// {"agents", "planner", "max_background"}. The key must already exist —
+// {"agents", "planner", "job_timeout"}. The key must already exist —
 // adding/removing keys or whole sections stays an $EDITOR job.
 //
 // The write is atomic (temp file + rename) and validated: if the resulting
@@ -109,9 +109,6 @@ func (c ConfigScalar) toml() string {
 // validateConfigFile re-runs every config parser, returning the first error.
 func validateConfigFile(paths Paths) error {
 	if _, err := LoadAgentTypes(paths); err != nil {
-		return err
-	}
-	if _, err := LoadParallelSessionPolicy(paths); err != nil {
 		return err
 	}
 	if _, err := LoadRepoConcurrency(paths); err != nil {

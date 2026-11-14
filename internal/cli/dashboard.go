@@ -15,7 +15,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/cli/style"
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/runtime"
 )
 
 // dashboardListCap is how many entries each list shows in styled mode before
@@ -26,17 +25,16 @@ const dashboardListCap = 8
 // entirely from existing store/status sources; the dashboard never owns
 // workflow state.
 type dashboardSnapshot struct {
-	Home            string                  `json:"home"`
-	DatabasePath    string                  `json:"database_path"`
-	DatabaseExists  bool                    `json:"database_exists"`
-	Daemon          dashboardDaemon         `json:"daemon"`
-	Repos           []dashboardRepo         `json:"repos"`
-	Agents          []dashboardAgent        `json:"agents"`
-	RuntimeSessions []dashboardSession      `json:"runtime_sessions"`
-	ActiveJobs      []dashboardActiveJob    `json:"active_jobs"`
-	Jobs            dashboardJobs           `json:"jobs"`
-	Worktrees       []dashboardWorktree     `json:"worktrees"`
-	ResourceLocks   []dashboardResourceLock `json:"resource_locks"`
+	Home           string                  `json:"home"`
+	DatabasePath   string                  `json:"database_path"`
+	DatabaseExists bool                    `json:"database_exists"`
+	Daemon         dashboardDaemon         `json:"daemon"`
+	Repos          []dashboardRepo         `json:"repos"`
+	Agents         []dashboardAgent        `json:"agents"`
+	ActiveJobs     []dashboardActiveJob    `json:"active_jobs"`
+	Jobs           dashboardJobs           `json:"jobs"`
+	Worktrees      []dashboardWorktree     `json:"worktrees"`
+	ResourceLocks  []dashboardResourceLock `json:"resource_locks"`
 
 	// jobRows carries per-job rows for the web dashboard's run summary. The
 	// latest-event message it also carried went with the attention grouping the
@@ -91,24 +89,6 @@ type dashboardAgent struct {
 	Runtime string `json:"runtime"`
 	Role    string `json:"role,omitempty"`
 	Health  string `json:"health,omitempty"`
-}
-
-type dashboardSession struct {
-	Name    string `json:"name"`
-	Runtime string `json:"runtime"`
-	Repo    string `json:"repo,omitempty"`
-	State   string `json:"state,omitempty"`
-	// Stale marks a phantom "running" session — an agent_instance still at
-	// state=running whose lease (expires_at) has elapsed (#505 gap 2). omitempty
-	// keeps the --json shape byte-identical for healthy sessions (no new key).
-	Stale bool `json:"stale,omitempty"`
-
-	// Detail fields shown only in the web session detail. They are unexported so
-	// the --json output stays byte-stable.
-	sessionType string
-	role        string
-	lastUsedAt  string
-	expiresAt   string
 }
 
 type dashboardJobs struct {
@@ -257,15 +237,14 @@ func tailDaemonLogErrors(logFile string, limit int) []string {
 
 func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot, error) {
 	snapshot := dashboardSnapshot{
-		Home:            paths.Home,
-		DatabasePath:    paths.Database,
-		Jobs:            dashboardJobs{ByState: map[string]int{}},
-		Repos:           []dashboardRepo{},
-		Agents:          []dashboardAgent{},
-		RuntimeSessions: []dashboardSession{},
-		ActiveJobs:      []dashboardActiveJob{},
-		Worktrees:       []dashboardWorktree{},
-		ResourceLocks:   []dashboardResourceLock{},
+		Home:          paths.Home,
+		DatabasePath:  paths.Database,
+		Jobs:          dashboardJobs{ByState: map[string]int{}},
+		Repos:         []dashboardRepo{},
+		Agents:        []dashboardAgent{},
+		ActiveJobs:    []dashboardActiveJob{},
+		Worktrees:     []dashboardWorktree{},
+		ResourceLocks: []dashboardResourceLock{},
 	}
 	now := time.Now().UTC()
 	if info, err := os.Stat(paths.Database); err == nil && !info.IsDir() {
@@ -299,23 +278,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			}
 			snapshot.Agents = append(snapshot.Agents, dashboardAgent{Name: agent.Name, Runtime: agent.Runtime, Role: agent.Role, Health: agent.HealthStatus})
 		}
-		instances, err := store.ListAgentInstances(ctx)
-		if err != nil {
-			return err
-		}
-		for _, instance := range instances {
-			snapshot.RuntimeSessions = append(snapshot.RuntimeSessions, dashboardSession{
-				Name:        instance.Name,
-				Runtime:     instance.Runtime,
-				Repo:        instance.RepoFullName,
-				State:       instance.State,
-				Stale:       runningSessionStale(ctx, store, instance, now),
-				sessionType: instance.Type,
-				role:        instance.Role,
-				lastUsedAt:  instance.LastUsedAt,
-				expiresAt:   instance.ExpiresAt,
-			})
-		}
+
 		jobs, err := store.ListJobs(ctx)
 		if err != nil {
 			return err
@@ -425,17 +388,6 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 	}
 	dashboardMore(stdout, st, hidden)
 
-	dashboardSectionHeader(stdout, st, "runtime_sessions", len(snapshot.RuntimeSessions))
-	if st.Enabled() && !all {
-		for _, line := range groupedRuntimeSessions(snapshot.RuntimeSessions) {
-			writeLine(stdout, "  %s", line)
-		}
-	} else {
-		for _, session := range snapshot.RuntimeSessions {
-			writeLine(stdout, "  %s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), dashboardSessionStateText(session))
-		}
-	}
-
 	dashboardSectionHeader(stdout, st, "active_jobs", len(snapshot.ActiveJobs))
 	activeJobs, hidden := dashboardTruncate(st, all, snapshot.ActiveJobs)
 	for _, job := range activeJobs {
@@ -470,11 +422,6 @@ func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboar
 	for _, lock := range snapshot.ResourceLocks {
 		if lock.Stale {
 			lines = append(lines, st.Red("stale lock")+" "+lock.Key)
-		}
-	}
-	for _, session := range snapshot.RuntimeSessions {
-		if session.Stale {
-			lines = append(lines, st.Red("stale session")+" "+session.Name)
 		}
 	}
 	if len(lines) == 0 {
@@ -517,100 +464,6 @@ func dashboardJobStateColor(st style.Style, state string) string {
 	default:
 		return state
 	}
-}
-
-// dashboardSessionStateText renders a session's state, appending "(stale)" for a
-// phantom running session (#505 gap 2) so a dead runtime session is never
-// silently shown as live.
-func dashboardSessionStateText(session dashboardSession) string {
-	if session.Stale {
-		return session.State + " (stale)"
-	}
-	return session.State
-}
-
-// groupedRuntimeSessions collapses generated "<type>-bg-<hex>" sessions sharing
-// a type/runtime/state into a single counted line, leaving other sessions
-// individual. Stale (phantom running) sessions group separately so they are not
-// hidden inside a healthy "running" count (#505 gap 2).
-func groupedRuntimeSessions(sessions []dashboardSession) []string {
-	type groupKey struct {
-		prefix, runtime, state string
-		stale                  bool
-	}
-	order := []groupKey{}
-	counts := map[groupKey]int{}
-	singles := []dashboardSession{}
-	for _, session := range sessions {
-		if prefix, ok := style.GroupSuffix(session.Name); ok {
-			key := groupKey{prefix: prefix, runtime: session.Runtime, state: session.State, stale: session.Stale}
-			if counts[key] == 0 {
-				order = append(order, key)
-			}
-			counts[key]++
-		} else {
-			singles = append(singles, session)
-		}
-	}
-	lines := make([]string, 0, len(order)+len(singles))
-	for _, key := range order {
-		state := key.state
-		if key.stale {
-			state += " (stale)"
-		}
-		lines = append(lines, fmt.Sprintf("%s [%s] ×%d %s", key.prefix, key.runtime, counts[key], state))
-	}
-	for _, session := range singles {
-		lines = append(lines, fmt.Sprintf("%s [%s] %s %s", session.Name, session.Runtime, emptyText(session.Repo), dashboardSessionStateText(session)))
-	}
-	return lines
-}
-
-// runningSessionStale reports a phantom "running" runtime session (#505 gap 2)
-// using TWO independent signals, so a daemon that crashed EARLY in a long job —
-// and thus still holds a FUTURE lease — is not mistaken for live:
-//
-//   - lease elapsed (dashboardSessionStale): the deferred TouchAgentInstance never
-//     ran and the lease aged out — the "long after completion" case; and
-//   - the resumable runtime-session lock (runtime:<rt>:<ref>) is no longer held by
-//     a live owner: the daemon that marked the session running has died, so even
-//     WITHIN the lease window the session is dead. This closes the crash-soon-
-//     after-start gap the lease-only check missed (a 1-minute-in crash of a
-//     30-minute job left a ~29-minute future lease and showed as healthy).
-//
-// For a non-resumable runtime / empty ref (no session lock exists) there is no
-// liveness signal, so it falls back to the lease check alone. It never flags a
-// genuinely live session: a running job marks the instance running AFTER acquiring
-// the lock and clears it to idle BEFORE releasing the lock (LIFO defers), so a
-// running row always coincides with a live-owner lock; and any lock-lookup error
-// fails safe to "not stale" rather than mislabeling a live session.
-func runningSessionStale(ctx context.Context, store *db.Store, instance db.AgentInstance, now time.Time) bool {
-	if dashboardSessionStale(instance.State, instance.ExpiresAt, now) {
-		return true
-	}
-	if instance.State != "running" || store == nil {
-		return false
-	}
-	agent := runtime.Agent{Runtime: instance.Runtime, RuntimeRef: instance.RuntimeRef}
-	if _, ok := runtimeSessionResourceKey(agent); !ok {
-		return false // non-resumable / no ref: the lease is the only available signal
-	}
-	held, _, err := runtimeSessionHeldByLiveOwner(ctx, store, agent)
-	if err != nil {
-		return false // never mislabel a live session on a transient lookup error
-	}
-	return !held
-}
-
-// dashboardSessionStale reports a phantom "running" runtime session whose lease
-// (expires_at) has already elapsed (#505 gap 2) — the lease-based half of the
-// signal (see runningSessionStale for the within-lease liveness half). A daemon
-// that dies mid-job never runs its deferred TouchAgentInstance, so the row keeps
-// advertising a session that no longer exists. It reuses the same expiry test as
-// resource_locks; a normal idle row past its lease (the idle GC reclaims it) is
-// deliberately NOT flagged.
-func dashboardSessionStale(state, expiresAt string, now time.Time) bool {
-	return state == "running" && dashboardLockStale(expiresAt, now)
 }
 
 func dashboardLockStale(expiresAt string, now time.Time) bool {

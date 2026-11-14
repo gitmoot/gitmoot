@@ -1221,7 +1221,7 @@ func TestSelectRunnableQueuedJobsAllowsSeparateTaskWorktrees(t *testing.T) {
 		t.Fatalf("ListQueuedJobs returned error: %v", err)
 	}
 
-	selected, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 2, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+	selected, remaining := selectRunnableQueuedJobs(ctx, store, jobs, 2)
 
 	if len(selected) != 2 || len(remaining) != 0 {
 		t.Fatalf("selected=%d remaining=%d, want two selected separate worktrees", len(selected), len(remaining))
@@ -4245,7 +4245,7 @@ func TestDispatchDeclineDedupsPerReasonRatherThanPerPass(t *testing.T) {
 	// the second job on the limit clause every pass.
 	var declined string
 	for pass := 0; pass < 3; pass++ {
-		_, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 1, config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue})
+		_, remaining := selectRunnableQueuedJobs(ctx, store, jobs, 1)
 		if len(remaining) != 1 {
 			t.Fatalf("pass %d remaining=%d, want one", pass, len(remaining))
 		}
@@ -4299,7 +4299,6 @@ func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
 	if len(jobs) != 3 {
 		t.Fatalf("queued jobs = %d, want three", len(jobs))
 	}
-	policy := config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
 	last := jobs[2].ID
 
 	// Two ticks at different limits. ADMISSION OUTPUT IS ASSERTED TOO: this change
@@ -4308,7 +4307,7 @@ func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
 		limit      int
 		wantQueued int
 	}{{limit: 2, wantQueued: 2}, {limit: 1, wantQueued: 1}} {
-		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, pass.limit, policy)
+		queued, remaining := selectRunnableQueuedJobs(ctx, store, jobs, pass.limit)
 		if len(queued) != pass.wantQueued || len(queued)+len(remaining) != len(jobs) {
 			t.Fatalf("limit=%d admitted %d (remaining %d), want %d admitted and every job accounted for", pass.limit, len(queued), len(remaining), pass.wantQueued)
 		}
@@ -4340,7 +4339,7 @@ func TestDispatchDeclineDedupsOnTheClauseNotTheOperand(t *testing.T) {
 	// The limit<=0 caller path declines EVERY pending job, so it is the highest
 	// volume branch of the four and needs the same bound.
 	for pass := 0; pass < 2; pass++ {
-		queued, remaining := selectRunnableQueuedJobsWithPolicy(ctx, store, jobs, 0, policy)
+		queued, remaining := selectRunnableQueuedJobs(ctx, store, jobs, 0)
 		if len(queued) != 0 || len(remaining) != len(jobs) {
 			t.Fatalf("limit=0 pass %d admitted %d and left %d, want zero admitted and every job pending", pass, len(queued), len(remaining))
 		}
@@ -4404,7 +4403,7 @@ func TestDispatchDeclineClauseLabelsMatchTheirBranch(t *testing.T) {
 		{
 			// The limit branch, reached by having already admitted its whole budget.
 			name:       "limit",
-			selector:   queuedJobResourceSelector{limit: 1, checkouts: map[string]bool{}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			selector:   queuedJobResourceSelector{limit: 1, checkouts: map[string]bool{}, runtimes: map[string]bool{}},
 			selected:   1,
 			wantClause: "limit",
 			wantInMsg:  "selected=1 limit=1",
@@ -4412,15 +4411,14 @@ func TestDispatchDeclineClauseLabelsMatchTheirBranch(t *testing.T) {
 		{
 			// The checkout branch, reached by pre-seeding this job's own key.
 			name:       "checkout",
-			selector:   queuedJobResourceSelector{limit: 8, checkouts: map[string]bool{checkoutKey: true}, runtimes: map[string]bool{}, tempReservations: map[string]int{}},
+			selector:   queuedJobResourceSelector{limit: 8, checkouts: map[string]bool{checkoutKey: true}, runtimes: map[string]bool{}},
 			wantClause: "checkout",
 			wantInMsg:  checkoutKey,
 		},
 		{
-			// The runtime branch, reached by pre-seeding the runtime key with a
-			// serializing policy so no temp session can rescue it.
+			// The runtime branch, reached by pre-seeding the runtime key.
 			name:       "runtime",
-			selector:   queuedJobResourceSelector{limit: 8, policy: config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}, checkouts: map[string]bool{}, runtimes: map[string]bool{runtimeKey: true}, tempReservations: map[string]int{}},
+			selector:   queuedJobResourceSelector{limit: 8, checkouts: map[string]bool{}, runtimes: map[string]bool{runtimeKey: true}},
 			wantClause: "runtime",
 			wantInMsg:  runtimeKey,
 		},

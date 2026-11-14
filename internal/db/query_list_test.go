@@ -52,9 +52,6 @@ func TestListMethodsPreserveTheirEmptyResultShape(t *testing.T) {
 		if got, err := store.ListRepos(ctx); err != nil || got == nil {
 			t.Fatalf("ListRepos = %#v, err %v; want non-nil empty slice (marshals to [] not null)", got, err)
 		}
-		if got, err := store.ListAgentInstances(ctx); err != nil || got == nil {
-			t.Fatalf("ListAgentInstances = %#v, err %v; want non-nil empty slice", got, err)
-		}
 		// Served straight to the dashboard HTTP client, so null-vs-[] is visible
 		// to a browser, not just to Go callers.
 		if got, err := store.ListDashboardBlockedJobs(ctx); err != nil || got == nil {

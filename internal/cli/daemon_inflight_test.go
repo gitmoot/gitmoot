@@ -6,11 +6,8 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gitmoot/gitmoot/internal/config"
-	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/db/dbtest"
 )
 
 // TestDaemonRunSelfRegistrationSurfacesRunningDaemon is the #505 gap-3 regression:
@@ -72,43 +69,16 @@ func TestDaemonRunSelfRegistrationSurfacesRunningDaemon(t *testing.T) {
 
 // TestDaemonRunStartupReconcile binds the #505 regression to the INTEGRATION
 // point, not just the leaf helpers: the single startup seam runDaemonRun defers
-// (daemonRunStartupReconcile) must, in one call, (a) self-register this process so
-// `daemon status` flips from "stopped" to "running pid" (gap 3) AND (b) reconcile
-// a pre-seeded orphaned running runtime session to idle (gap 2). Without the
-// wiring both user-visible behaviors silently regress; exercising the seam (rather
-// than registerDaemonRunState / ReconcileOrphanedRunningInstances in isolation)
-// makes a dropped call detectable. The returned cleanup deregisters our marker.
+// (daemonRunStartupReconcile) must self-register this process so `daemon
+// status` flips from "stopped" to "running pid" (gap 3). Exercising the seam
+// (rather than registerDaemonRunState in isolation) makes a dropped call
+// detectable. The returned cleanup deregisters our marker.
 func TestDaemonRunStartupReconcile(t *testing.T) {
 	home := t.TempDir()
 	paths := config.PathsForHome(home)
 	if err := config.Initialize(paths); err != nil {
 		t.Fatalf("Initialize returned error: %v", err)
 	}
-
-	// Pre-seed an orphaned running runtime session: a crashed daemon left it at
-	// state=running with an elapsed lease and no active job.
-	store, err := dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	past := time.Now().UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000000000Z")
-	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:           "researcher-bg-orphan",
-		Type:           "researcher",
-		Runtime:        "claude",
-		RuntimeRef:     "ref-orphan",
-		RepoFullName:   "owner/repo",
-		Role:           "researcher",
-		AutonomyPolicy: "read-only",
-		State:          "running",
-		CreatedAt:      nowStr,
-		LastUsedAt:     nowStr,
-		ExpiresAt:      past,
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance returned error: %v", err)
-	}
-	store.Close()
 
 	// Before startup: no daemon.json → status reports stopped (the systemd bug).
 	var stdout, stderr bytes.Buffer
@@ -119,13 +89,10 @@ func TestDaemonRunStartupReconcile(t *testing.T) {
 		t.Fatalf("pre-startup status = %q, want stopped", stdout.String())
 	}
 
-	// The integration seam: register + reconcile in one call (test process stands
-	// in for the daemon-run process; its argv passes processLooksLikeDaemon).
+	// The integration seam (test process stands in for the daemon-run process;
+	// its argv passes processLooksLikeDaemon).
 	var startupOut bytes.Buffer
 	cleanup := daemonRunStartupReconcile(context.Background(), home, os.Args, &startupOut)
-	if !strings.Contains(startupOut.String(), "reconciled 1 orphaned running runtime session(s)") {
-		t.Fatalf("startup reconcile message missing: %q", startupOut.String())
-	}
 
 	// (a) self-registered: status now reports the live daemon.
 	stdout.Reset()
@@ -136,21 +103,6 @@ func TestDaemonRunStartupReconcile(t *testing.T) {
 	if !strings.Contains(stdout.String(), "running pid") {
 		t.Fatalf("post-startup status = %q, want running pid", stdout.String())
 	}
-
-	// (b) the orphaned running session was reset to idle.
-	store, err = dbtest.Open(t, paths.Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	instance, err := store.GetAgentInstance(context.Background(), "researcher-bg-orphan")
-	if err != nil {
-		t.Fatalf("GetAgentInstance returned error: %v", err)
-	}
-	store.Close()
-	if instance.State != "idle" {
-		t.Fatalf("orphaned instance state = %q, want idle", instance.State)
-	}
-
 	// cleanup deregisters our marker → status back to stopped, but the meta is kept
 	// so `daemon restart` can still recover the prior daemon's args/workdir.
 	cleanup()

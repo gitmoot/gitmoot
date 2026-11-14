@@ -37,15 +37,6 @@ type Agent struct {
 	HealthStatus   string
 	Model          string
 	Effort         string
-	// SingleUseSession marks an agent whose runtime session exists solely for
-	// the current job (ephemeral delegation workers and per-job temp workers:
-	// the session is started for the job and disposed after it). Adapters whose
-	// CLIs report SESSION-CUMULATIVE usage on resumed sessions (codex, see
-	// codexDeliverResult) may attribute that cumulative usage to the job when
-	// this is set — the whole session belongs to the job, so cumulative IS the
-	// per-job cost. Never set for long-lived registered agents, whose sessions
-	// span many jobs. In-memory only; not persisted on the agents table.
-	SingleUseSession bool
 	// ReadOnlySeat marks a delivery running in a detached read-only worktree.
 	// The CLI wraps these jobs in a hard filesystem sandbox before adapters
 	// receive the widened command and network permissions below.

@@ -54,8 +54,8 @@ ask`). Use `gitmoot agent ask <agent>` only when a separate agent should plan.
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
 same resumable runtime session (omp runs a fresh session per job).
-The daemon default is `--workers 1`; raise it only for independent runtime
-sessions or managed agent types with `max_background` greater than one.
+The daemon default is `--workers 1`; raise it only for independent jobs
+(distinct checkouts and runtime sessions; omp jobs each run a fresh session).
 
 For runtime selection, `gitmoot agent start <name> --runtime <runtime>` accepts
 only `omp`, the sole job runtime. Agents still registered on the removed

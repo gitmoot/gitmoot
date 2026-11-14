@@ -68,7 +68,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestJobTokenMigrationOnPreExistingDB":                                   true,
 		"TestKeychainMigrationAppliesToExistingDatabase":                         true,
 		"TestMigrateAddsExecBackendAttempts":                                     true,
-		"TestMigrateAppendsAgentInstanceAutonomyPolicy":                          true,
 		"TestMigrateAppendsTaskWorktreePath":                                     true,
 		"TestMigrateBackfillsRootID":                                             true,
 		"TestMigrationAddsRunnerAndOwnerBootColumns":                             true,
@@ -125,6 +124,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2588: upgrades a database built from the migrations before the
 	// escalation_rounds table drop through the real Open path.
 	realPathTests["TestEscalationRoundsRemovalMigrationOnPreviousSchema"] = true
+	// #2590: upgrades a database seeded with agent_instances rows, built from
+	// the migrations before the table drop, through the real Open path.
+	realPathTests["TestAgentInstancesRemovalMigrationOnPreviousSchema"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

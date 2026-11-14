@@ -1389,50 +1389,6 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 
 }
 
-func (s *Store) DelegateQueuedJob(ctx context.Context, id string, fromAgent string, toAgent string, payload string, event JobEvent) (bool, error) {
-	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
-	if fenceErr != nil {
-		return false, fenceErr
-	}
-	defer releaseLifecycle()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-
-	// root_id is intentionally left untouched here (#420). This is an in-place
-	// re-assignment of an already-queued job to a different agent; the job stays
-	// in the same coordination tree, so its root_id (set at insert from the
-	// original payload's RootJobID) remains correct. A re-delegation never carries
-	// a new RootJobID, so re-binding the COALESCE would only re-derive the same id.
-	projection := jobProjectionFromPayload(payload)
-	result, err := tx.ExecContext(ctx, `UPDATE jobs SET agent = ?, payload = ?, result_hash = ?, repo = ?, pull_request = ?, blocker_retry_at = ?, blocker_suggested_action = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND agent = ? AND state = ? AND workflow_id = ?`,
-		strings.TrimSpace(toAgent), payload, jobResultHashFromPayload(payload), projection.Repo, projection.PullRequest,
-		projection.BlockerRetryAt, projection.BlockerSuggestedAction, id, strings.TrimSpace(fromAgent), "queued", projection.WorkflowID)
-	if err != nil {
-		return false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if affected == 0 {
-		if err := rejectWorkflowIDMismatch(ctx, tx, id, projection.WorkflowID); err != nil {
-			return false, err
-		}
-		return false, tx.Commit()
-	}
-	if event.JobID == "" {
-		event.JobID = id
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id, kind, message) VALUES (?, ?, ?)`, event.JobID, event.Kind, event.Message); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
-
-}
-
 func (s *Store) UpdateJobPayload(ctx context.Context, id string, payload string) error {
 	ctx, releaseLifecycle, fenceErr := s.AcquireJobLifecycle(ctx)
 	if fenceErr != nil {

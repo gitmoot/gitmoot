@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,8 +13,6 @@ import (
 
 	"github.com/gitmoot/gitmoot/internal/config"
 	"github.com/gitmoot/gitmoot/internal/db"
-	"github.com/gitmoot/gitmoot/internal/runtime"
-	"github.com/gitmoot/gitmoot/internal/subprocess"
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
@@ -260,52 +257,6 @@ func TestJanitorHostPathsIncludeEveryResolvableCheckout(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("host paths %v miss %s", got, want)
 		}
-	}
-}
-
-// Review P1 (#2444): a dispatch to a managed agent TYPE with no live instance
-// starts the runtime while it resolves the agent. Under janitor pressure that
-// start must not happen: no runtime call, no instance.
-func TestJanitorPressureDoesNotStartAColdManagedInstance(t *testing.T) {
-	declareNoRealAdapterExec(t)
-	home := t.TempDir()
-	repoDir := t.TempDir()
-	runGit(t, repoDir, "init")
-	runGit(t, repoDir, "branch", "-m", "main")
-	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/owner/repo.git")
-	seedGitHead(t, repoDir)
-	t.Chdir(repoDir)
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "type", "set", "planner", "--home", home, "--runtime", "omp", "--role", "planner",
-		"--policy", "workspace-write", "--max-background", "1", "--idle-timeout", "20m", "--job-timeout", "5m", "--capability", "ask"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("agent type set = %d: %s", code, stderr.String())
-	}
-	enableJanitorCapacity(t, config.PathsForHome(home))
-	replaceJanitorStatus(t, `{"schema_version":1,"kind":"status","data":{"inventory_report":{}}}`, nil)
-	runner := &agentStartRunner{results: []subprocess.Result{{Stdout: `{"type":"thread.started","thread_id":"550e8400-e29b-41d4-a716-446655440111"}` + "\n"}}}
-	defer replaceRuntimeFactory(runtime.Factory{Runner: runner})()
-
-	for _, args := range [][]string{
-		{"agent", "ask", "planner", "plan", "--home", home, "--repo", "owner/repo", "--background"},
-		{"agent", "ask", "planner", "plan", "--home", home, "--repo", "owner/repo"},
-	} {
-		stdout.Reset()
-		stderr.Reset()
-		if code := Run(args, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "janitor pressure holds new heavy work") {
-			t.Fatalf("%v = %d (stderr %q), want the janitor hold", args, code, stderr.String())
-		}
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("runtime started under janitor pressure: %+v", runner.calls)
-	}
-	store := openCLIJobStore(t, home)
-	defer store.Close()
-	instances, err := store.ListAgentInstances(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(instances) != 0 {
-		t.Fatalf("instances created under pressure: %+v", instances)
 	}
 }
 

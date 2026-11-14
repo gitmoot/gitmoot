@@ -46,7 +46,7 @@ func buildUnlabeledJobsCheck(jobs []db.Job, now time.Time, threshold int) doctor
 		if err != nil {
 			continue
 		}
-		if strings.TrimSpace(payload.ParentJobID) != "" || !workflow.IsUnlabeledAgentDispatch(payload.WorkflowID, payload.DelegationReason) {
+		if strings.TrimSpace(payload.ParentJobID) != "" || !workflow.IsUnlabeledAgentDispatch(payload.WorkflowID) {
 			continue
 		}
 		if created := parseJobTimeMillis(job.CreatedAt); created <= cutoff {
@@ -77,7 +77,7 @@ func unlabeledJobCounts(jobs []db.Job, now time.Time, threshold int) map[string]
 	cutoff := now.Add(-24 * time.Hour).UnixMilli()
 	for _, job := range jobs {
 		p, err := workflow.DecodeJobPayload(job)
-		if err == nil && strings.TrimSpace(p.ParentJobID) == "" && workflow.IsUnlabeledAgentDispatch(p.WorkflowID, p.DelegationReason) && parseJobTimeMillis(job.CreatedAt) > cutoff {
+		if err == nil && strings.TrimSpace(p.ParentJobID) == "" && workflow.IsUnlabeledAgentDispatch(p.WorkflowID) && parseJobTimeMillis(job.CreatedAt) > cutoff {
 			counts[p.Repo]++
 		}
 	}

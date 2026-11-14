@@ -976,16 +976,14 @@ func loadAgentTypesFailOpen(paths config.Paths) map[string]config.AgentType {
 // agentConfigInfo maps a resolved config.AgentType onto the dashboard's
 // AgentConfigInfo. The values are the [agents.<name>] section as LoadAgentTypes
 // resolves it — parse-time defaults INCLUDED (capabilities default ["ask"],
-// max_background 1, idle_timeout 20m, job_timeout 10m) — surfaced as-is per the
+// job_timeout 10m) — surfaced as-is per the
 // contract. Only ever called for an agent that has a config section (a non-nil
 // return is meaningful presence).
 func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 	return &dashboard.AgentConfigInfo{
-		MaxBackground: at.MaxBackground,
-		IdleTimeout:   strings.TrimSpace(at.IdleTimeout),
-		JobTimeout:    strings.TrimSpace(at.JobTimeout),
-		Model:         strings.TrimSpace(at.Model),
-		Capabilities:  at.Capabilities,
+		JobTimeout:   strings.TrimSpace(at.JobTimeout),
+		Model:        strings.TrimSpace(at.Model),
+		Capabilities: at.Capabilities,
 	}
 }
 

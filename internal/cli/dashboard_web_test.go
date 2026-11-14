@@ -1452,8 +1452,8 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 	// rest); nosection-agent gets NO [agents.<name>] section at all.
 	if err := config.SaveAgentType(paths, config.AgentType{
 		Name: "full-agent", Runtime: "codex",
-		MaxBackground: 3, IdleTimeout: "15m", JobTimeout: "30m",
-		Model: "gpt-5.5", Capabilities: []string{"orchestrate", "review"},
+		JobTimeout: "30m",
+		Model:      "gpt-5.5", Capabilities: []string{"orchestrate", "review"},
 	}); err != nil {
 		t.Fatalf("SaveAgentType full-agent: %v", err)
 	}
@@ -1488,8 +1488,7 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 	if full.Config == nil {
 		t.Fatalf("full-agent Config = nil, want a section")
 	}
-	if full.Config.MaxBackground != 3 || full.Config.IdleTimeout != "15m" ||
-		full.Config.JobTimeout != "30m" || full.Config.Model != "gpt-5.5" {
+	if full.Config.JobTimeout != "30m" || full.Config.Model != "gpt-5.5" {
 		t.Fatalf("full-agent Config = %+v, want the seeded section values", full.Config)
 	}
 	if len(full.Config.Capabilities) != 2 {
@@ -1504,8 +1503,8 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 	if plain.Config == nil {
 		t.Fatalf("plain-agent Config = nil, want a non-nil section")
 	}
-	if plain.Config.MaxBackground != 1 || plain.Config.IdleTimeout != "20m" || plain.Config.JobTimeout != "10m" {
-		t.Fatalf("plain-agent Config defaults = %+v, want max_background 1 / idle 20m / job 10m", plain.Config)
+	if plain.Config.JobTimeout != "10m" {
+		t.Fatalf("plain-agent Config defaults = %+v, want job 10m", plain.Config)
 	}
 
 	// Agent(nosection-agent): no config section => nil Config.

@@ -59,17 +59,6 @@ func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 		}
 		setJobTimes(t, home, id, dashboardSQLiteTime(now.Add(-time.Hour)), dashboardSQLiteTime(now.Add(-time.Hour)))
 	}
-	for _, entry := range []struct {
-		id      string
-		payload workflow.JobPayload
-	}{
-		{"continuation", workflow.JobPayload{Repo: "acme/drift", Sender: "worker", DelegationReason: "runtime_session_busy"}},
-	} {
-		if err := store.CreateJob(ctx, db.Job{ID: entry.id, Agent: "worker", Type: "ask", State: "queued", Payload: mustJSON(t, entry.payload)}); err != nil {
-			t.Fatal(err)
-		}
-		setJobTimes(t, home, entry.id, dashboardSQLiteTime(now.Add(-time.Hour)), dashboardSQLiteTime(now.Add(-time.Hour)))
-	}
 	overview, err := dashboardOverview(ctx, store, now, func(string) workflow.RequireWorkflowPolicy { return workflow.RequireWorkflowPolicy{Enabled: true} })
 	if err != nil {
 		t.Fatal(err)

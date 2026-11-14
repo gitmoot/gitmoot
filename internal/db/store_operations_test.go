@@ -110,95 +110,31 @@ func TestAgentActiveJobCountCountsQueuedAndRunning(t *testing.T) {
 	}
 }
 
-// TestUpdateAgentAutonomyPolicyMovesEveryPlaneThatCanBecomeEffective covers
-// #2134 F2 across two review rounds.
-//
-// Round one wrote only `agents`, so instance-only agents - which GetAgent
-// resolves at store_agents.go:108 and dispatch therefore uses - had no
-// in-place writer at all.
-//
-// Round two wrote the instance only when no row matched, mirroring GetAgent's
-// precedence, on the reasoning that touching a plane dispatch is not reading
-// is worse than leaving it stale. Review disproved that with an executed
-// probe, reproduced here as the third arm: RemoveAgent deletes `agents` and
-// not `agent_instances`, so a stale instance OUTLIVES the row that outranked
-// it and then becomes authoritative, silently re-widening a tightened agent.
-func TestUpdateAgentAutonomyPolicyMovesEveryPlaneThatCanBecomeEffective(t *testing.T) {
+// TestUpdateAgentAutonomyPolicyWritesTheRegisteredAgent covers the store half
+// of `agent policy` (#2132): the registered row moves in place, and a name with
+// no agents row is refused. The agent_instances plane #2134 F2 also wrote is
+// gone with the table (#2590).
+func TestUpdateAgentAutonomyPolicyWritesTheRegisteredAgent(t *testing.T) {
 	store := openStoreOperationsTestStore(t)
 	ctx := context.Background()
-
-	// INSTANCE-ONLY: dispatchable through GetAgent's fallback, so it must be
-	// writable in place.
-	if err := store.UpsertAgentInstance(ctx, AgentInstance{
-		Name: "ephemeral", Type: "worker", Runtime: "codex", RuntimeRef: "ref-1",
-		RepoFullName: "gitmoot/gitmoot", Role: "worker", AutonomyPolicy: "read-only", State: "idle",
+	if err := store.UpsertAgent(ctx, Agent{
+		Name: "worker", Role: "worker", Runtime: "codex", RuntimeRef: "ref-2",
+		AutonomyPolicy: "danger-full-access", HealthStatus: "idle",
 	}); err != nil {
-		t.Fatalf("UpsertAgentInstance: %v", err)
+		t.Fatalf("UpsertAgent: %v", err)
 	}
-	if err := store.UpdateAgentAutonomyPolicy(ctx, "ephemeral", "danger-full-access", nil); err != nil {
-		t.Fatalf("refused a dispatchable instance-only agent: %v", err)
+	if err := store.UpdateAgentAutonomyPolicy(ctx, "worker", "read-only", nil); err != nil {
+		t.Fatalf("UpdateAgentAutonomyPolicy(worker): %v", err)
 	}
-	got, err := store.GetAgent(ctx, "ephemeral")
+	got, err := store.GetAgent(ctx, "worker")
 	if err != nil {
 		t.Fatalf("GetAgent: %v", err)
 	}
-	if got.AutonomyPolicy != "danger-full-access" {
-		t.Errorf("instance-only policy = %q, want danger-full-access", got.AutonomyPolicy)
+	if got.AutonomyPolicy != "read-only" {
+		t.Errorf("policy = %q, want read-only", got.AutonomyPolicy)
 	}
-
-	// BOTH PLANES PRESENT: both must move. Start them WIDE and tighten, so a
-	// missed plane leaves a permission granted rather than merely stale.
-	for _, seed := range []func() error{
-		func() error {
-			return store.UpsertAgent(ctx, Agent{
-				Name: "both", Role: "worker", Runtime: "codex", RuntimeRef: "ref-2",
-				AutonomyPolicy: "danger-full-access", HealthStatus: "idle",
-			})
-		},
-		func() error {
-			return store.UpsertAgentInstance(ctx, AgentInstance{
-				Name: "both", Type: "worker", Runtime: "codex", RuntimeRef: "ref-2",
-				RepoFullName: "gitmoot/gitmoot", Role: "worker",
-				AutonomyPolicy: "danger-full-access", State: "idle",
-			})
-		},
-	} {
-		if err := seed(); err != nil {
-			t.Fatalf("seed: %v", err)
-		}
-	}
-	if err := store.UpdateAgentAutonomyPolicy(ctx, "both", "read-only", nil); err != nil {
-		t.Fatalf("UpdateAgentAutonomyPolicy(both): %v", err)
-	}
-	instance, err := store.GetAgentInstance(ctx, "both")
-	if err != nil {
-		t.Fatalf("GetAgentInstance: %v", err)
-	}
-	if instance.AutonomyPolicy != "read-only" {
-		t.Errorf("instance policy = %q, want read-only: a plane left wide can become effective later", instance.AutonomyPolicy)
-	}
-
-	// THE PROBE THAT DISPROVED ROUND TWO, through the real production path:
-	// remove the winning row and see what dispatch would now resolve.
-	removed, err := store.RemoveAgent(ctx, "both")
-	if err != nil {
-		t.Fatalf("RemoveAgent: %v", err)
-	}
-	if !removed {
-		t.Fatal("RemoveAgent reported nothing removed")
-	}
-	survivor, err := store.GetAgent(ctx, "both")
-	if err != nil {
-		t.Fatalf("GetAgent after remove: %v", err)
-	}
-	if survivor.AutonomyPolicy != "read-only" {
-		t.Errorf("after removing the agents row GetAgent resolves %q, want read-only: "+
-			"the surviving instance silently re-widened an agent that was tightened",
-			survivor.AutonomyPolicy)
-	}
-
 	if err := store.UpdateAgentAutonomyPolicy(ctx, "nosuch", "auto", nil); err == nil {
-		t.Error("accepted an agent present in neither plane")
+		t.Error("accepted an unregistered agent")
 	}
 }
 

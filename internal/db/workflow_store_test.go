@@ -452,14 +452,6 @@ func TestWorkflowIDImmutableAcrossPayloadUpdatePaths(t *testing.T) {
 		t.Fatalf("mismatched transition events=%+v err=%v", events, err)
 	}
 
-	delegateOriginal := seed("delegate", "queued", "release-42")
-	ok, err = store.DelegateQueuedJob(ctx, "delegate", "from", "to", `{"repo":"acme/widget","workflow_id":"other"}`, JobEvent{Kind: "delegated"})
-	if ok {
-		t.Fatal("mismatched delegation succeeded")
-	}
-	assertImmutable(err)
-	assertUnchanged("delegate", delegateOriginal, "queued", "from")
-
 	unlabelled := seed("unlabelled", "running", "")
 	err = store.UpdateJobPayload(ctx, "unlabelled", `{"repo":"acme/widget","workflow_id":"release-42"}`)
 	assertImmutable(err)

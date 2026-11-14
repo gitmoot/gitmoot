@@ -42,16 +42,13 @@ const (
 )
 
 // diskGuardRemoteRouteCheck reports why a local review cannot run remotely, or
-// nil when it can. Exact pull-request head, no ephemeral agent, no earlier
+// nil when it can. Exact pull-request head, no earlier
 // cloud attempt (remote admission allows one), and a runtime and model that
 // run remotely.
 func diskGuardRemoteRouteCheck(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) error {
 	head := strings.ToLower(strings.TrimSpace(payload.HeadSHA))
 	if payload.PullRequest <= 0 || head == "" || dispatchHeadSHAError(head) != nil {
 		return fmt.Errorf("the review has no exact pull-request head, which a remote run requires")
-	}
-	if payload.Ephemeral != nil {
-		return fmt.Errorf("an ephemeral reviewer cannot run remotely")
 	}
 	if payload.ReviewNoExecution {
 		return fmt.Errorf("a no-execution review runs only on the local backend (#2364)")

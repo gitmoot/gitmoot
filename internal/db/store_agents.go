@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 )
 
 func (s *Store) UpsertAgent(ctx context.Context, agent Agent) error {
@@ -82,34 +81,14 @@ var ErrAgentPolicyCommit = errors.New("agent policy commit failed")
 // replaces the runtime session, and the agents this exists for have live
 // sessions and hundreds of completed jobs.
 //
-// #2134 F2 round two: WRITES EVERY PLANE THAT CAN BECOME EFFECTIVE, NOT ONLY
-// THE ONE THAT DECIDES TODAY.
-//
-// Round two mirrored GetAgent's precedence instead - agents first, instances
-// only on zero rows affected - on the reasoning that writing a plane dispatch
-// is not reading is worse than leaving it stale. Review disproved that with an
-// executed probe: RemoveAgent deletes agent_repos and
-// agents, but NOT agent_instances. So tightening an agent to read-only moved
-// only the row, removing the agent then deleted that row, and GetAgent
-// resolved the surviving instance at its untouched danger-full-access. The
-// stale plane became authoritative later and SILENTLY RE-WIDENED an agent an
-// operator had deliberately tightened.
-//
-// A stale plane that can outlive the winning one is not inert, so consistency
-// across planes is the invariant, not minimality of writes. Both rows move, in
-// one transaction, and only a name present in NEITHER is unregistered.
-//
 // #2134 F1 round two: beforeCommit IS A CROSS-PLANE BARRIER.
 //
 // The config plane is a TOML file, so no SQL transaction can span it, and
-// review showed ordering alone cannot fix that: config is an INDEPENDENT
-// dispatch authority, because explicit managed-type routing skips GetAgent
-// entirely (agent_dispatch.go:1689) and builds the runtime agent from config
-// (:1828, :2029). Writing config first therefore made a FAILED command widen a
-// live authority - the same defect as writing the row first, pointed the other
-// way.
+// review showed ordering alone cannot fix that: writing config first made a
+// FAILED command widen the config plane, and writing the row first made it
+// widen the row - the same defect pointed either way.
 //
-// A held transaction is the coordinator instead. Rows update, beforeCommit
+// A held transaction is the coordinator instead. The row updates, beforeCommit
 // writes the non-SQL plane, and the commit lands only if it succeeded. The
 // barrier failing rolls back, so nothing moved anywhere. Only a commit failure
 // after a successful barrier leaves the caller's plane ahead, and that is
@@ -125,22 +104,15 @@ func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy stri
 	}
 	defer tx.Rollback()
 
-	total := int64(0)
-	for _, statement := range []string{
-		`UPDATE agents SET autonomy_policy = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`,
-		`UPDATE agent_instances SET autonomy_policy = ? WHERE name = ?`,
-	} {
-		result, err := tx.ExecContext(ctx, statement, policy, name)
-		if err != nil {
-			return err
-		}
-		affected, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		total += affected
+	result, err := tx.ExecContext(ctx, `UPDATE agents SET autonomy_policy = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?`, policy, name)
+	if err != nil {
+		return err
 	}
-	if total == 0 {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
 		return fmt.Errorf("agent %q is not registered", name)
 	}
 
@@ -160,33 +132,7 @@ func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy stri
 func (s *Store) GetAgent(ctx context.Context, name string) (Agent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT name, role, runtime, runtime_ref, repo_scope, model, effort, capabilities_json, autonomy_policy, health_status
 		FROM agents WHERE name = ?`, name)
-	agent, err := scanAgent(row)
-	if err == nil {
-		return agent, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return Agent{}, err
-	}
-	instance, err := s.GetAgentInstance(ctx, name)
-	if err != nil {
-		return Agent{}, err
-	}
-	policy := strings.TrimSpace(instance.AutonomyPolicy)
-	if policy == "" {
-		policy = "auto"
-	}
-	return Agent{
-		Name:           instance.Name,
-		Role:           instance.Role,
-		Runtime:        instance.Runtime,
-		RuntimeRef:     instance.RuntimeRef,
-		RepoScope:      instance.RepoFullName,
-		Model:          instance.Model,
-		Effort:         instance.Effort,
-		Capabilities:   instance.Capabilities,
-		AutonomyPolicy: policy,
-		HealthStatus:   instance.State,
-	}, nil
+	return scanAgent(row)
 }
 
 func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
@@ -332,217 +278,7 @@ func (s *Store) ListAgentRepos(ctx context.Context, agentName string) ([]string,
 func (s *Store) AgentCanAccessRepo(ctx context.Context, agentName string, repoFullName string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_repos WHERE agent_name = ? AND repo_full_name = ?`, agentName, repoFullName).Scan(&count)
-	if err != nil || count > 0 {
-		return count > 0, err
-	}
-	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_instances WHERE name = ? AND repo_full_name = ?`, agentName, repoFullName).Scan(&count)
 	return count > 0, err
-}
-
-func (s *Store) UpsertAgentInstance(ctx context.Context, instance AgentInstance) error {
-	capabilities, err := json.Marshal(instance.Capabilities)
-	if err != nil {
-		return err
-	}
-	instance.CreatedAt = normalizeStoredTime(instance.CreatedAt)
-	instance.LastUsedAt = normalizeStoredTime(instance.LastUsedAt)
-	instance.ExpiresAt = normalizeStoredTime(instance.ExpiresAt)
-	if strings.TrimSpace(instance.AutonomyPolicy) == "" {
-		instance.AutonomyPolicy = "auto"
-	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO agent_instances(name, type, runtime, runtime_ref, repo_full_name, role, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET
-			type = excluded.type,
-			runtime = excluded.runtime,
-			runtime_ref = excluded.runtime_ref,
-			repo_full_name = excluded.repo_full_name,
-			role = excluded.role,
-			model = excluded.model,
-			effort = excluded.effort,
-			capabilities_json = excluded.capabilities_json,
-			autonomy_policy = excluded.autonomy_policy,
-			state = excluded.state,
-			last_used_at = excluded.last_used_at,
-			expires_at = excluded.expires_at`,
-		instance.Name, instance.Type, instance.Runtime, instance.RuntimeRef, instance.RepoFullName, instance.Role, instance.Model, instance.Effort, string(capabilities), instance.AutonomyPolicy, instance.State, instance.CreatedAt, instance.LastUsedAt, instance.ExpiresAt)
-	return err
-}
-
-func (s *Store) GetAgentInstance(ctx context.Context, name string) (AgentInstance, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
-		FROM agent_instances WHERE name = ?`, name)
-	return scanAgentInstance(row)
-}
-
-func (s *Store) FindReusableAgentInstance(ctx context.Context, typ string, repo string, autonomyPolicy string, now time.Time) (AgentInstance, bool, error) {
-	if strings.TrimSpace(autonomyPolicy) == "" {
-		autonomyPolicy = "auto"
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
-		FROM agent_instances
-		WHERE type = ? AND repo_full_name = ? AND autonomy_policy = ? AND expires_at > ?
-			AND state = 'idle'
-			AND NOT EXISTS (
-				SELECT 1 FROM jobs
-				WHERE jobs.agent = agent_instances.name
-					AND jobs.state IN ('queued', 'running')
-			)
-		ORDER BY last_used_at DESC, created_at DESC
-		LIMIT 1`, typ, repo, autonomyPolicy, formatResourceLockTime(now))
-	instance, err := scanAgentInstance(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return AgentInstance{}, false, nil
-	}
-	if err != nil {
-		return AgentInstance{}, false, err
-	}
-	return instance, true, nil
-}
-
-func (s *Store) CountActiveAgentInstances(ctx context.Context, typ string, autonomyPolicy string, now time.Time) (int, error) {
-	if strings.TrimSpace(autonomyPolicy) == "" {
-		autonomyPolicy = "auto"
-	}
-	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM agent_instances
-		WHERE type = ? AND autonomy_policy = ?
-			AND (
-				expires_at > ?
-				OR EXISTS (
-					SELECT 1 FROM jobs
-					WHERE jobs.agent = agent_instances.name
-						AND jobs.state IN ('queued', 'running')
-				)
-			)`, typ, autonomyPolicy, formatResourceLockTime(now)).Scan(&count)
-	return count, err
-}
-
-func (s *Store) FindActiveAgentInstance(ctx context.Context, typ string, repo string, autonomyPolicy string, now time.Time) (AgentInstance, bool, error) {
-	if strings.TrimSpace(autonomyPolicy) == "" {
-		autonomyPolicy = "auto"
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
-		FROM agent_instances
-		WHERE type = ? AND repo_full_name = ? AND autonomy_policy = ?
-			AND (
-				expires_at > ?
-				OR EXISTS (
-					SELECT 1 FROM jobs
-					WHERE jobs.agent = agent_instances.name
-						AND jobs.state IN ('queued', 'running')
-				)
-			)
-		ORDER BY
-			CASE WHEN expires_at > ? THEN 0 ELSE 1 END,
-			last_used_at DESC,
-			created_at DESC
-		LIMIT 1`, typ, repo, autonomyPolicy, formatResourceLockTime(now), formatResourceLockTime(now))
-	instance, err := scanAgentInstance(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return AgentInstance{}, false, nil
-	}
-	if err != nil {
-		return AgentInstance{}, false, err
-	}
-	return instance, true, nil
-}
-
-func (s *Store) ListAgentInstances(ctx context.Context) ([]AgentInstance, error) {
-	out, err := queryList(ctx, s.db, `SELECT name, type, runtime, runtime_ref, repo_full_name, role, model, effort, capabilities_json, autonomy_policy, state, created_at, last_used_at, expires_at
-		FROM agent_instances ORDER BY type, repo_full_name, name`, nil, scanAgentInstance)
-	// emptyIfNil (query_list.go) is the whole contract, including the QUERY-time
-	// divergence this justification used to omit: on an early failure these
-	// methods return a non-nil len-0 slice with the error, where the pre-#1759
-	// bodies returned nil. Stated once there rather than restated here, because
-	// six copies of a justification drift and the previous six were already
-	// silent about half of it (#1795 review N4).
-	return emptyIfNil(out), err
-}
-
-func (s *Store) TouchAgentInstance(ctx context.Context, name string, now time.Time, idleTimeout time.Duration) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances SET state = 'idle', last_used_at = ?, expires_at = ? WHERE name = ?`,
-		formatResourceLockTime(now), formatResourceLockTime(now.Add(idleTimeout)), name)
-	if err != nil {
-		return err
-	}
-	return requireAffected(result, "agent instance", name)
-}
-
-func (s *Store) MarkAgentInstanceRunning(ctx context.Context, name string, now time.Time, jobTimeout time.Duration) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances SET state = 'running', last_used_at = ?, expires_at = ? WHERE name = ?`,
-		formatResourceLockTime(now), formatResourceLockTime(now.Add(jobTimeout)), name)
-	if err != nil {
-		return err
-	}
-	return requireAffected(result, "agent instance", name)
-}
-
-func (s *Store) DeleteAgentInstance(ctx context.Context, name string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances WHERE name = ?`, strings.TrimSpace(name))
-	if err != nil {
-		return err
-	}
-	return requireAffected(result, "agent instance", name)
-}
-
-func (s *Store) DeleteExpiredAgentInstances(ctx context.Context, now time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM agent_instances
-		WHERE state = 'idle'
-			AND expires_at <= ?
-			AND NOT EXISTS (
-				SELECT 1 FROM jobs
-				WHERE jobs.agent = agent_instances.name
-					AND jobs.state IN ('queued', 'running', 'failed', 'blocked', 'cancelled')
-			)`, formatResourceLockTime(now))
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-
-// ReconcileOrphanedRunningInstances resets to 'idle' any agent_instance left at
-// state='running' whose lease (expires_at) has already elapsed and that has NO
-// active (queued/running) job (#505 gap 2). Such a row is a phantom: a daemon
-// that died mid-job never ran its deferred TouchAgentInstance, so the instance is
-// stuck advertising a runtime session that no longer exists and the existing
-// idle-only GC never reclaims it. It never disturbs a genuinely live session: an
-// in-flight job within its timeout keeps a FUTURE expires_at (set to
-// now+jobTimeout by MarkAgentInstanceRunning), and the active-job guard protects
-// queued/running work — so this is safe to call from any number of concurrent
-// daemons. Resetting (rather than deleting) keeps the row reusable and lets the
-// normal idle GC reclaim it. Returns the number of rows reconciled.
-func (s *Store) ReconcileOrphanedRunningInstances(ctx context.Context, now time.Time) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `UPDATE agent_instances
-		SET state = 'idle'
-		WHERE state = 'running'
-			AND expires_at <= ?
-			AND NOT EXISTS (
-				SELECT 1 FROM jobs
-				WHERE jobs.agent = agent_instances.name
-					AND jobs.state IN ('queued', 'running')
-			)`, formatResourceLockTime(now))
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-
-func scanAgentInstance(row interface{ Scan(dest ...any) error }) (AgentInstance, error) {
-	var instance AgentInstance
-	var capabilities string
-	if err := row.Scan(&instance.Name, &instance.Type, &instance.Runtime, &instance.RuntimeRef, &instance.RepoFullName, &instance.Role, &instance.Model, &instance.Effort, &capabilities, &instance.AutonomyPolicy, &instance.State, &instance.CreatedAt, &instance.LastUsedAt, &instance.ExpiresAt); err != nil {
-		return AgentInstance{}, err
-	}
-	if strings.TrimSpace(instance.AutonomyPolicy) == "" {
-		instance.AutonomyPolicy = "auto"
-	}
-	if strings.TrimSpace(capabilities) != "" {
-		if err := json.Unmarshal([]byte(capabilities), &instance.Capabilities); err != nil {
-			return AgentInstance{}, err
-		}
-	}
-	return instance, nil
 }
 
 func scanAgent(scanner agentScanner) (Agent, error) {

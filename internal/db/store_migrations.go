@@ -3361,4 +3361,13 @@ DROP TABLE IF EXISTS escalation_rounds;
 DROP TABLE IF EXISTS agent_template_versions;
 DROP TABLE IF EXISTS agent_templates;
 	`,
+	// #2590 removes per-job worker sessions: temp workers forked on a busy
+	// runtime session, managed agent-type instance pools (max_background) and
+	// `gitmoot agent gc`. agent_instances was their only store; every writer
+	// and reader is deleted in the same change. The live home held 0 rows; the
+	// last temp worker ran on 2026-10-01. It never had a separate index.
+	// resource_locks stays: it still serializes a runtime session.
+	`
+DROP TABLE IF EXISTS agent_instances;
+	`,
 }

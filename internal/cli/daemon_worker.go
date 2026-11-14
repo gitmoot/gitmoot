@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,7 +31,7 @@ type jobWorker struct {
 	Stdout io.Writer
 	// ConfigHome is ALWAYS the RAW --home (never the resolved <home>/.gitmoot
 	// root) — INVARIANT (#459). The read-only policy loaders below
-	// (orchestratePolicy/parallelSessionPolicy/admissionPolicy via configPaths())
+	// (orchestratePolicy/admissionPolicy via configPaths())
 	// resolve it through pathsFromFlag -> PathsForHome, which appends ".gitmoot"
 	// exactly once. Passing the already-resolved root here would append it a SECOND
 	// time and read a phantom <home>/.gitmoot/.gitmoot/config.toml. workflowHome()
@@ -162,11 +161,6 @@ func (w jobWorker) replyWakeDelivery(ctx context.Context) (replyWakeDelivery, er
 		loadOrg:   messageOrgLoader(w.workflowHome()),
 		ownerGram: w.OwnerGram,
 	}, nil
-}
-
-type tempWorkerEligibility struct {
-	Eligible bool
-	Reason   string
 }
 
 func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWorker {
@@ -333,8 +327,8 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	// every cleanup defer, a run this worker claimed must not stay running.
 	exitGuard := beginWorkerExitGuard(job.ID)
 	settleCtx := ctx
-	// Every engine claim made under this frame (RunJob, the temp worker's
-	// RunJob) reports its exact generation to the guard.
+	// Every engine claim made under this frame (RunJob) reports its exact
+	// generation to the guard.
 	ctx = workflow.WithClaimObserver(ctx, exitGuard.claimed)
 	defer func() {
 		panicked := recover()
@@ -359,9 +353,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		return nil
 	}
 	// Resolve WHERE the runtime executes before any path can construct or start
-	// an adapter. In particular, ephemeral jobs materialize and start a host
-	// runtime below, so delaying this decision until after agent lookup would let
-	// them bypass the backend boundary entirely.
+	// an adapter, so no path can bypass the backend boundary.
 	execBackend, execConfig, err := w.resolveExecutionBackendForJob(job, payload)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -762,24 +754,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	if !acquired {
 		message := fmt.Sprintf("runtime session %s is busy", lockKey)
-		policy, policyErr := w.parallelSessionPolicy()
-		if policyErr != nil {
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, policyErr); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, policyErr)
-			return nil
-		}
-		eligibility := tempWorkerEligible(ctx, w.Store, job, payload, agent, policy, time.Now().UTC())
-		if eligibility.Eligible {
-			eligibleMessage := fmt.Sprintf("%s; temp worker eligible", message)
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_eligible", Message: eligibleMessage}); eventErr != nil {
-				return eventErr
-			}
-			return w.runWithTempWorker(ctx, job, payload, execBackend, agent, checkout, policy, eligibleMessage)
-		} else if strings.TrimSpace(eligibility.Reason) != "" {
-			message = fmt.Sprintf("%s; temp worker ineligible: %s", message, eligibility.Reason)
-		}
 		// Dedup the runtime_lock_wait row + flood log to once per wait episode
 		// (#598): a permanently-contended job otherwise wrote one row per dispatch
 		// pass. The busy error is returned UNCONDITIONALLY (outside the episode
@@ -1047,7 +1021,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 	}
 	// #1817: THE SEAT'S OWN RUNTIME IS PUBLISHED UNAVAILABLE, SO REFUSE HERE -
 	// after the adapter exists, so the real-adapter discriminator can be asked,
-	// and before MarkAgentInstanceRunning and any delivery.
+	// and before any delivery.
 	//
 	// BLOCKED, NOT FAILED. Every other error out of seat setup means something
 	// went wrong while preparing this job, so failed is right. This one means
@@ -1125,20 +1099,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 	}
 
-	if managed.Instance {
-		if err := w.Store.MarkAgentInstanceRunning(ctx, agent.Name, time.Now().UTC(), jobTimeout); err != nil {
-			if finishErr := w.finishPreDeliveryJob(ctx, job, remoteReviewAdmitted, workflow.JobFailed, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, agent, checkout, err)
-			return nil
-		}
-		defer func() {
-			if err := w.Store.TouchAgentInstance(context.Background(), agent.Name, time.Now().UTC(), managed.IdleTimeout); err != nil {
-				writeLine(w.Stdout, "job %s managed agent state update failed: %v", job.ID, err)
-			}
-		}()
-	}
 	writeLine(w.Stdout, "running job %s for %s in %s", job.ID, agent.Name, payload.Repo)
 	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
 	if execBackend == execbackend.Remote {
@@ -1780,19 +1740,6 @@ func resumableSessionRuntime(string) bool {
 // therefore computes the same registered key. Gate and acquisition agree because
 // neither one uses this function.
 //
-// #1952 narrowed that to REGISTERED seats, and a first version of this note
-// asserted "no seat job carries an ephemeral spec" on the strength of a grep for
-// co-assignment — which cannot establish absence. TRACED, the opposite was true:
-// the retired delegation engine (#2588) set Ephemeral and ReadOnlySeat on the
-// SAME request for an ask/review action, so historical ephemeral read-only
-// seat rows exist.
-//
-// It needs no seat branch anyway, because the registered-ref story does not
-// describe it: an ephemeral job has no registered session at all, so the gate
-// keys it by job id (see queuedJobRuntimeResourceKey) whether or not it is a
-// seat, and the worker still locks the materialized session. Nothing here
-// depends on the two flags being mutually exclusive.
-//
 // An earlier version of this comment claimed both derived their key from HERE.
 // That is the opposite of the code, and acting on it is exactly the mutation
 // TestDaemonWorkerLocksTheRegisteredSessionForAReadOnlySeat exists to kill. The
@@ -2126,7 +2073,7 @@ func readOnlyRuntimeSandboxGrants(home string, agent runtime.Agent, checkout str
 	// and this home, whether the command the seat will exec is the daemon's copy
 	// of the runtime or the exit-126 unavailable shim. Recording it here costs
 	// nothing extra - the staging pass already ran - and it is available before
-	// the adapter is composed, before MarkAgentInstanceRunning, and before any
+	// the adapter is composed, and before any
 	// model token is billed.
 	//
 	// RECORDED, NOT REFUSED. Seat setup has callers that compose a seat adapter
@@ -2502,17 +2449,6 @@ func (w jobWorker) configPaths() (config.Paths, error) {
 	return pathsFromFlag(w.ConfigHome)
 }
 
-func (w jobWorker) parallelSessionPolicy() (config.ParallelSessionPolicy, error) {
-	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
-		return config.DefaultParallelSessionPolicy(), nil
-	}
-	paths, err := w.configPaths()
-	if err != nil {
-		return config.ParallelSessionPolicy{}, err
-	}
-	return config.LoadParallelSessionPolicy(paths)
-}
-
 // resolveExecBackend resolves the effective execution backend for one job
 // (#1536 P1): the optional [remote_exec] section (default "local") overridden
 // by the payload's exec_backend field. It is read per dispatch — like
@@ -2538,7 +2474,7 @@ var daemonJobExecBackendFor = func(w jobWorker, jobOverride string, jobOverrideP
 }
 
 // repoConcurrency loads the per-repo [repos."owner/repo"] scheduler overrides
-// (#576), mirroring parallelSessionPolicy: an implicit/empty config home has no
+// (#576), mirroring admissionPolicy: an implicit/empty config home has no
 // overrides (nil ⇒ every repo uses the global default), and an explicit home
 // loads them from the config file. Errors are surfaced to the caller, which
 // fails safe to the global default.
@@ -2587,9 +2523,9 @@ func (w jobWorker) resolveRepoScheduler(repoFilter string, globalLimit int) (int
 	return limit, usePool
 }
 
-// admissionPolicy loads the host-level [admission] budget config, mirroring
-// parallelSessionPolicy: an implicit/empty config home uses the defaults
-// (both caps 0 ⇒ off), and an explicit home loads from the config file.
+// admissionPolicy loads the host-level [admission] budget config: an
+// implicit/empty config home uses the defaults (both caps 0 ⇒ off), and an
+// explicit home loads from the config file.
 func (w jobWorker) admissionPolicy() (config.AdmissionPolicy, error) {
 	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
 		return config.DefaultAdmissionPolicy(), nil
@@ -2644,524 +2580,9 @@ func (w jobWorker) admissionEstimate(ctx context.Context, job db.Job) admissionE
 	return perJobAdmissionEstimate(ctx, w.Store, job, policy)
 }
 
-func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, agent runtime.Agent, policy config.ParallelSessionPolicy, now time.Time) tempWorkerEligibility {
-	if payload.Ephemeral != nil {
-		// An ephemeral job already runs directly on its own throwaway worker;
-		// forking it into a second temp worker would double-spawn.
-		return tempWorkerEligibility{Reason: "ephemeral worker runs directly"}
-	}
-	if strings.TrimSpace(payload.RuntimeOverride) != "" {
-		// An override job already runs on its own per-job session (a fresh ref or
-		// an explicit --session); forking a temp worker from the effective agent
-		// would re-derive a second session for the same one-shot job.
-		return tempWorkerEligibility{Reason: "runtime override runs on its own session"}
-	}
-	if payload.DelegationReason == "temp_worker_merge_back" {
-		return tempWorkerEligibility{Reason: "merge-back waits for original runtime session"}
-	}
-	if payload.DelegationReason == "runtime_session_busy" {
-		return tempWorkerEligibility{Reason: "delegated temp worker waits for assigned runtime session"}
-	}
-	if policy.SameSession != config.ParallelSessionForkTempSession {
-		return tempWorkerEligibility{Reason: "parallel_sessions.same_session is queue"}
-	}
-	if !resumableSessionRuntime(agent.Runtime) {
-		return tempWorkerEligibility{Reason: fmt.Sprintf("runtime %s does not support temp workers", agent.Runtime)}
-	}
-	if !parallelSessionActionAllowed(job.Type, policy.EligibleActions) {
-		return tempWorkerEligibility{Reason: fmt.Sprintf("action %s is not eligible", job.Type)}
-	}
-	if readOnlyImplementationBlocked(job.Type, agent) {
-		return tempWorkerEligibility{Reason: "implementation requires writable agent policy"}
-	}
-	if strings.TrimSpace(job.Type) == "implement" {
-		path, ok := queuedJobTaskWorktreePath(ctx, store, payload)
-		if !ok {
-			return tempWorkerEligibility{Reason: "implementation requires task worktree"}
-		}
-		if info, err := os.Stat(path); err != nil || !info.IsDir() {
-			return tempWorkerEligibility{Reason: "implementation task worktree is missing"}
-		}
-	}
-	if store != nil {
-		count, err := store.CountActiveAgentInstances(ctx, tempWorkerAgentType(agent.Name), agent.AutonomyPolicy, now)
-		if err != nil {
-			return tempWorkerEligibility{Reason: fmt.Sprintf("count active temp workers: %v", err)}
-		}
-		if count >= policy.MaxTempSessionsPerAgent {
-			return tempWorkerEligibility{Reason: fmt.Sprintf("max temp workers reached for %s", agent.Name)}
-		}
-	}
-	return tempWorkerEligibility{Eligible: true}
-}
-
-func parallelSessionActionAllowed(action string, eligibleActions []string) bool {
-	action = strings.TrimSpace(action)
-	for _, candidate := range eligibleActions {
-		if strings.TrimSpace(candidate) == action {
-			return true
-		}
-	}
-	return false
-}
-
-func tempWorkerAgentType(agentName string) string {
-	return "temp:" + strings.TrimSpace(agentName)
-}
-
-type tempWorkerStartResult struct {
-	Agent       runtime.Agent
-	IdleTimeout time.Duration
-	JobTimeout  time.Duration
-}
-
-func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string, policy config.ParallelSessionPolicy, reason string) error {
-	jobRunner, err := jobSubprocessRunnerForBackend(backend)
-	if err != nil {
-		return err
-	}
-	started, err := w.startTempWorker(ctx, job, payload, backend, original, checkout)
-	if err != nil {
-		if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "temp_worker_failed", Message: err.Error()}); eventErr != nil {
-			return eventErr
-		}
-		waitMessage := fmt.Sprintf("%s; temp worker start failed: %v", reason, err)
-		// Once per wait episode (#598); busy error returned unconditionally so the
-		// pool dispatcher observes the bounce.
-		if !runtimeLockWaitEpisodeOpen(job.ID) {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: waitMessage}); eventErr != nil {
-				return eventErr
-			}
-			markRuntimeLockWaitEpisode(job.ID)
-			writeLine(w.Stdout, "job %s waiting: %s", job.ID, waitMessage)
-		}
-		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, waitMessage)
-	}
-	payload.OriginalAgent = original.Name
-	payload.DelegatedAgent = started.Agent.Name
-	payload.DelegationReason = "runtime_session_busy"
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	delegated, err := w.Store.DelegateQueuedJob(ctx, job.ID, original.Name, started.Agent.Name, string(encoded), db.JobEvent{
-		JobID:   job.ID,
-		Kind:    "temp_worker_delegated",
-		Message: fmt.Sprintf("delegated from %s to %s: %s", original.Name, started.Agent.Name, reason),
-	})
-	if err != nil {
-		w.cleanupTempWorker(context.Background(), started.Agent.Name)
-		return err
-	}
-	if !delegated {
-		w.cleanupTempWorker(context.Background(), started.Agent.Name)
-		return nil
-	}
-	delegatedJob, err := w.Store.GetJob(ctx, job.ID)
-	if err != nil {
-		return err
-	}
-	// delegatedJob carries the temp agent and rewritten payload. It is not an
-	// admission token: this read can observe a cancel/retry generation that raced
-	// after job was admitted. Every pre-flight terminal write below therefore
-	// remains anchored to job, while runtime work uses delegatedJob's metadata.
-	adapter, err := w.deliveryAdapterForBackend(backend, started.Agent, checkout)
-	if err == nil {
-		// #1807: the temp-worker fork leaves run() before the sandbox wrap at
-		// the normal delivery site, and startTempWorker COPIES the delivery
-		// agent, so ReadOnlySeat survives into this path. Without this the seat
-		// routes around both the Landlock wrap and the staging policy - the very
-		// property this path's caller was gated on. The wrap is a no-op for an
-		// ordinary temp worker (it returns the adapter unchanged unless
-		// ReadOnlySeat is set), so this cannot affect the common path.
-		var forkSetup readOnlySeatSetup
-		adapter, forkSetup, err = wrapReadOnlySandboxAdapter(w.ConfigHome, started.Agent, checkout, payload.Repo, adapter)
-		// Same job-end cleanup as run(): this path never had one, so a
-		// temp-worker seat leaked its cache root, and would leak its private
-		// temp dir (#2314).
-		if stateAdapter, ok := adapter.(readOnlyRuntimeAdapter); ok {
-			defer func() {
-				if cleanupErr := stateAdapter.cleanup(); cleanupErr != nil {
-					writeLine(w.Stdout, "job %s read-only runtime state cleanup failed: %v", job.ID, cleanupErr)
-				}
-			}()
-		}
-		if len(forkSetup.dropped) > 0 {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "read_only_seat_config_narrowed", Message: "withheld from the seat's staged config: " + strings.Join(forkSetup.dropped, ", ")}); eventErr != nil {
-				return eventErr
-			}
-		}
-		// #1817's fourth entry point, measured on 2026-09-05 07:44:52: the
-		// temp-worker fork allocated a read-only worktree, minted a worker,
-		// marked the job running and posted an attributed PR comment, all before
-		// anything asked whether the selected path could start. Refuse the same
-		// capability here as in run(); a temp worker is new work, so its runtime
-		// being unavailable is not less true for being delegated.
-		if err == nil && forkSetup.runtimeUnavailable != "" && w.adapterIsDeclaredReal() {
-			err = &seatRuntimeCapabilityError{agentName: started.Agent.Name, runtimeName: started.Agent.Runtime, cause: forkSetup.runtimeUnavailable}
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: seatRuntimeUnavailableEvent, Message: err.Error()}); eventErr != nil {
-				writeLine(w.Stdout, "job %s %s event failed: %v", job.ID, seatRuntimeUnavailableEvent, eventErr)
-			}
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobBlocked, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-			return nil
-		}
-	}
-	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		return nil
-	}
-	writeLine(w.Stdout, "running job %s for temporary worker %s in %s", job.ID, started.Agent.Name, payload.Repo)
-	// Same lease-outlives-context invariant as run(): the temp-worker run context is
-	// armed at started.JobTimeout below, so the lease must be jobTimeout+grace to
-	// cover teardown and avoid the #536 live-worker reap+requeue window.
-	tempLockTTL := started.JobTimeout + runtimeLeaseTeardownGrace
-	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), tempLockTTL)
-	if err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		return nil
-	}
-	if !acquired {
-		message := fmt.Sprintf("runtime session %s is busy", lockKey)
-		// Once per wait episode (#598); busy error returned unconditionally so the
-		// pool dispatcher observes the bounce.
-		if !runtimeLockWaitEpisodeOpen(delegatedJob.ID) {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: delegatedJob.ID, Kind: "runtime_lock_wait", Message: message}); eventErr != nil {
-				return eventErr
-			}
-			markRuntimeLockWaitEpisode(delegatedJob.ID)
-			writeLine(w.Stdout, "job %s waiting: %s", delegatedJob.ID, message)
-		}
-		return fmt.Errorf("%w: %s", errRuntimeSessionBusy, message)
-	}
-	// Acquired the temp worker's runtime lock (delegatedJob.ID == job.ID; the
-	// delegation keeps the same job id): close any open wait episode.
-	endRuntimeLockWaitEpisode(delegatedJob.ID)
-	defer func() {
-		if err := releaseLock(context.Background()); err != nil {
-			writeLine(w.Stdout, "job %s temp runtime lock release failed: %v", delegatedJob.ID, err)
-		}
-	}()
-	stopRuntimeLockHeartbeat := startRuntimeSessionLockHeartbeat(ctx, w.Store, lockKey, ownerToken, tempLockTTL)
-	defer stopRuntimeLockHeartbeat()
-	// See runQueuedJob: thread the owner token so terminal cleanup recognizes this
-	// run's own still-held lock and does not refuse the healthy-path cleanup (#536).
-	ctx = workflow.WithRuntimeSelfOwnerToken(ctx, ownerToken)
-	// Shared tool-cache grant (#1113 lever 1): mirrors the primary worker path so
-	// runtime-session contention rerouting through the temp worker doesn't
-	// silently lose the cache redirect. Fail-open (disk hygiene, not security).
-	var tempToolCacheEnv []string
-	if cachePaths, cacheErr := w.configPaths(); cacheErr != nil {
-		writeLine(w.Stdout, "job %s tool cache config load failed: %v", delegatedJob.ID, cacheErr)
-	} else if env, grantErr := applyIsolatedToolCacheGrants(cachePaths, payload, &started.Agent); grantErr != nil {
-		writeLine(w.Stdout, "job %s tool cache grant failed: %v", delegatedJob.ID, grantErr)
-	} else {
-		tempToolCacheEnv = env
-	}
-	if len(tempToolCacheEnv) > 0 {
-		if envAdapter, envErr := injectDeliveryAdapterEnv(adapter, tempToolCacheEnv); envErr != nil {
-			writeLine(w.Stdout, "job %s tool cache env inject failed: %v", delegatedJob.ID, envErr)
-		} else {
-			adapter = envAdapter
-		}
-	}
-	// Temp-session delivery is a separate early-return path; attach the same
-	// append-only capture here or it would be absent from the trajectory corpus.
-	retainedLogFile, retainedLogErr := openRetainedTranscriptLog(w.ConfigHome, delegatedJob.ID, delegatedJob.Type, effectiveTranscriptRuntime(payload, started.Agent), delegatedJob.LifecycleGeneration, w.Store)
-	if retainedLogErr != nil {
-		writeLine(w.Stdout, "job %s transcript log open failed: %v", delegatedJob.ID, retainedLogErr)
-	}
-	if retainedLogFile != nil {
-		teeAdapter, teeErr := appendDeliveryAdapterOutput(adapter, retainedLogFile)
-		if teeErr != nil {
-			_ = retainedLogFile.Close()
-			writeLine(w.Stdout, "job %s transcript tee build failed: %v", delegatedJob.ID, teeErr)
-		} else {
-			adapter = teeAdapter
-			defer func() { _ = retainedLogFile.Close() }()
-		}
-	}
-	adapter = wrapManagedWorktreeRuntimeEnv(payload, adapter)
-	if err := w.Store.MarkAgentInstanceRunning(ctx, started.Agent.Name, time.Now().UTC(), started.JobTimeout); err != nil {
-		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-			return finishErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		return nil
-	}
-	defer func() {
-		if err := w.Store.TouchAgentInstance(context.Background(), started.Agent.Name, time.Now().UTC(), started.IdleTimeout); err != nil {
-			writeLine(w.Stdout, "job %s temp worker state update failed: %v", delegatedJob.ID, err)
-		}
-	}()
-	runCtx, stopRun := w.runningJobContext(ctx, job.ID)
-	defer stopRun()
-	runStartedAt := time.Now().UTC()
-	var cancel context.CancelFunc
-	runCtx, cancel = context.WithTimeout(runCtx, started.JobTimeout)
-	defer cancel()
-	runDeadline, hasRunDeadline := runCtx.Deadline()
-	stopKillPending := func() {}
-	if hasRunDeadline {
-		stopKillPending = armJobKillPending(w.Store, delegatedJob.ID, runDeadline)
-	}
-	engine := w.workflowForJob(checkout, jobRunner)
-	_, err = engine.RunJob(runCtx, delegatedJob.ID, started.Agent, adapter)
-	err = w.recordUnrecordedResult(ctx, engine, err)
-	stopKillPending()
-	if err != nil {
-		var markErr error
-		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			markErr = w.handleRunJobError(ctx, delegatedJob.ID, observedJobLifecycle(delegatedJob), context.DeadlineExceeded, jobTimeoutEvidence{Deadline: runDeadline, Started: runStartedAt})
-		} else {
-			markErr = w.handleRunJobError(ctx, delegatedJob.ID, observedJobLifecycle(delegatedJob), err)
-		}
-		if markErr != nil {
-			return markErr
-		}
-		if reconcileErr := engine.ReconcileTerminalDrivingJob(ctx, delegatedJob.ID); reconcileErr != nil {
-			return reconcileErr
-		}
-		_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, err)
-		// Same record as the ordinary path (#1620) — a delegated run's runtime
-		// error was journal-only too, and the temp-worker row is exactly where an
-		// operator looks first.
-		w.recordDeliveryFailureDiagnostics(ctx, delegatedJob.ID, delegatedJob.LifecycleGeneration, err)
-		writeLine(w.Stdout, "job %s failed: %v", delegatedJob.ID, err)
-		return nil
-	}
-	if clearErr := clearRoleUnavailableOnSuccess(ctx, w.Store, payload.ActingOrgRole, started.Agent.Runtime); clearErr != nil {
-		writeLine(w.Stdout, "job %s org-role quota unavailability clear failed: %v", delegatedJob.ID, clearErr)
-	}
-	if policy.MergeBack == config.ParallelSessionMergeBackSummary {
-		if err := w.queueTempWorkerMergeBack(ctx, delegatedJob.ID, original, started.Agent); err != nil {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: delegatedJob.ID, Kind: "temp_worker_merge_back_failed", Message: err.Error()}); eventErr != nil {
-				return eventErr
-			}
-			return err
-		}
-	}
-	if err := engine.ReconcileTerminalDrivingJob(ctx, delegatedJob.ID); err != nil {
-		return err
-	}
-	_ = w.postJobResultComment(ctx, delegatedJob.ID, started.Agent, checkout, nil)
-	writeLine(w.Stdout, "job %s completed by temporary worker %s", delegatedJob.ID, started.Agent.Name)
-	return nil
-}
-
-func (w jobWorker) queueTempWorkerMergeBack(ctx context.Context, completedJobID string, original runtime.Agent, tempAgent runtime.Agent) error {
-	completedJob, err := w.Store.GetJob(ctx, completedJobID)
-	if err != nil {
-		return err
-	}
-	payload, err := daemonJobPayload(completedJob)
-	if err != nil {
-		return err
-	}
-	if payload.Result == nil {
-		return fmt.Errorf("completed temp-worker job %s has no result", completedJob.ID)
-	}
-	mergeBackID := completedJob.ID + "-merge-back"
-	if _, err := w.Store.GetJob(ctx, mergeBackID); err == nil {
-		return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_existing", Message: fmt.Sprintf("summary merge-back job %s already exists", mergeBackID)})
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	request := workflow.JobRequest{
-		ID:               mergeBackID,
-		Agent:            original.Name,
-		Action:           "ask",
-		Model:            payload.Model,
-		Effort:           payload.Effort,
-		Repo:             payload.Repo,
-		Branch:           payload.Branch,
-		GoalID:           payload.GoalID,
-		TaskID:           payload.TaskID,
-		TaskTitle:        payload.TaskTitle,
-		LeadAgent:        payload.LeadAgent,
-		Reviewers:        payload.Reviewers,
-		ReviewRound:      payload.ReviewRound,
-		Sender:           tempAgent.Name,
-		Instructions:     tempWorkerMergeBackInstructions(completedJob, payload, tempAgent.Name),
-		OriginalAgent:    original.Name,
-		DelegatedAgent:   tempAgent.Name,
-		DelegationReason: "temp_worker_merge_back",
-		Constraints: []string{
-			"This is a temp-worker merge-back summary only.",
-			"Do not edit files, create commits, open pull requests, or dispatch more agents unless the summary explicitly requires follow-up.",
-		},
-	}
-	mailbox := workflow.NewMailbox(w.Store)
-	mailbox.RuntimeDefaultModel = runtimeDefaultModelResolver(w.workflowHome())
-	mailbox.ReviewModelPool = reviewModelPoolResolver(w.workflowHome())
-	mailbox.RequireWorkflowPolicy = requireWorkflowPolicyResolver(w.workflowHome())
-	mailbox.OrgPolicy = orgPolicyResolver(w.workflowHome())
-	if _, err := mailbox.Enqueue(ctx, request); err != nil {
-		return err
-	}
-	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: completedJob.ID, Kind: "temp_worker_merge_back_queued", Message: fmt.Sprintf("queued summary merge-back job %s for %s", mergeBackID, original.Name)})
-}
-
-func tempWorkerMergeBackInstructions(job db.Job, payload workflow.JobPayload, tempAgentName string) string {
-	result := payload.Result
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "Temporary worker %s completed job %s.\n", tempAgentName, job.ID)
-	fmt.Fprintf(&builder, "Repo: %s\n", payload.Repo)
-	if strings.TrimSpace(payload.Branch) != "" {
-		fmt.Fprintf(&builder, "Branch: %s\n", payload.Branch)
-	}
-	if payload.PullRequest > 0 {
-		fmt.Fprintf(&builder, "Pull request: #%d\n", payload.PullRequest)
-	}
-	if strings.TrimSpace(payload.HeadSHA) != "" {
-		fmt.Fprintf(&builder, "Head SHA: %s\n", payload.HeadSHA)
-	}
-	fmt.Fprintf(&builder, "Decision: %s\n", result.Decision)
-	if strings.TrimSpace(result.Summary) != "" {
-		fmt.Fprintf(&builder, "Summary: %s\n", result.Summary)
-	}
-	appendMergeBackList(&builder, "Changes made", result.ChangesMade)
-	appendMergeBackList(&builder, "Tests run", result.TestsRun)
-	appendMergeBackList(&builder, "Needs", result.Needs)
-	builder.WriteString("\nAcknowledge the summary and keep any follow-up concise.")
-	return builder.String()
-}
-
-func appendMergeBackList(builder *strings.Builder, label string, values []string) {
-	values = compactMergeBackStrings(values)
-	if len(values) == 0 {
-		return
-	}
-	fmt.Fprintf(builder, "%s:\n", label)
-	for _, value := range values {
-		fmt.Fprintf(builder, "- %s\n", value)
-	}
-}
-
-func compactMergeBackStrings(values []string) []string {
-	out := []string{}
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			out = append(out, value)
-		}
-	}
-	return out
-}
-
-func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
-	idleTimeout := 20 * time.Minute
-	managed, err := w.managedJobConfig(ctx, original.Name)
-	if err != nil {
-		return tempWorkerStartResult{}, err
-	}
-	if managed.OK {
-		idleTimeout = managed.IdleTimeout
-	}
-	// Resolve the same authority as the primary dispatch path so runtime-session
-	// contention cannot route a payload around the hard ceiling.
-	jobTimeout := effectiveJobTimeout(payload, managed, job.Type)
-	tempAgent := original
-	tempAgent.Name = tempWorkerInstanceName(original.Name, job.ID)
-	tempAgent.RuntimeRef = ""
-	// A temp worker's session is started for this one job and disposed after it
-	// — single-use, so session-cumulative usage (codex, #658) is the job's cost.
-	tempAgent.SingleUseSession = true
-	now := time.Now().UTC()
-	reserved := db.AgentInstance{
-		Name:           tempAgent.Name,
-		Type:           tempWorkerAgentType(original.Name),
-		Runtime:        tempAgent.Runtime,
-		RuntimeRef:     "starting:" + tempAgent.Name,
-		RepoFullName:   payload.Repo,
-		Role:           tempAgent.Role,
-		Model:          tempAgent.Model,
-		Effort:         tempAgent.Effort,
-		Capabilities:   tempAgent.Capabilities,
-		AutonomyPolicy: tempAgent.AutonomyPolicy,
-		State:          "starting",
-		CreatedAt:      formatManagedAgentTime(now),
-		LastUsedAt:     formatManagedAgentTime(now),
-		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
-	}
-	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
-		return tempWorkerStartResult{}, err
-	}
-	adapter, err := w.StartAdapterFactory(backend, tempAgent.Runtime, checkout)
-	if err != nil {
-		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
-		return tempWorkerStartResult{}, err
-	}
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: tempAgent, Prompt: agentStartupPrompt(tempAgent)})
-	if err != nil {
-		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
-		return tempWorkerStartResult{}, err
-	}
-	tempAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
-	if err := runtime.ValidateAgent(tempAgent); err != nil {
-		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
-		return tempWorkerStartResult{}, err
-	}
-	instance := reserved
-	instance.RuntimeRef = tempAgent.RuntimeRef
-	instance.State = "idle"
-	if err := w.Store.UpsertAgentInstance(ctx, instance); err != nil {
-		_ = w.Store.DeleteAgentInstance(context.Background(), reserved.Name)
-		return tempWorkerStartResult{}, err
-	}
-	return tempWorkerStartResult{Agent: tempAgent, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
-}
-
-func (w jobWorker) cleanupTempWorker(ctx context.Context, agentName string) {
-	if err := w.Store.DeleteAgentInstance(ctx, agentName); err != nil {
-		writeLine(w.Stdout, "temp worker %s instance cleanup failed: %v", agentName, err)
-	}
-	if removed, err := w.Store.RemoveAgent(ctx, agentName); err != nil {
-		writeLine(w.Stdout, "temp worker %s agent cleanup failed: %v", agentName, err)
-	} else if removed {
-		writeLine(w.Stdout, "temp worker %s agent cleanup removed regular agent row", agentName)
-	}
-}
-
-func tempWorkerInstanceName(agentName string, jobID string) string {
-	base := strings.Trim(strings.ToLower(agentName), "-_ ")
-	if base == "" {
-		base = "agent"
-	}
-	job := strings.Trim(strings.ToLower(jobID), "-_ ")
-	if job == "" {
-		job = strconv.FormatInt(time.Now().UTC().UnixNano(), 16)
-	}
-	name := base + "-temp-" + job
-	var builder strings.Builder
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-			builder.WriteRune(r)
-		case r >= '0' && r <= '9':
-			builder.WriteRune(r)
-		case r == '-' || r == '_':
-			builder.WriteRune(r)
-		default:
-			builder.WriteRune('-')
-		}
-	}
-	return strings.Trim(builder.String(), "-_")
-}
-
 type managedJobRuntimeConfig struct {
 	OK                bool
-	Instance          bool
 	JobTimeout        time.Duration
-	IdleTimeout       time.Duration
 	JobTimeoutDefault time.Duration
 	JobTimeoutMax     time.Duration
 	// ReviewJobTimeout is the floor a REVIEW gets whichever reviewer answers it
@@ -3225,33 +2646,9 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	if err != nil {
 		return managedJobRuntimeConfig{}, err
 	}
-	// A normal registered agent's stable name is also its [agents.<type>]
-	// enrollment key. A live instance row, when present, is an explicit override
-	// layer: managed/temp workers retain the type that created them even when their
-	// generated instance name differs.
+	// A registered agent's stable name is also its [agents.<type>] enrollment
+	// key.
 	configType := registered.Name
-	instance, err := w.Store.GetAgentInstance(ctx, agentName)
-	if err == nil {
-		runtimeConfig.Instance = true
-		configType = instance.Type
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return managedJobRuntimeConfig{}, err
-	}
-	if original := originalAgentForTempWorkerType(configType); original != "" {
-		originalAgent, err := w.Store.GetAgent(ctx, original)
-		if errors.Is(err, sql.ErrNoRows) {
-			return runtimeConfig, nil
-		}
-		if err != nil {
-			return managedJobRuntimeConfig{}, err
-		}
-		configType = originalAgent.Name
-		if originalInstance, instanceErr := w.Store.GetAgentInstance(ctx, original); instanceErr == nil {
-			configType = originalInstance.Type
-		} else if !errors.Is(instanceErr, sql.ErrNoRows) {
-			return managedJobRuntimeConfig{}, instanceErr
-		}
-	}
 	if !configFilePresent {
 		return runtimeConfig, nil
 	}
@@ -3261,8 +2658,8 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	}
 	agentType, ok := types[configType]
 	if !ok {
-		// Enrollment is optional for both stable agents and live instances. Keep
-		// Instance above for lifecycle updates, but use the daemon timeout default.
+		// Enrollment is optional: an unenrolled agent uses the daemon timeout
+		// default.
 		return runtimeConfig, nil
 	}
 	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
@@ -3272,16 +2669,8 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	if jobTimeout <= 0 {
 		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout must be positive", configType)
 	}
-	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
-	if err != nil {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", configType, err)
-	}
-	if idleTimeout <= 0 {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s idle_timeout must be positive", configType)
-	}
 	runtimeConfig.OK = true
 	runtimeConfig.JobTimeout = jobTimeout
-	runtimeConfig.IdleTimeout = idleTimeout
 	return runtimeConfig, nil
 }
 
@@ -3443,14 +2832,6 @@ func recoverKillPendingJobs(ctx context.Context, store *db.Store, stdout io.Writ
 		}
 	}
 	return nil
-}
-
-func originalAgentForTempWorkerType(typ string) string {
-	original, ok := strings.CutPrefix(strings.TrimSpace(typ), "temp:")
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(original)
 }
 
 func (w jobWorker) runningJobContext(ctx context.Context, jobID string) (context.Context, func()) {

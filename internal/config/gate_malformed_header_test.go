@@ -155,7 +155,7 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 //	guard loaders, by refusal, in TestGateLoadersRefuseTheirOwnMalformedHeader:
 //	  merge_gate.go:112, admission.go:74, require_workflow.go:71,
 //	  orchestrate.go:625 (via LoadReviewConfig)
-//	by routing, here: parallel_sessions.go:46, transcripts.go:50, router.go:46,
+//	by routing, here: transcripts.go:50, router.go:46,
 //	  daemon_runtime.go:99, github_limiter.go:80, remote_exec.go:72,
 //	  credentials.go:52
 //	in TestMalformedHeaderRoutingRemainingLoaders: result_checks.go:59,
@@ -169,17 +169,6 @@ func TestWellFormedGateConfigIsUnchanged(t *testing.T) {
 // so each needs its own observable field; a revert at one of them would NOT
 // fail this test.
 func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
-	t.Run("parallel_sessions", func(t *testing.T) {
-		paths := writeGateConfig(t, "[parallel_sessions]\nsame_session = \"queue\"\n[parallel_sessions\nsame_session = \"fork_temp_session\"\n")
-		policy, err := LoadParallelSessionPolicy(paths)
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if policy.SameSession != "queue" {
-			t.Fatalf("same_session = %q, want queue: the override after a malformed header was misattributed", policy.SameSession)
-		}
-	})
-
 	t.Run("transcripts", func(t *testing.T) {
 		paths := writeGateConfig(t, "[transcripts]\nenabled = false\n[transcripts\nenabled = true\n")
 		if got := LoadTranscriptsConfig(paths); got.Enabled {
@@ -230,13 +219,6 @@ func TestMalformedHeaderRoutingPerCallSite(t *testing.T) {
 	// The valid-header path for the same loaders, so these assertions cannot be
 	// satisfied by a loader that simply ignores everything.
 	t.Run("valid headers still apply their values", func(t *testing.T) {
-		policy, err := LoadParallelSessionPolicy(writeGateConfig(t, "[parallel_sessions]\nsame_session = \"fork_temp_session\"\n"))
-		if err != nil {
-			t.Fatalf("load: %v", err)
-		}
-		if policy.SameSession != "fork_temp_session" {
-			t.Errorf("same_session = %q, want fork_temp_session", policy.SameSession)
-		}
 		if got := LoadTranscriptsConfig(writeGateConfig(t, "[transcripts]\nenabled = true\n")); !got.Enabled {
 			t.Error("transcripts enabled = true was not applied")
 		}

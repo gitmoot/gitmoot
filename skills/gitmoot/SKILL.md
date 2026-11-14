@@ -51,8 +51,8 @@ owning that worktree is `in_progress`, while its conclusive sampled absence is
 For background work, keep Gitmoot's resource model explicit: repo checkout
 locks protect local checkouts, runtime session locks serialize delivery for the
 same resumable runtime session (omp runs a fresh session per job).
-The daemon default is `--workers 1`; raise it only for independent runtime
-sessions or managed agent types with `max_background` greater than one.
+The daemon default is `--workers 1`; raise it only for independent jobs
+(distinct checkouts and runtime sessions; omp jobs each run a fresh session).
 omp is the only job runtime (`shell` remains a subscribe-only runtime for no-LLM
 tests). Agents still registered on the removed `codex`, `claude`, or `kimi`
 runtimes are reported as unsupported by `gitmoot agent list` and `gitmoot
