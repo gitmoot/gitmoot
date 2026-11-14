@@ -138,7 +138,7 @@ const ImplementerAttributionGapReason = noImplementJobAttributionReason
 
 // IsSeatActionableGateCause reports a gate-miss cause whose remedy is an action
 // by the seat that wrote the change, not a decision for anyone above it. Today
-// that is the implementer-attribution gap: the remedy is `gitmoot run record`
+// that is the implementer-attribution gap: the remedy is `gitmoot job record`
 // by the implementing seat. The pre-#2600 wording still matches.
 func IsSeatActionableGateCause(cause string) bool {
 	cause = strings.TrimSpace(cause)

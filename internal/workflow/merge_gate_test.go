@@ -1175,7 +1175,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 				"no implement run is recorded for this pr",
 				"NOT disqualified",
 				"attribution gap, not a failed independence check",
-				"gitmoot run record --implementer <implementing-agent>",
+				"gitmoot job record --agent <implementing-agent>",
 				"--type implement",
 			},
 			doNotWant: []string{"implemented in a pane"},
@@ -1187,7 +1187,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 				"no implement run is recorded for this pr",
 				"NOT disqualified",
 				"attribution gap, not a failed independence check",
-				"gitmoot run record --implementer <implementing-agent>",
+				"gitmoot job record --agent <implementing-agent>",
 				"--type implement",
 			},
 			doNotWant: []string{"implemented in a pane"},
@@ -1288,7 +1288,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 // recording a durable implement row -- was already available and unnamed. A guard that pins
 // the wrong remedy verbatim keeps it shipped, which is why this constant moved rather than
 // being deleted.
-const boundAttributionGapRemedy = "gitmoot run record --implementer <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>"
+const boundAttributionGapRemedy = "gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>"
 
 // forbiddenAttributionGapPermissions are phrasings that turn the decline into permission to
 // merge without independence. The gate still REFUSES on an attribution gap; only the remedy
@@ -1460,7 +1460,7 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 			// costume of a remedy. The added clause names --acting-role and states that
 			// independence is still enforced, so the escape hatch cannot be read as a
 			// waiver.
-			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement run is recorded for this pr, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot run record --implementer <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered reviewer, record --acting-role <role> in place of --implementer: attribution is then the role, and independence is still enforced against it",
+			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement run is recorded for this pr, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered reviewer, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it",
 		},
 	}
 	for name, check := range wants {

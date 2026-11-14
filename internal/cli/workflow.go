@@ -266,10 +266,11 @@ func (record taskListOutput) reference() string {
 }
 
 func prRecordFromTask(task db.Task) taskListOutput {
+	number, _ := workflow.ReviewRecordPRNumber(task.ID)
 	return taskListOutput{
 		ID:                     task.ID,
 		Repo:                   task.RepoFullName,
-		Number:                 reviewRecordPRNumber(task.ID),
+		Number:                 number,
 		GoalID:                 task.GoalID,
 		Title:                  task.Title,
 		State:                  task.State,
@@ -296,25 +297,6 @@ func (record *taskListOutput) addPullRequest(pr db.PullRequest) {
 	record.BaseBranch = pr.BaseBranch
 	record.HeadSHA = pr.HeadSHA
 	record.MergeCommitSHA = pr.MergeCommitSHA
-}
-
-// reviewRecordPRNumber reads the pull request number out of a review record id
-// ("review-pr-<number>-<hash>", successors keep the prefix); 0 when the id
-// carries none (old adhoc-/task- rows).
-func reviewRecordPRNumber(id string) int64 {
-	remainder, ok := strings.CutPrefix(strings.TrimSpace(id), "review-pr-")
-	if !ok {
-		return 0
-	}
-	numberText, suffix, ok := strings.Cut(remainder, "-")
-	if !ok || strings.TrimSpace(suffix) == "" {
-		return 0
-	}
-	number, err := strconv.ParseInt(numberText, 10, 64)
-	if err != nil || number <= 0 {
-		return 0
-	}
-	return number
 }
 
 type prRecordKey struct {

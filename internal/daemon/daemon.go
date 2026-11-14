@@ -572,7 +572,7 @@ func (d Daemon) reconcileTransientlyBlockedMergeGates(ctx context.Context, openP
 		var number int64
 		if branch == "" {
 			var ok bool
-			number, ok = reviewTaskPullRequestNumber(task.ID)
+			number, ok = workflow.ReviewRecordPRNumber(task.ID)
 			if !ok {
 				continue
 			}
@@ -751,7 +751,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 		var number int64
 		if branch == "" {
 			var ok bool
-			number, ok = reviewTaskPullRequestNumber(task.ID)
+			number, ok = workflow.ReviewRecordPRNumber(task.ID)
 			if !ok {
 				continue
 			}
@@ -766,7 +766,7 @@ func (d Daemon) reconcileExternallyMergedTasks(ctx context.Context, openPullNumb
 				// branch guard after the lookup refuses a PR whose head is not
 				// this task's branch.
 				var ok bool
-				number, ok = reviewTaskPullRequestNumber(task.ID)
+				number, ok = workflow.ReviewRecordPRNumber(task.ID)
 				if !ok {
 					continue
 				}
@@ -1145,20 +1145,6 @@ func externalMergeCandidateState(state string) bool {
 	default:
 		return false
 	}
-}
-
-func reviewTaskPullRequestNumber(taskID string) (int64, bool) {
-	const prefix = "review-pr-"
-	remainder, ok := strings.CutPrefix(strings.TrimSpace(taskID), prefix)
-	if !ok {
-		return 0, false
-	}
-	numberText, suffix, ok := strings.Cut(remainder, "-")
-	if !ok || strings.TrimSpace(suffix) == "" {
-		return 0, false
-	}
-	number, err := strconv.ParseInt(numberText, 10, 64)
-	return number, err == nil && number > 0
 }
 
 // PollIssuesOnce is the opt-in issue-comment workflow (#389, bounded by #566). It
@@ -2137,7 +2123,7 @@ func (d Daemon) lookupReadyPullRequestTask(ctx context.Context, pull github.Pull
 			candidate.State != string(workflow.TaskReadyToMerge) {
 			continue
 		}
-		number, ok := reviewTaskPullRequestNumber(candidate.ID)
+		number, ok := workflow.ReviewRecordPRNumber(candidate.ID)
 		if !ok || number != pull.Number {
 			continue
 		}
@@ -3060,7 +3046,7 @@ func (d Daemon) lookupMergeCommandTask(ctx context.Context, pull github.PullRequ
 			candidate.State != string(workflow.TaskAwaitingHumanMerge) {
 			continue
 		}
-		number, ok := reviewTaskPullRequestNumber(candidate.ID)
+		number, ok := workflow.ReviewRecordPRNumber(candidate.ID)
 		if ok && number == pull.Number {
 			candidates = append(candidates, candidate)
 		}
