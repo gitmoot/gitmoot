@@ -41,13 +41,13 @@ func TestAgentListAndDoctorNameAgentsOnRemovedRuntimes(t *testing.T) {
 	configFile.Close()
 
 	wantNamed := []string{
-		`agent old-codex: removed job runtime: runtime "codex" is no longer supported; gitmoot requires omp`,
-		`agent old-claude: removed job runtime: runtime "claude" is no longer supported; gitmoot requires omp`,
-		`agent type kimi-type: removed job runtime: runtime "kimi" is no longer supported; gitmoot requires omp`,
+		`reviewer old-codex: removed job runtime: runtime "codex" is no longer supported; gitmoot requires omp`,
+		`reviewer old-claude: removed job runtime: runtime "claude" is no longer supported; gitmoot requires omp`,
+		`reviewer type kimi-type: removed job runtime: runtime "kimi" is no longer supported; gitmoot requires omp`,
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"agent", "list", "--home", home}, &stdout, &stderr); code != 0 {
+	if code := Run([]string{"reviewer", "list", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("agent list code = %d, stderr = %s", code, stderr.String())
 	}
 	for _, name := range []string{"old-codex", "old-claude", "current-omp", "tests-shell"} {
@@ -70,7 +70,7 @@ func TestAgentListAndDoctorNameAgentsOnRemovedRuntimes(t *testing.T) {
 	if !ok {
 		t.Fatal("unsupportedAgentRuntimeDoctorCheck ok=false for an initialized home")
 	}
-	if check.OK || check.Name != "agent runtimes" || !strings.HasPrefix(check.Detail, "3 unsupported: ") {
+	if check.OK || check.Name != "reviewer runtimes" || !strings.HasPrefix(check.Detail, "3 unsupported: ") {
 		t.Fatalf("doctor check = %+v, want a failing 'agent runtimes' check naming 3 agents", check)
 	}
 	for _, want := range wantNamed {

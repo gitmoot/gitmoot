@@ -2664,10 +2664,10 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 	}
 	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
 	if err != nil {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout: %w", configType, err)
+		return managedJobRuntimeConfig{}, fmt.Errorf("reviewer type %s job_timeout: %w", configType, err)
 	}
 	if jobTimeout <= 0 {
-		return managedJobRuntimeConfig{}, fmt.Errorf("agent type %s job_timeout must be positive", configType)
+		return managedJobRuntimeConfig{}, fmt.Errorf("reviewer type %s job_timeout must be positive", configType)
 	}
 	runtimeConfig.OK = true
 	runtimeConfig.JobTimeout = jobTimeout
@@ -3143,7 +3143,7 @@ func startRuntimeAdapterForBackend(backend execbackend.Backend, home string, run
 		return runtimeAdapterFor(home, runtimeName, checkout)
 	}, func() (runtime.Adapter, error) {
 		// Agent-start sessions are host-owned and have no lifecycle instance.
-		return nil, errors.New("agent start sessions do not support the remote execution backend")
+		return nil, errors.New("reviewer start sessions do not support the remote execution backend")
 	})
 }
 

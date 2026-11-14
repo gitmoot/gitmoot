@@ -83,7 +83,7 @@ func TestDetectReviewLoopSameAgentSameHeadRefused(t *testing.T) {
 	if match.Agent != "g7-review" || match.JobID != "review-g7" || match.Decision != "approved" {
 		t.Fatalf("match = %+v", match)
 	}
-	if !strings.Contains(match.Reason(), "agent g7-review already holds") {
+	if !strings.Contains(match.Reason(), "reviewer g7-review already holds") {
 		t.Fatalf("reason = %q", match.Reason())
 	}
 

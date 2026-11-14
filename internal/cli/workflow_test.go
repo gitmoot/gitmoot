@@ -103,7 +103,7 @@ func subscribeShellImplementAgent(t *testing.T, home string, name string, repo s
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{
-		"agent", "subscribe", name,
+		"reviewer", "subscribe", name,
 		"--home", home,
 		"--runtime", "shell",
 		"--session", `printf '%s\n' '{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`,

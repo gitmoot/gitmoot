@@ -471,7 +471,7 @@ func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref 
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return e.block(ctx, ref, fmt.Sprintf("agent %q is not subscribed", request.Agent))
+			return e.block(ctx, ref, fmt.Sprintf("reviewer %q is not subscribed", request.Agent))
 		}
 		return err
 	}
@@ -480,10 +480,10 @@ func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref 
 		return err
 	}
 	if !allowed {
-		return e.block(ctx, ref, fmt.Sprintf("agent %q is not allowed on %q", agent.Name, request.Repo))
+		return e.block(ctx, ref, fmt.Sprintf("reviewer %q is not allowed on %q", agent.Name, request.Repo))
 	}
 	if !contains(agent.Capabilities, request.Action) {
-		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
+		return e.block(ctx, ref, fmt.Sprintf("reviewer %q lacks %q capability", agent.Name, request.Action))
 	}
 	if request.Action == "implement" {
 		// Fail-closed: an implement job whose agent grants no headless write

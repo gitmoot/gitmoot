@@ -254,7 +254,7 @@ func (c *RuntimeContractChecker) check(ctx context.Context, meta RuntimeMetadata
 			Kind:       RuntimeRequirementBinaryPresent,
 			Name:       fmt.Sprintf("executable %q", meta.Contract.Binary),
 			Source:     fmt.Sprintf("runtime %q contract binary", meta.Name),
-			Remedy:     fmt.Sprintf("install %s on the host that will run this job, or dispatch it to an agent whose runtime is installed", meta.Contract.Binary),
+			Remedy:     fmt.Sprintf("install %s on the host that will run this job, or dispatch it to a reviewer whose runtime is installed", meta.Contract.Binary),
 			State:      RuntimeContractUnknown,
 			Instrument: probe.instrument,
 			Detail:     probe.detail,
@@ -466,13 +466,13 @@ func RuntimeContractDispatchError(agent Agent, result RuntimeContractResult) err
 		// and it sends the reader looking for a CLI upgrade instead of a missing
 		// binary (#1817).
 		if requirement.Kind == RuntimeRequirementBinaryPresent {
-			return fmt.Errorf("runtime preflight blocked agent %q: runtime %q requires %s and it does not resolve on PATH (%s); remedy: %s",
+			return fmt.Errorf("runtime preflight blocked reviewer %q: runtime %q requires %s and it does not resolve on PATH (%s); remedy: %s",
 				agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
 		}
-		return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q does not satisfy %s required by %s; remedy: %s",
+		return fmt.Errorf("runtime preflight blocked reviewer %q: runtime %q installed version %q does not satisfy %s required by %s; remedy: %s",
 			agent.Name, result.Runtime, result.Version, requirement.Name, requirement.Source, requirement.Remedy)
 	}
-	return fmt.Errorf("runtime preflight blocked agent %q: runtime %q installed version %q has an unsupported contract; remedy: run the job on a runtime whose installed CLI satisfies its declared contract", agent.Name, result.Runtime, result.Version)
+	return fmt.Errorf("runtime preflight blocked reviewer %q: runtime %q installed version %q has an unsupported contract; remedy: run the job on a runtime whose installed CLI satisfies its declared contract", agent.Name, result.Runtime, result.Version)
 }
 
 // RuntimeContractAbsentBinaryError reports the runtime's declared executable as
@@ -491,7 +491,7 @@ func RuntimeContractAbsentBinaryError(agent Agent, result RuntimeContractResult)
 		if requirement.Kind != RuntimeRequirementBinaryPresent {
 			continue
 		}
-		return fmt.Errorf("dispatch refused for agent %q: runtime %q will exec %s on this host and it does not resolve on PATH (%s); remedy: %s",
+		return fmt.Errorf("dispatch refused for reviewer %q: runtime %q will exec %s on this host and it does not resolve on PATH (%s); remedy: %s",
 			agent.Name, result.Runtime, requirement.Name, requirement.Detail, requirement.Remedy)
 	}
 	return nil

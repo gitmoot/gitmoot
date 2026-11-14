@@ -127,7 +127,7 @@ func assertRuntimeOverrideInvariants(t *testing.T, store *db.Store, home string,
 	// The agent's registered default runtime is untouched — assert via the
 	// REAL `agent show` surface, not just the store.
 	var out, errBuf bytes.Buffer
-	if code := Run([]string{"agent", "show", "maintainer", "--home", home}, &out, &errBuf); code != 0 {
+	if code := Run([]string{"reviewer", "show", "maintainer", "--home", home}, &out, &errBuf); code != 0 {
 		t.Fatalf("agent show exit = %d, stderr=%s", code, errBuf.String())
 	}
 	show := out.String()
@@ -154,7 +154,7 @@ func TestRuntimeOverrideForegroundShellE2E(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "maintainer", "what is the state of the repo?",
+		"ask", "maintainer", "what is the state of the repo?",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--runtime", "shell",
@@ -186,7 +186,7 @@ func TestRuntimeOverrideDaemonBackgroundShellE2E(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "maintainer", "what is the state of the repo?",
+		"ask", "maintainer", "what is the state of the repo?",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--runtime", "shell",
@@ -225,14 +225,14 @@ func TestRuntimeOverrideValidationBeforeEnqueue(t *testing.T) {
 	home, store, _ := runtimeOverrideE2EHome(t)
 
 	for name, args := range map[string][]string{
-		"unknown runtime":         {"agent", "ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "bogus"},
-		"shell without session":   {"agent", "ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "shell"},
-		"session without runtime": {"agent", "ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--session", "printf ok"},
+		"unknown runtime":         {"ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "bogus"},
+		"shell without session":   {"ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "shell"},
+		"session without runtime": {"ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--session", "printf ok"},
 		// "last" names no concrete session: the delivery would resume whichever
 		// session is most recent (possibly another agent's default-runtime
 		// session, mid-flight) under a "runtime:<rt>:last" lock that can never
 		// serialize with the concrete session's lock.
-		"last session": {"agent", "ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "claude", "--session", "last"},
+		"last session": {"ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "claude", "--session", "last"},
 	} {
 		var out, errBuf bytes.Buffer
 		if code := Run(args, &out, &errBuf); code == 0 {
@@ -249,7 +249,7 @@ func TestRuntimeOverrideValidationBeforeEnqueue(t *testing.T) {
 
 	// The unknown-runtime error enumerates the valid registry values.
 	var out, errBuf bytes.Buffer
-	if code := Run([]string{"agent", "ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "bogus"}, &out, &errBuf); code == 0 {
+	if code := Run([]string{"ask", "maintainer", "hi", "--home", home, "--repo", "owner/repo", "--runtime", "bogus"}, &out, &errBuf); code == 0 {
 		t.Fatal("unknown runtime accepted")
 	}
 	for _, supported := range runtime.SupportedRuntimes() {

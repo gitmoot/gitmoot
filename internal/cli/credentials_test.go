@@ -366,7 +366,7 @@ test -n "${HOME:-}" && home_set=yes
 printf '{"gitmoot_result":{"decision":"approved","summary":"PATH_SET=%s|HOME_SET=%s|GH_TOKEN=%s|GITHUB_TOKEN=%s|CLAUDE_CODE_OAUTH_TOKEN=%s|SSH_AUTH_SOCK=%s|GH_CONFIG_DIR=%s|GH_PROMPT_DISABLED=%s|GH_EMPTY=%s|GH_MODE=%s","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}' \
   "$path_set" "$home_set" "${GH_TOKEN-unset}" "${GITHUB_TOKEN-unset}" "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${SSH_AUTH_SOCK-unset}" "${GH_CONFIG_DIR-unset}" "${GH_PROMPT_DISABLED-unset}" "$gh_empty" "$gh_mode"`
 				args := []string{
-					"agent", "ask", "maintainer", "inspect environment",
+					"ask", "maintainer", "inspect environment",
 					"--home", home,
 					"--repo", "owner/repo",
 					"--runtime", "shell",

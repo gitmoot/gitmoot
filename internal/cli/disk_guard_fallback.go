@@ -64,7 +64,7 @@ func diskGuardRemoteRouteCheck(ctx context.Context, store *db.Store, job db.Job,
 	if runtimeName == "" {
 		agent, err := store.GetAgent(ctx, job.Agent)
 		if err != nil {
-			return fmt.Errorf("read reviewer agent %q: %w", job.Agent, err)
+			return fmt.Errorf("read reviewer %q: %w", job.Agent, err)
 		}
 		runtimeName = agent.Runtime
 	}

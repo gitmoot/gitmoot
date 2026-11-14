@@ -167,7 +167,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
 	dryRun := fs.Bool("dry-run", false, "run without mutating external systems")
-	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
+	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
 	pprofAddr := fs.String("pprof-addr", "", "off by default; if set (use a loopback addr, e.g. 127.0.0.1:6060) serve net/http/pprof on it for live diagnostics (#1111)")
@@ -813,7 +813,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	fs.StringVar(&session, "root", "", "alias for --session")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	workers := fs.Int("workers", 1, "worker count")
-	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
+	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<reviewer> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
 	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
 	if err := fs.Parse(args); err != nil {

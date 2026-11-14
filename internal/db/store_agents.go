@@ -60,19 +60,19 @@ func (s *Store) UpdateAgentRuntimeRef(ctx context.Context, name, ref string) err
 		return err
 	}
 	if affected == 0 {
-		return fmt.Errorf("agent %q is not registered", name)
+		return fmt.Errorf("reviewer %q is not registered", name)
 	}
 	return nil
 }
 
 // ErrAgentPolicyBarrier reports that the caller's cross-plane barrier failed,
 // so the transaction was rolled back and NO plane changed.
-var ErrAgentPolicyBarrier = errors.New("agent policy barrier failed")
+var ErrAgentPolicyBarrier = errors.New("reviewer policy barrier failed")
 
 // ErrAgentPolicyCommit reports that the barrier succeeded but the commit did
 // not. The caller's plane has moved and the database has not, so the caller
 // MUST compensate.
-var ErrAgentPolicyCommit = errors.New("agent policy commit failed")
+var ErrAgentPolicyCommit = errors.New("reviewer policy commit failed")
 
 // UpdateAgentAutonomyPolicy writes a REGISTERED agent's autonomy policy in
 // place, without re-registering it (#2132).
@@ -113,7 +113,7 @@ func (s *Store) UpdateAgentAutonomyPolicy(ctx context.Context, name, policy stri
 		return err
 	}
 	if affected == 0 {
-		return fmt.Errorf("agent %q is not registered", name)
+		return fmt.Errorf("reviewer %q is not registered", name)
 	}
 
 	if beforeCommit != nil {
@@ -177,7 +177,7 @@ type rowQuerier interface {
 // without re-deriving the condition from message text - but do not read the
 // wrap as an exercised contract, because nothing observes it (#1787 review
 // round 3, F3, which proved it with a %w -> %v mutant the whole suite ignored).
-var ErrAgentHasActiveJobs = errors.New("agent has queued or running jobs")
+var ErrAgentHasActiveJobs = errors.New("reviewer has queued or running runs")
 
 // AgentActiveJobCount returns how many queued or running jobs reference the
 // named agent. It is the busy pre-flight for `agent restart`'s rebind refusal.

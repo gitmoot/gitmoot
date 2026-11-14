@@ -176,7 +176,7 @@ func TestEffectiveRuntimeRecordedWithoutOverrideForegroundE2E(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "what is the state of the repo?",
+		"ask", "shell-asker", "what is the state of the repo?",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--json",
@@ -204,7 +204,7 @@ func TestEffectiveRuntimeRecordedWithoutOverrideDaemonE2E(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "what is the state of the repo?",
+		"ask", "shell-asker", "what is the state of the repo?",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--background",
@@ -239,7 +239,7 @@ func TestEffectiveRuntimePersistenceFailureBlocksDaemonExecution(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "do not run after a persistence failure",
+		"ask", "shell-asker", "do not run after a persistence failure",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--background",
@@ -297,7 +297,7 @@ func TestEffectiveRuntimeNullPayloadBlocksDaemonExecution(t *testing.T) {
 
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "do not run with a null payload envelope",
+		"ask", "shell-asker", "do not run with a null payload envelope",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--background",
@@ -394,7 +394,7 @@ func TestForegroundEffectiveRuntimePersistsAtomicallyWithEnqueue(t *testing.T) {
 	}
 	var out, errBuf bytes.Buffer
 	code := Run([]string{
-		"agent", "ask", "shell-asker", "run with enqueue-time runtime evidence",
+		"ask", "shell-asker", "run with enqueue-time runtime evidence",
 		"--home", home,
 		"--repo", "owner/repo",
 		"--json",

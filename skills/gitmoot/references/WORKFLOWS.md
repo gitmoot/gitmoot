@@ -10,7 +10,7 @@ gitmoot init
 gitmoot org init
 gitmoot repo add owner/repo --path /path/to/checkout
 gitmoot org seat add <your-role> --pane <pane-id>
-gitmoot agent subscribe reviewer-1 --runtime omp --session fresh:reviewer-1 --role <reviewer-role> --repo owner/repo --capability review
+gitmoot reviewer subscribe reviewer-1 --runtime omp --session fresh:reviewer-1 --role <reviewer-role> --repo owner/repo --capability review
 gitmoot daemon start
 gitmoot doctor
 ```
@@ -102,7 +102,7 @@ printed above:
 ```sh
 gitmoot repo add acme/widget --path $HOME/repo --home $H
 gitmoot org seat add me --home $H
-gitmoot agent subscribe shell-reviewer --runtime shell --session 'echo "{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Read the whole diff: a.txt adds one line; nothing to run.\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"evidence\":\"static_only\"}}"' --role reviewer --repo acme/widget --capability review --home $H
+gitmoot reviewer subscribe shell-reviewer --runtime shell --session 'echo "{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"Read the whole diff: a.txt adds one line; nothing to run.\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"evidence\":\"static_only\"}}"' --role reviewer --repo acme/widget --capability review --home $H
 gitmoot job record --acting-role me --repo acme/widget --type implement --decision implemented --pr 1 --branch feat --summary "add a.txt" --home $H
 gitmoot review request --repo acme/widget --pr 1 --head <sha> --branch feat --reviewer shell-reviewer --role me --home $H
 gitmoot job run <job-id> --home $H
@@ -118,7 +118,7 @@ gitmoot job show <job-id> --home $H
 - The shell session runs sandboxed in a read-only checkout of the head: it can
   read the checkout (`cat a.txt` works) but not other paths (`cat
   /tmp/verdict.json` fails `Permission denied` and the job ends `failed`).
-  Print the verdict inline with `echo`. Re-running `agent subscribe` with a
+  Print the verdict inline with `echo`. Re-running `reviewer subscribe` with a
   new `--session` replaces the command.
 - Pass both `--head` and `--branch` so the request does not need to read the
   pull request from GitHub.

@@ -11,7 +11,7 @@ What gitmoot enforces today, and what a seat must not work around.
 - Do not merge with `gh pr merge`, `git push` to the base, or an admin override
   to get around a held gate. The gate is the merge authority; see section 3 of
   [SKILL.md](../SKILL.md) for what to do when it holds.
-- Do not start or stop daemons, register or remove agents, cancel other roles'
+- Do not start or stop daemons, register or remove reviewers, cancel other roles'
   jobs, or release locks unless the user asks.
 
 ## Locks

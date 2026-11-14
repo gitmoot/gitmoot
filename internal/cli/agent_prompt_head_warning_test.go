@@ -30,7 +30,7 @@ func TestDispatchPromptHeadWarningReachesOperator(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("dispatchAgentCommand exit = %d, stderr=%s", exit, stderr.String())
 	}
-	if got := strings.Count(stderr.String(), "agent ask: warning:"); got != 1 {
+	if got := strings.Count(stderr.String(), "ask: warning:"); got != 1 {
 		t.Fatalf("operator warnings = %d, want 1; stderr=%q", got, stderr.String())
 	}
 
@@ -135,7 +135,7 @@ func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
 	if ctlExit != 0 {
 		t.Fatalf("control dispatch exit = %d, stderr=%s", ctlExit, ctlErr.String())
 	}
-	if got := strings.Count(ctlErr.String(), "agent ask: warning:"); got != 1 {
+	if got := strings.Count(ctlErr.String(), "ask: warning:"); got != 1 {
 		t.Fatalf("control dispatch warnings = %d, want 1; the DISPATCH path does not scan at all, so the silence asserted below proves nothing; stderr=%q", got, ctlErr.String())
 	}
 	controlEvents, err := store.ListJobEvents(context.Background(), control.JobID)
@@ -152,7 +152,7 @@ func TestDispatchEmitsNoWarningWhenThePromptAgreesWithTheHead(t *testing.T) {
 		t.Fatalf("control dispatch durable events = %d, want 1; the durable emit is not reached from this path", controlDurable)
 	}
 
-	if got := strings.Count(stderr.String(), "agent ask: warning:"); got != 0 {
+	if got := strings.Count(stderr.String(), "ask: warning:"); got != 0 {
 		t.Fatalf("operator warnings = %d, want 0: the prompt AGREES with the dispatch head; stderr=%q", got, stderr.String())
 	}
 	events, err := store.ListJobEvents(context.Background(), output.JobID)

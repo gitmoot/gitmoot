@@ -133,7 +133,7 @@ func testSupersedeReReviewsSettledBlockingReview(t *testing.T, part string) {
 
 	// One winner: a second superseder naming the same old job finds the claim moved.
 	var out, errOut strings.Builder
-	if code := runReview(append([]string{"request"}, append(append([]string{}, base...), "--supersede", first.JobID, "--reason", "again")...), &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "held by job "+second.JobID) {
+	if code := runReview(append([]string{"request"}, append(append([]string{}, base...), "--supersede", first.JobID, "--reason", "again")...), &out, &errOut); code == 0 || !strings.Contains(errOut.String(), "held by review "+second.JobID) {
 		t.Fatalf("competing supersede: exit %d stderr %q, want refusal naming the new holder", code, errOut.String())
 	}
 }
@@ -175,7 +175,7 @@ func TestReviewRequestSupersedeRefusesOutsideItsContract(t *testing.T) {
 	}
 	settlePartReview(t, store, blocked.JobID, string(workflow.JobBlocked), "blocked")
 	// A different part's job, a different reviewer, and missing flags are all refused.
-	refused(append(part("clean"), "--supersede", blocked.JobID, "--reason", "r"), "is held by job "+approved.JobID)
+	refused(append(part("clean"), "--supersede", blocked.JobID, "--reason", "r"), "is held by review "+approved.JobID)
 	other := append(part("blocked"), "--supersede", blocked.JobID, "--reason", "r")
 	other[len(other)-5] = "other-reviewer" // the value after --reviewer
 	refused(other, "differs from opus-reviewer")

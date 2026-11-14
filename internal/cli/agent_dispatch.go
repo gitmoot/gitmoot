@@ -487,10 +487,10 @@ const (
 var promptCommitTokenRE = regexp.MustCompile(`\b[0-9a-fA-F]{7,64}\b`)
 
 type localAgentJobOutput struct {
-	JobID                string                `json:"job_id"`
+	JobID                string                `json:"run_id"`
 	State                string                `json:"state"`
 	Repo                 string                `json:"repo"`
-	Agent                string                `json:"agent"`
+	Agent                string                `json:"reviewer"`
 	Action               string                `json:"action"`
 	SelectedAction       string                `json:"selected_action,omitempty"`
 	SelectedActionReason string                `json:"selected_action_reason,omitempty"`
@@ -1247,7 +1247,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			Message: message,
 		})
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_lock_wait", Message: message})
-		return localAgentJobOutput{}, fmt.Errorf("runtime session %s is busy; queued job %s was not run", lockKey, job.ID)
+		return localAgentJobOutput{}, fmt.Errorf("runtime session %s is busy; queued run %s was not run", lockKey, job.ID)
 	}
 	defer func() {
 		_ = releaseLock(context.Background())
@@ -1611,7 +1611,7 @@ func isHexString(value string) bool {
 
 func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
 	if request.PullRequest <= 0 {
-		return localAgentDispatchRequest{}, errors.New("agent review requires --pr number")
+		return localAgentDispatchRequest{}, errors.New("review requires --pr number")
 	}
 	if strings.TrimSpace(request.Branch) == "" || strings.TrimSpace(request.HeadSHA) == "" {
 		checkout := record.CheckoutPath
@@ -1650,7 +1650,7 @@ func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, rec
 
 func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
 	if strings.TrimSpace(request.HeadSHA) == "" {
-		return localAgentDispatchRequest{}, errors.New("agent review requires a pull request head SHA")
+		return localAgentDispatchRequest{}, errors.New("review requires a pull request head SHA")
 	}
 	if strings.TrimSpace(request.Branch) != "" {
 		if task, err := store.GetTaskByRepoBranch(ctx, repo.FullName(), request.Branch); err == nil {
@@ -1764,13 +1764,13 @@ func liveReviewTaskSuccessor(ctx context.Context, store *db.Store, disposedID st
 }
 
 func disposedReviewTaskError(task db.Task) error {
-	return fmt.Errorf("task %s is %s; create a successor task with `gitmoot task successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
+	return fmt.Errorf("pr %s is %s; create a successor with `gitmoot pr successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
 }
 
 func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, name string) (db.Agent, error) {
 	agent, err := store.GetAgent(ctx, name)
 	if errors.Is(err, sql.ErrNoRows) {
-		return db.Agent{}, fmt.Errorf("agent %q not found", name)
+		return db.Agent{}, fmt.Errorf("reviewer %q not found", name)
 	}
 	return agent, err
 }
@@ -1830,10 +1830,10 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 		return err
 	}
 	if !allowed {
-		return fmt.Errorf("agent %q is not allowed on %q", agent.Name, repo)
+		return fmt.Errorf("reviewer %q is not allowed on %q", agent.Name, repo)
 	}
 	if !agentHasCapability(agent.Capabilities, action) {
-		return fmt.Errorf("agent %q lacks %s capability", agent.Name, action)
+		return fmt.Errorf("reviewer %q lacks %s capability", agent.Name, action)
 	}
 	return nil
 }
@@ -1948,10 +1948,10 @@ func reviewReadOnlyWorktreeCapacity(home string) error {
 }
 
 func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
-	writeLine(stdout, "job: %s", output.JobID)
+	writeLine(stdout, "run: %s", output.JobID)
 	writeLine(stdout, "state: %s", output.State)
 	writeLine(stdout, "repo: %s", output.Repo)
-	writeLine(stdout, "agent: %s", output.Agent)
+	writeLine(stdout, "reviewer: %s", output.Agent)
 	writeLine(stdout, "action: %s", output.Action)
 	if output.AdvanceError != "" {
 		writeLine(stdout, "advance_error: %s", output.AdvanceError)

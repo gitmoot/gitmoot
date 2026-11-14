@@ -25,7 +25,7 @@ type JobResultComment struct {
 
 func RenderJobResultComment(comment JobResultComment) string {
 	var builder strings.Builder
-	builder.WriteString("> Agent: `")
+	builder.WriteString("> Reviewer: `")
 	builder.WriteString(markdownInline(comment.AgentName))
 	builder.WriteString("`\n")
 	builder.WriteString("> Runtime: `")

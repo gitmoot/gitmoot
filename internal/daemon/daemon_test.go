@@ -1416,7 +1416,7 @@ func TestPollOnceAcknowledgesUnknownAgentWithoutJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PollOnce returned error: %v", err)
 	}
-	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "could not find subscribed agent `missing`") {
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "could not find subscribed reviewer `missing`") {
 		t.Fatalf("posted acknowledgements = %+v", client.posted)
 	}
 	if _, err := store.GetJob(ctx, jobID(repo, 4, 303, 0, "missing", "review")); err == nil {
@@ -1590,7 +1590,7 @@ func TestPollOnceReportsHelpCommand(t *testing.T) {
 	if len(client.posted) != 1 {
 		t.Fatalf("posted = %+v, want one help comment", client.posted)
 	}
-	for _, want := range []string{"Gitmoot help for `gitmoot/gitmoot` PR #10", "`audit`: review,ask", "/gitmoot <agent> <review|ask>"} {
+	for _, want := range []string{"Gitmoot help for `gitmoot/gitmoot` PR #10", "`audit`: review,ask", "/gitmoot <reviewer> <review|ask>"} {
 		if !strings.Contains(client.posted[0].body, want) {
 			t.Fatalf("help output missing %q:\n%s", want, client.posted[0].body)
 		}

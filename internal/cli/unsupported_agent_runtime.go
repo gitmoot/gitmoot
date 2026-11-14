@@ -59,10 +59,10 @@ func unsupportedAgentRuntimeDoctorCheck(paths config.Paths) (doctor.Check, bool)
 
 func buildUnsupportedAgentRuntimeCheck(messages []string) doctor.Check {
 	if len(messages) == 0 {
-		return doctor.Check{Name: "agent runtimes", OK: true, Detail: "every agent runs on a supported runtime (omp, shell)"}
+		return doctor.Check{Name: "reviewer runtimes", OK: true, Detail: "every reviewer runs on a supported runtime (omp, shell)"}
 	}
 	return doctor.Check{
-		Name:   "agent runtimes",
+		Name:   "reviewer runtimes",
 		Detail: fmt.Sprintf("%d unsupported: %s", len(messages), strings.Join(messages, "; ")),
 	}
 }

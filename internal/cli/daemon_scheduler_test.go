@@ -488,7 +488,7 @@ func TestRunQueuedJobsPostsAttributedResultComment(t *testing.T) {
 	}
 	body := comments.posted[0].body
 	for _, want := range []string{
-		"> Agent: `audit`",
+		"> Reviewer: `audit`",
 		"> Runtime: `shell`",
 		"> Job: `job-comment`",
 		"**Decision:** `approved`",
@@ -592,7 +592,7 @@ func TestRunQueuedJobsPostsMalformedOutputDiagnosticComment(t *testing.T) {
 		t.Fatalf("posted comments = %+v, want 1", comments.posted)
 	}
 	body := comments.posted[0].body
-	if !strings.Contains(body, "> Agent: `audit`") || !strings.Contains(body, "**Decision:** `failed`") || !strings.Contains(body, "**Diagnostics:**") {
+	if !strings.Contains(body, "> Reviewer: `audit`") || !strings.Contains(body, "**Decision:** `failed`") || !strings.Contains(body, "**Diagnostics:**") {
 		t.Fatalf("comment body missing failure diagnostics:\n%s", body)
 	}
 	if strings.Contains(body, "not valid json") || strings.Contains(body, "ghp_abcdefghijklmnopqrstuvwxyz123456") {
