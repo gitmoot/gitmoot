@@ -25,11 +25,6 @@ var jobPayloadKnownJSONFields = func() map[string]struct{} {
 			fields[name] = struct{}{}
 		}
 	}
-	// unmarshalPayload recognizes these legacy aliases and rewrites them to the
-	// canonical template_* fields. They are known inputs, not future members.
-	for _, name := range []string{"preset_id", "preset_resolved_commit", "preset_content"} {
-		fields[name] = struct{}{}
-	}
 	return fields
 }()
 
