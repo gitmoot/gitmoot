@@ -39,8 +39,8 @@ auto_settle_after = "24h"
 	if err := runWorkflowAutoSettleOnce(ctx, paths, store, now, &stdout); err != nil {
 		t.Fatalf("runWorkflowAutoSettleOnce: %v", err)
 	}
-	if got := stdout.String(); !strings.Contains(got, "auto-settled workflow release/merged") ||
-		strings.Contains(got, "auto-settled workflow release/open") {
+	if got := stdout.String(); !strings.Contains(got, "auto-settled campaign release/merged") ||
+		strings.Contains(got, "auto-settled campaign release/open") {
 		t.Fatalf("stdout = %q", got)
 	}
 	meta, err := store.GetWorkflowMeta(ctx, "release/merged")

@@ -19,7 +19,7 @@ func runOrgEscalateResolve(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory")
 	roleFlag := fs.String("role", "", "acting requester or addressed coordinator")
 	answer := fs.String("answer", "", "decision or answer to record in the thread")
-	answerID := fs.Int64("note", 0, "existing answer note in the same workflow")
+	answerID := fs.Int64("note", 0, "existing answer note in the same campaign")
 	jsonOutput := fs.Bool("json", false, "JSON output")
 	if helpRequested(args) {
 		printMessageActionUsage(stdout, "resolve")

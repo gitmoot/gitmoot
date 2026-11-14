@@ -90,7 +90,7 @@ func runRepoAdd(args []string, stdout, stderr io.Writer) int {
 	path := fs.String("path", ".", "local checkout path")
 	poll := fs.Duration("poll", 30*time.Second, "poll interval")
 	force := fs.Bool("force", false, "allow a linked worktree to replace the registered checkout")
-	agentsMD := fs.Bool("agents-md", false, "append the Gitmoot workflow-label discipline to AGENTS.md")
+	agentsMD := fs.Bool("agents-md", false, "append the Gitmoot campaign-label discipline to AGENTS.md")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -191,12 +191,12 @@ const gitmootDisciplineMarker = "<!-- gitmoot:discipline -->"
 const gitmootDisciplineSection = `<!-- gitmoot:discipline -->
 ## Gitmoot work discipline
 
-- Label every agent dispatch: pass ` + "`--workflow <namespace>/<campaign>`" + ` on every
-  ` + "`gitmoot agent ask/run/review/implement`" + ` and ` + "`gitmoot orchestrate`" + ` call.
-- Journal milestones: ` + "`gitmoot workflow note <label> \"...\" --author <you>`" + ` at
+- Label every run: pass ` + "`--campaign <namespace>/<campaign>`" + ` on every
+  ` + "`gitmoot ask`" + ` and ` + "`gitmoot review request`" + ` call.
+- Journal milestones: ` + "`gitmoot note add <campaign> \"...\" --author <you>`" + ` at
   kickoff, hand-offs, PR-open, and done — the journal is the only cross-session
   memory and the operator's supervision surface.
-- Check ` + "`gitmoot workflow list`" + ` / the dashboard Workflows page before dispatching:
+- Check ` + "`gitmoot campaign list`" + ` / the dashboard Campaigns page before dispatching:
   someone may already be on it.
 `
 

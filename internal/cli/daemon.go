@@ -43,5 +43,5 @@ func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot daemon logs")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "  --repo owner/repo SCOPES the daemon to a SINGLE repo: it polls only that repo's PRs and")
-	fmt.Fprintln(w, "  claims only that repo's queued jobs. Omit --repo to supervise ALL enabled registered repos.")
+	fmt.Fprintln(w, "  claims only that repo's queued runs. Omit --repo to supervise ALL enabled registered repos.")
 }

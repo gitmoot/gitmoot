@@ -12,6 +12,10 @@ disagrees, trust its live `--help`.
 
 - [gitmoot](#gitmoot)
 - [gitmoot ask](#gitmoot-ask)
+- [gitmoot campaign](#gitmoot-campaign)
+- [gitmoot campaign list](#gitmoot-campaign-list)
+- [gitmoot campaign register](#gitmoot-campaign-register)
+- [gitmoot campaign show](#gitmoot-campaign-show)
 - [gitmoot config](#gitmoot-config)
 - [gitmoot config path](#gitmoot-config-path)
 - [gitmoot config show](#gitmoot-config-show)
@@ -39,6 +43,8 @@ disagrees, trust its live `--help`.
 - [gitmoot message resolve](#gitmoot-message-resolve)
 - [gitmoot message send](#gitmoot-message-send)
 - [gitmoot message show](#gitmoot-message-show)
+- [gitmoot note](#gitmoot-note)
+- [gitmoot note show](#gitmoot-note-show)
 - [gitmoot org](#gitmoot-org)
 - [gitmoot org await](#gitmoot-org-await)
 - [gitmoot org await list](#gitmoot-org-await-list)
@@ -128,11 +134,6 @@ disagrees, trust its live `--help`.
 - [gitmoot status](#gitmoot-status)
 - [gitmoot update](#gitmoot-update)
 - [gitmoot version](#gitmoot-version)
-- [gitmoot workflow](#gitmoot-workflow)
-- [gitmoot workflow list](#gitmoot-workflow-list)
-- [gitmoot workflow register](#gitmoot-workflow-register)
-- [gitmoot workflow show](#gitmoot-workflow-show)
-- [gitmoot workflow show-note](#gitmoot-workflow-show-note)
 
 ## gitmoot
 
@@ -164,7 +165,8 @@ Commands:
   pr         inspect pull requests and their review state
   run        inspect and recover runs (reviews, asks, implementation records)
   findings   report the review findings ledger per repository
-  workflow   inspect external-coordinator workflow groups and notes
+  campaign   inspect campaigns: sets of runs and notes that belong together
+  note       add and read campaign notes
   dashboard  show a snapshot of local Gitmoot state
 ```
 
@@ -181,6 +183,49 @@ Usage:
     override runtime's default model (the reviewer's configured default model is never applied to another runtime).
     Effort rule: --effort with --runtime is interpreted for the OVERRIDE runtime; without --effort the run uses the
     override runtime's default effort (the reviewer's configured default effort is never applied to another runtime).
+```
+
+## gitmoot campaign
+
+```text
+Campaigns: sets of runs and notes that belong together.
+
+Usage:
+  gitmoot campaign list [--json]
+  gitmoot campaign show <label> [--json] [--limit N]
+  gitmoot campaign describe <label> "<text>" [--json]
+  gitmoot campaign register <label> "<description>" [--json] [--home DIR]
+  gitmoot campaign close <label> [--reason R] [--json]
+
+Notes on a campaign: see gitmoot note --help.
+```
+
+## gitmoot campaign list
+
+```text
+Usage of campaign list:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print campaign summaries as JSON
+```
+
+## gitmoot campaign register
+
+```text
+usage: campaign register LABEL DESCRIPTION [--home DIR] [--json]
+```
+
+## gitmoot campaign show
+
+```text
+Usage: gitmoot campaign show <label> [--json] [--limit N] [--home DIR]
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the campaign timeline as JSON
+  -limit int
+    	maximum merged timeline entries (0 means all) (default 100)
 ```
 
 ## gitmoot config
@@ -220,7 +265,7 @@ Usage:
   gitmoot daemon logs
 
   --repo owner/repo SCOPES the daemon to a SINGLE repo: it polls only that repo's PRs and
-  claims only that repo's queued jobs. Omit --repo to supervise ALL enabled registered repos.
+  claims only that repo's queued runs. Omit --repo to supervise ALL enabled registered repos.
 ```
 
 ## gitmoot daemon drain
@@ -232,7 +277,7 @@ Usage of daemon drain:
   -home string
     	home directory to use instead of the current user's home
   -timeout duration
-    	how long to wait for in-flight jobs before reporting what remains (default 15m0s)
+    	how long to wait for in-flight runs before reporting what remains (default 15m0s)
 ```
 
 ## gitmoot daemon logs
@@ -250,19 +295,19 @@ Usage of daemon restart:
   -home string
     	home directory to use instead of the current user's home
   -parallel int
-    	run jobs in parallel: sets --workers N and --scheduler pool together (#444)
+    	process runs in parallel: sets --workers N and --scheduler pool together (#444)
   -poll duration
     	poll interval (default 30s)
   -repo string
-    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos
+    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued runs). Omit to supervise ALL enabled registered repos
   -root string
     	alias for --session
   -scheduler string
-    	queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
+    	queued-run scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
   -session string
-    	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
+    	scope the daemon worker to one run id (and runs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<reviewer> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to runs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -276,21 +321,21 @@ Usage of daemon run:
   -home string
     	home directory to use instead of the current user's home
   -parallel int
-    	run jobs in parallel: sets --workers N and --scheduler pool together (#444)
+    	process runs in parallel: sets --workers N and --scheduler pool together (#444)
   -poll duration
     	poll interval (default 30s)
   -pprof-addr string
     	off by default; if set (use a loopback addr, e.g. 127.0.0.1:6060) serve net/http/pprof on it for live diagnostics (#1111)
   -repo string
-    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos
+    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued runs). Omit to supervise ALL enabled registered repos
   -root string
     	alias for --session
   -scheduler string
-    	queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
+    	queued-run scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
   -session string
-    	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
+    	scope the daemon worker to one run id (and runs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<reviewer> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to runs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -302,19 +347,19 @@ Usage of daemon start:
   -home string
     	home directory to use instead of the current user's home
   -parallel int
-    	run jobs in parallel: sets --workers N and --scheduler pool together (#444)
+    	process runs in parallel: sets --workers N and --scheduler pool together (#444)
   -poll duration
     	poll interval (default 30s)
   -repo string
-    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued jobs). Omit to supervise ALL enabled registered repos
+    	GitHub repository as owner/repo: scopes the daemon to a SINGLE repo (polls only that repo's PRs; claims only that repo's queued runs). Omit to supervise ALL enabled registered repos
   -root string
     	alias for --session
   -scheduler string
-    	queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
+    	queued-run scheduler: barrier (default) or pool (#394 opt-in continuous worker pool) (default "barrier")
   -session string
-    	scope the daemon worker to one job id (and jobs whose payload names it as root_job_id)
+    	scope the daemon worker to one run id (and runs whose payload names it as root_job_id)
   -watch-issues
-    	poll open issues and route @<reviewer> ask comments to jobs (#389)
+    	poll open issues and route @<reviewer> ask comments to runs (#389)
   -workers int
     	worker count (default 1)
 ```
@@ -425,17 +470,17 @@ Usage of key path:
 
 ```text
 Usage:
-  gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]
+  gitmoot message send ROLE "TEXT" [--campaign LABEL] [--role ROLE] [--json] [--home DIR]
   gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
   gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
   gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]
-  gitmoot message escalate [--workflow LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"
+  gitmoot message escalate [--campaign LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"
   gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json] [--home DIR]
   gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop --runtime claude|codex
   gitmoot message directive send|ack|done|cancel --help
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -448,7 +493,7 @@ Escalations track decisions; directives retain issuer and recipient authority ch
 
 ```text
 Usage:
-  gitmoot message directive send --to ROLE [--workflow LABEL] [--role ROLE] [--json] [--home DIR] (--stdin | -F FILE | TEXT)
+  gitmoot message directive send --to ROLE [--campaign LABEL] [--role ROLE] [--json] [--home DIR] (--stdin | -F FILE | TEXT)
   gitmoot message directive ack ID [--role ROLE] [--json] [--home DIR]
   gitmoot message directive cancel ID [--role ROLE] [--json] [--home DIR]
   gitmoot message directive done ID [--role ROLE] [--json] [--home DIR]
@@ -465,10 +510,10 @@ single flag-like word, such as -x, is refused; put -- before it to send it anywa
 
 ```text
 Usage:
-  gitmoot message escalate [--workflow LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"
+  gitmoot message escalate [--campaign LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -484,7 +529,7 @@ Usage:
   gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -512,7 +557,7 @@ Usage:
   gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -528,7 +573,7 @@ Usage:
   gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json] [--home DIR]
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -541,10 +586,10 @@ Escalations track decisions; directives retain issuer and recipient authority ch
 
 ```text
 Usage:
-  gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]
+  gitmoot message send ROLE "TEXT" [--campaign LABEL] [--role ROLE] [--json] [--home DIR]
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -560,13 +605,33 @@ Usage:
   gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]
 
 Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
 --role is an operator attribution override, not an authentication credential.
 Saved mail, notification submission, reading and task completion are separate facts.
 Escalations track decisions; directives retain issuer and recipient authority checks.
+```
+
+## gitmoot note
+
+```text
+Campaign notes: the durable journal of directives, decisions and receipts.
+
+Usage:
+  gitmoot note add <campaign> "<body>" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]
+  gitmoot note show <id> [--json]
+```
+
+## gitmoot note show
+
+```text
+Usage of note show:
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the stored note as JSON
 ```
 
 ## gitmoot org
@@ -958,7 +1023,7 @@ owner/repo may be given before or after the flags.
 ```text
 Usage of repo add:
   -agents-md
-    	append the Gitmoot workflow-label discipline to AGENTS.md
+    	append the Gitmoot campaign-label discipline to AGENTS.md
   -force
     	allow a linked worktree to replace the registered checkout
   -home string
@@ -1020,7 +1085,7 @@ Usage:
   gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- "review instructions"]
   gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]
   gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]
-  gitmoot review list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot review list [--repo owner/repo] [--state state] [--campaign label] [--json]
   gitmoot review show <id> [--json]
   gitmoot review watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
   gitmoot review cancel <id>
@@ -1037,7 +1102,7 @@ another reviewer. No verdict ever triggers a model change.
 
 ```text
 Usage:
-  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]
   gitmoot run show <id> [--json]
   gitmoot run events <id>
   gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
@@ -1051,7 +1116,7 @@ Usage:
   gitmoot run gates clear <id> --need "<text>"|--all
   gitmoot run cancel <id>
   gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
-  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]
+  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--campaign label] [--json]
   gitmoot run close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
   gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
 ```
@@ -1074,6 +1139,8 @@ Usage of review level:
 
 ```text
 Usage of review list:
+  -campaign string
+    	campaign label
   -home string
     	home directory to use instead of the current user's home
   -json
@@ -1084,8 +1151,6 @@ Usage of review list:
     	repo scope as owner/repo
   -state string
     	run state filter
-  -workflow string
-    	external-coordinator workflow label
 ```
 
 ## gitmoot review request
@@ -1404,7 +1469,7 @@ Usage of reviewer type show:
 
 ```text
 Usage:
-  gitmoot run list [--repo owner/repo] [--state state] [--workflow label] [--json]
+  gitmoot run list [--repo owner/repo] [--state state] [--campaign label] [--json]
   gitmoot run show <id> [--json]
   gitmoot run events <id>
   gitmoot run watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]
@@ -1418,7 +1483,7 @@ Usage:
   gitmoot run gates clear <id> --need "<text>"|--all
   gitmoot run cancel <id>
   gitmoot run cancel --state blocked [--older-than 168h|7d] [--repo owner/repo] [--reviewer name] [--yes]
-  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--workflow label] [--json]
+  gitmoot run open --implementer name --repo owner/repo --type ask|review|implement [--title ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--campaign label] [--json]
   gitmoot run close <id> --decision approved|changes_requested|blocked|implemented|failed|skipped [--summary ...] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
   gitmoot run record (--implementer name | --acting-role role) --repo owner/repo --type ask|review|implement --decision ... [--title ...] [--summary ...] [--pr-id id] [--parent-run id] [--pr n] [--head-sha sha] [--branch name] [--model name] [--input-tokens n] [--output-tokens n] [--json]
 ```
@@ -1529,6 +1594,8 @@ Usage:
 
 ```text
 Usage of run list:
+  -campaign string
+    	campaign label
   -home string
     	home directory to use instead of the current user's home
   -json
@@ -1539,14 +1606,14 @@ Usage of run list:
     	repo scope as owner/repo
   -state string
     	run state filter
-  -workflow string
-    	external-coordinator workflow label
 ```
 
 ## gitmoot run open
 
 ```text
 Usage of run open:
+  -campaign string
+    	campaign label
   -head-sha string
     	optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the run payload and no merge policy reads it (#1990)
   -home string
@@ -1567,8 +1634,6 @@ Usage of run open:
     	optional human title for the run
   -type string
     	run type: ask|review|implement
-  -workflow string
-    	external-coordinator workflow label
 ```
 
 ## gitmoot run record
@@ -1690,9 +1755,9 @@ list shows the resolved metadata for each built-in runtime: capabilities, defaul
 model/effort, known models, and where token usage is read from. Values come from the
 compiled built-in defaults, overlaid with any [runtimes.<name>] config overrides.
 
-prune removes staged runtime copies under <home>/runtimes that no job staged for
+prune removes staged runtime copies under <home>/runtimes that no run staged for
 --min-idle and no live process uses. The daemon runs it daily with the default.
-A removed copy is staged again the next time a job needs it.
+A removed copy is staged again the next time a run needs it.
 ```
 
 ## gitmoot runtime list
@@ -1716,7 +1781,7 @@ Usage of runtime prune:
   -json
     	print the report as JSON
   -min-idle duration
-    	remove only copies no job staged for at least this long (default 168h0m0s)
+    	remove only copies no run staged for at least this long (default 168h0m0s)
 ```
 
 ## gitmoot sandbox
@@ -1786,57 +1851,4 @@ Usage of version:
     	home directory to use instead of the current user's home
   -json
     	print version information as JSON
-```
-
-## gitmoot workflow
-
-```text
-External-coordinator workflow groups and journal.
-
-Usage:
-  gitmoot workflow list [--json]
-  gitmoot workflow show-note <id> [--json]
-  gitmoot workflow show <label> [--json] [--limit N]
-  gitmoot workflow describe <label> "<text>" [--json]
-  gitmoot workflow register <label> "<description>" [--json] [--home DIR]
-  gitmoot workflow note <label> "<body>" [--author A] [--pane P] [--session ID] [--workdir PATH] [--no-auto] [--summary DESCRIPTION] [--status STATUS] [--repo owner/repo]
-  gitmoot workflow close <label> [--reason R] [--json]
-```
-
-## gitmoot workflow list
-
-```text
-Usage of workflow list:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print workflow summaries as JSON
-```
-
-## gitmoot workflow register
-
-```text
-usage: workflow register LABEL DESCRIPTION [--home DIR] [--json]
-```
-
-## gitmoot workflow show
-
-```text
-Usage: gitmoot workflow show <label> [--json] [--limit N] [--home DIR]
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the workflow timeline as JSON
-  -limit int
-    	maximum merged timeline entries (0 means all) (default 100)
-```
-
-## gitmoot workflow show-note
-
-```text
-Usage of workflow show-note:
-  -home string
-    	home directory to use instead of the current user's home
-  -json
-    	print the stored note as JSON
 ```

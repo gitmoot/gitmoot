@@ -1459,7 +1459,7 @@ type orgRecycleOutput struct {
 	Pane       string `json:"pane"`
 	Kind       string `json:"kind"`
 	AgentName  string `json:"agent_name"`
-	WorkflowID string `json:"workflow_id"`
+	WorkflowID string `json:"campaign"`
 }
 
 const orgRecycleSnapshotTimeout = 10 * time.Second
@@ -1535,7 +1535,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 
 	workflowID := "org/" + role.Name
 	if err := workflow.ValidateWorkflowID(workflowID); err != nil {
-		fmt.Fprintf(stderr, "org recycle: role lifecycle workflow: %v\n", err)
+		fmt.Fprintf(stderr, "org recycle: role lifecycle campaign: %v\n", err)
 		return 1
 	}
 	noteBody := workflow.FormatOrgHandoffNote(role.Name, handoff)
@@ -1550,7 +1550,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 
 	provider := newOrgProvider([]config.OrgRole{role})
 	if provider == nil {
-		fmt.Fprintf(stderr, "org recycle: organization provider is not configured (handoff journaled in workflow %s)\n", workflowID)
+		fmt.Fprintf(stderr, "org recycle: organization provider is not configured (handoff journaled in campaign %s)\n", workflowID)
 		return 1
 	}
 	snapshotCtx, cancelSnapshot := context.WithTimeout(ctx, orgRecycleSnapshotTimeout)
@@ -1570,7 +1570,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(&boot, "\nhandoff: %s\n", handoff)
 	req := org.RecycleRequest{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, Model: role.Model, BootPrompt: boot.String()}
 	if err := provider.Recycle(ctx, req); err != nil {
-		fmt.Fprintf(stderr, "org recycle: %v (handoff journaled in workflow %s)\n", err, workflowID)
+		fmt.Fprintf(stderr, "org recycle: %v (handoff journaled in campaign %s)\n", err, workflowID)
 		return 1
 	}
 	out := orgRecycleOutput{Role: role.Name, Pane: pane, Kind: kind, AgentName: role.Name, WorkflowID: workflowID}
@@ -1581,7 +1581,7 @@ func runOrgRecycle(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	fmt.Fprintf(stdout, "recycled org role %s as %s in pane %s; handoff journaled in workflow %s\n", role.Name, kind, pane, workflowID)
+	fmt.Fprintf(stdout, "recycled org role %s as %s in pane %s; handoff journaled in campaign %s\n", role.Name, kind, pane, workflowID)
 	return 0
 }
 
@@ -1784,7 +1784,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	toFlag := fs.String("to", "", "ancestor or descendant role to ask")
-	workflowID := fs.String("workflow", "", "workflow label for the organization question note")
+	workflowID := fs.String("campaign", "", "campaign label for the organization question note")
 	fromFlag := fs.String("role", "", "acting organization role")
 	repo := fs.String("repo", "", "repository binding for the escalation note")
 	jsonOutput := fs.Bool("json", false, "print the escalation as JSON")
@@ -1792,7 +1792,7 @@ func runOrgEscalate(args []string, stdout, stderr io.Writer) int {
 		printMessageActionUsage(stdout, "escalate")
 		return 0
 	}
-	question, flagArgs, ok := orgAddressedTextAndFlags(args)
+	question, flagArgs, ok := orgAddressedTextAndFlags(args, stderr)
 	if !ok {
 		fmt.Fprintln(stderr, "message escalate requires exactly one question")
 		return 2
@@ -1960,9 +1960,13 @@ func orgEscalateResolveIDAndFlags(args []string) (string, []string, bool) {
 	return strings.TrimSpace(args[idIndex]), flagArgs, strings.TrimSpace(args[idIndex]) != ""
 }
 
-func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
-	needsValue := map[string]bool{"--home": true, "--to": true, "--workflow": true, "--role": true, "--repo": true}
+func orgAddressedTextAndFlags(args []string, stderr io.Writer) (string, []string, bool) {
+	needsValue := map[string]bool{"--home": true, "--to": true, "--campaign": true, "--role": true, "--repo": true}
+	args = append([]string(nil), args...)
 	for i := 0; i < len(args); i++ {
+		if i != len(args)-1 && strings.HasPrefix(args[i], "-") {
+			args[i] = renameFlagToken(args[i], stderr, FlagAlias{Old: "workflow", New: "campaign"})
+		}
 		arg := args[i]
 		if needsValue[arg] {
 			i++
@@ -1971,7 +1975,7 @@ func orgAddressedTextAndFlags(args []string) (string, []string, bool) {
 			}
 			continue
 		}
-		if arg == "--json" || strings.HasPrefix(arg, "--json=") || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--to=") || strings.HasPrefix(arg, "--workflow=") || strings.HasPrefix(arg, "--role=") || strings.HasPrefix(arg, "--repo=") {
+		if arg == "--json" || strings.HasPrefix(arg, "--json=") || strings.HasPrefix(arg, "--home=") || strings.HasPrefix(arg, "--to=") || strings.HasPrefix(arg, "--campaign=") || strings.HasPrefix(arg, "--role=") || strings.HasPrefix(arg, "--repo=") {
 			continue
 		}
 		if i != len(args)-1 {

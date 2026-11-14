@@ -34,7 +34,7 @@ func TestMailboxRequireWorkflowStrictRejectsBeforeCreation(t *testing.T) {
 	store := openTestStore(t)
 	mb := Mailbox{store: store, RequireWorkflowPolicy: func(string) RequireWorkflowPolicy { return RequireWorkflowPolicy{Enabled: true, Mode: "strict"} }}
 	_, err := mb.Enqueue(ctx, JobRequest{ID: "strict", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local"})
-	if err == nil || !strings.Contains(err.Error(), "pass --workflow") {
+	if err == nil || !strings.Contains(err.Error(), "pass --campaign") {
 		t.Fatalf("err=%v", err)
 	}
 	if _, err := store.GetJob(ctx, "strict"); err == nil {
@@ -71,7 +71,7 @@ func TestMailboxRequireWorkflowConfigCompatibility(t *testing.T) {
 			}}
 			job, err := mb.Enqueue(ctx, JobRequest{ID: "compat", Agent: "a", Action: "ask", Repo: "owner/repo", Sender: "local"})
 			if test.wantStrict {
-				if err == nil || !strings.Contains(err.Error(), "pass --workflow") {
+				if err == nil || !strings.Contains(err.Error(), "pass --campaign") {
 					t.Fatalf("Enqueue() job=%+v err=%v, want strict rejection", job, err)
 				}
 				return
