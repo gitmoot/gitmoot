@@ -904,11 +904,11 @@ gitmoot dashboard --all
 gitmoot dashboard --web [--addr 127.0.0.1:8080]
 ```
 
-`gitmoot dashboard --web` serves the **read-only web dashboard** (a live
-job graph with run summaries and prompt/output inspection)
-until interrupted; `--addr` sets the listen address (default
-`127.0.0.1:8080`). Use it when the user wants a browser view of a running
-job tree. The Overview and Org pages also show the fleet activity strip:
+`gitmoot dashboard --web` serves the **read-only web dashboard** (Overview,
+Tasks, Workflows, Jobs, Agents, Org, Comms, Health, Config, Charts and the
+Galaxy graph, with prompt/output inspection per job) until interrupted; `--addr`
+sets the listen address (default `127.0.0.1:8080`). Use it when the user wants a
+browser view of a running orchestration. The Overview and Org pages also show the fleet activity strip:
 live Herdr sessions are counted separately from engine jobs and unresolved
 escalations. Org tree nodes retain the hierarchy while adding session status,
 terminal task title, turn age, and last-completed-turn detail. No session,

@@ -449,7 +449,7 @@ func (d *webDataSource) tasksJSON(ctx context.Context) ([]byte, error) {
 		tasks = []dashboard.TaskSummary{}
 	}
 	sort.SliceStable(tasks, func(i, j int) bool {
-		if ir, jr := dashboardWireTaskStateRank(tasks[i].State), dashboardWireTaskStateRank(tasks[j].State); ir != jr {
+		if ir, jr := dashboardTaskStateRank(tasks[i].State), dashboardTaskStateRank(tasks[j].State); ir != jr {
 			return ir < jr
 		}
 		if tasks[i].UpdatedAt != tasks[j].UpdatedAt {
@@ -458,19 +458,6 @@ func (d *webDataSource) tasksJSON(ctx context.Context) ([]byte, error) {
 		return tasks[i].ID < tasks[j].ID
 	})
 	return marshalDashboardJSON(tasks)
-}
-
-func dashboardWireTaskStateRank(state string) int {
-	switch state {
-	case "pr_open":
-		return 0
-	case "blocked":
-		return 1
-	case "merged":
-		return 2
-	default:
-		return 3
-	}
 }
 
 func (d *webDataSource) handleWorkflows(w http.ResponseWriter, r *http.Request) {

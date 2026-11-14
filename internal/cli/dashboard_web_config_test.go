@@ -123,7 +123,7 @@ private_token = "` + secret + `"
 		t.Fatalf("agents = %+v, want one worker", snapshot.Agents)
 	}
 	agent := snapshot.Agents[0]
-	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" || agent.MaxBackground != 0 {
+	if agent.Name != "worker" || agent.Runtime != "codex" || agent.Model != "gpt-test" {
 		t.Fatalf("worker config = %+v", agent)
 	}
 	if !reflect.DeepEqual(agent.Capabilities, []string{"ask", "implement"}) || agent.AutonomyPolicy != "workspace-write" {

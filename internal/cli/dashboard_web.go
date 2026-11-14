@@ -75,10 +75,9 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 // (description/status) through the cached workflows route. Every other route
 // remains owned by the pinned dashboard module.
 //
-// #2206 removed the last two transitional routes this comment used to name: the
-// module no longer has a Brain page to feed, and no longer requires Knowledge or
-// ChatThreads on its DataSource, so gitmoot stopped answering for pages that do
-// not exist. Skills is empty since #2589 dropped the agent template tables.
+// #2206 removed the Brain, Knowledge and Chat routes, and #2593 removed the
+// single-run graph (/api/runs, /api/state, /events) and the Learning page
+// (/api/learning/skills): gitmoot does not answer for pages that do not exist.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
@@ -133,7 +132,6 @@ var dashboardNavManifest = []dashboardNavItem{
 	{Href: "/comms", Title: "Comms", Group: "FLEET"},
 	{Href: "/galaxy", Title: "Galaxy", Group: "INSIGHT"},
 	{Href: "/charts", Title: "Charts", Group: "INSIGHT"},
-	{Href: "/learning", Title: "Learning", Group: "INSIGHT"},
 	{Href: "/attention", Title: "Needs a human", Group: "SYSTEM"},
 	{Href: "/health", Title: "Health", Group: "SYSTEM"},
 	{Href: "/config", Title: "Config", Group: "SYSTEM"},
@@ -260,31 +258,25 @@ func (d *webDataSource) writeDashboardAPIJSON(w http.ResponseWriter, value any, 
 }
 
 // webDataSource implements dashboard.DataSource over a local Gitmoot home. It
-// reuses existing read paths, including buildDashboardSnapshot for the run list
-// and store APIs for job and workflow details, so it does not duplicate store
-// queries or mutate workflow state.
+// reuses the store APIs for job and workflow details, so it does not duplicate
+// store queries or mutate workflow state.
 type webDataSource struct {
 	home string
 
 	cacheOnce     sync.Once
 	responseCache *dashboardJSONCache
 
-	registryMu sync.Mutex
-	pollers    map[string]*ssePoller
-
 	fleetMu     sync.Mutex
 	fleetPoller *fleetActivityPoller
 
 	// These hooks keep the shared-poller concurrency tests fast and
 	// deterministic. Production leaves them nil/zero.
-	sseState        func(context.Context, string) (dashboard.State, error)
-	ssePollInterval time.Duration
-	fleetSnapshot   func(context.Context) (dashboardFleetActivity, error)
-	fleetInterval   time.Duration
+	fleetSnapshot func(context.Context) (dashboardFleetActivity, error)
+	fleetInterval time.Duration
 
 	// mu guards the Health() caches below (Health can be called concurrently and
 	// its resolvers run in goroutines). Everything else on the source is stateless
-	// per call; SSE pollers use registryMu and their own locks.
+	// per call; the fleet-activity poller uses fleetMu and its own locks.
 	mu sync.Mutex
 	// daemonVersionKey/daemonVersion cache the running daemon binary's reported
 	// version, keyed by (executable path, file mtime) so SEQUENTIAL 12s health
@@ -338,9 +330,6 @@ func (d *webDataSource) healthJSON(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if health.Locks == nil {
-		health.Locks = []dashboard.HealthLock{}
-	}
 	if health.ResourceLocks == nil {
 		health.ResourceLocks = []dashboard.HealthResourceLock{}
 	}
@@ -389,92 +378,6 @@ var _ dashboard.WorkflowDataSource = (*webDataSource)(nil)
 var _ dashboard.OverviewDataSource = (*webDataSource)(nil)
 var _ dashboard.TasksDataSource = (*webDataSource)(nil)
 var _ dashboard.ChangeCursorDataSource = (*webDataSource)(nil)
-
-// Runs lists every orchestration run (delegation tree) rooted at an originating
-// job, newest activity first. It reuses buildDashboardSnapshot so the run list
-// shares the one-shot dashboard's read path.
-func (d *webDataSource) Runs(ctx context.Context) ([]dashboard.RunSummary, error) {
-	paths, err := initializedPaths(d.home)
-	if err != nil {
-		return nil, err
-	}
-	snapshot, err := buildDashboardSnapshot(d.home, paths)
-	if err != nil {
-		return nil, err
-	}
-	jobs := make([]db.Job, 0, len(snapshot.jobRows))
-	for _, row := range snapshot.jobRows {
-		jobs = append(jobs, row.Job)
-	}
-	return summarizeRuns(jobs), nil
-}
-
-// State returns a snapshot of one run's delegation graph. An empty runID selects
-// the most-recent active (else most-recent) run. Nodes come from ListJobs scoped
-// to the run's tree; edges are ParentID (delegation parentage) plus Deps (a
-// child's declared delegation deps resolved to its sibling job IDs).
-func (d *webDataSource) State(ctx context.Context, runID string) (dashboard.State, error) {
-	out := dashboard.State{Nodes: []dashboard.Node{}}
-	err := withStore(d.home, func(store *db.Store) error {
-		jobs, err := store.ListJobs(ctx)
-		if err != nil {
-			return err
-		}
-		if len(jobs) == 0 {
-			return nil
-		}
-		jobByID := make(map[string]db.Job, len(jobs))
-		for _, j := range jobs {
-			jobByID[j.ID] = j
-		}
-
-		requested := strings.TrimSpace(runID)
-		target := requested
-		if target == "" {
-			target = mostRecentRunRoot(jobs, jobByID)
-		} else {
-			target = jobRootID(jobByID, target)
-		}
-		if _, ok := jobByID[target]; target == "" || !ok {
-			// An explicitly requested run that does not resolve to a real job is
-			// a 404; an empty request against an empty store is just an empty
-			// snapshot.
-			if requested != "" {
-				return dashboard.ErrRunNotFound
-			}
-			return nil
-		}
-
-		runtimeByAgent := agentRuntimeMap(ctx, store)
-
-		// Scope to the run's tree and parse each job's payload once.
-		var tree []db.Job
-		payloadByID := make(map[string]workflow.JobPayload)
-		childrenByParent := map[string][]db.Job{}
-		for _, j := range jobs {
-			if jobRootID(jobByID, j.ID) != target {
-				continue
-			}
-			tree = append(tree, j)
-			p, _ := workflow.DecodeJobPayload(j)
-			payloadByID[j.ID] = p
-			if pj := strings.TrimSpace(j.ParentJobID); pj != "" {
-				childrenByParent[pj] = append(childrenByParent[pj], j)
-			}
-		}
-
-		out.RunID = target
-		out.Title = runTitle(payloadByID[target], jobByID[target])
-		out.Workflow = strings.TrimSpace(payloadByID[target].WorkflowID)
-		for _, j := range tree {
-			events, _ := store.ListJobEvents(ctx, j.ID)
-			deps, action := resolveDelegationEdges(j, payloadByID, childrenByParent)
-			out.Nodes = append(out.Nodes, buildDashboardNode(j, payloadByID[j.ID], events, runtimeByAgent, deps, action))
-		}
-		return nil
-	})
-	return out, err
-}
 
 const (
 	dashboardWorkflowMaxRuns  = 50
@@ -850,14 +753,10 @@ func (d *webDataSource) Jobs(ctx context.Context) ([]dashboard.JobSummary, error
 	return out, err
 }
 
-// Agents lists the registered agents (one AgentSummary each) plus one synthetic
-// rollup row for the fleet of ephemeral workers. It is a single read-only pass:
-// ListAgents supplies the registered rows' identity/config, and the SAME
-// ListJobs scan aggregates each agent's job counts and last-active time. Every
-// job whose agent name carries the engine's "-ephemeral-" infix folds into the
-// one rollup row (Ephemeral == true, blank Runtime). Registered rows sort
-// most-recently-active first (never-active last, alphabetical); the ephemeral
-// rollup is always last.
+// Agents lists the registered agents (one AgentSummary each). It is a single
+// read-only pass: ListAgents supplies the rows' identity/config, and the SAME
+// ListJobs scan aggregates each agent's job counts and last-active time. Rows
+// sort most-recently-active first (never-active last, alphabetical).
 func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, error) {
 	out := []dashboard.AgentSummary{}
 	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
@@ -871,10 +770,10 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 		}
 
 		// Aggregate per-agent job stats from the single ListJobs pass (shared with
-		// Agent()). Ephemeral workers fold into one rollup.
-		byAgent, ephemeral, hasEphemeral := aggregateAgentJobStats(jobs)
+		// Agent()).
+		byAgent := aggregateAgentJobStats(jobs)
 
-		out = make([]dashboard.AgentSummary, 0, len(agents)+1)
+		out = make([]dashboard.AgentSummary, 0, len(agents))
 		for _, a := range agents {
 			summary := newAgentSummary(a)
 			if s := byAgent[a.Name]; s != nil {
@@ -882,32 +781,25 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 			}
 			out = append(out, summary)
 		}
-		// Registered agents: most-recently-active first; never-active (LastActive
-		// == 0) fall to the end, alphabetical. The ephemeral rollup is appended
-		// after this sort so it is always last.
+		// Most-recently-active first; never-active (LastActive == 0) fall to the
+		// end, alphabetical.
 		sort.SliceStable(out, func(i, j int) bool {
 			if out[i].LastActive != out[j].LastActive {
 				return out[i].LastActive > out[j].LastActive
 			}
 			return out[i].Name < out[j].Name
 		})
-		if hasEphemeral {
-			rollup := dashboard.AgentSummary{Name: "ephemeral workers", Ephemeral: true}
-			ephemeral.applyTo(&rollup)
-			out = append(out, rollup)
-		}
 		return nil
 	})
 	return out, err
 }
 
 // Agent returns the click-through detail for a single agent by name: the same
-// AgentSummary Agents() builds for that one row. Template stays nil and Versions
-// empty: agent templates were removed in #2589. An unknown name maps to the
-// dashboard's not-found sentinel (mirroring how Job() maps an unknown job id), so
-// the API layer returns 404 rather than 500.
+// AgentSummary Agents() builds for that one row, plus its [agents.<name>] config
+// section. An unknown name maps to the dashboard's not-found sentinel (mirroring
+// how Job() maps an unknown job id), so the API layer returns 404 rather than 500.
 func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.AgentDetail, error) {
-	detail := dashboard.AgentDetail{Versions: []dashboard.TemplateVersionInfo{}}
+	var detail dashboard.AgentDetail
 	err := withStoreAndPaths(d.home, func(paths config.Paths, store *db.Store) error {
 		agent, err := store.GetAgent(ctx, name)
 		if err != nil {
@@ -924,7 +816,7 @@ func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.Agent
 		// Build the summary exactly as Agents() does for one row: identity from the
 		// registered agent, tallies from the shared per-agent aggregation.
 		summary := newAgentSummary(agent)
-		byAgent, _, _ := aggregateAgentJobStats(jobs)
+		byAgent := aggregateAgentJobStats(jobs)
 		if s := byAgent[agent.Name]; s != nil {
 			s.applyTo(&summary)
 		}
@@ -976,9 +868,8 @@ func loadAgentTypesFailOpen(paths config.Paths) map[string]config.AgentType {
 // agentConfigInfo maps a resolved config.AgentType onto the dashboard's
 // AgentConfigInfo. The values are the [agents.<name>] section as LoadAgentTypes
 // resolves it — parse-time defaults INCLUDED (capabilities default ["ask"],
-// job_timeout 10m) — surfaced as-is per the
-// contract. Only ever called for an agent that has a config section (a non-nil
-// return is meaningful presence).
+// job_timeout 10m) — surfaced as-is per the contract. Only ever called for an
+// agent that has a config section (a non-nil return is meaningful presence).
 func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 	return &dashboard.AgentConfigInfo{
 		JobTimeout:   strings.TrimSpace(at.JobTimeout),
@@ -987,29 +878,22 @@ func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 	}
 }
 
-// aggregateAgentJobStats folds a job slice into per-registered-agent tallies plus
-// one rollup for the fleet of ephemeral workers (names carrying the "-ephemeral-"
-// infix). It is the single aggregation both Agents() (which walks byAgent for
-// every registered row and appends the ephemeral rollup) and Agent() (which picks
-// one byAgent entry) share, so their counts can never diverge.
-func aggregateAgentJobStats(jobs []db.Job) (byAgent map[string]*agentJobStat, ephemeral agentJobStat, hasEphemeral bool) {
-	byAgent = map[string]*agentJobStat{}
+// aggregateAgentJobStats folds a job slice into per-agent tallies keyed by agent
+// name. It is the single aggregation both Agents() (which walks byAgent for every
+// registered row) and Agent() (which picks one byAgent entry) share, so their
+// counts can never diverge.
+func aggregateAgentJobStats(jobs []db.Job) map[string]*agentJobStat {
+	byAgent := map[string]*agentJobStat{}
 	for _, j := range jobs {
 		name := strings.TrimSpace(j.Agent)
-		var s *agentJobStat
-		if strings.Contains(name, "-ephemeral-") {
-			s = &ephemeral
-			hasEphemeral = true
-		} else {
-			s = byAgent[name]
-			if s == nil {
-				s = &agentJobStat{}
-				byAgent[name] = s
-			}
+		s := byAgent[name]
+		if s == nil {
+			s = &agentJobStat{}
+			byAgent[name] = s
 		}
 		s.observe(j)
 	}
-	return byAgent, ephemeral, hasEphemeral
+	return byAgent
 }
 
 // agentJobStat accumulates one agent's job tallies across the ListJobs pass:
@@ -1494,16 +1378,13 @@ func utcDayStart(t time.Time) time.Time {
 // treats it as wedged (blocked jobs are surfaced regardless of age).
 const stuckQueuedThreshold = 10 * time.Minute
 
-// Health returns the daemon liveness, fleet totals, held locks, wedged jobs and
+// Health returns the daemon liveness, fleet totals, held resource locks, wedged jobs and
 // recent failures behind the Health page. The daemon block mirrors
 // buildDashboardSnapshot (currentDaemonPID + daemon.json meta over d.home);
 // everything else is a single read-only ListJobs pass plus the resource lock listing.
 // Stuck reasons reuse loadStuckReason/deriveStuckReason unchanged.
 func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 	out := dashboard.Health{
-		// Branch locks retired in #2591; Locks stays an empty list until the
-		// dashboard module drops the field (#2593).
-		Locks:          []dashboard.HealthLock{},
 		ResourceLocks:  []dashboard.HealthResourceLock{},
 		Stuck:          []dashboard.HealthStuckJob{},
 		RecentFailures: []dashboard.HealthFailure{},
@@ -1563,7 +1444,7 @@ func (d *webDataSource) Health(ctx context.Context) (dashboard.Health, error) {
 			return err
 		}
 
-		// Non-branch resource locks (runtime sessions etc.) are listed ONCE and
+		// Resource locks (runtime sessions etc.) are listed ONCE and
 		// shared: they feed both out.ResourceLocks below and every stuck job's
 		// deriveStuckReason. Going through loadStuckReason instead would re-scan
 		// the resource_locks table per stuck job on every 12s /api/health poll —
@@ -1891,171 +1772,6 @@ func healthStuckSince(job db.Job, cutoffMillis int64) (since int64, stuck bool) 
 	return since, false
 }
 
-const (
-	sseMaxSubscribersPerRun = 64
-	ssePollInterval         = 2 * time.Second
-)
-
-type ssePoller struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-
-	mu   sync.Mutex
-	subs map[int]chan dashboard.State
-	seq  int
-	refs int
-
-	last      string
-	lastState dashboard.State
-	haveState bool
-}
-
-// Subscribe shares one read-only State poller between every viewer of the same
-// requested run and fans changed snapshots out to per-connection channels.
-// The registry uses the trimmed raw run id: canonicalizing "" or a child id to
-// its root currently requires the same full ListJobs rebuild this path avoids.
-// In practice dashboard viewers use the same run query, so equivalent requests
-// still collapse in the common case.
-func (d *webDataSource) Subscribe(ctx context.Context, runID string) (<-chan dashboard.State, func(), error) {
-	_ = ctx // The module handler owns connection cancellation and calls cancel.
-	runID = strings.TrimSpace(runID)
-
-	d.registryMu.Lock()
-	if d.pollers == nil {
-		d.pollers = make(map[string]*ssePoller)
-	}
-	poller := d.pollers[runID]
-	created := poller == nil
-	var pollCtx context.Context
-	if created {
-		poller = &ssePoller{}
-		pollCtx, poller.cancel = context.WithCancel(context.Background())
-		poller.done = make(chan struct{})
-		poller.subs = make(map[int]chan dashboard.State)
-		d.pollers[runID] = poller
-	}
-
-	poller.mu.Lock()
-	if len(poller.subs) >= sseMaxSubscribersPerRun {
-		// Only an existing over-capacity poller can reject: a freshly created
-		// poller has zero subscribers and always admits its first below.
-		poller.mu.Unlock()
-		d.registryMu.Unlock()
-		return nil, nil, errors.New("dashboard: too many SSE subscribers for run")
-	}
-	id := poller.seq
-	poller.seq++
-	// Buffer 1 with coalescing fanout (see runSSEPoller): the channel holds at
-	// most the newest snapshot for a slow subscriber, never a stale backlog.
-	ch := make(chan dashboard.State, 1)
-	poller.subs[id] = ch
-	poller.refs++
-	poller.mu.Unlock()
-	d.registryMu.Unlock()
-	if created {
-		go d.runSSEPoller(pollCtx, runID, poller)
-	}
-
-	// Seed only after releasing registryMu: the hard lock rule forbids channel
-	// sends while the registry is held. Re-taking only the poller's own lock
-	// serializes this with fanout. If fanout already queued a fresher snapshot,
-	// the channel is non-empty and no stale cached seed is appended behind it.
-	poller.mu.Lock()
-	if poller.haveState && len(ch) == 0 {
-		ch <- poller.lastState
-	}
-	poller.mu.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
-			d.registryMu.Lock()
-			poller.mu.Lock()
-			if sub, ok := poller.subs[id]; ok {
-				delete(poller.subs, id)
-				close(sub)
-				poller.refs--
-				if poller.refs == 0 {
-					poller.cancel()
-					delete(d.pollers, runID)
-				}
-			}
-			poller.mu.Unlock()
-			d.registryMu.Unlock()
-		})
-	}
-	return ch, cancel, nil
-}
-
-func (d *webDataSource) runSSEPoller(ctx context.Context, runID string, poller *ssePoller) {
-	defer close(poller.done)
-	interval := d.ssePollInterval
-	if interval <= 0 {
-		interval = ssePollInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	publish := func() {
-		// One shared rebuild per tick regardless of viewer count, deduped by
-		// fingerprint — byte-identical to the old per-connection poller, just
-		// shared. (A cheap version-cache was rejected: no cheap signal covers a
-		// bare jobs-table state write, so it risked freezing a live viewer.)
-		state, err := d.sseStateSnapshot(ctx, runID)
-		if err != nil {
-			return
-		}
-		key := stateFingerprint(state)
-
-		poller.mu.Lock()
-		changed := !poller.haveState || key != poller.last
-		poller.lastState = state
-		poller.haveState = true
-		if changed {
-			poller.last = key
-			for _, sub := range poller.subs {
-				// Coalescing latest-wins delivery: drop any stale queued snapshot
-				// then enqueue the newest, so a briefly-slow viewer converges to
-				// the current state instead of freezing on an intermediate one,
-				// and the shared poller never blocks on one lagging subscriber.
-				select {
-				case <-sub:
-				default:
-				}
-				select {
-				case sub <- state:
-				default:
-				}
-			}
-		}
-		poller.mu.Unlock()
-	}
-
-	publish()
-	for {
-		select {
-		case <-ctx.Done():
-			// Cancelled only at refs==0, after the last unsubscribe removed and
-			// closed its channel under poller.mu, so nothing remains to close.
-			return
-		case <-ticker.C:
-			// A tick and cancellation can become ready together. Do not begin
-			// another snapshot after the last subscriber has stopped the poller.
-			if ctx.Err() != nil {
-				return
-			}
-			publish()
-		}
-	}
-}
-
-func (d *webDataSource) sseStateSnapshot(ctx context.Context, runID string) (dashboard.State, error) {
-	if d.sseState != nil {
-		return d.sseState(ctx, runID)
-	}
-	return d.State(ctx, runID)
-}
-
 // agentRuntimeMap builds a name->runtime lookup from the agent registry so a
 // node can report its runtime (omp|shell, or a removed name). A lookup error yields
 // an empty map; ephemeral/delegated agents absent from the registry fall back to
@@ -2146,179 +1862,6 @@ func delegationJobIDs(siblings []db.Job) map[string]string {
 		}
 	}
 	return m
-}
-
-// summarizeRuns groups jobs into delegation trees (rooted at each originating
-// job) and returns one RunSummary per tree, newest activity first. Pure so it is
-// unit-tested directly.
-func summarizeRuns(jobs []db.Job) []dashboard.RunSummary {
-	jobByID := make(map[string]db.Job, len(jobs))
-	for _, j := range jobs {
-		jobByID[j.ID] = j
-	}
-	type agg struct {
-		updated  string
-		created  string
-		states   []string
-		maxDepth int
-		done     int
-		root     db.Job
-	}
-	byRoot := map[string]*agg{}
-	var order []string
-	for _, j := range jobs {
-		root := jobRootID(jobByID, j.ID)
-		a := byRoot[root]
-		if a == nil {
-			a = &agg{}
-			byRoot[root] = a
-			order = append(order, root)
-		}
-		a.states = append(a.states, j.State)
-		if j.UpdatedAt > a.updated {
-			a.updated = j.UpdatedAt
-		}
-		if a.created == "" || (j.CreatedAt != "" && j.CreatedAt < a.created) {
-			a.created = j.CreatedAt
-		}
-		if j.DelegationDepth > a.maxDepth {
-			a.maxDepth = j.DelegationDepth
-		}
-		// A run's "done" count uses FINAL (resumability) semantics: a blocked job is
-		// not counted as done because it can still resume via RetryJob (#632),
-		// keeping the run active and matching runStateActive.
-		if workflow.IsFinalJobState(strings.TrimSpace(j.State)) {
-			a.done++
-		}
-		if j.ID == root {
-			a.root = j
-		}
-	}
-	out := make([]dashboard.RunSummary, 0, len(order))
-	for _, root := range order {
-		a := byRoot[root]
-		payload, _ := workflow.DecodeJobPayload(a.root)
-		nodeCount := len(a.states)
-		// An orchestration is a genuine delegation tree: a coordinator delegated to
-		// children, so some job sits below the root (DelegationDepth > 0). Native
-		// review-fanout jobs and ask continuations share the root but add no
-		// delegation depth, so counting nodes alone would mislabel a one-shot
-		// implement/ask (which spawns review jobs) as an orchestration.
-		significance := "one-shot"
-		if a.maxDepth > 0 {
-			significance = "orchestration"
-		}
-		kind, agent := parseRunKindAgent(root, a.root)
-		started := parseJobTimeMillis(a.created)
-		updated := parseJobTimeMillis(a.updated)
-		var duration int64
-		if started > 0 && updated > started {
-			duration = updated - started
-		}
-		out = append(out, dashboard.RunSummary{
-			RunID:        root,
-			Title:        runTitle(payload, a.root),
-			State:        aggregateRunState(a.states),
-			Kind:         kind,
-			Significance: significance,
-			Agent:        agent,
-			Repo:         strings.TrimSpace(payload.Repo),
-			PR:           payload.PullRequest,
-			NodeCount:    nodeCount,
-			Depth:        a.maxDepth + 1, // delegation levels (root = level 1)
-			DoneCount:    a.done,
-			Snippet:      firstInstructionLine(payload.Instructions),
-			Started:      started,
-			Updated:      updated,
-			Duration:     duration,
-		})
-	}
-	// Active (non-terminal) runs sort first, then most-recent activity, then id
-	// for a deterministic tiebreak. The list is capped so a long history never
-	// swamps the run picker; the cap keeps the freshest/active runs.
-	sort.SliceStable(out, func(i, j int) bool {
-		ai, aj := runStateActive(out[i].State), runStateActive(out[j].State)
-		if ai != aj {
-			return ai
-		}
-		if out[i].Updated != out[j].Updated {
-			return out[i].Updated > out[j].Updated
-		}
-		return out[i].RunID < out[j].RunID
-	})
-	if len(out) > maxRunSummaries {
-		out = out[:maxRunSummaries]
-	}
-	return out
-}
-
-// maxRunSummaries caps the run list returned by Runs()/summarizeRuns so the web
-// dashboard's run picker stays bounded on a home with a long orchestration
-// history.
-const maxRunSummaries = 60
-
-// runStateActive reports whether an aggregated run state is still live (not a
-// settled terminal state), so active runs can be surfaced ahead of finished
-// ones in the run list.
-func runStateActive(state dashboard.NodeState) bool {
-	// Active is the negation of FINAL (resumability) semantics: a blocked run is
-	// still "active" because it can resume via RetryJob (#632). Uses IsFinalJobState
-	// rather than IsSettledJobState so blocked work remains live.
-	return !workflow.IsFinalJobState(string(state))
-}
-
-// activityJobActive is the web dashboard's liveness predicate for a job row.
-func activityJobActive(state string) bool {
-	return state == "queued" || state == "running"
-}
-
-// mostRecentRunRoot returns the run root to show when no run is requested: the
-// most-recently-updated run that has live (queued/running) work, else the
-// most-recently-updated run overall. Deterministic on ties (root id).
-func mostRecentRunRoot(jobs []db.Job, jobByID map[string]db.Job) string {
-	type agg struct {
-		updated string
-		active  bool
-	}
-	byRoot := map[string]*agg{}
-	for _, j := range jobs {
-		root := jobRootID(jobByID, j.ID)
-		a := byRoot[root]
-		if a == nil {
-			a = &agg{}
-			byRoot[root] = a
-		}
-		if j.UpdatedAt > a.updated {
-			a.updated = j.UpdatedAt
-		}
-		if activityJobActive(j.State) {
-			a.active = true
-		}
-	}
-	roots := make([]string, 0, len(byRoot))
-	for root := range byRoot {
-		roots = append(roots, root)
-	}
-	sort.Strings(roots)
-	best := ""
-	var bestA *agg
-	for _, root := range roots {
-		a := byRoot[root]
-		if bestA == nil {
-			best, bestA = root, a
-			continue
-		}
-		if a.active != bestA.active {
-			if a.active {
-				best, bestA = root, a
-			}
-			continue
-		}
-		if a.updated > bestA.updated {
-			best, bestA = root, a
-		}
-	}
-	return best
 }
 
 // jobRootID walks a job's parent chain to the originating job (empty
@@ -2579,15 +2122,4 @@ func parseJobTimeMillis(value string) int64 {
 		}
 	}
 	return 0
-}
-
-// stateFingerprint is a cheap change signal for the SSE poller: it changes
-// whenever any node's identity, state, or event count changes.
-func stateFingerprint(state dashboard.State) string {
-	var b strings.Builder
-	b.WriteString(state.RunID)
-	for _, n := range state.Nodes {
-		fmt.Fprintf(&b, "|%s:%s:%d", n.ID, n.State, len(n.Events))
-	}
-	return b.String()
 }

@@ -126,7 +126,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "write the snapshot as JSON")
 	all := fs.Bool("all", false, "show full lists without truncation or grouping")
-	web := fs.Bool("web", false, "serve the read-only web dashboard (live orchestration graph) until interrupted")
+	web := fs.Bool("web", false, "serve the read-only web dashboard until interrupted")
 	webAddr := fs.String("addr", "127.0.0.1:8080", "address for --web to listen on")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

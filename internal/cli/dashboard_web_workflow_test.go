@@ -151,36 +151,6 @@ func TestDashboardWorkflowIndexLessStateOrder(t *testing.T) {
 	}
 }
 
-func TestWebDataSourceStateCarriesRootWorkflowOnly(t *testing.T) {
-	t.Parallel()
-	unlabelledHome := dashboardTestHome(t)
-	seedWebDashboardTree(t, unlabelledHome)
-	unlabelled, err := (&webDataSource{home: unlabelledHome}).State(context.Background(), "coord")
-	if err != nil {
-		t.Fatalf("State(unlabelled): %v", err)
-	}
-	if unlabelled.Workflow != "" {
-		t.Fatalf("unlabelled State.Workflow = %q, want empty", unlabelled.Workflow)
-	}
-
-	home := dashboardTestHome(t)
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	payload := workflow.JobPayload{WorkflowID: "release-42", TaskTitle: "release root"}
-	mustCreateJob(t, store, db.Job{ID: "release-root", Agent: "lead", Type: "orchestrate", State: "running", Payload: mustJSON(t, payload)}, "", "")
-	store.Close()
-
-	state, err := (&webDataSource{home: home}).State(context.Background(), "release-root")
-	if err != nil {
-		t.Fatalf("State(labelled): %v", err)
-	}
-	if state.Workflow != "release-42" {
-		t.Fatalf("State.Workflow = %q, want release-42", state.Workflow)
-	}
-}
-
 func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 	t.Parallel()
 	home := dashboardTestHome(t)
@@ -281,27 +251,8 @@ func TestWebDashboardUnlabelledLegacyHTTPGolden(t *testing.T) {
 	setJobTimes(t, home, "legacy", "2026-01-02 03:04:05", "2026-01-02 03:04:05")
 
 	handler := dashboard.Serve(&webDataSource{home: home})
-	assertDashboardHTTPGolden(t, handler, "/api/state?run=legacy", legacyUnlabelledStateGolden)
 	assertDashboardHTTPGolden(t, handler, "/api/graph", legacyUnlabelledGraphGolden)
 }
-
-const legacyUnlabelledStateGolden = `{
-  "runId": "legacy",
-  "title": "legacy",
-  "nodes": [
-    {
-      "id": "legacy",
-      "title": "legacy",
-      "agent": "",
-      "runtime": "",
-      "state": "running",
-      "depth": 0,
-      "startedAt": 1767323045000,
-      "events": []
-    }
-  ]
-}
-`
 
 const legacyUnlabelledGraphGolden = `{
   "nodes": [

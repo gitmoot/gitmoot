@@ -61,8 +61,8 @@ func seedWebDashboardTree(t *testing.T, home string) {
 	mustCreateJob(t, store, db.Job{ID: "coord-cont", Agent: "project-lead", Type: "orchestrate", State: "queued", Payload: mustJSON(t, contPayload), ParentJobID: "coord"}, "", "")
 }
 
-// TestWebDataSourceNotFound asserts the DataSource maps an unknown job/run to the
-// dashboard sentinels (so the API returns 404, not 500), while a real run resolves.
+// TestWebDataSourceNotFound asserts the DataSource maps an unknown job to the
+// dashboard sentinel (so the API returns 404, not 500), while a real job resolves.
 func TestWebDataSourceNotFound(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedWebDashboardTree(t, home)
@@ -72,11 +72,8 @@ func TestWebDataSourceNotFound(t *testing.T) {
 	if _, err := ds.Job(ctx, "no-such-job"); !errors.Is(err, dashboard.ErrJobNotFound) {
 		t.Fatalf("Job(unknown) err = %v, want ErrJobNotFound", err)
 	}
-	if _, err := ds.State(ctx, "no-such-run"); !errors.Is(err, dashboard.ErrRunNotFound) {
-		t.Fatalf("State(unknown) err = %v, want ErrRunNotFound", err)
-	}
-	if _, err := ds.State(ctx, "coord"); err != nil {
-		t.Fatalf("State(coord) err = %v, want nil", err)
+	if _, err := ds.Job(ctx, "coord"); err != nil {
+		t.Fatalf("Job(coord) err = %v, want nil", err)
 	}
 }
 
@@ -101,55 +98,18 @@ func mustJSON(t *testing.T, v any) string {
 	return string(b)
 }
 
-func nodeByID(nodes []dashboard.Node, id string) (dashboard.Node, bool) {
-	for _, n := range nodes {
-		if n.ID == id {
-			return n, true
-		}
-	}
-	return dashboard.Node{}, false
-}
-
-func TestWebDataSourceBuildsGraphFromStore(t *testing.T) {
+// TestWebDataSourceJobNodesFromStore asserts Job() builds each node's parentage,
+// dependency edge, runtime, model, title, PR link and events from the store.
+func TestWebDataSourceJobNodesFromStore(t *testing.T) {
 	home := dashboardTestHome(t)
 	seedWebDashboardTree(t, home)
 
 	ds := &webDataSource{home: home}
 	ctx := context.Background()
 
-	// Runs: one run rooted at the coordinator, showing live (running) work.
-	runs, err := ds.Runs(ctx)
+	search, err := ds.Job(ctx, "child-search")
 	if err != nil {
-		t.Fatalf("Runs: %v", err)
-	}
-	if len(runs) != 1 {
-		t.Fatalf("expected 1 run, got %d: %+v", len(runs), runs)
-	}
-	if runs[0].RunID != "coord" {
-		t.Fatalf("run id = %q, want coord", runs[0].RunID)
-	}
-	if runs[0].State != "running" {
-		t.Fatalf("run state = %q, want running", runs[0].State)
-	}
-	if runs[0].Title != "add search + export" {
-		t.Fatalf("run title = %q", runs[0].Title)
-	}
-
-	// State (active run): four nodes, correct parentage, dep edge, runtime.
-	state, err := ds.State(ctx, "")
-	if err != nil {
-		t.Fatalf("State: %v", err)
-	}
-	if state.RunID != "coord" {
-		t.Fatalf("state run id = %q, want coord", state.RunID)
-	}
-	if len(state.Nodes) != 4 {
-		t.Fatalf("expected 4 nodes, got %d: %+v", len(state.Nodes), state.Nodes)
-	}
-
-	search, ok := nodeByID(state.Nodes, "child-search")
-	if !ok {
-		t.Fatalf("child-search node missing")
+		t.Fatalf("Job child-search: %v", err)
 	}
 	if search.ParentID != "coord" {
 		t.Fatalf("child-search parent = %q, want coord", search.ParentID)
@@ -173,9 +133,9 @@ func TestWebDataSourceBuildsGraphFromStore(t *testing.T) {
 		t.Fatalf("child-search should carry worker events")
 	}
 
-	export, ok := nodeByID(state.Nodes, "child-export")
-	if !ok {
-		t.Fatalf("child-export node missing")
+	export, err := ds.Job(ctx, "child-export")
+	if err != nil {
+		t.Fatalf("Job child-export: %v", err)
 	}
 	if len(export.Deps) != 1 || export.Deps[0] != "child-search" {
 		t.Fatalf("child-export deps = %v, want [child-search]", export.Deps)
@@ -183,25 +143,16 @@ func TestWebDataSourceBuildsGraphFromStore(t *testing.T) {
 	if export.State != "running" {
 		t.Fatalf("child-export state = %q, want running", export.State)
 	}
+	if export.Title != "implement: export" {
+		t.Fatalf("child-export title = %q", export.Title)
+	}
 
-	coord, ok := nodeByID(state.Nodes, "coord")
-	if !ok {
-		t.Fatalf("coord node missing")
+	coord, err := ds.Job(ctx, "coord")
+	if err != nil {
+		t.Fatalf("Job coord: %v", err)
 	}
 	if coord.Runtime != "codex" {
 		t.Fatalf("coord runtime = %q, want codex", coord.Runtime)
-	}
-
-	// Job: single node lookup resolves the same dep edge as State.
-	node, err := ds.Job(ctx, "child-export")
-	if err != nil {
-		t.Fatalf("Job: %v", err)
-	}
-	if len(node.Deps) != 1 || node.Deps[0] != "child-search" {
-		t.Fatalf("Job child-export deps = %v, want [child-search]", node.Deps)
-	}
-	if node.Title != "implement: export" {
-		t.Fatalf("Job child-export title = %q", node.Title)
 	}
 }
 
@@ -244,13 +195,9 @@ func TestWebDataSourceNodeTiming(t *testing.T) {
 	ds := &webDataSource{home: home}
 	ctx := context.Background()
 
-	state, err := ds.State(ctx, "coord")
+	search, err := ds.Job(ctx, "child-search")
 	if err != nil {
-		t.Fatalf("State: %v", err)
-	}
-	search, ok := nodeByID(state.Nodes, "child-search")
-	if !ok {
-		t.Fatalf("child-search node missing")
+		t.Fatalf("Job child-search: %v", err)
 	}
 	if search.StartedAt != wantStart {
 		t.Fatalf("child-search StartedAt = %d, want %d", search.StartedAt, wantStart)
@@ -266,24 +213,15 @@ func TestWebDataSourceNodeTiming(t *testing.T) {
 	}
 
 	// A non-terminal (running) job stamps StartedAt but leaves EndedAt unset.
-	export, ok := nodeByID(state.Nodes, "child-export")
-	if !ok {
-		t.Fatalf("child-export node missing")
+	export, err := ds.Job(ctx, "child-export")
+	if err != nil {
+		t.Fatalf("Job child-export: %v", err)
 	}
 	if export.StartedAt != wantStart {
 		t.Fatalf("child-export StartedAt = %d, want %d", export.StartedAt, wantStart)
 	}
 	if export.EndedAt != 0 {
 		t.Fatalf("child-export EndedAt = %d, want 0 (running job is not terminal)", export.EndedAt)
-	}
-
-	// /api/job (GetJob) timing must match /api/state (GetJob now selects created_at/updated_at).
-	node, err := ds.Job(ctx, "child-search")
-	if err != nil {
-		t.Fatalf("Job: %v", err)
-	}
-	if node.StartedAt != wantStart || node.EndedAt != wantEnd {
-		t.Fatalf("Job timing = (%d,%d), want (%d,%d)", node.StartedAt, node.EndedAt, wantStart, wantEnd)
 	}
 }
 
@@ -373,40 +311,6 @@ func TestNodeTitleDescriptive(t *testing.T) {
 	got = nodeTitle(workflow.JobPayload{}, db.Job{ID: "job-xyz"}, "")
 	if got != "job-xyz" {
 		t.Fatalf("fallback title = %q, want job-xyz", got)
-	}
-}
-
-// TestSummarizeRunsSortedAndCapped asserts the run list puts active runs first,
-// then most-recent, and caps at maxRunSummaries.
-func TestSummarizeRunsSortedAndCapped(t *testing.T) {
-	var jobs []db.Job
-	// 70 terminal (succeeded) roots with increasing updated_at, plus one older
-	// active (running) root. The active root must lead despite its older time,
-	// and the list must cap at maxRunSummaries.
-	for i := 0; i < 70; i++ {
-		jobs = append(jobs, db.Job{
-			ID:        fmt.Sprintf("done-%02d", i),
-			State:     "succeeded",
-			UpdatedAt: fmt.Sprintf("2026-05-%02d 10:00:00", (i%27)+1),
-		})
-	}
-	jobs = append(jobs, db.Job{ID: "active-root", State: "running", UpdatedAt: "2026-01-01 00:00:00"})
-
-	runs := summarizeRuns(jobs)
-	if len(runs) != maxRunSummaries {
-		t.Fatalf("run count = %d, want %d (capped)", len(runs), maxRunSummaries)
-	}
-	if runs[0].RunID != "active-root" {
-		t.Fatalf("first run = %q, want active-root (active leads even when older)", runs[0].RunID)
-	}
-	if runs[0].State != "running" {
-		t.Fatalf("first run state = %q, want running", runs[0].State)
-	}
-	// Terminal runs after the active one are newest-activity first.
-	for i := 2; i < len(runs); i++ {
-		if runs[i-1].Updated < runs[i].Updated {
-			t.Fatalf("runs not newest-first at %d: %d < %d", i, runs[i-1].Updated, runs[i].Updated)
-		}
 	}
 }
 
@@ -758,9 +662,8 @@ func TestSplitRepoScope(t *testing.T) {
 }
 
 // TestWebDataSourceAgents asserts Agents() emits one row per registered agent
-// (with repo-scope split and per-agent job aggregation) plus one synthetic
-// ephemeral rollup last, and that registered rows sort most-recently-active
-// first (never-active last).
+// (with repo-scope split and per-agent job aggregation), and that rows sort
+// most-recently-active first (never-active last).
 func TestWebDataSourceAgents(t *testing.T) {
 	home := dashboardTestHome(t)
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
@@ -787,33 +690,26 @@ func TestWebDataSourceAgents(t *testing.T) {
 	mustCreateJob(t, store, db.Job{ID: "b1", Agent: "builder", Type: "implement", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 	mustCreateJob(t, store, db.Job{ID: "b2", Agent: "builder", Type: "implement", State: "running", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 	mustCreateJob(t, store, db.Job{ID: "p1", Agent: "project-lead", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
-	// Two ephemeral-worker jobs (names carry the "-ephemeral-" infix) fold into one rollup.
-	mustCreateJob(t, store, db.Job{ID: "e1", Agent: "task-1-ephemeral-aaa111", Type: "implement", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
-	mustCreateJob(t, store, db.Job{ID: "e2", Agent: "task-2-ephemeral-bbb222", Type: "review", State: "failed", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 	store.Close()
 
 	// LastActive ordering: builder(10:30) > project-lead(10:20) > idle-agent(0).
-	// The ephemeral rollup has the newest activity (10:40) yet must still sort LAST.
 	setJobTimes(t, home, "b1", "2026-05-23 10:00:00", "2026-05-23 10:15:00")
 	setJobTimes(t, home, "b2", "2026-05-23 10:00:00", "2026-05-23 10:30:00")
 	setJobTimes(t, home, "p1", "2026-05-23 10:00:00", "2026-05-23 10:20:00")
-	setJobTimes(t, home, "e1", "2026-05-23 10:00:00", "2026-05-23 10:35:00")
-	setJobTimes(t, home, "e2", "2026-05-23 10:00:00", "2026-05-23 10:40:00")
 
 	ds := &webDataSource{home: home}
 	agents, err := ds.Agents(ctx)
 	if err != nil {
 		t.Fatalf("Agents: %v", err)
 	}
-	// 3 registered + 1 ephemeral rollup.
-	if len(agents) != 4 {
-		t.Fatalf("agent count = %d, want 4: %+v", len(agents), agents)
+	if len(agents) != 3 {
+		t.Fatalf("agent count = %d, want 3: %+v", len(agents), agents)
 	}
-	wantOrder := []string{"builder", "project-lead", "idle-agent", "ephemeral workers"}
+	wantOrder := []string{"builder", "project-lead", "idle-agent"}
 	for i, name := range wantOrder {
 		if agents[i].Name != name {
 			t.Fatalf("agents[%d].Name = %q, want %q (order %v)", i, agents[i].Name, name,
-				[]string{agents[0].Name, agents[1].Name, agents[2].Name, agents[3].Name})
+				[]string{agents[0].Name, agents[1].Name, agents[2].Name})
 		}
 	}
 
@@ -834,63 +730,10 @@ func TestWebDataSourceAgents(t *testing.T) {
 	if builder.LastActive != parseJobTimeMillis("2026-05-23 10:30:00") {
 		t.Errorf("builder lastActive = %d, want %d", builder.LastActive, parseJobTimeMillis("2026-05-23 10:30:00"))
 	}
-	if builder.Ephemeral {
-		t.Errorf("builder must not be flagged ephemeral")
-	}
 
 	idle, _ := agentSummaryByName(agents, "idle-agent")
 	if idle.JobCount != 0 || idle.LastActive != 0 {
 		t.Errorf("idle-agent = job%d lastActive%d, want 0/0", idle.JobCount, idle.LastActive)
-	}
-
-	// The synthetic ephemeral rollup: both ephemeral jobs, blank runtime, last row.
-	rollup := agents[len(agents)-1]
-	if !rollup.Ephemeral || rollup.Name != "ephemeral workers" {
-		t.Fatalf("last row = %+v, want ephemeral rollup", rollup)
-	}
-	if rollup.Runtime != "" {
-		t.Errorf("ephemeral rollup runtime = %q, want empty", rollup.Runtime)
-	}
-	if rollup.JobCount != 2 || rollup.SucceededCount != 1 || rollup.FailedCount != 1 || rollup.RunningCount != 0 {
-		t.Errorf("ephemeral counts = job%d run%d ok%d fail%d, want 2/0/1/1",
-			rollup.JobCount, rollup.RunningCount, rollup.SucceededCount, rollup.FailedCount)
-	}
-	if rollup.LastActive != parseJobTimeMillis("2026-05-23 10:40:00") {
-		t.Errorf("ephemeral lastActive = %d, want %d", rollup.LastActive, parseJobTimeMillis("2026-05-23 10:40:00"))
-	}
-}
-
-func TestSummarizeRunsEnriched(t *testing.T) {
-	root := "local-ask-project-lead-18bde5e13a42d5a7"
-	jobs := []db.Job{
-		{ID: root, State: "succeeded", DelegationDepth: 0, CreatedAt: "2026-06-01 10:00:00", UpdatedAt: "2026-06-01 10:05:00"},
-		{ID: "c1", ParentJobID: root, State: "succeeded", DelegationDepth: 1, CreatedAt: "2026-06-01 10:01:00", UpdatedAt: "2026-06-01 10:04:00"},
-		{ID: "c2", ParentJobID: root, State: "running", DelegationDepth: 1, CreatedAt: "2026-06-01 10:01:00", UpdatedAt: "2026-06-01 10:02:00"},
-	}
-	runs := summarizeRuns(jobs)
-	if len(runs) != 1 {
-		t.Fatalf("run count = %d, want 1", len(runs))
-	}
-	r := runs[0]
-	if r.Significance != "orchestration" {
-		t.Errorf("significance = %q, want orchestration", r.Significance)
-	}
-	if r.NodeCount != 3 {
-		t.Errorf("nodeCount = %d, want 3", r.NodeCount)
-	}
-	if r.Depth != 2 {
-		t.Errorf("depth = %d, want 2 (max delegation depth 1 + 1 level)", r.Depth)
-	}
-	if r.DoneCount != 2 {
-		t.Errorf("doneCount = %d, want 2 (two terminal jobs)", r.DoneCount)
-	}
-	if r.Kind != "ask" || r.Agent != "project-lead" {
-		t.Errorf("kind/agent = %q/%q, want ask/project-lead", r.Kind, r.Agent)
-	}
-	// a single-node run is a one-shot, not an orchestration.
-	solo := summarizeRuns([]db.Job{{ID: "local-ask-x-abcabcabcabc", State: "succeeded"}})
-	if solo[0].Significance != "one-shot" || solo[0].NodeCount != 1 {
-		t.Errorf("solo run = %q/%d, want one-shot/1", solo[0].Significance, solo[0].NodeCount)
 	}
 }
 
@@ -1158,11 +1001,6 @@ func TestWebDataSourceHealth(t *testing.T) {
 		t.Fatalf("recent failures = %+v, want [f2 f1] newest-first", h.RecentFailures)
 	}
 
-	// Branch locks retired (#2591): the field stays an empty list.
-	if h.Locks == nil || len(h.Locks) != 0 {
-		t.Fatalf("locks = %+v, want an empty non-nil list", h.Locks)
-	}
-
 	// Resource lock mapping.
 	if len(h.ResourceLocks) != 1 {
 		t.Fatalf("resourceLocks = %d, want 1: %+v", len(h.ResourceLocks), h.ResourceLocks)
@@ -1203,9 +1041,9 @@ func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
 	}
 }
 
-// seedDetailAgents registers planner-agent (with two jobs) and plain-agent for
-// the agent-detail tests.
-func seedDetailAgents(t *testing.T, home string) {
+// seedDetailAgent registers a plain agent with two jobs (one succeeded, one
+// running) for the Agent() detail tests.
+func seedDetailAgent(t *testing.T, home string) {
 	t.Helper()
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
@@ -1213,43 +1051,29 @@ func seedDetailAgents(t *testing.T, home string) {
 	}
 	defer store.Close()
 	ctx := context.Background()
-
 	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Runtime: "codex"}); err != nil {
 		t.Fatalf("UpsertAgent planner-agent: %v", err)
 	}
-	if err := store.UpsertAgent(ctx, db.Agent{Name: "plain-agent", Runtime: "claude"}); err != nil {
-		t.Fatalf("UpsertAgent plain-agent: %v", err)
-	}
-
 	mustCreateJob(t, store, db.Job{ID: "pa1", Agent: "planner-agent", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 	mustCreateJob(t, store, db.Job{ID: "pa2", Agent: "planner-agent", Type: "orchestrate", State: "running", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 }
 
 // TestWebDataSourceAgentDetail asserts Agent() builds the same summary as Agents()
-// for one row and, since #2589 removed agent templates, reports no template and
-// a non-nil empty version history.
+// for one row.
 func TestWebDataSourceAgentDetail(t *testing.T) {
 	home := dashboardTestHome(t)
-	seedDetailAgents(t, home)
+	seedDetailAgent(t, home)
 
 	ds := &webDataSource{home: home}
 	detail, err := ds.Agent(context.Background(), "planner-agent")
 	if err != nil {
 		t.Fatalf("Agent: %v", err)
 	}
-
-	// Summary: identity + job tallies (same as Agents()).
 	if detail.Name != "planner-agent" || detail.Runtime != "codex" {
 		t.Fatalf("summary identity = %+v", detail.AgentSummary)
 	}
 	if detail.JobCount != 2 || detail.RunningCount != 1 || detail.SucceededCount != 1 {
 		t.Fatalf("summary counts = job%d run%d ok%d, want 2/1/1", detail.JobCount, detail.RunningCount, detail.SucceededCount)
-	}
-	if detail.Template != nil {
-		t.Fatalf("template = %+v, want nil", detail.Template)
-	}
-	if detail.Versions == nil || len(detail.Versions) != 0 {
-		t.Fatalf("versions = %+v, want non-nil empty", detail.Versions)
 	}
 }
 
@@ -1257,7 +1081,7 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 // not-found sentinel (so the API returns 404, mirroring Job()).
 func TestWebDataSourceAgentUnknown(t *testing.T) {
 	home := dashboardTestHome(t)
-	seedDetailAgents(t, home)
+	seedDetailAgent(t, home)
 	ds := &webDataSource{home: home}
 	if _, err := ds.Agent(context.Background(), "no-such-agent"); !errors.Is(err, dashboard.ErrAgentNotFound) {
 		t.Fatalf("Agent(unknown) err = %v, want ErrAgentNotFound", err)
@@ -1447,7 +1271,7 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 	paths := config.PathsForHome(home)
 	ctx := context.Background()
 
-	// Config sections: full-agent sets every pool knob explicitly; plain-agent has
+	// Config sections: full-agent sets job timeout, model and capabilities; plain-agent has
 	// a section carrying nothing but the runtime (parse-time defaults fill the
 	// rest); nosection-agent gets NO [agents.<name>] section at all.
 	if err := config.SaveAgentType(paths, config.AgentType{
