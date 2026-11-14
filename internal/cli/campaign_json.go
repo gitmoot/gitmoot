@@ -44,13 +44,15 @@ func newCampaignNoteJSONPtr(n *db.WorkflowNote) *campaignNoteJSON {
 }
 
 type messageJSON struct {
-	Campaign string `json:"campaign,omitempty"`
+	Campaign    string `json:"campaign,omitempty"`
+	SourceRunID string `json:"source_run_id,omitempty"`
 	db.Message
-	HiddenWorkflow string `json:"workflow,omitempty"`
+	HiddenWorkflow    string `json:"workflow,omitempty"`
+	HiddenSourceJobID string `json:"source_job_id,omitempty"`
 }
 
 func newMessageJSON(m db.Message) messageJSON {
-	return messageJSON{Campaign: m.WorkflowID, Message: m}
+	return messageJSON{Campaign: m.WorkflowID, SourceRunID: m.SourceJobID, Message: m}
 }
 
 func newMessagesJSON(messages []db.Message) []messageJSON {
