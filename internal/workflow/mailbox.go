@@ -510,15 +510,6 @@ type DeliveryAdapter interface {
 	Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error)
 }
 
-// PreparedEnqueue is an enqueue with every NON-WRITE step already done: payload built,
-// template snapshot taken, model resolved, ids derived, policy applied. It holds no
-// open transaction and performs no git, network or LLM work, so a caller can commit it
-// inside a transaction it already owns (#1673).
-type PreparedEnqueue struct {
-	Job    db.Job
-	Events []db.JobEvent
-}
-
 // dispatcherIdentity resolves who asked for a job to exist, most specific first.
 //
 // #1967. review_finding_observations records observer_job (the reviewer that
@@ -556,17 +547,6 @@ func dispatcherIdentity(request JobRequest) string {
 		}
 	}
 	return ""
-}
-
-// PrepareEnqueue runs Enqueue's read-and-compute half and returns the row to insert.
-// It writes NOTHING durable: that is the whole point, and it is what lets a resolution
-// commit its job insert in the same transaction as its task write and its receipt.
-func (m Mailbox) PrepareEnqueue(ctx context.Context, request JobRequest) (PreparedEnqueue, error) {
-	job, events, err := m.prepareEnqueue(ctx, request)
-	if err != nil {
-		return PreparedEnqueue{}, err
-	}
-	return PreparedEnqueue{Job: job, Events: events}, nil
 }
 
 func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job, []db.JobEvent, error) {

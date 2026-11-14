@@ -200,11 +200,6 @@ func renderResultFieldHelp() string {
 	// artifact announced solely through an environment variable and an
 	// operator-facing troubleshooting page is staged and undirected.
 	b.WriteString("- if the environment variable GITMOOT_PRIOR_VERDICTS names a file, it holds the prior review verdicts for the repo under review, rendered as JSON and frozen at its own as_of time. READ IT before concluding there are none, and treat a verdict recorded after as_of as absent rather than missing. Each entry carries the reviewer, head_sha, decision, severity, findings count and that verdict's own evidence mode.\n")
-	// human_questions is a top-level ask-gate field (#445), documented in the
-	// prompt block the runtime agent actually receives.
-	if h := resultFieldAnnotations["human_questions"].help; h != "" {
-		b.WriteString("- " + h + "\n")
-	}
 	return b.String()
 }
 
