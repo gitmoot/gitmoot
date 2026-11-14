@@ -141,7 +141,7 @@ func TestBuildIncludesReadOnlySnapshotWhenRepoDetected(t *testing.T) {
 	for _, want := range []string{
 		"Current snapshot",
 		"- daemon: running (pid 123)",
-		"- tasks: 2 (implementing: 1, planned: 1)",
+		"- prs: 2 (implementing: 1, planned: 1)",
 		"- jobs: 1 (succeeded: 1)",
 	} {
 		if !strings.Contains(contextText, want) {

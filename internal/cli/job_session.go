@@ -54,7 +54,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo (must be tracked)")
 	typeName := fs.String("type", "", "job type: "+strings.Join(workflow.SessionJobActions, "|"))
 	title := fs.String("title", "", "optional human title for the job")
-	task := fs.String("task", "", "optional task id to associate")
+	task := fs.String("pr-id", "", "optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr")
 	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
 	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
@@ -63,7 +63,7 @@ func runJobOpen(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}); err != nil { // #2600
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -249,7 +249,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	severity := fs.String("severity", "", "review severity: "+strings.Join(workflow.ReviewSeverities, "|"))
 	title := fs.String("title", "", "optional human title for the job")
 	summary := fs.String("summary", "", "optional result summary")
-	task := fs.String("task", "", "optional task id to associate")
+	task := fs.String("pr-id", "", "optional pr id (review-pr-N-...) to associate; usually unneeded, --repo and --pr identify the pr")
 	parentJobID := fs.String("parent-job-id", "", "optional existing parent job id")
 	pr := fs.Int("pr", 0, "optional pull request number")
 	headSHA := fs.String("head-sha", "", "optional caller-asserted head SHA, recorded as display metadata only: it is NOT stored in the job payload and no merge policy reads it (#1990)")
@@ -261,7 +261,7 @@ func runJobRecord(args []string, stdout, stderr io.Writer) int {
 	if helpRequested(args) {
 		return printFlagSetHelp(fs, stdout)
 	}
-	if err := fs.Parse(args); err != nil {
+	if err := parseWithFlagAliases(fs, args, stderr, FlagAlias{Old: "task", New: "pr-id"}); err != nil { // #2600
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}

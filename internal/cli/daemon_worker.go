@@ -2893,7 +2893,7 @@ func blockTaskForPermissionBlockedJob(ctx context.Context, store *db.Store, job 
 	}
 	if err == nil {
 		if existing.State == string(workflow.TaskDismissed) {
-			return fmt.Errorf("task %s is dismissed; permission-blocked job cannot resurrect it", existing.ID)
+			return fmt.Errorf("PR %s is dismissed; permission-blocked run cannot resurrect it", existing.ID)
 		}
 		fromState = existing.State
 		if task.RepoFullName == "" {

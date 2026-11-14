@@ -1682,7 +1682,7 @@ func prepareLocalReviewTask(ctx context.Context, store *db.Store, repo github.Re
 					// (the daemon pre-flight "checkout head is ..." guard
 					// deferred by the checkout-contention classifier).
 					request.ReviewTaskHeadDivergence = fmt.Sprintf(
-						"review rebound to task %s owning branch %s although its registered checkout HEAD %s differs from the requested head %s (#1530); the review runs in an exact-head read-only worktree, so the rebind affects attribution only",
+						"review rebound to PR %s owning branch %s although its registered checkout HEAD %s differs from the requested head %s (#1530); the review runs in an exact-head read-only worktree, so the rebind affects attribution only",
 						task.ID, request.Branch, head, request.HeadSHA)
 				}
 			}
@@ -1764,7 +1764,7 @@ func liveReviewTaskSuccessor(ctx context.Context, store *db.Store, disposedID st
 }
 
 func disposedReviewTaskError(task db.Task) error {
-	return fmt.Errorf("pr %s is %s; create a successor with `gitmoot pr successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
+	return fmt.Errorf("PR %s is %s; create a successor with `gitmoot pr successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
 }
 
 func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, name string) (db.Agent, error) {

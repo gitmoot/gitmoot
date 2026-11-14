@@ -418,7 +418,7 @@ func (g PolicyMergeGate) Evaluate(ctx context.Context, request MergeRequest) (Me
 	if pullRequestMerged(pr) {
 		if strings.TrimSpace(request.TaskID) != "" && strings.TrimSpace(request.ExpectedTaskState) != "" {
 			if _, _, err := g.Store.RecoverClaimedTaskState(ctx, request.TaskID, string(TaskMerged),
-				"pull_request_merged", fmt.Sprintf("recovered merged pull request #%d from durable task claim", request.PullRequest)); err != nil {
+				"pull_request_merged", fmt.Sprintf("recovered merged pull request #%d from durable PR-state claim", request.PullRequest)); err != nil {
 				return MergeDecision{}, err
 			}
 		}
@@ -674,7 +674,7 @@ func (g PolicyMergeGate) executePullRequestMergeFenced(ctx context.Context, requ
 	}
 	changed, currentState, err := g.Store.CompleteTaskStateClaim(ctx, taskID, token,
 		string(TaskMerged), "pull_request_merged",
-		fmt.Sprintf("merged pull request #%d while holding durable task-state claim", request.PullRequest))
+		fmt.Sprintf("merged pull request #%d while holding durable PR-state claim", request.PullRequest))
 	if err != nil {
 		return result, fmt.Errorf("external merge succeeded but task %s claim completion failed: %w", taskID, err)
 	}
@@ -722,7 +722,7 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 	}
 	postMergeWarnings := []string{}
 	if err := g.cleanupTaskWorktree(ctx, request, pr.HeadRef); err != nil {
-		postMergeWarnings = append(postMergeWarnings, "cleanup task worktree: "+err.Error())
+		postMergeWarnings = append(postMergeWarnings, "cleanup PR worktree: "+err.Error())
 	}
 	if g.Git != nil && strings.TrimSpace(pr.BaseRef) != "" {
 		if err := g.Git.UpdateBase(ctx, "origin", pr.BaseRef); err != nil {
@@ -731,7 +731,7 @@ func (g PolicyMergeGate) finishMerged(ctx context.Context, request MergeRequest,
 	}
 	if g.NextTasks != nil {
 		if err := g.NextTasks.EnqueueNextTask(ctx, request.TaskID); err != nil {
-			postMergeWarnings = append(postMergeWarnings, "enqueue next task: "+err.Error())
+			postMergeWarnings = append(postMergeWarnings, "enqueue next PR: "+err.Error())
 		}
 	}
 	reason := "merged"
@@ -1509,9 +1509,16 @@ const (
 	// Type == "implement", which is exactly what collectImplementerAttribution
 	// reads. The gate still refuses — attribution genuinely is unknown — but the
 	// lane can now clear it without a coordinator round.
-	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered agent, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it"
-	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly"
-	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly"
+	noImplementJobAttributionReason            = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement run is recorded for this pr, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered reviewer, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it"
+	emptyImplementAgentAttributionReason       = "latest review round's approval cannot be verified as independent: an implement run matches this pr but has no recorded agent; this is an attribution data anomaly"
+	malformedImplementPayloadAttributionReason = "latest review round's approval cannot be verified as independent: an implement run has a malformed payload, so attribution for this pr cannot be verified; this is a corrupt-record anomaly"
+	// legacyNoImplementJobAttributionReason is the pre-#2600 wording of
+	// noImplementJobAttributionReason. Stored [org:escalate …] notes and wake
+	// bodies keep it, so the matchers in merge_reason.go recognise both until
+	// those rows drain. The escalation dedupe compares whole rendered reasons,
+	// so each still-open attribution miss gets one escalation in the new
+	// wording after the deploy that reworded it.
+	legacyNoImplementJobAttributionReason = "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered agent, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it"
 )
 
 // implementerIdentity is WHO implemented a task, and of which KIND. It exists

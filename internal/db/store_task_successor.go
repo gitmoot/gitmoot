@@ -25,7 +25,7 @@ const (
 var taskSuccessorSuffix = regexp.MustCompile(`-successor-([0-9]+)$`)
 
 // ErrTaskNotDisposed refuses a successor for a task that can still be used.
-var ErrTaskNotDisposed = errors.New("task is not disposed")
+var ErrTaskNotDisposed = errors.New("pr is not disposed")
 
 // TaskSuccessorRoot returns the first task of id's successor chain.
 func TaskSuccessorRoot(id string) string {
@@ -93,7 +93,7 @@ func latestTaskInChain(ctx context.Context, q interface {
 		}
 		latest = next
 	}
-	return Task{}, fmt.Errorf("task %s has more than %d successors", root, maxTaskSuccessors)
+	return Task{}, fmt.Errorf("pr %s has more than %d successors", root, maxTaskSuccessors)
 }
 
 // CreateTaskSuccessor creates the next successor of id's chain when the newest
@@ -130,7 +130,7 @@ func (s *Store) CreateTaskSuccessor(ctx context.Context, id string, disposedStat
 	}
 	if !slices.Contains(disposedStates, latest.State) {
 		if latest.ID == root {
-			return Task{}, false, fmt.Errorf("%w: task %s is %s", ErrTaskNotDisposed, latest.ID, latest.State)
+			return Task{}, false, fmt.Errorf("%w: pr %s is %s", ErrTaskNotDisposed, latest.ID, latest.State)
 		}
 		return latest, false, tx.Commit()
 	}

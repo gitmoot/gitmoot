@@ -141,7 +141,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 			}
 			if workflow.TaskState(successor.State) == workflow.TaskMerged {
 				return d.commitTaskDisposal(ctx, candidate, workflow.TaskSuperseded, taskDisposalTierSuccessorMerged,
-					fmt.Sprintf("successor task %s on %s#%d merged after this task blocked", successor.ID, itemEvidence.subjectRepo, itemEvidence.subjectIssue), "", "")
+					fmt.Sprintf("successor PR %s on %s#%d merged after this PR blocked", successor.ID, itemEvidence.subjectRepo, itemEvidence.subjectIssue), "", "")
 			}
 			if peerEvidence.pullRequest <= 0 {
 				continue
@@ -152,7 +152,7 @@ func (d Daemon) disposeTaskCandidate(ctx context.Context, candidate db.StaleTask
 			}
 			if pullRequestListedAsMerged(pull) && mergedAfter(pull.MergedAt, blockedAt) {
 				return d.commitTaskDisposal(ctx, candidate, workflow.TaskSuperseded, taskDisposalTierSuccessorMerged,
-					fmt.Sprintf("successor PR #%d on %s#%d merged after this task blocked", pull.Number, itemEvidence.subjectRepo, itemEvidence.subjectIssue), "", "")
+					fmt.Sprintf("successor PR #%d on %s#%d merged after this PR blocked", pull.Number, itemEvidence.subjectRepo, itemEvidence.subjectIssue), "", "")
 			}
 		}
 		getter, ok := d.GitHub.(issueGetter)
@@ -188,7 +188,7 @@ func (d Daemon) strandTask(ctx context.Context, candidate db.StaleTaskCandidate,
 	payload := ""
 	if role != "" {
 		ev := events.NewEvent(events.EventJobNeedsAttention, candidate.ID, candidate.ID, candidate.RepoFullName,
-			string(workflow.TaskStranded), fmt.Sprintf("task %s stranded: %s", candidate.ID, fullReason), d.now(), workflow.RedactCommentText)
+			string(workflow.TaskStranded), fmt.Sprintf("PR %s stranded: %s", candidate.ID, fullReason), d.now(), workflow.RedactCommentText)
 		ev.Cause = "task_disposal_stranded"
 		ev.WakeKind = db.WakeOutboxKindEscalation
 		ev.WakeTargetRole = role

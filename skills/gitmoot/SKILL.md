@@ -79,10 +79,10 @@ change is an org role, not a registered reviewer (every seat created with
 `gitmoot org seat add` is a role; `--agent` with a role name fails `agent
 "<name>" not found`). The record then prints an empty
 `agent:` and keeps the role as the job's acting role, which is what the gate
-reads. The record binds to the repository and pull request (and `--task`), not
+reads. The record binds to the repository and pull request (and `--pr-id`), not
 to a head: one record covers every later head of that pull request, and
-`--head-sha` is display only. Add `--task <task-id>` when the pull request
-already has a review task (`gitmoot task list --repo owner/repo`). Never record
+`--head-sha` is display only. `--repo` and `--pr` identify the pr; add
+`--pr-id <id>` only to pin one review record (`gitmoot pr show owner/repo#<n>`). Never record
 an agent that did not write the change.
 
 Then request the review at the exact head you pushed:

@@ -577,7 +577,7 @@ func (e Engine) runMergeGateWithHumanMerge(ctx context.Context, reviewer string,
 					FromState: expectedTaskState,
 					ToState:   expectedTaskState,
 					Reason: fmt.Sprintf(
-						"not transitioned to ready_to_merge: job %s still owns branch %s while an objection stands at this head; a task cannot be mergeable and under repair at once. %s",
+						"not transitioned to ready_to_merge: run %s still owns branch %s while an objection stands at this head; a PR cannot be mergeable and under repair at once. %s",
 						decision.HeldByJob, strings.TrimSpace(payload.Branch), decision.Reason.Render()),
 				})
 			}
@@ -757,6 +757,6 @@ func (e Engine) objectionBindsToCurrentHead(ctx context.Context, payload JobPayl
 		return true, "", nil
 	}
 	return false, fmt.Sprintf(
-		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the task is not transitioned and no fix leg is dispatched",
+		"the objection is bound to head %s but the pull request's current head is %s; a verdict at a superseded head describes a commit the branch has moved past, so the PR is not transitioned and no fix leg is dispatched",
 		objectionHead, currentHead), nil
 }

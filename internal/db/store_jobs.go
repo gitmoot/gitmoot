@@ -1353,7 +1353,7 @@ func (s *Store) TransitionJobStatePayloadWithEventAndTaskTransition(ctx context.
 		if err := tx.QueryRowContext(ctx, `SELECT state FROM tasks WHERE id = ?`, taskID).Scan(&current); err != nil {
 			return false, err
 		}
-		return false, fmt.Errorf("task %s is %s; retry requires explicit recovery from %s", taskID, current, taskFrom)
+		return false, fmt.Errorf("PR %s is %s; retry requires explicit recovery from %s", taskID, current, taskFrom)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO task_events(task_id, kind, from_state, to_state, reason)
 		VALUES (?, ?, ?, ?, ?)`, taskID, taskKind, taskFrom, taskTo, taskReason); err != nil {

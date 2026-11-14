@@ -1546,7 +1546,7 @@ func TestPollOnceReportsStatusCommand(t *testing.T) {
 		t.Fatalf("posted acknowledgements = %+v, want 1", client.posted)
 	}
 	body := client.posted[0].body
-	for _, want := range []string{"Gitmoot status for PR #10", "task: `task-010` `reviewing`", "queued=1", "merge_gate: `pending` ci pending"} {
+	for _, want := range []string{"Gitmoot status for PR #10", "pr: `task-010` `reviewing`", "queued=1", "merge_gate: `pending` ci pending"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("status body missing %q:\n%s", want, body)
 		}
@@ -1867,7 +1867,7 @@ func TestPollOnceReportsStatusCommandCountsUnregisteredPRJobs(t *testing.T) {
 		t.Fatalf("posted acknowledgements = %+v, want 1", client.posted)
 	}
 	body := client.posted[0].body
-	for _, want := range []string{"task: `pr-10-comment-909` not registered", "queued=1"} {
+	for _, want := range []string{"pr: `pr-10-comment-909` not registered", "queued=1"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("status body missing %q:\n%s", want, body)
 		}
@@ -2044,9 +2044,9 @@ func TestMergeCommandShowsAmbiguousBranchlessTasksAndRemedy(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"Gitmoot cannot merge PR #41 because multiple branchless tasks match it",
+		"Gitmoot cannot merge PR #41 because multiple branchless PR records match it",
 		"`review-pr-41-first`, `review-pr-41-second`",
-		"Gitmoot cannot pick which task owns the pull request, so merge PR #41 from GitHub",
+		"Gitmoot cannot pick which record owns the pull request, so merge PR #41 from GitHub",
 	} {
 		if !strings.Contains(client.posted[0].body, want) {
 			t.Fatalf("operator-visible reply %q does not contain %q", client.posted[0].body, want)
@@ -2184,7 +2184,7 @@ func TestMergeCommandShowsTerminalBlockedTaskState(t *testing.T) {
 	}, true)
 
 	for _, want := range []string{
-		"Gitmoot did not merge PR #41; the task is now `blocked`.",
+		"Gitmoot did not merge PR #41; the PR is now `blocked`.",
 		"Cause: review at evaluated head has a blocking result.",
 	} {
 		if !strings.Contains(body, want) {

@@ -92,3 +92,29 @@ func TestRenderPinsEveryGateAndTheCombinedPath(t *testing.T) {
 		t.Fatalf("combined render = %q, want %q", got, want)
 	}
 }
+
+// TestAttributionGapMatchersAcceptLegacyWording pins the #2600 transition: the
+// attribution-gap cause was reworded (job/task -> run/pr), but stored
+// [org:escalate …] notes and wake bodies keep the old sentence, so both the
+// seat routing (prefix) and the owner Gram (substring) must still recognise it.
+func TestAttributionGapMatchersAcceptLegacyWording(t *testing.T) {
+	for name, cause := range map[string]string{
+		"current": noImplementJobAttributionReason,
+		"legacy":  legacyNoImplementJobAttributionReason,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !IsSeatActionableGateCause("  " + cause) {
+				t.Errorf("IsSeatActionableGateCause rejected the %s wording", name)
+			}
+			if !IsImplementerAttributionGap("review gate: " + cause + " for head abc") {
+				t.Errorf("IsImplementerAttributionGap rejected the %s wording", name)
+			}
+		})
+	}
+	if noImplementJobAttributionReason == legacyNoImplementJobAttributionReason {
+		t.Fatal("legacy wording must differ from the current wording, or it is not a compatibility case")
+	}
+	if IsSeatActionableGateCause(emptyImplementAgentAttributionReason) || IsImplementerAttributionGap(malformedImplementPayloadAttributionReason) {
+		t.Fatal("the anomaly causes must not be read as the seat-actionable attribution gap")
+	}
+}

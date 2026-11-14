@@ -37,20 +37,20 @@ func TestTaskListQueriesStrandedDisposal(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"task", "list", "--home", home, "--state", "stranded", "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("task list stranded code=%d stderr=%s", code, stderr.String())
+	if code := Run([]string{"pr", "list", "--home", home, "--state", "stranded", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr list stranded code=%d stderr=%s", code, stderr.String())
 	}
 	var listed []taskListOutput
 	if err := json.Unmarshal(stdout.Bytes(), &listed); err != nil {
 		t.Fatal(err)
 	}
 	if len(listed) != 1 || listed[0].ID != "task-stranded" || listed[0].DisposalTier != "tier4_stranded" || !strings.Contains(listed[0].DisposalReason, "no disposal evidence") {
-		t.Fatalf("stranded task list = %+v", listed)
+		t.Fatalf("stranded pr list = %+v", listed)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"task", "list", "--home", home, "--state", "blocked", "--json"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
-		t.Fatalf("blocked task list code=%d stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	if code := Run([]string{"pr", "list", "--home", home, "--state", "blocked", "--json"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
+		t.Fatalf("blocked pr list code=%d stdout=%q stderr=%s", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -96,8 +96,8 @@ func TestTaskListFindsStrandedTaskWhenEscalationWriteFails(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"task", "list", "--home", home, "--state", "stranded", "--json"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("task list stranded code=%d stderr=%s", code, stderr.String())
+	if code := Run([]string{"pr", "list", "--home", home, "--state", "stranded", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("pr list stranded code=%d stderr=%s", code, stderr.String())
 	}
 	var stranded []taskListOutput
 	if err := json.Unmarshal(stdout.Bytes(), &stranded); err != nil {
@@ -106,11 +106,11 @@ func TestTaskListFindsStrandedTaskWhenEscalationWriteFails(t *testing.T) {
 	if len(stranded) != 1 || stranded[0].ID != "task-escalation-failed" ||
 		!strings.Contains(stranded[0].DisposalReason, "escalation write failed") ||
 		!strings.Contains(stranded[0].DisposalReason, "forced task disposal escalation failure") {
-		t.Fatalf("stranded task list = %+v", stranded)
+		t.Fatalf("stranded pr list = %+v", stranded)
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if code := Run([]string{"task", "list", "--home", home, "--state", "blocked", "--json"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
-		t.Fatalf("blocked task list code=%d stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	if code := Run([]string{"pr", "list", "--home", home, "--state", "blocked", "--json"}, &stdout, &stderr); code != 0 || strings.TrimSpace(stdout.String()) != "[]" {
+		t.Fatalf("blocked pr list code=%d stdout=%q stderr=%s", code, stdout.String(), stderr.String())
 	}
 }

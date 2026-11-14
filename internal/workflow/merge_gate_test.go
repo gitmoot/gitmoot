@@ -926,7 +926,7 @@ func TestPolicyMergeGateRejectsUnverifiableReviewAuthorship(t *testing.T) {
 		{
 			name:          "no implement job",
 			reviewerAgent: "audit",
-			wantReason:    "no implement job is recorded for this task",
+			wantReason:    "no implement run is recorded for this pr",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1172,7 +1172,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			omitUnrelatedJob:   true,
 			bridgePrecondition: true,
 			want: []string{
-				"no implement job is recorded for this task",
+				"no implement run is recorded for this pr",
 				"NOT disqualified",
 				"attribution gap, not a failed independence check",
 				"gitmoot job record --agent <implementing-agent>",
@@ -1184,7 +1184,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			name:               "no_implement_job",
 			bridgePrecondition: true,
 			want: []string{
-				"no implement job is recorded for this task",
+				"no implement run is recorded for this pr",
 				"NOT disqualified",
 				"attribution gap, not a failed independence check",
 				"gitmoot job record --agent <implementing-agent>",
@@ -1197,7 +1197,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 			seed: func(t *testing.T, store *db.Store, payload JobPayload) {
 				insertCompletedJob(t, store, db.Job{ID: "implement-empty-agent", Type: "implement"}, payload)
 			},
-			want: []string{"matches this task but has no recorded agent", "attribution data anomaly"},
+			want: []string{"matches this pr but has no recorded agent", "attribution data anomaly"},
 		},
 		{
 			name: "malformed_implement_payload",
@@ -1208,7 +1208,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 					t.Fatalf("CreateJobWithEvent returned error: %v", err)
 				}
 			},
-			want: []string{"implement job has a malformed payload", "corrupt-record anomaly"},
+			want: []string{"implement run has a malformed payload", "corrupt-record anomaly"},
 		},
 	}
 
@@ -1288,7 +1288,7 @@ func TestPolicyMergeGateNamesImplementerAttributionDeclineCause(t *testing.T) {
 // recording a durable implement row -- was already available and unnamed. A guard that pins
 // the wrong remedy verbatim keeps it shipped, which is why this constant moved rather than
 // being deleted.
-const boundAttributionGapRemedy = "gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>"
+const boundAttributionGapRemedy = "gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>"
 
 // forbiddenAttributionGapPermissions are phrasings that turn the decline into permission to
 // merge without independence. The gate still REFUSES on an attribution gap; only the remedy
@@ -1428,11 +1428,11 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 	}{
 		"empty agent": {
 			got:  emptyImplementAgentAttributionReason,
-			want: "latest review round's approval cannot be verified as independent: an implement job matches this task but has no recorded agent; this is an attribution data anomaly",
+			want: "latest review round's approval cannot be verified as independent: an implement run matches this pr but has no recorded agent; this is an attribution data anomaly",
 		},
 		"malformed payload": {
 			got:  malformedImplementPayloadAttributionReason,
-			want: "latest review round's approval cannot be verified as independent: an implement job has a malformed payload, so attribution for this task cannot be verified; this is a corrupt-record anomaly",
+			want: "latest review round's approval cannot be verified as independent: an implement run has a malformed payload, so attribution for this pr cannot be verified; this is a corrupt-record anomaly",
 		},
 		// The no-implement-job reason is the only one of the four that hands the operator a
 		// PROCEDURE, so it is the only one where ADDED text can change what the reader does.
@@ -1460,7 +1460,7 @@ func TestImplementerAttributionAnomalyDeclinesRemainByteStable(t *testing.T) {
 			// costume of a remedy. The added clause names --acting-role and states that
 			// independence is still enforced, so the escape hatch cannot be read as a
 			// waiver.
-			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement job is recorded for this task, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --task <task-id> --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered agent, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it",
+			want: "latest review round's approval is NOT disqualified, but independence cannot be verified: no implement run is recorded for this pr, so the gate cannot establish who implemented it. This is an attribution gap, not a failed independence check, and it is the expected state for in-session implementation. Remedy, runnable by the implementing lane: record the durable attribution row with gitmoot job record --agent <implementing-agent> --repo <owner/repo> --type implement --decision implemented --pr <number> --head-sha <sha>, then re-evaluate. Do not record an agent that did not implement, and do not record the reviewer. If the work was done in session by an org role that is not a registered reviewer, record --acting-role <role> in place of --agent: attribution is then the role, and independence is still enforced against it",
 		},
 	}
 	for name, check := range wants {
@@ -2254,7 +2254,7 @@ func TestPolicyMergeGateReportsWorktreeCleanupWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Evaluate returned error: %v", err)
 	}
-	if !decision.Merged || !strings.Contains(decision.Reason.Render(), "cleanup task worktree") {
+	if !decision.Merged || !strings.Contains(decision.Reason.Render(), "cleanup PR worktree") {
 		t.Fatalf("decision = %+v, want cleanup warning", decision)
 	}
 	task, err := store.GetTask(ctx, "task-9")

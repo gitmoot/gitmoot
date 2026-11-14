@@ -229,7 +229,7 @@ func TestReviewScopeInstructionsMatchesFollowUpText(t *testing.T) {
 		Findings:        []string{"F1: guard has no test"},
 		ChangedFiles:    []string{"internal/cli/review.go"},
 	}
-	want := fmt.Sprintf("Review pull request #%d as a scoped follow-up for task %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle)) +
+	want := fmt.Sprintf("Review pull request #%d as a scoped follow-up for PR record %s.\n", event.PullRequest, taskLabel(event.TaskID, event.TaskTitle)) +
 		ReviewScopeInstructions(event.HeadSHA, scope)
 	if got := scopedReviewInstructions(event, scope); got != want {
 		t.Fatalf("follow-up text drifted from the shared paragraph:\n got: %q\nwant: %q", got, want)

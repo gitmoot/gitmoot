@@ -1154,7 +1154,7 @@ func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now
 	// consumer keying off (job_id, since) can still tell a re-nudge of the SAME
 	// anchor apart from a fresh digest whose oldest task changed identity
 	// between ticks.
-	detail := fmt.Sprintf("%d tasks blocked — oldest %s (since %s) — %s%s",
+	detail := fmt.Sprintf("%d PRs blocked — oldest %s (since %s) — %s%s",
 		len(items), oldest.blockedFor.Round(time.Second), oldest.blockedSince.UTC().Format(time.RFC3339), oldest.taskID, suffix)
 	ev := events.NewEvent(events.EventJobBlocked, oldest.taskID, oldest.taskID, repo, string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
 	ev.Cause = "blocked_since"
@@ -1162,7 +1162,7 @@ func buildBlockedTaskDigestEvent(repo string, items []blockedTaskDigestItem, now
 }
 
 func buildBlockedTaskAlertExhaustedEvent(repo string, item blockedTaskDigestItem, now time.Time) events.Event {
-	detail := fmt.Sprintf("task %s remains blocked after %d alerts over %s (since %s); alert ladder exhausted, task remains queryable pending evidence disposal",
+	detail := fmt.Sprintf("PR %s remains blocked after %d alerts over %s (since %s); alert ladder exhausted, PR remains queryable pending evidence disposal",
 		item.taskID, blockedTaskMaxNudges, item.blockedFor.Round(time.Second), item.blockedSince.UTC().Format(time.RFC3339))
 	ev := events.NewEvent(events.EventJobNeedsAttention, item.taskID, item.taskID, repo,
 		string(workflow.TaskBlocked), detail, now, workflow.RedactCommentText)
