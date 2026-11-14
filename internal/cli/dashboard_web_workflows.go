@@ -81,7 +81,7 @@ func deriveDashboardWorkflowState(now time.Time, activity dashboardWorkflowActiv
 // Workflows returns one deterministic index row for every explicit workflow
 // label. Unlabeled jobs are omitted from the workflow index.
 // workflowAPIEntries returns the widened (description/status) index entries.
-// It is the source for both the cached /api/workflows shadow (workflowsJSON)
+// It is the source for both the cached /api/campaigns shadow (workflowsJSON)
 // and any caller needing the server-owned extension fields.
 func (d *webDataSource) workflowAPIEntries(ctx context.Context) ([]dashboardWorkflowAPIEntry, error) {
 	var out []dashboardWorkflowAPIEntry

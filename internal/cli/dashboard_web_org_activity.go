@@ -43,7 +43,7 @@ type dashboardFleetActivitySummary struct {
 	Working         int `json:"working"`
 	Blocked         int `json:"blocked"`
 	InputPending    int `json:"input_pending"`
-	JobsRunning     int `json:"jobs_running"`
+	JobsRunning     int `json:"runs_running"`
 	EscalationsOpen int `json:"escalations_open"`
 }
 

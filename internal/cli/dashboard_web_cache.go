@@ -353,7 +353,7 @@ func (d *webDataSource) handleCharts(w http.ResponseWriter, r *http.Request) {
 
 // handleGraph shadows the module's /api/graph with the same body (the module
 // marshals the DataSource Graph identically) cached on the job-event cursor,
-// like /api/jobs (#2639). Keys are per repo filter; a filter naming no job's
+// like /api/runs (#2639). Keys are per repo filter; a filter naming no job's
 // repo is computed through the single-flight but never retained, so arbitrary
 // ?repo= values cannot grow the cache.
 func (d *webDataSource) handleGraph(w http.ResponseWriter, r *http.Request) {

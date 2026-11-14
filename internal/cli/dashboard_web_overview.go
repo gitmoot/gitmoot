@@ -186,7 +186,7 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time, requ
 			title = reason
 		}
 		out.NeedsYou = append(out.NeedsYou, dashboard.OverviewNeedsYou{
-			Kind: "blocked_job", Repo: job.Repo, Ref: job.Agent, Title: title,
+			Kind: "blocked_run", Repo: job.Repo, Ref: job.Agent, Title: title,
 			AgeS: dashboardAgeSeconds(now, workflowMillisTime(parseJobTimeMillis(job.UpdatedAt))),
 			Link: "/attention",
 		})
@@ -203,8 +203,8 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time, requ
 		failures := item.Counts.Failed + item.Counts.Blocked
 		title := fmt.Sprintf("%d run%s failed · coordinator silent", failures, dashboardPlural(failures))
 		out.NeedsYou = append(out.NeedsYou, dashboard.OverviewNeedsYou{
-			Kind: "stalled_workflow", Ref: item.Label, Title: title, AgeS: item.StalledForS,
-			Link: "/workflows/" + url.PathEscape(item.Label), Label: item.Label,
+			Kind: "stalled_campaign", Ref: item.Label, Title: title, AgeS: item.StalledForS,
+			Link: "/campaigns/" + url.PathEscape(item.Label), Label: item.Label,
 			Pane: item.Coordinator.Pane, SessionID: item.Coordinator.SessionID, LastNote: item.LastNote,
 		})
 	}
@@ -224,8 +224,8 @@ func dashboardOverview(ctx context.Context, store *db.Store, now time.Time, requ
 	for _, repo := range repos {
 		count := unlabeledCounts[repo]
 		out.NeedsYou = append(out.NeedsYou, dashboard.OverviewNeedsYou{
-			Kind: "unlabeled_jobs", Repo: repo,
-			Title: fmt.Sprintf("%d unlabeled agent jobs in 24h (%s)", count, repo),
+			Kind: "unlabeled_runs", Repo: repo,
+			Title: fmt.Sprintf("%d unlabeled runs in 24h (%s)", count, repo),
 		})
 	}
 
@@ -438,13 +438,13 @@ func sortDashboardOverview(out *dashboard.Overview) {
 
 func dashboardNeedRank(kind string) int {
 	switch kind {
-	case "stalled_workflow":
+	case "stalled_campaign":
 		return 0
 	case "pr_awaiting_merge":
 		return 1
-	case "blocked_job":
+	case "blocked_run":
 		return 2
-	case "unlabeled_jobs":
+	case "unlabeled_runs":
 		return 3
 	default:
 		return 4

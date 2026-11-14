@@ -472,7 +472,7 @@ Prove a deploy: `gitmoot version` (commit/build), `gitmoot daemon status`,
 `gitmoot version` only proves the binary **you** invoked, not what the services
 run. Probe the deployed behavior instead: `/root/.local/bin/gitmoot-dashboard-web
 version` for the dashboard service, and hit its API for a field the new build
-changed (e.g. `curl -s http://172.17.0.1:8790/api/workflows`).
+changed (e.g. `curl -s http://172.17.0.1:8790/api/campaigns`).
 
 ## Work strategy (lead-engineer)
 

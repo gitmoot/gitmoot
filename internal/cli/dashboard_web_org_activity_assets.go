@@ -200,7 +200,7 @@ const dashboardFleetActivityJS = `
     metric(strip, 'sessions', 'live sessions', '/org');
     metric(strip, 'blocked', 'blocked', '/org');
     metric(strip, 'input_pending', 'needs input', '/org');
-    metric(strip, 'jobs_running', 'jobs running', '/jobs');
+    metric(strip, 'runs_running', 'runs running', '/runs');
     metric(strip, 'escalations_open', 'escalations open', '/org');
     return strip;
   }
@@ -212,7 +212,7 @@ const dashboardFleetActivityJS = `
     strip.classList.toggle('source-down', source.state === 'down');
     strip.classList.toggle('no-sessions', source.state !== 'down' && sessions === 0);
     let title = sessions + ' live session' + (sessions === 1 ? '' : 's');
-    let copy = 'Session work is independent of engine jobs.';
+    let copy = 'Session work is independent of engine runs.';
     if (source.state === 'down') {
       title = 'Session source down';
       copy = source.detail || 'Herdr session activity is unavailable.';
@@ -222,7 +222,7 @@ const dashboardFleetActivityJS = `
     }
     setText(strip.querySelector('[data-gmfa-title]'), title);
     setText(strip.querySelector('[data-gmfa-copy]'), copy);
-    ['working','sessions','blocked','input_pending','jobs_running','escalations_open'].forEach(key => {
+    ['working','sessions','blocked','input_pending','runs_running','escalations_open'].forEach(key => {
       setText(strip.querySelector('[data-value="' + key + '"]'), Number(summary[key] || 0));
     });
   }

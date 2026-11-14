@@ -91,18 +91,20 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 // (/api/learning/skills): gitmoot does not answer for pages that do not exist.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
+	mux.HandleFunc("GET /api/runs", ds.handleJobs)
 	mux.HandleFunc("GET /api/charts", ds.handleCharts)
 	mux.HandleFunc("GET /api/health", ds.handleHealth)
 	// #2639: cached shadow of the module's galaxy route.
 	mux.HandleFunc("GET /api/graph", ds.handleGraph)
 	mux.HandleFunc("GET /api/overview", ds.handleOverview)
 	mux.HandleFunc("GET /api/attention", ds.handleAttention)
-	mux.HandleFunc("GET /api/agents", ds.handleAgents)
-	mux.HandleFunc("GET /api/tasks", ds.handleTasks)
+	mux.HandleFunc("GET /api/reviewers", ds.handleAgents)
+	mux.HandleFunc("GET /api/prs", ds.handleTasks)
 	// #958 widens this cached shadow: workflowsJSON now emits description/status,
 	// and the "workflows" cache key already includes the workflow-note-id so a
 	// status change busts the cache.
+	mux.HandleFunc("GET /api/campaigns", ds.handleWorkflows)
+	// transition alias for one release (#2596); remove with the old command names
 	mux.HandleFunc("GET /api/workflows", ds.handleWorkflows)
 	registerDashboardCommsRoutes(mux, ds)
 	mux.HandleFunc("GET /api/fleet/activity", ds.handleFleetActivity)
@@ -112,7 +114,7 @@ func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux.HandleFunc("GET /assets/gitmoot-stale-notifications.js", handleStaleNotificationsJS)
 	mux.HandleFunc("GET /api/stale-notifications", ds.handleStaleNotificationsAPI)
 	// #958 single-label detail widening (no module cache policy for this route).
-	mux.HandleFunc("GET /api/workflow/{label}", ds.handleWorkflowAPI)
+	mux.HandleFunc("GET /api/campaign/{label}", ds.handleWorkflowAPI)
 	mux.Handle("/", withDashboardCommsNav(withStaleNotificationAssets(withFleetActivityAssets(dashboard.Serve(ds)))))
 	return mux
 }
@@ -137,10 +139,10 @@ type dashboardNavItem struct {
 
 var dashboardNavManifest = []dashboardNavItem{
 	{Href: "/", Title: "Overview", Group: "WORK"},
-	{Href: "/tasks", Title: "Tasks", Group: "WORK"},
-	{Href: "/workflows", Title: "Workflows", Group: "WORK"},
-	{Href: "/jobs", Title: "Jobs", Group: "WORK"},
-	{Href: "/agents", Title: "Agents", Group: "FLEET"},
+	{Href: "/prs", Title: "PRs", Group: "WORK"},
+	{Href: "/campaigns", Title: "Campaigns", Group: "WORK"},
+	{Href: "/runs", Title: "Runs", Group: "WORK"},
+	{Href: "/reviewers", Title: "Reviewers", Group: "FLEET"},
 	{Href: "/org", Title: "Org", Group: "FLEET"},
 	{Href: "/comms", Title: "Comms", Group: "FLEET"},
 	{Href: "/galaxy", Title: "Galaxy", Group: "INSIGHT"},
@@ -214,13 +216,13 @@ type dashboardWorkflowAPIView struct {
 func (d *webDataSource) handleWorkflowAPI(w http.ResponseWriter, r *http.Request) {
 	label := strings.TrimSpace(r.PathValue("label"))
 	if label == "" {
-		http.Error(w, "missing workflow label", http.StatusBadRequest)
+		http.Error(w, "missing campaign label", http.StatusBadRequest)
 		return
 	}
 	view, err := d.Workflow(r.Context(), label, dashboard.WorkflowQuery{
-		RunCursor:  r.URL.Query().Get("runCursor"),
+		RunCursor:  r.URL.Query().Get("rootCursor"),
 		NoteCursor: r.URL.Query().Get("noteCursor"),
-		MaxRuns:    dashboardAPIWorkflowLimit(r.URL.Query().Get("maxRuns"), dashboardWorkflowMaxRuns),
+		MaxRuns:    dashboardAPIWorkflowLimit(r.URL.Query().Get("maxRoots"), dashboardWorkflowMaxRuns),
 		MaxNotes:   dashboardAPIWorkflowLimit(r.URL.Query().Get("maxNotes"), dashboardWorkflowMaxNotes),
 	})
 	if err != nil {
@@ -1061,7 +1063,7 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 			}
 			out.Nodes = append(out.Nodes, dashboard.GraphNode{
 				ID:    j.ID,
-				Type:  "job",
+				Type:  "run",
 				Label: nodeTitle(p, j, ""),
 				State: mapNodeState(j.State),
 				Agent: agent,
@@ -1092,7 +1094,7 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 			out.Nodes = append(out.Nodes, dashboard.GraphNode{ID: "repo::" + r, Type: "repo", Label: r, Repo: r})
 		}
 		for _, a := range sortedSetKeys(agentHubs) {
-			out.Nodes = append(out.Nodes, dashboard.GraphNode{ID: "agent::" + a, Type: "agent", Label: a, Agent: a})
+			out.Nodes = append(out.Nodes, dashboard.GraphNode{ID: "agent::" + a, Type: "reviewer", Label: a, Agent: a})
 		}
 		workflowLabels := make([]string, 0, len(workflowHubs))
 		for label := range workflowHubs {
@@ -1106,7 +1108,7 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 		for _, label := range workflowLabels {
 			rollup := workflowHubs[label]
 			out.Nodes = append(out.Nodes, dashboard.GraphNode{
-				ID: "workflow::" + label, Type: "workflow", Label: label,
+				ID: "workflow::" + label, Type: "campaign", Label: label,
 				JobCount: rollup.jobs, NoteCount: noteCounts[label],
 				TokensIn: rollup.tokensIn, TokensOut: rollup.tokensOut,
 			})
@@ -1126,10 +1128,10 @@ func (d *webDataSource) Graph(ctx context.Context, repo string) (dashboard.Graph
 				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "repo::" + r, Kind: "repo"})
 			}
 			if a := strings.TrimSpace(j.Agent); a != "" {
-				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "agent::" + a, Kind: "agent"})
+				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "agent::" + a, Kind: "reviewer"})
 			}
 			if label := strings.TrimSpace(j.WorkflowID); label != "" {
-				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "workflow::" + label, Kind: "workflow"})
+				out.Links = append(out.Links, dashboard.GraphLink{Source: j.ID, Target: "workflow::" + label, Kind: "campaign"})
 			}
 		}
 
