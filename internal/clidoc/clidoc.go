@@ -11,7 +11,9 @@
 // command path. A path whose `--help` prints its parent's help again (a
 // subcommand without help of its own, or a literal argument such as the `codex`
 // in `gitmoot plugin build codex|claude`) is still a known path; it just gets no
-// section of its own in the rendered reference.
+// section of its own in the rendered reference. A path whose `--help` exits
+// non-zero or prints nothing fails discovery: that output is an error, not help,
+// and must never be published as the command's reference.
 package clidoc
 
 import (
@@ -26,13 +28,12 @@ import (
 // exit code.
 type Runner func(args []string) (output string, code int)
 
-// Command is one known command path, the output and exit status of
-// `gitmoot <path> --help`, and whether that output is the path's own help
-// (non-empty and different from its parent's).
+// Command is one known command path, the output of `gitmoot <path> --help`,
+// and whether that output is the path's own help (different from its
+// parent's).
 type Command struct {
 	Path []string
 	Help string
-	Code int
 	Own  bool
 }
 
@@ -68,7 +69,8 @@ var wordPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 // Tree is every known command path keyed by Name.
 type Tree map[string]Command
 
-// Discover returns every known command path, the root included under "".
+// Discover returns every known command path, the root included under "". It
+// fails when any path's `--help` exits non-zero or prints nothing.
 func Discover(run Runner) (Tree, error) {
 	rootHelp, code := run([]string{"--help"})
 	if code != 0 {
@@ -80,30 +82,40 @@ func Discover(run Runner) (Tree, error) {
 	}
 	tree := Tree{"": {Help: rootHelp, Own: true}}
 	queue := []Command{}
-	visit := func(path []string) {
+	visit := func(path []string) error {
 		key := strings.Join(path, " ")
 		if _, ok := tree[key]; ok {
-			return
+			return nil
 		}
 		help, code := run(append(append([]string{}, path...), "--help"))
+		if code != 0 {
+			return fmt.Errorf("gitmoot %s --help exited %d instead of printing help:\n%s", key, code, help)
+		}
+		if strings.TrimSpace(help) == "" {
+			return fmt.Errorf("gitmoot %s --help printed nothing", key)
+		}
 		parent := tree[strings.Join(path[:len(path)-1], " ")]
 		command := Command{
 			Path: append([]string{}, path...),
 			Help: help,
-			Code: code,
-			Own:  strings.TrimSpace(help) != "" && help != parent.Help,
+			Own:  help != parent.Help,
 		}
 		tree[key] = command
 		queue = append(queue, command)
+		return nil
 	}
 	for _, name := range names {
-		visit([]string{name})
+		if err := visit([]string{name}); err != nil {
+			return nil, err
+		}
 	}
 	for len(queue) > 0 {
 		parent := queue[0]
 		queue = queue[1:]
 		for _, path := range childPaths(parent) {
-			visit(path)
+			if err := visit(path); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return tree, nil
@@ -272,9 +284,6 @@ func Render(tree Tree) []byte {
 	}
 	for _, command := range sections {
 		b.WriteString("\n## " + heading(command) + "\n\n")
-		if command.Code != 0 {
-			fmt.Fprintf(&b, "`--help` exits %d here and prints:\n\n", command.Code)
-		}
 		b.WriteString("```text\n")
 		b.WriteString(strings.TrimRight(command.Help, "\n"))
 		b.WriteString("\n```\n")

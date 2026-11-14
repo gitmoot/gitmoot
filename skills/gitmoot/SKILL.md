@@ -44,19 +44,22 @@ are not job runtimes.
 
 Check the install before anything else: `gitmoot version`, then `gitmoot doctor`
 (exit 1 lists `failed required checks:`; on a throwaway home without GitHub,
-Herdr or omp, the `omp`, `gh auth`, `herdr` and `repo remote` failures are
-expected). The binary is the authority. If this skill disagrees with
+Herdr or omp, the `omp`, `gh auth` and `repo remote` failures are expected,
+plus `herdr` once an org role is declared and `base branch` when run outside
+a git checkout). The binary is the authority. If this skill disagrees with
 `gitmoot --help` or a command's own `--help`, trust the help.
 [references/CLI.md](references/CLI.md) is that help, generated from the binary.
 
 **Home and argument order.** `--home <dir>` keeps state in `<dir>/.gitmoot`
 instead of `$HOME/.gitmoot`. It is a flag of each subcommand, never of
 `gitmoot` itself: write `gitmoot doctor --home H`, because `--home` before the
-subcommand fails with `unknown command "--home"`. `version` has no `--home`.
-Put a positional name or id right after the
-subcommand words and flags after it (`gitmoot job show <job-id> --home H`,
+subcommand fails with `unknown command "--home"`. `gitmoot version --home H`
+prints the `config:` and `database:` paths of that home. Put a positional name
+or id right after the subcommand words and flags after it
+(`gitmoot job show <job-id> --home H`,
 `gitmoot agent subscribe <name> --runtime ...`); the other order fails with
-"requires exactly one id/name". Two exceptions take their flags first:
+"requires exactly one id/name". Two exceptions take every flag, `--home`
+included, before the positional:
 `message escalate --to <role> "question"` and
 `org await withdraw --reason "why" <await-id>`. Every example here uses the
 order that works. Role-aware commands read your role from `GITMOOT_ORG_ROLE`;
@@ -148,12 +151,23 @@ gitmoot findings --repo owner/repo --pr <n>
   head.
 
 A verdict is `approved` or `changes_requested` (with a `severity` of `P0` to
-`P3`); `blocked` and `failed` mean the review did not finish (request the same
-head again to retry). To act on `changes_requested`: fix, push, and request a
-review of the **new** head. A new head is a new review; asking again for the
-same head only returns the verdict it already has. A finding closes only when
-a later review cites its UID as `continues_uid` with `"state": "answered"` and
-evidence (see
+`P3`); `blocked`, `failed` and `cancelled` mean the review did not finish.
+
+- **`failed` or `cancelled`:** request the same head again; that starts a new
+  review of it.
+- **`blocked`:** requesting the same head again does not retry it. The blocked
+  job keeps its claim on the head, so the request prints `state: attached`
+  and the same job with `(blocked)`. Read why with `gitmoot job show <job-id>`
+  (`why_stuck`) and what it needs with `gitmoot job gates <job-id>`. Then
+  either clear its gates (`gitmoot job gates clear <job-id> --need "text"`;
+  clearing the last one runs it again), re-queue the same job with
+  `gitmoot job retry <job-id>`, or cancel it with `gitmoot job cancel <job-id>`
+  and request the head again for a new review.
+
+To act on `changes_requested`: fix, push, and request a review of the **new**
+head. A new head is a new review; asking again for the same head only returns
+the verdict it already has. A finding closes only when a later review cites
+its UID as `continues_uid` with `"state": "answered"` and evidence (see
 [references/RESULT_CONTRACT.md](references/RESULT_CONTRACT.md#the-findings-ledger)); an
 approval that does not cite it leaves it open.
 
@@ -258,8 +272,9 @@ gitmoot daemon drain --timeout 15m
 - `job show` reports the state and, for a stuck job, `why_stuck` and a
   suggested action. `gitmoot job events <job-id>` lists what happened.
 - `job cancel <job-id>` cancels one job.
-  `gitmoot job cancel --state blocked --older-than 7d` cancels old blocked jobs
-  in bulk.
+  `gitmoot job cancel --state blocked --older-than 7d` only previews the old
+  blocked jobs it would cancel and changes nothing; add `--yes` to cancel
+  them: `gitmoot job cancel --state blocked --older-than 7d --yes`.
 - A `blocked` job lists what it needs with `gitmoot job gates <job-id>`. Clear
   one with `gitmoot job gates clear <job-id> --need "text"`; clearing the last
   one runs the job again.

@@ -7,12 +7,24 @@ Three end-to-end walkthroughs. Every command is in
 
 ```sh
 gitmoot init
+gitmoot org init
 gitmoot repo add owner/repo --path /path/to/checkout
 gitmoot org seat add <your-role> --pane <pane-id>
 gitmoot agent subscribe reviewer-1 --runtime omp --session fresh:reviewer-1 --role <reviewer-role> --repo owner/repo --capability review
 gitmoot daemon start
 gitmoot doctor
 ```
+
+`org seat add` acts as a role declared in the org registry, by default the
+root role `owner`; on a fresh home it fails `acting role "owner" is not
+declared`. `gitmoot org init` declares `owner` (it appends the `[org]` and
+`[org.roles."owner"]` block shown in the no-model walkthrough below to
+`~/.gitmoot/config.toml`) and then checks Herdr 0.7.5 or later, which
+`--pane` needs too. Without Herdr, `org init` still declares `owner` but exits
+1, and `--pane` fails `inspect live Herdr panes`: leave `--pane` out and the
+seat is created unbound (bind it later by running `org seat add` again with
+`--pane`), or follow the no-model walkthrough, which declares `owner`
+directly.
 
 The reviewer needs the `review` capability and must not also have `implement`.
 An omp reviewer's `--session` is a UUID or `fresh:<suffix>`; omp starts a fresh
@@ -51,7 +63,7 @@ To check the flow without spending a model, register a `shell` reviewer whose
 command prints a verdict, and run the job in the foreground. It needs no
 GitHub login, no Herdr and no omp, and touches nothing outside `/tmp/gm-demo`.
 `--home $H` keeps all state in `$H/.gitmoot`; `HOME` is exported too because
-`git` and `gitmoot version` read it.
+`git` reads it, and so does any `gitmoot` command run without `--home`.
 
 ```sh
 export HOME=/tmp/gm-demo
@@ -65,11 +77,12 @@ gitmoot init --home $H
 ```
 
 `repo add` reads the checkout's `origin` remote, so the repository needs one;
-it is never contacted. `org seat add` needs an acting role declared in the
-org registry: by default that is `owner`. `gitmoot org init` writes it but then
-fails without Herdr, so declare it directly. Append to `$H/.gitmoot/config.toml`
-(the `[disk_guard]` lines only matter on a nearly full disk, where the disk
-guard would otherwise refuse the request; use them in a throwaway home only):
+it is never contacted. `org seat add` acts as a role declared in the org
+registry, by default `owner`. `gitmoot org init` declares it but then exits 1
+without Herdr, so declare it directly: append to `$H/.gitmoot/config.toml` the
+same `[org]` and `[org.roles."owner"]` block `org init` writes (the
+`[disk_guard]` lines only matter on a nearly full disk, where the disk guard
+would otherwise refuse the request; use them in a throwaway home only):
 
 ```toml
 [disk_guard]

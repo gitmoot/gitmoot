@@ -127,6 +127,7 @@ disagrees, trust its live `--help`.
 - [gitmoot workflow](#gitmoot-workflow)
 - [gitmoot workflow list](#gitmoot-workflow-list)
 - [gitmoot workflow register](#gitmoot-workflow-register)
+- [gitmoot workflow show](#gitmoot-workflow-show)
 - [gitmoot workflow show-note](#gitmoot-workflow-show-note)
 
 ## gitmoot
@@ -1208,8 +1209,6 @@ Usage of org init:
 
 ## gitmoot org interrupts
 
-`--help` exits 2 here and prints:
-
 ```text
 Usage of org interrupts:
   -home string
@@ -1218,7 +1217,6 @@ Usage of org interrupts:
     	emit the report as JSON
   -window string
     	window to report over, for example 24h or 7d; 0 reports every recorded wake (default "7d")
-org interrupts: flag: help requested
 ```
 
 ## gitmoot org recycle
@@ -1475,8 +1473,6 @@ another reviewer. No verdict ever triggers a model change.
 
 ## gitmoot review level
 
-`--help` exits 2 here and prints:
-
 ```text
 Usage of review level:
   -home string
@@ -1611,10 +1607,13 @@ Usage of runtime prune:
 
 ## gitmoot sandbox
 
-`--help` exits 2 here and prints:
-
 ```text
-unknown sandbox subcommand "--help"; use probe
+Usage:
+  gitmoot sandbox probe
+
+probe reports whether this kernel enforces the runtime sandbox (Landlock):
+it prints "supported (Landlock ABI vN)" and exits 0, or "unsupported"
+and the reason and exits 1.
 ```
 
 ## gitmoot setup
@@ -1737,6 +1736,18 @@ Usage of workflow list:
 
 ```text
 usage: workflow register LABEL DESCRIPTION [--home DIR] [--json]
+```
+
+## gitmoot workflow show
+
+```text
+Usage: gitmoot workflow show <label> [--json] [--limit N] [--home DIR]
+  -home string
+    	home directory to use instead of the current user's home
+  -json
+    	print the workflow timeline as JSON
+  -limit int
+    	maximum merged timeline entries (0 means all) (default 100)
 ```
 
 ## gitmoot workflow show-note
