@@ -73,6 +73,12 @@ var normalizationOwnedResultFields = map[string]string{
 	// agent to assert its own provenance, which is the one thing it must not do:
 	// normalization overwrites any supplied value for exactly that reason.
 	"evidence_declared": "assigned by result normalization from the producer's own silence, never requested from an agent",
+	// Kept on AgentResult only to read historical results (#2588): agents are
+	// no longer offered delegation, and a result carrying delegations fails
+	// the result check.
+	"delegations": "no longer offered to agents; kept only to read historical results",
+	// Only ever required by delegations that requested artifacts (#2588).
+	"artifact_body": "only required by delegations, which are no longer offered to agents",
 }
 
 func contractFieldNames() []string {
@@ -83,8 +89,6 @@ func contractFieldNames() []string {
 		}
 		fields = append(fields, field)
 	}
-	fields = append(fields, jsonFieldNames(workflow.Delegation{})...)
-	fields = append(fields, jsonFieldNames(workflow.EphemeralSpec{})...)
 	fields = append(fields, jsonFieldNames(workflow.HumanQuestion{})...)
 	return fields
 }
@@ -103,7 +107,7 @@ func TestNormalizationOwnedFieldsStayOutOfThePrompt(t *testing.T) {
 }
 
 // TestContractFieldsCoveredInJobPrompt is the load-bearing drift guard: every
-// JSON field of AgentResult, Delegation, EphemeralSpec and HumanQuestion must be
+// offered JSON field of AgentResult and HumanQuestion must be
 // named in the rendered job prompt. Adding a field to any of those structs
 // without teaching the generator (and thus the prompt) about it fails here.
 func TestContractFieldsCoveredInJobPrompt(t *testing.T) {
@@ -139,10 +143,6 @@ func TestEnumValuesCoveredInJobPrompt(t *testing.T) {
 
 	var values []string
 	values = append(values, workflow.ResultDecisions...)
-	values = append(values, workflow.DelegationFailurePolicies...)
-	values = append(values, workflow.DelegationSynthesisRules...)
-	values = append(values, workflow.EphemeralRuntimes...)
-	values = append(values, workflow.DelegationActions...)
 	values = append(values, workflow.ChecksBlockedKinds...)
 
 	for _, v := range values {
@@ -156,7 +156,7 @@ func TestEnumValuesCoveredInJobPrompt(t *testing.T) {
 // literal. Agents copy this verbatim, so it must never change shape; the
 // generator reproduces it from the struct field set.
 func TestExampleShapeIsByteIdentical(t *testing.T) {
-	const want = `{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed|skipped","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+	const want = `{"gitmoot_result":{"decision":"approved|changes_requested|blocked|implemented|failed|skipped","summary":"...","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 	for name, prompt := range map[string]string{
 		"job":    renderedJob(),
@@ -176,32 +176,11 @@ func TestSkippedDecisionSemanticsAreRendered(t *testing.T) {
 		for _, want := range []string{
 			"task itself had no work to do",
 			"Do not use skipped in a PR review",
-			"skipped must not be returned with delegations",
 			"skipped is an abstention for quorum and verify",
 		} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("%s prompt missing %q\n--- prompt ---\n%s", name, want, prompt)
 			}
-		}
-	}
-}
-
-// TestGoldenPhrasingsPreserved keeps the battle-tested wording verbatim. These
-// exact strings are what agents were trained against; rewording them regresses
-// real coordinator behavior, so they are pinned here.
-func TestGoldenPhrasingsPreserved(t *testing.T) {
-	prompt := renderedJob()
-
-	for _, want := range []string{
-		// "agent" not "to": the single most common field-name mistake.
-		`use "agent", not "to"`,
-		// empty delegations = done: the completion signal.
-		"Leave delegations empty ([]) when no follow-up agents are needed — that is how you signal the work is complete.",
-		// the per-entry error addressing scheme.
-		`delegations[<index>] (id "<id>")`,
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("rendered prompt dropped a battle-tested phrasing %q\n--- prompt ---\n%s", want, prompt)
 		}
 	}
 }

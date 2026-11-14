@@ -229,14 +229,9 @@ func checkIDs(in ResultCheckInput) map[string]ResultCheck {
 // ITSELF, and the two rows that matter are the ones that broke a
 // field-non-emptiness version in opposite directions: a one-token tests_run that
 // passed while saying nothing, and an honest docs-only approval that failed while
-// saying everything. A coordinator fan-out is exempt — it has nothing to report
-// yet by construction, and the shipped review-panel template prescribes exactly
-// that result.
+// saying everything. A review result carrying delegations never reaches these
+// checks: the mailbox refuses it first (#2588).
 func TestRunResultChecksReviewVerdictAccountsForItself(t *testing.T) {
-	panelDelegations := []Delegation{
-		{ID: "lens-a", Agent: "r1", Action: "review"},
-		{ID: "lens-b", Agent: "r2", Action: "review"},
-	}
 	cases := []struct {
 		name       string
 		result     AgentResult
@@ -283,18 +278,6 @@ func TestRunResultChecksReviewVerdictAccountsForItself(t *testing.T) {
 			wantPassed: []string{"review-verdict-has-evidence"},
 		},
 		{
-			// The verbatim "Coordinator Result" from
-			// skills/gitmoot/agent-templates/review-panel.md. The product's own
-			// documented recipe must not record a contract violation on every run.
-			name: "the shipped panel coordinator result is exempt",
-			result: AgentResult{
-				Decision:    "approved",
-				Summary:     "Convening a three-reviewer panel on the PR with diverse lenses.",
-				Delegations: panelDelegations,
-			},
-			wantAbsent: []string{"review-verdict-has-evidence"},
-		},
-		{
 			// blocked/failed are self-describing non-answers that legitimately carry
 			// no findings or tests. Nudging them would turn an honest "I could not
 			// review this" into a recorded violation.
@@ -303,18 +286,6 @@ func TestRunResultChecksReviewVerdictAccountsForItself(t *testing.T) {
 				Decision: "blocked", Summary: "checkout unavailable",
 				Needs: []string{"a working checkout"},
 			},
-			wantAbsent: []string{"review-verdict-has-evidence"},
-		},
-		{
-			// A fan-out that requests changes still owes findings, because
-			// review-evidence-present is about an actionable rejection rather than
-			// about who produced the verdict.
-			name: "a changes-requested fan-out still owes findings",
-			result: AgentResult{
-				Decision: "changes_requested", Summary: "panel will report",
-				Delegations: panelDelegations,
-			},
-			wantFailed: []string{"review-evidence-present"},
 			wantAbsent: []string{"review-verdict-has-evidence"},
 		},
 		{

@@ -10,8 +10,8 @@ import (
 )
 
 // TestNoExecutionReviewResultChecks pins what a no-execution review (#2364)
-// may record: a static-only verdict passes; any claim that something ran, or
-// delegated work that would run outside the restriction, is refused.
+// may record: a static-only verdict passes; any claim that something ran is
+// refused. Delegations are refused for every review (ReviewDelegationResultChecks).
 func TestNoExecutionReviewResultChecks(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -22,7 +22,6 @@ func TestNoExecutionReviewResultChecks(t *testing.T) {
 		{name: "static only with a placeholder tests_run entry", result: AgentResult{Decision: "approved", Evidence: EvidenceStaticOnly, TestsRun: []string{"  "}}},
 		{name: "executed claim", result: AgentResult{Decision: "approved", Evidence: EvidenceExecuted, TestsRun: []string{"go test ./..."}}, failed: []string{"review-no-execution-claims-nothing-ran"}},
 		{name: "tests listed under static_only", result: AgentResult{Decision: "approved", Evidence: EvidenceStaticOnly, TestsRun: []string{"go test ./internal/x"}}, failed: []string{"review-no-execution-claims-nothing-ran"}},
-		{name: "delegation", result: AgentResult{Decision: "approved", Evidence: EvidenceStaticOnly, Delegations: []Delegation{{Agent: "x", Action: "ask"}}}, failed: []string{"review-no-execution-delegates-nothing"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

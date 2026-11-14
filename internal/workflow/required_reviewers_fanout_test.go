@@ -15,9 +15,7 @@ import (
 //
 // Reachability is source-verified rather than assumed: a ready outcome here
 // leads to setTaskState(TaskReadyToMerge) at engine_routing_merge.go:739, :787
-// and :843, and the panel-specific defence (highRiskLensQuorumMet) only runs
-// when payload.RiskTier is RiskTierHigh - empty on the #1910 panel that
-// motivated this.
+// and :843.
 func TestAllRequiredReviewersApprovedRefusesAFanOutCoordinatorsOwnSlot(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)

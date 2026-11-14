@@ -287,29 +287,6 @@ type JobRequest struct {
 	ReviewRelatedPRs []ReviewRelatedPR
 	ReviewModelPool  []string
 	ReviewRequester  string
-	// StagedReviewVerdictAgent marks this job as the PREFLIGHT stage of a staged
-	// review and names the agent its verdict delegation must go to (#1821).
-	//
-	// IT IS A MARKER SET AT DISPATCH, NEVER AN INFERENCE, and that is the whole
-	// point of it existing. The first attempt at the staged evidence ceiling
-	// inferred "this is a staged pair" from the parent having declared
-	// `evidence`, and a reviewer broke it with the case that inference misses: an
-	// honest review COORDINATOR also declares static_only for itself, because it
-	// orchestrates without executing, while its lens children genuinely do
-	// execute. That inference silently downgraded every lens child's evidence,
-	// including rows the merge gate depends on. PR #2024 was closed for it.
-	//
-	// So the staged relationship is stated by the dispatcher that creates it, and
-	// consumers ask this field rather than deducing the relationship from a
-	// property that other job shapes share.
-	//
-	// Empty for every job that is not a staged preflight, which is all of them
-	// unless a repo declares [repos."owner/repo"] staged_review_verdict_agent.
-	StagedReviewVerdictAgent string
-	// InheritedEvidence is the ceiling a staged review's VERDICT child inherits
-	// from its preflight (#1821). Set only for the child the preflight's marker
-	// names, never for any other delegation.
-	InheritedEvidence string
 }
 
 func jobRequestExecBackend(value *string) string {
@@ -504,16 +481,6 @@ type JobPayload struct {
 	// byte-identically. It is stamped on a high-risk review coordinator and
 	// inherited by its lens children for explainable escalation.
 	RiskTier string `json:"risk_tier,omitempty"`
-	// StagedReviewVerdictAgent is the staged-review marker (#1821): non-empty
-	// only on the PREFLIGHT stage of a staged review, naming the agent its
-	// verdict delegation goes to. Set by the dispatch that creates the preflight,
-	// never inferred. Additive/omitempty, so every other job serializes
-	// byte-identically.
-	StagedReviewVerdictAgent string `json:"staged_review_verdict_agent,omitempty"`
-	// InheritedEvidence is the preflight ceiling this job was dispatched under
-	// (#1821), one of the declared evidence values. Non-empty only on the verdict
-	// child of a marked staged preflight. Additive/omitempty.
-	InheritedEvidence string `json:"inherited_evidence,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
 	// job that never hit a classified blocker serializes byte-identically).
 	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
@@ -724,82 +691,80 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// Cleanup selectors compare WorktreePath textually with the allocator-derived
 	// obligation path, so managed allocators must preserve their canonical path.
 	payload, err := marshalPayload(JobPayload{
-		Repo:                     request.Repo,
-		Branch:                   request.Branch,
-		PullRequest:              request.PullRequest,
-		PullRequestReady:         pullRequestReady,
-		HeadSHA:                  request.HeadSHA,
-		GoalID:                   request.GoalID,
-		TaskID:                   request.TaskID,
-		TaskTitle:                request.TaskTitle,
-		LeadAgent:                request.LeadAgent,
-		Reviewers:                compactStrings(request.Reviewers),
-		ReviewRound:              request.ReviewRound,
-		ReviewScope:              cloneReviewScope(request.ReviewScope),
-		Sender:                   request.Sender,
-		ActingOrgRole:            strings.TrimSpace(request.ActingOrgRole),
-		Instructions:             request.Instructions,
-		Constraints:              compactStrings(request.Constraints),
-		ParentJobID:              request.ParentJobID,
-		DelegationID:             request.DelegationID,
-		DelegationDepth:          request.DelegationDepth,
-		DelegatedBy:              request.DelegatedBy,
-		RootJobID:                request.RootJobID,
-		DispatchedBy:             dispatcherIdentity(request),
-		Deps:                     compactStrings(request.Deps),
-		JobTimeout:               strings.TrimSpace(request.JobTimeout),
-		RetryCount:               request.RetryCount,
-		Fingerprint:              strings.TrimSpace(request.Fingerprint),
-		FailurePolicy:            strings.TrimSpace(request.FailurePolicy),
-		SynthesisRule:            strings.TrimSpace(request.SynthesisRule),
-		DelegationArtifactDir:    request.DelegationArtifactDir,
-		WorktreePath:             request.WorktreePath,
-		ReadOnlyWorktree:         request.ReadOnlyWorktree,
-		ReadOnlySeat:             request.ReadOnlySeat,
-		ReviewNoExecution:        request.ReviewNoExecution,
-		TemplateID:               snapshot.ID,
-		TemplateResolvedCommit:   snapshot.ResolvedCommit,
-		TemplateContent:          snapshot.Content,
-		OriginalAgent:            request.OriginalAgent,
-		DelegatedAgent:           request.DelegatedAgent,
-		DelegationReason:         request.DelegationReason,
-		RecentDelegationHashes:   request.RecentDelegationHashes,
-		DelegationRepeatCount:    request.DelegationRepeatCount,
-		NonProgressStreak:        request.NonProgressStreak,
-		LastProgressDigest:       request.LastProgressDigest,
-		VerifyAttempt:            request.VerifyAttempt,
-		DelegationFinalize:       request.DelegationFinalize,
-		Model:                    request.Model,
-		Effort:                   request.Effort,
-		ExecBackend:              jobRequestExecBackend(request.ExecBackend),
-		ExecProvider:             strings.TrimSpace(request.ExecProvider),
-		ExecTemplate:             strings.TrimSpace(request.ExecTemplate),
-		PolicyRoutedReview:       request.PolicyRoutedReview,
-		DiskGuardRouted:          request.DiskGuardRouted,
-		ReviewChecksRouted:       request.ReviewChecksRouted,
-		Plan:                     request.Plan,
-		PlanInto:                 strings.TrimSpace(request.PlanInto),
-		WorkflowID:               strings.TrimSpace(request.WorkflowID),
-		RuntimeOverride:          strings.TrimSpace(request.RuntimeOverride),
-		RuntimeOverrideRef:       strings.TrimSpace(request.RuntimeOverrideRef),
-		RuntimeConfigDir:         strings.TrimSpace(request.RuntimeConfigDir),
-		EffectiveRuntime:         strings.TrimSpace(request.EffectiveRuntime),
-		Phase:                    request.Phase,
-		SkipNativeReviewFanout:   skipNativeReviewFanout,
-		PostMergeReview:          request.PostMergeReview,
-		Ephemeral:                request.Ephemeral,
-		HumanAnswer:              request.HumanAnswer,
-		RiskTier:                 strings.TrimSpace(request.RiskTier),
-		StagedReviewVerdictAgent: strings.TrimSpace(request.StagedReviewVerdictAgent),
-		InheritedEvidence:        normalizeInheritedEvidence(request.InheritedEvidence),
-		ReviewPurpose:            reviewPurpose,
-		ReviewPart:               strings.ToLower(strings.TrimSpace(request.ReviewPart)),
-		ReviewSupersedes:         strings.TrimSpace(request.ReviewSupersedes),
-		ReviewSupersedeReason:    strings.TrimSpace(request.ReviewSupersedeReason),
-		ReviewEvidence:           request.ReviewEvidence,
-		ReviewRelatedPRs:         request.ReviewRelatedPRs,
-		ReviewModelPool:          reviewPool,
-		ReviewRequester:          strings.TrimSpace(request.ReviewRequester),
+		Repo:                   request.Repo,
+		Branch:                 request.Branch,
+		PullRequest:            request.PullRequest,
+		PullRequestReady:       pullRequestReady,
+		HeadSHA:                request.HeadSHA,
+		GoalID:                 request.GoalID,
+		TaskID:                 request.TaskID,
+		TaskTitle:              request.TaskTitle,
+		LeadAgent:              request.LeadAgent,
+		Reviewers:              compactStrings(request.Reviewers),
+		ReviewRound:            request.ReviewRound,
+		ReviewScope:            cloneReviewScope(request.ReviewScope),
+		Sender:                 request.Sender,
+		ActingOrgRole:          strings.TrimSpace(request.ActingOrgRole),
+		Instructions:           request.Instructions,
+		Constraints:            compactStrings(request.Constraints),
+		ParentJobID:            request.ParentJobID,
+		DelegationID:           request.DelegationID,
+		DelegationDepth:        request.DelegationDepth,
+		DelegatedBy:            request.DelegatedBy,
+		RootJobID:              request.RootJobID,
+		DispatchedBy:           dispatcherIdentity(request),
+		Deps:                   compactStrings(request.Deps),
+		JobTimeout:             strings.TrimSpace(request.JobTimeout),
+		RetryCount:             request.RetryCount,
+		Fingerprint:            strings.TrimSpace(request.Fingerprint),
+		FailurePolicy:          strings.TrimSpace(request.FailurePolicy),
+		SynthesisRule:          strings.TrimSpace(request.SynthesisRule),
+		DelegationArtifactDir:  request.DelegationArtifactDir,
+		WorktreePath:           request.WorktreePath,
+		ReadOnlyWorktree:       request.ReadOnlyWorktree,
+		ReadOnlySeat:           request.ReadOnlySeat,
+		ReviewNoExecution:      request.ReviewNoExecution,
+		TemplateID:             snapshot.ID,
+		TemplateResolvedCommit: snapshot.ResolvedCommit,
+		TemplateContent:        snapshot.Content,
+		OriginalAgent:          request.OriginalAgent,
+		DelegatedAgent:         request.DelegatedAgent,
+		DelegationReason:       request.DelegationReason,
+		RecentDelegationHashes: request.RecentDelegationHashes,
+		DelegationRepeatCount:  request.DelegationRepeatCount,
+		NonProgressStreak:      request.NonProgressStreak,
+		LastProgressDigest:     request.LastProgressDigest,
+		VerifyAttempt:          request.VerifyAttempt,
+		DelegationFinalize:     request.DelegationFinalize,
+		Model:                  request.Model,
+		Effort:                 request.Effort,
+		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
+		ExecProvider:           strings.TrimSpace(request.ExecProvider),
+		ExecTemplate:           strings.TrimSpace(request.ExecTemplate),
+		PolicyRoutedReview:     request.PolicyRoutedReview,
+		DiskGuardRouted:        request.DiskGuardRouted,
+		ReviewChecksRouted:     request.ReviewChecksRouted,
+		Plan:                   request.Plan,
+		PlanInto:               strings.TrimSpace(request.PlanInto),
+		WorkflowID:             strings.TrimSpace(request.WorkflowID),
+		RuntimeOverride:        strings.TrimSpace(request.RuntimeOverride),
+		RuntimeOverrideRef:     strings.TrimSpace(request.RuntimeOverrideRef),
+		RuntimeConfigDir:       strings.TrimSpace(request.RuntimeConfigDir),
+		EffectiveRuntime:       strings.TrimSpace(request.EffectiveRuntime),
+		Phase:                  request.Phase,
+		SkipNativeReviewFanout: skipNativeReviewFanout,
+		PostMergeReview:        request.PostMergeReview,
+		Ephemeral:              request.Ephemeral,
+		HumanAnswer:            request.HumanAnswer,
+		RiskTier:               strings.TrimSpace(request.RiskTier),
+		ReviewPurpose:          reviewPurpose,
+		ReviewPart:             strings.ToLower(strings.TrimSpace(request.ReviewPart)),
+		ReviewSupersedes:       strings.TrimSpace(request.ReviewSupersedes),
+		ReviewSupersedeReason:  strings.TrimSpace(request.ReviewSupersedeReason),
+		ReviewEvidence:         request.ReviewEvidence,
+		ReviewRelatedPRs:       request.ReviewRelatedPRs,
+		ReviewModelPool:        reviewPool,
+		ReviewRequester:        strings.TrimSpace(request.ReviewRequester),
 	})
 	if err != nil {
 		return db.Job{}, nil, err
@@ -1406,20 +1371,6 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	if err := m.ensureRunning(ctx, job.ID); err != nil {
 		return AgentResult{}, err
 	}
-	// #1821: clamp a staged verdict to what its preflight found runnable, BEFORE
-	// the result is stored, so no consumer ever reads the unclamped claim. The
-	// event is the audit trail: an overruled producer is a different fact from
-	// one that declared static_only itself, and a merge decision leaning on this
-	// evidence should be able to tell them apart.
-	//
-	// payload.InheritedEvidence is non-empty ONLY on the verdict child of a
-	// marked staged preflight (stagedVerdictCeiling), so this cannot fire for a
-	// coordinator's lens children.
-	if ApplyInheritedEvidenceCeiling(&result, payload.InheritedEvidence) {
-		_ = m.addEvent(ctx, job.ID, InheritedEvidenceClampedEvent, fmt.Sprintf(
-			"declared %s evidence was clamped to %s: the preflight stage for this exact head recorded %s, so nothing here could have run",
-			EvidenceExecuted, EvidenceStaticOnly, EvidenceStaticOnly))
-	}
 	// #2316: a remote review exists to run the checks the local seat cannot.
 	// When its own report says they did not run, record what it is: static.
 	if execBackend == execbackend.Remote && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
@@ -1429,26 +1380,33 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 		}
 	}
 	payload.Result = &result
-	// #2364: a no-execution review's result is checked whatever the
-	// result_checks mode, because the mode is an audit dial and this is the
-	// review's own contract. A failure takes the block path. The agent flag
-	// covers a review made no-execution by its repository's policy, which the
-	// worker applies on the agent; it is recorded on the payload here so the
-	// stored job says which contract its verdict was produced under.
+	// Mandatory review checks run whatever the result_checks mode, because the
+	// mode is an audit dial and these are the review's own contract. Every
+	// failing mandatory check is recorded, then the job takes the block path.
+	// #2364: a no-execution review must run nothing. The agent flag covers a
+	// review made no-execution by its repository's policy, which the worker
+	// applies on the agent; it is recorded on the payload here so the stored
+	// job says which contract its verdict was produced under.
+	// #2588: reviewers are no longer offered delegation, so a review result
+	// that still carries delegations is refused rather than dispatched or
+	// silently dropped.
+	var mandatoryFailed []ResultCheck
 	if (payload.ReviewNoExecution || agent.NoExecution) && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
 		payload.ReviewNoExecution = true
-		if failed := NoExecutionReviewResultChecks(result); len(failed) > 0 {
-			payload.ResultChecks = failed
-			summary := SummarizeResultChecks(failed)
-			_ = m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary)
-			if err := m.savePayload(ctx, job.ID, payload); err != nil {
-				return AgentResult{}, err
-			}
-			if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
-				return AgentResult{}, err
-			}
-			return AgentResult{}, &ResultChecksError{Failed: failed}
+		mandatoryFailed = NoExecutionReviewResultChecks(result)
+	}
+	mandatoryFailed = append(mandatoryFailed, ReviewDelegationResultChecks(job.Type, result)...)
+	if len(mandatoryFailed) > 0 {
+		payload.ResultChecks = mandatoryFailed
+		summary := SummarizeResultChecks(mandatoryFailed)
+		_ = m.addEvent(ctx, job.ID, ResultChecksFailedEventKind, summary)
+		if err := m.savePayload(ctx, job.ID, payload); err != nil {
+			return AgentResult{}, err
 		}
+		if err := m.fail(ctx, job.ID, "result checks failed: "+summary); err != nil {
+			return AgentResult{}, err
+		}
+		return AgentResult{}, &ResultChecksError{Failed: mandatoryFailed}
 	}
 	// #526 deterministic binary-checklist audit of the parsed result. The worktree
 	// observation above is recorded in every mode. Off (the zero value and "off")
@@ -1766,29 +1724,6 @@ type claimAnchor struct {
 // A nil anchor keeps the historical unanchored running->state transition.
 func (m Mailbox) writeTerminalPayload(writeCtx context.Context, jobID string, state JobState, message string, payload JobPayload, anchor *claimAnchor) error {
 	clearRuntimeIdentity(&payload)
-	// THE STAGED PREFLIGHT CONTRACT IS ENFORCED HERE, AT INGESTION, BECAUSE THIS
-	// IS WHERE A RESULT BECOMES CONSUMABLE (#2029 round four, P1).
-	//
-	// The enforcement used to live downstream and moved three times, each
-	// placement one layer further out than the consumer that had just been found
-	// beating it. It cannot win that way: emitTerminal is called from THIS
-	// function, and its review branch classifies a succeeded non-fan-out review
-	// result as a verdict and wakes the pull request's owner. A marked preflight
-	// returning approved with zero delegations is precisely that shape.
-	//
-	// Forcing the terminal state to FAILED is what makes the result
-	// unconsumable rather than merely late: emitTerminal's verdict branch is
-	// gated on JobSucceeded, the ledger write and task move are gated on the
-	// review decision, and none of them can read a failed job as a verdict.
-	//
-	// THE REVIEWER'S TEXT IS NOT REWRITTEN. Only the state changes; the result is
-	// stored verbatim so the refusal can be diagnosed from the row rather than
-	// from this message alone.
-	if reason := stagedPreflightVerdictRefusal(payload); reason != "" && state == JobSucceeded {
-		state = JobFailed
-		message = fmt.Sprintf("staged review preflight named verdict agent %q but %s (#1821, #2029)",
-			strings.TrimSpace(payload.StagedReviewVerdictAgent), reason)
-	}
 	message = terminalMessageWithDiagnostics(state, message, payload.FailureDiagnostics)
 	encoded, err := marshalPayload(payload)
 	if err != nil {

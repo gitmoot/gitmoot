@@ -605,35 +605,6 @@ is a real value and renders as `0`; a rendered `0` for silence would invent a
 stalled seat. An unavailable role keeps its reported turn, because an
 unavailability incident says whether a role may be dispatched to, not whether
 the provider reported anything.
-The same `[repos."owner/repo"]` section declares a repo's **staged review**
-verdict agent (#1821):
-
-```toml
-[repos."owner/repo"]
-staged_review_verdict_agent = "gm-review-opus"
-```
-
-A staged review splits one review into a cheap preflight stage that answers
-*can this review be performed here* and a **verdict** stage whose result is the
-review. `staged_review_verdict_agent` names the agent that would run the
-verdict stage.
-
-Local `agent review` and review-resolved `agent run` dispatch honor this key:
-they run the requested reviewer as a **preflight** parent. The parent checks
-whether the review can run and delegates exactly once to the configured verdict
-agent. The preflight is marked so its result cannot be consumed as the final
-review verdict. Daemon fanout, comment-command, and
-externally recorded session reviews do not consult this key; they keep their
-ordinary review paths.
-
-It is **off by default** and there is deliberately **no default and no fallback
-list**. A repo that has not declared one uses the ordinary, unstaged review
-path, and having a `[repos.*]` section for some
-other key is **not** a declaration. That is the campaign's non-fallback rule
-applied to the choice of reviewer itself - a strong reviewer that cannot be
-identified must never degrade to *the cheap stage approved it* - so the
-reviewer is an operator's decision per repo rather than a constant in the
-Gitmoot source.
 
 Job kill deadlines are independent from stale-running detection. Configure the
 daemon defaults with:
@@ -1210,7 +1181,7 @@ What one request does, in order:
    registering after a different-purpose verdict is not satisfied by it.
    `gitmoot org await review` keeps the bare `owner/repo#N@sha` key and its
    any-purpose meaning, and a routed review inherits its purpose into REVIEW
-   delegation children so a staged review still answers the purposed wait —
+   delegation children so a delegated review still answers the purposed wait —
    scoped to review legs, because a non-review leg carrying a review purpose is
    read by consumers keyed on review type. The wake fires from the reviewing job's own
    state transition when the verdict is persisted, before and independently of
