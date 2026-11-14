@@ -41,6 +41,10 @@ var commandAliases = []commandAlias{
 	// #2601
 	{old: []string{"job", "run"}, new: []string{"run", "start"}},
 	{old: []string{"job"}, new: []string{"run"}},
+	// #2602
+	{old: []string{"workflow", "note"}, new: []string{"note", "add"}},
+	{old: []string{"workflow", "show-note"}, new: []string{"note", "show"}},
+	{old: []string{"workflow"}, new: []string{"campaign"}},
 }
 
 // aliasWarned records which old names already warned in this process.

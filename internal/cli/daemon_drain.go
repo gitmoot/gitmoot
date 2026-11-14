@@ -154,7 +154,7 @@ func runDaemonDrain(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon drain", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	timeout := fs.Duration("timeout", 15*time.Minute, "how long to wait for in-flight jobs before reporting what remains")
+	timeout := fs.Duration("timeout", 15*time.Minute, "how long to wait for in-flight runs before reporting what remains")
 	clear := fs.Bool("clear", false, "stop draining and resume claiming")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -180,7 +180,7 @@ func runDaemonDrain(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "daemon drain: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(stdout, "draining: the daemon has stopped claiming new work; queued jobs stay queued")
+	fmt.Fprintln(stdout, "draining: the daemon has stopped claiming new work; queued runs stay queued")
 
 	deadline := time.Now().Add(*timeout)
 	var remaining []db.Job
@@ -203,7 +203,7 @@ func runDaemonDrain(args []string, stdout, stderr io.Writer) int {
 	}
 
 	if len(remaining) == 0 {
-		fmt.Fprintln(stdout, "drained: no engine-dispatched job is in flight, it is safe to restart")
+		fmt.Fprintln(stdout, "drained: no engine-dispatched run is in flight, it is safe to restart")
 		fmt.Fprintln(stdout, "run `gitmoot daemon drain --clear` after the restart, or the new daemon will not claim.")
 		return 0
 	}
@@ -235,7 +235,7 @@ func runDaemonDrain(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "\nEach is recorded with a daemon_drain_deadline_exceeded event; none was parked or killed.")
 	fmt.Fprintln(stdout, "\nDrain remains ACTIVE, so nothing new is being claimed and the set can only shrink.")
-	fmt.Fprintln(stdout, "Wait and re-run, or decide about these jobs explicitly before restarting.")
+	fmt.Fprintln(stdout, "Wait and re-run, or decide about these runs explicitly before restarting.")
 	return 1
 }
 

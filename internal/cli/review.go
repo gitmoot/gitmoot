@@ -121,7 +121,7 @@ func printReviewUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot review request --pr NUMBER [--repo OWNER/REPO] [--head SHA] [--branch NAME] [--purpose code|security|ui|architecture] [--role ROLE] [--ttl DURATION] [--reviewer NAME] [--message TEXT] [--runtime NAME] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--model PROVIDER/MODEL] [--effort LEVEL] [--campaign LABEL] [--session REF] [--full] [--post-merge] [--no-execution] [--part NAME [--supersede RUN --reason TEXT]] [--related-pr N]... [--allow-prompt-head-mismatch] [--background] [--json] [--home DIR] [-- \"review instructions\"]")
 	fmt.Fprintln(w, "  gitmoot review status --pr NUMBER [--repo OWNER/REPO] [--json] [--home DIR]")
 	fmt.Fprintln(w, "  gitmoot review level --repo OWNER/REPO --pr NUMBER [--json] [--home DIR]")
-	fmt.Fprintln(w, "  gitmoot review list [--repo owner/repo] [--state state] [--workflow label] [--json]")
+	fmt.Fprintln(w, "  gitmoot review list [--repo owner/repo] [--state state] [--campaign label] [--json]")
 	fmt.Fprintln(w, "  gitmoot review show <id> [--json]")
 	fmt.Fprintln(w, "  gitmoot review watch <id> [--poll 1s] [--json] [--transcript [--log-path path] [--runtime runtime]]")
 	fmt.Fprintln(w, "  gitmoot review cancel <id>")

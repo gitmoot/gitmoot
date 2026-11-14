@@ -13,7 +13,7 @@ func TestMessageFormalThreadsWithoutWorkflow(t *testing.T) {
 		ThreadID   int64  `json:"thread_id"`
 		Recipient  string `json:"to"`
 		Kind       string `json:"kind"`
-		WorkflowID string `json:"workflow"`
+		WorkflowID string `json:"campaign"`
 		Lifecycle  string `json:"lifecycle"`
 	}
 	home := directiveTestHome(t)

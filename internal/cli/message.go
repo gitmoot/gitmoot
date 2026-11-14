@@ -19,18 +19,18 @@ import (
 // messageUsage lists each message subcommand's usage line in display order, so
 // the full usage and a single subcommand's usage never drift apart.
 var messageUsage = []struct{ action, line string }{
-	{"send", `gitmoot message send ROLE "TEXT" [--workflow LABEL] [--role ROLE] [--json] [--home DIR]`},
+	{"send", `gitmoot message send ROLE "TEXT" [--campaign LABEL] [--role ROLE] [--json] [--home DIR]`},
 	{"inbox", `gitmoot message inbox [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]`},
 	{"show", `gitmoot message show ID [--thread] [--before ID] [--limit 20] [--role ROLE] [--json] [--home DIR]`},
 	{"reply", `gitmoot message reply ID "TEXT" [--role ROLE] [--json] [--home DIR]`},
-	{"escalate", `gitmoot message escalate [--workflow LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"`},
+	{"escalate", `gitmoot message escalate [--campaign LABEL] [--to ROLE] [--repo OWNER/REPO] [--role ROLE] [--json] [--home DIR] "QUESTION"`},
 	{"resolve", `gitmoot message resolve ID [--answer TEXT | --note ID] [--role ROLE] [--json] [--home DIR]`},
 	{"pending", `gitmoot message pending --claim --hook UserPromptSubmit|PostToolUse|Stop --runtime claude|codex`},
 	{"directive", `gitmoot message directive send|ack|done|cancel --help`},
 }
 
 const messageUsageNotes = `Messages are durable ordinary conversation between registered fleet roles.
-No workflow, job, subscription or acknowledgment is required. Flags follow positional arguments.
+No campaign, run, subscription or acknowledgment is required. Flags follow positional arguments.
 -h, -help or --help anywhere prints usage and saves nothing.
 Message text that is a single flag-like word, such as --help or -x, is refused.
 Sender defaults to GITMOOT_ORG_ROLE, then the current registered Herdr pane.
@@ -200,13 +200,13 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 		fs.BoolVar(&thread, "thread", false, "show the conversation thread")
 	}
 	if action == "send" {
-		fs.StringVar(&workflowID, "workflow", "", "optional registered workflow")
+		fs.StringVar(&workflowID, "campaign", "", "optional registered campaign")
 	}
 	if action == "inbox" || action == "show" {
 		fs.Int64Var(&before, "before", 0, "older than this message ID")
 		fs.IntVar(&limit, "limit", 20, "page size 1–100")
 	}
-	if err := fs.Parse(args[positional+1:]); err != nil {
+	if err := parseWithFlagAliases(fs, args[positional+1:], stderr, FlagAlias{Old: "workflow", New: "campaign"}); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -252,7 +252,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			if *jsonOutput {
-				return writeJSON(stdout, messages)
+				return writeJSON(stdout, newMessagesJSON(messages))
 			}
 			for _, message := range messages {
 				printInboxMessage(stdout, message)
@@ -268,7 +268,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 				return err
 			}
 			if *jsonOutput {
-				return writeJSON(stdout, messages)
+				return writeJSON(stdout, newMessagesJSON(messages))
 			}
 			if len(messages) == 0 {
 				fmt.Fprintln(stdout, "No messages.")
@@ -314,7 +314,7 @@ func runMessage(args []string, stdout, stderr io.Writer) int {
 			return err
 		}
 		if *jsonOutput {
-			return writeJSON(stdout, message)
+			return writeJSON(stdout, newMessageJSON(message))
 		}
 		if action != "show" {
 			fmt.Fprintf(stdout, "saved message %d from %s to %s; notification=%s; no acknowledgment required\n", message.ID, message.Sender, message.Recipient, message.Status)
@@ -345,7 +345,7 @@ func printInboxMessage(stdout io.Writer, message db.Message) {
 		fmt.Fprintf(stdout, "Reply to message %d\n", message.ReplyTo)
 	}
 	if message.WorkflowID != "" {
-		fmt.Fprintf(stdout, "Workflow: %s\n", message.WorkflowID)
+		fmt.Fprintf(stdout, "Campaign: %s\n", message.WorkflowID)
 	}
 	if message.SourceJobID != "" {
 		fmt.Fprintf(stdout, "Source: job %s · state=%s\n", message.SourceJobID, terminalSafeWorkflowText(message.SourceState))

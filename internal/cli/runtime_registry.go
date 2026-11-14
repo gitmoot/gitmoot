@@ -175,9 +175,9 @@ func printRuntimeUsage(w io.Writer) {
 	fmt.Fprintln(w, "model/effort, known models, and where token usage is read from. Values come from the")
 	fmt.Fprintln(w, "compiled built-in defaults, overlaid with any [runtimes.<name>] config overrides.")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "prune removes staged runtime copies under <home>/runtimes that no job staged for")
+	fmt.Fprintln(w, "prune removes staged runtime copies under <home>/runtimes that no run staged for")
 	fmt.Fprintln(w, "--min-idle and no live process uses. The daemon runs it daily with the default.")
-	fmt.Fprintln(w, "A removed copy is staged again the next time a job needs it.")
+	fmt.Fprintln(w, "A removed copy is staged again the next time a run needs it.")
 }
 
 // runtimeListEntry is the JSON shape for `gitmoot runtime list --json`.

@@ -71,7 +71,7 @@ func TestMailboxRejectsInvalidWorkflowIDAndExternalJobPersistsValidID(t *testing
 	seedAgent(t, store, "coord", []string{"ask"}, "acme/widget")
 	mailbox := Mailbox{store: store}
 	_, err := mailbox.Enqueue(ctx, JobRequest{ID: "bad", Agent: "coord", Action: "ask", Repo: "acme/widget", WorkflowID: "Bad_ID"})
-	if err == nil || !strings.Contains(err.Error(), "invalid workflow id") {
+	if err == nil || !strings.Contains(err.Error(), "invalid campaign label") {
 		t.Fatalf("invalid enqueue error = %v", err)
 	}
 	job, err := mailbox.OpenExternalJob(ctx, JobRequest{ID: "session", Agent: "coord", Action: "ask", Repo: "acme/widget", WorkflowID: "release-42"})

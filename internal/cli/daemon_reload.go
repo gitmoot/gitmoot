@@ -130,7 +130,7 @@ func (c *daemonReloadableConfig) apply(next config.DaemonRuntimeConfig) string {
 	if next.WorkersSet {
 		reread = append(reread, fmt.Sprintf("workers=%d", next.Workers))
 		if next.Workers != c.workers {
-			changed = append(changed, fmt.Sprintf("workers %d->%d (live pool resize; in-flight jobs unaffected)", c.workers, next.Workers))
+			changed = append(changed, fmt.Sprintf("workers %d->%d (live pool resize; in-flight runs unaffected)", c.workers, next.Workers))
 			c.workers = next.Workers
 		}
 	}

@@ -758,7 +758,7 @@ func wakeOutboxEvent(batch []db.WakeOutboxObligation, now time.Time) (events.Eve
 		retrievalCommands := make([]string, 0, len(batch))
 		for _, entry := range batch {
 			if entry.SourceKind == db.WakeOutboxSourceWorkflowNote {
-				retrievalCommands = append(retrievalCommands, "gitmoot workflow show-note "+entry.SourceID)
+				retrievalCommands = append(retrievalCommands, "gitmoot note show "+entry.SourceID)
 			}
 		}
 		if len(retrievalCommands) > 0 {
