@@ -114,25 +114,17 @@ func (m Mailbox) OpenExternalJob(ctx context.Context, request JobRequest) (db.Jo
 		return db.Job{}, err
 	}
 
-	snapshot, err := m.templateSnapshot(ctx, request.Agent)
-	if err != nil {
-		return db.Job{}, err
-	}
-
 	payload, err := marshalPayload(JobPayload{
-		Repo:                   request.Repo,
-		Branch:                 request.Branch,
-		PullRequest:            request.PullRequest,
-		GoalID:                 request.GoalID,
-		TaskID:                 request.TaskID,
-		TaskTitle:              request.TaskTitle,
-		Sender:                 firstNonEmptyString(request.Sender, "session"),
-		Instructions:           request.Instructions,
-		WorkflowID:             strings.TrimSpace(request.WorkflowID),
-		ParentJobID:            strings.TrimSpace(request.ParentJobID),
-		TemplateID:             snapshot.ID,
-		TemplateResolvedCommit: snapshot.ResolvedCommit,
-		TemplateContent:        snapshot.Content,
+		Repo:         request.Repo,
+		Branch:       request.Branch,
+		PullRequest:  request.PullRequest,
+		GoalID:       request.GoalID,
+		TaskID:       request.TaskID,
+		TaskTitle:    request.TaskTitle,
+		Sender:       firstNonEmptyString(request.Sender, "session"),
+		Instructions: request.Instructions,
+		WorkflowID:   strings.TrimSpace(request.WorkflowID),
+		ParentJobID:  strings.TrimSpace(request.ParentJobID),
 		// Carried so attribution can name a role for in-session work (#1718). It
 		// was previously dropped here, which is why a recorded session job could
 		// only ever be attributed to an agent.

@@ -14,7 +14,6 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 		Runtime:   "codex",
 		JobID:     "job-123",
 		JobState:  string(JobSucceeded),
-		Payload:   JobPayload{TemplateID: "thermo-nuclear-code-quality-review"},
 		Result: &AgentResult{
 			Decision:    "changes_requested",
 			Summary:     "fix the edge case",
@@ -28,7 +27,6 @@ func TestRenderJobResultCommentIncludesAttributionAndResult(t *testing.T) {
 	for _, want := range []string{
 		"> Agent: `audit`",
 		"> Runtime: `codex`",
-		"> Template: `thermo-nuclear-code-quality-review`",
 		"> Job: `job-123`",
 		"**Decision:** `changes_requested`",
 		"**Summary:** fix the edge case",
@@ -289,5 +287,18 @@ func TestRenderJobResultCommentCapsTotalBody(t *testing.T) {
 	}
 	if !strings.Contains(body, "comment truncated") {
 		t.Fatalf("comment did not include truncation notice")
+	}
+}
+
+// #2589: agent templates are gone, so the attribution block no longer carries a
+// Template line even for a payload persisted before the removal.
+func TestRenderJobResultCommentOmitsRemovedTemplateLine(t *testing.T) {
+	payload, err := unmarshalPayload(`{"repo":"owner/repo","template_id":"thermo"}`)
+	if err != nil {
+		t.Fatalf("unmarshalPayload: %v", err)
+	}
+	body := RenderJobResultComment(JobResultComment{AgentName: "audit", Runtime: "codex", JobID: "job-1", JobState: string(JobSucceeded), Payload: payload})
+	if strings.Contains(body, "Template") {
+		t.Fatalf("comment body still renders a template line:\n%s", body)
 	}
 }

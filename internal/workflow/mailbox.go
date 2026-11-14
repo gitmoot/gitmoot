@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gitmoot/gitmoot/internal/agenttemplate"
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/evidence"
 	"github.com/gitmoot/gitmoot/internal/execbackend"
@@ -337,9 +336,6 @@ type JobPayload struct {
 	ReadOnlyWorktreeDiff          string `json:"read_only_worktree_diff,omitempty"`
 	ReadOnlyWorktreeDiffTruncated bool   `json:"read_only_worktree_diff_truncated,omitempty"`
 	ReadOnlyWorktreeDiffError     string `json:"read_only_worktree_diff_error,omitempty"`
-	TemplateID                    string `json:"template_id,omitempty"`
-	TemplateResolvedCommit        string `json:"template_resolved_commit,omitempty"`
-	TemplateContent               string `json:"template_content,omitempty"`
 	OriginalAgent                 string `json:"original_agent,omitempty"`
 	DelegatedAgent                string `json:"delegated_agent,omitempty"`
 	DelegationReason              string `json:"delegation_reason,omitempty"`
@@ -584,11 +580,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// at all enqueued a pool-less review and said nothing, which is the exact
 	// shape of the daemon comment path before #2186 round 4.
 	reviewIsPoolless := strings.EqualFold(strings.TrimSpace(request.Action), "review") && len(reviewPool) == 0
-	snapshot, err := m.templateSnapshot(ctx, request.Agent)
-	if err != nil {
-		return db.Job{}, nil, err
-	}
-
 	// #1277: inherit the skip-native-review-fanout intent from the parent job.
 	//
 	// Propagating the flag at each JobRequest construction site is whack-a-mole:
@@ -660,9 +651,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
 		ReadOnlySeat:           request.ReadOnlySeat,
 		ReviewNoExecution:      request.ReviewNoExecution,
-		TemplateID:             snapshot.ID,
-		TemplateResolvedCommit: snapshot.ResolvedCommit,
-		TemplateContent:        snapshot.Content,
 		OriginalAgent:          request.OriginalAgent,
 		DelegatedAgent:         request.DelegatedAgent,
 		DelegationReason:       request.DelegationReason,
@@ -943,27 +931,6 @@ func (m Mailbox) resolveEnqueueModel(ctx context.Context, request JobRequest) (s
 		Model:               request.Model,
 		RuntimeDefaultModel: runtimeDefaultModel,
 	}), nil
-}
-
-func (m Mailbox) templateSnapshot(ctx context.Context, agentName string) (db.AgentTemplate, error) {
-	agent, err := m.store.GetAgent(ctx, agentName)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return db.AgentTemplate{}, nil
-		}
-		return db.AgentTemplate{}, err
-	}
-	if strings.TrimSpace(agent.TemplateID) == "" {
-		return db.AgentTemplate{}, nil
-	}
-	template, err := m.store.GetAgentTemplateReference(ctx, agent.TemplateID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return db.AgentTemplate{}, fmt.Errorf("agent %q references missing template %q", agent.Name, agent.TemplateID)
-		}
-		return db.AgentTemplate{}, err
-	}
-	return template, nil
 }
 
 // DeliveryError marks an error that provably originated from the runtime
@@ -1782,17 +1749,14 @@ func (m Mailbox) savePayload(ctx context.Context, jobID string, payload JobPaylo
 
 func (p JobPayload) prompt(action string) prompts.JobPrompt {
 	return prompts.JobPrompt{
-		Repo:                   p.Repo,
-		Branch:                 p.Branch,
-		PullRequest:            p.PullRequest,
-		Task:                   taskLabel(p.TaskID, p.TaskTitle),
-		Sender:                 p.Sender,
-		Action:                 action,
-		Instructions:           p.Instructions,
-		Constraints:            p.Constraints,
-		TemplateID:             p.TemplateID,
-		TemplateResolvedCommit: p.TemplateResolvedCommit,
-		TemplateInstructions:   agenttemplate.InstructionsForContent(p.TemplateContent),
+		Repo:         p.Repo,
+		Branch:       p.Branch,
+		PullRequest:  p.PullRequest,
+		Task:         taskLabel(p.TaskID, p.TaskTitle),
+		Sender:       p.Sender,
+		Action:       action,
+		Instructions: p.Instructions,
+		Constraints:  p.Constraints,
 	}
 }
 
@@ -1949,8 +1913,8 @@ func marshalPayload(payload JobPayload) (string, error) {
 }
 
 // ParseJobPayload decodes a stored job payload (the same form the mailbox
-// writes), tolerating the legacy preset_* keys. It does not know the job's
-// type; a reader that acts on a review decision uses DecodeJobPayload.
+// writes). It does not know the job's type; a reader that acts on a review
+// decision uses DecodeJobPayload.
 func ParseJobPayload(value string) (JobPayload, error) {
 	return unmarshalPayload(value)
 }
@@ -2000,23 +1964,6 @@ func unmarshalPayload(value string) (JobPayload, error) {
 	var payload JobPayload
 	if err := json.Unmarshal([]byte(value), &payload); err != nil {
 		return JobPayload{}, fmt.Errorf("parse job payload: %w", err)
-	}
-	var legacy struct {
-		PresetID             string `json:"preset_id"`
-		PresetResolvedCommit string `json:"preset_resolved_commit"`
-		PresetContent        string `json:"preset_content"`
-	}
-	if err := json.Unmarshal([]byte(value), &legacy); err != nil {
-		return JobPayload{}, fmt.Errorf("parse legacy job payload: %w", err)
-	}
-	if payload.TemplateID == "" {
-		payload.TemplateID = legacy.PresetID
-	}
-	if payload.TemplateResolvedCommit == "" {
-		payload.TemplateResolvedCommit = legacy.PresetResolvedCommit
-	}
-	if payload.TemplateContent == "" {
-		payload.TemplateContent = legacy.PresetContent
 	}
 	return payload, nil
 }

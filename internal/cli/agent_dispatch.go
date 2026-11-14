@@ -1999,14 +1999,6 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background but no active instance is available", typeName)
 	}
 	instanceAgent := runtimeAgentFromType(agentType, repo, managedAgentInstanceName(typeName))
-	var cachedTemplate db.AgentTemplate
-	if instanceAgent.TemplateID != "" {
-		var err error
-		cachedTemplate, err = loadInstalledTemplate(ctx, store, instanceAgent.TemplateID)
-		if err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-	}
 	if deferRuntimeStart {
 		if !resumableSessionRuntime(instanceAgent.Runtime) {
 			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed reviewer requires a resumable runtime")
@@ -2015,7 +2007,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		instance := db.AgentInstance{
 			Name: instanceAgent.Name, Type: agentType.Name, Runtime: instanceAgent.Runtime,
 			RuntimeRef: instanceAgent.RuntimeRef, RepoFullName: repo, Role: instanceAgent.Role,
-			TemplateID: instanceAgent.TemplateID, Model: instanceAgent.Model, Effort: instanceAgent.Effort,
+			Model: instanceAgent.Model, Effort: instanceAgent.Effort,
 			Capabilities: instanceAgent.Capabilities, AutonomyPolicy: instanceAgent.AutonomyPolicy,
 			State: "idle", CreatedAt: formatManagedAgentTime(now), LastUsedAt: formatManagedAgentTime(now),
 			ExpiresAt: formatManagedAgentTime(now.Add(jobTimeout)),
@@ -2054,7 +2046,6 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		RuntimeRef:     "starting:" + instanceAgent.Name,
 		RepoFullName:   repo,
 		Role:           instanceAgent.Role,
-		TemplateID:     instanceAgent.TemplateID,
 		Model:          instanceAgent.Model,
 		Effort:         instanceAgent.Effort,
 		Capabilities:   instanceAgent.Capabilities,
@@ -2072,7 +2063,7 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		return db.Agent{}, noopAgentReservationRelease, err
 	}
 	releaseOnError = false
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent, cachedTemplate)})
+	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent)})
 	if err != nil {
 		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
 		return db.Agent{}, noopAgentReservationRelease, err
@@ -2089,7 +2080,6 @@ func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home strin
 		RuntimeRef:     instanceAgent.RuntimeRef,
 		RepoFullName:   repo,
 		Role:           instanceAgent.Role,
-		TemplateID:     instanceAgent.TemplateID,
 		Model:          instanceAgent.Model,
 		Effort:         instanceAgent.Effort,
 		Capabilities:   instanceAgent.Capabilities,
@@ -2171,7 +2161,6 @@ func runtimeAgentFromType(agentType config.AgentType, repo string, name string) 
 		Role:           agentType.Role,
 		Runtime:        agentType.Runtime,
 		RepoScope:      repo,
-		TemplateID:     agentType.Template,
 		Model:          agentType.Model,
 		Effort:         agentType.Effort,
 		Capabilities:   agentType.Capabilities,

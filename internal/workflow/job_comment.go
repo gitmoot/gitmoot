@@ -31,11 +31,6 @@ func RenderJobResultComment(comment JobResultComment) string {
 	builder.WriteString("> Runtime: `")
 	builder.WriteString(markdownInline(comment.Runtime))
 	builder.WriteString("`\n")
-	if strings.TrimSpace(comment.Payload.TemplateID) != "" {
-		builder.WriteString("> Template: `")
-		builder.WriteString(markdownInline(comment.Payload.TemplateID))
-		builder.WriteString("`\n")
-	}
 	builder.WriteString("> Job: `")
 	builder.WriteString(markdownInline(comment.JobID))
 	builder.WriteString("`\n")

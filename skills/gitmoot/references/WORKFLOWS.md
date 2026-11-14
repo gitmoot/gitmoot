@@ -133,52 +133,15 @@ gitmoot job show <job-id>
 gitmoot job events <job-id>
 ```
 
-## Built-In Thermo Review Agent
-
-Use the thermo template for strict review-only work. It should not implement code
-or request implementation capability.
-
-```sh
-gitmoot agent start thermo-review --runtime omp --repo owner/repo --template thermo-nuclear-code-quality-review --start-daemon
-```
-
-PR comment:
-
-```text
-/gitmoot thermo-review review
-```
-
-## Custom Prompt Agent
-
-Use custom prompt agent templates for project-specific reviewers or helpers.
-Templates are read-only installed data (#2204): Gitmoot cannot author one, so the
-`agent_templates` row is seeded or edited directly, and `agent template list`
-confirms it is installed before an agent references it.
-
-```sh
-gitmoot agent template list --tag review
-gitmoot agent start frontend-reviewer \
-  --runtime omp \
-  --repo owner/repo \
-  --template frontend-reviewer \
-  --role reviewer \
-  --capability ask \
-  --capability review
-```
-
-Template content is snapshotted into each queued job. A job created before a row
-was edited keeps the prompt it was created with; only later jobs see the change.
-
 ## Current-Chat Planner
 
-Use the same `planner` template in the current chat (a Claude Code or Codex
-session with the Gitmoot plugin, or an omp session) when the
-user wants a fast implementation plan and the current session already has the
-repo context. Load the prompt with `gitmoot agent prompt planner` when it is
-cached, or read the packaged `agent-templates/planner.md` instructions from the
-Gitmoot skill package. Inspect only the relevant files, use web search only for
-current external contracts or best-practice claims, and return the plan directly
-in chat.
+When the user wants a fast implementation plan and the current session (a Claude
+Code or Codex session with the Gitmoot plugin, or an omp session) already has
+the repo context, plan directly in the current chat. Inspect only the relevant
+files, use web search only for current external contracts or best-practice
+claims, and return the plan directly in chat. To track it, open a session job
+with `gitmoot job open --agent <agent> --repo owner/repo --type ask` and close
+it with `gitmoot job close <id>` when done.
 
 ```text
 Use the Gitmoot planner here. Write a task-by-task implementation plan for this feature.
@@ -233,65 +196,41 @@ recorded summary; one with neither is out of contract. Prefer this
 durable handshake over an
 interactive plan-approval prompt for any unattended seat: a session blocked on
 an in-pane approval modal reports idle, runs no job, and escalates nothing, so
-every fleet channel reads it as healthy while it waits. The `planner` template knows this
-handshake: in coordinator mode it posts its plan as a workflow note, reports
-the plan-id, and stops until an approval referencing that id arrives.
+every fleet channel reads it as healthy while it waits.
 
-## Current-Chat Custom Agent Prompt
+## Current-Chat Agent Work
 
-Use a registered agent or custom template in the current chat when the user says
-something like:
+When the user says something like:
 
 ```text
 Use frontend-reviewer here. Review this diff.
 ```
 
-Resolve and load the prompt with:
-
-```sh
-gitmoot agent prompt frontend-reviewer
-```
-
-Treat the returned content as instructions for the current chat. This is prompt
-import, not true system-prompt injection, and it does not create a Gitmoot job,
-start a daemon, resume a runtime session, or post a PR comment. If the user
-wants tracked background execution, use `gitmoot agent ask <agent> --background`
+do the work directly in the current chat. This does not create a Gitmoot job,
+start a daemon, resume a runtime session, or post a PR comment. To track it,
+clock in with `gitmoot job open --agent frontend-reviewer --repo owner/repo
+--type review` and clock out with `gitmoot job close <id>`. If the user wants
+tracked background execution, use `gitmoot agent ask <agent> --background`
 instead.
 
 ## Background Planner Agent
 
-Use the planner template when the user wants a structured implementation plan to
-run as a tracked Gitmoot background agent job.
-
-```sh
-gitmoot agent start project-planner \
-  --runtime omp \
-  --repo owner/repo \
-  --path . \
-  --template planner \
-  --start-daemon
-```
-
-Ask from a PR comment:
-
-```text
-/gitmoot project-planner ask Write a task-by-task implementation plan for this feature.
-```
-
-Ask directly from a local Claude Code or Codex chat (with the Gitmoot plugin) by having the session call
-the Gitmoot CLI when the user explicitly wants a registered background-capable
-agent path:
+When the user wants a structured implementation plan to run as a tracked
+Gitmoot background agent job, ask a registered agent:
 
 ```sh
 gitmoot agent ask project-planner --repo owner/repo --background "Write a task-by-task implementation plan for this feature."
 gitmoot job watch <job-id>
 ```
 
-If the Codex plugin exposes a Gitmoot command bridge in chat, the equivalent
-form is `$gitmoot:gitmoot agent ask project-planner --repo owner/repo --background "..."`. The
-important part is that background planner work goes through `gitmoot agent ask`;
-fast "here" planning stays in the current chat and uses `gitmoot agent prompt`
-only to read prompt content.
+Or from a PR comment:
+
+```text
+/gitmoot project-planner ask Write a task-by-task implementation plan for this feature.
+```
+
+Background planner work goes through `gitmoot agent ask`; fast "here" planning
+stays in the current chat.
 
 ## Execution Model
 

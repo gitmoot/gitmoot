@@ -78,7 +78,7 @@ func runDashboardWeb(home, addr string, stdout, stderr io.Writer) int {
 // #2206 removed the last two transitional routes this comment used to name: the
 // module no longer has a Brain page to feed, and no longer requires Knowledge or
 // ChatThreads on its DataSource, so gitmoot stopped answering for pages that do
-// not exist. Skills stayed REAL - #2204 keeps its tables.
+// not exist. Skills is empty since #2589 dropped the agent template tables.
 func newDashboardWebHandler(ds *webDataSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/jobs", ds.handleJobs)
@@ -902,9 +902,8 @@ func (d *webDataSource) Agents(ctx context.Context) ([]dashboard.AgentSummary, e
 }
 
 // Agent returns the click-through detail for a single agent by name: the same
-// AgentSummary Agents() builds for that one row, plus its template (nil when the
-// agent has no template or the template lookup fails — fail-open, never an error)
-// and the template's version history newest-first. An unknown name maps to the
+// AgentSummary Agents() builds for that one row. Template stays nil and Versions
+// empty: agent templates were removed in #2589. An unknown name maps to the
 // dashboard's not-found sentinel (mirroring how Job() maps an unknown job id), so
 // the API layer returns 404 rather than 500.
 func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.AgentDetail, error) {
@@ -937,18 +936,6 @@ func (d *webDataSource) Agent(ctx context.Context, name string) (dashboard.Agent
 			detail.Config = agentConfigInfo(at)
 		}
 		detail.AgentSummary = summary
-
-		// Template + version history. Fail-open: a missing/broken template leaves the
-		// detail's Template nil and Versions the initialized empty slice rather than
-		// erroring the endpoint.
-		if tid := strings.TrimSpace(agent.TemplateID); tid != "" {
-			if tmpl, terr := store.GetAgentTemplate(ctx, tid); terr == nil {
-				detail.Template = agentTemplateInfo(tmpl)
-				if versions := agentTemplateVersions(ctx, store, tmpl); versions != nil {
-					detail.Versions = versions
-				}
-			}
-		}
 		return nil
 	})
 	if err != nil {
@@ -998,7 +985,6 @@ func agentConfigInfo(at config.AgentType) *dashboard.AgentConfigInfo {
 		IdleTimeout:   strings.TrimSpace(at.IdleTimeout),
 		JobTimeout:    strings.TrimSpace(at.JobTimeout),
 		Model:         strings.TrimSpace(at.Model),
-		Template:      strings.TrimSpace(at.Template),
 		Capabilities:  at.Capabilities,
 	}
 }
@@ -1026,63 +1012,6 @@ func aggregateAgentJobStats(jobs []db.Job) (byAgent map[string]*agentJobStat, ep
 		s.observe(j)
 	}
 	return byAgent, ephemeral, hasEphemeral
-}
-
-// agentTemplateInfo maps the store's AgentTemplate onto the dashboard's
-// AgentTemplateInfo (identity + source/resolved provenance).
-func agentTemplateInfo(tmpl db.AgentTemplate) *dashboard.AgentTemplateInfo {
-	return &dashboard.AgentTemplateInfo{
-		ID:             tmpl.ID,
-		Name:           strings.TrimSpace(tmpl.Name),
-		Description:    strings.TrimSpace(tmpl.Description),
-		SourceRepo:     strings.TrimSpace(tmpl.SourceRepo),
-		SourceRef:      strings.TrimSpace(tmpl.SourceRef),
-		SourcePath:     strings.TrimSpace(tmpl.SourcePath),
-		ResolvedCommit: strings.TrimSpace(tmpl.ResolvedCommit),
-		// Content is the full resolved prompt body; passed verbatim (no trim) so the
-		// detail view shows the exact template text an agent runs.
-		Content: tmpl.Content,
-	}
-}
-
-// agentTemplateVersions lists a template's version history newest-first (version
-// number descending, id tie-break) and marks the version the template currently
-// resolves to. Current is keyed on the template's current_version_id
-// (tmpl.VersionID from GetAgentTemplate) — the version an agent pinned to the
-// default "current" ref actually runs — NOT the latest_version_id, which only
-// applies to an explicit "@latest" ref and can point at an unpromoted candidate.
-// Timestamps go through parseJobTimeMillis (epoch ms, 0 when unknown). Returns nil
-// on a lookup error so the caller can keep the detail's Versions empty (fail-open).
-func agentTemplateVersions(ctx context.Context, store *db.Store, tmpl db.AgentTemplate) []dashboard.TemplateVersionInfo {
-	rows, err := store.ListAgentTemplateVersions(ctx, tmpl.ID)
-	if err != nil {
-		return nil
-	}
-	currentID := strings.TrimSpace(tmpl.VersionID)
-	out := make([]dashboard.TemplateVersionInfo, 0, len(rows))
-	for _, v := range rows {
-		out = append(out, dashboard.TemplateVersionInfo{
-			ID:             v.ID,
-			Number:         v.VersionNumber,
-			State:          strings.TrimSpace(v.State),
-			Name:           strings.TrimSpace(v.Name),
-			Description:    strings.TrimSpace(v.Description),
-			SourceRef:      strings.TrimSpace(v.SourceRef),
-			ResolvedCommit: strings.TrimSpace(v.ResolvedCommit),
-			CreatedAt:      parseJobTimeMillis(v.CreatedAt),
-			PromotedAt:     parseJobTimeMillis(v.PromotedAt),
-			Current:        currentID != "" && v.ID == currentID,
-			// Content is this version's full prompt body; passed verbatim (no trim).
-			Content: v.Content,
-		})
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Number != out[j].Number {
-			return out[i].Number > out[j].Number
-		}
-		return out[i].ID > out[j].ID
-	})
-	return out
 }
 
 // agentJobStat accumulates one agent's job tallies across the ListJobs pass:

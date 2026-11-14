@@ -91,9 +91,6 @@ type dashboardAgent struct {
 	Runtime string `json:"runtime"`
 	Role    string `json:"role,omitempty"`
 	Health  string `json:"health,omitempty"`
-	// templateID feeds the web agent detail; unexported so the --json output
-	// stays byte-identical.
-	templateID string
 }
 
 type dashboardSession struct {
@@ -107,10 +104,9 @@ type dashboardSession struct {
 	Stale bool `json:"stale,omitempty"`
 
 	// Detail fields shown only in the web session detail. They are unexported so
-	// the --json output stays byte-stable (mirrors dashboardAgent.templateID).
+	// the --json output stays byte-stable.
 	sessionType string
 	role        string
-	templateID  string
 	lastUsedAt  string
 	expiresAt   string
 }
@@ -301,7 +297,7 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 			if isEphemeralAgentName(agent.Name) {
 				continue // transient spawn-from-spec workers are not part of the registry
 			}
-			snapshot.Agents = append(snapshot.Agents, dashboardAgent{Name: agent.Name, Runtime: agent.Runtime, Role: agent.Role, Health: agent.HealthStatus, templateID: agent.TemplateID})
+			snapshot.Agents = append(snapshot.Agents, dashboardAgent{Name: agent.Name, Runtime: agent.Runtime, Role: agent.Role, Health: agent.HealthStatus})
 		}
 		instances, err := store.ListAgentInstances(ctx)
 		if err != nil {
@@ -316,7 +312,6 @@ func buildDashboardSnapshot(home string, paths config.Paths) (dashboardSnapshot,
 				Stale:       runningSessionStale(ctx, store, instance, now),
 				sessionType: instance.Type,
 				role:        instance.Role,
-				templateID:  instance.TemplateID,
 				lastUsedAt:  instance.LastUsedAt,
 				expiresAt:   instance.ExpiresAt,
 			})

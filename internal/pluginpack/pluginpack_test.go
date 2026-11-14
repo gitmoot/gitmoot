@@ -484,11 +484,13 @@ func TestBuildUsesEmbeddedSkillByDefault(t *testing.T) {
 	}
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "Gitmoot Agent Skill")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent ask <agent>")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot agent prompt <agent>")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "SKILL.md"), "gitmoot job open --agent <agent>")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "CLI.md"), "gitmoot agent ask project-planner --repo owner/repo")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "Current-Chat Custom Agent Prompt")
+	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "WORKFLOWS.md"), "Current-Chat Agent Work")
 	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "references", "RESULT_CONTRACT.md"), "gitmoot_result")
-	assertFileContains(t, filepath.Join(out, "skills", "gitmoot", "agent-templates", "planner.md"), "Gitmoot Planner")
+	if _, err := os.Stat(filepath.Join(out, "skills", "gitmoot", "agent-templates")); !os.IsNotExist(err) {
+		t.Fatalf("built package must not contain agent-templates dir, stat err = %v", err)
+	}
 }
 
 func TestBuildRefusesOverwriteWithoutForce(t *testing.T) {

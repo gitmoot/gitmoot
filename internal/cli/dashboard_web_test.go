@@ -1203,15 +1203,9 @@ func TestWebDataSourceHealthDaemonRunning(t *testing.T) {
 	}
 }
 
-// seedTemplatedAgent registers an agent bound to a template whose CURRENT version is
-// v1 while a NEWER v2 also exists (so version ordering and the Current marker are
-// both exercised — Current must follow current_version_id, not recency), and gives
-// the agent two jobs. It returns the current v1 version id and the newer v2 id.
-//
-// The newer-but-not-current version is produced by upserting v2 and then REVERTING to
-// v1: since #1752 removed the candidate layer, revert is the only way a template's
-// newest version is not its current one.
-func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
+// seedDetailAgents registers planner-agent (with two jobs) and plain-agent for
+// the agent-detail tests.
+func seedDetailAgents(t *testing.T, home string) {
 	t.Helper()
 	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
 	if err != nil {
@@ -1220,64 +1214,23 @@ func seedTemplatedAgent(t *testing.T, home string) (v1ID, v2ID string) {
 	defer store.Close()
 	ctx := context.Background()
 
-	base := db.AgentTemplate{
-		ID: "planner", Name: "Planner Template", Description: "plans the work",
-		SourceRepo: "jerryfane/noted", SourceRef: "main", SourcePath: "agents/planner.md",
-		ResolvedCommit: "aaaaaaaaaaaa", Content: "v1 content",
-	}
-	if err := store.UpsertAgentTemplate(ctx, base); err != nil {
-		t.Fatalf("UpsertAgentTemplate: %v", err)
-	}
-	// current_version_id (what the template resolves to) is v1 at this point.
-	tmpl, err := store.GetAgentTemplate(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetAgentTemplate: %v", err)
-	}
-	v1ID = tmpl.VersionID
-
-	v2 := base
-	v2.Content = "v2 content"
-	v2.ResolvedCommit = "bbbbbbbbbbbb"
-	v2.SourceRef = "candidate"
-	if err := store.UpsertAgentTemplate(ctx, v2); err != nil {
-		t.Fatalf("UpsertAgentTemplate v2: %v", err)
-	}
-	newer, err := store.GetLatestAgentTemplateVersion(ctx, "planner")
-	if err != nil {
-		t.Fatalf("GetLatestAgentTemplateVersion: %v", err)
-	}
-	v2ID = newer.VersionID
-	if v2ID == v1ID {
-		t.Fatalf("v2 upsert did not mint a new version: %q", v2ID)
-	}
-	// Revert to v1 so the template resolves to v1 while v2 remains the newest row.
-	if _, err := store.RevertAgentTemplateVersion(ctx, "planner", v1ID); err != nil {
-		t.Fatalf("RevertAgentTemplateVersion to v1: %v", err)
-	}
-
-	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Runtime: "codex", TemplateID: "planner"}); err != nil {
+	if err := store.UpsertAgent(ctx, db.Agent{Name: "planner-agent", Runtime: "codex"}); err != nil {
 		t.Fatalf("UpsertAgent planner-agent: %v", err)
 	}
 	if err := store.UpsertAgent(ctx, db.Agent{Name: "plain-agent", Runtime: "claude"}); err != nil {
 		t.Fatalf("UpsertAgent plain-agent: %v", err)
 	}
-	// A registered agent pointing at a template that does not exist -> fail-open.
-	if err := store.UpsertAgent(ctx, db.Agent{Name: "ghost-agent", Runtime: "codex", TemplateID: "no-such-template"}); err != nil {
-		t.Fatalf("UpsertAgent ghost-agent: %v", err)
-	}
 
 	mustCreateJob(t, store, db.Job{ID: "pa1", Agent: "planner-agent", Type: "orchestrate", State: "succeeded", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
 	mustCreateJob(t, store, db.Job{ID: "pa2", Agent: "planner-agent", Type: "orchestrate", State: "running", Payload: mustJSON(t, workflow.JobPayload{})}, "", "")
-	return v1ID, v2ID
 }
 
 // TestWebDataSourceAgentDetail asserts Agent() builds the same summary as Agents()
-// for one row, maps the template, and returns the version history newest-first
-// with Current marking the version the template currently resolves to
-// (current_version_id = v1), not the newer pending candidate (v2).
+// for one row and, since #2589 removed agent templates, reports no template and
+// a non-nil empty version history.
 func TestWebDataSourceAgentDetail(t *testing.T) {
 	home := dashboardTestHome(t)
-	v1ID, v2ID := seedTemplatedAgent(t, home)
+	seedDetailAgents(t, home)
 
 	ds := &webDataSource{home: home}
 	detail, err := ds.Agent(context.Background(), "planner-agent")
@@ -1292,88 +1245,11 @@ func TestWebDataSourceAgentDetail(t *testing.T) {
 	if detail.JobCount != 2 || detail.RunningCount != 1 || detail.SucceededCount != 1 {
 		t.Fatalf("summary counts = job%d run%d ok%d, want 2/1/1", detail.JobCount, detail.RunningCount, detail.SucceededCount)
 	}
-
-	// Template mapping.
-	if detail.Template == nil {
-		t.Fatalf("template is nil, want the planner template")
+	if detail.Template != nil {
+		t.Fatalf("template = %+v, want nil", detail.Template)
 	}
-	if detail.Template.ID != "planner" || detail.Template.Name != "Planner Template" {
-		t.Fatalf("template identity = %+v", detail.Template)
-	}
-	if detail.Template.SourceRepo != "jerryfane/noted" || detail.Template.SourceRef != "main" ||
-		detail.Template.SourcePath != "agents/planner.md" || detail.Template.ResolvedCommit != "aaaaaaaaaaaa" {
-		t.Fatalf("template source fields = %+v", detail.Template)
-	}
-	// Content is the full body of the version the template currently resolves to
-	// (current_version_id = v1), mapped verbatim from GetAgentTemplate().Content.
-	if detail.Template.Content != "v1 content" {
-		t.Fatalf("template content = %q, want %q (the current v1 body)", detail.Template.Content, "v1 content")
-	}
-
-	// Versions newest-first: v2 (superseded by the revert) before v1 (current).
-	// Current marks v1, the version the template resolves to — not the newest row.
-	if len(detail.Versions) != 2 {
-		t.Fatalf("versions = %d, want 2: %+v", len(detail.Versions), detail.Versions)
-	}
-	newest := detail.Versions[0]
-	if newest.ID != v2ID || newest.Number != 2 {
-		t.Fatalf("versions[0] = %+v, want v2 (number 2, id %s)", newest, v2ID)
-	}
-	if newest.State != "superseded" {
-		t.Fatalf("versions[0].State = %q, want superseded", newest.State)
-	}
-	if newest.Current {
-		t.Fatalf("newest v2 must not be marked Current; v1 is the current version")
-	}
-	// Each version carries its own body, mapped verbatim from the store row's Content.
-	if newest.Content != "v2 content" {
-		t.Fatalf("versions[0].Content = %q, want %q (the v2 body)", newest.Content, "v2 content")
-	}
-	oldest := detail.Versions[1]
-	if oldest.ID != v1ID || oldest.Number != 1 {
-		t.Fatalf("versions[1] = %+v, want v1 (number 1, id %s)", oldest, v1ID)
-	}
-	if !oldest.Current {
-		t.Fatalf("current v1 must be marked Current (template resolves to current_version_id)")
-	}
-	if oldest.State != "current" {
-		t.Fatalf("versions[1].State = %q, want current", oldest.State)
-	}
-	if oldest.Content != "v1 content" {
-		t.Fatalf("versions[1].Content = %q, want %q (the v1 body)", oldest.Content, "v1 content")
-	}
-	if oldest.CreatedAt <= 0 {
-		t.Fatalf("versions[1].CreatedAt = %d, want > 0 (parsed epoch ms)", oldest.CreatedAt)
-	}
-}
-
-// TestWebDataSourceAgentNoTemplate asserts an agent with no template (or a
-// dangling template id) returns a nil Template and a non-nil empty Versions slice
-// rather than erroring the endpoint.
-func TestWebDataSourceAgentNoTemplate(t *testing.T) {
-	home := dashboardTestHome(t)
-	seedTemplatedAgent(t, home)
-	ds := &webDataSource{home: home}
-	ctx := context.Background()
-
-	plain, err := ds.Agent(ctx, "plain-agent")
-	if err != nil {
-		t.Fatalf("Agent(plain-agent): %v", err)
-	}
-	if plain.Template != nil {
-		t.Fatalf("plain-agent template = %+v, want nil", plain.Template)
-	}
-	if plain.Versions == nil || len(plain.Versions) != 0 {
-		t.Fatalf("plain-agent versions = %+v, want non-nil empty", plain.Versions)
-	}
-
-	// A dangling template id must fail open (template absent), not 500.
-	ghost, err := ds.Agent(ctx, "ghost-agent")
-	if err != nil {
-		t.Fatalf("Agent(ghost-agent) errored on a missing template, want fail-open: %v", err)
-	}
-	if ghost.Template != nil || len(ghost.Versions) != 0 {
-		t.Fatalf("ghost-agent detail = %+v, want template nil + empty versions", ghost)
+	if detail.Versions == nil || len(detail.Versions) != 0 {
+		t.Fatalf("versions = %+v, want non-nil empty", detail.Versions)
 	}
 }
 
@@ -1381,7 +1257,7 @@ func TestWebDataSourceAgentNoTemplate(t *testing.T) {
 // not-found sentinel (so the API returns 404, mirroring Job()).
 func TestWebDataSourceAgentUnknown(t *testing.T) {
 	home := dashboardTestHome(t)
-	seedTemplatedAgent(t, home)
+	seedDetailAgents(t, home)
 	ds := &webDataSource{home: home}
 	if _, err := ds.Agent(context.Background(), "no-such-agent"); !errors.Is(err, dashboard.ErrAgentNotFound) {
 		t.Fatalf("Agent(unknown) err = %v, want ErrAgentNotFound", err)
@@ -1577,7 +1453,7 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 	if err := config.SaveAgentType(paths, config.AgentType{
 		Name: "full-agent", Runtime: "codex",
 		MaxBackground: 3, IdleTimeout: "15m", JobTimeout: "30m",
-		Model: "gpt-5.5", Template: "coordinator", Capabilities: []string{"orchestrate", "review"},
+		Model: "gpt-5.5", Capabilities: []string{"orchestrate", "review"},
 	}); err != nil {
 		t.Fatalf("SaveAgentType full-agent: %v", err)
 	}
@@ -1613,7 +1489,7 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 		t.Fatalf("full-agent Config = nil, want a section")
 	}
 	if full.Config.MaxBackground != 3 || full.Config.IdleTimeout != "15m" ||
-		full.Config.JobTimeout != "30m" || full.Config.Model != "gpt-5.5" || full.Config.Template != "coordinator" {
+		full.Config.JobTimeout != "30m" || full.Config.Model != "gpt-5.5" {
 		t.Fatalf("full-agent Config = %+v, want the seeded section values", full.Config)
 	}
 	if len(full.Config.Capabilities) != 2 {

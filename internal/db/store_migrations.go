@@ -3352,4 +3352,13 @@ DROP TABLE IF EXISTS branch_locks;
 	`
 DROP TABLE IF EXISTS escalation_rounds;
 	`,
+	// #2589 removes agent templates: `agent template`, `agent prompt`, the
+	// --template flags and the template-instructions prompt block are deleted in
+	// the same change, so nothing reads either table any more. Versions go first
+	// because they name their template. agents.template_id and
+	// agent_instances.template_id stay as history.
+	`
+DROP TABLE IF EXISTS agent_template_versions;
+DROP TABLE IF EXISTS agent_templates;
+	`,
 }

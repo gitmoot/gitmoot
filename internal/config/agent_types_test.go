@@ -33,7 +33,7 @@ job_timeout = "5m"
 		t.Fatalf("LoadAgentTypes returned error: %v", err)
 	}
 	planner := types["planner"]
-	if planner.Runtime != "codex" || planner.Template != "planner" || planner.Role != "planner" || planner.AutonomyPolicy != "workspace-write" || planner.MaxBackground != 2 || planner.IdleTimeout != "15m" || strings.Join(planner.Capabilities, ",") != "ask,review" {
+	if planner.Runtime != "codex" || planner.Role != "planner" || planner.AutonomyPolicy != "workspace-write" || planner.MaxBackground != 2 || planner.IdleTimeout != "15m" || strings.Join(planner.Capabilities, ",") != "ask,review" {
 		t.Fatalf("planner type = %+v", planner)
 	}
 
@@ -49,6 +49,15 @@ job_timeout = "5m"
 	}
 	if updated["planner"].MaxBackground != 3 || updated["planner"].AutonomyPolicy != "read-only" || strings.Join(updated["planner"].Capabilities, ",") != "ask" {
 		t.Fatalf("updated planner type = %+v", updated["planner"])
+	}
+	// #2589: agent templates are gone, so a legacy `template` key is ignored on
+	// load and dropped on save.
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if strings.Contains(string(content), `template = "planner"`) {
+		t.Fatalf("SaveAgentType kept the removed template key:\n%s", content)
 	}
 }
 
@@ -134,10 +143,6 @@ runtime = "codex"
 	if err != nil {
 		t.Fatalf("LoadAgentTypes returned error: %v", err)
 	}
-	if got := types["planner"].Template; got != "" {
-		t.Fatalf("retired template alias loaded template %q, want empty", got)
-	}
-
 	if err := SaveAgentType(paths, types["planner"]); err != nil {
 		t.Fatalf("SaveAgentType returned error: %v", err)
 	}

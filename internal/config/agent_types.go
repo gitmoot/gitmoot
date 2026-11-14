@@ -11,7 +11,6 @@ import (
 type AgentType struct {
 	Name           string
 	Runtime        string
-	Template       string
 	Model          string
 	Effort         string
 	Role           string
@@ -132,7 +131,6 @@ func saveAgentType(paths Paths, entry AgentType, write func(string, []byte) erro
 func applyAgentTypeDefaults(entry *AgentType) {
 	entry.Name = strings.TrimSpace(entry.Name)
 	entry.Runtime = strings.TrimSpace(entry.Runtime)
-	entry.Template = strings.TrimSpace(entry.Template)
 	entry.Model = strings.TrimSpace(entry.Model)
 	entry.Effort = strings.TrimSpace(entry.Effort)
 	entry.Role = strings.TrimSpace(entry.Role)
@@ -162,10 +160,6 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 	case "runtime":
 		parsed, err := parseConfigString(value)
 		entry.Runtime = parsed
-		return err
-	case "template":
-		parsed, err := parseConfigString(value)
-		entry.Template = parsed
 		return err
 	case "model":
 		parsed, err := parseConfigString(value)
@@ -309,11 +303,6 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	builder.WriteString("runtime = ")
 	builder.WriteString(strconv.Quote(entry.Runtime))
 	builder.WriteString("\n")
-	if entry.Template != "" {
-		builder.WriteString("template = ")
-		builder.WriteString(strconv.Quote(entry.Template))
-		builder.WriteString("\n")
-	}
 	if entry.Model != "" {
 		builder.WriteString("model = ")
 		builder.WriteString(strconv.Quote(entry.Model))

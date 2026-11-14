@@ -32,7 +32,6 @@ type Agent struct {
 	Runtime        string
 	RuntimeRef     string
 	RepoScope      string
-	TemplateID     string
 	Capabilities   []string
 	AutonomyPolicy string
 	HealthStatus   string
