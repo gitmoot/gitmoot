@@ -22,8 +22,6 @@ template = "planner"
 role = "planner"
 capabilities = ["ask", "review"]
 autonomy_policy = " workspace-write "
-max_background = 2
-idle_timeout = "15m"
 job_timeout = "5m"
 `), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -33,11 +31,11 @@ job_timeout = "5m"
 		t.Fatalf("LoadAgentTypes returned error: %v", err)
 	}
 	planner := types["planner"]
-	if planner.Runtime != "codex" || planner.Role != "planner" || planner.AutonomyPolicy != "workspace-write" || planner.MaxBackground != 2 || planner.IdleTimeout != "15m" || strings.Join(planner.Capabilities, ",") != "ask,review" {
+	if planner.Runtime != "codex" || planner.Role != "planner" || planner.AutonomyPolicy != "workspace-write" || planner.JobTimeout != "5m" || strings.Join(planner.Capabilities, ",") != "ask,review" {
 		t.Fatalf("planner type = %+v", planner)
 	}
 
-	planner.MaxBackground = 3
+	planner.JobTimeout = "7m"
 	planner.Capabilities = []string{"ask"}
 	planner.AutonomyPolicy = "read-only"
 	if err := SaveAgentType(paths, planner); err != nil {
@@ -47,7 +45,7 @@ job_timeout = "5m"
 	if err != nil {
 		t.Fatalf("LoadAgentTypes after save returned error: %v", err)
 	}
-	if updated["planner"].MaxBackground != 3 || updated["planner"].AutonomyPolicy != "read-only" || strings.Join(updated["planner"].Capabilities, ",") != "ask" {
+	if updated["planner"].JobTimeout != "7m" || updated["planner"].AutonomyPolicy != "read-only" || strings.Join(updated["planner"].Capabilities, ",") != "ask" {
 		t.Fatalf("updated planner type = %+v", updated["planner"])
 	}
 	// #2589: agent templates are gone, so a legacy `template` key is ignored on
@@ -58,6 +56,63 @@ job_timeout = "5m"
 	}
 	if strings.Contains(string(content), `template = "planner"`) {
 		t.Fatalf("SaveAgentType kept the removed template key:\n%s", content)
+	}
+}
+
+// TestRetiredWorkerSessionKeysAreIgnored pins that a home written before #2590
+// keeps loading. Its config still carries the retired instance-pool knobs
+// ([agents.<type>] max_background and idle_timeout, present in every live
+// agent block) and the [parallel_sessions] temp-worker policy section. Every
+// loader accepts the file, the retired keys are dropped from an agent block the
+// next time gitmoot rewrites it, and nothing writes them back.
+func TestRetiredWorkerSessionKeysAreIgnored(t *testing.T) {
+	paths := PathsForHome(t.TempDir())
+	if err := Initialize(paths); err != nil {
+		t.Fatalf("Initialize returned error: %v", err)
+	}
+	if err := os.WriteFile(paths.ConfigFile, []byte(DefaultConfig(paths)+`
+[parallel_sessions]
+same_session = "fork_temp_session"
+merge_back = "summary"
+max_temp_sessions_per_agent = 4
+eligible_actions = ["ask", "review", "implement"]
+
+[agents.planner]
+runtime = "omp"
+role = "planner"
+capabilities = ["ask", "review"]
+autonomy_policy = "read-only"
+max_background = 2
+idle_timeout = "15m"
+job_timeout = "5m"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := validateConfigFile(paths); err != nil {
+		t.Fatalf("an old home with retired worker-session keys no longer loads: %v", err)
+	}
+	types, err := LoadAgentTypes(paths)
+	if err != nil {
+		t.Fatalf("LoadAgentTypes: %v", err)
+	}
+	planner, ok := types["planner"]
+	if len(types) != 1 || !ok || planner.Runtime != "omp" || planner.JobTimeout != "5m" || planner.AutonomyPolicy != "read-only" {
+		t.Fatalf("agent types = %+v, want only planner with its kept keys", types)
+	}
+	if err := SaveAgentType(paths, planner); err != nil {
+		t.Fatalf("SaveAgentType: %v", err)
+	}
+	content, err := os.ReadFile(paths.ConfigFile)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	for _, retired := range []string{"max_background", "idle_timeout"} {
+		if strings.Contains(string(content), retired) {
+			t.Fatalf("rewritten config still carries retired key %s:\n%s", retired, content)
+		}
+	}
+	if !strings.Contains(string(content), `job_timeout = "5m"`) {
+		t.Fatalf("rewrite dropped a kept key:\n%s", content)
 	}
 }
 
@@ -172,7 +227,7 @@ func TestRetiredHeartbeatSectionIsIgnored(t *testing.T) {
 [agents.repo-maintainer]
 runtime = "codex"
 role = "repo-maintainer"
-max_background = 1
+job_timeout = "5m"
 
 [agents.repo-maintainer.heartbeats.daily]
 enabled = true
@@ -192,14 +247,14 @@ max_concurrent = 1
 		t.Fatalf("agent types = %v, want only repo-maintainer (no phantom subsection agent)", types)
 	}
 	maintainer := types["repo-maintainer"]
-	if maintainer.MaxBackground != 1 || maintainer.Runtime != "codex" {
+	if maintainer.JobTimeout != "5m" || maintainer.Runtime != "codex" {
 		t.Fatalf("repo-maintainer absorbed retired subsection keys: %+v", maintainer)
 	}
-	maintainer.MaxBackground = 2
+	maintainer.JobTimeout = "6m"
 	if err := SaveAgentType(paths, maintainer); err != nil {
 		t.Fatalf("SaveAgentType: %v", err)
 	}
-	if err := SetConfigScalar(paths, []string{"agents", "repo-maintainer", "max_background"}, IntScalar(3)); err != nil {
+	if err := SetConfigScalar(paths, []string{"agents", "repo-maintainer", "job_timeout"}, StringScalar("7m")); err != nil {
 		t.Fatalf("validated config write with a retired subsection present: %v", err)
 	}
 	content, err := os.ReadFile(paths.ConfigFile)

@@ -82,15 +82,11 @@ func TestFindRepeatedReviewersStillIgnoresAnUnrelatedRole(t *testing.T) {
 	}
 }
 
-// TestReviewDecisionAgentResolvesARoleButNotOverADelegate covers the funnel
-// three more of #2008's agent-keyed consumers share - reviewLegsAtHead,
-// followUpReviewScopes and the approval scan - and pins the ORDER inside it.
-//
-// The re-delegation branch must stay ahead of the identity rule. A
-// runtime_session_busy hand-off records the DELEGATE in job.Agent, so a version
-// that resolved the stored fields first would credit the leg to the delegate
-// rather than to the agent whose reviewer slot it fills.
-func TestReviewDecisionAgentResolvesARoleButNotOverADelegate(t *testing.T) {
+// TestReviewDecisionAgentResolvesARole covers the funnel three more of #2008's
+// agent-keyed consumers share - reviewLegsAtHead, followUpReviewScopes and the
+// approval scan: the agent column wins, and a role is credited only when the
+// job has no agent.
+func TestReviewDecisionAgentResolvesARole(t *testing.T) {
 	roleAuthored := reviewDecisionAgent(
 		db.Job{Type: "review", Agent: ""},
 		JobPayload{ActingOrgRole: " GitMoot "},
@@ -105,18 +101,5 @@ func TestReviewDecisionAgentResolvesARoleButNotOverADelegate(t *testing.T) {
 	)
 	if agentWins != "g7-review" {
 		t.Errorf("agent column lost to a role: got %q, want g7-review", agentWins)
-	}
-
-	delegated := reviewDecisionAgent(
-		db.Job{Type: "review", Agent: "busy-delegate"},
-		JobPayload{
-			DelegationReason: "runtime_session_busy",
-			DelegatedAgent:   "busy-delegate",
-			OriginalAgent:    "g7-review",
-			ActingOrgRole:    "gitmoot",
-		},
-	)
-	if delegated != "g7-review" {
-		t.Errorf("re-delegated leg credited to %q, want the original agent g7-review", delegated)
 	}
 }

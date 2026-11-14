@@ -25,60 +25,6 @@ func (a *timeoutCaptureAdapter) Deliver(ctx context.Context, _ runtime.Agent, _ 
 	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}, nil
 }
 
-func TestTempWorkerEligibleRejectsQueuePolicy(t *testing.T) {
-	policy := config.DefaultParallelSessionPolicy()
-	policy.SameSession = config.ParallelSessionQueue
-
-	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{}, runtime.Agent{Name: "lead", Runtime: runtime.OmpRuntime}, policy, time.Now().UTC())
-
-	if got.Eligible || !strings.Contains(got.Reason, "same_session is queue") {
-		t.Fatalf("tempWorkerEligible = %+v, want queue policy rejection", got)
-	}
-}
-
-func TestTempWorkerEligibleRejectsAlreadyDelegatedJob(t *testing.T) {
-	got := tempWorkerEligible(context.Background(), nil, db.Job{ID: "job-a", Type: "ask"}, workflow.JobPayload{DelegationReason: "runtime_session_busy"}, runtime.Agent{Name: "lead-temp-job-a", Runtime: runtime.OmpRuntime}, config.DefaultParallelSessionPolicy(), time.Now().UTC())
-
-	if got.Eligible || !strings.Contains(got.Reason, "delegated temp worker waits") {
-		t.Fatalf("tempWorkerEligible = %+v, want delegated job rejection", got)
-	}
-}
-
-func TestJobWorkerParallelSessionPolicyUsesDefaultWhenHomeNotExplicit(t *testing.T) {
-	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard)
-
-	got, err := worker.parallelSessionPolicy()
-	if err != nil {
-		t.Fatalf("parallelSessionPolicy returned error: %v", err)
-	}
-
-	if got.SameSession != config.ParallelSessionForkTempSession {
-		t.Fatalf("same_session = %q, want default fork_temp_session", got.SameSession)
-	}
-}
-
-func TestJobWorkerParallelSessionPolicyLoadsExplicitHome(t *testing.T) {
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatalf("Initialize returned error: %v", err)
-	}
-	content := strings.Replace(config.DefaultConfig(paths), `same_session = "fork_temp_session"`, `same_session = "queue"`, 1)
-	if err := os.WriteFile(paths.ConfigFile, []byte(content), 0o600); err != nil {
-		t.Fatalf("WriteFile config returned error: %v", err)
-	}
-	worker := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
-
-	got, err := worker.parallelSessionPolicy()
-	if err != nil {
-		t.Fatalf("parallelSessionPolicy returned error: %v", err)
-	}
-
-	if got.SameSession != config.ParallelSessionQueue {
-		t.Fatalf("same_session = %q, want explicit queue config", got.SameSession)
-	}
-}
-
 func TestJobNeedsAdvanceRetryResetsAfterJobRetry(t *testing.T) {
 	ctx := context.Background()
 	store := daemonWorkerStore(t)
@@ -323,47 +269,6 @@ func TestDaemonDispatchClampsPayloadTimeoutAndRecordsEvent(t *testing.T) {
 	if !strings.Contains(clampMessage, "12h") || !strings.Contains(clampMessage, "8h") {
 		t.Fatalf("job_timeout_clamped event = %q, want requested 12h and max 8h", clampMessage)
 	}
-}
-
-func TestDaemonDispatchInstanceTypeOverridesRegisteredTypeTimeout(t *testing.T) {
-	ctx := context.Background()
-	home := t.TempDir()
-	paths := config.PathsForHome(home)
-	if err := config.Initialize(paths); err != nil {
-		t.Fatal(err)
-	}
-	if err := config.SaveAgentType(paths, config.AgentType{Name: "plain", Runtime: runtime.ShellRuntime, JobTimeout: "10m"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := config.SaveAgentType(paths, config.AgentType{Name: "override", Runtime: runtime.ShellRuntime, JobTimeout: "20m"}); err != nil {
-		t.Fatal(err)
-	}
-	store := daemonWorkerStore(t)
-	seedDaemonWorkerAgent(t, store, "plain", runtime.ShellRuntime, "", []string{"ask"}, "owner/repo")
-	now := time.Now().UTC()
-	if err := store.UpsertAgentInstance(ctx, db.AgentInstance{
-		Name: "plain", Type: "override", Runtime: runtime.ShellRuntime, RepoFullName: "owner/repo",
-		Role: "plain", Capabilities: []string{"ask"}, State: "idle",
-		CreatedAt: now.Format(time.RFC3339Nano), LastUsedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339Nano),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{ID: "job-instance-timeout", Agent: "plain", Action: "ask", Repo: "owner/repo", Branch: "main"})
-	job, err := store.GetJob(ctx, "job-instance-timeout")
-	if err != nil {
-		t.Fatal(err)
-	}
-	capture := &timeoutCaptureAdapter{}
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
-		return t.TempDir(), nil
-	}
-	worker.AdapterFactory = func(runtime.Agent, string) (workflow.DeliveryAdapter, error) { return capture, nil }
-	started := time.Now()
-	if err := worker.run(ctx, job); err != nil {
-		t.Fatal(err)
-	}
-	assertCapturedTimeout(t, capture, started, 20*time.Minute)
 }
 
 func TestDaemonJobTimeoutIsSeparateFromStaleDetection(t *testing.T) {

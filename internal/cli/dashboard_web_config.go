@@ -176,7 +176,6 @@ func projectDashboardConfigAgents(registered []db.Agent, configured map[string]c
 		}
 		row.Capabilities = append([]string(nil), agentType.Capabilities...)
 		row.AutonomyPolicy = strings.TrimSpace(agentType.AutonomyPolicy)
-		row.MaxBackground = agentType.MaxBackground
 		byName[name] = row
 	}
 	names := make([]string, 0, len(byName))
@@ -213,8 +212,9 @@ func dashboardUnknownConfigKeys(path string) ([]string, error) {
 	for _, row := range dashboardConfigProjection {
 		known[row.section+"."+row.key] = struct{}{}
 	}
+	// max_background (#2590) is retired, so a leftover line lists as unknown.
 	agentKeys := map[string]struct{}{
-		"runtime": {}, "model": {}, "capabilities": {}, "autonomy_policy": {}, "max_background": {},
+		"runtime": {}, "model": {}, "capabilities": {}, "autonomy_policy": {},
 	}
 	unknown := map[string]struct{}{}
 	doc.Scan(func(key parser.Key, entry *tomledit.Entry) bool {

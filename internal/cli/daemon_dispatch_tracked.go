@@ -509,9 +509,9 @@ func laneBudgets(repoLocalSlots, hostCap int, tracker *inflightJobTracker) (loca
 // pass is seeded with the keys the local pass just selected so the two never
 // pick jobs that share a checkout or runtime session. With the lane off this is
 // exactly the single selection used before #2470.
-func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, policy config.ParallelSessionPolicy, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
+func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job, local, remote int, laneOn bool, seedCheckouts, seedRuntimes map[string]bool) ([]db.Job, []db.Job) {
 	if !laneOn {
-		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, policy, seedCheckouts, seedRuntimes)
+		return selectRunnableQueuedJobsSeeded(ctx, store, pending, local, seedCheckouts, seedRuntimes)
 	}
 	var localJobs, remoteJobs []db.Job
 	for _, job := range pending {
@@ -521,7 +521,7 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			localJobs = append(localJobs, job)
 		}
 	}
-	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, policy, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableQueuedJobsSeeded(ctx, store, localJobs, local, seedCheckouts, seedRuntimes)
 	if len(remoteJobs) == 0 {
 		return queued, remaining
 	}
@@ -535,7 +535,7 @@ func selectRunnableByLane(ctx context.Context, store *db.Store, pending []db.Job
 			runtimes[key] = true
 		}
 	}
-	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, policy, checkouts, runtimes)
+	remoteQueued, remoteRemaining := selectRunnableQueuedJobsSeeded(ctx, store, remoteJobs, remote, checkouts, runtimes)
 	return append(queued, remoteQueued...), append(remaining, remoteRemaining...)
 }
 
@@ -1057,12 +1057,8 @@ func dispatchQueuedJobsTracked(ctx context.Context, worker jobWorker, limit int,
 	if localBudget+remoteBudget <= 0 || len(eligible) == 0 {
 		return tracker.takeErr(repoFilter)
 	}
-	policy, err := worker.parallelSessionPolicy()
-	if err != nil {
-		policy = config.ParallelSessionPolicy{SameSession: config.ParallelSessionQueue}
-	}
 	seedCheckouts, seedRuntimes := tracker.seeds()
-	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, localBudget, remoteBudget, laneOn, policy, seedCheckouts, seedRuntimes)
+	queued, remaining := selectRunnableByLane(ctx, worker.Store, eligible, localBudget, remoteBudget, laneOn, seedCheckouts, seedRuntimes)
 	explainHeldBackJobs(ctx, worker, tracker, remaining)
 	for _, job := range queued {
 		job := job

@@ -341,7 +341,6 @@ type localAgentDispatchRequest struct {
 	Action         string
 	Instructions   string
 	Background     bool
-	Type           string
 	Model          string
 	Effort         string
 	WorkflowID     string
@@ -391,7 +390,6 @@ type localAgentDispatchRequest struct {
 	Runtime          string
 	RuntimeSession   string
 	Home             string
-	AllowManagedSync bool
 	JobTimeout       time.Duration
 	TaskID           string
 	PullRequest      int
@@ -674,11 +672,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 	}
 	if request.Action == "review" {
-		if err := validateLocalReviewTypeAtDispatch(request); err != nil {
-			return localAgentJobOutput{}, err
-		}
-	}
-	if request.Action == "review" {
 		checksRouted, err := applyReviewChecksRoute(&request, repo.FullName())
 		if err != nil {
 			return localAgentJobOutput{}, err
@@ -733,24 +726,10 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if request.remoteSource {
 		checkoutPath = ""
 	}
-	agent, releaseAgentReservation, err := resolveLocalDispatchAgent(ctx, store, request, repo.FullName(), record)
+	agent, err := resolveLocalDispatchAgent(ctx, store, request.Agent)
 	if err != nil {
 		return localAgentJobOutput{}, err
 	}
-	reservationReleased := false
-	releaseReservation := func(releaseCtx context.Context) error {
-		if reservationReleased {
-			return nil
-		}
-		if err := releaseAgentReservation(releaseCtx); err != nil {
-			return err
-		}
-		reservationReleased = true
-		return nil
-	}
-	defer func() {
-		_ = releaseReservation(context.Background())
-	}()
 	if err := ensureLocalAgentAccess(ctx, store, agent, repo.FullName(), request.Action); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -809,8 +788,7 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	// quota wall must not refuse a codex dispatch, and an override to the walled
 	// runtime must still refuse. effectiveAgent is the same expression the
 	// claiming worker resolves (daemon_worker.go), so the two agree by
-	// construction. The agent reservation taken above is released by the deferred
-	// releaseReservation on this error path, so refusing here strands nothing.
+	// construction. Nothing has been written yet, so refusing here strands nothing.
 	if err := refuseUnavailableOrgRole(ctx, store, request.ActingOrgRole, effectiveAgent.Runtime, time.Now().UTC()); err != nil {
 		return localAgentJobOutput{}, err
 	}
@@ -1192,9 +1170,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 	if foregroundContract != nil && foregroundContract.State == runtime.RuntimeContractUnknown {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "runtime_contract_unknown", Message: runtime.RuntimeContractEventMessage(job.ID, effectiveAgent, *foregroundContract)})
 	}
-	if err := releaseReservation(ctx); err != nil {
-		return localAgentJobOutput{}, err
-	}
 	for _, warning := range promptHeadWarnings {
 		_ = store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "prompt_head_warning", Message: warning})
 		if request.DispatchWarning != nil {
@@ -1230,16 +1205,9 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			RawOutputCount:       0,
 		}, nil
 	}
-	managed, err := localManagedAgentDispatchConfigForAgent(ctx, store, request.Home, agent.Name)
-	if err != nil {
-		return localAgentJobOutput{}, err
-	}
 	lockTTL := daemonRunningJobStaleAfter
 	jobTimeout := request.JobTimeout
-	if managed.OK {
-		jobTimeout = managed.JobTimeout
-	}
-	// Mirror run()/runWithTempWorker(): size the runtime-session lease to
+	// Mirror run(): size the runtime-session lease to
 	// jobTimeout + a teardown grace so a foreground `agent ask` that hits its
 	// timeout releases the lock before the lease expires. Otherwise the lease
 	// (== the run-context deadline) would expire mid-teardown and the stale
@@ -1332,15 +1300,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		}
 	}
 	runCtx := ctx
-	if managed.OK {
-		now := time.Now().UTC()
-		if err := store.MarkAgentInstanceRunning(ctx, agent.Name, now, managed.JobTimeout); err != nil {
-			return localAgentJobOutput{}, err
-		}
-		defer func() {
-			_ = store.TouchAgentInstance(context.Background(), agent.Name, time.Now().UTC(), managed.IdleTimeout)
-		}()
-	}
 	if jobTimeout > 0 {
 		var cancel context.CancelFunc
 		runCtx, cancel = context.WithTimeout(ctx, jobTimeout)
@@ -1650,23 +1609,6 @@ func isHexString(value string) bool {
 	return true
 }
 
-// validateLocalReviewTypeAtDispatch refuses a review forced onto a managed
-// agent type that does not exist, before any repo/task mutation or enqueue.
-func validateLocalReviewTypeAtDispatch(request localAgentDispatchRequest) error {
-	typeName := strings.TrimSpace(request.Type)
-	if typeName == "" {
-		return nil
-	}
-	exists, err := managedAgentTypeExists(request.Home, typeName)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return forcedManagedAgentTypeNotFoundError(typeName)
-	}
-	return nil
-}
-
 func prepareLocalReviewDispatchRequest(ctx context.Context, store *db.Store, record db.Repo, repo github.Repository, request localAgentDispatchRequest) (localAgentDispatchRequest, error) {
 	if request.PullRequest <= 0 {
 		return localAgentDispatchRequest{}, errors.New("agent review requires --pr number")
@@ -1825,356 +1767,12 @@ func disposedReviewTaskError(task db.Task) error {
 	return fmt.Errorf("task %s is %s; create a successor task with `gitmoot task successor %s`, then dispatch the review again", task.ID, task.State, task.ID)
 }
 
-func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, request localAgentDispatchRequest, repo string, record db.Repo) (db.Agent, func(context.Context) error, error) {
-	forceType := strings.TrimSpace(request.Type)
-	if forceType == "" {
-		agent, err := store.GetAgent(ctx, request.Agent)
-		if err == nil {
-			return agent, noopAgentReservationRelease, nil
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-	}
-	typeName := firstNonEmpty(forceType, request.Agent)
-	if forceType != "" {
-		exists, err := managedAgentTypeExists(request.Home, forceType)
-		if err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		if !exists {
-			return db.Agent{}, noopAgentReservationRelease, forcedManagedAgentTypeNotFoundError(forceType)
-		}
-	}
-	// A background dispatch (or a caller that explicitly opted in via
-	// AllowManagedSync) always reaches the managed path.
-	// For a plain foreground dispatch, fall through to the managed path only for
-	// the `ask` action AND only when the resolved name maps to a configured
-	// managed agent type; otherwise preserve the historical "agent not found"
-	// error so a name that resolves to neither a single instance nor a type still
-	// fails as before. Scoped to `ask`: `review` carries required params (--pr / --head-sha) that the foreground
-	// path does not validate before this point — letting a heuristic-selected
-	// `run`->`review` reach the managed path would spin an instance and then fail
-	// downstream (#395).
-	if !request.Background && !request.AllowManagedSync {
-		allowSync := false
-		if strings.TrimSpace(request.Action) == "ask" {
-			ok, err := managedAgentTypeExists(request.Home, typeName)
-			if err != nil {
-				return db.Agent{}, noopAgentReservationRelease, err
-			}
-			allowSync = ok
-		}
-		if !allowSync {
-			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", request.Agent)
-		}
-	}
-	return ensureManagedAgentInstance(ctx, store, request.Home, typeName, repo, record, request.Action == "review")
-}
-
-func forcedManagedAgentTypeNotFoundError(typeName string) error {
-	return fmt.Errorf("managed agent type %q not found: --type selects a managed agent type; --action chooses the job action", typeName)
-}
-
-// managedAgentTypeExists reports whether typeName names a configured managed
-// agent type for the given home. It is used to decide whether a foreground
-// ask/run may dispatch synchronously to a managed type (#395) without changing
-// the historical "agent not found" behavior for names that match neither a
-// single instance nor a type.
-func managedAgentTypeExists(home string, typeName string) (bool, error) {
-	typeName = strings.TrimSpace(typeName)
-	if typeName == "" {
-		return false, nil
-	}
-	types, err := loadAgentTypeConfig(home)
-	if err != nil {
-		return false, err
-	}
-	_, ok := types[typeName]
-	return ok, nil
-}
-
-func noopAgentReservationRelease(context.Context) error {
-	return nil
-}
-
-type localManagedAgentDispatchConfig struct {
-	OK          bool
-	IdleTimeout time.Duration
-	JobTimeout  time.Duration
-}
-
-func localManagedAgentDispatchConfigForAgent(ctx context.Context, store *db.Store, home string, agentName string) (localManagedAgentDispatchConfig, error) {
-	instance, err := store.GetAgentInstance(ctx, agentName)
+func resolveLocalDispatchAgent(ctx context.Context, store *db.Store, name string) (db.Agent, error) {
+	agent, err := store.GetAgent(ctx, name)
 	if errors.Is(err, sql.ErrNoRows) {
-		return localManagedAgentDispatchConfig{}, nil
+		return db.Agent{}, fmt.Errorf("agent %q not found", name)
 	}
-	if err != nil {
-		return localManagedAgentDispatchConfig{}, err
-	}
-	types, err := loadAgentTypeConfig(home)
-	if err != nil {
-		return localManagedAgentDispatchConfig{}, err
-	}
-	agentType, ok := types[instance.Type]
-	if !ok {
-		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s not found for managed agent %s", instance.Type, agentName)
-	}
-	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
-	if err != nil {
-		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s idle_timeout: %w", instance.Type, err)
-	}
-	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
-	if err != nil {
-		return localManagedAgentDispatchConfig{}, fmt.Errorf("agent type %s job_timeout: %w", instance.Type, err)
-	}
-	return localManagedAgentDispatchConfig{OK: true, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
-}
-
-func ensureManagedAgentInstance(ctx context.Context, store *db.Store, home string, typeName string, repo string, record db.Repo, deferRuntimeStart bool) (db.Agent, func(context.Context) error, error) {
-	types, err := loadAgentTypeConfig(home)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	agentType, ok := types[typeName]
-	if !ok {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent %q not found", typeName)
-	}
-	idleTimeout, err := time.ParseDuration(agentType.IdleTimeout)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent type %s idle_timeout: %w", typeName, err)
-	}
-	jobTimeout, err := time.ParseDuration(agentType.JobTimeout)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("agent type %s job_timeout: %w", typeName, err)
-	}
-	now := time.Now().UTC()
-	releaseTypeLock, acquiredTypeLock, typeLockKey, err := acquireManagedAgentTypeLockWithWait(ctx, store, typeName, daemonRunningJobStaleAfter, jobTimeout)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	if !acquiredTypeLock {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s is busy reserving %s", typeName, typeLockKey)
-	}
-	now = time.Now().UTC()
-	releaseOnError := true
-	defer func() {
-		if releaseOnError {
-			_ = releaseTypeLock(context.Background())
-		}
-	}()
-	if instance, ok, err := store.FindReusableAgentInstance(ctx, typeName, repo, agentType.AutonomyPolicy, now); err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	} else if ok {
-		if err := store.TouchAgentInstance(ctx, instance.Name, now, idleTimeout); err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		agent, err := store.GetAgent(ctx, instance.Name)
-		if err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		releaseOnError = false
-		return agent, releaseTypeLock, nil
-	}
-	count, err := store.CountActiveAgentInstances(ctx, typeName, agentType.AutonomyPolicy, now)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	if count >= agentType.MaxBackground {
-		instance, ok, err := store.FindActiveAgentInstance(ctx, typeName, repo, agentType.AutonomyPolicy, now)
-		if err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		if ok && strings.TrimSpace(instance.State) == "starting" {
-			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background while instances are still starting", typeName)
-		}
-		if ok {
-			agent, err := store.GetAgent(ctx, instance.Name)
-			if err != nil {
-				return db.Agent{}, noopAgentReservationRelease, err
-			}
-			releaseOnError = false
-			return agent, releaseTypeLock, nil
-		}
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed agent type %s reached max_background but no active instance is available", typeName)
-	}
-	instanceAgent := runtimeAgentFromType(agentType, repo, managedAgentInstanceName(typeName))
-	if deferRuntimeStart {
-		if !resumableSessionRuntime(instanceAgent.Runtime) {
-			return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("managed reviewer requires a resumable runtime")
-		}
-		instanceAgent.RuntimeRef = runtime.FreshRefForJob(instanceAgent.Name)
-		instance := db.AgentInstance{
-			Name: instanceAgent.Name, Type: agentType.Name, Runtime: instanceAgent.Runtime,
-			RuntimeRef: instanceAgent.RuntimeRef, RepoFullName: repo, Role: instanceAgent.Role,
-			Model: instanceAgent.Model, Effort: instanceAgent.Effort,
-			Capabilities: instanceAgent.Capabilities, AutonomyPolicy: instanceAgent.AutonomyPolicy,
-			State: "idle", CreatedAt: formatManagedAgentTime(now), LastUsedAt: formatManagedAgentTime(now),
-			ExpiresAt: formatManagedAgentTime(now.Add(jobTimeout)),
-		}
-		// Reviews always receive a fresh isolated session at delivery. Reserve
-		// their managed-type slot without starting a throwaway host session.
-		if err := store.UpsertAgentInstance(ctx, instance); err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		agent, err := store.GetAgent(ctx, instance.Name)
-		if err != nil {
-			return db.Agent{}, noopAgentReservationRelease, err
-		}
-		releaseOnError = false
-		return agent, releaseTypeLock, nil
-	}
-	// #2359: starting a cold managed instance runs the agent runtime now, for a
-	// background dispatch too, so it is heavy work janitor pressure must hold.
-	if paths, pathsErr := pathsFromFlag(home); pathsErr != nil {
-		return db.Agent{}, noopAgentReservationRelease, fmt.Errorf("resolve config paths for janitor admission: %w", pathsErr)
-	} else if err := janitorPressureRefusal(ctx, store, paths, repo, record.CheckoutPath, record.PrimaryCheckoutPath); err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	execBackend, err := localAgentDispatchExecBackendFor(home)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	adapter, err := startRuntimeAdapterForBackend(execBackend, home, instanceAgent.Runtime, record.CheckoutPath)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	reservedInstance := db.AgentInstance{
-		Name:           instanceAgent.Name,
-		Type:           agentType.Name,
-		Runtime:        instanceAgent.Runtime,
-		RuntimeRef:     "starting:" + instanceAgent.Name,
-		RepoFullName:   repo,
-		Role:           instanceAgent.Role,
-		Model:          instanceAgent.Model,
-		Effort:         instanceAgent.Effort,
-		Capabilities:   instanceAgent.Capabilities,
-		AutonomyPolicy: instanceAgent.AutonomyPolicy,
-		State:          "starting",
-		CreatedAt:      formatManagedAgentTime(now),
-		LastUsedAt:     formatManagedAgentTime(now),
-		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
-	}
-	if err := store.UpsertAgentInstance(ctx, reservedInstance); err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	if err := releaseTypeLock(ctx); err != nil {
-		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	releaseOnError = false
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: instanceAgent, Prompt: agentStartupPrompt(instanceAgent)})
-	if err != nil {
-		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	instanceAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
-	if err := runtime.ValidateAgent(instanceAgent); err != nil {
-		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	instance := db.AgentInstance{
-		Name:           instanceAgent.Name,
-		Type:           agentType.Name,
-		Runtime:        instanceAgent.Runtime,
-		RuntimeRef:     instanceAgent.RuntimeRef,
-		RepoFullName:   repo,
-		Role:           instanceAgent.Role,
-		Model:          instanceAgent.Model,
-		Effort:         instanceAgent.Effort,
-		Capabilities:   instanceAgent.Capabilities,
-		AutonomyPolicy: instanceAgent.AutonomyPolicy,
-		State:          "starting",
-		CreatedAt:      formatManagedAgentTime(now),
-		LastUsedAt:     formatManagedAgentTime(now),
-		ExpiresAt:      formatManagedAgentTime(now.Add(jobTimeout)),
-	}
-	if err := store.UpsertAgentInstance(ctx, instance); err != nil {
-		_ = store.DeleteAgentInstance(context.Background(), reservedInstance.Name)
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	agent, err := store.GetAgent(ctx, instance.Name)
-	if err != nil {
-		return db.Agent{}, noopAgentReservationRelease, err
-	}
-	return agent, func(releaseCtx context.Context) error {
-		return store.TouchAgentInstance(releaseCtx, instance.Name, time.Now().UTC(), idleTimeout)
-	}, nil
-}
-
-func acquireManagedAgentTypeLockWithWait(ctx context.Context, store *db.Store, typeName string, ttl time.Duration, waitTimeout time.Duration) (func(context.Context) error, bool, string, error) {
-	if waitTimeout <= 0 {
-		waitTimeout = ttl
-	}
-	deadline := time.Now().UTC().Add(waitTimeout)
-	var lastKey string
-	for {
-		release, acquired, key, err := acquireManagedAgentTypeLock(ctx, store, typeName, time.Now().UTC(), ttl)
-		lastKey = key
-		if err != nil || acquired {
-			return release, acquired, key, err
-		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return noopAgentReservationRelease, false, firstNonEmpty(lastKey, "agent-type:"+typeName), nil
-		}
-		sleep := 100 * time.Millisecond
-		if remaining < sleep {
-			sleep = remaining
-		}
-		select {
-		case <-ctx.Done():
-			return release, false, key, ctx.Err()
-		case <-time.After(sleep):
-		}
-	}
-}
-
-func acquireManagedAgentTypeLock(ctx context.Context, store *db.Store, typeName string, now time.Time, ttl time.Duration) (func(context.Context) error, bool, string, error) {
-	if ttl <= 0 {
-		return nil, false, "", fmt.Errorf("managed agent type lock ttl must be positive")
-	}
-	key := "agent-type:" + typeName
-	ownerToken, err := newRuntimeLockOwnerToken()
-	if err != nil {
-		return nil, false, key, err
-	}
-	owner := "agent-type:" + typeName
-	acquired, err := store.AcquireResourceLock(ctx, db.ResourceLock{
-		ResourceKey: key,
-		OwnerJobID:  owner,
-		OwnerToken:  ownerToken,
-		ExpiresAt:   now.UTC().Add(ttl).Format(time.RFC3339Nano),
-	}, now)
-	if err != nil || !acquired {
-		return func(context.Context) error { return nil }, acquired, key, err
-	}
-	return func(releaseCtx context.Context) error {
-		_, err := store.ReleaseResourceLock(releaseCtx, key, owner, ownerToken)
-		return err
-	}, true, key, nil
-}
-
-func runtimeAgentFromType(agentType config.AgentType, repo string, name string) runtime.Agent {
-	return runtime.Agent{
-		Name:           name,
-		Role:           agentType.Role,
-		Runtime:        agentType.Runtime,
-		RepoScope:      repo,
-		Model:          agentType.Model,
-		Effort:         agentType.Effort,
-		Capabilities:   agentType.Capabilities,
-		AutonomyPolicy: runtime.NormalizeStoredAutonomyPolicy(agentType.AutonomyPolicy),
-		HealthStatus:   "idle",
-	}
-}
-
-func managedAgentInstanceName(typeName string) string {
-	return fmt.Sprintf("%s-bg-%x", typeName, time.Now().UTC().UnixNano())
-}
-
-func formatManagedAgentTime(value time.Time) string {
-	return value.UTC().Format("2006-01-02T15:04:05.000000000Z")
+	return agent, err
 }
 
 func resolveLocalAgentRepo(ctx context.Context, store *db.Store, repoFlag string, runner subprocess.Runner) (github.Repository, db.Repo, string, bool, error) {
@@ -2245,7 +1843,7 @@ func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent
 // THE TIME COMPONENT IS NOT SUFFICIENT ON ITS OWN (#1559). Two dispatches for
 // the same agent and action can read the same UnixNano - clock resolution is not
 // guaranteed to be a nanosecond, and the observed collision came from four
-// reviews claimed inside one second under [parallel_sessions] - and the insert
+// reviews claimed inside one second under the since-removed [parallel_sessions] - and the insert
 // then fails with SQLITE_CONSTRAINT_PRIMARYKEY, so the job is silently not
 // written while the caller holds an id it believes exists.
 //

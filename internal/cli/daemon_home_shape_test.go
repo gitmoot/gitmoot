@@ -121,19 +121,18 @@ func TestPolicyLoadersNoPhantomDefenseInDepth(t *testing.T) {
 	home := initHomeWithBlockedTTL(t, "1h")
 	resolved := config.PathsForHome(home).Home
 
-	resolvedWorker := defaultJobWorker(nil, io.Discard, resolved)
+	// A real store, kept outside home: defaultJobWorker's once-per-process
+	// kill-pending recovery reads it, and a nil store panics when this is the
+	// first worker the test binary builds.
+	store := daemonWorkerStore(t)
+	resolvedWorker := defaultJobWorker(store, io.Discard, resolved)
 	// Each loader, given the resolved root, must create NO phantom regardless of
 	// whether the (now non-existent doubled) config reads.
-	_, _ = resolvedWorker.parallelSessionPolicy()
-	assertNoPhantom(t, home)
 	_, _ = resolvedWorker.admissionPolicy()
 	assertNoPhantom(t, home)
 
 	// The raw home (the production invariant) reads cleanly AND creates no phantom.
-	rawWorker := defaultJobWorker(nil, io.Discard, home)
-	if _, err := rawWorker.parallelSessionPolicy(); err != nil {
-		t.Fatalf("parallelSessionPolicy(raw): %v", err)
-	}
+	rawWorker := defaultJobWorker(store, io.Discard, home)
 	if _, err := rawWorker.admissionPolicy(); err != nil {
 		t.Fatalf("admissionPolicy(raw): %v", err)
 	}
@@ -148,7 +147,7 @@ func TestJobWorkerWorkflowHomeResolved(t *testing.T) {
 	resolvedRoot := config.PathsForHome(home).Home
 	checkout := t.TempDir()
 
-	w := defaultJobWorker(nil, io.Discard, home)
+	w := defaultJobWorker(daemonWorkerStore(t), io.Discard, home)
 	engine := w.defaultWorkflow(checkout)
 
 	if engine.Home != resolvedRoot {

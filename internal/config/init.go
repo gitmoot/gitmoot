@@ -182,12 +182,6 @@ artifact_blobs = %q
 # retain = "168h"
 # max_total_bytes = 2147483648
 
-[parallel_sessions]
-same_session = "fork_temp_session"
-merge_back = "summary"
-max_temp_sessions_per_agent = 4
-eligible_actions = ["ask", "review", "implement"]
-
 [orchestrate]
 # Emit one synthetic blocked event per continuously blocked task or Herdr org
 # role after this Go duration. 0s keeps both evaluators disabled.

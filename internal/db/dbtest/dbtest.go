@@ -212,10 +212,10 @@ const (
 // which is what every name-only gate expectation already assumed: two
 // differently-named agents are independent.
 //
-// It REFUSES synthetic names, because production refuses them. Temp workers
-// (`<parent>-temp-<job>`, minted in the daemon worker) and ephemeral delegation
-// agents (`<slug>-ephemeral-<hash>`, minted in the workflow result path) are
-// deliberately absent from the registry and resolve through their parent
+// It REFUSES synthetic names, because production refuses them. Historical temp
+// workers (`<parent>-temp-<job>`) and ephemeral delegation agents
+// (`<slug>-ephemeral-<hash>`), both retired (#2588, #2590), were never in the
+// registry and resolve through their parent
 // instead. Registering one here resolves it directly and silently retires the
 // parent-walk tests that cover that path.
 //

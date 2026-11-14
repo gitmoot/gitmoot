@@ -418,7 +418,7 @@ max_total_bytes = 2147483648
 ```
 
 Enabled capture appends every engine-delivered job attempt (foreground, daemon,
-temporary session, ephemeral, and delegated jobs) to a private canonical log
+ephemeral, and delegated jobs) to a private canonical log
 under `<home>/logs/jobs/`. Externally driven session jobs have no runtime
 subprocess and therefore no log. A home-scoped sweep removes settled logs after
 `retain`, then evicts the oldest settled logs when the total exceeds
@@ -539,8 +539,8 @@ repo to its primary checkout; an existing valid linked checkout remains usable.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`
-unless the Gitmoot home has multiple independent runtime sessions or managed
-agent types with `max_background` greater than one.
+unless the Gitmoot home has independent jobs (distinct checkouts and runtime
+sessions; omp jobs each run a fresh session).
 
 `daemon start --repo owner/repo` **scopes** the daemon to a single repo: it
 polls only that repo's PRs and claims only that repo's queued jobs. Omit
@@ -894,7 +894,7 @@ maintenance still wake at the resolved base
 interval.
 
 `gitmoot dashboard` prints a styled one-shot snapshot of local state — daemon
-health, repos, agents and runtime sessions, jobs by state, worktrees, and branch
+health, repos, agents, jobs by state, worktrees, and branch
 locks. It prints the same snapshot everywhere: terminal, pipe, or CI.
 
 ```sh
@@ -923,7 +923,7 @@ deep-links to the note's conversation. The page never resolves an escalation
 itself; use `gitmoot message resolve` from the CLI.
 
 The styled output leads with a "needs attention" block, colors and truncates
-long lists, and groups near-identical runtime sessions; `--all` shows
+long lists; `--all` shows
 everything.
 
 ## Review Router
@@ -1098,7 +1098,7 @@ Three things `agent review` reports that are easy to miss:
 
 - **A dispatch that cannot be delegated RECORDS why.** No `--org-role` (the
   router requires a verdict recipient), `--foreground`, or any flag the router
-  cannot express (`--type`, `--skip-native-review-fanout`, or an
+  cannot express (`--skip-native-review-fanout`, or an
   `--action` other than `review`) keeps the direct path and writes a
   `router_bypassed` job event
   naming the reason — read it months later with `gitmoot job events <id>` (NOT
@@ -1576,14 +1576,8 @@ config plane only, and most registered agents have no config section at all, so
 for them it refuses outright. `agent start` and `agent subscribe` carry
 `--policy` but mean re-registration, which replaces the runtime session.
 
-Dispatch resolves a registered agent through `GetAgent`, which reads **the
-`agents` row if one exists and otherwise the `agent_instances` row**. This verb
-updates **both** rows in one transaction rather than only the one that outranks
-the other today. A same-name `agent_instances` row can OUTLIVE the `agents` row
-that outranked it, because `agent remove` deletes `agents` and not
-`agent_instances`; a stale instance left behind would then become authoritative
-and silently re-widen an agent you had tightened. Only a name present in
-neither plane is unregistered.
+Dispatch resolves a registered agent through `GetAgent`, which reads the
+`agents` row. Only a name with no `agents` row is unregistered.
 
 **When a config type also exists, both planes are written**, and the command
 reports each:
@@ -1595,8 +1589,8 @@ config_type: danger-full-access          # or: none (registry-only agent; nothin
 ```
 
 **Failure semantics are all-or-nothing, enforced by a held transaction.** Both
-the agents row and the config type can authorise dispatch on their own: explicit
-managed-type routing never consults the row. So no ordering is safe, because
+the agents row and the config type can authorise dispatch on their own, so no
+ordering is safe, because
 whichever plane is written first is already live before the second can fail. The
 database transaction is the coordinator instead. The rows are updated, the
 config write runs as a barrier inside that still-open transaction, and the
@@ -1605,11 +1599,6 @@ back, so nothing moved on any plane. If the commit itself fails after config
 succeeded, the config write is rolled back too and the command reports that
 nothing changed; only if that rollback also fails does it report the planes as
 inconsistent, naming both values so you know what to correct.
-
-**Every plane that can become effective is written**, not only the one that
-decides today: a same-name `agent_instances` row is updated alongside the
-`agents` row, because `agent remove` deletes only the latter and a surviving
-instance would otherwise silently re-widen an agent you had tightened.
 
 `agent type show` returns **non-zero** when a registered agent's policy differs
 between planes, or when the effective policy cannot be determined; it prints
@@ -1893,30 +1882,27 @@ plugin helps Codex or Claude Code discover Gitmoot guidance, but it does not
 replace the Gitmoot CLI. Synchronous jobs and queued jobs both use the same
 runtime session locks.
 
-Configure managed background agent types:
+Configure agent types:
 
 ```sh
 gitmoot agent type list
 gitmoot agent type show planner
-gitmoot agent type set planner --runtime omp --max-background 2 --idle-timeout 20m
+gitmoot agent type set planner --runtime omp --job-timeout 30m
 gitmoot agent type set planner --model anthropic/claude-sonnet-4-5
 gitmoot agent type set planner --effort high
-gitmoot agent gc
+gitmoot agent type set planner --policy workspace-write
 ```
 
 `agent type set --model <name>` (or `[agents.<type>].model` in config) sets the
-default runtime model for that managed agent type.
+default runtime model for that agent type.
 
 `agent type set --effort <value>` (or `[agents.<type>].effort`) sets its default
 reasoning effort.
 
-A registered single instance **shadows** a managed type of the same name:
-dispatch resolves `gitmoot agent <name>` to a registered single instance before a
-type, so force the type with `--type <name>` (or do not register a single
-instance of that name). Since **v0.5.1** a foreground `gitmoot agent ask <type>`
-(the `ask` action) dispatches to the managed type synchronously; background
-`run`/`review` to a type and `[parallel_sessions]` temp-session
-forking use the **background** path. See WORKFLOWS.md → "Running one agent's jobs in parallel".
+Dispatch resolves only registered agents: a name that is a config type but not a
+registered agent fails with `agent "<name>" not found`. Older configs that still
+carry `[parallel_sessions]` or `[agents.<type>] max_background`/`idle_timeout`
+load fine; those keys are ignored.
 
 ## Organization registry and scoped dispatch
 

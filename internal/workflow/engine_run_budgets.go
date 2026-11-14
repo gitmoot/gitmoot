@@ -335,11 +335,6 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) (retErr error) {
 		leadAgent := strings.TrimSpace(payload.LeadAgent)
 		if leadAgent == "" {
 			leadAgent = job.Agent
-			if payload.DelegationReason == "runtime_session_busy" &&
-				payload.DelegatedAgent == job.Agent &&
-				strings.TrimSpace(payload.OriginalAgent) != "" {
-				leadAgent = payload.OriginalAgent
-			}
 		}
 		// Trigger 1 (in-process path): the implement job's own payload carries
 		// skip_native_review_fanout and the acting org role onto the PR event.

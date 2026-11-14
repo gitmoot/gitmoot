@@ -340,48 +340,11 @@ author hold, not a pending human merge decision. The `--draft`/`--ready`
 dispatch flags went with `agent implement`, so mark the PR ready on the forge
 when it should enter review and merge-gate processing.
 
-The daemon default is `--workers 1`. Users can raise it when jobs target
-different runtime sessions, managed agent types with `max_background` greater
-than one, or forkable temporary workers. By default `[parallel_sessions]` uses
-`same_session = "fork_temp_session"`, `merge_back = "summary"`,
-`max_temp_sessions_per_agent = 4`, and
-`eligible_actions = ["ask", "review", "implement"]`. Same-checkout work remains
-serialized; temp-session forking applies only to resumable-session runtimes, so
-omp jobs (fresh session per job) never fork.
-
-### Running one agent's jobs in parallel
-
-One registered agent serves one **foreground** ask at a time: `gitmoot agent ask
-<name>` pins a single resumable runtime session, serialized by the
-`runtime:<runtime>:<runtime_ref>` lock. Foreground asks do not auto-fork — to run
-the *same* agent on several questions at once, dispatch them as **background**
-jobs, where two mechanisms spin extra sessions for you:
-
-1. **Temp-session forking (default, zero-config).** `[parallel_sessions]` ships
-   with `same_session = "fork_temp_session"` and `max_temp_sessions_per_agent =
-   4`: when a registered agent's session is busy and another **eligible**
-   background job (`ask`/`review`/`implement`) is queued for it, the daemon forks
-   a throwaway temp worker from that agent so the jobs run in parallel. Same
-   resumable-session runtime only, so it never applies to omp; same-checkout
-   work stays serialized; an `implement` fork needs a safe task worktree.
-2. **Managed agent types (`max_background`).** `gitmoot agent type set <type>
-   --max-background N` defines a *pool* of named, reusable managed instances.
-   Dispatch to the type with `gitmoot agent ask <type> --type <type>
-   --background …` and the daemon reuses an idle instance or spins a new one, up
-   to `N`.
-
-Both only deliver real parallelism when the daemon has job slots: raise
-`--workers` above the default `1` (e.g. `--workers 6`) so `max_background`
-instances / temp sessions actually run concurrently.
-
-**Precedence — a single instance shadows a same-named type.** Dispatch resolves a
-registered agent by name **first**, so if you `gitmoot agent start researcher`
-*and* `gitmoot agent type set researcher`, plain `researcher` always uses the
-single instance. Force the managed type with `--type researcher` (or don't
-register a single instance of that name). Since **v0.5.1** a **foreground**
-`gitmoot agent ask <type>` (the `ask` action) dispatches to the managed type
-synchronously — it spins or reuses a managed instance up to `max_background`.
-`review`/`implement` to a type still use `--background`.
+The daemon default is `--workers 1`. Users can raise it for independent jobs:
+distinct checkouts and distinct runtime sessions (omp jobs each run a fresh
+session, so they never contend). Same-checkout work remains serialized, and a
+job whose resumable runtime session is busy waits for the
+`runtime:<runtime>:<runtime_ref>` lock (`runtime_lock_wait`).
 
 ## Multi-Repo Work
 

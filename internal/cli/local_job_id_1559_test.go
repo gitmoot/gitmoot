@@ -9,7 +9,7 @@ import (
 // action inside one instant, and the insert then fails with
 // SQLITE_CONSTRAINT_PRIMARYKEY, so the job is silently not written while the
 // caller holds an id it believes exists. Observed with four reviews claimed in
-// one second under `[parallel_sessions]`.
+// one second under the since-removed `[parallel_sessions]`.
 //
 // A PER-PROCESS COUNTER RATHER THAN RANDOMNESS, so a same-instant collision is
 // UNREACHABLE within a process rather than merely unlikely. Randomness would

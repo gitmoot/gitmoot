@@ -158,35 +158,6 @@ func TestCountAndSumJobsByRoot(t *testing.T) {
 	}
 }
 
-// TestDelegateQueuedJobPreservesRootID pins #420's decision to leave root_id
-// untouched on in-place re-delegation: a queued child re-assigned to a different
-// agent stays in the same tree, so its root_id must not change.
-func TestDelegateQueuedJobPreservesRootID(t *testing.T) {
-	ctx := context.Background()
-	store, err := openCachedTestStore(t, filepath.Join(t.TempDir(), "gitmoot.db"))
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	defer store.Close()
-
-	if err := store.CreateJob(ctx, Job{ID: "R/child", Agent: "from", Type: "ask", State: "queued", Payload: `{"root_job_id":"R"}`}); err != nil {
-		t.Fatalf("CreateJob returned error: %v", err)
-	}
-	if rootID := rootIDOf(t, store, "R/child"); rootID != "R" {
-		t.Fatalf("pre-delegation root_id = %q, want R", rootID)
-	}
-	ok, err := store.DelegateQueuedJob(ctx, "R/child", "from", "to", `{"root_job_id":"R","sender":"to"}`, JobEvent{Kind: "delegated", Message: "reassigned"})
-	if err != nil {
-		t.Fatalf("DelegateQueuedJob returned error: %v", err)
-	}
-	if !ok {
-		t.Fatal("DelegateQueuedJob reported no rows affected")
-	}
-	if rootID := rootIDOf(t, store, "R/child"); rootID != "R" {
-		t.Fatalf("post-delegation root_id = %q, want R (must be preserved)", rootID)
-	}
-}
-
 // TestMigrateBackfillsRootID pins the forward-only backfill on a pre-#420 DB:
 // apply every migration except the root_id one, insert legacy jobs (a self-root,
 // a payload-rooted child, an empty-root child, and a malformed-payload row), then

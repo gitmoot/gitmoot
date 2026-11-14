@@ -17,18 +17,7 @@ import (
 // to. It is the funnel for three of #2008's agent-keyed consumers -
 // reviewLegsAtHead, followUpReviewScopes and the approval scan below - which is
 // why the fallback lives here rather than at each of those call sites.
-//
-// The re-delegation case stays FIRST and stays ahead of the identity rule: a
-// runtime_session_busy hand-off records the delegate in job.Agent, so resolving
-// the stored fields first would still return that delegate and credit the leg to
-// it rather than to the agent whose slot it fills.
 func reviewDecisionAgent(job db.Job, payload JobPayload) string {
-	if job.Type == "review" &&
-		payload.DelegationReason == "runtime_session_busy" &&
-		payload.DelegatedAgent == job.Agent &&
-		strings.TrimSpace(payload.OriginalAgent) != "" {
-		return payload.OriginalAgent
-	}
 	// An externally driven session review persists ActingOrgRole IN PLACE OF an
 	// agent, so bare job.Agent returned "" and every caller's non-empty check then
 	// dropped the row from the legs, scopes and approvals it belonged in.
@@ -431,19 +420,10 @@ func (e Engine) existingJobMatchesRequest(ctx context.Context, request JobReques
 	if err != nil {
 		return false, err
 	}
-	if !jobMatchesRequestAgent(job, payload, request.Agent) {
+	if job.Agent != request.Agent {
 		return false, nil
 	}
 	return payloadMatchesRequest(payload, request), nil
-}
-
-func jobMatchesRequestAgent(job db.Job, payload JobPayload, requestAgent string) bool {
-	if job.Agent == requestAgent {
-		return true
-	}
-	return payload.DelegationReason == "runtime_session_busy" &&
-		payload.DelegatedAgent == job.Agent &&
-		payload.OriginalAgent == requestAgent
 }
 
 func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
@@ -460,22 +440,8 @@ func payloadMatchesRequest(payload JobPayload, request JobRequest) bool {
 		payload.Instructions == request.Instructions &&
 		payload.WorkflowID == request.WorkflowID &&
 		payload.WorktreePath == request.WorktreePath &&
-		payloadDelegationMatchesRequest(payload, request) &&
 		equalStrings(payload.Reviewers, compactStrings(request.Reviewers)) &&
 		equalStrings(payload.Constraints, compactStrings(request.Constraints))
-}
-
-func payloadDelegationMatchesRequest(payload JobPayload, request JobRequest) bool {
-	if payload.OriginalAgent == request.OriginalAgent &&
-		payload.DelegatedAgent == request.DelegatedAgent &&
-		payload.DelegationReason == request.DelegationReason {
-		return true
-	}
-	return request.OriginalAgent == "" &&
-		request.DelegatedAgent == "" &&
-		request.DelegationReason == "" &&
-		payload.DelegationReason == "runtime_session_busy" &&
-		payload.OriginalAgent == request.Agent
 }
 
 func equalStrings(left []string, right []string) bool {
@@ -490,29 +456,18 @@ func equalStrings(left []string, right []string) bool {
 	return true
 }
 
-func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref taskRef) error {
-	return e.ensureAgentAllowedWithCapability(ctx, request, ref, false)
-}
-
 func (e Engine) ensureJobExecutorAllowed(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
-	authorizationAgent := job.Agent
-	if payload.DelegationReason == "runtime_session_busy" && payload.DelegatedAgent == job.Agent && strings.TrimSpace(payload.OriginalAgent) != "" {
-		authorizationAgent = payload.OriginalAgent
-	}
-	allowMissingCapability := job.Type == "ask" &&
-		payload.DelegationReason == "temp_worker_merge_back" &&
-		payload.OriginalAgent == job.Agent
-	return e.ensureAgentAllowedWithCapability(ctx, JobRequest{
-		Agent:         authorizationAgent,
+	return e.ensureAgentAllowed(ctx, JobRequest{
+		Agent:         job.Agent,
 		Action:        job.Type,
 		ActingOrgRole: payload.ActingOrgRole,
 		Repo:          payload.Repo,
 		Sender:        payload.Sender,
 		Branch:        payload.Branch,
-	}, ref, allowMissingCapability)
+	}, ref)
 }
 
-func (e Engine) ensureAgentAllowedWithCapability(ctx context.Context, request JobRequest, ref taskRef, allowMissingCapability bool) error {
+func (e Engine) ensureAgentAllowed(ctx context.Context, request JobRequest, ref taskRef) error {
 	agent, err := e.Store.GetAgent(ctx, request.Agent)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -527,7 +482,7 @@ func (e Engine) ensureAgentAllowedWithCapability(ctx context.Context, request Jo
 	if !allowed {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q is not allowed on %q", agent.Name, request.Repo))
 	}
-	if !contains(agent.Capabilities, request.Action) && !allowMissingCapability {
+	if !contains(agent.Capabilities, request.Action) {
 		return e.block(ctx, ref, fmt.Sprintf("agent %q lacks %q capability", agent.Name, request.Action))
 	}
 	if request.Action == "implement" {

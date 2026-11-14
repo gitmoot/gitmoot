@@ -16,8 +16,9 @@ database = "/home/.gitmoot/gitmoot.db"
 # the planner runs ask jobs
 runtime = "codex"
 template = "gitmoot-plan-and-goal"
-max_background = 4
-idle_timeout = "10m"
+model = "planner/model"
+autonomy_policy = "read-only"
+job_timeout = "10m"
 
 [workflow]
 auto_settle_after = "48h"
@@ -38,7 +39,7 @@ func editTestPaths(t *testing.T, contents string) Paths {
 
 func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
-	if err := SetConfigScalar(paths, []string{"agents", "planner", "max_background"}, IntScalar(8)); err != nil {
+	if err := SetConfigScalar(paths, []string{"agents", "planner", "job_timeout"}, StringScalar("45m")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
 	out, err := os.ReadFile(paths.ConfigFile)
@@ -46,7 +47,7 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	got := string(out)
-	if !strings.Contains(got, "max_background = 8") {
+	if !strings.Contains(got, `job_timeout = "45m"`) {
 		t.Fatalf("value not updated:\n%s", got)
 	}
 	// Comments and untouched keys survive.
@@ -54,7 +55,7 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 		"# Gitmoot local configuration.",
 		"# the planner runs ask jobs",
 		`template = "gitmoot-plan-and-goal"`,
-		`idle_timeout = "10m"`,
+		`model = "planner/model"`,
 		`auto_settle_after = "48h"`,
 	} {
 		if !strings.Contains(got, want) {
@@ -66,19 +67,19 @@ func TestSetConfigScalarPreservesCommentsAndOtherKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAgentTypes after edit: %v", err)
 	}
-	if types["planner"].MaxBackground != 8 {
-		t.Fatalf("max_background = %d, want 8", types["planner"].MaxBackground)
+	if types["planner"].JobTimeout != "45m" {
+		t.Fatalf("job_timeout = %q, want 45m", types["planner"].JobTimeout)
 	}
 }
 
 func TestSetConfigScalarStringValue(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
-	if err := SetConfigScalar(paths, []string{"agents", "planner", "idle_timeout"}, StringScalar("20m")); err != nil {
+	if err := SetConfigScalar(paths, []string{"agents", "planner", "model"}, StringScalar("other/model")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
 	types, err := LoadAgentTypes(paths)
-	if err != nil || types["planner"].IdleTimeout != "20m" {
-		t.Fatalf("planner idle_timeout = %q (err %v)", types["planner"].IdleTimeout, err)
+	if err != nil || types["planner"].Model != "other/model" {
+		t.Fatalf("planner model = %q (err %v)", types["planner"].Model, err)
 	}
 }
 
@@ -88,7 +89,7 @@ func TestSetConfigScalarMissingKeyErrors(t *testing.T) {
 		t.Fatal("expected error for a missing key")
 	}
 	// Adding new keys is not allowed here (stays an $EDITOR job).
-	if err := SetConfigScalar(paths, []string{"agents", "ghost", "max_background"}, IntScalar(1)); err == nil {
+	if err := SetConfigScalar(paths, []string{"agents", "ghost", "job_timeout"}, StringScalar("1m")); err == nil {
 		t.Fatal("expected error for a missing section")
 	}
 }
@@ -96,9 +97,9 @@ func TestSetConfigScalarMissingKeyErrors(t *testing.T) {
 func TestSetConfigScalarRevertsOnInvalidResult(t *testing.T) {
 	paths := editTestPaths(t, editFixture)
 	original, _ := os.ReadFile(paths.ConfigFile)
-	// max_background must be an integer; writing a non-int string makes the
-	// re-parse fail, so the write must be reverted.
-	err := SetConfigScalar(paths, []string{"agents", "planner", "max_background"}, StringScalar("not-an-int"))
+	// autonomy_policy is validated on load; writing an unsupported policy makes
+	// the re-parse fail, so the write must be reverted.
+	err := SetConfigScalar(paths, []string{"agents", "planner", "autonomy_policy"}, StringScalar("bogus"))
 	if err == nil {
 		t.Fatal("expected validation failure")
 	}
@@ -126,14 +127,14 @@ func TestSetConfigScalarRejectsInvalidCleanupBudget(t *testing.T) {
 }
 
 func TestSetConfigScalarPreservesTrailingComment(t *testing.T) {
-	fixture := "[agents.planner]\nmax_background = 4 # ops cap, do not exceed\n"
+	fixture := "[agents.planner]\njob_timeout = \"10m\" # ops cap, do not exceed\n"
 	paths := editTestPaths(t, fixture)
-	if err := SetConfigScalar(paths, []string{"agents", "planner", "max_background"}, IntScalar(8)); err != nil {
+	if err := SetConfigScalar(paths, []string{"agents", "planner", "job_timeout"}, StringScalar("20m")); err != nil {
 		t.Fatalf("SetConfigScalar: %v", err)
 	}
 	out, _ := os.ReadFile(paths.ConfigFile)
 	got := string(out)
-	if !strings.Contains(got, "max_background = 8") {
+	if !strings.Contains(got, `job_timeout = "20m"`) {
 		t.Fatalf("value not updated:\n%s", got)
 	}
 	if !strings.Contains(got, "ops cap, do not exceed") {

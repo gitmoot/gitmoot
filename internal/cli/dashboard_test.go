@@ -37,12 +37,15 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 		"daemon: stopped",
 		"repos: 0",
 		"agents: 0",
-		"runtime_sessions: 0",
+		"active_jobs: 0",
 		"jobs: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "runtime_sessions") {
+		t.Fatalf("dashboard still renders the removed runtime_sessions section:\n%s", out)
 	}
 }
 
@@ -73,26 +76,6 @@ func TestDashboardTruncate(t *testing.T) {
 	t.Setenv("CLICOLOR_FORCE", "")
 	if shown, hidden := dashboardTruncate(style.For(io.Discard), false, items); len(shown) != 10 || hidden != 0 {
 		t.Fatalf("plain mode keeps all: %d, %d", len(shown), hidden)
-	}
-}
-
-func TestGroupedRuntimeSessions(t *testing.T) {
-	sessions := []dashboardSession{
-		{Name: "skillopt-generator-bg-aaa", Runtime: "codex", State: "idle"},
-		{Name: "skillopt-generator-bg-bbb", Runtime: "codex", State: "idle"},
-		{Name: "skillopt-generator-bg-ccc", Runtime: "codex", State: "running"},
-		{Name: "planner", Runtime: "codex", Repo: "owner/repo", State: "idle"},
-	}
-	lines := groupedRuntimeSessions(sessions)
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "skillopt-generator [codex] ×2 idle") {
-		t.Fatalf("missing grouped idle ×2:\n%s", joined)
-	}
-	if !strings.Contains(joined, "skillopt-generator [codex] ×1 running") {
-		t.Fatalf("missing grouped running ×1:\n%s", joined)
-	}
-	if !strings.Contains(joined, "planner [codex] owner/repo idle") {
-		t.Fatalf("ungrouped single missing:\n%s", joined)
 	}
 }
 
@@ -263,87 +246,6 @@ func TestBuildDashboardActiveJobsEmpty(t *testing.T) {
 	}
 	if len(active) != 0 {
 		t.Fatalf("expected no active jobs, got %d", len(active))
-	}
-}
-
-func TestDashboardSessionStale(t *testing.T) {
-	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-	past := "2026-06-27T11:00:00.000000000Z"
-	future := "2026-06-27T13:00:00.000000000Z"
-	cases := []struct {
-		name    string
-		state   string
-		expires string
-		want    bool
-	}{
-		{name: "running and lease elapsed is a phantom", state: "running", expires: past, want: true},
-		{name: "running within lease is live", state: "running", expires: future, want: false},
-		{name: "idle past lease is normal GC, not phantom", state: "idle", expires: past, want: false},
-		{name: "running with unparseable lease is not flagged", state: "running", expires: "nope", want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := dashboardSessionStale(tc.state, tc.expires, now); got != tc.want {
-				t.Fatalf("dashboardSessionStale(%q,%q) = %v, want %v", tc.state, tc.expires, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestDashboardFlagsPhantomRunningSession is the #505 gap-2 regression at the
-// snapshot/render boundary: an agent_instance left at state=running with an
-// elapsed lease must surface as "(stale)" (and on the needs-attention list), not
-// as a plainly-live "running" session.
-func TestDashboardFlagsPhantomRunningSession(t *testing.T) {
-	home := dashboardTestHome(t)
-	store, err := dbtest.Open(t, config.PathsForHome(home).Database)
-	if err != nil {
-		t.Fatalf("Open returned error: %v", err)
-	}
-	// expires_at is far in the past, so the running lease has elapsed → phantom.
-	past := time.Now().UTC().Add(-time.Hour).Format("2006-01-02T15:04:05.000000000Z")
-	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
-	if err := store.UpsertAgentInstance(context.Background(), db.AgentInstance{
-		Name:           "researcher-bg-dead",
-		Type:           "researcher",
-		Runtime:        "claude",
-		RuntimeRef:     "ref-dead",
-		RepoFullName:   "owner/repo",
-		Role:           "researcher",
-		Capabilities:   []string{"ask"},
-		AutonomyPolicy: "read-only",
-		State:          "running",
-		CreatedAt:      nowStr,
-		LastUsedAt:     nowStr,
-		ExpiresAt:      past,
-	}); err != nil {
-		t.Fatalf("UpsertAgentInstance returned error: %v", err)
-	}
-	store.Close()
-
-	// Snapshot carries the Stale flag.
-	paths, err := initializedPaths(home)
-	if err != nil {
-		t.Fatalf("initializedPaths returned error: %v", err)
-	}
-	snap, err := buildDashboardSnapshot(home, paths)
-	if err != nil {
-		t.Fatalf("buildDashboardSnapshot returned error: %v", err)
-	}
-	if len(snap.RuntimeSessions) != 1 || !snap.RuntimeSessions[0].Stale {
-		t.Fatalf("expected one stale runtime session, got %+v", snap.RuntimeSessions)
-	}
-
-	// Plain render shows "(stale)" and flags it for attention.
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"dashboard", "--home", home}, &stdout, &stderr); code != 0 {
-		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
-	}
-	out := stdout.String()
-	for _, want := range []string{"(stale)", "stale session", "researcher-bg-dead"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("dashboard output missing %q:\n%s", want, out)
-		}
 	}
 }
 

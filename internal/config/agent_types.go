@@ -16,8 +16,6 @@ type AgentType struct {
 	Role           string
 	Capabilities   []string
 	AutonomyPolicy string
-	MaxBackground  int
-	IdleTimeout    string
 	JobTimeout     string
 }
 
@@ -144,12 +142,6 @@ func applyAgentTypeDefaults(entry *AgentType) {
 	if strings.TrimSpace(entry.AutonomyPolicy) == "" {
 		entry.AutonomyPolicy = "auto"
 	}
-	if entry.MaxBackground <= 0 {
-		entry.MaxBackground = 1
-	}
-	if strings.TrimSpace(entry.IdleTimeout) == "" {
-		entry.IdleTimeout = "20m"
-	}
 	if strings.TrimSpace(entry.JobTimeout) == "" {
 		entry.JobTimeout = "10m"
 	}
@@ -188,19 +180,14 @@ func applyAgentTypeField(entry *AgentType, key string, value string) error {
 		}
 		entry.AutonomyPolicy = parsed
 		return nil
-	case "max_background":
-		parsed, err := strconv.Atoi(value)
-		entry.MaxBackground = parsed
-		return err
-	case "idle_timeout":
-		parsed, err := parseConfigString(value)
-		entry.IdleTimeout = parsed
-		return err
 	case "job_timeout":
 		parsed, err := parseConfigString(value)
 		entry.JobTimeout = parsed
 		return err
 	default:
+		// Unknown keys are ignored, so a home that still carries the retired
+		// instance-pool knobs max_background and idle_timeout (#2590) loads;
+		// the next SaveAgentType rewrites the block without them.
 		return nil
 	}
 }
@@ -324,10 +311,6 @@ func writeAgentTypeBlock(builder *strings.Builder, entry AgentType) {
 	}
 	builder.WriteString("]\nautonomy_policy = ")
 	builder.WriteString(strconv.Quote(entry.AutonomyPolicy))
-	builder.WriteString("\nmax_background = ")
-	builder.WriteString(strconv.Itoa(entry.MaxBackground))
-	builder.WriteString("\nidle_timeout = ")
-	builder.WriteString(strconv.Quote(entry.IdleTimeout))
 	builder.WriteString("\njob_timeout = ")
 	builder.WriteString(strconv.Quote(entry.JobTimeout))
 	builder.WriteString("\n")

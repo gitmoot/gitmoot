@@ -50,8 +50,6 @@ func runAgent(args []string, stdout, stderr io.Writer) int {
 		return runAgentReview(args[1:], stdout, stderr)
 	case "type":
 		return runAgentType(args[1:], stdout, stderr)
-	case "gc":
-		return runAgentGC(args[1:], stdout, stderr)
 	case "subscribe":
 		return runAgentSubscribe(args[1:], stdout, stderr)
 	case "show":
@@ -83,10 +81,9 @@ func printAgentUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent start <name> --runtime omp --repo owner/repo [--path .] [--model model] [--effort effort] [--start-daemon]")
 	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--home path] [--json]")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--runtime rt] [--session ref] [--exec-backend local|remote] [--exec-provider e2b|sandboxd|sandboxd-linux] [--allow-prompt-head-mismatch] [--no-fix-target] [--home path] [--json]")
 	printAgentRuntimeOverrideHelp(w)
 	fmt.Fprintln(w, "  gitmoot agent type list|show|set ...")
-	fmt.Fprintln(w, "  gitmoot agent gc")
 	fmt.Fprintln(w, "  gitmoot agent subscribe <name> --runtime omp|shell --session <id|name|last|command> --role <role> [--repo owner/repo...] [--model model] [--effort effort] --capability <capability>")
 	fmt.Fprintln(w, "    Omp sessions may use a UUID or fresh:<suffix> — never last, because omp never resumes. Shell sessions are commands.")
 	fmt.Fprintln(w, "  gitmoot agent allow <name> --repo owner/repo")
@@ -105,7 +102,6 @@ type agentAskOptions struct {
 	repo        string
 	jsonOutput  bool
 	background  bool
-	typeName    string
 	model       string
 	effort      string
 	workflowID  string
@@ -144,7 +140,6 @@ func runAgentAsk(args []string, stdout, stderr io.Writer) int {
 			Action:               "ask",
 			Instructions:         options.message,
 			Background:           options.background,
-			Type:                 options.typeName,
 			Model:                options.model,
 			Effort:               options.effort,
 			WorkflowID:           options.workflowID,
@@ -207,13 +202,6 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.background = true
 		case arg == "--force":
 			options.force = true
-		case arg == "--type":
-			if index+1 >= len(args) {
-				fmt.Fprintln(stderr, "agent ask requires a value for --type")
-				return agentAskOptions{}, false
-			}
-			index++
-			options.typeName = args[index]
 		case arg == "--action":
 			if index+1 >= len(args) {
 				fmt.Fprintln(stderr, "agent ask requires a value for --action")
@@ -291,8 +279,6 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 			options.repo = strings.TrimPrefix(arg, "--repo=")
 		case strings.HasPrefix(arg, "--home="):
 			options.home = strings.TrimPrefix(arg, "--home=")
-		case strings.HasPrefix(arg, "--type="):
-			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "--action="):
 			options.action = strings.TrimSpace(strings.TrimPrefix(arg, "--action="))
 		case strings.HasPrefix(arg, "-") && len(positionals) >= 2:
@@ -335,7 +321,7 @@ func parseAgentAskOptions(args []string, stderr io.Writer) (agentAskOptions, boo
 
 func printAgentAskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--type type] [--action ask] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]")
+	fmt.Fprintln(w, "  gitmoot agent ask <name> \"message\" [--repo owner/repo] [--background] [--action ask] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json] [--force]")
 	printAgentRuntimeOverrideHelp(w)
 }
 
@@ -359,7 +345,6 @@ type agentRunOptions struct {
 	jsonOutput     bool
 	background     bool
 	foreground     bool
-	typeName       string
 	action         string
 	model          string
 	effort         string
@@ -598,7 +583,6 @@ func agentReviewInputsTheRouterCannotCarry(options agentRunOptions) []string {
 		set  bool
 	}{
 		{"--action", strings.TrimSpace(options.action) != "" && !strings.EqualFold(strings.TrimSpace(options.action), "review")},
-		{"--type", strings.TrimSpace(options.typeName) != ""},
 		{"--skip-native-review-fanout", options.skipNativeReviewFanout},
 	} {
 		if candidate.set {
@@ -737,7 +721,6 @@ func localAgentDispatchRequestFromOptions(options agentRunOptions, action, reaso
 		Action:                  action,
 		Instructions:            options.message,
 		Background:              options.background,
-		Type:                    options.typeName,
 		Model:                   options.model,
 		Effort:                  options.effort,
 		WorkflowID:              options.workflowID,
@@ -810,7 +793,7 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			options.noExecution = true
 		case arg == "--allow-prompt-head-mismatch":
 			options.allowPromptHeadMismatch = true
-		case arg == "--type" || arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--part" || arg == "--related-pr":
+		case arg == "--action" || arg == "--model" || arg == "--effort" || arg == "--workflow" || arg == "--org-role" || arg == "--runtime" || arg == "--session" || arg == "--exec-backend" || arg == "--exec-provider" || arg == "--repo" || arg == "--home" || arg == "--pr" || arg == "--head-sha" || arg == "--branch" || arg == "--part" || arg == "--related-pr":
 			if index+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s requires a value for %s\n", label, arg)
 				return agentRunOptions{}, false
@@ -819,8 +802,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 			if !setAgentRunOption(&options, arg, args[index], stderr) {
 				return agentRunOptions{}, false
 			}
-		case strings.HasPrefix(arg, "--type="):
-			options.typeName = strings.TrimPrefix(arg, "--type=")
 		case strings.HasPrefix(arg, "--action="):
 			if !setAgentRunOption(&options, "--action", strings.TrimPrefix(arg, "--action="), stderr) {
 				return agentRunOptions{}, false
@@ -916,8 +897,6 @@ func parseAgentRunOptions(command string, args []string, stderr io.Writer) (agen
 func setAgentRunOption(options *agentRunOptions, flagName string, value string, stderr io.Writer) bool {
 	value = strings.TrimSpace(value)
 	switch flagName {
-	case "--type":
-		options.typeName = value
 	case "--action":
 		for _, action := range agentRunActions {
 			if value == action {
@@ -1011,7 +990,7 @@ func validateAgentRunActionOptions(command string, options agentRunOptions) erro
 
 func printAgentRunUsage(w io.Writer, command string) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--type type] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
+	fmt.Fprintln(w, "  gitmoot agent review <name> \"message\" --repo owner/repo --pr number [--head-sha sha] [--branch branch] [--background|--foreground] [--action review] [--model model] [--effort effort] [--workflow id] [--org-role role] [--runtime rt] [--session ref] [--home path] [--json]")
 	fmt.Fprintln(w, "  Reviews attributed with --org-role queue for daemon ownership by default; --foreground keeps synchronous execution.")
 	printAgentRuntimeOverrideHelp(w)
 }
@@ -1124,7 +1103,7 @@ func printAgentTypeUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot agent type list")
 	fmt.Fprintln(w, "  gitmoot agent type show <type>")
-	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write --max-background 2 --idle-timeout 20m")
+	fmt.Fprintln(w, "  gitmoot agent type set <type> --runtime omp --model <model> --effort <effort> --policy workspace-write")
 }
 
 func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
@@ -1153,7 +1132,7 @@ func runAgentTypeList(args []string, stdout, stderr io.Writer) int {
 	sort.Strings(names)
 	for _, name := range names {
 		entry := types[name]
-		fmt.Fprintf(stdout, "%s\t%s\t%d\n", entry.Name, entry.Runtime, entry.MaxBackground)
+		fmt.Fprintf(stdout, "%s\t%s\n", entry.Name, entry.Runtime)
 	}
 	return 0
 }
@@ -1272,8 +1251,6 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 	effort := fs.String("effort", "", "default reasoning effort for this agent type")
 	role := fs.String("role", "", "agent role")
 	policy := fs.String("policy", "", "agent autonomy policy: auto, read-only, workspace-write, or danger-full-access")
-	maxBackground := fs.Int("max-background", -1, "maximum managed background instances")
-	idleTimeout := fs.String("idle-timeout", "", "managed instance idle timeout")
 	jobTimeout := fs.String("job-timeout", "", "managed job timeout")
 	var capabilities repeatedFlag
 	fs.Var(&capabilities, "capability", "agent capability, repeatable")
@@ -1319,7 +1296,7 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if entry.Runtime == runtime.ShellRuntime {
-		fmt.Fprintln(stderr, "invalid runtime: managed agent types support omp")
+		fmt.Fprintln(stderr, "invalid runtime: agent types support omp")
 		return 2
 	}
 	if strings.TrimSpace(*model) != "" {
@@ -1338,25 +1315,6 @@ func runAgentTypeSet(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 		entry.AutonomyPolicy = normalized
-	}
-	if *maxBackground == 0 || *maxBackground < -1 {
-		fmt.Fprintln(stderr, "max background must be positive")
-		return 2
-	}
-	if *maxBackground > 0 {
-		entry.MaxBackground = *maxBackground
-	}
-	if strings.TrimSpace(*idleTimeout) != "" {
-		parsed, err := time.ParseDuration(*idleTimeout)
-		if err != nil {
-			fmt.Fprintf(stderr, "invalid idle timeout: %v\n", err)
-			return 2
-		}
-		if parsed <= 0 {
-			fmt.Fprintln(stderr, "idle timeout must be positive")
-			return 2
-		}
-		entry.IdleTimeout = strings.TrimSpace(*idleTimeout)
 	}
 	if strings.TrimSpace(*jobTimeout) != "" {
 		parsed, err := time.ParseDuration(*jobTimeout)
@@ -1399,33 +1357,6 @@ func validAgentTypeName(name string) bool {
 	return true
 }
 
-func runAgentGC(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("agent gc", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	home := fs.String("home", "", "home directory to use instead of the current user's home")
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "agent gc does not accept positional arguments")
-		return 2
-	}
-	var deleted int64
-	if err := withStore(*home, func(store *db.Store) error {
-		var err error
-		deleted, err = store.DeleteExpiredAgentInstances(context.Background(), time.Now().UTC())
-		return err
-	}); err != nil {
-		fmt.Fprintf(stderr, "agent gc: %v\n", err)
-		return 1
-	}
-	writeLine(stdout, "removed %d expired agent instances", deleted)
-	return 0
-}
-
 func loadAgentTypeConfig(home string) (map[string]config.AgentType, error) {
 	_, types, err := loadAgentTypeConfigWithPaths(home)
 	return types, err
@@ -1446,8 +1377,6 @@ func printAgentType(stdout io.Writer, entry config.AgentType) {
 	writeLine(stdout, "role: %s", entry.Role)
 	writeLine(stdout, "capabilities: %s", strings.Join(entry.Capabilities, ","))
 	writeLine(stdout, "policy: %s", runtime.NormalizeStoredAutonomyPolicy(entry.AutonomyPolicy))
-	writeLine(stdout, "max_background: %d", entry.MaxBackground)
-	writeLine(stdout, "idle_timeout: %s", entry.IdleTimeout)
 	writeLine(stdout, "job_timeout: %s", entry.JobTimeout)
 }
 
@@ -1891,8 +1820,8 @@ type agentShowOutput struct {
 // RE-REGISTRATION, which replaces the runtime session; one affected agent had
 // 106 completed implements and a live session.
 //
-// So this writes every plane that can make a policy effective - the agents row,
-// any same-name agent_instances row, and the config type when one exists - and
+// So this writes every plane that can make a policy effective - the agents row
+// and the config type when one exists - and
 // prints the before and after so the change is verifiable from the command's
 // own output rather than only by a follow-up read. The database rows move in
 // one transaction with the config write as its barrier, so a failure cannot
@@ -1949,9 +1878,9 @@ func runAgentPolicy(args []string, stdout, stderr io.Writer) int {
 		//
 		// Round two proved the config plane writable first and moved the row
 		// after, on the premise that the row is what decides. Review disproved
-		// the premise with an executed probe: explicit managed-type routing
-		// never calls GetAgent (agent_dispatch.go:1689) and builds the runtime
-		// agent straight from config (:1828, :2029). Config is an INDEPENDENT
+		// the premise with an executed probe: managed-type routing (removed in
+		// #2590) never called GetAgent and built the runtime agent straight
+		// from config. Config was an INDEPENDENT
 		// dispatch authority, so writing it first meant a command that returned
 		// rc=1 had already widened a live grant - #2132 inverted, which is the
 		// exact defect this verb exists to remove.

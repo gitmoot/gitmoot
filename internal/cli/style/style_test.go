@@ -89,21 +89,6 @@ func TestTopN(t *testing.T) {
 	}
 }
 
-func TestGroupSuffix(t *testing.T) {
-	prefix, ok := GroupSuffix("skillopt-generator-bg-18b7a8b38da37938")
-	if !ok || prefix != "skillopt-generator" {
-		t.Fatalf("GroupSuffix = %q, %v", prefix, ok)
-	}
-	if _, ok := GroupSuffix("planner"); ok {
-		t.Fatalf("GroupSuffix on plain name should be false")
-	}
-	// last -bg- wins
-	prefix, ok = GroupSuffix("a-bg-1-bg-2")
-	if !ok || prefix != "a-bg-1" {
-		t.Fatalf("GroupSuffix last marker = %q, %v", prefix, ok)
-	}
-}
-
 // charDevice is a writer whose Stat reports a character device, for detection
 // tests without touching the real terminal.
 type charDevice struct{}

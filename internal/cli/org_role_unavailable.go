@@ -112,29 +112,15 @@ func refuseUnavailableOrgRole(ctx context.Context, store *db.Store, role, select
 // selectedJobDispatchRuntime reports the runtime a QUEUED job will actually run
 // as, resolved in the same order the claiming worker resolves it.
 //
-// THE ORDER IS LOAD-BEARING AND IS NOT THE OBVIOUS ONE (#1641, #1952 review):
-//
-//  1. An ephemeral job's spec wins. daemon_worker.go materializes the throwaway
-//     worker UNCONDITIONALLY when payload.Ephemeral is set, building the agent
-//     from spec.Runtime and UpsertAgent-ing it under the job's agent name — so it
-//     OVERWRITES any pre-existing row of that name. Consulting the agents table
-//     first therefore checks the wall against a runtime that will never execute
-//     whenever a same-name row happens to exist.
-//  2. Otherwise the registered agent's runtime.
-//  3. A per-job runtime override wins over both, because the worker applies it
-//     after materialization.
+// The order (#1641, #1952 review): the registered agent's runtime, then a
+// per-job runtime override, which wins because the worker applies it last. The
+// ephemeral-spec step that once came first went with the workers that
+// materialized from it (#2588, #2590).
 //
 // Returning "" means UNKNOWN, not "some other runtime": refuseUnavailableOrgRole
-// fails closed on an empty value, so an ephemeral spec with an empty or
-// unrecognized runtime refuses rather than dispatches.
-//
-// Deliberately NOT resolveTranscriptRuntime, and for a sharper reason than the
-// first version of this comment gave: that helper answers "which transcript do I
-// read" and treats the ephemeral spec as a LAST fallback, the same shape
-// dashboard_web.go uses for a rendered column. Read/display paths may rank the
-// spec last; write/execute paths must not — mailbox.go assigns the spec's runtime
-// onto the agent at enqueue for exactly this reason. A dispatch refusal is an
-// execute-path decision.
+// fails closed on an empty value, so an unregistered agent refuses rather than
+// dispatches. A dispatch refusal is an execute-path decision, so this does not
+// reuse resolveTranscriptRuntime, which answers "which transcript do I read".
 func selectedJobDispatchRuntime(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload) string {
 	agent, ok := selectedJobRuntimeAgent(ctx, store, job, payload)
 	if !ok {

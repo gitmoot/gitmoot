@@ -2048,9 +2048,6 @@ func (d Daemon) workflowForJob(ctx context.Context, job db.Job) (*workflow.Engin
 //     stranded population this sweep exists for is ENGINE fan-out (Sender "github"),
 //     never an operator's own dispatch, so exempting Sender "local" costs the fix
 //     nothing and removes its only way to discard an explicit request.
-//   - a TEMP-WORKER MERGE-BACK summary describes work that already ran. Today it
-//     carries PullRequest 0 so the caller's `> 0` gate already skips it; it is named
-//     here so a future field addition cannot make it collateral.
 //   - a job an operator RETRIED after this sweep terminated it. `gitmoot job retry`
 //     accepts `cancelled` and writes the row back to `queued` with a `retry_queued`
 //     event, so without this the sweep re-cancelled it on the very next poll, forever:
@@ -2060,9 +2057,6 @@ func (d Daemon) workflowForJob(ctx context.Context, job db.Job) (*workflow.Engin
 //     anyway", while a retry older than the supersede is history.
 func (d Daemon) queuedJobSurvivesClosedPullRequest(ctx context.Context, job db.Job, payload workflow.JobPayload) (bool, error) {
 	if payload.Sender == "local" {
-		return true, nil
-	}
-	if payload.DelegationReason == "temp_worker_merge_back" {
 		return true, nil
 	}
 	events, err := d.Store.ListJobEvents(ctx, job.ID)

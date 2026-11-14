@@ -173,9 +173,6 @@ type JobRequest struct {
 	// any program but the runtime itself. It is only meaningful with
 	// ReadOnlySeat.
 	ReviewNoExecution bool
-	OriginalAgent     string
-	DelegatedAgent    string
-	DelegationReason  string
 	Model             string
 	Effort            string
 	// Plan and PlanInto request PLAN MODE for this job (#1479): the runtime plans
@@ -336,9 +333,6 @@ type JobPayload struct {
 	ReadOnlyWorktreeDiff          string `json:"read_only_worktree_diff,omitempty"`
 	ReadOnlyWorktreeDiffTruncated bool   `json:"read_only_worktree_diff_truncated,omitempty"`
 	ReadOnlyWorktreeDiffError     string `json:"read_only_worktree_diff_error,omitempty"`
-	OriginalAgent                 string `json:"original_agent,omitempty"`
-	DelegatedAgent                string `json:"delegated_agent,omitempty"`
-	DelegationReason              string `json:"delegation_reason,omitempty"`
 	Model                         string `json:"model,omitempty"`
 	Effort                        string `json:"effort,omitempty"`
 	// Plan / PlanInto are the requested plan mode (#1479); PlanMode is the
@@ -623,37 +617,35 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	// Cleanup selectors compare WorktreePath textually with the allocator-derived
 	// obligation path, so managed allocators must preserve their canonical path.
 	payload, err := marshalPayload(JobPayload{
-		Repo:                   request.Repo,
-		Branch:                 request.Branch,
-		PullRequest:            request.PullRequest,
-		PullRequestReady:       pullRequestReady,
-		HeadSHA:                request.HeadSHA,
-		GoalID:                 request.GoalID,
-		TaskID:                 request.TaskID,
-		TaskTitle:              request.TaskTitle,
-		LeadAgent:              request.LeadAgent,
-		Reviewers:              compactStrings(request.Reviewers),
-		ReviewRound:            request.ReviewRound,
-		ReviewScope:            cloneReviewScope(request.ReviewScope),
-		Sender:                 request.Sender,
-		ActingOrgRole:          strings.TrimSpace(request.ActingOrgRole),
-		Instructions:           request.Instructions,
-		Constraints:            compactStrings(request.Constraints),
-		ParentJobID:            request.ParentJobID,
-		DelegationID:           request.DelegationID,
-		DelegationDepth:        request.DelegationDepth,
-		DelegatedBy:            request.DelegatedBy,
-		RootJobID:              request.RootJobID,
-		DispatchedBy:           dispatcherIdentity(request),
-		JobTimeout:             strings.TrimSpace(request.JobTimeout),
-		Fingerprint:            strings.TrimSpace(request.Fingerprint),
-		WorktreePath:           request.WorktreePath,
-		ReadOnlyWorktree:       request.ReadOnlyWorktree,
-		ReadOnlySeat:           request.ReadOnlySeat,
-		ReviewNoExecution:      request.ReviewNoExecution,
-		OriginalAgent:          request.OriginalAgent,
-		DelegatedAgent:         request.DelegatedAgent,
-		DelegationReason:       request.DelegationReason,
+		Repo:              request.Repo,
+		Branch:            request.Branch,
+		PullRequest:       request.PullRequest,
+		PullRequestReady:  pullRequestReady,
+		HeadSHA:           request.HeadSHA,
+		GoalID:            request.GoalID,
+		TaskID:            request.TaskID,
+		TaskTitle:         request.TaskTitle,
+		LeadAgent:         request.LeadAgent,
+		Reviewers:         compactStrings(request.Reviewers),
+		ReviewRound:       request.ReviewRound,
+		ReviewScope:       cloneReviewScope(request.ReviewScope),
+		Sender:            request.Sender,
+		ActingOrgRole:     strings.TrimSpace(request.ActingOrgRole),
+		Instructions:      request.Instructions,
+		Constraints:       compactStrings(request.Constraints),
+		ParentJobID:       request.ParentJobID,
+		DelegationID:      request.DelegationID,
+		DelegationDepth:   request.DelegationDepth,
+		DelegatedBy:       request.DelegatedBy,
+		RootJobID:         request.RootJobID,
+		DispatchedBy:      dispatcherIdentity(request),
+		JobTimeout:        strings.TrimSpace(request.JobTimeout),
+		Fingerprint:       strings.TrimSpace(request.Fingerprint),
+		WorktreePath:      request.WorktreePath,
+		ReadOnlyWorktree:  request.ReadOnlyWorktree,
+		ReadOnlySeat:      request.ReadOnlySeat,
+		ReviewNoExecution: request.ReviewNoExecution,
+
 		Model:                  request.Model,
 		Effort:                 request.Effort,
 		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
@@ -824,7 +816,7 @@ func OrgScopeDecision(policy OrgEnforcement, actingRole, repo string) (string, e
 // Only explicit human CLI dispatches carry OperatorOrigin; shared local helpers
 // also serve comment and other automated producers.
 func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
-	if request.PolicyExempt == "exempt" || strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" || !request.OperatorOrigin {
+	if request.PolicyExempt == "exempt" || strings.TrimSpace(request.ParentJobID) != "" || !request.OperatorOrigin {
 		return "", nil
 	}
 	if m.OrgPolicy == nil {
@@ -839,16 +831,15 @@ func (m Mailbox) resolveEnqueueOrgScope(request *JobRequest) (string, error) {
 }
 
 // IsUnlabeledAgentDispatch is the shared eligibility predicate for enforcement
-// and diagnostics. The stored-row shape has workflow id and delegation reason
-// but not the original producer, so a non-empty delegation reason is the
-// durable approximation for internal continuations and merge-backs.
-func IsUnlabeledAgentDispatch(workflowID, delegationReason string) bool {
-	return strings.TrimSpace(workflowID) == "" && strings.TrimSpace(delegationReason) == ""
+// and diagnostics: a dispatch with no workflow id. Rows written before #2590
+// may still carry a delegation_reason from a temp-worker hand-off or
+// merge-back; none of those fall inside the 24h diagnostic window.
+func IsUnlabeledAgentDispatch(workflowID string) bool {
+	return strings.TrimSpace(workflowID) == ""
 }
 
 // resolveEnqueueWorkflowID applies require_workflow only to fresh external
-// dispatches. Engine children inherit their parent's WorkflowID, and
-// temporary-worker merge-back is an internal producer, so none are
+// dispatches. Engine children inherit their parent's WorkflowID, so none are
 // auto-filed or strict-rejected. Job
 // open (Sender "session") intentionally bypasses this chokepoint: diagnostics
 // count its unlabeled rows, but enforcement does not touch them.
@@ -859,10 +850,10 @@ func (m Mailbox) resolveEnqueueWorkflowID(request *JobRequest) (bool, error) {
 	}
 	// Engine re-enqueues and descendants retain their parent label (including a
 	// legacy empty label). Never retroactively regroup or kill those trees.
-	if strings.TrimSpace(request.ParentJobID) != "" || strings.TrimSpace(request.DelegationReason) == "temp_worker_merge_back" {
+	if strings.TrimSpace(request.ParentJobID) != "" {
 		return false, nil
 	}
-	if !IsUnlabeledAgentDispatch(request.WorkflowID, request.DelegationReason) || m.RequireWorkflowPolicy == nil {
+	if !IsUnlabeledAgentDispatch(request.WorkflowID) || m.RequireWorkflowPolicy == nil {
 		return false, nil
 	}
 	p := m.RequireWorkflowPolicy(strings.TrimSpace(request.Repo))

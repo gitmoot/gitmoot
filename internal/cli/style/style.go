@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 
 	"github.com/charmbracelet/x/term"
 )
@@ -135,15 +134,4 @@ func TopN[T any](items []T, n int) (shown []T, hidden int) {
 		return items, 0
 	}
 	return items[:n], len(items) - n
-}
-
-// GroupSuffix splits a generated session name such as "<type>-bg-<hex>" on its
-// final "-bg-" marker and returns the type prefix. ok is false when no marker
-// is present.
-func GroupSuffix(name string) (prefix string, ok bool) {
-	index := strings.LastIndex(name, "-bg-")
-	if index < 0 {
-		return "", false
-	}
-	return name[:index], true
 }
