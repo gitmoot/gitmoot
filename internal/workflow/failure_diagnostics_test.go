@@ -151,7 +151,7 @@ func TestMailboxRunSuccessStoresNoFailureDiagnostics(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store}
-	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`)
+	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-ok", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)
@@ -183,7 +183,7 @@ func TestMailboxRunClearsStaleFailureDiagnosticsOnRetry(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store}
-	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`)
+	agent := shellCrashAgent(`echo '{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`)
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-retry", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {
 		t.Fatalf("Enqueue returned error: %v", err)

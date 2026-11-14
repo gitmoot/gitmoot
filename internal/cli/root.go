@@ -42,14 +42,12 @@ var rootCommands = []command{
 	{name: "review", summary: "request a routed independent review and follow its verdict", run: runReview},
 	{name: "runtime", summary: "inspect runtime metadata (models, capabilities, usage)", run: runRuntime},
 	{name: "sandbox", summary: "probe kernel-enforced runtime sandbox support", run: runSandbox},
-	{name: "orchestrate", summary: "Orchestrate work across agents (a coordinator that fans out delegations)", run: runOrchestrate},
 	{name: "plugin", summary: "build and inspect Gitmoot agent plugins", run: runPlugin},
 	{name: "status", summary: "show local workflow status", run: runStatus},
 	{name: "task", summary: "inspect review-cycle tasks", run: runTask},
 	{name: "job", summary: "inspect and recover jobs", run: runJob},
 	{name: "findings", summary: "report the review findings ledger per repository", run: runFindings},
 	{name: "workflow", summary: "inspect external-coordinator workflow groups and notes", run: runWorkflowJournal},
-	{name: "escalation", summary: "inspect and repair blocked human-escalation rounds", run: runEscalation},
 	{name: "dashboard", summary: "show a snapshot of local Gitmoot state", run: runDashboard},
 }
 

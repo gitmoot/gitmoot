@@ -685,17 +685,8 @@ func (w *jobWorker) executionDeliveryAdapter(agent runtime.Agent, checkout strin
 // extending. It is the liveness half of the keepalive added in #2226, which
 // until now renewed on the deadline alone.
 //
-// TWO CASES STOP RENEWAL, and neither stops the JOB:
-//
-//   - the job has left the running state, so nothing is waiting on the sandbox;
-//   - its delegation root was killed, which by contract lets in-flight work
-//     finish but should not buy it more provider time.
-//
-// `job kill` is graceful by design (workflow/job_kill.go: "it does NOT cancel
-// in-flight jobs"), so a killed tree's running remote job keeps its sandbox.
-// That was harmless while the sandbox lapsed at the provider's one-hour ceiling;
-// with the keepalive it became a three-hour billed instance for a review the
-// operator had already killed. Round 2 review of #2226 named that amplification.
+// Renewal stops once the job has left the running state, so nothing is waiting
+// on the sandbox; that never stops the JOB itself.
 //
 // FAILS OPEN, deliberately. If the store cannot answer, renew: cutting a healthy
 // review's sandbox short on a transient read error is a worse failure than
@@ -710,27 +701,7 @@ func (w jobWorker) shouldRenewSandboxTTL(jobID string) bool {
 	if err != nil {
 		return true
 	}
-	if job.State != string(workflow.JobRunning) {
-		return false
-	}
-	killed, err := w.Store.IsRootJobKilled(ctx, rootJobIDForTTLLiveness(job))
-	if err != nil {
-		return true
-	}
-	return !killed
-}
-
-// rootJobIDForTTLLiveness resolves the delegation root whose killed flag governs
-// this job, falling back to the job itself when it is its own root.
-func rootJobIDForTTLLiveness(job db.Job) string {
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		return job.ID
-	}
-	if root := strings.TrimSpace(payload.RootJobID); root != "" {
-		return root
-	}
-	return job.ID
+	return job.State == string(workflow.JobRunning)
 }
 
 // sandboxTTLLivenessTimeout bounds the liveness read so a slow store cannot

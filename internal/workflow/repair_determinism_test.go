@@ -12,9 +12,9 @@ import (
 // gitmoot_result whose enclosing envelope is never closed - brace deficit 1,
 // bracket deficit 0, everything else well-formed. The instance that produced
 // the issue was 3794 bytes of approved review discarded for one character.
-const truncatedReviewEnvelope = `{"gitmoot_result":{"decision":"approved","summary":"one brace short","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}`
+const truncatedReviewEnvelope = `{"gitmoot_result":{"decision":"approved","summary":"one brace short","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[]}`
 
-const cleanReviewEnvelope = `{"gitmoot_result":{"decision":"approved","summary":"terminated cleanly","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+const cleanReviewEnvelope = `{"gitmoot_result":{"decision":"approved","summary":"terminated cleanly","findings":[],"changes_made":[],"tests_run":["go test ./..."],"needs":[]}}`
 
 func repairTestMailbox(t *testing.T) (*Mailbox, context.Context, runtime.Agent) {
 	t.Helper()
@@ -175,7 +175,7 @@ func TestMailboxRunPrefersACleanParseOverADelimiterRepair(t *testing.T) {
 		// is refused and the loop continues; attempt 3 parses clean.
 		adapter := &fakeDelivery{outputs: []string{
 			"no json here",
-			`{"gitmoot_result":{"decision":"changes_requested","summary":"missing severity","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}`,
+			`{"gitmoot_result":{"decision":"changes_requested","summary":"missing severity","findings":[],"changes_made":[],"tests_run":[],"needs":[]}`,
 			cleanReviewEnvelope,
 		}}
 		if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-2", Agent: "audit", Action: "review", Repo: "gitmoot/gitmoot"}); err != nil {

@@ -34,7 +34,7 @@ func TestDelimiterCloseRefusesWhatItCannotJustify(t *testing.T) {
 		output string
 	}{
 		{"ends inside a string literal", `{"gitmoot_result":{"decision":"approved","summary":"cut`},
-		{"closing a truncation still violates the review contract", `{"gitmoot_result":{"decision":"changes_requested","summary":"no severity","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}`},
+		{"closing a truncation still violates the review contract", `{"gitmoot_result":{"decision":"changes_requested","summary":"no severity","findings":[],"changes_made":[],"tests_run":[],"needs":[]}`},
 		{"more closers than openers", `{"gitmoot_result":{"decision":"approved"}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

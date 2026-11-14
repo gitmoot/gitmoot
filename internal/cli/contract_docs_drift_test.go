@@ -13,12 +13,9 @@ import (
 func TestContractDocsEnumsMatchWorkflow(t *testing.T) {
 	skill := filepath.Join("..", "..", "skills", "gitmoot", "SKILL.md")
 	assertDocEnumNear(t, skill, "gitmoot job close", workflow.ResultDecisions)
-	assertDocEnumNear(t, skill, "for coordinator delegation", workflow.DelegationActions)
 
 	contract := filepath.Join("..", "..", "skills", "gitmoot", "references", "RESULT_CONTRACT.md")
 	assertDocEnumNear(t, contract, `"decision"`, workflow.ResultDecisions)
-	assertDocEnumNear(t, contract, "failure_policy", workflow.DelegationFailurePolicies)
-	assertDocEnumNear(t, contract, "synthesis_rule", workflow.DelegationSynthesisRules)
 }
 
 func assertDocEnumNear(t *testing.T, path, marker string, values []string) {

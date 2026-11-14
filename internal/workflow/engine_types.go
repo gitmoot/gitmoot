@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -10,85 +9,6 @@ import (
 	"github.com/gitmoot/gitmoot/internal/db"
 	"github.com/gitmoot/gitmoot/internal/events"
 )
-
-// DelegationTimeoutDefaults are optional fallback timeouts for child delegation
-// jobs. They are intentionally generic orchestration policy, not tied to any
-// particular external coordinator or agent naming convention.
-type DelegationTimeoutDefaults struct {
-	Default   string
-	Plan      string
-	Implement string
-	Review    string
-	Gate      string
-	Repair    string
-}
-
-func (d DelegationTimeoutDefaults) timeoutFor(del Delegation) string {
-	switch strings.ToLower(strings.TrimSpace(del.Phase)) {
-	case "plan":
-		if d.Plan != "" {
-			return d.Plan
-		}
-	case "implement":
-		if d.Implement != "" {
-			return d.Implement
-		}
-	case "review", "review-prep", "review-dispatch":
-		if d.Review != "" {
-			return d.Review
-		}
-	case "gate":
-		if d.Gate != "" {
-			return d.Gate
-		}
-	case "repair", "continue":
-		if d.Repair != "" {
-			return d.Repair
-		}
-	}
-	switch strings.ToLower(strings.TrimSpace(del.Action)) {
-	case "implement":
-		if d.Implement != "" {
-			return d.Implement
-		}
-	case "review":
-		if d.Review != "" {
-			return d.Review
-		}
-	}
-	return d.Default
-}
-
-// defaultMaxDelegationNonProgressStreak is the streak threshold used when the
-// engine's MaxDelegationNonProgressStreak is unset (<= 0): two consecutive
-// non-progress generations trip the result-aware loop detector (#339).
-const defaultMaxDelegationNonProgressStreak = 2
-
-// defaultMaxVerifyReplanAttempts is the verify→replan attempt cap used when the
-// engine's MaxVerifyReplanAttempts is unset (<= 0): the engine issues at most two
-// bounded corrective replan continuations on a failed verify verdict before
-// routing to the #305 graceful finalize continuation (#439).
-const defaultMaxVerifyReplanAttempts = 2
-
-// nonProgressStreakThreshold returns the configured result-aware non-progress
-// streak threshold, falling back to defaultMaxDelegationNonProgressStreak when
-// unset so a zero-valued Engine keeps the documented default.
-func (e Engine) nonProgressStreakThreshold() int {
-	if e.MaxDelegationNonProgressStreak > 0 {
-		return e.MaxDelegationNonProgressStreak
-	}
-	return defaultMaxDelegationNonProgressStreak
-}
-
-// verifyReplanAttemptCap returns the configured verify→replan attempt cap,
-// falling back to defaultMaxVerifyReplanAttempts when unset so a zero-valued
-// Engine keeps the documented default (#439).
-func (e Engine) verifyReplanAttemptCap() int {
-	if e.MaxVerifyReplanAttempts > 0 {
-		return e.MaxVerifyReplanAttempts
-	}
-	return defaultMaxVerifyReplanAttempts
-}
 
 // now returns the engine's current time, defaulting to time.Now when Now is unset.
 func (e Engine) now() time.Time {
@@ -135,18 +55,6 @@ func (e Engine) mailbox() Mailbox {
 	mb.ReviewModelPool = e.ReviewModelPool
 	mb.RuntimeDefaultEffort = e.RuntimeDefaultEffort
 	mb.resultCheckMode = normalizeResultCheckMode(e.ResultCheckMode)
-	// A supersession recovery's advance runs on a COPY of the engine carrying its
-	// ownership lease. Every mailbox this engine builds inherits it, so the insert
-	// that mints a dependent or a continuation is bound to live ownership at commit
-	// (#1673). Nil on every ordinary path.
-	if e.supersedeAdvance != nil {
-		mb.advanceOwnership = &db.AdvanceOwnership{
-			LockKey:      e.supersedeAdvance.LockKey,
-			OwnerToken:   e.supersedeAdvance.Token,
-			OwnerJobID:   e.supersedeAdvance.JobID,
-			AtGeneration: e.supersedeAdvance.Generation,
-		}
-	}
 	// Session review jobs close through the Mailbox and never run AdvanceJob, so
 	// they need the same repository policy the advancement path uses in order to
 	// record the folded outcome (#1685-adjacent): without it the merge gate folds
@@ -224,11 +132,6 @@ func (e Engine) mailbox() Mailbox {
 					// no input where this widens the wake vocabulary, and
 					// TestReviewVerdictWakeVocabularyStaysTwoWords pins that rather
 					// than a defensive branch that no mutant could kill.
-					//
-					// A review result carrying delegations never reaches this
-					// line: since #2588 the mailbox refuses such a result with
-					// the review-delegates-nothing check and fails the job, so
-					// only payloads the guard above admitted are announced.
 					event.ReviewDecision = strings.TrimSpace(payload.Result.Decision)
 					if decision == "changes_requested" {
 						// Sender is a transport or agent identity, not necessarily a
@@ -455,81 +358,6 @@ type MergeGate interface {
 	Evaluate(ctx context.Context, request MergeRequest) (MergeDecision, error)
 }
 
-// EscalationRequest carries the context the EscalationNotifier needs to notify a
-// human that a delegation tree has paused awaiting their decision (#340).
-type EscalationRequest struct {
-	// CoordinatorJobID is the paused coordinator job; the human resumes the tree
-	// with `/gitmoot resume <CoordinatorJobID> retry|continue|abort`.
-	CoordinatorJobID string
-	// DelegationID is the failing leg that triggered the escalation.
-	DelegationID string
-	// ChildJobID is the failed child job id for that leg (best-effort; may be
-	// empty if the child could not be resolved).
-	ChildJobID string
-	// Reason is the child's failure summary (why the leg failed).
-	Reason string
-	// Question is the human-facing escalation question (the delegation's prompt),
-	// so the notification can quote what is being asked of the human.
-	Question string
-	// Ask is true when this is a non-failure ask-gate pause (#445) rather than a
-	// failure escalation, so the notifier renders the ask wording + the `answer`
-	// resume verb instead of the retry/continue/abort verbs.
-	Ask bool
-	// Questions carries the ask-gate's human_questions[] (#445) so the notifier can
-	// render each id + prompt (+ choices) and tell the human exactly what to answer.
-	// Empty for a failure escalation.
-	Questions []HumanQuestion
-	// Repo/PullRequest/Branch/TaskID/TaskTitle locate the tree's PR or issue so
-	// the notifier can post the @-tag comment in the right place.
-	Repo        string
-	PullRequest int
-	Branch      string
-	TaskID      string
-	TaskTitle   string
-}
-
-// EscalationNotifier is the injected seam the engine calls (best-effort) when a
-// tree pauses awaiting a human (#340). The daemon implements it to post a GitHub
-// comment that @-tags the human with the resume instructions.
-type EscalationNotifier interface {
-	NotifyEscalation(ctx context.Context, request EscalationRequest) error
-}
-
-// EscalationRepairRequiredError is a BlockedError that an OPERATOR must clear, as
-// opposed to one the delegation graph decided.
-//
-// The distinction is load-bearing for any caller that owes follow-up work. A
-// block_parent failure policy blocking a task is a DECISION: it is final for this run,
-// so a caller may settle whatever bookkeeping it holds. A round parked in needs_repair
-// is the opposite - the work is still owed and will become possible again the moment
-// `gitmoot escalation repair` runs - so a caller must leave its debt OUTSTANDING rather
-// than record it settled.
-//
-// Measured on the closed-PR supersession recovery (#1673/#1731): without this type the
-// parked-round refusal reached isDelegationPolicyOutcome, which classifies any
-// BlockedError as a policy outcome, so the recovery reported advanced=true, wrote
-// supersede_advance_confirmed and closed the finalization debt. The repair then had
-// nothing left to re-drive and the coordinator waited forever - a worse outcome than the
-// unguarded advance it replaced.
-//
-// It UNWRAPS to BlockedError on purpose: every existing consumer - the task block, the
-// dashboard, the daemon's classifier - keeps matching it, and only callers that ask
-// specifically about repair see the difference.
-type EscalationRepairRequiredError struct {
-	Blocked BlockedError
-}
-
-func (e EscalationRepairRequiredError) Error() string { return e.Blocked.Error() }
-
-func (e EscalationRepairRequiredError) Unwrap() error { return e.Blocked }
-
-// AsEscalationRepairRequired reports whether err (anywhere in its chain) is a refusal an
-// operator must clear.
-func AsEscalationRepairRequired(err error) bool {
-	var repair EscalationRepairRequiredError
-	return errors.As(err, &repair)
-}
-
 type BlockedError struct {
 	Reason string
 	// ResultDeliveryFailed distinguishes a job whose stored result did not reach
@@ -541,20 +369,6 @@ type BlockedError struct {
 
 func (e BlockedError) Error() string {
 	return "workflow blocked: " + e.Reason
-}
-
-// AwaitingHumanError is returned by pauseAwaitingHuman when a delegation fails
-// under the escalate_human failure_policy (#340). It is distinct from
-// BlockedError so the engine and daemon can tell a durable human-in-the-loop
-// pause (resumable via `/gitmoot resume`) apart from a terminal block. Like
-// BlockedError it propagates up through AdvanceJob as an AdvanceError, so the
-// agent's already-delivered result is preserved while the tree waits.
-type AwaitingHumanError struct {
-	Reason string
-}
-
-func (e AwaitingHumanError) Error() string {
-	return "workflow awaiting human: " + e.Reason
 }
 
 // AdvanceError wraps an error that occurred while advancing a job *after* the

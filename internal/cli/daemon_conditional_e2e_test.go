@@ -164,7 +164,7 @@ waitDecay:
 	// worker loop; whether it is still queued or already running (busy), the
 	// promotion gate must fire on the next pass.
 	seedDaemonWorkerAgent(t, store, "worker", "shell",
-		`sleep 2; printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"e2e promotion probe","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
+		`sleep 2; printf '%s\n' '{"gitmoot_result":{"decision":"approved","summary":"e2e promotion probe","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`,
 		[]string{"ask"}, "etag-e2e/dormant")
 	preDormant := conditionalGHLogLines(logPath, "repos/etag-e2e/dormant/pulls")
 	// A properly-shaped payload so the REAL worker loop claims and runs the

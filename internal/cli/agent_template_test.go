@@ -340,21 +340,21 @@ func TestRetiredPlannerHereTemplateIsHiddenAndBlocked(t *testing.T) {
 	}
 }
 
-// TestRetiredTemplateRefusalNamesItsOwnSuccessor pins the PER-ID successor. Round-1
-// review of #2215 caught retiredAgentTemplateError hardcoding the planner for every
-// retired id, so a `decompose-and-verify` caller was told to use `planner` - a
-// template that does not do what it asked for. Its real successor is `verifier`.
+// TestRetiredTemplateWithoutSuccessorIsRefusedByName pins the PER-ID successor.
+// Round-1 review of #2215 caught retiredAgentTemplateError hardcoding the planner
+// for every retired id. The #2588 coordinator recipes have no successor at all,
+// so their refusal must name the retired id and point at nothing.
 //
-// TestRetiredPlannerHereTemplateIsHiddenAndBlocked above covers the OTHER retired id
-// and would keep passing with the bug, because for `planner-here` the hardcoded
-// answer happened to be right. That is why this second arm exists.
-func TestRetiredTemplateRefusalNamesItsOwnSuccessor(t *testing.T) {
+// TestRetiredPlannerHereTemplateIsHiddenAndBlocked above covers the retired id
+// whose successor IS the planner and would keep passing with the bug. That is why
+// this second arm exists.
+func TestRetiredTemplateWithoutSuccessorIsRefusedByName(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	home := t.TempDir()
 	if code := Run([]string{"init", "--home", home}, &stdout, &stderr); code != 0 {
 		t.Fatalf("init exit code = %d, stderr=%s", code, stderr.String())
 	}
-	retiredID := agenttemplate.DecomposeAndVerifyTemplateID
+	const retiredID = "decompose-and-verify"
 	seedCachedAgentTemplate(t, home, db.AgentTemplate{
 		ID:             retiredID,
 		Name:           "Retired Decompose And Verify",
@@ -366,12 +366,11 @@ func TestRetiredTemplateRefusalNamesItsOwnSuccessor(t *testing.T) {
 		Content:        "Old recipe prompt.\n",
 	})
 
-	want, ok := agenttemplate.RetiredReplacement(retiredID)
-	if !ok {
-		t.Fatalf("RetiredReplacement(%s) reported not retired", retiredID)
+	if !agenttemplate.IsRetired(retiredID) {
+		t.Fatalf("IsRetired(%s) = false", retiredID)
 	}
-	if want == agenttemplate.PlannerTemplateID {
-		t.Fatalf("fixture is useless: %s's successor is the planner, so the hardcoding bug would pass", retiredID)
+	if replacement, ok := agenttemplate.RetiredReplacement(retiredID); ok {
+		t.Fatalf("RetiredReplacement(%s) = %q, want no successor", retiredID, replacement)
 	}
 
 	for _, args := range [][]string{
@@ -383,11 +382,11 @@ func TestRetiredTemplateRefusalNamesItsOwnSuccessor(t *testing.T) {
 		if code := Run(args, &stdout, &stderr); code == 0 {
 			t.Fatalf("%v exit code = 0, stdout=%s", args, stdout.String())
 		}
-		if !strings.Contains(stderr.String(), "agent template "+retiredID+" is retired; use "+want) {
-			t.Fatalf("%v stderr must name %s as the successor:\n%s", args, want, stderr.String())
+		if !strings.Contains(stderr.String(), "agent template "+retiredID+" is retired") {
+			t.Fatalf("%v stderr must refuse the retired id by name:\n%s", args, stderr.String())
 		}
-		if strings.Contains(stderr.String(), "use "+agenttemplate.PlannerTemplateID) {
-			t.Fatalf("%v still points at the planner:\n%s", args, stderr.String())
+		if strings.Contains(stderr.String(), "is retired; use") {
+			t.Fatalf("%v names a successor for a recipe that has none:\n%s", args, stderr.String())
 		}
 	}
 }

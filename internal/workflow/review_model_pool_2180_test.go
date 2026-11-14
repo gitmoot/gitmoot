@@ -22,16 +22,16 @@ import (
 // therefore made the provider fallback unreachable for them.
 type testStoreHandle struct{ store *db.Store }
 
-func (h *testStoreHandle) payload(t *testing.T, prepared PreparedEnqueue) JobPayload {
+func (h *testStoreHandle) payload(t *testing.T, prepared db.Job) JobPayload {
 	t.Helper()
-	payload, err := ParseJobPayload(prepared.Job.Payload)
+	payload, err := ParseJobPayload(prepared.Payload)
 	if err != nil {
 		t.Fatalf("ParseJobPayload: %v", err)
 	}
 	return payload
 }
 
-func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *testing.T) {
+func TestEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *testing.T) {
 	configured := []string{"sentinel/router-a", "sentinel/router-b"}
 	var askedFor []string
 
@@ -50,13 +50,14 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 	t.Run("a review is armed with the configured pool for its purpose", func(t *testing.T) {
 		askedFor = nil
 		mailbox, h := newMailbox(t)
-		prepared, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
+		prepared, err := mailbox.Enqueue(context.Background(), JobRequest{
 			ID: "job-review", Agent: "reviewer", Action: "review", Repo: "owner/repo",
 			Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 			ReviewPurpose: "security",
 		})
+
 		if err != nil {
-			t.Fatalf("PrepareEnqueue: %v", err)
+			t.Fatalf("Enqueue: %v", err)
 		}
 		payload := h.payload(t, prepared)
 		if !slices.Equal(payload.ReviewModelPool, configured) {
@@ -75,12 +76,13 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 	t.Run("a non-review job stays pool-less", func(t *testing.T) {
 		askedFor = nil
 		mailbox, h := newMailbox(t)
-		prepared, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
+		prepared, err := mailbox.Enqueue(context.Background(), JobRequest{
 			ID: "job-implement", Agent: "reviewer", Action: "implement", Repo: "owner/repo",
 			Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 		})
+
 		if err != nil {
-			t.Fatalf("PrepareEnqueue: %v", err)
+			t.Fatalf("Enqueue: %v", err)
 		}
 		if pool := h.payload(t, prepared).ReviewModelPool; len(pool) != 0 {
 			t.Fatalf("implement job acquired pool %v: the claim walk and the blocker both read this field", pool)
@@ -94,13 +96,14 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 		askedFor = nil
 		mailbox, h := newMailbox(t)
 		chosen := []string{"kimi-code/k3"}
-		prepared, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
+		prepared, err := mailbox.Enqueue(context.Background(), JobRequest{
 			ID: "job-chosen", Agent: "reviewer", Action: "review", Repo: "owner/repo",
 			Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 			ReviewPurpose: "code", ReviewModelPool: chosen,
 		})
+
 		if err != nil {
-			t.Fatalf("PrepareEnqueue: %v", err)
+			t.Fatalf("Enqueue: %v", err)
 		}
 		if pool := h.payload(t, prepared).ReviewModelPool; !slices.Equal(pool, chosen) {
 			t.Fatalf("pool = %v, want the caller's %v", pool, chosen)
@@ -113,11 +116,11 @@ func TestPrepareEnqueueResolvesAReviewPoolAndLeavesNonReviewJobsPoolLess(t *test
 	t.Run("an unstated purpose resolves the code chain", func(t *testing.T) {
 		askedFor = nil
 		mailbox, _ := newMailbox(t)
-		if _, err := mailbox.PrepareEnqueue(context.Background(), JobRequest{
+		if _, err := mailbox.Enqueue(context.Background(), JobRequest{
 			ID: "job-nopurpose", Agent: "reviewer", Action: "review", Repo: "owner/repo",
 			Branch: "main", PullRequest: 1, HeadSHA: strings.Repeat("a", 40),
 		}); err != nil {
-			t.Fatalf("PrepareEnqueue: %v", err)
+			t.Fatalf("Enqueue: %v", err)
 		}
 		if !slices.Equal(askedFor, []string{"code"}) {
 			t.Fatalf("resolver asked for %v, want the code default", askedFor)
@@ -146,14 +149,15 @@ func TestEngineProducedReviewsCarryTheResolvedPool(t *testing.T) {
 		ReviewModelPool: func(string) []string { return configured },
 	}
 
-	prepared, err := engine.mailbox().PrepareEnqueue(context.Background(), JobRequest{
+	prepared, err := engine.mailbox().Enqueue(context.Background(), JobRequest{
 		ID: "job-engine-review", Agent: "engine-reviewer", Action: "review", Repo: "owner/repo",
 		Branch: "main", PullRequest: 7, HeadSHA: strings.Repeat("c", 40), ReviewPurpose: "code",
 	})
+
 	if err != nil {
-		t.Fatalf("PrepareEnqueue: %v", err)
+		t.Fatalf("Enqueue: %v", err)
 	}
-	payload, err := ParseJobPayload(prepared.Job.Payload)
+	payload, err := ParseJobPayload(prepared.Payload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,8 +396,7 @@ func distinctiveValuesAtDepth(fieldType reflect.Type, seed, depth int) []reflect
 	// create a new place for the class to live.
 	case reflect.Interface:
 		for _, stub := range []any{
-			&recordingSink{}, &recordingNotifier{},
-			&fakeMergeGate{}, &fakeWorktreeManager{},
+			&recordingSink{}, &fakeMergeGate{}, &fakeWorktreeManager{},
 		} {
 			candidate := reflect.ValueOf(stub)
 			if candidate.Type().Implements(fieldType) {

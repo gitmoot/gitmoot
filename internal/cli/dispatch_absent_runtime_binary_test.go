@@ -66,7 +66,7 @@ func stubForegroundProbe(t *testing.T, result runtime.RuntimeContractResult) *in
 
 func stubForegroundAdapter(t *testing.T) {
 	t.Helper()
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	previous := localAgentDispatchRuntimeAdapterFor
 	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previous })
@@ -316,7 +316,7 @@ func TestDaemonClaimInjectedAdapterWithAbsentBinaryStillDelivers(t *testing.T) {
 		Branch: "task-1", PullRequest: 42, GoalID: "goal-1", TaskID: "task-1", TaskTitle: "Task 1",
 	})
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard)
 	worker.CheckoutValidator = func(context.Context, db.Job, workflow.JobPayload, runtime.Agent) (string, error) {
 		return checkout, nil

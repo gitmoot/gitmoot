@@ -172,7 +172,7 @@ func reviewVerdictWakeRun(t *testing.T, ctx context.Context, fx reviewVerdictFix
 	}
 
 	output := `{"gitmoot_result":{"decision":"` + fx.decision + `","severity":"` + fx.severity +
-		`","summary":"verdict summary","findings":[],"changes_made":[],"tests_run":["go test ./... ok"],"needs":[],"delegations":[]}}`
+		`","summary":"verdict summary","findings":[],"changes_made":[],"tests_run":["go test ./... ok"],"needs":[]}}`
 	adapter := &cliWorkerFakeAdapter{output: output}
 
 	if _, err := engine.RunJob(ctx, fx.jobID, runtime.Agent{

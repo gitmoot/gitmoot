@@ -70,7 +70,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestKeychainMigrationAppliesToExistingDatabase":                         true,
 		"TestMigrateAddsExecBackendAttempts":                                     true,
 		"TestMigrateAppendsAgentInstanceAutonomyPolicy":                          true,
-		"TestMigrateAppendsRootKilled":                                           true,
 		"TestMigrateAppendsTaskWorktreePath":                                     true,
 		"TestMigrateBackfillsRootID":                                             true,
 		"TestMigrationAddsRunnerAndOwnerBootColumns":                             true,
@@ -87,10 +86,6 @@ func TestStoreOpenPolicy(t *testing.T) {
 		"TestWorkflowMetaTextMigrations":                                         true,
 	}
 	realPathTests["TestMigrateExecBackendAttemptsLifecycleGenerationNotNullPreservesRows"] = true
-	// #1673: proves the round-open pair is ONE transaction by breaking the event
-	// insert from a SECOND connection to the same file, which a cached shared-memory
-	// store cannot express.
-	realPathTests["TestUpsertTaskWithJobEventUnlessStatesRollsBackTheTaskWhenTheEventFails"] = true
 	realPathTests["TestChatRemovalMigrationDropsTablesAndPendingChatWakes"] = true
 	// #1753's table-drop migration: both arms need a real on-disk database,
 	// because the upgrade arm builds the PREVIOUS release's schema first and
@@ -126,6 +121,9 @@ func TestStoreOpenPolicy(t *testing.T) {
 	// #2591: upgrades a database built from the migrations before the branch
 	// lock table drop through the real Open path.
 	realPathTests["TestBranchLockRemovalMigrationOnPreviousSchema"] = true
+	// #2588: upgrades a database built from the migrations before the
+	// escalation_rounds table drop through the real Open path.
+	realPathTests["TestEscalationRoundsRemovalMigrationOnPreviousSchema"] = true
 	directOpenFunctions := map[string]bool{
 		"ensureCachedMigratedTestTemplateOnce": true,
 		"openRealTestStore":                    true,

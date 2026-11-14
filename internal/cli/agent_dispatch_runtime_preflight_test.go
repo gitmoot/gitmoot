@@ -51,7 +51,7 @@ func TestForegroundRuntimePreflightUnknownRecordsAndDispatches(t *testing.T) {
 		return runtime.RuntimeContractResult{Runtime: runtime.ShellRuntime, Version: "unknown", State: runtime.RuntimeContractUnknown, Instrument: "binary-help"}
 	}
 	t.Cleanup(func() { localRuntimeContractPreflight = previousPreflight })
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}
 	previousAdapter := localAgentDispatchRuntimeAdapterFor
 	localAgentDispatchRuntimeAdapterFor = func(string, runtime.Agent, string) (runtime.Adapter, error) { return adapter, nil }
 	t.Cleanup(func() { localAgentDispatchRuntimeAdapterFor = previousAdapter })

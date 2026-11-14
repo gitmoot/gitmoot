@@ -50,9 +50,6 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 		{"workflow-register", func(h string) []string { return []string{"workflow", "register", "wf-1", h} }, "workflow register"},
 		{"workflow-close", func(h string) []string { return []string{"workflow", "close", "wf-1", "--reason", h} }, "workflow close"},
 		{"task-successor", func(h string) []string { return []string{"task", "successor", "t-1", "--reason", h} }, "task successor"},
-		{"escalation-repair", func(h string) []string {
-			return []string{"escalation", "repair", "job-1", "--round", "r-1", "--supersede", "--reason", h}
-		}, "escalation repair"},
 		{"job-open", func(h string) []string {
 			return []string{"job", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", h}
 		}, "job open"},
@@ -63,9 +60,7 @@ func TestFreeTextCommandsPrintHelpAndSaveNothing(t *testing.T) {
 			return []string{"job", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", h}
 		}, "job record"},
 		{"agent-ask", func(h string) []string { return []string{"agent", "ask", "a", h} }, "agent ask"},
-		{"agent-run", func(h string) []string { return []string{"agent", "run", "a", h} }, "agent run"},
 		{"agent-review", func(h string) []string { return []string{"agent", "review", "a", h, "--repo", "o/r", "--pr", "1"} }, "agent review"},
-		{"orchestrate", func(h string) []string { return []string{"orchestrate", "a", h} }, "orchestrate"},
 		{"org-events-rule-add", func(h string) []string {
 			return []string{"org", "events", "rule", "add", "--on", "reply", "--match", h, "--wake", "deimos"}
 		}, "org events rule add"},
@@ -106,13 +101,10 @@ func TestFreeTextCommandsRefuseFlagLikeText(t *testing.T) {
 		{"workflow", "register", "wf-1", "-x"},
 		{"workflow", "close", "wf-1", "--reason", "-x"},
 		{"task", "successor", "t-1", "--reason", "-x"},
-		{"escalation", "repair", "job-1", "--round", "r-1", "--supersede", "--reason", "-x"},
 		{"job", "open", "--agent", "a", "--repo", "o/r", "--type", "implement", "--title", "-x"},
 		{"job", "close", "job-1", "--decision", "approve", "--summary", "-x"},
 		{"job", "record", "--agent", "a", "--repo", "o/r", "--type", "implement", "--decision", "approve", "--summary", "-x"},
 		{"agent", "ask", "a", "--bogus"},
-		{"agent", "run", "a", "-x"},
-		{"orchestrate", "a", "-x"},
 		{"org", "events", "rule", "add", "--on", "reply", "--match", "-x", "--wake", "deimos"},
 	} {
 		t.Run(strings.Join(args[:2], "-"), func(t *testing.T) {

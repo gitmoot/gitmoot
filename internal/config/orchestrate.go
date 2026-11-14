@@ -14,50 +14,13 @@ import (
 // OrchestratePolicy contains host-level orchestration settings read from the
 // [orchestrate] section of the gitmoot config.
 type OrchestratePolicy struct {
-	// InlineArtifactBodies opts the coordinator continuation prompt into inlining
-	// each finished child's artifact_body as a fenced block (see issue #368). It is
-	// off by default because inlined briefs can be large.
-	InlineArtifactBodies bool
-	// InlineArtifactMaxBytes is the per-body byte cap applied when
-	// InlineArtifactBodies is set; 0 means the engine's built-in default.
-	InlineArtifactMaxBytes int
-	// InjectUpstreamDepContext opts a ready dependent delegation leg into running
-	// with its succeeded direct deps' results injected into its prompt as a
-	// byte-budgeted "Upstream dependency results" block (deps[] as real dataflow,
-	// see issue #419). It is off by default — flag-off the enqueued prompt is
-	// byte-identical — and reuses the same artifact-body byte budget as
-	// InlineArtifactBodies (no new knob). The daemon wires this into
-	// Engine.InjectUpstreamDepContext at startup.
-	InjectUpstreamDepContext bool
-	// MaxDelegationTokenBudget is the cumulative per-root token budget (input +
-	// output, summed across a delegation tree) that bounds a tree by cost in
-	// addition to depth/width/total-jobs/wall-clock (#338 Part B). 0 (the default)
-	// means unlimited/off, so default behavior is unchanged. The daemon wires this
-	// into Engine.MaxDelegationTokenBudget at startup.
-	MaxDelegationTokenBudget int
-	// MaxDelegationCostUSD is the cumulative per-root dollar-cost budget that bounds
-	// a delegation tree by its measured spend (token usage × a per-model price
-	// table), layered on top of the token budget (#380). 0 (the default) means
-	// unlimited/off, so default behavior is unchanged. The daemon wires this into
-	// Engine.MaxDelegationCostUSD at startup.
-	MaxDelegationCostUSD float64
-	// EscalationHandle is the GitHub login the escalate_human notifier @-tags when
-	// a tree pauses awaiting a human (#340). Empty (the default) falls back to the
-	// PR author, then the repo owner, so a notification always names someone.
-	EscalationHandle string
-	// EscalationTTL is how long a tree may sit paused awaiting a human before the
-	// daemon's background scan auto-finalizes it (#340), as a Go duration string.
-	// Empty (the default) uses DefaultEscalationTTL (24h); the daemon parses it.
-	EscalationTTL string
 	// BlockedTTL is the opt-in maximum time a job may sit BLOCKED — paused awaiting a
 	// human (an operator permission gate or an unrecoverable BlockedError) — before
 	// the daemon's housekeeping sweep dismisses it via CancelJob (#631), as a Go
 	// duration string. Empty or zero (the DEFAULT) means the sweep is DISABLED: a
 	// blocked job is a human-awaiting decision and is NEVER auto-discarded unless the
-	// operator opts in with a positive duration; a negative value is rejected. Unlike
-	// EscalationTTL — which auto-finalizes a whole paused delegation TREE and is ON by
-	// default — this dismisses a SINGLE blocked job and is OFF by default. The daemon
-	// resolves it per tick via resolveBlockedTTL.
+	// operator opts in with a positive duration; a negative value is rejected. The
+	// daemon resolves it per tick via resolveBlockedTTL.
 	BlockedTTL string
 	// BlockedRoleWakeAfter is the opt-in age after which a continuously blocked
 	// task or Herdr-backed organization role emits one synthesized blocked event.
@@ -67,56 +30,13 @@ type OrchestratePolicy struct {
 	// status flag a role whose delivered prompts repeatedly stall. 0 (the default)
 	// disables flagging; negative values are rejected.
 	MaxConsecutiveMissedWakes int
-	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
-	// non-progress loop detector (#339): how many consecutive continuation
-	// generations a delegation tree may produce with no new durable side effect
-	// before the loop ladder trips. 0 (the default) means use the engine's built-in
-	// default (2), so default behavior is unchanged. The daemon wires this into
-	// Engine.MaxDelegationNonProgressStreak at startup.
-	MaxDelegationNonProgressStreak int
-	// MaxVerifyReplanAttempts is the per-root cap on the engine-level verify→replan
-	// corrective loop (#439): how many bounded replan continuations the engine issues
-	// on a FAILED verify verdict before routing to the #305 graceful finalize
-	// continuation. 0 (the default) means use the engine's built-in default (2), so
-	// default behavior is unchanged. The daemon wires this into
-	// Engine.MaxVerifyReplanAttempts at startup.
-	MaxVerifyReplanAttempts int
-	// Default*Timeout are optional child delegation job timeout defaults. Empty
-	// strings mean unbounded. Explicit per-delegation timeout values win, then the
-	// phase-specific default, then DefaultDelegationTimeout, then unbounded. These
-	// are ordinary orchestrator defaults; they are not tied to an agent name.
-	DefaultDelegationTimeout string
-	DefaultPlanTimeout       string
-	DefaultImplementTimeout  string
-	DefaultReviewTimeout     string
-	DefaultGateTimeout       string
-	DefaultRepairTimeout     string
 }
-
-// DefaultEscalationTTL is the fallback time a paused-for-human tree may sit
-// before the daemon auto-finalizes it gracefully (#340).
-const DefaultEscalationTTL = "24h"
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
-		InlineArtifactBodies:           false,
-		InlineArtifactMaxBytes:         0,
-		InjectUpstreamDepContext:       false,
-		MaxDelegationTokenBudget:       0,
-		MaxDelegationCostUSD:           0,
-		EscalationHandle:               "",
-		EscalationTTL:                  "",
-		BlockedTTL:                     "",
-		BlockedRoleWakeAfter:           0,
-		MaxConsecutiveMissedWakes:      0,
-		MaxDelegationNonProgressStreak: 0,
-		MaxVerifyReplanAttempts:        0,
-		DefaultDelegationTimeout:       "",
-		DefaultPlanTimeout:             "",
-		DefaultImplementTimeout:        "",
-		DefaultReviewTimeout:           "",
-		DefaultGateTimeout:             "",
-		DefaultRepairTimeout:           "",
+		BlockedTTL:                "",
+		BlockedRoleWakeAfter:      0,
+		MaxConsecutiveMissedWakes: 0,
 	}
 }
 
@@ -155,34 +75,6 @@ func LoadOrchestratePolicy(paths Paths) (OrchestratePolicy, error) {
 
 func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value string) error {
 	switch key {
-	case "inline_artifact_bodies":
-		parsed, err := strconv.ParseBool(value)
-		policy.InlineArtifactBodies = parsed
-		return err
-	case "inline_artifact_max_bytes":
-		parsed, err := strconv.Atoi(value)
-		policy.InlineArtifactMaxBytes = parsed
-		return err
-	case "inject_upstream_dep_context":
-		parsed, err := strconv.ParseBool(value)
-		policy.InjectUpstreamDepContext = parsed
-		return err
-	case "max_delegation_token_budget":
-		parsed, err := strconv.Atoi(value)
-		policy.MaxDelegationTokenBudget = parsed
-		return err
-	case "max_delegation_cost_usd":
-		parsed, err := strconv.ParseFloat(value, 64)
-		policy.MaxDelegationCostUSD = parsed
-		return err
-	case "escalation_handle":
-		parsed, err := parseConfigString(value)
-		policy.EscalationHandle = strings.TrimPrefix(strings.TrimSpace(parsed), "@")
-		return err
-	case "escalation_ttl":
-		parsed, err := parseConfigString(value)
-		policy.EscalationTTL = strings.TrimSpace(parsed)
-		return err
 	case "blocked_ttl":
 		parsed, err := parseConfigString(value)
 		policy.BlockedTTL = strings.TrimSpace(parsed)
@@ -203,59 +95,14 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.Atoi(value)
 		policy.MaxConsecutiveMissedWakes = parsed
 		return err
-	case "max_delegation_non_progress_streak":
-		parsed, err := strconv.Atoi(value)
-		policy.MaxDelegationNonProgressStreak = parsed
-		return err
-	case "max_verify_replan_attempts":
-		parsed, err := strconv.Atoi(value)
-		policy.MaxVerifyReplanAttempts = parsed
-		return err
-	case "default_delegation_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultDelegationTimeout = strings.TrimSpace(parsed)
-		return err
-	case "default_plan_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultPlanTimeout = strings.TrimSpace(parsed)
-		return err
-	case "default_implement_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultImplementTimeout = strings.TrimSpace(parsed)
-		return err
-	case "default_review_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultReviewTimeout = strings.TrimSpace(parsed)
-		return err
-	case "default_gate_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultGateTimeout = strings.TrimSpace(parsed)
-		return err
-	case "default_repair_timeout":
-		parsed, err := parseConfigString(value)
-		policy.DefaultRepairTimeout = strings.TrimSpace(parsed)
-		return err
 	default:
+		// Unknown keys are ignored, so a home that still carries a retired key
+		// (the #2588 delegation budgets, timeouts and escalation settings) loads.
 		return nil
 	}
 }
 
 func validateOrchestratePolicy(policy OrchestratePolicy) error {
-	if policy.MaxDelegationTokenBudget < 0 {
-		return fmt.Errorf("orchestrate.max_delegation_token_budget must be 0 (unlimited) or positive")
-	}
-	if policy.MaxDelegationCostUSD < 0 {
-		return fmt.Errorf("orchestrate.max_delegation_cost_usd must be 0 (unlimited) or positive")
-	}
-	if ttl := strings.TrimSpace(policy.EscalationTTL); ttl != "" {
-		parsed, err := time.ParseDuration(ttl)
-		if err != nil {
-			return fmt.Errorf("orchestrate.escalation_ttl %q is invalid: %w", ttl, err)
-		}
-		if parsed <= 0 {
-			return fmt.Errorf("orchestrate.escalation_ttl must be positive")
-		}
-	}
 	if ttl := strings.TrimSpace(policy.BlockedTTL); ttl != "" {
 		parsed, err := time.ParseDuration(ttl)
 		if err != nil {
@@ -274,46 +121,12 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	if policy.MaxConsecutiveMissedWakes < 0 {
 		return fmt.Errorf("orchestrate.max_consecutive_missed_wakes must be 0 (disabled) or positive")
 	}
-	if policy.MaxDelegationNonProgressStreak < 0 {
-		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")
-	}
-	if policy.MaxVerifyReplanAttempts < 0 {
-		return fmt.Errorf("orchestrate.max_verify_replan_attempts must be 0 (engine default) or positive")
-	}
-	for key, value := range map[string]string{
-		"default_delegation_timeout": policy.DefaultDelegationTimeout,
-		"default_plan_timeout":       policy.DefaultPlanTimeout,
-		"default_implement_timeout":  policy.DefaultImplementTimeout,
-		"default_review_timeout":     policy.DefaultReviewTimeout,
-		"default_gate_timeout":       policy.DefaultGateTimeout,
-		"default_repair_timeout":     policy.DefaultRepairTimeout,
-	} {
-		if err := validateOptionalDuration("orchestrate."+key, value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateOptionalDuration(name string, value string) error {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	parsed, err := time.ParseDuration(value)
-	if err != nil {
-		return fmt.Errorf("%s %q is invalid: %w", name, value, err)
-	}
-	if parsed <= 0 {
-		return fmt.Errorf("%s must be positive when set", name)
-	}
 	return nil
 }
 
 // ReviewPolicy is the resolved review policy for one repository. Native review
 // fanout is disabled by default: agents and coordinators request reviews
 // explicitly, while operators may opt a repository back into native scheduling.
-// Risk-tiered adaptive review remains independently opt-in.
 type ReviewPolicy struct {
 	// NativeFanoutEnabled permits HandlePullRequestOpened to schedule the
 	// configured native reviewer roster. Default false = OFF.
@@ -321,8 +134,6 @@ type ReviewPolicy struct {
 	// BlockingSeverity is the least severe changes-requested review that restarts
 	// the fix loop. Default P3 preserves the historical block-all behavior.
 	BlockingSeverity string
-	// RiskTiersEnabled opts the engine into risk-tiered review. Default false = OFF.
-	RiskTiersEnabled bool
 	// HighRiskPaths is the changed-path glob list that resolves the `high` tier.
 	// Empty falls back to the engine's built-in defaults.
 	HighRiskPaths []string
@@ -373,7 +184,6 @@ func DefaultReviewPolicy() ReviewPolicy {
 	return ReviewPolicy{
 		NativeFanoutEnabled: false,
 		BlockingSeverity:    reviewseverity.DefaultBlocking,
-		RiskTiersEnabled:    false,
 		RemotePurposes:      []string{"security"},
 		// Undeclared, which behaves as consuming. Defaulting to "consuming" here
 		// would make an operator's explicit declaration indistinguishable from
@@ -579,7 +389,7 @@ func (c ReviewConfig) ChecksRoute(repo string) (ReviewChecksRoute, error) {
 	return override.checks, nil
 }
 
-// For resolves the effective policy for repo. Risk-tier settings remain global;
+// For resolves the effective policy for repo. Risk classification settings remain global;
 // native fanout, blocking severity, findings consumption, and remote CI
 // admission support repository overrides.
 func (c ReviewConfig) For(repo string) ReviewPolicy {
@@ -612,8 +422,8 @@ func (c ReviewConfig) For(repo string) ReviewPolicy {
 }
 
 // LoadReviewConfig parses [review] and [repos."owner/repo".review]. A missing
-// config file or section yields blocking severity P3, with native fanout and
-// risk tiers disabled. Invalid fields retain their safe defaults while valid
+// config file or section yields blocking severity P3, with native fanout
+// disabled. Invalid fields retain their safe defaults while valid
 // fields continue to load; the joined parse error still lets strict callers
 // reject the file.
 func LoadReviewConfig(paths Paths) (ReviewConfig, error) {
@@ -803,13 +613,6 @@ func applyReviewPolicyField(policy *ReviewPolicy, key string, value string) erro
 			return err
 		}
 		policy.BlockingSeverity = parsed
-		return nil
-	case "risk_tiers_enabled":
-		parsed, err := parseConfigBool(value)
-		if err != nil {
-			return err
-		}
-		policy.RiskTiersEnabled = parsed
 		return nil
 	case "high_risk_paths":
 		parsed, err := parseConfigStringArray(value)

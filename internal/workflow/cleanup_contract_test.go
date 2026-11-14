@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -49,10 +48,7 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 			}
 			runWorktreeGit(t, checkout, "worktree", "add", "-b", branch, path, "HEAD")
 			insertCompletedJob(t, store, db.Job{ID: parent, Agent: "coord", Type: "ask"}, JobPayload{
-				Repo: "owner/repo", Result: &AgentResult{Decision: "approved", Delegations: []Delegation{
-					{ID: "produce", Action: "implement", Prompt: "produce"},
-					{ID: "integrate", Action: "review", Prompt: "integrate", Deps: []string{"produce"}},
-				}},
+				Repo: "owner/repo", Result: &AgentResult{Decision: "approved"},
 			})
 			payload := JobPayload{Repo: "owner/repo", ParentJobID: parent, DelegationID: "produce",
 				WorktreePath: path, Branch: branch, Result: &AgentResult{Decision: "implemented", Summary: "producer result"}}
@@ -78,11 +74,6 @@ func TestCleanupPreservesResumableConsumerUntilSucceeded(t *testing.T) {
 				if exists, err := manager.BranchExists(ctx, branch); err != nil || !exists {
 					t.Fatalf("%s consumer lost producer branch: exists=%v err=%v", state, exists, err)
 				}
-			}
-			cleanup()
-			assertRetained("undispatched")
-			if _, err := store.GetJob(ctx, consumer); !errors.Is(err, sql.ErrNoRows) {
-				t.Fatalf("cleanup changed the undispatched consumer: %v", err)
 			}
 			insertCompletedJob(t, store, db.Job{ID: consumer, Agent: "consumer", Type: "review", ParentJobID: parent, DelegationID: "integrate"}, JobPayload{
 				Repo: "owner/repo", ParentJobID: parent, DelegationID: "integrate", Deps: []string{"produce"},

@@ -51,97 +51,6 @@ func TestSupersedeDebtMarkerClassificationIsCanonicalOnly(t *testing.T) {
 	}
 }
 
-// TestSupersedeAdvanceClaimPreventsAdvancingAMovedLifecycle isolates the CLAIM half
-// of the bracket, which the confirm half masks in the outcome-only assertions.
-//
-// The claim's job is PREVENTION: when the row has already moved before the bracket
-// starts, AdvanceJob must never run at all. The confirm's job is detection after
-// the fact. Without the claim the parent gets advanced from a superseded verdict
-// and the damage is only noticed afterwards, so the observable here is the parent
-// itself — under a `continue` policy, whether a coordinator continuation was
-// enqueued.
-//
-// MUTATION PROOF: make the claim append unconditional and the continuation appears.
-func TestSupersedeAdvanceClaimPreventsAdvancingAMovedLifecycle(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "fan out",
-			Delegations: []Delegation{
-				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: "continue"},
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-		t.Fatalf("AdvanceJob(parent-job): %v", err)
-	}
-	const child = "parent-job/delegation/api"
-	observed := mustJob(t, store, child)
-	// Stamp the synthetic result WITHOUT advancing, so the recovery enters the
-	// already-finalized arm and the bracket is the only thing left to do.
-	superseded, err := store.TransitionJobStateWithEventAtGeneration(ctx, child, observed.State, observed.LifecycleGeneration, string(JobFailed),
-		db.JobEvent{JobID: child, Kind: JobEventSupersededPullRequestClosed, Message: "pr closed"},
-		db.JobEvent{JobID: child, Kind: JobEventSupersedeFinalizePending, Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration)})
-	if err != nil || !superseded {
-		t.Fatalf("supersede: transitioned=%v err=%v", superseded, err)
-	}
-	stamped := mustJob(t, store, child)
-	payload, err := unmarshalPayload(stamped.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	payload.Result = &AgentResult{Decision: "failed", Summary: "pr closed"}
-	encoded, err := marshalPayload(payload)
-	if err != nil {
-		t.Fatalf("marshalPayload: %v", err)
-	}
-	if err := store.UpdateJobPayload(ctx, child, encoded); err != nil {
-		t.Fatalf("UpdateJobPayload: %v", err)
-	}
-
-	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
-		if at != supersedeDebtStageBeforeAdvanceClaim {
-			return nil
-		}
-		interleaved++
-		// A payload-preserving lifecycle bump: AdvanceJob would SUCCEED if it ran.
-		for _, state := range []JobState{JobQueued, JobRunning} {
-			if err := store.UpdateJobState(hookCtx, child, string(state)); err != nil {
-				t.Fatalf("UpdateJobState(%s): %v", state, err)
-			}
-		}
-		return nil
-	}
-	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
-
-	if _, err := engine.CompletePendingSupersedeFinalization(ctx, child); err != nil {
-		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
-	}
-	if interleaved != 1 {
-		t.Fatalf("interleave hook ran %d times, want 1", interleaved)
-	}
-	if _, err := store.GetJob(ctx, "parent-job/continuation"); err == nil {
-		t.Fatal("the coordinator was advanced from a superseded verdict: the claim did not prevent the advance")
-	}
-	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceClaimed); got != 0 {
-		t.Fatalf("%s events = %d, want 0: the claim must refuse a moved lifecycle", JobEventSupersedeAdvanceClaimed, got)
-	}
-	debt, err := latestSupersedeFinalizeDebt(ctx, store, child)
-	if err != nil {
-		t.Fatalf("latestSupersedeFinalizeDebt: %v", err)
-	}
-	if !debt.pending {
-		t.Fatal("the debt was closed although the parent advance never ran")
-	}
-}
-
 // TestSupersedeCleanupFailureLeavesTheDebtOutstanding pins the half of the
 // cross-process finding that is about ERROR HANDLING rather than ordering.
 //
@@ -224,94 +133,6 @@ END;`); err != nil {
 	}
 }
 
-// TestSupersedeAdvanceRefusesALifecycleMovedDuringASuccessfulAdvance isolates the
-// CONFIRM half of the parent-advance bracket.
-//
-// The other before-advance case moves the row with RetryJob, which clears the
-// child's result, so AdvanceJob fails and the error path classifies it. A re-queue
-// that PRESERVES the payload lets AdvanceJob succeed while the row has moved, and
-// then the confirm append is the only thing standing between a stale verdict and a
-// debt recorded paid.
-//
-// MUTATION PROOF: make the confirm unconditional and the debt is closed for a
-// lifecycle that no longer owns the row.
-func TestSupersedeAdvanceRefusesALifecycleMovedDuringASuccessfulAdvance(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "coord", []string{"ask"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "api", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	if err := store.UpsertTask(ctx, db.Task{
-		ID: "task-7", RepoFullName: "gitmoot/gitmoot", State: string(TaskImplementing), Branch: "task-7",
-	}); err != nil {
-		t.Fatalf("UpsertTask: %v", err)
-	}
-	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
-		Repo: "gitmoot/gitmoot", Branch: "task-7", PullRequest: 7, TaskID: "task-7", LeadAgent: "coord",
-		Result: &AgentResult{
-			Decision: "approved",
-			Summary:  "fan out",
-			Delegations: []Delegation{
-				{ID: "api", Agent: "api", Action: "review", Prompt: "review api", FailurePolicy: "continue"},
-			},
-		},
-	})
-	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
-		t.Fatalf("AdvanceJob(parent-job): %v", err)
-	}
-	const child = "parent-job/delegation/api"
-	observed := mustJob(t, store, child)
-	if _, err := engine.FinalizeClosedPullRequestDelegationChild(ctx, observed, "pr closed"); err != nil && !isDelegationPolicyOutcome(err) {
-		t.Fatalf("FinalizeClosedPullRequestDelegationChild: %v", err)
-	}
-	// Re-arm the debt for the superseded run: the shape a failed first payment leaves.
-	if err := store.AddJobEvent(ctx, db.JobEvent{
-		JobID: child, Kind: JobEventSupersedeFinalizePending,
-		Message: formatSupersedeFinalizeDebt(observed.LifecycleGeneration),
-	}); err != nil {
-		t.Fatalf("arm the debt: %v", err)
-	}
-
-	interleaved := 0
-	supersedeDebtInterleaveHook = func(hookCtx context.Context, at string) error {
-		if at != supersedeDebtStageBeforeAdvance {
-			return nil
-		}
-		interleaved++
-		// A lifecycle bump that PRESERVES the payload, so AdvanceJob still has a
-		// result to work from and succeeds.
-		for _, state := range []JobState{JobQueued, JobRunning} {
-			if err := store.UpdateJobState(hookCtx, child, string(state)); err != nil {
-				t.Fatalf("UpdateJobState(%s): %v", state, err)
-			}
-		}
-		return nil
-	}
-	t.Cleanup(func() { supersedeDebtInterleaveHook = nil })
-
-	if _, err := engine.CompletePendingSupersedeFinalization(ctx, child); err != nil {
-		t.Fatalf("CompletePendingSupersedeFinalization: %v", err)
-	}
-	if interleaved != 1 {
-		t.Fatalf("interleave hook ran %d times, want 1", interleaved)
-	}
-	debt, err := latestSupersedeFinalizeDebt(ctx, store, child)
-	if err != nil {
-		t.Fatalf("latestSupersedeFinalizeDebt: %v", err)
-	}
-	if !debt.pending {
-		t.Fatal("the debt was closed for a lifecycle that moved during its parent advance")
-	}
-	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceConfirmed); got != 1 {
-		// Exactly one: the fixture's own successful supersession confirmed once. The
-		// stale payment must not add a second.
-		t.Fatalf("%s events = %d, want 1 (the fixture's own, none from the stale payment)", JobEventSupersedeAdvanceConfirmed, got)
-	}
-	if got := countWorkflowJobEvents(t, store, child, JobEventSupersedeAdvanceSuperseded); got != 1 {
-		t.Fatalf("%s events = %d, want exactly 1 durable trace", JobEventSupersedeAdvanceSuperseded, got)
-	}
-}
-
 // openEngineStoreAt is openEngineStore with a CALLER-CHOSEN path, so a test can
 // open a second raw connection to the same file and inject a fault.
 func openEngineStoreAt(t *testing.T, path string) *db.Store {
@@ -335,4 +156,17 @@ func mustParseTestTime(t *testing.T, value string) time.Time {
 		t.Fatalf("parse %q: %v", value, err)
 	}
 	return parsed
+}
+
+func insertQueuedJob(t *testing.T, store *db.Store, job db.Job, payload JobPayload) {
+	t.Helper()
+	encoded, err := marshalPayload(payload)
+	if err != nil {
+		t.Fatalf("marshalPayload returned error: %v", err)
+	}
+	job.State = string(JobQueued)
+	job.Payload = encoded
+	if err := store.CreateJob(context.Background(), job); err != nil {
+		t.Fatalf("CreateJob(%s) returned error: %v", job.ID, err)
+	}
 }

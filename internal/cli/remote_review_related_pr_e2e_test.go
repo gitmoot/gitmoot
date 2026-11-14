@@ -20,7 +20,7 @@ import (
 // its sandbox workspace, after an optional extra step.
 const remoteRelatedProbe = `seen=$(cat .gitmoot-related/pr-7/db/schema.sql 2>/dev/null | tr -d '\n' || echo absent)
 %s
-printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"related=%%s","findings":[],"changes_made":[],"tests_run":["cat related"],"needs":[],"delegations":[]}}' "$seen"`
+printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"related=%%s","findings":[],"changes_made":[],"tests_run":["cat related"],"needs":[]}}' "$seen"`
 
 // #2509 / #2534 review P2-3. A related tree reaches a remote review's sandbox
 // at its pinned digest, and a reviewer that restores write bits and edits it

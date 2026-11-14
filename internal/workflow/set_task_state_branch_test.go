@@ -286,7 +286,7 @@ func TestWriteTaskStateRefusesMergedWrittenAfterTheRead(t *testing.T) {
 			//    `awaiting_human` still come through persistTaskStateOwned, which is the
 			//    write point this window is about.
 			stale.State = string(refused)
-			if _, err := persistTaskStateOwned(ctx, store, stale, refused, nil); err != nil {
+			if _, err := persistTaskStateOwned(ctx, store, stale, refused); err != nil {
 				t.Fatalf("persistTaskStateOwned(%s) returned error: %v", refused, err)
 			}
 

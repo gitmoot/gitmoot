@@ -75,7 +75,7 @@ func main() {
 		summary := fmt.Sprintf("launch=%s entries=%s cwdwrite=%s project=%s delivery=%d counter=%s", cwd, count, cwdWrite, project, delivery, counterState)
 		result, _ := json.Marshal(map[string]any{"gitmoot_result": map[string]any{
 			"decision": "approved", "summary": summary, "findings": []any{}, "changes_made": []any{},
-			"tests_run": []any{}, "needs": []any{}, "delegations": []any{},
+			"tests_run": []any{}, "needs": []any{},
 		}})
 		text = string(result)
 	}

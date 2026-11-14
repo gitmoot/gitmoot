@@ -31,9 +31,9 @@ import (
 // integration, not just units. They mirror the established full-chain patterns in
 // session_job_e2e_test.go, review_head_resync_test.go and canary_e2e_test.go.
 
-const reliabilityBlockedNeedsResult = `{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["API key","R2 token"],"delegations":[]}}`
+const reliabilityBlockedNeedsResult = `{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["API key","R2 token"]}}`
 
-const reliabilityApprovedReviewResult = `{"gitmoot_result":{"decision":"approved","summary":"looks good at the new head","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const reliabilityApprovedReviewResult = `{"gitmoot_result":{"decision":"approved","summary":"looks good at the new head","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 func reliabilityDeliveredCount(delivered []string, id string) int {
 	n := 0

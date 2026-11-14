@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/gitmoot/gitmoot/internal/db"
@@ -102,45 +101,5 @@ func assertFanoutChildRole(t *testing.T, ctx context.Context, store *db.Store, w
 	}
 	if !found {
 		t.Fatal("no review job was enqueued; cannot assert attribution")
-	}
-}
-
-// #1250 finding 2 (g7-review). The risk-tiered path diverts BEFORE the ordinary
-// attributed request loop, so the whole high-risk branch was unattributed.
-func TestHighRiskFanoutAttributesLensChildren(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "sec", []string{"review"}, "gitmoot/gitmoot")
-	engine := testEngine(store)
-	engine.RiskTiersEnabled = true
-
-	event := highRiskEvent()
-	event.ActingOrgRole = "gmc-fanout"
-	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
-		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
-	}
-
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatalf("ListJobs returned error: %v", err)
-	}
-	lenses := 0
-	for _, job := range jobs {
-		if !strings.Contains(job.ID, "/delegation/") {
-			continue
-		}
-		lenses++
-		payload, err := ParseJobPayload(job.Payload)
-		if err != nil {
-			t.Fatalf("ParseJobPayload returned error: %v", err)
-		}
-		if payload.ActingOrgRole != "gmc-fanout" {
-			t.Fatalf("high-risk lens %q acting_org_role = %q, want gmc-fanout", job.ID, payload.ActingOrgRole)
-		}
-	}
-	if lenses == 0 {
-		t.Fatal("no lens children were enqueued; cannot assert attribution")
 	}
 }

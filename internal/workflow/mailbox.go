@@ -31,12 +31,6 @@ const maxRepairAttempts = 2
 
 type Mailbox struct {
 	store *db.Store
-	// advanceOwnership, when set, binds every job this mailbox inserts to a live
-	// supersession advance lease: the insert carries the ownership predicate in its
-	// OWN transaction, so a lease lost between the decision and the write refuses
-	// the enqueue instead of minting a job for a lifecycle that has moved (#1673).
-	// Nil on every ordinary path, which is byte-identical to before.
-	advanceOwnership *db.AdvanceOwnership
 	// RecordReviewFindings persists a review job's findings to the #1822 ledger.
 	// Injected because the Mailbox owns the DELIVERY-FAILURE path, where a
 	// partial review is salvaged (#2224), while the writer lives on the Engine
@@ -149,32 +143,22 @@ type JobRequest struct {
 	Sender           string
 	// ActingOrgRole attributes a fresh local dispatch to an organization role.
 	// It is persisted for audit provenance, then inherited by engine children.
-	ActingOrgRole string
-	Instructions  string
-	Constraints   []string
-	// TemplateOverride, when non-nil, replaces the agent's own template snapshot
-	// for this job only (the agent's identity is unchanged). Used by the
-	// orchestrate/run --recipe flag to route a coordinator to a built-in recipe
-	// template's prompt without rebinding the agent.
-	TemplateOverride *db.AgentTemplate
-	ParentJobID      string
-	DelegationID     string
-	DelegationDepth  int
-	DelegatedBy      string
-	RootJobID        string
+	ActingOrgRole   string
+	Instructions    string
+	Constraints     []string
+	ParentJobID     string
+	DelegationID    string
+	DelegationDepth int
+	DelegatedBy     string
+	RootJobID       string
 	// DispatchedBy names the identity that asked for this job, when the dispatch
 	// site knows something more specific than DelegatedBy/ActingOrgRole/Sender
 	// can express (#1967). It is optional: dispatcherIdentity resolves a value
 	// for every request, so a dispatch site that omits it is still attributed.
-	DispatchedBy          string
-	Deps                  []string
-	JobTimeout            string
-	RetryCount            int
-	Fingerprint           string
-	FailurePolicy         string
-	SynthesisRule         string
-	DelegationArtifactDir string
-	WorktreePath          string
+	DispatchedBy string
+	JobTimeout   string
+	Fingerprint  string
+	WorktreePath string
 	// ReadOnlyWorktree is the historical disposal marker for a top-level
 	// throwaway detached worktree with no DelegationID. Terminal cleanup owns it.
 	// It says nothing about runtime writability. ReadOnlySeat carries the
@@ -189,18 +173,12 @@ type JobRequest struct {
 	// runtime gets a read-only tool allowlist and the sandbox denies executing
 	// any program but the runtime itself. It is only meaningful with
 	// ReadOnlySeat.
-	ReviewNoExecution      bool
-	OriginalAgent          string
-	DelegatedAgent         string
-	DelegationReason       string
-	RecentDelegationHashes []string
-	DelegationRepeatCount  int
-	NonProgressStreak      int
-	LastProgressDigest     string
-	VerifyAttempt          int
-	DelegationFinalize     bool
-	Model                  string
-	Effort                 string
+	ReviewNoExecution bool
+	OriginalAgent     string
+	DelegatedAgent    string
+	DelegationReason  string
+	Model             string
+	Effort            string
 	// Plan and PlanInto request PLAN MODE for this job (#1479): the runtime plans
 	// the work first and then AUTO-EXECUTES that plan. PlanInto pins the model the
 	// execution phase runs on and REQUIRES Plan. Both are rejected at the enqueue
@@ -260,16 +238,6 @@ type JobRequest struct {
 	// its findings become follow-ups for the requesting role, and it never
 	// enters the changes_requested/approved lifecycle or the merge gate.
 	PostMergeReview bool
-	Ephemeral       *EphemeralSpec
-	// HumanAnswer carries the rendered ask-gate answer block (#445) into the
-	// coordinator continuation enqueued by the `answer` resume verb. Empty for
-	// every other job, so the stored payload is byte-identical by default.
-	HumanAnswer string
-	// RiskTier is the resolved risk-tier of the change (#650), stamped on a
-	// high-risk review coordinator and inherited by its lens children so reports
-	// and the dashboard can explain an escalation. Empty (the default) for every
-	// job outside the opt-in risk-tiered path.
-	RiskTier string
 	// ReviewPurpose, ReviewModelPool and ReviewRequester are the #2171 router's
 	// selection record; see JobPayload for semantics.
 	ReviewPurpose string
@@ -326,15 +294,18 @@ type JobPayload struct {
 	// DispatchedBy is the resolved dispatcher identity (#1967), the value source
 	// of truth for the denormalized jobs.dispatched_by column. omitempty keeps
 	// pre-#1967 payloads byte-identical.
-	DispatchedBy          string   `json:"dispatched_by,omitempty"`
-	Deps                  []string `json:"deps,omitempty"`
-	JobTimeout            string   `json:"job_timeout,omitempty"`
-	RetryCount            int      `json:"retry_count,omitempty"`
-	Fingerprint           string   `json:"fingerprint,omitempty"`
-	FailurePolicy         string   `json:"failure_policy,omitempty"`
-	SynthesisRule         string   `json:"synthesis_rule,omitempty"`
-	DelegationArtifactDir string   `json:"delegation_artifact_dir,omitempty"`
-	WorktreePath          string   `json:"worktree_path,omitempty"`
+	DispatchedBy string `json:"dispatched_by,omitempty"`
+	// Deps and RetryCount are read-only history (#2588): the dependency edges and
+	// retry ordinal of an Orchestra delegation child. Deps feeds the dashboard's run
+	// graph; RetryCount names the child's worktree path for terminal cleanup.
+	// Nothing writes them.
+	Deps       []string `json:"deps,omitempty"`
+	RetryCount int      `json:"retry_count,omitempty"`
+	JobTimeout string   `json:"job_timeout,omitempty"`
+	// Fingerprint is the heartbeat overlap guard key (#533): an active job
+	// carrying it blocks the next fire of the same heartbeat.
+	Fingerprint  string `json:"fingerprint,omitempty"`
+	WorktreePath string `json:"worktree_path,omitempty"`
 	// RuntimePID is the exact subprocess started by the runtime runner for the
 	// current delivery. RuntimePIDStartTime is Linux /proc starttime field 22,
 	// captured at the same moment so liveness checks cannot mistake a recycled
@@ -363,23 +334,17 @@ type JobPayload struct {
 	// capture bound; Error is the durable failure marker when capture itself
 	// failed. All fields are additive/omitempty so jobs without isolated
 	// read-only worktrees serialize unchanged.
-	ReadOnlyWorktreeDiff          string   `json:"read_only_worktree_diff,omitempty"`
-	ReadOnlyWorktreeDiffTruncated bool     `json:"read_only_worktree_diff_truncated,omitempty"`
-	ReadOnlyWorktreeDiffError     string   `json:"read_only_worktree_diff_error,omitempty"`
-	TemplateID                    string   `json:"template_id,omitempty"`
-	TemplateResolvedCommit        string   `json:"template_resolved_commit,omitempty"`
-	TemplateContent               string   `json:"template_content,omitempty"`
-	OriginalAgent                 string   `json:"original_agent,omitempty"`
-	DelegatedAgent                string   `json:"delegated_agent,omitempty"`
-	DelegationReason              string   `json:"delegation_reason,omitempty"`
-	RecentDelegationHashes        []string `json:"recent_delegation_hashes,omitempty"`
-	DelegationRepeatCount         int      `json:"delegation_repeat_count,omitempty"`
-	NonProgressStreak             int      `json:"non_progress_streak,omitempty"`
-	LastProgressDigest            string   `json:"last_progress_digest,omitempty"`
-	VerifyAttempt                 int      `json:"verify_attempt,omitempty"`
-	DelegationFinalize            bool     `json:"delegation_finalize,omitempty"`
-	Model                         string   `json:"model,omitempty"`
-	Effort                        string   `json:"effort,omitempty"`
+	ReadOnlyWorktreeDiff          string `json:"read_only_worktree_diff,omitempty"`
+	ReadOnlyWorktreeDiffTruncated bool   `json:"read_only_worktree_diff_truncated,omitempty"`
+	ReadOnlyWorktreeDiffError     string `json:"read_only_worktree_diff_error,omitempty"`
+	TemplateID                    string `json:"template_id,omitempty"`
+	TemplateResolvedCommit        string `json:"template_resolved_commit,omitempty"`
+	TemplateContent               string `json:"template_content,omitempty"`
+	OriginalAgent                 string `json:"original_agent,omitempty"`
+	DelegatedAgent                string `json:"delegated_agent,omitempty"`
+	DelegationReason              string `json:"delegation_reason,omitempty"`
+	Model                         string `json:"model,omitempty"`
+	Effort                        string `json:"effort,omitempty"`
 	// Plan / PlanInto are the requested plan mode (#1479); PlanMode is the
 	// resolved EVIDENCE the adapter reported after dispatch —
 	// "plan-into:<model>", "plan-into:<runtime-default>", or absent for a normal
@@ -442,14 +407,16 @@ type JobPayload struct {
 	// merge gate) read a field instead of parsing the runtime_override event
 	// sentence. Additive/omitempty: payloads predating #1528 simply omit it and
 	// the resolver falls back to the agent registry default.
-	EffectiveRuntime       string         `json:"effective_runtime,omitempty"`
-	Phase                  string         `json:"phase,omitempty"`
-	SkipNativeReviewFanout bool           `json:"skip_native_review_fanout,omitempty"`
-	PostMergeReview        bool           `json:"post_merge_review,omitempty"`
-	Ephemeral              *EphemeralSpec `json:"ephemeral,omitempty"`
-	HumanAnswer            string         `json:"human_answer,omitempty"`
-	RawOutputs             []string       `json:"raw_outputs,omitempty"`
-	Result                 *AgentResult   `json:"result,omitempty"`
+	EffectiveRuntime       string `json:"effective_runtime,omitempty"`
+	Phase                  string `json:"phase,omitempty"`
+	SkipNativeReviewFanout bool   `json:"skip_native_review_fanout,omitempty"`
+	PostMergeReview        bool   `json:"post_merge_review,omitempty"`
+	// Ephemeral is read-only history (#2588): the inline worker spec of an
+	// Orchestra delegation child, kept so `job show` and the dashboard can still
+	// name the runtime such a historical job ran on. Nothing writes it.
+	Ephemeral  *EphemeralSpec `json:"ephemeral,omitempty"`
+	RawOutputs []string       `json:"raw_outputs,omitempty"`
+	Result     *AgentResult   `json:"result,omitempty"`
 	// ResultRepair names the engine repair the ACCEPTED parse required, or is
 	// absent for a clean parse (#1507). Today the only value is
 	// AgentResultRepairDelimiterBalance: the agent's bytes were JSON closers
@@ -485,11 +452,6 @@ type JobPayload struct {
 	// (omitempty): a job whose result passed every applicable check — and every
 	// job when [workflow] result_checks = off — serializes byte-identically.
 	ResultChecks []ResultCheck `json:"result_checks,omitempty"`
-	// RiskTier is the resolved risk-tier of the change (#650), additive/omitempty
-	// so a payload outside the opt-in risk-tiered review path serializes
-	// byte-identically. It is stamped on a high-risk review coordinator and
-	// inherited by its lens children for explainable escalation.
-	RiskTier string `json:"risk_tier,omitempty"`
 	// Operational-blocker deferral context (#532, additive — all omitempty, so a
 	// job that never hit a classified blocker serializes byte-identically).
 	// BlockerClass is the last classified blocker (e.g. "runtime_auth",
@@ -544,22 +506,8 @@ type JobPayload struct {
 	ReviewRequester string `json:"review_requester,omitempty"`
 }
 
-// enqueuePreWriteHook fires between an anchored enqueue's ownership renewal and its
-// insert — the only window a pre-write check cannot cover, and the reason the
-// binding is asserted inside the insert's transaction (#1673). Nil in production.
-var enqueuePreWriteHook func(ctx context.Context, jobID string)
-
 type DeliveryAdapter interface {
 	Deliver(ctx context.Context, agent runtime.Agent, job runtime.Job) (runtime.Result, error)
-}
-
-// PreparedEnqueue is an enqueue with every NON-WRITE step already done: payload built,
-// template snapshot taken, model resolved, ids derived, policy applied. It holds no
-// open transaction and performs no git, network or LLM work, so a caller can commit it
-// inside a transaction it already owns (#1673).
-type PreparedEnqueue struct {
-	Job    db.Job
-	Events []db.JobEvent
 }
 
 // dispatcherIdentity resolves who asked for a job to exist, most specific first.
@@ -601,17 +549,6 @@ func dispatcherIdentity(request JobRequest) string {
 	return ""
 }
 
-// PrepareEnqueue runs Enqueue's read-and-compute half and returns the row to insert.
-// It writes NOTHING durable: that is the whole point, and it is what lets a resolution
-// commit its job insert in the same transaction as its task write and its receipt.
-func (m Mailbox) PrepareEnqueue(ctx context.Context, request JobRequest) (PreparedEnqueue, error) {
-	job, events, err := m.prepareEnqueue(ctx, request)
-	if err != nil {
-		return PreparedEnqueue{}, err
-	}
-	return PreparedEnqueue{Job: job, Events: events}, nil
-}
-
 func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job, []db.JobEvent, error) {
 	if m.store == nil {
 		return db.Job{}, nil, errors.New("mailbox store is required")
@@ -650,11 +587,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 	snapshot, err := m.templateSnapshot(ctx, request.Agent)
 	if err != nil {
 		return db.Job{}, nil, err
-	}
-	// A --recipe override swaps in the recipe template's content while leaving the
-	// agent's identity untouched; the snapshot fields below then carry it.
-	if request.TemplateOverride != nil {
-		snapshot = *request.TemplateOverride
 	}
 
 	// #1277: inherit the skip-native-review-fanout intent from the parent job.
@@ -722,13 +654,8 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		DelegatedBy:            request.DelegatedBy,
 		RootJobID:              request.RootJobID,
 		DispatchedBy:           dispatcherIdentity(request),
-		Deps:                   compactStrings(request.Deps),
 		JobTimeout:             strings.TrimSpace(request.JobTimeout),
-		RetryCount:             request.RetryCount,
 		Fingerprint:            strings.TrimSpace(request.Fingerprint),
-		FailurePolicy:          strings.TrimSpace(request.FailurePolicy),
-		SynthesisRule:          strings.TrimSpace(request.SynthesisRule),
-		DelegationArtifactDir:  request.DelegationArtifactDir,
 		WorktreePath:           request.WorktreePath,
 		ReadOnlyWorktree:       request.ReadOnlyWorktree,
 		ReadOnlySeat:           request.ReadOnlySeat,
@@ -739,12 +666,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		OriginalAgent:          request.OriginalAgent,
 		DelegatedAgent:         request.DelegatedAgent,
 		DelegationReason:       request.DelegationReason,
-		RecentDelegationHashes: request.RecentDelegationHashes,
-		DelegationRepeatCount:  request.DelegationRepeatCount,
-		NonProgressStreak:      request.NonProgressStreak,
-		LastProgressDigest:     request.LastProgressDigest,
-		VerifyAttempt:          request.VerifyAttempt,
-		DelegationFinalize:     request.DelegationFinalize,
 		Model:                  request.Model,
 		Effort:                 request.Effort,
 		ExecBackend:            jobRequestExecBackend(request.ExecBackend),
@@ -763,9 +684,6 @@ func (m Mailbox) prepareEnqueue(ctx context.Context, request JobRequest) (db.Job
 		Phase:                  request.Phase,
 		SkipNativeReviewFanout: skipNativeReviewFanout,
 		PostMergeReview:        request.PostMergeReview,
-		Ephemeral:              request.Ephemeral,
-		HumanAnswer:            request.HumanAnswer,
-		RiskTier:               strings.TrimSpace(request.RiskTier),
 		ReviewPurpose:          reviewPurpose,
 		ReviewPart:             strings.ToLower(strings.TrimSpace(request.ReviewPart)),
 		ReviewSupersedes:       strings.TrimSpace(request.ReviewSupersedes),
@@ -832,19 +750,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		return db.Job{}, err
 	}
 	queuedEvent := db.JobEvent{JobID: job.ID, Kind: string(JobQueued), Message: "job queued"}
-	if m.advanceOwnership != nil {
-		// enqueuePreWriteHook occupies the ONE window a pre-write ownership check
-		// cannot cover: between that check and this insert. Nil in production.
-		if enqueuePreWriteHook != nil {
-			enqueuePreWriteHook(ctx, job.ID)
-		}
-		// The ownership predicate and the INSERT commit together, which is why the
-		// hook above cannot smuggle an effect through: a lease lost in that window
-		// makes the insert's own transaction refuse.
-		if err := m.store.CreateJobWithEventIfAdvanceOwned(ctx, job, *m.advanceOwnership, time.Now().UTC(), queuedEvent, request.RequiredEvents...); err != nil {
-			return db.Job{}, err
-		}
-	} else if err := m.store.CreateJobWithEvent(ctx, job, queuedEvent, request.RequiredEvents...); err != nil {
+	if err := m.store.CreateJobWithEvent(ctx, job, queuedEvent, request.RequiredEvents...); err != nil {
 		return db.Job{}, err
 	}
 	for _, event := range advisory {
@@ -1017,22 +923,16 @@ func adhocWorkflowID(agent string, now time.Time) string {
 // chokepoint. It deliberately mirrors delivery: the job override wins, then the
 // effective agent's model, then that effective runtime's registry default. A
 // runtime override changes the runtime and clears the registered model because
-// that model belongs to the agent's original runtime. Ephemeral workers have no
-// agent row, so their inline runtime/model spec is their effective agent config.
+// that model belongs to the agent's original runtime.
 func (m Mailbox) resolveEnqueueModel(ctx context.Context, request JobRequest) (string, error) {
 	agent := runtime.Agent{}
-	if request.Ephemeral != nil {
-		agent.Runtime = strings.TrimSpace(request.Ephemeral.Runtime)
-		agent.Model = request.Ephemeral.Model
-	} else {
-		stored, err := m.store.GetAgent(ctx, request.Agent)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return "", err
-		}
-		if err == nil {
-			agent.Runtime = stored.Runtime
-			agent.Model = stored.Model
-		}
+	stored, err := m.store.GetAgent(ctx, request.Agent)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	if err == nil {
+		agent.Runtime = stored.Runtime
+		agent.Model = stored.Model
 	}
 	agent = runtime.ApplyJobRuntimeOverride(agent, request.RuntimeOverride, request.RuntimeOverrideRef)
 	runtimeDefaultModel := ""
@@ -1390,21 +1290,16 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	}
 	payload.Result = &result
 	// Mandatory review checks run whatever the result_checks mode, because the
-	// mode is an audit dial and these are the review's own contract. Every
-	// failing mandatory check is recorded, then the job takes the block path.
-	// #2364: a no-execution review must run nothing. The agent flag covers a
-	// review made no-execution by its repository's policy, which the worker
-	// applies on the agent; it is recorded on the payload here so the stored
-	// job says which contract its verdict was produced under.
-	// #2588: reviewers are no longer offered delegation, so a review result
-	// that still carries delegations is refused rather than dispatched or
-	// silently dropped.
+	// mode is an audit dial and these are the review's own contract; a failure
+	// takes the block path. #2364: a no-execution review must run nothing. The
+	// agent flag covers a review made no-execution by its repository's policy,
+	// which the worker applies on the agent; it is recorded on the payload here
+	// so the stored job says which contract its verdict was produced under.
 	var mandatoryFailed []ResultCheck
 	if (payload.ReviewNoExecution || agent.NoExecution) && strings.EqualFold(strings.TrimSpace(job.Type), "review") {
 		payload.ReviewNoExecution = true
 		mandatoryFailed = NoExecutionReviewResultChecks(result)
 	}
-	mandatoryFailed = append(mandatoryFailed, ReviewDelegationResultChecks(job.Type, result)...)
 	if len(mandatoryFailed) > 0 {
 		payload.ResultChecks = mandatoryFailed
 		summary := SummarizeResultChecks(mandatoryFailed)
@@ -1424,7 +1319,7 @@ func (m Mailbox) run(ctx context.Context, jobID string, agent runtime.Agent, ada
 	// additionally routes a failure down the same terminal path a malformed result
 	// takes (m.fail). The audit itself is pure and LLM-free.
 	if mode := normalizeResultCheckMode(m.resultCheckMode); mode != ResultChecksOff {
-		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, IsFinalize: payload.DelegationFinalize, Result: result}); len(failed) > 0 {
+		if failed := FailedResultChecks(ResultCheckInput{Action: job.Type, Result: result}); len(failed) > 0 {
 			payload.ResultChecks = failed
 			summary := SummarizeResultChecks(failed)
 			// Surface in `gitmoot job events`/`job show`. Best-effort in block mode
@@ -1895,7 +1790,6 @@ func (p JobPayload) prompt(action string) prompts.JobPrompt {
 		Action:                 action,
 		Instructions:           p.Instructions,
 		Constraints:            p.Constraints,
-		DelegationArtifactDir:  p.DelegationArtifactDir,
 		TemplateID:             p.TemplateID,
 		TemplateResolvedCommit: p.TemplateResolvedCommit,
 		TemplateInstructions:   agenttemplate.InstructionsForContent(p.TemplateContent),
@@ -2193,4 +2087,12 @@ func (m *Mailbox) recordResultRepair(ctx context.Context, jobID string, payload 
 	}
 	payload.ResultRepair = repair
 	return m.addEvent(ctx, jobID, resultRepairedEvent, fmt.Sprintf("accepted envelope repaired by %s: the agent's output was JSON closers short and the engine appended exactly the missing closers; the stored result is a repaired parse, not a clean one", repair))
+}
+
+// EphemeralSpec is the inline worker spec an Orchestra delegation child carried
+// (#2588 removed the engine that wrote it). Only Runtime and Model are read, to
+// name what a historical job ran on.
+type EphemeralSpec struct {
+	Runtime string `json:"runtime"`
+	Model   string `json:"model,omitempty"`
 }

@@ -22,7 +22,7 @@ type timeoutCaptureAdapter struct {
 
 func (a *timeoutCaptureAdapter) Deliver(ctx context.Context, _ runtime.Agent, _ runtime.Job) (runtime.Result, error) {
 	a.deadline, a.hasDeadline = ctx.Deadline()
-	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`}, nil
+	return runtime.Result{Raw: `{"gitmoot_result":{"decision":"approved","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`}, nil
 }
 
 func TestTempWorkerEligibleRejectsQueuePolicy(t *testing.T) {

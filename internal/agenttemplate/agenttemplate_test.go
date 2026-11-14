@@ -15,9 +15,9 @@ import (
 
 func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	definitions := Builtins()
-	// 4 since #2203 retired decompose-and-verify.
-	if len(definitions) != 4 {
-		t.Fatalf("builtin count = %d, want 4", len(definitions))
+	// 2 since #2588 retired the review-panel and verifier coordinator recipes.
+	if len(definitions) != 2 {
+		t.Fatalf("builtin count = %d, want 2", len(definitions))
 	}
 	thermo, ok := Lookup(ThermoNuclearCodeQualityReviewID)
 	if !ok {
@@ -36,35 +36,20 @@ func TestBuiltinsIncludesPlannerAndThermoTemplates(t *testing.T) {
 	if planner.SourceRepo != "gitmoot/gitmoot" || planner.SourcePath != "skills/gitmoot/agent-templates/planner.md" {
 		t.Fatalf("planner source = %+v", planner)
 	}
-	reviewPanel, ok := Lookup(ReviewPanelTemplateID)
-	if !ok {
-		t.Fatal("review-panel template missing")
-	}
-	if reviewPanel.Mutation || reviewPanel.DefaultRole != "coordinator" || !reflect.DeepEqual(reviewPanel.DefaultCapabilities, []string{"ask", "review"}) {
-		t.Fatalf("review-panel definition = %+v", reviewPanel)
-	}
-	if reviewPanel.SourceRepo != "gitmoot/gitmoot" || reviewPanel.SourcePath != "skills/gitmoot/agent-templates/review-panel.md" {
-		t.Fatalf("review-panel source = %+v", reviewPanel)
-	}
-	// decompose-and-verify was RETIRED by #2203: it must no longer be a built-in,
-	// and its id must still be recognised so `agent template add decompose-and-verify`
-	// is refused by name with a successor instead of reported unknown.
-	if _, ok := Lookup(DecomposeAndVerifyTemplateID); ok {
-		t.Fatal("decompose-and-verify is retired and must not be a built-in definition")
-	}
-	replacement, retired := RetiredReplacement(DecomposeAndVerifyTemplateID)
-	if !retired || replacement != VerifierTemplateID {
-		t.Fatalf("RetiredReplacement(decompose-and-verify) = %q, %v; want verifier, true", replacement, retired)
-	}
-	verifier, ok := Lookup(VerifierTemplateID)
-	if !ok {
-		t.Fatal("verifier template missing")
-	}
-	if verifier.Mutation || verifier.DefaultRole != "coordinator" || !reflect.DeepEqual(verifier.DefaultCapabilities, []string{"ask", "review"}) {
-		t.Fatalf("verifier definition = %+v", verifier)
-	}
-	if verifier.SourceRepo != "gitmoot/gitmoot" || verifier.SourcePath != "skills/gitmoot/agent-templates/verifier.md" {
-		t.Fatalf("verifier source = %+v", verifier)
+	// review-panel, verifier and decompose-and-verify were delegation fan-out
+	// recipes; #2588 removed the delegation engine. They must no longer be
+	// built-ins, their ids must still be recognised so `agent template add` refuses
+	// them by name, and none has a successor.
+	for _, id := range []string{"review-panel", "verifier", "decompose-and-verify"} {
+		if _, ok := Lookup(id); ok {
+			t.Fatalf("%s is retired and must not be a built-in definition", id)
+		}
+		if !IsRetired(id) {
+			t.Fatalf("IsRetired(%s) = false, want true", id)
+		}
+		if replacement, ok := RetiredReplacement(id); ok || replacement != "" {
+			t.Fatalf("RetiredReplacement(%s) = %q, %v; want no successor", id, replacement, ok)
+		}
 	}
 }
 
@@ -134,19 +119,6 @@ func TestEmbeddedBuiltinTemplatesParseAndValidate(t *testing.T) {
 		}
 		if !reflect.DeepEqual(parsed.Metadata.Capabilities, def.DefaultCapabilities) {
 			t.Fatalf("template %s capabilities = %v, want %v", def.ID, parsed.Metadata.Capabilities, def.DefaultCapabilities)
-		}
-		// The MetadataForDefinition fallback (used when a fetched file lacks
-		// frontmatter) must agree with the embedded file's frontmatter for the
-		// coordinator recipes, or a no-frontmatter fetch would report different
-		// tags/inputs/outputs than the template actually declares.
-		if def.ID == ReviewPanelTemplateID || def.ID == VerifierTemplateID {
-			fallback := MetadataForDefinition(def)
-			if !reflect.DeepEqual(fallback.Tags, parsed.Metadata.Tags) ||
-				!reflect.DeepEqual(fallback.Inputs, parsed.Metadata.Inputs) ||
-				!reflect.DeepEqual(fallback.Outputs, parsed.Metadata.Outputs) {
-				t.Fatalf("template %s: MetadataForDefinition fallback diverges from frontmatter (tags %v/%v inputs %v/%v outputs %v/%v)",
-					def.ID, fallback.Tags, parsed.Metadata.Tags, fallback.Inputs, parsed.Metadata.Inputs, fallback.Outputs, parsed.Metadata.Outputs)
-			}
 		}
 	}
 }

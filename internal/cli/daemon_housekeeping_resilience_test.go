@@ -701,7 +701,7 @@ func TestBackgroundReclaimReservesTheRegisteredCheckoutPathKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	alias := registeredCheckoutWorktreeKey(h.worker.delegationParentCheckout(h.ctx, job))
+	alias := registeredCheckoutWorktreeKey(delegationReclaimCheckout(h.ctx, h.worker, job, path).path)
 	if alias == "" {
 		t.Fatal("no worktree key for the registered checkout")
 	}

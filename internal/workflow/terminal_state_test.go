@@ -1,10 +1,6 @@
 package workflow
 
-import (
-	"testing"
-
-	"github.com/gitmoot/gitmoot/internal/db"
-)
+import "testing"
 
 // TestSettledVsFinalTruthTables pins the canonical two-predicate contract (#632):
 // `blocked` is SETTLED (barrier semantics) but NOT FINAL (resumability
@@ -32,27 +28,5 @@ func TestSettledVsFinalTruthTables(t *testing.T) {
 		if got := IsFinalJobState(c.state); got != c.wantFinal {
 			t.Errorf("IsFinalJobState(%q) = %v, want %v", c.state, got, c.wantFinal)
 		}
-	}
-}
-
-// TestPinDelegationBarrierProceedsPastBlockedChild pins the engine's observable
-// barrier semantics (#632): a delegation whose child is `blocked` counts as
-// resolved, so the coordinator continuation is not stalled by it. This is the
-// "settled includes blocked" behavior encoded via allDelegationsResolved and
-// must hold identically before and after the predicate refactor.
-func TestPinDelegationBarrierProceedsPastBlockedChild(t *testing.T) {
-	delegations := []Delegation{{ID: "a"}, {ID: "b"}}
-	children := map[string]db.Job{
-		"a": {ID: "root/delegation/a", State: string(JobSucceeded)},
-		"b": {ID: "root/delegation/b", State: string(JobBlocked)},
-	}
-	if !allDelegationsResolved(delegations, children, nil) {
-		t.Fatal("allDelegationsResolved with a blocked child = false, want true (barrier must proceed past blocked)")
-	}
-
-	// A still-running child, by contrast, is NOT resolved: the barrier waits.
-	children["b"] = db.Job{ID: "root/delegation/b", State: string(JobRunning)}
-	if allDelegationsResolved(delegations, children, nil) {
-		t.Fatal("allDelegationsResolved with a running child = true, want false (barrier must wait on running)")
 	}
 }

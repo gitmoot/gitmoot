@@ -936,7 +936,7 @@ func failRunningJob(ctx context.Context, store *db.Store, stdout io.Writer, now 
 		payload.FailureDiagnostics = &workflow.FailureDiagnostics{Phase: workflow.FailurePhaseRecovery, StderrTail: tail}
 		payload.Result = &workflow.AgentResult{
 			Decision: "failed", Summary: fmt.Sprintf("daemon recovery: %s (elapsed %s)", cause, elapsed),
-			Findings: []json.RawMessage{}, ChangesMade: []string{}, TestsRun: []string{}, Needs: []string{}, Delegations: []workflow.Delegation{},
+			Findings: []json.RawMessage{}, ChangesMade: []string{}, TestsRun: []string{}, Needs: []string{},
 		}
 		if b, err := json.Marshal(payload); err == nil {
 			encoded = string(b)
@@ -2896,9 +2896,6 @@ func listPendingQueuedJobs(ctx context.Context, worker jobWorker, repoFilter str
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
-		if queuedChildOfKilledRoot(ctx, worker.Store, job) {
-			continue
-		}
 		// Operational-blocker hold (#532): a job deferred behind a classified
 		// blocker is not eligible until its earliest-retry-at passes. Both
 		// schedulers (barrier and pool) funnel through this listing, so the hold
@@ -3787,12 +3784,10 @@ func queuedJobMatchesRepo(job db.Job, repoFilter string) bool {
 	return err == nil && payload.Repo == repoFilter
 }
 
-// queuedJobMatchesSession reports whether a job belongs to the delegation tree
-// rooted at rootFilter. An empty filter matches everything (the default daemon
-// behavior). Otherwise a job matches iff it is the root coordinator job itself
-// (job.ID == rootFilter) or carries the root id in its payload
-// (payload.RootJobID == rootFilter); children and continuations inherit the
-// root id via the payload.
+// queuedJobMatchesSession reports whether a job is in scope for the daemon's
+// --session filter. An empty filter matches everything (the default daemon
+// behavior). Otherwise a job matches iff it is the named job itself
+// (job.ID == rootFilter) or carries that id as payload.RootJobID.
 func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	rootFilter = strings.TrimSpace(rootFilter)
 	if rootFilter == "" {
@@ -3803,47 +3798,6 @@ func queuedJobMatchesSession(job db.Job, rootFilter string) bool {
 	}
 	payload, err := daemonJobPayload(job)
 	return err == nil && payload.RootJobID == rootFilter
-}
-
-// queuedChildOfKilledRoot reports whether a queued job is a delegation child leg
-// of a tree whose root has been killed by an operator (#341). Only child legs are
-// matched and skipped. Two classes are deliberately exempted so the graceful
-// finalize can still run:
-//   - the root coordinator itself (payload.RootJobID == "" or == job.ID); and
-//   - any continuation (coordinator reconvene or the #305 graceful finalize),
-//     which carries no DelegationID — it MUST run so the engine routes the killed
-//     tree through enqueueFinalizeContinuation and emits a terminal result.
-//
-// Delegation child legs set DelegationID (delegationRequest), so a non-empty
-// DelegationID is what marks a job as skippable work. A payload-parse miss or
-// store error fails open (returns false) so a hiccup never silently strands a job.
-//
-// NOTE: the same child-leg classification invariant (RootJobID != "" &&
-// RootJobID != job.ID && DelegationID != "") is re-implemented inline in
-// workflow.KillDelegationTree (internal/workflow/job_kill.go, #480) to eagerly
-// cancel queued child legs at kill time. The cli->workflow import direction
-// prevents sharing one helper, so if the classification rules here change, update
-// the workflow site too — the two MUST stay in lockstep.
-func queuedChildOfKilledRoot(ctx context.Context, store *db.Store, job db.Job) bool {
-	if store == nil {
-		return false
-	}
-	payload, err := daemonJobPayload(job)
-	if err != nil {
-		return false
-	}
-	rootJobID := strings.TrimSpace(payload.RootJobID)
-	if rootJobID == "" || rootJobID == job.ID {
-		return false
-	}
-	// Continuations (DelegationID == "") reconvene the coordinator / finalize the
-	// tree and must always run, even for a killed root. Only actual child legs are
-	// skipped.
-	if strings.TrimSpace(payload.DelegationID) == "" {
-		return false
-	}
-	killed, err := store.IsRootJobKilled(ctx, rootJobID)
-	return err == nil && killed
 }
 
 func queuedJobCheckoutKey(ctx context.Context, store *db.Store, job db.Job) string {

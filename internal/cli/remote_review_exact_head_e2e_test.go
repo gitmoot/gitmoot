@@ -31,7 +31,7 @@ prior=absent
 if [ -n "${GITMOOT_PRIOR_VERDICTS:-}" ] && grep -q PRIOR-TITLE-2281 "$GITMOOT_PRIOR_VERDICTS" && grep -q PRIOR-DETAIL-2281 "$GITMOOT_PRIOR_VERDICTS"; then
   prior=present
 fi
-printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"head=%s base=%s files=%s prior=%s","findings":[],"changes_made":[],"tests_run":["git rev-parse HEAD"],"needs":[],"delegations":[]}}' "$head" "$base" "$files" "$prior"`
+printf '{"gitmoot_result":{"decision":"approved","evidence":"executed","summary":"head=%s base=%s files=%s prior=%s","findings":[],"changes_made":[],"tests_run":["git rev-parse HEAD"],"needs":[]}}' "$head" "$base" "$files" "$prior"`
 
 // #2281: a policy-routed remote review ended blocked because the instance
 // had neither the exact head commit nor the prior findings ("commit <head> is

@@ -44,38 +44,6 @@ func TestRenderJobIncludesContextAndContract(t *testing.T) {
 	}
 }
 
-func TestRenderJobIncludesDelegationArtifacts(t *testing.T) {
-	prompt := RenderJob(JobPrompt{
-		Repo:                  "gitmoot/gitmoot",
-		Branch:                "task-005",
-		Action:                "implement",
-		Instructions:          "build the api",
-		DelegationArtifactDir: "/home/user/.gitmoot/delegations/parent-job",
-	})
-
-	for _, want := range []string{
-		"Delegation artifacts:",
-		"/home/user/.gitmoot/delegations/parent-job/brief.md",
-		"/home/user/.gitmoot/delegations/parent-job/context-manifest.json",
-	} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q:\n%s", want, prompt)
-		}
-	}
-}
-
-func TestRenderJobOmitsDelegationArtifactsWhenUnset(t *testing.T) {
-	prompt := RenderJob(JobPrompt{
-		Repo:         "gitmoot/gitmoot",
-		Branch:       "task-005",
-		Action:       "implement",
-		Instructions: "build the api",
-	})
-	if strings.Contains(prompt, "Delegation artifacts:") {
-		t.Fatalf("prompt unexpectedly includes delegation artifacts section:\n%s", prompt)
-	}
-}
-
 func TestRenderRepairPromptIncludesErrorAndRawOutput(t *testing.T) {
 	prompt := RenderRepairPrompt("not json", errors.New("missing gitmoot_result"))
 

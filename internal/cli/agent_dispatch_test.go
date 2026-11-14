@@ -56,7 +56,7 @@ scope = ["owner/repo"]
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	adapter := installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"looks good","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -91,45 +91,6 @@ scope = ["owner/repo"]
 		t.Fatalf("background review invoked runtime %d times, want zero", adapter.calls)
 	}
 
-	runArgs := append([]string{}, args...)
-	runArgs[0] = "run-reviewer"
-	runArgs = append(runArgs, "--action", "review")
-	stdout.Reset()
-	stderr.Reset()
-	code = runAgentRun(runArgs, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("agent run review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-	jobs, err = store.ListJobs(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var runJob *db.Job
-	for index := range jobs {
-		if jobs[index].Agent == "run-reviewer" {
-			runJob = &jobs[index]
-			break
-		}
-	}
-	if runJob == nil || runJob.Type != "review" || runJob.State != string(workflow.JobQueued) {
-		t.Fatalf("agent run review job = %+v, want daemon-owned queued review", runJob)
-	}
-	runPayload, err := daemonJobPayload(*runJob)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runPayload.ActingOrgRole != "joltra" {
-		t.Fatalf("agent run review acting role = %q, want joltra", runPayload.ActingOrgRole)
-	}
-	for _, want := range []string{"state: queued", "next: gitmoot job watch"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("agent run stdout = %q, want %q", stdout.String(), want)
-		}
-	}
-	if adapter.calls != 0 {
-		t.Fatalf("background agent run review invoked runtime %d times, want zero", adapter.calls)
-	}
-
 	stdout.Reset()
 	stderr.Reset()
 	code = runAgentReview(append(args, "--foreground"), &stdout, &stderr)
@@ -138,16 +99,6 @@ scope = ["owner/repo"]
 	}
 	if adapter.calls != 1 {
 		t.Fatalf("explicit foreground review invoked runtime %d times, want one", adapter.calls)
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	code = runAgentRun(append(runArgs, "--foreground"), &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("foreground agent run review exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-	if adapter.calls != 2 {
-		t.Fatalf("explicit foreground agent run review invoked runtime %d times, want two total", adapter.calls)
 	}
 }
 
@@ -797,7 +748,7 @@ scope = ["owner/repo"]
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -932,7 +883,7 @@ func TestAgentReviewReportsWhenNoVerdictWaitCanBeAttached(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1083,7 +1034,7 @@ func TestAgentReviewRoutesThroughTheReviewRouter(t *testing.T) {
 	// coincidence, which is exactly how the first version of this test passed
 	// while asserting nothing.
 	seedDaemonWorkerAgentWithPolicy(t, store, "dual-reviewer", runtime.ShellRuntime, "true", []string{"review", "implement"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1291,7 +1242,7 @@ func TestAgentReviewDisclosesInputsTheRouterCannotCarry(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1389,7 +1340,7 @@ func TestReviewRequestHonorsTheForwardedSession(t *testing.T) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1503,7 +1454,7 @@ func TestRouterBypassReasonIsRecordedOnTheJob(t *testing.T) {
 			replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 				return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 			})
-			installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+			installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 			previousGitHubFactory := newAgentDispatchGitHubClient
 			newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 			t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1572,7 +1523,7 @@ func TestRoutedDispatchRecordsNoBypassAndForegroundRecordsOne(t *testing.T) {
 		replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 			return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 		})
-		installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+		installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 		previousGitHubFactory := newAgentDispatchGitHubClient
 		newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 		t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })
@@ -1663,7 +1614,7 @@ func agentReviewJSONFixture(t *testing.T) (string, *db.Store, string) {
 	replaceDiskGuardMeasurement(t, func(string) (diskFilesystemUsage, error) {
 		return diskFilesystemUsage{TotalBytes: 20 << 30, FreeBytes: 10 << 30}, nil
 	})
-	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[],"delegations":[]}}`)
+	installReviewLeadTestAdapter(t, `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":["inspection"],"needs":[]}}`)
 	previousGitHubFactory := newAgentDispatchGitHubClient
 	newAgentDispatchGitHubClient = func(string) github.Client { return githubtest.NoopClient{} }
 	t.Cleanup(func() { newAgentDispatchGitHubClient = previousGitHubFactory })

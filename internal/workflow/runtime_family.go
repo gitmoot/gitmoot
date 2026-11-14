@@ -130,17 +130,18 @@ func resolveRuntimeNameDirect(ctx context.Context, store *db.Store, jobID string
 	return "", false, nil
 }
 
-// maxSyntheticParentHops bounds the walk. A temp worker forked from an
-// ephemeral delegation child is two hops, so four leaves headroom while making
+// maxSyntheticParentHops bounds the walk. A temp worker forked from a
+// historical ephemeral child is two hops, so four leaves headroom while making
 // a cycle in parent_job_id terminate instead of hanging the caller.
 const maxSyntheticParentHops = 4
 
 // tempAgentInfix and ephemeralAgentInfix are the two synthetic shapes.
 // daemon_worker.go mints `<parent-agent>-temp-<parent-job-id>`, so the parent
-// AGENT is the prefix and needs no store read. ephemeralAgentName mints
-// `<slug(delegation-id)>-ephemeral-<shortHash(parent-job+delegation)>`, which
-// HASHES the parent job: nothing in that name recovers it, so the parent comes
-// from the job row's parent_job_id column instead.
+// AGENT is the prefix and needs no store read. Historical ephemeral rows (the
+// retired delegation engine minted them as
+// `<slug(delegation-id)>-ephemeral-<shortHash(parent-job+delegation)>`) HASH
+// the parent job: nothing in that name recovers it, so the parent comes from
+// the job row's parent_job_id column instead.
 //
 // #2004 as filed claimed the parent job is recoverable from the name in both
 // shapes. That is true of temp and false of ephemeral; the hash is one-way. The

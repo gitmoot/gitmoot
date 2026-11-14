@@ -86,7 +86,7 @@ func staleBranchGitCheckout(t *testing.T, fullName string) string {
 // rendezvousResult builds a valid gitmoot_result envelope with the given terminal
 // decision (approved → JobSucceeded, failed → JobFailed).
 func rendezvousResult(decision, summary string) string {
-	return fmt.Sprintf(`{"gitmoot_result":{"decision":%q,"summary":%q,"findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`, decision, summary)
+	return fmt.Sprintf(`{"gitmoot_result":{"decision":%q,"summary":%q,"findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`, decision, summary)
 }
 
 // rendezvousSeatScript is a shell-runtime agent command that touches its own start

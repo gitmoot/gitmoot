@@ -76,65 +76,6 @@ func TestUnscopableFollowUpReanchorsInsteadOfWedging(t *testing.T) {
 	}
 }
 
-// TestRoutineRoundInheritsLensScopesForOneReviewer pins the lens -> routine
-// transition. One reviewer runs several lenses on the high-risk path, so its
-// candidates are keyed by lens id. A following ROUTINE round has no lens id: looking
-// up the bare reviewer alone missed every lens entry and silently issued an unscoped
-// full-PR re-review, spending the compare call anyway.
-func TestRoutineRoundInheritsLensScopesForOneReviewer(t *testing.T) {
-	ctx := context.Background()
-	store := openEngineStore(t)
-	seedAgent(t, store, "lead", []string{"implement"}, "gitmoot/gitmoot")
-	seedAgent(t, store, "audit", []string{"review"}, "gitmoot/gitmoot")
-	insertPriorLensReview(t, store, "prior-correctness", LensCorrectness, JobSucceeded, "changes_requested",
-		json.RawMessage(`{"lens":"correctness","id":"C-1","summary":"correctness finding"}`))
-	insertPriorLensReview(t, store, "prior-security", LensSecurity, JobSucceeded, "changes_requested",
-		json.RawMessage(`{"lens":"security","id":"S-9","summary":"security finding"}`))
-
-	engine := testEngine(store)
-	// The prior round was high-risk; this round classifies routine (label removed,
-	// or the tier flag flipped off).
-	engine.RiskTiersEnabled = false
-	compareCalls := 0
-	engine.ReviewChangedFiles = func(_ context.Context, _ string, _ int, previousHead, currentHead string) ([]string, error) {
-		compareCalls++
-		if previousHead != "head-one" || currentHead != "head-two" {
-			t.Fatalf("compare = %s..%s, want head-one..head-two", previousHead, currentHead)
-		}
-		return []string{"internal/auth/session.go"}, nil
-	}
-	event := highRiskEvent()
-	event.HeadSHA = "head-two"
-	event.RequiredReviewers = []string{"audit"}
-	if err := engine.HandlePullRequestOpened(ctx, event); err != nil {
-		t.Fatalf("HandlePullRequestOpened: %v", err)
-	}
-	if compareCalls != 1 {
-		t.Fatalf("compare calls = %d, want 1", compareCalls)
-	}
-	job := mustJob(t, store, "review-audit-task-7-review-2")
-	payload, err := unmarshalPayload(job.Payload)
-	if err != nil {
-		t.Fatalf("unmarshalPayload: %v", err)
-	}
-	if payload.ReviewScope == nil {
-		t.Fatal("routine round after a lens round lost the scope and re-reviewed the full PR")
-	}
-	if payload.ReviewScope.PreviousHeadSHA != "head-one" {
-		t.Fatalf("scope previous head = %q, want head-one", payload.ReviewScope.PreviousHeadSHA)
-	}
-	joined := strings.Join(payload.ReviewScope.Findings, " ")
-	if !strings.Contains(joined, `"id":"C-1"`) || !strings.Contains(joined, `"id":"S-9"`) {
-		t.Fatalf("routine scope findings = %#v, want both lenses' findings", payload.ReviewScope.Findings)
-	}
-	if len(payload.ReviewScope.ChangedFiles) != 1 || payload.ReviewScope.ChangedFiles[0] != "internal/auth/session.go" {
-		t.Fatalf("routine scope files = %#v", payload.ReviewScope.ChangedFiles)
-	}
-	if !strings.Contains(payload.Instructions, "Do not re-review the full PR-to-base diff") {
-		t.Fatalf("routine round issued unscoped instructions: %q", payload.Instructions)
-	}
-}
-
 func hasReviewScopeUnavailableEvent(t *testing.T, store *db.Store, head string) bool {
 	t.Helper()
 	events, err := store.ListTaskEvents(context.Background(), "task-1678")

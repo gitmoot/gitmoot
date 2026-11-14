@@ -1,6 +1,6 @@
 ---
 name: gitmoot
-description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, agent-templates, custom prompt agents, orchestration, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
+description: Use Gitmoot for local-first AI agent coordination across repositories, reviews, GitHub PR comments, agent subscriptions, daemon checks, stuck jobs, agent-templates, custom prompt agents, the web dashboard, per-job runtime overrides, the config-driven runtime metadata registry, and Codex, Claude Code, Kimi Code, or omp runtime workflows.
 license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and omp (the job runtime; shell runs no-LLM tests).
 metadata:
@@ -15,9 +15,7 @@ reviews, PR comments, and runtime workflows. Use this skill when the
 user wants PR-comment agent workflows, repo-scoped agent subscriptions,
 background daemon checks, omp agent startup, the Claude Code, Codex or omp plugins, structured
 implementation plans, agent template workflows, custom
-prompt agents, or job status. When a job
-pauses at `awaiting_human`, answer it locally with `gitmoot job answer <job-id>
-"<question-id>: text"` (see CLI.md § Jobs).
+prompt agents, or job status.
 
 For current-chat prompt import, "use <agent> here" or "use Gitmoot agent
 <agent> here" means import the agent's prompt into this current chat and apply
@@ -86,16 +84,14 @@ blocker", or "what does this job need" (#682), route to
 `gitmoot job gates <id>` to list the open resource gates — one per `needs[]` entry
 a blocked job recorded — then `gitmoot job gates clear <id> --need "<text>"` (or
 `--all`) to satisfy them. Clearing the **last** open gate auto-re-runs the blocked
-job via the same machinery as `gitmoot job retry` (resume on clear, no polling). A
-job whose tree is **paused awaiting a human** (`escalate_human` / ask-gate) is
-never auto-resumed by clearing gates — that still needs a `gitmoot resume`
-decision. See CLI.md § Resumable gates.
+job via the same machinery as `gitmoot job retry` (resume on clear, no polling).
+See CLI.md § Resumable gates.
 
 For Gitmoot health or status questions, first use the injected SessionStart
 snapshot when it is present and sufficient. If more detail is needed, run the
 relevant read-only Gitmoot CLI checks and answer directly from the results.
 Mention `gitmoot dashboard` (or `gitmoot dashboard --web` for a browser view of
-a running orchestration) only after that answer, as a live monitoring
+a running job tree) only after that answer, as a live monitoring
 follow-up. Do not start daemons, create agents, change subscriptions, update
 templates, or release locks unless the user asks for that action.
 
@@ -134,11 +130,6 @@ organization event wakes; add validates the event kind, target org role, and
 `addressed` (default) or `observer` scope. Use
 `gitmoot agent prompt <agent-or-template>` to import an
 agent prompt into the current chat. Use
-`gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
-so Gitmoot can route to ask or review and own read-only worktrees, branch
-locks, and workflow advancement. Add `--action ask|review` when that job action
-must be explicit; `--type` is
-independent and selects a managed agent type, not an action. Use
 `gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. To get an independent review of a pull
 request, use `gitmoot review request --pr <number>` and let Gitmoot choose the
@@ -163,8 +154,8 @@ ordinary non-review admission nor provider spending/concurrency limits.
 
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
 `--action implement`, `task run`, and `repo auto-fix`
-are all gone; an `implement` delegation leg and a `/gitmoot <agent> implement`
-comment are refused. That is the product statement, not a gap: gitmoot reviews,
+are all gone; a `/gitmoot <agent> implement`
+comment is refused. That is the product statement, not a gap: gitmoot reviews,
 seats implement. Do the file changes in THIS session, then record them so the
 merge gate can attribute them:
 `gitmoot job record --agent <seat> --repo owner/repo --type implement
@@ -184,29 +175,13 @@ used instead of a round counter because #1419's panel rejected round-based
 instruments. Direct PR-comment ingress remains separate #1433 work.
 Add `--background` only when the user wants a queued background job.
 
-Orchestrate (Orchestra): when the user says "orchestrate …" or "spin up an
-orchestra of agents", run a background coordinator that returns a `delegations[]`
-score so the players (child agents) run and a finale (continuation) reconvenes
-and synthesizes. `gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
-`gitmoot agent run <agent> --background "..."`. See
-[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md) for the delegation fields and
-termination bounds. A coordinator can also spawn throwaway, auto-disposed
-ephemeral workers on demand via a delegation's `ephemeral` spec (no
-pre-registration; mutually exclusive with `agent`). A `synthesis_rule`
-(`summary`/`vote`/`quorum`) reconciles the producers' **self-report**; to check
-the combined result against the goal **independently**, add a read-only verify
-leg on a **different** runtime/model that `deps` on the producer(s) — produce vs.
-independent check, the same separation as ROMA's Verifier (cross-evaluation beats
-self-evaluation; see the `verifier` recipe and the
-"produce vs. independent check" note in
-[RESULT_CONTRACT.md](references/RESULT_CONTRACT.md)). An agent (via `--model` on start/subscribe/type set) and an
-individual job or delegation (via `--model` on run/ask/review or the
-delegation `model` field) can pin a runtime model, with the per-job/delegation
-value overriding the agent default. When neither pins one, a job falls back to the
+An agent (via `--model` on start/subscribe/type set) and an
+individual job (via `--model` on ask/review) can pin a runtime model, with the
+per-job value overriding the agent default. When neither pins one, a job falls back to the
 runtime's configured `[runtimes.<name>].default_model`, then the runtime CLI's own
-default. Agents, jobs, delegations, and ephemeral worker specs can likewise
-set reasoning effort with `--effort` or the `effort` field. Job/delegation effort
-overrides agent/worker effort, then `[runtimes.omp].default_effort`. omp receives
+default. Agents and jobs can likewise
+set reasoning effort with `--effort` or the `effort` field. Job effort
+overrides agent effort, then `[runtimes.omp].default_effort`. omp receives
 effort as `--thinking <level>` when the value is one of
 `off|minimal|low|medium|high|xhigh|max|auto`, and no flag at all otherwise.
 The `omp` runtime is a multi-provider **routing
@@ -218,10 +193,7 @@ uses the upstream provider proved by a successful OMP delivery, not the `omp`
 wrapper or requested model text. It is advisory: same-family comparisons emit
 `merge_gate_family_advisory` and unresolved comparisons emit
 `merge_gate_family_unresolved`; neither disqualifies a distinct reviewer with
-substantive evidence. For a review fan-out, every coordinating parent is an
-announcement rather than a verdict, including nested fan-outs; the gate applies
-identity and family checks to each approving leaf and records approval evidence
-on that leaf (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
+substantive evidence (see CLI.md § Agent Setup). Use `gitmoot runtime list` to inspect
 each built-in
 runtime's resolved metadata: capabilities, default model/effort,
 known models, and the token-usage source.
@@ -267,17 +239,12 @@ Exact-head review notices carry system provenance and remain separate from
 ordinary discussion of a review. A queued or uncertain notification is not proof
 of submission, reading, acceptance or completion. Jobs join a group through
 `--workflow <label>` on agent
-ask/run/review, orchestrate, or `job open`; orchestration descendants
-inherit the label automatically. Use
+ask/review or `job open`. Use
 `[workflow] require_workflow = true` to enforce this discipline. `auto` mode
 files fresh unlabeled dispatches under `adhoc/<agent>-<yyyy-mm-dd>` and records
 `workflow_autolabeled`; `strict` instead requires `--workflow`. Per-repo
 overrides live in `[repos."owner/repo"]`, and `repo add --agents-md` scaffolds
 the discipline into a checkout's AGENTS.md.
-
-When a job pauses at `awaiting_human`, the local (non-PR) answer path is
-`gitmoot job answer <job-id> "<question-id>: text"`. It resumes through the same
-escalation-resume engine the daemon's PR-comment `answer` verb uses.
 
 The plugin is only the runtime discovery surface for this skill. Local agent
 invocation still goes through the `gitmoot` CLI and the same registered agent,

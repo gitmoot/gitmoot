@@ -10,11 +10,11 @@ import (
 
 // vagueImplementResult is an implement result with no listed changes or tests.
 // Implement result checks were removed (#2586), so it must audit clean.
-const vagueImplementResult = `{"gitmoot_result":{"decision":"implemented","summary":"did the work","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const vagueImplementResult = `{"gitmoot_result":{"decision":"implemented","summary":"did the work","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 // degenerateAskResult parses cleanly (valid contract) but its one-character
 // answer fails ask-answer-actionable, so only the #526 audit catches it.
-const degenerateAskResult = `{"gitmoot_result":{"decision":"approved","summary":"s","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`
+const degenerateAskResult = `{"gitmoot_result":{"decision":"approved","summary":"s","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`
 
 func shellAgent() runtime.Agent {
 	return runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "gitmoot/gitmoot", Role: "implementer"}
@@ -192,7 +192,7 @@ func TestMailboxRunResultChecksWarnCleanResultIsQuiet(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	mailbox := Mailbox{store: store, resultCheckMode: ResultChecksWarn}
-	clean := `{"gitmoot_result":{"decision":"implemented","summary":"implemented X","findings":[],"changes_made":["added foo.go"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`
+	clean := `{"gitmoot_result":{"decision":"implemented","summary":"implemented X","findings":[],"changes_made":["added foo.go"],"tests_run":["go test ./..."],"needs":[]}}`
 	adapter := &fakeDelivery{outputs: []string{clean}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-clean", Agent: "audit", Action: "implement", Repo: "gitmoot/gitmoot"}); err != nil {

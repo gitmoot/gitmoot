@@ -420,7 +420,6 @@ type localAgentDispatchRequest struct {
 	ReviewRelatedPRs       []workflow.ReviewRelatedPR
 	Reviewers              []string
 	SkipNativeReviewFanout bool
-	Recipe                 string
 	SelectedAction         string
 	SelectedActionReason   string
 	ExecutionPath          string
@@ -926,17 +925,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 			return localAgentJobOutput{}, err
 		}
 	}
-	// A --recipe routes this coordinator to a named built-in recipe template's
-	// prompt (resolved from the installed-template store) without rebinding the
-	// agent; the override is captured into the job payload at enqueue time.
-	var recipeTemplate *db.AgentTemplate
-	if strings.TrimSpace(request.Recipe) != "" {
-		tmpl, err := loadInstalledTemplate(ctx, store, request.Recipe)
-		if err != nil {
-			return localAgentJobOutput{}, err
-		}
-		recipeTemplate = &tmpl
-	}
 	// Give every eligible read-only job its own detached worktree BEFORE enqueue.
 	// The worktree is both its checkout key and its hard filesystem boundary.
 	// Falling back to the shared checkout would silently drop that boundary, so
@@ -1155,7 +1143,6 @@ func dispatchLocalAgentJob(ctx context.Context, store *db.Store, request localAg
 		ReviewSupersedeReason:  request.ReviewSupersedeReason,
 		ReviewEvidence:         request.ReviewEvidence,
 		ReviewRelatedPRs:       request.ReviewRelatedPRs,
-		TemplateOverride:       recipeTemplate,
 		WorktreePath:           readOnlyWorktreePath,
 		ReadOnlyWorktree:       readOnlyWorktreePath != "",
 		ReadOnlySeat:           readOnlyWorktreePath != "" || request.remoteSource,
@@ -1574,9 +1561,7 @@ func enqueuePermissionBlockedLocalAgentJob(ctx context.Context, store *db.Store,
 	if err := store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "route_selected", Message: routeSelectedMessage(request)}); err != nil {
 		return localAgentJobOutput{}, err
 	}
-	// The matched source state is not consulted here: this site only blocks the job
-	// and reports State: blocked, it never describes the transition afterwards.
-	if _, _, err := markJobPermissionBlocked(ctx, store, job); err != nil {
+	if _, err := markJobPermissionBlocked(ctx, store, job); err != nil {
 		return localAgentJobOutput{}, err
 	}
 	return localAgentJobOutput{
@@ -2252,20 +2237,6 @@ func localAgentTargetRepo(ctx context.Context, repoFlag string, runner subproces
 	return github.Repository{Owner: parsed.Owner, Name: parsed.Name}, nil
 }
 
-// #1685 removed a role gate that lived here. It refused any agent whose registry
-// role was "coordinator" from a review slot, on the theory that a coordinator in
-// that slot can only produce a fan-out. The theory was right and the conclusion
-// was wrong: a fan-out in a review slot is the SHIPPED recipe
-// (skills/gitmoot/agent-templates/review-panel.md, capabilities [ask, review]),
-// and the merge gate now decides such a row on its delegates instead of counting
-// it as a verdict. Refusing the dispatch removed a documented capability to
-// compensate for a consumer defect that no longer exists — and it did so by
-// exact-matching one literal against a free-form registry column, which let
-// "review-coordinator" and "coordinator-sol" through anyway.
-//
-// Do not reintroduce a role gate here without first answering what it catches
-// that the consumers do not.
-
 func ensureLocalAgentAccess(ctx context.Context, store *db.Store, agent db.Agent, repo string, action string) error {
 	allowed, err := store.AgentCanAccessRepo(ctx, agent.Name, repo)
 	if err != nil {
@@ -2415,18 +2386,6 @@ func printLocalAgentJobOutput(stdout io.Writer, output localAgentJobOutput) {
 	printRawMessages(stdout, "findings", output.Result.Findings)
 	printStringList(stdout, "needs", output.Result.Needs)
 	printStringList(stdout, "tests_run", output.Result.TestsRun)
-	printStringList(stdout, "delegations", delegationAgentNames(output.Result.Delegations))
-}
-
-func delegationAgentNames(delegations []workflow.Delegation) []string {
-	names := make([]string, 0, len(delegations))
-	for _, d := range delegations {
-		name := strings.TrimSpace(d.Agent)
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	return names
 }
 
 func printRawMessages(stdout io.Writer, label string, values []json.RawMessage) {

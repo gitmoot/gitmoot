@@ -17,7 +17,7 @@
 //
 // Drift guard: every struct field MUST have an annotation. An un-annotated NEW
 // field is a hard error here — that is the mechanism by which adding a field to
-// AgentResult/HumanQuestion forces the prompt
+// AgentResult forces the prompt
 // to be regenerated. CI
 // re-runs `go generate ./... && git diff --exit-code` so a stale checked-in
 // artifact fails the build.
@@ -59,15 +59,10 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"changes_made": {example: "[]"},
 	"tests_run":    {example: "[]"},
 	"needs":        {example: "[]"},
-	// delegations is NOT offered to agents (#2588): reviewers no longer fan
-	// out, and a result that still carries delegations fails the result
-	// check. The field stays on AgentResult only to read historical results.
-	"delegations": {},
-	"evidence":    {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
+	"evidence":     {help: `top-level evidence (string, one of ` + enumList(workflow.EvidenceKinds) + `): REQUIRED on reviews. Say "executed" only if you actually ran the commands you cite; say "static_only" when you read code and could not run it (no toolchain, no network, a sandbox refusal). Never infer test success from inability to execute, and never claim "executed" for a command you could not run - a static-only review is a legitimate verdict, a mislabeled one is not. Omitting it is recorded as static_only.`},
 	// artifact_body was only required by delegations that requested
 	// artifacts (#2588), so it is no longer offered to agents.
-	"artifact_body":   {},
-	"human_questions": {help: `top-level human_questions (object[], optional): use SPARINGLY to pause for a specific human decision instead of guessing; each entry is {` + humanQuestionFieldsHelp() + `}. Returning it pauses the tree awaiting a human answer (no leg fails, no continuation runs); a human replies with /gitmoot resume <job> answer "<id>: ...". Leave it absent when you can proceed.`},
+	"artifact_body": {},
 	// superseded_pull_request_closed is PRODUCT-OWNED, so it carries neither an
 	// example nor help: no agent is ever asked for it. The
 	// closed-PR sweep sets it on the SYNTHETIC result it mints for a delegation child
@@ -93,12 +88,6 @@ var resultFieldAnnotations = map[string]fieldAnnotation{
 	"checks_blocked":    {help: `top-level checks_blocked (string, optional, one of ` + enumList(workflow.ChecksBlockedKinds) + `): when you could not run some or all of the project's checks, name the main reason: toolchain (the language toolchain or test runner is missing or not runnable), dependencies (it ran but the project's dependencies were missing), sandbox (the sandbox refused a path or device), network, service (a database, browser or credentialed API was needed), or other. Say what you could not run in summary or tests_run as well. Omit it when every check you wanted to run ran.`},
 }
 
-var humanQuestionFieldAnnotations = map[string]fieldAnnotation{
-	"id":      {help: `id (string, required, unique)`},
-	"prompt":  {help: `prompt (string, required)`},
-	"choices": {help: `choices (string[], optional)`},
-}
-
 const resultDecisionHelp = "\nDecision semantics:\n- Use decision skipped only when the task itself had no work to do. Do not use skipped in a PR review to mean nothing to flag; use approved. - skipped is an abstention for quorum and verify. Vote still counts the skipped child's succeeded job state.\n"
 
 func main() {
@@ -112,9 +101,6 @@ func run() error {
 	// Validate every struct field is annotated. An un-annotated NEW field is a
 	// hard failure — this is the drift mechanism.
 	if err := requireAnnotations(reflect.TypeOf(workflow.AgentResult{}), resultFieldAnnotations, "AgentResult"); err != nil {
-		return err
-	}
-	if err := requireAnnotations(reflect.TypeOf(workflow.HumanQuestion{}), humanQuestionFieldAnnotations, "HumanQuestion"); err != nil {
 		return err
 	}
 
@@ -214,11 +200,6 @@ func renderResultFieldHelp() string {
 	// artifact announced solely through an environment variable and an
 	// operator-facing troubleshooting page is staged and undirected.
 	b.WriteString("- if the environment variable GITMOOT_PRIOR_VERDICTS names a file, it holds the prior review verdicts for the repo under review, rendered as JSON and frozen at its own as_of time. READ IT before concluding there are none, and treat a verdict recorded after as_of as absent rather than missing. Each entry carries the reviewer, head_sha, decision, severity, findings count and that verdict's own evidence mode.\n")
-	// human_questions is a top-level ask-gate field (#445), documented in the
-	// prompt block the runtime agent actually receives.
-	if h := resultFieldAnnotations["human_questions"].help; h != "" {
-		b.WriteString("- " + h + "\n")
-	}
 	return b.String()
 }
 
@@ -233,27 +214,11 @@ func enumList(values []string) string {
 	return strings.Join(values, "|")
 }
 
-func humanQuestionFieldsHelp() string {
-	return structFieldsHelp(reflect.TypeOf(workflow.HumanQuestion{}), humanQuestionFieldAnnotations)
-}
-
-func structFieldsHelp(t reflect.Type, annotations map[string]fieldAnnotation) string {
-	var parts []string
-	for i := 0; i < t.NumField(); i++ {
-		name, _ := jsonField(t.Field(i))
-		if name == "" {
-			continue
-		}
-		parts = append(parts, annotations[name].help)
-	}
-	return strings.Join(parts, ", ")
-}
-
 func renderFile(shape, help string) string {
 	var b bytes.Buffer
 	b.WriteString("// Code generated by internal/prompts/contractgen; DO NOT EDIT.\n")
 	b.WriteString("// Regenerate with `go generate ./...` after changing the workflow result\n")
-	b.WriteString("// structs (AgentResult/HumanQuestion) or the generator's\n")
+	b.WriteString("// struct (AgentResult) or the generator's\n")
 	b.WriteString("// annotation table. CI runs `go generate ./... && git diff --exit-code`.\n\n")
 	b.WriteString("package prompts\n\n")
 	b.WriteString("// resultContractShape is the byte-identical {\"gitmoot_result\":{…}} example\n")

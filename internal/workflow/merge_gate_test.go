@@ -138,12 +138,8 @@ func insertMergeGateReviewFixture(t *testing.T, store *db.Store, fixture mergeGa
 	}
 }
 
-// insertMergeGateDelegationChild creates a delegation child AND records that
-// delegation on the parent's stored result. Production always writes both: the
-// engine dispatches children FROM the parent result's delegations[], so a parent
-// with children and an empty delegations[] is a shape the product never
-// produces. Fixtures that built it hid #1685 — the fan-out row is exactly the
-// row whose delegations[] is populated.
+// insertMergeGateDelegationChild creates a historical delegation child row
+// under parentID.
 func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, delegationID string, state JobState, result *AgentResult) {
 	t.Helper()
 	payload, err := marshalPayload(JobPayload{
@@ -166,47 +162,6 @@ func insertMergeGateDelegationChild(t *testing.T, store *db.Store, parentID, del
 	}, db.JobEvent{Kind: string(state), Message: "delegation fixture state"}); err != nil {
 		t.Fatalf("CreateJobWithEvent returned error: %v", err)
 	}
-	if strings.TrimSpace(delegationID) == "" {
-		// An ordinary child with no delegation id was never declared by the parent.
-		return
-	}
-	declareMergeGateParentDelegation(t, store, parentID, delegationID)
-}
-
-// declareMergeGateParentDelegation appends one delegation to the parent review's
-// stored result, mirroring what the agent wrote before the engine fanned out.
-//
-// It RESTORES the parent's recorded timestamps afterwards. UpdateJobPayload bumps
-// updated_at, and roundless review rows are ranked by exactly that column
-// (reviewRoundKeyForJob), so a fixture that declares a delegation would otherwise
-// silently make its parent the newest round and break tests about recency that
-// have nothing to do with delegation. Adding evidence to a fixture must not move
-// that fixture in time.
-func declareMergeGateParentDelegation(t *testing.T, store *db.Store, parentID, delegationID string) {
-	t.Helper()
-	ctx := context.Background()
-	parent, err := store.GetJob(ctx, parentID)
-	if err != nil {
-		t.Fatalf("GetJob(%s) returned error: %v", parentID, err)
-	}
-	payload, err := ParseJobPayload(parent.Payload)
-	if err != nil {
-		t.Fatalf("ParseJobPayload(%s) returned error: %v", parentID, err)
-	}
-	if payload.Result == nil {
-		return
-	}
-	payload.Result.Delegations = append(payload.Result.Delegations, Delegation{
-		ID: delegationID, Agent: delegationID, Action: "review",
-	})
-	encoded, err := marshalPayload(payload)
-	if err != nil {
-		t.Fatalf("marshalPayload returned error: %v", err)
-	}
-	if err := store.UpdateJobPayload(ctx, parentID, string(encoded)); err != nil {
-		t.Fatalf("UpdateJobPayload(%s) returned error: %v", parentID, err)
-	}
-	setMergeGateJobRecordedTimes(t, store, parentID, parent.CreatedAt, parent.UpdatedAt)
 }
 
 func insertMergeGateHeadlessIntegrationParent(t *testing.T, store *db.Store, parentID string) {

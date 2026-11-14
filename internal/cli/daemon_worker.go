@@ -429,26 +429,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		}
 		job.Payload = string(encoded)
 	}
-	// An ephemeral child carries an inline worker spec instead of a
-	// pre-registered agent. Materialize a throwaway agent + runtime session
-	// from the spec before the normal flow runs (which assumes the agent
-	// already exists via GetAgent below), and register a cleanup defer so the
-	// worker is auto-disposed on every exit path — success, failure, or block.
-	if payload.Ephemeral != nil {
-		if err := w.startEphemeralWorker(ctx, job, payload, execBackend, jobRunner); err != nil {
-			if eventErr := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "ephemeral_worker_failed", Message: err.Error()}); eventErr != nil {
-				return eventErr
-			}
-			if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
-				return finishErr
-			}
-			_ = w.postJobResultComment(ctx, job.ID, runtime.Agent{Name: job.Agent}, "", err)
-			return nil
-		}
-		// Idempotent removal of the agent row + instance regardless of how run
-		// returns; uses a background context so cleanup survives ctx cancel.
-		defer w.cleanupTempWorker(context.Background(), job.Agent)
-	}
 	dbAgent, err := w.lookupAgent(ctx, job.Agent)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, job, workflow.JobFailed, err); finishErr != nil {
@@ -458,14 +438,6 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		return nil
 	}
 	agent := runtimeAgent(dbAgent)
-	// An ephemeral worker's runtime session exists solely for this job — it was
-	// started by startEphemeralWorker above and disposed by the cleanup defer.
-	// Mark it single-use so adapters whose CLIs report session-cumulative usage
-	// (codex, #658) can attribute that usage to the job: the whole session is
-	// this job's cost. In-memory only — GetAgent never returns the flag.
-	if payload.Ephemeral != nil {
-		agent.SingleUseSession = true
-	}
 	// Per-job runtime override (#531): the payload carries the override, so a
 	// background/daemon job honors it identically to a foreground dispatch. The
 	// effective agent swaps in the override runtime + the job's own session ref;
@@ -592,7 +564,7 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		return nil
 	}
 	if readOnlyImplementationBlocked(job.Type, agent) {
-		transitioned, blockedFrom, err := markJobPermissionBlocked(ctx, w.Store, job)
+		transitioned, err := markJobPermissionBlocked(ctx, w.Store, job)
 		if err != nil {
 			return err
 		}
@@ -607,31 +579,10 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		// Mailbox chokepoint), exactly like the MID-RUN permission block in
 		// handleRunJobError which already emits job.blocked. Emit here too so both
 		// halves of the permission-blocked terminal case are covered; gated on the
-		// genuine transition above, nil-safe when no event rule is enabled. The following
-		// finalizePreflightDelegationChild only attaches a synthetic result
-		// (savePayload, no transition), so it never re-emits.
+		// genuine transition above, nil-safe when no event rule is enabled.
 		emitDaemonTerminalEvent(ctx, w.eventSink(), w.Store, job.ID, daemonTerminalPermissionGuard, string(workflow.JobBlocked), agentPermissionBlockedMessage)
 		_ = w.postJobResultComment(ctx, job.ID, agent, "", errors.New(agentPermissionBlockedMessage))
 		writeLine(w.Stdout, "job %s blocked: %s", job.ID, agentPermissionBlockedMessage)
-		// A read-only implement DELEGATION child short-circuits to blocked here,
-		// BEFORE finishQueuedJob, via markJobPermissionBlocked (a direct transition)
-		// — and blockTaskForPermissionBlockedJob only blocks the task, it never
-		// advances the parent DAG. So without this the parent strands exactly like
-		// #409. Route the delegation child through the finalize helper its MATCHED
-		// SOURCE STATE selects, so its failure_policy fires with a truthful cause.
-		// The admitted row cannot be that witness: queued→running does not bump the
-		// generation this CAS is anchored to, so a concurrent claim makes the
-		// JobRunning arm match and a label keyed on the handed-in row would call a
-		// child that DID run "refused before it ran" (#1852). Gated strictly on a
-		// delegation child (ParentJobID set, Result nil), so a NON-delegation
-		// permission-blocked job is byte-identical.
-		finalize, finalizeErr := w.permissionBlockFinalizerFor(blockedFrom)
-		if finalizeErr != nil {
-			return finalizeErr
-		}
-		if err := finalize(ctx, job.ID, errors.New(agentPermissionBlockedMessage)); err != nil {
-			return err
-		}
 		return nil
 	}
 	// #1926-f5: THE SECOND SEAM, ACTED ON HERE - after the policy guards above, and
@@ -667,14 +618,9 @@ func (w jobWorker) run(ctx context.Context, job db.Job) (returnErr error) {
 		// missing commit object, an unwritable path) is unclassified and keeps the
 		// terminal path, and the hold itself is bounded by maxOperationalBlockerRetries.
 		//
-		// This site uses deferPreDeliveryAllocationContention rather than the general
-		// helper because a high-risk LENS CHILD reaches this same path-less fallback
-		// (TestNativeReviewWorktreePreparationCoversHighRiskLensChild), and the general
-		// helper's delegation-child exclusion would route it to
-		// finishQueuedJob(JobFailed) → finalizePreflightDelegationChild, advancing the
-		// delegation DAG with a synthetic `failed` verdict on a lock another worker
-		// holds for a sub-second op. The narrowing is typed and pre-delivery only; see
-		// the helper's own comment for why that is the safe boundary.
+		// The narrowing is typed and pre-delivery only; see
+		// deferPreDeliveryAllocationContention's own comment for why that is the
+		// safe boundary.
 		if deferred, deferErr := w.deferPreDeliveryAllocationContention(ctx, job, payload, err); deferErr != nil {
 			writeLine(w.Stdout, "job %s review-worktree contention deferral failed: %v", job.ID, deferErr)
 		} else if deferred {
@@ -1836,10 +1782,10 @@ func resumableSessionRuntime(string) bool {
 //
 // #1952 narrowed that to REGISTERED seats, and a first version of this note
 // asserted "no seat job carries an ephemeral spec" on the strength of a grep for
-// co-assignment — which cannot establish absence. TRACED, the opposite is true:
-// delegationRequest (engine_run_budgets.go) sets Ephemeral, and
-// allocateAndEnqueueDelegationInner sets ReadOnlySeat on that SAME request for
-// an ask/review action, so an ephemeral read-only seat exists.
+// co-assignment — which cannot establish absence. TRACED, the opposite was true:
+// the retired delegation engine (#2588) set Ephemeral and ReadOnlySeat on the
+// SAME request for an ask/review action, so historical ephemeral read-only
+// seat rows exist.
 //
 // It needs no seat branch anyway, because the registered-ref story does not
 // describe it: an ephemeral job has no registered session at all, so the gate
@@ -2698,21 +2644,6 @@ func (w jobWorker) admissionEstimate(ctx context.Context, job db.Job) admissionE
 	return perJobAdmissionEstimate(ctx, w.Store, job, policy)
 }
 
-// orchestratePolicy loads the host-level [orchestrate] policy, mirroring
-// parallelSessionPolicy: an implicit or empty config home uses the defaults, and
-// an explicit home loads from the config file. A load error is best-effort at
-// the call site and leaves the workflow engine on its defaults.
-func (w jobWorker) orchestratePolicy() (config.OrchestratePolicy, error) {
-	if !w.ConfigHomeExplicit && strings.TrimSpace(w.ConfigHome) == "" {
-		return config.DefaultOrchestratePolicy(), nil
-	}
-	paths, err := w.configPaths()
-	if err != nil {
-		return config.OrchestratePolicy{}, err
-	}
-	return config.LoadOrchestratePolicy(paths)
-}
-
 func tempWorkerEligible(ctx context.Context, store *db.Store, job db.Job, payload workflow.JobPayload, agent runtime.Agent, policy config.ParallelSessionPolicy, now time.Time) tempWorkerEligibility {
 	if payload.Ephemeral != nil {
 		// An ephemeral job already runs directly on its own throwaway worker;
@@ -3198,137 +3129,6 @@ func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload work
 	return tempWorkerStartResult{Agent: tempAgent, IdleTimeout: idleTimeout, JobTimeout: jobTimeout}, nil
 }
 
-// startEphemeralWorker materializes a throwaway agent for a job whose payload
-// carries an inline worker spec, generalizing the temp-worker machinery from
-// "fork an existing agent" to "spawn from a spec". It persists the agent (so the
-// rest of run's flow — GetAgent, the engine's executor checks — finds it),
-// associates payload.Repo via the agent's RepoScope, and reserves + starts a
-// runtime session (mirroring startTempWorker). The agent name on the job is
-// already the engine-assigned "-ephemeral-" name; callers register a deferred
-// cleanupTempWorker to auto-dispose the worker on every exit path. The worker
-// runs read-only unless the spec opts into a writable autonomy policy.
-func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, backend execbackend.Backend, jobRunner subprocess.Runner) (err error) {
-	spec := payload.Ephemeral
-	if spec == nil {
-		return errors.New("ephemeral worker requires a spec")
-	}
-	capabilities := spec.Capabilities
-	if len(capabilities) == 0 {
-		capabilities = []string{job.Type}
-	}
-	// Least privilege: default read-only, except an implement must be able to
-	// write. The spec may still opt into a different (validated) policy. Note an
-	// EMPTY-policy implement spec is already refused upstream by
-	// validateEphemeralSpec (#452), so this implement default is now defense in
-	// depth for any path that reaches here without that validation.
-	defaultPolicy := runtime.AutonomyPolicyReadOnly
-	if job.Type == "implement" {
-		defaultPolicy = runtime.AutonomyPolicyWorkspaceWrite
-	}
-	policy := firstNonEmpty(strings.TrimSpace(spec.AutonomyPolicy), defaultPolicy)
-	// Role is required by runtime.ValidateAgent but optional on the spec; fall
-	// back to the job action (e.g. "review"/"implement"), then a generic role.
-	role := firstNonEmpty(strings.TrimSpace(spec.Role), strings.TrimSpace(job.Type), "worker")
-	ephemeralAgent := runtime.Agent{
-		Name:           job.Agent,
-		Role:           role,
-		Runtime:        spec.Runtime,
-		Model:          spec.Model,
-		Effort:         spec.Effort,
-		TemplateID:     spec.Template,
-		Capabilities:   capabilities,
-		AutonomyPolicy: policy,
-		RepoScope:      payload.Repo,
-		ExecBackend:    string(backend),
-	}
-	// Persisting with RepoScope set associates the worker with payload.Repo
-	// (agent_repos), mirroring how a normal agent gains repo access.
-	if err := w.Store.UpsertAgent(ctx, dbAgent(ephemeralAgent)); err != nil {
-		return err
-	}
-	// The agent row (and, below, its instance + a live runtime session) now
-	// exist. Dispose them if any later bring-up step fails so a partial
-	// materialization cannot leak an agent/instance/session — mirroring
-	// startTempWorker's cleanup-on-error. (The named return err is set by the
-	// `return err` paths below.)
-	defer func() {
-		if err != nil {
-			w.cleanupTempWorker(context.Background(), ephemeralAgent.Name)
-		}
-	}()
-	// Normalize the stored policy back onto the in-memory agent so the runtime
-	// session is started with the same sandbox the rest of run will use.
-	ephemeralAgent.AutonomyPolicy = runtime.NormalizeStoredAutonomyPolicy(ephemeralAgent.AutonomyPolicy)
-	checkout, err := w.checkoutForJob(ctx, job, payload, ephemeralAgent, jobRunner)
-	if err != nil {
-		return err
-	}
-	var cachedTemplate db.AgentTemplate
-	if ephemeralAgent.TemplateID != "" {
-		cachedTemplate, err = loadInstalledTemplate(ctx, w.Store, ephemeralAgent.TemplateID)
-		if err != nil {
-			return err
-		}
-	}
-	now := time.Now().UTC()
-	reserved := db.AgentInstance{
-		Name:    ephemeralAgent.Name,
-		Type:    tempWorkerAgentType(ephemeralWorkerInstanceOrigin),
-		Runtime: ephemeralAgent.Runtime,
-		// "starting:" placeholder ref keeps the reserved row valid before the
-		// adapter returns the real runtime ref.
-		RuntimeRef:     "starting:" + ephemeralAgent.Name,
-		RepoFullName:   payload.Repo,
-		Role:           ephemeralAgent.Role,
-		TemplateID:     ephemeralAgent.TemplateID,
-		Model:          ephemeralAgent.Model,
-		Effort:         ephemeralAgent.Effort,
-		Capabilities:   ephemeralAgent.Capabilities,
-		AutonomyPolicy: ephemeralAgent.AutonomyPolicy,
-		State:          "starting",
-		CreatedAt:      formatManagedAgentTime(now),
-		LastUsedAt:     formatManagedAgentTime(now),
-		ExpiresAt:      formatManagedAgentTime(now.Add(defaultDaemonRunningJobStaleAfter)),
-	}
-	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
-		return err
-	}
-	adapter, err := w.StartAdapterFactory(backend, ephemeralAgent.Runtime, checkout)
-	if err != nil {
-		return err
-	}
-	started, err := adapter.Start(ctx, runtime.StartRequest{Agent: ephemeralAgent, Prompt: agentStartupPrompt(ephemeralAgent, cachedTemplate)})
-	if err != nil {
-		return err
-	}
-	ephemeralAgent.RuntimeRef = strings.TrimSpace(started.RuntimeRef)
-	if err := runtime.ValidateAgent(ephemeralAgent); err != nil {
-		return err
-	}
-	// Persist the live runtime_ref on both the agent row (so GetAgent below
-	// resolves a runnable session) and the instance.
-	if err := w.Store.UpsertAgent(ctx, dbAgent(ephemeralAgent)); err != nil {
-		return err
-	}
-	instance := reserved
-	instance.RuntimeRef = ephemeralAgent.RuntimeRef
-	instance.State = "idle"
-	if err := w.Store.UpsertAgentInstance(ctx, instance); err != nil {
-		return err
-	}
-	if err := w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "ephemeral_worker_started", Message: fmt.Sprintf("materialized %s worker %s", ephemeralAgent.Runtime, ephemeralAgent.Name)}); err != nil {
-		return err
-	}
-	writeLine(w.Stdout, "materialized ephemeral worker %s (%s) for job %s in %s", ephemeralAgent.Name, ephemeralAgent.Runtime, job.ID, payload.Repo)
-	return nil
-}
-
-// ephemeralWorkerInstanceOrigin is the synthetic "original" agent name used in an
-// ephemeral worker's instance type. It has no registered instance, so
-// managedJobConfig treats the worker as unmanaged (no agent-type config), which
-// is correct for a spec-spawned worker that does not belong to a managed pool.
-const ephemeralWorkerInstanceOrigin = "gitmoot-ephemeral-spec"
-
 func (w jobWorker) cleanupTempWorker(ctx context.Context, agentName string) {
 	if err := w.Store.DeleteAgentInstance(ctx, agentName); err != nil {
 		writeLine(w.Stdout, "temp worker %s instance cleanup failed: %v", agentName, err)
@@ -3447,11 +3247,6 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 		return managedJobRuntimeConfig{}, err
 	}
 	if original := originalAgentForTempWorkerType(configType); original != "" {
-		// Ephemeral specs have no registered parent type by design; they inherit the
-		// daemon default while retaining their instance lifecycle row.
-		if original == ephemeralWorkerInstanceOrigin {
-			return runtimeConfig, nil
-		}
 		originalAgent, err := w.Store.GetAgent(ctx, original)
 		if errors.Is(err, sql.ErrNoRows) {
 			return runtimeConfig, nil
@@ -3814,34 +3609,6 @@ func (w jobWorker) recordAdvanceRetryOnce(ctx context.Context, jobID, message st
 	return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: jobID, Kind: "advance_retry", Message: message})
 }
 
-// closedPullRequestSupersededChild reports whether this job is EXACTLY the shape the
-// closed-PR sweep produces: a delegation child terminalized because its pull request is
-// no longer open, carrying the synthetic result the parent's advanceDelegations consumes
-// (#1673).
-//
-// IT READS THE RESULT, NOT THE EVENT LOG. An event scan cannot be made safe here:
-// job_events has no lifecycle_generation column, and RetryJob starts a new run while
-// PRESERVING prior events, so a historical supersession would keep authorizing the
-// bypass for a job that has since been retried and failed normally - and that run still
-// owes the full advance, deferred teardown and implement bookkeeping included. Carrying
-// the fact in the result means RetryJob clears it along with Result, so the stale case
-// cannot arise rather than being detected.
-//
-// Rejected alternatives: stamping the generation on the supersession event at write time
-// (follows the exec-backend-attempts precedent, but adds a write-side schema change and
-// still leaves a scan whose correctness depends on the filter being right everywhere it
-// is read); and comparing against a recorded generation boundary (same objection, plus a
-// second durable fact to keep in agreement - the defect class this campaign kept hitting).
-func closedPullRequestSupersededChild(job db.Job, payload workflow.JobPayload) bool {
-	if strings.TrimSpace(payload.ParentJobID) == "" || payload.Result == nil {
-		return false
-	}
-	if job.State != string(workflow.JobFailed) {
-		return false
-	}
-	return payload.Result.SupersededPullRequestClosed
-}
-
 func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	payload, err := daemonJobPayload(job)
 	if err != nil {
@@ -3862,41 +3629,10 @@ func (w jobWorker) advanceJob(ctx context.Context, job db.Job) error {
 	}
 	checkout, err := w.checkoutForPostDeliveryAdvance(ctx, job, payload, agent, jobRunner)
 	if err != nil {
-		// THE STRUCTURAL ROUTE (#1673). A child terminalized by the closed-PR sweep can
-		// never satisfy this preflight - the shared checkout is never on a dead PR's head
-		// - and gating its parent advancement on that stranded the parent forever. But
-		// letting it through the FULL advance with an empty checkout was too broad:
-		// AdvanceJob also normalizes high-risk lens verdicts, continues into the review
-		// merge gate and registers worktree teardown, so a preflight failure would become
-		// database and remote action under an unvalidated checkout. (It can dispatch a
-		// child's own delegations too, but not for one whose decision is "failed" - the
-		// parent-side block short-circuits first, which review measured. The point is what
-		// the narrow operation EXCLUDES, not that each excluded step was reachable here.)
-		//
-		// So this shape is routed to an operation that CANNOT reach any of that, rather
-		// than to the full advance with a narrower predicate in front of it. A predicate
-		// is a list the next edit widens; an operation that cannot execute the child's own
-		// advancement cannot be widened by accident.
-		if closedPullRequestSupersededChild(job, payload) {
-			parentOnly := w.workflowForJob("", jobRunner)
-			if advErr := parentOnly.AdvanceParentDAGForTerminalChild(ctx, job.ID); advErr != nil {
-				var blocked workflow.BlockedError
-				if errors.As(advErr, &blocked) {
-					return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_blocked", Message: advErr.Error()})
-				}
-				return w.recordAdvanceRetryOnce(ctx, job.ID, "parent-only advancement failed: "+advErr.Error())
-			}
-			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_completed",
-				Message: "parent advancement completed without a delivery checkout (closed pull request)"})
-		}
 		return w.recordAdvanceRetryOnce(ctx, job.ID, "post-delivery workflow retry preflight failed: "+err.Error())
 	}
 	engine := w.workflowForJob(checkout, jobRunner)
 	if err := engine.AdvanceJob(ctx, job.ID); err != nil {
-		var awaiting workflow.AwaitingHumanError
-		if errors.As(err, &awaiting) {
-			return w.Store.AddJobEvent(ctx, db.JobEvent{JobID: job.ID, Kind: "advance_awaiting_human", Message: err.Error()})
-		}
 		var blocked workflow.BlockedError
 		if errors.As(err, &blocked) {
 			return w.recordBlockedAdvancement(ctx, job.ID, observedJobLifecycle(job), err, blocked)
@@ -4054,9 +3790,7 @@ func (w jobWorker) workflowForHost(checkout string) workflow.Engine {
 }
 
 func (w jobWorker) defaultWorkflowForRunner(checkout string, runner subprocess.Runner) workflow.Engine {
-	engine := daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner, nil)
-	w.applyOrchestratePolicy(&engine)
-	return engine
+	return daemonWorkflowEngineForRunner(w.Store, github.NewClient(checkout), checkout, w.workflowHome(), runner, nil)
 }
 
 func (w jobWorker) checkoutForJob(ctx context.Context, job db.Job, payload workflow.JobPayload, agent runtime.Agent, runner subprocess.Runner) (string, error) {
@@ -4071,39 +3805,6 @@ func (w jobWorker) workflowForJob(checkout string, runner subprocess.Runner) wor
 		return w.WorkflowFactory(checkout)
 	}
 	return w.defaultWorkflowForRunner(checkout, runner)
-}
-
-// applyOrchestratePolicy sets the engine's opt-in [orchestrate] fields — the
-// artifact-body inlining knobs, the upstream-dep-context injection toggle (#419),
-// the per-root delegation token (#338 Part B) and dollar-cost (#380) budgets, the
-// result-aware non-progress streak threshold (#339), and the verify→replan
-// attempt cap (#439) — from the host policy. It is fail-safe: any load error
-// leaves the engine with its defaults (inlining off, upstream-dep injection off,
-// both budgets 0 = unlimited, streak threshold and verify cap 0 = engine default)
-// rather than failing engine construction.
-func (w jobWorker) applyOrchestratePolicy(engine *workflow.Engine) {
-	policy, err := w.orchestratePolicy()
-	if err != nil {
-		return
-	}
-	engine.InlineArtifactBodies = policy.InlineArtifactBodies
-	engine.MaxInlineArtifactBytes = policy.InlineArtifactMaxBytes
-	engine.InjectUpstreamDepContext = policy.InjectUpstreamDepContext
-	engine.MaxDelegationTokenBudget = policy.MaxDelegationTokenBudget
-	engine.MaxDelegationCostUSD = policy.MaxDelegationCostUSD
-	engine.MaxDelegationNonProgressStreak = policy.MaxDelegationNonProgressStreak
-	engine.MaxVerifyReplanAttempts = policy.MaxVerifyReplanAttempts
-	engine.DelegationTimeoutDefaults = workflow.DelegationTimeoutDefaults{
-		Default:   policy.DefaultDelegationTimeout,
-		Plan:      policy.DefaultPlanTimeout,
-		Implement: policy.DefaultImplementTimeout,
-		Review:    policy.DefaultReviewTimeout,
-		Gate:      policy.DefaultGateTimeout,
-		Repair:    policy.DefaultRepairTimeout,
-	}
-	if notifier, ok := engine.EscalationNotifier.(*daemonEscalationNotifier); ok && notifier != nil {
-		notifier.Handle = policy.EscalationHandle
-	}
 }
 
 // workflowHome resolves the GITMOOT_HOME root used to place per-delegation

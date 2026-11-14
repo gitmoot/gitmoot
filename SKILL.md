@@ -141,7 +141,6 @@ gitmoot runtime list [--json]
 gitmoot agent list
 gitmoot agent doctor <agent>
 gitmoot agent prompt <agent-or-template>
-gitmoot agent run <agent> --repo owner/repo "question or review request"
 gitmoot agent review <agent> --repo owner/repo --pr <number> "review request"
 gitmoot agent ask <agent> --repo owner/repo "question or instructions"
 gitmoot job list --repo owner/repo
@@ -152,13 +151,12 @@ gitmoot job gates clear <job-id> --need "<text>"|--all
 gitmoot job open --agent <name> --repo owner/repo --type ask|review|implement [--title "..."]
 gitmoot job close <job-id> --decision approved|changes_requested|blocked|implemented|failed [--severity P0|P1|P2|P3] [--summary "..."]
 gitmoot job record (--agent <name> | --acting-role <role>) --repo owner/repo --type ask|review|implement --decision implemented [--severity P0|P1|P2|P3] [--summary "..."]
-gitmoot job answer <job-id> "<question-id>: answer text" [--json]
 ```
 
 **Gitmoot does not dispatch implementation (#2203).** `agent implement`,
 `--action implement`, `task run`/`task recover`/`task resume-work`, `repo
-auto-fix`, and the implement heartbeat are gone; an `implement` delegation leg
-and a `/gitmoot <agent> implement` comment are refused. Seats implement in
+auto-fix`, and the implement heartbeat are gone; a `/gitmoot <agent> implement`
+comment is refused. Seats implement in
 their own session and record it — 568 of the last 570 implement rows were
 already exactly that:
 
@@ -173,31 +171,25 @@ only when the user explicitly wants a foreground process. `--repo owner/repo`
 SCOPES the daemon to a single repo: it polls only that repo's PRs and claims
 only that repo's queued jobs. Omit `--repo` to supervise every enabled
 registered repo from one daemon (#581). Both `daemon run` and `daemon start` accept `--session <root-job-id>`
-(alias `--root`) to pin the worker to one orchestration run: it then runs only
-jobs whose `root_job_id` matches that value plus the root coordinator job
+(alias `--root`) to pin the worker to one job tree: it then runs only
+jobs whose `root_job_id` matches that value plus the root job
 itself.
 
 Use `gitmoot agent prompt <agent-or-template>` when the user wants to reuse a
-Gitmoot agent prompt in the current chat. Use `gitmoot agent run` for
-coordinator delegation through a registered Gitmoot agent; Gitmoot will route to
-ask or review and own read-only worktrees and workflow advancement. To orchestrate an orchestra of agents,
-`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for `gitmoot agent run
-<agent> --background "..."`. Use `gitmoot agent ask` only for analysis, planning,
+Gitmoot agent prompt in the current chat. Use `gitmoot agent review` to dispatch
+a review through a registered Gitmoot agent; Gitmoot owns read-only worktrees
+and workflow advancement. Use `gitmoot agent ask` only for analysis, planning,
 or questions. Add `--background` only when the user wants a queued background
 job. This is the same agent registry and runtime adapter path used by PR-comment
 jobs; the plugin only helps the runtime discover this skill and does not replace
 the `gitmoot` CLI.
 
-Use `gitmoot job answer <job-id> "<question-id>: text"` to resume a job paused at
-`awaiting_human`; it routes through the same escalation-resume path the daemon's
-PR-comment `answer` verb uses.
-
 Use `gitmoot runtime list` to inspect runtime metadata.
 
 Use `gitmoot workflow list`, `gitmoot workflow show`, and `gitmoot workflow note`
 for external-coordinator workflow groups.
-Attach `--workflow <label>` to agent ask/run/review, orchestrate, or
-`job open`; orchestration descendants inherit the label automatically.
+Attach `--workflow <label>` to agent ask/review or
+`job open`.
 
 ## PR Comment Commands
 
@@ -211,7 +203,6 @@ Use GitHub PR comments as the public audit trail:
 /gitmoot retry <job-id>
 /gitmoot cancel <job-id>
 /gitmoot merge
-/gitmoot resume <job-id> retry|continue|abort|answer [instructions]
 @<agent> ask|review [instructions]
 ```
 
@@ -225,18 +216,6 @@ gitmoot agent start thermo-review \
   --repo owner/repo \
   --template thermo-nuclear-code-quality-review \
   --start-daemon
-```
-
-Coordinator recipes are built-in templates for the Orchestra pattern: a
-coordinator that fans work out to ephemeral workers (no pre-registration) and
-reconvenes them in one continuation. `review-panel` convenes a panel of
-diverse-lens reviewers over a PR and synthesizes their verdict; `verifier` is
-the minimal one-producer + independent-verify pair. Route any coordinator agent
-through a recipe with the `--recipe` flag on `gitmoot orchestrate`:
-
-```sh
-gitmoot orchestrate project-planner "Review PR #123 in this repo." --repo owner/repo --recipe review-panel
-gitmoot orchestrate project-planner "Produce the export-feature migration plan and prove it is complete." --repo owner/repo --recipe verifier
 ```
 
 Start an agent against an installed custom prompt template:
@@ -278,16 +257,14 @@ object:
     "findings": [],
     "changes_made": [],
     "tests_run": [],
-    "needs": [],
-    "delegations": []
+    "needs": []
   }
 }
 ```
 
 Use `blocked` when work cannot continue without human input or external state.
 Use `failed` when the attempted action errored. Do not report tests, changes, or
-approvals that were not actually verified. Use `delegations` to request follow-up
-work by named Gitmoot agents.
+approvals that were not actually verified.
 
 ## Safety Rules
 A read-only review seat is handed an immutable, daemon-owned COPY of the

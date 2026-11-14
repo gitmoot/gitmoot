@@ -57,71 +57,28 @@ and decision-complete task breakdowns.
 When you plan under a coordinator or an org workflow, the plan is not finished
 until it is recorded and approved. Post the completed plan with
 `gitmoot workflow note <label> "..."`, report the entry id the CLI prints as
-the plan-id, and STOP. Do not implement and do not emit implement delegations
-until an explicit approval referencing that plan-id reaches you — in org mode
+the plan-id, and STOP. Do not implement until an explicit approval
+referencing that plan-id reaches you — in org mode
 an authorized `message directive`, otherwise an explicit human approval. Approval is never
 inferred from silence. Work outside the approved plan needs an amended plan
 and a fresh approval, not silent expansion.
 
-## Coordinator Delegations
+## Managed Agent Result
 
-When you run as a managed coordinator agent, you orchestrate an orchestra of
-agents: as the conductor you return a `delegations[]` score, the players (child
-agents) run in parallel or in dependency order, and a finale (continuation)
-reconvenes and synthesizes the results. The conductor is this coordinator agent;
-the players are the delegated child agents; the score is the `delegations[]` DAG
-(its `deps` are the cues); the finale is the continuation job.
-
-When you run as a managed coordinator agent and want Gitmoot to fan work out to
-other named agents, return a top-level `delegations` array in your
-`gitmoot_result`. Gitmoot enqueues one child job per delegation and records a
-`delegation_enqueued` event on your job for each one.
-
-Each delegation requires four fields:
-
-- `id`: stable identifier for the delegation within this result.
-- `agent`: name of the Gitmoot agent to run.
-- `action`: job action — `ask` or `review`. An `implement` leg is refused with
-  the action named: Gitmoot does not dispatch implementation (#2203), so a seat
-  implements in its own session and records it with
-  `gitmoot job record --type implement`.
-- `prompt`: instructions for the delegated job.
-
-Optional advanced controls are also supported: `worktree`, `artifacts`, `deps`,
-`timeout`, `retry`, `failure_policy`, `fingerprint`, and `synthesis_rule`. A
-delegation with no `deps` is dispatched immediately and runs in parallel with
-its siblings; a delegation with `deps` runs only after every listed sibling has
-succeeded. Once all top-level delegations reach a terminal state, Gitmoot
-enqueues one coordinator continuation job so you can synthesize the results.
-
-See `references/RESULT_CONTRACT.md` for the full field reference. Example
-coordinator result that delegates two flat parallel jobs to different
-agents (it assumes the plan was already approved — or plan-waived — per
-the Plan Approval Gate above):
+When you run as a managed agent, report the plan in your `gitmoot_result`.
+Gitmoot does not fan work out to other agents for you: name follow-up work in
+`summary` and `needs`. See `references/RESULT_CONTRACT.md` for the full field
+reference. Example result:
 
 ```json
 {
   "gitmoot_result": {
     "decision": "approved",
-    "summary": "Approved plan 1234 received; delegating the design read and the plan review.",
+    "summary": "Plan recorded as workflow note 1234; awaiting approval before implementation.",
     "findings": [],
     "changes_made": [],
     "tests_run": [],
-    "needs": [],
-    "delegations": [
-      {
-        "id": "survey-api",
-        "agent": "backend-coder",
-        "action": "ask",
-        "prompt": "Survey the existing REST surface approved plan 1234 touches and report the exact files, handlers, and contracts an implementer must change."
-      },
-      {
-        "id": "review-plan",
-        "agent": "reviewer",
-        "action": "review",
-        "prompt": "Review the implementation plan for correctness and risk."
-      }
-    ]
+    "needs": []
   }
 }
 ```

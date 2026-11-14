@@ -16,14 +16,12 @@ import (
 	"github.com/gitmoot/gitmoot/internal/workflow"
 )
 
-// The checkout-bound git client backs every per-delegation worktree role; assert
-// at compile time so the engine's runtime type-assertions can never silently fall
-// back (which would skip read-only-fanout or #332 integration worktrees).
+// The checkout-bound git client backs the review worktree roles; assert at
+// compile time so the engine's runtime type-assertions can never silently fall
+// back.
 var (
-	_ workflow.WorktreeManager            = (*gitutil.Client)(nil)
-	_ workflow.ReadOnlyWorktreeManager    = (*gitutil.Client)(nil)
-	_ workflow.IntegrationWorktreeManager = (*gitutil.Client)(nil)
-	_ workflow.WorktreeCommitter          = (*gitutil.Client)(nil)
+	_ workflow.WorktreeManager         = (*gitutil.Client)(nil)
+	_ workflow.ReadOnlyWorktreeManager = (*gitutil.Client)(nil)
 )
 
 // daemonWorkflowEngine builds the per-tick/per-repo workflow.Engine. Its `home`
@@ -31,9 +29,9 @@ var (
 // (config.Paths.Home), NOT the raw --home. All three callers comply:
 // jobWorker.workflowHome() (resolves ConfigHome once), the registered-repo
 // supervisor (paths.Home), and local dispatch (paths.Home). The resolved root is
-// used verbatim for engine.ArtifactRoot, engine.Home, and daemonEventSink — none
-// of which re-resolve — so handing it the raw --home would misplace delegation
-// artifacts and the event-sink config probe.
+// used verbatim for engine.Home and daemonEventSink — neither of which
+// re-resolves — so handing it the raw --home would misplace worktrees and the
+// event-sink config probe.
 func daemonWorkflowEngine(store *db.Store, gh github.Client, checkout string, home string) workflow.Engine {
 	return daemonWorkflowEngineForRunner(store, gh, checkout, home, subprocess.ExecRunner{}, nil)
 }
@@ -57,15 +55,10 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		RequireWorkflowPolicy: requireWorkflowPolicyResolverRoot(home),
 		OrgPolicy:             orgPolicyResolverRoot(home),
 		MergeGate:             newDaemonMergeGate(store, gh, checkout, home, runner),
-		// escalate_human (#340): @-tag the human on the tree's PR/issue when a leg
-		// pauses awaiting a decision. Best-effort and nil-safe in the engine; the
-		// handle is filled in from policy by applyOrchestratePolicy.
-		EscalationNotifier: &daemonEscalationNotifier{Store: store, GitHub: gh},
 		// Outbound event stream: the engine emits job.finished/job.failed/
-		// job.blocked on its terminal Mailbox path and job.needs_attention on an
-		// escalate_human pause through this best-effort, nil-safe event-rule
-		// sink. The sink is cached per home and store, so re-building the engine
-		// per tick reuses it.
+		// job.blocked on its terminal Mailbox path through this best-effort,
+		// nil-safe event-rule sink. The sink is cached per home and store, so
+		// re-building the engine per tick reuses it.
 		EventSink: daemonEventSink(store, home),
 		// Registry default model/effort fallbacks: when a delivered job pins no
 		// agent/job override, fall back to the HOME-AWARE resolved runtime registry
@@ -83,11 +76,8 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		// to the documented default warn on any load error.
 		ResultCheckMode: resultChecksMode(home),
 	}
-	// Opt-in risk-tiered adaptive review (#650): copy the [review] policy onto the
-	// engine. Off by default (RiskTiersEnabled false), so the review fan-out is
-	// byte-identical unless a home config turns it on.
+	// Copy the [review] policy resolvers onto the engine.
 	applyReviewPolicy(&engine, home)
-	wireReviewRiskSignals(&engine, gh)
 	wireReviewPostMergeIssues(&engine, gh)
 	// The review-scope seam needs the daemon's CHECKOUT, not just the API client:
 	// no hosted compare response can prove its own file list is the whole range,
@@ -100,10 +90,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 	// consumers, so no future wiring can supply one side and not the other.
 	engine.LedgerResolvers = daemonLedgerResolvers(gh, checkout, runner)
 	if strings.TrimSpace(home) != "" {
-		// Root delegation artifacts under GITMOOT_HOME (alongside worktrees)
-		// rather than inside the repo checkout, so generated briefs stay out of
-		// the tracked tree and are never committed.
-		engine.ArtifactRoot = home
 		engine.CleanupRetention = func() (time.Duration, error) {
 			return config.LoadDelegationWorktreeTTL(config.Paths{ConfigFile: filepath.Join(home, "config.toml")})
 		}
@@ -134,130 +120,6 @@ func daemonWorkflowEngineForRunner(store *db.Store, gh github.Client, checkout s
 		engine.DelegationWorktrees = jobGitClient(checkout, runner)
 	}
 	return engine
-}
-
-// daemonEscalationNotifier implements workflow.EscalationNotifier (#340): when a
-// delegation tree pauses awaiting a human, it @-tags that human in a GitHub
-// comment on the tree's PR (or the issue carrying the coordinator) with the
-// resume instructions. Best-effort: any lookup/post failure is returned to the
-// engine, which already treats notifier errors as non-fatal (the pause itself is
-// durable via the task state + recorded event + dashboard Attention).
-type daemonEscalationNotifier struct {
-	Store  *db.Store
-	GitHub github.Client
-	// Handle is the configured escalation_handle (a GitHub login without the @).
-	// Empty falls back to the PR author, then the repo owner.
-	Handle string
-}
-
-func (n *daemonEscalationNotifier) NotifyEscalation(ctx context.Context, request workflow.EscalationRequest) error {
-	if n == nil || n.Store == nil || n.GitHub == nil {
-		return nil
-	}
-	repoFull := strings.TrimSpace(request.Repo)
-	pull := request.PullRequest
-	owner := ""
-	// The engine seam leaves PR/repo best-effort; the coordinator job's payload is
-	// the source of truth for both, so load it when either is missing.
-	if repoFull == "" || pull <= 0 {
-		if job, err := n.Store.GetJob(ctx, request.CoordinatorJobID); err == nil {
-			if payload, perr := daemonJobPayload(job); perr == nil {
-				if repoFull == "" {
-					repoFull = strings.TrimSpace(payload.Repo)
-				}
-				if pull <= 0 {
-					pull = payload.PullRequest
-				}
-			}
-		}
-	}
-	if repoFull == "" || pull <= 0 {
-		// No issue/PR to post on; the durable pause (state + event + Attention)
-		// still stands. Nothing to notify.
-		return nil
-	}
-	repo, err := github.ParseRepository(repoFull)
-	if err != nil {
-		return err
-	}
-	owner = repo.Owner
-
-	// Default @-handle: the configured escalation_handle, else the repo owner (the
-	// human who owns the tree). The PullRequest type carries no author field, so
-	// the owner is the available, always-present human to tag.
-	handle := strings.TrimPrefix(strings.TrimSpace(n.Handle), "@")
-	if handle == "" {
-		handle = owner
-	}
-
-	body := buildEscalationComment(handle, request)
-	_, err = n.GitHub.PostIssueComment(ctx, repo, int64(pull), body)
-	return err
-}
-
-// buildEscalationComment renders the @-tag escalation comment body (#340).
-//
-// The body must never begin a line with "@<handle>" or a bare "/gitmoot": the
-// daemon ingests comments on its own PRs, and ParseCommand treats a line whose
-// first token is "@<agent>" as a "@<agent> <action>" command — so a leading
-// "@<handle> Gitmoot paused…" would make the daemon post a spurious "unsupported
-// command action" ack on its own escalation notification. The human is mentioned
-// mid-line ("cc @<handle>"), which still notifies them on GitHub but is not
-// parsed as a command.
-func buildEscalationComment(handle string, request workflow.EscalationRequest) string {
-	if request.Ask {
-		return buildAskGateComment(handle, request)
-	}
-	var b strings.Builder
-	b.WriteString("Gitmoot paused a delegation tree awaiting your decision (escalate_human).\n")
-	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
-		b.WriteString("cc @" + h + "\n")
-	}
-	b.WriteString("\n")
-	if d := strings.TrimSpace(request.DelegationID); d != "" {
-		b.WriteString(fmt.Sprintf("- failing leg: `%s`\n", d))
-	}
-	if r := strings.TrimSpace(request.Reason); r != "" {
-		b.WriteString(fmt.Sprintf("- reason: %s\n", r))
-	}
-	if q := strings.TrimSpace(request.Question); q != "" {
-		b.WriteString(fmt.Sprintf("- question: %s\n", q))
-	}
-	b.WriteString("\nResume with one of:\n")
-	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s retry <instructions>` — re-run the failing leg with your guidance\n", request.CoordinatorJobID))
-	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s continue` — proceed the coordinator with what completed\n", request.CoordinatorJobID))
-	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s abort` — stop and synthesize a best-effort final result\n", request.CoordinatorJobID))
-	return b.String()
-}
-
-// buildAskGateComment renders the @-tag comment for a non-failure ask-gate pause
-// (#445): a HEALTHY coordinator returned human_questions[] to ask a specific
-// decision rather than guess. It quotes each question (id + prompt + choices) and
-// gives the `answer` resume verb instead of the failure verbs. Like
-// buildEscalationComment it never begins a line with "@<handle>" or "/gitmoot"
-// (the human is mentioned mid-line) so the daemon does not parse its own
-// notification as a command.
-func buildAskGateComment(handle string, request workflow.EscalationRequest) string {
-	var b strings.Builder
-	b.WriteString("Gitmoot paused a job awaiting your answer to a question (no work failed; the agent chose to ask instead of guess).\n")
-	if h := strings.TrimPrefix(strings.TrimSpace(handle), "@"); h != "" {
-		b.WriteString("cc @" + h + "\n")
-	}
-	b.WriteString("\nQuestions:\n")
-	if len(request.Questions) > 0 {
-		for _, q := range request.Questions {
-			line := fmt.Sprintf("- `%s`: %s", strings.TrimSpace(q.ID), strings.TrimSpace(q.Prompt))
-			if len(q.Choices) > 0 {
-				line += fmt.Sprintf(" (choices: %s)", strings.Join(q.Choices, ", "))
-			}
-			b.WriteString(line + "\n")
-		}
-	} else if q := strings.TrimSpace(request.Question); q != "" {
-		b.WriteString(q + "\n")
-	}
-	b.WriteString("\nAnswer with:\n")
-	b.WriteString(fmt.Sprintf("- `/gitmoot resume %s answer \"<id>: your answer\"` — one `<id>: ...` line per question\n", request.CoordinatorJobID))
-	return b.String()
 }
 
 type daemonMergeGate struct {

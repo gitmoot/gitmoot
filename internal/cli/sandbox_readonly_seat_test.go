@@ -91,7 +91,7 @@ func (r *repairStateRunner) RunEnv(_ context.Context, _ string, env []string, co
 			return subprocess.Result{}, errors.New("repair delivery lost first-delivery state")
 		}
 		r.repairStateObserved = true
-		return subprocess.Result{Command: command, Args: args, Stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`)}, nil
+		return subprocess.Result{Command: command, Args: args, Stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`)}, nil
 	default:
 		return subprocess.Result{}, errors.New("unexpected extra repair delivery")
 	}
@@ -122,7 +122,7 @@ func (r *renameRuntimeStateRunner) RunEnv(_ context.Context, _ string, env []str
 	return subprocess.Result{
 		Command: command,
 		Args:    args,
-		Stdout:  readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"state moved","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`),
+		Stdout:  readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"state moved","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`),
 	}, nil
 }
 
@@ -409,7 +409,7 @@ func TestWorkerReadOnlyReviewRewrapsToolCacheAndTranscript(t *testing.T) {
 		WorktreePath: checkout, ReadOnlySeat: true, Model: readOnlySeatOmpModel,
 	})
 	runner := &streamingReviewRunner{
-		stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"reviewer adapter rewrap probe","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`),
+		stdout: readOnlySeatOmpStdout(`{"gitmoot_result":{"decision":"approved","summary":"reviewer adapter rewrap probe","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}`),
 	}
 	var workerOutput bytes.Buffer
 	worker := defaultJobWorker(store, &workerOutput, home)

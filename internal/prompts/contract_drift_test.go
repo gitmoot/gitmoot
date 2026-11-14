@@ -70,10 +70,6 @@ var normalizationOwnedResultFields = map[string]string{
 	// agent to assert its own provenance, which is the one thing it must not do:
 	// normalization overwrites any supplied value for exactly that reason.
 	"evidence_declared": "assigned by result normalization from the producer's own silence, never requested from an agent",
-	// Kept on AgentResult only to read historical results (#2588): agents are
-	// no longer offered delegation, and a result carrying delegations fails
-	// the result check.
-	"delegations": "no longer offered to agents; kept only to read historical results",
 	// Only ever required by delegations that requested artifacts (#2588).
 	"artifact_body": "only required by delegations, which are no longer offered to agents",
 }
@@ -86,7 +82,6 @@ func contractFieldNames() []string {
 		}
 		fields = append(fields, field)
 	}
-	fields = append(fields, jsonFieldNames(workflow.HumanQuestion{})...)
 	return fields
 }
 
@@ -104,8 +99,8 @@ func TestNormalizationOwnedFieldsStayOutOfThePrompt(t *testing.T) {
 }
 
 // TestContractFieldsCoveredInJobPrompt is the load-bearing drift guard: every
-// offered JSON field of AgentResult and HumanQuestion must be
-// named in the rendered job prompt. Adding a field to any of those structs
+// offered JSON field of AgentResult must be named in the rendered job prompt.
+// Adding a field to the struct
 // without teaching the generator (and thus the prompt) about it fails here.
 func TestContractFieldsCoveredInJobPrompt(t *testing.T) {
 	prompt := renderedJob()

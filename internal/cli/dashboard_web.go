@@ -744,8 +744,8 @@ func resolveWorkflowPayloadDeps(job db.Job, payload workflow.JobPayload, childre
 	return deps
 }
 
-// Job returns a single node by job id, resolving its delegation deps against the
-// parent's settled result and sibling children (the same mapping State uses).
+// Job returns a single node by job id, resolving its historical delegation deps
+// against its sibling children (the same mapping State uses).
 func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, error) {
 	var node dashboard.Node
 	err := withStore(d.home, func(store *db.Store) error {
@@ -763,16 +763,12 @@ func (d *webDataSource) Job(ctx context.Context, jobID string) (dashboard.Node, 
 		var deps []string
 		var action string
 		if pj := strings.TrimSpace(job.ParentJobID); pj != "" && strings.TrimSpace(job.DelegationID) != "" {
-			if parent, perr := store.GetJob(ctx, pj); perr == nil {
-				pp, _ := workflow.DecodeJobPayload(parent)
-				meta := parentDelegMeta(pp)[job.DelegationID]
-				action = meta.action
-				if siblings, serr := store.ListJobsByParent(ctx, pj); serr == nil {
-					delegToJob := delegationJobIDs(siblings)
-					for _, dep := range meta.deps {
-						if id := delegToJob[strings.TrimSpace(dep)]; id != "" {
-							deps = append(deps, id)
-						}
+			action = job.Type
+			if siblings, serr := store.ListJobsByParent(ctx, pj); serr == nil {
+				delegToJob := delegationJobIDs(siblings)
+				for _, dep := range payload.Deps {
+					if id := delegToJob[strings.TrimSpace(dep)]; id != "" {
+						deps = append(deps, id)
 					}
 				}
 			}
@@ -2195,42 +2191,22 @@ func buildDashboardNode(job db.Job, payload workflow.JobPayload, events []db.Job
 	return node
 }
 
-// resolveDelegationEdges returns a child job's sibling-job-id deps and its
-// delegation action, read from the parent coordinator's settled result. A
-// non-delegation job (originating coordinator / continuation) yields no deps.
+// resolveDelegationEdges returns a historical delegation child's sibling-job-id
+// deps (from its own payload's recorded Deps) and its action (the job type). A
+// non-delegation job yields no deps.
 func resolveDelegationEdges(job db.Job, payloadByID map[string]workflow.JobPayload, childrenByParent map[string][]db.Job) ([]string, string) {
 	pj := strings.TrimSpace(job.ParentJobID)
-	delegID := strings.TrimSpace(job.DelegationID)
-	if pj == "" || delegID == "" {
+	if pj == "" || strings.TrimSpace(job.DelegationID) == "" {
 		return nil, ""
 	}
-	meta := parentDelegMeta(payloadByID[pj])[delegID]
 	delegToJob := delegationJobIDs(childrenByParent[pj])
 	var deps []string
-	for _, dep := range meta.deps {
+	for _, dep := range payloadByID[job.ID].Deps {
 		if id := delegToJob[strings.TrimSpace(dep)]; id != "" {
 			deps = append(deps, id)
 		}
 	}
-	return deps, meta.action
-}
-
-// delegMeta is a delegation's declared action and deps, read from its parent's
-// settled result.
-type delegMeta struct {
-	action string
-	deps   []string
-}
-
-// parentDelegMeta indexes a coordinator's settled delegations by delegation id.
-func parentDelegMeta(parent workflow.JobPayload) map[string]delegMeta {
-	m := map[string]delegMeta{}
-	if parent.Result != nil {
-		for _, dgn := range parent.Result.Delegations {
-			m[dgn.ID] = delegMeta{action: dgn.Action, deps: dgn.Deps}
-		}
-	}
-	return m
+	return deps, job.Type
 }
 
 // delegationJobIDs maps each child's delegation id to its job id so declared

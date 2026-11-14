@@ -26,7 +26,7 @@ func largeReview(t *testing.T, extra string) string {
 		extra = "," + extra
 	}
 	return `{"gitmoot_result":{"decision":"changes_requested","severity":"P2","summary":"many findings",` +
-		`"findings":` + string(encoded) + `,"changes_made":[],"tests_run":[],"needs":[],"delegations":[]` + extra + `}}`
+		`"findings":` + string(encoded) + `,"changes_made":[],"tests_run":[],"needs":[]` + extra + `}}`
 }
 
 // The usmle-app incident (message 366736): a finished review over 12 KB with one

@@ -57,7 +57,7 @@ func TestNativeReviewWorkerRunsInOwnedExactHeadWorktree(t *testing.T) {
 		t.Fatalf("scheduled job is not a native workflow review: %+v", job)
 	}
 
-	runner := &sandboxAdapterCaptureRunner{stdout: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[],"delegations":[]}}`}
+	runner := &sandboxAdapterCaptureRunner{stdout: `{"gitmoot_result":{"decision":"approved","summary":"exact head reviewed","findings":[],"changes_made":[],"tests_run":["exact-head smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
 	worker.AdapterFactory = func(agent runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -208,7 +208,7 @@ func TestNativeReviewWorktreePreparationCoversHighRiskLensChild(t *testing.T) {
 		t.Fatalf("GetJob: %v", err)
 	}
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"correctness lens reviewed","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"correctness lens reviewed","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	var deliveredCheckout, deliveredHead string
 	worker.AdapterFactory = func(_ runtime.Agent, checkout string) (workflow.DeliveryAdapter, error) {
@@ -480,7 +480,7 @@ func TestNativeReviewWorktreeContentionDefersInsteadOfBurningTheLeg(t *testing.T
 		t.Fatalf("GetJob: %v", err)
 	}
 
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"re-attempted after contention","findings":[],"changes_made":[],"tests_run":["retry smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"re-attempted after contention","findings":[],"changes_made":[],"tests_run":["retry smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
@@ -636,7 +636,7 @@ func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJob: %v", err)
 	}
-	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"lens re-attempted after contention","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[],"delegations":[]}}`}
+	adapter := &cliWorkerFakeAdapter{output: `{"gitmoot_result":{"decision":"approved","summary":"lens re-attempted after contention","findings":[],"changes_made":[],"tests_run":["lens smoke"],"needs":[]}}`}
 	worker := defaultJobWorker(store, io.Discard, home)
 	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
 		return adapter, nil
@@ -693,149 +693,5 @@ func TestNativeReviewWorktreeContentionDefersLensChild(t *testing.T) {
 	}
 	if strings.TrimSpace(after.WorktreePath) == "" || !after.ReadOnlyWorktree {
 		t.Fatalf("re-attempted lens child payload = %+v, want the exact-head worktree it was denied", after)
-	}
-}
-
-// TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild is the other side of
-// the narrowing above, for the LENS CHILD class specifically:
-// TestNativeReviewWorktreeHardFailureStaysTerminal proves a non-transient allocation
-// failure settles terminally for a routine leg, but the ParentJobID exclusion is what
-// used to guarantee that for a child, and this round removes it for one typed family.
-// A head the checkout does not carry and cannot fetch must therefore STILL run the
-// DAG's terminal routing — finishQueuedJob(JobFailed) → finalizePreflightDelegationChild
-// — rather than be held on a hold that can never clear.
-//
-// MUTATION PROOF: replace deferPreDeliveryAllocationContention's typed guard with a
-// bare `true` and this child is held queued with no synthetic verdict instead of
-// failing.
-func TestNativeReviewWorktreeHardFailureStaysTerminalForLensChild(t *testing.T) {
-	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	sharedCheckout, _, _ := readonlyReviewWorktreeGitCheckout(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	const parentID = "review-coordinator/task-1698/review-1"
-	const jobID = parentID + "/delegation/correctness"
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
-		PullRequest: 1698, HeadSHA: "0123456789abcdef0123456789abcdef01234567", TaskID: "task-1698",
-		TaskTitle: "Unreachable head lens child", LeadAgent: "implementer", Reviewers: []string{"reviewer"},
-		ReviewRound: "review-1", ParentJobID: parentID, DelegationID: "correctness",
-		DelegationDepth: 1, Instructions: "Review the correctness lens at the exact head.",
-	})
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatalf("GetJob: %v", err)
-	}
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
-		return nil, errors.New("adapter must never be built for an unallocatable head")
-	}
-	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
-	}
-	// The parent coordinator row is deliberately absent, so AdvanceJob's parent
-	// lookup is the LAST step of the terminal routing and its error is the witness
-	// that the routing ran end to end. Everything before it — the queued→failed
-	// transition and the synthetic verdict — is asserted directly below.
-	runErr := worker.run(ctx, job)
-	reloaded, payload := blockerE2EJobPayload(t, store, jobID)
-	if reloaded.State != string(workflow.JobFailed) {
-		t.Fatalf("unallocatable-head lens child state = %q, want failed (run err=%v)", reloaded.State, runErr)
-	}
-	if payload.BlockerClass != "" || payload.BlockerRetryAt != "" {
-		t.Fatalf("unallocatable-head lens child was HELD: %+v", payload)
-	}
-	if blockerE2EHasEventKind(t, store, jobID, blockerDeferredEventKind) {
-		t.Fatal("a non-transient allocation failure recorded a blocker_deferred event for the lens child")
-	}
-	// The DAG's terminal routing must still fire: a synthetic failed verdict is what
-	// lets the parent's failure_policy run instead of stranding the round (#409).
-	if payload.Result == nil || payload.Result.Decision != "failed" {
-		t.Fatalf("unallocatable-head lens child result = %+v, want a synthetic failed verdict", payload.Result)
-	}
-	if !blockerE2EHasEventKind(t, store, jobID, "delegation_refused_finalized") {
-		t.Fatal("unallocatable-head lens child never ran finalizePreflightDelegationChild")
-	}
-	if runErr == nil || !strings.Contains(runErr.Error(), parentID) {
-		t.Fatalf("worker.run err = %v, want the absent-parent error proving the DAG advance was attempted", runErr)
-	}
-}
-
-// TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded is the ceiling on the
-// narrowing: a deferred lens child must not hold the coordinator forever. Nothing
-// else can terminalize it while it waits — the engine's finalizeTimedOutJob switch
-// (engine_run_budgets.go) accepts only JobRunning/JobFailed/JobBlocked, so neither
-// FinalizeTimedOutJob nor FinalizeTimedOutDelegationChild touches a QUEUED held
-// child. The only bound is maxOperationalBlockerRetries, shared with every other
-// blocker class: three holds, then blocker_exhausted and the SAME terminal DAG
-// routing the child has today.
-//
-// MUTATION PROOF: drop the `attempt > maxOperationalBlockerRetries` branch from
-// holdCheckoutContention and the fourth run holds again instead of settling.
-func TestNativeReviewWorktreeContentionOnLensChildIsBudgetBounded(t *testing.T) {
-	ctx := context.Background()
-	store, home := blockerE2EHome(t)
-	sharedCheckout, reviewHead, _ := readonlyReviewWorktreeGitCheckout(t)
-	seedDaemonWorkerRepo(t, store, "owner/repo", sharedCheckout)
-	seedDaemonWorkerAgentWithPolicy(t, store, "reviewer", runtime.ShellRuntime, "true", []string{"review"}, "owner/repo", runtime.AutonomyPolicyReadOnly)
-	const parentID = "review-coordinator/task-1698/review-1"
-	const jobID = parentID + "/delegation/correctness"
-	enqueueDaemonWorkerJob(t, store, workflow.JobRequest{
-		ID: jobID, Agent: "reviewer", Action: "review", Repo: "owner/repo", Branch: "feature/review",
-		PullRequest: 1698, HeadSHA: reviewHead, TaskID: "task-1698", TaskTitle: "Wedged lock lens child",
-		LeadAgent: "implementer", Reviewers: []string{"reviewer"}, ReviewRound: "review-1",
-		ParentJobID: parentID, DelegationID: "correctness", DelegationDepth: 1,
-		Instructions: "Review the correctness lens at the exact head.",
-	})
-	worker := defaultJobWorker(store, io.Discard, home)
-	worker.AdapterFactory = func(_ runtime.Agent, _ string) (workflow.DeliveryAdapter, error) {
-		return nil, errors.New("adapter must never be built while the lock is wedged")
-	}
-	worker.WorkflowFactory = func(checkout string) workflow.Engine {
-		return daemonWorkflowEngine(store, githubtest.NoopClient{}, checkout, worker.workflowHome())
-	}
-	// The lock is never released: the worst case the narrowing has to survive.
-	if _, err := workflow.AcquireCheckoutMutationLock(ctx, store, sharedCheckout, "wedged-worker", time.Now().UTC()); err != nil {
-		t.Fatalf("AcquireCheckoutMutationLock: %v", err)
-	}
-	for attempt := 1; attempt <= maxOperationalBlockerRetries; attempt++ {
-		job, err := store.GetJob(ctx, jobID)
-		if err != nil {
-			t.Fatalf("GetJob before attempt %d: %v", attempt, err)
-		}
-		if err := worker.run(ctx, job); err != nil {
-			t.Fatalf("worker.run attempt %d: %v", attempt, err)
-		}
-		held, payload := blockerE2EJobPayload(t, store, jobID)
-		if held.State != string(workflow.JobQueued) || payload.BlockerAttempts != attempt {
-			t.Fatalf("attempt %d: state=%q attempts=%d, want queued with attempts=%d", attempt, held.State, payload.BlockerAttempts, attempt)
-		}
-		if payload.Result != nil {
-			t.Fatalf("attempt %d advanced the delegation DAG with result %+v", attempt, payload.Result)
-		}
-	}
-	// Budget spent: the next attempt must settle terminally and hand the round back
-	// to the delegation DAG rather than hold a fourth time.
-	job, err := store.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatalf("GetJob before the exhausting attempt: %v", err)
-	}
-	runErr := worker.run(ctx, job)
-	settled, payload := blockerE2EJobPayload(t, store, jobID)
-	if settled.State != string(workflow.JobFailed) {
-		t.Fatalf("state after the budget was spent = %q, want failed (run err=%v)", settled.State, runErr)
-	}
-	if payload.BlockerAttempts != maxOperationalBlockerRetries {
-		t.Fatalf("blocker attempts = %d, want the budget %d (a fourth hold was written)", payload.BlockerAttempts, maxOperationalBlockerRetries)
-	}
-	if !blockerE2EHasEventKind(t, store, jobID, blockerExhaustedEventKind) {
-		t.Fatalf("missing %s event: the hold ran past its ceiling silently", blockerExhaustedEventKind)
-	}
-	if payload.Result == nil || payload.Result.Decision != "failed" {
-		t.Fatalf("exhausted lens child result = %+v, want the synthetic failed verdict that releases the coordinator", payload.Result)
-	}
-	if runErr == nil || !strings.Contains(runErr.Error(), parentID) {
-		t.Fatalf("worker.run err = %v, want the absent-parent error proving the DAG advance was attempted", runErr)
 	}
 }

@@ -335,7 +335,7 @@ func TestSupervisorBusyBranchRunsTheRecoveryPoll(t *testing.T) {
 	started := filepath.Join(stateDir, "started")
 	release := filepath.Join(stateDir, "release")
 	script := fmt.Sprintf(
-		`printf started > %q; while [ ! -e %q ]; do sleep 0.05; done; printf '%%s\n' '{"gitmoot_result":{"decision":"approved","summary":"released","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}'`,
+		`printf started > %q; while [ ! -e %q ]; do sleep 0.05; done; printf '%%s\n' '{"gitmoot_result":{"decision":"approved","summary":"released","findings":[],"changes_made":[],"tests_run":[],"needs":[]}}'`,
 		started,
 		release,
 	)

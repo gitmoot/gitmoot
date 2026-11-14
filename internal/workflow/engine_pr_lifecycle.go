@@ -190,38 +190,6 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 		}
 		reviewScopes = nil
 	}
-	// Opt-in risk-tiered adaptive review (#650). When RiskTiersEnabled, classify
-	// the PR (label > path > default). A `high` tier replaces the single native
-	// fan-out with a refutation-lens delegation batch synthesized by the EXISTING
-	// risk tiers off (the default) the classifier is never called and the
-	// single-review path below is byte-identical.
-	if e.RiskTiersEnabled {
-		labels, changedPaths := event.Labels, event.ChangedPaths
-		// The in-process implement->PR trigger carries no GitHub file data. Resolve
-		// the classifier's signals through the best-effort seam when the event has
-		// none and the seam is wired.
-		if len(labels) == 0 && len(changedPaths) == 0 && e.PullRequestSignals != nil && event.PullRequest > 0 {
-			l, p, err := e.PullRequestSignals(ctx, event.Repo, event.PullRequest)
-			if err != nil {
-				// The signals are UNKNOWN this poll (a transient GitHub error). Do NOT
-				// fall through to the routine single-review fan-out: committing this head
-				// to a routine review job would let a later poll (seam recovered ->
-				// `high`) dispatch the lens quorum onto the SAME review round, so a routine
-				// single review and the high-risk lens quorum would coexist and the routine
-				// reviewer's approval could drive the merge gate without ever satisfying the
-				// adversarial quorum. Defer classification to the next poll instead: the
-				// daemon re-fires HandlePullRequestOpened at the same head, and the routine
-				// path stays reachable if the seam keeps resolving `routine`. Only record
-				// the PR baseline (idempotent) so nothing is dispatched this poll.
-				return e.recordPullRequestBaseline(ctx, event)
-			}
-			labels, changedPaths = l, p
-		}
-		classification := ClassifyRisk(e.HighRiskPaths, e.RiskLabelHigh, e.RiskLabelRoutine, labels, changedPaths)
-		if classification.Tier == RiskTierHigh {
-			return e.dispatchHighRiskReview(ctx, event, reviewers, reviewScopes, classification, reviewRound, ref)
-		}
-	}
 	// A reviewer that already HAS a review job at this exact head and round gets no
 	// second one, whatever state that job is in. The deterministic id encodes
 	// reviewer + head + round, but the idempotent-enqueue collision check compares
@@ -410,6 +378,15 @@ func (e Engine) prepareNativeReviewWorktree(ctx context.Context, request JobRequ
 	return request, true, nil
 }
 
+// PullRequestFetcher fetches a pull request's head ref (pull/<n>/head) into the
+// bound checkout. It is an OPTIONAL capability of a worktree manager: the
+// checkout-bound gitutil.Client satisfies it, an in-memory test manager need
+// not. allocateNativeReviewWorktree uses it to recover a cold checkout that
+// lacks the exact PR head object.
+type PullRequestFetcher interface {
+	FetchPullRequest(ctx context.Context, remote string, number int) error
+}
+
 // allocateNativeReviewWorktree creates the detached worktree at the review head,
 // retrying once after fetching pull/<n>/head. It uses the SHORT
 // ReadOnlyWorktreeDispatchLockWaitBudget, like every other pre-enqueue read-only
@@ -460,98 +437,6 @@ func (e Engine) releaseNativeReviewWorktree(ctx context.Context, path string) {
 		return
 	}
 	_ = manager.RemoveWorktreeForce(ctx, path)
-}
-
-// dispatchHighRiskReview replaces the single native review fan-out with a
-// refutation-lens delegation batch for a PR classified `high` (#650). It seeds a
-// synthetic, already-completed review COORDINATOR job whose result carries the
-// lens delegations (each tagged synthesis_rule "quorum") and then invokes the
-// EXISTING delegation dispatcher — so the fan-out, the deps machinery, and the
-// cross-lens synthesis are all the same engine the coordinator-returns-delegations
-// path uses, never a bespoke synthesis. When every lens approves, the quorum is
-// satisfied and the coordinator continuation is enqueued; when ANY lens reports a
-// critical refutation (a `blocked` decision, a NON-approving quorum outcome) the
-// quorum fails and the shared task is blocked — the explicit "blocks on a critical
-// refutation or a failed quorum" acceptance behavior.
-//
-// It is idempotent against the daemon's re-poll: the coordinator id is derived
-// from the stable review round for this head SHA, and the lens children are
-// review jobs the daemon's PR-watcher routing already recognizes, so a re-poll at
-// the same head never re-dispatches.
-func (e Engine) dispatchHighRiskReview(ctx context.Context, event PullRequestEvent, reviewers []string, reviewScopes map[reviewScopeKey]*ReviewScope, classification RiskClassification, round string, ref taskRef) error {
-	coordID := "review-coordinator/" + event.Branch + "/" + round
-	if _, err := e.Store.GetJob(ctx, coordID); err == nil {
-		// Already dispatched for this head SHA/round: idempotent no-op.
-		return nil
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-
-	// #1850 round 2 F4: the lens path writes to the ledger via AdvanceJob, so it
-	// must disclose the ledger too or its rounds cannot discharge what the gate
-	// will demand.
-	delegations := highRiskLensDelegations(reviewers, event, reviewScopes,
-		e.ledgerObligationBrief(ctx, event.Repo, event.PullRequest, event.HeadSHA, event.TaskID))
-	if len(delegations) < 2 {
-		// Defensive: no reviewers to fan out to. Fall back to recording the baseline
-		// rather than silently dropping the PR (should not happen — callers guarantee
-		// len(reviewers) >= 1, which yields >= 2 lenses).
-		return e.recordPullRequestBaseline(ctx, event)
-	}
-
-	coordPayload := JobPayload{
-		// #1250: the high-risk path diverts BEFORE the ordinary attributed request
-		// loop, so without this the lens children inherit an empty coordinator
-		// payload and the whole risk-tiered branch stays unattributed.
-		ActingOrgRole: event.ActingOrgRole,
-		Repo:          event.Repo,
-		Branch:        event.Branch,
-		PullRequest:   event.PullRequest,
-		HeadSHA:       event.HeadSHA,
-		GoalID:        event.GoalID,
-		TaskID:        event.TaskID,
-		TaskTitle:     event.TaskTitle,
-		LeadAgent:     event.LeadAgent,
-		Reviewers:     reviewers,
-		ReviewRound:   round,
-		Sender:        event.Sender,
-		DispatchedBy:  event.DispatchedBy,
-		Instructions: fmt.Sprintf(
-			"Synthesize the high-risk adversarial review of pull request #%d for task %s from the lens findings below.",
-			event.PullRequest, taskLabel(event.TaskID, event.TaskTitle),
-		),
-		RiskTier: classification.Tier,
-		Result: &AgentResult{
-			Decision:    "approved",
-			Summary:     "high-risk adversarial lens fan-out",
-			Delegations: delegations,
-		},
-	}
-	encoded, err := marshalPayload(coordPayload)
-	if err != nil {
-		return err
-	}
-	coordJob := db.Job{
-		ID:      coordID,
-		Agent:   event.LeadAgent,
-		Type:    "review_coordinator",
-		State:   string(JobSucceeded),
-		Payload: encoded,
-	}
-	if err := e.Store.CreateJobWithEvent(ctx, coordJob, db.JobEvent{
-		JobID:   coordID,
-		Kind:    "risk_tier_resolved",
-		Message: fmt.Sprintf("risk tier %q (%s): %s", classification.Tier, classification.Source, classification.Reason),
-	}); err != nil {
-		return err
-	}
-	if err := e.dispatchDelegations(ctx, coordJob, coordPayload, ref); err != nil {
-		return err
-	}
-	if err := e.setTaskState(ctx, ref, TaskReviewing); err != nil {
-		return err
-	}
-	return e.recordPullRequestBaseline(ctx, event)
 }
 
 func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullRequestEvent) error {

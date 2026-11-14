@@ -4,7 +4,6 @@ package prompts
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"unicode/utf8"
 )
@@ -18,7 +17,6 @@ type JobPrompt struct {
 	Action                 string
 	Instructions           string
 	Constraints            []string
-	DelegationArtifactDir  string
 	TemplateID             string
 	TemplateResolvedCommit string
 	TemplateInstructions   string
@@ -57,18 +55,6 @@ func RenderJob(prompt JobPrompt) string {
 				builder.WriteByte('\n')
 			}
 		}
-	}
-
-	if dir := strings.TrimSpace(prompt.DelegationArtifactDir); dir != "" {
-		builder.WriteString("\nDelegation artifacts:\n")
-		builder.WriteString("This job was delegated by a coordinator that shared context on disk.\n")
-		builder.WriteString("Read these files for the shared brief and the wider delegation batch before acting:\n")
-		builder.WriteString("- ")
-		builder.WriteString(filepath.Join(dir, "brief.md"))
-		builder.WriteByte('\n')
-		builder.WriteString("- ")
-		builder.WriteString(filepath.Join(dir, "context-manifest.json"))
-		builder.WriteByte('\n')
 	}
 
 	builder.WriteString("\nRequired output:\n")

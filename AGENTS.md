@@ -282,7 +282,7 @@ boundary — component tests miss the home double-resolution bug class (#446/#45
 - Pipelines were retired in #2542; they live in
   [stagehand](https://github.com/gitmoot/stagehand). There is no
   `internal/pipeline/` package and no `gitmoot pipeline` command.
-- `internal/workflow/` — the job/delegation engine, mailbox, memory controller,
+- `internal/workflow/` — the job engine, mailbox, memory controller,
   and the `gitmoot_result` contract.
 - `internal/runtime/` — the omp/shell adapters.
 - `internal/config/` — config loaders (`init.go` holds the `DefaultConfig`
@@ -338,7 +338,7 @@ portable code behavior.
 - **Never re-resolve an already-resolved home** (`<home>/.gitmoot/.gitmoot` →
   silent nil; the #446/#459 bug class). Use the dual-mode resolver.
 - Manage the live daemon via `systemctl --user`, never `gitmoot daemon restart`.
-- In E2E/orchestrate set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
+- In E2E set `HERDR_SOCKET_PATH=/tmp/throwaway` and unset `HERDR_ENV`
   or panes leak to the prod Telegram group.
 - Global flags like `--home` use Go flag parsing, so they must precede positional
   args (e.g. `agent template --home /tmp/h show <id>`, not after the id).
@@ -359,17 +359,13 @@ portable code behavior.
 
 gitmoot runs agents through registered runtimes — **omp** for every job
 (`gitmoot agent start --runtime omp`), plus subscribe-only `shell` for no-LLM tests.
-Jobs return a `gitmoot_result` JSON object, and agents can fan work out via a
-validated `delegations[]` DAG with a coordinator continuation job (the
-**Orchestra** pattern), bounded by depth, a per-root job budget, and loop
-detection.
-`gitmoot orchestrate <agent> "..." [--repo R]` is sugar for
-`gitmoot agent run <agent> --background "..."`. Contracts:
+Reviews and asks run as throwaway sessions that return one `gitmoot_result`
+JSON object; gitmoot records it and the job ends. There is no fan-out, no
+coordinator continuation, and no `orchestrate` / `agent run`: a result carrying
+`delegations` or `human_questions` is refused. Contracts:
 
-- `skills/gitmoot/references/RESULT_CONTRACT.md` — `gitmoot_result` + the
-  `delegations` fields and termination bounds.
-- `skills/gitmoot/references/SAFETY.md` — checkout/runtime locks and
-  delegation termination bounds.
+- `skills/gitmoot/references/RESULT_CONTRACT.md` — the `gitmoot_result` fields.
+- `skills/gitmoot/references/SAFETY.md` — checkout/runtime locks.
 - `skills/gitmoot/SKILL.md` — the entry point for the Gitmoot agent skill.
 
 ## Deploy recipe (this host)

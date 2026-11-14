@@ -1,7 +1,6 @@
 package workflow
 
 import (
-	"context"
 	"strings"
 )
 
@@ -84,36 +83,4 @@ func costFromTokens(model string, inputTokens, outputTokens int) float64 {
 	}
 	p := priceForModel(model)
 	return float64(inputTokens)*p.InputPerToken + float64(outputTokens)*p.OutputPerToken
-}
-
-// sumRootDelegationCost sums the USD cost across an entire coordination tree —
-// the originating coordinator (self-rooted to rootID) plus every child or
-// continuation whose root_id points back at it — by pricing each job's measured
-// token usage through priceForModel(payload.Model). It is the cost analogue of
-// sumRootDelegationTokens (#338 Part B). Unlike the count/token sums it cannot be
-// pushed fully into SQL (per-job pricing needs payload.Model), so it uses
-// ListJobsByRoot (#420): an indexed lookup that returns exactly the tree, then
-// unmarshals only those payloads instead of scanning and unmarshalling the whole
-// table. The grouping key is identical (root_id denormalizes the old
-// payload.RootJobID filter), so the total is byte-identical.
-//
-// Cost is measured accounting derived from the same per-job token counts the
-// token budget already sums (db.Job.InputTokens / OutputTokens) — a job whose
-// runtime did not report usage contributes 0, so the sum under-counts rather
-// than over-counts. A job whose model id is empty/unknown is priced at the
-// mid-tier fallback (defaultUnknownModelPrice) so it is never free.
-func (e Engine) sumRootDelegationCost(ctx context.Context, rootID string) (float64, error) {
-	jobs, err := e.Store.ListJobsByRoot(ctx, rootID)
-	if err != nil {
-		return 0, err
-	}
-	total := 0.0
-	for _, job := range jobs {
-		payload, err := DecodeJobPayload(job)
-		if err != nil {
-			return 0, err
-		}
-		total += costFromTokens(payload.Model, job.InputTokens, job.OutputTokens)
-	}
-	return total, nil
 }

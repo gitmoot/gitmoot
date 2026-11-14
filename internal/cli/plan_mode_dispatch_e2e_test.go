@@ -116,7 +116,7 @@ func TestPlanModeDaemonDispatchE2E(t *testing.T) {
 
 	t.Run("unsupported runtime fails loudly without dispatch", func(t *testing.T) {
 		marker := filepath.Join(root, "shell-ran")
-		script := "touch " + marker + "; printf '%s\\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"silently downgraded\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}'"
+		script := "touch " + marker + "; printf '%s\\n' '{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"silently downgraded\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[]}}'"
 		job, payload, events := runPlanModeDaemonJob(t, filepath.Join(root, "unsupported-home"), "plan-shell", runtime.ShellRuntime,
 			script, workflow.JobRequest{Plan: true})
 		if job.State != string(workflow.JobFailed) {
@@ -159,7 +159,7 @@ EOF
     printf '%s\n' "$@" > "$GITMOOT_OMP_ARGV_FILE"
     cat <<'EOF'
 {"type":"session","version":3,"id":"01920000-0000-7000-8000-000000000151","timestamp":"2026-08-15T00:00:00.000Z","cwd":"/repo"}
-{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"stub completed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[],\"delegations\":[]}}"}],"usage":{"input":1,"output":1,"totalTokens":2},"stopReason":"stop"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"{\"gitmoot_result\":{\"decision\":\"approved\",\"summary\":\"stub completed\",\"findings\":[],\"changes_made\":[],\"tests_run\":[],\"needs\":[]}}"}],"usage":{"input":1,"output":1,"totalTokens":2},"stopReason":"stop"}}
 {"type":"agent_end","messages":[],"isTerminal":true}
 EOF
     ;;

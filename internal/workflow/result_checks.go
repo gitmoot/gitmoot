@@ -100,13 +100,11 @@ type ResultCheck struct {
 }
 
 // ResultCheckInput carries the minimal job context the deterministic checks need
-// beyond the parsed result: the job action and whether the job is a coordinator
-// finalize continuation (payload.DelegationFinalize). Keeping this a small value
-// type makes the check set trivially unit-testable without a store or a job row.
+// beyond the parsed result: the job action. Keeping this a small value type makes
+// the check set trivially unit-testable without a store or a job row.
 type ResultCheckInput struct {
-	Action     string
-	IsFinalize bool
-	Result     AgentResult
+	Action string
+	Result AgentResult
 }
 
 // minActionableAnswerChars is the floor below which an ask/finalize answer is
@@ -157,8 +155,6 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 				Explanation: explain(pass, "the review requests changes but findings[] is empty, so there is no evidence to act on"),
 			})
 		}
-		// A review result carrying delegations never reaches here: the mailbox
-		// refuses it first (ReviewDelegationResultChecks, #2588).
 		if isTerminalReviewVerdict(r.Decision) {
 			// The obligation is that a verdict ACCOUNTS FOR ITSELF: it cites what it
 			// found, names something it actually ran, or states why there was nothing
@@ -213,35 +209,13 @@ func RunResultChecks(in ResultCheckInput) []ResultCheck {
 			})
 		}
 	case "ask":
-		// The coordinator finalize continuation is dispatched as an "ask" carrying
-		// DelegationFinalize (#305): it is a reconciliation, not a plain answer, so
-		// it gets the coordinator check below instead of the ask-answer check.
-		if !in.IsFinalize {
-			pass := isActionableAnswer(r)
-			checks = append(checks, ResultCheck{
-				ID:          "ask-answer-actionable",
-				Action:      "ask",
-				Question:    "Did the ask job return a non-empty, actionable answer?",
-				Pass:        pass,
-				Explanation: explain(pass, "the ask job's answer (summary/artifact_body) is empty or too short to be actionable"),
-			})
-		}
-	}
-
-	// Coordinator finalize continuation (#305): a coordinator re-invoked to
-	// reconcile its children's results must produce a substantive synthesis rather
-	// than a terse rubber-stamp. This grounds "reconcile the children" on the
-	// fields available at result-parse time (a substantive answer body); it does
-	// NOT cross-reference each child job — deeper per-child reconciliation is left
-	// as future work once child results are threaded to this seam.
-	if in.IsFinalize {
 		pass := isActionableAnswer(r)
 		checks = append(checks, ResultCheck{
-			ID:          "coordinator-outcome-reconciled",
-			Action:      "coordinator",
-			Question:    "Did the coordinator reconcile and summarize its children's outcomes?",
+			ID:          "ask-answer-actionable",
+			Action:      "ask",
+			Question:    "Did the ask job return a non-empty, actionable answer?",
 			Pass:        pass,
-			Explanation: explain(pass, "the coordinator finalize produced no substantive reconciliation summary"),
+			Explanation: explain(pass, "the ask job's answer (summary/artifact_body) is empty or too short to be actionable"),
 		})
 	}
 
@@ -350,27 +324,6 @@ func NoExecutionReviewResultChecks(r AgentResult) []ResultCheck {
 		})
 	}
 	return failed
-}
-
-// ReviewDelegationResultChecks returns the failed check for a review result
-// that still carries delegations, or nil (#2588). Reviewers are no longer
-// offered delegation: the prompt contract does not mention it, so a review
-// that returns delegations[] is off-contract, and dispatching or silently
-// dropping them would both misreport the review. Like
-// NoExecutionReviewResultChecks it is not subject to the result_checks mode:
-// the mailbox always refuses a failure.
-func ReviewDelegationResultChecks(action string, r AgentResult) []ResultCheck {
-	if !strings.EqualFold(strings.TrimSpace(action), "review") || len(r.Delegations) == 0 {
-		return nil
-	}
-	return []ResultCheck{{
-		ID:       "review-delegates-nothing",
-		Action:   "review",
-		Question: "Does the review result carry no delegations?",
-		Explanation: fmt.Sprintf(
-			"the review declared %d delegations, but reviewers can no longer delegate work to other jobs; return the verdict with findings directly and omit delegations",
-			len(r.Delegations)),
-	}}
 }
 
 // hasActionableEntries reports whether a string slice contains at least one
