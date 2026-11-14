@@ -333,7 +333,7 @@ func writeMessageResult(home string, id int64, role string, stdout, stderr io.Wr
 		if err != nil {
 			return err
 		}
-		return writeJSON(stdout, message)
+		return writeJSON(stdout, newMessageJSON(message))
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
