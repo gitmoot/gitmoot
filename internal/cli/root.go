@@ -57,6 +57,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	args = rewriteCommandAlias(args, stderr)
 	name := args[0]
 	if name == "sandbox-exec" {
 		return runSandboxExec(args[1:], stdout, stderr)
