@@ -100,7 +100,7 @@ func TestDashboardWorkflowTerminalStatusIndexAndDetailAgree(t *testing.T) {
 }
 
 // TestDashboardClosedWorkflowWithRunningJobIsNotActive pins #1106 on the consumed
-// /api/workflows path: a coordinator workflow born via `job open` keeps a
+// /api/campaigns path: a coordinator workflow born via `job open` keeps a
 // perpetually-running job, so closing it (status=done) must leave the active
 // bucket -- the terminal status wins over the lingering running job.
 func TestDashboardClosedWorkflowWithRunningJobIsNotActive(t *testing.T) {
@@ -191,7 +191,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 		t.Fatalf("workflow links = %d, want 3 labelled jobs", got)
 	}
 	for _, link := range all.Links {
-		if link.Kind == "workflow" && link.Source == "repo-a-legacy" {
+		if link.Kind == "campaign" && link.Source == "repo-a-legacy" {
 			t.Fatalf("unlabelled job gained workflow link: %+v", link)
 		}
 	}
@@ -208,7 +208,7 @@ func TestWebDataSourceGraphWorkflowHubsRespectVisibleJobs(t *testing.T) {
 		t.Fatalf("filtered workflow links = %d, want 2 visible labelled jobs", got)
 	}
 	for _, link := range filtered.Links {
-		if link.Kind == "workflow" && link.Source == "repo-b-release" {
+		if link.Kind == "campaign" && link.Source == "repo-b-release" {
 			t.Fatalf("repo filter leaked hidden workflow link: %+v", link)
 		}
 	}
@@ -229,7 +229,7 @@ func TestWebDataSourceGraphUnlabelledLegacyJSONUnchanged(t *testing.T) {
 		t.Fatalf("Graph: %v", err)
 	}
 	want := dashboard.Graph{
-		Nodes: []dashboard.GraphNode{{ID: "legacy", Type: "job", Label: "legacy", State: "running", Run: "legacy"}},
+		Nodes: []dashboard.GraphNode{{ID: "legacy", Type: "run", Label: "legacy", State: "running", Run: "legacy"}},
 		Links: []dashboard.GraphLink{}, Repos: []string{},
 	}
 	gotJSON, _ := json.Marshal(got)
@@ -260,16 +260,38 @@ const legacyUnlabelledGraphGolden = `{
   "nodes": [
     {
       "id": "legacy",
-      "type": "job",
+      "type": "run",
       "label": "legacy",
       "state": "running",
-      "run": "legacy"
+      "root": "legacy"
     }
   ],
   "links": [],
   "repos": []
 }
 `
+
+// TestDashboardWorkflowsTransitionAlias pins the one-release #2596 alias: the
+// fleet-tools probes still curl /api/workflows, so it answers with the
+// /api/campaigns body while every other pre-#2603 route is gone.
+func TestDashboardWorkflowsTransitionAlias(t *testing.T) {
+	home := dashboardTestHome(t)
+	handler := newDashboardWebHandler(&webDataSource{home: home})
+	get := func(path string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		return rr
+	}
+	campaigns, alias := get("/api/campaigns"), get("/api/workflows")
+	if campaigns.Code != http.StatusOK || alias.Code != http.StatusOK || campaigns.Body.String() != alias.Body.String() {
+		t.Fatalf("/api/workflows alias = %d %q, want /api/campaigns %d %q", alias.Code, alias.Body.String(), campaigns.Code, campaigns.Body.String())
+	}
+	for _, path := range []string{"/api/jobs", "/api/job/x", "/api/job/x/checks", "/api/agents", "/api/agent/x", "/api/tasks", "/api/workflow/x"} {
+		if rr := get(path); rr.Code != http.StatusNotFound {
+			t.Fatalf("GET %s status = %d, want 404", path, rr.Code)
+		}
+	}
+}
 
 func assertDashboardHTTPGolden(t *testing.T, handler http.Handler, target, want string) {
 	t.Helper()
@@ -502,7 +524,7 @@ func TestWebDataSourceWorkflowsIndexLifecycleCoordinatorAndSlashDetail(t *testin
 		}
 	}
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/workflow/fable%2Fdashboard-redesign", nil))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/campaign/fable%2Fdashboard-redesign", nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("encoded slash detail status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -682,7 +704,7 @@ func TestDashboardWorkflowDescriptionStatusAPI(t *testing.T) {
 
 	handler := newDashboardWebHandler(&webDataSource{home: home})
 	indexRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(indexRecorder, httptest.NewRequest(http.MethodGet, "/api/workflows", nil))
+	handler.ServeHTTP(indexRecorder, httptest.NewRequest(http.MethodGet, "/api/campaigns", nil))
 	if indexRecorder.Code != http.StatusOK {
 		t.Fatalf("index status=%d body=%s", indexRecorder.Code, indexRecorder.Body.String())
 	}
@@ -695,7 +717,7 @@ func TestDashboardWorkflowDescriptionStatusAPI(t *testing.T) {
 	}
 
 	detailRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/api/workflow/release%2Fapi-fields", nil))
+	handler.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/api/campaign/release%2Fapi-fields", nil))
 	if detailRecorder.Code != http.StatusOK {
 		t.Fatalf("detail status=%d body=%s", detailRecorder.Code, detailRecorder.Body.String())
 	}
@@ -720,7 +742,7 @@ func workflowGraphNode(nodes []dashboard.GraphNode, label string) (dashboard.Gra
 func workflowGraphLinkCount(links []dashboard.GraphLink) int {
 	var count int
 	for _, link := range links {
-		if link.Kind == "workflow" {
+		if link.Kind == "campaign" {
 			count++
 		}
 	}

@@ -28,7 +28,7 @@ type dashboardCommsResponse struct {
 
 type dashboardCommsThread struct {
 	ThreadID   int64                   `json:"thread_id,omitempty"`
-	WorkflowID string                  `json:"workflow_id"`
+	WorkflowID string                  `json:"campaign"`
 	Repo       string                  `json:"repo,omitempty"`
 	UpdatedAt  string                  `json:"updated_at"`
 	Unresolved int                     `json:"unresolved"`
@@ -49,7 +49,7 @@ type dashboardCommsMessage struct {
 	PullRequest        int                       `json:"pull_request,omitempty"`
 	HeadSHA            string                    `json:"head_sha,omitempty"`
 	ReviewPurpose      string                    `json:"review_purpose,omitempty"`
-	SourceJobID        string                    `json:"source_job_id,omitempty"`
+	SourceJobID        string                    `json:"source_run_id,omitempty"`
 	SourceState        string                    `json:"source_state,omitempty"`
 	ReviewDecision     string                    `json:"review_decision,omitempty"`
 	Resolution         *dashboardCommsResolution `json:"resolution,omitempty"`
@@ -150,7 +150,7 @@ func renderDashboardCommsMobileNav() string {
 	}
 	var out strings.Builder
 	out.WriteString(`<nav class="gm-mobile-nav" aria-label="Dashboard mobile navigation">`)
-	for _, href := range []string{"/", "/tasks", "/workflows"} {
+	for _, href := range []string{"/", "/prs", "/campaigns"} {
 		item := manifestByHref[href]
 		fmt.Fprintf(&out, `<a class="gm-mobile-item" href="%s">%s<span>%s</span></a>`,
 			html.EscapeString(item.Href),
@@ -167,10 +167,10 @@ func dashboardCommsNavIcon(href string) string {
 	const generic = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="6"/></svg>`
 	icons := map[string]string{
 		"/":          `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="6" height="6" rx="1.4"/><rect x="14" y="4" width="6" height="6" rx="1.4"/><rect x="4" y="14" width="6" height="6" rx="1.4"/><rect x="14" y="14" width="6" height="6" rx="1.4"/></svg>`,
-		"/tasks":     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16M17 4v16M4 7h6M14 12h6M4 17h6"/><circle cx="7" cy="7" r="1.8"/><circle cx="17" cy="12" r="1.8"/><circle cx="7" cy="17" r="1.8"/></svg>`,
-		"/workflows": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16"/><circle cx="7" cy="7" r="2"/><circle cx="7" cy="13" r="2"/><circle cx="7" cy="19" r="2"/><path d="M11 7h8M11 13h6M11 19h8"/></svg>`,
-		"/jobs":      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h11M8 12h11M8 18h11"/><circle cx="4" cy="6" r="1.1"/><circle cx="4" cy="12" r="1.1"/><circle cx="4" cy="18" r="1.1"/></svg>`,
-		"/agents":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="8" width="14" height="11" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="3.6" r="1"/><path d="M9.6 13h.01M14.4 13h.01"/></svg>`,
+		"/prs":       `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16M17 4v16M4 7h6M14 12h6M4 17h6"/><circle cx="7" cy="7" r="1.8"/><circle cx="17" cy="12" r="1.8"/><circle cx="7" cy="17" r="1.8"/></svg>`,
+		"/campaigns": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 4v16"/><circle cx="7" cy="7" r="2"/><circle cx="7" cy="13" r="2"/><circle cx="7" cy="19" r="2"/><path d="M11 7h8M11 13h6M11 19h8"/></svg>`,
+		"/runs":      `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M8 6h11M8 12h11M8 18h11"/><circle cx="4" cy="6" r="1.1"/><circle cx="4" cy="12" r="1.1"/><circle cx="4" cy="18" r="1.1"/></svg>`,
+		"/reviewers": `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="8" width="14" height="11" rx="2.5"/><path d="M12 8V5"/><circle cx="12" cy="3.6" r="1"/><path d="M9.6 13h.01M14.4 13h.01"/></svg>`,
 		"/org":       `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="9" y="3" width="6" height="5" rx="1.4"/><rect x="3" y="16" width="6" height="5" rx="1.4"/><rect x="15" y="16" width="6" height="5" rx="1.4"/><path d="M12 8v3.5M6 16v-2.5h12V16"/></svg>`,
 		"/comms":     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h12a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z"/><path d="M9 10h11a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-3l-3 2v-2"/></svg>`,
 		"/galaxy":    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 3l1.7 4.5L18 9l-4.3 1.5L12 15l-1.7-4.5L6 9l4.3-1.5z"/><circle cx="18.5" cy="17.5" r="1"/></svg>`,
@@ -436,7 +436,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
     <!-- gitmoot-dashboard-sidebar -->
     <section class="gm-content">
       <section class="filters" aria-label="Comms filters">
-        <input class="control search" id="search" type="search" placeholder="Search workflows, roles, bodies…" aria-label="Search comms">
+        <input class="control search" id="search" type="search" placeholder="Search campaigns, roles, bodies…" aria-label="Search comms">
         <select class="control" id="from"><option value="">From: anyone</option></select>
         <select class="control" id="to"><option value="">To: anyone</option></select>
         <select class="control" id="resolution"><option value="">Any resolution</option><option value="open">Unresolved</option><option value="resolved">Resolved</option></select>
@@ -448,11 +448,11 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
       <section class="workspace">
         <aside class="rail" id="rail">
           <div class="railhead"><div class="seg"><button id="open" type="button">Open</button><button id="all" class="active" type="button">All</button></div></div>
-          <div class="threads" id="threads"><div class="state"><strong>Loading comms</strong>Reading workflow notes…</div></div>
+          <div class="threads" id="threads"><div class="state"><strong>Loading comms</strong>Reading campaign notes…</div></div>
         </aside>
         <section class="conversation" id="conversation">
-          <div class="conversation-head" id="conversation-head"><button class="navlink mobile-back" id="back" type="button">← Threads</button><div><h1>Comms</h1><small>Select a workflow thread</small></div></div>
-          <div class="messages" id="messages"><div class="state"><strong>No thread selected</strong>Choose a workflow from the thread rail.</div></div>
+          <div class="conversation-head" id="conversation-head"><button class="navlink mobile-back" id="back" type="button">← Threads</button><div><h1>Comms</h1><small>Select a campaign thread</small></div></div>
+          <div class="messages" id="messages"><div class="state"><strong>No thread selected</strong>Choose a campaign from the thread rail.</div></div>
         </section>
       </section>
       <footer class="comms-footer"><span class="pulse"></span>Read-only org traffic · resolve escalations with <code style="margin-left:4px">gitmoot message resolve</code></footer>
@@ -463,8 +463,8 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
 <script>
 (()=>{
   const $=id=>document.getElementById(id), state={data:[],selected:'',mode:'all',deep:'',error:false};
-  const threadKey=t=>t.thread_id?'message:'+t.thread_id:t.workflow_id;
-  const threadTitle=t=>t.thread_id?'Conversation #'+t.thread_id+(t.workflow_id?' · '+t.workflow_id:''):t.workflow_id;
+  const threadKey=t=>t.thread_id?'message:'+t.thread_id:t.campaign;
+  const threadTitle=t=>t.thread_id?'Conversation #'+t.thread_id+(t.campaign?' · '+t.campaign:''):t.campaign;
   const isOpen=m=>(m.kind==='escalation'&&!m.resolution&&m.lifecycle!=='resolved')||(m.kind==='directive'&&!['completed','cancelled'].includes(m.lifecycle));
   const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const when=v=>{const d=new Date(v);return isNaN(d)?v:d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'})};
@@ -481,7 +481,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   const visible=()=>{
     const q=$('search').value.trim().toLowerCase(),from=$('from').value,to=$('to').value,res=$('resolution').value,date=$('date').value,systems=$('systems').checked;
     return state.data.map(t=>({...t,_messages:t.messages.filter(m=>matchesMessage(m,q,from,to,res,date,systems))}))
-      .filter(t=>(state.mode==='all'||t.unresolved>0)&&(!q||t.workflow_id.toLowerCase().includes(q)||t._messages.length)&&t._messages.length);
+      .filter(t=>(state.mode==='all'||t.unresolved>0)&&(!q||t.campaign.toLowerCase().includes(q)||t._messages.length)&&t._messages.length);
   };
   const stateBox=(title,copy,cls='')=>'<div class="state '+cls+'" role="status"><strong>'+esc(title)+'</strong>'+esc(copy)+'</div>';
   const renderThreads=()=>{
@@ -500,7 +500,7 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
     if(m.resolution)foot='<div class="footer" id="note-'+m.resolution.note_id+'">Resolved by <b>'+esc(m.resolution.by)+'</b> · '+esc(when(m.resolution.created_at))+' <a href="?note='+m.resolution.note_id+'#note-'+m.resolution.note_id+'">marker #'+m.resolution.note_id+'</a></div>';
     if(m.notification_status)foot+='<div class="footer">Notification: '+esc(m.notification_status)+(m.notification_reason?' · '+esc(m.notification_reason):'')+'</div>';
     if(m.lifecycle)foot+='<div class="footer">Lifecycle: '+esc(m.lifecycle)+'</div>';
-    if(m.source_job_id)foot+='<div class="footer">Source job: '+esc(m.source_job_id)+(m.source_state?' · '+esc(m.source_state):'')+'</div>';
+    if(m.source_run_id)foot+='<div class="footer">Source run: '+esc(m.source_run_id)+(m.source_state?' · '+esc(m.source_state):'')+'</div>';
     if(m.head_sha)foot+='<div class="footer">Review: '+esc(m.repo)+'#'+esc(m.pull_request)+' · head '+esc(m.head_sha)+' · '+esc(m.review_purpose)+(m.review_decision?' · '+esc(m.review_decision):'')+'</div>';
     return '<article class="message '+(reply?'reply ':'')+(open?'open':'')+'" id="note-'+m.id+'"><div class="bubble"><div class="meta"><span class="role">'+esc(m.from||'unknown')+'</span><span class="arrow">→</span><span class="role">'+esc(m.to||'unknown')+'</span><span class="chip">'+esc(m.kind)+'</span><span>'+esc(when(m.created_at))+'</span><a class="note" href="?note='+m.id+'#note-'+m.id+'">#'+m.id+'</a></div><div class="body">'+esc(m.body)+'</div><button class="expand" type="button">Expand</button>'+foot+'</div></article>';
   };
@@ -510,11 +510,11 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
     $('conversation-head').innerHTML='<button class="navlink mobile-back" id="back" type="button">← Threads</button><div><h1>'+esc(threadTitle(t))+'</h1><small>'+(t.unresolved?t.unresolved+' open obligation'+(t.unresolved===1?'':'s'):'No open formal obligations')+(t.repo?' · '+esc(t.repo):'')+'</small></div>';
     $('back').onclick=()=>{$('rail').classList.remove('thread-open');$('conversation').classList.remove('thread-open')};
     const msgs=t._messages||t.messages;
-    $('messages').innerHTML=msgs.length?msgs.map(messageHTML).join(''):stateBox('No matching conversation','This workflow has traffic, but none matches the active filters.');
+    $('messages').innerHTML=msgs.length?msgs.map(messageHTML).join(''):stateBox('No matching conversation','This campaign has traffic, but none matches the active filters.');
     document.querySelectorAll('.body').forEach(body=>{const btn=body.nextElementSibling;if(body.scrollHeight>body.clientHeight+2){btn.style.display='inline-block';btn.onclick=()=>{body.classList.toggle('expanded');btn.textContent=body.classList.contains('expanded')?'Collapse':'Expand'}}});
     if(state.deep){requestAnimationFrame(()=>{const node=$('note-'+state.deep);if(node){node.scrollIntoView({block:'center'});node.classList.add('focus');setTimeout(()=>node.classList.remove('focus'),1900)}state.deep=''})}
   };
-  const select=(id,push=true)=>{state.selected=id;$('rail').classList.add('thread-open');$('conversation').classList.add('thread-open');if(push){const u=new URL(location.href);if(id.startsWith('message:')){u.searchParams.set('thread',id.slice(8));u.searchParams.delete('workflow')}else{u.searchParams.set('workflow',id);u.searchParams.delete('thread')}u.searchParams.delete('note');history.replaceState({},'',u)}renderThreads()};
+  const select=(id,push=true)=>{state.selected=id;$('rail').classList.add('thread-open');$('conversation').classList.add('thread-open');if(push){const u=new URL(location.href);if(id.startsWith('message:')){u.searchParams.set('thread',id.slice(8));u.searchParams.delete('campaign');u.searchParams.delete('workflow')}else{u.searchParams.set('campaign',id);u.searchParams.delete('workflow');u.searchParams.delete('thread')}u.searchParams.delete('note');history.replaceState({},'',u)}renderThreads()};
   const roleOptions=()=>{
     const roles=new Set();state.data.forEach(t=>t.messages.forEach(m=>{if(m.from)roles.add(m.from);if(m.to)roles.add(m.to)}));
     [...roles].sort().forEach(role=>{$('from').insertAdjacentHTML('beforeend','<option>'+esc(role)+'</option>');$('to').insertAdjacentHTML('beforeend','<option>'+esc(role)+'</option>')});
@@ -540,13 +540,13 @@ button,input,select{font:inherit;color:inherit}button{cursor:pointer}.shell{heig
   const closeMobileNav=()=>{$('dashboard-sidebar').classList.remove('mobile-open');$('mobile-backdrop').classList.remove('mobile-open')};
   const toggleMobileNav=()=>{$('dashboard-sidebar').classList.toggle('mobile-open');$('mobile-backdrop').classList.toggle('mobile-open')};
   $('mobile-menu').onclick=toggleMobileNav;$('mobile-more').onclick=toggleMobileNav;$('mobile-backdrop').onclick=closeMobileNav;
-  const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('workflow'),wantedThread=p.get('thread');
+  const p=new URLSearchParams(location.search),note=p.get('note')||(location.hash.match(/^#note-(\d+)$/)||[])[1],wanted=p.get('campaign')||p.get('workflow'),wantedThread=p.get('thread');
   const api=new URL('/api/comms',location.origin);if(note)api.searchParams.set('note',note);
   fetch(api.pathname+api.search,{cache:'no-store'}).then(async r=>{if(!r.ok)throw new Error(await r.text());return r.json()}).then(data=>{
     state.data=Array.isArray(data.threads)?data.threads:[];roleOptions();renderStale(data.stale_notifications);
     if(note){state.deep=String(note);const found=state.data.find(t=>t.messages.some(m=>String(m.id)===state.deep||(m.resolution&&String(m.resolution.note_id)===state.deep)));if(found)state.selected=threadKey(found)}
     if(!state.selected&&wantedThread){const found=state.data.find(t=>String(t.thread_id)===wantedThread);if(found)state.selected=threadKey(found)}
-    if(!state.selected&&wanted){const found=state.data.find(t=>t.workflow_id===wanted);if(found)state.selected=threadKey(found)}
+    if(!state.selected&&wanted){const found=state.data.find(t=>t.campaign===wanted);if(found)state.selected=threadKey(found)}
     if(!state.data.length){$('threads').innerHTML=stateBox('No messages yet','Fleet conversations and addressed notifications will appear here.');$('messages').innerHTML=stateBox('Conversation is empty','There are no Comms threads to display.');return}
     if(state.selected)select(state.selected,false);else renderThreads();
   }).catch(()=>{state.error=true;renderThreads();$('messages').innerHTML=stateBox('Comms source unavailable','The inbox store could not be read.','source-down')});

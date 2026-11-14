@@ -343,7 +343,7 @@ Usage of dashboard:
   -json
     	write the snapshot as JSON
   -web
-    	serve the read-only web dashboard until interrupted
+    	serve the read-only web dashboard (reviewers, PRs, runs, campaigns) until interrupted
 ```
 
 ## gitmoot doctor

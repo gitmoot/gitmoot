@@ -63,10 +63,10 @@ func TestDashboardOverviewUnlabeledJobsNeedsYou(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(overview.NeedsYou) != 1 || overview.NeedsYou[0].Kind != "unlabeled_jobs" || overview.NeedsYou[0].Title != "10 unlabeled agent jobs in 24h (acme/drift)" {
+	if len(overview.NeedsYou) != 1 || overview.NeedsYou[0].Kind != "unlabeled_runs" || overview.NeedsYou[0].Title != "10 unlabeled runs in 24h (acme/drift)" {
 		t.Fatalf("needs=%+v", overview.NeedsYou)
 	}
-	if !(dashboardNeedRank("stalled_workflow") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("pr_awaiting_merge") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("blocked_job") < dashboardNeedRank("unlabeled_jobs") && dashboardNeedRank("unlabeled_jobs") < dashboardNeedRank("anything_unknown")) {
+	if !(dashboardNeedRank("stalled_campaign") < dashboardNeedRank("unlabeled_runs") && dashboardNeedRank("pr_awaiting_merge") < dashboardNeedRank("unlabeled_runs") && dashboardNeedRank("blocked_run") < dashboardNeedRank("unlabeled_runs") && dashboardNeedRank("unlabeled_runs") < dashboardNeedRank("anything_unknown")) {
 		t.Fatal("unlabeled_jobs rank is not advisory")
 	}
 }
@@ -95,7 +95,7 @@ func TestDashboardOverviewUnlabeledJobsNeedsPolicyAndSortsRepos(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, item := range off.NeedsYou {
-		if item.Kind == "unlabeled_jobs" {
+		if item.Kind == "unlabeled_runs" {
 			t.Fatalf("feature-off overview contains unlabeled jobs: %+v", off.NeedsYou)
 		}
 	}
@@ -105,7 +105,7 @@ func TestDashboardOverviewUnlabeledJobsNeedsPolicyAndSortsRepos(t *testing.T) {
 	}
 	var repos []string
 	for _, item := range on.NeedsYou {
-		if item.Kind == "unlabeled_jobs" {
+		if item.Kind == "unlabeled_runs" {
 			repos = append(repos, item.Repo)
 		}
 	}
@@ -238,11 +238,11 @@ func TestDashboardOverviewTasksAndWorkflows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dashboardOverview: %v", err)
 	}
-	if len(overview.NeedsYou) != 3 || overview.NeedsYou[0].Kind != "stalled_workflow" || overview.NeedsYou[0].Label != "ops/stalled" || overview.NeedsYou[0].Pane != "ops-pane" || overview.NeedsYou[1].Kind != "pr_awaiting_merge" || overview.NeedsYou[1].Ref != "#42" || overview.NeedsYou[2].Kind != "blocked_job" || overview.NeedsYou[2].Title != "waiting on deployment credentials" {
+	if len(overview.NeedsYou) != 3 || overview.NeedsYou[0].Kind != "stalled_campaign" || overview.NeedsYou[0].Label != "ops/stalled" || overview.NeedsYou[0].Pane != "ops-pane" || overview.NeedsYou[1].Kind != "pr_awaiting_merge" || overview.NeedsYou[1].Ref != "#42" || overview.NeedsYou[2].Kind != "blocked_run" || overview.NeedsYou[2].Title != "waiting on deployment credentials" {
 		t.Fatalf("needs_you = %+v", overview.NeedsYou)
 	}
 	for _, item := range overview.NeedsYou {
-		if item.Kind == "stalled_workflow" && item.Label == "ops/merge-settled" {
+		if item.Kind == "stalled_campaign" && item.Label == "ops/merge-settled" {
 			t.Fatalf("merge-settled workflow appeared in needs_you: %+v", overview.NeedsYou)
 		}
 	}
@@ -329,9 +329,9 @@ func TestWebDashboardTasksRoundTripAndMergedWindow(t *testing.T) {
 	store.Close()
 
 	recorder := httptest.NewRecorder()
-	dashboard.Serve(&webDataSource{home: home}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/tasks", nil))
+	dashboard.Serve(&webDataSource{home: home}).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/prs", nil))
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("GET /api/tasks status=%d body=%s", recorder.Code, recorder.Body.String())
+		t.Fatalf("GET /api/prs status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var tasks []dashboard.TaskSummary
 	if err := json.Unmarshal(recorder.Body.Bytes(), &tasks); err != nil {

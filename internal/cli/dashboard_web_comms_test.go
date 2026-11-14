@@ -466,6 +466,11 @@ func dashboardEmbeddedModuleNav(t *testing.T, body string) []dashboardNavItem {
 		}
 		if action != "" {
 			route := strings.ToLower(action)
+			// The SPA's view handlers kept their internal names (#2603); their
+			// canonical routes follow the new vocabulary.
+			if renamed, ok := map[string]string{"tasks": "prs", "workflows": "campaigns", "jobs": "runs", "agents": "reviewers"}[route]; ok {
+				route = renamed
+			}
 			href = "/" + route
 			if route == "overview" {
 				href = "/"

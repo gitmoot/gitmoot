@@ -310,7 +310,7 @@ func TestNodeTitleDescriptive(t *testing.T) {
 	// Empty inputs fall back to the job id, never panic.
 	got = nodeTitle(workflow.JobPayload{}, db.Job{ID: "job-xyz"}, "")
 	if got != "job-xyz" {
-		t.Fatalf("fallback title = %q, want job-xyz", got)
+		t.Fatalf("fallback title = %q, want run-xyz", got)
 	}
 }
 
@@ -366,14 +366,14 @@ func TestWebDataSourceGraph(t *testing.T) {
 		return n
 	}
 
-	// Job nodes: all five seeded jobs are present as type "job".
+	// Job nodes: all five seeded jobs are present as type "run".
 	for _, id := range []string{"coord", "child-search", "child-export", "coord-cont", "other-root"} {
 		n, ok := graphNode(g.Nodes, id)
 		if !ok {
 			t.Fatalf("job node %q missing", id)
 		}
-		if n.Type != "job" {
-			t.Fatalf("node %q type = %q, want job", id, n.Type)
+		if n.Type != "run" {
+			t.Fatalf("node %q type = %q, want run", id, n.Type)
 		}
 	}
 	if n, _ := graphNode(g.Nodes, "coord"); n.Run != "coord" {
@@ -387,7 +387,7 @@ func TestWebDataSourceGraph(t *testing.T) {
 	if n, ok := graphNode(g.Nodes, "repo::jerryfane/noted"); !ok || n.Type != "repo" || n.Repo != "jerryfane/noted" {
 		t.Fatalf("repo hub node bad: %+v ok=%v", n, ok)
 	}
-	if n, ok := graphNode(g.Nodes, "agent::builder"); !ok || n.Type != "agent" || n.Agent != "builder" {
+	if n, ok := graphNode(g.Nodes, "agent::builder"); !ok || n.Type != "reviewer" || n.Agent != "builder" {
 		t.Fatalf("agent hub builder bad: %+v ok=%v", n, ok)
 	}
 	if _, ok := graphNode(g.Nodes, "agent::project-lead"); !ok {
@@ -405,7 +405,7 @@ func TestWebDataSourceGraph(t *testing.T) {
 	if !hasLink(g.Links, "child-search", "repo::jerryfane/noted", "repo") {
 		t.Fatalf("missing repo spoke for child-search")
 	}
-	if !hasLink(g.Links, "child-search", "agent::builder", "agent") {
+	if !hasLink(g.Links, "child-search", "agent::builder", "reviewer") {
 		t.Fatalf("missing agent spoke for child-search")
 	}
 	if kindCount(g.Links, "dep") == 0 {
@@ -640,10 +640,10 @@ func TestJobTitle(t *testing.T) {
 		t.Errorf("title = %q, want %q", got, "Do the thing")
 	}
 	if got := jobTitle(workflow.JobPayload{TaskTitle: "Fancy Title"}, db.Job{ID: "job-1"}); got != "job-1" {
-		t.Errorf("title = %q, want job-1 (task title is not used; id fallback)", got)
+		t.Errorf("title = %q, want run-1 (task title is not used; id fallback)", got)
 	}
 	if got := jobTitle(workflow.JobPayload{}, db.Job{ID: "job-2"}); got != "job-2" {
-		t.Errorf("title = %q, want job-2 (id fallback)", got)
+		t.Errorf("title = %q, want run-2 (id fallback)", got)
 	}
 }
 
@@ -783,7 +783,7 @@ func TestBuildChartsBucketingAndZeroFill(t *testing.T) {
 
 	tot := charts.Totals
 	if tot.Jobs != 3 || tot.Succeeded != 1 || tot.Failed != 1 || tot.TokensIn != 106 || tot.TokensOut != 29 || tot.ActiveAgents != 2 {
-		t.Fatalf("totals = %+v, want jobs3 ok1 fail1 in106 out29 active2", tot)
+		t.Fatalf("totals = %+v, want runs3 ok1 fail1 in106 out29 active2", tot)
 	}
 
 	if len(charts.Agents) != 2 || charts.Agents[0].Name != "builder" {
@@ -1328,7 +1328,7 @@ func TestWebDataSourceAgentConfig(t *testing.T) {
 		t.Fatalf("plain-agent Config = nil, want a non-nil section")
 	}
 	if plain.Config.JobTimeout != "10m" {
-		t.Fatalf("plain-agent Config defaults = %+v, want job 10m", plain.Config)
+		t.Fatalf("plain-agent Config defaults = %+v, want run 10m", plain.Config)
 	}
 
 	// Agent(nosection-agent): no config section => nil Config.

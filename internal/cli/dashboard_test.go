@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -36,9 +37,9 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 	for _, want := range []string{
 		"daemon: stopped",
 		"repos: 0",
-		"agents: 0",
-		"active_jobs: 0",
-		"jobs: 0",
+		"reviewers: 0",
+		"active_runs: 0",
+		"runs: 0",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)
@@ -46,6 +47,30 @@ func TestDashboardSnapshotRendersSections(t *testing.T) {
 	}
 	if strings.Contains(out, "runtime_sessions") {
 		t.Fatalf("dashboard still renders the removed runtime_sessions section:\n%s", out)
+	}
+}
+
+// TestDashboardJSONUsesNewVocabulary pins the #2603 --json key renames:
+// agents -> reviewers, active_jobs -> active_runs, jobs -> runs.
+func TestDashboardJSONUsesNewVocabulary(t *testing.T) {
+	home := dashboardTestHome(t)
+	var stdout, stderr bytes.Buffer
+	if code := Run([]string{"dashboard", "--home", home, "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("dashboard --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("dashboard --json is not an object: %v\n%s", err, stdout.String())
+	}
+	for _, key := range []string{"reviewers", "active_runs", "runs"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("dashboard --json missing %q:\n%s", key, stdout.String())
+		}
+	}
+	for _, key := range []string{"agents", "active_jobs", "jobs"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("dashboard --json still has old key %q:\n%s", key, stdout.String())
+		}
 	}
 }
 
@@ -265,7 +290,7 @@ func TestDashboardRendersActiveJobsSection(t *testing.T) {
 		t.Fatalf("dashboard exit code = %d, stderr=%s", code, stderr.String())
 	}
 	out := stdout.String()
-	for _, want := range []string{"active_jobs: 1", "live-1", "planner"} {
+	for _, want := range []string{"active_runs: 1", "live-1", "planner"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("dashboard output missing %q:\n%s", want, out)
 		}

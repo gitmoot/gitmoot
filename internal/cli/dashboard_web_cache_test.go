@@ -407,7 +407,7 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	if err := raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The dashboard module has no JobSummary.Model field in this pane, so /api/jobs
+	// The dashboard module has no JobSummary.Model field in this pane, so /api/runs
 	// byte parity remains unchanged. The gitmoot-owned node builder must still carry
 	// the persisted model while the cached and uncached module responses match.
 	modelNode, err := (&webDataSource{home: home}).Job(context.Background(), "child-search")
@@ -421,8 +421,8 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	cached := newDashboardWebHandler(&webDataSource{home: home, responseCache: newDashboardJSONCache(nil)})
 	uncached := dashboard.Serve(&webDataSource{home: home})
 	for _, path := range []string{
-		"/api/jobs", "/api/charts?days=30", "/api/charts?days=0",
-		"/api/overview", "/api/attention", "/api/agents", "/api/tasks",
+		"/api/runs", "/api/charts?days=30", "/api/charts?days=0",
+		"/api/overview", "/api/attention", "/api/reviewers", "/api/prs",
 	} {
 		want := httptest.NewRecorder()
 		uncached.ServeHTTP(want, httptest.NewRequest(http.MethodGet, path, nil))
@@ -439,7 +439,7 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 		}
 	}
 
-	// #958: /api/workflows is a deliberate SUPERSET of the pinned module output
+	// #958: /api/campaigns is a deliberate SUPERSET of the pinned module output
 	// (it adds description + status), so it is validated apart from the strict
 	// module-byte-parity loop above. Two invariants still hold: the cached shadow
 	// is cache-stable (miss==hit and equals the widened builder), and it diverges
@@ -451,16 +451,16 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 	}
 	for _, wantOutcome := range []string{"miss", "hit"} {
 		got := httptest.NewRecorder()
-		cached.ServeHTTP(got, httptest.NewRequest(http.MethodGet, "/api/workflows", nil))
+		cached.ServeHTTP(got, httptest.NewRequest(http.MethodGet, "/api/campaigns", nil))
 		if got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), wantWidened) {
-			t.Fatalf("/api/workflows %s differs from widened builder\nwant:\n%s\ngot:\n%s", wantOutcome, wantWidened, got.Body.Bytes())
+			t.Fatalf("/api/campaigns %s differs from widened builder\nwant:\n%s\ngot:\n%s", wantOutcome, wantWidened, got.Body.Bytes())
 		}
 		if outcome := got.Header().Get(dashboardCacheHeader); outcome != wantOutcome {
-			t.Fatalf("/api/workflows cache outcome = %q, want %q", outcome, wantOutcome)
+			t.Fatalf("/api/campaigns cache outcome = %q, want %q", outcome, wantOutcome)
 		}
 	}
 	moduleRec := httptest.NewRecorder()
-	uncached.ServeHTTP(moduleRec, httptest.NewRequest(http.MethodGet, "/api/workflows", nil))
+	uncached.ServeHTTP(moduleRec, httptest.NewRequest(http.MethodGet, "/api/campaigns", nil))
 	var widenedEntries, moduleEntries []map[string]any
 	if err := json.Unmarshal(wantWidened, &widenedEntries); err != nil {
 		t.Fatal(err)
@@ -491,7 +491,7 @@ func TestDashboardCachedHandlersMatchModuleBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	rr := httptest.NewRecorder()
-	uncached.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/jobs", nil))
+	uncached.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/runs", nil))
 	if !bytes.Equal(rr.Body.Bytes(), wantLegacy) {
 		t.Fatalf("projected jobs differ from the pre-change full-unmarshal path\nwant:\n%s\ngot:\n%s", wantLegacy, rr.Body.Bytes())
 	}
@@ -501,7 +501,7 @@ func TestDashboardCachedTierTwoHandlersMatchModuleBytesEmpty(t *testing.T) {
 	home := dashboardTestHome(t)
 	cached := newDashboardWebHandler(&webDataSource{home: home, responseCache: newDashboardJSONCache(nil)})
 	module := dashboard.Serve(&webDataSource{home: home})
-	for _, path := range []string{"/api/overview", "/api/attention", "/api/agents", "/api/tasks", "/api/workflows"} {
+	for _, path := range []string{"/api/overview", "/api/attention", "/api/reviewers", "/api/prs", "/api/campaigns"} {
 		t.Run(strings.TrimPrefix(path, "/api/"), func(t *testing.T) {
 			want := httptest.NewRecorder()
 			module.ServeHTTP(want, httptest.NewRequest(http.MethodGet, path, nil))
@@ -602,7 +602,7 @@ func TestDashboardAgentsCacheRegistryMaxAndJobCursor(t *testing.T) {
 	read := func(wantOutcome string) dashboard.AgentSummary {
 		t.Helper()
 		rr := httptest.NewRecorder()
-		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/agents", nil))
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/reviewers", nil))
 		if rr.Code != http.StatusOK || rr.Header().Get(dashboardCacheHeader) != wantOutcome {
 			t.Fatalf("agents status=%d outcome=%q body=%s", rr.Code, rr.Header().Get(dashboardCacheHeader), rr.Body.String())
 		}
@@ -660,7 +660,7 @@ func TestDashboardTierTwoCachesUncoveredWritesUseHardMax(t *testing.T) {
 		after  string
 	}{
 		{
-			name: "task upsert", path: "/api/tasks", maxAge: dashboardTasksCachePolicy.maxAge,
+			name: "task upsert", path: "/api/prs", maxAge: dashboardTasksCachePolicy.maxAge,
 			seed: func(t *testing.T, store *db.Store) {
 				if err := store.UpsertTask(context.Background(), db.Task{ID: "task", RepoFullName: "acme/app", Title: "before", State: "reviewing"}); err != nil {
 					t.Fatal(err)
@@ -684,7 +684,7 @@ func TestDashboardTierTwoCachesUncoveredWritesUseHardMax(t *testing.T) {
 			before: "before", after: "after",
 		},
 		{
-			name: "workflow direct job transition", path: "/api/workflows", maxAge: dashboardWorkflowsCachePolicy.maxAge,
+			name: "workflow direct job transition", path: "/api/campaigns", maxAge: dashboardWorkflowsCachePolicy.maxAge,
 			seed: func(t *testing.T, store *db.Store) {
 				payload := mustJSON(t, workflow.JobPayload{WorkflowID: "cache/workflow", Repo: "acme/app"})
 				if err := store.CreateJob(context.Background(), db.Job{ID: "workflow-job", Agent: "worker", Type: "ask", State: "queued", Payload: payload}); err != nil {

@@ -30,9 +30,9 @@ type dashboardSnapshot struct {
 	DatabaseExists bool                    `json:"database_exists"`
 	Daemon         dashboardDaemon         `json:"daemon"`
 	Repos          []dashboardRepo         `json:"repos"`
-	Agents         []dashboardAgent        `json:"agents"`
-	ActiveJobs     []dashboardActiveJob    `json:"active_jobs"`
-	Jobs           dashboardJobs           `json:"jobs"`
+	Agents         []dashboardAgent        `json:"reviewers"`
+	ActiveJobs     []dashboardActiveJob    `json:"active_runs"`
+	Jobs           dashboardJobs           `json:"runs"`
 	Worktrees      []dashboardWorktree     `json:"worktrees"`
 	ResourceLocks  []dashboardResourceLock `json:"resource_locks"`
 
@@ -104,14 +104,14 @@ type dashboardJobs struct {
 // "session busy" signal and is already surfaced in the resource_locks section.
 type dashboardActiveJob struct {
 	ID    string `json:"id"`
-	Agent string `json:"agent"`
+	Agent string `json:"reviewer"`
 	Repo  string `json:"repo,omitempty"`
 	Type  string `json:"type"`
 	State string `json:"state"`
 }
 
 type dashboardWorktree struct {
-	Task string `json:"task"`
+	Task string `json:"pr"`
 	Repo string `json:"repo,omitempty"`
 	Path string `json:"path"`
 }
@@ -126,7 +126,7 @@ func runDashboard(args []string, stdout, stderr io.Writer) int {
 	home := fs.String("home", "", "home directory to use instead of the current user's home")
 	jsonOutput := fs.Bool("json", false, "write the snapshot as JSON")
 	all := fs.Bool("all", false, "show full lists without truncation or grouping")
-	web := fs.Bool("web", false, "serve the read-only web dashboard until interrupted")
+	web := fs.Bool("web", false, "serve the read-only web dashboard (reviewers, PRs, runs, campaigns) until interrupted")
 	webAddr := fs.String("addr", "127.0.0.1:8080", "address for --web to listen on")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -381,21 +381,21 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 	}
 	dashboardMore(stdout, st, hidden)
 
-	dashboardSectionHeader(stdout, st, "agents", len(snapshot.Agents))
+	dashboardSectionHeader(stdout, st, "reviewers", len(snapshot.Agents))
 	agents, hidden := dashboardTruncate(st, all, snapshot.Agents)
 	for _, agent := range agents {
 		writeLine(stdout, "  %s [%s]%s", agent.Name, agent.Runtime, dashboardSuffix(agent.Role, agent.Health))
 	}
 	dashboardMore(stdout, st, hidden)
 
-	dashboardSectionHeader(stdout, st, "active_jobs", len(snapshot.ActiveJobs))
+	dashboardSectionHeader(stdout, st, "active_runs", len(snapshot.ActiveJobs))
 	activeJobs, hidden := dashboardTruncate(st, all, snapshot.ActiveJobs)
 	for _, job := range activeJobs {
 		writeLine(stdout, "  %s %s [%s] %s %s", job.ID, job.Agent, job.Type, emptyText(job.Repo), dashboardJobStateColor(st, job.State))
 	}
 	dashboardMore(stdout, st, hidden)
 
-	dashboardSectionHeader(stdout, st, "jobs", snapshot.Jobs.Total)
+	dashboardSectionHeader(stdout, st, "runs", snapshot.Jobs.Total)
 	for _, state := range sortedKeys(snapshot.Jobs.ByState) {
 		writeLine(stdout, "  %s: %d", dashboardJobStateColor(st, state), snapshot.Jobs.ByState[state])
 	}
@@ -414,10 +414,10 @@ func printDashboardSnapshot(stdout io.Writer, st style.Style, snapshot dashboard
 func printDashboardAttention(stdout io.Writer, st style.Style, snapshot dashboardSnapshot, home string) {
 	lines := []string{}
 	if blocked := snapshot.Jobs.ByState["blocked"]; blocked > 0 {
-		lines = append(lines, st.Red(fmt.Sprintf("%d blocked job(s)", blocked)))
+		lines = append(lines, st.Red(fmt.Sprintf("%d blocked run(s)", blocked)))
 	}
 	if failed := snapshot.Jobs.ByState["failed"]; failed > 0 {
-		lines = append(lines, st.Red(fmt.Sprintf("%d failed job(s)", failed)))
+		lines = append(lines, st.Red(fmt.Sprintf("%d failed run(s)", failed)))
 	}
 	for _, lock := range snapshot.ResourceLocks {
 		if lock.Stale {
