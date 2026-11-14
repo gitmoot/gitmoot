@@ -264,7 +264,7 @@ func TestPollRegisteredReposRoutesEachRepoWithOwnGitHubClient(t *testing.T) {
 		t.Fatalf("job payload repos = %+v, want both repos", seenRepos)
 	}
 	for path, client := range clients {
-		if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `review` job") {
+		if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "queued `review` run") {
 			t.Fatalf("posted acknowledgements for %s = %+v", path, client.posted)
 		}
 	}
